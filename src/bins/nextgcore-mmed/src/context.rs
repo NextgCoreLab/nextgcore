@@ -11,23 +11,23 @@ use std::sync::RwLock;
 // ============================================================================
 
 /// Maximum number of served GUMMEI
-pub const OGS_MAX_NUM_OF_SERVED_GUMMEI: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_SERVED_GUMMEI: usize = 8;
 /// Maximum number of supported TA
-pub const OGS_MAX_NUM_OF_SUPPORTED_TA: usize = 16;
+pub const NEXTGCORE_MAX_NUM_OF_SUPPORTED_TA: usize = 16;
 /// Maximum number of PLMN per MME
-pub const OGS_MAX_NUM_OF_PLMN_PER_MME: usize = 6;
+pub const NEXTGCORE_MAX_NUM_OF_PLMN_PER_MME: usize = 6;
 /// Maximum number of algorithms
-pub const OGS_MAX_NUM_OF_ALGORITHM: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_ALGORITHM: usize = 8;
 /// Maximum number of sessions
-pub const OGS_MAX_NUM_OF_SESS: usize = 4;
+pub const NEXTGCORE_MAX_NUM_OF_SESS: usize = 4;
 /// Maximum number of bearers
-pub const OGS_MAX_NUM_OF_BEARER: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_BEARER: usize = 8;
 /// Maximum number of APN
-pub const OGS_MAX_NUM_OF_APN: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_APN: usize = 8;
 /// Maximum number of TAI
-pub const OGS_MAX_NUM_OF_TAI: usize = 16;
+pub const NEXTGCORE_MAX_NUM_OF_TAI: usize = 16;
 /// Maximum number of cell ID
-pub const OGS_MAX_NUM_OF_CELL_ID: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_CELL_ID: usize = 8;
 
 /// Groups per MME (spec says 65535, using 256 for practical purposes)
 pub const GRP_PER_MME: usize = 256;
@@ -35,43 +35,43 @@ pub const GRP_PER_MME: usize = 256;
 pub const CODE_PER_MME: usize = 256;
 
 /// Key length
-pub const OGS_KEY_LEN: usize = 16;
+pub const NEXTGCORE_KEY_LEN: usize = 16;
 /// RAND length
-pub const OGS_RAND_LEN: usize = 16;
+pub const NEXTGCORE_RAND_LEN: usize = 16;
 /// AUTN length
-pub const OGS_AUTN_LEN: usize = 16;
+pub const NEXTGCORE_AUTN_LEN: usize = 16;
 /// MAX RES length
-pub const OGS_MAX_RES_LEN: usize = 16;
+pub const NEXTGCORE_MAX_RES_LEN: usize = 16;
 /// SHA256 digest size
-pub const OGS_SHA256_DIGEST_SIZE: usize = 32;
+pub const NEXTGCORE_SHA256_DIGEST_SIZE: usize = 32;
 /// MAX IMSI length
-pub const OGS_MAX_IMSI_LEN: usize = 15;
+pub const NEXTGCORE_MAX_IMSI_LEN: usize = 15;
 /// MAX IMSI BCD length
-pub const OGS_MAX_IMSI_BCD_LEN: usize = 15;
+pub const NEXTGCORE_MAX_IMSI_BCD_LEN: usize = 15;
 /// MAX IMEISV length
-pub const OGS_MAX_IMEISV_LEN: usize = 16;
+pub const NEXTGCORE_MAX_IMEISV_LEN: usize = 16;
 /// MAX IMEISV BCD length
-pub const OGS_MAX_IMEISV_BCD_LEN: usize = 16;
+pub const NEXTGCORE_MAX_IMEISV_BCD_LEN: usize = 16;
 /// MAX MSISDN length
-pub const OGS_MAX_MSISDN_LEN: usize = 15;
+pub const NEXTGCORE_MAX_MSISDN_LEN: usize = 15;
 /// MAX MSISDN BCD length
-pub const OGS_MAX_MSISDN_BCD_LEN: usize = 15;
+pub const NEXTGCORE_MAX_MSISDN_BCD_LEN: usize = 15;
 /// Hash MME length
-pub const OGS_HASH_MME_LEN: usize = 8;
+pub const NEXTGCORE_HASH_MME_LEN: usize = 8;
 /// Charging characteristics length
-pub const OGS_CHRGCHARS_LEN: usize = 2;
+pub const NEXTGCORE_CHRGCHARS_LEN: usize = 2;
 
 /// Invalid UE S1AP ID
 pub const INVALID_UE_S1AP_ID: u32 = 0xffffffff;
 /// Invalid pool ID
-pub const OGS_INVALID_POOL_ID: u64 = 0;
+pub const NEXTGCORE_INVALID_POOL_ID: u64 = 0;
 /// Minimum pool ID
-pub const OGS_MIN_POOL_ID: u64 = 1;
+pub const NEXTGCORE_MIN_POOL_ID: u64 = 1;
 /// Maximum pool ID
-pub const OGS_MAX_POOL_ID: u64 = u64::MAX - 1;
+pub const NEXTGCORE_MAX_POOL_ID: u64 = u64::MAX - 1;
 
 /// NAS KSI no key available
-pub const OGS_NAS_KSI_NO_KEY_IS_AVAILABLE: u8 = 7;
+pub const NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE: u8 = 7;
 
 /// Minimum EPS bearer ID
 pub const MIN_EPS_BEARER_ID: u8 = 5;
@@ -788,27 +788,27 @@ pub struct MmeUeMemento {
     /// UE additional security capability
     pub ue_additional_security_capability: UeAdditionalSecurityCapability,
     /// Expected response (XRES)
-    pub xres: [u8; OGS_MAX_RES_LEN],
+    pub xres: [u8; NEXTGCORE_MAX_RES_LEN],
     /// XRES length
     pub xres_len: u8,
     /// KASME (derived key from HSS)
-    pub kasme: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kasme: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// RAND (random challenge)
-    pub rand: [u8; OGS_RAND_LEN],
+    pub rand: [u8; NEXTGCORE_RAND_LEN],
     /// AUTN (authentication token)
-    pub autn: [u8; OGS_AUTN_LEN],
+    pub autn: [u8; NEXTGCORE_AUTN_LEN],
     /// NAS integrity key
-    pub knas_int: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_int: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// NAS encryption key
-    pub knas_enc: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_enc: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// Downlink NAS count
     pub dl_count: u32,
     /// Uplink NAS count
     pub ul_count: u32,
     /// KeNB (eNB key)
-    pub kenb: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kenb: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Hash for MME
-    pub hash_mme: [u8; OGS_HASH_MME_LEN],
+    pub hash_mme: [u8; NEXTGCORE_HASH_MME_LEN],
     /// Nonce from UE
     pub nonceue: u32,
     /// Nonce from MME
@@ -816,7 +816,7 @@ pub struct MmeUeMemento {
     /// GPRS ciphering key sequence number
     pub gprs_ciphering_key_sequence_number: u8,
     /// Next hop key
-    pub nh: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub nh: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Selected encryption algorithm
     pub selected_enc_algorithm: u8,
     /// Selected integrity algorithm
@@ -955,29 +955,29 @@ pub struct MmeUe {
 
     // UE Identity
     /// IMSI
-    pub imsi: [u8; OGS_MAX_IMSI_LEN],
+    pub imsi: [u8; NEXTGCORE_MAX_IMSI_LEN],
     /// IMSI length
     pub imsi_len: usize,
     /// IMSI BCD string
     pub imsi_bcd: String,
     /// IMEISV
-    pub imeisv: [u8; OGS_MAX_IMEISV_LEN],
+    pub imeisv: [u8; NEXTGCORE_MAX_IMEISV_LEN],
     /// IMEISV length
     pub imeisv_len: usize,
     /// Masked IMEISV
-    pub masked_imeisv: [u8; OGS_MAX_IMEISV_LEN],
+    pub masked_imeisv: [u8; NEXTGCORE_MAX_IMEISV_LEN],
     /// Masked IMEISV length
     pub masked_imeisv_len: usize,
     /// IMEISV BCD string
     pub imeisv_bcd: String,
     /// MSISDN
-    pub msisdn: [u8; OGS_MAX_MSISDN_LEN],
+    pub msisdn: [u8; NEXTGCORE_MAX_MSISDN_LEN],
     /// MSISDN length
     pub msisdn_len: usize,
     /// MSISDN BCD string
     pub msisdn_bcd: String,
     /// Additional MSISDN
-    pub a_msisdn: [u8; OGS_MAX_MSISDN_LEN],
+    pub a_msisdn: [u8; NEXTGCORE_MAX_MSISDN_LEN],
     /// Additional MSISDN length
     pub a_msisdn_len: usize,
     /// Additional MSISDN BCD string
@@ -1024,27 +1024,27 @@ pub struct MmeUe {
     /// UE additional security capability
     pub ue_additional_security_capability: UeAdditionalSecurityCapability,
     /// Expected response (XRES)
-    pub xres: [u8; OGS_MAX_RES_LEN],
+    pub xres: [u8; NEXTGCORE_MAX_RES_LEN],
     /// XRES length
     pub xres_len: u8,
     /// KASME
-    pub kasme: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kasme: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// RAND
-    pub rand: [u8; OGS_RAND_LEN],
+    pub rand: [u8; NEXTGCORE_RAND_LEN],
     /// AUTN
-    pub autn: [u8; OGS_AUTN_LEN],
+    pub autn: [u8; NEXTGCORE_AUTN_LEN],
     /// NAS integrity key
-    pub knas_int: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_int: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// NAS encryption key
-    pub knas_enc: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_enc: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// Downlink NAS count
     pub dl_count: u32,
     /// Uplink NAS count
     pub ul_count: u32,
     /// KeNB
-    pub kenb: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kenb: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Hash MME
-    pub hash_mme: [u8; OGS_HASH_MME_LEN],
+    pub hash_mme: [u8; NEXTGCORE_HASH_MME_LEN],
     /// Nonce UE
     pub nonceue: u32,
     /// Nonce MME
@@ -1054,7 +1054,7 @@ pub struct MmeUe {
     /// Next hop chaining counter
     pub nhcc: u8,
     /// Next hop key
-    pub nh: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub nh: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Selected encryption algorithm
     pub selected_enc_algorithm: u8,
     /// Selected integrity algorithm
@@ -1066,7 +1066,7 @@ pub struct MmeUe {
     /// Network access mode
     pub network_access_mode: u32,
     /// Charging characteristics
-    pub charging_characteristics: [u8; OGS_CHRGCHARS_LEN],
+    pub charging_characteristics: [u8; NEXTGCORE_CHRGCHARS_LEN],
     /// Charging characteristics presence
     pub charging_characteristics_presence: bool,
     /// Context identifier (default APN)
@@ -1423,7 +1423,7 @@ impl MmeContext {
             sgsap_port: 29118,
             relative_capacity: 255,
             mme_ue_s1ap_id: AtomicU32::new(1),
-            pool_id_counter: AtomicU64::new(OGS_MIN_POOL_ID),
+            pool_id_counter: AtomicU64::new(NEXTGCORE_MIN_POOL_ID),
             initialized: AtomicBool::new(false),
             ..Default::default()
         }
@@ -1526,7 +1526,7 @@ impl MmeContext {
             enb_ue_s1ap_id,
             mme_ue_s1ap_id,
             enb_id,
-            mme_ue_id: OGS_INVALID_POOL_ID,
+            mme_ue_id: NEXTGCORE_INVALID_POOL_ID,
             ..Default::default()
         };
         self.enb_ue_pool.write().unwrap().insert(id, enb_ue);
@@ -1565,7 +1565,7 @@ impl MmeContext {
         let sgw_ue = SgwUe {
             id,
             sgw_id,
-            mme_ue_id: OGS_INVALID_POOL_ID,
+            mme_ue_id: NEXTGCORE_INVALID_POOL_ID,
             ..Default::default()
         };
         self.sgw_ue_pool.write().unwrap().insert(id, sgw_ue);
@@ -1594,8 +1594,8 @@ impl MmeContext {
         let mme_ue = MmeUe {
             id,
             enb_ue_id,
-            enb_ue_holding_id: OGS_INVALID_POOL_ID,
-            sgw_ue_id: OGS_INVALID_POOL_ID,
+            enb_ue_holding_id: NEXTGCORE_INVALID_POOL_ID,
+            sgw_ue_id: NEXTGCORE_INVALID_POOL_ID,
             ..Default::default()
         };
         self.mme_ue_pool.write().unwrap().insert(id, mme_ue);
@@ -1639,7 +1639,7 @@ impl MmeContext {
     pub fn mme_ue_set_imsi(&self, id: u64, imsi_bcd: &str) -> bool {
         if let Some(ue) = self.mme_ue_pool.write().unwrap().get_mut(&id) {
             ue.imsi_bcd = imsi_bcd.to_string();
-            ue.imsi_len = imsi_bcd.len().min(OGS_MAX_IMSI_LEN);
+            ue.imsi_len = imsi_bcd.len().min(NEXTGCORE_MAX_IMSI_LEN);
             self.imsi_ue_hash
                 .write()
                 .unwrap()
@@ -1804,10 +1804,10 @@ impl MmeContext {
     /// Deassociate eNB UE from MME UE
     pub fn enb_ue_deassociate_mme_ue(&self, enb_ue_id: u64, mme_ue_id: u64) {
         if let Some(enb_ue) = self.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
-            enb_ue.mme_ue_id = OGS_INVALID_POOL_ID;
+            enb_ue.mme_ue_id = NEXTGCORE_INVALID_POOL_ID;
         }
         if let Some(mme_ue) = self.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
-            mme_ue.enb_ue_id = OGS_INVALID_POOL_ID;
+            mme_ue.enb_ue_id = NEXTGCORE_INVALID_POOL_ID;
         }
     }
 

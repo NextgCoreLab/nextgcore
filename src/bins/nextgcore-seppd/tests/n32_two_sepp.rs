@@ -143,11 +143,11 @@ fn configure_local_sepp(tls: bool, prins: bool) {
 async fn raw_post(api_root: &str, path: &str, body: String) -> (u16, String) {
     let rest = api_root.strip_prefix("http://").expect("http api root");
     let (host, port) = rest.split_once(':').expect("host:port");
-    let config = ogs_sbi::client::SbiClientConfig::new(host, port.parse().unwrap())
+    let config = nextgcore_sbi::client::SbiClientConfig::new(host, port.parse().unwrap())
         .with_connect_timeout(Duration::from_secs(3))
         .with_request_timeout(Duration::from_secs(5));
-    let client = ogs_sbi::client::SbiClient::new(config);
-    let mut request = ogs_sbi::message::SbiRequest::post(path);
+    let client = nextgcore_sbi::client::SbiClient::new(config);
+    let mut request = nextgcore_sbi::message::SbiRequest::post(path);
     request.http.set_content(body);
     request.http.set_header("Content-Type", "application/json");
     let response = client.send_request(request).await.expect("raw POST");

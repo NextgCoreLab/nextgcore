@@ -133,7 +133,7 @@ pub fn nas_eps_send_to_downlink_nas_transport(enb_ue: &EnbUe, message: Vec<u8>) 
         return Err(NasError::EnbUeNotFound);
     }
 
-    // Build S1AP downlink NAS transport message (APER via ogs-s1ap)
+    // Build S1AP downlink NAS transport message (APER via nextgcore-s1ap)
     let _s1ap_message = s1ap_build::build_downlink_nas_transport(enb_ue, &message)
         .map_err(|_| NasError::BuildFailed)?;
 
@@ -240,7 +240,7 @@ pub fn nas_eps_send_attach_accept(
     // Clear UE radio capability as per TS24.301
     mme_ue.ue_radio_capability.clear();
 
-    // Build S1AP initial context setup request (APER via ogs-s1ap)
+    // Build S1AP initial context setup request (APER via nextgcore-s1ap)
     let _s1ap_message = s1ap_build::build_initial_context_setup_request(
         mme_ue,
         enb_ue,
@@ -794,7 +794,7 @@ pub fn nas_eps_send_activate_default_bearer_context_request(
 
     let esm_message = esm_build::build_activate_default_bearer_context_request(sess, create_action);
 
-    // Build S1AP E-RAB setup request (APER via ogs-s1ap)
+    // Build S1AP E-RAB setup request (APER via nextgcore-s1ap)
     let _s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message)
         .map_err(|_| NasError::BuildFailed)?;
 
@@ -828,7 +828,7 @@ pub fn nas_eps_send_activate_dedicated_bearer_context_request(
 
     let esm_message = esm_build::build_activate_dedicated_bearer_context_request(bearer);
 
-    // Build S1AP E-RAB setup request (APER via ogs-s1ap)
+    // Build S1AP E-RAB setup request (APER via nextgcore-s1ap)
     let _s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message)
         .map_err(|_| NasError::BuildFailed)?;
 
@@ -868,7 +868,7 @@ pub fn nas_eps_send_modify_bearer_context_request(
         esm_build::build_modify_bearer_context_request(bearer, qos_presence, tft_presence);
 
     if qos_presence {
-        // Build S1AP E-RAB modify request (APER via ogs-s1ap)
+        // Build S1AP E-RAB modify request (APER via nextgcore-s1ap)
         let _s1ap_message = s1ap_build::build_e_rab_modify_request(enb_ue, bearer, &esm_message)
             .map_err(|_| NasError::BuildFailed)?;
         nas_eps_send_to_enb(mme_ue, enb_ue, esm_message)
@@ -905,7 +905,7 @@ pub fn nas_eps_send_deactivate_bearer_context_request(
     let esm_message =
         esm_build::build_deactivate_bearer_context_request(bearer, EsmCause::RegularDeactivation);
 
-    // Build S1AP E-RAB release command (APER via ogs-s1ap)
+    // Build S1AP E-RAB release command (APER via nextgcore-s1ap)
     let _s1ap_message = s1ap_build::build_e_rab_release_command(
         enb_ue,
         bearer.ebi,

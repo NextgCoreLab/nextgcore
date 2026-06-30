@@ -8,10 +8,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::context::{global_context, SbiContext};
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
-    send_method_not_allowed, send_not_found, SbiServer, SbiServerConfig as OgsSbiServerConfig,
+use nextgcore_sbi::context::{global_context, SbiContext};
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{
+    send_method_not_allowed, send_not_found, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,8 +104,8 @@ async fn main() -> Result<()> {
 
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
         .parse()
         .context("Invalid SBI address")?;
 
-    let mut sbi_server_config = OgsSbiServerConfig::new(addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
         let cert = args
             .tls_cert
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
     {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
-        ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
     }
 
     // Spawn the notification dispatcher background task (T5.3).
@@ -308,18 +308,18 @@ async fn register_with_nrf(
             log::info!("NWDAF registered with NRF successfully (id={nf_instance_id})");
 
             let mut self_instance =
-                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Nwdaf);
+                nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Nwdaf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = ogs_sbi::context::NfService::new(
+            let mut svc = nextgcore_sbi::context::NfService::new(
                 "nnwdaf-eventssubscription",
-                ogs_sbi::types::SbiServiceType::NnwdafEventssubscription,
+                nextgcore_sbi::types::SbiServiceType::NnwdafEventssubscription,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
             self_instance.add_service(svc);
-            let mut svc2 = ogs_sbi::context::NfService::new(
+            let mut svc2 = nextgcore_sbi::context::NfService::new(
                 "nnwdaf-analyticsinfo",
-                ogs_sbi::types::SbiServiceType::NnwdafAnalyticsinfo,
+                nextgcore_sbi::types::SbiServiceType::NnwdafAnalyticsinfo,
             );
             svc2.port = sbi_port;
             svc2.ip_addresses = vec![sbi_addr.to_string()];

@@ -13,11 +13,11 @@
 //! No live ECS peer exists in this stack, so registration is gated behind the
 //! `--ecs-uri` config: when unset, the request is built and logged but skipped
 //! (the request SHAPE is still unit-tested). When set, the request is POSTed
-//! via the existing `ogs-sbi` client and a refresh task is spawned.
+//! via the existing `nextgcore-sbi` client and a refresh task is spawned.
 
 use std::time::Duration;
 
-use ogs_sbi::context::global_context;
+use nextgcore_sbi::context::global_context;
 use serde::{Deserialize, Serialize};
 
 use crate::types::EndPoint;
@@ -160,7 +160,7 @@ async fn register_once(ecs_uri: &str, registration: &EesRegistration) -> Result<
 
 /// Extract the assigned registrationId from the `Location` header (last path
 /// segment) or, failing that, the response body's `registrationId` field.
-fn extract_registration_id(response: &ogs_sbi::message::SbiResponse) -> Option<String> {
+fn extract_registration_id(response: &nextgcore_sbi::message::SbiResponse) -> Option<String> {
     if let Some(loc) = response.http.get_header("location") {
         if let Some(id) = loc.trim_end_matches('/').rsplit('/').next() {
             if !id.is_empty() {
@@ -262,14 +262,14 @@ mod tests {
 
     #[test]
     fn test_extract_registration_id_from_location() {
-        let resp = ogs_sbi::message::SbiResponse::with_status(201)
+        let resp = nextgcore_sbi::message::SbiResponse::with_status(201)
             .with_header("Location", "/eecs-eesregistration/v1/registrations/reg-42");
         assert_eq!(extract_registration_id(&resp), Some("reg-42".to_string()));
     }
 
     #[test]
     fn test_extract_registration_id_from_body() {
-        let resp = ogs_sbi::message::SbiResponse::with_status(201)
+        let resp = nextgcore_sbi::message::SbiResponse::with_status(201)
             .with_json_body(&serde_json::json!({"registrationId": "reg-99"}))
             .unwrap();
         assert_eq!(extract_registration_id(&resp), Some("reg-99".to_string()));

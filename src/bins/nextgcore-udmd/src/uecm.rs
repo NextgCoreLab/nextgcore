@@ -11,7 +11,7 @@
 //! can be unit-gated with a mock instead of a running udrd.
 
 use crate::context::udm_self;
-use ogs_sbi::message::SbiResponse;
+use nextgcore_sbi::message::SbiResponse;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -294,7 +294,7 @@ fn udr_write_outcome(supi: &str, op: &str, result: Result<SbiResponse, String>) 
         Ok(resp) if resp.is_success() => None,
         Ok(resp) if resp.status >= 500 => {
             log::error!("[{supi}] UDR {op} returned {}", resp.status);
-            Some(ogs_sbi::server::send_service_unavailable("UDR persistence failed"))
+            Some(nextgcore_sbi::server::send_service_unavailable("UDR persistence failed"))
         }
         Ok(resp) => {
             log::warn!("[{supi}] UDR {op} returned {} (degraded)", resp.status);
@@ -389,7 +389,7 @@ pub async fn process_amf_registration_update(
                 Some(v) => v,
                 None => {
                     log::error!("[{supi}] UDR AMF context GET returned unparseable body");
-                    return ogs_sbi::server::send_service_unavailable("UDR response invalid");
+                    return nextgcore_sbi::server::send_service_unavailable("UDR response invalid");
                 }
             }
         }
@@ -403,11 +403,11 @@ pub async fn process_amf_registration_update(
         }
         Ok(resp) => {
             log::error!("[{supi}] UDR AMF context GET returned {}", resp.status);
-            return ogs_sbi::server::send_service_unavailable("UDR context GET failed");
+            return nextgcore_sbi::server::send_service_unavailable("UDR context GET failed");
         }
         Err(e) => {
             log::warn!("[{supi}] UDR AMF context GET failed: {e} (no prior stored)");
-            return ogs_sbi::server::send_service_unavailable("UDR unavailable");
+            return nextgcore_sbi::server::send_service_unavailable("UDR unavailable");
         }
     };
 

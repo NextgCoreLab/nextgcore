@@ -9,11 +9,11 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::context::global_context;
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
+use nextgcore_sbi::context::global_context;
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
+    SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,8 +99,8 @@ async fn main() -> Result<()> {
 
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
         .parse()
         .context("Invalid SBI address")?;
 
-    let mut sbi_server_config = OgsSbiServerConfig::new(addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
         let cert = args
             .tls_cert
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
     if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
-        ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
     }
 
     log::info!("NextGCore MB-SMF ready (instance: {nf_instance_id})");
@@ -1357,11 +1357,11 @@ async fn register_with_nrf(
             log::info!("MB-SMF registered with NRF successfully (id={nf_instance_id})");
 
             let mut self_instance =
-                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Mbsmf);
+                nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Mbsmf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = ogs_sbi::context::NfService::new(
+            let mut svc = nextgcore_sbi::context::NfService::new(
                 "nmbsmf-mbssession",
-                ogs_sbi::types::SbiServiceType::NmbsmfMbssession,
+                nextgcore_sbi::types::SbiServiceType::NmbsmfMbssession,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
@@ -1439,7 +1439,7 @@ mod tests {
             .position(|w| w == needle)
     }
 
-    // ---- mbsmfd-01: N4mb PFCP establishment encoded via ogs-pfcp ----
+    // ---- mbsmfd-01: N4mb PFCP establishment encoded via nextgcore-pfcp ----
 
     /// Encode an N4mb establishment packet via the shared [`n4mb`] builder.
     fn encode_establishment(
@@ -1461,8 +1461,8 @@ mod tests {
             c_teid: dl_teid,
         };
         let req = n4mb::build_establishment_request(&params);
-        ogs_pfcp::message::build_message(
-            &ogs_pfcp::message::PfcpMessage::SessionEstablishmentRequest(req),
+        nextgcore_pfcp::message::build_message(
+            &nextgcore_pfcp::message::PfcpMessage::SessionEstablishmentRequest(req),
             7,
             Some(0),
         )
@@ -1503,8 +1503,8 @@ mod tests {
 
     #[test]
     fn test_n4mb_establishment_roundtrip_decode() {
-        use ogs_pfcp::message::{parse_message, PfcpMessage};
-        use ogs_pfcp::types::NodeIdType;
+        use nextgcore_pfcp::message::{parse_message, PfcpMessage};
+        use nextgcore_pfcp::types::NodeIdType;
 
         let cp_addr = [127, 0, 0, 1];
         let upf_addr = [10, 0, 0, 7];
@@ -1556,7 +1556,7 @@ mod tests {
             .expect("forwarding parameters present");
         assert_eq!(
             fp.destination_interface,
-            ogs_pfcp::types::DestinationInterface::Access
+            nextgcore_pfcp::types::DestinationInterface::Access
         );
     }
 

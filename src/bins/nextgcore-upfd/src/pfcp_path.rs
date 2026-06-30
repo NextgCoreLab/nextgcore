@@ -1922,7 +1922,7 @@ mod tests {
             .expect("UP Function Features must be present");
         assert_eq!(feat.value.len(), 8, "full Rel-17 feature octets");
         let mut bytes = bytes::Bytes::copy_from_slice(&feat.value);
-        let decoded = ogs_pfcp::types::UpFunctionFeatures::decode(&mut bytes).unwrap();
+        let decoded = nextgcore_pfcp::types::UpFunctionFeatures::decode(&mut bytes).unwrap();
         assert!(decoded.ftup, "FTUP must be advertised");
         assert!(decoded.empu, "EMPU must be advertised");
         assert!(

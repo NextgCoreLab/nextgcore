@@ -131,7 +131,7 @@ impl NasSecurityHeader {
 /// `amf_ue.use_ogs_nas_security` OFF (the DEFAULT) it calls the unchanged
 /// hand-rolled [`nas_5gs_security_encode_legacy`] — byte-for-byte and
 /// behavior-for-behavior identical to the pre-Phase-6 code. With the canary ON
-/// it delegates to the conformant ogs-nas-backed adapter
+/// it delegates to the conformant nextgcore-nas-backed adapter
 /// [`nas_5gs_security_encode_ogs`] (byte-identical for 3GPP-access frames).
 pub fn nas_5gs_security_encode(
     amf_ue: &mut AmfUe,
@@ -242,7 +242,7 @@ fn nas_5gs_security_encode_legacy(
 /// `ngap_path.rs` uplink call site. With the canary `amf_ue.use_ogs_nas_security`
 /// OFF (the DEFAULT, LIVE path) it calls the hand-rolled
 /// [`nas_5gs_security_decode_legacy`]. With the canary ON it delegates to the
-/// ogs-nas-backed adapter [`nas_5gs_security_decode_ogs`].
+/// nextgcore-nas-backed adapter [`nas_5gs_security_decode_ogs`].
 ///
 /// amfd-03/amfd-04: BOTH paths are now fail-closed and verify-then-commit. A MAC
 /// mismatch returns `Err(MacVerificationFailed)` (the tampered plaintext is never
@@ -406,46 +406,46 @@ fn nas_5gs_security_decode_legacy(
 }
 
 // ============================================================================
-// nas-06 Phase-6 C1/C3 — ogs-nas-backed security adapter (canary-gated)
+// nas-06 Phase-6 C1/C3 — nextgcore-nas-backed security adapter (canary-gated)
 // ============================================================================
 //
 // These adapters delegate the NAS protect/unprotect primitives to the
-// conformant `ogs_nas::common::security` implementation. They run ONLY when
+// conformant `nextgcore_nas::common::security` implementation. They run ONLY when
 // `amf_ue.use_ogs_nas_security` is true (default false); the default-OFF path
 // keeps the legacy hand-rolled encoders/decoders above byte-for-byte and
 // behavior-for-behavior unchanged.
 //
-// Layout note: amfd frames are `EPD | SHT | MAC | SQN | payload`; ogs-nas
+// Layout note: amfd frames are `EPD | SHT | MAC | SQN | payload`; nextgcore-nas
 // protect/unprotect operate on `MAC | SQN | payload`. The adapter prepends /
 // strips the 2-octet `EPD|SHT` accordingly.
 //
 // COUNT model: `AmfUe.dl_count`/`ul_count` are 24-bit NAS COUNTs (low 8 bits =
-// SQN). ogs-nas models COUNT as a `NasCount { overflow, sqn }`. The two
+// SQN). nextgcore-nas models COUNT as a `NasCount { overflow, sqn }`. The two
 // converters below are exact inverses over the 24-bit domain, and EVERY adapter
 // call writes `NasCount::value()` back into the AmfUe u32 so the count persists
 // through the memento (without writeback the counts desync).
 //
-// BEARER caveat: ogs-nas hardwires NAS bearer/connection-id 1 (3GPP access),
+// BEARER caveat: nextgcore-nas hardwires NAS bearer/connection-id 1 (3GPP access),
 // while the legacy path derives it from `access_type`. So byte-identity with
 // the legacy encoder holds for 3GPP access (bearer 1) only; non-3GPP access is
 // the known divergence locked by `drift_non_3gpp_bearer_divergence_locked`.
-// PQC algorithms (NEA4/NIA4, id 4) are not supported by ogs-nas protect and are
+// PQC algorithms (NEA4/NIA4, id 4) are not supported by nextgcore-nas protect and are
 // out of scope for this adapter (the legacy path still handles them).
 
-/// Convert a 24-bit AmfUe NAS COUNT (u32) to an ogs-nas `NasCount`.
-fn nas_count_from_u32(v: u32) -> ogs_nas::common::security::NasCount {
-    ogs_nas::common::security::NasCount::new(v >> 8, (v & 0xff) as u8)
+/// Convert a 24-bit AmfUe NAS COUNT (u32) to an nextgcore-nas `NasCount`.
+fn nas_count_from_u32(v: u32) -> nextgcore_nas::common::security::NasCount {
+    nextgcore_nas::common::security::NasCount::new(v >> 8, (v & 0xff) as u8)
 }
 
-/// Convert an ogs-nas `NasCount` back to the 24-bit AmfUe COUNT (u32).
+/// Convert an nextgcore-nas `NasCount` back to the 24-bit AmfUe COUNT (u32).
 /// Inverse of [`nas_count_from_u32`] over the 24-bit domain.
-fn nas_count_to_u32(c: ogs_nas::common::security::NasCount) -> u32 {
+fn nas_count_to_u32(c: nextgcore_nas::common::security::NasCount) -> u32 {
     c.value() & 0x00ff_ffff
 }
 
-/// nas-06 Phase-6 C1: ogs-nas-backed NAS security ENCODE adapter.
+/// nas-06 Phase-6 C1: nextgcore-nas-backed NAS security ENCODE adapter.
 ///
-/// Delegates to `ogs_nas::common::security::protect_nas_message`. Proven
+/// Delegates to `nextgcore_nas::common::security::protect_nas_message`. Proven
 /// byte-identical to [`nas_5gs_security_encode_legacy`] for 3GPP-access 5GMM
 /// downlink frames (see `encode_ogs_matches_legacy_*`). Gated behind
 /// `amf_ue.use_ogs_nas_security` (default false).
@@ -454,8 +454,8 @@ fn nas_5gs_security_encode_ogs(
     message: &[u8],
     security_header_type: u8,
 ) -> Option<Vec<u8>> {
-    use ogs_nas::common::security::{protect_nas_message, NasSecurityContext};
-    use ogs_nas::common::types::SecurityAlgorithms;
+    use nextgcore_nas::common::security::{protect_nas_message, NasSecurityContext};
+    use nextgcore_nas::common::types::SecurityAlgorithms;
 
     // PLAIN passthrough: no header, no count change (identical to legacy).
     if security_header_type == security_header::PLAIN_NAS_MESSAGE {
@@ -481,7 +481,7 @@ fn nas_5gs_security_encode_ogs(
         integrity_protected = false;
     }
 
-    // Force integrity algo to NONE(0) when disabled so ogs-nas emits a zero MAC,
+    // Force integrity algo to NONE(0) when disabled so nextgcore-nas emits a zero MAC,
     // exactly like the legacy encoder leaving MAC=[0;4].
     let mut ctx = NasSecurityContext::new(
         SecurityAlgorithms {
@@ -497,7 +497,7 @@ fn nas_5gs_security_encode_ogs(
     );
     ctx.dl_count = nas_count_from_u32(amf_ue.dl_count);
 
-    // direction::DOWNLINK (1) matches ogs-nas downlink. protect emits
+    // direction::DOWNLINK (1) matches nextgcore-nas downlink. protect emits
     // MAC|SQN|(ciphered payload) and advances ctx.dl_count.
     let protected = protect_nas_message(&mut ctx, direction::DOWNLINK, message, ciphered).ok()?;
 
@@ -513,9 +513,9 @@ fn nas_5gs_security_encode_ogs(
     Some(result)
 }
 
-/// nas-06 Phase-6 C1+C3: ogs-nas-backed NAS security DECODE adapter (STRICT).
+/// nas-06 Phase-6 C1+C3: nextgcore-nas-backed NAS security DECODE adapter (STRICT).
 ///
-/// Delegates to `ogs_nas::common::security::unprotect_nas_message`. Unlike the
+/// Delegates to `nextgcore_nas::common::security::unprotect_nas_message`. Unlike the
 /// lenient [`nas_5gs_security_decode_legacy`] it:
 ///   * returns `Err` on MAC failure and does NOT advance the UL COUNT
 ///     (verify-then-commit, TS 24.501 §4.4.3.3); and
@@ -533,9 +533,9 @@ fn nas_5gs_security_decode_ogs(
     security_header_type: u8,
     message: &[u8],
 ) -> Result<Vec<u8>, NasSecurityError> {
-    use ogs_nas::common::security::{unprotect_nas_message, NasSecurityContext};
-    use ogs_nas::common::types::SecurityAlgorithms;
-    use ogs_nas::error::NasError;
+    use nextgcore_nas::common::security::{unprotect_nas_message, NasSecurityContext};
+    use nextgcore_nas::common::types::SecurityAlgorithms;
+    use nextgcore_nas::error::NasError;
 
     let mut header_type = SecurityHeaderType::from_byte(security_header_type);
 
@@ -568,7 +568,7 @@ fn nas_5gs_security_decode_ogs(
         return Err(NasSecurityError::MessageTooShort);
     }
 
-    // Strip the 2-octet EPD|SHT; ogs-nas wants MAC|SQN|payload.
+    // Strip the 2-octet EPD|SHT; nextgcore-nas wants MAC|SQN|payload.
     let inner = &message[2..];
     let sqn = message[6]; // == inner[4]
 
@@ -660,7 +660,7 @@ pub fn nas_encrypt(
             let length = (message.len() * 8) as u32;
             let mut key_arr = [0u8; 16];
             key_arr.copy_from_slice(&key[..16.min(key.len())]);
-            ogs_crypt::snow3g::snow_3g_f8(
+            nextgcore_crypt::snow3g::snow_3g_f8(
                 &key_arr,
                 count,
                 bearer as u32,
@@ -682,7 +682,7 @@ pub fn nas_encrypt(
             key_arr.copy_from_slice(&key[..16.min(key.len())]);
 
             let input = message.to_vec();
-            if let Ok(()) = ogs_crypt::aes::aes_ctr128_encrypt(&key_arr, &mut iv, &input, message) {
+            if let Ok(()) = nextgcore_crypt::aes::aes_ctr128_encrypt(&key_arr, &mut iv, &input, message) {
                 // Success
             }
         }
@@ -693,7 +693,7 @@ pub fn nas_encrypt(
             key_arr.copy_from_slice(&key[..16.min(key.len())]);
 
             let input = message.to_vec();
-            ogs_crypt::zuc::zuc_eea3(
+            nextgcore_crypt::zuc::zuc_eea3(
                 &key_arr,
                 count,
                 bearer as u32,
@@ -741,7 +741,7 @@ pub fn nas_mac_calculate(
             let length = (message.len() * 8) as u64;
             let mut key_arr = [0u8; 16];
             key_arr.copy_from_slice(&key[..16.min(key.len())]);
-            ogs_crypt::snow3g::snow_3g_f9(
+            nextgcore_crypt::snow3g::snow_3g_f9(
                 &key_arr,
                 count,
                 (bearer as u32) << 27,
@@ -765,7 +765,7 @@ pub fn nas_mac_calculate(
             input.extend_from_slice(&[0u8; 3]); // Padding
             input.extend_from_slice(message);
 
-            let mac_full = ogs_crypt::aes_cmac::aes_cmac_calculate(&key_arr, &input);
+            let mac_full = nextgcore_crypt::aes_cmac::aes_cmac_calculate(&key_arr, &input);
             let mut mac = [0u8; 4];
             mac.copy_from_slice(&mac_full[..4]);
             mac
@@ -775,7 +775,7 @@ pub fn nas_mac_calculate(
             let length = (message.len() * 8) as u32;
             let mut key_arr = [0u8; 16];
             key_arr.copy_from_slice(&key[..16.min(key.len())]);
-            let mac_u32 = ogs_crypt::zuc::zuc_eia3(
+            let mac_u32 = nextgcore_crypt::zuc::zuc_eia3(
                 &key_arr,
                 count,
                 bearer as u32,
@@ -1249,8 +1249,8 @@ mod tests {
     /// payload, COUNT 0, BEARER 1 (3GPP), DIRECTION downlink.
     #[test]
     fn test_cross_stack_nas_security_reference_vector() {
-        use ogs_crypt::kdf::{
-            ogs_kdf_kamf, ogs_kdf_nas_5gs, OGS_KDF_NAS_ENC_ALG, OGS_KDF_NAS_INT_ALG,
+        use nextgcore_crypt::kdf::{
+            nextgcore_kdf_kamf, nextgcore_kdf_nas_5gs, NEXTGCORE_KDF_NAS_ENC_ALG, NEXTGCORE_KDF_NAS_INT_ALG,
         };
 
         // -- fixed inputs (shared with the sim) --
@@ -1263,7 +1263,7 @@ mod tests {
         let abba = [0x00u8, 0x00];
 
         // -- KAMF (TS 33.501 Annex A.7) --
-        let kamf = ogs_kdf_kamf(supi, &abba, &kseaf);
+        let kamf = nextgcore_kdf_kamf(supi, &abba, &kseaf);
         let expected_kamf: [u8; 32] = [
             84, 220, 101, 65, 23, 243, 138, 4, 80, 226, 49, 139, 229, 104, 34, 238, 12, 174, 245,
             76, 108, 223, 167, 207, 103, 220, 31, 103, 8, 43, 231, 105,
@@ -1271,8 +1271,8 @@ mod tests {
         assert_eq!(kamf, expected_kamf, "KAMF derivation drifted");
 
         // -- KNAS_int / KNAS_enc (TS 33.501 Annex A.8, NIA2/NEA2 = 0x02) --
-        let knas_int = ogs_kdf_nas_5gs(OGS_KDF_NAS_INT_ALG, 0x02, &kamf);
-        let knas_enc = ogs_kdf_nas_5gs(OGS_KDF_NAS_ENC_ALG, 0x02, &kamf);
+        let knas_int = nextgcore_kdf_nas_5gs(NEXTGCORE_KDF_NAS_INT_ALG, 0x02, &kamf);
+        let knas_enc = nextgcore_kdf_nas_5gs(NEXTGCORE_KDF_NAS_ENC_ALG, 0x02, &kamf);
         let expected_knas_int: [u8; 16] = [
             38, 115, 160, 80, 204, 200, 220, 83, 104, 212, 33, 203, 134, 23, 71, 52,
         ];
@@ -1308,16 +1308,16 @@ mod tests {
 
     /// nas-06 Phase 0 drift bridge (security path): amfd's hand-rolled
     /// `nas_5gs_security_encode` must produce the same protected frame as the
-    /// conformant ogs-nas `protect_nas_message`, and ogs-nas `unprotect` must
-    /// recover the body. amfd emits `EPD|SHT|MAC|SQN|ciphered`; ogs-nas emits
+    /// conformant nextgcore-nas `protect_nas_message`, and nextgcore-nas `unprotect` must
+    /// recover the body. amfd emits `EPD|SHT|MAC|SQN|ciphered`; nextgcore-nas emits
     /// `MAC|SQN|ciphered`, so we compare after stripping the 2-octet EPD|SHT.
     /// Pinned to access_type=1 (=> bearer 1 on both sides) and COUNT 0.
     #[test]
     fn drift_security_encode_matches_ogs_nas_protect() {
-        use ogs_nas::common::security::{
+        use nextgcore_nas::common::security::{
             protect_nas_message, unprotect_nas_message, NasCount, NasSecurityContext,
         };
-        use ogs_nas::common::types::SecurityAlgorithms;
+        use nextgcore_nas::common::types::SecurityAlgorithms;
 
         // Representative plain inner downlink 5GMM body.
         let body: [u8; 8] = [0x7e, 0x00, 0x5d, 0x02, 0x00, 0x02, 0xe0, 0xe1];
@@ -1331,7 +1331,7 @@ mod tests {
         )
         .unwrap();
 
-        // ogs-nas protect with the same keys / algorithms / COUNT / direction.
+        // nextgcore-nas protect with the same keys / algorithms / COUNT / direction.
         let mut ctx = NasSecurityContext::new(
             SecurityAlgorithms {
                 ciphering: ue.selected_enc_algorithm,
@@ -1347,10 +1347,10 @@ mod tests {
         assert_eq!(
             &amfd[2..],
             &ogs[..],
-            "amfd security frame must equal ogs-nas protect (bytes 2..)"
+            "amfd security frame must equal nextgcore-nas protect (bytes 2..)"
         );
 
-        // ogs-nas unprotect must recover the original plaintext body.
+        // nextgcore-nas unprotect must recover the original plaintext body.
         let mut rx = NasSecurityContext::new(
             SecurityAlgorithms {
                 ciphering: ue.selected_enc_algorithm,
@@ -1360,20 +1360,20 @@ mod tests {
             ue.knas_int,
         );
         let recovered = unprotect_nas_message(&mut rx, 1, &amfd[2..], true).unwrap();
-        assert_eq!(recovered, body, "ogs-nas must recover the amfd-protected body");
+        assert_eq!(recovered, body, "nextgcore-nas must recover the amfd-protected body");
     }
 
     /// KNOWN DIVERGENCE LOCK (nas-06): amfd derives the NAS connection-id
     /// (bearer) from access_type — non-3GPP (access_type=2) uses bearer 2, per
-    /// TS 33.501 — whereas ogs-nas hardwires bearer 1. So for non-3GPP access
-    /// the protected frames differ. This guard fails the moment ogs-nas takes
+    /// TS 33.501 — whereas nextgcore-nas hardwires bearer 1. So for non-3GPP access
+    /// the protected frames differ. This guard fails the moment nextgcore-nas takes
     /// a connection-id parameter (the divergence fix), at which point convert
     /// it to an assert_eq. The 3GPP path (access_type=1) is byte-equal and is
     /// covered by `drift_security_encode_matches_ogs_nas_protect`.
     #[test]
     fn drift_non_3gpp_bearer_divergence_locked() {
-        use ogs_nas::common::security::{protect_nas_message, NasCount, NasSecurityContext};
-        use ogs_nas::common::types::SecurityAlgorithms;
+        use nextgcore_nas::common::security::{protect_nas_message, NasCount, NasSecurityContext};
+        use nextgcore_nas::common::types::SecurityAlgorithms;
 
         let body: [u8; 8] = [0x7e, 0x00, 0x5d, 0x02, 0x00, 0x02, 0xe0, 0xe1];
         let mut ue = create_test_ue();
@@ -1399,16 +1399,16 @@ mod tests {
         assert_ne!(
             &amfd[2..],
             &ogs[..],
-            "non-3GPP bearer divergence appears fixed (ogs-nas took a connection-id); \
+            "non-3GPP bearer divergence appears fixed (nextgcore-nas took a connection-id); \
              convert this guard to assert_eq"
         );
     }
 
     // ======================================================================
-    // nas-06 Phase-6 C1/C2/C3 — ogs-nas security adapter (canary-gated)
+    // nas-06 Phase-6 C1/C2/C3 — nextgcore-nas security adapter (canary-gated)
     // ======================================================================
 
-    /// C1: the ogs-nas ENCODE adapter must be byte-for-byte identical to the
+    /// C1: the nextgcore-nas ENCODE adapter must be byte-for-byte identical to the
     /// legacy encoder across representative SHTs (3GPP access, NEA2/NIA2). This
     /// is the proof that flipping the canary leaves the ENCODE wire image
     /// unchanged for the production (3GPP) path.
@@ -1498,8 +1498,8 @@ mod tests {
     /// Helper: craft a valid uplink-protected frame (EPD|SHT|MAC|SQN|payload)
     /// the way a conformant UE would, for the strict decode tests.
     fn make_uplink_frame(ue: &AmfUe, body: &[u8], sht: u8, count: u32) -> Vec<u8> {
-        use ogs_nas::common::security::{protect_nas_message, NasCount, NasSecurityContext};
-        use ogs_nas::common::types::SecurityAlgorithms;
+        use nextgcore_nas::common::security::{protect_nas_message, NasCount, NasSecurityContext};
+        use nextgcore_nas::common::types::SecurityAlgorithms;
         let mut ctx = NasSecurityContext::new(
             SecurityAlgorithms {
                 ciphering: ue.selected_enc_algorithm,

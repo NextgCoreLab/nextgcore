@@ -21,12 +21,12 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::client::{SbiClient, SbiClientConfig};
-use ogs_sbi::context::global_context;
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::oauth::{JwksCache, OAuth2Client};
-use ogs_sbi::server::{send_method_not_allowed, SbiServer, SbiServerConfig as OgsSbiServerConfig};
-use ogs_sbi::types::NfType;
+use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::context::global_context;
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
+use nextgcore_sbi::server::{send_method_not_allowed, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig};
+use nextgcore_sbi::types::NfType;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -203,8 +203,8 @@ async fn main() -> Result<()> {
 
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -259,7 +259,7 @@ async fn main() -> Result<()> {
         .parse()
         .context("Invalid SBI address")?;
 
-    let mut sbi_server_config = OgsSbiServerConfig::new(addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
         let cert = args
             .tls_cert
@@ -320,7 +320,7 @@ async fn main() -> Result<()> {
     if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
-        ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
     }
 
     log::info!("NextGCore NSACF ready (instance: {nf_instance_id})");
@@ -1567,11 +1567,11 @@ async fn register_with_nrf(
             log::info!("NSACF registered with NRF successfully (id={nf_instance_id})");
 
             let mut self_instance =
-                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Nsacf);
+                nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Nsacf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = ogs_sbi::context::NfService::new(
+            let mut svc = nextgcore_sbi::context::NfService::new(
                 "nnsacf-nsac",
-                ogs_sbi::types::SbiServiceType::NnsacfNsac,
+                nextgcore_sbi::types::SbiServiceType::NnsacfNsac,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
@@ -1608,8 +1608,8 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ogs_sbi::client::SbiClient;
-    use ogs_sbi::server::{SbiServer, SbiServerConfig};
+    use nextgcore_sbi::client::SbiClient;
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     use serde_json::json;
 
     #[test]

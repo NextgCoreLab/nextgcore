@@ -11,11 +11,11 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::client::{SbiClient, SbiClientConfig};
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::oauth::{JwksCache, OAuth2Client};
-use ogs_sbi::server::{send_method_not_allowed, SbiServer, SbiServerConfig as OgsSbiServerConfig};
-use ogs_sbi::types::NfType;
+use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
+use nextgcore_sbi::server::{send_method_not_allowed, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig};
+use nextgcore_sbi::types::NfType;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -206,8 +206,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -316,7 +316,7 @@ async fn main() -> Result<()> {
                                     if let Some(nrf) = nrf_list.first() {
                                         log::info!("NRF URI configured: {}", nrf.uri);
                                         nrf_uri_cfg = Some(nrf.uri.clone());
-                                        ogs_sbi::context::global_context()
+                                        nextgcore_sbi::context::global_context()
                                             .set_nrf_uri(&nrf.uri)
                                             .await;
                                     }
@@ -356,11 +356,11 @@ async fn main() -> Result<()> {
     // Open legacy SBI server (for context initialization)
     nssf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Start actual HTTP/2 SBI server using ogs-sbi
+    // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let mut sbi_server_config = OgsSbiServerConfig::new(sbi_addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
     if require_oauth2 {
         // Server side (TS 33.501 §13.4.1): verify incoming Bearer tokens
         // against the NRF's published JWKS and require the token's `aud` to
@@ -400,7 +400,7 @@ async fn main() -> Result<()> {
     // Register with NRF (B24.3)
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
         }
         Ok(_) => {}
         Err(e) => {
@@ -648,7 +648,7 @@ async fn nssf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 // ---------------------------------------------------------------------------
 
 async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
-    // The ogs-sbi server glue strips the query string from header.uri and
+    // The nextgcore-sbi server glue strips the query string from header.uri and
     // stores the RAW (still percent-encoded) values in http.params, so
     // decode on access. parse_query_params covers callers that kept the
     // full URI (e.g. direct handler invocation).
@@ -1132,7 +1132,7 @@ async fn handle_ns_selection_pdu_session(
             // Subscription-based filtering: if SUPI provided, query UDR for
             // subscribed NSSAIs and filter (TS 29.531 6.1.3.2.3.1).
             if let Some(ref supi_val) = supi {
-                match ogs_dbi::ogs_dbi_subscription_data_async(supi_val.to_string()).await {
+                match nextgcore_dbi::nextgcore_dbi_subscription_data_async(supi_val.to_string()).await {
                     Ok(sub_data) => {
                         let subscribed: Vec<(u8, Option<u32>)> = sub_data
                             .slice
@@ -2005,11 +2005,11 @@ async fn send_hnssf_query(
     home_id: u64,
     param: &nnssf_handler::NsSelectionParam,
 ) -> Result<nnssf_handler::NsiInformation, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     // Find NSSF instances for H-NSSF query
     let nssf_instances = sbi_ctx
-        .find_nf_instances_by_service(ogs_sbi::types::SbiServiceType::NnssfNsselection)
+        .find_nf_instances_by_service(nextgcore_sbi::types::SbiServiceType::NnssfNsselection)
         .await;
 
     let nssf_instance = nssf_instances
@@ -2017,7 +2017,7 @@ async fn send_hnssf_query(
         .ok_or_else(|| "No H-NSSF instance available for nnssf-nsselection service".to_string())?;
 
     let nssf_service = nssf_instance
-        .find_service(ogs_sbi::types::SbiServiceType::NnssfNsselection)
+        .find_service(nextgcore_sbi::types::SbiServiceType::NnssfNsselection)
         .ok_or("H-NSSF instance has no nnssf-nsselection service")?;
 
     let host = nssf_service
@@ -2127,7 +2127,7 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 ///
 /// Returns the NF instance ID so callers can start a heartbeat worker.
 async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -2189,20 +2189,20 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
             log::info!("NSSF registered with NRF successfully (id={nf_instance_id})");
 
             let mut self_instance =
-                ogs_sbi::context::NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Nssf);
+                nextgcore_sbi::context::NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Nssf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
 
-            let mut svc = ogs_sbi::context::NfService::new(
+            let mut svc = nextgcore_sbi::context::NfService::new(
                 "nnssf-nsselection",
-                ogs_sbi::types::SbiServiceType::NnssfNsselection,
+                nextgcore_sbi::types::SbiServiceType::NnssfNsselection,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
             self_instance.add_service(svc);
 
-            let mut svc2 = ogs_sbi::context::NfService::new(
+            let mut svc2 = nextgcore_sbi::context::NfService::new(
                 "nnssf-nssaiavailability",
-                ogs_sbi::types::SbiServiceType::NnssfNssaiavailability,
+                nextgcore_sbi::types::SbiServiceType::NnssfNssaiavailability,
             );
             svc2.port = sbi_port;
             svc2.ip_addresses = vec![sbi_addr.to_string()];
@@ -2221,7 +2221,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
 /// Discover NF services from NRF (B24.3)
 async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Result<(), String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -2262,13 +2262,13 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
             let nf_type_str = nf_json.get("nfType").and_then(|v| v.as_str()).unwrap_or("");
 
             let nf_type = match nf_type_str {
-                "NSSF" => ogs_sbi::types::NfType::Nssf,
-                "NRF" => ogs_sbi::types::NfType::Nrf,
-                "AMF" => ogs_sbi::types::NfType::Amf,
+                "NSSF" => nextgcore_sbi::types::NfType::Nssf,
+                "NRF" => nextgcore_sbi::types::NfType::Nrf,
+                "AMF" => nextgcore_sbi::types::NfType::Amf,
                 _ => continue,
             };
 
-            let mut instance = ogs_sbi::context::NfInstance::new(nf_id, nf_type);
+            let mut instance = nextgcore_sbi::context::NfInstance::new(nf_id, nf_type);
 
             if let Some(fqdn) = nf_json.get("fqdn").and_then(|v| v.as_str()) {
                 instance.fqdn = Some(fqdn.to_string());
@@ -2286,8 +2286,8 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                         .get("serviceName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if let Some(svc_type) = ogs_sbi::types::SbiServiceType::from_name(svc_name) {
-                        let mut svc = ogs_sbi::context::NfService::new(svc_name, svc_type);
+                    if let Some(svc_type) = nextgcore_sbi::types::SbiServiceType::from_name(svc_name) {
+                        let mut svc = nextgcore_sbi::context::NfService::new(svc_name, svc_type);
                         if let Some(endpoints) =
                             svc_json.get("ipEndPoints").and_then(|v| v.as_array())
                         {
@@ -2364,7 +2364,7 @@ async fn run_event_loop_async(
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
         // Compute optimal sleep duration based on pending timers
-        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+        let poll_interval = nextgcore_core::async_timer::compute_poll_interval(
             timer_mgr.inner(),
             Duration::from_millis(100),
         );
@@ -2404,8 +2404,8 @@ async fn run_event_loop_async(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ogs_sbi::client::SbiClient;
-    use ogs_sbi::server::{SbiServer, SbiServerConfig};
+    use nextgcore_sbi::client::SbiClient;
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     use serde_json::json;
 
     #[test]

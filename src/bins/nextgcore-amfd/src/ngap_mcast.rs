@@ -18,7 +18,7 @@ use bytes::{BufMut, BytesMut};
 
 /// Minimal byte-buffer builder for the simplified MBS NGAP messages below.
 ///
-/// The MBS procedures (TS 38.413 Section 9.2.9) are not exposed by ogs-ngap
+/// The MBS procedures (TS 38.413 Section 9.2.9) are not exposed by nextgcore-ngap
 /// yet, so these messages keep their simplified internal layout. This builder
 /// is private to this module so it cannot leak into the NGAP wire path.
 #[derive(Debug, Default)]

@@ -164,7 +164,7 @@ impl ScpSmContext {
             Some("nf-status-notify") => match method.as_str() {
                 "POST" => {
                     log::debug!("NF status notify received");
-                    // Note: Call ogs_nnrf_nfm_handle_nf_status_notify
+                    // Note: Call nextgcore_nnrf_nfm_handle_nf_status_notify
                     // NF status notify processing is handled by the nnrf integration module
                 }
                 _ => {

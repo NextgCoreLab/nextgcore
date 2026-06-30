@@ -450,12 +450,12 @@ pub fn build_gtpu_header_with_seq(
 /// Build a GTP-U header for a G-PDU carrying a PDU Session Container
 /// extension header with the given QFI (TS 29.281 5.2.1 / TS 38.415).
 ///
-/// Uses the ogs-gtp library extension-header codec so the bit
+/// Uses the nextgcore-gtp library extension-header codec so the bit
 /// layout (E flag, length units, padding, next-type chaining) is shared
 /// with the rest of the stack.
 pub fn build_gtpu_header_with_qfi(teid: u32, payload_len: u16, qfi: u8) -> Vec<u8> {
     use bytes::BytesMut;
-    use ogs_gtp::v1::types::{ExtensionHeaderType, Gtp1ExtHeader, PduSessionContainer};
+    use nextgcore_gtp::v1::types::{ExtensionHeaderType, Gtp1ExtHeader, PduSessionContainer};
 
     let ext = Gtp1ExtHeader::pdu_session_container(&PduSessionContainer::dl(qfi));
     let ext_len = ext.encoded_len();
@@ -703,7 +703,7 @@ pub struct DataPlanePdr {
     pub urr_ids: Vec<u32>,
     pub outer_header_removal: Option<u8>,
     /// Compiled SDF filter rule for 5-tuple matching (None = match all)
-    pub sdf_rule: Option<ogs_ipfw::IpfwRule>,
+    pub sdf_rule: Option<nextgcore_ipfw::IpfwRule>,
     /// QFI from the PDI (TS 29.244 8.2.89) — when set, an uplink G-PDU must
     /// carry the same QFI in its PDU Session Container to match this PDR
     pub qfi: Option<u8>,
@@ -1543,7 +1543,7 @@ impl PacketTuple {
     }
 
     /// Check if this packet matches an IpfwRule
-    fn matches_rule(&self, rule: &ogs_ipfw::IpfwRule) -> bool {
+    fn matches_rule(&self, rule: &nextgcore_ipfw::IpfwRule) -> bool {
         // Check protocol (0 = any)
         if rule.proto != 0 && rule.proto != self.protocol {
             return false;
@@ -3333,7 +3333,7 @@ mod tests {
             src_port: 1000,
             dst_port: 80,
         };
-        let mut rule = ogs_ipfw::IpfwRule::default();
+        let mut rule = nextgcore_ipfw::IpfwRule::default();
         rule.proto = 17; // UDP — mismatch with TCP
         assert!(!tuple.matches_rule(&rule));
     }
@@ -3347,7 +3347,7 @@ mod tests {
             src_port: 1000,
             dst_port: 80,
         };
-        let rule = ogs_ipfw::IpfwRule::default(); // proto=0 = any
+        let rule = nextgcore_ipfw::IpfwRule::default(); // proto=0 = any
         assert!(tuple.matches_rule(&rule));
     }
 
@@ -3360,7 +3360,7 @@ mod tests {
             src_port: 5000,
             dst_port: 80,
         };
-        let mut rule = ogs_ipfw::IpfwRule::default();
+        let mut rule = nextgcore_ipfw::IpfwRule::default();
         rule.ipv4_src = true;
         // 10.45.0.0/16 mask
         rule.ip.src.addr[0] = u32::from_be_bytes([10, 45, 0, 0]);
@@ -3387,9 +3387,9 @@ mod tests {
             src_port: 5000,
             dst_port: 8080,
         };
-        let mut rule = ogs_ipfw::IpfwRule::default();
+        let mut rule = nextgcore_ipfw::IpfwRule::default();
         // Port range 80-8080 (inclusive)
-        rule.port.dst = ogs_ipfw::PortRange::range(80, 8080);
+        rule.port.dst = nextgcore_ipfw::PortRange::range(80, 8080);
         assert!(tuple.matches_rule(&rule));
 
         // Port 8081 — just outside range
@@ -3458,7 +3458,7 @@ mod tests {
 
     #[test]
     fn test_match_pdr_sdf_packet_matches() {
-        let mut rule = ogs_ipfw::IpfwRule::default();
+        let mut rule = nextgcore_ipfw::IpfwRule::default();
         rule.proto = 17; // UDP only
         let session = make_test_session(vec![DataPlanePdr {
             pdr_id: 1,
@@ -3485,7 +3485,7 @@ mod tests {
 
     #[test]
     fn test_match_pdr_sdf_packet_no_match_skips_to_wildcard() {
-        let mut rule = ogs_ipfw::IpfwRule::default();
+        let mut rule = nextgcore_ipfw::IpfwRule::default();
         rule.proto = 17; // SDF: UDP only
         let session = make_test_session(vec![
             DataPlanePdr {
@@ -3890,7 +3890,7 @@ mod tests {
 
     #[test]
     fn test_match_pdr_sdf_rule_requires_packet_info() {
-        let mut rule = ogs_ipfw::IpfwRule::default();
+        let mut rule = nextgcore_ipfw::IpfwRule::default();
         rule.proto = 17;
         let session = make_test_session(vec![DataPlanePdr {
             pdr_id: 1,

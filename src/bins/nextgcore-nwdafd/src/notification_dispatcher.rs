@@ -44,7 +44,7 @@ use crate::analytics::{AnalyticsEngine, NfLoadSample};
 use crate::context::{
     AnalyticsId, AnalyticsSubscription, MatchingDirection, NotificationMethod, NwdafContext,
 };
-use ogs_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;

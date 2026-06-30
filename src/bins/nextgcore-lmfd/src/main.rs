@@ -8,11 +8,11 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::context::global_context;
-use ogs_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
-use ogs_sbi::server::{
+use nextgcore_sbi::context::global_context;
+use nextgcore_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
+    SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,8 +92,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
         .parse()
         .context("Invalid SBI address")?;
 
-    let mut sbi_server_config = OgsSbiServerConfig::new(addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
         let cert = args
             .tls_cert
@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
     if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
-        ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
     }
 
     log::info!("NextGCore LMF ready (instance: {nf_instance_id})");
@@ -971,11 +971,11 @@ async fn register_with_nrf(
             log::info!("LMF registered with NRF successfully (id={nf_instance_id})");
 
             let mut self_instance =
-                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Lmf);
+                nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Lmf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = ogs_sbi::context::NfService::new(
+            let mut svc = nextgcore_sbi::context::NfService::new(
                 "nlmf-loc",
-                ogs_sbi::types::SbiServiceType::NlmfLoc,
+                nextgcore_sbi::types::SbiServiceType::NlmfLoc,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];

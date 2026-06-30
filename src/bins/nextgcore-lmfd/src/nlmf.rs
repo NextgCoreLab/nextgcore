@@ -8,7 +8,7 @@
 //! NOTE (lmfd-LIB-03 follow-up): this module is intentionally LOCAL to the
 //! `nextgcore-lmfd` crate. Once a second consumer needs these types (e.g. the
 //! AMF for `Namf_Location`, per lmfd-AMF-01), this whole module SHOULD MOVE to
-//! `ogs-sbi/src/models/nlmf.rs` and be shared. It is kept here for now so the
+//! `nextgcore-sbi/src/models/nlmf.rs` and be shared. It is kept here for now so the
 //! Wave-3 SBI-surface fixes do not touch shared libs.
 
 use serde::{Deserialize, Serialize};

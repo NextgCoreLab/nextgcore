@@ -8,8 +8,8 @@
 use crate::analytics::AnalyticsEngine;
 use crate::context::*;
 use crate::notification_dispatcher::compute_event_infos;
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{send_bad_request, send_not_found};
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{send_bad_request, send_not_found};
 use std::collections::HashMap;
 
 // ── query-string + S-NSSAI parsing helpers ───────────────────────────────────

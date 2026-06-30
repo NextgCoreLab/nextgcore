@@ -2,15 +2,15 @@
 //!
 //! Port of src/mme/s1ap-build.c - S1AP message building functions.
 //!
-//! All messages are APER-encoded via the `ogs-s1ap` codec per 3GPP TS 36.413.
-//! This module converts MME context types into `ogs-s1ap` message structures
+//! All messages are APER-encoded via the `nextgcore-s1ap` codec per 3GPP TS 36.413.
+//! This module converts MME context types into `nextgcore-s1ap` message structures
 //! and returns the encoded wire bytes. There is no bespoke byte layout here:
-//! every builder goes through `ogs_s1ap::builder`.
+//! every builder goes through `nextgcore_s1ap::builder`.
 
 use crate::context::{
     ECgi, EnbUe, EpsTai, IpAddr, MmeBearer, MmeContext, MmeUe, PlmnId, S1apCause, S1apCauseGroup,
 };
-use ogs_s1ap::{
+use nextgcore_s1ap::{
     builder, AllocationRetentionPriority, Cause, CauseMisc, CauseNas, CauseProtocol,
     CauseRadioNetwork, CauseTransport, CnDomain, DlNasTransport, ErabItem, ErabLevelQosParameters,
     ErabModifyRequest, ErabReleaseCommand, ErabSetupRequest, ErabToBeModifiedItem,
@@ -100,7 +100,7 @@ pub mod misc_cause {
 }
 
 // ============================================================================
-// Context Type <-> ogs-s1ap Type Conversions
+// Context Type <-> nextgcore-s1ap Type Conversions
 // ============================================================================
 
 /// Encode PLMN ID to 3 bytes (TS 36.413 §9.2.3.8 TBCD encoding)
@@ -128,7 +128,7 @@ pub fn decode_plmn_id(bytes: &[u8; 3]) -> PlmnId {
     }
 }
 
-/// Convert context TAI into the ogs-s1ap TAI
+/// Convert context TAI into the nextgcore-s1ap TAI
 pub fn tai_to_s1ap(tai: &EpsTai) -> Tai {
     Tai {
         plmn_identity: encode_plmn_id(&tai.plmn_id),
@@ -136,7 +136,7 @@ pub fn tai_to_s1ap(tai: &EpsTai) -> Tai {
     }
 }
 
-/// Convert ogs-s1ap TAI into the context TAI
+/// Convert nextgcore-s1ap TAI into the context TAI
 pub fn tai_from_s1ap(tai: &Tai) -> EpsTai {
     EpsTai {
         plmn_id: decode_plmn_id(&tai.plmn_identity),
@@ -144,7 +144,7 @@ pub fn tai_from_s1ap(tai: &Tai) -> EpsTai {
     }
 }
 
-/// Convert context E-CGI into the ogs-s1ap EUTRAN-CGI
+/// Convert context E-CGI into the nextgcore-s1ap EUTRAN-CGI
 pub fn ecgi_to_s1ap(ecgi: &ECgi) -> EutranCgi {
     EutranCgi {
         plmn_identity: encode_plmn_id(&ecgi.plmn_id),
@@ -152,7 +152,7 @@ pub fn ecgi_to_s1ap(ecgi: &ECgi) -> EutranCgi {
     }
 }
 
-/// Convert ogs-s1ap EUTRAN-CGI into the context E-CGI
+/// Convert nextgcore-s1ap EUTRAN-CGI into the context E-CGI
 pub fn ecgi_from_s1ap(cgi: &EutranCgi) -> ECgi {
     ECgi {
         plmn_id: decode_plmn_id(&cgi.plmn_identity),
@@ -160,7 +160,7 @@ pub fn ecgi_from_s1ap(cgi: &EutranCgi) -> ECgi {
     }
 }
 
-/// Convert a (group, value) cause pair into the ogs-s1ap Cause CHOICE.
+/// Convert a (group, value) cause pair into the nextgcore-s1ap Cause CHOICE.
 ///
 /// Out-of-range values fall back to the group's `unspecified` value so that
 /// a valid cause is always emitted on the wire.
@@ -191,7 +191,7 @@ pub fn cause_to_s1ap(group: S1apCauseGroup, value: i64) -> Cause {
     }
 }
 
-/// Convert an ogs-s1ap Cause CHOICE into the context (group, value) pair
+/// Convert an nextgcore-s1ap Cause CHOICE into the context (group, value) pair
 pub fn cause_from_s1ap(cause: &Cause) -> S1apCause {
     match cause {
         Cause::RadioNetwork(v) => S1apCause {
@@ -551,7 +551,7 @@ pub fn build_error_indication(
 mod tests {
     use super::*;
     use crate::context::{Bitrate, ServedGummei, TmsiInfo};
-    use ogs_s1ap::{decode_s1ap_pdu, S1apMessage};
+    use nextgcore_s1ap::{decode_s1ap_pdu, S1apMessage};
 
     fn test_plmn() -> PlmnId {
         PlmnId::new("310", "410")
@@ -938,14 +938,14 @@ mod tests {
     fn test_strict_decode_rejects_missing_mandatory_ie() {
         // Hand-craft a Downlink NAS Transport whose container only carries
         // the UE S1AP IDs (no NAS-PDU): a strict peer must reject it.
-        use ogs_asn1c::per::{AperEncode, AperEncoder};
-        use ogs_asn1c::s1ap::ies::ProtocolIeContainer;
-        use ogs_asn1c::s1ap::pdu::{InitiatingMessage, InitiatingMessageValue, S1apPdu};
-        use ogs_asn1c::s1ap::types::{Criticality, ProcedureCode};
+        use nextgcore_asn1c::per::{AperEncode, AperEncoder};
+        use nextgcore_asn1c::s1ap::ies::ProtocolIeContainer;
+        use nextgcore_asn1c::s1ap::pdu::{InitiatingMessage, InitiatingMessageValue, S1apPdu};
+        use nextgcore_asn1c::s1ap::types::{Criticality, ProcedureCode};
 
         let mut container = ProtocolIeContainer::new();
-        ogs_s1ap::ie::encode_mme_ue_s1ap_id(&mut container, 42, Criticality::Reject).unwrap();
-        ogs_s1ap::ie::encode_enb_ue_s1ap_id(&mut container, 7, Criticality::Reject).unwrap();
+        nextgcore_s1ap::ie::encode_mme_ue_s1ap_id(&mut container, 42, Criticality::Reject).unwrap();
+        nextgcore_s1ap::ie::encode_enb_ue_s1ap_id(&mut container, 7, Criticality::Reject).unwrap();
 
         let pdu = S1apPdu::InitiatingMessage(InitiatingMessage {
             procedure_code: ProcedureCode::DOWNLINK_NAS_TRANSPORT,
@@ -958,7 +958,7 @@ mod tests {
         let bytes = encoder.into_bytes().to_vec();
 
         match decode_s1ap_pdu(&bytes) {
-            Err(ogs_s1ap::S1apError::MissingMandatoryIe(name)) => assert_eq!(name, "NAS-PDU"),
+            Err(nextgcore_s1ap::S1apError::MissingMandatoryIe(name)) => assert_eq!(name, "NAS-PDU"),
             other => panic!("expected MissingMandatoryIe(NAS-PDU), got {other:?}"),
         }
     }

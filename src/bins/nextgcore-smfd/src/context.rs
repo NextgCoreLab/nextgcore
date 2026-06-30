@@ -23,27 +23,27 @@ pub const MAX_NUM_OF_DNS: usize = 2;
 /// Maximum number of P-CSCF servers
 pub const MAX_NUM_OF_P_CSCF: usize = 16;
 /// Maximum IMSI length
-pub const OGS_MAX_IMSI_LEN: usize = 15;
+pub const NEXTGCORE_MAX_IMSI_LEN: usize = 15;
 /// Maximum IMSI BCD length
-pub const OGS_MAX_IMSI_BCD_LEN: usize = 15;
+pub const NEXTGCORE_MAX_IMSI_BCD_LEN: usize = 15;
 /// Maximum MSISDN length
-pub const OGS_MAX_MSISDN_LEN: usize = 15;
+pub const NEXTGCORE_MAX_MSISDN_LEN: usize = 15;
 /// Maximum MSISDN BCD length
-pub const OGS_MAX_MSISDN_BCD_LEN: usize = 15;
+pub const NEXTGCORE_MAX_MSISDN_BCD_LEN: usize = 15;
 /// Maximum IMEISV length
-pub const OGS_MAX_IMEISV_LEN: usize = 8;
+pub const NEXTGCORE_MAX_IMEISV_LEN: usize = 8;
 /// Maximum IMEISV BCD length
-pub const OGS_MAX_IMEISV_BCD_LEN: usize = 16;
+pub const NEXTGCORE_MAX_IMEISV_BCD_LEN: usize = 16;
 /// Maximum number of PCC rules
-pub const OGS_MAX_NUM_OF_PCC_RULE: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_PCC_RULE: usize = 8;
 /// Maximum number of flows in NAS
-pub const OGS_MAX_NUM_OF_FLOW_IN_NAS: usize = 16;
+pub const NEXTGCORE_MAX_NUM_OF_FLOW_IN_NAS: usize = 16;
 /// Maximum number of flows in bearer
-pub const OGS_MAX_NUM_OF_FLOW_IN_BEARER: usize = 16;
+pub const NEXTGCORE_MAX_NUM_OF_FLOW_IN_BEARER: usize = 16;
 /// Invalid pool ID
-pub const OGS_INVALID_POOL_ID: u64 = 0;
+pub const NEXTGCORE_INVALID_POOL_ID: u64 = 0;
 /// NAS PDU session identity unassigned
-pub const OGS_NAS_PDU_SESSION_IDENTITY_UNASSIGNED: u8 = 0;
+pub const NEXTGCORE_NAS_PDU_SESSION_IDENTITY_UNASSIGNED: u8 = 0;
 
 // ============================================================================
 // Basic Types

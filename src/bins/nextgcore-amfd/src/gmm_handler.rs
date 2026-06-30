@@ -3,7 +3,7 @@
 //! Port of src/amf/gmm-handler.c - GMM message handling functions for 5G NAS
 
 use crate::context::{
-    AmfUe, Guti5gs, PlmnId, RanUe, UeSecurityCapability, OGS_NAS_KSI_NO_KEY_IS_AVAILABLE,
+    AmfUe, Guti5gs, PlmnId, RanUe, UeSecurityCapability, NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE,
 };
 use crate::gmm_build::{mobile_identity_type, GmmCause};
 
@@ -12,7 +12,7 @@ use crate::gmm_build::{mobile_identity_type, GmmCause};
 // ============================================================================
 
 /// Minimum SUCI length
-pub const OGS_NAS_5GS_MOBILE_IDENTITY_SUCI_MIN_SIZE: usize = 8;
+pub const NEXTGCORE_NAS_5GS_MOBILE_IDENTITY_SUCI_MIN_SIZE: usize = 8;
 
 /// Protection scheme IDs
 pub mod protection_scheme {
@@ -140,7 +140,7 @@ pub fn handle_registration_request(
     amf_ue.nas_ue_tsc = request.tsc;
     amf_ue.nas_ue_ksi = request.ksi;
 
-    if amf_ue.nas_ue_ksi < OGS_NAS_KSI_NO_KEY_IS_AVAILABLE {
+    if amf_ue.nas_ue_ksi < NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE {
         amf_ue.nas_tsc = amf_ue.nas_ue_tsc;
         amf_ue.nas_ksi = amf_ue.nas_ue_ksi;
     }
@@ -274,7 +274,7 @@ pub fn handle_service_request(
     amf_ue.nas_ue_tsc = request.tsc;
     amf_ue.nas_ue_ksi = request.ksi;
 
-    if amf_ue.nas_ue_ksi < OGS_NAS_KSI_NO_KEY_IS_AVAILABLE {
+    if amf_ue.nas_ue_ksi < NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE {
         amf_ue.nas_tsc = amf_ue.nas_ue_tsc;
         amf_ue.nas_ksi = amf_ue.nas_ue_ksi;
     }
@@ -341,7 +341,7 @@ pub fn handle_deregistration_request(
     amf_ue.nas_ue_tsc = request.tsc;
     amf_ue.nas_ue_ksi = request.ksi;
 
-    if amf_ue.nas_ue_ksi < OGS_NAS_KSI_NO_KEY_IS_AVAILABLE {
+    if amf_ue.nas_ue_ksi < NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE {
         amf_ue.nas_tsc = amf_ue.nas_ue_tsc;
         amf_ue.nas_ksi = amf_ue.nas_ue_ksi;
     }
@@ -669,7 +669,7 @@ pub fn registration_request_from_old_amf(
 
 /// Parse SUCI from mobile identity buffer
 pub fn parse_suci(buffer: &[u8]) -> Option<(String, PlmnId)> {
-    if buffer.len() < OGS_NAS_5GS_MOBILE_IDENTITY_SUCI_MIN_SIZE {
+    if buffer.len() < NEXTGCORE_NAS_5GS_MOBILE_IDENTITY_SUCI_MIN_SIZE {
         return None;
     }
 

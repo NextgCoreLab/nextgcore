@@ -2,23 +2,23 @@
 //!
 //! Port of src/amf/gmm-build.c - GMM message building functions for 5G NAS
 
-use crate::context::{AmfUe, Guti5gs, OGS_AUTN_LEN};
+use crate::context::{AmfUe, Guti5gs, NEXTGCORE_AUTN_LEN};
 use bytes::{BufMut, BytesMut};
 // nas-06: the conformant 5GMM encoder library. amfd is migrating its hand-rolled
-// builders onto ogs-nas message-by-message (Phase 1 = the cause-only builders).
-use ogs_nas::common::types as ogs_types;
-use ogs_nas::fiveg::ie::{FiveGsIdentityType, Nssai, PduSessionStatus};
-use ogs_nas::fiveg::message as ogs_msg;
-use ogs_nas::fiveg::types as ogs_ftypes;
+// builders onto nextgcore-nas message-by-message (Phase 1 = the cause-only builders).
+use nextgcore_nas::common::types as nextgcore_types;
+use nextgcore_nas::fiveg::ie::{FiveGsIdentityType, Nssai, PduSessionStatus};
+use nextgcore_nas::fiveg::message as nextgcore_msg;
+use nextgcore_nas::fiveg::types as nextgcore_ftypes;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
 /// Extended protocol discriminator for 5GMM
-pub const OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM: u8 = 0x7e;
+pub const NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM: u8 = 0x7e;
 /// Extended protocol discriminator for 5GSM
-pub const OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM: u8 = 0x2e;
+pub const NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM: u8 = 0x2e;
 
 /// Security header types
 pub mod security_header {
@@ -236,7 +236,7 @@ impl NasMessageBuilder {
         let mut builder = Self::new();
         builder
             .buffer
-            .put_u8(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+            .put_u8(NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         builder.buffer.put_u8(security_header_type);
         builder
     }
@@ -336,7 +336,7 @@ impl Default for NasMessageBuilder {
 /// Includes: 5GS registration result (mandatory), 5G-GUTI (0x77),
 /// TAI list (0x54), Allowed NSSAI (0x15) and T3512 (0x5E).
 pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    // nas-06 Phase 2 (Tier C, REGISTRATION-CRITICAL): encoded via ogs-nas. Byte-
+    // nas-06 Phase 2 (Tier C, REGISTRATION-CRITICAL): encoded via nextgcore-nas. Byte-
     // identical to the prior hand-rolled output — 5GS registration result LV
     // [01, access&7]; 5G-GUTI (0x77 TLV-E) when a next-GUTI is assigned; single-TAI
     // partial list type-00 (0x54 TLV); Allowed NSSAI (0x15 TLV, omitted when empty);
@@ -348,19 +348,19 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
         matches!(amf_ue.access_type & 0x07, 1..=3),
         "5GS registration result access type must be 1/2/3"
     );
-    let registration_result = ogs_ftypes::RegistrationResult {
+    let registration_result = nextgcore_ftypes::RegistrationResult {
         sms_allowed: false,
         value: match amf_ue.access_type & 0x07 {
-            2 => ogs_ftypes::RegistrationResultValue::Non3gppAccess,
-            3 => ogs_ftypes::RegistrationResultValue::ThreeGppAndNon3gppAccess,
-            _ => ogs_ftypes::RegistrationResultValue::ThreeGppAccess,
+            2 => nextgcore_ftypes::RegistrationResultValue::Non3gppAccess,
+            3 => nextgcore_ftypes::RegistrationResultValue::ThreeGppAndNon3gppAccess,
+            _ => nextgcore_ftypes::RegistrationResultValue::ThreeGppAccess,
         },
     };
 
     // 5G-GUTI (optional, IEI 0x77 TLV-E) — only when a next-GUTI has been assigned.
     let guti = if amf_ue.next_guti.tmsi != 0 {
         let g = &amf_ue.next_guti;
-        Some(ogs_ftypes::MobileIdentity::FiveGGuti(ogs_ftypes::FiveGGuti {
+        Some(nextgcore_ftypes::MobileIdentity::FiveGGuti(nextgcore_ftypes::FiveGGuti {
             plmn_id: to_ogs_plmn(&g.plmn_id),
             amf_region_id: g.amf_region_id,
             amf_set_id: g.amf_set_id,
@@ -371,12 +371,12 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
         None
     };
 
-    // TAI list (single TAI, list type 00 = one PLMN). The ogs-nas encoder backfills
+    // TAI list (single TAI, list type 00 = one PLMN). The nextgcore-nas encoder backfills
     // the length octet; one TAC -> num-elements field 0, matching encode_tai_list.
     let tai = &amf_ue.nr_tai;
-    let tai_list = Some(ogs_ftypes::TaiList {
+    let tai_list = Some(nextgcore_ftypes::TaiList {
         length: 0,
-        elements: vec![ogs_ftypes::TaiListElement::PartialTaiList0 {
+        elements: vec![nextgcore_ftypes::TaiListElement::PartialTaiList0 {
             plmn_id: to_ogs_plmn(&tai.plmn_id),
             tacs: vec![[(tai.tac >> 16) as u8, (tai.tac >> 8) as u8, tai.tac as u8]],
         }],
@@ -396,20 +396,20 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
             s_nssai_list: nssai_source
                 .iter()
                 .map(|s| match s.sd {
-                    Some(sd) => ogs_types::SNssai::with_sd(
+                    Some(sd) => nextgcore_types::SNssai::with_sd(
                         s.sst,
                         [(sd >> 16) as u8, (sd >> 8) as u8, sd as u8],
                     ),
-                    None => ogs_types::SNssai::new(s.sst),
+                    None => nextgcore_types::SNssai::new(s.sst),
                 })
                 .collect(),
         })
     };
 
     // T3512 value (IEI 0x5E): 9 minutes — unit 010 (multiples of 1 minute), value 9.
-    let t3512_value = Some(ogs_types::GprsTimer3::new(2, 9));
+    let t3512_value = Some(nextgcore_types::GprsTimer3::new(2, 9));
 
-    let msg = ogs_msg::FiveGmmMessage::RegistrationAccept(ogs_msg::RegistrationAccept {
+    let msg = nextgcore_msg::FiveGmmMessage::RegistrationAccept(nextgcore_msg::RegistrationAccept {
         registration_result,
         presencemask: 0,
         guti,
@@ -421,15 +421,15 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
         t3512_value,
         t3502_value: None,
     });
-    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
+    Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
-/// Convert amfd's nibble-encoded PLMN into the ogs-nas digit-array `PlmnId` so the
+/// Convert amfd's nibble-encoded PLMN into the nextgcore-nas digit-array `PlmnId` so the
 /// two encoders emit identical bytes. amfd marks a 2-digit MNC with `mnc3 == 0xf`;
-/// ogs-nas derives the 0xF filler from `mnc_len == 2`, so the two agree byte-for-byte.
-fn to_ogs_plmn(p: &crate::context::PlmnId) -> ogs_types::PlmnId {
+/// nextgcore-nas derives the 0xF filler from `mnc_len == 2`, so the two agree byte-for-byte.
+fn to_ogs_plmn(p: &crate::context::PlmnId) -> nextgcore_types::PlmnId {
     let mnc_len = if p.mnc3 == 0x0f { 2 } else { 3 };
-    ogs_types::PlmnId::new([p.mcc1, p.mcc2, p.mcc3], [p.mnc1, p.mnc2, p.mnc3], mnc_len)
+    nextgcore_types::PlmnId::new([p.mcc1, p.mcc2, p.mcc3], [p.mnc1, p.mnc2, p.mnc3], mnc_len)
 }
 
 /// Encode a single-TAI "TAI list" per TS 24.501 Section 9.11.3.9
@@ -472,16 +472,16 @@ pub fn encode_nssai_value(snssais: &[crate::context::SNssai]) -> Vec<u8> {
 
 /// Build Registration Reject message (TS 24.501 Section 8.2.8).
 ///
-/// nas-06 Phase 1: encoded via the conformant `ogs-nas` library. Byte-identical
+/// nas-06 Phase 1: encoded via the conformant `nextgcore-nas` library. Byte-identical
 /// to the previous hand-rolled output (plain header + mandatory 5GMM cause; the
 /// optional T3346/T3502/EAP IEs are not emitted by amfd). Locked by
 /// `drift_registration_reject_through_ogs_nas` and `golden_registration_reject`.
 pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
-    let msg = ogs_msg::FiveGmmMessage::RegistrationReject(ogs_msg::RegistrationReject {
+    let msg = nextgcore_msg::FiveGmmMessage::RegistrationReject(nextgcore_msg::RegistrationReject {
         gmm_cause: gmm_cause as u8,
         ..Default::default()
     });
-    ogs_msg::build_5gmm_message(&msg).to_vec()
+    nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build Security Mode Reject message (TS 24.501 Section 8.2.27).
@@ -490,48 +490,48 @@ pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
 /// e.g. on detection of a UE-security-capabilities mismatch / bidding-down
 /// attack (TS 33.501 Section 6.7.2 → 5GMM cause #23).
 pub fn build_security_mode_reject(gmm_cause: GmmCause) -> Vec<u8> {
-    // nas-06 Phase 1: encoded via ogs-nas (plain header + mandatory 5GMM cause).
+    // nas-06 Phase 1: encoded via nextgcore-nas (plain header + mandatory 5GMM cause).
     // Byte-identical to the prior hand-rolled output; locked by
     // `drift_security_mode_reject_through_ogs_nas` + `golden_security_mode_reject`.
-    let msg = ogs_msg::FiveGmmMessage::SecurityModeReject(ogs_msg::SecurityModeReject {
+    let msg = nextgcore_msg::FiveGmmMessage::SecurityModeReject(nextgcore_msg::SecurityModeReject {
         gmm_cause: gmm_cause as u8,
     });
-    ogs_msg::build_5gmm_message(&msg).to_vec()
+    nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build Service Accept message (plain inner; wrap with nas_5gs_security_encode).
 ///
-/// nas-06 Phase 2 (Tier C): encoded via ogs-nas. Byte-identical to the prior hand-
+/// nas-06 Phase 2 (Tier C): encoded via nextgcore-nas. Byte-identical to the prior hand-
 /// rolled output — bare header, plus the optional PDU session status (0x50, LV: len
 /// 2 + the rotate_right(8)-swapped PSI bitmap). Locked by `golden_service_accept`.
 pub fn build_service_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let msg = ogs_msg::FiveGmmMessage::ServiceAccept(ogs_msg::ServiceAccept {
+    let msg = nextgcore_msg::FiveGmmMessage::ServiceAccept(nextgcore_msg::ServiceAccept {
         pdu_session_status: pdu_session_status_ie(amf_ue),
         pdu_session_reactivation_result: None,
         eap_message: None,
         t3448_value: None,
     });
-    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
+    Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
 /// Build Service Reject message (TS 24.501 Section 8.2.18).
 ///
-/// nas-06 Phase 2 (Tier C): encoded via ogs-nas. Byte-identical to the prior hand-
+/// nas-06 Phase 2 (Tier C): encoded via nextgcore-nas. Byte-identical to the prior hand-
 /// rolled output — mandatory 5GMM cause, then the optional PDU session status
 /// (0x50). Locked by `golden_service_reject`.
 pub fn build_service_reject(amf_ue: &AmfUe, gmm_cause: GmmCause) -> Vec<u8> {
-    let msg = ogs_msg::FiveGmmMessage::ServiceReject(ogs_msg::ServiceReject {
+    let msg = nextgcore_msg::FiveGmmMessage::ServiceReject(nextgcore_msg::ServiceReject {
         gmm_cause: gmm_cause as u8,
         pdu_session_status: pdu_session_status_ie(amf_ue),
         t3346_value: None,
         eap_message: None,
     });
-    ogs_msg::build_5gmm_message(&msg).to_vec()
+    nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// The optional PDU-session-status IE (0x50) shared by Service Accept/Reject:
 /// present only when the UE has session status to report, carrying the
-/// rotate_right(8)-swapped PSI bitmap verbatim (the ogs-nas encoder writes the
+/// rotate_right(8)-swapped PSI bitmap verbatim (the nextgcore-nas encoder writes the
 /// fixed length octet 2 and the u16 with no further byte-swap).
 fn pdu_session_status_ie(amf_ue: &AmfUe) -> Option<PduSessionStatus> {
     if amf_ue.pdu_session_status_present {
@@ -546,26 +546,26 @@ fn pdu_session_status_ie(amf_ue: &AmfUe) -> Option<PduSessionStatus> {
 
 /// Build Deregistration Accept message (UE-initiated; plain inner).
 ///
-/// nas-06 Phase 2 (Tier D): encoded via ogs-nas. The UE-initiated Deregistration
+/// nas-06 Phase 2 (Tier D): encoded via nextgcore-nas. The UE-initiated Deregistration
 /// Accept has no body, so this is the bare plain header — byte-identical to the
 /// prior hand-rolled output. Locked by `golden_deregistration_accept`.
 pub fn build_deregistration_accept(_amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let msg = ogs_msg::FiveGmmMessage::DeregistrationAcceptFromUe;
-    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
+    let msg = nextgcore_msg::FiveGmmMessage::DeregistrationAcceptFromUe;
+    Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
 /// Build Deregistration Request message (network-initiated; plain inner,
 /// TS 24.501 Section 8.2.11; wrap with nas_5gs_security_encode).
 ///
-/// nas-06: NOT migrated to ogs-nas (deferred). amfd writes the de-registration
+/// nas-06: NOT migrated to nextgcore-nas (deferred). amfd writes the de-registration
 /// type as a bare 0x00 (non-re-reg) / 0x01 (re-reg) byte — its own non-conformant
 /// convention (re-reg flag placed in bit 0 rather than the spec's bit 3, switch-off
-/// bit never set, access-type sub-field left 0). ogs-nas `DeRegistrationType` packs
+/// bit never set, access-type sub-field left 0). nextgcore-nas `DeRegistrationType` packs
 /// a real `AccessType` whose minimum value is 1, so it cannot represent the 0x00
 /// access-type sub-field; an amfd-built non-re-reg request does not round-trip
-/// byte-equal through ogs-nas (0x00 -> 0x01). Locked by
+/// byte-equal through nextgcore-nas (0x00 -> 0x01). Locked by
 /// `drift_deregistration_request_divergence_locked`; migrate once amfd adopts the
-/// conformant de-reg-type bit layout (or ogs-nas gains a raw-byte escape).
+/// conformant de-reg-type bit layout (or nextgcore-nas gains a raw-byte escape).
 pub fn build_deregistration_request(
     _amf_ue: &AmfUe,
     dereg_reason: DeregistrationReason,
@@ -574,7 +574,7 @@ pub fn build_deregistration_request(
     let mut builder = NasMessageBuilder::new();
 
     // GMM header (plain inner message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_epd(NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
     builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::DEREGISTRATION_REQUEST_TO_UE);
 
@@ -598,62 +598,62 @@ pub fn build_deregistration_request(
 /// `identity_type` is one of `mobile_identity_type::*` (SUCI for the
 /// subscription identity before authentication, IMEI/IMEISV for PEI).
 pub fn build_identity_request(identity_type: u8) -> Vec<u8> {
-    // nas-06 Phase 2 (Tier A): encoded via ogs-nas (plain header + mandatory
+    // nas-06 Phase 2 (Tier A): encoded via nextgcore-nas (plain header + mandatory
     // type-of-identity V field, low 3 bits). Byte-identical to the prior hand-
     // rolled output for every valid identity type; locked by
     // `drift_identity_request_through_ogs_nas` + `golden_identity_request`.
     // Identity type 0 ("no identity") is invalid in an Identity Request (callers
-    // pass SUCI/IMEISV); ogs-nas floors it to SUCI, so guard it in debug builds.
+    // pass SUCI/IMEISV); nextgcore-nas floors it to SUCI, so guard it in debug builds.
     debug_assert!(
         identity_type & 0x07 != 0,
         "Identity Request with identity type 0 (no identity) is invalid"
     );
-    let msg = ogs_msg::FiveGmmMessage::IdentityRequest(ogs_msg::IdentityRequest {
+    let msg = nextgcore_msg::FiveGmmMessage::IdentityRequest(nextgcore_msg::IdentityRequest {
         identity_type: FiveGsIdentityType::from(identity_type),
     });
-    ogs_msg::build_5gmm_message(&msg).to_vec()
+    nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build Authentication Request message (TS 24.501 Section 8.2.1).
 ///
-/// nas-06 Phase 2 (Tier B, LIVE 5G-AKA path): encoded via ogs-nas. Byte-identical
+/// nas-06 Phase 2 (Tier B, LIVE 5G-AKA path): encoded via nextgcore-nas. Byte-identical
 /// to the prior hand-rolled output — ngKSI half-octet (TS 24.501 9.11.3.32: bit 4
 /// = TSC, bits 1-3 = key set id), mandatory ABBA (LV), RAND (type-3 TV, IEI 0x21,
 /// no length octet), AUTN (TLV, IEI 0x20). AUTN is the fixed 128-bit field, always
-/// 16 octets per TS 33.501 — ogs-nas hard-codes the length octet to 16, matching
+/// 16 octets per TS 33.501 — nextgcore-nas hard-codes the length octet to 16, matching
 /// amfd's `autn.len()` for every real input (guarded by debug_assert). Locked by
 /// `drift_authentication_request_through_ogs_nas` + `golden_authentication_request`.
 pub fn build_authentication_request(amf_ue: &AmfUe) -> Vec<u8> {
     debug_assert_eq!(
         amf_ue.autn.len(),
-        OGS_AUTN_LEN,
+        NEXTGCORE_AUTN_LEN,
         "AUTN must be 16 octets (TS 33.501) for a conformant Authentication Request"
     );
-    let mut autn = [0u8; OGS_AUTN_LEN];
-    let n = amf_ue.autn.len().min(OGS_AUTN_LEN);
+    let mut autn = [0u8; NEXTGCORE_AUTN_LEN];
+    let n = amf_ue.autn.len().min(NEXTGCORE_AUTN_LEN);
     autn[..n].copy_from_slice(&amf_ue.autn[..n]);
 
-    let msg = ogs_msg::FiveGmmMessage::AuthenticationRequest(ogs_msg::AuthenticationRequest {
-        ngksi: ogs_types::KeySetIdentifier::new(amf_ue.nas_tsc, amf_ue.nas_ksi),
-        abba: ogs_types::Abba::new(amf_ue.abba[..amf_ue.abba_len as usize].to_vec()),
+    let msg = nextgcore_msg::FiveGmmMessage::AuthenticationRequest(nextgcore_msg::AuthenticationRequest {
+        ngksi: nextgcore_types::KeySetIdentifier::new(amf_ue.nas_tsc, amf_ue.nas_ksi),
+        abba: nextgcore_types::Abba::new(amf_ue.abba[..amf_ue.abba_len as usize].to_vec()),
         rand: Some(amf_ue.rand),
         autn: Some(autn),
         eap_message: None,
     });
-    ogs_msg::build_5gmm_message(&msg).to_vec()
+    nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build Authentication Reject message (TS 24.501 Section 8.2.4).
 ///
-/// nas-06 Phase 1: encoded via ogs-nas. amfd never carries the optional EAP
+/// nas-06 Phase 1: encoded via nextgcore-nas. amfd never carries the optional EAP
 /// message IE, so the output is the bare plain header — byte-identical to the
 /// prior hand-rolled output. Locked by `drift_authentication_reject_through_ogs_nas`
 /// + `golden_authentication_reject`.
 pub fn build_authentication_reject() -> Vec<u8> {
-    let msg = ogs_msg::FiveGmmMessage::AuthenticationReject(ogs_msg::AuthenticationReject {
+    let msg = nextgcore_msg::FiveGmmMessage::AuthenticationReject(nextgcore_msg::AuthenticationReject {
         eap_message: None,
     });
-    ogs_msg::build_5gmm_message(&msg).to_vec()
+    nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build Security Mode Command message (TS 24.501 Section 8.2.25)
@@ -664,7 +664,7 @@ pub fn build_authentication_reject() -> Vec<u8> {
 /// Registration Request (anti-bidding-down, TS 33.501 Section 6.7.2).
 pub fn build_security_mode_command(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     // nas-06 Phase 2 (Tier B, LIVE registration/security-mode path): encoded via
-    // ogs-nas. Byte-identical to the prior hand-rolled output:
+    // nextgcore-nas. Byte-identical to the prior hand-rolled output:
     //   - Selected NAS security algorithms (9.11.3.34: bits 8-5 ciphering, 4-1 integrity)
     //   - ngKSI (bit 4 = TSC, bits 1-3 = key set id)
     //   - Replayed UE security capabilities (LV): 2 octets, OR 4 when EPS algorithms
@@ -676,17 +676,17 @@ pub fn build_security_mode_command(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     // (the golden covers BOTH the 2- and 4-octet UE-sec-cap branches).
     let cap = &amf_ue.ue_security_capability;
     let replayed = if cap.eea != 0 || cap.eia != 0 {
-        ogs_types::UeSecurityCapability::with_eps(cap.ea, cap.ia, cap.eea, cap.eia)
+        nextgcore_types::UeSecurityCapability::with_eps(cap.ea, cap.ia, cap.eea, cap.eia)
     } else {
-        ogs_types::UeSecurityCapability::new(cap.ea, cap.ia)
+        nextgcore_types::UeSecurityCapability::new(cap.ea, cap.ia)
     };
 
-    let msg = ogs_msg::FiveGmmMessage::SecurityModeCommand(ogs_msg::SecurityModeCommand {
-        selected_nas_security_algorithms: ogs_types::SecurityAlgorithms::new(
+    let msg = nextgcore_msg::FiveGmmMessage::SecurityModeCommand(nextgcore_msg::SecurityModeCommand {
+        selected_nas_security_algorithms: nextgcore_types::SecurityAlgorithms::new(
             amf_ue.selected_enc_algorithm,
             amf_ue.selected_int_algorithm,
         ),
-        ngksi: ogs_types::KeySetIdentifier::new(amf_ue.nas_tsc, amf_ue.nas_ksi),
+        ngksi: nextgcore_types::KeySetIdentifier::new(amf_ue.nas_tsc, amf_ue.nas_ksi),
         replayed_ue_security_capabilities: replayed,
         imeisv_request: Some(1),
         selected_eps_nas_security_algorithms: None,
@@ -695,7 +695,7 @@ pub fn build_security_mode_command(amf_ue: &AmfUe) -> Option<Vec<u8>> {
         abba: None,
         replayed_s1_ue_security_capabilities: None,
     });
-    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
+    Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
 /// Build Configuration Update Command message
@@ -703,7 +703,7 @@ pub fn build_configuration_update_command(
     amf_ue: &AmfUe,
     param: &ConfigurationUpdateCommandParam,
 ) -> Option<Vec<u8>> {
-    // nas-06 Phase 2 (Tier D): encoded via ogs-nas. Byte-identical to the prior
+    // nas-06 Phase 2 (Tier D): encoded via nextgcore-nas. Byte-identical to the prior
     // hand-rolled output — optional configuration update indication (type-1 TV,
     // IEI 0xD: bit 1 = ack, bit 2 = registration) and optional 5G-GUTI (0x77 TLV-E,
     // reusing to_ogs_plmn). amfd carries no other configuration IE (NITZ is a
@@ -724,7 +724,7 @@ pub fn build_configuration_update_command(
 
     let guti = if param.guti && amf_ue.next_guti.tmsi != 0 {
         let g = &amf_ue.next_guti;
-        Some(ogs_ftypes::MobileIdentity::FiveGGuti(ogs_ftypes::FiveGGuti {
+        Some(nextgcore_ftypes::MobileIdentity::FiveGGuti(nextgcore_ftypes::FiveGGuti {
             plmn_id: to_ogs_plmn(&g.plmn_id),
             amf_region_id: g.amf_region_id,
             amf_set_id: g.amf_set_id,
@@ -735,7 +735,7 @@ pub fn build_configuration_update_command(
         None
     };
 
-    let msg = ogs_msg::FiveGmmMessage::ConfigurationUpdateCommand(ogs_msg::ConfigurationUpdateCommand {
+    let msg = nextgcore_msg::FiveGmmMessage::ConfigurationUpdateCommand(nextgcore_msg::ConfigurationUpdateCommand {
         configuration_update_indication,
         guti,
         tai_list: None,
@@ -750,7 +750,7 @@ pub fn build_configuration_update_command(
         configured_nssai: None,
         rejected_nssai: None,
     });
-    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
+    Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
 /// Build DL NAS Transport message
@@ -764,7 +764,7 @@ pub fn build_dl_nas_transport(
     let mut builder = NasMessageBuilder::new();
 
     // GMM header (plain inner message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_epd(NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
     builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::DL_NAS_TRANSPORT);
 
@@ -802,14 +802,14 @@ pub fn build_dl_nas_transport(
 
 /// Build 5GMM Status message (plain inner; wrap with nas_5gs_security_encode).
 ///
-/// nas-06 Phase 1: encoded via ogs-nas (plain header + mandatory 5GMM cause).
+/// nas-06 Phase 1: encoded via nextgcore-nas (plain header + mandatory 5GMM cause).
 /// Byte-identical to the prior hand-rolled output; locked by
 /// `drift_gmm_status_through_ogs_nas` + `golden_gmm_status`.
 pub fn build_gmm_status(gmm_cause: GmmCause) -> Option<Vec<u8>> {
-    let msg = ogs_msg::FiveGmmMessage::FiveGmmStatus(ogs_msg::FiveGmmStatus {
+    let msg = nextgcore_msg::FiveGmmMessage::FiveGmmStatus(nextgcore_msg::FiveGmmStatus {
         gmm_cause: gmm_cause as u8,
     });
-    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
+    Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
 // ============================================================================
@@ -863,7 +863,7 @@ fn get_pdu_session_status(amf_ue: &AmfUe) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{PlmnId, OGS_RAND_LEN};
+    use crate::context::{PlmnId, NEXTGCORE_RAND_LEN};
 
     fn create_test_amf_ue() -> AmfUe {
         AmfUe {
@@ -916,7 +916,7 @@ mod tests {
         let msg = build_registration_reject(GmmCause::IllegalUe);
 
         assert!(!msg.is_empty());
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[1], 0x00); // Plain NAS
         assert_eq!(msg[2], message_type::REGISTRATION_REJECT);
         assert_eq!(msg[3], GmmCause::IllegalUe as u8);
@@ -927,7 +927,7 @@ mod tests {
         let msg = build_identity_request(mobile_identity_type::SUCI);
 
         assert!(!msg.is_empty());
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[1], 0x00); // Plain NAS
         assert_eq!(msg[2], message_type::IDENTITY_REQUEST);
         assert_eq!(msg[3], mobile_identity_type::SUCI);
@@ -941,7 +941,7 @@ mod tests {
         let msg = build_authentication_reject();
 
         assert!(!msg.is_empty());
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[1], 0x00); // Plain NAS
         assert_eq!(msg[2], message_type::AUTHENTICATION_REJECT);
     }
@@ -952,7 +952,7 @@ mod tests {
         let msg = build_authentication_request(&amf_ue);
 
         assert!(!msg.is_empty());
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[1], 0x00); // Plain NAS
         assert_eq!(msg[2], message_type::AUTHENTICATION_REQUEST);
     }
@@ -966,38 +966,38 @@ mod tests {
         let msg = msg.unwrap();
         assert!(!msg.is_empty());
         // First two bytes are security header
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
     }
 
     // ------------------------------------------------------------------
-    // nas-06 Phase 0: cross-stack drift bridge (amfd <-> ogs-nas)
+    // nas-06 Phase 0: cross-stack drift bridge (amfd <-> nextgcore-nas)
     //
-    // amfd hand-rolls its 5GMM encoders; ogs-nas is the conformant library
+    // amfd hand-rolls its 5GMM encoders; nextgcore-nas is the conformant library
     // but is not yet on the runtime path. These tests lock the two stacks
     // together until convergence completes: every byte-compatible amfd-built
-    // message must (a) parse through ogs-nas and (b) re-encode byte-for-byte
+    // message must (a) parse through nextgcore-nas and (b) re-encode byte-for-byte
     // identically. Any divergence fails CI — the intent of the "land first"
     // safety net. (DL NAS Transport and the non-3GPP bearer case diverge and
     // are tracked separately; they are NOT asserted green here.)
     // ------------------------------------------------------------------
 
-    /// Assert amfd-built plain 5GMM bytes parse via ogs-nas and re-encode
+    /// Assert amfd-built plain 5GMM bytes parse via nextgcore-nas and re-encode
     /// byte-identically.
     fn assert_drift_roundtrip(amfd_bytes: &[u8], label: &str) {
-        use ogs_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
+        use nextgcore_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(amfd_bytes))
-            .unwrap_or_else(|e| panic!("ogs-nas must parse amfd {label}: {e:?}"));
+            .unwrap_or_else(|e| panic!("nextgcore-nas must parse amfd {label}: {e:?}"));
         let re = build_5gmm_message(&parsed);
         assert_eq!(
             &re[..],
             amfd_bytes,
-            "amfd {label} must round-trip byte-equal through ogs-nas"
+            "amfd {label} must round-trip byte-equal through nextgcore-nas"
         );
     }
 
     #[test]
     fn drift_authentication_reject_through_ogs_nas() {
-        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_authentication_reject();
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
         assert!(matches!(parsed, FiveGmmMessage::AuthenticationReject(_)));
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn drift_registration_reject_through_ogs_nas() {
-        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_registration_reject(GmmCause::PlmnNotAllowed);
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
         assert!(matches!(parsed, FiveGmmMessage::RegistrationReject(_)));
@@ -1015,7 +1015,7 @@ mod tests {
 
     #[test]
     fn drift_security_mode_reject_through_ogs_nas() {
-        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_security_mode_reject(GmmCause::PlmnNotAllowed);
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
         assert!(matches!(parsed, FiveGmmMessage::SecurityModeReject(_)));
@@ -1024,7 +1024,7 @@ mod tests {
 
     #[test]
     fn drift_gmm_status_through_ogs_nas() {
-        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_gmm_status(GmmCause::PlmnNotAllowed).unwrap();
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
         assert!(matches!(parsed, FiveGmmMessage::FiveGmmStatus(_)));
@@ -1033,7 +1033,7 @@ mod tests {
 
     #[test]
     fn drift_identity_request_through_ogs_nas() {
-        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_identity_request(mobile_identity_type::SUCI);
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
         assert!(matches!(parsed, FiveGmmMessage::IdentityRequest(_)));
@@ -1042,7 +1042,7 @@ mod tests {
 
     #[test]
     fn drift_authentication_request_through_ogs_nas() {
-        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_authentication_request(&create_test_amf_ue());
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
         assert!(matches!(parsed, FiveGmmMessage::AuthenticationRequest(_)));
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[test]
     fn drift_security_mode_command_through_ogs_nas() {
-        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_security_mode_command(&create_test_amf_ue()).unwrap();
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
         assert!(matches!(parsed, FiveGmmMessage::SecurityModeCommand(_)));
@@ -1060,14 +1060,14 @@ mod tests {
 
     /// KNOWN DIVERGENCE LOCK (nas-06): amfd writes the PDU-session-id as a
     /// 2-octet type-3 TV (`12 <psi>`, spec-correct per TS 24.501 §9.11.3.41),
-    /// but ogs-nas `DlNasTransport` decode/encode treats it as a 3-octet TLV
+    /// but nextgcore-nas `DlNasTransport` decode/encode treats it as a 3-octet TLV
     /// (`12 01 <psi>`). So an amfd-built DL NAS Transport does NOT yet
-    /// round-trip byte-equal through ogs-nas. This guard fails the moment the
-    /// divergence is fixed (ogs-nas `message.rs` ~1411 encode / ~1461 decode,
+    /// round-trip byte-equal through nextgcore-nas. This guard fails the moment the
+    /// divergence is fixed (nextgcore-nas `message.rs` ~1411 encode / ~1461 decode,
     /// TLV->TV) — at which point convert it into a positive drift round-trip.
     #[test]
     fn drift_dl_nas_transport_psi_divergence_locked() {
-        use ogs_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
+        use nextgcore_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
         let payload = [0x2eu8, 0x01, 0x01, 0xc1]; // minimal N1-SM-ish container
         let amfd = build_dl_nas_transport(Some(5), 1, &payload, None, None).unwrap();
         let roundtrips = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd))
@@ -1075,14 +1075,14 @@ mod tests {
             .unwrap_or(false);
         assert!(
             !roundtrips,
-            "DL NAS Transport now round-trips through ogs-nas — the PSI TLV/TV \
+            "DL NAS Transport now round-trips through nextgcore-nas — the PSI TLV/TV \
              divergence is fixed; convert this guard into a byte-equal drift test"
         );
     }
 
     #[test]
     fn drift_registration_accept_minimal_through_ogs_nas() {
-        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         // Minimal happy-path Registration Accept: tmsi=0 skips the GUTI IE and
         // the default (empty) NSSAI skips the 0x15 IE, leaving reg-result +
         // TAI list (0x54) + T3512 (0x5E) — the registration-critical core.
@@ -1097,12 +1097,12 @@ mod tests {
     // ------------------------------------------------------------------
     // nas-06 Phase 1: golden wire vectors for the migrated cause-only builders.
     //
-    // These pin the EXACT bytes the (now ogs-nas-backed) builders emit. They are
+    // These pin the EXACT bytes the (now nextgcore-nas-backed) builders emit. They are
     // the pre-migration ground truth — hand-rolled output for these four messages
     // was a plain 3-byte 5GMM header (EPD 0x7E, SHT 0x00, msg-type) followed by the
     // single mandatory 5GMM-cause octet (none for Authentication Reject). The drift
-    // tests above already prove ogs-nas round-trips amfd's bytes; these guard the
-    // absolute wire image so a future ogs-nas encoding change cannot silently shift
+    // tests above already prove nextgcore-nas round-trips amfd's bytes; these guard the
+    // absolute wire image so a future nextgcore-nas encoding change cannot silently shift
     // amfd's output without tripping CI.
     // ------------------------------------------------------------------
 
@@ -1164,8 +1164,8 @@ mod tests {
         ue.nas_ksi = 3;
         ue.abba = [0xab, 0xcd];
         ue.abba_len = 2;
-        ue.rand = [0xaa; OGS_RAND_LEN];
-        ue.autn = vec![0xbb; OGS_AUTN_LEN];
+        ue.rand = [0xaa; NEXTGCORE_RAND_LEN];
+        ue.autn = vec![0xbb; NEXTGCORE_AUTN_LEN];
 
         // EPD|SHT|AUTH REQ(0x56) | ngksi | ABBA LV(02 ab cd) | RAND TV(21 + 16) | AUTN TLV(20 10 + 16)
         let mut expected = vec![0x7e, 0x00, 0x56, 0x0b, 0x02, 0xab, 0xcd, 0x21];
@@ -1211,7 +1211,7 @@ mod tests {
         // branches that the minimal drift test does NOT cover. The expected wire
         // image is reconstructed from the OLD, still-present byte helpers
         // (encode_guti/encode_tai_list/encode_nssai_value) + the documented IE
-        // framing, so this asserts new(ogs-nas) == old(hand-rolled) directly.
+        // framing, so this asserts new(nextgcore-nas) == old(hand-rolled) directly.
         let mut ue = create_test_amf_ue();
         ue.access_type = 1; // 3GPP access
         ue.nr_tai = crate::context::Tai5gs {
@@ -1381,15 +1381,15 @@ mod tests {
     }
 
     /// KNOWN DIVERGENCE LOCK (nas-06 Tier D): amfd encodes the de-registration type
-    /// as a bare 0x00 (non-re-reg) byte, but ogs-nas `DeRegistrationType` packs a real
+    /// as a bare 0x00 (non-re-reg) byte, but nextgcore-nas `DeRegistrationType` packs a real
     /// `AccessType` whose minimum value is 1, so it cannot represent the 0x00 access-
     /// type sub-field — an amfd-built non-re-reg Deregistration Request does NOT round-
-    /// trip byte-equal through ogs-nas (0x00 -> 0x01). This guard fails the moment the
+    /// trip byte-equal through nextgcore-nas (0x00 -> 0x01). This guard fails the moment the
     /// divergence is fixed (amfd adopts the conformant de-reg-type bit layout, or
-    /// ogs-nas gains a raw-byte escape); convert it into a positive drift test then.
+    /// nextgcore-nas gains a raw-byte escape); convert it into a positive drift test then.
     #[test]
     fn drift_deregistration_request_divergence_locked() {
-        use ogs_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
+        use nextgcore_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
         let amfd = build_deregistration_request(
             &create_test_amf_ue(),
             DeregistrationReason::UeNotSwitchOff, // non-re-reg -> de-reg-type byte 0x00
@@ -1401,7 +1401,7 @@ mod tests {
             .unwrap_or(false);
         assert!(
             !roundtrips,
-            "Deregistration Request now round-trips through ogs-nas — the de-reg-type \
+            "Deregistration Request now round-trips through nextgcore-nas — the de-reg-type \
              0x00 / AccessType divergence is fixed; convert this guard into a byte-equal \
              drift test and migrate build_deregistration_request"
         );
@@ -1423,7 +1423,7 @@ mod tests {
         let msg = build_service_reject(&amf_ue, GmmCause::Congestion);
 
         assert!(!msg.is_empty());
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[2], message_type::SERVICE_REJECT);
         assert_eq!(msg[3], GmmCause::Congestion as u8);
     }
@@ -1435,7 +1435,7 @@ mod tests {
 
         assert!(msg.is_some());
         let msg = msg.unwrap();
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[1], 0x00); // plain inner
         assert_eq!(msg[2], message_type::DL_NAS_TRANSPORT);
         assert_eq!(msg[3], 0x01); // container type

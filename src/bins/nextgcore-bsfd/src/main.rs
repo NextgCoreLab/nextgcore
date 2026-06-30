@@ -7,13 +7,13 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::oauth::{JwksCache, OAuth2Client};
-use ogs_sbi::server::{
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
+use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
+    SbiServerConfig as NextgcoreSbiServerConfig,
 };
-use ogs_sbi::types::NfType;
+use nextgcore_sbi::types::NfType;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -159,8 +159,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
                                     if let Some(nrf) = nrf_list.first() {
                                         log::info!("NRF URI configured: {}", nrf.uri);
                                         nrf_uri_cfg = Some(nrf.uri.clone());
-                                        ogs_sbi::context::global_context()
+                                        nextgcore_sbi::context::global_context()
                                             .set_nrf_uri(&nrf.uri)
                                             .await;
                                     }
@@ -253,11 +253,11 @@ async fn main() -> Result<()> {
     // Open legacy SBI server (for context initialization)
     bsf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Start actual HTTP/2 SBI server using ogs-sbi
+    // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let mut sbi_server_config = OgsSbiServerConfig::new(sbi_addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
     if require_oauth2 {
         // Server side (TS 33.501 §13.4.1): verify incoming Bearer tokens
         // against the NRF's JWKS and require the token's `aud` to include this
@@ -296,7 +296,7 @@ async fn main() -> Result<()> {
     // Register with NRF and start heartbeat worker
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
         }
         Ok(_) => {}
         Err(e) => {
@@ -363,7 +363,7 @@ async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // bsfd-13 stub: subscription sub-resource (any method) -> 501.
         // Must be checked BEFORE the generic pcfBindings/POST arm.
         ("nbsf-management", "pcfBindings", _) if parts.len() >= 5 && parts[4] == "subscriptions" => {
-            ogs_sbi::server::send_error(
+            nextgcore_sbi::server::send_error(
                 501,
                 "Not Implemented",
                 "Nbsf_Management Subscribe/Unsubscribe is not implemented (bsfd-13 stub)",
@@ -441,7 +441,7 @@ const SAME_PCF_BIT: u64 = 0x2;
 
 /// 400 ProblemDetails for a missing mandatory PcfBinding attribute.
 fn missing_mandatory(attr: &str) -> SbiResponse {
-    ogs_sbi::server::send_error(
+    nextgcore_sbi::server::send_error(
         400,
         "Bad Request",
         &format!("Missing mandatory attribute: {attr}"),
@@ -659,7 +659,7 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
     }
     if let Some(mac) = mac_addr48 {
         if context::normalize_mac(mac).is_none() {
-            return ogs_sbi::server::send_error(
+            return nextgcore_sbi::server::send_error(
                 400,
                 "Bad Request",
                 &format!("Invalid macAddr48: {mac}"),
@@ -672,7 +672,7 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
     let expiry = binding_data.get("expiry").and_then(|v| v.as_str());
     if let Some(e) = expiry {
         if context::rfc3339_to_epoch(e).is_none() {
-            return ogs_sbi::server::send_error(
+            return nextgcore_sbi::server::send_error(
                 400,
                 "Bad Request",
                 &format!("expiry is not a valid RFC 3339 DateTime: {e}"),
@@ -959,7 +959,7 @@ async fn handle_pcf_binding_discovery(request: &SbiRequest) -> SbiResponse {
                 .with_json_body(&binding_json(sess))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
-        _ => ogs_sbi::server::send_error(
+        _ => nextgcore_sbi::server::send_error(
             400,
             "Bad Request",
             "Multiple PCF bindings match the query parameter combination",
@@ -1056,7 +1056,7 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
 
     // TS 29.521 §5.2: validate the merge-patch Content-Type before any mutation.
     if !merge_patch_content_type_ok(request) {
-        return ogs_sbi::server::send_error(
+        return nextgcore_sbi::server::send_error(
             415,
             "Unsupported Media Type",
             "PATCH body must be application/merge-patch+json",
@@ -1084,7 +1084,7 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
         let context = match ctx.read() {
             Ok(c) => c,
             Err(_) => {
-                return ogs_sbi::server::send_error(
+                return nextgcore_sbi::server::send_error(
                     500,
                     "Internal Server Error",
                     "BSF context unavailable",
@@ -1116,7 +1116,7 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
             }
             Patch::Set(s) => {
                 if !context.set_ue_ipv4(&mut sess, Some(s)) {
-                    return ogs_sbi::server::send_error(
+                    return nextgcore_sbi::server::send_error(
                         400,
                         "Bad Request",
                         &format!("Invalid ipv4Addr: {s}"),
@@ -1132,7 +1132,7 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
             }
             Patch::Set(s) => {
                 if !context.set_ue_ipv6(&mut sess, Some(s)) {
-                    return ogs_sbi::server::send_error(
+                    return nextgcore_sbi::server::send_error(
                         400,
                         "Bad Request",
                         &format!("Invalid ipv6Prefix: {s}"),
@@ -1148,7 +1148,7 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
             }
             Patch::Set(s) => {
                 if !context.set_ue_mac(&mut sess, Some(s)) {
-                    return ogs_sbi::server::send_error(
+                    return nextgcore_sbi::server::send_error(
                         400,
                         "Bad Request",
                         &format!("Invalid macAddr48: {s}"),
@@ -1174,7 +1174,7 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
             }
             Patch::Set(s) => {
                 if !sess.set_expiry(s) {
-                    return ogs_sbi::server::send_error(
+                    return nextgcore_sbi::server::send_error(
                         400,
                         "Bad Request",
                         &format!("expiry is not a valid RFC 3339 DateTime: {s}"),
@@ -1530,7 +1530,7 @@ async fn handle_pcf_ue_binding_delete(binding_id: &str) -> SbiResponse {
 
 async fn handle_pcf_ue_binding_update(binding_id: &str, request: &SbiRequest) -> SbiResponse {
     if !merge_patch_content_type_ok(request) {
-        return ogs_sbi::server::send_error(
+        return nextgcore_sbi::server::send_error(
             415,
             "Unsupported Media Type",
             "PATCH body must be application/merge-patch+json",
@@ -1786,7 +1786,7 @@ async fn handle_pcf_mbs_binding_discovery(request: &SbiRequest) -> SbiResponse {
         [b] => SbiResponse::with_status(200)
             .with_json_body(&mbs_binding_json(b))
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        _ => ogs_sbi::server::send_error(
+        _ => nextgcore_sbi::server::send_error(
             400,
             "Bad Request",
             "Multiple MBS bindings match the query parameter combination",
@@ -1815,7 +1815,7 @@ async fn handle_pcf_mbs_binding_delete(binding_id: &str) -> SbiResponse {
 
 async fn handle_pcf_mbs_binding_update(binding_id: &str, request: &SbiRequest) -> SbiResponse {
     if !merge_patch_content_type_ok(request) {
-        return ogs_sbi::server::send_error(
+        return nextgcore_sbi::server::send_error(
             415,
             "Unsupported Media Type",
             "PATCH body must be application/merge-patch+json",
@@ -1921,7 +1921,7 @@ async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBoo
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
         // Compute optimal sleep duration based on pending timers
-        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+        let poll_interval = nextgcore_core::async_timer::compute_poll_interval(
             timer_mgr.inner(),
             Duration::from_millis(100),
         );
@@ -1995,7 +1995,7 @@ async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBoo
 /// Returns the NF instance ID on success so the caller can start a heartbeat
 /// worker.
 async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -2163,7 +2163,7 @@ mod tests {
     // ephemeral port (strict-peer rejections + discovery matrix + expiry).
     // ------------------------------------------------------------------
 
-    use ogs_sbi::client::SbiClient;
+    use nextgcore_sbi::client::SbiClient;
     use serde_json::json;
 
     fn ephemeral_addr() -> SocketAddr {
@@ -2177,7 +2177,7 @@ mod tests {
         // The handlers consult the global BSF context: initialize it once.
         bsf_context_init(1024);
         let addr = ephemeral_addr();
-        let server = SbiServer::new(OgsSbiServerConfig::new(addr));
+        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
         server
             .start(bsf_sbi_request_handler)
             .await
@@ -2231,7 +2231,7 @@ mod tests {
     async fn start_bsf_oauth2(jwks: serde_json::Value) -> (SbiServer, SbiClient) {
         bsf_context_init(1024);
         let addr = ephemeral_addr();
-        let mut cfg = OgsSbiServerConfig::new(addr);
+        let mut cfg = NextgcoreSbiServerConfig::new(addr);
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Bsf);

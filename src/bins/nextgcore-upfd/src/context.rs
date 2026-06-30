@@ -14,9 +14,9 @@ use std::time::Instant;
 // ============================================================================
 
 /// Maximum number of URRs per session
-pub const OGS_MAX_NUM_OF_URR: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_URR: usize = 8;
 /// Maximum number of framed routes in PDI
-pub const OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI: usize = 8;
 
 // ============================================================================
 // IP Subnet
@@ -898,7 +898,7 @@ impl Pdr {
         // SDF filter matching: compile and check flow description if present
         if let Some(ref sdf) = self.sdf_filter {
             if let Some(ref desc) = sdf.flow_description {
-                if let Ok(rule) = ogs_ipfw::compile_rule(desc) {
+                if let Ok(rule) = nextgcore_ipfw::compile_rule(desc) {
                     // Without actual packet data here, we accept if the rule compiled OK.
                     // Real per-packet SDF matching happens in DataPlaneSession::match_pdr_with_packet.
                     let _ = rule;
@@ -1118,7 +1118,7 @@ impl Clone for RateLimiter {
 // PFCP Session (simplified)
 // ============================================================================
 
-/// PFCP session data (simplified from ogs_pfcp_sess_t)
+/// PFCP session data (simplified from nextgcore_pfcp_sess_t)
 #[derive(Debug, Clone, Default)]
 pub struct PfcpSess {
     /// PDR list IDs
@@ -1197,7 +1197,7 @@ pub struct UpfSess {
     /// PFCP node ID
     pub pfcp_node_id: Option<u64>,
     /// URR accounting data
-    pub urr_acc: [UrrAccounting; OGS_MAX_NUM_OF_URR],
+    pub urr_acc: [UrrAccounting; NEXTGCORE_MAX_NUM_OF_URR],
     /// APN/DNN
     pub apn_dnn: Option<String>,
     /// TSN bridge (Rel-18)
@@ -1240,7 +1240,7 @@ impl UpfSess {
             self.ipv4_framed_routes = Some(Vec::new());
         }
         if let Some(routes) = &mut self.ipv4_framed_routes {
-            if routes.len() < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI {
+            if routes.len() < NEXTGCORE_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI {
                 routes.push(subnet);
             }
         }
@@ -1252,7 +1252,7 @@ impl UpfSess {
             self.ipv6_framed_routes = Some(Vec::new());
         }
         if let Some(routes) = &mut self.ipv6_framed_routes {
-            if routes.len() < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI {
+            if routes.len() < NEXTGCORE_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI {
                 routes.push(subnet);
             }
         }
@@ -1278,14 +1278,14 @@ impl UpfSess {
 
     /// Add URR accounting
     pub fn urr_acc_add(&mut self, urr_idx: usize, size: usize, is_uplink: bool) {
-        if urr_idx < OGS_MAX_NUM_OF_URR {
+        if urr_idx < NEXTGCORE_MAX_NUM_OF_URR {
             self.urr_acc[urr_idx].add(size, is_uplink);
         }
     }
 
     /// Take URR accounting snapshot
     pub fn urr_acc_snapshot(&mut self, urr_idx: usize) {
-        if urr_idx < OGS_MAX_NUM_OF_URR {
+        if urr_idx < NEXTGCORE_MAX_NUM_OF_URR {
             self.urr_acc[urr_idx].snapshot();
         }
     }

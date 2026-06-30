@@ -204,7 +204,7 @@ pub async fn send_notify_post(notify_uri: &str, body: &impl Serialize) {
     };
 
     let path = extract_path(notify_uri);
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
     let client = sbi_ctx.get_client(&host, port).await;
 
     match client.post_json(&path, &body_val).await {

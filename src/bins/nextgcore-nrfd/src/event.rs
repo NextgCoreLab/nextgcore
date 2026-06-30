@@ -2,10 +2,10 @@
 //!
 //! Port of src/nrf/event.h and event.c - Event definitions for NRF
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
-pub const OGS_FSM_USER_SIG: i32 = 2;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for NRF
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,19 +26,19 @@ impl NrfEventId {
     /// Get the name of the event
     pub fn name(&self) -> &'static str {
         match self {
-            NrfEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            NrfEventId::FsmExit => "OGS_FSM_EXIT_SIG",
-            NrfEventId::SbiServer => "OGS_EVENT_SBI_SERVER",
-            NrfEventId::SbiClient => "OGS_EVENT_SBI_CLIENT",
-            NrfEventId::SbiTimer => "OGS_EVENT_SBI_TIMER",
+            NrfEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            NrfEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
+            NrfEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
+            NrfEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
+            NrfEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
         }
     }
 
     /// Convert from i32 signal
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => NrfEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => NrfEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => NrfEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => NrfEventId::FsmExit,
             _ => NrfEventId::SbiServer, // Default to SBI server
         }
     }
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn test_event_name() {
         let event = NrfEvent::new(NrfEventId::SbiServer);
-        assert_eq!(event.name(), "OGS_EVENT_SBI_SERVER");
+        assert_eq!(event.name(), "NEXTGCORE_EVENT_SBI_SERVER");
     }
 
     #[test]

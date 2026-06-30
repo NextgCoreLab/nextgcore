@@ -3,10 +3,10 @@
 //! Port of src/amf/sbi-path.c - SBI service discovery and message routing
 
 use base64::Engine;
-use ogs_sbi::client::SbiClient;
-use ogs_sbi::constants::content_type;
-use ogs_sbi::context::{global_context, NfInstance, NfService};
-use ogs_sbi::message::{SbiPart, SbiRequest, SbiResponse};
+use nextgcore_sbi::client::SbiClient;
+use nextgcore_sbi::constants::content_type;
+use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+use nextgcore_sbi::message::{SbiPart, SbiRequest, SbiResponse};
 
 use crate::context::{AmfSess, AmfUe, RanUe};
 
@@ -282,17 +282,17 @@ pub fn amf_sbi_open() -> SbiResult<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
 
-    let mut nf_instance = NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Amf);
+    let mut nf_instance = NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Amf);
     nf_instance.ipv4_addresses.push(sbi_addr.clone());
 
     // Register Namf services: namf-comm, namf-evts, namf-mt, namf-loc
-    let mut comm_service = NfService::new("namf-comm", ogs_sbi::types::SbiServiceType::NamfComm);
+    let mut comm_service = NfService::new("namf-comm", nextgcore_sbi::types::SbiServiceType::NamfComm);
     comm_service.versions = vec!["v1".to_string()];
     comm_service.port = sbi_port;
     comm_service.ip_addresses.push(sbi_addr.clone());
     nf_instance.add_service(comm_service);
 
-    let mut evts_service = NfService::new("namf-evts", ogs_sbi::types::SbiServiceType::NamfEvts);
+    let mut evts_service = NfService::new("namf-evts", nextgcore_sbi::types::SbiServiceType::NamfEvts);
     evts_service.versions = vec!["v1".to_string()];
     evts_service.port = sbi_port;
     nf_instance.add_service(evts_service);
@@ -384,9 +384,9 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
             log::info!("AMF registered with NRF (id={nf_instance_id})");
 
             // Update self instance in SBI context
-            let mut self_instance = NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Amf);
+            let mut self_instance = NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Amf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = NfService::new("namf-comm", ogs_sbi::types::SbiServiceType::NamfComm);
+            let mut svc = NfService::new("namf-comm", nextgcore_sbi::types::SbiServiceType::NamfComm);
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
             self_instance.add_service(svc);
@@ -445,12 +445,12 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
             let nf_type_str = nf_json.get("nfType").and_then(|v| v.as_str()).unwrap_or("");
 
             let nf_type = match nf_type_str {
-                "AUSF" => ogs_sbi::types::NfType::Ausf,
-                "UDM" => ogs_sbi::types::NfType::Udm,
-                "SMF" => ogs_sbi::types::NfType::Smf,
-                "PCF" => ogs_sbi::types::NfType::Pcf,
-                "NSSF" => ogs_sbi::types::NfType::Nssf,
-                "NRF" => ogs_sbi::types::NfType::Nrf,
+                "AUSF" => nextgcore_sbi::types::NfType::Ausf,
+                "UDM" => nextgcore_sbi::types::NfType::Udm,
+                "SMF" => nextgcore_sbi::types::NfType::Smf,
+                "PCF" => nextgcore_sbi::types::NfType::Pcf,
+                "NSSF" => nextgcore_sbi::types::NfType::Nssf,
+                "NRF" => nextgcore_sbi::types::NfType::Nrf,
                 _ => continue,
             };
 
@@ -472,7 +472,7 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
                         .get("serviceName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if let Some(svc_type) = ogs_sbi::types::SbiServiceType::from_name(svc_name) {
+                    if let Some(svc_type) = nextgcore_sbi::types::SbiServiceType::from_name(svc_name) {
                         let mut svc = NfService::new(svc_name, svc_type);
                         if let Some(endpoints) =
                             svc_json.get("ipEndPoints").and_then(|v| v.as_array())
@@ -520,46 +520,46 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 /// Send SBI request to NF instance
 pub fn amf_sbi_send_request(_nf_instance_id: &str, _xact: &SbiXact) -> SbiResult<()> {
     // Note: Implement actual SBI request sending
-    // HTTP/2 request transmission handled by ogs_sbi client module
+    // HTTP/2 request transmission handled by nextgcore_sbi client module
     Ok(())
 }
 
 /// Discover NF endpoint for the given service type using SbiContext cache + env var fallback
 fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
-    // Map AMF SbiServiceType to ogs_sbi SbiServiceType and env var names
-    let (ogs_service_type, env_addr, env_port, default_port) = match service_type {
+    // Map AMF SbiServiceType to nextgcore_sbi SbiServiceType and env var names
+    let (nextgcore_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
-            ogs_sbi::types::SbiServiceType::NausfAuth,
+            nextgcore_sbi::types::SbiServiceType::NausfAuth,
             "AUSF_SBI_ADDR",
             "AUSF_SBI_PORT",
             7777u16,
         ),
         SbiServiceType::NudmUecm => (
-            ogs_sbi::types::SbiServiceType::NudmUecm,
+            nextgcore_sbi::types::SbiServiceType::NudmUecm,
             "UDM_SBI_ADDR",
             "UDM_SBI_PORT",
             7777,
         ),
         SbiServiceType::NudmSdm => (
-            ogs_sbi::types::SbiServiceType::NudmSdm,
+            nextgcore_sbi::types::SbiServiceType::NudmSdm,
             "UDM_SBI_ADDR",
             "UDM_SBI_PORT",
             7777,
         ),
         SbiServiceType::NsmfPdusession => (
-            ogs_sbi::types::SbiServiceType::NsmfPdusession,
+            nextgcore_sbi::types::SbiServiceType::NsmfPdusession,
             "SMF_SBI_ADDR",
             "SMF_SBI_PORT",
             7777,
         ),
         SbiServiceType::NnssfNsselection => (
-            ogs_sbi::types::SbiServiceType::NnssfNsselection,
+            nextgcore_sbi::types::SbiServiceType::NnssfNsselection,
             "NSSF_SBI_ADDR",
             "NSSF_SBI_PORT",
             7777,
         ),
         SbiServiceType::NpcfAmPolicyControl => (
-            ogs_sbi::types::SbiServiceType::NpcfAmPolicyControl,
+            nextgcore_sbi::types::SbiServiceType::NpcfAmPolicyControl,
             "PCF_SBI_ADDR",
             "PCF_SBI_PORT",
             7777,
@@ -574,7 +574,7 @@ fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)>
     let sbi_ctx = global_context();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         // We're inside a tokio runtime, spawn a blocking task
-        let svc_type = ogs_service_type;
+        let svc_type = nextgcore_service_type;
         let ctx = sbi_ctx.clone();
         if let Ok(result) = handle.block_on(async {
             let instances = ctx.find_nf_instances_by_service(svc_type).await;
@@ -1262,45 +1262,45 @@ pub async fn call_ausf_5g_aka_confirm(
 /// Unlike `resolve_nf_endpoint`, this is safe to call from async context
 /// (no `Handle::block_on`).
 pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
-    let (ogs_service_type, env_addr, env_port, default_port) = match service_type {
+    let (nextgcore_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
-            ogs_sbi::types::SbiServiceType::NausfAuth,
+            nextgcore_sbi::types::SbiServiceType::NausfAuth,
             "AUSF_SBI_ADDR",
             "AUSF_SBI_PORT",
             7777u16,
         ),
         SbiServiceType::NudmUecm => (
-            ogs_sbi::types::SbiServiceType::NudmUecm,
+            nextgcore_sbi::types::SbiServiceType::NudmUecm,
             "UDM_SBI_ADDR",
             "UDM_SBI_PORT",
             7777,
         ),
         SbiServiceType::NudmSdm => (
-            ogs_sbi::types::SbiServiceType::NudmSdm,
+            nextgcore_sbi::types::SbiServiceType::NudmSdm,
             "UDM_SBI_ADDR",
             "UDM_SBI_PORT",
             7777,
         ),
         SbiServiceType::NsmfPdusession => (
-            ogs_sbi::types::SbiServiceType::NsmfPdusession,
+            nextgcore_sbi::types::SbiServiceType::NsmfPdusession,
             "SMF_SBI_ADDR",
             "SMF_SBI_PORT",
             7777,
         ),
         SbiServiceType::NnssfNsselection => (
-            ogs_sbi::types::SbiServiceType::NnssfNsselection,
+            nextgcore_sbi::types::SbiServiceType::NnssfNsselection,
             "NSSF_SBI_ADDR",
             "NSSF_SBI_PORT",
             7777,
         ),
         SbiServiceType::NpcfAmPolicyControl => (
-            ogs_sbi::types::SbiServiceType::NpcfAmPolicyControl,
+            nextgcore_sbi::types::SbiServiceType::NpcfAmPolicyControl,
             "PCF_SBI_ADDR",
             "PCF_SBI_PORT",
             7777,
         ),
         SbiServiceType::NnsacfNsac => (
-            ogs_sbi::types::SbiServiceType::NnsacfNsac,
+            nextgcore_sbi::types::SbiServiceType::NnsacfNsac,
             "NSACF_SBI_ADDR",
             "NSACF_SBI_PORT",
             7777,
@@ -1309,9 +1309,9 @@ pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResul
     };
 
     let sbi_ctx = global_context();
-    let instances = sbi_ctx.find_nf_instances_by_service(ogs_service_type).await;
+    let instances = sbi_ctx.find_nf_instances_by_service(nextgcore_service_type).await;
     if let Some(inst) = instances.first() {
-        if let Some(svc) = inst.find_service(ogs_service_type) {
+        if let Some(svc) = inst.find_service(nextgcore_service_type) {
             let host = svc
                 .ip_addresses
                 .first()
@@ -1694,10 +1694,10 @@ mod tests {
     /// Stub NSACF: validates the nested UeACRequestData shape (TS 29.536), then
     /// answers by SUPI — "imsi-reject" -> 403 (total failure), "imsi-partial" ->
     /// 200 with an acuFailureList naming that SUPI, otherwise 204 (admitted).
-    async fn stub_nsacf_ue(req: ogs_sbi::message::SbiRequest) -> ogs_sbi::message::SbiResponse {
+    async fn stub_nsacf_ue(req: nextgcore_sbi::message::SbiRequest) -> nextgcore_sbi::message::SbiResponse {
         let path = req.header.uri.split('?').next().unwrap_or("").to_string();
         if !path.ends_with("/nnsacf-nsac/v1/slices/ues") {
-            return ogs_sbi::message::SbiResponse::with_status(404);
+            return nextgcore_sbi::message::SbiResponse::with_status(404);
         }
         let body: serde_json::Value = req
             .http
@@ -1718,7 +1718,7 @@ mod tests {
         assert!(op["snssai"]["sst"].is_u64(), "op carries snssai");
 
         match supi.as_str() {
-            "imsi-reject" => ogs_sbi::message::SbiResponse::with_status(403).with_body(
+            "imsi-reject" => nextgcore_sbi::message::SbiResponse::with_status(403).with_body(
                 serde_json::json!({"status": 403, "cause": "ALL_SLICE_FAILED"}).to_string(),
                 "application/problem+json",
             ),
@@ -1728,11 +1728,11 @@ mod tests {
                         supi: [{ "snssai": op["snssai"].clone(), "reason": "EXCEED_MAX_UE_NUM" }]
                     }
                 });
-                ogs_sbi::message::SbiResponse::with_status(200)
+                nextgcore_sbi::message::SbiResponse::with_status(200)
                     .with_json_body(&resp)
-                    .unwrap_or_else(|_| ogs_sbi::message::SbiResponse::with_status(200))
+                    .unwrap_or_else(|_| nextgcore_sbi::message::SbiResponse::with_status(200))
             }
-            _ => ogs_sbi::message::SbiResponse::with_status(204),
+            _ => nextgcore_sbi::message::SbiResponse::with_status(204),
         }
     }
 
@@ -1741,7 +1741,7 @@ mod tests {
         let port = nsacf_free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let server =
-            ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(addr));
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(addr));
         server.start(stub_nsacf_ue).await.expect("start stub NSACF");
 
         let run = async {
@@ -1852,14 +1852,14 @@ mod tests {
 
         // Serialize the request's parts exactly as the SBI client would, then
         // decode it back to prove the wire shape the SMF receives.
-        let boundary = ogs_sbi::multipart::generate_boundary();
-        let body = ogs_sbi::multipart::encode(
+        let boundary = nextgcore_sbi::multipart::generate_boundary();
+        let body = nextgcore_sbi::multipart::encode(
             request.http.content.as_deref(),
             &request.http.parts,
             &boundary,
         );
-        let ct = ogs_sbi::multipart::content_type_with_boundary(&boundary);
-        let decoded = ogs_sbi::multipart::decode(&ct, &body).expect("decode multipart");
+        let ct = nextgcore_sbi::multipart::content_type_with_boundary(&boundary);
+        let decoded = nextgcore_sbi::multipart::decode(&ct, &body).expect("decode multipart");
 
         let root: serde_json::Value =
             serde_json::from_str(decoded.json.as_deref().unwrap()).unwrap();
@@ -1909,12 +1909,12 @@ mod tests {
                 bytes::Bytes::copy_from_slice(&n2),
             ),
         ];
-        let boundary = ogs_sbi::multipart::generate_boundary();
-        let body = ogs_sbi::multipart::encode(Some(&root.to_string()), &parts, &boundary);
-        let ct = ogs_sbi::multipart::content_type_with_boundary(&boundary);
+        let boundary = nextgcore_sbi::multipart::generate_boundary();
+        let body = nextgcore_sbi::multipart::encode(Some(&root.to_string()), &parts, &boundary);
+        let ct = nextgcore_sbi::multipart::content_type_with_boundary(&boundary);
 
         // Client-side: decode into the response amfd's caller would see.
-        let decoded = ogs_sbi::multipart::decode(&ct, &body).unwrap();
+        let decoded = nextgcore_sbi::multipart::decode(&ct, &body).unwrap();
         let mut response = SbiResponse::with_status(201);
         response.http.content = decoded.json.clone();
         response.http.parts = decoded.parts;

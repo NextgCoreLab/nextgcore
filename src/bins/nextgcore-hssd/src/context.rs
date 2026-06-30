@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Maximum IMSI BCD length
-pub const OGS_MAX_IMSI_BCD_LEN: usize = 15;
+pub const NEXTGCORE_MAX_IMSI_BCD_LEN: usize = 15;
 
 /// SUPI type prefix for IMSI
-pub const OGS_ID_SUPI_TYPE_IMSI: &str = "imsi";
+pub const NEXTGCORE_ID_SUPI_TYPE_IMSI: &str = "imsi";
 
 /// HSS IMSI structure - represents an IMSI identity for S6a interface
 #[derive(Debug, Clone)]

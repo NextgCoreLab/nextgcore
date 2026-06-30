@@ -23,12 +23,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ogs_pfcp::header::PfcpHeader;
-use ogs_pfcp::message::{
+use nextgcore_pfcp::header::PfcpHeader;
+use nextgcore_pfcp::message::{
     build_message, parse_message, AssociationSetupRequest, PfcpMessage, SessionDeletionRequest,
     SessionEstablishmentRequest,
 };
-use ogs_pfcp::types::{
+use nextgcore_pfcp::types::{
     ApplyAction, CreateFar, CreatePdr, DestinationInterface, FSeid, FTeid, ForwardingParameters,
     NodeId, OuterHeaderCreation, PfcpCause, Pdi, SourceInterface,
 };
@@ -65,7 +65,7 @@ pub struct N4mbEstablishParams {
 }
 
 /// Build the N4mb Session Establishment Request message via the conformant
-/// `ogs-pfcp` encoders (TS 29.244). [mbsmfd-01 + mbsmfd-09]
+/// `nextgcore-pfcp` encoders (TS 29.244). [mbsmfd-01 + mbsmfd-09]
 ///
 /// Structure:
 ///   - Node ID (IPv4 of the MB-SMF / CP function)              §7.5.2.1
@@ -371,7 +371,7 @@ impl N4mbPfcpNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ogs_pfcp::message::{AssociationSetupResponse, SessionEstablishmentResponse};
+    use nextgcore_pfcp::message::{AssociationSetupResponse, SessionEstablishmentResponse};
 
     fn loopback(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -501,7 +501,7 @@ mod tests {
         let req = build_establishment_request(&p);
 
         let mut body = bytes::BytesMut::new();
-        ogs_pfcp::message::PfcpMessage::SessionEstablishmentRequest(req.clone())
+        nextgcore_pfcp::message::PfcpMessage::SessionEstablishmentRequest(req.clone())
             .encode_body(&mut body);
 
         // OuterHeaderCreation IE: type 84 = 0x0054, len 10 (desc 2 + teid 4 +

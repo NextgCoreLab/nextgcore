@@ -4,23 +4,23 @@
 //! 3GPP TS 29.212 section 5.6 (Gx messages) and section 5.3 (Gx AVPs).
 //!
 //! All messages on this path are real Diameter messages (RFC 6733 wire
-//! format) built with the shared `ogs-diameter` codec. Grouped AVPs use
+//! format) built with the shared `nextgcore-diameter` codec. Grouped AVPs use
 //! 3GPP vendor-id 10415 with the M/V bits required by the TS 29.212 AVP
 //! table.
 
 use bytes::Bytes;
 
-use ogs_diameter::avp::{find_all_avps, find_avp, Avp, AvpData};
-use ogs_diameter::common::avp_code;
-use ogs_diameter::gx::{avp as gx_avp, cmd as gx_cmd, GX_APPLICATION_ID};
-use ogs_diameter::message::DiameterMessage;
-use ogs_diameter::OGS_3GPP_VENDOR_ID;
+use nextgcore_diameter::avp::{find_all_avps, find_avp, Avp, AvpData};
+use nextgcore_diameter::common::avp_code;
+use nextgcore_diameter::gx::{avp as gx_avp, cmd as gx_cmd, GX_APPLICATION_ID};
+use nextgcore_diameter::message::DiameterMessage;
+use nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID;
 
-use crate::context::{pcrf_self, OGS_IPV6_LEN};
+use crate::context::{pcrf_self, NEXTGCORE_IPV6_LEN};
 use crate::fd_path::{pcrf_diam_stats, LocalIdentity};
 
 /// Base-protocol AVP codes used on this path that are not exported by the
-/// shared `ogs-diameter` common module.
+/// shared `nextgcore-diameter` common module.
 pub mod base_avp {
     /// Failed-AVP (RFC 6733 section 7.5)
     pub const FAILED_AVP: u32 = 279;
@@ -236,7 +236,7 @@ pub struct CcrInfo {
     /// Framed-IP-Address
     pub framed_ipv4: Option<[u8; 4]>,
     /// Framed-IPv6-Prefix (prefix bytes, zero padded)
-    pub framed_ipv6: Option<[u8; OGS_IPV6_LEN]>,
+    pub framed_ipv6: Option<[u8; NEXTGCORE_IPV6_LEN]>,
     /// Network-Request-Support was present in the CCR
     pub network_request_support: bool,
 }
@@ -359,8 +359,8 @@ pub fn parse_ccr(msg: &DiameterMessage) -> Result<CcrInfo, GxRequestError> {
             if b.len() < 2 {
                 return None;
             }
-            let mut prefix = [0u8; OGS_IPV6_LEN];
-            let n = (b.len() - 2).min(OGS_IPV6_LEN);
+            let mut prefix = [0u8; NEXTGCORE_IPV6_LEN];
+            let n = (b.len() - 2).min(NEXTGCORE_IPV6_LEN);
             prefix[..n].copy_from_slice(&b[2..2 + n]);
             Some(prefix)
         });
@@ -403,21 +403,21 @@ pub fn build_arp_avp(
     };
     Avp::vendor_mandatory(
         gx_avp::ALLOCATION_RETENTION_PRIORITY,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Grouped(vec![
             Avp::vendor_mandatory(
                 gx_avp::PRIORITY_LEVEL,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Unsigned32(priority_level as u32),
             ),
             Avp::vendor_mandatory(
                 gx_avp::PRE_EMPTION_CAPABILITY,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Enumerated(cap),
             ),
             Avp::vendor_mandatory(
                 gx_avp::PRE_EMPTION_VULNERABILITY,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Enumerated(vuln),
             ),
         ]),
@@ -429,11 +429,11 @@ pub fn build_arp_avp(
 pub fn build_default_eps_bearer_qos_avp(data: &GxSessionData) -> Avp {
     Avp::vendor_mandatory(
         gx_avp::DEFAULT_EPS_BEARER_QOS,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Grouped(vec![
             Avp::vendor_mandatory(
                 gx_avp::QOS_CLASS_IDENTIFIER,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Enumerated(data.qos_index as i32),
             ),
             build_arp_avp(
@@ -449,16 +449,16 @@ pub fn build_default_eps_bearer_qos_avp(data: &GxSessionData) -> Avp {
 pub fn build_session_qos_information_avp(ambr_ul: u64, ambr_dl: u64) -> Avp {
     Avp::vendor_mandatory(
         gx_avp::QOS_INFORMATION,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Grouped(vec![
             Avp::vendor_mandatory(
                 gx_avp::APN_AGGREGATE_MAX_BITRATE_UL,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Unsigned32(ambr_ul.min(u32::MAX as u64) as u32),
             ),
             Avp::vendor_mandatory(
                 gx_avp::APN_AGGREGATE_MAX_BITRATE_DL,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Unsigned32(ambr_dl.min(u32::MAX as u64) as u32),
             ),
         ]),
@@ -469,30 +469,30 @@ pub fn build_session_qos_information_avp(ambr_ul: u64, ambr_dl: u64) -> Avp {
 fn build_rule_qos_information_avp(rule: &PccRuleData) -> Avp {
     let mut members = vec![Avp::vendor_mandatory(
         gx_avp::QOS_CLASS_IDENTIFIER,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Enumerated(rule.qos_index as i32),
     )];
     members.push(Avp::vendor_mandatory(
         gx_avp::MAX_REQUESTED_BANDWIDTH_UL,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Unsigned32(rule.mbr_uplink.min(u32::MAX as u64) as u32),
     ));
     members.push(Avp::vendor_mandatory(
         gx_avp::MAX_REQUESTED_BANDWIDTH_DL,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Unsigned32(rule.mbr_downlink.min(u32::MAX as u64) as u32),
     ));
     if rule.gbr_uplink > 0 {
         members.push(Avp::vendor_mandatory(
             gx_avp::GUARANTEED_BITRATE_UL,
-            OGS_3GPP_VENDOR_ID,
+            NEXTGCORE_3GPP_VENDOR_ID,
             AvpData::Unsigned32(rule.gbr_uplink.min(u32::MAX as u64) as u32),
         ));
     }
     if rule.gbr_downlink > 0 {
         members.push(Avp::vendor_mandatory(
             gx_avp::GUARANTEED_BITRATE_DL,
-            OGS_3GPP_VENDOR_ID,
+            NEXTGCORE_3GPP_VENDOR_ID,
             AvpData::Unsigned32(rule.gbr_downlink.min(u32::MAX as u64) as u32),
         ));
     }
@@ -503,7 +503,7 @@ fn build_rule_qos_information_avp(rule: &PccRuleData) -> Avp {
     ));
     Avp::vendor_mandatory(
         gx_avp::QOS_INFORMATION,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Grouped(members),
     )
 }
@@ -513,16 +513,16 @@ fn build_rule_qos_information_avp(rule: &PccRuleData) -> Avp {
 fn build_flow_information_avp(flow: &FlowData) -> Avp {
     Avp::vendor_mandatory(
         gx_avp::FLOW_INFORMATION,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Grouped(vec![
             Avp::vendor_mandatory(
                 gx_avp::FLOW_DESCRIPTION,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::OctetString(Bytes::copy_from_slice(flow.description.as_bytes())),
             ),
             Avp::vendor_mandatory(
                 gx_avp::FLOW_DIRECTION,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Enumerated(flow.direction),
             ),
         ]),
@@ -535,7 +535,7 @@ fn build_flow_information_avp(flow: &FlowData) -> Avp {
 pub fn build_charging_rule_definition_avp(rule: &PccRuleData) -> Avp {
     let mut members = vec![Avp::vendor_mandatory(
         gx_avp::CHARGING_RULE_NAME,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::OctetString(Bytes::copy_from_slice(rule.name.as_bytes())),
     )];
     for flow in &rule.flows {
@@ -543,18 +543,18 @@ pub fn build_charging_rule_definition_avp(rule: &PccRuleData) -> Avp {
     }
     members.push(Avp::vendor_mandatory(
         gx_avp::FLOW_STATUS,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Enumerated(rule.flow_status),
     ));
     members.push(build_rule_qos_information_avp(rule));
     members.push(Avp::vendor_mandatory(
         gx_avp::PRECEDENCE,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Unsigned32(rule.precedence),
     ));
     Avp::vendor_mandatory(
         gx_avp::CHARGING_RULE_DEFINITION,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Grouped(members),
     )
 }
@@ -568,7 +568,7 @@ pub fn build_charging_rule_install_avp(rules: &[PccRuleData]) -> Avp {
         .collect();
     Avp::vendor_mandatory(
         gx_avp::CHARGING_RULE_INSTALL,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Grouped(members),
     )
 }
@@ -581,14 +581,14 @@ pub fn build_charging_rule_remove_avp(rule_names: &[String]) -> Avp {
         .map(|name| {
             Avp::vendor_mandatory(
                 gx_avp::CHARGING_RULE_NAME,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::OctetString(Bytes::copy_from_slice(name.as_bytes())),
             )
         })
         .collect();
     Avp::vendor_mandatory(
         gx_avp::CHARGING_RULE_REMOVE,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Grouped(members),
     )
 }
@@ -597,7 +597,7 @@ pub fn build_charging_rule_remove_avp(rule_names: &[String]) -> Avp {
 pub fn build_event_trigger_avp(trigger: u32) -> Avp {
     Avp::vendor_mandatory(
         gx_avp::EVENT_TRIGGER,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Enumerated(trigger as i32),
     )
 }
@@ -700,7 +700,7 @@ pub fn build_cca_success(
         if info.network_request_support {
             cca.add_avp(Avp::vendor_mandatory(
                 gx_avp::BEARER_CONTROL_MODE,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Enumerated(bearer_control_mode::UE_NW),
             ));
         }
@@ -1165,17 +1165,17 @@ pub fn build_subscriber_session_data(imsi: &str, apn: &str) -> GxSessionData {
 
 /// Subscriber policy from the DB: QoS profile + AMBR for the APN
 struct SubscriberPolicy {
-    qos: ogs_dbi::types::OgsQos,
-    ambr: ogs_dbi::types::OgsAmbr,
+    qos: nextgcore_dbi::types::NextgcoreQos,
+    ambr: nextgcore_dbi::types::NextgcoreAmbr,
 }
 
 /// Query the DB for a subscriber's session policy (QoS, ARP, AMBR) for the
 /// given APN. Returns None if the DB is not reachable or the subscriber
 /// has no matching session entry.
 fn lookup_subscriber_policy(imsi: &str, apn: &str) -> Option<SubscriberPolicy> {
-    use ogs_dbi::ogs_dbi_subscription_data;
+    use nextgcore_dbi::nextgcore_dbi_subscription_data;
     let supi = format!("imsi-{imsi}");
-    let subscription_data = ogs_dbi_subscription_data(&supi).ok()?;
+    let subscription_data = nextgcore_dbi_subscription_data(&supi).ok()?;
 
     // Find the session matching the APN
     for slice in &subscription_data.slice {
@@ -1196,7 +1196,7 @@ fn lookup_subscriber_policy(imsi: &str, apn: &str) -> Option<SubscriberPolicy> {
     // Fall back to UE-level AMBR if present
     if subscription_data.ambr.downlink > 0 || subscription_data.ambr.uplink > 0 {
         return Some(SubscriberPolicy {
-            qos: ogs_dbi::types::OgsQos::default(),
+            qos: nextgcore_dbi::types::NextgcoreQos::default(),
             ambr: subscription_data.ambr,
         });
     }
@@ -1437,7 +1437,7 @@ mod arp_db_value {
 mod tests {
     use super::*;
     use crate::fd_path::LocalIdentity;
-    use ogs_diameter::rx::RX_APPLICATION_ID;
+    use nextgcore_diameter::rx::RX_APPLICATION_ID;
 
     fn local() -> LocalIdentity {
         LocalIdentity {
@@ -1451,12 +1451,12 @@ mod tests {
         cc_request_type: u32,
         cc_request_number: u32,
     ) -> DiameterMessage {
-        let mut ccr = ogs_diameter::gx::create_ccr(
+        let mut ccr = nextgcore_diameter::gx::create_ccr(
             session_id,
             "pgw.epc.mnc001.mcc001.3gppnetwork.org",
             "epc.mnc001.mcc001.3gppnetwork.org",
             "epc.mnc001.mcc001.3gppnetwork.org",
-            ogs_diameter::gx::CcRequestType::from(cc_request_type),
+            nextgcore_diameter::gx::CcRequestType::from(cc_request_type),
             cc_request_number,
         );
         ccr.header.hop_by_hop_id = 0x1234;
@@ -1473,8 +1473,8 @@ mod tests {
             ]),
         );
         ccr.add_avp(sub_id);
-        ogs_diameter::gx::add_called_station_id(&mut ccr, "internet");
-        ogs_diameter::gx::add_framed_ip_address(&mut ccr, std::net::Ipv4Addr::new(10, 45, 0, 2));
+        nextgcore_diameter::gx::add_called_station_id(&mut ccr, "internet");
+        nextgcore_diameter::gx::add_framed_ip_address(&mut ccr, std::net::Ipv4Addr::new(10, 45, 0, 2));
         ccr
     }
 
@@ -1602,7 +1602,7 @@ mod tests {
 
         // Default-EPS-Bearer-QoS: QCI + ARP
         let deq = cca
-            .find_vendor_avp(gx_avp::DEFAULT_EPS_BEARER_QOS, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(gx_avp::DEFAULT_EPS_BEARER_QOS, NEXTGCORE_3GPP_VENDOR_ID)
             .expect("Default-EPS-Bearer-QoS present");
         assert!(deq.is_mandatory());
         let deq_members = deq.parse_grouped().unwrap();
@@ -1612,7 +1612,7 @@ mod tests {
         assert!(qci >= 1);
         let arp =
             find_avp(&deq_members, gx_avp::ALLOCATION_RETENTION_PRIORITY).expect("ARP present");
-        assert_eq!(arp.vendor_id, Some(OGS_3GPP_VENDOR_ID));
+        assert_eq!(arp.vendor_id, Some(NEXTGCORE_3GPP_VENDOR_ID));
         let arp_members = arp.parse_grouped().unwrap();
         assert!(find_avp(&arp_members, gx_avp::PRIORITY_LEVEL).is_some());
         assert!(find_avp(&arp_members, gx_avp::PRE_EMPTION_CAPABILITY).is_some());
@@ -1620,7 +1620,7 @@ mod tests {
 
         // QoS-Information with APN-AMBR
         let qi = cca
-            .find_vendor_avp(gx_avp::QOS_INFORMATION, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(gx_avp::QOS_INFORMATION, NEXTGCORE_3GPP_VENDOR_ID)
             .expect("QoS-Information present");
         let qi_members = qi.parse_grouped().unwrap();
         let ambr_dl = find_avp(&qi_members, gx_avp::APN_AGGREGATE_MAX_BITRATE_DL)
@@ -1630,7 +1630,7 @@ mod tests {
 
         // Charging-Rule-Install with full Charging-Rule-Definition
         let cri = cca
-            .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, NEXTGCORE_3GPP_VENDOR_ID)
             .expect("Charging-Rule-Install present");
         let cri_members = cri.parse_grouped().unwrap();
         let crd = find_avp(&cri_members, gx_avp::CHARGING_RULE_DEFINITION)
@@ -1716,10 +1716,10 @@ mod tests {
         let cca = roundtrip(&cca);
         assert_eq!(cca.result_code(), Some(result_code::DIAMETER_SUCCESS));
         assert!(cca
-            .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, NEXTGCORE_3GPP_VENDOR_ID)
             .is_none());
         assert!(cca
-            .find_vendor_avp(gx_avp::DEFAULT_EPS_BEARER_QOS, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(gx_avp::DEFAULT_EPS_BEARER_QOS, NEXTGCORE_3GPP_VENDOR_ID)
             .is_some());
         // TERMINATION removes the session
         let (cca, aborts) = handle_ccr(&roundtrip(&build_test_ccr(sid, 3, 2)), &local());
@@ -1727,7 +1727,7 @@ mod tests {
         assert_eq!(cca.result_code(), Some(result_code::DIAMETER_SUCCESS));
         assert!(aborts.is_empty());
         assert!(cca
-            .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, NEXTGCORE_3GPP_VENDOR_ID)
             .is_none());
         {
             let ctx = pcrf_self();
@@ -1828,7 +1828,7 @@ mod tests {
         );
 
         let cri = rar
-            .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, NEXTGCORE_3GPP_VENDOR_ID)
             .expect("install present");
         let members = cri.parse_grouped().unwrap();
         let crd = find_avp(&members, gx_avp::CHARGING_RULE_DEFINITION).expect("definition");
@@ -1859,7 +1859,7 @@ mod tests {
         let rar = roundtrip(&rar);
 
         let crr = rar
-            .find_vendor_avp(gx_avp::CHARGING_RULE_REMOVE, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(gx_avp::CHARGING_RULE_REMOVE, NEXTGCORE_3GPP_VENDOR_ID)
             .expect("remove present");
         let members = crr.parse_grouped().unwrap();
         let names: Vec<_> = find_all_avps(&members, gx_avp::CHARGING_RULE_NAME)
@@ -1906,17 +1906,17 @@ mod tests {
         raa.add_avp(Avp::mandatory(
             avp_code::EXPERIMENTAL_RESULT,
             AvpData::Grouped(vec![
-                Avp::mandatory(avp_code::VENDOR_ID, AvpData::Unsigned32(OGS_3GPP_VENDOR_ID)),
+                Avp::mandatory(avp_code::VENDOR_ID, AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID)),
                 Avp::mandatory(
                     avp_code::EXPERIMENTAL_RESULT_CODE,
-                    AvpData::Unsigned32(ogs_diameter::gx::exp_result::PCC_RULE_EVENT),
+                    AvpData::Unsigned32(nextgcore_diameter::gx::exp_result::PCC_RULE_EVENT),
                 ),
             ]),
         ));
         let raa = roundtrip(&raa);
         assert_eq!(
             parse_raa(&raa),
-            Ok(ogs_diameter::gx::exp_result::PCC_RULE_EVENT)
+            Ok(nextgcore_diameter::gx::exp_result::PCC_RULE_EVENT)
         );
         // No result codes at all -> error
         let empty = DiameterMessage::new_answer(&rar);

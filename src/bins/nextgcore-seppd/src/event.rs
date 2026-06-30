@@ -2,11 +2,11 @@
 //!
 //! Port of src/sepp/event.h and event.c - Event definitions for SEPP
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
 #[allow(dead_code)]
-pub const OGS_FSM_USER_SIG: i32 = 2;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for SEPP
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,18 +26,18 @@ pub enum SeppEventId {
 impl SeppEventId {
     pub fn name(&self) -> &'static str {
         match self {
-            SeppEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            SeppEventId::FsmExit => "OGS_FSM_EXIT_SIG",
-            SeppEventId::SbiServer => "OGS_EVENT_SBI_SERVER",
-            SeppEventId::SbiClient => "OGS_EVENT_SBI_CLIENT",
-            SeppEventId::SbiTimer => "OGS_EVENT_SBI_TIMER",
+            SeppEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            SeppEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
+            SeppEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
+            SeppEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
+            SeppEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
         }
     }
 
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => SeppEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => SeppEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => SeppEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => SeppEventId::FsmExit,
             _ => SeppEventId::SbiServer,
         }
     }
@@ -69,14 +69,14 @@ impl SeppTimerId {
         match self {
             SeppTimerId::PeerEstablish => "SEPP_TIMER_PEER_ESTABLISH",
             SeppTimerId::NfInstanceRegistrationInterval => {
-                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+                "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            SeppTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
-            SeppTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
-            SeppTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",
-            SeppTimerId::SubscriptionValidity => "OGS_TIMER_SUBSCRIPTION_VALIDITY",
-            SeppTimerId::SubscriptionPatch => "OGS_TIMER_SUBSCRIPTION_PATCH",
-            SeppTimerId::SbiClientWait => "OGS_TIMER_SBI_CLIENT_WAIT",
+            SeppTimerId::NfInstanceHeartbeatInterval => "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
+            SeppTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
+            SeppTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
+            SeppTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",
+            SeppTimerId::SubscriptionPatch => "NEXTGCORE_TIMER_SUBSCRIPTION_PATCH",
+            SeppTimerId::SbiClientWait => "NEXTGCORE_TIMER_SBI_CLIENT_WAIT",
         }
     }
 }

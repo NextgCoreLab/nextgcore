@@ -25,11 +25,11 @@ impl PcrfEventId {
     pub fn name(&self) -> &'static str {
         match self {
             PcrfEventId::Base => "PCRF_EVT_BASE",
-            PcrfEventId::Entry => "OGS_FSM_ENTRY_SIG",
-            PcrfEventId::Exit => "OGS_FSM_EXIT_SIG",
-            PcrfEventId::SbiServer => "OGS_EVENT_SBI_SERVER",
-            PcrfEventId::SbiClient => "OGS_EVENT_SBI_CLIENT",
-            PcrfEventId::SbiTimer => "OGS_EVENT_SBI_TIMER",
+            PcrfEventId::Entry => "NEXTGCORE_FSM_ENTRY_SIG",
+            PcrfEventId::Exit => "NEXTGCORE_FSM_EXIT_SIG",
+            PcrfEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
+            PcrfEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
+            PcrfEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
         }
     }
 }
@@ -129,8 +129,8 @@ mod tests {
     #[test]
     fn test_event_id_name() {
         assert_eq!(PcrfEventId::Base.name(), "PCRF_EVT_BASE");
-        assert_eq!(PcrfEventId::Entry.name(), "OGS_FSM_ENTRY_SIG");
-        assert_eq!(PcrfEventId::Exit.name(), "OGS_FSM_EXIT_SIG");
+        assert_eq!(PcrfEventId::Entry.name(), "NEXTGCORE_FSM_ENTRY_SIG");
+        assert_eq!(PcrfEventId::Exit.name(), "NEXTGCORE_FSM_EXIT_SIG");
     }
 
     #[test]

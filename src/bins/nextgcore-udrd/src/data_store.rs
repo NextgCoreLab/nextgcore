@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
-use ogs_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use serde_json::Value;
 
 /// Kind of change subscription (which resource tree it watches).

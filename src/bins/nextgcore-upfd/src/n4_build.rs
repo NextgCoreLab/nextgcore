@@ -774,7 +774,7 @@ pub fn build_session_deletion_response(msg_type: u8, usage_reports: &[UsageRepor
 }
 
 /// Build Session Report Request
-/// Port of ogs_pfcp_build_session_report_request
+/// Port of nextgcore_pfcp_build_session_report_request
 pub fn build_session_report_request(msg_type: u8, report: &UserPlaneReport) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
 
@@ -1696,15 +1696,15 @@ pub fn build_heartbeat_request(recovery_time_stamp: u32) -> Vec<u8> {
 /// - FTUP: F-TEID allocation in the UP function (CHOOSE flag handling)
 /// - EMPU: sending of End Marker packets
 ///
-/// Encoded with the ogs-pfcp library codec (full 8 feature octets).
+/// Encoded with the nextgcore-pfcp library codec (full 8 feature octets).
 pub fn upf_function_features() -> Vec<u8> {
     use bytes::BytesMut;
-    let features = ogs_pfcp::types::UpFunctionFeatures {
+    let features = nextgcore_pfcp::types::UpFunctionFeatures {
         ftup: true,
         empu: true,
         ..Default::default()
     };
-    let mut buf = BytesMut::with_capacity(ogs_pfcp::types::UpFunctionFeatures::ENCODED_LEN);
+    let mut buf = BytesMut::with_capacity(nextgcore_pfcp::types::UpFunctionFeatures::ENCODED_LEN);
     features.encode(&mut buf);
     buf.to_vec()
 }

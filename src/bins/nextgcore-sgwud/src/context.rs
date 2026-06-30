@@ -13,7 +13,7 @@ use std::sync::RwLock;
 // ============================================================================
 
 /// Invalid pool ID
-pub const OGS_INVALID_POOL_ID: u64 = 0;
+pub const NEXTGCORE_INVALID_POOL_ID: u64 = 0;
 
 // ============================================================================
 // IP Address
@@ -92,7 +92,7 @@ impl FSeid {
 // PFCP Session (simplified)
 // ============================================================================
 
-/// PFCP session data (simplified from ogs_pfcp_sess_t)
+/// PFCP session data (simplified from nextgcore_pfcp_sess_t)
 #[derive(Debug, Clone, Default)]
 pub struct PfcpSess {
     /// PDR list IDs

@@ -16,11 +16,11 @@ use nextgcore_udrd::data_store::{
 use nextgcore_udrd::{
     udr_context_final, udr_context_init, udr_sbi_close, udr_sbi_open, SbiServerConfig, UdrSmContext,
 };
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::oauth::JwksCache;
-use ogs_sbi::server::{
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::JwksCache;
+use nextgcore_sbi::server::{
     send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
+    SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -136,8 +136,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
     // Parse configuration to get db_uri and seed NRF URI
     let db_uri = parse_db_uri(&args.config);
     if !db_uri.is_empty() {
-        match ogs_dbi::ogs_dbi_init_async(db_uri.clone()).await {
+        match nextgcore_dbi::nextgcore_dbi_init_async(db_uri.clone()).await {
             Ok(()) => log::info!("MongoDB connected: {}", mask_uri(&db_uri)),
             Err(e) => log::warn!("MongoDB init failed (will use defaults): {e:?}"),
         }
@@ -227,7 +227,7 @@ async fn main() -> Result<()> {
     }
     if let Some(uri) = &nrf_uri_cfg {
         log::info!("NRF URI configured: {uri}");
-        ogs_sbi::context::global_context().set_nrf_uri(uri).await;
+        nextgcore_sbi::context::global_context().set_nrf_uri(uri).await;
     }
 
     // Build SBI server configuration (legacy, for context)
@@ -242,11 +242,11 @@ async fn main() -> Result<()> {
     // Open legacy SBI context (for context initialization)
     udr_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Start actual HTTP/2 SBI server using ogs-sbi
+    // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let mut sbi_server_config = OgsSbiServerConfig::new(sbi_addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
     if require_oauth2 {
         // Verify bearer tokens against the NRF's published keys (auth stage
         // 4b). With no NRF URI configured the server fails closed.
@@ -274,7 +274,7 @@ async fn main() -> Result<()> {
     // Register with NRF and start heartbeat worker
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
         }
         Ok(_) => {}
         Err(e) => {
@@ -310,7 +310,7 @@ async fn main() -> Result<()> {
     log::info!("UDR context finalized");
 
     // Cleanup database
-    ogs_dbi::ogs_dbi_final();
+    nextgcore_dbi::nextgcore_dbi_final();
 
     log::info!("NextGCore UDR stopped");
     Ok(())
@@ -524,7 +524,7 @@ async fn handle_auth_data(
         ("authentication-subscription", "GET") => {
             log::info!("[{supi}] GET authentication-subscription");
 
-            match ogs_dbi::subscription::ogs_dbi_auth_info_async(supi.to_string()).await {
+            match nextgcore_dbi::subscription::nextgcore_dbi_auth_info_async(supi.to_string()).await {
                 Ok(auth_info) => {
                     let response_json = build_auth_subscription_json(supi, &auth_info);
                     log::info!("[{supi}] Returning auth subscription data");
@@ -566,7 +566,7 @@ async fn handle_auth_data(
                 }
                 None => return missing_mandatory("encPermanentKey"),
             };
-            let provision = ogs_dbi::subscription::OgsDbiAuthProvision {
+            let provision = nextgcore_dbi::subscription::NextgcoreDbiAuthProvision {
                 k_hex,
                 opc_hex: body
                     .get("encOpcKey")
@@ -585,7 +585,7 @@ async fn handle_auth_data(
                     .and_then(|s| u64::from_str_radix(s, 16).ok())
                     .unwrap_or(0),
             };
-            match ogs_dbi::subscription::ogs_dbi_provision_auth_info_async(
+            match nextgcore_dbi::subscription::nextgcore_dbi_provision_auth_info_async(
                 supi.to_string(),
                 provision,
             )
@@ -604,7 +604,7 @@ async fn handle_auth_data(
                         SbiResponse::with_status(204)
                     }
                 }
-                Err(ogs_dbi::DbiError::NotInitialized) => send_error(
+                Err(nextgcore_dbi::DbiError::NotInitialized) => send_error(
                     503,
                     "Service Unavailable",
                     "Subscriber database unavailable",
@@ -633,7 +633,7 @@ async fn handle_auth_data(
                             if path == "/sequenceNumber/sqn" {
                                 if let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) {
                                     let sqn = u64::from_str_radix(sqn_hex, 16).unwrap_or(0);
-                                    if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_sqn_async(
+                                    if let Err(e) = nextgcore_dbi::subscription::nextgcore_dbi_update_sqn_async(
                                         supi.to_string(),
                                         sqn,
                                     )
@@ -650,7 +650,7 @@ async fn handle_auth_data(
 
             // Increment SQN for next use
             if let Err(e) =
-                ogs_dbi::subscription::ogs_dbi_increment_sqn_async(supi.to_string()).await
+                nextgcore_dbi::subscription::nextgcore_dbi_increment_sqn_async(supi.to_string()).await
             {
                 log::error!("[{supi}] DB increment_sqn failed: {e:?}");
             }
@@ -661,7 +661,7 @@ async fn handle_auth_data(
             log::info!("[{supi}] {method} authentication-status");
 
             if let Err(e) =
-                ogs_dbi::subscription::ogs_dbi_increment_sqn_async(supi.to_string()).await
+                nextgcore_dbi::subscription::nextgcore_dbi_increment_sqn_async(supi.to_string()).await
             {
                 log::error!("[{supi}] DB increment_sqn failed: {e:?}");
             }
@@ -752,7 +752,7 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
             if let Some(pei) = reg_data.get("pei").and_then(|v| v.as_str()) {
                 let imeisv = pei.strip_prefix("imeisv-").unwrap_or(pei).to_string();
                 if let Err(e) =
-                    ogs_dbi::subscription::ogs_dbi_update_imeisv_async(supi.to_string(), imeisv)
+                    nextgcore_dbi::subscription::nextgcore_dbi_update_imeisv_async(supi.to_string(), imeisv)
                         .await
                 {
                     log::debug!("[{supi}] DB update_imeisv unavailable: {e:?}");
@@ -1065,7 +1065,7 @@ async fn handle_provisioned_data(
     log::info!("[{supi}] GET provisioned-data/{dataset}");
 
     let subscription_data =
-        match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string()).await {
+        match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(supi.to_string()).await {
             Ok(data) => data,
             Err(e) => {
                 log::error!("[{supi}] DB subscription_data query failed: {e:?}");
@@ -1191,7 +1191,7 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                         return SbiResponse::with_status(200)
                             .with_body(stored.to_string(), "application/json");
                     }
-                    match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string())
+                    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(supi.to_string())
                         .await
                     {
                         Ok(data) => {
@@ -1242,7 +1242,7 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                         return SbiResponse::with_status(200)
                             .with_body(stored.to_string(), "application/json");
                     }
-                    match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string())
+                    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(supi.to_string())
                         .await
                     {
                         Ok(data) => {
@@ -1307,7 +1307,7 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
 
 /// Build SM policy data from subscription data
 fn build_sm_policy_data(
-    data: &ogs_dbi::types::OgsSubscriptionData,
+    data: &nextgcore_dbi::types::NextgcoreSubscriptionData,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut sm_policy_snssai_data = serde_json::Map::new();
     for slice in &data.slice {
@@ -1935,7 +1935,7 @@ async fn handle_application_data(
 // Data builders (from nudr_handler.rs, adapted for direct SBI response)
 // ============================================================================
 
-fn build_am_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+fn build_am_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serde_json::Value {
     let mut am = serde_json::Map::new();
     if data.num_of_msisdn > 0 {
         let gpsis: Vec<serde_json::Value> = data
@@ -1994,7 +1994,7 @@ fn build_am_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Valu
     serde_json::Value::Object(am)
 }
 
-fn build_smf_selection_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+fn build_smf_selection_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serde_json::Value {
     let mut smf_sel = serde_json::Map::new();
     let mut snssai_infos = serde_json::Map::new();
     for slice in &data.slice {
@@ -2034,7 +2034,7 @@ fn build_smf_selection_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde
 /// Mapping (mirrors the legacy `nudr_handler.rs:636-648`):
 /// - `pre_emption_capability == 1`   → `"MAY_PREEMPT"`, else `"NOT_PREEMPT"`
 /// - `pre_emption_vulnerability == 1` → `"PREEMPTABLE"`, else `"NOT_PREEMPTABLE"`
-fn arp_json(arp: &ogs_dbi::types::OgsArp) -> serde_json::Value {
+fn arp_json(arp: &nextgcore_dbi::types::NextgcoreArp) -> serde_json::Value {
     let preempt_cap = if arp.pre_emption_capability == 1 {
         "MAY_PREEMPT"
     } else {
@@ -2052,7 +2052,7 @@ fn arp_json(arp: &ogs_dbi::types::OgsArp) -> serde_json::Value {
     })
 }
 
-fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+fn build_sm_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serde_json::Value {
     let mut sm_data_list = Vec::new();
     for slice in &data.slice {
         let mut sm_entry = serde_json::Map::new();
@@ -2077,7 +2077,7 @@ fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Valu
                     3 => "IPV4V6",
                     _ => "IPV4V6",
                 };
-                // TS 29.505 §5.4.4 sscModes: OgsSession carries no provisioned
+                // TS 29.505 §5.4.4 sscModes: NextgcoreSession carries no provisioned
                 // SSC-mode field in the current DB schema.  The legacy
                 // nudr_handler.rs:627 emitted the full set {1,2,3} as the
                 // documented default, which is used here. (udrd-12)
@@ -2114,9 +2114,9 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 /// is 5 bits per TS 33.102 SQN array management).
 fn build_auth_subscription_json(
     supi: &str,
-    auth_info: &ogs_dbi::subscription::OgsDbiAuthInfo,
+    auth_info: &nextgcore_dbi::subscription::NextgcoreDbiAuthInfo,
 ) -> serde_json::Value {
-    // TS 29.505 §5.4.2.2: OgsDbiAuthInfo does not surface the provisioned
+    // TS 29.505 §5.4.2.2: NextgcoreDbiAuthInfo does not surface the provisioned
     // authenticationMethod from the DB schema; default to "5G_AKA" per
     // TS 33.501 §6.1.2 (most deployments use 5G-AKA). (udrd-10)
     let auth_method = "5G_AKA";
@@ -2268,7 +2268,7 @@ async fn run_event_loop_async(shutdown: Arc<AtomicBool>) -> Result<()> {
 /// Returns the NF instance ID on success so the caller can start a heartbeat
 /// worker.
 async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -2446,7 +2446,7 @@ udr:
         // TS 29.505 AuthenticationSubscription / SequenceNumber round-trip:
         // sqnScheme + indLength + 12-hex-digit sqn must be present.
         // udrd-08: the low 5 IND bits must be zeroed — 0x1F21 → 0x1F20.
-        let mut info = ogs_dbi::subscription::OgsDbiAuthInfo::default();
+        let mut info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo::default();
         info.sqn = 0x1F21;
         info.use_opc = true;
         let doc = build_auth_subscription_json("imsi-001010000000001", &info);
@@ -2476,7 +2476,7 @@ udr:
     // HTTP-level tests over a real HTTP/2 SBI server on ephemeral ports.
     // ------------------------------------------------------------------
 
-    use ogs_sbi::client::SbiClient;
+    use nextgcore_sbi::client::SbiClient;
     use serde_json::json;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -2499,7 +2499,7 @@ udr:
         mpsc::UnboundedReceiver<(String, String)>,
     ) {
         let udr_addr = ephemeral_addr();
-        let udr_server = SbiServer::new(OgsSbiServerConfig::new(udr_addr));
+        let udr_server = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
         udr_server
             .start(udr_sbi_request_handler)
             .await
@@ -2507,7 +2507,7 @@ udr:
 
         let listener_addr = ephemeral_addr();
         let (tx, rx) = mpsc::unbounded_channel::<(String, String)>();
-        let listener = SbiServer::new(OgsSbiServerConfig::new(listener_addr));
+        let listener = SbiServer::new(NextgcoreSbiServerConfig::new(listener_addr));
         listener
             .start(move |req: SbiRequest| {
                 let tx = tx.clone();
@@ -3007,7 +3007,7 @@ udr:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_auth_provisioning_and_plmn_validation() {
         let udr_addr = ephemeral_addr();
-        let udr = SbiServer::new(OgsSbiServerConfig::new(udr_addr));
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
         udr.start(udr_sbi_request_handler)
             .await
             .expect("UDR SBI server starts");
@@ -3094,28 +3094,28 @@ udr:
     ///   pre_emption_vulnerability == 0 → "NOT_PREEMPTABLE"
     #[test]
     fn test_build_sm_data_arp_all_three_fields() {
-        use ogs_dbi::types::{
-            OgsAmbr, OgsArp, OgsQos, OgsSession, OgsSliceData, OgsSNssai, OgsSubscriptionData,
+        use nextgcore_dbi::types::{
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSession, NextgcoreSliceData, NextgcoreSNssai, NextgcoreSubscriptionData,
         };
 
-        let arp = OgsArp {
+        let arp = NextgcoreArp {
             priority_level: 8,
             pre_emption_capability: 1,
             pre_emption_vulnerability: 0,
         };
-        let sess = OgsSession {
+        let sess = NextgcoreSession {
             name: Some("internet".to_string()),
             session_type: 1, // IPV4
-            qos: OgsQos { index: 9, arp, ..Default::default() },
-            ambr: OgsAmbr { uplink: 1_000_000_000, downlink: 1_000_000_000 },
+            qos: NextgcoreQos { index: 9, arp, ..Default::default() },
+            ambr: NextgcoreAmbr { uplink: 1_000_000_000, downlink: 1_000_000_000 },
             ..Default::default()
         };
-        let slice = OgsSliceData {
-            s_nssai: OgsSNssai::new(1, None),
+        let slice = NextgcoreSliceData {
+            s_nssai: NextgcoreSNssai::new(1, None),
             session: vec![sess],
             ..Default::default()
         };
-        let data = OgsSubscriptionData {
+        let data = NextgcoreSubscriptionData {
             slice: vec![slice],
             ..Default::default()
         };
@@ -3134,28 +3134,28 @@ udr:
     /// Complementary case: capability==0 / vulnerability==1 flips both strings.
     #[test]
     fn test_build_sm_data_arp_not_preempt_preemptable() {
-        use ogs_dbi::types::{
-            OgsAmbr, OgsArp, OgsQos, OgsSession, OgsSliceData, OgsSNssai, OgsSubscriptionData,
+        use nextgcore_dbi::types::{
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSession, NextgcoreSliceData, NextgcoreSNssai, NextgcoreSubscriptionData,
         };
 
-        let arp = OgsArp {
+        let arp = NextgcoreArp {
             priority_level: 1,
             pre_emption_capability: 0,
             pre_emption_vulnerability: 1,
         };
-        let sess = OgsSession {
+        let sess = NextgcoreSession {
             name: Some("ims".to_string()),
             session_type: 3, // IPV4V6
-            qos: OgsQos { index: 5, arp, ..Default::default() },
-            ambr: OgsAmbr { uplink: 0, downlink: 0 },
+            qos: NextgcoreQos { index: 5, arp, ..Default::default() },
+            ambr: NextgcoreAmbr { uplink: 0, downlink: 0 },
             ..Default::default()
         };
-        let slice = OgsSliceData {
-            s_nssai: OgsSNssai::new(1, None),
+        let slice = NextgcoreSliceData {
+            s_nssai: NextgcoreSNssai::new(1, None),
             session: vec![sess],
             ..Default::default()
         };
-        let data = OgsSubscriptionData {
+        let data = NextgcoreSubscriptionData {
             slice: vec![slice],
             ..Default::default()
         };
@@ -3243,7 +3243,7 @@ udr:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_varueid_routing() {
         let udr_addr = ephemeral_addr();
-        let udr = SbiServer::new(OgsSbiServerConfig::new(udr_addr));
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
         udr.start(udr_sbi_request_handler)
             .await
             .expect("UDR SBI server starts");
@@ -3337,7 +3337,7 @@ udr:
     /// TS 29.505 §5.4.2.23: SQN must have the low 5 (indLength) bits zeroed.
     #[test]
     fn test_sqn_ind_zeroed() {
-        let mut info = ogs_dbi::subscription::OgsDbiAuthInfo::default();
+        let mut info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo::default();
         // 0x23 = 0b100011 → IND bits [4:0] = 0b00011 = 3 → must be zeroed → 0x20
         info.sqn = 0x23;
         info.use_opc = true;
@@ -3353,7 +3353,7 @@ udr:
 
     #[test]
     fn test_sqn_ind_zeroed_already_clean() {
-        let mut info = ogs_dbi::subscription::OgsDbiAuthInfo::default();
+        let mut info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo::default();
         // 0x20 already has IND bits zeroed → no change
         info.sqn = 0x20;
         info.use_opc = true;
@@ -3366,11 +3366,11 @@ udr:
     // udrd-10: authenticationMethod defaults to 5G_AKA
     // ------------------------------------------------------------------
 
-    /// OgsDbiAuthInfo does not carry the provisioned authenticationMethod;
+    /// NextgcoreDbiAuthInfo does not carry the provisioned authenticationMethod;
     /// the emitted value must default to "5G_AKA" per TS 33.501 §6.1.2.
     #[test]
     fn test_authentication_method_default_5g_aka() {
-        let info = ogs_dbi::subscription::OgsDbiAuthInfo::default();
+        let info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo::default();
         let doc = build_auth_subscription_json("imsi-001010000000001", &info);
         assert_eq!(
             doc["authenticationMethod"].as_str().unwrap(),
@@ -3388,19 +3388,19 @@ udr:
     /// handler at nudr_handler.rs:627).
     #[test]
     fn test_ssc_modes_default() {
-        use ogs_dbi::types::{
-            OgsAmbr, OgsArp, OgsQos, OgsSession, OgsSliceData, OgsSNssai, OgsSubscriptionData,
+        use nextgcore_dbi::types::{
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSession, NextgcoreSliceData, NextgcoreSNssai, NextgcoreSubscriptionData,
         };
-        let sess = OgsSession {
+        let sess = NextgcoreSession {
             name: Some("internet".to_string()),
             session_type: 1,
-            qos: OgsQos { index: 9, arp: OgsArp::default(), ..Default::default() },
-            ambr: OgsAmbr { uplink: 1_000_000, downlink: 1_000_000 },
+            qos: NextgcoreQos { index: 9, arp: NextgcoreArp::default(), ..Default::default() },
+            ambr: NextgcoreAmbr { uplink: 1_000_000, downlink: 1_000_000 },
             ..Default::default()
         };
-        let data = OgsSubscriptionData {
-            slice: vec![OgsSliceData {
-                s_nssai: OgsSNssai::new(1, None),
+        let data = NextgcoreSubscriptionData {
+            slice: vec![NextgcoreSliceData {
+                s_nssai: NextgcoreSNssai::new(1, None),
                 session: vec![sess],
                 ..Default::default()
             }],

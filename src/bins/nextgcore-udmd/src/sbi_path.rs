@@ -4,9 +4,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ogs_sbi::context::{global_context, NfInstance, NfService};
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::types::{NfType, SbiServiceType};
+use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::types::{NfType, SbiServiceType};
 
 /// SBI server configuration
 #[derive(Debug, Clone)]

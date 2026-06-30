@@ -7,10 +7,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
+    SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -148,8 +148,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -206,7 +206,7 @@ async fn main() -> Result<()> {
                                 if let Some(nrf_list) = client.nrf {
                                     if let Some(nrf) = nrf_list.first() {
                                         log::info!("NRF URI configured: {}", nrf.uri);
-                                        ogs_sbi::context::global_context()
+                                        nextgcore_sbi::context::global_context()
                                             .set_nrf_uri(&nrf.uri)
                                             .await;
                                     }
@@ -237,11 +237,11 @@ async fn main() -> Result<()> {
     // Open legacy SBI server (for context initialization)
     pcf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Start actual HTTP/2 SBI server using ogs-sbi
+    // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+    let sbi_server = SbiServer::new(NextgcoreSbiServerConfig::new(sbi_addr));
 
     sbi_server
         .start(pcf_sbi_request_handler)
@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
     // Register with NRF and start heartbeat worker
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
         }
         Ok(_) => {}
         Err(e) => {
@@ -1776,7 +1776,7 @@ async fn run_event_loop_async(pcf_sm: &mut PcfSmContext, shutdown: Arc<AtomicBoo
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
         // Compute optimal sleep duration based on pending timers
-        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+        let poll_interval = nextgcore_core::async_timer::compute_poll_interval(
             timer_mgr.inner(),
             Duration::from_millis(100),
         );
@@ -1818,7 +1818,7 @@ async fn run_event_loop_async(pcf_sm: &mut PcfSmContext, shutdown: Arc<AtomicBoo
 /// Returns the NF instance ID on success so the caller can start a heartbeat
 /// worker.
 async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -2188,8 +2188,8 @@ mod tests {
                 Run explicitly: `cargo test -p nextgcore-pcfd -- --ignored`. The in-process sm_policy \
                 lifecycle tests above cover the same handler logic in the default suite."]
     async fn sm_policy_lifecycle_over_real_http() {
-        use ogs_sbi::client::{SbiClient, SbiClientConfig};
-        use ogs_sbi::server::{SbiServer, SbiServerConfig};
+        use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
 
         pcf_context_init(64, 64);
 

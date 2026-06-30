@@ -49,10 +49,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{
     send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
+    SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -200,8 +200,8 @@ async fn main() -> Result<()> {
 
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -236,7 +236,7 @@ async fn main() -> Result<()> {
         .parse()
         .context("Invalid SBI address")?;
 
-    let mut sbi_server_config = OgsSbiServerConfig::new(addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
         let cert = args
             .tls_cert

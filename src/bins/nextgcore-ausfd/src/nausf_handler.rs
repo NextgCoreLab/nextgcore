@@ -42,7 +42,7 @@ pub fn ausf_nausf_auth_handle_authenticate(ausf_ue_id: u64, stream_id: u64) -> b
     }
 
     // Discover UDM and send request
-    // In C: ausf_sbi_discover_and_send(OGS_SBI_SERVICE_TYPE_NUDM_UEAU, ...)
+    // In C: ausf_sbi_discover_and_send(NEXTGCORE_SBI_SERVICE_TYPE_NUDM_UEAU, ...)
     let result = sbi_path::ausf_sbi_discover_and_send_nudm_ueau_get(ausf_ue_id, stream_id, None);
 
     if result.is_err() {

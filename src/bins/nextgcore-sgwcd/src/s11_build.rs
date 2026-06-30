@@ -1,18 +1,18 @@
 //! SGWC S11 / S5-C Message Builders (TS 29.274)
 //!
 //! Port of src/sgwc/s11-build.c and src/sgwc/s5c-build.c. All messages are
-//! built with the ogs-gtp GTPv2-C codec (proper TLV framing); there is no
+//! built with the nextgcore-gtp GTPv2-C codec (proper TLV framing); there is no
 //! hand-rolled byte layout in this module.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use ogs_gtp::v2::header::{Gtp2Header, Gtp2MessageType};
-use ogs_gtp::v2::ie::{
+use nextgcore_gtp::v2::header::{Gtp2Header, Gtp2MessageType};
+use nextgcore_gtp::v2::ie::{
     Gtp2AmbrIe, Gtp2ApnIe, Gtp2ApnRestrictionIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe,
     Gtp2EbiIe, Gtp2FTeidIe, Gtp2IeType, Gtp2IndicationIe, Gtp2PaaIe, Gtp2PdnTypeIe, Gtp2RatTypeIe,
     Gtp2RecoveryIe, Gtp2SelectionModeIe,
 };
-use ogs_gtp::v2::message::Gtp2Message;
+use nextgcore_gtp::v2::message::Gtp2Message;
 
 use crate::context::{sgwc_self, SgwcBearer, SgwcSess, SgwcTunnel};
 use crate::s11_handler::gtp_cause;
@@ -103,7 +103,7 @@ fn bearer_qos_ie(bearer: &SgwcBearer) -> Gtp2BearerQosIe {
 
 /// Build the ARP IE (TS 29.274 Section 8.55): one octet with the same
 /// PCI/PL/PVI layout as the Bearer QoS ARP octet.
-fn arp_ie(bearer: &SgwcBearer) -> ogs_gtp::v2::ie::Gtp2Ie {
+fn arp_ie(bearer: &SgwcBearer) -> nextgcore_gtp::v2::ie::Gtp2Ie {
     let mut arp = 0u8;
     if bearer.arp_pci {
         arp |= 0x40;
@@ -112,7 +112,7 @@ fn arp_ie(bearer: &SgwcBearer) -> ogs_gtp::v2::ie::Gtp2Ie {
     if bearer.arp_pvi {
         arp |= 0x01;
     }
-    ogs_gtp::v2::ie::Gtp2Ie::from_slice(Gtp2IeType::Arp as u8, 0, &[arp])
+    nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(Gtp2IeType::Arp as u8, 0, &[arp])
 }
 
 fn new_message(message_type: Gtp2MessageType, teid: u32, sequence_number: u32) -> Gtp2Message {
@@ -200,7 +200,7 @@ pub fn build_create_session_response(
     Gtp2ApnRestrictionIe::new(0).encode(&mut restriction_buf, 0);
     {
         let mut b = restriction_buf.freeze();
-        msg.add_ie(ogs_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
     }
 
     // APN-AMBR (C, instance 0)
@@ -208,7 +208,7 @@ pub fn build_create_session_response(
         let mut ambr_buf = bytes::BytesMut::new();
         Gtp2AmbrIe::new(sess.ambr_ul, sess.ambr_dl).encode(&mut ambr_buf, 0);
         let mut b = ambr_buf.freeze();
-        msg.add_ie(ogs_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
     }
 
     // Bearer Contexts created (M, instance 0): one grouped IE per bearer
@@ -239,7 +239,7 @@ pub fn build_create_session_response(
     let mut rec_buf = bytes::BytesMut::new();
     Gtp2RecoveryIe::new(restart_counter).encode(&mut rec_buf, 0);
     let mut b = rec_buf.freeze();
-    msg.add_ie(ogs_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
+    msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
 
     Ok(msg)
 }
@@ -464,7 +464,7 @@ pub fn build_s5c_create_session_request(
 
     // IMSI (C, instance 0)
     if !sgwc_ue.imsi.is_empty() {
-        msg.add_ie(ogs_gtp::v2::ie::Gtp2Ie::from_slice(
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
             Gtp2IeType::Imsi as u8,
             0,
             &sgwc_ue.imsi,
@@ -480,7 +480,7 @@ pub fn build_s5c_create_session_request(
     let mut rat_buf = bytes::BytesMut::new();
     Gtp2RatTypeIe::new(rat).encode(&mut rat_buf, 0);
     let mut b = rat_buf.freeze();
-    msg.add_ie(ogs_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
+    msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
 
     // Sender F-TEID for control plane (M, instance 0): S5/S8 SGW GTP-C
     msg.add_ie(
@@ -498,20 +498,20 @@ pub fn build_s5c_create_session_request(
     let mut apn_buf = bytes::BytesMut::new();
     Gtp2ApnIe::from_string(apn).encode(&mut apn_buf, 0);
     let mut b = apn_buf.freeze();
-    msg.add_ie(ogs_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
+    msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
 
     // Selection Mode (C, instance 0)
     let mut sel_buf = bytes::BytesMut::new();
     Gtp2SelectionModeIe::new(0).encode(&mut sel_buf, 0);
     let mut b = sel_buf.freeze();
-    msg.add_ie(ogs_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
+    msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
 
     // PDN Type (C, instance 0)
     if sess.paa.pdn_type != 0 {
         let mut pdn_buf = bytes::BytesMut::new();
         Gtp2PdnTypeIe::new(sess.paa.pdn_type).encode(&mut pdn_buf, 0);
         let mut b = pdn_buf.freeze();
-        msg.add_ie(ogs_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
     }
 
     // PAA (C, instance 0)
@@ -523,7 +523,7 @@ pub fn build_s5c_create_session_request(
     let mut ambr_buf = bytes::BytesMut::new();
     Gtp2AmbrIe::new(sess.ambr_ul, sess.ambr_dl).encode(&mut ambr_buf, 0);
     let mut b = ambr_buf.freeze();
-    msg.add_ie(ogs_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
+    msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
 
     // Bearer Contexts to be created (M, instance 0)
     let mut bearer_count = 0;

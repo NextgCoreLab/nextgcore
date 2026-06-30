@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use ogs_dbi::mongoc::{ogs_mongoc, DbiResult};
+use nextgcore_dbi::mongoc::{nextgcore_mongoc, DbiResult};
 
 /// Maximum number of IP addresses for PCF
 pub const MAX_NUM_OF_PCF_IP: usize = 8;
@@ -1176,14 +1176,14 @@ impl BsfContext {
 
 /// Get the BSF bindings collection from MongoDB
 fn get_bsf_bindings_collection(
-) -> DbiResult<ogs_dbi::mongodb::sync::Collection<ogs_dbi::mongodb::bson::Document>> {
-    let dbi = ogs_mongoc();
+) -> DbiResult<nextgcore_dbi::mongodb::sync::Collection<nextgcore_dbi::mongodb::bson::Document>> {
+    let dbi = nextgcore_mongoc();
     let dbi_guard = dbi.lock().unwrap();
     let db = dbi_guard
         .mongoc
         .database
         .as_ref()
-        .ok_or(ogs_dbi::DbiError::NotInitialized)?;
+        .ok_or(nextgcore_dbi::DbiError::NotInitialized)?;
     Ok(db.collection("bsf_bindings"))
 }
 
@@ -1192,8 +1192,8 @@ fn get_bsf_bindings_collection(
 /// Pure function (no I/O) so the round-trip can be unit-tested without a
 /// database. Persists pcfIpEndPoints, MAC, ipDomain, and expiry so
 /// bindings survive BSF restarts intact.
-pub fn sess_to_doc(sess: &BsfSess) -> ogs_dbi::mongodb::bson::Document {
-    use ogs_dbi::mongodb::bson::{doc, Bson, Document};
+pub fn sess_to_doc(sess: &BsfSess) -> nextgcore_dbi::mongodb::bson::Document {
+    use nextgcore_dbi::mongodb::bson::{doc, Bson, Document};
 
     let mut d = doc! {
         "binding_id": &sess.binding_id,
@@ -1272,7 +1272,7 @@ pub fn sess_to_doc(sess: &BsfSess) -> ogs_dbi::mongodb::bson::Document {
 }
 
 /// Reconstruct a session from its MongoDB document representation.
-pub fn doc_to_sess(doc: &ogs_dbi::mongodb::bson::Document) -> BsfSess {
+pub fn doc_to_sess(doc: &nextgcore_dbi::mongodb::bson::Document) -> BsfSess {
     let id = doc.get_i64("id").unwrap_or(0) as u64;
     let mut sess = BsfSess::new(id);
 
@@ -1348,10 +1348,10 @@ pub fn doc_to_sess(doc: &ogs_dbi::mongodb::bson::Document) -> BsfSess {
 /// Upsert a BSF binding to MongoDB
 fn bsf_db_upsert_binding(sess: &BsfSess) -> DbiResult<()> {
     let collection = get_bsf_bindings_collection()?;
-    let filter = ogs_dbi::mongodb::bson::doc! { "binding_id": &sess.binding_id };
+    let filter = nextgcore_dbi::mongodb::bson::doc! { "binding_id": &sess.binding_id };
     let doc = sess_to_doc(sess);
 
-    let opts = ogs_dbi::mongodb::options::ReplaceOptions::builder()
+    let opts = nextgcore_dbi::mongodb::options::ReplaceOptions::builder()
         .upsert(true)
         .build();
     collection.replace_one(filter, doc, opts)?;
@@ -1363,7 +1363,7 @@ fn bsf_db_upsert_binding(sess: &BsfSess) -> DbiResult<()> {
 /// Delete a BSF binding from MongoDB
 fn bsf_db_delete_binding(binding_id: &str) -> DbiResult<()> {
     let collection = get_bsf_bindings_collection()?;
-    let filter = ogs_dbi::mongodb::bson::doc! { "binding_id": binding_id };
+    let filter = nextgcore_dbi::mongodb::bson::doc! { "binding_id": binding_id };
     collection.delete_one(filter, None)?;
     log::debug!("BSF binding {binding_id} removed from DB");
     Ok(())
@@ -1372,7 +1372,7 @@ fn bsf_db_delete_binding(binding_id: &str) -> DbiResult<()> {
 /// Load all BSF bindings from MongoDB
 fn bsf_db_load_all_bindings() -> DbiResult<Vec<BsfSess>> {
     let collection = get_bsf_bindings_collection()?;
-    let cursor = collection.find(ogs_dbi::mongodb::bson::doc! {}, None)?;
+    let cursor = collection.find(nextgcore_dbi::mongodb::bson::doc! {}, None)?;
 
     let mut bindings = Vec::new();
     for result in cursor {
@@ -1386,7 +1386,7 @@ fn bsf_db_load_all_bindings() -> DbiResult<Vec<BsfSess>> {
 //
 // The mongodb sync driver blocks; calling it from SBI handlers stalls the
 // tokio runtime. These wrappers offload to `tokio::task::spawn_blocking`,
-// mirroring the ogs-dbi `*_async` pattern. Failures are logged at debug level
+// mirroring the nextgcore-dbi `*_async` pattern. Failures are logged at debug level
 // (DB persistence is best-effort; bindings remain in memory).
 // ---------------------------------------------------------------------------
 

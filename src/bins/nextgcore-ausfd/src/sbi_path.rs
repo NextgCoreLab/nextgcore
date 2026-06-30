@@ -2,7 +2,7 @@
 //!
 //! Port of src/ausf/sbi-path.c - SBI server and client path functions.
 //!
-//! NOTE (ausfd-10): the live SBI server is the HTTP/2 `ogs_sbi::server::SbiServer`
+//! NOTE (ausfd-10): the live SBI server is the HTTP/2 `nextgcore_sbi::server::SbiServer`
 //! started in `main.rs`, and live Nudm client requests are issued directly from
 //! `main.rs` (`send_udm_generate_auth_data` / `send_udm_auth_result`). The
 //! `ausf_sbi_discover_and_send_*` functions here are the inert FSM-path
@@ -51,29 +51,29 @@ pub fn ausf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     log::info!("Opening AUSF SBI server on {}:{}", config.addr, config.port);
 
     // Initialize SELF NF instance
-    // In C: nf_instance = ogs_sbi_self()->nf_instance;
-    // ogs_sbi_nf_fsm_init(nf_instance);
+    // In C: nf_instance = nextgcore_sbi_self()->nf_instance;
+    // nextgcore_sbi_nf_fsm_init(nf_instance);
 
     // Build NF instance information
-    // In C: ogs_sbi_nf_instance_build_default(nf_instance);
-    // ogs_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_SCP);
-    // ogs_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_AMF);
+    // In C: nextgcore_sbi_nf_instance_build_default(nf_instance);
+    // nextgcore_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_SCP);
+    // nextgcore_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_AMF);
 
     // Build NF service information (nausf-auth)
-    // In C: service = ogs_sbi_nf_service_build_default(nf_instance, OGS_SBI_SERVICE_NAME_NAUSF_AUTH);
-    // ogs_sbi_nf_service_add_version(service, OGS_SBI_API_V1, OGS_SBI_API_V1_0_0, NULL);
-    // ogs_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_AMF);
+    // In C: service = nextgcore_sbi_nf_service_build_default(nf_instance, NEXTGCORE_SBI_SERVICE_NAME_NAUSF_AUTH);
+    // nextgcore_sbi_nf_service_add_version(service, NEXTGCORE_SBI_API_V1, NEXTGCORE_SBI_API_V1_0_0, NULL);
+    // nextgcore_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_AMF);
 
     // Initialize NRF NF Instance
-    // In C: nf_instance = ogs_sbi_self()->nrf_instance;
-    // if (nf_instance) ogs_sbi_nf_fsm_init(nf_instance);
+    // In C: nf_instance = nextgcore_sbi_self()->nrf_instance;
+    // if (nf_instance) nextgcore_sbi_nf_fsm_init(nf_instance);
 
     // Setup Subscription-Data
-    // In C: ogs_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL);
-    // ogs_sbi_subscription_spec_add(OpenAPI_nf_type_NULL, OGS_SBI_SERVICE_NAME_NUDM_UEAU);
+    // In C: nextgcore_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL);
+    // nextgcore_sbi_subscription_spec_add(OpenAPI_nf_type_NULL, NEXTGCORE_SBI_SERVICE_NAME_NUDM_UEAU);
 
     // Start SBI server
-    // In C: ogs_sbi_server_start_all(ogs_sbi_server_handler)
+    // In C: nextgcore_sbi_server_start_all(nextgcore_sbi_server_handler)
 
     SBI_RUNNING.store(true, Ordering::SeqCst);
 
@@ -88,8 +88,8 @@ pub fn ausf_sbi_close() {
     log::info!("Closing AUSF SBI server");
 
     // Stop all clients and servers
-    // In C: ogs_sbi_client_stop_all();
-    // ogs_sbi_server_stop_all();
+    // In C: nextgcore_sbi_client_stop_all();
+    // nextgcore_sbi_server_stop_all();
 
     SBI_RUNNING.store(false, Ordering::SeqCst);
 
@@ -107,7 +107,7 @@ pub fn ausf_sbi_is_running() -> bool {
 pub fn ausf_sbi_send_request(nf_instance_id: &str, xact_id: u64) -> bool {
     log::debug!("Sending SBI request to NF instance [{nf_instance_id}] xact [{xact_id}]");
 
-    // In C: ogs_sbi_send_request_to_nf_instance(nf_instance, xact)
+    // In C: nextgcore_sbi_send_request_to_nf_instance(nf_instance, xact)
     // This would send the request through the SBI client
 
     true
@@ -130,7 +130,7 @@ pub fn ausf_sbi_discover_and_send_nudm_ueau_get(
     // In C code:
     // 1. Create SBI xact with ausf_ue->id, service_type, discovery_option, build function
     // 2. Set xact->assoc_stream_id = stream_id
-    // 3. Call ogs_sbi_discover_and_send(xact)
+    // 3. Call nextgcore_sbi_discover_and_send(xact)
 
     // For now, log the request details
     log::debug!(

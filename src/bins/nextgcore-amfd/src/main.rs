@@ -234,7 +234,7 @@ impl AmfApp {
                 if let Some(nrf_list) = &client.nrf {
                     if let Some(nrf) = nrf_list.first() {
                         log::info!("NRF URI configured: {}", nrf.uri);
-                        ogs_sbi::context::global_context()
+                        nextgcore_sbi::context::global_context()
                             .set_nrf_uri(&nrf.uri)
                             .await;
                     }
@@ -676,7 +676,7 @@ async fn main() -> Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;
     let sbi_server =
-        ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(sbi_sock));
+        nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(sbi_sock));
     sbi_server
         .start(namf_server::namf_request_handler)
         .await
@@ -686,7 +686,7 @@ async fn main() -> Result<()> {
     // Register with NRF (if configured)
     match sbi_path::amf_nrf_register(&sbi_addr, sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
         }
         Ok(_) => {}
         Err(e) => {

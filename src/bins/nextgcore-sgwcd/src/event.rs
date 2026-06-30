@@ -25,8 +25,8 @@ impl SgwcEventId {
     /// Get the name of the event
     pub fn name(&self) -> &'static str {
         match self {
-            SgwcEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            SgwcEventId::FsmExit => "OGS_FSM_EXIT_SIG",
+            SgwcEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            SgwcEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
             SgwcEventId::S11Message => "SGWC_EVT_S11_MESSAGE",
             SgwcEventId::S5cMessage => "SGWC_EVT_S5C_MESSAGE",
             SgwcEventId::SxaMessage => "SGWC_EVT_SXA_MESSAGE",

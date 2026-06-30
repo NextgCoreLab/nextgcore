@@ -12,10 +12,10 @@ use nextgcore_udmd::{
     timer_manager, timer_type_to_timer_id, udm_context_final, udm_context_init, udm_sbi_close,
     udm_sbi_open, udm_self, SbiServerConfig, UdmEvent, UdmSdmSubscription, UdmSmContext,
 };
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
+    SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -135,8 +135,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
                                 if let Some(nrf_list) = client.nrf {
                                     if let Some(nrf) = nrf_list.first() {
                                         log::info!("NRF URI configured: {}", nrf.uri);
-                                        ogs_sbi::context::global_context()
+                                        nextgcore_sbi::context::global_context()
                                             .set_nrf_uri(&nrf.uri)
                                             .await;
                                     }
@@ -257,11 +257,11 @@ async fn main() -> Result<()> {
     // Open legacy SBI server (for context initialization)
     udm_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Start actual HTTP/2 SBI server using ogs-sbi
+    // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+    let sbi_server = SbiServer::new(NextgcoreSbiServerConfig::new(sbi_addr));
 
     sbi_server
         .start(udm_sbi_request_handler)
@@ -273,7 +273,7 @@ async fn main() -> Result<()> {
     // Register with NRF and start heartbeat worker
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
         }
         Ok(_) => {}
         Err(e) => {
@@ -616,7 +616,7 @@ async fn handle_get_am_data(supi: &str, request: &SbiRequest) -> SbiResponse {
         }
         Err(e) => {
             log::warn!("[{supi}] UDR am-data query failed: {e}");
-            ogs_sbi::server::send_service_unavailable("UDR unavailable")
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
         }
     }
 }
@@ -659,7 +659,7 @@ async fn handle_get_smf_select_data(supi: &str, request: &SbiRequest) -> SbiResp
         }
         Err(e) => {
             log::warn!("[{supi}] UDR smf-select query failed: {e}");
-            ogs_sbi::server::send_service_unavailable("UDR unavailable")
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
         }
     }
 }
@@ -700,7 +700,7 @@ async fn handle_get_sm_data(supi: &str, request: &SbiRequest) -> SbiResponse {
         }
         Err(e) => {
             log::warn!("[{supi}] UDR sm-data query failed: {e}");
-            ogs_sbi::server::send_service_unavailable("UDR unavailable")
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
         }
     }
 }
@@ -733,7 +733,7 @@ async fn handle_get_nssai(supi: &str, _request: &SbiRequest) -> SbiResponse {
         }
         Err(e) => {
             log::warn!("[{supi}] UDR nssai query failed: {e}");
-            ogs_sbi::server::send_service_unavailable("UDR unavailable")
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
         }
     }
 }
@@ -987,11 +987,11 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
                     supi,
                     resp.status
                 );
-                return ogs_sbi::server::send_service_unavailable("UDR query failed");
+                return nextgcore_sbi::server::send_service_unavailable("UDR query failed");
             }
             Err(e) => {
                 log::error!("[{supi}] UDR auth subscription query failed: {e}");
-                return ogs_sbi::server::send_service_unavailable("UDR unavailable");
+                return nextgcore_sbi::server::send_service_unavailable("UDR unavailable");
             }
         };
 
@@ -1058,7 +1058,7 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
             Some(ue) => ue,
             None => {
                 log::error!("[{supi}] Failed to create/find UE in context");
-                return ogs_sbi::server::send_service_unavailable("UE context creation failed");
+                return nextgcore_sbi::server::send_service_unavailable("UE context creation failed");
             }
         };
         ue.clone()
@@ -1108,7 +1108,7 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
         };
         let rand_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(rand_hex);
         let auts_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(auts_hex);
-        if rand_bytes.len() != 16 || auts_bytes.len() != ogs_crypt::milenage::OGS_AUTS_LEN {
+        if rand_bytes.len() != 16 || auts_bytes.len() != nextgcore_crypt::milenage::NEXTGCORE_AUTS_LEN {
             return send_problem(400, "INVALID_FORMAT", "Invalid RAND/AUTS length");
         }
         // The RAND echoed by the UE must be the one we sent
@@ -1120,14 +1120,14 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
         let mut conc_sqn_ms = [0u8; 6];
         conc_sqn_ms.copy_from_slice(&auts_bytes[..6]);
         let (sqn_ms, mac_s) =
-            match ogs_crypt::kdf::ogs_auc_sqn(&ue.opc, &ue.k, &rand_arr, &conc_sqn_ms) {
+            match nextgcore_crypt::kdf::nextgcore_auc_sqn(&ue.opc, &ue.k, &rand_arr, &conc_sqn_ms) {
                 Ok(r) => r,
                 Err(e) => {
                     log::error!("[{supi}] SQN extraction failed: {e:?}");
                     return send_problem(500, "UNSPECIFIED", "SQN extraction failed");
                 }
             };
-        if mac_s != auts_bytes[6..ogs_crypt::milenage::OGS_AUTS_LEN] {
+        if mac_s != auts_bytes[6..nextgcore_crypt::milenage::NEXTGCORE_AUTS_LEN] {
             log::error!("[{supi}] AUTS MAC-S verification failed");
             return send_problem(
                 403,
@@ -1149,15 +1149,15 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
 
     // Step 4: Generate RAND and compute the AV with Milenage
     let mut rand = [0u8; 16];
-    ogs_core::rand::ogs_random(&mut rand);
+    nextgcore_core::rand::nextgcore_random(&mut rand);
     ue.rand = rand;
 
     let (autn, ik, ck, _ak, res) =
-        match ogs_crypt::milenage::milenage_generate(&ue.opc, &ue.amf, &ue.k, &ue.sqn, &rand) {
+        match nextgcore_crypt::milenage::milenage_generate(&ue.opc, &ue.amf, &ue.k, &ue.sqn, &rand) {
             Ok(result) => result,
             Err(e) => {
                 log::error!("[{supi}] Milenage generate failed: {e:?}");
-                return ogs_sbi::server::send_internal_error("Milenage computation failed");
+                return nextgcore_sbi::server::send_internal_error("Milenage computation failed");
             }
         };
 
@@ -1180,7 +1180,7 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
         }
         Ok(r) if r.status >= 500 => {
             log::error!("[{supi}] UDR SQN PATCH returned {}: refusing to issue AV", r.status);
-            return ogs_sbi::server::send_service_unavailable("UDR SQN update failed");
+            return nextgcore_sbi::server::send_service_unavailable("UDR SQN update failed");
         }
         Ok(r) => {
             // Non-5xx (e.g. 404): UDR may not have auth-subscription resource; degrade.
@@ -1189,7 +1189,7 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
         Err(e) => {
             // Transport failure: refuse to issue AV to prevent SQN replay.
             log::error!("[{supi}] UDR SQN PATCH failed: {e} — refusing to issue AV");
-            return ogs_sbi::server::send_service_unavailable("UDR unavailable");
+            return nextgcore_sbi::server::send_service_unavailable("UDR unavailable");
         }
     }
 
@@ -1202,7 +1202,7 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
             let mut sqn_xor_ak = [0u8; 6];
             sqn_xor_ak.copy_from_slice(&autn[..6]);
             let (ck_prime, ik_prime) =
-                ogs_crypt::kdf::ogs_kdf_ck_ik_prime(&ck, &ik, serving_network_name, &sqn_xor_ak);
+                nextgcore_crypt::kdf::nextgcore_kdf_ck_ik_prime(&ck, &ik, serving_network_name, &sqn_xor_ak);
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "authType": "EAP_AKA_PRIME",
@@ -1220,9 +1220,9 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
         }
         _ => {
             // 5G-AKA: derive KAUSF and XRES* (TS 33.501 Annex A.2/A.4)
-            let kausf = ogs_crypt::kdf::ogs_kdf_kausf(&ck, &ik, serving_network_name, &autn);
+            let kausf = nextgcore_crypt::kdf::nextgcore_kdf_kausf(&ck, &ik, serving_network_name, &autn);
             let xres_star =
-                ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, serving_network_name, &rand, &res);
+                nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, serving_network_name, &rand, &res);
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "authType": "5G_AKA",
@@ -1427,7 +1427,7 @@ async fn run_event_loop_async(udm_sm: &mut UdmSmContext, shutdown: Arc<AtomicBoo
 /// Returns the NF instance ID on success so the caller can start a heartbeat
 /// worker.
 async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -1706,7 +1706,7 @@ mod tests {
 
             // --- mock UDR on an ephemeral port ---
             let udr_port = free_port();
-            let udr_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+            let udr_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
                 [127, 0, 0, 1],
                 udr_port,
             ))));
@@ -1716,7 +1716,7 @@ mod tests {
 
             // --- real UDM handler on an ephemeral port ---
             let udm_port = free_port();
-            let udm_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
                 [127, 0, 0, 1],
                 udm_port,
             ))));
@@ -1725,7 +1725,7 @@ mod tests {
                 .await
                 .expect("udm start");
 
-            let client = ogs_sbi::client::SbiClient::with_host_port("127.0.0.1", udm_port);
+            let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", udm_port);
             let gen_path =
                 |id: &str| format!("/nudm-ueau/v1/{id}/security-information/generate-auth-data");
 
@@ -1810,8 +1810,8 @@ mod tests {
             let mut opc = [0u8; 16];
             opc.copy_from_slice(&unhex(TEST_OPC_HEX));
             let (res, ck, ik, _ak, _akstar) =
-                ogs_crypt::milenage::milenage_f2345(&opc, &k, &rand).unwrap();
-            let xres_star = ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+                nextgcore_crypt::milenage::milenage_f2345(&opc, &k, &rand).unwrap();
+            let xres_star = nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
             assert_eq!(
                 av.get("xresStar").and_then(|v| v.as_str()),
                 Some(nextgcore_udmd::nudm_handler::bytes_to_hex(&xres_star).as_str())
@@ -1821,13 +1821,13 @@ mod tests {
             // UE side: SQN_MS=0x000000000050, AUTS = (SQN_MS xor AK*) || MAC-S
             let sqn_ms = [0u8, 0, 0, 0, 0, 0x50];
             let (_r, _c, _i, _a, akstar) =
-                ogs_crypt::milenage::milenage_f2345(&opc, &k, &rand).unwrap();
+                nextgcore_crypt::milenage::milenage_f2345(&opc, &k, &rand).unwrap();
             let mut conc = [0u8; 6];
             for i in 0..6 {
                 conc[i] = sqn_ms[i] ^ akstar[i];
             }
             let (_mac_a, mac_s) =
-                ogs_crypt::milenage::milenage_f1(&opc, &k, &rand, &sqn_ms, &[0, 0]).unwrap();
+                nextgcore_crypt::milenage::milenage_f1(&opc, &k, &rand, &sqn_ms, &[0, 0]).unwrap();
             let mut auts = Vec::new();
             auts.extend_from_slice(&conc);
             auts.extend_from_slice(&mac_s);
@@ -1874,9 +1874,9 @@ mod tests {
             // ---- Profile A concealed SUCI ----
             // Conceal MSIN 0000000001 with the provisioned key (TBCD nibbles)
             let msin_bcd = [0x00u8, 0x00, 0x00, 0x00, 0x10]; // "0000000001" swapped nibbles
-            let hn_pub = ogs_crypt::ecies::x25519_public_key(&hn_priv);
+            let hn_pub = nextgcore_crypt::ecies::x25519_public_key(&hn_priv);
             let (eph_pub, ct, tag) =
-                ogs_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &msin_bcd).unwrap();
+                nextgcore_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &msin_bcd).unwrap();
             let mut scheme_output = Vec::new();
             scheme_output.extend_from_slice(&eph_pub);
             scheme_output.extend_from_slice(&ct);
@@ -1931,11 +1931,11 @@ mod tests {
             let mut rand = [0u8; 16];
             rand.copy_from_slice(&rand_v);
             let (_res, ck, ik, _ak, _akstar) =
-                ogs_crypt::milenage::milenage_f2345(&opc, &k, &rand).unwrap();
+                nextgcore_crypt::milenage::milenage_f2345(&opc, &k, &rand).unwrap();
             let mut sqn_xor_ak = [0u8; 6];
             sqn_xor_ak.copy_from_slice(&autn_v[..6]);
             let (ck_prime, _ik_prime) =
-                ogs_crypt::kdf::ogs_kdf_ck_ik_prime(&ck, &ik, TEST_SNN, &sqn_xor_ak);
+                nextgcore_crypt::kdf::nextgcore_kdf_ck_ik_prime(&ck, &ik, TEST_SNN, &sqn_xor_ak);
             assert_eq!(
                 av.get("ckPrime").and_then(|v| v.as_str()),
                 Some(nextgcore_udmd::nudm_handler::bytes_to_hex(&ck_prime).as_str())
@@ -2051,7 +2051,7 @@ mod tests {
 
     #[test]
     fn test_sdm_query_params_extracts_known_keys_ignores_others() {
-        use ogs_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
+        use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
         let mut request = SbiRequest {
             header: SbiHeader::with_method_uri("GET", "/nudm-sdm/v1/imsi-x/am-data"),
@@ -2092,7 +2092,7 @@ mod tests {
     #[tokio::test]
     async fn test_sdm_subscribe_persists_and_unsubscribe_is_idempotent() {
         let _ = env_logger::try_init();
-        use ogs_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
+        use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
         udm_context_init(64, 64);
         let supi = "imsi-udmd07-0001";
@@ -2177,7 +2177,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_event_returns_201_with_location_header() {
         let _ = env_logger::try_init();
-        use ogs_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
+        use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
         udm_context_init(64, 64);
         let supi = "imsi-udmd09-0001";

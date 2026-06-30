@@ -177,8 +177,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -209,7 +209,7 @@ async fn main() -> Result<()> {
     // RFC 5705 N32-f exporter secret into the n32c_handler store after every
     // successful outbound TLS handshake. The hook is a plain fn pointer so it
     // is Send+Sync and requires no heap allocation.
-    ogs_sbi::client::register_tls_exporter_hook(
+    nextgcore_sbi::client::register_tls_exporter_hook(
         n32c_handler::set_n32c_tls_exporter_secret,
     );
 
@@ -444,7 +444,7 @@ async fn run_event_loop_async(
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
         // Compute optimal sleep duration based on pending timers
-        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+        let poll_interval = nextgcore_core::async_timer::compute_poll_interval(
             timer_mgr.inner(),
             Duration::from_millis(100),
         );

@@ -3,10 +3,10 @@
 //! TS 29.558 §6 requires the EES to verify that a service consumer is
 //! authorized on every operation; the access token is a CAPIF/NRF-issued
 //! OAuth2 bearer (RFC 6749). This module provides a LOCAL `require_oauth2`
-//! gate built entirely on the existing public `ogs-sbi` primitives
+//! gate built entirely on the existing public `nextgcore-sbi` primitives
 //! (`authorize_bearer` for bearer extraction + ES256/JWKS verification, and
 //! the `send_unauthorized`/`send_forbidden` ProblemDetails helpers). It is NOT
-//! added to `ogs-sbi` — it lives in the EES crate per the bounded scope.
+//! added to `nextgcore-sbi` — it lives in the EES crate per the bounded scope.
 //!
 //! Token verification needs the issuer's public keys (a JWKS). Since no live
 //! CAPIF/NRF peer exists in this stack, the JWKS is provisioned out-of-band via
@@ -18,9 +18,9 @@
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::oauth::authorize_bearer;
-use ogs_sbi::server::{send_forbidden, send_unauthorized};
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::authorize_bearer;
+use nextgcore_sbi::server::{send_forbidden, send_unauthorized};
 
 /// OAuth2 scope required for the `eees-easregistration` service operations.
 pub const SCOPE_EASREGISTRATION: &str = "eees-easregistration";

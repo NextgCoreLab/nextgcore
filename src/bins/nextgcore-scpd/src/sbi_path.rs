@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ogs_sbi::types::UriScheme;
+use nextgcore_sbi::types::UriScheme;
 
 use crate::context::NfType;
 
@@ -80,7 +80,7 @@ pub fn scp_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     log::info!("Opening SCP SBI server on {}:{}", config.addr, config.port);
 
     // The HTTP/2 listener itself is started in main.rs
-    // (ogs_sbi::server::SbiServer fronting crate::proxy::ScpProxy); this
+    // (nextgcore_sbi::server::SbiServer fronting crate::proxy::ScpProxy); this
     // function tracks the lifecycle state used by the state machine.
     SBI_SERVER_RUNNING.store(true, Ordering::SeqCst);
 

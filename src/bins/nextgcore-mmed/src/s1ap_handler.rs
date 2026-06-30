@@ -2,20 +2,20 @@
 //!
 //! Port of src/mme/s1ap-handler.c - S1AP message handling functions.
 //!
-//! Incoming PDUs are decoded with `ogs_s1ap::decode_s1ap_pdu` (real APER per
+//! Incoming PDUs are decoded with `nextgcore_s1ap::decode_s1ap_pdu` (real APER per
 //! TS 36.413) and dispatched by message type. Each handler updates the MME
 //! context and returns the S1AP PDUs to transmit (responses may target a
 //! different eNB than the origin, e.g. during S1 handover).
 
 use crate::context::{
     ECgi, EpsTai, MmeContext, PagingType, S1apCause, S1apCauseGroup, UeCtxRelAction,
-    INVALID_UE_S1AP_ID, OGS_INVALID_POOL_ID,
+    INVALID_UE_S1AP_ID, NEXTGCORE_INVALID_POOL_ID,
 };
 use crate::s1ap_build::{
     self, cause_from_s1ap, decode_plmn_id, ecgi_from_s1ap, misc_cause, protocol_cause,
     radio_network_cause, tai_from_s1ap, transport_address_to_ip, ue_security_capabilities_from,
 };
-use ogs_s1ap::{
+use nextgcore_s1ap::{
     builder, decode_s1ap_pdu, Cause, EnbId, ErabSwitchedItem, ErabToBeSetupItemHoReq,
     HandoverCancel, HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
     HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
@@ -68,10 +68,10 @@ impl std::fmt::Display for S1apError {
 
 impl std::error::Error for S1apError {}
 
-impl From<ogs_s1ap::S1apError> for S1apError {
-    fn from(e: ogs_s1ap::S1apError) -> Self {
+impl From<nextgcore_s1ap::S1apError> for S1apError {
+    fn from(e: nextgcore_s1ap::S1apError) -> Self {
         match e {
-            ogs_s1ap::S1apError::MissingMandatoryIe(ie) => {
+            nextgcore_s1ap::S1apError::MissingMandatoryIe(ie) => {
                 S1apError::MissingMandatoryIe(ie.to_string())
             }
             other => S1apError::DecodingError(other.to_string()),
@@ -409,7 +409,7 @@ pub fn handle_uplink_nas_transport(
         msg.mme_ue_s1ap_id,
         msg.nas_pdu.len()
     );
-    (enb_ue.mme_ue_id != OGS_INVALID_POOL_ID).then_some(enb_ue.mme_ue_id)
+    (enb_ue.mme_ue_id != NEXTGCORE_INVALID_POOL_ID).then_some(enb_ue.mme_ue_id)
 }
 
 /// Handle NAS Non Delivery Indication (TS 36.413 §8.6.4).
@@ -576,7 +576,7 @@ pub fn handle_reset(ctx: &MmeContext, enb_id: u64, msg: &Reset) -> Vec<S1apSend>
 /// may already have moved to a handover target).
 fn release_s1_connection(ctx: &MmeContext, enb_ue_id: u64) {
     if let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) {
-        if enb_ue.mme_ue_id != OGS_INVALID_POOL_ID {
+        if enb_ue.mme_ue_id != NEXTGCORE_INVALID_POOL_ID {
             let still_attached = ctx
                 .mme_ue_find_by_id(enb_ue.mme_ue_id)
                 .is_some_and(|mme_ue| mme_ue.enb_ue_id == enb_ue_id);
@@ -829,7 +829,7 @@ pub fn handle_handover_request_acknowledge(
         erab_to_release_list: msg
             .erab_failed_list
             .iter()
-            .map(|item| ogs_s1ap::ErabItem {
+            .map(|item| nextgcore_s1ap::ErabItem {
                 erab_id: item.erab_id,
                 cause: item.cause,
             })
@@ -872,7 +872,7 @@ pub fn handle_handover_failure(
         return Vec::new();
     };
     if let Some(source) = ctx.enb_ue_pool.write().unwrap().get_mut(&source_ue.id) {
-        source.target_ue_id = OGS_INVALID_POOL_ID;
+        source.target_ue_id = NEXTGCORE_INVALID_POOL_ID;
     }
 
     let failure = HandoverPreparationFailure {
@@ -982,13 +982,13 @@ pub fn handle_handover_cancel(
         match pool.get_mut(&source_ue_id) {
             Some(source) => {
                 let target = source.target_ue_id;
-                source.target_ue_id = OGS_INVALID_POOL_ID;
+                source.target_ue_id = NEXTGCORE_INVALID_POOL_ID;
                 target
             }
-            None => OGS_INVALID_POOL_ID,
+            None => NEXTGCORE_INVALID_POOL_ID,
         }
     };
-    if target_ue_id != OGS_INVALID_POOL_ID {
+    if target_ue_id != NEXTGCORE_INVALID_POOL_ID {
         ctx.enb_ue_remove(target_ue_id);
     }
 
@@ -1185,7 +1185,7 @@ fn handle_erab_setup_response(
     ctx: &MmeContext,
     _enb_id: u64,
     mme_ue_s1ap_id: u32,
-    erab_setup_list: &[ogs_s1ap::ErabSetupItem],
+    erab_setup_list: &[nextgcore_s1ap::ErabSetupItem],
 ) {
     let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(mme_ue_s1ap_id) else {
         return;
@@ -1203,7 +1203,7 @@ fn handle_erab_setup_response(
     }
 }
 
-fn log_erab_failures(enb_id: u64, failures: &[ogs_s1ap::ErabFailedItem]) {
+fn log_erab_failures(enb_id: u64, failures: &[nextgcore_s1ap::ErabFailedItem]) {
     for item in failures {
         log::error!(
             "E-RAB {} failed on eNB {enb_id} with cause {:?}",
@@ -1280,7 +1280,7 @@ fn next_hop_advance(ctx: &MmeContext, mme_ue_id: u64) -> Option<(u8, [u8; 32])> 
     } else {
         mme_ue.nh
     };
-    mme_ue.nh = ogs_crypt::kdf::ogs_kdf_nh_enb(&mme_ue.kasme, &sync_input);
+    mme_ue.nh = nextgcore_crypt::kdf::nextgcore_kdf_nh_enb(&mme_ue.kasme, &sync_input);
     mme_ue.nhcc = (mme_ue.nhcc + 1) & 0x07;
     Some((mme_ue.nhcc, mme_ue.nh))
 }
@@ -1298,7 +1298,7 @@ pub fn s1ap_cause(cause: &Cause) -> S1apCause {
 mod tests {
     use super::*;
     use crate::context::{Bitrate, MmeUe, PlmnId, ServedGummei};
-    use ogs_s1ap::{
+    use nextgcore_s1ap::{
         CauseRadioNetwork, GlobalEnbId, STmsi, SupportedTaItem, UeAssociatedLogicalS1Connection,
         UeSecurityCapabilities,
     };
@@ -1356,14 +1356,14 @@ mod tests {
         let request = S1SetupRequest {
             global_enb_id: GlobalEnbId {
                 plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
-                enb_id: ogs_s1ap::EnbId::Macro(0x1234),
+                enb_id: nextgcore_s1ap::EnbId::Macro(0x1234),
             },
             enb_name: Some("test-enb".to_string()),
             supported_tas: vec![SupportedTaItem {
                 tac: 1,
                 broadcast_plmns: vec![s1ap_build::encode_plmn_id(&PlmnId::new("310", "410"))],
             }],
-            default_paging_drx: ogs_s1ap::PagingDrx::V64,
+            default_paging_drx: nextgcore_s1ap::PagingDrx::V64,
         };
         let bytes = builder::build_s1_setup_request(&request).unwrap();
 
@@ -1399,7 +1399,7 @@ mod tests {
         let (enb_id, enb_ue_id, mme_ue_id, _) = add_ue(&ctx);
 
         let bytes = builder::build_reset(&Reset {
-            cause: Cause::Misc(ogs_s1ap::CauseMisc::OmIntervention),
+            cause: Cause::Misc(nextgcore_s1ap::CauseMisc::OmIntervention),
             reset_type: ResetType::S1Interface,
         })
         .unwrap();
@@ -1417,7 +1417,7 @@ mod tests {
         // The S1 connection is gone; the MME UE survives (idle)
         assert!(ctx.enb_ue_find_by_id(enb_ue_id).is_none());
         let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
-        assert_eq!(mme_ue.enb_ue_id, OGS_INVALID_POOL_ID);
+        assert_eq!(mme_ue.enb_ue_id, NEXTGCORE_INVALID_POOL_ID);
     }
 
     #[test]
@@ -1519,11 +1519,11 @@ mod tests {
                 gtp_teid: 0x9999,
             }],
             source_mme_ue_s1ap_id: mme_ue_s1ap_id,
-            eutran_cgi: ogs_s1ap::EutranCgi {
+            eutran_cgi: nextgcore_s1ap::EutranCgi {
                 plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
                 cell_identity: 0x42,
             },
-            tai: ogs_s1ap::Tai {
+            tai: nextgcore_s1ap::Tai {
                 plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
                 tac: 2,
             },
@@ -1544,7 +1544,7 @@ mod tests {
                 // Fresh security context: NCC advanced from 0 to 1, NH
                 // derived from KeNB per TS 33.401 Annex A.4
                 assert_eq!(ack.security_context.next_hop_chaining_count, 1);
-                let expected_nh = ogs_crypt::kdf::ogs_kdf_nh_enb(&[0x11; 32], &[0x22; 32]);
+                let expected_nh = nextgcore_crypt::kdf::nextgcore_kdf_nh_enb(&[0x11; 32], &[0x22; 32]);
                 assert_eq!(ack.security_context.next_hop_parameter, expected_nh);
                 assert_eq!(ack.erab_switched_ul_list.len(), 1);
                 assert_eq!(ack.erab_switched_ul_list[0].gtp_teid, 0x5555);
@@ -1579,11 +1579,11 @@ mod tests {
                 gtp_teid: 0x9999,
             }],
             source_mme_ue_s1ap_id: 0xBEEF,
-            eutran_cgi: ogs_s1ap::EutranCgi {
+            eutran_cgi: nextgcore_s1ap::EutranCgi {
                 plmn_identity: [0x13, 0x00, 0x14],
                 cell_identity: 1,
             },
-            tai: ogs_s1ap::Tai {
+            tai: nextgcore_s1ap::Tai {
                 plmn_identity: [0x13, 0x00, 0x14],
                 tac: 1,
             },
@@ -1634,9 +1634,9 @@ mod tests {
             target_id: TargetId::TargetEnbId {
                 global_enb_id: GlobalEnbId {
                     plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
-                    enb_id: ogs_s1ap::EnbId::Macro(0x2222),
+                    enb_id: nextgcore_s1ap::EnbId::Macro(0x2222),
                 },
-                selected_tai: ogs_s1ap::Tai {
+                selected_tai: nextgcore_s1ap::Tai {
                     plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
                     tac: 2,
                 },
@@ -1674,9 +1674,9 @@ mod tests {
             target_id: TargetId::TargetEnbId {
                 global_enb_id: GlobalEnbId {
                     plmn_identity: [0x13, 0x00, 0x14],
-                    enb_id: ogs_s1ap::EnbId::Macro(0x7777),
+                    enb_id: nextgcore_s1ap::EnbId::Macro(0x7777),
                 },
-                selected_tai: ogs_s1ap::Tai {
+                selected_tai: nextgcore_s1ap::Tai {
                     plmn_identity: [0x13, 0x00, 0x14],
                     tac: 2,
                 },
@@ -1725,9 +1725,9 @@ mod tests {
             target_id: TargetId::TargetEnbId {
                 global_enb_id: GlobalEnbId {
                     plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
-                    enb_id: ogs_s1ap::EnbId::Macro(0x2222),
+                    enb_id: nextgcore_s1ap::EnbId::Macro(0x2222),
                 },
-                selected_tai: ogs_s1ap::Tai {
+                selected_tai: nextgcore_s1ap::Tai {
                     plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
                     tac: 2,
                 },
@@ -1748,7 +1748,7 @@ mod tests {
         let ack = HandoverRequestAcknowledge {
             mme_ue_s1ap_id: target_mme_ue_s1ap_id,
             enb_ue_s1ap_id: 300,
-            erab_admitted_list: vec![ogs_s1ap::ErabAdmittedItem {
+            erab_admitted_list: vec![nextgcore_s1ap::ErabAdmittedItem {
                 erab_id: 5,
                 transport_layer_address: vec![10, 0, 0, 8],
                 gtp_teid: 0x8888,
@@ -1779,11 +1779,11 @@ mod tests {
         let notify = HandoverNotify {
             mme_ue_s1ap_id: target_mme_ue_s1ap_id,
             enb_ue_s1ap_id: 300,
-            eutran_cgi: ogs_s1ap::EutranCgi {
+            eutran_cgi: nextgcore_s1ap::EutranCgi {
                 plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
                 cell_identity: 0x99,
             },
-            tai: ogs_s1ap::Tai {
+            tai: nextgcore_s1ap::Tai {
                 plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
                 tac: 2,
             },
@@ -1896,15 +1896,15 @@ mod tests {
         let msg = InitialUeMessage {
             enb_ue_s1ap_id: 55,
             nas_pdu: vec![0x07, 0x41, 0x71],
-            tai: ogs_s1ap::Tai {
+            tai: nextgcore_s1ap::Tai {
                 plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
                 tac: 1,
             },
-            eutran_cgi: ogs_s1ap::EutranCgi {
+            eutran_cgi: nextgcore_s1ap::EutranCgi {
                 plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
                 cell_identity: 0x100,
             },
-            rrc_establishment_cause: ogs_s1ap::RrcEstablishmentCause::MoSignalling,
+            rrc_establishment_cause: nextgcore_s1ap::RrcEstablishmentCause::MoSignalling,
             s_tmsi: Some(STmsi {
                 mmec: 1,
                 m_tmsi: 0x1234,
@@ -1928,7 +1928,7 @@ mod tests {
                 assert_eq!(
                     ind.cause,
                     Some(Cause::Protocol(
-                        ogs_s1ap::CauseProtocol::TransferSyntaxError
+                        nextgcore_s1ap::CauseProtocol::TransferSyntaxError
                     ))
                 );
             }

@@ -17,11 +17,11 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
-use ogs_sbi::oauth::JwksCache;
-use ogs_sbi::server::{
+use nextgcore_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::JwksCache;
+use nextgcore_sbi::server::{
     send_bad_request, send_error, send_forbidden, send_method_not_allowed, send_not_found,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    SbiServer, SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -146,8 +146,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
         .parse()
         .context("Invalid SBI address")?;
 
-    let mut sbi_server_config = OgsSbiServerConfig::new(addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
         let cert = args
             .tls_cert
@@ -279,18 +279,18 @@ async fn main() -> Result<()> {
 /// Read the caller identity from the bearer token's verified `sub` claim
 /// (PIND-10; TS 29.500 §5.2.3, TS 33.501 §13.4).
 ///
-/// **FLAG / known gap.** ogs-sbi verifies the bearer token at the *server*
+/// **FLAG / known gap.** nextgcore-sbi verifies the bearer token at the *server*
 /// layer when `require_oauth2` is enabled (signature + expiry, rejecting bad
 /// tokens with 401 before dispatch), but it does **not** thread the decoded
 /// claims into `SbiRequest`, and there is no public accessor on `SbiRequest`
 /// for the verified `sub`. We therefore re-read the already-verified token's
-/// payload here using the public `ogs_sbi::oauth::decode_jwt_parts` +
+/// payload here using the public `nextgcore_sbi::oauth::decode_jwt_parts` +
 /// `AccessTokenClaims`. This is sound for trust **only** because the server
 /// has already cryptographically verified the same token; the caller (via
 /// [`extract_caller_supi`]) gates this on [`oauth2_enabled`]. A token read
 /// while OAuth2 is disabled is unverified and MUST NOT be trusted.
 ///
-/// (A clean fix is to add a `verified claims` accessor to ogs-sbi
+/// (A clean fix is to add a `verified claims` accessor to nextgcore-sbi
 /// additively and thread the claims through `SbiRequest`; out of scope for
 /// this pind-local change, which must not modify shared libs.)
 fn caller_supi_from_token(request: &SbiRequest) -> Option<String> {
@@ -299,8 +299,8 @@ fn caller_supi_from_token(request: &SbiRequest) -> Option<String> {
         .strip_prefix("Bearer ")
         .or_else(|| auth.strip_prefix("bearer "))?
         .trim();
-    let (_header, payload, _sig) = ogs_sbi::oauth::decode_jwt_parts(token).ok()?;
-    let claims: ogs_sbi::oauth::AccessTokenClaims = serde_json::from_slice(&payload).ok()?;
+    let (_header, payload, _sig) = nextgcore_sbi::oauth::decode_jwt_parts(token).ok()?;
+    let claims: nextgcore_sbi::oauth::AccessTokenClaims = serde_json::from_slice(&payload).ok()?;
     let sub = claims.sub.trim();
     if sub.is_empty() {
         None
@@ -945,13 +945,13 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ogs_sbi::message::SbiRequest;
+    use nextgcore_sbi::message::SbiRequest;
     use std::sync::Mutex;
 
     /// A precomputed JWT (`header.payload.sig`) whose payload decodes to
     /// `AccessTokenClaims { sub: "imsi-token-owner-001", .. }`. The signature
     /// is NOT cryptographically valid: `caller_supi_from_token` only
-    /// base64-decodes the parts and reads `sub`. In production the ogs-sbi
+    /// base64-decodes the parts and reads `sub`. In production the nextgcore-sbi
     /// server layer has already verified the same token before dispatch, which
     /// is why `extract_caller_supi` only honors the token under `trust_token`
     /// (i.e. `oauth2_enabled()`).

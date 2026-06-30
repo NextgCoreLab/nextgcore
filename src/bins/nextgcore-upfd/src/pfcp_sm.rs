@@ -3,10 +3,10 @@
 //! Port of src/upf/pfcp-sm.c - PFCP state machine for UPF
 
 use crate::event::{UpfEvent, UpfEventId, UpfTimerId};
-use ogs_core::fsm::StateMachine;
+use nextgcore_core::fsm::StateMachine;
 
 // ============================================================================
-// PFCP Message Types (from ogs-pfcp)
+// PFCP Message Types (from nextgcore-pfcp)
 // ============================================================================
 
 /// PFCP message types

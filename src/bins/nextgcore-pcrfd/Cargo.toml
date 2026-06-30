@@ -27,11 +27,11 @@ tokio.workspace = true
 bytes.workspace = true
 
 # Internal crates
-ogs-core = { path = "../../libs/ogs-core" }
-ogs-metrics = { workspace = true }
-ogs-diameter = { path = "../../libs/ogs-diameter" }
-ogs-dbi = { path = "../../libs/ogs-dbi" }
-ogs-app = { path = "../../libs/ogs-app" }
+nextgcore-core = { path = "../../libs/nextgcore-core" }
+nextgcore-metrics = { workspace = true }
+nextgcore-diameter = { path = "../../libs/nextgcore-diameter" }
+nextgcore-dbi = { path = "../../libs/nextgcore-dbi" }
+nextgcore-app = { path = "../../libs/nextgcore-app" }
 
 [dev-dependencies]
 proptest.workspace = true

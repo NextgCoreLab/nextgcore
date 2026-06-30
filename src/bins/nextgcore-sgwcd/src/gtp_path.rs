@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use ogs_gtp::v2::header::Gtp2MessageType;
-use ogs_gtp::v2::ie::{Gtp2IeType, Gtp2RecoveryIe};
-use ogs_gtp::v2::message::Gtp2Message;
-use ogs_gtp::v2::xact::{Gtp2XactConfig, Gtp2XactMgr};
+use nextgcore_gtp::v2::header::Gtp2MessageType;
+use nextgcore_gtp::v2::ie::{Gtp2IeType, Gtp2RecoveryIe};
+use nextgcore_gtp::v2::message::Gtp2Message;
+use nextgcore_gtp::v2::xact::{Gtp2XactConfig, Gtp2XactMgr};
 
 use crate::context::{sgwc_self, SgwcBearer};
 use crate::s11_build;
@@ -264,7 +264,7 @@ impl GtpcServer {
         let mut rec = bytes::BytesMut::new();
         Gtp2RecoveryIe::new(self.inner.restart_counter).encode(&mut rec, 0);
         let mut b = rec.freeze();
-        if let Ok(ie) = ogs_gtp::v2::ie::Gtp2Ie::decode(&mut b) {
+        if let Ok(ie) = nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b) {
             msg.add_ie(ie);
         }
         self.send_request(peer, &msg, 0)
@@ -1193,7 +1193,7 @@ fn dispatch_bearer_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ogs_gtp::v2::ie::{Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2FTeidIe, Gtp2Ie};
+    use nextgcore_gtp::v2::ie::{Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2FTeidIe, Gtp2Ie};
     use std::net::UdpSocket;
 
     fn test_server(t3_ms: u64, n3: u32) -> GtpcServer {
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     fn csr(seq: u32, imsi: &[u8]) -> Gtp2Message {
-        let mut msg = Gtp2Message::new(ogs_gtp::v2::header::Gtp2Header::new(
+        let mut msg = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
             Gtp2MessageType::CreateSessionRequest as u8,
             0,
             seq,
@@ -1329,7 +1329,7 @@ mod tests {
         let server = test_server(1000, 1);
         let sock = client();
 
-        let msg = Gtp2Message::new(ogs_gtp::v2::header::Gtp2Header::new(
+        let msg = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
             Gtp2MessageType::ModifyBearerRequest as u8,
             0xDEAD_0001, // no UE has this TEID
             0x1003,
@@ -1388,7 +1388,7 @@ mod tests {
                 .teid;
 
         // Modify with eNB S1-U F-TEID
-        let mut mbr = Gtp2Message::new(ogs_gtp::v2::header::Gtp2Header::new(
+        let mut mbr = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
             Gtp2MessageType::ModifyBearerRequest as u8,
             sgw_teid,
             0x2002,
@@ -1411,7 +1411,7 @@ mod tests {
         );
 
         // Release access bearers
-        let rab = Gtp2Message::new(ogs_gtp::v2::header::Gtp2Header::new(
+        let rab = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
             Gtp2MessageType::ReleaseAccessBearersRequest as u8,
             sgw_teid,
             0x2003,
@@ -1424,12 +1424,12 @@ mod tests {
         );
 
         // Delete
-        let mut dsr = Gtp2Message::new(ogs_gtp::v2::header::Gtp2Header::new(
+        let mut dsr = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
             Gtp2MessageType::DeleteSessionRequest as u8,
             sgw_teid,
             0x2004,
         ));
-        dsr.add_ie(ogs_gtp::v2::ie::Gtp2EbiIe::new(5).to_ie(0));
+        dsr.add_ie(nextgcore_gtp::v2::ie::Gtp2EbiIe::new(5).to_ie(0));
         sock.send_to(&dsr.encode(), server.local_addr()).unwrap();
         let dsrsp = recv_msg(&sock);
         assert_eq!(
@@ -1534,7 +1534,7 @@ mod tests {
         );
         assert_eq!(ddn.header.sequence_number, seq);
 
-        let mut ack = Gtp2Message::new(ogs_gtp::v2::header::Gtp2Header::new(
+        let mut ack = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
             Gtp2MessageType::DownlinkDataNotificationAcknowledge as u8,
             ue.sgw_s11_teid,
             seq,

@@ -1,20 +1,20 @@
 //! NGAP ASN.1 Encoding for AMF
 //!
 //! This module provides ASN.1 APER encoding for NGAP messages
-//! using the ogs-ngap crate. This ensures wire compatibility with
+//! using the nextgcore-ngap crate. This ensures wire compatibility with
 //! the gNB (nextgsim-gnb) which also uses proper ASN.1 encoding.
 
-use ogs_asn1c::ngap::cause::{
+use nextgcore_asn1c::ngap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
 };
-use ogs_ngap::transfer::{
+use nextgcore_ngap::transfer::{
     AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
     PduSessionResourceReleaseCommandTransfer, PduSessionResourceSetupRequestTransfer,
     PduSessionResourceSetupResponseTransfer, PduSessionType, PreEmptionCapability,
     PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters,
     QosFlowSetupRequestItem, TransportLayerAddress, UpTransportLayerInformation,
 };
-use ogs_ngap::{builder, parser, types::*, NgapMessage};
+use nextgcore_ngap::{builder, parser, types::*, NgapMessage};
 
 use crate::context::AmfContext;
 
@@ -477,7 +477,7 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     }
 }
 
-/// Convert an AMF-context S-NSSAI (SD packed as a u32) to the ogs-ngap wire
+/// Convert an AMF-context S-NSSAI (SD packed as a u32) to the nextgcore-ngap wire
 /// S-NSSAI (SD as a 3-byte big-endian array).
 fn amf_snssai_to_ngap(s: &crate::context::SNssai) -> SNssai {
     SNssai {
@@ -509,13 +509,13 @@ fn nas_caps_octet_to_ngap_bits(octet: u8) -> u16 {
 /// Registration Accept rides inside the request as the NAS-PDU
 /// (TS 23.502 §4.2.2.2.2 step 16).
 ///
-/// amfd-08 (FLAGGED / blocked on ogs-ngap): the OPTIONAL Mobility Restriction
+/// amfd-08 (FLAGGED / blocked on nextgcore-ngap): the OPTIONAL Mobility Restriction
 /// List and Masked IMEISV IEs are not emitted. Both are optional in
 /// TS 38.413 §9.2.2.1, so omitting them is conformant for the non-roaming /
 /// no-forbidden-area case (the matched-sim path). Emitting them requires the
-/// shared `ogs_ngap::types::InitialContextSetupRequest` struct + builder to
+/// shared `nextgcore_ngap::types::InitialContextSetupRequest` struct + builder to
 /// expose those fields first (an additive shared-lib change, out of this
-/// amfd-only change's scope). Tracked for a follow-up that lands the ogs-ngap
+/// amfd-only change's scope). Tracked for a follow-up that lands the nextgcore-ngap
 /// fields, then populates MobilityRestrictionList from the UE's roaming/
 /// forbidden-area policy and Masked IMEISV from the 5GMM context.
 #[allow(clippy::too_many_arguments)]
@@ -623,7 +623,7 @@ pub fn build_pdu_session_resource_release_command_asn1(
     pdu_session_ids: &[u8],
 ) -> Option<Vec<u8>> {
     // Per-session PDUSessionResourceReleaseCommandTransfer with mandatory Cause
-    // (TS 38.413 Section 9.3.4.11), APER-encoded via ogs-ngap::transfer
+    // (TS 38.413 Section 9.3.4.11), APER-encoded via nextgcore-ngap::transfer
     let release_transfer = PduSessionResourceReleaseCommandTransfer {
         cause: Cause::Nas(CauseNas::NormalRelease),
     };
@@ -1229,7 +1229,7 @@ mod tests {
 
     #[test]
     fn test_parse_n2_sm_setup_response_transfer() {
-        use ogs_ngap::transfer::{AssociatedQosFlowItem, QosFlowPerTnlInformation};
+        use nextgcore_ngap::transfer::{AssociatedQosFlowItem, QosFlowPerTnlInformation};
 
         let response = PduSessionResourceSetupResponseTransfer {
             dl_qos_flow_per_tnl_information: QosFlowPerTnlInformation {
@@ -1259,13 +1259,13 @@ mod tests {
 
     #[test]
     fn test_release_command_carries_release_transfer() {
-        use ogs_asn1c::ngap::pdu::{InitiatingMessageValue, NgapPdu};
-        use ogs_asn1c::per::{AperDecode, AperDecoder};
+        use nextgcore_asn1c::ngap::pdu::{InitiatingMessageValue, NgapPdu};
+        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
 
         let bytes = build_pdu_session_resource_release_command_asn1(42, 1001, &[5]).expect("build");
 
-        // ogs-asn1c maps InitiatingMessage procedure code 28 to the generic
-        // `Other` container and the ogs-ngap dispatch does not cover it (lib
+        // nextgcore-asn1c maps InitiatingMessage procedure code 28 to the generic
+        // `Other` container and the nextgcore-ngap dispatch does not cover it (lib
         // gap, reported); re-tag the value so the typed release-command parse
         // path is exercised via decode_ngap_pdu_raw.
         let mut decoder = AperDecoder::new(&bytes);
@@ -1469,11 +1469,11 @@ mod tests {
 
     #[test]
     fn test_initial_context_setup_response_failure_roundtrip() {
-        // Build a Response/Failure with the ogs-ngap builder, then ensure the
+        // Build a Response/Failure with the nextgcore-ngap builder, then ensure the
         // AMF-side parse helpers recover the UE NGAP IDs (used to gate the
         // registration on the ICS Response).
         let resp = builder::build_initial_context_setup_response(
-            &ogs_ngap::types::InitialContextSetupResponse {
+            &nextgcore_ngap::types::InitialContextSetupResponse {
                 amf_ue_ngap_id: 7,
                 ran_ue_ngap_id: 9,
             },
@@ -1485,7 +1485,7 @@ mod tests {
         );
 
         let fail = builder::build_initial_context_setup_failure(
-            &ogs_ngap::types::InitialContextSetupFailure {
+            &nextgcore_ngap::types::InitialContextSetupFailure {
                 amf_ue_ngap_id: 11,
                 ran_ue_ngap_id: 13,
                 cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),

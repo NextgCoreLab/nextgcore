@@ -1,0 +1,173 @@
+//! NextGCore SBI (Service Based Interface) Library
+//!
+//! This crate provides HTTP/2 SBI operations for 5G core network functions.
+//! It implements the 3GPP Service Based Interface using hyper and h2 crates.
+//!
+//! # Features
+//!
+//! - HTTP/2 client and server using hyper
+//! - OpenAPI message serialization using serde_json
+//! - Service types and constants matching 3GPP specifications
+//! - NF instance and service discovery context management
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use nextgcore_sbi::{SbiClient, SbiClientConfig, SbiRequest, SbiResponse};
+//!
+//! async fn example() {
+//!     // Create a client
+//!     let client = SbiClient::with_host_port("localhost", 7777);
+//!     
+//!     // Send a GET request
+//!     let response = client.get("/nnrf-nfm/v1/nf-instances").await;
+//! }
+//! ```
+//!
+//! # Modules
+//!
+//! - [`types`] - Service types, NF types, and enumerations
+//! - [`constants`] - HTTP status codes, methods, headers, and other constants
+//! - [`message`] - SBI message structures (request, response, headers)
+//! - [`multipart`] - multipart/related N1/N2 binary containers (TS 29.500 §6.1.2.3)
+//! - [`client`] - HTTP/2 client implementation
+//! - [`server`] - HTTP/2 server implementation
+//! - [`context`] - NF instance and service discovery context
+//! - [`tls`] - TLS/mTLS configuration and certificate loading
+//! - [`oauth`] - OAuth2 client credentials flow for 5G SBA
+//! - [`overload`] - OCI/LCI overload & load control parse/emit + reaction
+//! - [`error`] - Error types
+
+pub mod constants;
+pub mod context;
+pub mod error;
+#[cfg(feature = "6g-extensions")]
+pub mod grpc; // SBI 2.0 gRPC support (B6.1)
+pub mod heartbeat;
+pub mod message;
+pub mod multipart;
+pub mod oauth;
+pub mod overload;
+#[cfg(feature = "6g-extensions")]
+pub mod pubsub;
+pub mod scp;
+pub mod security;
+pub mod tls;
+pub mod types; // Event-driven pub-sub (B6.1)
+
+pub mod client;
+pub mod server;
+
+// Re-export commonly used types
+pub use client::{
+    register_tls_exporter_hook, RetryPolicy, SbiClient, SbiClientConfig, TlsExporterHook,
+};
+pub use context::{global_context, NfInstance, NfService, NfStatus, NfSubscription, SbiContext};
+pub use error::{SbiError, SbiResult};
+#[cfg(feature = "6g-extensions")]
+pub use grpc::{
+    GrpcConfig, GrpcMetadata, GrpcMethod, GrpcServiceRegistry, GrpcServiceType, GrpcStatus,
+};
+pub use heartbeat::{
+    global_heartbeat_manager, init_heartbeat_manager, spawn_heartbeat_worker, HeartbeatConfig,
+    HeartbeatManager, HeartbeatRecord, HeartbeatStats, HeartbeatStatus,
+};
+pub use message::{
+    Guami, InvalidParam, PlmnId, ProblemDetails, SNssai, SbiDiscoveryOption, SbiHeader,
+    SbiHttpMessage, SbiMessageParams, SbiPart, SbiRequest, SbiResponse, Tai, UriComponents,
+};
+pub use multipart::MultipartBody;
+pub use oauth::{
+    authorize_bearer, authorize_bearer_aud, check_audience, AccessTokenClaims, AccessTokenError,
+    AccessTokenRequest, AccessTokenResponse, JwksCache, OAuth2Client, TokenCache,
+};
+pub use overload::{Lci, Oci, OverloadControl};
+#[cfg(feature = "6g-extensions")]
+pub use pubsub::{
+    EventBroker, EventFilter, EventReplayBuffer, SbiEvent, SbiEventCategory, Subscription,
+    SubscriptionId,
+};
+pub use scp::{
+    global_scp_router, init_scp_router, ScpBinding, ScpRouter, ScpRoutingInfo, ScpRoutingMode,
+};
+pub use security::{
+    authorize_sbi_request, extract_bearer_token, NrfSecurityConfig, PqcKeyExchange, PqcSignature,
+    PqcTlsConfig, SbiSecurityPolicy, TlsPaths, TlsVersion,
+};
+pub use server::{
+    send_bad_request, send_error, send_forbidden, send_gateway_timeout, send_internal_error,
+    send_method_not_allowed, send_not_found, send_service_unavailable, send_unauthorized,
+    SbiRequestHandler, SbiServer, SbiServerConfig, StreamId, DEFAULT_MAX_CONCURRENT_STREAMS,
+    DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE, DEFAULT_MAX_REQUEST_BODY_SIZE,
+};
+pub use tls::{
+    export_keying_material, export_n32_master_key, export_n32f_session_key, N32F_EXPORTER_KEY_LEN,
+    N32F_EXPORTER_LABEL, N32_MASTER_EXPORTER_LABEL, N32_MASTER_KEY_LEN,
+};
+pub use types::{NfType, SbiAppError, SbiServiceType, UriScheme};
+
+/// Initialize the SBI library
+pub fn init() {
+    // Initialize global context
+    let _ = global_context();
+}
+
+/// Finalize the SBI library
+pub fn finalize() {
+    // Cleanup if needed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_init() {
+        init();
+        let _ctx = global_context();
+        // Context is initialized
+    }
+
+    #[test]
+    fn test_service_type_roundtrip() {
+        let service_type = SbiServiceType::NnrfNfm;
+        let name = service_type.to_name();
+        let parsed = SbiServiceType::from_name(name);
+        assert_eq!(parsed, Some(service_type));
+    }
+
+    #[test]
+    fn test_request_builder() {
+        let request = SbiRequest::get("/test")
+            .with_param("key", "value")
+            .with_header("Accept", "application/json");
+
+        assert_eq!(request.header.method, "GET");
+        assert_eq!(request.header.uri, "/test");
+        assert_eq!(request.http.get_param("key"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_response_builder() {
+        let response = SbiResponse::ok().with_body(r#"{"status":"ok"}"#, "application/json");
+
+        assert!(response.is_success());
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn test_problem_details_serialization() {
+        let problem = ProblemDetails::with_status(404)
+            .with_title("Not Found")
+            .with_detail("The requested resource was not found")
+            .with_cause("RESOURCE_NOT_FOUND");
+
+        let json = serde_json::to_string(&problem).unwrap();
+        assert!(json.contains("404"));
+        assert!(json.contains("Not Found"));
+        assert!(json.contains("RESOURCE_NOT_FOUND"));
+
+        let parsed: ProblemDetails = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.status, Some(404));
+    }
+}

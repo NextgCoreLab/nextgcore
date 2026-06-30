@@ -7,10 +7,10 @@ use crate::nnrf_build::{
     ChangeItem, NotificationEventType,
 };
 use crate::nnrf_handler::{nf_manager, NfProfile, SubscriptionData};
-use ogs_sbi::client::{SbiClient, SbiClientConfig};
-use ogs_sbi::message::SbiRequest;
-use ogs_sbi::oauth::OAuth2Client;
-use ogs_sbi::types::{NfType, UriScheme};
+use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::message::SbiRequest;
+use nextgcore_sbi::oauth::OAuth2Client;
+use nextgcore_sbi::types::{NfType, UriScheme};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -270,7 +270,7 @@ async fn dispatch_notify_request_async(
 /// Send NF status notify to a single subscriber (async version)
 ///
 /// Builds and sends an NF status notification to the subscriber's callback URI
-/// using the ogs-sbi HTTP/2 client.
+/// using the nextgcore-sbi HTTP/2 client.
 pub async fn nrf_nnrf_nfm_send_nf_status_notify_async(
     subscription_data: &SubscriptionData,
     event: NotificationEventType,

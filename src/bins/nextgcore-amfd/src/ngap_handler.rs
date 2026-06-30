@@ -7,7 +7,7 @@ use crate::context::{
     Tai5gs, UavAuthorizationContext,
 };
 use crate::sbi_path;
-use ogs_ngap::types::{NgReset, ResetType, UeAssociatedLogicalNgConnectionItem};
+use nextgcore_ngap::types::{NgReset, ResetType, UeAssociatedLogicalNgConnectionItem};
 
 // ============================================================================
 // Constants
@@ -538,7 +538,7 @@ pub fn perform_an_release(ran_ue: &mut RanUe, cause: &NgapCause) -> Option<Vec<u
         ran_ue.ue_ctx_rel_action
     );
 
-    // Build UE Context Release Command (APER via ogs-ngap)
+    // Build UE Context Release Command (APER via nextgcore-ngap)
     let release_cmd = crate::ngap_asn1::build_ue_context_release_command_asn1(
         ran_ue.amf_ue_ngap_id,
         ran_ue.ran_ue_ngap_id as u32,
@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     fn test_handle_ng_reset_full_interface_releases_all_gnb_ues() {
-        use ogs_asn1c::ngap::cause::{Cause, CauseMisc};
+        use nextgcore_asn1c::ngap::cause::{Cause, CauseMisc};
 
         let gnb_pool_id = 987_001u64;
         let ctx = crate::context::amf_self();
@@ -1332,7 +1332,7 @@ mod tests {
 
     #[test]
     fn test_handle_ng_reset_partial_releases_listed_ues_only() {
-        use ogs_asn1c::ngap::cause::{Cause, CauseRadioNetwork};
+        use nextgcore_asn1c::ngap::cause::{Cause, CauseRadioNetwork};
 
         let gnb_pool_id = 987_002u64;
         let ctx = crate::context::amf_self();

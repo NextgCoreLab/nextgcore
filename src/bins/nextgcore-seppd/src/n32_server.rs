@@ -14,13 +14,13 @@
 //! mTLS: the listener supports TLS with client-certificate verification
 //! (`verify_client_cacert`) and the client presents a certificate when
 //! `client_cert`/`client_key` are configured — both via the existing
-//! rustls plumbing in ogs-sbi.
+//! rustls plumbing in nextgcore-sbi.
 
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use ogs_sbi::message::{SbiRequest as HttpRequest, SbiResponse as HttpResponse};
-use ogs_sbi::server::{send_error, SbiServer, SbiServerConfig};
+use nextgcore_sbi::message::{SbiRequest as HttpRequest, SbiResponse as HttpResponse};
+use nextgcore_sbi::server::{send_error, SbiServer, SbiServerConfig};
 
 use crate::context::{sepp_self, PlmnId, SecurityCapability, SeppNode};
 use crate::n32c_build::{
@@ -689,9 +689,9 @@ fn parse_api_root(api_root: &str) -> Result<(bool, String, u16), String> {
 fn n32_client(
     api_root: &str,
     tls: Option<&N32TlsConfig>,
-) -> Result<ogs_sbi::client::SbiClient, String> {
+) -> Result<nextgcore_sbi::client::SbiClient, String> {
     let (https, host, port) = parse_api_root(api_root)?;
-    let mut config = ogs_sbi::client::SbiClientConfig::new(&host, port)
+    let mut config = nextgcore_sbi::client::SbiClientConfig::new(&host, port)
         .with_connect_timeout(N32_CONNECT_TIMEOUT)
         .with_request_timeout(N32_REQUEST_TIMEOUT);
     if https {
@@ -703,11 +703,11 @@ fn n32_client(
             config.ca_cert = tls_cfg.ca_cert.clone();
         }
     }
-    Ok(ogs_sbi::client::SbiClient::new(config))
+    Ok(nextgcore_sbi::client::SbiClient::new(config))
 }
 
 async fn post_json(
-    client: &ogs_sbi::client::SbiClient,
+    client: &nextgcore_sbi::client::SbiClient,
     path: &str,
     body: String,
 ) -> Result<(u16, String), String> {
@@ -954,7 +954,7 @@ async fn sbi_consumer_handler(request: HttpRequest) -> HttpResponse {
     let method = request.header.method.clone();
     let uri = request.header.uri.clone();
 
-    // Liveness/local endpoints are handled by ogs-sbi; everything else with a
+    // Liveness/local endpoints are handled by nextgcore-sbi; everything else with a
     // target-apiroot is a forwarding request.
     let target_apiroot = request
         .http
@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn test_mtls_listener_config_mapping() {
-        // Verify the TLS/mTLS knobs map through to the ogs-sbi config
+        // Verify the TLS/mTLS knobs map through to the nextgcore-sbi config
         let tls = N32TlsConfig {
             cert: Some("/tls/server.crt".into()),
             key: Some("/tls/server.key".into()),
@@ -1065,7 +1065,7 @@ mod tests {
         config.verify_client = true;
         config.verify_client_cacert = tls.verify_client_cacert.clone();
 
-        assert_eq!(config.scheme, ogs_sbi::types::UriScheme::Https);
+        assert_eq!(config.scheme, nextgcore_sbi::types::UriScheme::Https);
         assert!(config.verify_client);
         assert_eq!(config.verify_client_cacert.as_deref(), Some("/tls/ca.crt"));
     }

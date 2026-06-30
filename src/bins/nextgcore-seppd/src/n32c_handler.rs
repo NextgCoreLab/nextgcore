@@ -459,7 +459,7 @@ pub const SUPPORTED_JWS_SUITES: &[&str] = &["ES256"];
 // N32-c TLS exporter secret store (TS 33.501 §13.2.4.4 / RFC 5705)
 //
 // The N32-f session key is derived from the N32-c TLS connection's exported
-// keying material. ogs-sbi exposes `export_keying_material` on a live rustls
+// keying material. nextgcore-sbi exposes `export_keying_material` on a live rustls
 // `ConnectionCommon` (added by L1), but the SbiServer/SbiClient handler
 // abstractions do not currently surface that connection to this crate. Until
 // they do, the TLS layer deposits the exported secret here keyed by peer
@@ -482,7 +482,7 @@ fn exporter_secret_store() -> &'static std::sync::RwLock<std::collections::HashM
 }
 
 /// Deposit the RFC 5705 exporter secret derived from the N32-c TLS
-/// connection with `peer_fqdn`. Called by the TLS layer once ogs-sbi
+/// connection with `peer_fqdn`. Called by the TLS layer once nextgcore-sbi
 /// surfaces the connection; see [`export_n32f_exporter_secret`].
 pub fn set_n32c_tls_exporter_secret(peer_fqdn: &str, secret: Vec<u8>) {
     if let Ok(mut store) = exporter_secret_store().write() {

@@ -15,13 +15,13 @@ use nextgcore_nrfd::{
     ChangeItem, DiscoveryQuery, NfProfile, NotificationEventType, NrfSmContext, PatchError,
     SbiServerConfig,
 };
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::oauth::{AccessTokenResponse, OAuth2Client};
-use ogs_sbi::server::{
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::{AccessTokenResponse, OAuth2Client};
+use nextgcore_sbi::server::{
     send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
+    SbiServerConfig as NextgcoreSbiServerConfig,
 };
-use ogs_sbi::types::NfType;
+use nextgcore_sbi::types::NfType;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -380,8 +380,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -515,13 +515,13 @@ async fn main() -> Result<()> {
     // Open legacy SBI server (for context initialization)
     let _server = nrf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Start actual HTTP/2 SBI server using ogs-sbi
+    // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let mut sbi_server_config = OgsSbiServerConfig::new(sbi_addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
 
-    // Wire TLS/mTLS configuration from CLI args into the ogs-sbi server
+    // Wire TLS/mTLS configuration from CLI args into the nextgcore-sbi server
     if args.tls {
         let cert = args
             .tls_cert
@@ -612,7 +612,7 @@ fn enforce_oauth2_on_request(
     if !require || !oauth2_protected_path(path) {
         return None;
     }
-    match ogs_sbi::oauth::authorize_bearer(auth_header, jwks) {
+    match nextgcore_sbi::oauth::authorize_bearer(auth_header, jwks) {
         Ok(_) => None,
         Err(e) => Some(send_error(
             401,
@@ -1702,10 +1702,10 @@ fn authorize_access_token(
 /// FLAGGED — transport plumbing not surfaced to nrfd: the CCA's ES256 SIGNATURE
 /// cannot be cryptographically verified here because the NRF does not hold the
 /// requesting NF's public key/cert in this crate, and the mutual-TLS client
-/// certificate subject is not surfaced on `SbiRequest` by the shared `ogs-sbi`
+/// certificate subject is not surfaced on `SbiRequest` by the shared `nextgcore-sbi`
 /// transport. Full binding requires (a) a `SbiRequest::client_identity()`
 /// accessor exposing the TLS client-cert subject and (b) NF public-key
-/// distribution — both additive `ogs-sbi` work outside this crate. This
+/// distribution — both additive `nextgcore-sbi` work outside this crate. This
 /// function performs the in-process claim-binding portion only.
 fn verify_cca_binding(
     cca_jwt: &str,
@@ -2473,13 +2473,13 @@ mod tests {
         let addr = probe.local_addr().expect("probe addr");
         drop(probe);
 
-        let server = SbiServer::new(OgsSbiServerConfig::new(addr));
+        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
         server
             .start(nrf_sbi_request_handler)
             .await
             .expect("SBI server starts");
 
-        let client = ogs_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
         let nf_id = "5e9b1c0a-1111-4f6a-8888-0123456789ab";
 
         let lifecycle = async {
@@ -2766,7 +2766,7 @@ mod tests {
     /// guards that the default server config has require_oauth2 off.
     #[test]
     fn test_nrf_server_never_blanket_requires_oauth2() {
-        let cfg = OgsSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 7777)));
+        let cfg = NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 7777)));
         assert!(
             !cfg.require_oauth2,
             "the NRF server must not gate its own token/jwks endpoints"

@@ -12,10 +12,10 @@ use nextgcore_ausfd::{
     ausf_context_final, ausf_context_init, ausf_sbi_close, ausf_sbi_open, ausf_self, timer_manager,
     AusfEvent, AusfSmContext, SbiServerConfig,
 };
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
+    SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -121,8 +121,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
                                 if let Some(nrf_list) = client.nrf {
                                     if let Some(nrf) = nrf_list.first() {
                                         log::info!("NRF URI configured: {}", nrf.uri);
-                                        ogs_sbi::context::global_context()
+                                        nextgcore_sbi::context::global_context()
                                             .set_nrf_uri(&nrf.uri)
                                             .await;
                                     }
@@ -205,11 +205,11 @@ async fn main() -> Result<()> {
     // Open legacy SBI server (for context initialization)
     ausf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Start actual HTTP/2 SBI server using ogs-sbi
+    // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+    let sbi_server = SbiServer::new(NextgcoreSbiServerConfig::new(sbi_addr));
 
     sbi_server
         .start(ausf_sbi_request_handler)
@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
     // Register with NRF (B23.4)
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
         }
         Ok(_) => {}
         Err(e) => {
@@ -511,7 +511,7 @@ async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
             ausf_ue.kausf = session.kausf;
 
             let challenge = session.generate_challenge();
-            let eap_payload_b64 = ogs_crypt::base64::encode(&challenge.encode());
+            let eap_payload_b64 = nextgcore_crypt::base64::encode(&challenge.encode());
             ausf_ue.eap_session = Some(session);
 
             if let Ok(context) = ctx.read() {
@@ -585,7 +585,7 @@ fn extract_consumer_plmns(authorization: &str) -> Vec<(String, String)> {
     while std_b64.len() % 4 != 0 {
         std_b64.push('=');
     }
-    let bytes = match ogs_crypt::base64::decode(&std_b64) {
+    let bytes = match nextgcore_crypt::base64::decode(&std_b64) {
         Some(b) => b,
         None => return Vec::new(),
     };
@@ -832,7 +832,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
     };
 
     // Decode EAP payload (base64)
-    let eap_bytes = match ogs_crypt::base64::decode(eap_payload) {
+    let eap_bytes = match nextgcore_crypt::base64::decode(eap_payload) {
         Some(bytes) => bytes,
         None => {
             return send_bad_request("Invalid EAP payload encoding", Some("INVALID_EAP"));
@@ -899,7 +899,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                         return SbiResponse::with_status(200)
                             .with_json_body(&serde_json::json!({
                                 "authResult": "AUTHENTICATION_FAILURE",
-                                "eapPayload": ogs_crypt::base64::encode(&eap_failure)
+                                "eapPayload": nextgcore_crypt::base64::encode(&eap_failure)
                             }))
                             .unwrap_or_else(|_| SbiResponse::with_status(200));
                     }
@@ -913,7 +913,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                         session.identifier = session.identifier.wrapping_add(1);
                         let challenge = session.generate_challenge();
                         let eap_payload_b64 =
-                            ogs_crypt::base64::encode(&challenge.encode());
+                            nextgcore_crypt::base64::encode(&challenge.encode());
                         ausf_ue.eap_session = Some(session);
                         if let Ok(context) = ctx.read() {
                             context.ue_update(&ausf_ue);
@@ -992,7 +992,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                 }
                 eap_body.insert(
                     "eapPayload".to_string(),
-                    serde_json::json!(ogs_crypt::base64::encode(&eap_success)),
+                    serde_json::json!(nextgcore_crypt::base64::encode(&eap_success)),
                 );
                 SbiResponse::with_status(200)
                     .with_json_body(&serde_json::Value::Object(eap_body))
@@ -1002,7 +1002,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                 SbiResponse::with_status(200)
                     .with_json_body(&serde_json::json!({
                         "authResult": "AUTHENTICATION_FAILURE",
-                        "eapPayload": ogs_crypt::base64::encode(&eap_failure)
+                        "eapPayload": nextgcore_crypt::base64::encode(&eap_failure)
                     }))
                     .unwrap_or_else(|_| SbiResponse::with_status(200))
             }
@@ -1018,7 +1018,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "authResult": "AUTHENTICATION_FAILURE",
-                    "eapPayload": ogs_crypt::base64::encode(&eap_failure)
+                    "eapPayload": nextgcore_crypt::base64::encode(&eap_failure)
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
@@ -1068,7 +1068,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                     ausf_ue.autn = autn;
                     ausf_ue.kausf = session.kausf;
                     let challenge = session.generate_challenge();
-                    let eap_payload_b64 = ogs_crypt::base64::encode(&challenge.encode());
+                    let eap_payload_b64 = nextgcore_crypt::base64::encode(&challenge.encode());
                     ausf_ue.eap_session = Some(session);
 
                     if let Ok(context) = ctx.read() {
@@ -1206,7 +1206,7 @@ fn build_generate_auth_data_body(
 /// to the static `"ausf-instance-id"` only when no self instance has been
 /// registered yet (e.g. NRF registration disabled).
 async fn resolve_ausf_instance_id() -> String {
-    ogs_sbi::context::global_context()
+    nextgcore_sbi::context::global_context()
         .get_self_instance()
         .await
         .map(|i| i.id)
@@ -1241,17 +1241,17 @@ async fn send_udm_generate_auth_data(
     serving_network_name: &str,
     resync_info: Option<&nextgcore_ausfd::ResynchronizationInfo>,
 ) -> Result<UdmAuthData, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     // Find UDM instance via cached discovery results or env var fallback
     let (host_owned, port);
     let udm_instances = sbi_ctx
-        .find_nf_instances_by_service(ogs_sbi::types::SbiServiceType::NudmUeau)
+        .find_nf_instances_by_service(nextgcore_sbi::types::SbiServiceType::NudmUeau)
         .await;
 
     if let Some(udm_instance) = udm_instances.first() {
         let udm_service = udm_instance
-            .find_service(ogs_sbi::types::SbiServiceType::NudmUeau)
+            .find_service(nextgcore_sbi::types::SbiServiceType::NudmUeau)
             .ok_or("UDM instance has no nudm-ueau service")?;
         host_owned = udm_service
             .fqdn
@@ -1398,10 +1398,10 @@ async fn send_udm_auth_result(
     serving_network_name: &str,
     auth_type: &str,
 ) -> Result<(), String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let udm_instances = sbi_ctx
-        .find_nf_instances_by_service(ogs_sbi::types::SbiServiceType::NudmUeau)
+        .find_nf_instances_by_service(nextgcore_sbi::types::SbiServiceType::NudmUeau)
         .await;
 
     let udm_instance = match udm_instances.first() {
@@ -1413,7 +1413,7 @@ async fn send_udm_auth_result(
     };
 
     let udm_service = udm_instance
-        .find_service(ogs_sbi::types::SbiServiceType::NudmUeau)
+        .find_service(nextgcore_sbi::types::SbiServiceType::NudmUeau)
         .ok_or("UDM instance has no nudm-ueau service")?;
 
     let host = udm_service
@@ -1428,7 +1428,7 @@ async fn send_udm_auth_result(
     let client = sbi_ctx.get_client(host, port).await;
 
     let body = serde_json::json!({
-        "nfInstanceId": ogs_sbi::context::global_context()
+        "nfInstanceId": nextgcore_sbi::context::global_context()
             .get_self_instance()
             .await
             .map(|i| i.id)
@@ -1462,7 +1462,7 @@ async fn send_udm_auth_result(
 /// Returns the NF instance ID that was registered, so callers can start a
 /// heartbeat worker for the same instance.
 async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -1517,11 +1517,11 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
             // Store self instance
             let mut self_instance =
-                ogs_sbi::context::NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Ausf);
+                nextgcore_sbi::context::NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Ausf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = ogs_sbi::context::NfService::new(
+            let mut svc = nextgcore_sbi::context::NfService::new(
                 "nausf-auth",
-                ogs_sbi::types::SbiServiceType::NausfAuth,
+                nextgcore_sbi::types::SbiServiceType::NausfAuth,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
@@ -1548,7 +1548,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
 /// Discover NF services from NRF
 async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Result<(), String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -1593,12 +1593,12 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                 .unwrap_or("UDM");
 
             let nf_type = match nf_type_str {
-                "UDM" => ogs_sbi::types::NfType::Udm,
-                "NRF" => ogs_sbi::types::NfType::Nrf,
+                "UDM" => nextgcore_sbi::types::NfType::Udm,
+                "NRF" => nextgcore_sbi::types::NfType::Nrf,
                 _ => continue,
             };
 
-            let mut instance = ogs_sbi::context::NfInstance::new(nf_id, nf_type);
+            let mut instance = nextgcore_sbi::context::NfInstance::new(nf_id, nf_type);
 
             if let Some(fqdn) = nf_json.get("fqdn").and_then(|v| v.as_str()) {
                 instance.fqdn = Some(fqdn.to_string());
@@ -1617,8 +1617,8 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                         .get("serviceName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if let Some(svc_type) = ogs_sbi::types::SbiServiceType::from_name(svc_name) {
-                        let mut svc = ogs_sbi::context::NfService::new(svc_name, svc_type);
+                    if let Some(svc_type) = nextgcore_sbi::types::SbiServiceType::from_name(svc_name) {
+                        let mut svc = nextgcore_sbi::context::NfService::new(svc_name, svc_type);
                         if let Some(endpoints) =
                             svc_json.get("ipEndPoints").and_then(|v| v.as_array())
                         {
@@ -1757,7 +1757,7 @@ mod tests {
     /// Initiate a 5G-AKA authentication session and return the confirmation href
     /// and the RAND bytes needed to compute a valid RES*.
     async fn initiate_5g_aka(
-        client: &ogs_sbi::client::SbiClient,
+        client: &nextgcore_sbi::client::SbiClient,
         identity: &str,
         snn: &str,
     ) -> (String, [u8; 16]) {
@@ -1891,17 +1891,17 @@ mod tests {
         let amf = [0x80u8, 0x00]; // separation bit set
         let sqn = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x21];
         let mut rand = [0u8; 16];
-        ogs_core::rand::ogs_random(&mut rand);
+        nextgcore_core::rand::nextgcore_random(&mut rand);
 
         let (autn, ik, ck, _ak, res) =
-            ogs_crypt::milenage::milenage_generate(&TEST_OPC, &amf, &TEST_K, &sqn, &rand)
+            nextgcore_crypt::milenage::milenage_generate(&TEST_OPC, &amf, &TEST_K, &sqn, &rand)
                 .expect("milenage");
 
         if supi == SUPI_EAP {
             let mut sqn_xor_ak = [0u8; 6];
             sqn_xor_ak.copy_from_slice(&autn[..6]);
             let (ck_prime, ik_prime) =
-                ogs_crypt::kdf::ogs_kdf_ck_ik_prime(&ck, &ik, &snn, &sqn_xor_ak);
+                nextgcore_crypt::kdf::nextgcore_kdf_ck_ik_prime(&ck, &ik, &snn, &sqn_xor_ak);
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "authType": "EAP_AKA_PRIME",
@@ -1917,8 +1917,8 @@ mod tests {
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(500))
         } else {
-            let kausf = ogs_crypt::kdf::ogs_kdf_kausf(&ck, &ik, &snn, &autn);
-            let xres_star = ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, &snn, &rand, &res);
+            let kausf = nextgcore_crypt::kdf::nextgcore_kdf_kausf(&ck, &ik, &snn, &autn);
+            let xres_star = nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, &snn, &rand, &res);
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "authType": "5G_AKA",
@@ -1956,7 +1956,7 @@ mod tests {
 
             // --- mock UDM on an ephemeral port ---
             let udm_port = free_port();
-            let udm_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
                 [127, 0, 0, 1],
                 udm_port,
             ))));
@@ -1966,7 +1966,7 @@ mod tests {
 
             // --- real AUSF handler on an ephemeral port ---
             let ausf_port = free_port();
-            let ausf_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
                 [127, 0, 0, 1],
                 ausf_port,
             ))));
@@ -1975,7 +1975,7 @@ mod tests {
                 .await
                 .expect("ausf start");
 
-            let client = ogs_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
+            let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
 
             // ---- strict-peer rejections ----
             // Missing servingNetworkName -> 400
@@ -2040,8 +2040,8 @@ mod tests {
             let mut rand = [0u8; 16];
             rand.copy_from_slice(&rand_bytes);
             let (res, ck, ik, _ak, _akstar) =
-                ogs_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
-            let res_star = ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+                nextgcore_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
+            let res_star = nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
 
             // Wrong RES* first -> AUTHENTICATION_FAILURE
             let resp = client
@@ -2119,7 +2119,7 @@ mod tests {
                 compute_mac, derive_keys_aka_prime, zero_at_mac, AkaPrimeAttribute,
                 AkaPrimeSubtype, EapCode, EapPacket, EapType,
             };
-            let challenge_bytes = ogs_crypt::base64::decode(eap_b64).expect("b64");
+            let challenge_bytes = nextgcore_crypt::base64::decode(eap_b64).expect("b64");
             let challenge = EapPacket::decode(&challenge_bytes).expect("decode");
             assert_eq!(challenge.code, EapCode::Request);
             assert_eq!(challenge.subtype, Some(AkaPrimeSubtype::Challenge));
@@ -2133,11 +2133,11 @@ mod tests {
             // UE side: run Milenage + the RFC 5448 key schedule
             // (RES itself is unused in the failure-path exchange below)
             let (_res, ck, ik, _ak, _akstar) =
-                ogs_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
+                nextgcore_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
             let mut sqn_xor_ak = [0u8; 6];
             sqn_xor_ak.copy_from_slice(&autn[..6]);
             let (ck_prime, ik_prime) =
-                ogs_crypt::kdf::ogs_kdf_ck_ik_prime(&ck, &ik, TEST_SNN, &sqn_xor_ak);
+                nextgcore_crypt::kdf::nextgcore_kdf_ck_ik_prime(&ck, &ik, TEST_SNN, &sqn_xor_ak);
             let ue_keys = derive_keys_aka_prime(&ck_prime, &ik_prime, SUPI_EAP);
 
             // UE side: verify the network's AT_MAC over the challenge
@@ -2182,7 +2182,7 @@ mod tests {
                 .post_json(
                     &eap_href,
                     &serde_json::json!({
-                        "eapPayload": ogs_crypt::base64::encode(&bad_response)
+                        "eapPayload": nextgcore_crypt::base64::encode(&bad_response)
                     }),
                 )
                 .await
@@ -2196,7 +2196,7 @@ mod tests {
             );
             // EAP-Failure packet returned
             let fail_payload = sess.get("eapPayload").and_then(|v| v.as_str()).unwrap();
-            assert_eq!(ogs_crypt::base64::decode(fail_payload).unwrap()[0], 4);
+            assert_eq!(nextgcore_crypt::base64::decode(fail_payload).unwrap()[0], 4);
 
             // Re-arm: a failed EAP exchange ends the session; start a new one
             let resp = client
@@ -2218,7 +2218,7 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap()
                 .to_string();
-            let challenge_bytes = ogs_crypt::base64::decode(eap_b64).unwrap();
+            let challenge_bytes = nextgcore_crypt::base64::decode(eap_b64).unwrap();
             let challenge = EapPacket::decode(&challenge_bytes).unwrap();
             let at_rand = challenge.find_attribute(AkaPrimeAttribute::AtRand).unwrap();
             let at_autn = challenge.find_attribute(AkaPrimeAttribute::AtAutn).unwrap();
@@ -2227,11 +2227,11 @@ mod tests {
             let mut autn = [0u8; 16];
             autn.copy_from_slice(&at_autn[2..18]);
             let (res, ck, ik, _ak, _akstar) =
-                ogs_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
+                nextgcore_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
             let mut sqn_xor_ak = [0u8; 6];
             sqn_xor_ak.copy_from_slice(&autn[..6]);
             let (ck_prime, ik_prime) =
-                ogs_crypt::kdf::ogs_kdf_ck_ik_prime(&ck, &ik, TEST_SNN, &sqn_xor_ak);
+                nextgcore_crypt::kdf::nextgcore_kdf_ck_ik_prime(&ck, &ik, TEST_SNN, &sqn_xor_ak);
             let ue_keys = derive_keys_aka_prime(&ck_prime, &ik_prime, SUPI_EAP);
             let build_eap_response2 = |res: &[u8], identifier: u8| -> Vec<u8> {
                 let mut response = EapPacket {
@@ -2261,7 +2261,7 @@ mod tests {
                 .post_json(
                     &eap_href,
                     &serde_json::json!({
-                        "eapPayload": ogs_crypt::base64::encode(&good_response)
+                        "eapPayload": nextgcore_crypt::base64::encode(&good_response)
                     }),
                 )
                 .await
@@ -2280,12 +2280,12 @@ mod tests {
             );
             // EAP-Success packet returned
             let ok_payload = sess.get("eapPayload").and_then(|v| v.as_str()).unwrap();
-            assert_eq!(ogs_crypt::base64::decode(ok_payload).unwrap()[0], 3);
+            assert_eq!(nextgcore_crypt::base64::decode(ok_payload).unwrap()[0], 3);
 
             // UE side derives the same KSEAF: KAUSF = MSB256(EMSK)
             let mut ue_kausf = [0u8; 32];
             ue_kausf.copy_from_slice(&ue_keys.emsk[..32]);
-            let ue_kseaf = ogs_crypt::kdf::ogs_kdf_kseaf(TEST_SNN, &ue_kausf);
+            let ue_kseaf = nextgcore_crypt::kdf::nextgcore_kdf_kseaf(TEST_SNN, &ue_kausf);
             assert_eq!(
                 sess.get("kSeaf").and_then(|v| v.as_str()),
                 Some(nextgcore_ausfd::nudm_handler::bytes_to_hex(&ue_kseaf).as_str()),
@@ -2316,7 +2316,7 @@ mod tests {
 
             // Mock UDM
             let udm_port = free_port();
-            let udm_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
                 [127, 0, 0, 1],
                 udm_port,
             ))));
@@ -2326,7 +2326,7 @@ mod tests {
 
             // Real AUSF handler
             let ausf_port = free_port();
-            let ausf_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
                 [127, 0, 0, 1],
                 ausf_port,
             ))));
@@ -2335,7 +2335,7 @@ mod tests {
                 .await
                 .expect("ausf start");
 
-            let client = ogs_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
+            let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
 
             // Identities distinct from the other integration test
             const SUCI_AKA: &str = "suci-0-001-01-0000-0-0-8888888801";
@@ -2368,9 +2368,9 @@ mod tests {
             // ----------------------------------------------------------------
             let (href, rand) = initiate_5g_aka(&client, SUCI_AKA, TEST_SNN).await;
             let (res, ck, ik, _ak, _akstar) =
-                ogs_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
+                nextgcore_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
             let res_star =
-                ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+                nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
             let resp = client
                 .put_json(
                     &href,
@@ -2403,9 +2403,9 @@ mod tests {
             // ----------------------------------------------------------------
             let (href, rand) = initiate_5g_aka(&client, SUPI_AKA, TEST_SNN).await;
             let (res, ck, ik, _ak, _akstar) =
-                ogs_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
+                nextgcore_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
             let res_star =
-                ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+                nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
             let resp = client
                 .put_json(
                     &href,
@@ -2522,7 +2522,7 @@ mod tests {
         // Build a JWT-shaped token whose payload carries a plmnList claim.
         let payload =
             serde_json::json!({"plmnList": [{"mcc": "208", "mnc": "093"}]}).to_string();
-        let payload_b64 = ogs_crypt::base64::encode(payload.as_bytes());
+        let payload_b64 = nextgcore_crypt::base64::encode(payload.as_bytes());
         let token = format!("Bearer hdr.{payload_b64}.sig");
         let plmns = extract_consumer_plmns(&token);
         assert_eq!(plmns, vec![("208".to_string(), "093".to_string())]);
@@ -2586,7 +2586,7 @@ mod tests {
 
             // Mock UDM (so the permissive/matching case can reach 201).
             let udm_port = free_port();
-            let udm_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
                 [127, 0, 0, 1],
                 udm_port,
             ))));
@@ -2596,7 +2596,7 @@ mod tests {
 
             // Real AUSF handler.
             let ausf_port = free_port();
-            let ausf_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
                 [127, 0, 0, 1],
                 ausf_port,
             ))));
@@ -2604,17 +2604,17 @@ mod tests {
                 .start(ausf_sbi_request_handler)
                 .await
                 .expect("ausf start");
-            let client = ogs_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
+            let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
 
             // TEST_SNN PLMN is (mcc=001, mnc=001).
             let bearer = |mcc: &str, mnc: &str| -> String {
                 let payload =
                     serde_json::json!({"plmnList": [{"mcc": mcc, "mnc": mnc}]}).to_string();
-                format!("Bearer h.{}.s", ogs_crypt::base64::encode(payload.as_bytes()))
+                format!("Bearer h.{}.s", nextgcore_crypt::base64::encode(payload.as_bytes()))
             };
 
             // Foreign PLMN in the token -> 403 SERVING_NETWORK_NOT_AUTHORIZED.
-            let req = ogs_sbi::message::SbiRequest::post("/nausf-auth/v1/ue-authentications")
+            let req = nextgcore_sbi::message::SbiRequest::post("/nausf-auth/v1/ue-authentications")
                 .with_header("Authorization", bearer("208", "093"))
                 .with_json_body(&serde_json::json!({
                     "supiOrSuci": SUPI_5G_AKA,
@@ -2631,7 +2631,7 @@ mod tests {
             );
 
             // Matching PLMN in the token -> entitlement passes (201).
-            let req = ogs_sbi::message::SbiRequest::post("/nausf-auth/v1/ue-authentications")
+            let req = nextgcore_sbi::message::SbiRequest::post("/nausf-auth/v1/ue-authentications")
                 .with_header("Authorization", bearer("001", "001"))
                 .with_json_body(&serde_json::json!({
                     "supiOrSuci": SUPI_5G_AKA,

@@ -5,12 +5,12 @@
 
 use crate::context::{
     udm_self, Amf3GppAccessRegistration, AuthEvent, AuthType, Guami, PlmnId, RatType,
-    SmfRegistration, UdmSdmSubscription, OGS_RAND_LEN, OGS_SQN_LEN,
+    SmfRegistration, UdmSdmSubscription, NEXTGCORE_RAND_LEN, NEXTGCORE_SQN_LEN,
 };
 use crate::nudr_handler::UdmSbiState;
 
-use ogs_crypt::kdf;
-use ogs_crypt::milenage::OGS_AUTS_LEN;
+use nextgcore_crypt::kdf;
+use nextgcore_crypt::milenage::NEXTGCORE_AUTS_LEN;
 
 /// HTTP status codes
 pub mod http_status {
@@ -233,7 +233,7 @@ pub fn udm_nudm_ueau_handle_get(
         let rand_bytes = hex_to_bytes(rand_str);
         let auts_bytes = hex_to_bytes(auts_str);
 
-        if rand_bytes.len() != OGS_RAND_LEN {
+        if rand_bytes.len() != NEXTGCORE_RAND_LEN {
             log::error!("[{}] Invalid RAND length", udm_ue.suci);
             return (HandlerResult::bad_request("Invalid RAND"), None);
         }
@@ -244,25 +244,25 @@ pub fn udm_nudm_ueau_handle_get(
             return (HandlerResult::bad_request("Invalid RAND"), None);
         }
 
-        if auts_bytes.len() != OGS_AUTS_LEN {
+        if auts_bytes.len() != NEXTGCORE_AUTS_LEN {
             log::error!("[{}] Invalid AUTS length", udm_ue.suci);
             return (HandlerResult::bad_request("Invalid AUTS"), None);
         }
 
         // Extract concealed SQN_MS from AUTS (first 6 bytes)
-        let mut conc_sqn_ms = [0u8; OGS_SQN_LEN];
-        conc_sqn_ms.copy_from_slice(&auts_bytes[..OGS_SQN_LEN]);
+        let mut conc_sqn_ms = [0u8; NEXTGCORE_SQN_LEN];
+        conc_sqn_ms.copy_from_slice(&auts_bytes[..NEXTGCORE_SQN_LEN]);
 
-        // Use ogs_auc_sqn() to derive SQN_MS and MAC-S from AUTS
+        // Use nextgcore_auc_sqn() to derive SQN_MS and MAC-S from AUTS
         // This verifies the AUTS by recomputing MAC-S with f1* and comparing
-        let rand_arr: &[u8; OGS_RAND_LEN] = match rand_bytes.as_slice().try_into() {
+        let rand_arr: &[u8; NEXTGCORE_RAND_LEN] = match rand_bytes.as_slice().try_into() {
             Ok(arr) => arr,
             Err(_) => {
                 log::error!("[{}] RAND array conversion failed", udm_ue.suci);
                 return (HandlerResult::bad_request("RAND conversion failed"), None);
             }
         };
-        let (sqn_ms, mac_s) = match kdf::ogs_auc_sqn(&udm_ue.opc, &udm_ue.k, rand_arr, &conc_sqn_ms)
+        let (sqn_ms, mac_s) = match kdf::nextgcore_auc_sqn(&udm_ue.opc, &udm_ue.k, rand_arr, &conc_sqn_ms)
         {
             Ok(result) => result,
             Err(e) => {
@@ -272,7 +272,7 @@ pub fn udm_nudm_ueau_handle_get(
         };
 
         // Verify MAC-S matches the MAC-S in AUTS (bytes 6..14)
-        if mac_s != auts_bytes[OGS_SQN_LEN..OGS_AUTS_LEN] {
+        if mac_s != auts_bytes[NEXTGCORE_SQN_LEN..NEXTGCORE_AUTS_LEN] {
             log::error!("[{}] AUTS MAC-S verification failed", udm_ue.suci);
             return (HandlerResult::bad_request("AUTS verification failed"), None);
         }
@@ -280,7 +280,7 @@ pub fn udm_nudm_ueau_handle_get(
         // Set new SQN = SQN_MS + 1 (prevents replay)
         let sqn_ms_val = buffer_to_u64(&sqn_ms);
         let new_sqn = (sqn_ms_val + 1) & 0xFFFFFFFFFFFF;
-        let mut new_sqn_bytes = [0u8; OGS_SQN_LEN];
+        let mut new_sqn_bytes = [0u8; NEXTGCORE_SQN_LEN];
         u64_to_buffer(new_sqn, &mut new_sqn_bytes);
 
         // Update UE with new SQN

@@ -1,0 +1,29 @@
+[package]
+name = "nextgcore-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore Application Framework Library"
+
+[features]
+## Gate 6G research modules (intent engine, cross-NF AI/ML hooks).
+## Enable with: cargo build -p nextgcore-app --features 6g-extensions
+6g-extensions = []
+
+[dependencies]
+nextgcore-core = { workspace = true }
+nextgcore-metrics = { workspace = true }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+log.workspace = true
+env_logger.workspace = true
+ctrlc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

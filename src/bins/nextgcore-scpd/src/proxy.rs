@@ -26,12 +26,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use ogs_sbi::client::{SbiClient, SbiClientConfig};
-use ogs_sbi::constants::{custom_header, discovery_header};
-use ogs_sbi::message::{ProblemDetails, SbiHttpMessage, SbiRequest, SbiResponse};
-use ogs_sbi::oauth::OAuth2Client;
-use ogs_sbi::types::{NfType, UriScheme};
-use ogs_sbi::SbiError;
+use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::constants::{custom_header, discovery_header};
+use nextgcore_sbi::message::{ProblemDetails, SbiHttpMessage, SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::OAuth2Client;
+use nextgcore_sbi::types::{NfType, UriScheme};
+use nextgcore_sbi::SbiError;
 
 use crate::sbi_path::{parse_search_result, select_nf_instance, DiscoveryCache};
 
@@ -56,7 +56,7 @@ const VIA_HEADER: &str = "Via";
 /// TS 29.500 §6.10.8.2).
 const SERVER_HEADER: &str = "Server";
 /// `3gpp-Sbi-Max-Forward-Hops` header (TS 29.500 §5.2.3.2.14 / §6.10.10.2).
-/// Not in `ogs_sbi::custom_header`; defined locally (additive, consumer-side).
+/// Not in `nextgcore_sbi::custom_header`; defined locally (additive, consumer-side).
 const MAX_FORWARD_HOPS_HEADER: &str = "3gpp-Sbi-Max-Forward-Hops";
 /// `WWW-Authenticate` response header (RFC 9110 §11.6.1) carrying the
 /// producer's Bearer challenge (TS 29.500 §6.10.11.2.3).
@@ -1394,8 +1394,8 @@ mod tests {
 
     /// Start a mock producer that echoes the request (method, uri, body and
     /// selected headers) as JSON and returns Binding/Oci headers.
-    async fn start_mock_producer(port: u16) -> ogs_sbi::server::SbiServer {
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+    async fn start_mock_producer(port: u16) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], port)),
         ));
         server
@@ -1431,9 +1431,9 @@ mod tests {
     }
 
     /// Start the SCP itself: an SbiServer fronting a ScpProxy.
-    async fn start_scp(port: u16, config: ScpProxyConfig) -> ogs_sbi::server::SbiServer {
+    async fn start_scp(port: u16, config: ScpProxyConfig) -> nextgcore_sbi::server::SbiServer {
         let proxy = Arc::new(ScpProxy::new(config));
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], port)),
         ));
         server
@@ -1515,8 +1515,8 @@ mod tests {
         port: u16,
         producer_port: u16,
         hits: Arc<AtomicU64>,
-    ) -> ogs_sbi::server::SbiServer {
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+    ) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], port)),
         ));
         server
@@ -1632,7 +1632,7 @@ mod tests {
         // the SCP must relay it verbatim, not replace it.
         let producer_port = ephemeral_port();
         let scp_port = ephemeral_port();
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], producer_port)),
         ));
         server
@@ -1687,7 +1687,7 @@ mod tests {
     async fn test_slow_producer_is_504_within_bounded_timeout() {
         // A producer that never answers within the SCP's request timeout.
         let producer_port = ephemeral_port();
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], producer_port)),
         ));
         server
@@ -1722,7 +1722,7 @@ mod tests {
     #[tokio::test]
     async fn test_nrf_returning_no_candidates_is_502() {
         let nrf_port = ephemeral_port();
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], nrf_port)),
         ));
         server
@@ -1789,8 +1789,8 @@ mod tests {
         producer_port: u16,
         token: &'static str,
         token_hits: Arc<AtomicU64>,
-    ) -> ogs_sbi::server::SbiServer {
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+    ) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], port)),
         ));
         server
@@ -1844,8 +1844,8 @@ mod tests {
 
     /// A producer that echoes back the Authorization header it received, so a
     /// test can assert the SCP attached a delegated Bearer token.
-    async fn start_auth_echo_producer(port: u16) -> ogs_sbi::server::SbiServer {
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+    async fn start_auth_echo_producer(port: u16) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], port)),
         ));
         server
@@ -2042,8 +2042,8 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// A producer that always answers a fixed error status with a small body.
-    async fn start_status_producer(port: u16, status: u16) -> ogs_sbi::server::SbiServer {
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+    async fn start_status_producer(port: u16, status: u16) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], port)),
         ));
         server
@@ -2063,8 +2063,8 @@ mod tests {
     async fn start_token_gated_producer(
         port: u16,
         fail_count: u64,
-    ) -> ogs_sbi::server::SbiServer {
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+    ) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], port)),
         ));
         let calls = Arc::new(AtomicU64::new(0));
@@ -2099,8 +2099,8 @@ mod tests {
         port: u16,
         producer_port: u16,
         captured: Arc<std::sync::Mutex<HashMap<String, String>>>,
-    ) -> ogs_sbi::server::SbiServer {
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+    ) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], port)),
         ));
         server
@@ -2300,7 +2300,7 @@ mod tests {
         )
         .await;
 
-        // NOTE: the ogs-sbi client serializes query params verbatim (no
+        // NOTE: the nextgcore-sbi client serializes query params verbatim (no
         // percent-encoding, a pre-existing lib gap outside scpd's ownership), so
         // factor *values* here are query-safe tokens. scpd-06 is about the
         // header→param *mapping*, which is value-independent.
@@ -2486,7 +2486,7 @@ mod tests {
         let scp_port = ephemeral_port();
 
         let producer = start_mock_producer(producer_port).await;
-        let nrf_server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+        let nrf_server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], nrf_port)),
         ));
         nrf_server
@@ -2657,7 +2657,7 @@ mod tests {
         let scp_port = ephemeral_port();
 
         let producer = start_mock_producer(producer_port).await;
-        let nrf_server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+        let nrf_server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], nrf_port)),
         ));
         nrf_server

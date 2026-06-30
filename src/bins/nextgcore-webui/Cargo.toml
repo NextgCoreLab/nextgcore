@@ -11,8 +11,8 @@ name = "nextgcore-webui"
 path = "src/main.rs"
 
 [dependencies]
-ogs-dbi = { workspace = true }
-ogs-core = { workspace = true }
+nextgcore-dbi = { workspace = true }
+nextgcore-core = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true

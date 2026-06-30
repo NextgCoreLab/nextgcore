@@ -2,10 +2,10 @@
 //!
 //! Port of src/udm/event.h and event.c - Event definitions for UDM
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
-pub const OGS_FSM_USER_SIG: i32 = 2;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for UDM
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,19 +26,19 @@ impl UdmEventId {
     /// Get the name of the event
     pub fn name(&self) -> &'static str {
         match self {
-            UdmEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            UdmEventId::FsmExit => "OGS_FSM_EXIT_SIG",
-            UdmEventId::SbiServer => "OGS_EVENT_SBI_SERVER",
-            UdmEventId::SbiClient => "OGS_EVENT_SBI_CLIENT",
-            UdmEventId::SbiTimer => "OGS_EVENT_SBI_TIMER",
+            UdmEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            UdmEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
+            UdmEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
+            UdmEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
+            UdmEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
         }
     }
 
     /// Convert from i32 signal
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => UdmEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => UdmEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => UdmEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => UdmEventId::FsmExit,
             _ => UdmEventId::SbiServer,
         }
     }
@@ -68,14 +68,14 @@ impl UdmTimerId {
     pub fn name(&self) -> &'static str {
         match self {
             UdmTimerId::NfInstanceRegistrationInterval => {
-                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+                "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            UdmTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
-            UdmTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
-            UdmTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",
-            UdmTimerId::SubscriptionValidity => "OGS_TIMER_SUBSCRIPTION_VALIDITY",
-            UdmTimerId::SubscriptionPatch => "OGS_TIMER_SUBSCRIPTION_PATCH",
-            UdmTimerId::SbiClientWait => "OGS_TIMER_SBI_CLIENT_WAIT",
+            UdmTimerId::NfInstanceHeartbeatInterval => "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
+            UdmTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
+            UdmTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
+            UdmTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",
+            UdmTimerId::SubscriptionPatch => "NEXTGCORE_TIMER_SUBSCRIPTION_PATCH",
+            UdmTimerId::SbiClientWait => "NEXTGCORE_TIMER_SBI_CLIENT_WAIT",
         }
     }
 }
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn test_event_name() {
         let event = UdmEvent::new(UdmEventId::SbiServer);
-        assert_eq!(event.name(), "OGS_EVENT_SBI_SERVER");
+        assert_eq!(event.name(), "NEXTGCORE_EVENT_SBI_SERVER");
     }
 
     #[test]

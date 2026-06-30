@@ -87,7 +87,7 @@ impl UdrSmContext {
     /// Port of udr_state_initial()
     fn handle_initial_state(&mut self, _event: &mut UdrEvent) {
         // Transition to operational state
-        // In C: OGS_FSM_TRAN(s, &udr_state_operational);
+        // In C: NEXTGCORE_FSM_TRAN(s, &udr_state_operational);
         log::info!("UDR SM: Transitioning from Initial to Operational");
         self.state = UdrState::Operational;
     }
@@ -128,7 +128,7 @@ impl UdrSmContext {
 
     /// Handle SBI server events
     ///
-    /// Port of udr_state_operational() case OGS_EVENT_SBI_SERVER
+    /// Port of udr_state_operational() case NEXTGCORE_EVENT_SBI_SERVER
     fn handle_sbi_server_event(&mut self, event: &mut UdrEvent) {
         let (stream_id, service_name, api_version, resource_components) = {
             let sbi = match &event.sbi {
@@ -164,7 +164,7 @@ impl UdrSmContext {
         };
 
         // Check API version
-        // In C: if (strcmp(message.h.api.version, OGS_SBI_API_V1) != 0)
+        // In C: if (strcmp(message.h.api.version, NEXTGCORE_SBI_API_V1) != 0)
         if api_version != "v1" {
             log::error!("Not supported version [{api_version}]");
             log::warn!("[stream={stream_id}] Would send 400 Bad Request: Unsupported API version");
@@ -189,7 +189,7 @@ impl UdrSmContext {
 
     /// Handle NNRF NFM (NF Management) requests
     ///
-    /// Port of udr_state_operational() CASE(OGS_SBI_SERVICE_NAME_NNRF_NFM)
+    /// Port of udr_state_operational() CASE(NEXTGCORE_SBI_SERVICE_NAME_NNRF_NFM)
     fn handle_nnrf_nfm_request(
         &mut self,
         _event: &mut UdrEvent,
@@ -199,10 +199,10 @@ impl UdrSmContext {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
-            // In C: CASE(OGS_SBI_RESOURCE_NAME_NF_STATUS_NOTIFY)
+            // In C: CASE(NEXTGCORE_SBI_RESOURCE_NAME_NF_STATUS_NOTIFY)
             Some("nf-status-notify") => {
                 log::debug!("NF status notify received");
-                // In C: ogs_nnrf_nfm_handle_nf_status_notify(stream, &message);
+                // In C: nextgcore_nnrf_nfm_handle_nf_status_notify(stream, &message);
                 log::debug!("[stream={stream_id}] Would send 204 No Content");
             }
             _ => {
@@ -216,7 +216,7 @@ impl UdrSmContext {
 
     /// Handle NUDR DR (Data Repository) requests
     ///
-    /// Port of udr_state_operational() CASE(OGS_SBI_SERVICE_NAME_NUDR_DR)
+    /// Port of udr_state_operational() CASE(NEXTGCORE_SBI_SERVICE_NAME_NUDR_DR)
     fn handle_nudr_dr_request(
         &mut self,
         event: &mut UdrEvent,
@@ -226,16 +226,16 @@ impl UdrSmContext {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
-            // In C: CASE(OGS_SBI_RESOURCE_NAME_SUBSCRIPTION_DATA)
+            // In C: CASE(NEXTGCORE_SBI_RESOURCE_NAME_SUBSCRIPTION_DATA)
             Some("subscription-data") => {
                 let resource2 = resource_components.get(2).map(|s| s.as_str());
 
                 match resource2 {
-                    // In C: CASE(OGS_SBI_RESOURCE_NAME_AUTHENTICATION_DATA)
+                    // In C: CASE(NEXTGCORE_SBI_RESOURCE_NAME_AUTHENTICATION_DATA)
                     Some("authentication-data") => {
                         nudr_handler::handle_subscription_authentication(event, stream_id);
                     }
-                    // In C: CASE(OGS_SBI_RESOURCE_NAME_CONTEXT_DATA)
+                    // In C: CASE(NEXTGCORE_SBI_RESOURCE_NAME_CONTEXT_DATA)
                     Some("context-data") => {
                         nudr_handler::handle_subscription_context(event, stream_id);
                     }
@@ -243,7 +243,7 @@ impl UdrSmContext {
                         // Check for provisioned-data at component[3]
                         let resource3 = resource_components.get(3).map(|s| s.as_str());
                         match resource3 {
-                            // In C: CASE(OGS_SBI_RESOURCE_NAME_PROVISIONED_DATA)
+                            // In C: CASE(NEXTGCORE_SBI_RESOURCE_NAME_PROVISIONED_DATA)
                             Some("provisioned-data") => {
                                 let method = event
                                     .sbi
@@ -272,7 +272,7 @@ impl UdrSmContext {
                     }
                 }
             }
-            // In C: CASE(OGS_SBI_RESOURCE_NAME_POLICY_DATA)
+            // In C: CASE(NEXTGCORE_SBI_RESOURCE_NAME_POLICY_DATA)
             Some("policy-data") => {
                 nudr_handler::handle_policy_data(event, stream_id);
             }
@@ -287,7 +287,7 @@ impl UdrSmContext {
 
     /// Handle SBI client events
     ///
-    /// Port of udr_state_operational() case OGS_EVENT_SBI_CLIENT
+    /// Port of udr_state_operational() case NEXTGCORE_EVENT_SBI_CLIENT
     fn handle_sbi_client_event(&mut self, event: &mut UdrEvent) {
         let (service_name, api_version, resource_components, res_status) = {
             let sbi = match &event.sbi {
@@ -323,7 +323,7 @@ impl UdrSmContext {
         // Route based on service name
         // In C: SWITCH(message.h.service.name)
         match service_name.as_str() {
-            // In C: CASE(OGS_SBI_SERVICE_NAME_NNRF_NFM)
+            // In C: CASE(NEXTGCORE_SBI_SERVICE_NAME_NNRF_NFM)
             "nnrf-nfm" => {
                 self.handle_nnrf_nfm_response(&resource_components, res_status);
             }
@@ -335,7 +335,7 @@ impl UdrSmContext {
 
     /// Handle NNRF NFM responses
     ///
-    /// Port of udr_state_operational() CASE(OGS_SBI_SERVICE_NAME_NNRF_NFM) for client
+    /// Port of udr_state_operational() CASE(NEXTGCORE_SBI_SERVICE_NAME_NNRF_NFM) for client
     fn handle_nnrf_nfm_response(
         &mut self,
         resource_components: &[String],
@@ -344,23 +344,23 @@ impl UdrSmContext {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
-            // In C: CASE(OGS_SBI_RESOURCE_NAME_NF_INSTANCES)
+            // In C: CASE(NEXTGCORE_SBI_RESOURCE_NAME_NF_INSTANCES)
             Some("nf-instances") => {
                 log::debug!("NF instances response received");
                 // In C: Dispatch to NF instance FSM
                 // nf_instance = e->h.sbi.data;
-                // if (OGS_FSM_STATE(&nf_instance->sm)) {
+                // if (NEXTGCORE_FSM_STATE(&nf_instance->sm)) {
                 //     e->h.sbi.message = &message;
-                //     ogs_fsm_dispatch(&nf_instance->sm, e);
+                //     nextgcore_fsm_dispatch(&nf_instance->sm, e);
                 // }
             }
-            // In C: CASE(OGS_SBI_RESOURCE_NAME_SUBSCRIPTIONS)
+            // In C: CASE(NEXTGCORE_SBI_RESOURCE_NAME_SUBSCRIPTIONS)
             Some("subscriptions") => {
                 log::debug!("Subscriptions response received, status: {res_status:?}");
                 // In C: Handle subscription response based on method
-                // POST: ogs_nnrf_nfm_handle_nf_status_subscribe
-                // PATCH: ogs_nnrf_nfm_handle_nf_status_update
-                // DELETE: ogs_sbi_subscription_data_remove
+                // POST: nextgcore_nnrf_nfm_handle_nf_status_subscribe
+                // PATCH: nextgcore_nnrf_nfm_handle_nf_status_update
+                // DELETE: nextgcore_sbi_subscription_data_remove
             }
             _ => {
                 log::error!("Invalid resource name [{:?}]", resource_components.first());
@@ -370,7 +370,7 @@ impl UdrSmContext {
 
     /// Handle SBI timer events
     ///
-    /// Port of udr_state_operational() case OGS_EVENT_SBI_TIMER
+    /// Port of udr_state_operational() case NEXTGCORE_EVENT_SBI_TIMER
     fn handle_sbi_timer_event(&mut self, event: &mut UdrEvent) {
         let timer_id = match event.timer_id {
             Some(id) => id,
@@ -381,10 +381,10 @@ impl UdrSmContext {
         };
 
         match timer_id {
-            // In C: case OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL:
-            // case OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL:
-            // case OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT:
-            // case OGS_TIMER_NF_INSTANCE_VALIDITY:
+            // In C: case NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL:
+            // case NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL:
+            // case NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT:
+            // case NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY:
             UdrTimerId::NfInstanceRegistrationInterval
             | UdrTimerId::NfInstanceHeartbeatInterval
             | UdrTimerId::NfInstanceNoHeartbeat
@@ -392,25 +392,25 @@ impl UdrSmContext {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
                     log::debug!("[{nf_instance_id}] NF instance timer: {timer_id:?}");
                     // In C: nf_instance = e->h.sbi.data;
-                    // ogs_fsm_dispatch(&nf_instance->sm, e);
-                    // if (OGS_FSM_CHECK(&nf_instance->sm, ogs_sbi_nf_state_exception))
-                    //     ogs_error("[%s] State machine exception [%d]",
+                    // nextgcore_fsm_dispatch(&nf_instance->sm, e);
+                    // if (NEXTGCORE_FSM_CHECK(&nf_instance->sm, nextgcore_sbi_nf_state_exception))
+                    //     nextgcore_error("[%s] State machine exception [%d]",
                     //             nf_instance->id, e->h.timer_id);
                 }
             }
-            // In C: case OGS_TIMER_SUBSCRIPTION_VALIDITY:
+            // In C: case NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY:
             UdrTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
                     log::error!("[{subscription_id}] Subscription validity expired");
-                    // In C: ogs_nnrf_nfm_send_nf_status_subscribe(...)
-                    // ogs_sbi_subscription_data_remove(subscription_data);
+                    // In C: nextgcore_nnrf_nfm_send_nf_status_subscribe(...)
+                    // nextgcore_sbi_subscription_data_remove(subscription_data);
                 }
             }
-            // In C: case OGS_TIMER_SUBSCRIPTION_PATCH:
+            // In C: case NEXTGCORE_TIMER_SUBSCRIPTION_PATCH:
             UdrTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
                     log::info!("[{subscription_id}] Need to update Subscription");
-                    // In C: ogs_nnrf_nfm_send_nf_status_update(subscription_data);
+                    // In C: nextgcore_nnrf_nfm_send_nf_status_update(subscription_data);
                 }
             }
             UdrTimerId::SbiClientWait => {

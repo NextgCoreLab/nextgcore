@@ -2,7 +2,7 @@
 //!
 //! Port of src/ausf/context.c - AUSF context with UE list and hash tables
 
-use ogs_crypt::kdf::{ogs_kdf_hxres_star, ogs_kdf_kseaf};
+use nextgcore_crypt::kdf::{nextgcore_kdf_hxres_star, nextgcore_kdf_kseaf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -135,13 +135,13 @@ impl AusfUe {
 
     /// Calculate HXRES* from RAND and XRES*
     pub fn calculate_hxres_star(&mut self) {
-        self.hxres_star = ogs_kdf_hxres_star(&self.rand, &self.xres_star);
+        self.hxres_star = nextgcore_kdf_hxres_star(&self.rand, &self.xres_star);
     }
 
     /// Calculate KSEAF from serving network name and KAUSF
     pub fn calculate_kseaf(&mut self) {
         if let Some(ref serving_network_name) = self.serving_network_name {
-            self.kseaf = ogs_kdf_kseaf(serving_network_name, &self.kausf);
+            self.kseaf = nextgcore_kdf_kseaf(serving_network_name, &self.kausf);
         }
     }
 
@@ -192,7 +192,7 @@ impl AusfUe {
             log::debug!(
                 "[AUSF SNPN] KAUSF derivation with NID: serving_network={serving_network_with_nid}"
             );
-            // In production, this would use ogs_kdf_kausf with NID-augmented serving network name
+            // In production, this would use nextgcore_kdf_kausf with NID-augmented serving network name
             // For now, we log the intent
         }
     }

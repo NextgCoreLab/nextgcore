@@ -32,12 +32,12 @@
 //! consumer is tracked as `lmfd-07`; conformance of the bytes built here is
 //! proven by the round-trip / framing unit tests below, independent of egress.
 
-use ogs_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
-use ogs_asn1c::ngap::pdu::{
+use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
+use nextgcore_asn1c::ngap::pdu::{
     build_downlink_non_ue_associated_nrppa_transport,
     build_downlink_ue_associated_nrppa_transport, NgapPdu,
 };
-use ogs_asn1c::per::{AperEncode, AperEncoder};
+use nextgcore_asn1c::per::{AperEncode, AperEncoder};
 
 /// NAS payload container type "LPP" (TS 24.501 Table 9.11.3.40.1).
 pub const PAYLOAD_CONTAINER_TYPE_LPP: u8 = 0x03;
@@ -96,10 +96,10 @@ pub fn build_lpp_dl_nas(lpp_pdu: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ogs_asn1c::ngap::pdu::{
+    use nextgcore_asn1c::ngap::pdu::{
         parse_non_ue_associated_nrppa_transport, parse_ue_associated_nrppa_transport,
     };
-    use ogs_asn1c::per::{AperDecode, AperDecoder};
+    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
 
     fn decode(bytes: &[u8]) -> NgapPdu {
         let mut decoder = AperDecoder::new(bytes);

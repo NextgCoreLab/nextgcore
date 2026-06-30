@@ -2,8 +2,8 @@
 //!
 //! Helper functions for sending SBI error responses in the BSF state machines.
 
-use ogs_sbi::message::SbiResponse;
-use ogs_sbi::server::{
+use nextgcore_sbi::message::SbiResponse;
+use nextgcore_sbi::server::{
     send_bad_request, send_forbidden, send_gateway_timeout, send_method_not_allowed, send_not_found,
 };
 

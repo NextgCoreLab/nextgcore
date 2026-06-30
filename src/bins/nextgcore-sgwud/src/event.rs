@@ -2,10 +2,10 @@
 //!
 //! Port of src/sgwu/event.h and event.c - Event definitions for SGWU
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
-pub const OGS_FSM_USER_SIG: i32 = 2;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for SGWU
 /// Port of sgwu_event_e from event.h
@@ -27,8 +27,8 @@ impl SgwuEventId {
     /// Get the name of the event
     pub fn name(&self) -> &'static str {
         match self {
-            SgwuEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            SgwuEventId::FsmExit => "OGS_FSM_EXIT_SIG",
+            SgwuEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            SgwuEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
             SgwuEventId::SxaMessage => "SGWU_EVT_SXA_MESSAGE",
             SgwuEventId::SxaTimer => "SGWU_EVT_SXA_TIMER",
             SgwuEventId::SxaNoHeartbeat => "SGWU_EVT_SXA_NO_HEARTBEAT",
@@ -38,8 +38,8 @@ impl SgwuEventId {
     /// Convert from i32 signal
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => SgwuEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => SgwuEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => SgwuEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => SgwuEventId::FsmExit,
             _ => SgwuEventId::SxaMessage,
         }
     }
@@ -203,8 +203,8 @@ mod tests {
 
     #[test]
     fn test_event_id_names() {
-        assert_eq!(SgwuEventId::FsmEntry.name(), "OGS_FSM_ENTRY_SIG");
-        assert_eq!(SgwuEventId::FsmExit.name(), "OGS_FSM_EXIT_SIG");
+        assert_eq!(SgwuEventId::FsmEntry.name(), "NEXTGCORE_FSM_ENTRY_SIG");
+        assert_eq!(SgwuEventId::FsmExit.name(), "NEXTGCORE_FSM_EXIT_SIG");
         assert_eq!(SgwuEventId::SxaMessage.name(), "SGWU_EVT_SXA_MESSAGE");
         assert_eq!(SgwuEventId::SxaTimer.name(), "SGWU_EVT_SXA_TIMER");
         assert_eq!(
@@ -257,11 +257,11 @@ mod tests {
     #[test]
     fn test_from_signal() {
         assert_eq!(
-            SgwuEventId::from_signal(OGS_FSM_ENTRY_SIG),
+            SgwuEventId::from_signal(NEXTGCORE_FSM_ENTRY_SIG),
             SgwuEventId::FsmEntry
         );
         assert_eq!(
-            SgwuEventId::from_signal(OGS_FSM_EXIT_SIG),
+            SgwuEventId::from_signal(NEXTGCORE_FSM_EXIT_SIG),
             SgwuEventId::FsmExit
         );
         assert_eq!(SgwuEventId::from_signal(99), SgwuEventId::SxaMessage);

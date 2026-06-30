@@ -373,7 +373,7 @@ pub fn zero_at_mac(raw: &[u8]) -> Option<Vec<u8>> {
 // ============================================================================
 
 /// Derive CK' and IK' from CK, IK, and serving network name per TS 33.501
-/// Annex A.3 (FC = 0x20). Delegates to [`ogs_crypt::kdf::ogs_kdf_ck_ik_prime`].
+/// Annex A.3 (FC = 0x20). Delegates to [`nextgcore_crypt::kdf::nextgcore_kdf_ck_ik_prime`].
 ///
 /// Returns (CK', IK') each 16 bytes.
 pub fn derive_ck_ik_prime(
@@ -382,7 +382,7 @@ pub fn derive_ck_ik_prime(
     serving_network_name: &str,
     sqn_xor_ak: &[u8; 6],
 ) -> ([u8; 16], [u8; 16]) {
-    ogs_crypt::kdf::ogs_kdf_ck_ik_prime(ck, ik, serving_network_name, sqn_xor_ak)
+    nextgcore_crypt::kdf::nextgcore_kdf_ck_ik_prime(ck, ik, serving_network_name, sqn_xor_ak)
 }
 
 /// PRF' as specified in RFC 5448 §3.4.1 (also RFC 9048 §3.4.1).
@@ -1072,7 +1072,7 @@ mod tests {
     /// RFC 5448 test vector 1: full PRF' key schedule from CK'/IK'.
     ///
     /// Identity "0555444333222111"; CK'/IK' as derived for network name "WLAN"
-    /// (the CK'/IK' derivation itself is vector-tested in ogs-crypt kdf).
+    /// (the CK'/IK' derivation itself is vector-tested in nextgcore-crypt kdf).
     #[test]
     fn test_rfc5448_key_schedule_vector1() {
         let ck_prime_v = unhex("0093962d0dd84aa5684b045c9edffa04");

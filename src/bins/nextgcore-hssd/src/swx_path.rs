@@ -233,11 +233,11 @@ pub fn handle_mar(
     }
 
     // 1. Query database for auth info (K, OPc, SQN, AMF)
-    use ogs_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
-    use ogs_dbi::{ogs_dbi_auth_info, ogs_dbi_increment_sqn};
+    use nextgcore_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
+    use nextgcore_dbi::{nextgcore_dbi_auth_info, nextgcore_dbi_increment_sqn};
 
     let supi = format!("imsi-{imsi_bcd}");
-    let auth_info = ogs_dbi_auth_info(&supi)?;
+    let auth_info = nextgcore_dbi_auth_info(&supi)?;
 
     // 2. Handle re-sync if sip_authorization present
     // (Not implemented in this basic version)
@@ -279,7 +279,7 @@ pub fn handle_mar(
     sip_authenticate.extend_from_slice(&autn);
 
     // 4. Update SQN in database
-    ogs_dbi_increment_sqn(&supi)?;
+    nextgcore_dbi_increment_sqn(&supi)?;
 
     // 5. Build and return MAA
     let response = MarResponse {
@@ -325,7 +325,7 @@ pub fn handle_sar(
     debug!("Extracted IMSI: {imsi_bcd}");
 
     // 1. Query database for subscription data
-    use ogs_dbi::ogs_dbi_subscription_data;
+    use nextgcore_dbi::nextgcore_dbi_subscription_data;
 
     let supi = format!("imsi-{imsi_bcd}");
 
@@ -337,7 +337,7 @@ pub fn handle_sar(
     match server_assignment_type {
         ServerAssignmentType::Registration | ServerAssignmentType::AaaUserDataRequest => {
             // Get subscription data from database
-            let subscription_data = ogs_dbi_subscription_data(&supi)?;
+            let subscription_data = nextgcore_dbi_subscription_data(&supi)?;
 
             // Build APN configurations from subscription data
             let mut apn_configurations = Vec::new();

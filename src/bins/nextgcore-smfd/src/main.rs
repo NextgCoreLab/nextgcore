@@ -19,10 +19,10 @@
 //! - S5/S8: GTP-C interface to SGW (EPC mode)
 
 use anyhow::{Context, Result};
-use ogs_sbi::context::{global_context, NfInstance, NfService};
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
-    send_bad_request, send_not_found, SbiServer, SbiServerConfig as OgsSbiServerConfig,
+use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{
+    send_bad_request, send_not_found, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -212,8 +212,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -290,7 +290,7 @@ async fn main() -> Result<()> {
     let sbi_addr: SocketAddr = format!("{}:{}", config.sbi_addr, config.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+    let sbi_server = SbiServer::new(NextgcoreSbiServerConfig::new(sbi_addr));
 
     sbi_server
         .start(smf_sbi_request_handler)
@@ -302,7 +302,7 @@ async fn main() -> Result<()> {
     // Register with NRF (if configured)
     match smf_nrf_register(&config.sbi_addr, config.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
         }
         Ok(_) => {}
         Err(e) => {
@@ -737,11 +737,11 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
             log::info!("SMF registered with NRF (id={nf_instance_id})");
 
             // Store self instance in SBI context
-            let mut self_instance = NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Smf);
+            let mut self_instance = NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Smf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = NfService::new(
                 "nsmf-pdusession",
-                ogs_sbi::types::SbiServiceType::NsmfPdusession,
+                nextgcore_sbi::types::SbiServiceType::NsmfPdusession,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
@@ -1429,8 +1429,8 @@ fn sbi_response_with_n1_n2(
     n1_sm_msg: &[u8],
     n2_sm_info: &[u8],
 ) -> SbiResponse {
-    use ogs_sbi::constants::content_type;
-    use ogs_sbi::message::SbiPart;
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
     json_root["n1SmMsg"] = serde_json::json!({ "contentId": "n1SmMsg" });
     json_root["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
     SbiResponse::with_status(status)
@@ -1449,15 +1449,15 @@ fn sbi_response_with_n1_n2(
 
 /// Build the N2 SM `PDUSessionResourceSetupRequestTransfer` (TS 38.413
 /// §9.3.4.1) carrying the UPF N3 GTP-U F-TEID and the QoS flow setup list,
-/// using the real-APER `ogs-ngap` transfer codec (not bespoke bytes).
+/// using the real-APER `nextgcore-ngap` transfer codec (not bespoke bytes).
 fn build_setup_request_transfer(
     upf_teid: u32,
     upf_addr: [u8; 4],
     qfi: u8,
     five_qi: u16,
     arp_priority_level: u8,
-) -> ogs_ngap::NgapResult<Vec<u8>> {
-    use ogs_ngap::transfer::{
+) -> nextgcore_ngap::NgapResult<Vec<u8>> {
+    use nextgcore_ngap::transfer::{
         AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
         PduSessionResourceSetupRequestTransfer, PduSessionType, PreEmptionCapability,
         PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters,
@@ -1498,7 +1498,7 @@ fn build_setup_request_transfer(
 /// Extract the gNB DL GTP-U endpoint (TEID, IPv4 address, first QFI) from a
 /// real-APER `PDUSessionResourceSetupResponseTransfer` (TS 38.413 §9.3.4.2).
 fn decode_setup_response_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
-    use ogs_ngap::transfer::{
+    use nextgcore_ngap::transfer::{
         PduSessionResourceSetupResponseTransfer, UpTransportLayerInformation,
     };
 
@@ -1526,7 +1526,7 @@ fn decode_setup_response_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> 
 /// Extract the target-gNB DL GTP-U endpoint from a real-APER
 /// `PathSwitchRequestTransfer` (TS 38.413 §9.3.4.8) during an Xn handover.
 fn decode_path_switch_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
-    use ogs_ngap::transfer::{PathSwitchRequestTransfer, UpTransportLayerInformation};
+    use nextgcore_ngap::transfer::{PathSwitchRequestTransfer, UpTransportLayerInformation};
 
     let transfer = match PathSwitchRequestTransfer::decode(data) {
         Ok(t) => t,
@@ -1569,8 +1569,8 @@ fn sm_context_create_error(
     pti: u8,
     gsm_cause_5gsm: u8,
 ) -> SbiResponse {
-    use ogs_sbi::constants::content_type;
-    use ogs_sbi::message::SbiPart;
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
     let n1 = policy::build_establishment_reject(psi, pti, gsm_cause_5gsm);
     // N1-bearing reject: the PDU Session Establishment Reject travels as a
     // 5gnas binary part referenced by RefToBinaryData (TS 29.502 §6.1.2.4).
@@ -2337,7 +2337,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 return problem_400("N2_SM_ERROR", "n2SmInfo missing or not valid base64");
             };
 
-            // Real-APER decode of the gNB DL N3 endpoint via the ogs-ngap
+            // Real-APER decode of the gNB DL N3 endpoint via the nextgcore-ngap
             // transfer codec (the gNB now emits real APER, not legacy bytes).
             let endpoint = if n2_sm_info_type == "PATH_SWITCH_REQ" {
                 decode_path_switch_dl_endpoint(&n2_bytes)
@@ -2589,8 +2589,8 @@ async fn send_sm_context_status_notification(
     };
     let path = uri_path(uri);
     let body = build_sm_context_status_notification(resource_status, cause);
-    let client = ogs_sbi::client::SbiClient::new(
-        ogs_sbi::client::SbiClientConfig::new(host, port)
+    let client = nextgcore_sbi::client::SbiClient::new(
+        nextgcore_sbi::client::SbiClientConfig::new(host, port)
             .with_connect_timeout(std::time::Duration::from_secs(2))
             .with_request_timeout(std::time::Duration::from_secs(3)),
     );
@@ -2957,7 +2957,7 @@ mod tests {
     // ------------------------------------------------------------------
     //
     // The smfd builds the N2 SM PDUSessionResourceSetupRequestTransfer with the
-    // real-APER ogs-ngap codec and decodes the gNB's SetupResponseTransfer with
+    // real-APER nextgcore-ngap codec and decodes the gNB's SetupResponseTransfer with
     // it. These pin the wire bytes against the independent nextgsim-ngap codec
     // (the gNB), mirroring the NG-Setup/ICS reconciliation: the request
     // bytes are byte-identical to the gNB's decoder vector, and the gNB's
@@ -2987,7 +2987,7 @@ mod tests {
 
     #[test]
     fn setup_request_transfer_self_roundtrips() {
-        use ogs_ngap::transfer::{
+        use nextgcore_ngap::transfer::{
             PduSessionResourceSetupRequestTransfer, UpTransportLayerInformation,
         };
         let bytes = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
@@ -3021,8 +3021,8 @@ mod tests {
     // (TS 29.502 §6.1.2.2.2 / §6.1.2.4)
     // ------------------------------------------------------------------
 
-    use ogs_sbi::constants::content_type;
-    use ogs_sbi::message::SbiPart;
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
 
     /// A valid PDU Session Establishment Request N1 container (PSI=5, PTI=2,
     /// IPv4v6, SSC mode 2) — the vector parsed in the policy unit tests.
@@ -3069,11 +3069,11 @@ mod tests {
         assert_eq!(resp.status, 201);
         // Serialize exactly as the SBI client serializes parts (multipart/
         // related), then decode it back to prove the wire shape.
-        let boundary = ogs_sbi::multipart::generate_boundary();
+        let boundary = nextgcore_sbi::multipart::generate_boundary();
         let body =
-            ogs_sbi::multipart::encode(resp.http.content.as_deref(), &resp.http.parts, &boundary);
-        let ct = ogs_sbi::multipart::content_type_with_boundary(&boundary);
-        let decoded = ogs_sbi::multipart::decode(&ct, &body).expect("decode multipart");
+            nextgcore_sbi::multipart::encode(resp.http.content.as_deref(), &resp.http.parts, &boundary);
+        let ct = nextgcore_sbi::multipart::content_type_with_boundary(&boundary);
+        let decoded = nextgcore_sbi::multipart::decode(&ct, &body).expect("decode multipart");
 
         // JSON root: N1/N2 are RefToBinaryData pointers; n2SmInfoType preserved.
         let root: serde_json::Value =
@@ -3184,16 +3184,16 @@ mod tests {
             content_type::APPLICATION_5GNAS,
             bytes::Bytes::copy_from_slice(&N1_ESTABLISHMENT_REQUEST),
         );
-        let boundary = ogs_sbi::multipart::generate_boundary();
-        let body = ogs_sbi::multipart::encode(
+        let boundary = nextgcore_sbi::multipart::generate_boundary();
+        let body = nextgcore_sbi::multipart::encode(
             Some(&root.to_string()),
             std::slice::from_ref(&part),
             &boundary,
         );
-        let ct = ogs_sbi::multipart::content_type_with_boundary(&boundary);
+        let ct = nextgcore_sbi::multipart::content_type_with_boundary(&boundary);
 
         // Server-side: decode into the request the smfd handler would see.
-        let decoded = ogs_sbi::multipart::decode(&ct, &body).unwrap();
+        let decoded = nextgcore_sbi::multipart::decode(&ct, &body).unwrap();
         let mut request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts");
         request.http.content = decoded.json.clone();
         request.http.parts = decoded.parts;

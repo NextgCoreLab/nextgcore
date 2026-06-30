@@ -196,7 +196,7 @@ pub fn build_session_deletion_response(sess: &SgwuSess) -> Option<PfcpMessage> {
 }
 
 /// Build Session Report Request (for downlink data notification, error indication)
-/// Port of ogs_pfcp_build_session_report_request
+/// Port of nextgcore_pfcp_build_session_report_request
 pub fn build_session_report_request(
     sess: &SgwuSess,
     report: &UserPlaneReport,

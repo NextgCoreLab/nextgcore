@@ -11,50 +11,50 @@ use std::sync::{Arc, RwLock};
 // ============================================================================
 
 /// Maximum number of served GUAMI
-pub const OGS_MAX_NUM_OF_SERVED_GUAMI: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_SERVED_GUAMI: usize = 8;
 /// Maximum number of supported TA
-pub const OGS_MAX_NUM_OF_SUPPORTED_TA: usize = 16;
+pub const NEXTGCORE_MAX_NUM_OF_SUPPORTED_TA: usize = 16;
 /// Maximum number of PLMN
-pub const OGS_MAX_NUM_OF_PLMN: usize = 6;
+pub const NEXTGCORE_MAX_NUM_OF_PLMN: usize = 6;
 /// Maximum number of slice support
-pub const OGS_MAX_NUM_OF_SLICE_SUPPORT: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_SLICE_SUPPORT: usize = 8;
 /// Maximum number of BPLMN
-pub const OGS_MAX_NUM_OF_BPLMN: usize = 12;
+pub const NEXTGCORE_MAX_NUM_OF_BPLMN: usize = 12;
 /// Maximum number of algorithms
-pub const OGS_MAX_NUM_OF_ALGORITHM: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_ALGORITHM: usize = 8;
 /// Maximum number of slices
-pub const OGS_MAX_NUM_OF_SLICE: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_SLICE: usize = 8;
 /// Maximum number of MSISDN
-pub const OGS_MAX_NUM_OF_MSISDN: usize = 2;
+pub const NEXTGCORE_MAX_NUM_OF_MSISDN: usize = 2;
 
 /// Key length
-pub const OGS_KEY_LEN: usize = 16;
+pub const NEXTGCORE_KEY_LEN: usize = 16;
 /// RAND length
-pub const OGS_RAND_LEN: usize = 16;
+pub const NEXTGCORE_RAND_LEN: usize = 16;
 /// AUTN length
-pub const OGS_AUTN_LEN: usize = 16;
+pub const NEXTGCORE_AUTN_LEN: usize = 16;
 /// MAX RES length
-pub const OGS_MAX_RES_LEN: usize = 16;
+pub const NEXTGCORE_MAX_RES_LEN: usize = 16;
 /// SHA256 digest size
-pub const OGS_SHA256_DIGEST_SIZE: usize = 32;
+pub const NEXTGCORE_SHA256_DIGEST_SIZE: usize = 32;
 /// NAS MAX ABBA length
-pub const OGS_NAS_MAX_ABBA_LEN: usize = 2;
+pub const NEXTGCORE_NAS_MAX_ABBA_LEN: usize = 2;
 /// MAX IMEISV length
-pub const OGS_MAX_IMEISV_LEN: usize = 8;
+pub const NEXTGCORE_MAX_IMEISV_LEN: usize = 8;
 /// MAX IMEISV BCD length
-pub const OGS_MAX_IMEISV_BCD_LEN: usize = 16;
+pub const NEXTGCORE_MAX_IMEISV_BCD_LEN: usize = 16;
 
 /// Invalid UE NGAP ID
 pub const INVALID_UE_NGAP_ID: u64 = 0xffffffffffffffff;
 /// Invalid pool ID
-pub const OGS_INVALID_POOL_ID: u64 = 0;
+pub const NEXTGCORE_INVALID_POOL_ID: u64 = 0;
 /// Minimum pool ID
-pub const OGS_MIN_POOL_ID: u64 = 1;
+pub const NEXTGCORE_MIN_POOL_ID: u64 = 1;
 /// Maximum pool ID
-pub const OGS_MAX_POOL_ID: u64 = u64::MAX - 1;
+pub const NEXTGCORE_MAX_POOL_ID: u64 = u64::MAX - 1;
 
 /// NAS KSI no key available
-pub const OGS_NAS_KSI_NO_KEY_IS_AVAILABLE: u8 = 7;
+pub const NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE: u8 = 7;
 
 // ============================================================================
 // Basic Types
@@ -532,18 +532,18 @@ impl AmfContext {
     pub fn new() -> Self {
         Self {
             num_of_served_guami: 0,
-            served_guami: Vec::with_capacity(OGS_MAX_NUM_OF_SERVED_GUAMI),
+            served_guami: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SERVED_GUAMI),
             num_of_served_tai: 0,
-            served_tai: Vec::with_capacity(OGS_MAX_NUM_OF_SUPPORTED_TA),
+            served_tai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SUPPORTED_TA),
             num_of_plmn_support: 0,
-            plmn_support: Vec::with_capacity(OGS_MAX_NUM_OF_PLMN),
+            plmn_support: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_PLMN),
             default_reject_cause: 0,
             num_of_access_control: 0,
-            access_control: Vec::with_capacity(OGS_MAX_NUM_OF_PLMN),
+            access_control: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_PLMN),
             num_of_ciphering_order: 0,
-            ciphering_order: Vec::with_capacity(OGS_MAX_NUM_OF_ALGORITHM),
+            ciphering_order: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_ALGORITHM),
             num_of_integrity_order: 0,
-            integrity_order: Vec::with_capacity(OGS_MAX_NUM_OF_ALGORITHM),
+            integrity_order: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_ALGORITHM),
             short_name: NetworkName::default(),
             full_name: NetworkName::default(),
             amf_name: None,
@@ -1068,10 +1068,10 @@ impl AmfContext {
         let mut ran_ue_list = self.ran_ue_list.write().unwrap();
 
         if let Some(amf_ue) = amf_ue_list.get_mut(&amf_ue_id) {
-            amf_ue.ran_ue_id = OGS_INVALID_POOL_ID;
+            amf_ue.ran_ue_id = NEXTGCORE_INVALID_POOL_ID;
         }
         if let Some(ran_ue) = ran_ue_list.get_mut(&ran_ue_id) {
-            ran_ue.amf_ue_id = OGS_INVALID_POOL_ID;
+            ran_ue.amf_ue_id = NEXTGCORE_INVALID_POOL_ID;
         }
         true
     }
@@ -1500,7 +1500,7 @@ impl AmfGnb {
             max_num_of_ostreams: 0,
             ostream_id: 0,
             num_of_supported_ta_list: 0,
-            supported_ta_list: Vec::with_capacity(OGS_MAX_NUM_OF_SUPPORTED_TA),
+            supported_ta_list: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SUPPORTED_TA),
             rat_type: RatType::Nr,
         }
     }
@@ -1576,8 +1576,8 @@ impl RanUe {
             initial_context_setup_request_sent: false,
             initial_context_setup_response_received: false,
             ue_ambr_sent: false,
-            source_ue_id: OGS_INVALID_POOL_ID,
-            target_ue_id: OGS_INVALID_POOL_ID,
+            source_ue_id: NEXTGCORE_INVALID_POOL_ID,
+            target_ue_id: NEXTGCORE_INVALID_POOL_ID,
             saved_nr_tai: Tai5gs::default(),
             saved_nr_cgi: NrCgi::default(),
             ue_ctx_rel_action: NgapUeCtxRelAction::Invalid,
@@ -1585,7 +1585,7 @@ impl RanUe {
             psimask_activated: 0,
             deactivation: NgapCause::default(),
             gnb_id,
-            amf_ue_id: OGS_INVALID_POOL_ID,
+            amf_ue_id: NEXTGCORE_INVALID_POOL_ID,
         }
     }
 }
@@ -1608,23 +1608,23 @@ pub struct AmfUeMemento {
     /// UE network capability
     pub ue_network_capability: UeNetworkCapability,
     /// Random challenge value
-    pub rand: [u8; OGS_RAND_LEN],
+    pub rand: [u8; NEXTGCORE_RAND_LEN],
     /// Authentication token
-    pub autn: [u8; OGS_AUTN_LEN],
+    pub autn: [u8; NEXTGCORE_AUTN_LEN],
     /// Expected auth response
-    pub xres_star: [u8; OGS_MAX_RES_LEN],
+    pub xres_star: [u8; NEXTGCORE_MAX_RES_LEN],
     /// ABBA value
-    pub abba: [u8; OGS_NAS_MAX_ABBA_LEN],
+    pub abba: [u8; NEXTGCORE_NAS_MAX_ABBA_LEN],
     /// ABBA length
     pub abba_len: u8,
     /// Hash of XRES*
-    pub hxres_star: [u8; OGS_MAX_RES_LEN],
+    pub hxres_star: [u8; NEXTGCORE_MAX_RES_LEN],
     /// Key for AMF derived from NAS key
-    pub kamf: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kamf: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Integrity key
-    pub knas_int: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_int: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// Ciphering key
-    pub knas_enc: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_enc: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// Downlink counter
     pub dl_count: u32,
     /// Uplink counter
@@ -1632,9 +1632,9 @@ pub struct AmfUeMemento {
     /// nas-06 Phase-6 strict-path replay baseline (persisted with ul_count).
     pub ul_count_established: bool,
     /// gNB key
-    pub kgnb: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kgnb: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Next hop key
-    pub nh: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub nh: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Selected encryption algorithm
     pub selected_enc_algorithm: u8,
     /// Selected integrity algorithm
@@ -1746,7 +1746,7 @@ pub struct AmfUe {
     /// PEI (Permanent Equipment Identifier)
     pub pei: Option<String>,
     /// Masked IMEISV
-    pub masked_imeisv: [u8; OGS_MAX_IMEISV_LEN],
+    pub masked_imeisv: [u8; NEXTGCORE_MAX_IMEISV_LEN],
     /// Masked IMEISV length
     pub masked_imeisv_len: usize,
     /// IMEISV BCD
@@ -1804,29 +1804,29 @@ pub struct AmfUe {
     /// 5G AKA confirmation
     pub confirmation_for_5g_aka: Confirmation5gAka,
     /// Random challenge value
-    pub rand: [u8; OGS_RAND_LEN],
+    pub rand: [u8; NEXTGCORE_RAND_LEN],
     /// Expected auth response
-    pub xres_star: [u8; OGS_MAX_RES_LEN],
+    pub xres_star: [u8; NEXTGCORE_MAX_RES_LEN],
     /// ABBA value
-    pub abba: [u8; OGS_NAS_MAX_ABBA_LEN],
+    pub abba: [u8; NEXTGCORE_NAS_MAX_ABBA_LEN],
     /// ABBA length
     pub abba_len: u8,
     /// Hash of XRES*
-    pub hxres_star: [u8; OGS_MAX_RES_LEN],
+    pub hxres_star: [u8; NEXTGCORE_MAX_RES_LEN],
     /// Key for AMF
-    pub kamf: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kamf: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Auth result
     pub auth_result: AuthResult,
     /// Integrity key
-    pub knas_int: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_int: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// Ciphering key
-    pub knas_enc: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_enc: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// Downlink counter
     pub dl_count: u32,
     /// Uplink counter
     pub ul_count: u32,
     /// nas-06 Phase-6 CANARY (default false): when true, the NAS security
-    /// ENCODE/DECODE path delegates to the conformant ogs-nas
+    /// ENCODE/DECODE path delegates to the conformant nextgcore-nas
     /// protect/unprotect adapter (strict MAC + replay) instead of the
     /// hand-rolled lenient path. Default-OFF keeps production behavior
     /// byte-for-byte unchanged. Flipping the default + removing the
@@ -1839,11 +1839,11 @@ pub struct AmfUe {
     /// `use_ogs_nas_security` path; persisted via the memento.
     pub ul_count_established: bool,
     /// gNB key
-    pub kgnb: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kgnb: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Next hop chaining counter
     pub nhcc: u8,
     /// Next hop key
-    pub nh: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub nh: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Selected encryption algorithm
     pub selected_enc_algorithm: u8,
     /// Selected integrity algorithm
@@ -2260,11 +2260,11 @@ impl AmfUe {
             supi: None,
             home_plmn_id: PlmnId::default(),
             pei: None,
-            masked_imeisv: [0u8; OGS_MAX_IMEISV_LEN],
+            masked_imeisv: [0u8; NEXTGCORE_MAX_IMEISV_LEN],
             masked_imeisv_len: 0,
             imeisv_bcd: String::new(),
             num_of_msisdn: 0,
-            msisdn: Vec::with_capacity(OGS_MAX_NUM_OF_MSISDN),
+            msisdn: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_MSISDN),
             current_m_tmsi: None,
             current_guti: Guti5gs::default(),
             next_m_tmsi: None,
@@ -2277,9 +2277,9 @@ impl AmfUe {
             nr_cgi: NrCgi::default(),
             ue_location_timestamp: 0,
             last_visited_plmn_id: PlmnId::default(),
-            requested_nssai: Vec::with_capacity(OGS_MAX_NUM_OF_SLICE),
-            allowed_nssai: Vec::with_capacity(OGS_MAX_NUM_OF_SLICE),
-            rejected_nssai: Vec::with_capacity(OGS_MAX_NUM_OF_SLICE),
+            requested_nssai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SLICE),
+            allowed_nssai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SLICE),
+            rejected_nssai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SLICE),
             policy_association: PolicyAssociation::default(),
             gmm_capability: GmmCapability::default(),
             security_context_available: false,
@@ -2289,30 +2289,30 @@ impl AmfUe {
             ue_security_capability: UeSecurityCapability::default(),
             ue_network_capability: UeNetworkCapability::default(),
             confirmation_for_5g_aka: Confirmation5gAka::default(),
-            rand: [0u8; OGS_RAND_LEN],
-            xres_star: [0u8; OGS_MAX_RES_LEN],
-            abba: [0u8; OGS_NAS_MAX_ABBA_LEN],
+            rand: [0u8; NEXTGCORE_RAND_LEN],
+            xres_star: [0u8; NEXTGCORE_MAX_RES_LEN],
+            abba: [0u8; NEXTGCORE_NAS_MAX_ABBA_LEN],
             abba_len: 0,
-            hxres_star: [0u8; OGS_MAX_RES_LEN],
-            kamf: [0u8; OGS_SHA256_DIGEST_SIZE],
+            hxres_star: [0u8; NEXTGCORE_MAX_RES_LEN],
+            kamf: [0u8; NEXTGCORE_SHA256_DIGEST_SIZE],
             auth_result: AuthResult::default(),
-            knas_int: [0u8; OGS_SHA256_DIGEST_SIZE / 2],
-            knas_enc: [0u8; OGS_SHA256_DIGEST_SIZE / 2],
+            knas_int: [0u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
+            knas_enc: [0u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
             dl_count: 0,
             ul_count: 0,
             use_ogs_nas_security: false,
             ul_count_established: false,
-            kgnb: [0u8; OGS_SHA256_DIGEST_SIZE],
+            kgnb: [0u8; NEXTGCORE_SHA256_DIGEST_SIZE],
             nhcc: 0,
-            nh: [0u8; OGS_SHA256_DIGEST_SIZE],
+            nh: [0u8; NEXTGCORE_SHA256_DIGEST_SIZE],
             selected_enc_algorithm: 0,
             selected_int_algorithm: 0,
             ue_ambr: Bitrate::default(),
             num_of_slice: 0,
-            slice: Vec::with_capacity(OGS_MAX_NUM_OF_SLICE),
+            slice: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SLICE),
             am_policy_control_features: 0,
             ran_ue_id,
-            ran_ue_holding_id: OGS_INVALID_POOL_ID,
+            ran_ue_holding_id: NEXTGCORE_INVALID_POOL_ID,
             ue_radio_capability: Vec::new(),
             handover: HandoverInfo::default(),
             data_change_subscription: DataChangeSubscription::default(),
@@ -2322,9 +2322,9 @@ impl AmfUe {
             registration_type: 0,
             nas_message_type: 0,
             nas_tsc: 0,
-            nas_ksi: OGS_NAS_KSI_NO_KEY_IS_AVAILABLE,
+            nas_ksi: NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE,
             nas_ue_tsc: 0,
-            nas_ue_ksi: OGS_NAS_KSI_NO_KEY_IS_AVAILABLE,
+            nas_ue_ksi: NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE,
             pdu_session_status_present: false,
             pdu_session_status: 0,
             uplink_data_status_present: false,
@@ -2335,7 +2335,7 @@ impl AmfUe {
             pending_n1_sm_msg: None,
             pending_psi: None,
             sessions: Vec::new(),
-            autn: vec![0u8; OGS_AUTN_LEN],
+            autn: vec![0u8; NEXTGCORE_AUTN_LEN],
             redcap_indication: false,
             snpn_nid: None,
             cag_id: None,
@@ -2353,7 +2353,7 @@ impl AmfUe {
     pub fn security_context_is_valid(&self) -> bool {
         self.security_context_available
             && !self.mac_failed
-            && self.nas.ue_ksi != OGS_NAS_KSI_NO_KEY_IS_AVAILABLE
+            && self.nas.ue_ksi != NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE
     }
 
     /// Clear security context
@@ -2410,7 +2410,7 @@ impl AmfUe {
         self.memento.ue_network_capability = self.ue_network_capability.clone();
         self.memento.rand = self.rand;
         // Copy from Vec to fixed-size array
-        let len = self.autn.len().min(OGS_AUTN_LEN);
+        let len = self.autn.len().min(NEXTGCORE_AUTN_LEN);
         self.memento.autn[..len].copy_from_slice(&self.autn[..len]);
         self.memento.xres_star = self.xres_star;
         self.memento.abba = self.abba;
@@ -2690,7 +2690,7 @@ impl AmfSess {
             payload_container_type: 0,
             payload_container: None,
             amf_ue_id,
-            ran_ue_id: OGS_INVALID_POOL_ID,
+            ran_ue_id: NEXTGCORE_INVALID_POOL_ID,
             s_nssai: SNssai::default(),
             mapped_hplmn: SNssai::default(),
             mapped_hplmn_presence: false,

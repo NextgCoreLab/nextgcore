@@ -122,8 +122,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -208,7 +208,7 @@ async fn main() -> Result<()> {
         ..Default::default()
     }));
     let mut http_config =
-        ogs_sbi::server::SbiServerConfig::with_host_port(&args.sbi_addr, args.sbi_port)
+        nextgcore_sbi::server::SbiServerConfig::with_host_port(&args.sbi_addr, args.sbi_port)
             .map_err(|e| anyhow::anyhow!("Invalid SBI listen address: {e}"))?;
     if args.tls {
         match (&args.tls_key, &args.tls_cert) {
@@ -218,10 +218,10 @@ async fn main() -> Result<()> {
             _ => anyhow::bail!("--tls requires both --tls-cert and --tls-key"),
         }
     }
-    let http_server = ogs_sbi::server::SbiServer::new(http_config);
+    let http_server = nextgcore_sbi::server::SbiServer::new(http_config);
     let handler_proxy = scp_proxy.clone();
     http_server
-        .start(move |request: ogs_sbi::message::SbiRequest| {
+        .start(move |request: nextgcore_sbi::message::SbiRequest| {
             let proxy = handler_proxy.clone();
             async move { proxy.handle(request).await }
         })
@@ -309,7 +309,7 @@ async fn run_event_loop_async(scp_sm: &mut ScpSmContext, shutdown: Arc<AtomicBoo
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
         // Compute optimal sleep duration based on pending timers
-        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+        let poll_interval = nextgcore_core::async_timer::compute_poll_interval(
             timer_mgr.inner(),
             Duration::from_millis(100),
         );

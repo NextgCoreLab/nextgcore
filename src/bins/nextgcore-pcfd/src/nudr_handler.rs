@@ -158,7 +158,7 @@ pub fn pcf_nudr_dr_handle_query_am_data(
             }
 
             // Send PolicyAssociation response
-            // In C: ogs_sbi_server_send_response(stream, response)
+            // In C: nextgcore_sbi_server_send_response(stream, response)
             log::debug!(
                 "[{}] Sending PolicyAssociation response (stream={})",
                 pcf_ue_am.supi,
@@ -239,12 +239,12 @@ pub fn query_subscription_data_pub(supi: &str) -> Option<SubscriptionData> {
     query_subscription_data(supi)
 }
 
-/// Query subscription data from database via ogs-dbi
-/// In C: ogs_dbi_subscription_data()
+/// Query subscription data from database via nextgcore-dbi
+/// In C: nextgcore_dbi_subscription_data()
 fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
     log::debug!("Querying subscription data for SUPI: {supi}");
 
-    match ogs_dbi::ogs_dbi_subscription_data(supi) {
+    match nextgcore_dbi::nextgcore_dbi_subscription_data(supi) {
         Ok(sub_data) => {
             log::debug!(
                 "[{}] Subscription data: AMBR up={}, down={}",
@@ -268,7 +268,7 @@ fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
     }
 }
 
-/// Get session data from database via ogs-dbi
+/// Get session data from database via nextgcore-dbi
 /// In C: pcf_get_session_data()
 pub fn pcf_get_session_data(
     supi: &str,
@@ -278,9 +278,9 @@ pub fn pcf_get_session_data(
 ) -> Option<SessionData> {
     log::debug!("Getting session data for SUPI={supi}, S-NSSAI={s_nssai:?}, DNN={dnn}");
 
-    let ogs_snssai = ogs_dbi::OgsSNssai::new(s_nssai.sst, s_nssai.sd);
+    let nextgcore_snssai = nextgcore_dbi::NextgcoreSNssai::new(s_nssai.sst, s_nssai.sd);
 
-    match ogs_dbi::ogs_dbi_session_data(supi, Some(&ogs_snssai), dnn) {
+    match nextgcore_dbi::nextgcore_dbi_session_data(supi, Some(&nextgcore_snssai), dnn) {
         Ok(sess_data) => {
             let qos = &sess_data.session.qos;
             let ambr = &sess_data.session.ambr;

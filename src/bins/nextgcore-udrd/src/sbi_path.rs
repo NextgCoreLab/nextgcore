@@ -43,38 +43,38 @@ pub fn udr_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     log::info!("Opening UDR SBI server on {}:{}", config.addr, config.port);
 
     // Initialize SELF NF instance
-    // In C: nf_instance = ogs_sbi_self()->nf_instance;
-    // ogs_assert(nf_instance);
-    // ogs_sbi_nf_fsm_init(nf_instance);
+    // In C: nf_instance = nextgcore_sbi_self()->nf_instance;
+    // nextgcore_assert(nf_instance);
+    // nextgcore_sbi_nf_fsm_init(nf_instance);
 
     // Build NF instance information. It will be transmitted to NRF.
-    // In C: ogs_sbi_nf_instance_build_default(nf_instance);
-    // ogs_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_SCP);
-    // ogs_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_PCF);
-    // ogs_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_UDM);
+    // In C: nextgcore_sbi_nf_instance_build_default(nf_instance);
+    // nextgcore_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_SCP);
+    // nextgcore_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_PCF);
+    // nextgcore_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_UDM);
 
     // Build NF service information. It will be transmitted to NRF.
-    // In C: if (ogs_sbi_nf_service_is_available(OGS_SBI_SERVICE_NAME_NUDR_DR)) {
-    //     service = ogs_sbi_nf_service_build_default(
-    //                 nf_instance, OGS_SBI_SERVICE_NAME_NUDR_DR);
-    //     ogs_assert(service);
-    //     ogs_sbi_nf_service_add_version(
-    //                 service, OGS_SBI_API_V1, OGS_SBI_API_V1_0_0, NULL);
-    //     ogs_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_PCF);
-    //     ogs_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_UDM);
+    // In C: if (nextgcore_sbi_nf_service_is_available(NEXTGCORE_SBI_SERVICE_NAME_NUDR_DR)) {
+    //     service = nextgcore_sbi_nf_service_build_default(
+    //                 nf_instance, NEXTGCORE_SBI_SERVICE_NAME_NUDR_DR);
+    //     nextgcore_assert(service);
+    //     nextgcore_sbi_nf_service_add_version(
+    //                 service, NEXTGCORE_SBI_API_V1, NEXTGCORE_SBI_API_V1_0_0, NULL);
+    //     nextgcore_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_PCF);
+    //     nextgcore_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_UDM);
     // }
 
     // Initialize NRF NF Instance
-    // In C: nf_instance = ogs_sbi_self()->nrf_instance;
+    // In C: nf_instance = nextgcore_sbi_self()->nrf_instance;
     // if (nf_instance)
-    //     ogs_sbi_nf_fsm_init(nf_instance);
+    //     nextgcore_sbi_nf_fsm_init(nf_instance);
 
     // Setup Subscription-Data
-    // In C: ogs_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL);
+    // In C: nextgcore_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL);
 
     // Start SBI server
-    // In C: if (ogs_sbi_server_start_all(ogs_sbi_server_handler) != OGS_OK)
-    //     return OGS_ERROR;
+    // In C: if (nextgcore_sbi_server_start_all(nextgcore_sbi_server_handler) != NEXTGCORE_OK)
+    //     return NEXTGCORE_ERROR;
 
     SBI_RUNNING.store(true, Ordering::SeqCst);
 
@@ -89,8 +89,8 @@ pub fn udr_sbi_close() {
     log::info!("Closing UDR SBI server");
 
     // Stop all clients and servers
-    // In C: ogs_sbi_client_stop_all();
-    // ogs_sbi_server_stop_all();
+    // In C: nextgcore_sbi_client_stop_all();
+    // nextgcore_sbi_server_stop_all();
 
     SBI_RUNNING.store(false, Ordering::SeqCst);
 

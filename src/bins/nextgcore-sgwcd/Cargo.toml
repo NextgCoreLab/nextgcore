@@ -11,11 +11,11 @@ name = "nextgcore-sgwcd"
 path = "src/main.rs"
 
 [dependencies]
-ogs-core = { workspace = true }
-ogs-gtp = { workspace = true }
-ogs-pfcp = { workspace = true }
-ogs-app = { workspace = true }
-ogs-metrics = { workspace = true }
+nextgcore-core = { workspace = true }
+nextgcore-gtp = { workspace = true }
+nextgcore-pfcp = { workspace = true }
+nextgcore-app = { workspace = true }
+nextgcore-metrics = { workspace = true }
 bytes.workspace = true
 log.workspace = true
 env_logger.workspace = true

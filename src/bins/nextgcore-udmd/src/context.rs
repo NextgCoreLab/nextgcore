@@ -106,13 +106,13 @@ pub struct SmfRegistration {
 }
 
 /// Key length constant
-pub const OGS_KEY_LEN: usize = 16;
+pub const NEXTGCORE_KEY_LEN: usize = 16;
 /// AMF length constant
-pub const OGS_AMF_LEN: usize = 2;
+pub const NEXTGCORE_AMF_LEN: usize = 2;
 /// RAND length constant
-pub const OGS_RAND_LEN: usize = 16;
+pub const NEXTGCORE_RAND_LEN: usize = 16;
 /// SQN length constant
-pub const OGS_SQN_LEN: usize = 6;
+pub const NEXTGCORE_SQN_LEN: usize = 6;
 
 /// UDM UE context
 #[derive(Debug, Clone)]
@@ -134,15 +134,15 @@ pub struct UdmUe {
     /// Deregistration callback URI
     pub dereg_callback_uri: Option<String>,
     /// K key (16 bytes)
-    pub k: [u8; OGS_KEY_LEN],
+    pub k: [u8; NEXTGCORE_KEY_LEN],
     /// OPc key (16 bytes)
-    pub opc: [u8; OGS_KEY_LEN],
+    pub opc: [u8; NEXTGCORE_KEY_LEN],
     /// AMF value (2 bytes)
-    pub amf: [u8; OGS_AMF_LEN],
+    pub amf: [u8; NEXTGCORE_AMF_LEN],
     /// RAND value (16 bytes)
-    pub rand: [u8; OGS_RAND_LEN],
+    pub rand: [u8; NEXTGCORE_RAND_LEN],
     /// SQN value (6 bytes)
-    pub sqn: [u8; OGS_SQN_LEN],
+    pub sqn: [u8; NEXTGCORE_SQN_LEN],
     /// GUAMI
     pub guami: Guami,
     /// Authentication type
@@ -172,11 +172,11 @@ impl UdmUe {
             ausf_instance_id: None,
             amf_instance_id: None,
             dereg_callback_uri: None,
-            k: [0u8; OGS_KEY_LEN],
-            opc: [0u8; OGS_KEY_LEN],
-            amf: [0u8; OGS_AMF_LEN],
-            rand: [0u8; OGS_RAND_LEN],
-            sqn: [0u8; OGS_SQN_LEN],
+            k: [0u8; NEXTGCORE_KEY_LEN],
+            opc: [0u8; NEXTGCORE_KEY_LEN],
+            amf: [0u8; NEXTGCORE_AMF_LEN],
+            rand: [0u8; NEXTGCORE_RAND_LEN],
+            sqn: [0u8; NEXTGCORE_SQN_LEN],
             guami: Guami::default(),
             auth_type: AuthType::default(),
             rat_type: RatType::default(),
@@ -629,7 +629,7 @@ impl UdmContext {
         let plaintext = match parsed.protection_scheme {
             PROTECTION_SCHEME_PROFILE_A => {
                 let priv_key: [u8; 32] = hnet_key.key.as_slice().try_into().ok()?;
-                ogs_crypt::ecies::suci_deconceal_profile_a(&priv_key, &scheme_output)
+                nextgcore_crypt::ecies::suci_deconceal_profile_a(&priv_key, &scheme_output)
                     .map_err(|e| {
                         log::error!("[{suci_or_supi}] Profile A deconcealment failed: {e}");
                     })
@@ -637,7 +637,7 @@ impl UdmContext {
             }
             PROTECTION_SCHEME_PROFILE_B => {
                 let priv_key: [u8; 32] = hnet_key.key.as_slice().try_into().ok()?;
-                ogs_crypt::ecies::suci_deconceal_profile_b(&priv_key, &scheme_output)
+                nextgcore_crypt::ecies::suci_deconceal_profile_b(&priv_key, &scheme_output)
                     .map_err(|e| {
                         log::error!("[{suci_or_supi}] Profile B deconcealment failed: {e}");
                     })
@@ -1236,12 +1236,12 @@ mod tests {
         ctx.init(100, 200);
 
         let hn_priv = [0x42u8; 32];
-        let hn_pub = ogs_crypt::ecies::x25519_public_key(&hn_priv);
+        let hn_pub = nextgcore_crypt::ecies::x25519_public_key(&hn_priv);
         ctx.hnet_key_add(1, PROTECTION_SCHEME_PROFILE_A, hn_priv.to_vec());
 
         let msin = "0123456789";
         let bcd = msin_to_bcd(msin);
-        let (eph_pub, ct, tag) = ogs_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &bcd).unwrap();
+        let (eph_pub, ct, tag) = nextgcore_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &bcd).unwrap();
         let mut scheme_output = Vec::new();
         scheme_output.extend_from_slice(&eph_pub);
         scheme_output.extend_from_slice(&ct);
@@ -1265,12 +1265,12 @@ mod tests {
 
         let mut hn_pub = [0u8; 33];
         let mut hn_priv = [0u8; 32];
-        ogs_crypt::ecc::ecc_make_key(&mut hn_pub, &mut hn_priv).unwrap();
+        nextgcore_crypt::ecc::ecc_make_key(&mut hn_pub, &mut hn_priv).unwrap();
         ctx.hnet_key_add(2, PROTECTION_SCHEME_PROFILE_B, hn_priv.to_vec());
 
         let msin = "0123456789";
         let bcd = msin_to_bcd(msin);
-        let (eph_pub, ct, tag) = ogs_crypt::ecc::ecies_profile_b_encrypt(&hn_pub, &bcd).unwrap();
+        let (eph_pub, ct, tag) = nextgcore_crypt::ecc::ecies_profile_b_encrypt(&hn_pub, &bcd).unwrap();
         let mut scheme_output = Vec::new();
         scheme_output.extend_from_slice(&eph_pub);
         scheme_output.extend_from_slice(&ct);
@@ -1296,9 +1296,9 @@ mod tests {
 
         // Tampered ciphertext: MAC verification must fail
         let hn_priv = [0x42u8; 32];
-        let hn_pub = ogs_crypt::ecies::x25519_public_key(&hn_priv);
+        let hn_pub = nextgcore_crypt::ecies::x25519_public_key(&hn_priv);
         let bcd = msin_to_bcd("0123456789");
-        let (eph_pub, ct, tag) = ogs_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &bcd).unwrap();
+        let (eph_pub, ct, tag) = nextgcore_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &bcd).unwrap();
         let mut scheme_output = Vec::new();
         scheme_output.extend_from_slice(&eph_pub);
         scheme_output.extend_from_slice(&ct);

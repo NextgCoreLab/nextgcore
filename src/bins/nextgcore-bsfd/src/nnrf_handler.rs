@@ -59,7 +59,7 @@ pub fn bsf_nnrf_handle_nf_discover(
     }
 
     // Process search result
-    // In C: ogs_nnrf_disc_handle_nf_discover_search_result(SearchResult)
+    // In C: nextgcore_nnrf_disc_handle_nf_discover_search_result(SearchResult)
     for nf_instance in &search_result.nf_instances {
         log::debug!(
             "Found NF instance: id={}, type={}, status={}",
@@ -70,7 +70,7 @@ pub fn bsf_nnrf_handle_nf_discover(
     }
 
     // Find NF instance by discovery parameters
-    // In C: ogs_sbi_nf_instance_find_by_discovery_param(...)
+    // In C: nextgcore_sbi_nf_instance_find_by_discovery_param(...)
     let nf_instance = search_result
         .nf_instances
         .first()

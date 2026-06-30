@@ -20,13 +20,13 @@ use tokio::time::timeout;
 use crate::common::{CapturedMessage, MessageCapture, MessageField, MessageType};
 
 // Re-export PFCP types from the library
-use ogs_pfcp::header::{PfcpHeader, PfcpMessageType};
-use ogs_pfcp::message::{
+use nextgcore_pfcp::header::{PfcpHeader, PfcpMessageType};
+use nextgcore_pfcp::message::{
     build_message, parse_message, AssociationSetupRequest, AssociationSetupResponse,
     HeartbeatRequest, HeartbeatResponse, PfcpMessage, SessionDeletionRequest,
     SessionDeletionResponse, SessionEstablishmentRequest, SessionEstablishmentResponse,
 };
-use ogs_pfcp::types::{FSeid, NodeId, PfcpCause};
+use nextgcore_pfcp::types::{FSeid, NodeId, PfcpCause};
 
 /// Mock UPF for PFCP testing
 pub struct MockUpf {

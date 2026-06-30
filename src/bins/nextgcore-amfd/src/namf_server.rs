@@ -11,14 +11,14 @@
 //! All error outcomes carry ProblemDetails bodies per TS 29.500 §5.2.7.
 //! Malformed input returns 400 — handlers never panic on bad bodies.
 
-use ogs_sbi::client::SbiClient;
-use ogs_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
-use ogs_sbi::server::{send_error, send_method_not_allowed, send_not_found};
+use nextgcore_sbi::client::SbiClient;
+use nextgcore_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{send_error, send_method_not_allowed, send_not_found};
 use serde_json::{json, Value};
 
 use crate::context::{
     amf_self, AmfSess, AmfUe, EventSubscription, NrCgi, PendingPositioningDl, PlmnId,
-    PositioningDlKind, RanUe, Tai5gs, UeContextTransferState, OGS_INVALID_POOL_ID,
+    PositioningDlKind, RanUe, Tai5gs, UeContextTransferState, NEXTGCORE_INVALID_POOL_ID,
 };
 use crate::namf_handler::{
     self, N1N2MessageTransferCause, N1N2MessageTransferReqData, N2InfoContainer, NgapIeType,
@@ -190,7 +190,7 @@ fn find_ue_by_context_id(ue_context_id: &str) -> Option<AmfUe> {
 
 /// CM state check: the UE is CM-CONNECTED when it has a live RAN UE context
 fn ue_ran_context(ue: &AmfUe) -> Option<RanUe> {
-    if ue.ran_ue_id == OGS_INVALID_POOL_ID {
+    if ue.ran_ue_id == NEXTGCORE_INVALID_POOL_ID {
         return None;
     }
     let ctx = amf_self();
@@ -691,7 +691,7 @@ fn handle_event_subscription_delete(subscription_id: &str) -> SbiResponse {
 
 /// Build a notification SBI client with bounded connect/request timeouts
 fn notify_client(host: &str, port: u16) -> SbiClient {
-    let config = ogs_sbi::client::SbiClientConfig::new(host, port)
+    let config = nextgcore_sbi::client::SbiClientConfig::new(host, port)
         .with_connect_timeout(std::time::Duration::from_secs(NOTIFY_CONNECT_TIMEOUT_SECS))
         .with_request_timeout(std::time::Duration::from_secs(NOTIFY_REQUEST_TIMEOUT_SECS));
     SbiClient::new(config)
@@ -1624,8 +1624,8 @@ fn handle_provide_positioning_info(ue_context_id: &str, request: &SbiRequest) ->
 mod tests {
     use super::*;
     use crate::context::amf_context_init;
-    use ogs_sbi::message::SbiPart;
-    use ogs_sbi::server::{SbiServer, SbiServerConfig};
+    use nextgcore_sbi::message::SbiPart;
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -1655,7 +1655,7 @@ mod tests {
             guard.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
             ue.ran_ue_id = ran_ue.id;
         } else {
-            ue.ran_ue_id = OGS_INVALID_POOL_ID;
+            ue.ran_ue_id = NEXTGCORE_INVALID_POOL_ID;
         }
         guard.amf_ue_update(&ue);
         ue

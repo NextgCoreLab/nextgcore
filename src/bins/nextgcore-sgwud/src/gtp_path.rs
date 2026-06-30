@@ -3,7 +3,7 @@
 //! Port of src/sgwu/gtp-path.c. Owns the real GTP-U UDP socket (port 2152)
 //! and the user-plane forwarding path: G-PDU in -> PDR match by TEID ->
 //! FAR apply (FORW/BUFF/DROP) -> G-PDU out. All wire framing goes through
-//! the ogs-gtp GTPv1-U codec; Echo Response carries the mandatory Recovery
+//! the nextgcore-gtp GTPv1-U codec; Echo Response carries the mandatory Recovery
 //! IE and Error Indication carries Tunnel Endpoint Identifier Data I +
 //! GTP-U Peer Address as proper IEs (TS 29.281 Section 7.3.1).
 
@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use ogs_gtp::v1::header::{Gtp1cMessageType, Gtp1uMessageType};
-use ogs_gtp::v1::message::{ErrorIndication, Gtp1Message};
-use ogs_gtp::GTPV1_U_UDP_PORT;
+use nextgcore_gtp::v1::header::{Gtp1cMessageType, Gtp1uMessageType};
+use nextgcore_gtp::v1::message::{ErrorIndication, Gtp1Message};
+use nextgcore_gtp::GTPV1_U_UDP_PORT;
 
 use crate::context::{apply_action, sgwu_self, SgwuFar, SgwuPdr};
 use crate::pfcp_path;

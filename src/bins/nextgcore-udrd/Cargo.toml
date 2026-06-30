@@ -26,10 +26,10 @@ serde_json.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 ctrlc.workspace = true
 clap.workspace = true
-ogs-sbi = { path = "../../libs/ogs-sbi" }
-ogs-metrics = { workspace = true }
-ogs-dbi = { path = "../../libs/ogs-dbi" }
-ogs-core = { path = "../../libs/ogs-core" }
+nextgcore-sbi = { path = "../../libs/nextgcore-sbi" }
+nextgcore-metrics = { workspace = true }
+nextgcore-dbi = { path = "../../libs/nextgcore-dbi" }
+nextgcore-core = { path = "../../libs/nextgcore-core" }
 tokio.workspace = true
 
 [dev-dependencies]

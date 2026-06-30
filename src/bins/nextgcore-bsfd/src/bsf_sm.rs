@@ -173,7 +173,7 @@ impl BsfSmContext {
             Some("nf-status-notify") => match method {
                 "POST" => {
                     log::debug!("NF status notify received");
-                    // Note: ogs_nnrf_nfm_handle_nf_status_notify would process NF status changes
+                    // Note: nextgcore_nnrf_nfm_handle_nf_status_notify would process NF status changes
                     // This is handled by the NRF handler when NRF integration is enabled
                 }
                 _ => {

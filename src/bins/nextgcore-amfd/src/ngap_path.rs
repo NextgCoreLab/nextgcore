@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use ogs_sctp::{OgsSctpInfo, SctpServer, SctpServerConfig, ServerEvent, OGS_NGAP_SCTP_PORT};
+use nextgcore_sctp::{NextgcoreSctpInfo, SctpServer, SctpServerConfig, ServerEvent, NEXTGCORE_NGAP_SCTP_PORT};
 
 use crate::context::{AmfContext, AmfGnb, AmfUe, Guti5gs, PlmnId, SNssai, UeSecurityCapability};
 use crate::event::AmfEvent;
@@ -89,7 +89,7 @@ impl SctpBackend {
 enum NgapTransport {
     Userspace(SctpServer),
     #[cfg(feature = "kernel-sctp")]
-    Kernel(ogs_sctp::KernelSctpServer),
+    Kernel(nextgcore_sctp::KernelSctpServer),
 }
 
 impl NgapTransport {
@@ -108,7 +108,7 @@ impl NgapTransport {
             SctpBackend::Kernel => {
                 #[cfg(feature = "kernel-sctp")]
                 {
-                    let server = ogs_sctp::KernelSctpServer::bind(addr, config)
+                    let server = nextgcore_sctp::KernelSctpServer::bind(addr, config)
                         .await
                         .map_err(|e| anyhow::anyhow!("Failed to bind kernel SCTP server: {e}"))?;
                     Ok(Self::Kernel(server))
@@ -141,7 +141,7 @@ impl NgapTransport {
         }
     }
 
-    async fn recv(&mut self, timeout: Duration) -> std::result::Result<bool, ogs_sctp::ServerError> {
+    async fn recv(&mut self, timeout: Duration) -> std::result::Result<bool, nextgcore_sctp::ServerError> {
         match self {
             Self::Userspace(s) => s.recv(timeout).await,
             #[cfg(feature = "kernel-sctp")]
@@ -154,7 +154,7 @@ impl NgapTransport {
         association_id: u64,
         stream_id: u16,
         data: &[u8],
-    ) -> std::result::Result<(), ogs_sctp::ServerError> {
+    ) -> std::result::Result<(), nextgcore_sctp::ServerError> {
         match self {
             Self::Userspace(s) => s.send(association_id, stream_id, data).await,
             #[cfg(feature = "kernel-sctp")]
@@ -180,11 +180,11 @@ const SCTP_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCESS_TYPE_3GPP: u8 = 0x01;
 
 /// NGAP elementary-procedure codes (TS 38.413 Section 9.3.1.2) used by the
-/// procedure dispatch. Sourced from the ogs-asn1c `ProcedureCode` table so
+/// procedure dispatch. Sourced from the nextgcore-asn1c `ProcedureCode` table so
 /// the wire byte we read at `data[1]` is matched against spec constants, not
 /// magic numbers.
 mod proc_code {
-    use ogs_asn1c::ngap::types::ProcedureCode;
+    use nextgcore_asn1c::ngap::types::ProcedureCode;
     pub const ERROR_INDICATION: u16 = ProcedureCode::ERROR_INDICATION.0 as u16;
     pub const HANDOVER_CANCEL: u16 = ProcedureCode::HANDOVER_CANCEL.0 as u16;
     pub const HANDOVER_NOTIFICATION: u16 = ProcedureCode::HANDOVER_NOTIFICATION.0 as u16;
@@ -214,7 +214,7 @@ pub struct GnbSession {
     /// gNB context
     pub gnb: AmfGnb,
     /// SCTP info
-    pub sctp_info: OgsSctpInfo,
+    pub sctp_info: NextgcoreSctpInfo,
 }
 
 impl GnbSession {
@@ -225,7 +225,7 @@ impl GnbSession {
             addr,
             fsm: NgapFsm::new(id),
             gnb: AmfGnb::new(id, &addr.to_string()),
-            sctp_info: OgsSctpInfo::default(),
+            sctp_info: NextgcoreSctpInfo::default(),
         }
     }
 }
@@ -649,8 +649,8 @@ impl NgapServer {
                     association_id,
                     None,
                     None,
-                    ogs_ngap::types::Cause::Protocol(
-                        ogs_asn1c::ngap::cause::CauseProtocol::MessageNotCompatibleWithReceiverState,
+                    nextgcore_ngap::types::Cause::Protocol(
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::MessageNotCompatibleWithReceiverState,
                     ),
                 )
                 .await?;
@@ -724,11 +724,11 @@ impl NgapServer {
                     "Unhandled NGAP procedure_code={procedure_code:?} from association {association_id}; emitting ErrorIndication"
                 );
                 let cause = match procedure_code {
-                    Some(_) => ogs_ngap::types::Cause::Protocol(
-                        ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                    Some(_) => nextgcore_ngap::types::Cause::Protocol(
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
                     ),
-                    None => ogs_ngap::types::Cause::Protocol(
-                        ogs_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
+                    None => nextgcore_ngap::types::Cause::Protocol(
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
                     ),
                 };
                 // Best-effort: include the UE NGAP IDs if they can be located.
@@ -903,8 +903,8 @@ impl NgapServer {
     ///
     /// Releases the affected UE contexts and responds with NG Reset Acknowledge.
     async fn handle_ng_reset(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        use ogs_ngap::types::ResetType;
-        use ogs_ngap::{parser::decode_ngap_pdu, NgapMessage};
+        use nextgcore_ngap::types::ResetType;
+        use nextgcore_ngap::{parser::decode_ngap_pdu, NgapMessage};
 
         let reset = match decode_ngap_pdu(data) {
             Ok(NgapMessage::NgReset(reset)) => reset,
@@ -1824,7 +1824,7 @@ impl NgapServer {
 
         let abba_len = state.amf_ue.abba_len as usize;
         let kamf =
-            ogs_crypt::kdf::ogs_kdf_kamf(&supi, &state.amf_ue.abba[..abba_len], &confirm.kseaf);
+            nextgcore_crypt::kdf::nextgcore_kdf_kamf(&supi, &state.amf_ue.abba[..abba_len], &confirm.kseaf);
         state.amf_ue.kamf = kamf;
 
         // Select NAS algorithms from the UE's replayed capabilities and the
@@ -1868,12 +1868,12 @@ impl NgapServer {
         state.amf_ue.selected_enc_algorithm =
             nas_security::select_encryption_algorithm(ue_enc_mask, amf_enc_mask);
 
-        let knas_int = ogs_crypt::kdf::ogs_kdf_nas_5gs(
+        let knas_int = nextgcore_crypt::kdf::nextgcore_kdf_nas_5gs(
             0x02, // N-NAS-int-alg (TS 33.501 Annex A.8)
             state.amf_ue.selected_int_algorithm,
             &kamf,
         );
-        let knas_enc = ogs_crypt::kdf::ogs_kdf_nas_5gs(
+        let knas_enc = nextgcore_crypt::kdf::nextgcore_kdf_nas_5gs(
             0x01, // N-NAS-enc-alg
             state.amf_ue.selected_enc_algorithm,
             &kamf,
@@ -2565,7 +2565,7 @@ impl NgapServer {
         } else {
             state.amf_ue.access_type
         };
-        let kgnb = ogs_crypt::kdf::ogs_kdf_kgnb_and_kn3iwf(
+        let kgnb = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(
             &state.amf_ue.kamf,
             state.amf_ue.ul_count,
             access_type_distinguisher,
@@ -3503,15 +3503,15 @@ impl NgapServer {
         association_id: u64,
         amf_ue_ngap_id: Option<u64>,
         ran_ue_ngap_id: Option<u32>,
-        cause: ogs_ngap::types::Cause,
+        cause: nextgcore_ngap::types::Cause,
     ) -> Result<()> {
-        let msg = ogs_ngap::types::ErrorIndication {
+        let msg = nextgcore_ngap::types::ErrorIndication {
             amf_ue_ngap_id,
             ran_ue_ngap_id,
             cause: Some(cause),
             criticality_diagnostics: None,
         };
-        match ogs_ngap::builder::build_error_indication(&msg) {
+        match nextgcore_ngap::builder::build_error_indication(&msg) {
             Ok(bytes) => {
                 self.send_to_association(association_id, &bytes).await?;
                 log::info!(
@@ -3528,8 +3528,8 @@ impl NgapServer {
     /// The AMF never replies; it logs the reported cause/diagnostics for the
     /// affected UE association so operators can trace the protocol error.
     async fn handle_error_indication(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        match ogs_ngap::parser::decode_ngap_pdu(data) {
-            Ok(ogs_ngap::NgapMessage::ErrorIndication(ei)) => {
+        match nextgcore_ngap::parser::decode_ngap_pdu(data) {
+            Ok(nextgcore_ngap::NgapMessage::ErrorIndication(ei)) => {
                 log::warn!(
                     "ErrorIndication from association {association_id}: \
                      amf_ue_ngap_id={:?}, ran_ue_ngap_id={:?}, cause={:?}",
@@ -3603,8 +3603,8 @@ impl NgapServer {
     /// preparation is rejected with HandoverPreparationFailure carrying the
     /// spec cause (TS 38.413 Section 9.2.3.6), rather than being dropped.
     async fn handle_handover_required(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        let required = match ogs_ngap::parser::decode_ngap_pdu(data) {
-            Ok(ogs_ngap::NgapMessage::HandoverRequired(r)) => r,
+        let required = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
+            Ok(nextgcore_ngap::NgapMessage::HandoverRequired(r)) => r,
             Ok(other) => {
                 log::warn!("Expected HandoverRequired, decoded {other:?}");
                 return Ok(());
@@ -3615,8 +3615,8 @@ impl NgapServer {
                     association_id,
                     None,
                     None,
-                    ogs_ngap::types::Cause::Protocol(
-                        ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                    nextgcore_ngap::types::Cause::Protocol(
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
                     ),
                 )
                 .await?;
@@ -3643,15 +3643,15 @@ impl NgapServer {
                 "HandoverRequired: target gNB not reachable on this AMF; \
                  rejecting with HandoverPreparationFailure"
             );
-            let failure = ogs_ngap::types::HandoverPreparationFailure {
+            let failure = nextgcore_ngap::types::HandoverPreparationFailure {
                 amf_ue_ngap_id: required.amf_ue_ngap_id,
                 ran_ue_ngap_id: required.ran_ue_ngap_id,
-                cause: ogs_ngap::types::Cause::RadioNetwork(
-                    ogs_asn1c::ngap::cause::CauseRadioNetwork::UnknownTargetId,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UnknownTargetId,
                 ),
                 criticality_diagnostics: None,
             };
-            if let Ok(bytes) = ogs_ngap::builder::build_handover_preparation_failure(&failure) {
+            if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure) {
                 self.send_to_association(association_id, &bytes).await?;
             }
             return Ok(());
@@ -3669,15 +3669,15 @@ impl NgapServer {
                 "HandoverRequired for unknown UE {}; rejecting",
                 required.amf_ue_ngap_id
             );
-            let failure = ogs_ngap::types::HandoverPreparationFailure {
+            let failure = nextgcore_ngap::types::HandoverPreparationFailure {
                 amf_ue_ngap_id: required.amf_ue_ngap_id,
                 ran_ue_ngap_id: required.ran_ue_ngap_id,
-                cause: ogs_ngap::types::Cause::RadioNetwork(
-                    ogs_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
                 ),
                 criticality_diagnostics: None,
             };
-            if let Ok(bytes) = ogs_ngap::builder::build_handover_preparation_failure(&failure) {
+            if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure) {
                 self.send_to_association(association_id, &bytes).await?;
             }
             return Ok(());
@@ -3696,33 +3696,33 @@ impl NgapServer {
             }
         };
 
-        let ho_request = ogs_ngap::types::HandoverRequest {
+        let ho_request = nextgcore_ngap::types::HandoverRequest {
             amf_ue_ngap_id: required.amf_ue_ngap_id,
             handover_type: required.handover_type,
             cause: required.cause,
-            ue_ambr: ogs_ngap::types::UeAmbrInfo {
+            ue_ambr: nextgcore_ngap::types::UeAmbrInfo {
                 dl: state.amf_ue.ue_ambr.downlink.max(1),
                 ul: state.amf_ue.ue_ambr.uplink.max(1),
             },
             ue_security_capabilities: ue_caps_to_ngap(&state.amf_ue.ue_security_capability),
-            security_context: ogs_ngap::types::SecurityContext {
+            security_context: nextgcore_ngap::types::SecurityContext {
                 next_hop_chaining_count: state.amf_ue.nhcc,
                 next_hop: state.amf_ue.nh,
             },
             pdu_session_list: required
                 .pdu_session_list
                 .iter()
-                .map(|p| ogs_ngap::types::PduSessionResourceSetupItemHoReq {
+                .map(|p| nextgcore_ngap::types::PduSessionResourceSetupItemHoReq {
                     pdu_session_id: p.pdu_session_id,
                     s_nssai: state
                         .amf_ue
                         .allowed_nssai
                         .first()
-                        .map(|s| ogs_ngap::types::SNssai {
+                        .map(|s| nextgcore_ngap::types::SNssai {
                             sst: s.sst,
                             sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
                         })
-                        .unwrap_or(ogs_ngap::types::SNssai { sst: 1, sd: None }),
+                        .unwrap_or(nextgcore_ngap::types::SNssai { sst: 1, sd: None }),
                     transfer: p.transfer.clone(),
                 })
                 .collect(),
@@ -3730,13 +3730,13 @@ impl NgapServer {
                 .amf_ue
                 .allowed_nssai
                 .iter()
-                .map(|s| ogs_ngap::types::SNssai {
+                .map(|s| nextgcore_ngap::types::SNssai {
                     sst: s.sst,
                     sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
                 })
                 .collect(),
             source_to_target_container: required.source_to_target_container.clone(),
-            guami: ogs_ngap::types::Guami {
+            guami: nextgcore_ngap::types::Guami {
                 plmn_identity: plmn_id_to_ngap_bytes(&guami_plmn),
                 amf_region_id: amf_region,
                 amf_set_id: amf_set,
@@ -3744,7 +3744,7 @@ impl NgapServer {
             },
         };
 
-        match ogs_ngap::builder::build_handover_request(&ho_request) {
+        match nextgcore_ngap::builder::build_handover_request(&ho_request) {
             Ok(bytes) => {
                 self.send_to_association(target_assoc, &bytes).await?;
                 log::info!(
@@ -3755,15 +3755,15 @@ impl NgapServer {
             }
             Err(e) => {
                 log::error!("Failed to build HandoverRequest: {e}");
-                let failure = ogs_ngap::types::HandoverPreparationFailure {
+                let failure = nextgcore_ngap::types::HandoverPreparationFailure {
                     amf_ue_ngap_id: required.amf_ue_ngap_id,
                     ran_ue_ngap_id: required.ran_ue_ngap_id,
-                    cause: ogs_ngap::types::Cause::Protocol(
-                        ogs_asn1c::ngap::cause::CauseProtocol::Unspecified,
+                    cause: nextgcore_ngap::types::Cause::Protocol(
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::Unspecified,
                     ),
                     criticality_diagnostics: None,
                 };
-                if let Ok(b) = ogs_ngap::builder::build_handover_preparation_failure(&failure) {
+                if let Ok(b) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure) {
                     self.send_to_association(association_id, &b).await?;
                 }
             }
@@ -3779,8 +3779,8 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        let ack = match ogs_ngap::parser::decode_ngap_pdu(data) {
-            Ok(ogs_ngap::NgapMessage::HandoverRequestAcknowledge(a)) => a,
+        let ack = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
+            Ok(nextgcore_ngap::NgapMessage::HandoverRequestAcknowledge(a)) => a,
             Ok(other) => {
                 log::warn!("Expected HandoverRequestAcknowledge, decoded {other:?}");
                 return Ok(());
@@ -3816,10 +3816,10 @@ impl NgapServer {
                 .ue_auth_state
                 .get(&ack.amf_ue_ngap_id)
                 .expect("checked");
-            (state.ran_ue_ngap_id, ogs_ngap::types::HandoverType::Intra5gs)
+            (state.ran_ue_ngap_id, nextgcore_ngap::types::HandoverType::Intra5gs)
         };
 
-        let command = ogs_ngap::types::HandoverCommand {
+        let command = nextgcore_ngap::types::HandoverCommand {
             amf_ue_ngap_id: ack.amf_ue_ngap_id,
             ran_ue_ngap_id,
             handover_type,
@@ -3827,7 +3827,7 @@ impl NgapServer {
             pdu_session_list: ack
                 .admitted_list
                 .iter()
-                .map(|a| ogs_ngap::types::PduSessionResourceHandoverItem {
+                .map(|a| nextgcore_ngap::types::PduSessionResourceHandoverItem {
                     pdu_session_id: a.pdu_session_id,
                     transfer: a.transfer.clone(),
                 })
@@ -3835,7 +3835,7 @@ impl NgapServer {
             release_list: None,
             target_to_source_container: ack.target_to_source_container.clone(),
         };
-        match ogs_ngap::builder::build_handover_command(&command) {
+        match nextgcore_ngap::builder::build_handover_command(&command) {
             Ok(bytes) => {
                 self.send_to_association(source_assoc, &bytes).await?;
                 log::info!(
@@ -3852,8 +3852,8 @@ impl NgapServer {
     /// Resource allocation failed at the target; relay a
     /// HandoverPreparationFailure to the source gNB so it aborts T304.
     async fn handle_handover_failure(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        let failure = match ogs_ngap::parser::decode_ngap_pdu(data) {
-            Ok(ogs_ngap::NgapMessage::HandoverFailure(f)) => f,
+        let failure = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
+            Ok(nextgcore_ngap::NgapMessage::HandoverFailure(f)) => f,
             Ok(other) => {
                 log::warn!("Expected HandoverFailure, decoded {other:?}");
                 return Ok(());
@@ -3873,14 +3873,14 @@ impl NgapServer {
             .get(&failure.amf_ue_ngap_id)
             .map(|s| (s.association_id, s.ran_ue_ngap_id));
         if let Some((source_assoc, ran_ue_ngap_id)) = source {
-            let prep_failure = ogs_ngap::types::HandoverPreparationFailure {
+            let prep_failure = nextgcore_ngap::types::HandoverPreparationFailure {
                 amf_ue_ngap_id: failure.amf_ue_ngap_id,
                 ran_ue_ngap_id,
                 cause: failure.cause,
                 criticality_diagnostics: None,
             };
             if let Ok(bytes) =
-                ogs_ngap::builder::build_handover_preparation_failure(&prep_failure)
+                nextgcore_ngap::builder::build_handover_preparation_failure(&prep_failure)
             {
                 self.send_to_association(source_assoc, &bytes).await?;
             }
@@ -3892,8 +3892,8 @@ impl NgapServer {
     /// the UE has successfully arrived. The AMF updates the UE's serving cell
     /// location and (in a full deployment) releases the source-side resources.
     async fn handle_handover_notify(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        let notify = match ogs_ngap::parser::decode_ngap_pdu(data) {
-            Ok(ogs_ngap::NgapMessage::HandoverNotify(n)) => n,
+        let notify = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
+            Ok(nextgcore_ngap::NgapMessage::HandoverNotify(n)) => n,
             Ok(other) => {
                 log::warn!("Expected HandoverNotify, decoded {other:?}");
                 return Ok(());
@@ -3913,7 +3913,7 @@ impl NgapServer {
             // target now that the UE has arrived (TS 23.502 Section 4.9.1.3).
             state.association_id = association_id;
             state.ran_ue_ngap_id = notify.ran_ue_ngap_id;
-            let ogs_ngap::types::UserLocationInformation::Nr {
+            let nextgcore_ngap::types::UserLocationInformation::Nr {
                 nr_cgi_plmn,
                 nr_cell_identity,
                 tai_plmn,
@@ -3940,8 +3940,8 @@ impl NgapServer {
     /// Handle a HandoverCancel from the source gNB (TS 38.413 Section 8.4.5).
     /// The AMF acknowledges with a HandoverCancelAcknowledge.
     async fn handle_handover_cancel(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        let cancel = match ogs_ngap::parser::decode_ngap_pdu(data) {
-            Ok(ogs_ngap::NgapMessage::HandoverCancel(c)) => c,
+        let cancel = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
+            Ok(nextgcore_ngap::NgapMessage::HandoverCancel(c)) => c,
             Ok(other) => {
                 log::warn!("Expected HandoverCancel, decoded {other:?}");
                 return Ok(());
@@ -3952,8 +3952,8 @@ impl NgapServer {
                     association_id,
                     None,
                     None,
-                    ogs_ngap::types::Cause::Protocol(
-                        ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                    nextgcore_ngap::types::Cause::Protocol(
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
                     ),
                 )
                 .await?;
@@ -3965,12 +3965,12 @@ impl NgapServer {
             cancel.amf_ue_ngap_id,
             cancel.cause
         );
-        let ack = ogs_ngap::types::HandoverCancelAcknowledge {
+        let ack = nextgcore_ngap::types::HandoverCancelAcknowledge {
             amf_ue_ngap_id: cancel.amf_ue_ngap_id,
             ran_ue_ngap_id: cancel.ran_ue_ngap_id,
             criticality_diagnostics: None,
         };
-        match ogs_ngap::builder::build_handover_cancel_acknowledge(&ack) {
+        match nextgcore_ngap::builder::build_handover_cancel_acknowledge(&ack) {
             Ok(bytes) => {
                 self.send_to_association(association_id, &bytes).await?;
                 log::info!(
@@ -3993,8 +3993,8 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        let req = match ogs_ngap::parser::decode_ngap_pdu(data) {
-            Ok(ogs_ngap::NgapMessage::PathSwitchRequest(r)) => r,
+        let req = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
+            Ok(nextgcore_ngap::NgapMessage::PathSwitchRequest(r)) => r,
             Ok(other) => {
                 log::warn!("Expected PathSwitchRequest, decoded {other:?}");
                 return Ok(());
@@ -4005,8 +4005,8 @@ impl NgapServer {
                     association_id,
                     None,
                     None,
-                    ogs_ngap::types::Cause::Protocol(
-                        ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                    nextgcore_ngap::types::Cause::Protocol(
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
                     ),
                 )
                 .await?;
@@ -4022,16 +4022,16 @@ impl NgapServer {
         // Unknown UE → PathSwitchRequestFailure with unknown-local-UE cause.
         if !self.ue_auth_state.contains_key(&amf_ue_ngap_id) {
             log::warn!("PathSwitchRequest for unknown UE {amf_ue_ngap_id}; failing");
-            let failure = ogs_ngap::types::PathSwitchRequestFailure {
+            let failure = nextgcore_ngap::types::PathSwitchRequestFailure {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: req.ran_ue_ngap_id,
-                cause: ogs_ngap::types::Cause::RadioNetwork(
-                    ogs_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
                 ),
                 released_list: None,
                 criticality_diagnostics: None,
             };
-            if let Ok(bytes) = ogs_ngap::builder::build_path_switch_request_failure(&failure) {
+            if let Ok(bytes) = nextgcore_ngap::builder::build_path_switch_request_failure(&failure) {
                 self.send_to_association(association_id, &bytes).await?;
             }
             return Ok(());
@@ -4044,7 +4044,7 @@ impl NgapServer {
                 .ue_auth_state
                 .get_mut(&amf_ue_ngap_id)
                 .expect("checked");
-            let new_nh = ogs_crypt::kdf::ogs_kdf_nh_gnb(&state.amf_ue.kamf, &state.amf_ue.nh);
+            let new_nh = nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&state.amf_ue.kamf, &state.amf_ue.nh);
             state.amf_ue.nh = new_nh;
             state.amf_ue.nhcc = state.amf_ue.nhcc.wrapping_add(1) & 0x07;
             // Move the UE's serving RAN association and RAN-UE-NGAP-ID to the
@@ -4052,10 +4052,10 @@ impl NgapServer {
             state.ran_ue_ngap_id = req.ran_ue_ngap_id;
             state.association_id = association_id;
 
-            let switched_list: Vec<ogs_ngap::types::PduSessionResourceSwitchedItem> = req
+            let switched_list: Vec<nextgcore_ngap::types::PduSessionResourceSwitchedItem> = req
                 .pdu_session_list
                 .iter()
-                .map(|p| ogs_ngap::types::PduSessionResourceSwitchedItem {
+                .map(|p| nextgcore_ngap::types::PduSessionResourceSwitchedItem {
                     pdu_session_id: p.pdu_session_id,
                     // Echo the gNB's path-switch transfer back as the ack
                     // transfer; in a full deployment the SMF supplies the UL
@@ -4068,7 +4068,7 @@ impl NgapServer {
                 .amf_ue
                 .allowed_nssai
                 .iter()
-                .map(|s| ogs_ngap::types::SNssai {
+                .map(|s| nextgcore_ngap::types::SNssai {
                     sst: s.sst,
                     sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
                 })
@@ -4090,16 +4090,16 @@ impl NgapServer {
             .nh;
 
         let allowed_for_ack = if allowed_nssai.is_empty() {
-            vec![ogs_ngap::types::SNssai { sst: 1, sd: None }]
+            vec![nextgcore_ngap::types::SNssai { sst: 1, sd: None }]
         } else {
             allowed_nssai
         };
 
-        let ack = ogs_ngap::types::PathSwitchRequestAcknowledge {
+        let ack = nextgcore_ngap::types::PathSwitchRequestAcknowledge {
             amf_ue_ngap_id,
             ran_ue_ngap_id: req.ran_ue_ngap_id,
             ue_security_capabilities: Some(ue_caps),
-            security_context: ogs_ngap::types::SecurityContext {
+            security_context: nextgcore_ngap::types::SecurityContext {
                 next_hop_chaining_count: ncc,
                 next_hop: nh,
             },
@@ -4107,7 +4107,7 @@ impl NgapServer {
             released_list: None,
             allowed_nssai: allowed_for_ack,
         };
-        match ogs_ngap::builder::build_path_switch_request_acknowledge(&ack) {
+        match nextgcore_ngap::builder::build_path_switch_request_acknowledge(&ack) {
             Ok(bytes) => {
                 self.send_to_association(association_id, &bytes).await?;
                 log::info!(
@@ -4118,16 +4118,16 @@ impl NgapServer {
             }
             Err(e) => {
                 log::error!("Failed to build PathSwitchRequestAcknowledge: {e}");
-                let failure = ogs_ngap::types::PathSwitchRequestFailure {
+                let failure = nextgcore_ngap::types::PathSwitchRequestFailure {
                     amf_ue_ngap_id,
                     ran_ue_ngap_id: req.ran_ue_ngap_id,
-                    cause: ogs_ngap::types::Cause::Protocol(
-                        ogs_asn1c::ngap::cause::CauseProtocol::Unspecified,
+                    cause: nextgcore_ngap::types::Cause::Protocol(
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::Unspecified,
                     ),
                     released_list: None,
                     criticality_diagnostics: None,
                 };
-                if let Ok(b) = ogs_ngap::builder::build_path_switch_request_failure(&failure) {
+                if let Ok(b) = nextgcore_ngap::builder::build_path_switch_request_failure(&failure) {
                     self.send_to_association(association_id, &b).await?;
                 }
             }
@@ -4139,16 +4139,16 @@ impl NgapServer {
     /// matching its Global RAN Node ID against connected gNB contexts.
     async fn find_association_for_target(
         &self,
-        target_id: &ogs_ngap::types::TargetId,
+        target_id: &nextgcore_ngap::types::TargetId,
     ) -> Option<u64> {
         let target_gnb_id = match target_id {
-            ogs_ngap::types::TargetId::TargetRanNodeId {
+            nextgcore_ngap::types::TargetId::TargetRanNodeId {
                 global_ran_node_id, ..
             } => match global_ran_node_id {
-                ogs_ngap::types::GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => Some(*gnb_id as u64),
+                nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => Some(*gnb_id as u64),
                 _ => None,
             },
-            ogs_ngap::types::TargetId::TargetGlobalNgEnbId { .. } => None,
+            nextgcore_ngap::types::TargetId::TargetGlobalNgEnbId { .. } => None,
         }?;
         let sessions = self.sessions.read().await;
         sessions
@@ -4248,7 +4248,7 @@ impl NgapServer {
         );
 
         // Decode the APER-encoded PDU Session Resource Setup Response using ASN.1
-        use ogs_ngap::{parser::decode_ngap_pdu, NgapMessage};
+        use nextgcore_ngap::{parser::decode_ngap_pdu, NgapMessage};
 
         let response_data = match decode_ngap_pdu(data) {
             Ok(NgapMessage::PduSessionResourceSetupResponse(resp)) => resp,
@@ -4649,7 +4649,7 @@ fn select_allowed_nssai(subscribed: &[SNssai], plmn_default: &[SNssai]) -> Vec<S
 /// returned by the AUSF (`Nausf_UEAuthentication`, TS 29.509 §6.1.3) verbatim
 /// into the EAP message IE (IEI 0x78, type 6 TLV-E) of an Authentication Request,
 /// alongside the ngKSI and ABBA. No RAND/AUTN are present (those belong to the
-/// 5G-AKA path). Encoded via ogs-nas so the wire image is conformant.
+/// 5G-AKA path). Encoded via nextgcore-nas so the wire image is conformant.
 ///
 /// This is the additive, self-contained core of amfd-05. Driving the EAP
 /// round-trips needs the AUSF `eap-session` SBI plumbing in `sbi_path.rs`
@@ -4661,8 +4661,8 @@ fn select_allowed_nssai(subscribed: &[SNssai], plmn_default: &[SNssai]) -> Vec<S
 /// out of scope for this amfd-only change; wiring is E2E-deferred.
 #[allow(dead_code)]
 fn build_eap_authentication_request(tsc: u8, ksi: u8, abba: &[u8], eap_payload: &[u8]) -> Vec<u8> {
-    use ogs_nas::common::types::{Abba, EapMessage, KeySetIdentifier};
-    use ogs_nas::fiveg::message::{build_5gmm_message, AuthenticationRequest, FiveGmmMessage};
+    use nextgcore_nas::common::types::{Abba, EapMessage, KeySetIdentifier};
+    use nextgcore_nas::fiveg::message::{build_5gmm_message, AuthenticationRequest, FiveGmmMessage};
 
     let msg = FiveGmmMessage::AuthenticationRequest(AuthenticationRequest {
         ngksi: KeySetIdentifier::new(tsc, ksi),
@@ -5241,9 +5241,9 @@ fn wire_caps_to_mask(wire: u8) -> u8 {
 /// Map the stored NAS UE security-capability octets (5G/EPS EA/IA bitmaps,
 /// MSB = algorithm 0) to the 16-bit NGAP UESecurityCapabilities bitstrings
 /// (TS 38.413 Section 9.3.1.86); the NAS octet occupies the high 8 bits.
-fn ue_caps_to_ngap(caps: &UeSecurityCapability) -> ogs_ngap::types::UeSecurityCapabilities {
+fn ue_caps_to_ngap(caps: &UeSecurityCapability) -> nextgcore_ngap::types::UeSecurityCapabilities {
     let to_bits = |octet: u8| -> u16 { (octet as u16) << 8 };
-    ogs_ngap::types::UeSecurityCapabilities {
+    nextgcore_ngap::types::UeSecurityCapabilities {
         nr_encryption_algorithms: to_bits(caps.ea),
         nr_integrity_algorithms: to_bits(caps.ia),
         eutra_encryption_algorithms: to_bits(caps.eea),
@@ -5373,7 +5373,7 @@ pub async fn amf_ngap_open(
     event_tx: mpsc::Sender<AmfEvent>,
 ) -> Result<()> {
     let addr = bind_addr.unwrap_or_else(|| {
-        format!("{DEFAULT_NGAP_ADDR}:{OGS_NGAP_SCTP_PORT}")
+        format!("{DEFAULT_NGAP_ADDR}:{NEXTGCORE_NGAP_SCTP_PORT}")
             .parse()
             .expect("value expected")
     });
@@ -5958,11 +5958,11 @@ mod tests {
         // exactly that key as the UE Security Key.
         let kamf = [0x42u8; 32];
         let ul_count = 1u32;
-        let kgnb = ogs_crypt::kdf::ogs_kdf_kgnb_and_kn3iwf(&kamf, ul_count, ACCESS_TYPE_3GPP);
+        let kgnb = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(&kamf, ul_count, ACCESS_TYPE_3GPP);
         assert_ne!(kgnb, [0u8; 32], "KgNB must be non-zero");
 
         // Different UL NAS COUNT -> different KgNB (input binding holds).
-        let kgnb2 = ogs_crypt::kdf::ogs_kdf_kgnb_and_kn3iwf(&kamf, ul_count + 1, ACCESS_TYPE_3GPP);
+        let kgnb2 = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(&kamf, ul_count + 1, ACCESS_TYPE_3GPP);
         assert_ne!(kgnb, kgnb2);
 
         // Wire it into an ICS request and confirm the security key round-trips.
@@ -5993,9 +5993,9 @@ mod tests {
             None,
         )
         .expect("build ICS");
-        let decoded = ogs_ngap::parser::decode_ngap_pdu(&bytes).expect("decode");
+        let decoded = nextgcore_ngap::parser::decode_ngap_pdu(&bytes).expect("decode");
         match decoded {
-            ogs_ngap::NgapMessage::InitialContextSetupRequest(req) => {
+            nextgcore_ngap::NgapMessage::InitialContextSetupRequest(req) => {
                 assert_eq!(req.security_key, kgnb);
                 assert_ne!(req.security_key, [0u8; 32]);
             }
@@ -6024,8 +6024,8 @@ mod tests {
         assert!(!state.initial_context_setup_response_received);
 
         // The gNB confirms: parse a real ICS Response and apply the gate.
-        let resp = ogs_ngap::builder::build_initial_context_setup_response(
-            &ogs_ngap::types::InitialContextSetupResponse {
+        let resp = nextgcore_ngap::builder::build_initial_context_setup_response(
+            &nextgcore_ngap::types::InitialContextSetupResponse {
                 amf_ue_ngap_id: 1,
                 ran_ue_ngap_id: 2,
             },
@@ -6077,32 +6077,32 @@ mod tests {
         // ErrorIndication carrying a protocol cause (TS 38.413 Section 10.3).
         // This mirrors the `_` dispatch arm's behaviour.
         let unknown_pdu = [0x00u8, 99, 0x00]; // InitiatingMessage, procedure 99
-        let parsed = ogs_ngap::parser::decode_ngap_pdu(&unknown_pdu);
+        let parsed = nextgcore_ngap::parser::decode_ngap_pdu(&unknown_pdu);
         // Either decodes to Unknown or fails to decode; both drive ErrorIndication.
         let is_unknown_or_err = matches!(
             parsed,
-            Ok(ogs_ngap::NgapMessage::Unknown { .. }) | Err(_)
+            Ok(nextgcore_ngap::NgapMessage::Unknown { .. }) | Err(_)
         );
         assert!(is_unknown_or_err, "got {parsed:?}");
 
         // Build the ErrorIndication the dispatch would emit and confirm it is a
         // valid, decodable PDU with the protocol cause.
-        let ei = ogs_ngap::types::ErrorIndication {
+        let ei = nextgcore_ngap::types::ErrorIndication {
             amf_ue_ngap_id: None,
             ran_ue_ngap_id: None,
-            cause: Some(ogs_ngap::types::Cause::Protocol(
-                ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+            cause: Some(nextgcore_ngap::types::Cause::Protocol(
+                nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
             )),
             criticality_diagnostics: None,
         };
-        let bytes = ogs_ngap::builder::build_error_indication(&ei).unwrap();
+        let bytes = nextgcore_ngap::builder::build_error_indication(&ei).unwrap();
         assert_eq!(bytes[0], 0x00); // InitiatingMessage
         assert_eq!(bytes[1], proc_code::ERROR_INDICATION as u8);
-        match ogs_ngap::parser::decode_ngap_pdu(&bytes).unwrap() {
-            ogs_ngap::NgapMessage::ErrorIndication(e) => {
+        match nextgcore_ngap::parser::decode_ngap_pdu(&bytes).unwrap() {
+            nextgcore_ngap::NgapMessage::ErrorIndication(e) => {
                 assert!(matches!(
                     e.cause,
-                    Some(ogs_ngap::types::Cause::Protocol(_))
+                    Some(nextgcore_ngap::types::Cause::Protocol(_))
                 ));
             }
             other => panic!("expected ErrorIndication, got {other:?}"),
@@ -6114,8 +6114,8 @@ mod tests {
         let start = crate::ngap_asn1::build_overload_start_asn1(40).expect("overload start");
         assert_eq!(start[0], 0x00);
         assert_eq!(start[1], proc_code::OVERLOAD_START as u8);
-        match ogs_ngap::parser::decode_ngap_pdu(&start).unwrap() {
-            ogs_ngap::NgapMessage::OverloadStart(o) => {
+        match nextgcore_ngap::parser::decode_ngap_pdu(&start).unwrap() {
+            nextgcore_ngap::NgapMessage::OverloadStart(o) => {
                 assert_eq!(o.traffic_load_reduction, Some(40));
             }
             other => panic!("expected OverloadStart, got {other:?}"),
@@ -6123,8 +6123,8 @@ mod tests {
 
         let stop = crate::ngap_asn1::build_overload_stop_asn1().expect("overload stop");
         assert_eq!(stop[1], proc_code::OVERLOAD_STOP as u8);
-        match ogs_ngap::parser::decode_ngap_pdu(&stop).unwrap() {
-            ogs_ngap::NgapMessage::OverloadStop(_) => {}
+        match nextgcore_ngap::parser::decode_ngap_pdu(&stop).unwrap() {
+            nextgcore_ngap::NgapMessage::OverloadStop(_) => {}
             other => panic!("expected OverloadStop, got {other:?}"),
         }
     }

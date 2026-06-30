@@ -22,10 +22,10 @@
 //! `main.rs`.
 
 use crate::CellMeasurement;
-use ogs_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
-use ogs_asn1c::lpp::nr_dl_tdoa::NrRstd;
-use ogs_asn1c::nrppa::ies::{MeasuredResultsValue, NgRanCell};
-use ogs_asn1c::nrppa::pdu::{parse_ecid_measurement_report, NrppaPdu};
+use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
+use nextgcore_asn1c::lpp::nr_dl_tdoa::NrRstd;
+use nextgcore_asn1c::nrppa::ies::{MeasuredResultsValue, NgRanCell};
+use nextgcore_asn1c::nrppa::pdu::{parse_ecid_measurement_report, NrppaPdu};
 
 // ---------------------------------------------------------------------------
 // Timing constant
@@ -41,7 +41,7 @@ const TC_NS: f64 = 1_000_000_000.0 / (480_000.0 * 4_096.0);
 
 /// Format an `NgRanCgi` as `"<plmn-6hex>-<cellid-9hex>"` for NR cells, or
 /// `"<plmn-6hex>-e<cellid-7hex>"` for E-UTRA cells.
-fn ng_ran_cgi_to_string(cgi: &ogs_asn1c::nrppa::ies::NgRanCgi) -> String {
+fn ng_ran_cgi_to_string(cgi: &nextgcore_asn1c::nrppa::ies::NgRanCgi) -> String {
     let p = &cgi.plmn_identity.0;
     let plmn = format!("{:02x}{:02x}{:02x}", p[0], p[1], p[2]);
     match cgi.ng_ran_cell {
@@ -355,20 +355,20 @@ mod tests {
         lpp_dl_tdoa_provide_to_measurements, lpp_multi_rtt_provide_to_measurements,
         nrppa_ecid_report_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TC_NS,
     };
-    use ogs_asn1c::lpp::ecid::{ProvideLocationInformation, ProvideLocationInformationR9};
-    use ogs_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
-    use ogs_asn1c::lpp::nr_dl_tdoa::{NrRstd, NrSlot, NrTimeStamp, NrTimingQuality};
-    use ogs_asn1c::lpp::nr_multi_rtt::{
+    use nextgcore_asn1c::lpp::ecid::{ProvideLocationInformation, ProvideLocationInformationR9};
+    use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
+    use nextgcore_asn1c::lpp::nr_dl_tdoa::{NrRstd, NrSlot, NrTimeStamp, NrTimingQuality};
+    use nextgcore_asn1c::lpp::nr_multi_rtt::{
         NrMultiRttMeasElement, NrMultiRttMeasList, NrMultiRttProvideLocationInformation,
         NrMultiRttSignalMeasurementInformation, NrUeRxTxTimeDiff,
     };
-    use ogs_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
-    use ogs_asn1c::nrppa::ies::{
+    use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
+    use nextgcore_asn1c::nrppa::ies::{
         ECidMeasurementResult, MeasuredResults, MeasuredResultsValue, NgRanCell, NgRanCgi,
         PlmnIdentity, ResultRsrpEutraItem, Tac, UeMeasurementId,
     };
-    use ogs_asn1c::nrppa::pdu::{build_ecid_measurement_report, NrppaPdu};
-    use ogs_asn1c::nrppa::types::NrppaTransactionId;
+    use nextgcore_asn1c::nrppa::pdu::{build_ecid_measurement_report, NrppaPdu};
+    use nextgcore_asn1c::nrppa::types::NrppaTransactionId;
 
     /// `nrrstd_to_ns`: single-unit inputs verify the 2^k × T_c scaling.
     ///
@@ -579,7 +579,7 @@ mod tests {
     /// The reference TRP leads with rstd_ns 0; each element carries its signed RSTD.
     #[test]
     fn rt_lpp_dl_tdoa_to_measurements() {
-        use ogs_asn1c::lpp::nr_dl_tdoa::{
+        use nextgcore_asn1c::lpp::nr_dl_tdoa::{
             DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList,
             NrDlTdoaProvideLocationInformation, NrDlTdoaSignalMeasurementInformation,
         };

@@ -375,10 +375,10 @@ pub async fn forward_n32f_request_async(
     let scheme = if tls_enabled { "https" } else { "http" };
     let forward_uri = format!("{scheme}://{host}:{port}/n32f-forward/v1/n32f-process");
 
-    let sbi_config = ogs_sbi::client::SbiClientConfig::new(&host, port);
-    let sbi_client = ogs_sbi::client::SbiClient::new(sbi_config);
+    let sbi_config = nextgcore_sbi::client::SbiClientConfig::new(&host, port);
+    let sbi_client = nextgcore_sbi::client::SbiClient::new(sbi_config);
 
-    let mut sbi_request = ogs_sbi::message::SbiRequest::post(&forward_uri);
+    let mut sbi_request = nextgcore_sbi::message::SbiRequest::post(&forward_uri);
 
     // Set N32f headers
     for (key, value) in &forward_result.headers {
@@ -689,7 +689,7 @@ pub fn select_peer_for_target(target_apiroot: &str) -> Result<crate::context::Se
 }
 
 /// Check if FQDN is in VPLMN (visited PLMN)
-/// Port of ogs_sbi_fqdn_in_vplmn
+/// Port of nextgcore_sbi_fqdn_in_vplmn
 fn is_fqdn_in_vplmn(fqdn: &str) -> bool {
     // Check if the FQDN contains a different PLMN ID than our serving PLMNs
     // Format: xxx.5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org
@@ -711,7 +711,7 @@ fn is_fqdn_in_vplmn(fqdn: &str) -> bool {
 }
 
 /// Extract PLMN ID from FQDN
-/// Port of ogs_plmn_id_mcc_from_fqdn / ogs_plmn_id_mnc_from_fqdn
+/// Port of nextgcore_plmn_id_mcc_from_fqdn / nextgcore_plmn_id_mnc_from_fqdn
 fn extract_plmn_from_fqdn(fqdn: &str) -> (u16, u16) {
     // Format: xxx.5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org
     let mut mcc: u16 = 0;

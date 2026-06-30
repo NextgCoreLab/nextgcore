@@ -19,7 +19,7 @@
 //! warning. When a PCF *is* configured, a rejection or transport failure is a
 //! hard failure for the PDU session (no silent fallback).
 
-use ogs_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -236,7 +236,7 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
     }
 
     // NRF discovery
-    let nrf_uri = ogs_sbi::context::global_context().get_nrf_uri().await?;
+    let nrf_uri = nextgcore_sbi::context::global_context().get_nrf_uri().await?;
     let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
     let client = SbiClient::new(
         SbiClientConfig::new(nrf_host, nrf_port)
@@ -325,7 +325,7 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
     }
 
     // NRF discovery
-    let nrf_uri = ogs_sbi::context::global_context().get_nrf_uri().await?;
+    let nrf_uri = nextgcore_sbi::context::global_context().get_nrf_uri().await?;
     let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
     let client = SbiClient::new(
         SbiClientConfig::new(nrf_host, nrf_port)
@@ -1549,7 +1549,7 @@ mod tests {
 
     // --------------- HTTP round-trip against a stub PCF -----------------
 
-    async fn stub_pcf_handler(req: ogs_sbi::message::SbiRequest) -> ogs_sbi::message::SbiResponse {
+    async fn stub_pcf_handler(req: nextgcore_sbi::message::SbiRequest) -> nextgcore_sbi::message::SbiResponse {
         let path = req.header.uri.split('?').next().unwrap_or("");
         let decision = serde_json::json!({
             "sessRules": {
@@ -1570,12 +1570,12 @@ mod tests {
                 .and_then(|c| serde_json::from_str(c).ok())
                 .unwrap_or_default();
             if body["pduSessionId"].as_u64() == Some(13) {
-                return ogs_sbi::message::SbiResponse::with_status(403).with_body(
+                return nextgcore_sbi::message::SbiResponse::with_status(403).with_body(
                     serde_json::json!({"cause": "POLICY_REJECTED"}).to_string(),
                     "application/problem+json",
                 );
             }
-            return ogs_sbi::message::SbiResponse::with_status(201)
+            return nextgcore_sbi::message::SbiResponse::with_status(201)
                 .with_header(
                     "Location",
                     "/npcf-smpolicycontrol/v1/sm-policies/stub-pol-1",
@@ -1583,13 +1583,13 @@ mod tests {
                 .with_body(decision.to_string(), "application/json");
         }
         if path.ends_with("/update") {
-            return ogs_sbi::message::SbiResponse::with_status(200)
+            return nextgcore_sbi::message::SbiResponse::with_status(200)
                 .with_body(decision.to_string(), "application/json");
         }
         if path.ends_with("/delete") {
-            return ogs_sbi::message::SbiResponse::with_status(204);
+            return nextgcore_sbi::message::SbiResponse::with_status(204);
         }
-        ogs_sbi::message::SbiResponse::with_status(404)
+        nextgcore_sbi::message::SbiResponse::with_status(404)
     }
 
     fn free_port() -> u16 {
@@ -1603,7 +1603,7 @@ mod tests {
     async fn sm_policy_lifecycle_http_round_trip() {
         let port = free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(addr));
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(addr));
         server
             .start(stub_pcf_handler)
             .await
@@ -1683,10 +1683,10 @@ mod tests {
     /// conformant /slices/pdus resource, then admits (204) unless
     /// `pduSessionId == 99` (the over-limit marker), in which case it returns a
     /// 403 ProblemDetails (total failure).
-    async fn stub_nsacf_handler(req: ogs_sbi::message::SbiRequest) -> ogs_sbi::message::SbiResponse {
+    async fn stub_nsacf_handler(req: nextgcore_sbi::message::SbiRequest) -> nextgcore_sbi::message::SbiResponse {
         let path = req.header.uri.split('?').next().unwrap_or("").to_string();
         if !path.ends_with("/nnsacf-nsac/v1/slices/pdus") {
-            return ogs_sbi::message::SbiResponse::with_status(404);
+            return nextgcore_sbi::message::SbiResponse::with_status(404);
         }
         let body: serde_json::Value = req
             .http
@@ -1709,12 +1709,12 @@ mod tests {
         assert_eq!(op["snssai"]["sst"], 1, "op carries snssai");
 
         if psi == 99 {
-            ogs_sbi::message::SbiResponse::with_status(403).with_body(
+            nextgcore_sbi::message::SbiResponse::with_status(403).with_body(
                 serde_json::json!({"status": 403, "cause": "ALL_SLICE_FAILED"}).to_string(),
                 "application/problem+json",
             )
         } else {
-            ogs_sbi::message::SbiResponse::with_status(204)
+            nextgcore_sbi::message::SbiResponse::with_status(204)
         }
     }
 
@@ -1722,7 +1722,7 @@ mod tests {
     async fn nsac_pdu_session_admit_admitted_and_rejected() {
         let port = free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(addr));
+        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(addr));
         server
             .start(stub_nsacf_handler)
             .await

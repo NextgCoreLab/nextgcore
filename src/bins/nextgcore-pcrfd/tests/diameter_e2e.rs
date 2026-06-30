@@ -18,15 +18,15 @@
 
 use bytes::Bytes;
 
-use ogs_diameter::avp::{find_all_avps, find_avp, Avp, AvpData};
-use ogs_diameter::common::avp_code;
-use ogs_diameter::config::DiameterConfig;
-use ogs_diameter::gx::{avp as gx_avp, cmd as gx_cmd, GX_APPLICATION_ID};
-use ogs_diameter::message::DiameterMessage;
-use ogs_diameter::peer::{DiameterPeer, PeerEvent};
-use ogs_diameter::rx::{avp as rx_avp, cmd as rx_cmd, RX_APPLICATION_ID};
-use ogs_diameter::transport::DiameterTransport;
-use ogs_diameter::OGS_3GPP_VENDOR_ID;
+use nextgcore_diameter::avp::{find_all_avps, find_avp, Avp, AvpData};
+use nextgcore_diameter::common::avp_code;
+use nextgcore_diameter::config::DiameterConfig;
+use nextgcore_diameter::gx::{avp as gx_avp, cmd as gx_cmd, GX_APPLICATION_ID};
+use nextgcore_diameter::message::DiameterMessage;
+use nextgcore_diameter::peer::{DiameterPeer, PeerEvent};
+use nextgcore_diameter::rx::{avp as rx_avp, cmd as rx_cmd, RX_APPLICATION_ID};
+use nextgcore_diameter::transport::DiameterTransport;
+use nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID;
 
 use nextgcore_pcrfd::{pcrf_context_init, pcrf_fd_listen, LocalIdentity};
 
@@ -153,47 +153,47 @@ fn build_aar(session_id: &str, host: &str, ue_ip: [u8; 4]) -> DiameterMessage {
     // Audio media component with explicit flow descriptions
     aar.add_avp(Avp::vendor_mandatory(
         rx_avp::MEDIA_COMPONENT_DESCRIPTION,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Grouped(vec![
             Avp::vendor_mandatory(
                 rx_avp::MEDIA_COMPONENT_NUMBER,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Unsigned32(1),
             ),
             Avp::vendor_mandatory(
                 rx_avp::MEDIA_TYPE,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Enumerated(0), // AUDIO
             ),
             Avp::vendor_mandatory(
                 rx_avp::MAX_REQUESTED_BANDWIDTH_DL,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Unsigned32(64000),
             ),
             Avp::vendor_mandatory(
                 rx_avp::MAX_REQUESTED_BANDWIDTH_UL,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Unsigned32(64000),
             ),
             Avp::vendor_mandatory(
                 rx_avp::MEDIA_SUB_COMPONENT,
-                OGS_3GPP_VENDOR_ID,
+                NEXTGCORE_3GPP_VENDOR_ID,
                 AvpData::Grouped(vec![
                     Avp::vendor_mandatory(
                         rx_avp::FLOW_NUMBER,
-                        OGS_3GPP_VENDOR_ID,
+                        NEXTGCORE_3GPP_VENDOR_ID,
                         AvpData::Unsigned32(1),
                     ),
                     Avp::vendor_mandatory(
                         rx_avp::FLOW_DESCRIPTION,
-                        OGS_3GPP_VENDOR_ID,
+                        NEXTGCORE_3GPP_VENDOR_ID,
                         AvpData::OctetString(Bytes::from_static(
                             b"permit out 17 from 10.0.0.1 5004 to 10.45.0.9 6000",
                         )),
                     ),
                     Avp::vendor_mandatory(
                         rx_avp::FLOW_DESCRIPTION,
-                        OGS_3GPP_VENDOR_ID,
+                        NEXTGCORE_3GPP_VENDOR_ID,
                         AvpData::OctetString(Bytes::from_static(
                             b"permit in 17 from 10.45.0.9 6000 to 10.0.0.1 5004",
                         )),
@@ -297,7 +297,7 @@ async fn test_gx_rx_full_wire_flow() {
     );
     // Full provisioning present on the wire
     let install = cca
-        .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, OGS_3GPP_VENDOR_ID)
+        .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, NEXTGCORE_3GPP_VENDOR_ID)
         .expect("Charging-Rule-Install");
     assert!(install.is_mandatory());
     assert!(install.is_vendor_specific());
@@ -312,7 +312,7 @@ async fn test_gx_rx_full_wire_flow() {
     assert!(find_avp(&crd, gx_avp::FLOW_INFORMATION).is_some());
     assert!(find_avp(&crd, gx_avp::QOS_INFORMATION).is_some());
     assert!(cca
-        .find_vendor_avp(gx_avp::DEFAULT_EPS_BEARER_QOS, OGS_3GPP_VENDOR_ID)
+        .find_vendor_avp(gx_avp::DEFAULT_EPS_BEARER_QOS, NEXTGCORE_3GPP_VENDOR_ID)
         .is_some());
     assert!(!find_all_avps(&cca.avps, gx_avp::EVENT_TRIGGER).is_empty());
 
@@ -346,7 +346,7 @@ async fn test_gx_rx_full_wire_flow() {
         // Hop-by-Hop must not be a fixed value like 0
         assert_ne!(rar.header.hop_by_hop_id, 0);
         let install = rar
-            .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, NEXTGCORE_3GPP_VENDOR_ID)
             .expect("RAR Charging-Rule-Install");
         let crd = find_avp(
             &install.parse_grouped().unwrap(),
@@ -393,7 +393,7 @@ async fn test_gx_rx_full_wire_flow() {
         assert_eq!(rar.header.command_code, gx_cmd::RE_AUTH);
         assert_eq!(rar.session_id(), Some(gx_sid));
         let remove = rar
-            .find_vendor_avp(gx_avp::CHARGING_RULE_REMOVE, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(gx_avp::CHARGING_RULE_REMOVE, NEXTGCORE_3GPP_VENDOR_ID)
             .expect("RAR Charging-Rule-Remove");
         let names: Vec<Vec<u8>> =
             find_all_avps(&remove.parse_grouped().unwrap(), gx_avp::CHARGING_RULE_NAME)
@@ -427,7 +427,7 @@ async fn test_gx_rx_full_wire_flow() {
     assert_eq!(cca_t.result_code(), Some(2001));
     // No provisioning AVPs on termination
     assert!(cca_t
-        .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, OGS_3GPP_VENDOR_ID)
+        .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, NEXTGCORE_3GPP_VENDOR_ID)
         .is_none());
 
     // A further CCR-U for the removed session must be rejected
@@ -486,7 +486,7 @@ async fn test_ccr_t_aborts_bound_rx_session_with_asr() {
         assert_eq!(asr.session_id(), Some(rx_sid));
         assert_eq!(asr.destination_host(), Some(af_host));
         let abort_cause = asr
-            .find_vendor_avp(rx_avp::ABORT_CAUSE, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(rx_avp::ABORT_CAUSE, NEXTGCORE_3GPP_VENDOR_ID)
             .expect("Abort-Cause");
         assert_eq!(abort_cause.as_i32(), Some(0)); // BEARER_RELEASED
         let mut asa = DiameterMessage::new_answer(&asr);

@@ -4,8 +4,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ogs_sbi::context::{global_context, NfInstance, NfService};
-use ogs_sbi::types::{NfType, SbiServiceType, UriScheme};
+use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+use nextgcore_sbi::types::{NfType, SbiServiceType, UriScheme};
 
 /// SBI server configuration
 #[derive(Debug, Clone)]
@@ -273,7 +273,7 @@ pub async fn send_notification_post(
     suffix: &str,
     body: &serde_json::Value,
 ) -> Result<u16, String> {
-    use ogs_sbi::client::{SbiClient, SbiClientConfig};
+    use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
     use std::time::Duration;
 
     let (host, port) = parse_uri_host_port(notification_uri)?;
@@ -474,7 +474,7 @@ pub fn pcf_ue_am_sbi_discover_and_send(
     // In C implementation:
     // 1. Create SBI transaction
     // 2. Set associated stream ID
-    // 3. Call ogs_sbi_discover_and_send()
+    // 3. Call nextgcore_sbi_discover_and_send()
 
     // Note: Discovery and sending requires NRF integration
     Ok(())
@@ -492,7 +492,7 @@ pub fn pcf_sess_sbi_discover_and_send(
     // In C implementation:
     // 1. Create SBI transaction
     // 2. Set associated stream ID
-    // 3. Call ogs_sbi_discover_and_send()
+    // 3. Call nextgcore_sbi_discover_and_send()
 
     // Note: Discovery and sending requires NRF integration
     Ok(())
@@ -503,7 +503,7 @@ pub fn pcf_sess_sbi_discover_and_send(
 //
 // These helpers implement the real discover-and-send mechanism the PCF needs to
 // retrieve UDR PolicyData (TS 29.519 nudr-dr) and register/deregister a BSF
-// binding (TS 29.521 Nbsf_Management) over the shared ogs-sbi client.
+// binding (TS 29.521 Nbsf_Management) over the shared nextgcore-sbi client.
 //
 // FLAGGED (deferred E2E): invoking these from the live SM-policy create/delete
 // path against real udrd/bsfd is the deferred, E2E-gated pcfd-04 work. The
@@ -617,8 +617,8 @@ pub async fn pcf_discover_endpoint(
 }
 
 /// Build a bounded-timeout SBI client for a discovered endpoint.
-fn client_for(ep: &DiscoveredEndpoint) -> ogs_sbi::client::SbiClient {
-    use ogs_sbi::client::{SbiClient, SbiClientConfig};
+fn client_for(ep: &DiscoveredEndpoint) -> nextgcore_sbi::client::SbiClient {
+    use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
     use std::time::Duration;
     SbiClient::new(
         SbiClientConfig::new(ep.host.clone(), ep.port)
@@ -794,8 +794,8 @@ mod tests {
     /// SmPolicyNotification body (bounded timeouts both directions).
     #[tokio::test]
     async fn notification_post_round_trip() {
-        use ogs_sbi::message::{SbiRequest as Req, SbiResponse as Resp};
-        use ogs_sbi::server::{SbiServer, SbiServerConfig};
+        use nextgcore_sbi::message::{SbiRequest as Req, SbiResponse as Resp};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::time::Duration;
 
         async fn stub_smf(req: Req) -> Resp {
@@ -878,8 +878,8 @@ mod tests {
     /// peer; live-interop invocation from the SM-policy path remains E2E-gated.
     #[tokio::test]
     async fn discover_and_send_udr_and_bsf_mock() {
-        use ogs_sbi::message::SbiRequest as Req;
-        use ogs_sbi::server::{SbiServer, SbiServerConfig};
+        use nextgcore_sbi::message::SbiRequest as Req;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::time::Duration;
 
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -945,9 +945,9 @@ mod tests {
 
     /// Mock NRF/UDR/BSF response router used by the pcfd-09 test.
     fn build_mock_response(
-        req: &ogs_sbi::message::SbiRequest,
+        req: &nextgcore_sbi::message::SbiRequest,
         port: u16,
-    ) -> ogs_sbi::message::SbiResponse {
+    ) -> nextgcore_sbi::message::SbiResponse {
         let method = req.header.method.clone();
         let path = req.header.uri.split('?').next().unwrap_or("").to_string();
         if path == "/nnrf-disc/v1/nf-instances" {
@@ -975,9 +975,9 @@ mod tests {
                     }
                 ]
             });
-            return ogs_sbi::message::SbiResponse::with_status(200)
+            return nextgcore_sbi::message::SbiResponse::with_status(200)
                 .with_json_body(&body)
-                .unwrap_or_else(|_| ogs_sbi::message::SbiResponse::with_status(500));
+                .unwrap_or_else(|_| nextgcore_sbi::message::SbiResponse::with_status(500));
         }
         if path.starts_with("/nudr-dr/v2/policy-data/") && path.ends_with("/sm-data") {
             let body = serde_json::json!({
@@ -988,19 +988,19 @@ mod tests {
                     }
                 }
             });
-            return ogs_sbi::message::SbiResponse::with_status(200)
+            return nextgcore_sbi::message::SbiResponse::with_status(200)
                 .with_json_body(&body)
-                .unwrap_or_else(|_| ogs_sbi::message::SbiResponse::with_status(500));
+                .unwrap_or_else(|_| nextgcore_sbi::message::SbiResponse::with_status(500));
         }
         if method == "POST" && path == "/nbsf-management/v1/pcfBindings" {
-            return ogs_sbi::message::SbiResponse::with_status(201)
+            return nextgcore_sbi::message::SbiResponse::with_status(201)
                 .with_header("Location", "/nbsf-management/v1/pcfBindings/bind-777")
                 .with_json_body(&serde_json::json!({ "bindingId": "bind-777" }))
-                .unwrap_or_else(|_| ogs_sbi::message::SbiResponse::with_status(500));
+                .unwrap_or_else(|_| nextgcore_sbi::message::SbiResponse::with_status(500));
         }
         if method == "DELETE" && path.starts_with("/nbsf-management/v1/pcfBindings/") {
-            return ogs_sbi::message::SbiResponse::with_status(204);
+            return nextgcore_sbi::message::SbiResponse::with_status(204);
         }
-        ogs_sbi::message::SbiResponse::with_status(404)
+        nextgcore_sbi::message::SbiResponse::with_status(404)
     }
 }

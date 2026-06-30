@@ -249,8 +249,8 @@ fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -329,7 +329,7 @@ mod tests {
         // exercised at process startup
         let server = gtp_path::GtpcServer::open(
             "127.0.0.1:0",
-            ogs_gtp::v2::xact::Gtp2XactConfig::default(),
+            nextgcore_gtp::v2::xact::Gtp2XactConfig::default(),
             1,
         )
         .unwrap();

@@ -343,7 +343,7 @@ fn lowest_id_member_with_role(
 /// **PIND-11 — persistence DEFERRED + FLAGGED.** All PIN profiles and element
 /// registrations are held in-memory only (the `RwLock<HashMap<..>>` fields
 /// below) and are lost on restart; `fini` clears everything. pind has **no**
-/// `mongodb` / `ogs-dbi` dependency in its own `Cargo.toml` today, and the
+/// `mongodb` / `nextgcore-dbi` dependency in its own `Cargo.toml` today, and the
 /// remediation rule for this batch forbids touching any `libs/` crate. A
 /// write-through persistence backend (TS 23.542 §6.5.4 PIN-profile storage)
 /// therefore cannot be added without either a new direct `mongodb` dependency

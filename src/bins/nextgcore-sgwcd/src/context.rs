@@ -13,11 +13,11 @@ use std::sync::{Arc, RwLock};
 // ============================================================================
 
 /// Maximum IMSI length
-pub const OGS_MAX_IMSI_LEN: usize = 15;
+pub const NEXTGCORE_MAX_IMSI_LEN: usize = 15;
 /// Maximum IMSI BCD length
-pub const OGS_MAX_IMSI_BCD_LEN: usize = 15;
+pub const NEXTGCORE_MAX_IMSI_BCD_LEN: usize = 15;
 /// Invalid pool ID
-pub const OGS_INVALID_POOL_ID: u64 = 0;
+pub const NEXTGCORE_INVALID_POOL_ID: u64 = 0;
 
 // ============================================================================
 // Basic Types
@@ -70,7 +70,7 @@ pub struct Paa {
 }
 
 // ============================================================================
-// GTP Interface Types (from OGS_GTP2_F_TEID_*)
+// GTP Interface Types (from NEXTGCORE_GTP2_F_TEID_*)
 // ============================================================================
 
 /// GTP F-TEID interface types

@@ -114,8 +114,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -595,7 +595,7 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 // Compile SDF filter's flow description into an IpfwRule
                                 let sdf_rule =
                                     p.pdi.sdf_flow_description.as_ref().and_then(|desc| {
-                                        match ogs_ipfw::compile_rule(desc) {
+                                        match nextgcore_ipfw::compile_rule(desc) {
                                             Ok(rule) => Some(rule),
                                             Err(e) => {
                                                 log::warn!(
