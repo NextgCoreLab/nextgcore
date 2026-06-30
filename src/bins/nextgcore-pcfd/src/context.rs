@@ -1126,16 +1126,22 @@ impl PcfContext {
     }
 
     pub fn ue_am_find_by_supi(&self, supi: &str) -> Option<PcfUeAm> {
-        let supi_am_hash = self.supi_am_hash.read().ok()?;
+        // AB-BA: ue_am_list before supi_am_hash (canonical primary-list-first).
+        // ue_am_add/remove take ue_am_list then supi_am_hash, so a hash-first
+        // read here inverts that order and deadlocks a concurrent writer
+        // (read(supi_am_hash) waits on write, while write(ue_am_list) waits on read).
         let ue_am_list = self.ue_am_list.read().ok()?;
+        let supi_am_hash = self.supi_am_hash.read().ok()?;
         supi_am_hash
             .get(supi)
             .and_then(|&id| ue_am_list.get(&id).cloned())
     }
 
     pub fn ue_am_find_by_association_id(&self, association_id: &str) -> Option<PcfUeAm> {
-        let association_id_hash = self.association_id_hash.read().ok()?;
+        // AB-BA: ue_am_list before association_id_hash (canonical
+        // primary-list-first; matches ue_am_add/remove).
         let ue_am_list = self.ue_am_list.read().ok()?;
+        let association_id_hash = self.association_id_hash.read().ok()?;
         association_id_hash
             .get(association_id)
             .and_then(|&id| ue_am_list.get(&id).cloned())
@@ -1213,8 +1219,10 @@ impl PcfContext {
     }
 
     pub fn ue_sm_find_by_supi(&self, supi: &str) -> Option<PcfUeSm> {
-        let supi_sm_hash = self.supi_sm_hash.read().ok()?;
+        // AB-BA: ue_sm_list before supi_sm_hash (canonical primary-list-first;
+        // matches ue_sm_add, which takes ue_sm_list then supi_sm_hash).
         let ue_sm_list = self.ue_sm_list.read().ok()?;
+        let supi_sm_hash = self.supi_sm_hash.read().ok()?;
         supi_sm_hash
             .get(supi)
             .and_then(|&id| ue_sm_list.get(&id).cloned())
@@ -1311,8 +1319,13 @@ impl PcfContext {
     }
 
     pub fn sess_find_by_sm_policy_id(&self, sm_policy_id: &str) -> Option<PcfSess> {
-        let sm_policy_id_hash = self.sm_policy_id_hash.read().ok()?;
+        // AB-BA: sess_list before sm_policy_id_hash (canonical primary-list-first).
+        // sess_add/sess_remove take sess_list then sm_policy_id_hash, so a
+        // hash-first read here inverts that order and deadlocks a concurrent
+        // create/delete — this is the cycle the concurrent sm_policy_* handler
+        // tests hit (the 2fbcae0 fix normalized only the list<->list edges).
         let sess_list = self.sess_list.read().ok()?;
+        let sm_policy_id_hash = self.sm_policy_id_hash.read().ok()?;
         sm_policy_id_hash
             .get(sm_policy_id)
             .and_then(|&id| sess_list.get(&id).cloned())
@@ -1329,8 +1342,10 @@ impl PcfContext {
     pub fn sess_find_by_ipv4addr(&self, ipv4addr_string: &str) -> Option<PcfSess> {
         if let Ok(addr) = ipv4addr_string.parse::<std::net::Ipv4Addr>() {
             let ipv4addr = u32::from(addr);
-            let ipv4addr_hash = self.ipv4addr_hash.read().ok()?;
+            // AB-BA: sess_list before ipv4addr_hash (canonical primary-list-first;
+            // sess_remove/sess_update take sess_list then ipv4addr_hash).
             let sess_list = self.sess_list.read().ok()?;
+            let ipv4addr_hash = self.ipv4addr_hash.read().ok()?;
             return ipv4addr_hash
                 .get(&ipv4addr)
                 .and_then(|&id| sess_list.get(&id).cloned());
@@ -1339,8 +1354,10 @@ impl PcfContext {
     }
 
     pub fn sess_find_by_ipv6addr(&self, ipv6prefix_string: &str) -> Option<PcfSess> {
-        let ipv6prefix_hash = self.ipv6prefix_hash.read().ok()?;
+        // AB-BA: sess_list before ipv6prefix_hash (canonical primary-list-first;
+        // sess_remove/sess_update take sess_list then ipv6prefix_hash).
         let sess_list = self.sess_list.read().ok()?;
+        let ipv6prefix_hash = self.ipv6prefix_hash.read().ok()?;
         ipv6prefix_hash
             .get(ipv6prefix_string)
             .and_then(|&id| sess_list.get(&id).cloned())
@@ -1461,8 +1478,10 @@ impl PcfContext {
     }
 
     pub fn app_find_by_app_session_id(&self, app_session_id: &str) -> Option<PcfApp> {
-        let app_session_id_hash = self.app_session_id_hash.read().ok()?;
+        // AB-BA: app_list before app_session_id_hash (canonical primary-list-first;
+        // app_add/app_remove take sess_list then app_list then app_session_id_hash).
         let app_list = self.app_list.read().ok()?;
+        let app_session_id_hash = self.app_session_id_hash.read().ok()?;
         app_session_id_hash
             .get(app_session_id)
             .and_then(|&id| app_list.get(&id).cloned())
