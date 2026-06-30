@@ -275,9 +275,10 @@ PHASE 6: Protocol Libraries (Priority: Medium)
 ================================================================================
 Estimated Tasks: ~20 TODOs
 
-6.1 NGAP Protocol Support
--------------------------
+6.1 NGAP/S1AP Protocol Support
+------------------------------
   - src/libs/ogs-ngap/src/lib.rs:5                  - TODO: Implement in Task 7
+  - src/libs/ogs-s1ap/src/lib.rs:5                  - TODO: Implement in Task 7
 
 Note: These require ASN.1 codec implementation (asn1c/rasn integration)
 
@@ -288,6 +289,32 @@ Note: These require ASN.1 codec implementation (asn1c/rasn integration)
 6.3 Cryptographic Functions
 ---------------------------
   - src/libs/ogs-crypt/src/base64.rs:5             - TODO: Implement in Task 4
+
+================================================================================
+PHASE 7: EPC/Diameter Support (Priority: Low)
+================================================================================
+Estimated Tasks: ~25 TODOs
+
+7.1 HSS - Home Subscriber Server (4G)
+-------------------------------------
+  - src/bins/nextgcore-hssd/src/sm.rs:96-195       - Database polling, change events
+  - src/bins/nextgcore-hssd/src/s6a_path.rs:57-183 - Diameter S6a handlers
+  - src/bins/nextgcore-hssd/src/cx_path.rs:80-169  - Diameter Cx handlers
+  - src/bins/nextgcore-hssd/src/context.rs:591     - YAML configuration parsing
+
+7.2 PCRF - Policy and Charging Rules Function (4G)
+--------------------------------------------------
+  - src/bins/nextgcore-pcrfd/src/gx_path.rs:167-326 - Gx Diameter handlers
+  - src/bins/nextgcore-pcrfd/src/fd_path.rs:228-244 - FreeDiameter integration
+  - src/bins/nextgcore-pcrfd/src/rx_path.rs:151-280 - Rx Diameter handlers
+  - src/bins/nextgcore-pcrfd/src/context.rs:489     - YAML configuration parsing
+
+7.3 SGW-C/SGW-U (4G)
+--------------------
+  - src/bins/nextgcore-sgwcd/src/sm.rs:99-176      - GTP/PFCP message handling
+  - src/bins/nextgcore-sgwcd/src/pfcp_sm.rs:87-207 - PFCP state machine
+  - src/bins/nextgcore-sgwud/src/timer.rs:229-236  - Timer events
+  - src/bins/nextgcore-sgwud/src/main.rs:53        - Main event loop
 
 ================================================================================
 PHASE 8: UPF Enhancements (Priority: Low)

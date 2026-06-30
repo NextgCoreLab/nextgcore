@@ -23,6 +23,7 @@ rustup install nightly
 | `fuzz_pfcp_message` | PFCP | N4 interface (SMF ↔ UPF) |
 | `fuzz_gtp_message` | GTPv1-C/GTPv2-C | Gn/Gp/S5/S8/S11 interfaces |
 | `fuzz_nas_message` | 5G NAS / EPS NAS | 5GMM/5GSM/EMM/ESM messages |
+| `fuzz_diameter_message` | Diameter | S6a/S6b/Gx/Gy/Rx/Cx/SWx interfaces |
 
 ## Running Fuzzers
 

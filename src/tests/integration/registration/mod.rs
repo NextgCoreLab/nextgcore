@@ -75,6 +75,69 @@ async fn test_5g_registration_flow() {
     env.stop_all().await.unwrap();
 }
 
+/// Test 4G UE attach flow through MME
+#[tokio::test]
+async fn test_4g_attach_flow() {
+    let _ = env_logger::try_init();
+
+    // Create mock environment with MME
+    let mut env = MockEnvironment::new().with_mme();
+    env.start_all().await.unwrap();
+
+    let capture = env.capture();
+
+    // Simulate attach request from UE
+    let attach_request =
+        CapturedMessage::new(MessageType::AttachRequest, Bytes::new(), "UE", "MME").with_field(
+            "imsi",
+            crate::common::MessageField::String("001010000000001".to_string()),
+        );
+
+    // Send attach request
+    let response = env.send_message(NfType::Mme, attach_request).await.unwrap();
+
+    // Verify authentication request is sent
+    assert!(response.is_some());
+    let auth_req = response.unwrap();
+    assert_eq!(auth_req.msg_type, MessageType::AuthenticationRequest);
+
+    // Simulate authentication response
+    let auth_response = CapturedMessage::new(
+        MessageType::AuthenticationResponse,
+        Bytes::new(),
+        "UE",
+        "MME",
+    );
+
+    let response = env.send_message(NfType::Mme, auth_response).await.unwrap();
+
+    // Verify security mode command is sent
+    assert!(response.is_some());
+    let smc = response.unwrap();
+    assert_eq!(smc.msg_type, MessageType::SecurityModeCommand);
+
+    // Simulate security mode complete
+    let smc_complete =
+        CapturedMessage::new(MessageType::SecurityModeComplete, Bytes::new(), "UE", "MME");
+
+    let response = env.send_message(NfType::Mme, smc_complete).await.unwrap();
+
+    // Verify attach accept is sent
+    assert!(response.is_some());
+    let attach_accept = response.unwrap();
+    assert_eq!(attach_accept.msg_type, MessageType::AttachAccept);
+
+    // Verify message sequence in capture
+    let cap = capture.read().await;
+    assert!(cap.has_sequence(&[
+        MessageType::AttachRequest,
+        MessageType::AuthenticationResponse,
+        MessageType::SecurityModeComplete,
+    ]));
+
+    env.stop_all().await.unwrap();
+}
+
 /// Test registration with invalid subscriber
 #[tokio::test]
 async fn test_registration_invalid_subscriber() {

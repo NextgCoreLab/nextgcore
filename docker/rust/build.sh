@@ -83,6 +83,20 @@ for nf in amfd ausfd bsfd dccfd eesd lmfd mbsmfd nrfd nsacfd nssfd nwdafd pcfd p
     fi
 done
 
+echo ""
+echo "=== Building EPC NF images (from core) ==="
+for nf in mmed sgwcd sgwud hssd pcrfd; do
+    if [ -f "$BINARIES_DIR/nextgcore-$nf" ]; then
+        tag="${nf%d}"
+        echo "  nextgcore-rust/$tag"
+        docker build -q \
+            -f "$SCRIPT_DIR/Dockerfile.nf" \
+            --build-arg NF_NAME="nextgcore-$nf" \
+            -t "nextgcore-rust/$tag:latest" \
+            "$SCRIPT_DIR" >/dev/null
+    fi
+done
+
 # Build gNB/UE images
 if [ -f "$BINARIES_DIR/nr-gnb" ]; then
     echo "  nextgsim-gnb"

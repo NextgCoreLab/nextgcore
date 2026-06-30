@@ -132,7 +132,8 @@ docker logs nextgsim-ue 2>&1 | grep "REGISTERED"
 |------|-------------|
 | `docker-compose-5gc-optimized.yml` | 5G Core with pre-built binaries (recommended) |
 | `docker-compose-5gc.yml` | 5G Core with in-container build |
-| `docker-compose.yml` | Full 5GC deployment |
+| `docker-compose-epc.yml` | 4G EPC deployment |
+| `docker-compose.yml` | Full 5GC + EPC deployment |
 
 ### Environment Variables
 
@@ -150,11 +151,16 @@ nextgcore/
 │   │   ├── nextgcore-amfd/    # Access and Mobility Management Function
 │   │   ├── nextgcore-ausfd/   # Authentication Server Function
 │   │   ├── nextgcore-bsfd/    # Binding Support Function
+│   │   ├── nextgcore-hssd/    # Home Subscriber Server
+│   │   ├── nextgcore-mmed/    # Mobility Management Entity
 │   │   ├── nextgcore-nrfd/    # Network Repository Function
 │   │   ├── nextgcore-nssfd/   # Network Slice Selection Function
 │   │   ├── nextgcore-pcfd/    # Policy Control Function
+│   │   ├── nextgcore-pcrfd/   # Policy and Charging Rules Function
 │   │   ├── nextgcore-scpd/    # Service Communication Proxy
 │   │   ├── nextgcore-seppd/   # Security Edge Protection Proxy
+│   │   ├── nextgcore-sgwcd/   # Serving Gateway Control Plane
+│   │   ├── nextgcore-sgwud/   # Serving Gateway User Plane
 │   │   ├── nextgcore-smfd/    # Session Management Function
 │   │   ├── nextgcore-udmd/    # Unified Data Management
 │   │   ├── nextgcore-udrd/    # Unified Data Repository
@@ -185,6 +191,16 @@ nextgcore/
 | **AMF** | Access and Mobility Management Function | TS 29.518 |
 | **SMF** | Session Management Function | TS 29.502 |
 | **UPF** | User Plane Function - Data forwarding | TS 29.244 |
+
+### Evolved Packet Core (EPC)
+
+| NF | Description |
+|----|-------------|
+| **HSS** | Home Subscriber Server |
+| **PCRF** | Policy and Charging Rules Function |
+| **MME** | Mobility Management Entity |
+| **SGW-C** | Serving Gateway Control Plane |
+| **SGW-U** | Serving Gateway User Plane |
 
 ### Optional Components
 

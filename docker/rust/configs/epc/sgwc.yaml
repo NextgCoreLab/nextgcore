@@ -1,0 +1,23 @@
+# NextGCore SGW-C Configuration for Docker EPC Deployment
+# Rust implementation
+
+logger:
+  file:
+    path: /var/log/nextgcore/sgwc.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+sgwc:
+  gtpc:
+    server:
+      - address: 172.24.0.3
+  pfcp:
+    server:
+      - address: 172.24.0.3
+    client:
+      sgwu:
+        - address: 172.24.0.6

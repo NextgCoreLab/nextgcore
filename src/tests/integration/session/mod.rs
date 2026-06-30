@@ -99,6 +99,81 @@ async fn test_pdu_session_establishment() {
     assert_eq!(cap.count(), 4);
 }
 
+/// Test EPS bearer activation flow
+#[tokio::test]
+async fn test_eps_bearer_activation() {
+    let _ = env_logger::try_init();
+
+    let capture = Arc::new(RwLock::new(MessageCapture::new()));
+
+    // Simulate Create Session Request from MME to SGW-C
+    let create_session_req = CapturedMessage::new(
+        MessageType::CreateSessionRequest,
+        Bytes::new(),
+        "MME",
+        "SGW-C",
+    )
+    .with_field("imsi", MessageField::String("001010000000001".to_string()))
+    .with_field("apn", MessageField::String("internet".to_string()));
+
+    {
+        let mut cap = capture.write().await;
+        cap.capture(create_session_req);
+    }
+
+    // Simulate PFCP session establishment from SGW-C to SGW-U
+    let pfcp_request = CapturedMessage::new(
+        MessageType::SessionEstablishmentRequest,
+        Bytes::new(),
+        "SGW-C",
+        "SGW-U",
+    );
+
+    {
+        let mut cap = capture.write().await;
+        cap.capture(pfcp_request);
+    }
+
+    // Simulate PFCP response
+    let pfcp_response = CapturedMessage::new(
+        MessageType::SessionEstablishmentResponse,
+        Bytes::new(),
+        "SGW-U",
+        "SGW-C",
+    );
+
+    {
+        let mut cap = capture.write().await;
+        cap.capture(pfcp_response);
+    }
+
+    // Simulate Create Session Response
+    let create_session_resp = CapturedMessage::new(
+        MessageType::CreateSessionResponse,
+        Bytes::new(),
+        "SGW-C",
+        "MME",
+    )
+    .with_field(
+        "cause",
+        MessageField::String("Request accepted".to_string()),
+    );
+
+    {
+        let mut cap = capture.write().await;
+        cap.capture(create_session_resp);
+    }
+
+    // Verify message sequence
+    let cap = capture.read().await;
+    assert!(cap.has_sequence(&[
+        MessageType::CreateSessionRequest,
+        MessageType::SessionEstablishmentRequest,
+        MessageType::SessionEstablishmentResponse,
+        MessageType::CreateSessionResponse,
+    ]));
+}
+
 /// Test PDU session modification
 #[tokio::test]
 async fn test_pdu_session_modification() {

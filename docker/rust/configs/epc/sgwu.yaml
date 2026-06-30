@@ -1,0 +1,20 @@
+# NextGCore SGW-U Configuration for Docker EPC Deployment
+# Rust implementation
+
+logger:
+  file:
+    path: /var/log/nextgcore/sgwu.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+sgwu:
+  pfcp:
+    server:
+      - address: 172.24.0.6
+  gtpu:
+    server:
+      - address: 172.24.0.6

@@ -71,6 +71,14 @@ pub enum MessageType {
     NfDeregister,
     NfDiscover,
 
+    // Diameter messages
+    AuthenticationInformationRequest,
+    AuthenticationInformationAnswer,
+    UpdateLocationRequest,
+    UpdateLocationAnswer,
+    CreditControlRequest,
+    CreditControlAnswer,
+
     // Unknown
     Unknown(String),
 }

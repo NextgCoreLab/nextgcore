@@ -39,7 +39,17 @@ The gap to a 6G-ready core network is therefore two-layered:
 | **UDR** | ~6 | Working (stateless) | Routing (nudr-dr) | N/A | Delegated to nudr_handler | Basic | Basic | **25%** |
 | **UPF** | ~10 | Working + Exception state | N/A (PFCP) | N/A | **Working** (TUN, GTP-U, session mgmt) | Basic | Good | **55%** |
 
-### 1.2 Shared Libraries
+### 1.2 EPC Network Functions
+
+| NF | Source Files | FSM | Protocol Interfaces | Service Handlers | Completeness |
+|-----|-------------|-----|---------------------|------------------|-------------|
+| **HSS** | 10 | Working + DB poll timer | S6a/Cx/SWx (Diameter) init/fini scaffolding | Stubbed (AIR/ULR/PUR/CLR/IDR structures defined) | **25%** |
+| **MME** | 21 | Working (5 FSMs: MME, EMM, ESM, S1AP, SGsAP) | S1AP/S11/S6a/SGsAP init scaffolding | Comprehensive type definitions, handlers stubbed | **30%** |
+| **PCRF** | 8 | Working + Exception state | Gx/Rx (Diameter) init/fini scaffolding | Stubbed | **15%** |
+| **SGW-C** | 13 | Working + PFCP sub-FSM (5 states) | S11/S5C/SXA event routing | Stubbed (GTP message types documented) | **25%** |
+| **SGW-U** | 10 | Working (returns SgwuSmResult) | SXA (PFCP) event routing | Stubbed (dispatch to PFCP node) | **20%** |
+
+### 1.3 Shared Libraries
 
 | Library | Purpose | Status | Key Types/Features |
 |---------|---------|--------|-------------------|
@@ -49,8 +59,10 @@ The gap to a 6G-ready core network is therefore two-layered:
 | **ogs-core** | Core utilities | **Functional** | 26 modules: list, hash, pool, pkbuf, timer, FSM, TLV, socket, poll, TCP/UDP |
 | **ogs-metrics** | Prometheus metrics | **Functional** | Counter/Gauge/Histogram, labels, Prometheus HTTP server |
 | **ogs-ngap** | NGAP protocol | **Minimal** | Only lib.rs stub (ASN.1 APER note) |
+| **ogs-s1ap** | S1AP protocol | Scaffolding | ASN.1 encoding via ogs-asn1c |
 | **ogs-sctp** | SCTP transport | **Working** | sctp-proto 0.6 integration (migration complete per must_be_implemented.txt) |
 | **ogs-gtp** | GTPv2-C protocol | Scaffolding | GTP-C message building |
+| **ogs-diameter** | Diameter protocol | Scaffolding | FreeDiameter integration stubs |
 | **ogs-crypt** | Crypto functions | Scaffolding | Auth vector generation |
 | **ogs-dbi** | Database interface | Scaffolding | MongoDB integration stubs |
 | **ogs-tun** | TUN device | **Working** | Used by UPF for data plane |
@@ -93,9 +105,15 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 - **SEPP:** N32 interface, PRINS/TLS security, message filtering.
 - **Impact:** No inter-PLMN roaming or service mesh support.
 
-### Phase 6: Protocol Libraries - NGAP (MEDIUM, ~20 TODOs)
+### Phase 6: Protocol Libraries - NGAP/S1AP (MEDIUM, ~20 TODOs)
 - **ogs-ngap:** Only a single-line stub. ASN.1 APER encoding not implemented.
-- **Impact:** AMF cannot communicate with gNBs.
+- **ogs-s1ap:** Scaffolding only.
+- **Impact:** AMF cannot communicate with gNBs; MME cannot communicate with eNBs.
+
+### Phase 7: EPC/Diameter (LOW, ~25 TODOs)
+- **ogs-diameter:** FreeDiameter integration is stub-only.
+- **HSS/PCRF:** S6a, Cx, SWx, Gx, Rx handlers are all stubbed.
+- **Impact:** No EPC authentication or policy control.
 
 ### Phase 8: UPF Enhancements (LOW, ~5 TODOs)
 - **UPF:** Already the most complete NF. Remaining work: URR (usage reporting), QER (QoS enforcement), FAR enhancements.
@@ -341,6 +359,7 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 | A8 | PCF: Policy decision engine, PCC rules | A1, A3 | MEDIUM |
 | A9 | SCP: Request forwarding, load balancing | A1, A3 | MEDIUM |
 | A10 | SEPP: N32 security, message filtering | A1, A3 | MEDIUM |
+| A11 | EPC: Diameter integration, HSS/MME handlers | A1 | LOW |
 | A12 | UPF: URR, QER, FAR enhancements | A6 | LOW |
 
 ### Phase B: 5G-Advanced / Pre-6G (New development)

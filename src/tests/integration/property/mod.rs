@@ -327,6 +327,42 @@ proptest! {
         }).unwrap();
     }
 
+    /// Property 15.8: Diameter result codes are in valid range
+    /// Feature: nextgcore-rust-conversion
+    /// Validates: Requirement 15.5 - Diameter communication
+    #[test]
+    fn prop_diameter_result_code_valid(result_code in 1000i64..6000) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let capture = Arc::new(RwLock::new(MessageCapture::new()));
+
+            let aia = CapturedMessage::new(
+                MessageType::AuthenticationInformationAnswer,
+                Bytes::new(),
+                "HSS",
+                "MME",
+            )
+            .with_field("result_code", MessageField::Number(result_code));
+
+            {
+                let mut cap = capture.write().await;
+                cap.capture(aia);
+            }
+
+            let cap = capture.read().await;
+            let msgs = cap.messages_of_type(&MessageType::AuthenticationInformationAnswer);
+
+            prop_assert_eq!(msgs.len(), 1);
+            let stored_code = msgs[0].get_number("result_code").unwrap();
+
+            // Diameter result codes: 1xxx (informational), 2xxx (success),
+            // 3xxx (protocol errors), 4xxx (transient failures), 5xxx (permanent failures)
+            prop_assert!(stored_code >= 1000);
+            prop_assert!(stored_code < 6000);
+
+            Ok(())
+        }).unwrap();
+    }
 
     /// Property 15.9: 5QI values are valid
     /// Feature: nextgcore-rust-conversion

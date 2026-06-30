@@ -1,0 +1,21 @@
+# NextGCore PCRF Configuration for Docker EPC Deployment
+# Rust implementation
+
+db_uri: mongodb://mongodb:27017/nextgcore
+
+logger:
+  file:
+    path: /var/log/nextgcore/pcrf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+pcrf:
+  freeDiameter: /etc/freeDiameter/pcrf.conf
+  metrics:
+    server:
+      - address: 172.24.0.9
+        port: 9090
