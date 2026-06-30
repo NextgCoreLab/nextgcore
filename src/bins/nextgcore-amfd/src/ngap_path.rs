@@ -36,6 +36,133 @@ use crate::timer::{AmfTimerConfigs, AmfTimerId};
 // Constants
 // ============================================================================
 
+// ============================================================================
+// SCTP transport backend selection (production remediation T0.2b)
+// ============================================================================
+
+/// Which SCTP transport the NGAP/N2 server listens on.
+///
+/// `Userspace` (default) is the pure-Rust SCTP-over-UDP (`sctp-proto`) backend
+/// that is wire-compatible with the nextgsim gNB. `Kernel` is native Linux
+/// kernel SCTP, which lets an **independent RAN** (e.g. UERANSIM) connect over
+/// standard SCTP — it requires building amfd with the `kernel-sctp` feature
+/// (Linux + libsctp). See [`NgapTransport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SctpBackend {
+    /// sctp-proto over UDP (matched nextgsim gNB).
+    #[default]
+    Userspace,
+    /// Native Linux kernel SCTP (standard external RAN).
+    Kernel,
+}
+
+impl SctpBackend {
+    /// Parse from a config/CLI string (`userspace` | `kernel`).
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "userspace" | "sctp-proto" | "" => Ok(Self::Userspace),
+            "kernel" | "kernel-sctp" => Ok(Self::Kernel),
+            other => Err(anyhow::anyhow!(
+                "invalid sctp_backend '{other}' (expected 'userspace' or 'kernel')"
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Userspace => "sctp-proto over UDP",
+            Self::Kernel => "native kernel SCTP",
+        }
+    }
+}
+
+/// NGAP SCTP transport — dispatches over the userspace or kernel backend.
+///
+/// The two arms share the same `bind` / `local_addr` / `set_event_sender` /
+/// `recv` / `send` surface and emit the same [`ServerEvent`]s, so the rest of
+/// the NGAP path is backend-agnostic. The kernel arm only exists when amfd is
+/// built with the `kernel-sctp` feature.
+// Exactly one transport is constructed per process and lives for its lifetime
+// (there is never a collection of these), so the userspace/kernel size delta is
+// irrelevant — boxing the proven userspace variant would only add indirection.
+#[allow(clippy::large_enum_variant)]
+enum NgapTransport {
+    Userspace(SctpServer),
+    #[cfg(feature = "kernel-sctp")]
+    Kernel(ogs_sctp::KernelSctpServer),
+}
+
+impl NgapTransport {
+    async fn bind(
+        backend: SctpBackend,
+        addr: SocketAddr,
+        config: SctpServerConfig,
+    ) -> Result<Self> {
+        match backend {
+            SctpBackend::Userspace => {
+                let server = SctpServer::bind(addr, config)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to bind userspace SCTP server: {e}"))?;
+                Ok(Self::Userspace(server))
+            }
+            SctpBackend::Kernel => {
+                #[cfg(feature = "kernel-sctp")]
+                {
+                    let server = ogs_sctp::KernelSctpServer::bind(addr, config)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to bind kernel SCTP server: {e}"))?;
+                    Ok(Self::Kernel(server))
+                }
+                #[cfg(not(feature = "kernel-sctp"))]
+                {
+                    let _ = (addr, config);
+                    Err(anyhow::anyhow!(
+                        "sctp_backend=kernel requested, but amfd was built without the \
+                         `kernel-sctp` feature (native SCTP requires Linux + libsctp)"
+                    ))
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        match self {
+            Self::Userspace(s) => s.local_addr(),
+            #[cfg(feature = "kernel-sctp")]
+            Self::Kernel(s) => s.local_addr(),
+        }
+    }
+
+    fn set_event_sender(&mut self, tx: mpsc::UnboundedSender<ServerEvent>) {
+        match self {
+            Self::Userspace(s) => s.set_event_sender(tx),
+            #[cfg(feature = "kernel-sctp")]
+            Self::Kernel(s) => s.set_event_sender(tx),
+        }
+    }
+
+    async fn recv(&mut self, timeout: Duration) -> std::result::Result<bool, ogs_sctp::ServerError> {
+        match self {
+            Self::Userspace(s) => s.recv(timeout).await,
+            #[cfg(feature = "kernel-sctp")]
+            Self::Kernel(s) => s.recv(timeout).await,
+        }
+    }
+
+    async fn send(
+        &mut self,
+        association_id: u64,
+        stream_id: u16,
+        data: &[u8],
+    ) -> std::result::Result<(), ogs_sctp::ServerError> {
+        match self {
+            Self::Userspace(s) => s.send(association_id, stream_id, data).await,
+            #[cfg(feature = "kernel-sctp")]
+            Self::Kernel(s) => s.send(association_id, stream_id, data).await,
+        }
+    }
+}
+
 /// Default NGAP bind address
 pub const DEFAULT_NGAP_ADDR: &str = "0.0.0.0";
 
@@ -210,8 +337,8 @@ impl UeNasContext {
 
 /// NGAP Server - handles all gNB connections via SCTP
 pub struct NgapServer {
-    /// SCTP server (sctp-proto based)
-    sctp_server: SctpServer,
+    /// SCTP transport (userspace sctp-proto or native kernel SCTP)
+    transport: NgapTransport,
     /// Bind address
     bind_addr: SocketAddr,
     /// Connected gNB sessions (keyed by SCTP association ID)
@@ -233,9 +360,10 @@ pub struct NgapServer {
 }
 
 impl NgapServer {
-    /// Create a new NGAP server with sctp-proto
+    /// Create a new NGAP server on the selected SCTP backend.
     pub async fn new(
         bind_addr: SocketAddr,
+        backend: SctpBackend,
         amf_context: Arc<RwLock<AmfContext>>,
         event_tx: mpsc::Sender<AmfEvent>,
     ) -> Result<Self> {
@@ -247,20 +375,18 @@ impl NgapServer {
             receive_buffer_size: 262144,
         };
 
-        let mut sctp_server = SctpServer::bind(bind_addr, config)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to bind SCTP server: {e}"))?;
+        let mut transport = NgapTransport::bind(backend, bind_addr, config).await?;
 
-        let local_addr = sctp_server.local_addr();
+        let local_addr = transport.local_addr();
 
         // Set up event channel for server events
         let (server_event_tx, server_event_rx) = mpsc::unbounded_channel();
-        sctp_server.set_event_sender(server_event_tx);
+        transport.set_event_sender(server_event_tx);
 
-        log::info!("NGAP server listening on {local_addr} (sctp-proto over UDP)");
+        log::info!("NGAP server listening on {local_addr} ({})", backend.label());
 
         Ok(Self {
-            sctp_server,
+            transport,
             bind_addr: local_addr,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             assoc_to_addr: Arc::new(RwLock::new(HashMap::new())),
@@ -298,7 +424,7 @@ impl NgapServer {
         }
 
         // Poll SCTP server for incoming data
-        match self.sctp_server.recv(SCTP_RECV_TIMEOUT).await {
+        match self.transport.recv(SCTP_RECV_TIMEOUT).await {
             Ok(true) => {
                 // Data was received, process any new events
                 while let Ok(event) = self.server_event_rx.try_recv() {
@@ -4345,7 +4471,7 @@ impl NgapServer {
         );
 
         // Use stream 0 for NGAP signaling
-        self.sctp_server
+        self.transport
             .send(association_id, 0, data)
             .await
             .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
@@ -5197,10 +5323,11 @@ pub struct NgapServerHandle {
 impl NgapServerHandle {
     pub async fn new(
         bind_addr: SocketAddr,
+        backend: SctpBackend,
         amf_context: Arc<RwLock<AmfContext>>,
         event_tx: mpsc::Sender<AmfEvent>,
     ) -> Result<Self> {
-        let server = NgapServer::new(bind_addr, amf_context, event_tx).await?;
+        let server = NgapServer::new(bind_addr, backend, amf_context, event_tx).await?;
         Ok(Self {
             inner: Arc::new(Mutex::new(server)),
         })
@@ -5224,7 +5351,7 @@ impl NgapServerHandle {
     pub async fn send(&self, association_id: u64, stream_id: u16, data: &[u8]) -> Result<()> {
         let mut server = self.inner.lock().await;
         server
-            .sctp_server
+            .transport
             .send(association_id, stream_id, data)
             .await
             .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
@@ -5241,6 +5368,7 @@ static NGAP_SERVER: once_cell::sync::OnceCell<NgapServerHandle> = once_cell::syn
 /// Initialize NGAP path
 pub async fn amf_ngap_open(
     bind_addr: Option<SocketAddr>,
+    backend: SctpBackend,
     amf_context: Arc<RwLock<AmfContext>>,
     event_tx: mpsc::Sender<AmfEvent>,
 ) -> Result<()> {
@@ -5250,12 +5378,12 @@ pub async fn amf_ngap_open(
             .expect("value expected")
     });
 
-    let handle = NgapServerHandle::new(addr, amf_context, event_tx).await?;
+    let handle = NgapServerHandle::new(addr, backend, amf_context, event_tx).await?;
     let local_addr = handle.local_addr().await;
 
     let _ = NGAP_SERVER.set(handle);
 
-    log::info!("NGAP path opened on {local_addr} (sctp-proto)");
+    log::info!("NGAP path opened on {local_addr} ({})", backend.label());
     Ok(())
 }
 
@@ -5295,7 +5423,7 @@ mod tests {
         let ctx = Arc::new(RwLock::new(AmfContext::new()));
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let handle = NgapServerHandle::new(addr, ctx, tx).await;
+        let handle = NgapServerHandle::new(addr, SctpBackend::Userspace, ctx, tx).await;
 
         assert!(handle.is_ok());
         let handle = handle.unwrap();

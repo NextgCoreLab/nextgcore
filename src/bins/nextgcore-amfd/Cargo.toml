@@ -10,6 +10,13 @@ description = "NextGCore AMF (Access and Mobility Management Function)"
 name = "nextgcore-amfd"
 path = "src/main.rs"
 
+[features]
+# Native Linux kernel-SCTP NGAP backend (production remediation T0.2b).
+# Enables `--sctp-backend kernel` so an independent RAN can connect over
+# standard SCTP. Requires Linux + libsctp at link/run time; off by default so
+# the host build keeps using the pure-Rust sctp-proto backend.
+kernel-sctp = ["ogs-sctp/kernel"]
+
 [dependencies]
 ogs-asn1c = { workspace = true }
 ogs-core = { workspace = true }

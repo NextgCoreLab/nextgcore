@@ -145,6 +145,12 @@ struct Args {
     /// NGAP bind address (e.g., "0.0.0.0:38412")
     #[arg(long, default_value = "0.0.0.0:38412")]
     ngap_addr: String,
+
+    /// SCTP transport backend: "userspace" (sctp-proto over UDP, matched
+    /// nextgsim gNB) or "kernel" (native Linux kernel SCTP for a standard
+    /// external RAN; needs the `kernel-sctp` build feature + libsctp).
+    #[arg(long, default_value = "userspace")]
+    sctp_backend: String,
 }
 
 /// AMF application state
@@ -430,7 +436,11 @@ impl AmfApp {
     }
 
     /// Initialize NGAP server (async)
-    pub async fn init_ngap(&mut self, ngap_addr: SocketAddr) -> Result<()> {
+    pub async fn init_ngap(
+        &mut self,
+        ngap_addr: SocketAddr,
+        sctp_backend: ngap_path::SctpBackend,
+    ) -> Result<()> {
         log::info!("Initializing NGAP server on {ngap_addr}...");
 
         let event_tx = self
@@ -438,7 +448,13 @@ impl AmfApp {
             .take()
             .ok_or_else(|| anyhow::anyhow!("NGAP event sender already taken"))?;
 
-        ngap_path::amf_ngap_open(Some(ngap_addr), Arc::clone(&self.amf_context), event_tx).await?;
+        ngap_path::amf_ngap_open(
+            Some(ngap_addr),
+            sctp_backend,
+            Arc::clone(&self.amf_context),
+            event_tx,
+        )
+        .await?;
 
         log::info!("NGAP server initialized on {ngap_addr}");
         Ok(())
@@ -641,12 +657,13 @@ async fn main() -> Result<()> {
     // Initialize (async)
     app.init(&args.config).await?;
 
-    // Parse NGAP address and initialize NGAP server
+    // Parse NGAP address + SCTP backend and initialize NGAP server
     let ngap_addr: SocketAddr = args
         .ngap_addr
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid NGAP address '{}': {}", args.ngap_addr, e))?;
-    app.init_ngap(ngap_addr).await?;
+    let sctp_backend = ngap_path::SctpBackend::parse(&args.sctp_backend)?;
+    app.init_ngap(ngap_addr, sctp_backend).await?;
 
     // Start the Namf SBI HTTP/2 server (TS 29.518: namf-comm, namf-evts,
     // namf-mt, namf-loc) on the advertised SBI endpoint

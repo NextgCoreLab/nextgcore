@@ -16,10 +16,47 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{
     self, c_int, c_void, sockaddr, sockaddr_in, sockaddr_in6, socklen_t, AF_INET, AF_INET6,
-    IPPROTO_SCTP, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR,
+    IPPROTO_SCTP, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR,
 };
 
 use super::{OgsSctpInfo, Result, SctpError};
+
+// ============================================================================
+// libsctp (lksctp-tools) FFI
+// ============================================================================
+//
+// `sctp_sendmsg`/`sctp_recvmsg` are the simple one-shot helpers from
+// `<netinet/sctp.h>` (libsctp). They carry the PPID + stream as SCTP send
+// info, which the plain `libc::send`/`recv` cannot. They are linked from
+// `libsctp` (`-lsctp`), present only on Linux with `libsctp-dev`. The
+// declarations type-check on any platform (`cargo check`); the symbols are
+// resolved only when an actual binary/test is *linked* on Linux — which is
+// exactly where the `kernel` feature is meant to run.
+#[link(name = "sctp")]
+extern "C" {
+    fn sctp_sendmsg(
+        sd: c_int,
+        msg: *const c_void,
+        len: libc::size_t,
+        to: *const sockaddr,
+        tolen: socklen_t,
+        ppid: u32,
+        flags: u32,
+        stream_no: u16,
+        timetolive: u32,
+        context: u32,
+    ) -> c_int;
+
+    fn sctp_recvmsg(
+        sd: c_int,
+        msg: *mut c_void,
+        len: libc::size_t,
+        from: *mut sockaddr,
+        fromlen: *mut socklen_t,
+        sinfo: *mut SctpSndRcvInfo,
+        msg_flags: *mut c_int,
+    ) -> c_int;
+}
 
 // ============================================================================
 // SCTP Constants
@@ -152,9 +189,16 @@ impl KernelSctpSocket {
         })
     }
 
-    /// Create a server socket (SOCK_SEQPACKET for one-to-many)
+    /// Create a listening server socket.
+    ///
+    /// Uses SOCK_STREAM (one-to-one): each peer association becomes its own
+    /// accepted socket via [`accept`](Self::accept), mirroring Open5GS's
+    /// default NGAP server model and the `KernelSctpServer` accept loop. (The
+    /// one-to-many SOCK_SEQPACKET model would identify associations by
+    /// `sctp_assoc_t` on a single fd and never call `accept`; we deliberately
+    /// take the simpler per-association-fd model so each gNB maps to one fd.)
     pub fn server(addr: SocketAddr) -> Result<Self> {
-        let mut sock = Self::new(&addr, SOCK_SEQPACKET)?;
+        let mut sock = Self::new(&addr, SOCK_STREAM)?;
         sock.is_server = true;
 
         // Set socket options
@@ -234,16 +278,26 @@ impl KernelSctpSocket {
         Ok((new_sock, peer_addr))
     }
 
-    /// Send data with PPID and stream number
+    /// Send data with PPID and stream number via `sctp_sendmsg`.
+    ///
+    /// The PPID travels on the wire in **network byte order**: lksctp
+    /// transmits the value passed to `sctp_sendmsg` verbatim, so the caller
+    /// byte-swaps it here (Open5GS `ogs_sctp_senddata` does the same with
+    /// `htobe32`). Getting this wrong silently breaks NGAP demux on the peer —
+    /// see the project's PPID-network-order note. NGAP uses PPID 60.
     pub fn send(&self, data: &[u8], ppid: u32, stream_no: u16) -> Result<usize> {
-        // For simplicity, use regular send for connected sockets
-        // Full implementation would use sctp_sendmsg
         let sent = unsafe {
-            libc::send(
+            sctp_sendmsg(
                 self.fd.as_raw_fd(),
                 data.as_ptr() as *const c_void,
                 data.len(),
+                std::ptr::null(), // connected socket: destination is implicit
                 0,
+                ppid.to_be(), // network byte order on the wire
+                0,            // flags
+                stream_no,
+                0, // timetolive (0 = no expiry)
+                0, // context
             )
         };
 
@@ -251,19 +305,26 @@ impl KernelSctpSocket {
             return Err(SctpError::SendFailed(io::Error::last_os_error()));
         }
 
-        let _ = (ppid, stream_no); // Note: PPID/stream set via sctp_sendmsg cmsg ancillary data
-
         Ok(sent as usize)
     }
 
-    /// Receive data
-    pub fn recv(&self, buf: &mut [u8]) -> Result<(usize, OgsSctpInfo)> {
+    /// Receive a single SCTP message, returning the byte count, the decoded
+    /// send/receive info (PPID restored to host order, stream number) and the
+    /// raw `msg_flags`. `msg_flags & MSG_NOTIFICATION` marks an SCTP event
+    /// notification (e.g. shutdown / association change) rather than user data.
+    pub fn recv_msg(&self, buf: &mut [u8]) -> Result<(usize, OgsSctpInfo, i32)> {
+        let mut sinfo = SctpSndRcvInfo::default();
+        let mut msg_flags: c_int = 0;
+
         let received = unsafe {
-            libc::recv(
+            sctp_recvmsg(
                 self.fd.as_raw_fd(),
                 buf.as_mut_ptr() as *mut c_void,
                 buf.len(),
-                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sinfo as *mut SctpSndRcvInfo,
+                &mut msg_flags as *mut c_int,
             )
         };
 
@@ -271,15 +332,39 @@ impl KernelSctpSocket {
             return Err(SctpError::ReceiveFailed(io::Error::last_os_error()));
         }
 
-        // Note: PPID/stream extracted via sctp_recvmsg cmsg ancillary data
         let info = OgsSctpInfo {
-            ppid: 0,
-            stream_no: 0,
+            ppid: u32::from_be(sinfo.sinfo_ppid), // wire (network) -> host order
+            stream_no: sinfo.sinfo_stream,
             inbound_streams: self.inbound_streams,
             outbound_streams: self.outbound_streams,
         };
 
-        Ok((received as usize, info))
+        Ok((received as usize, info, msg_flags))
+    }
+
+    /// Receive data (compatibility shim that discards `msg_flags`).
+    pub fn recv(&self, buf: &mut [u8]) -> Result<(usize, OgsSctpInfo)> {
+        let (n, info, _flags) = self.recv_msg(buf)?;
+        Ok((n, info))
+    }
+
+    /// Put the socket in (non-)blocking mode. Required before registering the
+    /// fd with tokio's `AsyncFd` in the async `KernelSctpServer`.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        let fd = self.fd.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(SctpError::SockoptFailed(io::Error::last_os_error()));
+        }
+        let new_flags = if nonblocking {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) } < 0 {
+            return Err(SctpError::SockoptFailed(io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
     /// Get local address
@@ -437,6 +522,12 @@ impl KernelSctpSocket {
         self.outbound_streams = num_ostreams;
 
         Ok(())
+    }
+}
+
+impl AsRawFd for KernelSctpSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }
 

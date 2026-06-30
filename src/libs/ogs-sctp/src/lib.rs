@@ -44,6 +44,15 @@ pub mod kernel;
 #[cfg(feature = "kernel")]
 pub use kernel::KernelSctpSocket;
 
+// Async kernel-SCTP NGAP server (T0.2b). Reuses the userspace server's event
+// types, so it requires both features; the `kernel` primitive alone still
+// builds standalone.
+#[cfg(all(feature = "kernel", feature = "sctp-proto"))]
+pub mod kernel_server;
+
+#[cfg(all(feature = "kernel", feature = "sctp-proto"))]
+pub use kernel_server::KernelSctpServer;
+
 // sctp-proto based server module
 #[cfg(feature = "sctp-proto")]
 pub mod server;
