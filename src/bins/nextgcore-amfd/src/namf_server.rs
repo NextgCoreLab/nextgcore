@@ -2314,7 +2314,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ue_context_transfer_error_paths() {
-        let supi = "imsi-001010000060031";
+        // Unique SUPI: the process-global AMF context (supi_hash) is shared by
+        // every test in this binary and amf_context_init is a one-shot OnceLock
+        // that never clears it. `imsi-001010000060031` is also registered by
+        // test_n1n2_nrppa_to_connected_ue_relays with security_context_available
+        // = true; reusing it raced that UE into supi_hash, so this MOBI_REG
+        // integrity check found a UE *with* a security context and passed (200)
+        // instead of failing (403). A SUPI no other test registers keeps this
+        // error path deterministic.
+        let supi = "imsi-001010000060033";
         setup_ue(supi, true, false); // no security context
 
         // 404 for unknown UE (CONTEXT_NOT_FOUND per TS 29.518 §6.1.7.3)
