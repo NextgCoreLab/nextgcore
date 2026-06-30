@@ -48,7 +48,7 @@ openapi-generator generate \
   -i specs/TS29510_Nnrf_NFManagement.yaml \
   -g rust \
   -o generated/nnrf \
-  --additional-properties=packageName=ogs-sbi-nnrf,library=reqwest
+  --additional-properties=packageName=nextgcore-sbi-nnrf,library=reqwest
 ```
 
 ### Configuration
@@ -58,7 +58,7 @@ The `openapi-generator-config.yaml` contains generator settings:
 ```yaml
 generatorName: rust
 additionalProperties:
-  packageName: ogs-sbi-models
+  packageName: nextgcore-sbi-models
   library: reqwest
   supportAsync: true
   preferUnsignedInt: true
@@ -70,7 +70,7 @@ additionalProperties:
 Generated models follow this pattern:
 
 ```rust
-// ogs-sbi/src/models/nf_profile.rs
+// nextgcore-sbi/src/models/nf_profile.rs
 
 use serde::{Deserialize, Serialize};
 

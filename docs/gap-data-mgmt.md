@@ -15,7 +15,7 @@ This report covers four nextgcore network functions responsible for subscriber d
 
 ### 1.1 Dependencies
 
-`ogs-core`, `ogs-crypt`, `ogs-sbi`, `ogs-dbi`, `ogs-app`, `tokio`, `clap`, `serde`, `serde_json`, `env_logger`, `log`, `ctrlc`, `anyhow`, `uuid`
+`nextgcore-core`, `nextgcore-crypt`, `nextgcore-sbi`, `nextgcore-dbi`, `nextgcore-app`, `tokio`, `clap`, `serde`, `serde_json`, `env_logger`, `log`, `ctrlc`, `anyhow`, `uuid`
 
 ### 1.2 FSM States & Transitions
 
@@ -72,7 +72,7 @@ Three-level FSM hierarchy. The main SM creates/destroys UE sub-SMs which in turn
 
 ### 2.1 Dependencies
 
-`ogs-sbi` only. **No `ogs-dbi`** -- the database integration crate is missing entirely.
+`nextgcore-sbi` only. **No `nextgcore-dbi`** -- the database integration crate is missing entirely.
 
 ### 2.2 FSM States & Transitions
 
@@ -105,7 +105,7 @@ None. UDR is a data-serving NF that does not initiate outbound SBI calls.
 
 ### 2.6 Completeness: **~20%**
 
-**Evidence:** Has correct SBI routing structure and handler dispatch, but every handler is a stub. The absence of `ogs-dbi` in Cargo.toml means zero database capability.
+**Evidence:** Has correct SBI routing structure and handler dispatch, but every handler is a stub. The absence of `nextgcore-dbi` in Cargo.toml means zero database capability.
 
 ---
 
@@ -129,7 +129,7 @@ None. UDR is a data-serving NF that does not initiate outbound SBI calls.
 
 ### 3.3 Completeness: **~55%**
 
-**Evidence:** Uses real `ogs_crypt::kdf` for HXRES* and KSEAF calculation. Weakened by: RES* comparison always succeeds, EAP-AKA' fully stubbed, SBI client HTTP sending not implemented.
+**Evidence:** Uses real `nextgcore_crypt::kdf` for HXRES* and KSEAF calculation. Weakened by: RES* comparison always succeeds, EAP-AKA' fully stubbed, SBI client HTTP sending not implemented.
 
 ---
 
@@ -185,7 +185,7 @@ None. UDR is a data-serving NF that does not initiate outbound SBI calls.
 
 ### Critical (must-fix for 5G compliance)
 
-1. **UDR database integration** -- Add `ogs-dbi` dependency, implement actual database queries
+1. **UDR database integration** -- Add `nextgcore-dbi` dependency, implement actual database queries
 2. **AUSF real auth verification** -- Implement actual RES* comparison
 3. **UDM Milenage/TUAK** -- Replace placeholder auth vector generation
 4. **SBI client HTTP sending** -- Implement actual HTTP/2 client calls

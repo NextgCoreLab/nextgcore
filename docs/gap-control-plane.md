@@ -74,7 +74,7 @@ Strong context model and FSM hierarchy. Multiple handler modules with function s
 ### Architecture
 
 - 19 source files with dedicated modules for N4/PFCP, GSM, GTP, binding
-- HTTP/2 SBI server using `ogs-sbi` crate
+- HTTP/2 SBI server using `nextgcore-sbi` crate
 - Supports both 5GC and EPC modes (GTP-C Gn interface)
 - Property tests included
 

@@ -8,19 +8,19 @@
 
 | Library | Purpose | Modules | Completeness | 6G Readiness |
 |---------|---------|---------|-------------|--------------|
-| ogs-core | Core runtime (data structures, networking, timers) | 31 | **85%** | Medium |
-| ogs-app | Application framework (config, init) | 4 | **80%** | Low |
-| ogs-crypt | 3GPP cryptographic algorithms | 10 | **80%** | Low |
-| ogs-dbi | MongoDB database interface | 5 | **70%** | Low |
-| ogs-ffi | FFI bindings for C comparison testing | 2 | **90%** | N/A |
-| ogs-metrics | Prometheus metrics collection | 5 | **75%** | Medium |
-| ogs-tun | TUN/TAP device management | 4 | **80%** | Low |
-| ogs-ipfw | IP firewall rule parsing | 3 | **85%** | Low |
-| ogs-proto | Common protocol definitions (PlmnId, AmfId, etc.) | 4 | **90%** | Low |
+| nextgcore-core | Core runtime (data structures, networking, timers) | 31 | **85%** | Medium |
+| nextgcore-app | Application framework (config, init) | 4 | **80%** | Low |
+| nextgcore-crypt | 3GPP cryptographic algorithms | 10 | **80%** | Low |
+| nextgcore-dbi | MongoDB database interface | 5 | **70%** | Low |
+| nextgcore-ffi | FFI bindings for C comparison testing | 2 | **90%** | N/A |
+| nextgcore-metrics | Prometheus metrics collection | 5 | **75%** | Medium |
+| nextgcore-tun | TUN/TAP device management | 4 | **80%** | Low |
+| nextgcore-ipfw | IP firewall rule parsing | 3 | **85%** | Low |
+| nextgcore-proto | Common protocol definitions (PlmnId, AmfId, etc.) | 4 | **90%** | Low |
 
 ---
 
-## 1. ogs-core -- Core Runtime
+## 1. nextgcore-core -- Core Runtime
 
 **Port of**: lib/core/ from C implementation
 
@@ -48,16 +48,16 @@
 
 ---
 
-## 2. ogs-app -- Application Framework
+## 2. nextgcore-app -- Application Framework
 
 ### Modules (4)
 
 | Module | Key Types | Status |
 |--------|----------|--------|
-| `yaml.rs` | `OgsYamlDocument`, `OgsYamlIter` | Complete |
-| `config.rs` | `OgsGlobalConf`, `OgsLocalConf`, `OgsPlmnId`, `MaxConf`, `TimeConf` | Complete |
-| `context.rs` | `OgsApp`, `OgsAppContext`, `LoggerConf`, `PoolConf`, `MetricsConf` | Complete |
-| `init.rs` | `OgsAppInitializer`, command line options, initialize/terminate | Complete |
+| `yaml.rs` | `NextgcoreYamlDocument`, `NextgcoreYamlIter` | Complete |
+| `config.rs` | `NextgcoreGlobalConf`, `NextgcoreLocalConf`, `NextgcorePlmnId`, `MaxConf`, `TimeConf` | Complete |
+| `context.rs` | `NextgcoreApp`, `NextgcoreAppContext`, `LoggerConf`, `PoolConf`, `MetricsConf` | Complete |
+| `init.rs` | `NextgcoreAppInitializer`, command line options, initialize/terminate | Complete |
 
 ### 6G Gaps
 
@@ -71,7 +71,7 @@
 
 ---
 
-## 3. ogs-crypt -- Cryptographic Library
+## 3. nextgcore-crypt -- Cryptographic Library
 
 ### Modules (10)
 
@@ -102,14 +102,14 @@
 
 ---
 
-## 4. ogs-dbi -- Database Interface
+## 4. nextgcore-dbi -- Database Interface
 
 ### Modules (5)
 
 | Module | Key Functions | Status |
 |--------|--------------|--------|
 | `types.rs` | Subscriber data types, auth info | Complete |
-| `mongoc.rs` | `OgsMongoc`, `OgsDbi` MongoDB client | Partial (connection mgmt) |
+| `mongoc.rs` | `NextgcoreMongoc`, `NextgcoreDbi` MongoDB client | Partial (connection mgmt) |
 | `subscription.rs` | Auth info, SQN update, subscription data | Partial |
 | `session.rs` | PDU session data queries | Partial |
 | `ims.rs` | MSISDN, IMS data queries | Partial |
@@ -127,7 +127,7 @@
 
 ---
 
-## 5. ogs-ffi -- FFI Bindings
+## 5. nextgcore-ffi -- FFI Bindings
 
 Testing utility for C comparison. Provides stub bindings by default, optional generated bindings.
 
@@ -135,7 +135,7 @@ Testing utility for C comparison. Provides stub bindings by default, optional ge
 
 ---
 
-## 6. ogs-metrics -- Prometheus Metrics
+## 6. nextgcore-metrics -- Prometheus Metrics
 
 ### Modules (5)
 
@@ -160,7 +160,7 @@ Testing utility for C comparison. Provides stub bindings by default, optional ge
 
 ---
 
-## 7. ogs-tun -- TUN Device Management
+## 7. nextgcore-tun -- TUN Device Management
 
 ### Modules (4)
 
@@ -175,7 +175,7 @@ Testing utility for C comparison. Provides stub bindings by default, optional ge
 
 ---
 
-## 8. ogs-ipfw -- IP Firewall Rules
+## 8. nextgcore-ipfw -- IP Firewall Rules
 
 ### Modules (3)
 
@@ -189,7 +189,7 @@ Testing utility for C comparison. Provides stub bindings by default, optional ge
 
 ---
 
-## 9. ogs-proto -- Protocol Definitions
+## 9. nextgcore-proto -- Protocol Definitions
 
 ### Modules (4)
 
@@ -219,7 +219,7 @@ Testing utility for C comparison. Provides stub bindings by default, optional ge
 | Post-quantum crypto | None | Critical |
 | OpenTelemetry observability | None (Prometheus only) | High |
 | Dynamic reconfiguration | None | High |
-| Async I/O throughout | Partial (ogs-core has sync poll) | High |
+| Async I/O throughout | Partial (nextgcore-core has sync poll) | High |
 | Structured logging | None | Medium |
 | Distributed coordination | None | Medium |
 | Graph/time-series DB | None (MongoDB only) | Medium |
@@ -228,9 +228,9 @@ Testing utility for C comparison. Provides stub bindings by default, optional ge
 
 ### Priority Recommendations
 
-1. **Add post-quantum crypto** to ogs-crypt (ML-KEM, ML-DSA)
-2. **Add OpenTelemetry** alongside Prometheus in ogs-metrics
-3. **Migrate to full async I/O** in ogs-core networking modules
-4. **Add dynamic config reload** to ogs-app
-5. **Add 6G types** to ogs-proto (ISAC, NTN, AI/ML, semantic comm)
-6. **Add ZUC-256** to ogs-crypt for 256-bit security
+1. **Add post-quantum crypto** to nextgcore-crypt (ML-KEM, ML-DSA)
+2. **Add OpenTelemetry** alongside Prometheus in nextgcore-metrics
+3. **Migrate to full async I/O** in nextgcore-core networking modules
+4. **Add dynamic config reload** to nextgcore-app
+5. **Add 6G types** to nextgcore-proto (ISAC, NTN, AI/ML, semantic comm)
+6. **Add ZUC-256** to nextgcore-crypt for 256-bit security

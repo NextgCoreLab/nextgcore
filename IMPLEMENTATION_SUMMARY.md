@@ -4,10 +4,10 @@ This document summarizes the 6G features implemented across the nextgcore worksp
 
 ## Completed Implementations
 
-### 1. ogs-core (Infrastructure)
+### 1. nextgcore-core (Infrastructure)
 
 #### B2.2: Distributed Timer Coordination
-- **File**: `libs/ogs-core/src/timer.rs`
+- **File**: `libs/nextgcore-core/src/timer.rs`
 - **Features**:
   - `DistributedTimerCoordinator` struct for multi-instance timer coordination
   - Three coordination modes: Local, Coordinated, LeaderBased
@@ -17,7 +17,7 @@ This document summarizes the 6G features implemented across the nextgcore worksp
 - **Key Types**: `DistributedTimerMode`, `TimerSyncRecord`, `DistributedTimerCoordinator`
 
 #### B2.3: OpenTelemetry-Compatible Structured Logging
-- **File**: `libs/ogs-core/src/log.rs`
+- **File**: `libs/nextgcore-core/src/log.rs`
 - **Features**:
   - `OtelLogRecord` with OTLP-compatible JSON formatting
   - OpenTelemetry severity levels (Trace/Debug/Info/Warn/Error/Fatal)
@@ -27,10 +27,10 @@ This document summarizes the 6G features implemented across the nextgcore worksp
   - Comprehensive unit tests
 - **Key Types**: `OtelSeverity`, `AttributeValue`, `OtelLogRecord`
 
-### 2. ogs-app (Configuration Management)
+### 2. nextgcore-app (Configuration Management)
 
 #### B3.2: Intent-Based Configuration Translation
-- **File**: `libs/ogs-app/src/intent.rs`
+- **File**: `libs/nextgcore-app/src/intent.rs`
 - **Features**:
   - High-level intent specification (QoS, Security, Energy, AI/ML, Slices)
   - Intent validation with conflict detection
@@ -41,7 +41,7 @@ This document summarizes the 6G features implemented across the nextgcore worksp
 - **Key Types**: `NetworkIntent`, `IntentTranslator`, `SliceIntent`, `QosIntent`, `SecurityIntent`, `EnergyIntent`, `AiMlIntent`
 
 #### B3.3: Configuration Versioning and Rollback
-- **File**: `libs/ogs-app/src/config.rs` (added at end)
+- **File**: `libs/nextgcore-app/src/config.rs` (added at end)
 - **Features**:
   - `ConfigHistoryManager` with snapshot management
   - Version tracking with timestamps and descriptions
@@ -52,10 +52,10 @@ This document summarizes the 6G features implemented across the nextgcore worksp
   - Comprehensive unit tests
 - **Key Types**: `ConfigVersion`, `ConfigSnapshot`, `ConfigHistoryManager`
 
-### 3. ogs-dbi (Database Operations)
+### 3. nextgcore-dbi (Database Operations)
 
 #### B4.4: Graph Database Support (Neo4j-compatible)
-- **File**: `libs/ogs-dbi/src/graphdb.rs`
+- **File**: `libs/nextgcore-dbi/src/graphdb.rs`
 - **Features**:
   - In-memory graph database for testing/simulation
   - Nodes with labels and properties
@@ -69,7 +69,7 @@ This document summarizes the 6G features implemented across the nextgcore worksp
 - **Key Types**: `GraphDbClient`, `GraphNode`, `GraphRelationship`, `PropertyValue`, `NetworkTopology`
 
 #### B4.5: Time-Series Database Support
-- **File**: `libs/ogs-dbi/src/tsdb.rs`
+- **File**: `libs/nextgcore-dbi/src/tsdb.rs`
 - **Features**:
   - In-memory time-series storage for testing
   - Data points with timestamps, values, and tags
@@ -81,7 +81,7 @@ This document summarizes the 6G features implemented across the nextgcore worksp
 - **Key Types**: `TsDbClient`, `TimeSeries`, `DataPoint`, `NetworkMetricsCollector`
 
 #### B4.6: Distributed Database Support
-- **File**: `libs/ogs-dbi/src/mongoc.rs` (added at end)
+- **File**: `libs/nextgcore-dbi/src/mongoc.rs` (added at end)
 - **Features**:
   - `DistributedDbCoordinator` for replica set management
   - Three replication modes: PrimarySecondary, MultiPrimary, Sharded
@@ -98,24 +98,24 @@ This document summarizes the 6G features implemented across the nextgcore worksp
 
 Due to response length constraints, the following features require additional implementation files to be created:
 
-### 4. ogs-metrics (Observability)
-- **B5.2**: AI-Native Observability (anomaly detection) - Create `libs/ogs-metrics/src/ai_obs.rs`
-- **B5.3**: Distributed Tracing (span/trace propagation) - Create `libs/ogs-metrics/src/tracing.rs`
-- **B5.4**: SLA Metric Enforcement - Create `libs/ogs-metrics/src/sla.rs`
+### 4. nextgcore-metrics (Observability)
+- **B5.2**: AI-Native Observability (anomaly detection) - Create `libs/nextgcore-metrics/src/ai_obs.rs`
+- **B5.3**: Distributed Tracing (span/trace propagation) - Create `libs/nextgcore-metrics/src/tracing.rs`
+- **B5.4**: SLA Metric Enforcement - Create `libs/nextgcore-metrics/src/sla.rs`
 
-### 5. ogs-sbi (Service Based Interface)
-- **B8.5**: SBI 2.0 / gRPC Support - Create `libs/ogs-sbi/src/grpc.rs`
-- **B8.6**: Event-Driven / Pub-Sub Messaging - Create `libs/ogs-sbi/src/events.rs`
+### 5. nextgcore-sbi (Service Based Interface)
+- **B8.5**: SBI 2.0 / gRPC Support - Create `libs/nextgcore-sbi/src/grpc.rs`
+- **B8.6**: Event-Driven / Pub-Sub Messaging - Create `libs/nextgcore-sbi/src/events.rs`
 
-### 6. ogs-nas (NAS Protocol)
-- **B9.4**: AI/ML Capability NAS IEs - Extend `libs/ogs-nas/src/fiveg/`
-- **B9.5**: ISAC NAS Signaling - Extend `libs/ogs-nas/src/fiveg/`
-- **B9.6**: Sub-THz Band Parameters - Extend `libs/ogs-nas/src/common/types.rs`
+### 6. nextgcore-nas (NAS Protocol)
+- **B9.4**: AI/ML Capability NAS IEs - Extend `libs/nextgcore-nas/src/fiveg/`
+- **B9.5**: ISAC NAS Signaling - Extend `libs/nextgcore-nas/src/fiveg/`
+- **B9.6**: Sub-THz Band Parameters - Extend `libs/nextgcore-nas/src/common/types.rs`
 
-### 7. ogs-asn1c (ASN.1 Codecs)
-- **B16.3**: XnAP Codec - Create `libs/ogs-asn1c/src/xnap/` directory
-- **B16.4**: F1AP Codec - Create `libs/ogs-asn1c/src/f1ap/` directory
-- **B16.5**: E1AP Codec - Create `libs/ogs-asn1c/src/e1ap/` directory
+### 7. nextgcore-asn1c (ASN.1 Codecs)
+- **B16.3**: XnAP Codec - Create `libs/nextgcore-asn1c/src/xnap/` directory
+- **B16.4**: F1AP Codec - Create `libs/nextgcore-asn1c/src/f1ap/` directory
+- **B16.5**: E1AP Codec - Create `libs/nextgcore-asn1c/src/e1ap/` directory
 
 ### 8. NF-Specific Features
 - **B20.5** (SCP): Service mesh sidecar architecture - Extend `bins/nextgcore-scpd/`
@@ -156,9 +156,9 @@ Due to response length constraints, the following features require additional im
 
 To complete the implementation:
 
-1. Create remaining ogs-metrics files (ai_obs.rs, tracing.rs, sla.rs)
-2. Create ogs-sbi extension files (grpc.rs, events.rs)
-3. Extend ogs-nas with 6G NAS IEs
+1. Create remaining nextgcore-metrics files (ai_obs.rs, tracing.rs, sla.rs)
+2. Create nextgcore-sbi extension files (grpc.rs, events.rs)
+3. Extend nextgcore-nas with 6G NAS IEs
 4. Create ASN.1 codec directories (xnap, f1ap, e1ap)
 5. Implement NF-specific 6G features in binary crates
 6. Create cross-NF capability modules
@@ -169,7 +169,7 @@ To complete the implementation:
 
 ### Distributed Timer Coordination
 ```rust
-use ogs_core::timer::{DistributedTimerCoordinator, DistributedTimerMode};
+use nextgcore_core::timer::{DistributedTimerCoordinator, DistributedTimerMode};
 
 let mut coordinator = DistributedTimerCoordinator::new(
     DistributedTimerMode::Coordinated,
@@ -184,7 +184,7 @@ let coordinated_expiry = coordinator.sync_timer(timer_id, expiry_nanos);
 
 ### OpenTelemetry Structured Logging
 ```rust
-use ogs_core::log::{OtelLogRecord, OtelSeverity, AttributeValue};
+use nextgcore_core::log::{OtelLogRecord, OtelSeverity, AttributeValue};
 
 let record = OtelLogRecord::new(OtelSeverity::Info, "UE registered")
     .with_attr("ue_id", AttributeValue::String("imsi-123456".to_string()))
@@ -197,7 +197,7 @@ let json = record.to_json(); // Export as JSON
 
 ### Intent-Based Configuration
 ```rust
-use ogs_app::{NetworkIntent, IntentTranslator, SliceIntent, QosIntent};
+use nextgcore_app::{NetworkIntent, IntentTranslator, SliceIntent, QosIntent};
 
 let intent = NetworkIntent::new("intent-1", "Low Latency Service")
     .with_slice(SliceIntent::URLlc)
@@ -214,7 +214,7 @@ let config = translator.translate(&intent)?;
 
 ### Graph Database for Network Topology
 ```rust
-use ogs_dbi::{NetworkTopology, GraphDbClient};
+use nextgcore_dbi::{NetworkTopology, GraphDbClient};
 
 let mut topo = NetworkTopology::new(GraphDbClient::in_memory());
 
@@ -231,7 +231,7 @@ let ues = topo.get_slice_ues(&slice.id);
 
 ### Time-Series Metrics Collection
 ```rust
-use ogs_dbi::{NetworkMetricsCollector, TsDbClient};
+use nextgcore_dbi::{NetworkMetricsCollector, TsDbClient};
 
 let mut collector = NetworkMetricsCollector::new(TsDbClient::in_memory());
 
@@ -247,7 +247,7 @@ let points = collector.client().query_range("network.throughput", 0, 2000000)?;
 
 ### Distributed Database Coordination
 ```rust
-use ogs_dbi::mongoc::{DistributedDbCoordinator, ReplicationMode, DbNode, NodeRole};
+use nextgcore_dbi::mongoc::{DistributedDbCoordinator, ReplicationMode, DbNode, NodeRole};
 
 let mut coordinator = DistributedDbCoordinator::new(ReplicationMode::PrimarySecondary);
 
@@ -272,9 +272,9 @@ All implementations include comprehensive unit tests. To run tests:
 cd /Users/parlakisik/projects/github/nextg/nextgcore/src
 
 # Test specific libraries
-cargo test -p ogs-core
-cargo test -p ogs-app
-cargo test -p ogs-dbi
+cargo test -p nextgcore-core
+cargo test -p nextgcore-app
+cargo test -p nextgcore-dbi
 
 # Test all workspace members
 cargo test --workspace

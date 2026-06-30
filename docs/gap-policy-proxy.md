@@ -21,7 +21,7 @@
 
 ### 2.1 Architecture
 
-- **Dependencies**: ogs-core, ogs-sbi, ogs-dbi, ogs-app, tokio, clap, uuid
+- **Dependencies**: nextgcore-core, nextgcore-sbi, nextgcore-dbi, nextgcore-app, tokio, clap, uuid
 - **Context**: `OnceLock<Arc<RwLock<PcfContext>>>` singleton with RwLock<HashMap> pools for UE AM, UE SM, Sessions, App sessions
 
 ### 2.2 SBI Routes & Handlers
