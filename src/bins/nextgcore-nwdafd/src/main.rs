@@ -219,6 +219,7 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         },
         ["nnwdaf-eventssubscription", "v1", "subscriptions", subscription_id] => match method {
             "GET" => handle_subscription_get(subscription_id).await,
+            "PUT" => handle_subscription_update(subscription_id, &request).await,
             "DELETE" => handle_subscription_delete(subscription_id).await,
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
@@ -428,6 +429,22 @@ mod tests {
         assert_eq!(
             resp.status, 201,
             "POST /nnwdaf-mlmodelprovision/v1/subscriptions must reach the create handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_routing_subscription_put_routed() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let req = SbiRequest::put("/nnwdaf-eventssubscription/v1/subscriptions/unknown-id")
+            .with_json_body(&serde_json::json!({
+                "notificationURI": "http://amf.local/cb",
+                "eventSubscriptions": [ { "event": "NF_LOAD" } ]
+            }))
+            .expect("valid JSON body");
+        let resp = nwdaf_sbi_request_handler(req).await;
+        assert_eq!(
+            resp.status, 404,
+            "PUT must route to the update handler (404, not 405)"
         );
     }
 

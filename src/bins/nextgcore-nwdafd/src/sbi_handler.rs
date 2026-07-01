@@ -186,44 +186,40 @@ pub async fn handle_analytics_info_query(request: &SbiRequest) -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-/// Handle analytics subscription creation.
-///
-/// TS 29.520 `NnwdafEventsSubscription`: parses `notificationURI` (mandatory),
-/// `notifCorrId` (optional), and `eventSubscriptions[]` (mandatory, minItems 1).
-/// Each `EventSubscription` carries `event`, optional `notificationMethod`,
-/// `extraReportReq.repPeriod`, threshold fields and per-event `snssais` filters.
-pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
-    log::info!("Analytics Subscription Create");
-
+/// Shared parser for the `NnwdafEventsSubscription` request body used by both
+/// POST (create) and PUT (update, TS 29.520 §5.1.3.3.3.2). Builds the
+/// `AnalyticsSubscription` keyed by `subscription_id`. On a validation failure
+/// returns a tiny `(detail, cause)` pair the caller turns into a 400 (keeps the
+/// Err variant small — clippy::result_large_err).
+fn parse_events_subscription(
+    request: &SbiRequest,
+    subscription_id: String,
+) -> Result<AnalyticsSubscription, (String, &'static str)> {
     let body = match &request.http.content {
         Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+        None => return Err(("Missing request body".to_string(), "MISSING_BODY")),
     };
-
-    let data: serde_json::Value = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
-    };
+    let data: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| (format!("Invalid JSON: {e}"), "INVALID_JSON"))?;
 
     // nwafd-09: notificationURI (exact casing), mandatory — no localhost default.
     let notification_uri = match data.get("notificationURI").and_then(|v| v.as_str()) {
         Some(u) if !u.is_empty() => u.to_string(),
         _ => {
-            return send_bad_request(
-                "notificationURI is a mandatory IE",
-                Some("MANDATORY_IE_MISSING"),
-            )
+            return Err((
+                "notificationURI is a mandatory IE".to_string(),
+                "MANDATORY_IE_MISSING",
+            ))
         }
     };
 
-    // eventSubscriptions[] is mandatory with minItems 1.
     let event_array = match data.get("eventSubscriptions").and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
         _ => {
-            return send_bad_request(
-                "eventSubscriptions is a mandatory IE and must be non-empty",
-                Some("MANDATORY_IE_MISSING"),
-            )
+            return Err((
+                "eventSubscriptions is a mandatory IE and must be non-empty".to_string(),
+                "MANDATORY_IE_MISSING",
+            ))
         }
     };
 
@@ -233,10 +229,10 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         let event = match AnalyticsId::from_str(event_token) {
             Some(e) => e,
             None => {
-                return send_bad_request(
-                    &format!("Invalid or missing event: {event_token}"),
-                    Some("INVALID_ANALYTICS_TYPE"),
-                )
+                return Err((
+                    format!("Invalid or missing event: {event_token}"),
+                    "INVALID_ANALYTICS_TYPE",
+                ))
             }
         };
 
@@ -250,17 +246,24 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
             .and_then(|v| v.get("repPeriod"))
             .and_then(|v| v.as_u64());
 
-        // loadLevelThreshold, or the loadLevel of the first nfLoadLvlThds entry.
-        let load_level_threshold = es
-            .get("loadLevelThreshold")
-            .and_then(|v| v.as_u64())
-            .or_else(|| {
-                es.get("nfLoadLvlThds")
-                    .and_then(|v| v.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|t| t.get("loadLevel"))
-                    .and_then(|v| v.as_u64())
-            });
+        // TS 29.520 EventSubscription threshold source depends on the event:
+        //  - SLICE_LOAD_LEVEL / NSI_LOAD_LEVEL use the scalar `loadLevelThreshold`.
+        //  - NF_LOAD (and other NF-load events) use `nfLoadLvlThds[].nfLoadLevel`
+        //    (ThresholdLevel, §5.1.6.2.30), falling back to `nfCpuUsage`.
+        let load_level_threshold = match event {
+            AnalyticsId::SliceLoadLevel | AnalyticsId::NsiLoadLevel => {
+                es.get("loadLevelThreshold").and_then(|v| v.as_u64())
+            }
+            _ => es
+                .get("nfLoadLvlThds")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|t| {
+                    t.get("nfLoadLevel")
+                        .or_else(|| t.get("nfCpuUsage"))
+                        .and_then(|v| v.as_u64())
+                }),
+        };
 
         let matching_dir = es
             .get("matchingDir")
@@ -283,14 +286,12 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         });
     }
 
-    // notifCorrId from the consumer; generate only if truly absent.
     let notif_corr_id = data
         .get("notifCorrId")
         .and_then(|v| v.as_str())
         .map(String::from)
         .unwrap_or_else(|| format!("corr-{}", uuid::Uuid::new_v4()));
 
-    // Optional legacy expiry hint (seconds-from-now); defaults to one hour.
     let expiry_seconds = data
         .get("expiryTime")
         .and_then(|v| v.as_u64())
@@ -301,7 +302,6 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         .expect("value expected")
         .as_secs();
 
-    // Derive periodicity + target from the events before they are moved.
     let rep_period = events.first().and_then(|e| e.rep_period_secs).or(Some(60));
     let first_snssai = events.first().and_then(|e| e.snssais.first()).cloned();
     let tgt_supi = data
@@ -312,16 +312,14 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         .and_then(|t| t.get("supi"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    let echo_events: Vec<serde_json::Value> = events.iter().map(event_subscription_json).collect();
 
-    let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
     let mut subscription = AnalyticsSubscription::new_with_events(
-        subscription_id.clone(),
+        subscription_id,
         events,
-        notification_uri.clone(),
+        notification_uri,
         now + expiry_seconds,
     );
-    subscription.notification_correlation_id = notif_corr_id.clone();
+    subscription.notification_correlation_id = notif_corr_id;
     subscription.repetition_period_secs = rep_period;
     if let Some(supi) = tgt_supi {
         subscription = subscription.with_target_supi(supi);
@@ -329,6 +327,33 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
     if let Some(s) = first_snssai {
         subscription = subscription.with_target_snssai(s);
     }
+    Ok(subscription)
+}
+
+/// Build the 200/201 body echoing the stored subscription representation.
+fn events_subscription_echo(sub: &AnalyticsSubscription) -> serde_json::Value {
+    serde_json::json!({
+        "subscriptionId": sub.subscription_id,
+        "notificationURI": sub.notification_uri,
+        "notifCorrId": sub.notification_correlation_id,
+        "eventSubscriptions": sub
+            .events
+            .iter()
+            .map(event_subscription_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Handle analytics subscription creation (POST /subscriptions).
+pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
+    log::info!("Analytics Subscription Create");
+
+    let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
+    let subscription = match parse_events_subscription(request, subscription_id) {
+        Ok(s) => s,
+        Err((detail, cause)) => return send_bad_request(&detail, Some(cause)),
+    };
+    let echo = events_subscription_echo(&subscription);
 
     let ctx = nwdaf_self();
     let result = if let Ok(context) = ctx.read() {
@@ -343,14 +368,44 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
                 "Location",
                 format!("/nnwdaf-eventssubscription/v1/subscriptions/{sub_id}"),
             )
-            .with_json_body(&serde_json::json!({
-                "subscriptionId": sub_id,
-                "notificationURI": notification_uri,
-                "notifCorrId": notif_corr_id,
-                "eventSubscriptions": echo_events,
-            }))
+            .with_json_body(&echo)
             .unwrap_or_else(|_| SbiResponse::with_status(201)),
         None => send_bad_request("Failed to create subscription", Some("SUBSCRIPTION_FAILED")),
+    }
+}
+
+/// Handle `PUT /nnwdaf-eventssubscription/v1/subscriptions/{id}` — replace an
+/// existing Individual NWDAF Events Subscription (TS 29.520 §5.1.3.3.3.2,
+/// UpdateNWDAFEventsSubscription). 200 + representation on success, 404 if the
+/// subscription is unknown.
+pub async fn handle_subscription_update(
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    log::info!("Analytics Subscription Update: {subscription_id}");
+
+    let subscription = match parse_events_subscription(request, subscription_id.to_string()) {
+        Ok(s) => s,
+        Err((detail, cause)) => return send_bad_request(&detail, Some(cause)),
+    };
+    let echo = events_subscription_echo(&subscription);
+
+    let ctx = nwdaf_self();
+    let updated = if let Ok(context) = ctx.read() {
+        context.update_subscription(subscription)
+    } else {
+        false
+    };
+
+    if updated {
+        SbiResponse::with_status(200)
+            .with_json_body(&echo)
+            .unwrap_or_else(|_| SbiResponse::with_status(200))
+    } else {
+        send_not_found(
+            &format!("Subscription {subscription_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        )
     }
 }
 
@@ -876,6 +931,103 @@ mod tests {
         assert_eq!(
             handle_ml_prov_subscription_delete(&sub_id).await.status,
             404
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscription_put_updates_and_404s() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let create = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                "eventSubscriptions": [ { "event": "NF_LOAD" } ]
+            }))
+            .expect("valid JSON body");
+        let create_resp = handle_subscription_create(&create).await;
+        assert_eq!(create_resp.status, 201);
+        let sub_id = body_json(&create_resp)["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string();
+
+        let put = SbiRequest::put(format!(
+            "/nnwdaf-eventssubscription/v1/subscriptions/{sub_id}"
+        ))
+        .with_json_body(&json!({
+            "notificationURI": "http://amf.example.org/notify2",
+            "eventSubscriptions": [ { "event": "UE_MOBILITY" } ]
+        }))
+        .expect("valid JSON body");
+        let put_resp = handle_subscription_update(&sub_id, &put).await;
+        assert_eq!(
+            put_resp.status, 200,
+            "PUT on an existing subscription must be 200"
+        );
+        let put_body = body_json(&put_resp);
+        assert_eq!(
+            put_body["notificationURI"].as_str(),
+            Some("http://amf.example.org/notify2")
+        );
+        assert_eq!(put_body["subscriptionId"].as_str(), Some(sub_id.as_str()));
+        assert_eq!(
+            put_body["eventSubscriptions"][0]["event"].as_str(),
+            Some("UE_MOBILITY")
+        );
+
+        // GET must now reflect the replaced representation.
+        let get_resp = handle_subscription_get(&sub_id).await;
+        assert_eq!(get_resp.status, 200);
+        assert_eq!(
+            body_json(&get_resp)["eventSubscriptions"][0]["event"].as_str(),
+            Some("UE_MOBILITY")
+        );
+
+        // PUT an unknown id -> 404.
+        let put_missing = SbiRequest::put("/nnwdaf-eventssubscription/v1/subscriptions/nope")
+            .with_json_body(&json!({
+                "notificationURI": "http://x/y",
+                "eventSubscriptions": [ { "event": "NF_LOAD" } ]
+            }))
+            .expect("valid JSON body");
+        assert_eq!(
+            handle_subscription_update("nope", &put_missing)
+                .await
+                .status,
+            404
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nf_load_threshold_parsed_from_nf_load_level() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let create = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                "eventSubscriptions": [{
+                    "event": "NF_LOAD",
+                    "notificationMethod": "THRESHOLD",
+                    "matchingDir": "ASCENDING",
+                    "nfLoadLvlThds": [ { "nfLoadLevel": 55 } ]
+                }]
+            }))
+            .expect("valid JSON body");
+        let resp = handle_subscription_create(&create).await;
+        assert_eq!(resp.status, 201);
+        let sub_id = body_json(&resp)["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string();
+
+        let ctx = nwdaf_self();
+        let stored = ctx
+            .read()
+            .unwrap()
+            .get_subscription(&sub_id)
+            .expect("subscription");
+        assert_eq!(
+            stored.events[0].load_level_threshold,
+            Some(55),
+            "NF_LOAD threshold must be read from nfLoadLvlThds[].nfLoadLevel, not the absent `loadLevel` field"
         );
     }
 }

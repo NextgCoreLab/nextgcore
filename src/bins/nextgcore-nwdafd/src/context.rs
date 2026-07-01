@@ -533,6 +533,20 @@ impl NwdafContext {
         removed
     }
 
+    /// Replace an existing analytics subscription (PUT). Returns false if the
+    /// subscription does not exist (so the handler can answer 404).
+    pub fn update_subscription(&self, subscription: AnalyticsSubscription) -> bool {
+        if let Ok(mut subs) = self.analytics_subscriptions.write() {
+            if let std::collections::hash_map::Entry::Occupied(mut e) =
+                subs.entry(subscription.subscription_id.clone())
+            {
+                e.insert(subscription);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get analytics subscription by ID
     pub fn get_subscription(&self, subscription_id: &str) -> Option<AnalyticsSubscription> {
         self.analytics_subscriptions
