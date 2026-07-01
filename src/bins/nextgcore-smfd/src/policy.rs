@@ -969,6 +969,7 @@ pub fn build_establishment_accept(
     sst: u8,
     sd: Option<u32>,
     dnn: &str,
+    cause_5gsm: Option<u8>,
 ) -> Vec<u8> {
     use crate::gsm_build::{
         encode_qos_flow_descriptions, encode_qos_rules, pf_component_type, pf_direction,
@@ -1019,6 +1020,15 @@ pub fn build_establishment_accept(
     msg.extend_from_slice(&dl_val.to_be_bytes());
     msg.push(ul_unit);
     msg.extend_from_slice(&ul_val.to_be_bytes());
+
+    // 5GSM cause (IEI 0x59, TV, 2 octets) per TS 24.501 Table 8.3.2.1.1 /
+    // clause 8.3.2.2: included when the selected PDU session type differs from
+    // the type requested by the UE (IPv4v6 requested, only the IPv4 leg
+    // granted -> #50). Sits after Session-AMBR, before the PDU address IE.
+    if let Some(cause) = cause_5gsm {
+        msg.push(0x59);
+        msg.push(cause);
+    }
 
     // PDU address (IEI 0x29) — encoded per the selected PDU session type
     // (TS 24.501 §9.11.4.10). The IPv4 form is byte-identical to the legacy
@@ -1224,6 +1234,7 @@ mod tests {
             1,
             None,
             "internet",
+            None,
         );
         // SM header (TS 24.501 §9.3 / Table 8.3.2.1.1 octets 1-4)
         assert_eq!(msg[0], 0x2E); // EPD: 5GSM
@@ -1312,6 +1323,7 @@ mod tests {
             1,
             None,
             "internet",
+            None,
         );
         // header | octet-5 | QoS rules LV-E | Session-AMBR LV | PDU address.
         const PINNED_PREFIX: [u8; 30] = [
@@ -1353,6 +1365,7 @@ mod tests {
             1,
             Some(0x010203),
             "xr",
+            None,
         );
         // S-NSSAI present with SST + 3-byte SD.
         let snssai_at = msg
@@ -1393,6 +1406,7 @@ mod tests {
             1,
             None,
             "internet",
+            None,
         );
         // octet-5: SSC mode 1 | IPv4v6 (0x13)
         assert_eq!(msg[4], (1 << 4) | pdu_session_type::IPV4V6);
@@ -1405,6 +1419,33 @@ mod tests {
         assert_eq!(msg[pdu_at + 2], pdu_session_type::IPV4V6);
         assert_eq!(&msg[pdu_at + 3..pdu_at + 11], &iid); // IPv6 IID
         assert_eq!(&msg[pdu_at + 11..pdu_at + 15], &[10, 45, 0, 2]); // IPv4
+    }
+
+    /// smfd#1 (TS 24.501 clause 8.3.2.2): when the UE requested IPv4v6 but only
+    /// the IPv4 leg is granted, the accept carries the 5GSM cause IE (IEI 0x59,
+    /// TV) with #50, placed after the Session-AMBR LV and before PDU address.
+    #[test]
+    fn accept_ipv4_downgrade_carries_5gsm_cause_50() {
+        let msg = build_establishment_accept(
+            5,
+            3,
+            pdu_session_type::IPV4,
+            2,
+            9,
+            9,
+            200_000_000,
+            50_000_000,
+            [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            None,
+            "internet",
+            Some(gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED),
+        );
+        // Header(4)+octet5(1)+QoS-LV-E(11)+Session-AMBR(7) = 23 bytes; the 5GSM
+        // cause TV occupies indices 23..25, then the PDU address IE (0x29).
+        assert_eq!(&msg[23..25], &[0x59, 50]);
+        assert_eq!(msg[25], 0x29);
     }
 
     // ----------------------------- smfd-08 ------------------------------

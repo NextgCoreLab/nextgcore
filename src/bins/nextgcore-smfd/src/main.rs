@@ -1496,6 +1496,36 @@ fn build_setup_request_transfer(
     transfer.encode()
 }
 
+/// Build a real-APER `PDUSessionResourceModifyRequestTransfer` (TS 38.413
+/// clause 9.3.4.3) carrying the re-authorized Session-AMBR and the QoS flow to
+/// add/modify. Mirrors [`build_setup_request_transfer`]; the gNB's strict APER
+/// decoder rejects a hand-rolled byte layout (smfd#2).
+fn build_modify_request_transfer(
+    qfi: u8,
+    ambr_dl_bps: u64,
+    ambr_ul_bps: u64,
+) -> nextgcore_ngap::NgapResult<Vec<u8>> {
+    use nextgcore_ngap::transfer::{
+        PduSessionAggregateMaximumBitRate, PduSessionResourceModifyRequestTransfer,
+        QosFlowAddOrModifyRequestItem,
+    };
+    let transfer = PduSessionResourceModifyRequestTransfer {
+        pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
+            dl: ambr_dl_bps,
+            ul: ambr_ul_bps,
+        }),
+        ul_ngu_up_tnl_modify_list: Vec::new(),
+        network_instance: None,
+        qos_flow_add_or_modify_request_list: vec![QosFlowAddOrModifyRequestItem {
+            qos_flow_identifier: qfi,
+            qos_flow_level_qos_parameters: None,
+            e_rab_id: None,
+        }],
+        qos_flow_to_release_list: Vec::new(),
+    };
+    transfer.encode()
+}
+
 /// Extract the gNB DL GTP-U endpoint (TEID, IPv4 address, first QFI) from a
 /// real-APER `PDUSessionResourceSetupResponseTransfer` (TS 38.413 §9.3.4.2).
 fn decode_setup_response_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
@@ -2153,6 +2183,11 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     let snssai_sd_u32 = snssai_sd
         .as_deref()
         .and_then(|s| u32::from_str_radix(s, 16).ok());
+    // TS 24.501 clause 8.3.2.2: when the UE requested IPv4v6 but this SMF grants
+    // only the IPv4 leg (selected_type != requested_type), the accept must carry
+    // 5GSM cause #50 "PDU session type IPv4 only allowed".
+    let est_5gsm_cause = (requested_type != selected_type)
+        .then_some(policy::gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED);
     let n1_sm_msg = policy::build_establishment_accept(
         pdu_session_id,
         pti,
@@ -2167,6 +2202,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         sst,
         snssai_sd_u32,
         &dnn,
+        est_5gsm_cause,
     );
 
     // ---- N2 SM Information: real-APER PDUSessionResourceSetupRequestTransfer ----
@@ -2492,8 +2528,17 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // N1: PDU Session Modification Command (PTI echoed, authorized AMBR)
             let n1_mod_cmd = policy::build_modification_command(psi, pti, ambr_dl, ambr_ul);
 
-            // N2 SM Info: QoS flow modification for gNB (QFI + confirm)
-            let n2_sm_info = vec![qfi, 0x01];
+            // N2 SM Info: real-APER PDUSessionResourceModifyRequestTransfer
+            // (TS 38.413 clause 9.3.4.3) carrying the re-authorized Session-AMBR
+            // and the QoS flow to modify; the gNB decodes it with its strict
+            // APER decoder -- a hand-rolled blob is rejected (smfd#2).
+            let n2_sm_info = match build_modify_request_transfer(qfi, ambr_dl, ambr_ul) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::error!("Failed to encode PDUSessionResourceModifyRequestTransfer: {e:?}");
+                    return SbiResponse::with_status(500);
+                }
+            };
 
             // N1 (PDU Session Modification Command) + N2 (QoS flow mod) carried
             // as multipart/related binary parts referenced by RefToBinaryData.
@@ -2998,6 +3043,23 @@ mod tests {
         assert_eq!(t.qos_flow_setup_request_list[0].qos_flow_identifier, 1);
     }
 
+    #[test]
+    fn modify_request_transfer_self_roundtrips() {
+        use nextgcore_ngap::transfer::PduSessionResourceModifyRequestTransfer;
+        let bytes = build_modify_request_transfer(1, 200_000_000, 100_000_000).unwrap();
+        let t = PduSessionResourceModifyRequestTransfer::decode(&bytes).expect("decode");
+        assert_eq!(
+            t.pdu_session_aggregate_maximum_bit_rate
+                .map(|a| (a.dl, a.ul)),
+            Some((200_000_000, 100_000_000))
+        );
+        assert_eq!(t.qos_flow_add_or_modify_request_list.len(), 1);
+        assert_eq!(
+            t.qos_flow_add_or_modify_request_list[0].qos_flow_identifier,
+            1
+        );
+    }
+
     /// The gNB (nextgsim-ngap) produces this SetupResponseTransfer for gNB DL
     /// F-TEID 0x00020002 / 10.46.0.1 / QFI 1 (pinned in the gNB test
     /// capture_tests.rs::gnb_setup_response_transfer_roundtrips). smfd must
@@ -3049,6 +3111,7 @@ mod tests {
             1,
             None,
             "internet",
+            None,
         );
         let n2 = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
 
