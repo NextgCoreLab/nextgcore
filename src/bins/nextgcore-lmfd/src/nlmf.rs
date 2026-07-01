@@ -26,6 +26,12 @@ pub mod cause {
     pub const UNREACHABLE_USER: &str = "UNREACHABLE_USER";
     pub const POSITIONING_DENIED: &str = "POSITIONING_DENIED";
     pub const POSITIONING_METHOD_FAILURE: &str = "POSITIONING_METHOD_FAILURE";
+    // lmfd#0: per-operation application errors (TS 29.572 §6.1.7.3-1).
+    pub const LOCATION_SESSION_UNKNOWN: &str = "LOCATION_SESSION_UNKNOWN";
+    pub const LOCATION_TRANSFER_NOT_SUPPORTED: &str = "LOCATION_TRANSFER_NOT_SUPPORTED";
+    pub const INSUFFICIENT_RESOURCES: &str = "INSUFFICIENT_RESOURCES";
+    pub const EVENT_REPORT_UNRECOGNIZED: &str = "EVENT_REPORT_UNRECOGNIZED";
+    pub const LOCATION_MEASUREMENT_UNKNOWN: &str = "LOCATION_MEASUREMENT_UNKNOWN";
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +106,17 @@ pub struct InputData {
     pub priority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ldr_type: Option<String>,
+    // lmfd#1: additional LDR / MO-LR IEs (TS 29.572 §6.1.6.2.2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ldr_reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ue_location_service_ind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub periodic_event_info: Option<PeriodicEventInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub area_event_info: Option<AreaEventInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub motion_event_info: Option<MotionEventInfo>,
     #[serde(rename = "hgmlcCallBackURI", skip_serializing_if = "Option::is_none")]
     pub hgmlc_call_back_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,6 +165,154 @@ pub struct Ncgi {
     pub plmn_id: PlmnId,
     #[serde(rename = "nrCellId")]
     pub nr_cell_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// lmfd#1: event-info structs for deferred/periodic/triggered LDR
+// (TS 29.572 §6.1.6.2.x, yaml:1321-1400).
+// ---------------------------------------------------------------------------
+
+/// `PeriodicEventInfo` — periodic-reporting parameters (TS 29.572).
+/// `reportingAmount` and `reportingInterval` are the two M IEs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PeriodicEventInfo {
+    pub reporting_amount: u32,
+    pub reporting_interval: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reporting_interval_ms: Option<u32>,
+}
+
+/// `AreaEventInfo` — area-based trigger parameters (TS 29.572).
+/// `areaDefinition` is the M IE (array of GAD area descriptions).
+/// Fidelity limit: area shapes are opaque `serde_json::Value` here;
+/// geometry parsing (TS 23.032 shapes) is E2E-gated (lmfd#0 deferred).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AreaEventInfo {
+    pub area_definition: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrence_info: Option<String>,
+}
+
+/// `MotionEventInfo` — motion-based trigger parameters (TS 29.572).
+/// `linearDistance` (metres) is the M IE.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MotionEventInfo {
+    pub linear_distance: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrence_info: Option<String>,
+}
+
+/// `UeLocationServiceInd` string values (TS 29.572 yaml:2450-2457).
+pub mod ue_location_service_ind {
+    pub const LOCATION_ESTIMATE: &str = "LOCATION_ESTIMATE";
+    pub const LOCATION_ASSISTANCE_DATA: &str = "LOCATION_ASSISTANCE_DATA";
+}
+
+// ---------------------------------------------------------------------------
+// lmfd#0: custom Nlmf_Location operation data types (TS 29.572 §6.1.4.x).
+// ---------------------------------------------------------------------------
+
+/// `CancelLocData` — POST /cancel-location request body (TS 29.572 §6.1.4.3.2).
+/// M: hgmlcCallBackURI, ldrReference.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelLocData {
+    #[serde(rename = "hgmlcCallBackURI")]
+    pub hgmlc_call_back_uri: String,
+    pub ldr_reference: String,
+    #[serde(rename = "lcsCorrelationID", skip_serializing_if = "Option::is_none")]
+    pub lcs_correlation_id: Option<String>,
+    #[serde(rename = "supportedFeatures", skip_serializing_if = "Option::is_none")]
+    pub supported_features: Option<String>,
+}
+
+/// `EventReportMessage` — embedded in `LocContextData` (TS 29.572 §6.1.4.5.2).
+/// Modelled minimally: `eventClass` is spec-string (M), `eventContent` opaque.
+/// Fidelity limit: full EventReport IE parsing is E2E-gated (lmfd#0 deferred).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventReportMessage {
+    pub event_class: String,
+    pub event_content: serde_json::Value,
+}
+
+/// `LocContextData` — POST /location-context-transfer request body (TS 29.572 §6.1.4.5.2).
+/// M: amfId, ldrType, hgmlcCallBackURI, ldrReference, eventReportMessage.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocContextData {
+    pub amf_id: String,
+    pub ldr_type: String,
+    #[serde(rename = "hgmlcCallBackURI")]
+    pub hgmlc_call_back_uri: String,
+    pub ldr_reference: String,
+    pub event_report_message: EventReportMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supi: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpsi: Option<String>,
+}
+
+/// `LocMeasurementReq` — POST /measure-location request body (TS 29.572 §6.1.4.6.2).
+/// All fields optional (no M IEs on the request).
+/// Fidelity limit: measure-location 200 requires real PRU/NRPPa measurements not
+/// collected by the LMF — handler returns 403 LOCATION_MEASUREMENT_UNKNOWN (honest).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocMeasurementReq {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ncgi: Option<Ncgi>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ecgi: Option<Ecgi>,
+}
+
+/// Minimal `LocMeasurements` entry (TS 29.572 §6.1.4.6.3).
+/// Fidelity limit: full measurement structures (PRU/NRPPa) are E2E-gated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocMeasurements {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loc_info: Option<String>,
+}
+
+/// `LocMeasurementResp` — POST /measure-location 200 response (TS 29.572 §6.1.4.6.3).
+/// M: locMeasurements (array).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocMeasurementResp {
+    pub loc_measurements: Vec<LocMeasurements>,
+}
+
+/// `UpConfig` — POST /configure-up request body (TS 29.572 §6.1.4.7.2).
+/// M: upNotifyCallBackUri, notifCorrelationId + anyOf[supi, gpsi].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpConfig {
+    pub up_notify_call_back_uri: String,
+    pub notif_correlation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supi: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpsi: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amf_reallocation_ind: Option<bool>,
+}
+
+/// `UpSubscription` — POST /up-subscriptions request/response body (TS 29.572 §6.1.4.8.x).
+/// M: upNotifyCallBackUri, notifCorrelationId, supi.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpSubscription {
+    pub up_notify_call_back_uri: String,
+    pub notif_correlation_id: String,
+    pub supi: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpsi: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +665,104 @@ mod tests {
         // Only POINT advertised -> POINT.
         let point = vec!["POINT".to_string()];
         assert_eq!(negotiate_gad_shape(Some(&point), false), "POINT");
+    }
+
+    // -- lmfd#0: operation body parse tests -----------------------------------
+
+    #[test]
+    fn test_cancel_loc_data_parse() {
+        let json = r#"{
+            "hgmlcCallBackURI": "http://gmlc/cancel-cb",
+            "ldrReference": "ref-abc",
+            "lcsCorrelationID": "corr-001"
+        }"#;
+        let d: CancelLocData = serde_json::from_str(json).unwrap();
+        assert_eq!(d.hgmlc_call_back_uri, "http://gmlc/cancel-cb");
+        assert_eq!(d.ldr_reference, "ref-abc");
+        assert_eq!(d.lcs_correlation_id.as_deref(), Some("corr-001"));
+    }
+
+    #[test]
+    fn test_loc_context_data_parse() {
+        let json = r#"{
+            "amfId": "amf-01",
+            "ldrType": "PERIODIC",
+            "hgmlcCallBackURI": "http://gmlc/ctx-cb",
+            "ldrReference": "ref-def",
+            "eventReportMessage": { "eventClass": "SUPPLEMENTARY_SERVICES", "eventContent": {} },
+            "supi": "imsi-001010000000042"
+        }"#;
+        let d: LocContextData = serde_json::from_str(json).unwrap();
+        assert_eq!(d.amf_id, "amf-01");
+        assert_eq!(d.ldr_type, "PERIODIC");
+        assert_eq!(d.event_report_message.event_class, "SUPPLEMENTARY_SERVICES");
+        assert_eq!(d.supi.as_deref(), Some("imsi-001010000000042"));
+    }
+
+    #[test]
+    fn test_up_config_parse() {
+        let json = r#"{
+            "upNotifyCallBackUri": "http://af/up-notify",
+            "notifCorrelationId": "notif-99",
+            "supi": "imsi-001010000000077"
+        }"#;
+        let d: UpConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(d.up_notify_call_back_uri, "http://af/up-notify");
+        assert_eq!(d.notif_correlation_id, "notif-99");
+        assert!(d.supi.is_some());
+        assert!(d.gpsi.is_none());
+    }
+
+    #[test]
+    fn test_loc_measurement_resp_roundtrip() {
+        let resp = LocMeasurementResp {
+            loc_measurements: vec![LocMeasurements {
+                loc_info: Some("info-a".to_string()),
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["locMeasurements"][0]["locInfo"], "info-a");
+        let back: LocMeasurementResp = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn test_up_subscription_roundtrip() {
+        let sub = UpSubscription {
+            up_notify_call_back_uri: "http://af/up".to_string(),
+            notif_correlation_id: "nc-1".to_string(),
+            supi: "imsi-001010000000055".to_string(),
+            gpsi: None,
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["upNotifyCallBackUri"], "http://af/up");
+        let back: UpSubscription = serde_json::from_str(&json).unwrap();
+        assert_eq!(sub, back);
+    }
+
+    // -- lmfd#1: InputData LDR fields parse -----------------------------------
+
+    #[test]
+    fn test_input_data_ldr_fields_parse() {
+        let json = r#"{
+            "supi": "imsi-001010000000088",
+            "ldrType": "PERIODIC",
+            "ldrReference": "ref-ldr-01",
+            "ueLocationServiceInd": "LOCATION_ASSISTANCE_DATA",
+            "periodicEventInfo": { "reportingAmount": 5, "reportingInterval": 60 }
+        }"#;
+        let d: InputData = serde_json::from_str(json).unwrap();
+        assert_eq!(d.ldr_type.as_deref(), Some("PERIODIC"));
+        assert_eq!(d.ldr_reference.as_deref(), Some("ref-ldr-01"));
+        assert_eq!(
+            d.ue_location_service_ind.as_deref(),
+            Some("LOCATION_ASSISTANCE_DATA")
+        );
+        let pei = d.periodic_event_info.unwrap();
+        assert_eq!(pei.reporting_amount, 5);
+        assert_eq!(pei.reporting_interval, 60);
     }
 
     // -- InputData parse + ecgi/ncgi exclusion (lmfd-03 acceptance) ---------

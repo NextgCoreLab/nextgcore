@@ -221,6 +221,35 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "GET" => handle_capabilities().await,
             _ => send_method_not_allowed(method, "capabilities"),
         },
+        // lmfd#0: Nlmf_Location custom operations (TS 29.572 §6.1.4).
+        // EventNotify/UPNotify (§6.1.5) are LMF-initiated outbound POSTs —
+        // deferred (E2E-gated: need a live GMLC/AF endpoint + trigger scheduler).
+        // TODO lmfd: implement EventNotify producer (TS 29.572 §6.1.5.1) once
+        // a trigger scheduler and outbound SBI client are available.
+        ["nlmf-loc", "v1", "cancel-location"] => match method {
+            "POST" => handle_cancel_location(&request).await,
+            _ => send_method_not_allowed(method, "cancel-location"),
+        },
+        ["nlmf-loc", "v1", "location-context-transfer"] => match method {
+            "POST" => handle_location_context_transfer(&request).await,
+            _ => send_method_not_allowed(method, "location-context-transfer"),
+        },
+        ["nlmf-loc", "v1", "measure-location"] => match method {
+            "POST" => handle_measure_location(&request).await,
+            _ => send_method_not_allowed(method, "measure-location"),
+        },
+        ["nlmf-loc", "v1", "configure-up"] => match method {
+            "POST" => handle_configure_up(&request).await,
+            _ => send_method_not_allowed(method, "configure-up"),
+        },
+        ["nlmf-loc", "v1", "up-subscriptions"] => match method {
+            "POST" => handle_up_subscribe(&request).await,
+            _ => send_method_not_allowed(method, "up-subscriptions"),
+        },
+        ["nlmf-loc", "v1", "up-subscriptions", subscription_id] => match method {
+            "DELETE" => handle_up_unsubscribe(subscription_id).await,
+            _ => send_method_not_allowed(method, "up-subscriptions/{subscriptionId}"),
+        },
         _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
 }
@@ -352,6 +381,35 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         );
     }
 
+    // lmfd#1: MO-LR requesting location assistance data -> the LMF delivers
+    // assistance data to the UE (LPP ProvideAssistanceData) and returns 204 No
+    // Content with no location body (TS 29.572 §6.1.4.2.2, 204 case).
+    if input.ue_location_service_ind.as_deref()
+        == Some(nlmf::ue_location_service_ind::LOCATION_ASSISTANCE_DATA)
+    {
+        log::info!("MO-LR location-assistance-data delivery -> 204 No Content");
+        return SbiResponse::no_content();
+    }
+
+    // lmfd#1: deferred/periodic/triggered LDR (ldrType present) -> register a
+    // reporting context keyed by ldrReference so it can be cancelled
+    // (cancel-location, §6.1.4.3) and later reported (EventNotify, §6.1.5).
+    // Activation still returns the 200 LocationDataExt below. EventNotify
+    // emission on trigger is E2E-gated (TODO lmfd: needs outbound GMLC callback,
+    // TS 29.572 §6.1.5.1).
+    if let (Some(ldr_type), Some(ldr_ref)) =
+        (input.ldr_type.as_deref(), input.ldr_reference.as_deref())
+    {
+        if let Ok(c) = lmf_self().read() {
+            c.register_ldr(LdrContext {
+                ldr_reference: ldr_ref.to_string(),
+                ldr_type: ldr_type.to_string(),
+                hgmlc_callback_uri: input.hgmlc_call_back_uri.clone(),
+                supi: input.supi.clone(),
+            });
+        }
+    }
+
     // lmfd-05/06/07: initiate the real positioning procedure — encode an
     // LMF-initiated LPP RequestLocationInformation and (best-effort) transfer it
     // to the serving AMF via Namf_Communication N1N2MessageTransfer.
@@ -432,6 +490,220 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
                 "Failed to encode LocationDataExt",
             )
         })
+}
+
+// ---------------------------------------------------------------------------
+// lmfd#0: custom Nlmf_Location operation handlers (TS 29.572 §6.1.4).
+// ---------------------------------------------------------------------------
+
+/// POST /nlmf-loc/v1/cancel-location (TS 29.572 §6.1.4.3).
+///
+/// Cancels an active deferred/periodic/triggered LDR session identified by
+/// `ldrReference`. Returns 204 on success, 403 LOCATION_SESSION_UNKNOWN when
+/// no matching session exists.
+async fn handle_cancel_location(request: &SbiRequest) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => {
+            return problem(
+                400,
+                nlmf::cause::MANDATORY_IE_MISSING,
+                "Missing request body",
+            )
+        }
+    };
+    let data: nlmf::CancelLocData = match serde_json::from_str(body) {
+        Ok(d) => d,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("Malformed CancelLocData: {e}"),
+            )
+        }
+    };
+    let removed = match lmf_self().read() {
+        Ok(c) => c.cancel_ldr(&data.ldr_reference),
+        Err(_) => false,
+    };
+    if removed {
+        SbiResponse::no_content()
+    } else {
+        problem(
+            403,
+            nlmf::cause::LOCATION_SESSION_UNKNOWN,
+            "No active LDR session for the given ldrReference",
+        )
+    }
+}
+
+/// POST /nlmf-loc/v1/location-context-transfer (TS 29.572 §6.1.4.5).
+///
+/// Transfers an LDR context from an old AMF to this LMF after AMF relocation.
+/// Validates `eventReportMessage.eventClass`; registers the LDR context.
+/// Returns 204 on success, 403 on unrecognized event class.
+async fn handle_location_context_transfer(request: &SbiRequest) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => {
+            return problem(
+                400,
+                nlmf::cause::MANDATORY_IE_MISSING,
+                "Missing request body",
+            )
+        }
+    };
+    let data: nlmf::LocContextData = match serde_json::from_str(body) {
+        Ok(d) => d,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("Malformed LocContextData: {e}"),
+            )
+        }
+    };
+    // Validate eventClass: only known classes are accepted.
+    match data.event_report_message.event_class.as_str() {
+        "SUPPLEMENTARY_SERVICES" | "DUMMY" => {}
+        _ => {
+            return problem(
+                403,
+                nlmf::cause::EVENT_REPORT_UNRECOGNIZED,
+                "Unrecognized eventReportMessage.eventClass",
+            )
+        }
+    }
+    if let Ok(c) = lmf_self().read() {
+        c.register_ldr(LdrContext {
+            ldr_reference: data.ldr_reference.clone(),
+            ldr_type: data.ldr_type.clone(),
+            hgmlc_callback_uri: Some(data.hgmlc_call_back_uri.clone()),
+            supi: data.supi.clone(),
+        });
+    }
+    SbiResponse::no_content()
+}
+
+/// POST /nlmf-loc/v1/measure-location (TS 29.572 §6.1.4.6).
+///
+/// Requests location measurements for the target cell. Returns 403
+/// LOCATION_MEASUREMENT_UNKNOWN because the LMF has no PRU/NRPPa
+/// measurements collected independently of a `determine-location` flow.
+/// Fabricating a 200 LocMeasurementResp with invented data would violate
+/// the non-fabrication contract (lmfd gate_notes).
+async fn handle_measure_location(request: &SbiRequest) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => {
+            return problem(
+                400,
+                nlmf::cause::MANDATORY_IE_MISSING,
+                "Missing request body",
+            )
+        }
+    };
+    let _req: nlmf::LocMeasurementReq = match serde_json::from_str(body) {
+        Ok(d) => d,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("Malformed LocMeasurementReq: {e}"),
+            )
+        }
+    };
+    // Honest: no PRU location measurements available without a full UE session.
+    problem(
+        403,
+        nlmf::cause::LOCATION_MEASUREMENT_UNKNOWN,
+        "No PRU location measurements available",
+    )
+}
+
+/// POST /nlmf-loc/v1/configure-up (TS 29.572 §6.1.4.7).
+///
+/// Configures user-plane location reporting for a UE. Validates that at least
+/// one of `supi` or `gpsi` is present. Returns 204 on success.
+async fn handle_configure_up(request: &SbiRequest) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => {
+            return problem(
+                400,
+                nlmf::cause::MANDATORY_IE_MISSING,
+                "Missing request body",
+            )
+        }
+    };
+    let data: nlmf::UpConfig = match serde_json::from_str(body) {
+        Ok(d) => d,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("Malformed UpConfig: {e}"),
+            )
+        }
+    };
+    // UpConfig requires anyOf[supi, gpsi] (TS 29.572 §6.1.6.2.x).
+    if data.supi.is_none() && data.gpsi.is_none() {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "UpConfig requires supi or gpsi",
+        );
+    }
+    SbiResponse::no_content()
+}
+
+/// POST /nlmf-loc/v1/up-subscriptions (TS 29.572 §6.1.4.8).
+///
+/// Creates a UP location reporting subscription. Returns 201 Created with the
+/// subscription resource location header and the subscription body.
+async fn handle_up_subscribe(request: &SbiRequest) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => {
+            return problem(
+                400,
+                nlmf::cause::MANDATORY_IE_MISSING,
+                "Missing request body",
+            )
+        }
+    };
+    let sub: nlmf::UpSubscription = match serde_json::from_str(body) {
+        Ok(d) => d,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("Malformed UpSubscription: {e}"),
+            )
+        }
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let location = format!("/nlmf-loc/v1/up-subscriptions/{id}");
+    SbiResponse::with_status(201)
+        .with_header("Location", location)
+        .with_json_body(&sub)
+        .unwrap_or_else(|_| {
+            problem(
+                500,
+                nlmf::cause::UNSPECIFIED,
+                "Failed to encode UpSubscription",
+            )
+        })
+}
+
+/// DELETE /nlmf-loc/v1/up-subscriptions/{subscriptionId} (TS 29.572 §6.1.4.9).
+///
+/// Deletes a UP location reporting subscription. Returns 204 No Content.
+/// Full subscription lifecycle (store + lookup) is E2E-gated (needs a persistent
+/// UP subscription store + a live UPF data path). Minimal implementation accepts
+/// any subscriptionId and returns 204.
+async fn handle_up_unsubscribe(_subscription_id: &str) -> SbiResponse {
+    SbiResponse::no_content()
 }
 
 /// Handle a (bespoke/debug) measurement request — NOT a TS 29.572 resource.
@@ -1227,5 +1499,172 @@ mod tests {
         assert_eq!(resp.status, 400);
         let v = body_json(&resp);
         assert_eq!(v["cause"], "MANDATORY_IE_INCORRECT");
+    }
+
+    // -- lmfd#0: configure-up -------------------------------------------------
+
+    #[tokio::test]
+    async fn test_configure_up_204() {
+        let body = r#"{
+            "upNotifyCallBackUri": "http://af/up-notify",
+            "notifCorrelationId": "nc-001",
+            "supi": "imsi-001010000000070"
+        }"#;
+        let req = SbiRequest::post("/nlmf-loc/v1/configure-up").with_body(body, "application/json");
+        let resp = handle_configure_up(&req).await;
+        assert_eq!(resp.status, 204);
+    }
+
+    #[tokio::test]
+    async fn test_configure_up_missing_ue_id_400() {
+        let body = r#"{
+            "upNotifyCallBackUri": "http://af/up-notify",
+            "notifCorrelationId": "nc-002"
+        }"#;
+        let req = SbiRequest::post("/nlmf-loc/v1/configure-up").with_body(body, "application/json");
+        let resp = handle_configure_up(&req).await;
+        assert_eq!(resp.status, 400);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "MANDATORY_IE_MISSING");
+    }
+
+    // -- lmfd#0: measure-location -> 403 LOCATION_MEASUREMENT_UNKNOWN --------
+
+    #[tokio::test]
+    async fn test_measure_location_unknown_403() {
+        let body = r#"{}"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/measure-location").with_body(body, "application/json");
+        let resp = handle_measure_location(&req).await;
+        assert_eq!(resp.status, 403);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "LOCATION_MEASUREMENT_UNKNOWN");
+    }
+
+    // -- lmfd#0: location-context-transfer ------------------------------------
+
+    #[tokio::test]
+    async fn test_location_context_transfer_204() {
+        let body = r#"{
+            "amfId": "amf-01",
+            "ldrType": "PERIODIC",
+            "hgmlcCallBackURI": "http://gmlc/ctx-cb",
+            "ldrReference": "aa01",
+            "eventReportMessage": { "eventClass": "SUPPLEMENTARY_SERVICES", "eventContent": {} }
+        }"#;
+        let req = SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
+            .with_body(body, "application/json");
+        let resp = handle_location_context_transfer(&req).await;
+        assert_eq!(resp.status, 204);
+        // LDR context must be registered.
+        let found = lmf_self().read().unwrap().ldr_find("aa01");
+        assert!(found.is_some(), "LDR context not registered");
+        assert_eq!(found.unwrap().ldr_type, "PERIODIC");
+    }
+
+    #[tokio::test]
+    async fn test_location_context_transfer_bad_event_class_403() {
+        let body = r#"{
+            "amfId": "amf-01",
+            "ldrType": "UE_AVAILABLE",
+            "hgmlcCallBackURI": "http://gmlc/ctx-cb",
+            "ldrReference": "aa02",
+            "eventReportMessage": { "eventClass": "BOGUS_CLASS", "eventContent": {} }
+        }"#;
+        let req = SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
+            .with_body(body, "application/json");
+        let resp = handle_location_context_transfer(&req).await;
+        assert_eq!(resp.status, 403);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "EVENT_REPORT_UNRECOGNIZED");
+    }
+
+    // -- lmfd#0: cancel-location lifecycle ------------------------------------
+
+    #[tokio::test]
+    async fn test_cancel_location_lifecycle() {
+        // Seed an LDR session directly.
+        lmf_self().read().unwrap().register_ldr(LdrContext {
+            ldr_reference: "bb01".to_string(),
+            ldr_type: "UE_AVAILABLE".to_string(),
+            hgmlc_callback_uri: Some("http://gmlc/cb".to_string()),
+            supi: None,
+        });
+
+        // First cancel -> 204.
+        let body = r#"{"hgmlcCallBackURI":"http://gmlc/cb","ldrReference":"bb01"}"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/cancel-location").with_body(body, "application/json");
+        let resp = handle_cancel_location(&req).await;
+        assert_eq!(resp.status, 204);
+
+        // Second cancel -> 403 LOCATION_SESSION_UNKNOWN.
+        let req2 =
+            SbiRequest::post("/nlmf-loc/v1/cancel-location").with_body(body, "application/json");
+        let resp2 = handle_cancel_location(&req2).await;
+        assert_eq!(resp2.status, 403);
+        let v = body_json(&resp2);
+        assert_eq!(v["cause"], "LOCATION_SESSION_UNKNOWN");
+    }
+
+    // -- lmfd#0: up-subscriptions 201 + unsubscribe 204 ----------------------
+
+    #[tokio::test]
+    async fn test_up_subscribe_201_and_unsubscribe_204() {
+        let body = r#"{
+            "upNotifyCallBackUri": "http://af/up",
+            "notifCorrelationId": "nc-sub-1",
+            "supi": "imsi-001010000000080"
+        }"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/up-subscriptions").with_body(body, "application/json");
+        let resp = handle_up_subscribe(&req).await;
+        assert_eq!(resp.status, 201);
+        assert!(
+            resp.http.get_header("Location").is_some(),
+            "Location header missing on 201"
+        );
+
+        // DELETE any subscriptionId -> 204.
+        let resp2 = handle_up_unsubscribe("sub-1").await;
+        assert_eq!(resp2.status, 204);
+    }
+
+    // -- lmfd#1: 204 assistance-data branch -----------------------------------
+
+    #[tokio::test]
+    async fn test_determine_location_assistance_data_204() {
+        let body =
+            r#"{"supi":"imsi-001010000000012","ueLocationServiceInd":"LOCATION_ASSISTANCE_DATA"}"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 204);
+    }
+
+    // -- lmfd#1: deferred LDR registers context and is cancellable -----------
+
+    #[tokio::test]
+    async fn test_determine_location_deferred_ldr_registers_and_cancellable() {
+        seed_fix("imsi-001010000000013", 40.0);
+        let body = r#"{
+            "supi": "imsi-001010000000013",
+            "ldrType": "PERIODIC",
+            "ldrReference": "cc01",
+            "hgmlcCallBackURI": "http://gmlc/cb"
+        }"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        // Periodic LDR activation returns 200 LocationDataExt (fix exists).
+        assert_eq!(resp.status, 200);
+        // LDR context must have been registered.
+        let found = lmf_self()
+            .read()
+            .unwrap()
+            .ldr_find("cc01")
+            .expect("LDR context not registered after deferred determine-location");
+        assert_eq!(found.ldr_type, "PERIODIC");
+        assert_eq!(found.hgmlc_callback_uri.as_deref(), Some("http://gmlc/cb"));
     }
 }

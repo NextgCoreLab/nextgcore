@@ -148,6 +148,21 @@ pub struct UeLocationContext {
     pub active_measurement: Option<u64>,
 }
 
+/// Registered deferred/periodic/triggered LDR session context (lmfd#1).
+/// Keyed by `ldrReference` in `ldr_sessions`; created on `determine-location`
+/// or `location-context-transfer`; removed by `cancel-location`.
+#[derive(Debug, Clone)]
+pub struct LdrContext {
+    /// The `ldrReference` that identifies this session (TS 29.572 §6.1.4.2.2).
+    pub ldr_reference: String,
+    /// `LdrType` enum value (UE_AVAILABLE/PERIODIC/ENTERING_INTO_AREA/…).
+    pub ldr_type: String,
+    /// HGMLC callback URI for EventNotify (TS 29.572 §6.1.5).
+    pub hgmlc_callback_uri: Option<String>,
+    /// Target SUPI when known.
+    pub supi: Option<String>,
+}
+
 /// LMF Context
 pub struct LmfContext {
     /// UE location contexts (SUPI -> context)
@@ -168,6 +183,8 @@ pub struct LmfContext {
     /// Populated via [`LmfContext::set_cell_coord`] from config or tests.
     /// Empty means unconfigured; real solvers fall back to the heuristic placeholder.
     cell_registry: RwLock<HashMap<String, TrpCoord>>,
+    /// Registered deferred/periodic/triggered LDR sessions (ldrReference -> ctx). lmfd#1.
+    ldr_sessions: RwLock<HashMap<String, LdrContext>>,
 }
 
 impl LmfContext {
@@ -186,6 +203,7 @@ impl LmfContext {
             ],
             initialized: AtomicBool::new(false),
             cell_registry: RwLock::new(HashMap::new()),
+            ldr_sessions: RwLock::new(HashMap::new()),
         }
     }
 
@@ -210,6 +228,9 @@ impl LmfContext {
         }
         if let Ok(mut reps) = self.reports.write() {
             reps.clear();
+        }
+        if let Ok(mut ldrs) = self.ldr_sessions.write() {
+            ldrs.clear();
         }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("LMF context finalized");
@@ -366,6 +387,37 @@ impl LmfContext {
 
     pub fn measurement_count(&self) -> usize {
         self.measurements.read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // LDR session store (lmfd#1): deferred/periodic/triggered LDR contexts
+    // -----------------------------------------------------------------------
+
+    /// Register (or replace) an LDR session keyed by `ldrReference`.
+    /// Returns `true` on success. Used by `determine-location` (ldrType present)
+    /// and `location-context-transfer` (TS 29.572 §6.1.4.2.2, §6.1.4.5.2).
+    pub fn register_ldr(&self, ctx: LdrContext) -> bool {
+        if let Ok(mut l) = self.ldr_sessions.write() {
+            l.insert(ctx.ldr_reference.clone(), ctx);
+            return true;
+        }
+        false
+    }
+
+    /// Remove an LDR session by `ldrReference`.
+    /// Returns `true` if the session existed (it was cancelled), `false` if not
+    /// found (→ caller should return 403 LOCATION_SESSION_UNKNOWN).
+    /// Used by `cancel-location` (TS 29.572 §6.1.4.3.2).
+    pub fn cancel_ldr(&self, ldr_reference: &str) -> bool {
+        if let Ok(mut l) = self.ldr_sessions.write() {
+            return l.remove(ldr_reference).is_some();
+        }
+        false
+    }
+
+    /// Look up an LDR session by `ldrReference`. Returns a clone, or `None`.
+    pub fn ldr_find(&self, ldr_reference: &str) -> Option<LdrContext> {
+        self.ldr_sessions.read().ok()?.get(ldr_reference).cloned()
     }
 
     /// Register (or update) a cell geodetic coordinate for use by the real
@@ -1076,6 +1128,30 @@ mod tests_real_solve {
     }
 
     // -- Registry API ---------------------------------------------------------
+    // -- LDR session store (lmfd#1) -------------------------------------------
+
+    #[test]
+    fn test_ldr_register_cancel() {
+        let ctx = LmfContext::new();
+        let ldr = LdrContext {
+            ldr_reference: "ldr-test-001".to_string(),
+            ldr_type: "PERIODIC".to_string(),
+            hgmlc_callback_uri: Some("http://gmlc/cb".to_string()),
+            supi: Some("imsi-001010000000099".to_string()),
+        };
+        // Register: find should return Some
+        assert!(ctx.register_ldr(ldr));
+        let found = ctx.ldr_find("ldr-test-001");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().ldr_type, "PERIODIC");
+        // Cancel: returns true (was present)
+        assert!(ctx.cancel_ldr("ldr-test-001"));
+        // ldr_find now None
+        assert!(ctx.ldr_find("ldr-test-001").is_none());
+        // Second cancel: returns false (already gone)
+        assert!(!ctx.cancel_ldr("ldr-test-001"));
+    }
+
     #[test]
     fn test_set_cell_coord_and_build_registry() {
         let mut ctx = LmfContext::new();
