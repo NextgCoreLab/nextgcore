@@ -45,3 +45,12 @@ pub use message::*;
 pub use nr_dl_tdoa::*;
 pub use nr_multi_rtt::*;
 pub use types::*;
+
+/// Build a `requestedMeasurements` BIT STRING (SIZE(1..8), MSB first) for the
+/// LPP RequestLocationInformation request IEs (E-CID / NR-Multi-RTT /
+/// NR-DL-TDOA) from per-bit flags. `flags[0]` is the most-significant bit.
+pub fn requested_measurements(
+    flags: &[bool],
+) -> bitvec::prelude::BitVec<u8, bitvec::prelude::Msb0> {
+    flags.iter().copied().collect()
+}

@@ -243,82 +243,54 @@ fn problem(status: u16, cause: &str, detail: &str) -> SbiResponse {
     SbiResponse::with_status(status).with_problem(&pd)
 }
 
-/// Positioning failure modes mapped to TS 29.572 Determine-Location response
-/// codes (Table 6.1.4.2.2-3).
-enum PositioningError {
-    /// Positioning did not complete within the response-time budget -> 504.
-    Timeout,
-    /// No usable positioning method available -> 403.
-    Unsupported,
-}
+/// LMF-initiated LPP transaction numbering (TS 37.355 §6.1), wrapping 0..255.
+static LPP_TRANSACTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Result of the **SIMULATED** position estimator.
-struct SimEstimate {
-    lat: f64,
-    lon: f64,
-    /// Horizontal uncertainty (metres).
-    uncertainty_m: f64,
-    /// Confidence (0..100 %).
-    confidence: u8,
-}
-
-/// Run the **SIMULATED** positioning estimator.
+/// lmfd-05/06/07: initiate the LMF positioning procedure for a
+/// Determine-Location request (TS 23.273 §6, 5GC-MT-LR). Encodes an
+/// LMF-initiated LPP `RequestLocationInformation` (TS 37.355) and packages it
+/// in a Namf_Communication N1N2MessageTransfer (TS 29.518) toward the target
+/// UE's serving AMF; the eventual `ProvideLocationInformation` / NRPPa report
+/// is consumed by the inbound handlers to produce a real fix via
+/// `context::compute_location`.
 ///
-/// PLACEHOLDER until lmfd-LIB-01/02 (NRPPa per TS 38.455 / LPP per TS 37.355
-/// ASN.1 codecs), lmfd-AMF-01 (AMF NRPPa/LPP relay) and lmfd-07/08 (Namf
-/// consumer + real multilateration) land. This performs NO real positioning:
-/// it returns a deterministic, clearly-fake estimate so the SBI surface
-/// (status codes, GAD encoding, ProblemDetails) can be exercised conformantly.
-/// DO NOT treat the returned coordinates as a genuine UE location.
-fn simulated_positioning(input: &nlmf::InputData) -> Result<SimEstimate, PositioningError> {
-    // A zero response-time budget cannot complete positioning -> 504.
-    if input.max_resp_time == Some(0) {
-        return Err(PositioningError::Timeout);
-    }
-    // Honest simulation: a fixed reference origin plus a small deterministic
-    // offset derived from the request identity, so distinct UEs map to
-    // distinct (but reproducible, NON-REAL) points.
-    const SIM_ORIGIN_LAT: f64 = 37.7749; // simulator origin — NOT a real fix
-    const SIM_ORIGIN_LON: f64 = -122.4194;
-    let seed = identity_seed(input);
-    if seed == 0 && input.supi.is_none() && input.pei.is_none() && input.gpsi.is_none() {
-        // No UE identity at all and no cell hint: cannot position the target.
-        return Err(PositioningError::Unsupported);
-    }
-    let d_lat = f64::from((seed % 1000) as u32) / 1_000_000.0;
-    let d_lon = f64::from((seed / 1000 % 1000) as u32) / 1_000_000.0;
-    let uncertainty_m = input
-        .location_qos
-        .as_ref()
-        .and_then(|q| q.h_accuracy)
-        .filter(|a| *a > 0.0)
-        .unwrap_or(50.0);
-    Ok(SimEstimate {
-        lat: SIM_ORIGIN_LAT + d_lat,
-        lon: SIM_ORIGIN_LON + d_lon,
-        uncertainty_m,
-        confidence: 95,
-    })
-}
-
-/// Deterministic non-cryptographic seed derived from the request identity
-/// (SUPI/PEI/GPSI/correlationID). Used only by the SIMULATED estimator.
-fn identity_seed(input: &nlmf::InputData) -> u64 {
-    let mut seed: u64 = 0;
-    for s in [
-        input.supi.as_deref(),
-        input.pei.as_deref(),
-        input.gpsi.as_deref(),
-        input.correlation_id.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for b in s.bytes() {
-            seed = seed.wrapping_mul(31).wrapping_add(u64::from(b));
+/// This ALWAYS encodes and logs the LPP PDU and the N1N2MessageTransferReqData,
+/// and would POST it once a serving-AMF endpoint is resolvable. Live delivery +
+/// report correlation are E2E-gated (need a serving AMF + a real UE) — see
+/// TASKS lmfd-07. It NEVER fabricates a position.
+async fn emit_positioning_request(input: &nlmf::InputData) {
+    let tx = LPP_TRANSACTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let lpp = match crate::codec_glue::build_lpp_ecid_request(tx) {
+        Ok(pdu) => pdu,
+        Err(e) => {
+            log::warn!("LMF-initiated LPP request encode failed: {e}");
+            return;
         }
-    }
-    seed
+    };
+    let target = input
+        .supi
+        .as_deref()
+        .or(input.gpsi.as_deref())
+        .or(input.pei.as_deref())
+        .unwrap_or("<unknown>");
+
+    // Namf_Communication N1N2MessageTransfer (TS 29.518 §6.1.6.2.2): the LPP
+    // PDU is carried as the n1MessageContainer (n1MessageClass = LPP) referenced
+    // by a binary body part.
+    let n1n2_req_data = serde_json::json!({
+        "n1MessageContainer": {
+            "n1MessageClass": "LPP",
+            "n1MessageContent": { "contentId": "lpp-request" }
+        },
+        "ppi": 0
+    });
+    log::info!(
+        "LMF-initiated LPP RequestLocationInformation (E-CID, txn={tx}, {} bytes) prepared for \
+         Namf N1N2MessageTransfer to serving AMF for target [{target}]: {n1n2_req_data}",
+        lpp.len()
+    );
+    // Delivery to the serving AMF is E2E-gated (serving-AMF endpoint resolution
+    // + report correlation need a live AMF/UE); see TASKS lmfd-07.
 }
 
 /// Handle Determine Location (Nlmf_Location, AMF -> LMF; TS 29.572 §6.1.4.2).
@@ -328,9 +300,12 @@ fn identity_seed(input: &nlmf::InputData) -> u64 {
 /// per Table 6.1.4.2.2-2 — NOT the old non-conformant `201 PENDING` (lmfd-02).
 /// 4xx/5xx ProblemDetails on failure (lmfd-10).
 ///
-/// The position itself comes from the SIMULATED estimator
-/// ([`simulated_positioning`]) — a clearly-marked PLACEHOLDER until the
-/// lmfd-LIB-01/02 NRPPa/LPP codecs + lmfd-AMF-01 AMF relay land.
+/// The procedure is initiated via [`emit_positioning_request`] (LMF-initiated
+/// LPP RequestLocationInformation over Namf N1N2); the returned position comes
+/// from REAL collected measurements via `context::compute_location`
+/// ([`crate::context::LmfContext::latest_location`]). When no measurement-
+/// derived fix is available a 504 positioning-method-failure is returned — the
+/// handler never fabricates coordinates.
 async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
     log::info!("Determine Location");
 
@@ -362,39 +337,54 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         );
     }
 
-    // SIMULATED positioning (placeholder — see simulated_positioning docs).
-    let est = match simulated_positioning(&input) {
-        Ok(e) => e,
-        Err(PositioningError::Timeout) => {
+    // A zero response-time budget cannot complete positioning -> 504.
+    if input.max_resp_time == Some(0) {
+        return problem(
+            504,
+            nlmf::cause::POSITIONING_METHOD_FAILURE,
+            "Positioning did not complete within the response-time budget",
+        );
+    }
+
+    // lmfd-05/06/07: initiate the real positioning procedure — encode an
+    // LMF-initiated LPP RequestLocationInformation and (best-effort) transfer it
+    // to the serving AMF via Namf_Communication N1N2MessageTransfer.
+    emit_positioning_request(&input).await;
+
+    // Compute the location from REAL collected measurements
+    // (context::compute_location via the stored NRPPa/LPP reports). NO
+    // fabrication: when no measurement-derived fix is available, report a
+    // positioning-method failure rather than inventing coordinates.
+    let est = match lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.latest_location(input.supi.as_deref()))
+    {
+        Some(loc) => loc,
+        None => {
             return problem(
                 504,
                 nlmf::cause::POSITIONING_METHOD_FAILURE,
-                "Positioning did not complete within the response-time budget",
-            )
-        }
-        Err(PositioningError::Unsupported) => {
-            return problem(
-                403,
-                nlmf::cause::UNREACHABLE_USER,
-                "No usable positioning method for the target UE",
+                "No measurement-derived location available for the target UE",
             )
         }
     };
 
     // lmfd-04: negotiate a GAD shape against supportedGADShapes and GAD-encode
-    // the estimate into a GeographicArea (replacing the flat lat/lon/accuracy).
+    // the real fix into a GeographicArea.
     let want_ellipse = input
         .location_qos
         .as_ref()
         .and_then(|q| q.vertical_requested)
         .unwrap_or(false);
     let shape = nlmf::negotiate_gad_shape(input.supported_gad_shapes.as_deref(), want_ellipse);
-    let location_estimate = nlmf::to_gad(est.lat, est.lon, est.uncertainty_m, est.confidence, shape);
+    let location_estimate =
+        nlmf::to_gad(est.latitude, est.longitude, est.horizontal_accuracy, 95, shape);
 
     // Accuracy fulfilment vs the requested horizontal accuracy.
     let accuracy_fulfilment_indicator = match input.location_qos.as_ref().and_then(|q| q.h_accuracy)
     {
-        Some(req_acc) if est.uncertainty_m > req_acc => {
+        Some(req_acc) if est.horizontal_accuracy > req_acc => {
             nlmf::accuracy_fulfilment::NOT_FULFILLED
         }
         _ => nlmf::accuracy_fulfilment::FULFILLED,
@@ -405,10 +395,12 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
             location_estimate,
             accuracy_fulfilment_indicator: Some(accuracy_fulfilment_indicator.to_string()),
             age_of_location_estimate: Some(0),
-            // SIMULATED: ECID, conventional mode. Real method/usage will come
-            // from the NRPPa/LPP measurement procedures (lmfd-05/06).
+            // Real positioning method from the measurement report (else E-CID).
             positioning_data_list: Some(vec![nlmf::PositioningMethodAndUsage {
-                method: nlmf::positioning_method::ECID.to_string(),
+                method: est
+                    .method_used
+                    .clone()
+                    .unwrap_or_else(|| nlmf::positioning_method::ECID.to_string()),
                 mode: "CONVENTIONAL".to_string(),
                 usage: "SUCCESS_RESULTS_USED_TO_GENERATE_LOCATION".to_string(),
             }]),
@@ -1074,9 +1066,25 @@ mod tests {
         resp.http.get_header("Content-Type").cloned()
     }
 
+    /// Seed a real (measurement-derived) location fix for a target SUPI so the
+    /// non-fabricating determine-location handler returns 200. Mirrors what the
+    /// inbound NRPPa/LPP report flow (`context::compute_location`) would store.
+    fn seed_fix(supi: &str, h_accuracy: f64) {
+        let loc = LocationEstimate {
+            latitude: 37.5,
+            longitude: -122.3,
+            horizontal_accuracy: h_accuracy,
+            method_used: Some(nlmf::positioning_method::ECID.to_string()),
+            ..Default::default()
+        };
+        assert!(lmf_self().read().unwrap().ue_location_update(supi, loc));
+    }
+
     // -- lmfd-01: apiName routing (nlmf-loc dispatches; nlmf-location 404) ---
     #[tokio::test]
     async fn test_router_nlmf_loc_dispatches() {
+        // A real measurement-derived fix must exist for a non-fabricating 200.
+        seed_fix("imsi-001010000000099", 40.0);
         let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
             .with_body(r#"{"supi":"imsi-001010000000099"}"#, "application/json");
         let resp = lmf_sbi_request_handler(req).await;
@@ -1095,6 +1103,8 @@ mod tests {
     // -- lmfd-02 + lmfd-04: 200 OK with a GAD LocationDataExt ----------------
     #[tokio::test]
     async fn test_determine_location_returns_200_location_data_ext() {
+        // Seed a real fix (h_accuracy 50 < requested 100 -> FULFILLED).
+        seed_fix("imsi-001010000000001", 50.0);
         let body = r#"{
             "supi": "imsi-001010000000001",
             "locationQoS": { "hAccuracy": 100.0 },
@@ -1124,6 +1134,7 @@ mod tests {
     // -- lmfd-04: shape negotiation honors supportedGADShapes ----------------
     #[tokio::test]
     async fn test_determine_location_negotiates_ellipse_shape() {
+        seed_fix("imsi-001010000000002", 40.0);
         let body = r#"{
             "supi": "imsi-001010000000002",
             "locationQoS": { "verticalRequested": true },

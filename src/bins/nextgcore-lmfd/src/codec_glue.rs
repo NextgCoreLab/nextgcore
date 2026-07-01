@@ -22,10 +22,48 @@
 //! `main.rs`.
 
 use crate::CellMeasurement;
+use nextgcore_asn1c::lpp::ecid::{
+    EcidRequestLocationInformation, RequestLocationInformation, RequestLocationInformationR9,
+};
 use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
 use nextgcore_asn1c::lpp::nr_dl_tdoa::NrRstd;
+use nextgcore_asn1c::lpp::requested_measurements;
+use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
 use nextgcore_asn1c::nrppa::ies::{MeasuredResultsValue, NgRanCell};
 use nextgcore_asn1c::nrppa::pdu::{parse_ecid_measurement_report, NrppaPdu};
+
+/// Encode an LMF-initiated LPP `RequestLocationInformation` (TS 37.355 §6.2,
+/// message body c1 index 4) requesting E-CID measurements (rsrpReq + rsrqReq),
+/// for transport to the target UE inside a Namf_Communication
+/// N1N2MessageTransfer. `transaction_number` correlates the eventual
+/// `ProvideLocationInformation` response (TS 37.355 §6.1, initiator =
+/// locationServer). Returns the UPER-encoded PDU.
+pub fn build_lpp_ecid_request(transaction_number: u8) -> Result<Vec<u8>, String> {
+    let msg = LppMessage {
+        transaction_id: Some(LppTransactionId {
+            initiator: Initiator::LocationServer,
+            transaction_number: TransactionNumber(transaction_number),
+        }),
+        end_transaction: false,
+        sequence_number: None,
+        acknowledgement: None,
+        message_body: Some(LppMessageBody::C1(MessageBodyC1::RequestLocationInformation(
+            RequestLocationInformation {
+                ies: RequestLocationInformationR9 {
+                    // requestedMeasurements: bit0 = rsrpReq, bit1 = rsrqReq.
+                    ecid: Some(EcidRequestLocationInformation {
+                        requested_measurements: requested_measurements(&[true, true]),
+                    }),
+                    nr_multi_rtt: None,
+                    nr_dl_tdoa: None,
+                },
+            },
+        ))),
+    };
+    msg.encode()
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("LPP RequestLocationInformation encode: {e}"))
+}
 
 // ---------------------------------------------------------------------------
 // Timing constant
@@ -351,9 +389,10 @@ pub fn decode_lpp_dl_tdoa_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasureme
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_nrppa_ecid_report, extract_lpp_request_id, extract_nrppa_request_id,
-        lpp_dl_tdoa_provide_to_measurements, lpp_multi_rtt_provide_to_measurements,
-        nrppa_ecid_report_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TC_NS,
+        build_lpp_ecid_request, decode_nrppa_ecid_report, extract_lpp_request_id,
+        extract_nrppa_request_id, lpp_dl_tdoa_provide_to_measurements,
+        lpp_multi_rtt_provide_to_measurements, nrppa_ecid_report_to_measurements, nrrstd_to_ns,
+        nrrstd_to_signed_ns, TC_NS,
     };
     use nextgcore_asn1c::lpp::ecid::{ProvideLocationInformation, ProvideLocationInformationR9};
     use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
@@ -369,6 +408,27 @@ mod tests {
     };
     use nextgcore_asn1c::nrppa::pdu::{build_ecid_measurement_report, NrppaPdu};
     use nextgcore_asn1c::nrppa::types::NrppaTransactionId;
+
+    /// The LMF-initiated LPP RequestLocationInformation round-trips: encode ->
+    /// decode -> it is a RequestLocationInformation carrying the E-CID request,
+    /// and the transaction number / locationServer initiator survive.
+    #[test]
+    fn lpp_ecid_request_roundtrips() {
+        let bytes = build_lpp_ecid_request(7).expect("encode LPP request");
+        let decoded = LppMessage::decode(&bytes).expect("decode LPP request");
+        assert_eq!(extract_lpp_request_id(&decoded), Some(7));
+        assert!(matches!(
+            decoded.message_body,
+            Some(LppMessageBody::C1(MessageBodyC1::RequestLocationInformation(_)))
+        ));
+        if let Some(LppMessageBody::C1(MessageBodyC1::RequestLocationInformation(r))) =
+            &decoded.message_body
+        {
+            assert!(r.ies.ecid.is_some(), "E-CID request IE present");
+            assert!(r.ies.nr_multi_rtt.is_none());
+            assert!(r.ies.nr_dl_tdoa.is_none());
+        }
+    }
 
     /// `nrrstd_to_ns`: single-unit inputs verify the 2^k × T_c scaling.
     ///

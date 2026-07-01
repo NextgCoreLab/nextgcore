@@ -335,6 +335,35 @@ impl LmfContext {
         self.ue_locations.read().ok()?.get(supi).cloned()
     }
 
+    /// Return the most recently computed **real** location fix for the target,
+    /// preferring the UE's stored fix (by SUPI), else the newest completed
+    /// measurement report. Returns `None` when no measurement-derived fix
+    /// exists — the caller MUST NOT fabricate one (a genuine positioning
+    /// failure). A fix is "real" only when its horizontal accuracy is > 0
+    /// (a defaulted, all-zero estimate means the solver had no measurements).
+    pub fn latest_location(&self, supi: Option<&str>) -> Option<LocationEstimate> {
+        if let Some(supi) = supi {
+            if let Some(loc) = self
+                .ue_location_get(supi)
+                .and_then(|c| c.last_location)
+                .filter(|l| l.horizontal_accuracy > 0.0)
+            {
+                return Some(loc);
+            }
+        }
+        // Newest completed report (highest request_id) carrying a real fix.
+        let reports = self.reports.read().ok()?;
+        reports
+            .iter()
+            .filter(|(_, r)| {
+                r.location
+                    .as_ref()
+                    .is_some_and(|l| l.horizontal_accuracy > 0.0)
+            })
+            .max_by_key(|(id, _)| **id)
+            .and_then(|(_, r)| r.location.clone())
+    }
+
     pub fn measurement_count(&self) -> usize {
         self.measurements.read().map(|m| m.len()).unwrap_or(0)
     }
