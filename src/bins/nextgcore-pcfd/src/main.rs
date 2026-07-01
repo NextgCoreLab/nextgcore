@@ -348,6 +348,23 @@ async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             handle_am_policy_update(pol_asso_id, &request).await
         }
 
+        // UE Policy Control Service (npcf-ue-policy-control, TS 29.525)
+        // Note: update sub-resource arm first (POST .../policies/{id}/update)
+        ("npcf-ue-policy-control", "policies", "POST")
+            if parts.len() >= 5 && parts[4] == "update" =>
+        {
+            handle_ue_policy_update(parts[3], &request).await
+        }
+        ("npcf-ue-policy-control", "policies", "POST") if parts.len() < 4 => {
+            handle_ue_policy_create(&request).await
+        }
+        ("npcf-ue-policy-control", "policies", "GET") if parts.len() >= 4 => {
+            handle_ue_policy_get(parts[3]).await
+        }
+        ("npcf-ue-policy-control", "policies", "DELETE") if parts.len() >= 4 => {
+            handle_ue_policy_delete(parts[3]).await
+        }
+
         // SM Policy Control Service (npcf-smpolicycontrol, TS 29.512)
         // Note: Order matters - more specific patterns first
         ("npcf-smpolicycontrol", "sm-policies", "POST")
@@ -425,6 +442,8 @@ const PCF_AM_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
 const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 = 0x3;
 /// PolicyAuthorization (TS 29.514): no optional features negotiated → "0".
 const PCF_PA_SUPPORTED_FEATURES: u64 = 0x0;
+/// UEPolicyControl (TS 29.525 §5.8): no optional features negotiated -> "0".
+const PCF_UE_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
 
 /// Negotiate a SupportedFeatures bitmask: parse the consumer hex string,
 /// intersect with the producer-supported mask, and return the lowercase-hex
@@ -652,6 +671,95 @@ async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) -> Sbi
     }
 }
 
+// UE Policy Control handlers (npcf-ue-policy-control, TS 29.525)
+
+async fn handle_ue_policy_create(request: &SbiRequest) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+    let data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+    // PolicyAssociationRequest mandatory IEs (TS 29.525): notificationUri, supi, suppFeat.
+    let Some(notification_uri) = data.get("notificationUri").and_then(|v| v.as_str()) else {
+        return send_bad_request("notificationUri is required", Some("MANDATORY_IE_MISSING"));
+    };
+    let Some(supi) = data.get("supi").and_then(|v| v.as_str()) else {
+        return send_bad_request("supi is required", Some("MANDATORY_IE_MISSING"));
+    };
+    let Some(supp_feat) = data.get("suppFeat").and_then(|v| v.as_str()) else {
+        return send_bad_request("suppFeat is required", Some("MANDATORY_IE_MISSING"));
+    };
+    let negotiated = negotiate_features(Some(supp_feat), PCF_UE_POLICY_SUPPORTED_FEATURES);
+    let assoc = ue_policy::ue_policy_add(supi, notification_uri, &negotiated);
+    // PolicyAssociation (TS 29.525 §5.6.2.2): suppFeat is the only mandatory member.
+    // `uePolicy` (URSP octet string per TS 24.526) is intentionally omitted — TS 24.526
+    // is not available offline; it is optional so the body stays conformant.
+    let resp = serde_json::json!({
+        "suppFeat": negotiated,
+        "triggers": ["UE_POLICY"],
+        "request": { "notificationUri": notification_uri, "supi": supi, "suppFeat": supp_feat },
+    });
+    SbiResponse::with_status(201)
+        .with_header(
+            "Location",
+            format!("/npcf-ue-policy-control/v1/policies/{}", assoc.pol_asso_id),
+        )
+        .with_json_body(&resp)
+        .unwrap_or_else(|_| SbiResponse::with_status(201))
+}
+
+async fn handle_ue_policy_get(pol_asso_id: &str) -> SbiResponse {
+    match ue_policy::ue_policy_find(pol_asso_id) {
+        Some(a) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "suppFeat": a.supp_feat,
+                "triggers": ["UE_POLICY"],
+                "request": { "notificationUri": a.notification_uri, "supi": a.supi, "suppFeat": a.supp_feat },
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("UE Policy {pol_asso_id} not found"),
+            Some("POLICY_NOT_FOUND"),
+        ),
+    }
+}
+
+async fn handle_ue_policy_delete(pol_asso_id: &str) -> SbiResponse {
+    if ue_policy::ue_policy_remove(pol_asso_id) {
+        SbiResponse::with_status(204)
+    } else {
+        send_not_found(
+            &format!("UE Policy {pol_asso_id} not found"),
+            Some("POLICY_NOT_FOUND"),
+        )
+    }
+}
+
+async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+    if let Err(e) = serde_json::from_str::<serde_json::Value>(body) {
+        return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON"));
+    }
+    match ue_policy::ue_policy_find(pol_asso_id) {
+        Some(_) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "resourceUri": format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}"),
+                "triggers": ["UE_POLICY"],
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("UE Policy {pol_asso_id} not found"),
+            Some("POLICY_NOT_FOUND"),
+        ),
+    }
+}
+
 // SM Policy Control handlers
 
 /// Whether a DNN identifies a UAV (aerial) session (Rel-18, TS 23.256).
@@ -854,9 +962,31 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                 }
             }
 
+            // Register the PCF↔PDU-session binding with the BSF so an AF can
+            // discover the serving PCF (TS 23.503 §6.1.1.2, TS 29.521). Best
+            // effort: no-op when no BSF/NRF is reachable.
+            sbi_path::pcf_sess_register_bsf_binding(sess.id);
+
             // Query real session data from UDR/database
             let s_nssai = SNssai { sst, sd };
             let session_data = pcf_get_session_data(supi, None, &s_nssai, dnn);
+
+            // Retrieve the SM PolicyData from UDR over Nudr_DataRepository (TS 29.519,
+            // TS 29.512 §4.2.2.2) on the live path. Bounded; on 404/unreachable we keep
+            // the local subscription/config data as the documented fallback. The QoS/ARP/
+            // AMBR/PCC decision is not re-derived from this resource (SmPolicyDnnData does
+            // not carry them); only the spec-defined online/offline charging flags are.
+            let udr_dnn_data = sbi_path::pcf_udr_sm_policy_dnn_data(supi, sst, sd, dnn).await;
+            if udr_dnn_data.is_some() {
+                log::info!(
+                    "UDR SmPolicyData retrieved over Nudr_DataRepository for SUPI {supi} dnn={dnn}"
+                );
+            } else {
+                log::warn!(
+                    "UDR SmPolicyData unavailable (404/unreachable) for SUPI {supi} dnn={dnn}; \
+                     using local defaults"
+                );
+            }
 
             // Build policy decision from subscription data (TS 29.512).
             // When the DB has no policy data for this DNN/slice, the
@@ -882,6 +1012,26 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                     )
                 }
             };
+
+            // Map the TS 29.519 SmPolicyDnnData online/offline flags into the
+            // ChargingData decisions when the UDR provided them.
+            let mut decision = decision;
+            if let Some(ref d) = udr_dnn_data {
+                let online = d.get("online").and_then(|v| v.as_bool());
+                let offline = d.get("offline").and_then(|v| v.as_bool());
+                if online.is_some() || offline.is_some() {
+                    if let Some(map) = decision.chg_decs.as_object_mut() {
+                        for (_id, chg) in map.iter_mut() {
+                            if let Some(o) = online {
+                                chg["online"] = serde_json::json!(o);
+                            }
+                            if let Some(o) = offline {
+                                chg["offline"] = serde_json::json!(o);
+                            }
+                        }
+                    }
+                }
+            }
 
             SbiResponse::with_status(201)
                 .with_header(
@@ -1202,6 +1352,9 @@ async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
 
     match sess {
         Some(sess) => {
+            // Deregister the BSF binding (best-effort) before dropping the session.
+            let binding_id = sess.binding.id.clone().unwrap_or_default();
+            sbi_path::pcf_sess_deregister_bsf_binding(binding_id);
             if let Ok(context) = ctx.read() {
                 context.sess_remove(sess.id);
             }
@@ -1852,6 +2005,14 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
             {
                 "serviceInstanceId": format!("{nf_instance_id}-npcf-smpolicycontrol"),
                 "serviceName": "npcf-smpolicycontrol",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            },
+            {
+                "serviceInstanceId": format!("{nf_instance_id}-npcf-ue-policy-control"),
+                "serviceName": "npcf-ue-policy-control",
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
                 "scheme": "http",
                 "nfServiceStatus": "REGISTERED",
@@ -2655,6 +2816,81 @@ mod tests {
         let dec = build_sm_policy_decision("p-trig-2", &gbr);
         assert!(dec.triggers.contains(&"RES_MO_RE".to_string()));
         assert!(dec.triggers.contains(&"QOS_NOTIF".to_string()));
+    }
+
+    /// pcfd#0: full Npcf_UEPolicyControl lifecycle (TS 29.525).
+    #[tokio::test]
+    async fn ue_policy_create_get_update_delete_lifecycle() {
+        pcf_context_init(64, 64);
+        // Missing mandatory suppFeat -> 400
+        let bad = serde_json::json!({
+            "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/1",
+            "supi": "imsi-001010000000070"
+        });
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-ue-policy-control/v1/policies",
+            Some(bad),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+
+        // Create -> 201 + Location + PolicyAssociation (suppFeat mandatory, triggers minItems1)
+        let ok = serde_json::json!({
+            "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/1",
+            "supi": "imsi-001010000000070",
+            "suppFeat": "0"
+        });
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-ue-policy-control/v1/policies",
+            Some(ok),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let loc = resp.http.get_header("location").expect("Location").clone();
+        assert!(loc.starts_with("/npcf-ue-policy-control/v1/policies/"));
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["suppFeat"], "0");
+        assert!(body["triggers"].as_array().is_some_and(|a| !a.is_empty()));
+        // TS 24.526 URSP bytes intentionally absent (not in specs/)
+        assert!(body.get("uePolicy").is_none());
+        let pol_id = loc.rsplit('/').next().unwrap().to_string();
+
+        // GET -> 200
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-ue-policy-control/v1/policies/{pol_id}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+
+        // Update -> 200 PolicyUpdate
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-ue-policy-control/v1/policies/{pol_id}/update"),
+            Some(serde_json::json!({"triggers": ["UE_POLICY"]})),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+
+        // DELETE -> 204, then 404
+        let resp = pcf_sbi_request_handler(make_request(
+            "DELETE",
+            &format!("/npcf-ue-policy-control/v1/policies/{pol_id}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let resp = pcf_sbi_request_handler(make_request(
+            "DELETE",
+            &format!("/npcf-ue-policy-control/v1/policies/{pol_id}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 404);
     }
 
     /// pcfd-11: GET on an individual SM policy returns the stored

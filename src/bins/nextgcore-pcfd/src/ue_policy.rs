@@ -189,6 +189,43 @@ impl UePolicyContext {
     }
 }
 
+// --- Npcf_UEPolicyControl association store (TS 29.525 §5.6.2.2) ---
+use std::sync::{Mutex, OnceLock};
+
+#[derive(Debug, Clone)]
+pub struct UePolicyAssociation {
+    pub pol_asso_id: String,
+    pub supi: String,
+    pub notification_uri: String,
+    pub supp_feat: String,
+}
+
+fn ue_policy_store() -> &'static Mutex<HashMap<String, UePolicyAssociation>> {
+    static STORE: OnceLock<Mutex<HashMap<String, UePolicyAssociation>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+pub fn ue_policy_add(supi: &str, notification_uri: &str, supp_feat: &str) -> UePolicyAssociation {
+    let assoc = UePolicyAssociation {
+        pol_asso_id: uuid::Uuid::new_v4().to_string(),
+        supi: supi.to_string(),
+        notification_uri: notification_uri.to_string(),
+        supp_feat: supp_feat.to_string(),
+    };
+    if let Ok(mut m) = ue_policy_store().lock() {
+        m.insert(assoc.pol_asso_id.clone(), assoc.clone());
+    }
+    assoc
+}
+pub fn ue_policy_find(pol_asso_id: &str) -> Option<UePolicyAssociation> {
+    ue_policy_store().lock().ok()?.get(pol_asso_id).cloned()
+}
+pub fn ue_policy_remove(pol_asso_id: &str) -> bool {
+    ue_policy_store()
+        .lock()
+        .map(|mut m| m.remove(pol_asso_id).is_some())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

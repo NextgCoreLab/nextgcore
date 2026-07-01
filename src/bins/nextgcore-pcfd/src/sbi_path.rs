@@ -78,6 +78,16 @@ fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
     pa_svc.port = config.port;
     nf_instance.add_service(pa_svc);
 
+    // npcf-ue-policy-control service (allowed: AMF) — TS 29.525
+    let mut ue_policy_svc = NfService::new(
+        SbiServiceType::NpcfUePolicyControl.to_name(),
+        SbiServiceType::NpcfUePolicyControl,
+    );
+    ue_policy_svc.scheme = scheme;
+    ue_policy_svc.ip_addresses.push(config.addr.clone());
+    ue_policy_svc.port = config.port;
+    nf_instance.add_service(ue_policy_svc);
+
     nf_instance
 }
 
@@ -673,6 +683,39 @@ pub async fn pcf_udr_get_sm_policy_data(
     }
 }
 
+/// Navigate a TS 29.519 SmPolicyData body to the SmPolicyDnnData object for
+/// `dnn` (smPolicySnssaiData{*}.smPolicyDnnData{dnn}). Pure/sync for unit tests.
+pub fn extract_sm_policy_dnn_data(
+    data: &serde_json::Value,
+    dnn: &str,
+) -> Option<serde_json::Value> {
+    let snssai_map = data.get("smPolicySnssaiData")?.as_object()?;
+    for (_k, entry) in snssai_map {
+        if let Some(dnn_map) = entry.get("smPolicyDnnData").and_then(|v| v.as_object()) {
+            if let Some(d) = dnn_map.get(dnn) {
+                return Some(d.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Live-path bounded Nudr_DataRepository GET of the UE's SM PolicyData (TS 29.519),
+/// returning the SmPolicyDnnData object for `dnn` when provisioned. `None` on
+/// 404 / unreachable / timeout — caller then falls back to local defaults.
+pub async fn pcf_udr_sm_policy_dnn_data(
+    supi: &str,
+    sst: u8,
+    sd: Option<u32>,
+    dnn: &str,
+) -> Option<serde_json::Value> {
+    let fut = pcf_udr_get_sm_policy_data(supi, sst, sd, dnn);
+    match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
+        Ok(Ok(Some(v))) => extract_sm_policy_dnn_data(&v, dnn),
+        _ => None,
+    }
+}
+
 /// Register a PCF binding with a discovered BSF
 /// (TS 29.521 Nbsf_Management: `POST /nbsf-management/v1/pcfBindings`).
 /// Returns the binding id (from the Location header, else the response
@@ -725,6 +768,96 @@ pub async fn pcf_deregister_bsf_binding(binding_id: &str) -> Result<bool, String
         .await
         .map_err(|e| format!("nbsf-management delete failed: {e}"))?;
     Ok(resp.status == 204 || resp.status == 200)
+}
+
+/// Build the TS 29.521 PcfBinding body for a PDU session. `dnn` and `snssai`
+/// are the mandatory members; supi and ipv4Addr are included when known.
+pub fn build_pcf_binding_body(
+    supi: &str,
+    dnn: &str,
+    sst: u8,
+    sd: Option<u32>,
+    ipv4: Option<&str>,
+) -> serde_json::Value {
+    let mut b = serde_json::json!({
+        "supi": supi,
+        "dnn": dnn,
+        "snssai": match sd {
+            Some(sd) => serde_json::json!({"sst": sst, "sd": format!("{sd:06x}")}),
+            None => serde_json::json!({"sst": sst}),
+        },
+    });
+    if let Some(ip) = ipv4 {
+        b["ipv4Addr"] = serde_json::json!(ip);
+    }
+    b
+}
+
+/// Register this PDU session's PCF binding with the BSF (TS 23.503 §6.1.1.2,
+/// TS 29.521). Best-effort, spawned fire-and-forget; the returned bindingId is
+/// stored on the session so delete can deregister it. No-op when no BSF is
+/// reachable (Ok(None)).
+pub fn pcf_sess_register_bsf_binding(sess_id: u64) {
+    let snap = crate::context::pcf_self().read().ok().and_then(|ctx| {
+        let sess = ctx.sess_find_by_id(sess_id)?;
+        let supi = ctx
+            .ue_sm_find_by_id(sess.pcf_ue_sm_id)
+            .map(|u| u.supi)
+            .unwrap_or_default();
+        Some((
+            sess.sm_policy_id.clone(),
+            supi,
+            sess.dnn.clone(),
+            sess.s_nssai.sst,
+            sess.s_nssai.sd,
+            sess.ipv4addr_string.clone(),
+        ))
+    });
+    let Some((sm_policy_id, supi, dnn, sst, sd, ipv4)) = snap else {
+        log::warn!("[sess_id={sess_id}] BSF binding: session not found");
+        return;
+    };
+    let dnn = dnn.unwrap_or_else(|| "internet".to_string());
+    let binding = build_pcf_binding_body(&supi, &dnn, sst, sd, ipv4.as_deref());
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                match pcf_register_bsf_binding(&binding).await {
+                    Ok(Some(id)) => {
+                        log::info!("PCF binding registered with BSF (id={id}) for {sm_policy_id}");
+                        if let Ok(ctx) = crate::context::pcf_self().read() {
+                            if let Some(mut sess) = ctx.sess_find_by_sm_policy_id(&sm_policy_id) {
+                                sess.binding
+                                    .store(&format!("/nbsf-management/v1/pcfBindings/{id}"), &id);
+                                ctx.sess_update(&sess);
+                            }
+                        }
+                    }
+                    Ok(None) => log::debug!("No BSF reachable; PCF binding not registered"),
+                    Err(e) => log::warn!("BSF binding registration failed: {e}"),
+                }
+            });
+        }
+        Err(_) => log::warn!("BSF binding registration skipped: no async runtime"),
+    }
+}
+
+/// Deregister a session's BSF binding (best-effort, spawned).
+pub fn pcf_sess_deregister_bsf_binding(binding_id: String) {
+    if binding_id.is_empty() {
+        return;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            match pcf_deregister_bsf_binding(&binding_id).await {
+                Ok(true) => log::info!("PCF binding {binding_id} deregistered from BSF"),
+                Ok(false) => {
+                    log::debug!("No BSF reachable; binding {binding_id} not deregistered")
+                }
+                Err(e) => log::warn!("BSF binding deregistration failed: {e}"),
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1006,5 +1139,44 @@ mod tests {
             return nextgcore_sbi::message::SbiResponse::with_status(204);
         }
         nextgcore_sbi::message::SbiResponse::with_status(404)
+    }
+
+    /// pcfd#1: TS 29.521 PcfBinding body builder emits the mandatory dnn + snssai
+    /// members and optional supi/ipv4Addr when present.
+    #[test]
+    fn pcf_binding_body_has_mandatory_dnn_and_snssai() {
+        let b = build_pcf_binding_body(
+            "imsi-001010000000088",
+            "internet",
+            1,
+            Some(0x010203),
+            Some("10.45.0.88"),
+        );
+        assert_eq!(b["dnn"], "internet");
+        assert_eq!(b["snssai"]["sst"], 1);
+        assert_eq!(b["snssai"]["sd"], "010203");
+        assert_eq!(b["supi"], "imsi-001010000000088");
+        assert_eq!(b["ipv4Addr"], "10.45.0.88");
+
+        // Without SD and without IPv4
+        let b2 = build_pcf_binding_body("imsi-1", "ims", 2, None, None);
+        assert!(b2["snssai"].get("sd").is_none());
+        assert!(b2.get("ipv4Addr").is_none());
+    }
+
+    /// pcfd#2: TS 29.519 SmPolicyData navigation extracts the DNN data object.
+    #[test]
+    fn extract_sm_policy_dnn_data_navigates_udr_body() {
+        let body = serde_json::json!({
+            "smPolicySnssaiData": { "01010203": {
+                "snssai": { "sst": 1, "sd": "010203" },
+                "smPolicyDnnData": { "internet": { "dnn": "internet", "online": true, "offline": false } }
+            }}
+        });
+        let d = extract_sm_policy_dnn_data(&body, "internet").expect("dnn data");
+        assert_eq!(d["online"], true);
+        assert_eq!(d["offline"], false);
+        assert_eq!(d["dnn"], "internet");
+        assert!(extract_sm_policy_dnn_data(&body, "ims").is_none());
     }
 }
