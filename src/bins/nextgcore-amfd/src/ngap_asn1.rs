@@ -493,11 +493,15 @@ fn amf_snssai_to_ngap(s: &crate::context::SNssai) -> SNssai {
 }
 
 /// Map the 8-bit replayed NAS UE security capability octet (TS 24.501
-/// §9.11.3.54, bit 8 = algorithm 0) onto the 16-bit NGAP BIT STRING field
-/// (TS 38.413 §9.3.1.86), where algorithm 0 is the most significant bit. The
-/// NAS octet maps verbatim onto the top 8 bits of the 16-bit field.
+/// §9.11.3.54, bit 8 / 0x80 = the null algorithm xEA0/xIA0) onto the 16-bit
+/// NGAP BIT STRING field (TS 38.413 §9.3.1.86). In NGAP the null algorithm is
+/// NOT representable ("all bits equal to 0 – UE supports no other algorithm
+/// than NEA0") and the first/most-significant bit is 128-xEA1. So we drop the
+/// NAS MSB (xEA0) and left-align: NAS bit 7 (0x40, 128-xEA1) lands on the NGAP
+/// MSB (0x8000). A left shift of 9 does exactly this — the xEA0 bit shifts out
+/// of the u16 and each remaining algorithm bit moves to its NGAP position.
 fn nas_caps_octet_to_ngap_bits(octet: u8) -> u16 {
-    (octet as u16) << 8
+    (octet as u16) << 9
 }
 
 /// Build an Initial Context Setup Request with proper ASN.1 APER encoding
@@ -1349,9 +1353,10 @@ mod tests {
         assert_eq!(req.allowed_nssai.len(), 1);
         assert_eq!(req.allowed_nssai[0].sst, 1);
         assert_eq!(req.allowed_nssai[0].sd, Some([0x01, 0x02, 0x03]));
-        // Replayed UE security capabilities: NAS octet maps onto the top byte
-        assert_eq!(req.ue_security_capabilities.nr_encryption_algorithms, 0xF000);
-        assert_eq!(req.ue_security_capabilities.nr_integrity_algorithms, 0xF000);
+        // Replayed UE security capabilities: NGAP §9.3.1.86 drops the null
+        // algorithm (NAS 0xF0 = EA0|EA1|EA2|EA3 -> NEA1|NEA2|NEA3 = 0xE000).
+        assert_eq!(req.ue_security_capabilities.nr_encryption_algorithms, 0xE000);
+        assert_eq!(req.ue_security_capabilities.nr_integrity_algorithms, 0xE000);
         // UE Security Key = KgNB, non-zero and exactly the derived value
         assert_eq!(req.security_key, kgnb);
         assert_ne!(req.security_key, [0u8; 32]);

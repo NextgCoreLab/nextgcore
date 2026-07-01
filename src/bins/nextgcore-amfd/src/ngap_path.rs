@@ -5239,10 +5239,12 @@ fn wire_caps_to_mask(wire: u8) -> u8 {
 }
 
 /// Map the stored NAS UE security-capability octets (5G/EPS EA/IA bitmaps,
-/// MSB = algorithm 0) to the 16-bit NGAP UESecurityCapabilities bitstrings
-/// (TS 38.413 Section 9.3.1.86); the NAS octet occupies the high 8 bits.
+/// MSB = the null algorithm xEA0/xIA0) to the 16-bit NGAP UESecurityCapabilities
+/// bitstrings (TS 38.413 Section 9.3.1.86). The NGAP first bit is 128-xEA1 and
+/// the null algorithm is not representable, so the NAS MSB (xEA0) is dropped and
+/// the remaining bits are left-aligned (shift 9): NAS bit 7 (128-xEA1) -> NGAP MSB.
 fn ue_caps_to_ngap(caps: &UeSecurityCapability) -> nextgcore_ngap::types::UeSecurityCapabilities {
-    let to_bits = |octet: u8| -> u16 { (octet as u16) << 8 };
+    let to_bits = |octet: u8| -> u16 { (octet as u16) << 9 };
     nextgcore_ngap::types::UeSecurityCapabilities {
         nr_encryption_algorithms: to_bits(caps.ea),
         nr_integrity_algorithms: to_bits(caps.ia),
@@ -6232,17 +6234,20 @@ mod tests {
 
     #[test]
     fn test_ue_caps_to_ngap_high_octet() {
+        // NGAP §9.3.1.86: the null algorithm (NAS MSB, xEA0) is not representable
+        // and the NGAP MSB is 128-xEA1, so the NAS octet is shifted left by 9 and
+        // xEA0 is dropped.
         let caps = UeSecurityCapability {
-            ea: 0xE0,
-            ia: 0xC0,
-            eea: 0x80,
-            eia: 0x40,
+            ea: 0xE0,  // EA0|EA1|EA2 -> NEA1|NEA2 = 0xC000
+            ia: 0xC0,  // IA0|IA1     -> NIA1      = 0x8000
+            eea: 0x80, // EEA0 only   -> (none)    = 0x0000
+            eia: 0x40, // EIA1        -> 128-EIA1  = 0x8000
         };
         let ngap = ue_caps_to_ngap(&caps);
-        assert_eq!(ngap.nr_encryption_algorithms, 0xE000);
-        assert_eq!(ngap.nr_integrity_algorithms, 0xC000);
-        assert_eq!(ngap.eutra_encryption_algorithms, 0x8000);
-        assert_eq!(ngap.eutra_integrity_algorithms, 0x4000);
+        assert_eq!(ngap.nr_encryption_algorithms, 0xC000);
+        assert_eq!(ngap.nr_integrity_algorithms, 0x8000);
+        assert_eq!(ngap.eutra_encryption_algorithms, 0x0000);
+        assert_eq!(ngap.eutra_integrity_algorithms, 0x8000);
     }
 
     // amfd-06 — Allowed-NSSAI must never echo Requested-NSSAI.
