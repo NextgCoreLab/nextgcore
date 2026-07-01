@@ -609,21 +609,11 @@ async fn handle_prins_message(msg: &N32fReformattedMessage) -> HttpResponse {
 
     match prins::unprotect_message(&prins_ctx, msg) {
         Ok(rec) => {
-            let rec_json = ReconstructedRequestJson {
-                method: rec.method,
-                url: rec.url,
-                headers: rec.headers,
-                body: rec.body.as_deref().map(crate::jose::b64url_encode),
-                message_id: Some(rec.message_id),
-            };
-            log::info!(
-                "N32-f PRINS message verified: {} {}",
-                rec_json.method,
-                rec_json.url
-            );
-            HttpResponse::ok()
-                .with_json_body(&rec_json)
-                .unwrap_or_else(|_| HttpResponse::internal_error())
+            log::info!("N32-f PRINS request verified: {} {}", rec.method, rec.url);
+            // TS 29.573 §6.2.4.2: forward the reconstructed request to the
+            // target NF, then reformat + PRINS-protect the NF's response as an
+            // N32fReformattedRspMsg and return it over N32-f.
+            forward_and_protect_response(&prins_ctx, rec).await
         }
         Err(e) => {
             log::error!("N32-f PRINS verification failed: {e}");
@@ -659,6 +649,133 @@ async fn handle_prins_message(msg: &N32fReformattedMessage) -> HttpResponse {
             };
             send_error(400, "Bad Request", &e.detail, Some(cause))
         }
+    }
+}
+
+/// The receiving SEPP forwards the reconstructed SBI request to the target NF,
+/// then reformats and PRINS-protects the NF's HTTP response as an
+/// N32fReformattedRspMsg to return over N32-f (TS 29.573 §6.2.4.2). An
+/// unresolvable/unreachable target yields a protected gateway-error response.
+async fn forward_and_protect_response(
+    prins_ctx: &prins::PrinsContext,
+    rec: prins::ReconstructedRequest,
+) -> HttpResponse {
+    let (status, resp_headers, resp_body) = forward_to_target_nf(&rec).await;
+    match prins::protect_response_message(prins_ctx, status, &resp_headers, resp_body.as_deref()) {
+        Ok(reformatted) => HttpResponse::ok()
+            .with_json_body(&reformatted)
+            .unwrap_or_else(|_| HttpResponse::internal_error()),
+        Err(e) => {
+            log::error!("N32-f: failed to protect target-NF response: {e}");
+            HttpResponse::internal_error()
+        }
+    }
+}
+
+/// Resolve and reach the target NF for a reconstructed N32-f request, returning
+/// (status, headers, body). Resolution prefers the `3gpp-Sbi-Target-apiRoot`
+/// header, then the absolute URL authority. Unresolvable/unreachable targets
+/// map to a synthesized problem+json response.
+async fn forward_to_target_nf(
+    rec: &prins::ReconstructedRequest,
+) -> (u16, Vec<(String, String)>, Option<Vec<u8>>) {
+    let api_root = rec
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("3gpp-Sbi-Target-apiRoot"))
+        .map(|(_, v)| v.clone())
+        .or_else(|| authority_from_url(&rec.url));
+
+    let Some(api_root) = api_root else {
+        return problem_response(400, "target NF apiRoot could not be resolved");
+    };
+    let client = match n32_client(&api_root, None) {
+        Ok(c) => c,
+        Err(e) => return problem_response(400, &format!("bad target apiRoot: {e}")),
+    };
+
+    let path = path_and_query_from_url(&rec.url);
+    let mut request = match rec.method.to_ascii_uppercase().as_str() {
+        "GET" => HttpRequest::get(&path),
+        "POST" => HttpRequest::post(&path),
+        "PUT" => HttpRequest::put(&path),
+        "PATCH" => HttpRequest::patch(&path),
+        "DELETE" => HttpRequest::delete(&path),
+        other => return problem_response(405, &format!("unsupported method {other}")),
+    };
+    for (k, v) in &rec.headers {
+        // Do not forward the SEPP routing header to the NF.
+        if k.eq_ignore_ascii_case("3gpp-Sbi-Target-apiRoot") {
+            continue;
+        }
+        request.http.set_header(k.clone(), v.clone());
+    }
+    if let Some(body) = &rec.body {
+        if let Ok(s) = String::from_utf8(body.clone()) {
+            request.http.set_content(s);
+        }
+    }
+
+    match client.send_request(request).await {
+        Ok(resp) => {
+            let headers: Vec<(String, String)> = resp
+                .http
+                .headers
+                .iter()
+                // Drop hop-by-hop / length headers the sending side regenerates.
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.to_ascii_lowercase().as_str(),
+                        "content-length" | "transfer-encoding" | "connection"
+                    )
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let body = resp.http.content.map(|c| c.into_bytes());
+            (resp.status, headers, body)
+        }
+        Err(e) => {
+            log::warn!("N32-f: forward to target NF [{api_root}] failed: {e}");
+            problem_response(504, &format!("target NF unreachable: {e}"))
+        }
+    }
+}
+
+fn problem_response(status: u16, detail: &str) -> (u16, Vec<(String, String)>, Option<Vec<u8>>) {
+    let body = serde_json::json!({ "status": status, "detail": detail });
+    (
+        status,
+        vec![(
+            "content-type".to_string(),
+            "application/problem+json".to_string(),
+        )],
+        serde_json::to_vec(&body).ok(),
+    )
+}
+
+/// Extract the `scheme://authority` prefix from an absolute URL, or `None` for
+/// a relative path.
+fn authority_from_url(url: &str) -> Option<String> {
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return None;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    (!authority.is_empty()).then(|| format!("{scheme}://{authority}"))
+}
+
+/// Extract the path (with query) from an absolute URL, or return a relative
+/// path unchanged.
+fn path_and_query_from_url(url: &str) -> String {
+    match url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+        Some(rest) => match rest.find('/') {
+            Some(idx) => rest[idx..].to_string(),
+            None => "/".to_string(),
+        },
+        None => url.to_string(),
     }
 }
 
@@ -912,7 +1029,26 @@ pub async fn forward_via_n32f(
     };
 
     let client = n32_client(&api_root, tls)?;
-    post_json(&client, "/n32f-forward/v1/n32f-process", n32f_body).await
+    let (status, resp_body) =
+        post_json(&client, "/n32f-forward/v1/n32f-process", n32f_body).await?;
+
+    // TS 29.573 §6.2.4.2: in PRINS the peer SEPP returns a protected
+    // N32fReformattedRspMsg carrying the target NF's HTTP response. Unprotect
+    // it to recover the real (status, body) before returning to the caller.
+    if node.negotiated_security_scheme == SecurityCapability::Prins && status == 200 {
+        if let Ok(reformatted) = serde_json::from_str::<N32fReformattedMessage>(&resp_body) {
+            let prins_ctx = crate::sbi_path::build_prins_context(node_id)
+                .ok_or("PRINS negotiated but no N32-f security context")?;
+            let rec = prins::unprotect_response_message(&prins_ctx, &reformatted)
+                .map_err(|e| format!("N32-f response unprotect failed: {e}"))?;
+            let body = rec
+                .body
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            return Ok((rec.status_code, body));
+        }
+    }
+    Ok((status, resp_body))
 }
 
 // ============================================================================

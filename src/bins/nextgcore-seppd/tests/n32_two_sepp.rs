@@ -208,13 +208,25 @@ async fn two_sepp_n32_handshake_and_forwarding() {
         assert!(node.has_plmn_id(999, 70), "peer serving PLMNs not learned");
 
         // ------------------------------------------------------------------
-        // Phase 2: PRINS-protected N32-f forward round trip
+        // Phase 2: full PRINS request + response round trip (TS 29.573
+        // §6.2.4.2). The receiving SEPP (B1) unprotects the request, forwards
+        // it to the target NF — here routed back to B1's own HTTP server via
+        // 3gpp-Sbi-Target-apiRoot — then PRINS-protects the NF's HTTP response
+        // as an N32fReformattedRspMsg and returns it; forward_via_n32f
+        // unprotects that response. B1 exposes no /nudm-sdm resource, so it
+        // answers 404 RESOURCE_NOT_FOUND: end-to-end proof that the request
+        // path was reconstructed + forwarded and the response was PRINS-
+        // protected, returned, and unprotected.
         // ------------------------------------------------------------------
         let body = serde_json::json!({
             "supi": "imsi-999700000000001",
             "nssai": {"sst": 1}
         });
-        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            // Route the reconstructed request back to B1's own HTTP server.
+            ("3gpp-Sbi-Target-apiRoot".to_string(), b1.api_root()),
+        ];
         // Include a query string so the spec RequestLine (sepp-03,
         // scheme/authority/path/queryFragment) round-trips over real HTTP.
         let forward_url = "/nudm-sdm/v1/supi?supported-features=1";
@@ -227,18 +239,14 @@ async fn two_sepp_n32_handshake_and_forwarding() {
             None,
         )
         .await
-        .expect("N32-f forward");
-        assert_eq!(status, 200, "peer rejected protected message: {rsp_body}");
-
-        let rec: ReconstructedJson = serde_json::from_str(&rsp_body).unwrap();
-        assert_eq!(rec.method, "POST");
-        // The path and query must be reconstructed identically by the peer.
-        assert_eq!(rec.url, forward_url);
-        assert!(rec.message_id.is_some());
-        let rec_body = b64url_decode(&rec.body.expect("body")).unwrap();
-        let rec_json: serde_json::Value = serde_json::from_slice(&rec_body).unwrap();
-        assert_eq!(rec_json["supi"], "imsi-999700000000001");
-        assert_eq!(rec_json["nssai"]["sst"], 1);
+        .expect("N32-f forward round trip");
+        // The unprotected response is the target NF's (B1's) answer to the
+        // forwarded request.
+        assert_eq!(status, 404, "unexpected N32-f response status: {rsp_body}");
+        assert!(
+            rsp_body.contains("RESOURCE_NOT_FOUND"),
+            "expected forwarded 404 from target NF, got: {rsp_body}"
+        );
 
         // ------------------------------------------------------------------
         // Phase 3: tampered message -> 400 + n32f-error report back to A

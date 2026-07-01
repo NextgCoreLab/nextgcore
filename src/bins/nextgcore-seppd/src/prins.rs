@@ -543,12 +543,21 @@ pub struct N32fPayloadElement {
     pub value: serde_json::Value,
 }
 
-/// DataToIntegrityProtectBlock: integrity-protected (JWE AAD) but cleartext
+/// DataToIntegrityProtectBlock (TS 29.573 §6.2.5.2.5): integrity-protected
+/// (JWE AAD) but cleartext. Carries `requestLine` for a forwarded API request
+/// and `statusLine` for a forwarded API response — the two are mutually
+/// exclusive (exactly one present).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataToIntegrityProtectBlock {
     pub meta_data: N32fMetaData,
-    pub request_line: RequestLine,
+    /// Request line of the forwarded HTTP API request (present for a request).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_line: Option<RequestLine>,
+    /// Status line of the forwarded HTTP API response — a string, e.g. "200"
+    /// (present for a response; TS 29.573 §6.2.5.2.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_line: Option<String>,
     #[serde(default)]
     pub headers: Vec<HttpHeader>,
     #[serde(default)]
@@ -745,7 +754,8 @@ pub fn protect_message(
             // receiver can verify PLMN-ID consistency against the N32-f context.
             sender_plmn_id: ctx.local_plmn_ids.first().map(PlmnIdMeta::from_plmn),
         },
-        request_line: build_request_line(method, url),
+        request_line: Some(build_request_line(method, url)),
+        status_line: None,
         // sepp-06: HttpHeader { header, value: EncodedHttpHeaderValue }. This
         // SEPP carries header values in the clear (integrity-protected).
         headers: headers
@@ -811,6 +821,113 @@ pub fn protect_message(
     })
 }
 
+/// Apply PRINS protection to an outgoing SBI *response*, producing the
+/// N32fReformattedMessage (N32fReformattedRspMsg shape) per TS 29.573 §6.3.
+/// The receiving SEPP calls this after forwarding the reconstructed request to
+/// the target NF, to protect that NF's HTTP response for return over N32-f.
+/// The body is carried integrity-protected in the clear (response-IE
+/// encryption is policy-driven and not applied here).
+pub fn protect_response_message(
+    ctx: &PrinsContext,
+    status_code: u16,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+) -> Result<N32fReformattedMessage, JoseError> {
+    let mut cipher_block = DataToIntegrityProtectAndCipherBlock::default();
+    let mut payload_elements: Vec<N32fPayloadElement> = Vec::new();
+
+    if let Some(body_bytes) = body {
+        match serde_json::from_slice::<serde_json::Value>(body_bytes).ok() {
+            Some(json) => {
+                let no_encrypt: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                flatten_body_leaves(
+                    &json,
+                    String::new(),
+                    &no_encrypt,
+                    &mut cipher_block,
+                    &mut payload_elements,
+                );
+                if payload_elements.is_empty() {
+                    payload_elements.push(N32fPayloadElement {
+                        ie_path: String::new(),
+                        ie_value_location: IeLocation::Body,
+                        value: json,
+                    });
+                }
+            }
+            None => {
+                payload_elements.push(N32fPayloadElement {
+                    ie_path: String::new(),
+                    ie_value_location: IeLocation::MultipartBinary,
+                    value: serde_json::Value::String(b64url_encode(body_bytes)),
+                });
+            }
+        }
+    }
+
+    let integrity_block = DataToIntegrityProtectBlock {
+        meta_data: N32fMetaData {
+            n32f_context_id: ctx.peer_context_id.clone(),
+            message_id: generate_message_id(),
+            authorized_ipx_id: AUTHORIZED_IPX_ID_NONE.to_string(),
+            sender_plmn_id: ctx.local_plmn_ids.first().map(PlmnIdMeta::from_plmn),
+        },
+        request_line: None,
+        status_line: Some(status_code.to_string()),
+        headers: headers
+            .iter()
+            .map(|(name, value)| HttpHeader {
+                header: name.clone(),
+                value: EncodedHttpHeaderValue::Plain(value.clone()),
+            })
+            .collect(),
+        payload: payload_elements,
+    };
+
+    let aad_bytes =
+        serde_json::to_vec(&integrity_block).map_err(|e| JoseError::Format(e.to_string()))?;
+    let plaintext =
+        serde_json::to_vec(&cipher_block).map_err(|e| JoseError::Format(e.to_string()))?;
+
+    // Response direction: protect with this SEPP's response-direction session
+    // key + IV salt (TS 33.501 §13.2.4.4.1); SEQ from the per-salt response
+    // counter.
+    let (key, iv_salt) = ctx.protect_key(N32fDirection::Response);
+    let seq = ctx.next_send_seq(N32fDirection::Response)?;
+    let jwe = jose::jwe_encrypt_with_iv_salt(
+        key,
+        ctx.jwe_enc,
+        iv_salt,
+        seq,
+        &plaintext,
+        Some(&aad_bytes),
+        Some(&ctx.kid),
+    )?;
+
+    let signing_key = ctx.local_signing_key.as_ref().ok_or_else(|| {
+        JoseError::Crypto("no local ES256 signing key for modificationsBlock".into())
+    })?;
+    let mods_payload = ModificationsBlockPayload {
+        identity: ctx.local_fqdn.clone(),
+        operations: Vec::new(),
+        tag: jwe.tag.clone(),
+    };
+    let mods_bytes =
+        serde_json::to_vec(&mods_payload).map_err(|e| JoseError::Format(e.to_string()))?;
+    let jws = jose::jws_sign_es256(signing_key, &mods_bytes, Some(&ctx.local_fqdn))?;
+
+    log::info!(
+        "PRINS protect response: status={} ({} payload leaves)",
+        status_code,
+        integrity_block.payload.len()
+    );
+
+    Ok(N32fReformattedMessage {
+        reformatted_data: jwe,
+        modifications_block: vec![jws],
+    })
+}
+
 // ============================================================================
 // Unprotect (receiving SEPP)
 // ============================================================================
@@ -825,16 +942,40 @@ pub struct ReconstructedRequest {
     pub message_id: String,
 }
 
-/// Verify and remove PRINS protection from a received N32fReformattedMessage.
+/// Reconstructed SBI response after successful unprotection (the sending SEPP
+/// recovers this from an N32fReformattedRspMsg to relay to the consumer NF).
+#[derive(Debug, Clone)]
+pub struct ReconstructedResponse {
+    pub status_code: u16,
+    pub headers: HashMap<String, String>,
+    pub body: Option<Vec<u8>>,
+    pub message_id: String,
+}
+
+/// Core PRINS verify+decrypt+reassemble, shared by the request and response
+/// unprotect paths. Returns the authenticated integrity block plus the
+/// reconstructed headers/body and the messageId.
 ///
-/// Verification order per TS 29.573: parse AAD (cleartext copy is needed
-/// for the error report's messageId), verify the JWS modification chain,
+/// Verification order per TS 29.573: parse AAD (cleartext copy is needed for
+/// the error report's messageId), verify the JWS modification chain,
 /// AEAD-decrypt (which authenticates the AAD), apply allowed JSON-Patch
-/// operations, then reassemble the original request.
-pub fn unprotect_message(
+/// operations, then reassemble headers/body. `direction` selects the session
+/// key and anti-replay counter: `Request` for a received N32-f request,
+/// `Response` for a received N32-f response.
+#[allow(clippy::type_complexity)]
+fn unprotect_common(
     ctx: &PrinsContext,
     msg: &N32fReformattedMessage,
-) -> Result<ReconstructedRequest, N32fUnprotectError> {
+    direction: N32fDirection,
+) -> Result<
+    (
+        DataToIntegrityProtectBlock,
+        HashMap<String, String>,
+        Option<Vec<u8>>,
+        String,
+    ),
+    N32fUnprotectError,
+> {
     // --- Parse the (not yet authenticated) AAD for metaData/messageId ---
     let aad_b64 = msg.reformatted_data.aad.as_ref().ok_or_else(|| {
         N32fUnprotectError::new(
@@ -989,11 +1130,11 @@ pub fn unprotect_message(
     }
 
     // --- AEAD decrypt; authenticates the AAD (integrity block) ---
-    // The inbound message was originated by the PEER as an N32-f request, so
-    // it is decrypted with the peer's request-direction session key (selected
-    // by the peer's role). The IV is carried on the wire, so only the key is
-    // needed here.
-    let (key, _iv_salt) = ctx.unprotect_key(N32fDirection::Request);
+    // The inbound message was originated by the PEER in `direction` (a request
+    // or a response), so it is decrypted with the peer's session key for that
+    // direction (selected by the peer's role). The IV is carried on the wire,
+    // so only the key is needed here.
+    let (key, _iv_salt) = ctx.unprotect_key(direction);
     let plaintext = jose::jwe_decrypt(key, &msg.reformatted_data).map_err(|e| {
         let error_type = match e {
             JoseError::Tampered => N32fErrorType::IntegrityCheckFailed,
@@ -1022,7 +1163,7 @@ pub fn unprotect_message(
             "malformed JWE nonce (expected IV salt(8) || SEQ(32-bit))",
         )
     })?;
-    ctx.check_recv_seq(N32fDirection::Request, seq).map_err(|reason| {
+    ctx.check_recv_seq(direction, seq).map_err(|reason| {
         N32fUnprotectError::new(
             N32fErrorType::IntegrityCheckFailed,
             Some(message_id.clone()),
@@ -1151,17 +1292,71 @@ pub fn unprotect_message(
         headers.insert(h.header.clone(), value);
     }
 
-    let url = join_request_line(&integrity_block.request_line);
+    Ok((integrity_block, headers, body, message_id))
+}
+
+/// Verify and remove PRINS protection from a received N32-f *request*
+/// (N32fReformattedReqMsg), reconstructing the original SBI request.
+pub fn unprotect_message(
+    ctx: &PrinsContext,
+    msg: &N32fReformattedMessage,
+) -> Result<ReconstructedRequest, N32fUnprotectError> {
+    let (integrity_block, headers, body, message_id) =
+        unprotect_common(ctx, msg, N32fDirection::Request)?;
+    let request_line = integrity_block.request_line.ok_or_else(|| {
+        N32fUnprotectError::new(
+            N32fErrorType::MessageReconstructionFailed,
+            Some(message_id.clone()),
+            "N32-f request message carries no requestLine",
+        )
+    })?;
+    let url = join_request_line(&request_line);
     log::info!(
         "PRINS unprotect OK: {} {} (msg_id={})",
-        integrity_block.request_line.method,
+        request_line.method,
         url,
         message_id
     );
-
     Ok(ReconstructedRequest {
-        method: integrity_block.request_line.method.clone(),
+        method: request_line.method.clone(),
         url,
+        headers,
+        body,
+        message_id,
+    })
+}
+
+/// Verify and remove PRINS protection from a received N32-f *response*
+/// (N32fReformattedRspMsg), reconstructing the original SBI response.
+pub fn unprotect_response_message(
+    ctx: &PrinsContext,
+    msg: &N32fReformattedMessage,
+) -> Result<ReconstructedResponse, N32fUnprotectError> {
+    let (integrity_block, headers, body, message_id) =
+        unprotect_common(ctx, msg, N32fDirection::Response)?;
+    let status_line = integrity_block.status_line.ok_or_else(|| {
+        N32fUnprotectError::new(
+            N32fErrorType::MessageReconstructionFailed,
+            Some(message_id.clone()),
+            "N32-f response message carries no statusLine",
+        )
+    })?;
+    // statusLine is a string; take the leading integer status code (e.g. "200"
+    // or "200 OK").
+    let status_code = status_line
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| {
+            N32fUnprotectError::new(
+                N32fErrorType::MessageReconstructionFailed,
+                Some(message_id.clone()),
+                format!("malformed statusLine [{status_line}]"),
+            )
+        })?;
+    log::info!("PRINS unprotect response OK: {status_code} (msg_id={message_id})");
+    Ok(ReconstructedResponse {
+        status_code,
         headers,
         body,
         message_id,
@@ -1453,6 +1648,65 @@ mod tests {
         assert_eq!(rec.headers.get("content-type").unwrap(), "application/json");
     }
 
+    /// N32-f response path (TS 29.573 §6.2.5.2.5): the receiving SEPP protects
+    /// the target NF's HTTP response with statusLine + response-direction keys,
+    /// and the sending SEPP recovers the original status/headers/body.
+    #[test]
+    fn protect_unprotect_response_roundtrip() {
+        // Full bidirectional pair: the responder SEPP signs the response, the
+        // initiator SEPP verifies it (reverse of the request direction).
+        let (sender_sk, sender_vk) = es256_keypair();
+        let (recv_sk, recv_vk) = es256_keypair();
+        let km = shared_material();
+        let kid = format!("kid-{}", generate_n32f_context_id());
+        let mut sender = PrinsContext::new(
+            "ctx-local-1111",
+            "ctx-peer-2222",
+            km.clone(),
+            N32fRole::Initiator,
+            kid.clone(),
+            SENDER_FQDN,
+        )
+        .with_signing_key(sender_sk);
+        sender.register_verifying_key(RECEIVER_FQDN, recv_vk);
+        let mut receiver = PrinsContext::new(
+            "ctx-peer-2222",
+            "ctx-local-1111",
+            km,
+            N32fRole::Responder,
+            kid,
+            RECEIVER_FQDN,
+        )
+        .with_signing_key(recv_sk);
+        receiver.register_verifying_key(SENDER_FQDN, sender_vk);
+
+        // The receiving SEPP protects the target NF's HTTP response.
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        let body = serde_json::to_vec(&serde_json::json!({
+            "supi": "imsi-001010000000001",
+            "authType": "5G_AKA"
+        }))
+        .unwrap();
+        let msg = protect_response_message(&receiver, 200, &headers, Some(&body)).unwrap();
+
+        // AAD carries statusLine (not requestLine).
+        let aad = b64url_decode(msg.reformatted_data.aad.as_ref().unwrap()).unwrap();
+        let block: DataToIntegrityProtectBlock = serde_json::from_slice(&aad).unwrap();
+        assert_eq!(block.status_line.as_deref(), Some("200"));
+        assert!(block.request_line.is_none());
+
+        // The sending SEPP recovers the NF response.
+        let rec = unprotect_response_message(&sender, &msg).unwrap();
+        assert_eq!(rec.status_code, 200);
+        let rbody: serde_json::Value = serde_json::from_slice(&rec.body.unwrap()).unwrap();
+        assert_eq!(rbody["supi"], "imsi-001010000000001");
+        assert_eq!(rbody["authType"], "5G_AKA");
+        assert_eq!(rec.headers.get("content-type").unwrap(), "application/json");
+
+        // A request-unprotect on a response message must fail (no requestLine).
+        assert!(unprotect_message(&sender, &msg).is_err());
+    }
+
     #[test]
     fn tampered_aad_detected_as_integrity_failure() {
         let (sender, receiver) = ctx_pair();
@@ -1468,7 +1722,7 @@ mod tests {
         // Tamper with a cleartext field inside the integrity block
         let aad = b64url_decode(msg.reformatted_data.aad.as_ref().unwrap()).unwrap();
         let mut block: DataToIntegrityProtectBlock = serde_json::from_slice(&aad).unwrap();
-        block.request_line.path = "/nudm-sdm/v1/EVIL".to_string();
+        block.request_line.as_mut().unwrap().path = "/nudm-sdm/v1/EVIL".to_string();
         msg.reformatted_data.aad = Some(b64url_encode(&serde_json::to_vec(&block).unwrap()));
 
         let err = unprotect_message(&receiver, &msg).unwrap_err();
@@ -1946,7 +2200,8 @@ mod tests {
                 authorized_ipx_id: AUTHORIZED_IPX_ID_NONE.to_string(),
                 sender_plmn_id: None,
             },
-            request_line: build_request_line("POST", "/nudm-sdm/v1/supi"),
+            request_line: Some(build_request_line("POST", "/nudm-sdm/v1/supi")),
+            status_line: None,
             headers: vec![],
             payload: vec![N32fPayloadElement {
                 ie_path: "not-a-pointer".to_string(),
@@ -2104,7 +2359,8 @@ mod tests {
                 authorized_ipx_id: AUTHORIZED_IPX_ID_NONE.to_string(),
                 sender_plmn_id: None,
             },
-            request_line: build_request_line("GET", "/nudm-sdm/v1/supi"),
+            request_line: Some(build_request_line("GET", "/nudm-sdm/v1/supi")),
+            status_line: None,
             headers: vec![HttpHeader {
                 header: "authorization".to_string(),
                 value: EncodedHttpHeaderValue::Encrypted { enc_block_index: 0 },

@@ -403,6 +403,35 @@ pub async fn forward_n32f_request_async(
                 "N32f response from {host}:{port}: status={}",
                 response.status
             );
+            // TS 29.573 §6.2.4.2: in PRINS the peer SEPP returns a protected
+            // N32fReformattedRspMsg; unprotect it to recover the target NF's
+            // real HTTP response before relaying to the consumer NF.
+            if security_scheme == SecurityCapability::Prins && response.status == 200 {
+                if let Some(body_str) = response.http.content.as_deref() {
+                    if let Ok(reformatted) =
+                        serde_json::from_str::<crate::prins::N32fReformattedMessage>(body_str)
+                    {
+                        let Some(prins_ctx) = build_prins_context(node_id) else {
+                            return Err("No N32-f security context to unprotect response".into());
+                        };
+                        return match crate::prins::unprotect_response_message(
+                            &prins_ctx,
+                            &reformatted,
+                        ) {
+                            Ok(rec) => Ok(N32fForwardResult {
+                                status: rec.status_code,
+                                headers: rec.headers,
+                                body: rec.body,
+                            }),
+                            Err(e) => {
+                                log::error!("N32f response unprotect failed: {e}");
+                                Err(format!("N32f response unprotect failed: {e}"))
+                            }
+                        };
+                    }
+                }
+            }
+            // TLS mode (or an unexpected non-PRINS body): pass through.
             Ok(N32fForwardResult {
                 status: response.status,
                 headers: forward_result.headers,
