@@ -8,7 +8,8 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::subscription::{MbsEvent, SubEntry, SubscriptionStore};
+use crate::subscription::{SubEntry, SubscriptionStore};
+use crate::types::PatchItem;
 
 /// S-NSSAI (Single Network Slice Selection Assistance Information)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -663,13 +664,13 @@ impl MbSmfContext {
         self.status_subs.lock().ok().map(|mut s| s.add(entry))
     }
 
-    /// Update a Status subscription (PUT). Returns false if not found.
-    pub fn status_sub_update(&self, id: &str, entry: SubEntry) -> bool {
+    /// Apply a JSON Patch (RFC 6902 subset) to a Status subscription.
+    /// Returns the modified bare document, or None if not found.
+    pub fn status_sub_patch(&self, id: &str, ops: &[PatchItem]) -> Option<serde_json::Value> {
         self.status_subs
             .lock()
             .ok()
-            .map(|mut s| s.update(id, entry))
-            .unwrap_or(false)
+            .and_then(|mut s| s.patch(id, ops))
     }
 
     /// Remove a Status subscription (DELETE). Returns false if not found.
@@ -681,12 +682,17 @@ impl MbSmfContext {
             .unwrap_or(false)
     }
 
-    /// Collect Status subscriptions that match `event` (for notify fan-out).
-    pub fn status_subs_matching(&self, event: &MbsEvent) -> Vec<SubEntry> {
+    /// Collect Status subscriptions that match `event_type` and `session` key
+    /// (for notify fan-out).
+    pub fn status_subs_matching(
+        &self,
+        event_type: &str,
+        session: &Option<serde_json::Value>,
+    ) -> Vec<SubEntry> {
         self.status_subs
             .lock()
             .ok()
-            .map(|s| s.matching(event))
+            .map(|s| s.matching(event_type, session))
             .unwrap_or_default()
     }
 
@@ -703,13 +709,13 @@ impl MbSmfContext {
             .map(|mut s| s.add(entry))
     }
 
-    /// Update a ContextStatus subscription (PUT). Returns false if not found.
-    pub fn ctx_sub_update(&self, id: &str, entry: SubEntry) -> bool {
+    /// Apply a JSON Patch (RFC 6902 subset) to a ContextStatus subscription.
+    /// Returns the modified bare document, or None if not found.
+    pub fn ctx_sub_patch(&self, id: &str, ops: &[PatchItem]) -> Option<serde_json::Value> {
         self.context_status_subs
             .lock()
             .ok()
-            .map(|mut s| s.update(id, entry))
-            .unwrap_or(false)
+            .and_then(|mut s| s.patch(id, ops))
     }
 
     /// Remove a ContextStatus subscription (DELETE). Returns false if not found.
@@ -721,12 +727,16 @@ impl MbSmfContext {
             .unwrap_or(false)
     }
 
-    /// Collect ContextStatus subscriptions that match `event`.
-    pub fn ctx_subs_matching(&self, event: &MbsEvent) -> Vec<SubEntry> {
+    /// Collect ContextStatus subscriptions that match `event_type` and `session` key.
+    pub fn ctx_subs_matching(
+        &self,
+        event_type: &str,
+        session: &Option<serde_json::Value>,
+    ) -> Vec<SubEntry> {
         self.context_status_subs
             .lock()
             .ok()
-            .map(|s| s.matching(event))
+            .map(|s| s.matching(event_type, session))
             .unwrap_or_default()
     }
 

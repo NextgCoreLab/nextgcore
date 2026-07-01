@@ -212,7 +212,7 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         },
         ["nmbsmf-mbssession", "v1", "mbs-sessions", "contexts", "subscriptions", sub_id] => {
             match method {
-                "PUT" => handle_ctx_status_subscribe_update(sub_id, &request).await,
+                "PATCH" => handle_ctx_status_subscribe_mod(sub_id, &request).await,
                 "DELETE" => handle_ctx_status_unsubscribe(sub_id).await,
                 _ => send_method_not_allowed(method, "mbs-sessions/contexts/subscriptions/{id}"),
             }
@@ -224,7 +224,7 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "mbs-sessions/subscriptions"),
         },
         ["nmbsmf-mbssession", "v1", "mbs-sessions", "subscriptions", sub_id] => match method {
-            "PUT" => handle_status_subscribe_update(sub_id, &request).await,
+            "PATCH" => handle_status_subscribe_mod(sub_id, &request).await,
             "DELETE" => handle_status_unsubscribe(sub_id).await,
             _ => send_method_not_allowed(method, "mbs-sessions/subscriptions/{id}"),
         },
@@ -547,17 +547,19 @@ async fn handle_mbs_session_release(session_id: &str) -> SbiResponse {
     });
 
     match removed {
-        Some(_) => {
+        Some(session) => {
             log::info!("MBS Session {session_id} released");
-            // Notify all subscribers of the session release event. [mbsmfd-05]
-            emit_status_notify(
-                subscription::MbsEvent::SessionRelease,
-                Some(serde_json::json!({"mbsSessionId": session_id})),
-            );
-            emit_ctx_status_notify(
-                subscription::MbsEvent::SessionRelease,
-                Some(serde_json::json!({"mbsSessionId": session_id})),
-            );
+            // For Broadcast sessions: emit BROADCAST_DELIVERY_STATUS/TERMINATED to Status subs.
+            if matches!(session.session_type, MbsSessionType::Broadcast) {
+                emit_status_notify(session_id);
+            }
+            // Emit SESSION_RELEASE to ContextStatus subs keyed by this session's MbsSessionId.
+            let session_key = serde_json::to_value(types::MbsSessionId {
+                tmgi: Some(spec_tmgi_from(&session.tmgi)),
+                ssm: None,
+            })
+            .unwrap_or_default();
+            emit_ctx_status_notify("SESSION_RELEASE", Some(session_key));
             SbiResponse::with_status(204)
         }
         None => send_not_found(
@@ -1082,7 +1084,7 @@ async fn handle_member_leave(session_id: &str, supi: &str) -> SbiResponse {
 // ---------------------------------------------------------------------------
 
 /// StatusSubscribe — POST `/mbs-sessions/subscriptions` → 201 + Location
-/// (TS 29.532 §5.3.2.6).
+/// (TS 29.532 §5.3.2.6). Body: StatusSubscribeReqData{subscription:MbsSessionSubscription}.
 async fn handle_status_subscribe(request: &SbiRequest) -> SbiResponse {
     let body = match &request.http.content {
         Some(c) => c,
@@ -1097,11 +1099,26 @@ async fn handle_status_subscribe(request: &SbiRequest) -> SbiResponse {
             )
         }
     };
-    let entry = subscription::SubEntry {
-        notify_uri: req.notify_uri.clone(),
-        notify_correlation_id: req.notify_correlation_id.clone(),
-        event_list: req.event_list.clone(),
-        nf_instance_id: req.nf_instance_id.clone(),
+    let entry = {
+        let sub = &req.subscription;
+        if sub.event_list.is_empty() || sub.notify_uri.is_empty() {
+            return send_bad_request(
+                "subscription requires eventList and notifyUri",
+                Some("MANDATORY_IE_MISSING"),
+            );
+        }
+        let document = serde_json::to_value(sub).unwrap_or_default();
+        subscription::SubEntry {
+            notify_uri: sub.notify_uri.clone(),
+            notify_correlation_id: sub.notify_correlation_id.clone(),
+            event_types: sub
+                .event_list
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect(),
+            mbs_session_id: document.get("mbsSessionId").cloned(),
+            document,
+        }
     };
     let ctx = mbsmf_self();
     let sub_id = match ctx.read().ok().and_then(|c| c.status_sub_add(entry)) {
@@ -1109,53 +1126,51 @@ async fn handle_status_subscribe(request: &SbiRequest) -> SbiResponse {
         None => return send_bad_request("Failed to create subscription", None),
     };
     log::info!("[sub] Status subscription created: {sub_id}");
+    let rsp_body = subscription::StatusSubscribeRspData {
+        subscription: req.subscription,
+    };
     SbiResponse::with_status(201)
         .with_header(
             "Location",
             format!("/nmbsmf-mbssession/v1/mbs-sessions/subscriptions/{sub_id}"),
         )
-        .with_json_body(&req)
+        .with_json_body(&rsp_body)
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
-/// StatusSubscribe Update — PUT `/mbs-sessions/subscriptions/{id}` → 200
-/// (TS 29.532 §5.3.2.6, replace existing subscription document).
-async fn handle_status_subscribe_update(sub_id: &str, request: &SbiRequest) -> SbiResponse {
+/// StatusSubscribeMod — PATCH `/mbs-sessions/subscriptions/{id}` → 200
+/// (TS 29.532 §5.3.2.6, operationId StatusSubscribeMod).
+/// Body: application/json-patch+json (array of PatchItem). Returns modified bare subscription.
+async fn handle_status_subscribe_mod(sub_id: &str, request: &SbiRequest) -> SbiResponse {
     let body = match &request.http.content {
         Some(c) => c,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
-    let req: subscription::StatusSubscribeReqData = match serde_json::from_str(body) {
-        Ok(r) => r,
+    let patch: types::PatchData = match serde_json::from_str(body) {
+        Ok(p) => p,
         Err(e) => {
             return send_bad_request(
-                &format!("Invalid StatusSubscribeReqData: {e}"),
+                &format!("Invalid PatchData: {e}"),
                 Some("INVALID_MSG_FORMAT"),
             )
         }
     };
-    let entry = subscription::SubEntry {
-        notify_uri: req.notify_uri.clone(),
-        notify_correlation_id: req.notify_correlation_id.clone(),
-        event_list: req.event_list.clone(),
-        nf_instance_id: req.nf_instance_id.clone(),
-    };
     let ctx = mbsmf_self();
-    let updated = ctx
+    match ctx
         .read()
         .ok()
-        .map(|c| c.status_sub_update(sub_id, entry))
-        .unwrap_or(false);
-    if updated {
-        log::debug!("[sub] Status subscription updated: {sub_id}");
-        SbiResponse::with_status(200)
-            .with_json_body(&req)
-            .unwrap_or_else(|_| SbiResponse::with_status(200))
-    } else {
-        send_not_found(
+        .and_then(|c| c.status_sub_patch(sub_id, &patch))
+    {
+        Some(doc) => {
+            log::debug!("[sub] Status subscription patched: {sub_id}");
+            SbiResponse::with_status(200)
+                .with_json_body(&doc)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => send_not_found(
             &format!("Status subscription {sub_id} not found"),
             Some("SUBSCRIPTION_NOT_FOUND"),
-        )
+        ),
     }
 }
 
@@ -1180,7 +1195,7 @@ async fn handle_status_unsubscribe(sub_id: &str) -> SbiResponse {
 }
 
 /// ContextStatusSubscribe — POST `/mbs-sessions/contexts/subscriptions` → 201
-/// (TS 29.532 §5.3.2.9).
+/// (TS 29.532 §5.3.2.9). Body: ContextStatusSubscribeReqData{subscription:ContextStatusSubscription}.
 async fn handle_ctx_status_subscribe(request: &SbiRequest) -> SbiResponse {
     let body = match &request.http.content {
         Some(c) => c,
@@ -1195,11 +1210,27 @@ async fn handle_ctx_status_subscribe(request: &SbiRequest) -> SbiResponse {
             )
         }
     };
-    let entry = subscription::SubEntry {
-        notify_uri: req.notify_uri.clone(),
-        notify_correlation_id: req.notify_correlation_id.clone(),
-        event_list: req.event_list.clone(),
-        nf_instance_id: req.nf_instance_id.clone(),
+    let entry = {
+        let sub = &req.subscription;
+        if sub.event_list.is_empty() {
+            return send_bad_request(
+                "subscription requires eventList",
+                Some("MANDATORY_IE_MISSING"),
+            );
+        }
+        let document = serde_json::to_value(sub).unwrap_or_default();
+        let session_id_val = serde_json::to_value(&sub.mbs_session_id).unwrap_or_default();
+        subscription::SubEntry {
+            notify_uri: sub.notify_uri.clone(),
+            notify_correlation_id: sub.notify_correlation_id.clone(),
+            event_types: sub
+                .event_list
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect(),
+            mbs_session_id: Some(session_id_val),
+            document,
+        }
     };
     let ctx = mbsmf_self();
     let sub_id = match ctx.read().ok().and_then(|c| c.ctx_sub_add(entry)) {
@@ -1207,53 +1238,51 @@ async fn handle_ctx_status_subscribe(request: &SbiRequest) -> SbiResponse {
         None => return send_bad_request("Failed to create subscription", None),
     };
     log::info!("[sub] ContextStatus subscription created: {sub_id}");
+    let rsp_body = subscription::ContextStatusSubscribeRspData {
+        subscription: req.subscription,
+    };
     SbiResponse::with_status(201)
         .with_header(
             "Location",
             format!("/nmbsmf-mbssession/v1/mbs-sessions/contexts/subscriptions/{sub_id}"),
         )
-        .with_json_body(&req)
+        .with_json_body(&rsp_body)
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
-/// ContextStatusSubscribe Update — PUT `/mbs-sessions/contexts/subscriptions/{id}` → 200
-/// (TS 29.532 §5.3.2.9).
-async fn handle_ctx_status_subscribe_update(sub_id: &str, request: &SbiRequest) -> SbiResponse {
+/// ContextStatusSubscribeMod — PATCH `/mbs-sessions/contexts/subscriptions/{id}` → 200
+/// (TS 29.532 §5.3.2.9, operationId ContextStatusSubscribeMod).
+/// Body: application/json-patch+json. Returns modified bare subscription.
+async fn handle_ctx_status_subscribe_mod(sub_id: &str, request: &SbiRequest) -> SbiResponse {
     let body = match &request.http.content {
         Some(c) => c,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
-    let req: subscription::ContextStatusSubscribeReqData = match serde_json::from_str(body) {
-        Ok(r) => r,
+    let patch: types::PatchData = match serde_json::from_str(body) {
+        Ok(p) => p,
         Err(e) => {
             return send_bad_request(
-                &format!("Invalid ContextStatusSubscribeReqData: {e}"),
+                &format!("Invalid PatchData: {e}"),
                 Some("INVALID_MSG_FORMAT"),
             )
         }
     };
-    let entry = subscription::SubEntry {
-        notify_uri: req.notify_uri.clone(),
-        notify_correlation_id: req.notify_correlation_id.clone(),
-        event_list: req.event_list.clone(),
-        nf_instance_id: req.nf_instance_id.clone(),
-    };
     let ctx = mbsmf_self();
-    let updated = ctx
+    match ctx
         .read()
         .ok()
-        .map(|c| c.ctx_sub_update(sub_id, entry))
-        .unwrap_or(false);
-    if updated {
-        log::debug!("[sub] ContextStatus subscription updated: {sub_id}");
-        SbiResponse::with_status(200)
-            .with_json_body(&req)
-            .unwrap_or_else(|_| SbiResponse::with_status(200))
-    } else {
-        send_not_found(
+        .and_then(|c| c.ctx_sub_patch(sub_id, &patch))
+    {
+        Some(doc) => {
+            log::debug!("[sub] ContextStatus subscription patched: {sub_id}");
+            SbiResponse::with_status(200)
+                .with_json_body(&doc)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => send_not_found(
             &format!("ContextStatus subscription {sub_id} not found"),
             Some("SUBSCRIPTION_NOT_FOUND"),
-        )
+        ),
     }
 }
 
@@ -1277,21 +1306,28 @@ async fn handle_ctx_status_unsubscribe(sub_id: &str) -> SbiResponse {
     }
 }
 
-/// Fan out a Status notification for `event` to all matching subscribers.
-/// Each POST is fire-and-forget (spawned); failures are logged as warnings.
-/// [mbsmfd-05]
-fn emit_status_notify(event: subscription::MbsEvent, detail: Option<serde_json::Value>) {
+/// Fan out a Status notification for a broadcast session delivery termination.
+/// Fires BROADCAST_DELIVERY_STATUS / TERMINATED to all matching Status subscribers.
+/// Called only when a Broadcast session is released. [mbsmfd-05]
+fn emit_status_notify(session_id: &str) {
+    let _ = session_id; // session_id is available for future session-keyed filtering
     let ctx = mbsmf_self();
     let subs = ctx
         .read()
         .ok()
-        .map(|c| c.status_subs_matching(&event))
+        .map(|c| c.status_subs_matching("BROADCAST_DELIVERY_STATUS", &None))
         .unwrap_or_default();
+    let ts = crate::context::unix_to_rfc3339(crate::context::now_unix());
     for sub in subs {
         let body = subscription::StatusNotifyReqData {
-            notify_correlation_id: sub.notify_correlation_id.clone(),
-            mbs_event: event.clone(),
-            event_detail: detail.clone(),
+            event_list: subscription::MbsSessionEventReportList {
+                event_report_list: vec![subscription::MbsSessionEventReport {
+                    event_type: "BROADCAST_DELIVERY_STATUS".to_string(),
+                    time_stamp: Some(ts.clone()),
+                    broadcast_del_status: Some("TERMINATED".to_string()),
+                }],
+                notify_correlation_id: sub.notify_correlation_id.clone(),
+            },
         };
         let uri = sub.notify_uri.clone();
         tokio::spawn(async move {
@@ -1300,20 +1336,24 @@ fn emit_status_notify(event: subscription::MbsEvent, detail: Option<serde_json::
     }
 }
 
-/// Fan out a ContextStatus notification for `event` to all matching
-/// ContextStatus subscribers (SMF-facing). [mbsmfd-05]
-fn emit_ctx_status_notify(event: subscription::MbsEvent, detail: Option<serde_json::Value>) {
+/// Fan out a ContextStatus notification for `event_type` to all matching
+/// ContextStatus subscribers (SMF-facing), filtered by `session_key`. [mbsmfd-05]
+fn emit_ctx_status_notify(event_type: &str, session_key: Option<serde_json::Value>) {
     let ctx = mbsmf_self();
     let subs = ctx
         .read()
         .ok()
-        .map(|c| c.ctx_subs_matching(&event))
+        .map(|c| c.ctx_subs_matching(event_type, &session_key))
         .unwrap_or_default();
+    let ts = crate::context::unix_to_rfc3339(crate::context::now_unix());
+    let event_type = event_type.to_string();
     for sub in subs {
         let body = subscription::ContextStatusNotifyReqData {
+            report_list: vec![subscription::ContextStatusEventReport {
+                event_type: event_type.clone(),
+                time_stamp: ts.clone(),
+            }],
             notify_correlation_id: sub.notify_correlation_id.clone(),
-            mbs_event: event.clone(),
-            event_detail: detail.clone(),
         };
         let uri = sub.notify_uri.clone();
         tokio::spawn(async move {
@@ -1767,7 +1807,7 @@ mod tests {
     #[tokio::test]
     async fn test_router_status_subscribe_and_unsubscribe() {
         mbsmf_context_init(256);
-        let body = r#"{"notifyUri":"http://nef:9000/notify","notifyCorrelationId":"corr-1"}"#;
+        let body = r#"{"subscription":{"eventList":[{"eventType":"BROADCAST_DELIVERY_STATUS"}],"notifyUri":"http://nef:9000/notify"}}"#;
         let rsp = mbsmf_sbi_request_handler(
             SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/subscriptions")
                 .with_body(body, "application/json"),
@@ -1793,11 +1833,11 @@ mod tests {
         assert_eq!(del2.status, 404, "Second delete → 404");
     }
 
-    // PUT updates an existing Status subscription; PUT on unknown ID → 404.
+    // PATCH updates an existing Status subscription; PATCH on unknown ID → 404.
     #[tokio::test]
     async fn test_router_status_subscribe_update() {
         mbsmf_context_init(256);
-        let create_body = r#"{"notifyUri":"http://nef/cb","notifyCorrelationId":"corr-orig"}"#;
+        let create_body = r#"{"subscription":{"eventList":[{"eventType":"BROADCAST_DELIVERY_STATUS"}],"notifyUri":"http://nef/cb","notifyCorrelationId":"corr-orig"}}"#;
         let rsp = mbsmf_sbi_request_handler(
             SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/subscriptions")
                 .with_body(create_body, "application/json"),
@@ -1807,33 +1847,37 @@ mod tests {
         let loc = rsp.http.get_header("location").cloned().unwrap();
         let sub_id = loc.rsplit('/').next().unwrap().to_string();
 
-        // Update with a new correlationId → 200.
-        let upd_body = r#"{"notifyUri":"http://nef/cb","notifyCorrelationId":"corr-updated"}"#;
+        // PATCH to replace notifyCorrelationId → 200 with updated doc.
+        let patch_body =
+            r#"[{"op":"replace","path":"/notifyCorrelationId","value":"corr-updated"}]"#;
         let upd = mbsmf_sbi_request_handler(
-            SbiRequest::put(format!(
+            SbiRequest::patch(format!(
                 "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions/{sub_id}"
             ))
-            .with_body(upd_body, "application/json"),
+            .with_body(patch_body, "application/json-patch+json"),
         )
         .await;
-        assert_eq!(upd.status, 200, "PUT → 200");
+        assert_eq!(upd.status, 200, "PATCH → 200");
+        let doc: serde_json::Value =
+            serde_json::from_str(upd.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(doc["notifyCorrelationId"], "corr-updated");
 
-        // PUT on a random unknown ID → 404.
+        // PATCH on a random unknown ID → 404.
         let miss = mbsmf_sbi_request_handler(
-            SbiRequest::put(
+            SbiRequest::patch(
                 "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions/00000000-0000-0000-0000-000000000000",
             )
-            .with_body(upd_body, "application/json"),
+            .with_body(patch_body, "application/json-patch+json"),
         )
         .await;
-        assert_eq!(miss.status, 404, "PUT unknown → 404");
+        assert_eq!(miss.status, 404, "PATCH unknown → 404");
     }
 
     // ContextStatus subscribe → 201 + Location; unsubscribe → 204.
     #[tokio::test]
     async fn test_router_ctx_status_subscribe_and_unsubscribe() {
         mbsmf_context_init(256);
-        let body = r#"{"notifyUri":"http://smf:8080/ctx-notify","notifyCorrelationId":"ctx-corr-1","eventList":["SESSION_RELEASE"]}"#;
+        let body = r#"{"subscription":{"nfcInstanceId":"smf-1","mbsSessionId":{"tmgi":{"mbsServiceId":"010203","plmnId":{"mcc":"001","mnc":"01"}}},"eventList":[{"eventType":"SESSION_RELEASE"}],"notifyUri":"http://smf:8080/ctx-notify"}}"#;
         let rsp = mbsmf_sbi_request_handler(
             SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/subscriptions")
                 .with_body(body, "application/json"),
@@ -1880,7 +1924,7 @@ mod tests {
         // Subscribe to SESSION_RELEASE on this notifyUri (unreachable in unit
         // tests — the notify POST is spawned async and fails silently).
         let sub_body = format!(
-            r#"{{"notifyUri":"http://127.0.0.1:1/notify","notifyCorrelationId":"rel-corr-{session_id}","eventList":["SESSION_RELEASE"]}}"#
+            r#"{{"subscription":{{"eventList":[{{"eventType":"SESSION_RELEASE"}}],"notifyUri":"http://127.0.0.1:1/notify","notifyCorrelationId":"rel-corr-{session_id}"}}}}"#
         );
         let sub_rsp = mbsmf_sbi_request_handler(
             SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/subscriptions")
