@@ -75,7 +75,7 @@ use context::{ees_context_final, ees_context_init, ees_self, UpdateError};
 use eec::EecRegistration;
 use services::{
     AcrMgntEventSubsc, AcrParamInfoReq, AcrParamInfoResp, AppClientInfo, CeaAnnouncement,
-    EecCtxtRelReq, EecCtxtRelResp, RelocResult,
+    EecContext,
 };
 use types::{cause, EasDiscoveryReq, EasDiscoveryResp, EasDiscoverySubscription, EasRegistration};
 
@@ -95,8 +95,10 @@ const EASREG_REGISTRATIONS_PATH: &str = "/eees-easregistration/v1/registrations"
 /// Resource path prefix for CEA announcement resources (eesd-13).
 const CEA_ANNOUNCEMENTS_PATH: &str = "/eees-cea/v1/announcements";
 
-/// Resource path prefix for App Client Information resources (eesd-13).
-const APPCLIENTINFO_RESOURCES_PATH: &str = "/eees-appclientinformation/v1/app-client-infos";
+/// Resource path prefix for App Client Information subscriptions (eesd-13).
+/// TS 29.558 §8.4.2: the Eees_AppClientInformation API is an AC-information
+/// reporting subscription hosted at `/subscriptions` (not `/app-client-infos`).
+const APPCLIENTINFO_RESOURCES_PATH: &str = "/eees-appclientinformation/v1/subscriptions";
 
 /// Resource path prefix for ACR Management Event subscription resources (eesd-13).
 const ACRMGNTEVENT_SUBSCRIPTIONS_PATH: &str = "/eees-acrmgntevent/v1/subscriptions";
@@ -450,25 +452,29 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 _ => send_method_not_allowed(method, "announcements/{announcementId}"),
             }
         }
-        // eesd-13: eees-appclientinformation (TS 29.558 §5.5) — App Client Information.
-        ["eees-appclientinformation", "v1", "app-client-infos"] => {
+        // eesd-13: eees-appclientinformation (TS 29.558 §8.4.2) — AC Information
+        // reporting subscriptions, hosted at /subscriptions per the spec.
+        ["eees-appclientinformation", "v1", "subscriptions"] => {
             if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCLIENTINFORMATION) {
                 return resp;
             }
             match method {
                 "POST" => handle_acinfo_create(&request).await,
                 "GET" => handle_acinfo_list().await,
-                _ => send_method_not_allowed(method, "app-client-infos"),
+                _ => send_method_not_allowed(method, "subscriptions"),
             }
         }
-        ["eees-appclientinformation", "v1", "app-client-infos", ac_info_id] => {
+        ["eees-appclientinformation", "v1", "subscriptions", subscription_id] => {
             if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCLIENTINFORMATION) {
                 return resp;
             }
             match method {
-                "GET" => handle_acinfo_get(ac_info_id).await,
-                "DELETE" => handle_acinfo_delete(ac_info_id).await,
-                _ => send_method_not_allowed(method, "app-client-infos/{acInfoId}"),
+                "GET" => handle_acinfo_get(subscription_id).await,
+                // TS 29.558 §8.4.2 table 8.4.2.1-1: both full update (PUT) and
+                // partial update (PATCH) are defined on the individual resource.
+                "PUT" | "PATCH" => handle_acinfo_update(subscription_id, &request).await,
+                "DELETE" => handle_acinfo_delete(subscription_id).await,
+                _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
         }
         // eesd-13: eees-acrmgntevent (TS 29.558 §5.8) — ACR Management Event subscriptions.
@@ -493,14 +499,25 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
         }
-        // eesd-13: eees-eeccontextreloc (TS 29.558 §5.10) — EEC Context Relocation.
-        ["eees-eeccontextreloc", "v1", "request-relocation"] => {
+        // eesd-13: eees-eeccontextreloc (TS 29.558 §8.7.2) — EEC Contexts.
+        // Spec resource is /eec-contexts: POST pushes an EEC context, GET pulls.
+        ["eees-eeccontextreloc", "v1", "eec-contexts"] => {
             if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EECCONTEXTRELOC) {
                 return resp;
             }
             match method {
-                "POST" => handle_eec_ctxt_reloc(&request).await,
-                _ => send_method_not_allowed(method, "request-relocation"),
+                "POST" => handle_eec_context_push(&request).await,
+                "GET" => handle_eec_context_list().await,
+                _ => send_method_not_allowed(method, "eec-contexts"),
+            }
+        }
+        ["eees-eeccontextreloc", "v1", "eec-contexts", eec_id] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EECCONTEXTRELOC) {
+                return resp;
+            }
+            match method {
+                "GET" => handle_eec_context_pull(eec_id).await,
+                _ => send_method_not_allowed(method, "eec-contexts/{eecId}"),
             }
         }
         // eesd-13: eees-acr-param (TS 29.558 §5.13) — ACR Parameter Information.
@@ -1415,9 +1432,9 @@ async fn handle_cea_delete(announcement_id: &str) -> SbiResponse {
 
 // ---- eesd-13: eees-appclientinformation handlers ----------------------------
 
-/// `ProvideAppClientInfo` (`POST .../eees-appclientinformation/v1/app-client-infos`).
+/// `ProvideAppClientInfo` (`POST .../eees-appclientinformation/v1/subscriptions`).
 ///
-/// Parses `AppClientInfo` (mandatory: `acId`), mints an `acInfoId`,
+/// Parses `AppClientInfo` (mandatory: `acId`), mints an `subscriptionId`,
 /// and returns 201 + `Location` + echoed body.
 async fn handle_acinfo_create(request: &SbiRequest) -> SbiResponse {
     log::info!("AppClientInfo create");
@@ -1443,7 +1460,7 @@ async fn handle_acinfo_create(request: &SbiRequest) -> SbiResponse {
     let ctx = ees_self();
     match ctx.read().ok().and_then(|c| c.acinfo_create(info)) {
         Some(created) => {
-            let id = created.ac_info_id.clone().unwrap_or_default();
+            let id = created.subscription_id.clone().unwrap_or_default();
             SbiResponse::with_status(201)
                 .with_header("Location", format!("{APPCLIENTINFO_RESOURCES_PATH}/{id}"))
                 .with_json_body(&created)
@@ -1468,32 +1485,73 @@ async fn handle_acinfo_list() -> SbiResponse {
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-async fn handle_acinfo_get(ac_info_id: &str) -> SbiResponse {
+async fn handle_acinfo_get(subscription_id: &str) -> SbiResponse {
     let info = ees_self()
         .read()
         .ok()
-        .and_then(|c| c.acinfo_find(ac_info_id));
+        .and_then(|c| c.acinfo_find(subscription_id));
     match info {
         Some(info) => SbiResponse::with_status(200)
             .with_json_body(&info)
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(
-            &format!("AppClientInfo {ac_info_id} not found"),
+            &format!("AppClientInfo {subscription_id} not found"),
             Some(cause::SUBSCRIPTION_NOT_FOUND),
         ),
     }
 }
 
-async fn handle_acinfo_delete(ac_info_id: &str) -> SbiResponse {
-    log::info!("AppClientInfo delete: {ac_info_id}");
+/// TS 29.558 §8.4.2: PUT (full replace) / PATCH (partial update) of an existing
+/// AC-information subscription. The server-minted `subscriptionId` is preserved
+/// regardless of the body, and the updated resource is returned (200).
+async fn handle_acinfo_update(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("AppClientInfo update: {subscription_id}");
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let mut info: AppClientInfo = match serde_json::from_value(value) {
+        Ok(i) => i,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (acId): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if info.ac_id.trim().is_empty() {
+        return send_bad_request(
+            "Mandatory IE acId is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    // The resource id is immutable and taken from the URI, never the body.
+    info.subscription_id = Some(subscription_id.to_string());
+    match ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.acinfo_update(subscription_id, info))
+    {
+        Some(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("AppClientInfo {subscription_id} not found"),
+            Some(cause::SUBSCRIPTION_NOT_FOUND),
+        ),
+    }
+}
+
+async fn handle_acinfo_delete(subscription_id: &str) -> SbiResponse {
+    log::info!("AppClientInfo delete: {subscription_id}");
     let removed = ees_self()
         .read()
         .ok()
-        .and_then(|c| c.acinfo_delete(ac_info_id));
+        .and_then(|c| c.acinfo_delete(subscription_id));
     match removed {
         Some(_) => SbiResponse::with_status(204),
         None => send_not_found(
-            &format!("AppClientInfo {ac_info_id} not found"),
+            &format!("AppClientInfo {subscription_id} not found"),
             Some(cause::SUBSCRIPTION_NOT_FOUND),
         ),
     }
@@ -1625,48 +1683,75 @@ async fn handle_acrmgnt_sub_delete(subscription_id: &str) -> SbiResponse {
 
 // ---- eesd-13: eees-eeccontextreloc handler ----------------------------------
 
-/// `RequestEECContextRelocation` (`POST .../eees-eeccontextreloc/v1/request-relocation`).
-///
-/// Parses `EecCtxtRelReq` (mandatory: `eecId`, `srcEesId`, `tgtEesId`).
-/// This EES always returns `SUCCESS` — the actual cross-EES context transfer
-/// protocol is out of scope for the unit-tested stub (no live peer EES).
-async fn handle_eec_ctxt_reloc(request: &SbiRequest) -> SbiResponse {
-    log::info!("EEC context relocation request");
+/// Push an EEC context (`POST .../eees-eeccontextreloc/v1/eec-contexts`,
+/// TS 29.558 §8.7.2). Parses `EecContext` (mandatory: `eecId`), stores it, and
+/// returns 201 Created with a `Location` to the individual resource.
+async fn handle_eec_context_push(request: &SbiRequest) -> SbiResponse {
+    log::info!("EEC context push");
     let value = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let req: EecCtxtRelReq = match serde_json::from_value(value) {
-        Ok(r) => r,
+    let ctx: EecContext = match serde_json::from_value(value) {
+        Ok(c) => c,
         Err(e) => {
             return send_bad_request(
-                &format!("Missing or invalid mandatory IE (eecId/srcEesId/tgtEesId): {e}"),
+                &format!("Missing or invalid mandatory IE (eecId): {e}"),
                 Some(cause::MANDATORY_IE_MISSING),
             );
         }
     };
-    if req.eec_id.trim().is_empty()
-        || req.src_ees_id.trim().is_empty()
-        || req.tgt_ees_id.trim().is_empty()
-    {
+    if ctx.eec_id.trim().is_empty() {
         return send_bad_request(
-            "Mandatory IE eecId/srcEesId/tgtEesId is empty",
+            "Mandatory IE eecId is empty",
             Some(cause::MANDATORY_IE_MISSING),
         );
     }
-    log::info!(
-        "EEC context relocation: eecId={} src={} tgt={} (stub → SUCCESS)",
-        req.eec_id,
-        req.src_ees_id,
-        req.tgt_ees_id
-    );
-    let resp = EecCtxtRelResp {
-        eec_id: req.eec_id,
-        reloc_result: RelocResult::Success,
-        supp_feat: req.supp_feat,
-    };
+    let eec_id = ctx.eec_id.clone();
+    match ees_self().read().ok().and_then(|c| c.eec_context_push(ctx)) {
+        Some(stored) => SbiResponse::with_status(201)
+            .with_header(
+                "Location",
+                format!("/eees-eeccontextreloc/v1/eec-contexts/{eec_id}"),
+            )
+            .with_json_body(&stored)
+            .unwrap_or_else(|_| SbiResponse::with_status(201)),
+        None => send_error(
+            507,
+            "Insufficient Storage",
+            "Failed to store EEC context (capacity exhausted)",
+            Some(cause::INSUFFICIENT_RESOURCES),
+        ),
+    }
+}
+
+/// Pull one EEC context by `eecId`
+/// (`GET .../eees-eeccontextreloc/v1/eec-contexts/{eecId}`, TS 29.558 §8.7.2).
+async fn handle_eec_context_pull(eec_id: &str) -> SbiResponse {
+    match ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.eec_context_pull(eec_id))
+    {
+        Some(ctx) => SbiResponse::with_status(200)
+            .with_json_body(&ctx)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("EEC context {eec_id} not found"),
+            Some(cause::SUBSCRIPTION_NOT_FOUND),
+        ),
+    }
+}
+
+/// List all stored EEC contexts
+/// (`GET .../eees-eeccontextreloc/v1/eec-contexts`, TS 29.558 §8.7.2).
+async fn handle_eec_context_list() -> SbiResponse {
+    let ctxs = ees_self()
+        .read()
+        .map(|c| c.eec_context_list())
+        .unwrap_or_default();
     SbiResponse::with_status(200)
-        .with_json_body(&resp)
+        .with_json_body(&ctxs)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
@@ -2552,7 +2637,7 @@ mod tests {
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
         let body = r#"{"acId":"ac-uniq-1","easIds":["eas1"],"acType":"V2X"}"#;
-        let req = SbiRequest::post("/eees-appclientinformation/v1/app-client-infos")
+        let req = SbiRequest::post("/eees-appclientinformation/v1/subscriptions")
             .with_header(
                 "Authorization",
                 bearer(&sk, "k1", "eees-appclientinformation"),
@@ -2566,34 +2651,43 @@ mod tests {
         let created: AppClientInfo =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(created.ac_id, "ac-uniq-1");
-        assert_eq!(created.ac_info_id.as_deref(), Some(id.as_str()));
+        assert_eq!(created.subscription_id.as_deref(), Some(id.as_str()));
 
         // GET → 200.
-        let req = SbiRequest::get(format!(
-            "/eees-appclientinformation/v1/app-client-infos/{id}"
-        ))
-        .with_header(
-            "Authorization",
-            bearer(&sk, "k1", "eees-appclientinformation"),
-        );
+        let req = SbiRequest::get(format!("/eees-appclientinformation/v1/subscriptions/{id}"))
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", "eees-appclientinformation"),
+            );
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
 
+        // PUT (full update) → 200, id preserved (TS 29.558 §8.4.2).
+        let put_body = r#"{"acId":"ac-uniq-1","acType":"IoT"}"#;
+        let req = SbiRequest::put(format!("/eees-appclientinformation/v1/subscriptions/{id}"))
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", "eees-appclientinformation"),
+            )
+            .with_body(put_body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let updated: AppClientInfo =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(updated.subscription_id.as_deref(), Some(id.as_str()));
+        assert_eq!(updated.ac_type.as_deref(), Some("IoT"));
+
         // DELETE → 204; GET → 404.
-        let req = SbiRequest::delete(format!(
-            "/eees-appclientinformation/v1/app-client-infos/{id}"
-        ))
-        .with_header(
-            "Authorization",
-            bearer(&sk, "k1", "eees-appclientinformation"),
-        );
+        let req = SbiRequest::delete(format!("/eees-appclientinformation/v1/subscriptions/{id}"))
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", "eees-appclientinformation"),
+            );
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
-        let req = SbiRequest::get(format!(
-            "/eees-appclientinformation/v1/app-client-infos/{id}"
-        ))
-        .with_header(
-            "Authorization",
-            bearer(&sk, "k1", "eees-appclientinformation"),
-        );
+        let req = SbiRequest::get(format!("/eees-appclientinformation/v1/subscriptions/{id}"))
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", "eees-appclientinformation"),
+            );
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
 
         auth::clear_auth_jwks();
@@ -2651,10 +2745,11 @@ mod tests {
         auth::clear_auth_jwks();
     }
 
-    /// eesd-13 eees-eeccontextreloc: mandatory three-ID body → 200 + SUCCESS;
-    /// missing `srcEesId` → 400; no token → 401.
+    /// eesd-13 eees-eeccontextreloc (TS 29.558 §8.7.2): POST /eec-contexts pushes
+    /// a context (201 + Location), GET pulls it back (200); missing `eecId` → 400;
+    /// no token → 401.
     #[test]
-    fn test_eec_context_reloc_200_and_400() {
+    fn test_eec_context_push_pull() {
         let _g = auth::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2662,28 +2757,43 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        // Valid relocation request → 200 + SUCCESS.
-        let body = r#"{"eecId":"eec1","srcEesId":"ees-src.local","tgtEesId":"ees-tgt.local"}"#;
-        let req = SbiRequest::post("/eees-eeccontextreloc/v1/request-relocation")
+        // POST push → 201 + Location to /eec-contexts/{eecId}.
+        let body = r#"{"eecId":"eec1","ueId":"ue-1"}"#;
+        let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
             .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"))
             .with_body(body, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
-        assert_eq!(resp.status, 200);
-        let reloc: EecCtxtRelResp =
+        assert_eq!(resp.status, 201);
+        let loc = resp.http.get_header("location").cloned().unwrap();
+        assert_eq!(loc, "/eees-eeccontextreloc/v1/eec-contexts/eec1");
+        let stored: EecContext =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(reloc.eec_id, "eec1");
-        assert_eq!(reloc.reloc_result, RelocResult::Success);
+        assert_eq!(stored.eec_id, "eec1");
 
-        // Missing srcEesId → 400.
-        let bad = r#"{"eecId":"eec1","tgtEesId":"ees-tgt.local"}"#;
-        let req = SbiRequest::post("/eees-eeccontextreloc/v1/request-relocation")
+        // GET pull → 200 with the stored context.
+        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts/eec1")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let pulled: EecContext =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pulled.ue_id.as_deref(), Some("ue-1"));
+
+        // Unknown eecId → 404.
+        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts/nope")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        // Missing eecId → 400.
+        let bad = r#"{"ueId":"ue-1"}"#;
+        let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
             .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"))
             .with_body(bad, "application/json");
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
 
         // No token → 401.
         auth::clear_auth_jwks();
-        let req = SbiRequest::post("/eees-eeccontextreloc/v1/request-relocation")
+        let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
             .with_body(body, "application/json");
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 401);
 
@@ -2762,9 +2872,9 @@ mod tests {
 
         for path in [
             "/eees-cea/v1/announcements",
-            "/eees-appclientinformation/v1/app-client-infos",
+            "/eees-appclientinformation/v1/subscriptions",
             "/eees-acrmgntevent/v1/subscriptions",
-            "/eees-eeccontextreloc/v1/request-relocation",
+            "/eees-eeccontextreloc/v1/eec-contexts",
             "/eees-acr-param/v1/request-acr-params",
         ] {
             let req = SbiRequest::post(path);

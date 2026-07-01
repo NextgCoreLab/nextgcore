@@ -54,10 +54,10 @@ pub struct CeaAnnouncement {
 // ============================================================================
 
 /// `AppClientInfo` — body of `ProvideAppClientInfo`
-/// (`POST .../eees-appclientinformation/v1/app-client-infos`) and stored
+/// (`POST .../eees-appclientinformation/v1/subscriptions`) and stored
 /// resource.
 ///
-/// Mandatory IE: `acId`. The server mints an `acInfoId` on creation.
+/// Mandatory IE: `acId`. The server mints an `subscriptionId` on creation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppClientInfo {
@@ -65,7 +65,7 @@ pub struct AppClientInfo {
     pub ac_id: String,
     /// Server-minted resource identifier (read-only; populated on creation).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ac_info_id: Option<String>,
+    pub subscription_id: Option<String>,
     /// EAS application identifiers this AC connects to (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eas_ids: Option<Vec<String>>,
@@ -139,6 +139,29 @@ pub enum RelocResult {
     Success,
     /// Context relocation failed.
     Failure,
+}
+
+/// `EECContext` — the EEC Context resource of the EEC-context-relocation API
+/// (TS 29.558 §8.7.2), pushed via `POST .../eec-contexts` and pulled via
+/// `GET .../eec-contexts`.
+///
+/// Mandatory IE: `eecId` (the context key). Only the spec-known identifying
+/// fields are modelled here; the full EEC-context body (AC/EAS/session state)
+/// is intentionally left as an opaque passthrough rather than fabricated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EecContext {
+    /// EEC identifier (mandatory) — the resource key.
+    pub eec_id: String,
+    /// UE identifier (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ue_id: Option<String>,
+    /// Opaque EEC context payload carried verbatim (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eec_context_info: Option<serde_json::Value>,
+    /// Supported features (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supp_feat: Option<String>,
 }
 
 /// `EecCtxtRelReq` — body of `RequestEECContextRelocation`
@@ -265,7 +288,7 @@ mod tests {
         let body = r#"{"acId":"ac1"}"#;
         let info: AppClientInfo = serde_json::from_str(body).expect("deserializes");
         assert_eq!(info.ac_id, "ac1");
-        assert!(info.ac_info_id.is_none());
+        assert!(info.subscription_id.is_none());
         let back = serde_json::to_string(&info).unwrap();
         assert!(back.contains(r#""acId":"ac1""#));
     }
@@ -276,19 +299,19 @@ mod tests {
         assert!(serde_json::from_str::<AppClientInfo>(r#"{"easIds":["eas1"]}"#).is_err());
     }
 
-    /// Full round-trip with `acInfoId` and optional fields.
+    /// Full round-trip with `subscriptionId` and optional fields.
     #[test]
     fn test_app_client_info_full_roundtrip() {
         let info = AppClientInfo {
             ac_id: "ac1".into(),
-            ac_info_id: Some("acinfo-uuid-1".into()),
+            subscription_id: Some("acinfo-uuid-1".into()),
             eas_ids: Some(vec!["eas1".into(), "eas2".into()]),
             ac_type: Some("V2X".into()),
             exp_time: None,
             supp_feat: Some("1".into()),
         };
         let json = serde_json::to_string(&info).unwrap();
-        assert!(json.contains(r#""acInfoId":"acinfo-uuid-1""#));
+        assert!(json.contains(r#""subscriptionId":"acinfo-uuid-1""#));
         assert!(json.contains(r#""easIds""#));
         assert!(json.contains(r#""acType":"V2X""#));
         let back: AppClientInfo = serde_json::from_str(&json).unwrap();
