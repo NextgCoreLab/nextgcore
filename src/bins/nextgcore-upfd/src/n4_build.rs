@@ -1460,12 +1460,15 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
     // Gate Status (IE type 25)
     if let Some(ie) = ParsedIe::find_ie(&ies, 25) {
         if !ie.value.is_empty() {
-            qer.ul_gate = ie.value[0] & 0x03; // bits 0-1
-            qer.dl_gate = (ie.value[0] >> 2) & 0x03; // bits 2-3
+            // TS 29.244 §8.2.7 (Fig 8.2.7-1): octet 5 bits 1-2 = DL Gate,
+            // bits 3-4 = UL Gate (matches smfd's add_gate_status encode).
+            qer.dl_gate = ie.value[0] & 0x03; // bits 1-2
+            qer.ul_gate = (ie.value[0] >> 2) & 0x03; // bits 3-4
         }
     }
 
-    // MBR (IE type 26)
+    // MBR (IE type 26). TS 29.244 §8.2.8: the 5-octet fields are kbit/s;
+    // convert to bit/s for the internal rate policer.
     if let Some(ie) = ParsedIe::find_ie(&ies, 26) {
         if ie.value.len() >= 10 {
             qer.ul_mbr = u64::from_be_bytes([
@@ -1477,7 +1480,8 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[2],
                 ie.value[3],
                 ie.value[4],
-            ]);
+            ])
+            .saturating_mul(1000);
             qer.dl_mbr = u64::from_be_bytes([
                 0,
                 0,
@@ -1487,11 +1491,12 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[7],
                 ie.value[8],
                 ie.value[9],
-            ]);
+            ])
+            .saturating_mul(1000);
         }
     }
 
-    // GBR (IE type 27)
+    // GBR (IE type 27). TS 29.244 §8.2.9: kbit/s on the wire -> bit/s internal.
     if let Some(ie) = ParsedIe::find_ie(&ies, 27) {
         if ie.value.len() >= 10 {
             qer.ul_gbr = u64::from_be_bytes([
@@ -1503,7 +1508,8 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[2],
                 ie.value[3],
                 ie.value[4],
-            ]);
+            ])
+            .saturating_mul(1000);
             qer.dl_gbr = u64::from_be_bytes([
                 0,
                 0,
@@ -1513,7 +1519,8 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[7],
                 ie.value[8],
                 ie.value[9],
-            ]);
+            ])
+            .saturating_mul(1000);
         }
     }
 

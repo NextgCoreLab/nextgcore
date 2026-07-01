@@ -798,21 +798,21 @@ impl PfcpMessageBuilder {
         self.add_tlv(pfcp_ie::OUTER_HEADER_CREATION, &value)
     }
 
-    /// Add MBR (Maximum Bit Rate) IE
+    /// Add MBR (Maximum Bit Rate) IE. `uplink`/`downlink` are in bit/s; the
+    /// TS 29.244 §8.2.8 field is kbit/s (5 octets each), so convert (round up).
     pub fn add_mbr(&mut self, uplink: u64, downlink: u64) -> &mut Self {
         let mut value = BytesMut::new();
-        // MBR is encoded as 5 bytes each for UL and DL
-        value.put_slice(&uplink.to_be_bytes()[3..8]); // 5 bytes
-        value.put_slice(&downlink.to_be_bytes()[3..8]); // 5 bytes
+        value.put_slice(&uplink.div_ceil(1000).to_be_bytes()[3..8]); // 5 bytes, kbit/s
+        value.put_slice(&downlink.div_ceil(1000).to_be_bytes()[3..8]); // 5 bytes, kbit/s
         self.add_tlv(pfcp_ie::MBR, &value)
     }
 
-    /// Add GBR (Guaranteed Bit Rate) IE
+    /// Add GBR (Guaranteed Bit Rate) IE. `uplink`/`downlink` are in bit/s; the
+    /// TS 29.244 §8.2.9 field is kbit/s (5 octets each), so convert (round up).
     pub fn add_gbr(&mut self, uplink: u64, downlink: u64) -> &mut Self {
         let mut value = BytesMut::new();
-        // GBR is encoded as 5 bytes each for UL and DL
-        value.put_slice(&uplink.to_be_bytes()[3..8]); // 5 bytes
-        value.put_slice(&downlink.to_be_bytes()[3..8]); // 5 bytes
+        value.put_slice(&uplink.div_ceil(1000).to_be_bytes()[3..8]); // 5 bytes, kbit/s
+        value.put_slice(&downlink.div_ceil(1000).to_be_bytes()[3..8]); // 5 bytes, kbit/s
         self.add_tlv(pfcp_ie::GBR, &value)
     }
 

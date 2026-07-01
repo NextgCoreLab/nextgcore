@@ -620,13 +620,15 @@ impl UeIpAddress {
 
     /// Encode to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
+        // TS 29.244 §8.2.62 octet 5: bit 1 = V6, bit 2 = V4 (the opposite of
+        // F-TEID; same convention as F-SEID above). V6 is the LSB.
         let flags = ((self.ip6pl as u8) << 6)
             | ((self.chv6 as u8) << 5)
             | ((self.chv4 as u8) << 4)
             | ((self.ipv6d as u8) << 3)
             | ((self.sd as u8) << 2)
-            | ((self.ipv6 as u8) << 1)
-            | (self.ipv4 as u8);
+            | ((self.ipv4 as u8) << 1)
+            | (self.ipv6 as u8);
         buf.put_u8(flags);
         if let Some(addr) = &self.ipv4_addr {
             buf.put_slice(addr);
@@ -651,8 +653,9 @@ impl UeIpAddress {
             });
         }
         let flags = buf.get_u8();
-        let ipv4 = flags & 0x01 != 0;
-        let ipv6 = (flags >> 1) & 0x01 != 0;
+        // TS 29.244 §8.2.62 octet 5: bit 1 = V6, bit 2 = V4.
+        let ipv6 = flags & 0x01 != 0;
+        let ipv4 = (flags >> 1) & 0x01 != 0;
         let sd = (flags >> 2) & 0x01 != 0;
         let ipv6d = (flags >> 3) & 0x01 != 0;
         let chv4 = (flags >> 4) & 0x01 != 0;
@@ -955,16 +958,20 @@ impl OuterHeaderCreation {
 
     /// Encode to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
-        let desc = ((self.description.n6 as u16) << 9)
-            | ((self.description.n19 as u16) << 8)
-            | ((self.description.s_tag as u16) << 7)
-            | ((self.description.c_tag as u16) << 6)
-            | ((self.description.ipv6 as u16) << 5)
-            | ((self.description.ipv4 as u16) << 4)
-            | ((self.description.udp_ipv6 as u16) << 3)
-            | ((self.description.udp_ipv4 as u16) << 2)
-            | ((self.description.gtpu_udp_ipv6 as u16) << 1)
-            | (self.description.gtpu_udp_ipv4 as u16);
+        // TS 29.244 Table 8.2.56-1: octet 5 (transmitted first = high byte of
+        // the big-endian u16) carries GTP-U/UDP/IPv4 in bit 1 (u16 bit 8) up to
+        // S-TAG in bit 8 (u16 bit 15); octet 6 (low byte) carries N19 (bit 1)
+        // and N6 (bit 2). GTP-U/UDP/IPv4 must therefore encode to 0x0100.
+        let desc = ((self.description.gtpu_udp_ipv4 as u16) << 8)
+            | ((self.description.gtpu_udp_ipv6 as u16) << 9)
+            | ((self.description.udp_ipv4 as u16) << 10)
+            | ((self.description.udp_ipv6 as u16) << 11)
+            | ((self.description.ipv4 as u16) << 12)
+            | ((self.description.ipv6 as u16) << 13)
+            | ((self.description.c_tag as u16) << 14)
+            | ((self.description.s_tag as u16) << 15)
+            | (self.description.n19 as u16)
+            | ((self.description.n6 as u16) << 1);
         buf.put_u16(desc);
         if let Some(teid) = self.teid {
             buf.put_u32(teid);
@@ -995,17 +1002,19 @@ impl OuterHeaderCreation {
             });
         }
         let desc_val = buf.get_u16();
+        // TS 29.244 Table 8.2.56-1 (see encode): octet-5 flags in the high byte,
+        // N19/N6 in the low byte.
         let description = OuterHeaderCreationDescription {
-            gtpu_udp_ipv4: desc_val & 0x01 != 0,
-            gtpu_udp_ipv6: (desc_val >> 1) & 0x01 != 0,
-            udp_ipv4: (desc_val >> 2) & 0x01 != 0,
-            udp_ipv6: (desc_val >> 3) & 0x01 != 0,
-            ipv4: (desc_val >> 4) & 0x01 != 0,
-            ipv6: (desc_val >> 5) & 0x01 != 0,
-            c_tag: (desc_val >> 6) & 0x01 != 0,
-            s_tag: (desc_val >> 7) & 0x01 != 0,
-            n19: (desc_val >> 8) & 0x01 != 0,
-            n6: (desc_val >> 9) & 0x01 != 0,
+            gtpu_udp_ipv4: (desc_val >> 8) & 0x01 != 0,
+            gtpu_udp_ipv6: (desc_val >> 9) & 0x01 != 0,
+            udp_ipv4: (desc_val >> 10) & 0x01 != 0,
+            udp_ipv6: (desc_val >> 11) & 0x01 != 0,
+            ipv4: (desc_val >> 12) & 0x01 != 0,
+            ipv6: (desc_val >> 13) & 0x01 != 0,
+            c_tag: (desc_val >> 14) & 0x01 != 0,
+            s_tag: (desc_val >> 15) & 0x01 != 0,
+            n19: desc_val & 0x01 != 0,
+            n6: (desc_val >> 1) & 0x01 != 0,
         };
 
         let teid = if description.gtpu_udp_ipv4 || description.gtpu_udp_ipv6 {
@@ -4446,8 +4455,8 @@ mod tests {
         let mut buf = BytesMut::new();
         ue.encode(&mut buf);
         let encoded = buf.freeze();
-        // flags = V6 (0x02) | IP6PL (0x40) = 0x42
-        assert_eq!(encoded[0], 0x42);
+        // flags = V6 (0x01) | IP6PL (0x40) = 0x41 (TS 29.244 §8.2.62)
+        assert_eq!(encoded[0], 0x41);
         assert_eq!(encoded.len(), 1 + 16 + 1);
         assert_eq!(*encoded.last().unwrap(), 56);
 
@@ -4474,14 +4483,39 @@ mod tests {
     #[test]
     fn test_ue_ip_address_ip6pl_set_but_truncated_rejected() {
         // (b) IP6PL flag set but the trailing prefix-length octet is absent:
-        // flags = V6 (0x02) | IP6PL (0x40) followed by only the 16-byte IPv6
+        // flags = V6 (0x01) | IP6PL (0x40) followed by only the 16-byte IPv6
         // address. Strict decode must reject rather than silently drop it.
         let mut bytes = BytesMut::new();
-        bytes.put_u8(0x42);
+        bytes.put_u8(0x41);
         bytes.put_slice(&[0x20; 16]);
         assert!(matches!(
             UeIpAddress::decode(&mut bytes.freeze()),
             Err(PfcpError::BufferTooShort { .. })
         ));
+    }
+
+    #[test]
+    fn test_ue_ip_address_v4_v6_flag_bits_golden() {
+        // TS 29.244 §8.2.62: V6 is octet-5 bit 1 (0x01), V4 is bit 2 (0x02) —
+        // the same convention as F-SEID (§8.2.37), opposite F-TEID.
+        let mut buf = BytesMut::new();
+        UeIpAddress::new_ipv4([10, 45, 0, 2], false).encode(&mut buf);
+        assert_eq!(buf[0], 0x02, "V4-only UE IP flags must be 0x02");
+        let mut buf6 = BytesMut::new();
+        UeIpAddress::new_ipv6([0x20; 16], false).encode(&mut buf6);
+        assert_eq!(buf6[0], 0x01, "V6-only UE IP flags must be 0x01");
+    }
+
+    #[test]
+    fn test_outer_header_creation_gtpu_ipv4_golden() {
+        // TS 29.244 Table 8.2.56-1: GTP-U/UDP/IPv4 (octet 5 bit 1) encodes to
+        // 0x0100 on the wire (octet5=0x01, octet6=0x00).
+        let mut buf = BytesMut::new();
+        OuterHeaderCreation::new_gtpu_ipv4(0x1234_5678, [10, 0, 0, 1]).encode(&mut buf);
+        assert_eq!(&buf[0..2], &[0x01, 0x00], "GTP-U/UDP/IPv4 desc must be 0x0100");
+        let mut b = buf.freeze();
+        let decoded = OuterHeaderCreation::decode(&mut b).unwrap();
+        assert!(decoded.description.gtpu_udp_ipv4);
+        assert_eq!(decoded.teid, Some(0x1234_5678));
     }
 }

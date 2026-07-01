@@ -503,10 +503,11 @@ mod tests {
             .encode_body(&mut body);
 
         // OuterHeaderCreation IE: type 84 = 0x0054, len 10 (desc 2 + teid 4 +
-        // ipv4 4), description GTP-U/UDP/IPv4 = 0x0001.
+        // ipv4 4), description GTP-U/UDP/IPv4 = 0x0100 (TS 29.244 Table 8.2.56-1,
+        // octet 5 bit 1).
         let teid = p.c_teid.to_be_bytes();
         let needle = [
-            0x00, 0x54, 0x00, 0x0A, 0x00, 0x01, teid[0], teid[1], teid[2], teid[3], 239, 1, 0, 1,
+            0x00, 0x54, 0x00, 0x0A, 0x01, 0x00, teid[0], teid[1], teid[2], teid[3], 239, 1, 0, 1,
         ];
         assert!(
             body.windows(needle.len()).any(|w| w == needle),
