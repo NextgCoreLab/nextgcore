@@ -1698,18 +1698,21 @@ fn authorize_access_token(
     }
 }
 
-/// nrfd-05: client-credentials-assertion (CCA) binding check (TS 29.510 §6.7.5,
-/// TS 33.501 §13.3.1). Decodes the CCA JWT payload and verifies its subject is
-/// the body `nfInstanceId` and that it has not expired.
+/// nrfd-05 / CCA hardening: client-credentials-assertion (CCA) binding check
+/// (TS 29.510 §6.7.5, TS 33.501 §13.3.8.3). Decodes the CCA JWT payload and
+/// verifies its subject/issuer are the body `nfInstanceId`, that it has not
+/// expired, that the `iat` timestamp is present and not in the future, and that
+/// the `aud` claim matches the NRF's own NF type ("NRF").
 ///
-/// FLAGGED — transport plumbing not surfaced to nrfd: the CCA's ES256 SIGNATURE
-/// cannot be cryptographically verified here because the NRF does not hold the
-/// requesting NF's public key/cert in this crate, and the mutual-TLS client
-/// certificate subject is not surfaced on `SbiRequest` by the shared `nextgcore-sbi`
-/// transport. Full binding requires (a) a `SbiRequest::client_identity()`
-/// accessor exposing the TLS client-cert subject and (b) NF public-key
-/// distribution — both additive `nextgcore-sbi` work outside this crate. This
-/// function performs the in-process claim-binding portion only.
+/// FLAGGED — the CCA's ES256 SIGNATURE is still not cryptographically verified
+/// here: the NRF does not hold the requesting NF's public key/cert in this crate,
+/// and the mutual-TLS client-certificate subject is not surfaced on `SbiRequest`
+/// by the shared `nextgcore-sbi` transport. Full binding additionally requires
+/// (a) a `SbiRequest::client_identity()` accessor exposing the TLS client-cert
+/// subject and (b) NF public-key distribution — both additive `nextgcore-sbi`
+/// work outside this crate. This function performs the claim-binding plus the
+/// iat/aud validation mandated of the NRF by §13.3.8.3; signature verification
+/// remains deferred.
 fn verify_cca_binding(
     cca_jwt: &str,
     expected_nf_instance_id: &str,
@@ -1763,6 +1766,38 @@ fn verify_cca_binding(
                 "Client Credentials Assertion has expired".to_string(),
             ));
         }
+    }
+    // TS 33.501 §13.3.8.3: the NRF validates the timestamp (iat). The CCA carries
+    // it (§13.3.8.2); require its presence and reject a future-dated assertion,
+    // allowing a small clock skew.
+    const CCA_CLOCK_SKEW_SECS: u64 = 60;
+    match payload.get("iat").and_then(|v| v.as_u64()) {
+        Some(iat) if iat > now.saturating_add(CCA_CLOCK_SKEW_SECS) => {
+            return Err((
+                "invalid_client",
+                "Client Credentials Assertion iat is in the future".to_string(),
+            ));
+        }
+        Some(_) => {}
+        None => {
+            return Err((
+                "invalid_client",
+                "Client Credentials Assertion is missing the mandatory iat claim".to_string(),
+            ));
+        }
+    }
+    // TS 33.501 §13.3.8.3: the receiving NRF checks that the audience claim
+    // matches its own NF type ("NRF"). `aud` is a JSON string or array of strings.
+    let aud_matches_nrf = match payload.get("aud") {
+        Some(serde_json::Value::String(s)) => s == "NRF",
+        Some(serde_json::Value::Array(a)) => a.iter().any(|v| v.as_str() == Some("NRF")),
+        _ => false,
+    };
+    if !aud_matches_nrf {
+        return Err((
+            "invalid_client",
+            "Client Credentials Assertion audience does not match the NRF's NF type".to_string(),
+        ));
     }
     Ok(())
 }
@@ -3141,23 +3176,27 @@ mod tests {
         use base64::Engine;
         use serde_json::json;
 
-        // Build a CCA JWT with the given claims (signature is a placeholder —
-        // signature verification is FLAGGED, only the claim binding is checked).
+        let now = 1_000_000u64;
+        // Encode arbitrary CCA claims into a placeholder-signed JWT (signature
+        // verification is FLAGGED; this function checks the claim binding + iat/aud).
+        let encode_cca = |claims: serde_json::Value| -> String {
+            let h = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+            let p = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+            format!("{h}.{p}.{}", URL_SAFE_NO_PAD.encode(b"sig"))
+        };
+        // Conformant CCA defaults: iat=now, aud="NRF" (the NRF's own NF type).
         let cca = |sub: &str, iss: Option<&str>, exp: Option<u64>| -> String {
-            let mut claims = json!({ "sub": sub });
+            let mut claims = json!({ "sub": sub, "iat": now, "aud": "NRF" });
             if let Some(i) = iss {
                 claims["iss"] = json!(i);
             }
             if let Some(e) = exp {
                 claims["exp"] = json!(e);
             }
-            let h = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
-            let p = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
-            format!("{h}.{p}.{}", URL_SAFE_NO_PAD.encode(b"sig"))
+            encode_cca(claims)
         };
-        let now = 1_000_000u64;
 
-        // Matching subject + issuer, not expired -> Ok.
+        // Matching subject + issuer, not expired, iat present, aud NRF -> Ok.
         assert!(
             verify_cca_binding(&cca("nf-1", Some("nf-1"), Some(now + 100)), "nf-1", now).is_ok()
         );
@@ -3180,6 +3219,46 @@ mod tests {
             verify_cca_binding("not-a-jwt", "nf-1", now).unwrap_err().0,
             "invalid_client"
         );
+        // TS 33.501 §13.3.8.3 hardening: missing iat -> invalid_client.
+        assert_eq!(
+            verify_cca_binding(
+                &encode_cca(json!({ "sub": "nf-1", "aud": "NRF", "exp": now + 100 })),
+                "nf-1",
+                now
+            )
+            .unwrap_err()
+            .0,
+            "invalid_client"
+        );
+        // Future-dated iat (beyond skew) -> invalid_client.
+        assert_eq!(
+            verify_cca_binding(
+                &encode_cca(json!({ "sub": "nf-1", "aud": "NRF", "iat": now + 10_000 })),
+                "nf-1",
+                now
+            )
+            .unwrap_err()
+            .0,
+            "invalid_client"
+        );
+        // Audience not the NRF -> invalid_client.
+        assert_eq!(
+            verify_cca_binding(
+                &encode_cca(json!({ "sub": "nf-1", "aud": "UDM", "iat": now })),
+                "nf-1",
+                now
+            )
+            .unwrap_err()
+            .0,
+            "invalid_client"
+        );
+        // aud as an array containing NRF -> Ok.
+        assert!(verify_cca_binding(
+            &encode_cca(json!({ "sub": "nf-1", "aud": ["UDM", "NRF"], "iat": now })),
+            "nf-1",
+            now
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------
