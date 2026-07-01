@@ -301,6 +301,34 @@ impl UdmSdmSubscription {
     }
 }
 
+/// udmd#0: A stored Nudm_EE (Event Exposure) subscription (TS 29.503 6.4).
+#[derive(Debug, Clone)]
+pub struct UdmEeSubscription {
+    /// Unique subscription ID.
+    pub id: String,
+    /// UE identity scope (SUPI/GPSI/extgroupid/'anyUE').
+    pub ue_identity: String,
+    /// Event-occurrence callback URI.
+    pub callback_reference: String,
+    /// Raw EeSubscription JSON as received.
+    pub raw: String,
+}
+
+impl UdmEeSubscription {
+    pub fn for_ue(
+        ue_identity: impl Into<String>,
+        callback_reference: impl Into<String>,
+        raw: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            ue_identity: ue_identity.into(),
+            callback_reference: callback_reference.into(),
+            raw: raw.into(),
+        }
+    }
+}
+
 /// SUCI protection scheme identifiers (TS 23.003 Annex C / TS 33.501 Annex C)
 pub const PROTECTION_SCHEME_NULL: u8 = 0;
 /// ECIES Profile A (Curve25519)
@@ -415,6 +443,8 @@ pub struct UdmContext {
     sess_list: RwLock<HashMap<u64, UdmSess>>,
     /// SDM subscription list (by subscription ID)
     sdm_subscription_list: RwLock<HashMap<String, UdmSdmSubscription>>,
+    /// udmd#0: EE subscription list (by subscription ID)
+    ee_subscription_list: RwLock<HashMap<String, UdmEeSubscription>>,
     /// SUCI hash (SUCI -> pool ID)
     suci_hash: RwLock<HashMap<String, u64>>,
     /// SUPI hash (SUPI -> pool ID)
@@ -445,6 +475,7 @@ impl UdmContext {
             ue_list: RwLock::new(HashMap::new()),
             sess_list: RwLock::new(HashMap::new()),
             sdm_subscription_list: RwLock::new(HashMap::new()),
+            ee_subscription_list: RwLock::new(HashMap::new()),
             suci_hash: RwLock::new(HashMap::new()),
             supi_hash: RwLock::new(HashMap::new()),
             hnet_keys: RwLock::new(HashMap::new()),
@@ -927,6 +958,30 @@ impl UdmContext {
     pub fn sdm_subscription_find_by_id(&self, id: &str) -> Option<UdmSdmSubscription> {
         let sdm_list = self.sdm_subscription_list.read().ok()?;
         sdm_list.get(id).cloned()
+    }
+
+    /// udmd#0: Insert an EE subscription.
+    pub fn ee_subscription_insert(&self, sub: UdmEeSubscription) -> bool {
+        let mut ee_list = match self.ee_subscription_list.write() {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        let id = sub.id.clone();
+        ee_list.insert(id.clone(), sub);
+        log::debug!("EE subscription inserted (id={id})");
+        true
+    }
+
+    /// udmd#0: Find an EE subscription by ID.
+    pub fn ee_subscription_find_by_id(&self, id: &str) -> Option<UdmEeSubscription> {
+        let ee_list = self.ee_subscription_list.read().ok()?;
+        ee_list.get(id).cloned()
+    }
+
+    /// udmd#0: Remove an EE subscription by ID.
+    pub fn ee_subscription_remove(&self, id: &str) -> Option<UdmEeSubscription> {
+        let mut ee_list = self.ee_subscription_list.write().ok()?;
+        ee_list.remove(id)
     }
 
     /// Update SDM subscription in the context

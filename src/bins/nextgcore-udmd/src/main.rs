@@ -15,7 +15,8 @@ use nextgcore_sbi::server::{
 };
 use nextgcore_udmd::{
     timer_manager, timer_type_to_timer_id, udm_context_final, udm_context_init, udm_sbi_close,
-    udm_sbi_open, udm_self, SbiServerConfig, UdmEvent, UdmSdmSubscription, UdmSmContext,
+    udm_sbi_open, udm_self, SbiServerConfig, UdmEeSubscription, UdmEvent, UdmSdmSubscription,
+    UdmSmContext,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -395,6 +396,13 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
             match (*resource, method) {
                 ("am-data", "GET") => handle_get_am_data(supi, &request).await,
+                // udmd#1: SoR / UPU acknowledgement (TS 29.503 5.2.2.6, PUT).
+                ("am-data", "PUT") if parts.len() >= 5 && parts[4] == "sor-ack" => {
+                    handle_sor_ack(supi, &request).await
+                }
+                ("am-data", "PUT") if parts.len() >= 5 && parts[4] == "upu-ack" => {
+                    handle_upu_ack(supi, &request).await
+                }
                 ("smf-select-data", "GET") => handle_get_smf_select_data(supi, &request).await,
                 ("sm-data", "GET") => handle_get_sm_data(supi, &request).await,
                 ("nssai", "GET") => handle_get_nssai(supi, &request).await,
@@ -422,6 +430,22 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                     handle_generate_auth_data(supi, &request).await
                 }
                 ("auth-events", _, "POST") => handle_auth_event(supi, &request).await,
+                _ => send_method_not_allowed(method, uri),
+            }
+        }
+
+        // Event Exposure Service (nudm-ee) - udmd#0, TS 29.503 5.5/6.4
+        "nudm-ee" if parts.len() >= 4 => {
+            let ue_identity = parts[2];
+            let resource = parts.get(3).unwrap_or(&"");
+            match (*resource, method) {
+                ("ee-subscriptions", "POST") => handle_ee_subscribe(ue_identity, &request).await,
+                ("ee-subscriptions", "DELETE") if parts.len() >= 5 => {
+                    handle_ee_unsubscribe(ue_identity, parts[4]).await
+                }
+                ("ee-subscriptions", "PATCH") if parts.len() >= 5 => {
+                    handle_ee_modify(ue_identity, parts[4], &request).await
+                }
                 _ => send_method_not_allowed(method, uri),
             }
         }
@@ -833,6 +857,143 @@ async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiRespons
     if let Ok(context) = ctx.read() {
         context.sdm_subscription_remove(subscription_id);
     };
+    SbiResponse::with_status(204)
+}
+
+/// udmd#0: Nudm_EE CreateEeSubscription (TS 29.503 5.5.2.2 / 6.4).
+async fn handle_ee_subscribe(ue_identity: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("EE Subscribe: ueIdentity={ue_identity}");
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+    let ee_sub: serde_json::Value = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+    // EeSubscription mandatory IEs: callbackReference + monitoringConfigurations (TS29503_Nudm_EE.yaml:472-474).
+    let callback_reference = match ee_sub.get("callbackReference").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return send_bad_request(
+                "callbackReference is mandatory",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+    let has_moni = ee_sub
+        .get("monitoringConfigurations")
+        .and_then(|v| v.as_object())
+        .map(|m| !m.is_empty())
+        .unwrap_or(false);
+    if !has_moni {
+        return send_bad_request(
+            "monitoringConfigurations is mandatory",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    }
+    let sub = UdmEeSubscription::for_ue(ue_identity, callback_reference, body.clone());
+    let subscription_id = sub.id.clone();
+    {
+        let ctx = udm_self();
+        if let Ok(context) = ctx.read() {
+            context.ee_subscription_insert(sub);
+        };
+    }
+    // CreatedEeSubscription requires the echoed eeSubscription (yaml:409-413).
+    let mut echoed = ee_sub;
+    if let Some(obj) = echoed.as_object_mut() {
+        obj.insert(
+            "subscriptionId".to_string(),
+            serde_json::json!(subscription_id),
+        );
+    }
+    SbiResponse::with_status(201)
+        .with_header(
+            "Location",
+            format!("/nudm-ee/v1/{ue_identity}/ee-subscriptions/{subscription_id}"),
+        )
+        .with_json_body(&serde_json::json!({ "eeSubscription": echoed }))
+        .unwrap_or_else(|_| SbiResponse::with_status(201))
+}
+
+/// udmd#0: Nudm_EE DeleteEeSubscription (TS 29.503 5.5.2.3).
+async fn handle_ee_unsubscribe(ue_identity: &str, subscription_id: &str) -> SbiResponse {
+    log::info!("EE Unsubscribe: ueIdentity={ue_identity}, subscriptionId={subscription_id}");
+    let exists = {
+        let ctx = udm_self();
+        let guard = ctx.read().ok();
+        guard
+            .as_ref()
+            .and_then(|c| c.ee_subscription_find_by_id(subscription_id))
+            .is_some()
+    };
+    if !exists {
+        return send_problem(404, "NOT_FOUND", "Subscription not found");
+    }
+    let ctx = udm_self();
+    if let Ok(context) = ctx.read() {
+        context.ee_subscription_remove(subscription_id);
+    };
+    SbiResponse::with_status(204)
+}
+
+/// udmd#0: Nudm_EE UpdateEeSubscription (TS 29.503 5.5.2.4).
+/// JSON-Patch application deferred; 204 on existing sub / 404 otherwise (yaml 363).
+async fn handle_ee_modify(
+    ue_identity: &str,
+    subscription_id: &str,
+    _request: &SbiRequest,
+) -> SbiResponse {
+    log::info!("EE Modify: ueIdentity={ue_identity}, subscriptionId={subscription_id}");
+    let exists = {
+        let ctx = udm_self();
+        let guard = ctx.read().ok();
+        guard
+            .as_ref()
+            .and_then(|c| c.ee_subscription_find_by_id(subscription_id))
+            .is_some()
+    };
+    if !exists {
+        return send_problem(404, "NOT_FOUND", "Subscription not found");
+    }
+    SbiResponse::with_status(204)
+}
+
+/// udmd#1: Nudm_Sdm SoRAckInfo (TS 29.503 5.2.2.6, PUT /am-data/sor-ack).
+async fn handle_sor_ack(supi: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("SoR Ack: SUPI={supi}");
+    handle_ack_info(supi, request, "SoR")
+}
+
+/// udmd#1: Nudm_Sdm UpuAck (TS 29.503 5.2.2.6, PUT /am-data/upu-ack).
+async fn handle_upu_ack(supi: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("UPU Ack: SUPI={supi}");
+    handle_ack_info(supi, request, "UPU")
+}
+
+/// AcknowledgeInfo validation for SoR/UPU acks (TS29503_Nudm_SDM.yaml:4398).
+/// Mandatory IE: provisioningTime.
+fn handle_ack_info(supi: &str, request: &SbiRequest, kind: &str) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+    let ack: serde_json::Value = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+    if ack
+        .get("provisioningTime")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
+        return send_bad_request(
+            "provisioningTime is mandatory",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    }
+    log::info!("[{supi}] {kind} acknowledgement accepted");
     SbiResponse::with_status(204)
 }
 
@@ -2278,5 +2439,123 @@ mod tests {
             loc.starts_with("/nudm-ueau/v1/"),
             "Location must use nudm-ueau service path; got: {loc}"
         );
+    }
+
+    // ========================================================================
+    // udmd#0: EE subscribe persists; unsubscribe 404-on-missing then 204
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_ee_subscribe_persists_and_unsubscribe_404_then_204() {
+        let _ = env_logger::try_init();
+        use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
+        udm_context_init(64, 64);
+        let ue = "imsi-udmdee-0001";
+        // Missing monitoringConfigurations -> 400 MANDATORY_IE_MISSING.
+        let bad = SbiRequest {
+            header: SbiHeader::with_method_uri(
+                "POST",
+                format!("/nudm-ee/v1/{ue}/ee-subscriptions"),
+            ),
+            http: SbiHttpMessage {
+                content: Some(
+                    serde_json::json!({"callbackReference":"http://nef.example.org/ee-notify"})
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(handle_ee_subscribe(ue, &bad).await.status, 400);
+        // Valid -> 201 + Location + echoed eeSubscription.subscriptionId.
+        let req = SbiRequest {
+            header: SbiHeader::with_method_uri(
+                "POST",
+                format!("/nudm-ee/v1/{ue}/ee-subscriptions"),
+            ),
+            http: SbiHttpMessage {
+                content: Some(
+                    serde_json::json!({
+                        "callbackReference": "http://nef.example.org/ee-notify",
+                        "monitoringConfigurations": {"1": {}}
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resp = handle_ee_subscribe(ue, &req).await;
+        assert_eq!(resp.status, 201);
+        let loc = resp
+            .http
+            .headers
+            .get("location")
+            .cloned()
+            .unwrap_or_default();
+        assert!(loc.contains(ue) && loc.contains("ee-subscriptions"));
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+        let sub_id = body
+            .get("eeSubscription")
+            .and_then(|s| s.get("subscriptionId"))
+            .and_then(|v| v.as_str())
+            .expect("subscriptionId echoed")
+            .to_string();
+        assert_eq!(handle_ee_unsubscribe(ue, "nope-uuid").await.status, 404);
+        assert_eq!(handle_ee_unsubscribe(ue, &sub_id).await.status, 204);
+    }
+
+    // ========================================================================
+    // udmd#1: SoR/UPU ack requires provisioningTime, returns 204 on valid
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_sor_upu_ack_requires_provisioning_time_then_204() {
+        use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
+        let supi = "imsi-udmdsor-0001";
+        // Missing provisioningTime -> 400.
+        let bad = SbiRequest {
+            header: SbiHeader::with_method_uri(
+                "PUT",
+                format!("/nudm-sdm/v1/{supi}/am-data/sor-ack"),
+            ),
+            http: SbiHttpMessage {
+                content: Some("{}".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(handle_sor_ack(supi, &bad).await.status, 400);
+        // Valid SoR ack -> 204.
+        let ok = SbiRequest {
+            header: SbiHeader::with_method_uri(
+                "PUT",
+                format!("/nudm-sdm/v1/{supi}/am-data/sor-ack"),
+            ),
+            http: SbiHttpMessage {
+                content: Some(
+                    serde_json::json!({"provisioningTime": "2026-01-01T00:00:00Z"}).to_string(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(handle_sor_ack(supi, &ok).await.status, 204);
+        // Valid UPU ack -> 204.
+        let ok_upu = SbiRequest {
+            header: SbiHeader::with_method_uri(
+                "PUT",
+                format!("/nudm-sdm/v1/{supi}/am-data/upu-ack"),
+            ),
+            http: SbiHttpMessage {
+                content: Some(
+                    serde_json::json!({"provisioningTime": "2026-01-01T00:00:00Z"}).to_string(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(handle_upu_ack(supi, &ok_upu).await.status, 204);
     }
 }
