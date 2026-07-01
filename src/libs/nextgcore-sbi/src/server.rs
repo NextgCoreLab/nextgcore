@@ -264,19 +264,32 @@ impl OAuthVerifier {
         })
     }
 
-    async fn authorize(&self, auth_header: Option<&str>) -> SbiResult<()> {
+    /// Verify the bearer token's signature, expiry and (when configured)
+    /// audience, and — when `required_scope` is `Some` — that the token's scope
+    /// authorizes the invoked service (TS 33.501 §13.4.1.2, TS 29.510
+    /// §5.4.2.2.2). `required_scope` is the invoked apiName (service name);
+    /// `None` (e.g. a non-service path) skips only the scope check.
+    async fn authorize(
+        &self,
+        auth_header: Option<&str>,
+        required_scope: Option<&str>,
+    ) -> SbiResult<()> {
         let aud = self.expected_audience.as_deref();
-        match &self.keys {
+        let claims = match &self.keys {
             OAuthKeySource::Static(jwks) => {
-                crate::oauth::authorize_bearer_aud(auth_header, jwks, aud).map(|_| ())
+                crate::oauth::authorize_bearer_aud(auth_header, jwks, aud)?
             }
-            OAuthKeySource::Remote(cache) => {
-                cache.authorize_aud(auth_header, aud).await.map(|_| ())
+            OAuthKeySource::Remote(cache) => cache.authorize_aud(auth_header, aud).await?,
+            OAuthKeySource::Unconfigured => {
+                return Err(SbiError::ServerError(
+                    "require_oauth2 is enabled but neither oauth2_jwks nor oauth2_jwks_uri is configured".into(),
+                ))
             }
-            OAuthKeySource::Unconfigured => Err(SbiError::ServerError(
-                "require_oauth2 is enabled but neither oauth2_jwks nor oauth2_jwks_uri is configured".into(),
-            )),
+        };
+        if let Some(scope) = required_scope {
+            crate::oauth::check_token_scope(&claims.scope, scope)?;
         }
+        Ok(())
     }
 }
 
@@ -369,7 +382,10 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                     .http
                     .get_header("authorization")
                     .map(|s| s.as_str());
-                if let Err(e) = verifier.authorize(auth).await {
+                // TS 33.501 §13.4.1.2: reject a token whose scope does not
+                // authorize the invoked service (the decomposed apiName).
+                let required_scope = sbi_request.header.service_name.as_deref();
+                if let Err(e) = verifier.authorize(auth, required_scope).await {
                     let (status, title) = match e {
                         SbiError::AuthorizationFailed(_) => (401, "Unauthorized"),
                         _ => (503, "Service Unavailable"),
@@ -1199,7 +1215,7 @@ mod tests {
             expected_audience: None,
         };
         let err = unconfigured
-            .authorize(Some("Bearer a.b.c"))
+            .authorize(Some("Bearer a.b.c"), None)
             .await
             .unwrap_err();
         assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
@@ -1210,7 +1226,7 @@ mod tests {
             keys: OAuthKeySource::Static(serde_json::json!({"keys": []})),
             expected_audience: None,
         };
-        let err = static_v.authorize(None).await.unwrap_err();
+        let err = static_v.authorize(None, None).await.unwrap_err();
         assert!(matches!(err, SbiError::AuthorizationFailed(_)));
 
         // A remote source that can't be reached is our fault (mapped to 503).
@@ -1220,7 +1236,10 @@ mod tests {
             )),
             expected_audience: None,
         };
-        let err = remote.authorize(Some("Bearer a.b.c")).await.unwrap_err();
+        let err = remote
+            .authorize(Some("Bearer a.b.c"), None)
+            .await
+            .unwrap_err();
         assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
     }
 
@@ -1633,7 +1652,7 @@ mod tests {
             expected_audience: Some("UDM".into()),
         };
         let header = format!("Bearer {token}");
-        assert!(verifier.authorize(Some(&header)).await.is_ok());
+        assert!(verifier.authorize(Some(&header), None).await.is_ok());
 
         // Same token, but the verifier expects "AMF": rejected as
         // AuthorizationFailed (mapped to 401 on the wire).
@@ -1641,7 +1660,7 @@ mod tests {
             keys: OAuthKeySource::Static(jwks.clone()),
             expected_audience: Some("AMF".into()),
         };
-        let err = wrong.authorize(Some(&header)).await.unwrap_err();
+        let err = wrong.authorize(Some(&header), None).await.unwrap_err();
         assert!(matches!(err, SbiError::AuthorizationFailed(_)));
 
         // No expectation: audience not checked (current behaviour preserved).
@@ -1649,6 +1668,33 @@ mod tests {
             keys: OAuthKeySource::Static(jwks),
             expected_audience: None,
         };
-        assert!(none.authorize(Some(&header)).await.is_ok());
+        assert!(none.authorize(Some(&header), None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_oauth_scope_enforced() {
+        // The helper's token carries scope "nudm-sdm".
+        let (token, jwks) = token_jwks_with_aud("UDM");
+        let verifier = OAuthVerifier {
+            keys: OAuthKeySource::Static(jwks),
+            expected_audience: None,
+        };
+        let header = format!("Bearer {token}");
+
+        // Invoked service is in scope -> authorized.
+        assert!(verifier
+            .authorize(Some(&header), Some("nudm-sdm"))
+            .await
+            .is_ok());
+
+        // A different service the token is not scoped for -> 401.
+        let err = verifier
+            .authorize(Some(&header), Some("nudm-uecm"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SbiError::AuthorizationFailed(_)));
+
+        // No required scope (e.g. a non-service path) -> scope check skipped.
+        assert!(verifier.authorize(Some(&header), None).await.is_ok());
     }
 }

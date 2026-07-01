@@ -440,6 +440,25 @@ pub fn check_audience(aud: &serde_json::Value, expected: &str) -> SbiResult<()> 
     }
 }
 
+/// Verify that a token's space-delimited `scope` claim authorizes the invoked
+/// SBI service.
+///
+/// TS 33.501 §13.4.1.2 / TS 29.510 §5.4.2.2.2: the NRF issues a token whose
+/// `scope` lists the service name(s) the consumer is authorized to invoke on
+/// the producer; the producer must reject a request whose service is not among
+/// them. `required` is the invoked service name (apiName, e.g. `nudm-sdm`); the
+/// token is accepted when its scope contains that exact entry. Returns
+/// `AuthorizationFailed` (→ 401) otherwise.
+pub fn check_token_scope(scope_claim: &str, required: &str) -> SbiResult<()> {
+    if scope_claim.split_whitespace().any(|s| s == required) {
+        Ok(())
+    } else {
+        Err(SbiError::AuthorizationFailed(format!(
+            "token scope '{scope_claim}' does not authorize the requested service '{required}'"
+        )))
+    }
+}
+
 // ============================================================================
 // OAuth2 Client (Token exchange with NRF)
 // ============================================================================
