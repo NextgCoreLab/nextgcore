@@ -20,7 +20,6 @@ members = [
     "libs/nextgcore-proto",
     "libs/nextgcore-ipfw",
     "libs/nextgcore-tun",
-    # "libs/nextgcore-ffi",  # excluded: requires clang, no crate depends on it
 
     # Binary crates (mirrors src/)
     "bins/nextgcore-amfd",
@@ -129,9 +128,6 @@ diameter-rs = "0.5"            # Diameter protocol (AAA)
 # Pure Rust SCTP (userspace over UDP - no C dependencies)
 sctp-proto = "0.6"             # SCTP protocol (same as nextgsim for wire compatibility)
 
-# FFI and bindgen (optional - only for C interop testing)
-bindgen = "0.69"
-
 # Testing
 proptest = "1.4"
 hex-literal = "0.4"
@@ -174,7 +170,6 @@ nextgcore-metrics = { path = "libs/nextgcore-metrics" }
 nextgcore-proto = { path = "libs/nextgcore-proto" }
 nextgcore-ipfw = { path = "libs/nextgcore-ipfw" }
 nextgcore-tun = { path = "libs/nextgcore-tun" }
-nextgcore-ffi = { path = "libs/nextgcore-ffi" }
 
 # Workspace-wide lint configuration
 # 3GPP protocol implementations naturally have many parameters and complex types.

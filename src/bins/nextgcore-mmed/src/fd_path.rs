@@ -997,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn test_diameter_error_from_ogs() {
+    fn test_diameter_error_from_nextgcore() {
         let io_err = nextgcore_diameter::error::DiameterError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "refused",

@@ -341,7 +341,7 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     // [01, access&7]; 5G-GUTI (0x77 TLV-E) when a next-GUTI is assigned; single-TAI
     // partial list type-00 (0x54 TLV); Allowed NSSAI (0x15 TLV, omitted when empty);
     // T3512 = 9 minutes (GPRS timer 3, 0x49). Locked by
-    // `drift_registration_accept_minimal_through_ogs_nas` (reg-result+TAI+T3512) and
+    // `drift_registration_accept_minimal_through_nextgcore_nas` (reg-result+TAI+T3512) and
     // `golden_registration_accept_full` (GUTI + multi-S-NSSAI branches, derived from
     // the still-present encode_guti/encode_tai_list/encode_nssai_value helpers).
     debug_assert!(
@@ -361,7 +361,7 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     let guti = if amf_ue.next_guti.tmsi != 0 {
         let g = &amf_ue.next_guti;
         Some(nextgcore_ftypes::MobileIdentity::FiveGGuti(nextgcore_ftypes::FiveGGuti {
-            plmn_id: to_ogs_plmn(&g.plmn_id),
+            plmn_id: to_nextgcore_plmn(&g.plmn_id),
             amf_region_id: g.amf_region_id,
             amf_set_id: g.amf_set_id,
             amf_pointer: g.amf_pointer,
@@ -377,7 +377,7 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     let tai_list = Some(nextgcore_ftypes::TaiList {
         length: 0,
         elements: vec![nextgcore_ftypes::TaiListElement::PartialTaiList0 {
-            plmn_id: to_ogs_plmn(&tai.plmn_id),
+            plmn_id: to_nextgcore_plmn(&tai.plmn_id),
             tacs: vec![[(tai.tac >> 16) as u8, (tai.tac >> 8) as u8, tai.tac as u8]],
         }],
     });
@@ -427,7 +427,7 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
 /// Convert amfd's nibble-encoded PLMN into the nextgcore-nas digit-array `PlmnId` so the
 /// two encoders emit identical bytes. amfd marks a 2-digit MNC with `mnc3 == 0xf`;
 /// nextgcore-nas derives the 0xF filler from `mnc_len == 2`, so the two agree byte-for-byte.
-fn to_ogs_plmn(p: &crate::context::PlmnId) -> nextgcore_types::PlmnId {
+fn to_nextgcore_plmn(p: &crate::context::PlmnId) -> nextgcore_types::PlmnId {
     let mnc_len = if p.mnc3 == 0x0f { 2 } else { 3 };
     nextgcore_types::PlmnId::new([p.mcc1, p.mcc2, p.mcc3], [p.mnc1, p.mnc2, p.mnc3], mnc_len)
 }
@@ -475,7 +475,7 @@ pub fn encode_nssai_value(snssais: &[crate::context::SNssai]) -> Vec<u8> {
 /// nas-06 Phase 1: encoded via the conformant `nextgcore-nas` library. Byte-identical
 /// to the previous hand-rolled output (plain header + mandatory 5GMM cause; the
 /// optional T3346/T3502/EAP IEs are not emitted by amfd). Locked by
-/// `drift_registration_reject_through_ogs_nas` and `golden_registration_reject`.
+/// `drift_registration_reject_through_nextgcore_nas` and `golden_registration_reject`.
 pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
     let msg = nextgcore_msg::FiveGmmMessage::RegistrationReject(nextgcore_msg::RegistrationReject {
         gmm_cause: gmm_cause as u8,
@@ -492,7 +492,7 @@ pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
 pub fn build_security_mode_reject(gmm_cause: GmmCause) -> Vec<u8> {
     // nas-06 Phase 1: encoded via nextgcore-nas (plain header + mandatory 5GMM cause).
     // Byte-identical to the prior hand-rolled output; locked by
-    // `drift_security_mode_reject_through_ogs_nas` + `golden_security_mode_reject`.
+    // `drift_security_mode_reject_through_nextgcore_nas` + `golden_security_mode_reject`.
     let msg = nextgcore_msg::FiveGmmMessage::SecurityModeReject(nextgcore_msg::SecurityModeReject {
         gmm_cause: gmm_cause as u8,
     });
@@ -601,7 +601,7 @@ pub fn build_identity_request(identity_type: u8) -> Vec<u8> {
     // nas-06 Phase 2 (Tier A): encoded via nextgcore-nas (plain header + mandatory
     // type-of-identity V field, low 3 bits). Byte-identical to the prior hand-
     // rolled output for every valid identity type; locked by
-    // `drift_identity_request_through_ogs_nas` + `golden_identity_request`.
+    // `drift_identity_request_through_nextgcore_nas` + `golden_identity_request`.
     // Identity type 0 ("no identity") is invalid in an Identity Request (callers
     // pass SUCI/IMEISV); nextgcore-nas floors it to SUCI, so guard it in debug builds.
     debug_assert!(
@@ -622,7 +622,7 @@ pub fn build_identity_request(identity_type: u8) -> Vec<u8> {
 /// no length octet), AUTN (TLV, IEI 0x20). AUTN is the fixed 128-bit field, always
 /// 16 octets per TS 33.501 — nextgcore-nas hard-codes the length octet to 16, matching
 /// amfd's `autn.len()` for every real input (guarded by debug_assert). Locked by
-/// `drift_authentication_request_through_ogs_nas` + `golden_authentication_request`.
+/// `drift_authentication_request_through_nextgcore_nas` + `golden_authentication_request`.
 pub fn build_authentication_request(amf_ue: &AmfUe) -> Vec<u8> {
     debug_assert_eq!(
         amf_ue.autn.len(),
@@ -647,7 +647,7 @@ pub fn build_authentication_request(amf_ue: &AmfUe) -> Vec<u8> {
 ///
 /// nas-06 Phase 1: encoded via nextgcore-nas. amfd never carries the optional EAP
 /// message IE, so the output is the bare plain header — byte-identical to the
-/// prior hand-rolled output. Locked by `drift_authentication_reject_through_ogs_nas`
+/// prior hand-rolled output. Locked by `drift_authentication_reject_through_nextgcore_nas`
 /// + `golden_authentication_reject`.
 pub fn build_authentication_reject() -> Vec<u8> {
     let msg = nextgcore_msg::FiveGmmMessage::AuthenticationReject(nextgcore_msg::AuthenticationReject {
@@ -672,7 +672,7 @@ pub fn build_security_mode_command(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     //   - IMEISV request (type-1 TV, IEI 0xE, value 1 -> 0xE1)
     //   - Additional 5G security information (TLV, IEI 0x36, "retransmission requested")
     // ABBA is intentionally not carried (matches the prior encoder). Locked by
-    // `drift_security_mode_command_through_ogs_nas` + `golden_security_mode_command`
+    // `drift_security_mode_command_through_nextgcore_nas` + `golden_security_mode_command`
     // (the golden covers BOTH the 2- and 4-octet UE-sec-cap branches).
     let cap = &amf_ue.ue_security_capability;
     let replayed = if cap.eea != 0 || cap.eia != 0 {
@@ -706,7 +706,7 @@ pub fn build_configuration_update_command(
     // nas-06 Phase 2 (Tier D): encoded via nextgcore-nas. Byte-identical to the prior
     // hand-rolled output — optional configuration update indication (type-1 TV,
     // IEI 0xD: bit 1 = ack, bit 2 = registration) and optional 5G-GUTI (0x77 TLV-E,
-    // reusing to_ogs_plmn). amfd carries no other configuration IE (NITZ is a
+    // reusing to_nextgcore_plmn). amfd carries no other configuration IE (NITZ is a
     // future TODO and was never emitted). Locked by golden_configuration_update_command.
     let configuration_update_indication =
         if param.registration_requested || param.acknowledgement_requested {
@@ -725,7 +725,7 @@ pub fn build_configuration_update_command(
     let guti = if param.guti && amf_ue.next_guti.tmsi != 0 {
         let g = &amf_ue.next_guti;
         Some(nextgcore_ftypes::MobileIdentity::FiveGGuti(nextgcore_ftypes::FiveGGuti {
-            plmn_id: to_ogs_plmn(&g.plmn_id),
+            plmn_id: to_nextgcore_plmn(&g.plmn_id),
             amf_region_id: g.amf_region_id,
             amf_set_id: g.amf_set_id,
             amf_pointer: g.amf_pointer,
@@ -804,7 +804,7 @@ pub fn build_dl_nas_transport(
 ///
 /// nas-06 Phase 1: encoded via nextgcore-nas (plain header + mandatory 5GMM cause).
 /// Byte-identical to the prior hand-rolled output; locked by
-/// `drift_gmm_status_through_ogs_nas` + `golden_gmm_status`.
+/// `drift_gmm_status_through_nextgcore_nas` + `golden_gmm_status`.
 pub fn build_gmm_status(gmm_cause: GmmCause) -> Option<Vec<u8>> {
     let msg = nextgcore_msg::FiveGmmMessage::FiveGmmStatus(nextgcore_msg::FiveGmmStatus {
         gmm_cause: gmm_cause as u8,
@@ -996,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_authentication_reject_through_ogs_nas() {
+    fn drift_authentication_reject_through_nextgcore_nas() {
         use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_authentication_reject();
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
@@ -1005,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_registration_reject_through_ogs_nas() {
+    fn drift_registration_reject_through_nextgcore_nas() {
         use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_registration_reject(GmmCause::PlmnNotAllowed);
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
@@ -1014,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_security_mode_reject_through_ogs_nas() {
+    fn drift_security_mode_reject_through_nextgcore_nas() {
         use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_security_mode_reject(GmmCause::PlmnNotAllowed);
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
@@ -1023,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_gmm_status_through_ogs_nas() {
+    fn drift_gmm_status_through_nextgcore_nas() {
         use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_gmm_status(GmmCause::PlmnNotAllowed).unwrap();
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
@@ -1032,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_identity_request_through_ogs_nas() {
+    fn drift_identity_request_through_nextgcore_nas() {
         use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_identity_request(mobile_identity_type::SUCI);
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
@@ -1041,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_authentication_request_through_ogs_nas() {
+    fn drift_authentication_request_through_nextgcore_nas() {
         use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_authentication_request(&create_test_amf_ue());
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_security_mode_command_through_ogs_nas() {
+    fn drift_security_mode_command_through_nextgcore_nas() {
         use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let amfd = build_security_mode_command(&create_test_amf_ue()).unwrap();
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_registration_accept_minimal_through_ogs_nas() {
+    fn drift_registration_accept_minimal_through_nextgcore_nas() {
         use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         // Minimal happy-path Registration Accept: tmsi=0 skips the GUTI IE and
         // the default (empty) NSSAI skips the 0x15 IE, leaving reg-result +
@@ -1267,7 +1267,7 @@ mod tests {
 
     #[test]
     fn golden_registration_accept_3digit_mnc() {
-        // 3-digit MNC (310/260): to_ogs_plmn must use mnc_len=3 and the real 3rd
+        // 3-digit MNC (310/260): to_nextgcore_plmn must use mnc_len=3 and the real 3rd
         // digit, NOT the 0xf filler used for 2-digit MNCs. Exercises the GUTI and
         // TAI PLMN bytes on the 3-digit path (analytically proven, now golden-locked
         // via the self-verifying reconstruction from the old nibble helpers).

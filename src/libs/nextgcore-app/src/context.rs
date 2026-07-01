@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ogs_app_singleton() {
+    fn test_nextgcore_app_singleton() {
         let app1 = nextgcore_app();
         let app2 = nextgcore_app();
 

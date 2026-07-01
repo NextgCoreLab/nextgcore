@@ -31,7 +31,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ogs_random() {
+    fn test_nextgcore_random() {
         let mut buf1 = [0u8; 16];
         let mut buf2 = [0u8; 16];
 
@@ -45,7 +45,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ogs_random32() {
+    fn test_nextgcore_random32() {
         let r1 = nextgcore_random32();
         let r2 = nextgcore_random32();
 
@@ -54,7 +54,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ogs_random_bytes() {
+    fn test_nextgcore_random_bytes() {
         let bytes = nextgcore_random_bytes(32);
         assert_eq!(bytes.len(), 32);
         // Very unlikely to be all zeros

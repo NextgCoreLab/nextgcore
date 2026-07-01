@@ -54,7 +54,7 @@ pub fn nextgcore_time_to_duration(usec: NextgcoreTime) -> Duration {
 }
 
 /// Convert Duration to NextgcoreTime
-pub fn duration_to_ogs_time(d: Duration) -> NextgcoreTime {
+pub fn duration_to_nextgcore_time(d: Duration) -> NextgcoreTime {
     d.as_micros() as i64
 }
 

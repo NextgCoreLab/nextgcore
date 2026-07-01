@@ -450,7 +450,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ogs_uint24() {
+    fn test_nextgcore_uint24() {
         let u = NextgcoreUint24::new(0x123456);
         assert_eq!(u.v, 0x123456);
 
@@ -466,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ogs_id_parsing() {
+    fn test_nextgcore_id_parsing() {
         let supi = "imsi-123456789012345";
         assert_eq!(nextgcore_id_get_type(supi), Some("imsi".to_string()));
         assert_eq!(nextgcore_id_get_value(supi), Some("123456789012345".to_string()));
@@ -480,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ogs_ascii_to_hex() {
+    fn test_nextgcore_ascii_to_hex() {
         let mut buf = [0u8; 16];
         let len = nextgcore_ascii_to_hex("465B5CE8B199B49FAA5F0A2EE238A6BC", &mut buf);
         assert_eq!(len, 16);

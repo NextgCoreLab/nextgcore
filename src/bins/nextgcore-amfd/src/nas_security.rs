@@ -128,18 +128,18 @@ impl NasSecurityHeader {
 /// nas-06 Phase-6 C2: this is the single security-encode entry point that the
 /// 4 `ngap_path.rs` call sites already use, so they route through the gate
 /// transparently with zero textual change. With the canary
-/// `amf_ue.use_ogs_nas_security` OFF (the DEFAULT) it calls the unchanged
+/// `amf_ue.use_nextgcore_nas_security` OFF (the DEFAULT) it calls the unchanged
 /// hand-rolled [`nas_5gs_security_encode_legacy`] — byte-for-byte and
 /// behavior-for-behavior identical to the pre-Phase-6 code. With the canary ON
 /// it delegates to the conformant nextgcore-nas-backed adapter
-/// [`nas_5gs_security_encode_ogs`] (byte-identical for 3GPP-access frames).
+/// [`nas_5gs_security_encode_nextgcore`] (byte-identical for 3GPP-access frames).
 pub fn nas_5gs_security_encode(
     amf_ue: &mut AmfUe,
     message: &[u8],
     security_header_type: u8,
 ) -> Option<Vec<u8>> {
-    if amf_ue.use_ogs_nas_security {
-        nas_5gs_security_encode_ogs(amf_ue, message, security_header_type)
+    if amf_ue.use_nextgcore_nas_security {
+        nas_5gs_security_encode_nextgcore(amf_ue, message, security_header_type)
     } else {
         nas_5gs_security_encode_legacy(amf_ue, message, security_header_type)
     }
@@ -147,9 +147,9 @@ pub fn nas_5gs_security_encode(
 
 /// Hand-rolled NAS security encoder (the pre-nas-06 production path).
 ///
-/// PRESERVED UNCHANGED. Selected when the `use_ogs_nas_security` canary is OFF
+/// PRESERVED UNCHANGED. Selected when the `use_nextgcore_nas_security` canary is OFF
 /// (default). Do NOT modify — the Phase-6 adapter is proven byte-identical
-/// against this function (`encode_ogs_matches_legacy_*`).
+/// against this function (`encode_nextgcore_matches_legacy_*`).
 fn nas_5gs_security_encode_legacy(
     amf_ue: &mut AmfUe,
     message: &[u8],
@@ -239,10 +239,10 @@ fn nas_5gs_security_encode_legacy(
 /// Decode NAS message with security protection (gated dispatcher).
 ///
 /// nas-06 Phase-6 C2: single security-decode entry point used by the
-/// `ngap_path.rs` uplink call site. With the canary `amf_ue.use_ogs_nas_security`
+/// `ngap_path.rs` uplink call site. With the canary `amf_ue.use_nextgcore_nas_security`
 /// OFF (the DEFAULT, LIVE path) it calls the hand-rolled
 /// [`nas_5gs_security_decode_legacy`]. With the canary ON it delegates to the
-/// nextgcore-nas-backed adapter [`nas_5gs_security_decode_ogs`].
+/// nextgcore-nas-backed adapter [`nas_5gs_security_decode_nextgcore`].
 ///
 /// amfd-03/amfd-04: BOTH paths are now fail-closed and verify-then-commit. A MAC
 /// mismatch returns `Err(MacVerificationFailed)` (the tampered plaintext is never
@@ -256,15 +256,15 @@ pub fn nas_5gs_security_decode(
     security_header_type: u8,
     message: &[u8],
 ) -> Result<Vec<u8>, NasSecurityError> {
-    if amf_ue.use_ogs_nas_security {
-        nas_5gs_security_decode_ogs(amf_ue, security_header_type, message)
+    if amf_ue.use_nextgcore_nas_security {
+        nas_5gs_security_decode_nextgcore(amf_ue, security_header_type, message)
     } else {
         nas_5gs_security_decode_legacy(amf_ue, security_header_type, message)
     }
 }
 
 /// Hand-rolled NAS security decoder — the LIVE production decode path
-/// (selected when the `use_ogs_nas_security` canary is OFF, the default).
+/// (selected when the `use_nextgcore_nas_security` canary is OFF, the default).
 ///
 /// amfd-03 / amfd-04 (fail-closed, verify-then-commit): unlike the original
 /// lenient behaviour this:
@@ -411,7 +411,7 @@ fn nas_5gs_security_decode_legacy(
 //
 // These adapters delegate the NAS protect/unprotect primitives to the
 // conformant `nextgcore_nas::common::security` implementation. They run ONLY when
-// `amf_ue.use_ogs_nas_security` is true (default false); the default-OFF path
+// `amf_ue.use_nextgcore_nas_security` is true (default false); the default-OFF path
 // keeps the legacy hand-rolled encoders/decoders above byte-for-byte and
 // behavior-for-behavior unchanged.
 //
@@ -447,9 +447,9 @@ fn nas_count_to_u32(c: nextgcore_nas::common::security::NasCount) -> u32 {
 ///
 /// Delegates to `nextgcore_nas::common::security::protect_nas_message`. Proven
 /// byte-identical to [`nas_5gs_security_encode_legacy`] for 3GPP-access 5GMM
-/// downlink frames (see `encode_ogs_matches_legacy_*`). Gated behind
-/// `amf_ue.use_ogs_nas_security` (default false).
-fn nas_5gs_security_encode_ogs(
+/// downlink frames (see `encode_nextgcore_matches_legacy_*`). Gated behind
+/// `amf_ue.use_nextgcore_nas_security` (default false).
+fn nas_5gs_security_encode_nextgcore(
     amf_ue: &mut AmfUe,
     message: &[u8],
     security_header_type: u8,
@@ -522,13 +522,13 @@ fn nas_5gs_security_encode_ogs(
 ///   * rejects replays using the persisted `ul_count_established` high-water
 ///     state (TS 24.501 §4.4.3.2).
 ///
-/// Gated behind `amf_ue.use_ogs_nas_security` (default false).
+/// Gated behind `amf_ue.use_nextgcore_nas_security` (default false).
 ///
 /// E2E-UNVALIDATED: the lenient->strict flip MAY drop frames that the matched
 /// sim retransmits. Flipping the canary default + removing the hand-rolled
 /// decoder is DEFERRED pending matched-sim + real Open5GS E2E (registration +
 /// PDU session + ping).
-fn nas_5gs_security_decode_ogs(
+fn nas_5gs_security_decode_nextgcore(
     amf_ue: &mut AmfUe,
     security_header_type: u8,
     message: &[u8],
@@ -1313,7 +1313,7 @@ mod tests {
     /// `MAC|SQN|ciphered`, so we compare after stripping the 2-octet EPD|SHT.
     /// Pinned to access_type=1 (=> bearer 1 on both sides) and COUNT 0.
     #[test]
-    fn drift_security_encode_matches_ogs_nas_protect() {
+    fn drift_security_encode_matches_nextgcore_nas_protect() {
         use nextgcore_nas::common::security::{
             protect_nas_message, unprotect_nas_message, NasCount, NasSecurityContext,
         };
@@ -1369,7 +1369,7 @@ mod tests {
     /// the protected frames differ. This guard fails the moment nextgcore-nas takes
     /// a connection-id parameter (the divergence fix), at which point convert
     /// it to an assert_eq. The 3GPP path (access_type=1) is byte-equal and is
-    /// covered by `drift_security_encode_matches_ogs_nas_protect`.
+    /// covered by `drift_security_encode_matches_nextgcore_nas_protect`.
     #[test]
     fn drift_non_3gpp_bearer_divergence_locked() {
         use nextgcore_nas::common::security::{protect_nas_message, NasCount, NasSecurityContext};
@@ -1413,7 +1413,7 @@ mod tests {
     /// is the proof that flipping the canary leaves the ENCODE wire image
     /// unchanged for the production (3GPP) path.
     #[test]
-    fn encode_ogs_matches_legacy_byte_for_byte() {
+    fn encode_nextgcore_matches_legacy_byte_for_byte() {
         let cases: &[(&[u8], u8)] = &[
             (&[0x7e, 0x00, 0x41], security_header::INTEGRITY_PROTECTED),
             (
@@ -1435,7 +1435,7 @@ mod tests {
             let mut ue_old = create_test_ue();
             let mut ue_new = create_test_ue();
             let old = nas_5gs_security_encode_legacy(&mut ue_old, msg, sht);
-            let new = nas_5gs_security_encode_ogs(&mut ue_new, msg, sht);
+            let new = nas_5gs_security_encode_nextgcore(&mut ue_new, msg, sht);
             assert_eq!(old, new, "encode adapter byte-mismatch for sht={sht:#x}");
             // COUNT state must track identically.
             assert_eq!(ue_old.dl_count, ue_new.dl_count, "dl_count desync sht={sht:#x}");
@@ -1446,7 +1446,7 @@ mod tests {
     /// C1: byte-identity must hold across multiple consecutive encodes, proving
     /// the NasCount<->u32 writeback keeps the SQN/COUNT in lock-step.
     #[test]
-    fn encode_ogs_matches_legacy_across_multiple_counts() {
+    fn encode_nextgcore_matches_legacy_across_multiple_counts() {
         let mut ue_old = create_test_ue();
         let mut ue_new = create_test_ue();
         for i in 0..6u8 {
@@ -1456,7 +1456,7 @@ mod tests {
                 &msg,
                 security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
             );
-            let new = nas_5gs_security_encode_ogs(
+            let new = nas_5gs_security_encode_nextgcore(
                 &mut ue_new,
                 &msg,
                 security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
@@ -1477,7 +1477,7 @@ mod tests {
         // Default is OFF.
         let ue_default = create_test_ue();
         assert!(
-            !ue_default.use_ogs_nas_security,
+            !ue_default.use_nextgcore_nas_security,
             "canary MUST default to false"
         );
 
@@ -1490,7 +1490,7 @@ mod tests {
 
         // ON -> adapter bytes (byte-identical to legacy for 3GPP access).
         let mut ue_on = create_test_ue();
-        ue_on.use_ogs_nas_security = true;
+        ue_on.use_nextgcore_nas_security = true;
         let on = nas_5gs_security_encode(&mut ue_on, &msg, sht).unwrap();
         assert_eq!(on, legacy, "canary ON adapter must be byte-identical to legacy");
     }
@@ -1520,9 +1520,9 @@ mod tests {
     /// NOT advance the UL COUNT (vs the lenient legacy path which warns +
     /// continues).
     #[test]
-    fn decode_ogs_mac_fail_returns_err_no_count_advance() {
+    fn decode_nextgcore_mac_fail_returns_err_no_count_advance() {
         let mut ue = create_test_ue();
-        ue.use_ogs_nas_security = true;
+        ue.use_nextgcore_nas_security = true;
         let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
         let mut frame = make_uplink_frame(&ue, &[0x7e, 0x00, 0x57, 0x01], sht, 0);
         // Tamper the trailing payload octet -> MAC mismatch.
@@ -1530,7 +1530,7 @@ mod tests {
         frame[last] ^= 0xff;
 
         let before = ue.ul_count;
-        let res = nas_5gs_security_decode_ogs(&mut ue, sht, &frame);
+        let res = nas_5gs_security_decode_nextgcore(&mut ue, sht, &frame);
         assert!(
             matches!(res, Err(NasSecurityError::MacVerificationFailed)),
             "strict decode must Err on MAC failure"
@@ -1545,19 +1545,19 @@ mod tests {
     /// C3 (E2E-UNVALIDATED): a valid frame is accepted, then an exact replay of
     /// it is rejected via the persisted established-count state.
     #[test]
-    fn decode_ogs_rejects_replay() {
+    fn decode_nextgcore_rejects_replay() {
         let mut ue = create_test_ue();
-        ue.use_ogs_nas_security = true;
+        ue.use_nextgcore_nas_security = true;
         let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
         let f0 = make_uplink_frame(&ue, &[0x7e, 0x00, 0x57, 0x00], sht, 0);
 
         // First reception is accepted and establishes the baseline.
-        let body = nas_5gs_security_decode_ogs(&mut ue, sht, &f0).expect("first frame accepted");
+        let body = nas_5gs_security_decode_nextgcore(&mut ue, sht, &f0).expect("first frame accepted");
         assert_eq!(body, [0x7e, 0x00, 0x57, 0x00], "must recover the plaintext body");
         assert!(ue.ul_count_established, "baseline must be established");
 
         // Exact replay (SQN 0, candidate == stored) is rejected.
-        let replay = nas_5gs_security_decode_ogs(&mut ue, sht, &f0);
+        let replay = nas_5gs_security_decode_nextgcore(&mut ue, sht, &f0);
         assert!(
             matches!(replay, Err(NasSecurityError::MacVerificationFailed)),
             "replayed frame must be rejected"
@@ -1567,14 +1567,14 @@ mod tests {
     /// C3: a legitimate in-order successor (next SQN) is still accepted after
     /// establishing the baseline (the replay guard is strictly-backward only).
     #[test]
-    fn decode_ogs_accepts_in_order_successor() {
+    fn decode_nextgcore_accepts_in_order_successor() {
         let mut ue = create_test_ue();
-        ue.use_ogs_nas_security = true;
+        ue.use_nextgcore_nas_security = true;
         let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
         let f0 = make_uplink_frame(&ue, &[0x7e, 0x00, 0x57, 0x00], sht, 0);
         let f1 = make_uplink_frame(&ue, &[0x7e, 0x00, 0x57, 0x01], sht, 1);
-        nas_5gs_security_decode_ogs(&mut ue, sht, &f0).expect("frame 0 accepted");
-        let body = nas_5gs_security_decode_ogs(&mut ue, sht, &f1).expect("frame 1 accepted");
+        nas_5gs_security_decode_nextgcore(&mut ue, sht, &f0).expect("frame 0 accepted");
+        let body = nas_5gs_security_decode_nextgcore(&mut ue, sht, &f1).expect("frame 1 accepted");
         assert_eq!(body, [0x7e, 0x00, 0x57, 0x01]);
         assert_eq!(ue.ul_count, 1, "UL COUNT advanced to the verified value");
     }
@@ -1886,7 +1886,7 @@ mod tests {
         let inner = [0x7e, 0x00, 0x43, 0x01]; // e.g. Registration Complete
         let frame = make_legacy_uplink_frame(&ue, &inner, sht, 0);
 
-        assert!(!ue.use_ogs_nas_security, "must exercise the LIVE legacy path");
+        assert!(!ue.use_nextgcore_nas_security, "must exercise the LIVE legacy path");
         let out = nas_5gs_security_decode(&mut ue, sht, &frame).expect("correct MAC must verify");
         assert_eq!(out, inner, "must recover the plaintext body");
         assert!(!ue.mac_failed, "a correct MAC must NOT flag mac_failed");
