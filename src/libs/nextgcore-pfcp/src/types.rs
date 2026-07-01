@@ -4512,7 +4512,11 @@ mod tests {
         // 0x0100 on the wire (octet5=0x01, octet6=0x00).
         let mut buf = BytesMut::new();
         OuterHeaderCreation::new_gtpu_ipv4(0x1234_5678, [10, 0, 0, 1]).encode(&mut buf);
-        assert_eq!(&buf[0..2], &[0x01, 0x00], "GTP-U/UDP/IPv4 desc must be 0x0100");
+        assert_eq!(
+            &buf[0..2],
+            &[0x01, 0x00],
+            "GTP-U/UDP/IPv4 desc must be 0x0100"
+        );
         let mut b = buf.freeze();
         let decoded = OuterHeaderCreation::decode(&mut b).unwrap();
         assert!(decoded.description.gtpu_udp_ipv4);
