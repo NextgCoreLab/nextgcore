@@ -124,7 +124,9 @@ impl SmfTimerId {
             SmfTimerId::NfInstanceRegistrationInterval => {
                 "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            SmfTimerId::NfInstanceHeartbeatInterval => "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
+            SmfTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
             SmfTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
             SmfTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
             SmfTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",

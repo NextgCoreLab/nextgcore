@@ -400,7 +400,10 @@ mod tests {
 
         // No exclusions → first binding.
         assert_eq!(
-            router.next_binding(NfType::Amf, &[]).unwrap().scp_instance_id,
+            router
+                .next_binding(NfType::Amf, &[])
+                .unwrap()
+                .scp_instance_id,
             "scp-a"
         );
         // Exclude the first → reselect the alternate.

@@ -251,12 +251,16 @@ pub fn upf_gtp_close() -> Result<(), GtpPathError> {
     let mut path = gtp_path().write().map_err(|_| GtpPathError::LockError)?;
     if let Some(fd) = path.gtpu_sock4.take() {
         if fd >= 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
     if let Some(fd) = path.gtpu_sock6.take() {
         if fd >= 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
     log::info!("GTP-U path closed");

@@ -84,14 +84,14 @@ impl UperEncode for NrMultiRttMeasElement {
         encoder.encode_sequence_preamble(
             Some(false),
             &[
-                self.nr_phys_cell_id.is_some(), // opt0
-                false,                          // opt1 nr-CellGlobalID UNSUPPORTED
-                self.nr_arfcn.is_some(),        // opt2
-                false,                          // opt3 nr-DL-PRS-ResourceID UNSUPPORTED
-                false,                          // opt4 nr-DL-PRS-ResourceSetID UNSUPPORTED
-                false,                          // opt5 nr-AdditionalPathList UNSUPPORTED
+                self.nr_phys_cell_id.is_some(),       // opt0
+                false,                                // opt1 nr-CellGlobalID UNSUPPORTED
+                self.nr_arfcn.is_some(),              // opt2
+                false,                                // opt3 nr-DL-PRS-ResourceID UNSUPPORTED
+                false,                                // opt4 nr-DL-PRS-ResourceSetID UNSUPPORTED
+                false,                                // opt5 nr-AdditionalPathList UNSUPPORTED
                 self.nr_dl_prs_rsrp_result.is_some(), // opt6
-                false,                          // opt7 nr-Multi-RTT-AdditionalMeasurements UNSUPPORTED
+                false, // opt7 nr-Multi-RTT-AdditionalMeasurements UNSUPPORTED
             ],
         );
         encoder.encode_constrained_whole_number(self.dl_prs_id as i64, &Self::DL_PRS_ID)?;
@@ -274,7 +274,9 @@ impl UperDecode for NrMultiRttProvideLocationInformation {
             ));
         }
         let signal_measurement_information = if opts[0] {
-            Some(NrMultiRttSignalMeasurementInformation::decode_uper(decoder)?)
+            Some(NrMultiRttSignalMeasurementInformation::decode_uper(
+                decoder,
+            )?)
         } else {
             None
         };
@@ -387,7 +389,7 @@ impl UperEncode for NrMultiRttRequestLocationInformation {
         encoder.encode_bit_string(&self.requested_measurements, Some(1), Some(8))?;
         encoder.write_bit(self.assistance_availability);
         self.report_config.encode_uper(encoder)?; // mandatory
-        // additionalPaths: presence only, no content.
+                                                  // additionalPaths: presence only, no content.
         Ok(())
     }
 }

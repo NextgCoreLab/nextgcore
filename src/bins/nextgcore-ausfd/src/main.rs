@@ -680,10 +680,9 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
         if let Ok(context) = ctx.read() {
             context.ue_update(&ausf_ue);
         }
-        if let (Some(supi), Some(snn)) = (
-            ausf_ue.supi.clone(),
-            ausf_ue.serving_network_name.clone(),
-        ) {
+        if let (Some(supi), Some(snn)) =
+            (ausf_ue.supi.clone(), ausf_ue.serving_network_name.clone())
+        {
             tokio::spawn(async move {
                 if let Err(e) = send_udm_auth_result(&supi, false, &snn, "5G_AKA").await {
                     log::warn!("Failed to notify UDM of auth result: {e}");
@@ -745,7 +744,10 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
 
     // Notify UDM of authentication result (fire-and-forget)
     let supi_for_udm = ausf_ue.supi.clone().expect("value expected");
-    let snn_for_udm = ausf_ue.serving_network_name.clone().expect("value expected");
+    let snn_for_udm = ausf_ue
+        .serving_network_name
+        .clone()
+        .expect("value expected");
     tokio::spawn(async move {
         if let Err(e) =
             send_udm_auth_result(&supi_for_udm, auth_success, &snn_for_udm, "5G_AKA").await
@@ -774,9 +776,7 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
     if auth_success {
         resp_body.insert(
             "kseaf".to_string(),
-            serde_json::Value::String(
-                nextgcore_ausfd::nudm_handler::bytes_to_hex(&ausf_ue.kseaf),
-            ),
+            serde_json::Value::String(nextgcore_ausfd::nudm_handler::bytes_to_hex(&ausf_ue.kseaf)),
         );
         // ausfd-04: include supi only when the original identity was a SUCI
         if ausf_ue.suci.starts_with("suci-") {
@@ -880,17 +880,14 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
             // the exchange; a supported-but-different KDF triggers a single
             // re-issue of the Challenge with the negotiated KDF.
             use nextgcore_ausfd::eap_aka_prime::KdfNegotiation;
-            if let Some(packet) =
-                nextgcore_ausfd::eap_aka_prime::EapPacket::decode(&eap_bytes)
-            {
+            if let Some(packet) = nextgcore_ausfd::eap_aka_prime::EapPacket::decode(&eap_bytes) {
                 match session.check_kdf_and_bidding(&packet) {
                     KdfNegotiation::BiddingDown | KdfNegotiation::Unsupported(_) => {
                         log::warn!(
                             "[{}] EAP-AKA' rejected: KDF/bidding negotiation failure",
                             ausf_ue.suci
                         );
-                        ausf_ue.auth_result =
-                            nextgcore_ausfd::AuthResult::AuthenticationFailure;
+                        ausf_ue.auth_result = nextgcore_ausfd::AuthResult::AuthenticationFailure;
                         ausf_ue.eap_session = Some(session);
                         if let Ok(context) = ctx.read() {
                             context.ue_update(&ausf_ue);
@@ -904,16 +901,12 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                             .unwrap_or_else(|_| SbiResponse::with_status(200));
                     }
                     KdfNegotiation::Renegotiate(kdf) => {
-                        log::info!(
-                            "[{}] EAP-AKA' renegotiating AT_KDF -> {kdf}",
-                            ausf_ue.suci
-                        );
+                        log::info!("[{}] EAP-AKA' renegotiating AT_KDF -> {kdf}", ausf_ue.suci);
                         session.offered_kdf = kdf;
                         session.kdf_renegotiated = true;
                         session.identifier = session.identifier.wrapping_add(1);
                         let challenge = session.generate_challenge();
-                        let eap_payload_b64 =
-                            nextgcore_crypt::base64::encode(&challenge.encode());
+                        let eap_payload_b64 = nextgcore_crypt::base64::encode(&challenge.encode());
                         ausf_ue.eap_session = Some(session);
                         if let Ok(context) = ctx.read() {
                             context.ue_update(&ausf_ue);
@@ -983,9 +976,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                 );
                 eap_body.insert(
                     "kSeaf".to_string(),
-                    serde_json::json!(nextgcore_ausfd::nudm_handler::bytes_to_hex(
-                        &ausf_ue.kseaf
-                    )),
+                    serde_json::json!(nextgcore_ausfd::nudm_handler::bytes_to_hex(&ausf_ue.kseaf)),
                 );
                 if ausf_ue.suci.starts_with("suci-") {
                     eap_body.insert("supi".to_string(), serde_json::json!(ausf_ue.supi));
@@ -1516,8 +1507,10 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
             log::info!("AUSF registered with NRF successfully (id={nf_instance_id})");
 
             // Store self instance
-            let mut self_instance =
-                nextgcore_sbi::context::NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Ausf);
+            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
+                &nf_instance_id,
+                nextgcore_sbi::types::NfType::Ausf,
+            );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = nextgcore_sbi::context::NfService::new(
                 "nausf-auth",
@@ -1617,7 +1610,9 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                         .get("serviceName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if let Some(svc_type) = nextgcore_sbi::types::SbiServiceType::from_name(svc_name) {
+                    if let Some(svc_type) =
+                        nextgcore_sbi::types::SbiServiceType::from_name(svc_name)
+                    {
                         let mut svc = nextgcore_sbi::context::NfService::new(svc_name, svc_type);
                         if let Some(endpoints) =
                             svc_json.get("ipEndPoints").and_then(|v| v.as_array())
@@ -1768,7 +1763,11 @@ mod tests {
             )
             .await
             .expect("POST ue-authentications");
-        assert_eq!(resp.status, 201, "initiate_5g_aka: expected 201, got {}", resp.status);
+        assert_eq!(
+            resp.status, 201,
+            "initiate_5g_aka: expected 201, got {}",
+            resp.status
+        );
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
         let href = body
@@ -1918,7 +1917,8 @@ mod tests {
                 .unwrap_or_else(|_| SbiResponse::with_status(500))
         } else {
             let kausf = nextgcore_crypt::kdf::nextgcore_kdf_kausf(&ck, &ik, &snn, &autn);
-            let xres_star = nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, &snn, &rand, &res);
+            let xres_star =
+                nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, &snn, &rand, &res);
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "authType": "5G_AKA",
@@ -2041,7 +2041,8 @@ mod tests {
             rand.copy_from_slice(&rand_bytes);
             let (res, ck, ik, _ak, _akstar) =
                 nextgcore_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
-            let res_star = nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+            let res_star =
+                nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
 
             // Wrong RES* first -> AUTHENTICATION_FAILURE
             let resp = client
@@ -2360,8 +2361,14 @@ mod tests {
                 Some("AUTHENTICATION_FAILURE"),
                 "wrong RES* → AUTHENTICATION_FAILURE"
             );
-            assert!(body.get("kseaf").is_none(), "kseaf must be absent on failure (ausfd-01)");
-            assert!(body.get("supi").is_none(), "supi must be absent on failure (ausfd-01)");
+            assert!(
+                body.get("kseaf").is_none(),
+                "kseaf must be absent on failure (ausfd-01)"
+            );
+            assert!(
+                body.get("supi").is_none(),
+                "supi must be absent on failure (ausfd-01)"
+            );
 
             // ----------------------------------------------------------------
             // Test: correct-RES* (SUCI identity) → kseaf present (64 hex), supi present
@@ -2459,7 +2466,10 @@ mod tests {
                 .put_json(&href, &serde_json::json!({"resStar": "zz"}))
                 .await
                 .expect("PUT resStar:zz");
-            assert_eq!(resp.status, 400, "bad-hex resStar must return 400 (ausfd-03)");
+            assert_eq!(
+                resp.status, 400,
+                "bad-hex resStar must return 400 (ausfd-03)"
+            );
 
             ausf_server.stop().await.expect("stop ausf");
             udm_server.stop().await.expect("stop udm");
@@ -2509,8 +2519,11 @@ mod tests {
             rand: "0123456789abcdef0123456789abcdef".to_string(),
             auts: "fedcba9876543210fedcba98765432".to_string(),
         };
-        let body =
-            build_generate_auth_data_body("5G:mnc001.mcc001.3gppnetwork.org", "id-2", Some(&resync));
+        let body = build_generate_auth_data_body(
+            "5G:mnc001.mcc001.3gppnetwork.org",
+            "id-2",
+            Some(&resync),
+        );
         assert!(body.get("resynchronizationInfo").is_some());
     }
 
@@ -2520,8 +2533,7 @@ mod tests {
     #[test]
     fn test_extract_consumer_plmns() {
         // Build a JWT-shaped token whose payload carries a plmnList claim.
-        let payload =
-            serde_json::json!({"plmnList": [{"mcc": "208", "mnc": "093"}]}).to_string();
+        let payload = serde_json::json!({"plmnList": [{"mcc": "208", "mnc": "093"}]}).to_string();
         let payload_b64 = nextgcore_crypt::base64::encode(payload.as_bytes());
         let token = format!("Bearer hdr.{payload_b64}.sig");
         let plmns = extract_consumer_plmns(&token);
@@ -2610,7 +2622,10 @@ mod tests {
             let bearer = |mcc: &str, mnc: &str| -> String {
                 let payload =
                     serde_json::json!({"plmnList": [{"mcc": mcc, "mnc": mnc}]}).to_string();
-                format!("Bearer h.{}.s", nextgcore_crypt::base64::encode(payload.as_bytes()))
+                format!(
+                    "Bearer h.{}.s",
+                    nextgcore_crypt::base64::encode(payload.as_bytes())
+                )
             };
 
             // Foreign PLMN in the token -> 403 SERVING_NETWORK_NOT_AUTHORIZED.

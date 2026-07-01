@@ -68,8 +68,8 @@ mod services;
 mod types;
 
 use acr::{
-    AcrContextError, AcrDecReq, AcrDetermReq, AcrInitReq, AcrStatus, EELACRReq, EELACRResp,
-    ACRUpdateData,
+    ACRUpdateData, AcrContextError, AcrDecReq, AcrDetermReq, AcrInitReq, AcrStatus, EELACRReq,
+    EELACRResp,
 };
 use context::{ees_context_final, ees_context_init, ees_self, UpdateError};
 use eec::EecRegistration;
@@ -100,7 +100,6 @@ const APPCLIENTINFO_RESOURCES_PATH: &str = "/eees-appclientinformation/v1/app-cl
 
 /// Resource path prefix for ACR Management Event subscription resources (eesd-13).
 const ACRMGNTEVENT_SUBSCRIPTIONS_PATH: &str = "/eees-acrmgntevent/v1/subscriptions";
-
 
 /// NextGCore EES - Edge Enabler Server
 #[derive(Parser, Debug)]
@@ -544,12 +543,16 @@ fn update_error_response(err: UpdateError, resource: &str) -> SbiResponse {
             "The immutable identifier (easId/eecId) shall not be modified",
             Some(cause::MODIFICATION_NOT_ALLOWED),
         ),
-        UpdateError::Invalid => {
-            send_bad_request("Update failed validation", Some(cause::MANDATORY_IE_MISSING))
-        }
-        UpdateError::Internal => {
-            send_error(500, "Internal Server Error", "Update failed", Some("UNSPECIFIED_NF_FAILURE"))
-        }
+        UpdateError::Invalid => send_bad_request(
+            "Update failed validation",
+            Some(cause::MANDATORY_IE_MISSING),
+        ),
+        UpdateError::Internal => send_error(
+            500,
+            "Internal Server Error",
+            "Update failed",
+            Some("UNSPECIFIED_NF_FAILURE"),
+        ),
     }
 }
 
@@ -589,7 +592,9 @@ async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
     // Distinguish malformed JSON from a structurally-missing mandatory IE.
     let value: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT")),
+        Err(e) => {
+            return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT"))
+        }
     };
 
     let mut reg: EasRegistration = match serde_json::from_value(value) {
@@ -844,14 +849,20 @@ async fn handle_disc_sub_create(request: &SbiRequest) -> SbiResponse {
 }
 
 async fn handle_disc_sub_list() -> SbiResponse {
-    let subs = ees_self().read().map(|c| c.disc_sub_list()).unwrap_or_default();
+    let subs = ees_self()
+        .read()
+        .map(|c| c.disc_sub_list())
+        .unwrap_or_default();
     SbiResponse::with_status(200)
         .with_json_body(&subs)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
 async fn handle_disc_sub_get(subscription_id: &str) -> SbiResponse {
-    let sub = ees_self().read().ok().and_then(|c| c.disc_sub_find(subscription_id));
+    let sub = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.disc_sub_find(subscription_id));
     match sub {
         Some(sub) => SbiResponse::with_status(200)
             .with_json_body(&sub)
@@ -899,7 +910,10 @@ async fn handle_disc_sub_update(subscription_id: &str, request: &SbiRequest) -> 
 }
 
 async fn handle_disc_sub_delete(subscription_id: &str) -> SbiResponse {
-    let removed = ees_self().read().ok().and_then(|c| c.disc_sub_delete(subscription_id));
+    let removed = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.disc_sub_delete(subscription_id));
     match removed {
         Some(_) => SbiResponse::with_status(204),
         None => send_not_found(
@@ -967,7 +981,10 @@ async fn handle_eec_list() -> SbiResponse {
 }
 
 async fn handle_eec_get(registration_id: &str) -> SbiResponse {
-    let reg = ees_self().read().ok().and_then(|c| c.eec_find(registration_id));
+    let reg = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.eec_find(registration_id));
     match reg {
         Some(reg) => SbiResponse::with_status(200)
             .with_json_body(&reg)
@@ -1036,7 +1053,10 @@ async fn handle_eec_modify(registration_id: &str, request: &SbiRequest) -> SbiRe
 
 async fn handle_eec_deregister(registration_id: &str) -> SbiResponse {
     log::info!("EEC Deregister: {registration_id}");
-    let removed = ees_self().read().ok().and_then(|c| c.eec_deregister(registration_id));
+    let removed = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.eec_deregister(registration_id));
     match removed {
         Some(_) => SbiResponse::with_status(204),
         None => send_not_found(
@@ -1060,9 +1080,12 @@ fn acr_context_error_response(err: AcrContextError, detail: &str) -> SbiResponse
             detail,
             Some(cause::INSUFFICIENT_RESOURCES),
         ),
-        AcrContextError::Internal => {
-            send_error(500, "Internal Server Error", detail, Some("UNSPECIFIED_NF_FAILURE"))
-        }
+        AcrContextError::Internal => send_error(
+            500,
+            "Internal Server Error",
+            detail,
+            Some("UNSPECIFIED_NF_FAILURE"),
+        ),
     }
 }
 
@@ -1124,7 +1147,9 @@ async fn handle_acr_initiate(request: &SbiRequest) -> SbiResponse {
         Ok(r) => r,
         Err(e) => {
             return send_bad_request(
-                &format!("Missing or invalid mandatory IE (requestorId/tEasEndpoint/easNotifInd): {e}"),
+                &format!(
+                    "Missing or invalid mandatory IE (requestorId/tEasEndpoint/easNotifInd): {e}"
+                ),
                 Some(cause::MANDATORY_IE_MISSING),
             );
         }
@@ -1170,7 +1195,9 @@ async fn handle_acr_declare(request: &SbiRequest) -> SbiResponse {
             );
         }
     };
-    if req.ue_id.trim().is_empty() || req.t_eas_id.trim().is_empty() || req.t_eas_endpoint.is_empty()
+    if req.ue_id.trim().is_empty()
+        || req.t_eas_id.trim().is_empty()
+        || req.t_eas_endpoint.is_empty()
     {
         return send_bad_request(
             "Mandatory IE ueId/tEasId/tEasEndpoint is empty",
@@ -1236,7 +1263,10 @@ async fn handle_eel_acr_request(request: &SbiRequest) -> SbiResponse {
         }
         Err(e) => acr_context_error_response(
             e,
-            &format!("EEL ACR request failed for ueId={}: no T-EAS available", req.ue_id),
+            &format!(
+                "EEL ACR request failed for ueId={}: no T-EAS available",
+                req.ue_id
+            ),
         ),
     }
 }
@@ -1264,10 +1294,15 @@ async fn handle_acr_status_update(request: &SbiRequest) -> SbiResponse {
         }
     };
     if req.eas_id.trim().is_empty() {
-        return send_bad_request("Mandatory IE easId is empty", Some(cause::MANDATORY_IE_MISSING));
+        return send_bad_request(
+            "Mandatory IE easId is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
     }
     // Per the §8.9.6.2.2 NOTE, at least one of these must be present.
-    if req.act_result_info.is_none() && req.e3_subsc_ids.is_none() && req.e3_notification_uri.is_none()
+    if req.act_result_info.is_none()
+        && req.e3_subsc_ids.is_none()
+        && req.e3_notification_uri.is_none()
     {
         return send_bad_request(
             "At least one of actResultInfo/e3SubscIds/e3NotificationUri must be present",
@@ -1348,7 +1383,10 @@ async fn handle_cea_list() -> SbiResponse {
 }
 
 async fn handle_cea_get(announcement_id: &str) -> SbiResponse {
-    let ann = ees_self().read().ok().and_then(|c| c.cea_find(announcement_id));
+    let ann = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.cea_find(announcement_id));
     match ann {
         Some(ann) => SbiResponse::with_status(200)
             .with_json_body(&ann)
@@ -1362,7 +1400,10 @@ async fn handle_cea_get(announcement_id: &str) -> SbiResponse {
 
 async fn handle_cea_delete(announcement_id: &str) -> SbiResponse {
     log::info!("CEA announcement delete: {announcement_id}");
-    let removed = ees_self().read().ok().and_then(|c| c.cea_delete(announcement_id));
+    let removed = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.cea_delete(announcement_id));
     match removed {
         Some(_) => SbiResponse::with_status(204),
         None => send_not_found(
@@ -1418,14 +1459,20 @@ async fn handle_acinfo_create(request: &SbiRequest) -> SbiResponse {
 }
 
 async fn handle_acinfo_list() -> SbiResponse {
-    let infos = ees_self().read().map(|c| c.acinfo_list()).unwrap_or_default();
+    let infos = ees_self()
+        .read()
+        .map(|c| c.acinfo_list())
+        .unwrap_or_default();
     SbiResponse::with_status(200)
         .with_json_body(&infos)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
 async fn handle_acinfo_get(ac_info_id: &str) -> SbiResponse {
-    let info = ees_self().read().ok().and_then(|c| c.acinfo_find(ac_info_id));
+    let info = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.acinfo_find(ac_info_id));
     match info {
         Some(info) => SbiResponse::with_status(200)
             .with_json_body(&info)
@@ -1439,7 +1486,10 @@ async fn handle_acinfo_get(ac_info_id: &str) -> SbiResponse {
 
 async fn handle_acinfo_delete(ac_info_id: &str) -> SbiResponse {
     log::info!("AppClientInfo delete: {ac_info_id}");
-    let removed = ees_self().read().ok().and_then(|c| c.acinfo_delete(ac_info_id));
+    let removed = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.acinfo_delete(ac_info_id));
     match removed {
         Some(_) => SbiResponse::with_status(204),
         None => send_not_found(
@@ -1481,7 +1531,10 @@ async fn handle_acrmgnt_sub_create(request: &SbiRequest) -> SbiResponse {
         Some(created) => {
             let id = created.subscription_id.clone().unwrap_or_default();
             SbiResponse::with_status(201)
-                .with_header("Location", format!("{ACRMGNTEVENT_SUBSCRIPTIONS_PATH}/{id}"))
+                .with_header(
+                    "Location",
+                    format!("{ACRMGNTEVENT_SUBSCRIPTIONS_PATH}/{id}"),
+                )
                 .with_json_body(&created)
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
@@ -1495,14 +1548,20 @@ async fn handle_acrmgnt_sub_create(request: &SbiRequest) -> SbiResponse {
 }
 
 async fn handle_acrmgnt_sub_list() -> SbiResponse {
-    let subs = ees_self().read().map(|c| c.acrmgnt_sub_list()).unwrap_or_default();
+    let subs = ees_self()
+        .read()
+        .map(|c| c.acrmgnt_sub_list())
+        .unwrap_or_default();
     SbiResponse::with_status(200)
         .with_json_body(&subs)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
 async fn handle_acrmgnt_sub_get(subscription_id: &str) -> SbiResponse {
-    let sub = ees_self().read().ok().and_then(|c| c.acrmgnt_sub_find(subscription_id));
+    let sub = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.acrmgnt_sub_find(subscription_id));
     match sub {
         Some(sub) => SbiResponse::with_status(200)
             .with_json_body(&sub)
@@ -1551,7 +1610,10 @@ async fn handle_acrmgnt_sub_update(subscription_id: &str, request: &SbiRequest) 
 }
 
 async fn handle_acrmgnt_sub_delete(subscription_id: &str) -> SbiResponse {
-    let removed = ees_self().read().ok().and_then(|c| c.acrmgnt_sub_delete(subscription_id));
+    let removed = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.acrmgnt_sub_delete(subscription_id));
     match removed {
         Some(_) => SbiResponse::with_status(204),
         None => send_not_found(
@@ -1594,7 +1656,9 @@ async fn handle_eec_ctxt_reloc(request: &SbiRequest) -> SbiResponse {
     }
     log::info!(
         "EEC context relocation: eecId={} src={} tgt={} (stub → SUCCESS)",
-        req.eec_id, req.src_ees_id, req.tgt_ees_id
+        req.eec_id,
+        req.src_ees_id,
+        req.tgt_ees_id
     );
     let resp = EecCtxtRelResp {
         eec_id: req.eec_id,
@@ -1762,7 +1826,8 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        let body = r#"{"easProf":{"easId":"eas1.example.com","endPt":{"fqdn":"eas1.example.com"}}}"#;
+        let body =
+            r#"{"easProf":{"easId":"eas1.example.com","endPt":{"fqdn":"eas1.example.com"}}}"#;
         let req = SbiRequest::post("/eees-easregistration/v1/registrations")
             .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
             .with_body(body, "application/json");
@@ -1840,7 +1905,12 @@ mod tests {
             .with_body(body, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 200);
-        assert!(resp.http.content.as_deref().unwrap().contains("discoveredEas"));
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("discoveredEas"));
 
         auth::clear_auth_jwks();
     }
@@ -2027,7 +2097,10 @@ mod tests {
         let stored: EecRegistration =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(stored.eec_id, "eec1.example.com");
-        assert!(stored.exp_time.is_some(), "EES mints an expTime when absent");
+        assert!(
+            stored.exp_time.is_some(),
+            "EES mints an expTime when absent"
+        );
         let id = stored.registration_id.clone().unwrap();
 
         // GET → 200.
@@ -2091,7 +2164,8 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        let body = r#"{"easProf":{"easId":"eas-feat.example.com","endPt":{"fqdn":"x"}},"suppFeat":"1"}"#;
+        let body =
+            r#"{"easProf":{"easId":"eas-feat.example.com","endPt":{"fqdn":"x"}},"suppFeat":"1"}"#;
         let req = SbiRequest::post("/eees-easregistration/v1/registrations")
             .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
             .with_body(body, "application/json");
@@ -2300,8 +2374,7 @@ mod tests {
             .with_body(body, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 200);
-        let er: EELACRResp =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let er: EELACRResp = serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(
             er.app_ctxt_store_addr.as_deref(),
             Some("https://store.example.com/ctx/eel-1")
@@ -2480,7 +2553,10 @@ mod tests {
 
         let body = r#"{"acId":"ac-uniq-1","easIds":["eas1"],"acType":"V2X"}"#;
         let req = SbiRequest::post("/eees-appclientinformation/v1/app-client-infos")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-appclientinformation"))
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", "eees-appclientinformation"),
+            )
             .with_body(body, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 201);
@@ -2493,16 +2569,31 @@ mod tests {
         assert_eq!(created.ac_info_id.as_deref(), Some(id.as_str()));
 
         // GET → 200.
-        let req = SbiRequest::get(format!("/eees-appclientinformation/v1/app-client-infos/{id}"))
-            .with_header("Authorization", bearer(&sk, "k1", "eees-appclientinformation"));
+        let req = SbiRequest::get(format!(
+            "/eees-appclientinformation/v1/app-client-infos/{id}"
+        ))
+        .with_header(
+            "Authorization",
+            bearer(&sk, "k1", "eees-appclientinformation"),
+        );
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
 
         // DELETE → 204; GET → 404.
-        let req = SbiRequest::delete(format!("/eees-appclientinformation/v1/app-client-infos/{id}"))
-            .with_header("Authorization", bearer(&sk, "k1", "eees-appclientinformation"));
+        let req = SbiRequest::delete(format!(
+            "/eees-appclientinformation/v1/app-client-infos/{id}"
+        ))
+        .with_header(
+            "Authorization",
+            bearer(&sk, "k1", "eees-appclientinformation"),
+        );
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
-        let req = SbiRequest::get(format!("/eees-appclientinformation/v1/app-client-infos/{id}"))
-            .with_header("Authorization", bearer(&sk, "k1", "eees-appclientinformation"));
+        let req = SbiRequest::get(format!(
+            "/eees-appclientinformation/v1/app-client-infos/{id}"
+        ))
+        .with_header(
+            "Authorization",
+            bearer(&sk, "k1", "eees-appclientinformation"),
+        );
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
 
         auth::clear_auth_jwks();
@@ -2635,7 +2726,9 @@ mod tests {
         assert_eq!(resp.status, 200);
         let info: AcrParamInfoResp =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        let params = info.acr_params.expect("acrParams must be present after Determine");
+        let params = info
+            .acr_params
+            .expect("acrParams must be present after Determine");
         assert_eq!(params.s_eas_id.as_deref(), Some("param-s-eas.example.com"));
         assert!(params.t_eas_id.is_some());
 
@@ -2712,7 +2805,10 @@ mod tests {
             .with_body(det_body, "application/json");
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
         {
-            let state = ees_self().read().unwrap().acr_find(Some(ue), Some("eec-flow"));
+            let state = ees_self()
+                .read()
+                .unwrap()
+                .acr_find(Some(ue), Some("eec-flow"));
             assert_eq!(state.unwrap().status, Some(acr::AcrStatus::Determined));
         }
 
@@ -2728,7 +2824,10 @@ mod tests {
             .with_body(init_body, "application/json");
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
         {
-            let state = ees_self().read().unwrap().acr_find(Some(ue), Some("eec-flow"));
+            let state = ees_self()
+                .read()
+                .unwrap()
+                .acr_find(Some(ue), Some("eec-flow"));
             assert_eq!(state.unwrap().status, Some(acr::AcrStatus::Initiated));
         }
 
@@ -2744,7 +2843,10 @@ mod tests {
             .with_body(decl_body, "application/json");
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
         {
-            let state = ees_self().read().unwrap().acr_find(Some(ue), Some("eec-flow"));
+            let state = ees_self()
+                .read()
+                .unwrap()
+                .acr_find(Some(ue), Some("eec-flow"));
             assert_eq!(state.unwrap().status, Some(acr::AcrStatus::Completed));
         }
 

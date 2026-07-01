@@ -315,7 +315,10 @@ impl NfProfile {
             return (false, false);
         }
         let allowed_by = |list: &[String]| {
-            list.is_empty() || list.iter().any(|t| t.eq_ignore_ascii_case(consumer_nf_type))
+            list.is_empty()
+                || list
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(consumer_nf_type))
         };
         let profile_ok = allowed_by(&self.allowed_nf_types());
         let service_ok = self
@@ -2162,7 +2165,10 @@ mod tests {
             assert_eq!(restored.nf_services[0].service_name, "nsmf-pdusession");
             // The verbatim attributes document is preserved too.
             assert_eq!(
-                restored.attributes.get("nfInstanceId").and_then(|v| v.as_str()),
+                restored
+                    .attributes
+                    .get("nfInstanceId")
+                    .and_then(|v| v.as_str()),
                 Some("11111111-1111-1111-1111-111111111111")
             );
 
@@ -2172,7 +2178,9 @@ mod tests {
             assert_eq!(sub.notification_uri, "http://amf:8080/cb");
             assert_eq!(sub.req_nf_type.as_deref(), Some("AMF"));
             assert_eq!(
-                sub.subscr_cond.as_ref().and_then(|c| c.service_name.as_deref()),
+                sub.subscr_cond
+                    .as_ref()
+                    .and_then(|c| c.service_name.as_deref()),
                 Some("nsmf-pdusession")
             );
             assert_eq!(sub.validity_duration, 3600);
@@ -2195,7 +2203,9 @@ mod tests {
         {
             let mgr = NfInstanceManager::with_state_path(&path);
             mgr.register(profile).expect("register");
-            assert!(mgr.deregister("22222222-2222-2222-2222-222222222222").is_ok());
+            assert!(mgr
+                .deregister("22222222-2222-2222-2222-222222222222")
+                .is_ok());
         }
         {
             let mgr = NfInstanceManager::with_state_path(&path);

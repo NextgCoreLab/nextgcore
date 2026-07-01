@@ -271,7 +271,8 @@ pub fn nas_encrypt(
             // iv[5..16] are zeros
 
             let mut output = vec![0u8; message.len()];
-            if nextgcore_crypt::aes::aes_ctr128_encrypt(&key, &mut iv, message, &mut output).is_ok() {
+            if nextgcore_crypt::aes::aes_ctr128_encrypt(&key, &mut iv, message, &mut output).is_ok()
+            {
                 message.copy_from_slice(&output);
             }
         }

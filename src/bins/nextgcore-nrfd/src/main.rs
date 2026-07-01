@@ -592,10 +592,7 @@ async fn main() -> Result<()> {
 /// services are gated (TS 33.501 §13.4.1 / §13.3.1).
 fn oauth2_protected_path(path: &str) -> bool {
     let p = path.trim_start_matches('/');
-    p == "nnrf-nfm"
-        || p == "nnrf-disc"
-        || p.starts_with("nnrf-nfm/")
-        || p.starts_with("nnrf-disc/")
+    p == "nnrf-nfm" || p == "nnrf-disc" || p.starts_with("nnrf-nfm/") || p.starts_with("nnrf-disc/")
 }
 
 /// nrfd-06: returns `Some(401)` when the request must be rejected for lacking a
@@ -1121,7 +1118,9 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
             orig_value: Some(serde_json::json!("SUSPENDED")),
         }];
         // Re-fetch the now-REGISTERED profile so the body is accurate.
-        let reactivated_profile = manager.get(nf_instance_id).unwrap_or_else(|| updated.clone());
+        let reactivated_profile = manager
+            .get(nf_instance_id)
+            .unwrap_or_else(|| updated.clone());
         let server_uri2 = nrf_self_uri().to_string();
         tokio::spawn(async move {
             if let Err(e) = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
@@ -1592,7 +1591,11 @@ fn producer_eligible(
 ) -> bool {
     if !requester_plmns.is_empty() {
         let pp = producer.plmns();
-        if !pp.is_empty() && !pp.iter().any(|x| requester_plmns.iter().any(|q| plmn_eq(x, q))) {
+        if !pp.is_empty()
+            && !pp
+                .iter()
+                .any(|x| requester_plmns.iter().any(|q| plmn_eq(x, q)))
+        {
             return false;
         }
     }
@@ -2374,9 +2377,16 @@ mod tests {
             serde_json::json!([{"serviceInstanceId": "s0", "serviceName": "nudm-sdm"}]),
             Some(serde_json::json!(["SMF", "AMF"])),
         );
-        let granted =
-            authorize_access_token(&consumer, "SMF", "UDM", &["nudm-sdm".into()], &[udm], &[], &[])
-                .expect("permitted scope must be granted");
+        let granted = authorize_access_token(
+            &consumer,
+            "SMF",
+            "UDM",
+            &["nudm-sdm".into()],
+            &[udm],
+            &[],
+            &[],
+        )
+        .expect("permitted scope must be granted");
         assert_eq!(granted, vec!["nudm-sdm".to_string()]);
     }
 
@@ -2389,9 +2399,16 @@ mod tests {
             serde_json::json!([{"serviceInstanceId": "s0", "serviceName": "nudm-uecm"}]),
             None,
         );
-        let err =
-            authorize_access_token(&consumer, "SMF", "UDM", &["nudm-sdm".into()], &[udm], &[], &[])
-                .expect_err("unoffered service must be rejected");
+        let err = authorize_access_token(
+            &consumer,
+            "SMF",
+            "UDM",
+            &["nudm-sdm".into()],
+            &[udm],
+            &[],
+            &[],
+        )
+        .expect_err("unoffered service must be rejected");
         assert_eq!(err.0, "invalid_scope");
     }
 
@@ -2405,9 +2422,16 @@ mod tests {
             serde_json::json!([{"serviceInstanceId": "s0", "serviceName": "nudm-sdm"}]),
             Some(serde_json::json!(["AMF"])),
         );
-        let err =
-            authorize_access_token(&consumer, "SMF", "UDM", &["nudm-sdm".into()], &[udm], &[], &[])
-                .expect_err("barred consumer type must be rejected");
+        let err = authorize_access_token(
+            &consumer,
+            "SMF",
+            "UDM",
+            &["nudm-sdm".into()],
+            &[udm],
+            &[],
+            &[],
+        )
+        .expect_err("barred consumer type must be rejected");
         assert_eq!(err.0, "unauthorized_client");
     }
 
@@ -2415,9 +2439,16 @@ mod tests {
     fn test_authorize_token_nftype_mismatch_is_invalid_request() {
         // Asserted nfType differs from the registered consumer profile.
         let consumer = auth_consumer("SMF");
-        let err =
-            authorize_access_token(&consumer, "AUSF", "UDM", &["nudm-sdm".into()], &[], &[], &[])
-                .expect_err("nfType mismatch must be rejected");
+        let err = authorize_access_token(
+            &consumer,
+            "AUSF",
+            "UDM",
+            &["nudm-sdm".into()],
+            &[],
+            &[],
+            &[],
+        )
+        .expect_err("nfType mismatch must be rejected");
         assert_eq!(err.0, "invalid_request");
     }
 
@@ -2780,7 +2811,8 @@ mod tests {
     #[test]
     fn test_nrfd_02_compute_changes_from_json_patch_replace() {
         use serde_json::json;
-        let pre = json!({"nfInstanceId": "a", "nfType": "SMF", "nfStatus": "REGISTERED", "load": 40});
+        let pre =
+            json!({"nfInstanceId": "a", "nfType": "SMF", "nfStatus": "REGISTERED", "load": 40});
         let patch = json!([
             {"op": "test",    "path": "/nfStatus", "value": "REGISTERED"},
             {"op": "replace", "path": "/load",     "value": 75}
@@ -2841,8 +2873,7 @@ mod tests {
     #[test]
     fn test_nrfd_02_compute_changes_from_merge_patch_null_is_remove() {
         use serde_json::json;
-        let pre =
-            json!({"nfInstanceId": "a", "nfType": "SMF", "nfStatus": "REGISTERED", "fqdn": "smf.example.com"});
+        let pre = json!({"nfInstanceId": "a", "nfType": "SMF", "nfStatus": "REGISTERED", "fqdn": "smf.example.com"});
         let patch = json!({"fqdn": null});
         let mut post = pre.clone();
         json_merge_patch(&mut post, &patch);
@@ -2851,10 +2882,7 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].op, "remove");
         assert_eq!(changes[0].path, "/fqdn");
-        assert_eq!(
-            changes[0].orig_value,
-            Some(json!("smf.example.com"))
-        );
+        assert_eq!(changes[0].orig_value, Some(json!("smf.example.com")));
         assert!(changes[0].value.is_none());
     }
 
@@ -2863,10 +2891,8 @@ mod tests {
     /// `profileChanges` payload is dispatched to the subscriber.
     #[test]
     fn test_nrfd_02_profile_changed_notify_dispatched_on_patch() {
-        use nextgcore_nrfd::{
-            nrf_nnrf_nfm_send_nf_profile_changed_notify_all, SubscriptionData,
-        };
         use nextgcore_nrfd::nnrf_handler::SubscrCond;
+        use nextgcore_nrfd::{nrf_nnrf_nfm_send_nf_profile_changed_notify_all, SubscriptionData};
         use serde_json::json;
 
         // Build an NF profile.
@@ -2933,8 +2959,8 @@ mod tests {
         assert_eq!(reactivate_changes[0].orig_value, Some(json!("SUSPENDED")));
 
         // Verify it serializes correctly into a NF_PROFILE_CHANGED body.
-        use nextgcore_nrfd::{nrf_nnrf_nfm_build_nf_profile_changed_notify, SubscriptionData};
         use nextgcore_nrfd::nnrf_handler::SubscrCond;
+        use nextgcore_nrfd::{nrf_nnrf_nfm_build_nf_profile_changed_notify, SubscriptionData};
 
         let profile = NfProfile::from_json(&json!({
             "nfInstanceId": "nrfd02-reactivate-nf",
@@ -3132,7 +3158,9 @@ mod tests {
         let now = 1_000_000u64;
 
         // Matching subject + issuer, not expired -> Ok.
-        assert!(verify_cca_binding(&cca("nf-1", Some("nf-1"), Some(now + 100)), "nf-1", now).is_ok());
+        assert!(
+            verify_cca_binding(&cca("nf-1", Some("nf-1"), Some(now + 100)), "nf-1", now).is_ok()
+        );
         // Subject mismatch -> invalid_client.
         assert_eq!(
             verify_cca_binding(&cca("nf-2", None, None), "nf-1", now)
@@ -3207,13 +3235,8 @@ mod tests {
         // A valid NRF-issued token on a protected path -> allowed.
         let auth = format!("Bearer {}", mint_nrf_token("sub-x", "NRF", 3600));
         assert!(
-            enforce_oauth2_on_request(
-                "/nnrf-nfm/v1/nf-instances/x",
-                Some(&auth),
-                true,
-                &jwks
-            )
-            .is_none()
+            enforce_oauth2_on_request("/nnrf-nfm/v1/nf-instances/x", Some(&auth), true, &jwks)
+                .is_none()
         );
     }
 
@@ -3249,7 +3272,10 @@ mod tests {
             3700,
         );
         assert_eq!(claims["aud"], json!(["p-1"]));
-        assert_eq!(claims["producerSnssaiList"], json!([{"sst": 1, "sd": "010203"}]));
+        assert_eq!(
+            claims["producerSnssaiList"],
+            json!([{"sst": 1, "sd": "010203"}])
+        );
         assert_eq!(claims["consumerPlmnId"], json!({"mcc": "001", "mnc": "01"}));
         assert_eq!(claims["producerPlmnId"], json!({"mcc": "001", "mnc": "01"}));
         assert_eq!(claims["producerNfSetId"], json!("set-udm-1"));

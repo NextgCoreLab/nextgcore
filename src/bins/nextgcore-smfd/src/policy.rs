@@ -236,7 +236,9 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
     }
 
     // NRF discovery
-    let nrf_uri = nextgcore_sbi::context::global_context().get_nrf_uri().await?;
+    let nrf_uri = nextgcore_sbi::context::global_context()
+        .get_nrf_uri()
+        .await?;
     let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
     let client = SbiClient::new(
         SbiClientConfig::new(nrf_host, nrf_port)
@@ -325,7 +327,9 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
     }
 
     // NRF discovery
-    let nrf_uri = nextgcore_sbi::context::global_context().get_nrf_uri().await?;
+    let nrf_uri = nextgcore_sbi::context::global_context()
+        .get_nrf_uri()
+        .await?;
     let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
     let client = SbiClient::new(
         SbiClientConfig::new(nrf_host, nrf_port)
@@ -457,9 +461,7 @@ pub async fn nsac_pdu_session_admit(
             }
         }
         other => {
-            log::warn!(
-                "NSACF PDU-session admission returned HTTP {other} (expected 204/200/403)"
-            );
+            log::warn!("NSACF PDU-session admission returned HTTP {other} (expected 204/200/403)");
             NsacAdmission::Unavailable
         }
     }
@@ -1244,7 +1246,7 @@ mod tests {
         let qos = &msg[7..7 + qos_len];
         assert_eq!(qos[0], 9); // QoS rule identifier == QFI
         assert_eq!(u16::from_be_bytes([qos[1], qos[2]]), 6); // rule length (2-octet)
-        // op (CREATE=1)<<5 | DQR(0x10) | num_pf(1) = 0x31
+                                                             // op (CREATE=1)<<5 | DQR(0x10) | num_pf(1) = 0x31
         assert_eq!(qos[3], 0x31);
         // packet filter header: dir BIDIR(3)<<4 | pf id 1 = 0x31
         assert_eq!(qos[4], 0x31);
@@ -1353,7 +1355,9 @@ mod tests {
             "xr",
         );
         // S-NSSAI present with SST + 3-byte SD.
-        let snssai_at = msg.windows(5).position(|w| w == [0x22, 0x04, 0x01, 0x01, 0x02]);
+        let snssai_at = msg
+            .windows(5)
+            .position(|w| w == [0x22, 0x04, 0x01, 0x01, 0x02]);
         assert!(snssai_at.is_some(), "S-NSSAI (0x22) with SST+SD expected");
         // QoS flow descriptions IE present (TLV-E): IEI 0x79, then the 5QI.
         let qfd_at = msg
@@ -1413,7 +1417,7 @@ mod tests {
         assert_eq!(&msg[..5], &[0x2E, 5, 2, 0xC3, 26]);
         assert_eq!(msg[5], 0x37); // IEI: Back-off timer value
         assert_eq!(msg[6], 0x01); // length
-        // GPRS timer 3: unit "1 minute" (101) | 10
+                                  // GPRS timer 3: unit "1 minute" (101) | 10
         assert_eq!(msg[7] >> 5, 0b101);
         assert_eq!(msg[7] & 0x1F, 10);
         // A non-congestion cause carries no back-off timer (byte-stable).
@@ -1426,7 +1430,12 @@ mod tests {
     #[test]
     fn reject_ssc_mode_carries_allowed_ssc_mode_ie() {
         // Allow SSC mode 1 only (bitmap 0b001).
-        let msg = build_establishment_reject_ext(5, 2, gsm_cause::REQUEST_REJECTED_UNSPECIFIED, Some(0b001));
+        let msg = build_establishment_reject_ext(
+            5,
+            2,
+            gsm_cause::REQUEST_REJECTED_UNSPECIFIED,
+            Some(0b001),
+        );
         let last = *msg.last().unwrap();
         assert_eq!(last >> 4, 0x0F); // IEI nibble
         assert_eq!(last & 0x07, 0b001); // SSC mode 1 allowed
@@ -1549,7 +1558,9 @@ mod tests {
 
     // --------------- HTTP round-trip against a stub PCF -----------------
 
-    async fn stub_pcf_handler(req: nextgcore_sbi::message::SbiRequest) -> nextgcore_sbi::message::SbiResponse {
+    async fn stub_pcf_handler(
+        req: nextgcore_sbi::message::SbiRequest,
+    ) -> nextgcore_sbi::message::SbiResponse {
         let path = req.header.uri.split('?').next().unwrap_or("");
         let decision = serde_json::json!({
             "sessRules": {
@@ -1603,7 +1614,9 @@ mod tests {
     async fn sm_policy_lifecycle_http_round_trip() {
         let port = free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(addr));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+        );
         server
             .start(stub_pcf_handler)
             .await
@@ -1683,7 +1696,9 @@ mod tests {
     /// conformant /slices/pdus resource, then admits (204) unless
     /// `pduSessionId == 99` (the over-limit marker), in which case it returns a
     /// 403 ProblemDetails (total failure).
-    async fn stub_nsacf_handler(req: nextgcore_sbi::message::SbiRequest) -> nextgcore_sbi::message::SbiResponse {
+    async fn stub_nsacf_handler(
+        req: nextgcore_sbi::message::SbiRequest,
+    ) -> nextgcore_sbi::message::SbiResponse {
         let path = req.header.uri.split('?').next().unwrap_or("").to_string();
         if !path.ends_with("/nnsacf-nsac/v1/slices/pdus") {
             return nextgcore_sbi::message::SbiResponse::with_status(404);
@@ -1722,7 +1737,9 @@ mod tests {
     async fn nsac_pdu_session_admit_admitted_and_rejected() {
         let port = free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(addr));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+        );
         server
             .start(stub_nsacf_handler)
             .await
@@ -1735,13 +1752,11 @@ mod tests {
 
         let run = async {
             // Within quota -> Admitted
-            let res =
-                nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-1", 5, 1, None).await;
+            let res = nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-1", 5, 1, None).await;
             assert_eq!(res, NsacAdmission::Admitted);
 
             // Over-limit marker (psi 99) -> Rejected (NSACF 403 total failure)
-            let res =
-                nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-2", 99, 1, None).await;
+            let res = nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-2", 99, 1, None).await;
             assert_eq!(res, NsacAdmission::Rejected);
 
             // DECREASE release is best-effort and must not panic

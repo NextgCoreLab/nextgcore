@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use nextgcore_sctp::{NextgcoreSctpInfo, SctpServer, SctpServerConfig, ServerEvent, NEXTGCORE_NGAP_SCTP_PORT};
+use nextgcore_sctp::{
+    NextgcoreSctpInfo, SctpServer, SctpServerConfig, ServerEvent, NEXTGCORE_NGAP_SCTP_PORT,
+};
 
 use crate::context::{AmfContext, AmfGnb, AmfUe, Guti5gs, PlmnId, SNssai, UeSecurityCapability};
 use crate::event::AmfEvent;
@@ -141,7 +143,10 @@ impl NgapTransport {
         }
     }
 
-    async fn recv(&mut self, timeout: Duration) -> std::result::Result<bool, nextgcore_sctp::ServerError> {
+    async fn recv(
+        &mut self,
+        timeout: Duration,
+    ) -> std::result::Result<bool, nextgcore_sctp::ServerError> {
         match self {
             Self::Userspace(s) => s.recv(timeout).await,
             #[cfg(feature = "kernel-sctp")]
@@ -383,7 +388,10 @@ impl NgapServer {
         let (server_event_tx, server_event_rx) = mpsc::unbounded_channel();
         transport.set_event_sender(server_event_tx);
 
-        log::info!("NGAP server listening on {local_addr} ({})", backend.label());
+        log::info!(
+            "NGAP server listening on {local_addr} ({})",
+            backend.label()
+        );
 
         Ok(Self {
             transport,
@@ -1823,8 +1831,11 @@ impl NgapServer {
         state.amf_ue.supi = Some(supi.clone());
 
         let abba_len = state.amf_ue.abba_len as usize;
-        let kamf =
-            nextgcore_crypt::kdf::nextgcore_kdf_kamf(&supi, &state.amf_ue.abba[..abba_len], &confirm.kseaf);
+        let kamf = nextgcore_crypt::kdf::nextgcore_kdf_kamf(
+            &supi,
+            &state.amf_ue.abba[..abba_len],
+            &confirm.kseaf,
+        );
         state.amf_ue.kamf = kamf;
 
         // Select NAS algorithms from the UE's replayed capabilities and the
@@ -2394,8 +2405,7 @@ impl NgapServer {
                 "[{supi}] no authorized S-NSSAI (UDM subscription + PLMN support \
                  both empty); rejecting registration with 5GMM #62"
             );
-            let reject =
-                gmm_build::build_registration_reject(GmmCause::NoNetworkSlicesAvailable);
+            let reject = gmm_build::build_registration_reject(GmmCause::NoNetworkSlicesAvailable);
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
             self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
                 .await?;
@@ -2488,7 +2498,11 @@ impl NgapServer {
         {
             state.amf_ue.ue_ambr.downlink = dl;
         }
-        if let Some(ul) = am_data.ue_ambr_uplink.as_deref().and_then(parse_bitrate_bps) {
+        if let Some(ul) = am_data
+            .ue_ambr_uplink
+            .as_deref()
+            .and_then(parse_bitrate_bps)
+        {
             state.amf_ue.ue_ambr.uplink = ul;
         }
 
@@ -3634,9 +3648,7 @@ impl NgapServer {
         // ID. Without a matching connected gNB the AMF cannot allocate handover
         // resources (inter-AMF / N2 relocation needs Namf_Communication, which
         // is out of scope here).
-        let target_assoc = self
-            .find_association_for_target(&required.target_id)
-            .await;
+        let target_assoc = self.find_association_for_target(&required.target_id).await;
 
         if target_assoc.is_none() {
             log::warn!(
@@ -3651,7 +3663,8 @@ impl NgapServer {
                 ),
                 criticality_diagnostics: None,
             };
-            if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure) {
+            if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure)
+            {
                 self.send_to_association(association_id, &bytes).await?;
             }
             return Ok(());
@@ -3677,7 +3690,8 @@ impl NgapServer {
                 ),
                 criticality_diagnostics: None,
             };
-            if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure) {
+            if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure)
+            {
                 self.send_to_association(association_id, &bytes).await?;
             }
             return Ok(());
@@ -3712,19 +3726,21 @@ impl NgapServer {
             pdu_session_list: required
                 .pdu_session_list
                 .iter()
-                .map(|p| nextgcore_ngap::types::PduSessionResourceSetupItemHoReq {
-                    pdu_session_id: p.pdu_session_id,
-                    s_nssai: state
-                        .amf_ue
-                        .allowed_nssai
-                        .first()
-                        .map(|s| nextgcore_ngap::types::SNssai {
-                            sst: s.sst,
-                            sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
-                        })
-                        .unwrap_or(nextgcore_ngap::types::SNssai { sst: 1, sd: None }),
-                    transfer: p.transfer.clone(),
-                })
+                .map(
+                    |p| nextgcore_ngap::types::PduSessionResourceSetupItemHoReq {
+                        pdu_session_id: p.pdu_session_id,
+                        s_nssai: state
+                            .amf_ue
+                            .allowed_nssai
+                            .first()
+                            .map(|s| nextgcore_ngap::types::SNssai {
+                                sst: s.sst,
+                                sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
+                            })
+                            .unwrap_or(nextgcore_ngap::types::SNssai { sst: 1, sd: None }),
+                        transfer: p.transfer.clone(),
+                    },
+                )
                 .collect(),
             allowed_nssai: state
                 .amf_ue
@@ -3763,7 +3779,8 @@ impl NgapServer {
                     ),
                     criticality_diagnostics: None,
                 };
-                if let Ok(b) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure) {
+                if let Ok(b) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure)
+                {
                     self.send_to_association(association_id, &b).await?;
                 }
             }
@@ -3816,7 +3833,10 @@ impl NgapServer {
                 .ue_auth_state
                 .get(&ack.amf_ue_ngap_id)
                 .expect("checked");
-            (state.ran_ue_ngap_id, nextgcore_ngap::types::HandoverType::Intra5gs)
+            (
+                state.ran_ue_ngap_id,
+                nextgcore_ngap::types::HandoverType::Intra5gs,
+            )
         };
 
         let command = nextgcore_ngap::types::HandoverCommand {
@@ -3988,11 +4008,7 @@ impl NgapServer {
     /// serving association, derives a fresh NH (TS 33.501 Section 6.9.2.3.3),
     /// and replies with PathSwitchRequestAcknowledge; on any inconsistency it
     /// replies with PathSwitchRequestFailure (TS 38.413 Section 9.2.3.12).
-    async fn handle_path_switch_request(
-        &mut self,
-        association_id: u64,
-        data: &[u8],
-    ) -> Result<()> {
+    async fn handle_path_switch_request(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
         let req = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
             Ok(nextgcore_ngap::NgapMessage::PathSwitchRequest(r)) => r,
             Ok(other) => {
@@ -4031,7 +4047,8 @@ impl NgapServer {
                 released_list: None,
                 criticality_diagnostics: None,
             };
-            if let Ok(bytes) = nextgcore_ngap::builder::build_path_switch_request_failure(&failure) {
+            if let Ok(bytes) = nextgcore_ngap::builder::build_path_switch_request_failure(&failure)
+            {
                 self.send_to_association(association_id, &bytes).await?;
             }
             return Ok(());
@@ -4044,7 +4061,8 @@ impl NgapServer {
                 .ue_auth_state
                 .get_mut(&amf_ue_ngap_id)
                 .expect("checked");
-            let new_nh = nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&state.amf_ue.kamf, &state.amf_ue.nh);
+            let new_nh =
+                nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&state.amf_ue.kamf, &state.amf_ue.nh);
             state.amf_ue.nh = new_nh;
             state.amf_ue.nhcc = state.amf_ue.nhcc.wrapping_add(1) & 0x07;
             // Move the UE's serving RAN association and RAN-UE-NGAP-ID to the
@@ -4127,7 +4145,8 @@ impl NgapServer {
                     released_list: None,
                     criticality_diagnostics: None,
                 };
-                if let Ok(b) = nextgcore_ngap::builder::build_path_switch_request_failure(&failure) {
+                if let Ok(b) = nextgcore_ngap::builder::build_path_switch_request_failure(&failure)
+                {
                     self.send_to_association(association_id, &b).await?;
                 }
             }
@@ -4145,7 +4164,9 @@ impl NgapServer {
             nextgcore_ngap::types::TargetId::TargetRanNodeId {
                 global_ran_node_id, ..
             } => match global_ran_node_id {
-                nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => Some(*gnb_id as u64),
+                nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => {
+                    Some(*gnb_id as u64)
+                }
                 _ => None,
             },
             nextgcore_ngap::types::TargetId::TargetGlobalNgEnbId { .. } => None,
@@ -4190,9 +4211,7 @@ impl NgapServer {
             state.gmm_fsm.transition_to_registered();
             log::info!("UE {amf_ue_ngap_id} context established (AS-layer security up)");
         } else {
-            log::warn!(
-                "Initial Context Setup Response for unknown UE {amf_ue_ngap_id}; ignoring"
-            );
+            log::warn!("Initial Context Setup Response for unknown UE {amf_ue_ngap_id}; ignoring");
         }
         Ok(())
     }
@@ -4662,7 +4681,9 @@ fn select_allowed_nssai(subscribed: &[SNssai], plmn_default: &[SNssai]) -> Vec<S
 #[allow(dead_code)]
 fn build_eap_authentication_request(tsc: u8, ksi: u8, abba: &[u8], eap_payload: &[u8]) -> Vec<u8> {
     use nextgcore_nas::common::types::{Abba, EapMessage, KeySetIdentifier};
-    use nextgcore_nas::fiveg::message::{build_5gmm_message, AuthenticationRequest, FiveGmmMessage};
+    use nextgcore_nas::fiveg::message::{
+        build_5gmm_message, AuthenticationRequest, FiveGmmMessage,
+    };
 
     let msg = FiveGmmMessage::AuthenticationRequest(AuthenticationRequest {
         ngksi: KeySetIdentifier::new(tsc, ksi),
@@ -5780,7 +5801,10 @@ mod tests {
             ),
             "tampered MAC must fail closed with Err, got {res:?}"
         );
-        assert_eq!(amf_side2.ul_count, 0, "tampered MAC must not advance UL COUNT");
+        assert_eq!(
+            amf_side2.ul_count, 0,
+            "tampered MAC must not advance UL COUNT"
+        );
     }
 
     #[test]
@@ -5960,11 +5984,16 @@ mod tests {
         // exactly that key as the UE Security Key.
         let kamf = [0x42u8; 32];
         let ul_count = 1u32;
-        let kgnb = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(&kamf, ul_count, ACCESS_TYPE_3GPP);
+        let kgnb =
+            nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(&kamf, ul_count, ACCESS_TYPE_3GPP);
         assert_ne!(kgnb, [0u8; 32], "KgNB must be non-zero");
 
         // Different UL NAS COUNT -> different KgNB (input binding holds).
-        let kgnb2 = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(&kamf, ul_count + 1, ACCESS_TYPE_3GPP);
+        let kgnb2 = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(
+            &kamf,
+            ul_count + 1,
+            ACCESS_TYPE_3GPP,
+        );
         assert_ne!(kgnb, kgnb2);
 
         // Wire it into an ICS request and confirm the security key round-trips.
@@ -6186,7 +6215,8 @@ mod tests {
         assert!(mismatch, "downgraded caps must be detected as a mismatch");
 
         // The reject the AMF sends carries 5GMM cause #23.
-        let reject = gmm_build::build_security_mode_reject(GmmCause::UeSecurityCapabilitiesMismatch);
+        let reject =
+            gmm_build::build_security_mode_reject(GmmCause::UeSecurityCapabilitiesMismatch);
         assert_eq!(reject[2], gmm_build::message_type::SECURITY_MODE_REJECT);
         assert_eq!(
             *reject.last().unwrap(),
@@ -6212,7 +6242,10 @@ mod tests {
             || replayed.ia != stored.ia
             || replayed.eea != stored.eea
             || replayed.eia != stored.eia;
-        assert!(!mismatch, "identical caps must NOT be flagged as bidding-down");
+        assert!(
+            !mismatch,
+            "identical caps must NOT be flagged as bidding-down"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -6259,7 +6292,10 @@ mod tests {
         // Subscription present -> the authorized (subscribed) set, verbatim.
         let allowed = select_allowed_nssai(&subscribed, &plmn_default);
         assert_eq!(allowed.len(), 1);
-        assert_eq!(allowed[0].sst, 2, "must use the network-authorized (subscribed) set");
+        assert_eq!(
+            allowed[0].sst, 2,
+            "must use the network-authorized (subscribed) set"
+        );
 
         // No subscription -> AMF-configured PLMN slice support (still authorized,
         // not the UE's request). Matches the matched-sim sst=1.
@@ -6294,10 +6330,17 @@ mod tests {
         assert_eq!(req[4], 0x02, "ABBA length");
         assert_eq!(&req[5..7], &abba, "ABBA value carried");
         // EAP message IE: IEI 0x78, 2-octet length, then the verbatim payload.
-        let iei = req.iter().position(|&b| b == 0x78).expect("EAP message IEI 0x78");
+        let iei = req
+            .iter()
+            .position(|&b| b == 0x78)
+            .expect("EAP message IEI 0x78");
         let len = ((req[iei + 1] as usize) << 8) | (req[iei + 2] as usize);
         assert_eq!(len, eap.len(), "EAP length octets");
-        assert_eq!(&req[iei + 3..iei + 3 + len], &eap, "EAP payload relayed verbatim");
+        assert_eq!(
+            &req[iei + 3..iei + 3 + len],
+            &eap,
+            "EAP payload relayed verbatim"
+        );
 
         // Reverse direction: parse the EAP-Response back out of an Auth Response.
         let mut resp = vec![

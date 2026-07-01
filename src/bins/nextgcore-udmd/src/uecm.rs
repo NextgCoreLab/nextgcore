@@ -77,7 +77,11 @@ fn require_obj<'a>(v: &'a Value, key: &str, label: &str) -> Result<&'a Value, Pr
 /// (TS 29.503 §6.2.6): `amfInstanceId`, `deregCallbackUri`,
 /// `guami{amfId, plmnId{mcc, mnc}}`, `ratType`.
 pub fn validate_amf_3gpp_registration(body: &Value) -> Result<(), ProblemDetails> {
-    require_str(body, "amfInstanceId", "Amf3GppAccessRegistration.amfInstanceId")?;
+    require_str(
+        body,
+        "amfInstanceId",
+        "Amf3GppAccessRegistration.amfInstanceId",
+    )?;
     require_str(
         body,
         "deregCallbackUri",
@@ -180,9 +184,7 @@ impl UdrClient {
 
     async fn smf_context_get(&self, supi: &str, psi: &str) -> Result<SbiResponse, String> {
         match self {
-            UdrClient::Live => {
-                crate::sbi_path::udm_nudr_dr_send_smf_context_get(supi, psi).await
-            }
+            UdrClient::Live => crate::sbi_path::udm_nudr_dr_send_smf_context_get(supi, psi).await,
             #[cfg(test)]
             UdrClient::Mock(m) => Ok(m.smf_context_get(supi, psi)),
         }
@@ -281,7 +283,9 @@ async fn notify_old_amf_if_changed(supi: &str, prior: &Value, new: &Value, clien
             "[{supi}] Deregistration notification to old AMF {old_uri} -> {}",
             resp.status
         ),
-        Err(e) => log::warn!("[{supi}] Deregistration notification to old AMF {old_uri} failed: {e}"),
+        Err(e) => {
+            log::warn!("[{supi}] Deregistration notification to old AMF {old_uri} failed: {e}")
+        }
     }
 }
 
@@ -289,12 +293,18 @@ async fn notify_old_amf_if_changed(supi: &str, prior: &Value, new: &Value, clien
 /// handler should early-return it); otherwise `None`, degrading gracefully
 /// (best-effort) on transport errors and non-5xx statuses so the matched-sim
 /// happy path still completes when udrd lacks context-data support.
-fn udr_write_outcome(supi: &str, op: &str, result: Result<SbiResponse, String>) -> Option<SbiResponse> {
+fn udr_write_outcome(
+    supi: &str,
+    op: &str,
+    result: Result<SbiResponse, String>,
+) -> Option<SbiResponse> {
     match result {
         Ok(resp) if resp.is_success() => None,
         Ok(resp) if resp.status >= 500 => {
             log::error!("[{supi}] UDR {op} returned {}", resp.status);
-            Some(nextgcore_sbi::server::send_service_unavailable("UDR persistence failed"))
+            Some(nextgcore_sbi::server::send_service_unavailable(
+                "UDR persistence failed",
+            ))
         }
         Ok(resp) => {
             log::warn!("[{supi}] UDR {op} returned {} (degraded)", resp.status);
@@ -311,8 +321,7 @@ fn udr_write_outcome(supi: &str, op: &str, result: Result<SbiResponse, String>) 
 ///
 /// Considers amfId + plmnId.mcc + plmnId.mnc. Missing fields never match.
 fn guami_matches(a: &Value, b: &Value) -> bool {
-    a.get("amfId").and_then(|x| x.as_str())
-        == b.get("amfId").and_then(|x| x.as_str())
+    a.get("amfId").and_then(|x| x.as_str()) == b.get("amfId").and_then(|x| x.as_str())
         && a.pointer("/plmnId/mcc").and_then(|x| x.as_str())
             == b.pointer("/plmnId/mcc").and_then(|x| x.as_str())
         && a.pointer("/plmnId/mnc").and_then(|x| x.as_str())
@@ -412,9 +421,7 @@ pub async fn process_amf_registration_update(
     };
 
     // GUAMI ownership check (TS 29.503 §5.3.2.4).
-    if let (Some(stored_guami), Some(req_guami)) =
-        (stored.get("guami"), body.get("guami"))
-    {
+    if let (Some(stored_guami), Some(req_guami)) = (stored.get("guami"), body.get("guami")) {
         if !guami_matches(stored_guami, req_guami) {
             log::warn!("[{supi}] PATCH rejected: GUAMI mismatch");
             return ProblemDetails {
@@ -755,8 +762,7 @@ mod tests {
             let body = remove_path(valid_smf_body(), path);
             let mock = Arc::new(MockUdr::new());
             let client = UdrClient::Mock(mock.clone());
-            let resp =
-                process_smf_registration("imsi-001010000000302", "5", &body, &client).await;
+            let resp = process_smf_registration("imsi-001010000000302", "5", &body, &client).await;
             assert_eq!(resp.status, 400, "missing {path:?} should be 400");
             assert_eq!(
                 problem_cause(&resp).as_deref(),
@@ -864,8 +870,7 @@ mod tests {
             "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "deadff" },
             "purgeFlag": true
         });
-        let resp =
-            process_amf_registration_update("imsi-udmd05-0001", &wrong_guami, &client).await;
+        let resp = process_amf_registration_update("imsi-udmd05-0001", &wrong_guami, &client).await;
         assert_eq!(resp.status, 403, "wrong GUAMI must be 403");
         assert_eq!(
             problem_cause(&resp).as_deref(),
@@ -874,7 +879,10 @@ mod tests {
         );
         // No PATCH should have been sent to UDR
         assert!(
-            !mock.calls().iter().any(|c| matches!(c, UdrCall::AmfPatch { .. })),
+            !mock
+                .calls()
+                .iter()
+                .any(|c| matches!(c, UdrCall::AmfPatch { .. })),
             "UDR PATCH must not be issued when GUAMI mismatches"
         );
     }
@@ -894,11 +902,12 @@ mod tests {
             "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
             "purgeFlag": true
         });
-        let resp =
-            process_amf_registration_update("imsi-udmd05-0002", &patch, &client).await;
+        let resp = process_amf_registration_update("imsi-udmd05-0002", &patch, &client).await;
         assert_eq!(resp.status, 204, "matching GUAMI must be 204");
         assert!(
-            mock.calls().iter().any(|c| matches!(c, UdrCall::AmfPatch { .. })),
+            mock.calls()
+                .iter()
+                .any(|c| matches!(c, UdrCall::AmfPatch { .. })),
             "UDR PATCH must be issued when GUAMI matches"
         );
     }
@@ -908,7 +917,8 @@ mod tests {
         // Empty mock → no stored registration → 404
         let mock = Arc::new(MockUdr::new());
         let client = UdrClient::Mock(mock);
-        let patch = json!({ "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" } });
+        let patch =
+            json!({ "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" } });
         let resp = process_amf_registration_update("imsi-udmd05-0003", &patch, &client).await;
         assert_eq!(resp.status, 404);
     }
@@ -926,8 +936,16 @@ mod tests {
         let resp = process_amf_registration(supi, &valid_amf_body(), &client).await;
         assert_eq!(resp.status, 201, "first PUT must be 201");
         // set_header lowercases all header keys (HTTP/2 convention).
-        let loc = resp.http.headers.get("location").cloned().unwrap_or_default();
-        assert!(loc.contains(supi), "Location header must reference the SUPI");
+        let loc = resp
+            .http
+            .headers
+            .get("location")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            loc.contains(supi),
+            "Location header must reference the SUPI"
+        );
 
         // Second PUT → prior exists → 200
         let resp = process_amf_registration(supi, &valid_amf_body(), &client).await;
@@ -975,12 +993,21 @@ mod tests {
         body_b["deregCallbackUri"] =
             json!("http://amf-b.example.org:7777/namf-callback/v1/imsi-x/dereg-notify");
         let resp = process_amf_registration(supi, &body_b, &client).await;
-        assert_eq!(resp.status, 200, "re-registration over existing AMF-A must be 200 (update)");
+        assert_eq!(
+            resp.status, 200,
+            "re-registration over existing AMF-A must be 200 (update)"
+        );
 
         let calls = mock.calls();
-        assert_eq!(deregister_count(&calls), 1, "exactly one dereg notification");
+        assert_eq!(
+            deregister_count(&calls),
+            1,
+            "exactly one dereg notification"
+        );
         let notified = calls.iter().find_map(|c| match c {
-            UdrCall::DeregNotify { callback_uri, body } => Some((callback_uri.clone(), body.clone())),
+            UdrCall::DeregNotify { callback_uri, body } => {
+                Some((callback_uri.clone(), body.clone()))
+            }
             _ => None,
         });
         let (uri, dereg_body) = notified.expect("a dereg notification was sent");
@@ -993,7 +1020,10 @@ mod tests {
         // Re-register with the SAME AMF-B id -> suppressed, no new notification.
         // Still an update (prior = AMF-B now stored) → 200.
         let resp = process_amf_registration(supi, &body_b, &client).await;
-        assert_eq!(resp.status, 200, "same-AMF re-registration still updates the resource → 200");
+        assert_eq!(
+            resp.status, 200,
+            "same-AMF re-registration still updates the resource → 200"
+        );
         assert_eq!(
             deregister_count(&mock.calls()),
             1,

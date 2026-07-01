@@ -137,7 +137,10 @@ impl Oci {
         if let Some(secs) = self.period_of_validity_secs {
             parts.push(format!("Period-of-Validity: {secs}s"));
         }
-        parts.push(format!("Overload-Reduction-Metric: {}", self.reduction_metric));
+        parts.push(format!(
+            "Overload-Reduction-Metric: {}",
+            self.reduction_metric
+        ));
         for (k, v) in &self.extra {
             parts.push(format!("{k}: {v}"));
         }
@@ -288,7 +291,12 @@ mod tests {
     #[test]
     fn test_oci_metric_clamped_and_missing() {
         // Out-of-range metric is clamped to 100.
-        assert_eq!(Oci::parse("Overload-Reduction-Metric: 250").unwrap().reduction_metric, 100);
+        assert_eq!(
+            Oci::parse("Overload-Reduction-Metric: 250")
+                .unwrap()
+                .reduction_metric,
+            100
+        );
         // No metric => not a valid OCI.
         assert!(Oci::parse("Timestamp: x").is_none());
         assert!(Oci::parse("").is_none());

@@ -259,7 +259,9 @@ impl UdrDataStore {
                 for s in arr {
                     let (Some(id), Some(kind), Some(uri)) = (
                         s.get("id").and_then(Value::as_str),
-                        s.get("kind").and_then(Value::as_str).and_then(SubKind::from_tag),
+                        s.get("kind")
+                            .and_then(Value::as_str)
+                            .and_then(SubKind::from_tag),
                         s.get("notify_uri").and_then(Value::as_str),
                     ) else {
                         continue;
@@ -440,7 +442,8 @@ impl UdrDataStore {
     pub fn smf_registration_put(&self, supi: &str, psi: &str, doc: Value) -> bool {
         let created = {
             let mut map = self.smf_registrations.write().expect("lock");
-            map.insert((supi.to_string(), psi.to_string()), doc).is_none()
+            map.insert((supi.to_string(), psi.to_string()), doc)
+                .is_none()
         };
         self.persist();
         created
@@ -1056,19 +1059,28 @@ mod tests {
         // AmPolicyData
         let am_doc = json!({"suppFeat": "0"});
         assert!(s.policy_am_put(supi, am_doc.clone()), "first put = created");
-        assert!(!s.policy_am_put(supi, am_doc.clone()), "second put = replaced");
+        assert!(
+            !s.policy_am_put(supi, am_doc.clone()),
+            "second put = replaced"
+        );
         assert_eq!(s.policy_am_get(supi), Some(am_doc));
 
         // SmPolicyData
         let sm_doc = json!({"smPolicySnssaiData": {}});
         assert!(s.policy_sm_put(supi, sm_doc.clone()), "first put = created");
-        assert!(!s.policy_sm_put(supi, sm_doc.clone()), "second put = replaced");
+        assert!(
+            !s.policy_sm_put(supi, sm_doc.clone()),
+            "second put = replaced"
+        );
         assert_eq!(s.policy_sm_get(supi), Some(sm_doc));
 
         // UePolicySet
         let ue_doc = json!({"subscPolicySections": {}});
         assert!(s.policy_ue_put(supi, ue_doc.clone()), "first put = created");
-        assert!(!s.policy_ue_put(supi, ue_doc.clone()), "second put = replaced");
+        assert!(
+            !s.policy_ue_put(supi, ue_doc.clone()),
+            "second put = replaced"
+        );
         assert_eq!(s.policy_ue_get(supi), Some(ue_doc));
 
         // Unknown SUPI has no stored policy
@@ -1155,7 +1167,10 @@ mod tests {
 
         // originalCallbackReference must be absent when body has no callbackReference
         let orig_cb = sub.body.get("callbackReference").and_then(Value::as_str);
-        assert!(orig_cb.is_none(), "this subscription has no callbackReference in body");
+        assert!(
+            orig_cb.is_none(),
+            "this subscription has no callbackReference in body"
+        );
 
         // Verify the payload won't include originalCallbackReference
         let mut payload_map = serde_json::Map::new();
@@ -1165,7 +1180,10 @@ mod tests {
         }
         payload_map.insert("notifyItems".to_string(), json!([]));
         let payload = Value::Object(payload_map);
-        assert!(!payload.as_object().unwrap().contains_key("originalCallbackReference"));
+        assert!(!payload
+            .as_object()
+            .unwrap()
+            .contains_key("originalCallbackReference"));
     }
 
     /// Unique snapshot path per test so concurrent runs do not collide.
@@ -1274,9 +1292,18 @@ mod tests {
         let t = UdrDataStore::default();
         t.restore_from(&snap);
         assert_eq!(t.amf_3gpp_get("imsi-1"), Some(json!({"x": 1})));
-        assert_eq!(t.exposure_sm_get("imsi-1", "7"), Some(json!({"dnn": "ims"})));
+        assert_eq!(
+            t.exposure_sm_get("imsi-1", "7"),
+            Some(json!({"dnn": "ims"}))
+        );
         assert_eq!(t.policy_am_get("imsi-1"), Some(json!({"suppFeat": "1"})));
-        assert_eq!(t.policy_sm_get("imsi-1"), Some(json!({"smPolicySnssaiData": {}})));
-        assert_eq!(t.policy_ue_get("imsi-1"), Some(json!({"subscPolicySections": {}})));
+        assert_eq!(
+            t.policy_sm_get("imsi-1"),
+            Some(json!({"smPolicySnssaiData": {}}))
+        );
+        assert_eq!(
+            t.policy_ue_get("imsi-1"),
+            Some(json!({"subscPolicySections": {}}))
+        );
     }
 }

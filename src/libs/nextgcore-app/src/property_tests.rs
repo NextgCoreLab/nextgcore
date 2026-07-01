@@ -6,8 +6,8 @@
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        nextgcore_time_from_msec, nextgcore_time_from_sec, MaxConf, NextgcoreGlobalConf, NextgcoreLocalConf, NextgcorePlmnId,
-        ParameterConf, PkbufConfig, SockoptConf,
+        nextgcore_time_from_msec, nextgcore_time_from_sec, MaxConf, NextgcoreGlobalConf,
+        NextgcoreLocalConf, NextgcorePlmnId, ParameterConf, PkbufConfig, SockoptConf,
     };
     use crate::context::{MetricsConf, NextgcoreAppContext, PoolConf};
     use crate::yaml::NextgcoreYamlDocument;
@@ -121,12 +121,14 @@ mod tests {
             arb_sockopt_conf(),
             arb_pkbuf_config(),
         )
-            .prop_map(|(parameter, max, sockopt, pkbuf_config)| NextgcoreGlobalConf {
-                parameter,
-                max,
-                sockopt,
-                pkbuf_config,
-            })
+            .prop_map(
+                |(parameter, max, sockopt, pkbuf_config)| NextgcoreGlobalConf {
+                    parameter,
+                    max,
+                    sockopt,
+                    pkbuf_config,
+                },
+            )
     }
 
     // Strategy for generating valid PLMN IDs

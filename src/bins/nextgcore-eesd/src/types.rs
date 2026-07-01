@@ -193,7 +193,11 @@ pub struct EasCharacteristics {
     pub eas_id: Option<String>,
     /// EAS category/type. Wire field is `easType`; `type` is accepted as an
     /// alias for compatibility with the matched-stack discovery body.
-    #[serde(rename = "easType", alias = "type", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "easType",
+        alias = "type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub eas_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ac_ids: Option<Vec<String>>,
@@ -479,10 +483,14 @@ mod tests {
     /// the mandatory `easProf.easId` / `easProf.endPt`.
     #[test]
     fn test_eas_registration_deserialize_example() {
-        let body = r#"{"easProf":{"easId":"eas1.example.com","endPt":{"fqdn":"eas1.example.com"}}}"#;
+        let body =
+            r#"{"easProf":{"easId":"eas1.example.com","endPt":{"fqdn":"eas1.example.com"}}}"#;
         let reg: EasRegistration = serde_json::from_str(body).expect("example deserializes");
         assert_eq!(reg.eas_prof.eas_id, "eas1.example.com");
-        assert_eq!(reg.eas_prof.end_pt.fqdn.as_deref(), Some("eas1.example.com"));
+        assert_eq!(
+            reg.eas_prof.end_pt.fqdn.as_deref(),
+            Some("eas1.example.com")
+        );
         assert!(reg.registration_id.is_none());
     }
 
@@ -597,10 +605,7 @@ mod tests {
     fn test_discovery_filter_type_alias() {
         let body = r#"{"easChars":{"type":"AR"}}"#;
         let filter: EasDiscoveryFilter = serde_json::from_str(body).unwrap();
-        assert_eq!(
-            filter.eas_chars.unwrap().eas_type.as_deref(),
-            Some("AR")
-        );
+        assert_eq!(filter.eas_chars.unwrap().eas_type.as_deref(), Some("AR"));
     }
 
     /// eesd-05: service-area overlap (shared TAI) gates discovery.

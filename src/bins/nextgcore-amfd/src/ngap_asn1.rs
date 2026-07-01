@@ -1348,14 +1348,20 @@ mod tests {
         assert_eq!(req.guami.amf_region_id, 2);
         assert_eq!(req.guami.amf_set_id, 1);
         assert_eq!(req.guami.amf_pointer, 0);
-        assert_eq!(req.guami.plmn_identity, encode_plmn_id(&PlmnId::new("999", "70")));
+        assert_eq!(
+            req.guami.plmn_identity,
+            encode_plmn_id(&PlmnId::new("999", "70"))
+        );
         // Allowed NSSAI round-trips with the SD packed as 3 bytes
         assert_eq!(req.allowed_nssai.len(), 1);
         assert_eq!(req.allowed_nssai[0].sst, 1);
         assert_eq!(req.allowed_nssai[0].sd, Some([0x01, 0x02, 0x03]));
         // Replayed UE security capabilities: NGAP §9.3.1.86 drops the null
         // algorithm (NAS 0xF0 = EA0|EA1|EA2|EA3 -> NEA1|NEA2|NEA3 = 0xE000).
-        assert_eq!(req.ue_security_capabilities.nr_encryption_algorithms, 0xE000);
+        assert_eq!(
+            req.ue_security_capabilities.nr_encryption_algorithms,
+            0xE000
+        );
         assert_eq!(req.ue_security_capabilities.nr_integrity_algorithms, 0xE000);
         // UE Security Key = KgNB, non-zero and exactly the derived value
         assert_eq!(req.security_key, kgnb);
@@ -1410,7 +1416,10 @@ mod tests {
             Cause::Transport(CauseTransport::TransportResourceUnavailable)
         );
         // group 2 = NAS
-        assert_eq!(build_cause(2, 1), Cause::Nas(CauseNas::AuthenticationFailure));
+        assert_eq!(
+            build_cause(2, 1),
+            Cause::Nas(CauseNas::AuthenticationFailure)
+        );
         // group 3 = Protocol, value 4 = semantic-error
         assert_eq!(
             build_cause(3, 4),
@@ -1426,14 +1435,8 @@ mod tests {
         // map to the per-group "unspecified" fallback, not undefined behaviour.
 
         // RadioNetwork: valid 0..=46; 47 and the max u8 fall back.
-        assert_eq!(
-            radio_network_cause(47),
-            CauseRadioNetwork::Unspecified
-        );
-        assert_eq!(
-            radio_network_cause(u8::MAX),
-            CauseRadioNetwork::Unspecified
-        );
+        assert_eq!(radio_network_cause(47), CauseRadioNetwork::Unspecified);
+        assert_eq!(radio_network_cause(u8::MAX), CauseRadioNetwork::Unspecified);
         assert_eq!(
             build_cause(0, 200),
             Cause::RadioNetwork(CauseRadioNetwork::Unspecified)
@@ -1463,10 +1466,7 @@ mod tests {
         let bytes = build_ng_setup_failure_asn1(0, 250, Some(0));
         match parser::decode_ngap_pdu(&bytes).expect("decode") {
             NgapMessage::NgSetupFailure(f) => {
-                assert_eq!(
-                    f.cause,
-                    Cause::RadioNetwork(CauseRadioNetwork::Unspecified)
-                );
+                assert_eq!(f.cause, Cause::RadioNetwork(CauseRadioNetwork::Unspecified));
             }
             other => panic!("Expected NgSetupFailure, got {other:?}"),
         }

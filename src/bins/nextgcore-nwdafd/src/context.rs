@@ -373,7 +373,7 @@ impl AnalyticsSubscription {
             .unwrap_or(std::time::Duration::ZERO)
             .as_secs();
         match (self.last_notification_time, self.repetition_period_secs) {
-            (None, _) => true, // never notified → always due
+            (None, _) => true,        // never notified → always due
             (Some(_), None) => false, // one-shot already fired
             (Some(last), Some(period)) => now.saturating_sub(last) >= period,
         }
@@ -856,7 +856,10 @@ mod tests {
         );
         assert!(ctx.update_ml_prov_subscription(updated));
         assert_eq!(
-            ctx.get_ml_prov_subscription("mlsub-1").unwrap().ml_events.len(),
+            ctx.get_ml_prov_subscription("mlsub-1")
+                .unwrap()
+                .ml_events
+                .len(),
             1
         );
         let absent = MlProvSubscription::new(
@@ -880,7 +883,10 @@ mod tests {
         ctx.set_event_level("s1", AnalyticsId::NfLoad, 42.0);
         ctx.set_event_level("s1", AnalyticsId::UeMobility, 7.0);
         assert_eq!(ctx.get_event_level("s1", AnalyticsId::NfLoad), Some(42.0));
-        assert_eq!(ctx.get_event_level("s1", AnalyticsId::UeMobility), Some(7.0));
+        assert_eq!(
+            ctx.get_event_level("s1", AnalyticsId::UeMobility),
+            Some(7.0)
+        );
         assert_eq!(ctx.get_event_level("s2", AnalyticsId::NfLoad), None);
     }
 

@@ -416,7 +416,10 @@ pub fn build_rx_answer_error(
         answer.add_avp(Avp::mandatory(
             avp_code::EXPERIMENTAL_RESULT,
             AvpData::Grouped(vec![
-                Avp::mandatory(avp_code::VENDOR_ID, AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID)),
+                Avp::mandatory(
+                    avp_code::VENDOR_ID,
+                    AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID),
+                ),
                 Avp::mandatory(
                     avp_code::EXPERIMENTAL_RESULT_CODE,
                     AvpData::Unsigned32(exp_code),

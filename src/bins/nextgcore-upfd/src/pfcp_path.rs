@@ -1676,8 +1676,13 @@ impl PfcpServer {
         what: &str,
     ) -> Result<(), String> {
         let seq = self.alloc_seq();
-        let message =
-            self.build_response(pfcp_type::SESSION_REPORT_REQUEST, smf_seid, seq, payload, true);
+        let message = self.build_response(
+            pfcp_type::SESSION_REPORT_REQUEST,
+            smf_seid,
+            seq,
+            payload,
+            true,
+        );
 
         // Register BEFORE sending so a fast response cannot race the insert.
         {
@@ -1794,10 +1799,7 @@ impl PfcpServer {
     /// Test hook: insert a session so UPF-initiated reports can resolve the
     /// CP function (SMF) address.
     async fn test_insert_session(&self, info: PfcpSessionInfo) {
-        self.sessions
-            .write()
-            .await
-            .insert(info.upf_seid, info);
+        self.sessions.write().await.insert(info.upf_seid, info);
     }
 
     /// Test hook: force every pending report's T1 timer to be considered

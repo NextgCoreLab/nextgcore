@@ -87,7 +87,10 @@ impl UperEncode for AlmanacKeplerianSet {
         e.encode_constrained_whole_number(self.kep_almanac_delta_i as i64, &Self::DELTA_I)?;
         e.encode_constrained_whole_number(self.kep_almanac_omega_dot as i64, &Self::OMEGA_DOT)?;
         e.encode_constrained_whole_number(self.kep_sv_health as i64, &Self::SV_HEALTH)?;
-        e.encode_constrained_whole_number(self.kep_almanac_a_power_half as i64, &Self::A_POWER_HALF)?;
+        e.encode_constrained_whole_number(
+            self.kep_almanac_a_power_half as i64,
+            &Self::A_POWER_HALF,
+        )?;
         e.encode_constrained_whole_number(self.kep_almanac_omega0 as i64, &Self::OMEGA0)?;
         e.encode_constrained_whole_number(self.kep_almanac_w as i64, &Self::W)?;
         e.encode_constrained_whole_number(self.kep_almanac_m0 as i64, &Self::M0)?;
@@ -111,7 +114,8 @@ impl UperDecode for AlmanacKeplerianSet {
             kep_almanac_delta_i: d.decode_constrained_whole_number(&Self::DELTA_I)? as i16,
             kep_almanac_omega_dot: d.decode_constrained_whole_number(&Self::OMEGA_DOT)? as i16,
             kep_sv_health: d.decode_constrained_whole_number(&Self::SV_HEALTH)? as u8,
-            kep_almanac_a_power_half: d.decode_constrained_whole_number(&Self::A_POWER_HALF)? as i32,
+            kep_almanac_a_power_half: d.decode_constrained_whole_number(&Self::A_POWER_HALF)?
+                as i32,
             kep_almanac_omega0: d.decode_constrained_whole_number(&Self::OMEGA0)? as i16,
             kep_almanac_w: d.decode_constrained_whole_number(&Self::W)? as i16,
             kep_almanac_m0: d.decode_constrained_whole_number(&Self::M0)? as i16,

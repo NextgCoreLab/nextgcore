@@ -682,7 +682,9 @@ pub fn nas_encrypt(
             key_arr.copy_from_slice(&key[..16.min(key.len())]);
 
             let input = message.to_vec();
-            if let Ok(()) = nextgcore_crypt::aes::aes_ctr128_encrypt(&key_arr, &mut iv, &input, message) {
+            if let Ok(()) =
+                nextgcore_crypt::aes::aes_ctr128_encrypt(&key_arr, &mut iv, &input, message)
+            {
                 // Success
             }
         }
@@ -1250,7 +1252,8 @@ mod tests {
     #[test]
     fn test_cross_stack_nas_security_reference_vector() {
         use nextgcore_crypt::kdf::{
-            nextgcore_kdf_kamf, nextgcore_kdf_nas_5gs, NEXTGCORE_KDF_NAS_ENC_ALG, NEXTGCORE_KDF_NAS_INT_ALG,
+            nextgcore_kdf_kamf, nextgcore_kdf_nas_5gs, NEXTGCORE_KDF_NAS_ENC_ALG,
+            NEXTGCORE_KDF_NAS_INT_ALG,
         };
 
         // -- fixed inputs (shared with the sim) --
@@ -1360,7 +1363,10 @@ mod tests {
             ue.knas_int,
         );
         let recovered = unprotect_nas_message(&mut rx, 1, &amfd[2..], true).unwrap();
-        assert_eq!(recovered, body, "nextgcore-nas must recover the amfd-protected body");
+        assert_eq!(
+            recovered, body,
+            "nextgcore-nas must recover the amfd-protected body"
+        );
     }
 
     /// KNOWN DIVERGENCE LOCK (nas-06): amfd derives the NAS connection-id
@@ -1438,8 +1444,14 @@ mod tests {
             let new = nas_5gs_security_encode_nextgcore(&mut ue_new, msg, sht);
             assert_eq!(old, new, "encode adapter byte-mismatch for sht={sht:#x}");
             // COUNT state must track identically.
-            assert_eq!(ue_old.dl_count, ue_new.dl_count, "dl_count desync sht={sht:#x}");
-            assert_eq!(ue_old.ul_count, ue_new.ul_count, "ul_count desync sht={sht:#x}");
+            assert_eq!(
+                ue_old.dl_count, ue_new.dl_count,
+                "dl_count desync sht={sht:#x}"
+            );
+            assert_eq!(
+                ue_old.ul_count, ue_new.ul_count,
+                "ul_count desync sht={sht:#x}"
+            );
         }
     }
 
@@ -1462,7 +1474,10 @@ mod tests {
                 security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
             );
             assert_eq!(old, new, "byte-mismatch at iter {i}");
-            assert_eq!(ue_old.dl_count, ue_new.dl_count, "dl_count desync at iter {i}");
+            assert_eq!(
+                ue_old.dl_count, ue_new.dl_count,
+                "dl_count desync at iter {i}"
+            );
         }
         assert_eq!(ue_new.dl_count, 6, "writeback did not advance the COUNT");
     }
@@ -1492,7 +1507,10 @@ mod tests {
         let mut ue_on = create_test_ue();
         ue_on.use_nextgcore_nas_security = true;
         let on = nas_5gs_security_encode(&mut ue_on, &msg, sht).unwrap();
-        assert_eq!(on, legacy, "canary ON adapter must be byte-identical to legacy");
+        assert_eq!(
+            on, legacy,
+            "canary ON adapter must be byte-identical to legacy"
+        );
     }
 
     /// Helper: craft a valid uplink-protected frame (EPD|SHT|MAC|SQN|payload)
@@ -1552,8 +1570,13 @@ mod tests {
         let f0 = make_uplink_frame(&ue, &[0x7e, 0x00, 0x57, 0x00], sht, 0);
 
         // First reception is accepted and establishes the baseline.
-        let body = nas_5gs_security_decode_nextgcore(&mut ue, sht, &f0).expect("first frame accepted");
-        assert_eq!(body, [0x7e, 0x00, 0x57, 0x00], "must recover the plaintext body");
+        let body =
+            nas_5gs_security_decode_nextgcore(&mut ue, sht, &f0).expect("first frame accepted");
+        assert_eq!(
+            body,
+            [0x7e, 0x00, 0x57, 0x00],
+            "must recover the plaintext body"
+        );
         assert!(ue.ul_count_established, "baseline must be established");
 
         // Exact replay (SQN 0, candidate == stored) is rejected.
@@ -1886,7 +1909,10 @@ mod tests {
         let inner = [0x7e, 0x00, 0x43, 0x01]; // e.g. Registration Complete
         let frame = make_legacy_uplink_frame(&ue, &inner, sht, 0);
 
-        assert!(!ue.use_nextgcore_nas_security, "must exercise the LIVE legacy path");
+        assert!(
+            !ue.use_nextgcore_nas_security,
+            "must exercise the LIVE legacy path"
+        );
         let out = nas_5gs_security_decode(&mut ue, sht, &frame).expect("correct MAC must verify");
         assert_eq!(out, inner, "must recover the plaintext body");
         assert!(!ue.mac_failed, "a correct MAC must NOT flag mac_failed");
@@ -1911,8 +1937,14 @@ mod tests {
             matches!(res, Err(NasSecurityError::MacVerificationFailed)),
             "tampered MAC must fail closed with Err, got {res:?}"
         );
-        assert_eq!(ue.ul_count, before, "MAC failure must NOT advance the UL COUNT");
-        assert!(!ue.ul_count_established, "no baseline established on failure");
+        assert_eq!(
+            ue.ul_count, before,
+            "MAC failure must NOT advance the UL COUNT"
+        );
+        assert!(
+            !ue.ul_count_established,
+            "no baseline established on failure"
+        );
     }
 
     /// amfd-04: an exact replay (non-advancing COUNT) is rejected once a
@@ -1956,6 +1988,9 @@ mod tests {
 
         let out = nas_5gs_security_decode(&mut ue, sht, &frame).expect("wrap frame accepted");
         assert_eq!(out, [0x7e, 0x00, 0x43, 0x09]);
-        assert_eq!(ue.ul_count, 0x0000_0100, "overflow octet incremented exactly once");
+        assert_eq!(
+            ue.ul_count, 0x0000_0100,
+            "overflow octet incremented exactly once"
+        );
     }
 }

@@ -38,11 +38,7 @@ fn encode_ext_constrained_int(
     }
 }
 
-fn decode_ext_constrained_int(
-    decoder: &mut AperDecoder,
-    min: i64,
-    max: i64,
-) -> PerResult<i64> {
+fn decode_ext_constrained_int(decoder: &mut AperDecoder, min: i64, max: i64) -> PerResult<i64> {
     let extended = decoder.read_bit()?;
     if !extended {
         decoder.decode_constrained_whole_number(&Constraint::new(min, max))
@@ -683,16 +679,16 @@ impl AperDecode for CgiNr {
 ///   confidence INTEGER(0..100), iE-Extensions OPTIONAL, ... }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NgRanAccessPointPosition {
-    pub latitude_sign_south: bool, // false = north, true = south
-    pub latitude: u32,             // 0..8388607
-    pub longitude: i32,            // -8388608..8388607
+    pub latitude_sign_south: bool,         // false = north, true = south
+    pub latitude: u32,                     // 0..8388607
+    pub longitude: i32,                    // -8388608..8388607
     pub direction_of_altitude_depth: bool, // false = height, true = depth
-    pub altitude: u16,             // 0..32767
-    pub uncertainty_semi_major: u8, // 0..127
-    pub uncertainty_semi_minor: u8, // 0..127
-    pub orientation_of_major_axis: u8, // 0..179
-    pub uncertainty_altitude: u8,  // 0..127
-    pub confidence: u8,            // 0..100
+    pub altitude: u16,                     // 0..32767
+    pub uncertainty_semi_major: u8,        // 0..127
+    pub uncertainty_semi_minor: u8,        // 0..127
+    pub orientation_of_major_axis: u8,     // 0..179
+    pub uncertainty_altitude: u8,          // 0..127
+    pub confidence: u8,                    // 0..100
 }
 
 impl NgRanAccessPointPosition {
@@ -715,14 +711,22 @@ impl AperEncode for NgRanAccessPointPosition {
         encoder.encode_constrained_whole_number(self.longitude as i64, &Self::LONGITUDE)?;
         encoder.encode_enumerated(self.direction_of_altitude_depth as i64, &Self::SIGN)?;
         encoder.encode_constrained_whole_number(self.altitude as i64, &Self::ALTITUDE)?;
-        encoder
-            .encode_constrained_whole_number(self.uncertainty_semi_major as i64, &Self::UNCERTAINTY7)?;
-        encoder
-            .encode_constrained_whole_number(self.uncertainty_semi_minor as i64, &Self::UNCERTAINTY7)?;
-        encoder
-            .encode_constrained_whole_number(self.orientation_of_major_axis as i64, &Self::ORIENTATION)?;
-        encoder
-            .encode_constrained_whole_number(self.uncertainty_altitude as i64, &Self::UNCERTAINTY7)?;
+        encoder.encode_constrained_whole_number(
+            self.uncertainty_semi_major as i64,
+            &Self::UNCERTAINTY7,
+        )?;
+        encoder.encode_constrained_whole_number(
+            self.uncertainty_semi_minor as i64,
+            &Self::UNCERTAINTY7,
+        )?;
+        encoder.encode_constrained_whole_number(
+            self.orientation_of_major_axis as i64,
+            &Self::ORIENTATION,
+        )?;
+        encoder.encode_constrained_whole_number(
+            self.uncertainty_altitude as i64,
+            &Self::UNCERTAINTY7,
+        )?;
         encoder.encode_constrained_whole_number(self.confidence as i64, &Self::CONFIDENCE)?;
         Ok(())
     }

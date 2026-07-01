@@ -47,8 +47,8 @@ pub fn build_lpp_ecid_request(transaction_number: u8) -> Result<Vec<u8>, String>
         end_transaction: false,
         sequence_number: None,
         acknowledgement: None,
-        message_body: Some(LppMessageBody::C1(MessageBodyC1::RequestLocationInformation(
-            RequestLocationInformation {
+        message_body: Some(LppMessageBody::C1(
+            MessageBodyC1::RequestLocationInformation(RequestLocationInformation {
                 ies: RequestLocationInformationR9 {
                     // requestedMeasurements: bit0 = rsrpReq, bit1 = rsrqReq.
                     ecid: Some(EcidRequestLocationInformation {
@@ -57,8 +57,8 @@ pub fn build_lpp_ecid_request(transaction_number: u8) -> Result<Vec<u8>, String>
                     nr_multi_rtt: None,
                     nr_dl_tdoa: None,
                 },
-            },
-        ))),
+            }),
+        )),
     };
     msg.encode()
         .map(|b| b.to_vec())
@@ -419,7 +419,9 @@ mod tests {
         assert_eq!(extract_lpp_request_id(&decoded), Some(7));
         assert!(matches!(
             decoded.message_body,
-            Some(LppMessageBody::C1(MessageBodyC1::RequestLocationInformation(_)))
+            Some(LppMessageBody::C1(
+                MessageBodyC1::RequestLocationInformation(_)
+            ))
         ));
         if let Some(LppMessageBody::C1(MessageBodyC1::RequestLocationInformation(r))) =
             &decoded.message_body
@@ -627,7 +629,7 @@ mod tests {
         assert_eq!(nrrstd_to_signed_ns(&NrRstd::K0(985_024)), 0.0);
         assert_eq!(nrrstd_to_signed_ns(&NrRstd::K2(246_256)), 0.0); // 985024/4
         assert_eq!(nrrstd_to_signed_ns(&NrRstd::K5(30_782)), 0.0); // 985024/32
-        // One k0 code = ±T_c around the midpoint (sign carried by the offset).
+                                                                   // One k0 code = ±T_c around the midpoint (sign carried by the offset).
         assert!((nrrstd_to_signed_ns(&NrRstd::K0(985_025)) - TC_NS).abs() < 1e-9);
         assert!((nrrstd_to_signed_ns(&NrRstd::K0(985_023)) + TC_NS).abs() < 1e-9);
         // Endpoints span ≈ ±501 µs.
@@ -640,8 +642,8 @@ mod tests {
     #[test]
     fn rt_lpp_dl_tdoa_to_measurements() {
         use nextgcore_asn1c::lpp::nr_dl_tdoa::{
-            DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList,
-            NrDlTdoaProvideLocationInformation, NrDlTdoaSignalMeasurementInformation,
+            DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList, NrDlTdoaProvideLocationInformation,
+            NrDlTdoaSignalMeasurementInformation,
         };
         let msg = LppMessage {
             transaction_id: Some(LppTransactionId {

@@ -1463,8 +1463,8 @@ pub fn encode_target_id(
             // TargetRANNodeID SEQUENCE { globalRANNodeID, selectedTAI, iE-Extensions OPTIONAL }
             encoder.write_bit(false); // extension
             encoder.write_bit(false); // no iE-Extensions
-            // NGAP-02b: reuse the single shared (conformant) GlobalRANNodeID
-            // encoder instead of a now-deleted misaligned/extensible inline copy.
+                                      // NGAP-02b: reuse the single shared (conformant) GlobalRANNodeID
+                                      // encoder instead of a now-deleted misaligned/extensible inline copy.
             encode_global_ran_node_id_into(&mut encoder, global_ran_node_id)?;
             encode_tai_inline(&mut encoder, selected_tai)?;
         }
@@ -1792,7 +1792,8 @@ pub fn encode_criticality_diagnostics(
             let id_constraint = nextgcore_asn1c::per::Constraint::new(0, 65535);
             encoder.encode_constrained_whole_number(item.ie_id as i64, &id_constraint)?;
             let err_constraint = nextgcore_asn1c::per::Constraint::extensible(0, 1);
-            encoder.encode_enumerated(type_of_error_to_index(item.type_of_error), &err_constraint)?;
+            encoder
+                .encode_enumerated(type_of_error_to_index(item.type_of_error), &err_constraint)?;
         }
     }
     encoder.align();
@@ -2745,8 +2746,8 @@ mod global_ran_node_id_tests {
         assert_eq!(
             value,
             &vec![
-                0x00, 0x00, 0xf1, 0x10, 0x10, 0x00, 0x0A, 0xBC, 0x00, 0x00, 0xf1, 0x10, 0x00,
-                0x00, 0x01
+                0x00, 0x00, 0xf1, 0x10, 0x10, 0x00, 0x0A, 0xBC, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00,
+                0x01
             ]
         );
         // No spurious leading extension bit on the GlobalRANNodeID choice and the

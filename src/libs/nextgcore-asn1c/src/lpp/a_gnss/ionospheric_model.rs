@@ -92,7 +92,8 @@ impl UperDecode for KlobucharModelParameter {
                 "LPP KlobucharModelParameter extension additions not supported".to_string(),
             ));
         }
-        let data_id_bits = decoder.decode_bit_string(Some(Self::DATA_ID_BITS), Some(Self::DATA_ID_BITS))?;
+        let data_id_bits =
+            decoder.decode_bit_string(Some(Self::DATA_ID_BITS), Some(Self::DATA_ID_BITS))?;
         let data_id = ((data_id_bits[0] as u8) << 1) | (data_id_bits[1] as u8);
         Ok(KlobucharModelParameter {
             data_id,
@@ -161,7 +162,10 @@ impl UperEncode for NeQuickModelParameter {
             self.iono_storm_flag3,
             self.iono_storm_flag4,
             self.iono_storm_flag5,
-        ].into_iter().flatten() {
+        ]
+        .into_iter()
+        .flatten()
+        {
             encoder.encode_constrained_whole_number(v as i64, &Self::STORM_FLAG)?;
         }
         Ok(())

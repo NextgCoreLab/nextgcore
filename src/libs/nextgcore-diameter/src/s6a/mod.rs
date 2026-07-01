@@ -687,7 +687,10 @@ pub fn experimental_result_avp(code: u32) -> Avp {
     Avp::mandatory(
         avp_code::EXPERIMENTAL_RESULT,
         AvpData::Grouped(vec![
-            Avp::mandatory(avp_code::VENDOR_ID, AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID)),
+            Avp::mandatory(
+                avp_code::VENDOR_ID,
+                AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID),
+            ),
             Avp::mandatory(
                 avp_code::EXPERIMENTAL_RESULT_CODE,
                 AvpData::Unsigned32(code),

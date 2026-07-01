@@ -71,7 +71,9 @@ impl SeppTimerId {
             SeppTimerId::NfInstanceRegistrationInterval => {
                 "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            SeppTimerId::NfInstanceHeartbeatInterval => "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
+            SeppTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
             SeppTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
             SeppTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
             SeppTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",

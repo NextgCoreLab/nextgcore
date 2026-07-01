@@ -61,7 +61,9 @@ impl ScpTimerId {
             ScpTimerId::NfInstanceRegistrationInterval => {
                 "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            ScpTimerId::NfInstanceHeartbeatInterval => "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
+            ScpTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
             ScpTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
             ScpTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
             ScpTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",

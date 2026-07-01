@@ -9,18 +9,18 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::JwksCache;
+use nextgcore_sbi::server::{
+    send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
+    SbiServerConfig as NextgcoreSbiServerConfig,
+};
 use nextgcore_udrd::data_store::{
     self, merge_patch, notify_application_data_change, notify_exposure_data_change,
     notify_influence_data_change, notify_subscription_data_change, SubKind,
 };
 use nextgcore_udrd::{
     udr_context_final, udr_context_init, udr_sbi_close, udr_sbi_open, SbiServerConfig, UdrSmContext,
-};
-use nextgcore_sbi::message::{SbiRequest, SbiResponse};
-use nextgcore_sbi::oauth::JwksCache;
-use nextgcore_sbi::server::{
-    send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -227,7 +227,9 @@ async fn main() -> Result<()> {
     }
     if let Some(uri) = &nrf_uri_cfg {
         log::info!("NRF URI configured: {uri}");
-        nextgcore_sbi::context::global_context().set_nrf_uri(uri).await;
+        nextgcore_sbi::context::global_context()
+            .set_nrf_uri(uri)
+            .await;
     }
 
     // Build SBI server configuration (legacy, for context)
@@ -524,7 +526,8 @@ async fn handle_auth_data(
         ("authentication-subscription", "GET") => {
             log::info!("[{supi}] GET authentication-subscription");
 
-            match nextgcore_dbi::subscription::nextgcore_dbi_auth_info_async(supi.to_string()).await {
+            match nextgcore_dbi::subscription::nextgcore_dbi_auth_info_async(supi.to_string()).await
+            {
                 Ok(auth_info) => {
                     let response_json = build_auth_subscription_json(supi, &auth_info);
                     log::info!("[{supi}] Returning auth subscription data");
@@ -633,11 +636,12 @@ async fn handle_auth_data(
                             if path == "/sequenceNumber/sqn" {
                                 if let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) {
                                     let sqn = u64::from_str_radix(sqn_hex, 16).unwrap_or(0);
-                                    if let Err(e) = nextgcore_dbi::subscription::nextgcore_dbi_update_sqn_async(
-                                        supi.to_string(),
-                                        sqn,
-                                    )
-                                    .await
+                                    if let Err(e) =
+                                        nextgcore_dbi::subscription::nextgcore_dbi_update_sqn_async(
+                                            supi.to_string(),
+                                            sqn,
+                                        )
+                                        .await
                                     {
                                         log::error!("[{supi}] DB update_sqn failed: {e:?}");
                                     }
@@ -650,7 +654,8 @@ async fn handle_auth_data(
 
             // Increment SQN for next use
             if let Err(e) =
-                nextgcore_dbi::subscription::nextgcore_dbi_increment_sqn_async(supi.to_string()).await
+                nextgcore_dbi::subscription::nextgcore_dbi_increment_sqn_async(supi.to_string())
+                    .await
             {
                 log::error!("[{supi}] DB increment_sqn failed: {e:?}");
             }
@@ -661,7 +666,8 @@ async fn handle_auth_data(
             log::info!("[{supi}] {method} authentication-status");
 
             if let Err(e) =
-                nextgcore_dbi::subscription::nextgcore_dbi_increment_sqn_async(supi.to_string()).await
+                nextgcore_dbi::subscription::nextgcore_dbi_increment_sqn_async(supi.to_string())
+                    .await
             {
                 log::error!("[{supi}] DB increment_sqn failed: {e:?}");
             }
@@ -751,9 +757,11 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
             // blocking Mongo call moved to the spawn_blocking wrapper).
             if let Some(pei) = reg_data.get("pei").and_then(|v| v.as_str()) {
                 let imeisv = pei.strip_prefix("imeisv-").unwrap_or(pei).to_string();
-                if let Err(e) =
-                    nextgcore_dbi::subscription::nextgcore_dbi_update_imeisv_async(supi.to_string(), imeisv)
-                        .await
+                if let Err(e) = nextgcore_dbi::subscription::nextgcore_dbi_update_imeisv_async(
+                    supi.to_string(),
+                    imeisv,
+                )
+                .await
                 {
                     log::debug!("[{supi}] DB update_imeisv unavailable: {e:?}");
                 }
@@ -839,8 +847,13 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
 
 /// TS 29.505 SmfRegistration mandatory IEs (Table 6.1.6.2.3-1: smfInstanceId,
 /// pduSessionId, singleNssai, dnn, plmnId).
-const SMF_REGISTRATION_MANDATORY_IES: [&str; 5] =
-    ["smfInstanceId", "pduSessionId", "singleNssai", "dnn", "plmnId"];
+const SMF_REGISTRATION_MANDATORY_IES: [&str; 5] = [
+    "smfInstanceId",
+    "pduSessionId",
+    "singleNssai",
+    "dnn",
+    "plmnId",
+];
 
 /// Handle SMF registration context.
 ///
@@ -880,7 +893,10 @@ fn handle_smf_registrations(
             }
             // Parse the SmfRegistration document from the request body.
             let Some(content) = request.http.content.as_ref() else {
-                return send_bad_request("Missing SmfRegistration body", Some("MANDATORY_IE_MISSING"));
+                return send_bad_request(
+                    "Missing SmfRegistration body",
+                    Some("MANDATORY_IE_MISSING"),
+                );
             };
             let mut doc: serde_json::Value = match serde_json::from_str(content) {
                 Ok(v @ serde_json::Value::Object(_)) => v,
@@ -972,7 +988,11 @@ fn parse_dataset_names(raw: &str) -> Option<std::collections::HashSet<String>> {
         .map(|s| s.trim().to_uppercase())
         .filter(|s| !s.is_empty())
         .collect();
-    if names.is_empty() { None } else { Some(names) }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
 }
 
 /// TS 29.504 §6.1.4.2 partial retrieval: project a JSON object value down to
@@ -1065,7 +1085,9 @@ async fn handle_provisioned_data(
     log::info!("[{supi}] GET provisioned-data/{dataset}");
 
     let subscription_data =
-        match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(supi.to_string()).await {
+        match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(supi.to_string())
+            .await
+        {
             Ok(data) => data,
             Err(e) => {
                 log::error!("[{supi}] DB subscription_data query failed: {e:?}");
@@ -1087,9 +1109,8 @@ async fn handle_provisioned_data(
                 .get("dataset-names")
                 .and_then(|raw| parse_dataset_names(raw));
 
-            let include = |name: &str| -> bool {
-                requested.as_ref().is_none_or(|set| set.contains(name))
-            };
+            let include =
+                |name: &str| -> bool { requested.as_ref().is_none_or(|set| set.contains(name)) };
 
             let mut combined = serde_json::Map::new();
             if include("AM") {
@@ -1162,7 +1183,10 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                         Err(resp) => return *resp,
                     };
                     if !body.is_object() {
-                        return send_bad_request("Body must be a JSON object", Some("INVALID_MSG_FORMAT"));
+                        return send_bad_request(
+                            "Body must be a JSON object",
+                            Some("INVALID_MSG_FORMAT"),
+                        );
                     }
                     let ds = nextgcore_udrd::data_store::store();
                     let created = ds.policy_am_put(supi, body.clone());
@@ -1191,8 +1215,10 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                         return SbiResponse::with_status(200)
                             .with_body(stored.to_string(), "application/json");
                     }
-                    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(supi.to_string())
-                        .await
+                    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(
+                        supi.to_string(),
+                    )
+                    .await
                     {
                         Ok(data) => {
                             let sm_policy_snssai_data = build_sm_policy_data(&data);
@@ -1212,7 +1238,10 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                         Err(resp) => return *resp,
                     };
                     if !body.is_object() {
-                        return send_bad_request("Body must be a JSON object", Some("INVALID_MSG_FORMAT"));
+                        return send_bad_request(
+                            "Body must be a JSON object",
+                            Some("INVALID_MSG_FORMAT"),
+                        );
                     }
                     // udrd-04: persist the provisioned SmPolicyData.
                     let ds = nextgcore_udrd::data_store::store();
@@ -1242,8 +1271,10 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                         return SbiResponse::with_status(200)
                             .with_body(stored.to_string(), "application/json");
                     }
-                    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(supi.to_string())
-                        .await
+                    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(
+                        supi.to_string(),
+                    )
+                    .await
                     {
                         Ok(data) => {
                             // Build a minimal UePolicySet with subscribed S-NSSAIs
@@ -1283,7 +1314,10 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                         Err(resp) => return *resp,
                     };
                     if !body.is_object() {
-                        return send_bad_request("Body must be a JSON object", Some("INVALID_MSG_FORMAT"));
+                        return send_bad_request(
+                            "Body must be a JSON object",
+                            Some("INVALID_MSG_FORMAT"),
+                        );
                     }
                     // udrd-04: persist the provisioned UePolicySet.
                     let ds = nextgcore_udrd::data_store::store();
@@ -1994,7 +2028,9 @@ fn build_am_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serd
     serde_json::Value::Object(am)
 }
 
-fn build_smf_selection_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serde_json::Value {
+fn build_smf_selection_data(
+    data: &nextgcore_dbi::types::NextgcoreSubscriptionData,
+) -> serde_json::Value {
     let mut smf_sel = serde_json::Map::new();
     let mut snssai_infos = serde_json::Map::new();
     for slice in &data.slice {
@@ -2684,9 +2720,8 @@ udr:
 
         // Unknown UE, collection GET -> 200 + empty JSON array (no panic).
         let unknown = "imsi-001019999999999";
-        let coll = format!(
-            "/nudr-dr/v1/subscription-data/{unknown}/context-data/smf-registrations"
-        );
+        let coll =
+            format!("/nudr-dr/v1/subscription-data/{unknown}/context-data/smf-registrations");
         let resp = client.get(&coll).await.expect("GET unknown smf-regs");
         assert_eq!(resp.status, 200, "unknown UE collection GET must be 200");
         let body: serde_json::Value =
@@ -2705,9 +2740,7 @@ udr:
         // Success path: PUT a full SmfRegistration then GET the actual stored
         // values back (not a hardcoded summary). A new registration is 201.
         let supi = "imsi-001019900000077";
-        let coll = format!(
-            "/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations"
-        );
+        let coll = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations");
         let single = format!("{coll}/5");
         let reg = json!({
             "smfInstanceId": "11111111-2222-3333-4444-555555555555",
@@ -2716,10 +2749,7 @@ udr:
             "dnn": "ims",
             "plmnId": {"mcc": "001", "mnc": "01"}
         });
-        let resp = client
-            .put_json(&single, &reg)
-            .await
-            .expect("PUT smf-reg");
+        let resp = client.put_json(&single, &reg).await.expect("PUT smf-reg");
         assert_eq!(resp.status, 201, "new SmfRegistration must be 201 Created");
 
         // Per-PDU GET returns the ACTUAL registered document.
@@ -2741,7 +2771,10 @@ udr:
         assert_eq!(arr.len(), 1, "one registration after PUT");
         assert_eq!(arr[0]["pduSessionId"], 5);
         assert_eq!(arr[0]["dnn"], "ims");
-        assert_eq!(arr[0]["smfInstanceId"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(
+            arr[0]["smfInstanceId"],
+            "11111111-2222-3333-4444-555555555555"
+        );
 
         // Replacing the same registration is 204 (not created).
         let resp = client
@@ -3095,7 +3128,8 @@ udr:
     #[test]
     fn test_build_sm_data_arp_all_three_fields() {
         use nextgcore_dbi::types::{
-            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSession, NextgcoreSliceData, NextgcoreSNssai, NextgcoreSubscriptionData,
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSNssai, NextgcoreSession,
+            NextgcoreSliceData, NextgcoreSubscriptionData,
         };
 
         let arp = NextgcoreArp {
@@ -3106,8 +3140,15 @@ udr:
         let sess = NextgcoreSession {
             name: Some("internet".to_string()),
             session_type: 1, // IPV4
-            qos: NextgcoreQos { index: 9, arp, ..Default::default() },
-            ambr: NextgcoreAmbr { uplink: 1_000_000_000, downlink: 1_000_000_000 },
+            qos: NextgcoreQos {
+                index: 9,
+                arp,
+                ..Default::default()
+            },
+            ambr: NextgcoreAmbr {
+                uplink: 1_000_000_000,
+                downlink: 1_000_000_000,
+            },
             ..Default::default()
         };
         let slice = NextgcoreSliceData {
@@ -3126,16 +3167,23 @@ udr:
         assert_eq!(arr.len(), 1);
         let arp_val = &arr[0]["dnnConfigurations"]["internet"]["5gQosProfile"]["arp"];
 
-        assert_eq!(arp_val["priorityLevel"], 8_u64,  "priorityLevel must be 8");
-        assert_eq!(arp_val["preemptCap"],  "MAY_PREEMPT",     "capability==1 → MAY_PREEMPT");
-        assert_eq!(arp_val["preemptVuln"], "NOT_PREEMPTABLE", "vulnerability==0 → NOT_PREEMPTABLE");
+        assert_eq!(arp_val["priorityLevel"], 8_u64, "priorityLevel must be 8");
+        assert_eq!(
+            arp_val["preemptCap"], "MAY_PREEMPT",
+            "capability==1 → MAY_PREEMPT"
+        );
+        assert_eq!(
+            arp_val["preemptVuln"], "NOT_PREEMPTABLE",
+            "vulnerability==0 → NOT_PREEMPTABLE"
+        );
     }
 
     /// Complementary case: capability==0 / vulnerability==1 flips both strings.
     #[test]
     fn test_build_sm_data_arp_not_preempt_preemptable() {
         use nextgcore_dbi::types::{
-            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSession, NextgcoreSliceData, NextgcoreSNssai, NextgcoreSubscriptionData,
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSNssai, NextgcoreSession,
+            NextgcoreSliceData, NextgcoreSubscriptionData,
         };
 
         let arp = NextgcoreArp {
@@ -3146,8 +3194,15 @@ udr:
         let sess = NextgcoreSession {
             name: Some("ims".to_string()),
             session_type: 3, // IPV4V6
-            qos: NextgcoreQos { index: 5, arp, ..Default::default() },
-            ambr: NextgcoreAmbr { uplink: 0, downlink: 0 },
+            qos: NextgcoreQos {
+                index: 5,
+                arp,
+                ..Default::default()
+            },
+            ambr: NextgcoreAmbr {
+                uplink: 0,
+                downlink: 0,
+            },
             ..Default::default()
         };
         let slice = NextgcoreSliceData {
@@ -3164,8 +3219,14 @@ udr:
         let arr = result.as_array().unwrap();
         let arp_val = &arr[0]["dnnConfigurations"]["ims"]["5gQosProfile"]["arp"];
 
-        assert_eq!(arp_val["preemptCap"],  "NOT_PREEMPT",  "capability==0 → NOT_PREEMPT");
-        assert_eq!(arp_val["preemptVuln"], "PREEMPTABLE",  "vulnerability==1 → PREEMPTABLE");
+        assert_eq!(
+            arp_val["preemptCap"], "NOT_PREEMPT",
+            "capability==0 → NOT_PREEMPT"
+        );
+        assert_eq!(
+            arp_val["preemptVuln"], "PREEMPTABLE",
+            "vulnerability==1 → PREEMPTABLE"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -3184,15 +3245,32 @@ udr:
         assert_eq!(format_ambr(0), "0 bps");
 
         // Non-round values must NOT truncate: drop to next exact unit
-        assert_eq!(format_ambr(1_500_000_000), "1500 Mbps",
-            "1.5 Gbps must not truncate to 1 Gbps");
-        assert_eq!(format_ambr(1_200_000), "1200 Kbps",
-            "1.2 Mbps must not truncate to 1 Mbps");
-        assert_eq!(format_ambr(12_345), "12345 bps",
-            "non-round bps falls through to bps");
+        assert_eq!(
+            format_ambr(1_500_000_000),
+            "1500 Mbps",
+            "1.5 Gbps must not truncate to 1 Gbps"
+        );
+        assert_eq!(
+            format_ambr(1_200_000),
+            "1200 Kbps",
+            "1.2 Mbps must not truncate to 1 Mbps"
+        );
+        assert_eq!(
+            format_ambr(12_345),
+            "12345 bps",
+            "non-round bps falls through to bps"
+        );
 
         // All outputs must match the TS 29.571 BitRate pattern
-        for bps in [1u64, 999, 1_000, 1_001, 1_500_000, 2_000_000_000, 5_000_000_000_000] {
+        for bps in [
+            1u64,
+            999,
+            1_000,
+            1_001,
+            1_500_000,
+            2_000_000_000,
+            5_000_000_000_000,
+        ] {
             let s = format_ambr(bps);
             let valid_suffix = s.ends_with(" bps")
                 || s.ends_with(" Kbps")
@@ -3264,8 +3342,10 @@ udr:
         assert_eq!(resp.status, 404, "nai- should be 404, not 400");
         let problem: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_ne!(problem["cause"], "INVALID_SUPI",
-            "nai- must not be rejected as INVALID_SUPI");
+        assert_ne!(
+            problem["cause"], "INVALID_SUPI",
+            "nai- must not be rejected as INVALID_SUPI"
+        );
 
         // gci- is a valid VarUeId, returns 404
         let resp = client
@@ -3389,13 +3469,21 @@ udr:
     #[test]
     fn test_ssc_modes_default() {
         use nextgcore_dbi::types::{
-            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSession, NextgcoreSliceData, NextgcoreSNssai, NextgcoreSubscriptionData,
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSNssai, NextgcoreSession,
+            NextgcoreSliceData, NextgcoreSubscriptionData,
         };
         let sess = NextgcoreSession {
             name: Some("internet".to_string()),
             session_type: 1,
-            qos: NextgcoreQos { index: 9, arp: NextgcoreArp::default(), ..Default::default() },
-            ambr: NextgcoreAmbr { uplink: 1_000_000, downlink: 1_000_000 },
+            qos: NextgcoreQos {
+                index: 9,
+                arp: NextgcoreArp::default(),
+                ..Default::default()
+            },
+            ambr: NextgcoreAmbr {
+                uplink: 1_000_000,
+                downlink: 1_000_000,
+            },
             ..Default::default()
         };
         let data = NextgcoreSubscriptionData {
@@ -3440,7 +3528,10 @@ udr:
 
         // PUT → 201 Created
         let am_doc = json!({"suppFeat": "0", "rfsp": 1});
-        let resp = client.put_json(&am_path, &am_doc).await.expect("PUT am-data");
+        let resp = client
+            .put_json(&am_path, &am_doc)
+            .await
+            .expect("PUT am-data");
         assert_eq!(resp.status, 201, "first PUT must be 201");
 
         // GET now returns stored doc
@@ -3451,13 +3542,19 @@ udr:
         assert_eq!(got, am_doc, "GET must return stored am-data");
 
         // Second PUT → 204 Replace
-        let resp = client.put_json(&am_path, &am_doc).await.expect("PUT am-data replace");
+        let resp = client
+            .put_json(&am_path, &am_doc)
+            .await
+            .expect("PUT am-data replace");
         assert_eq!(resp.status, 204, "second PUT must be 204");
 
         // --- sm-data ---
         let sm_path = format!("/nudr-dr/v1/policy-data/ues/{supi}/sm-data");
         let sm_doc = json!({"smPolicySnssaiData": {"01": {"snssai": {"sst": 1}}}});
-        let resp = client.put_json(&sm_path, &sm_doc).await.expect("PUT sm-data");
+        let resp = client
+            .put_json(&sm_path, &sm_doc)
+            .await
+            .expect("PUT sm-data");
         assert_eq!(resp.status, 201, "first PUT must be 201");
         let resp = client.get(&sm_path).await.expect("GET sm-data");
         assert_eq!(resp.status, 200);
@@ -3468,7 +3565,10 @@ udr:
         // --- ue-policy-set ---
         let ue_path = format!("/nudr-dr/v1/policy-data/ues/{supi}/ue-policy-set");
         let ue_doc = json!({"subscPolicySections": {"01": {"upsi": []}}});
-        let resp = client.put_json(&ue_path, &ue_doc).await.expect("PUT ue-policy-set");
+        let resp = client
+            .put_json(&ue_path, &ue_doc)
+            .await
+            .expect("PUT ue-policy-set");
         assert_eq!(resp.status, 201, "first PUT must be 201");
         let resp = client.get(&ue_path).await.expect("GET ue-policy-set");
         assert_eq!(resp.status, 200);

@@ -500,7 +500,10 @@ impl PinContext {
             .owner_index
             .write()
             .map_err(|_| PinContextError::NotFound)?;
-        let elements = self.elements.read().map_err(|_| PinContextError::NotFound)?;
+        let elements = self
+            .elements
+            .read()
+            .map_err(|_| PinContextError::NotFound)?;
 
         if pins.len() >= self.max_pins {
             log::error!("Maximum PINs [{}] reached", self.max_pins);
@@ -833,8 +836,7 @@ impl PinContext {
         let mut stats = ReapStats::default();
 
         // ── 1. Reap elements that missed their heartbeat ────────────────────
-        if let (Ok(mut pins), Ok(mut elements)) =
-            (self.pin_networks.write(), self.elements.write())
+        if let (Ok(mut pins), Ok(mut elements)) = (self.pin_networks.write(), self.elements.write())
         {
             let stale: Vec<String> = elements
                 .values()
@@ -1018,7 +1020,8 @@ impl Default for PinContext {
 }
 
 /// Global PIN context
-static GLOBAL_PIN_CONTEXT: std::sync::OnceLock<Arc<RwLock<PinContext>>> = std::sync::OnceLock::new();
+static GLOBAL_PIN_CONTEXT: std::sync::OnceLock<Arc<RwLock<PinContext>>> =
+    std::sync::OnceLock::new();
 
 pub fn pin_self() -> Arc<RwLock<PinContext>> {
     GLOBAL_PIN_CONTEXT
@@ -1048,11 +1051,7 @@ mod tests {
     /// Build a registration with the mandatory PINE Address + Port supplied
     /// (the context layer does not re-validate mandatory presence — that is the
     /// HTTP handler's job, PIND-05).
-    fn reg(
-        t: PinElementType,
-        caps: Vec<String>,
-        host: Option<String>,
-    ) -> PinElementRegistration {
+    fn reg(t: PinElementType, caps: Vec<String>, host: Option<String>) -> PinElementRegistration {
         PinElementRegistration::new(t, "10.0.0.9", 9000)
             .with_capabilities(caps)
             .with_host_supi(host)
@@ -1103,7 +1102,9 @@ mod tests {
         let mut ctx = PinContext::new();
         ctx.init(64);
 
-        let pin = ctx.pin_create("Smart Home", "imsi-001010000000001").unwrap();
+        let pin = ctx
+            .pin_create("Smart Home", "imsi-001010000000001")
+            .unwrap();
 
         let gw = ctx
             .element_register(
@@ -1132,7 +1133,9 @@ mod tests {
         let mut ctx = PinContext::new();
         ctx.init(64);
 
-        let pin = ctx.pin_create("Smart Home", "imsi-001010000000001").unwrap();
+        let pin = ctx
+            .pin_create("Smart Home", "imsi-001010000000001")
+            .unwrap();
 
         ctx.element_register(
             &pin.pin_id,
@@ -1286,14 +1289,22 @@ mod tests {
         let first = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::ManagementEntity, vec![], Some("imsi-owner-001".to_string())),
+                reg(
+                    PinElementType::ManagementEntity,
+                    vec![],
+                    Some("imsi-owner-001".to_string()),
+                ),
                 Some("imsi-owner-001"),
             )
             .unwrap();
         let second = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::ManagementEntity, vec![], Some("imsi-owner-001".to_string())),
+                reg(
+                    PinElementType::ManagementEntity,
+                    vec![],
+                    Some("imsi-owner-001".to_string()),
+                ),
                 Some("imsi-owner-001"),
             )
             .unwrap();
@@ -1301,7 +1312,10 @@ mod tests {
         assert_eq!(first.pemc_rank, Some(PemcRank::Primary));
         assert_eq!(second.pemc_rank, Some(PemcRank::Secondary));
         let pin = ctx.pin_find(&pin.pin_id).unwrap();
-        assert_eq!(pin.primary_pemc_id.as_deref(), Some(first.element_id.as_str()));
+        assert_eq!(
+            pin.primary_pemc_id.as_deref(),
+            Some(first.element_id.as_str())
+        );
     }
 
     #[test]
@@ -1313,14 +1327,22 @@ mod tests {
         let primary = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::ManagementEntity, vec![], Some("imsi-owner-001".to_string())),
+                reg(
+                    PinElementType::ManagementEntity,
+                    vec![],
+                    Some("imsi-owner-001".to_string()),
+                ),
                 Some("imsi-owner-001"),
             )
             .unwrap();
         let secondary = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::ManagementEntity, vec![], Some("imsi-owner-001".to_string())),
+                reg(
+                    PinElementType::ManagementEntity,
+                    vec![],
+                    Some("imsi-owner-001".to_string()),
+                ),
                 Some("imsi-owner-001"),
             )
             .unwrap();
@@ -1330,7 +1352,10 @@ mod tests {
             .unwrap();
 
         let pin = ctx.pin_find(&pin.pin_id).unwrap();
-        assert_eq!(pin.primary_pemc_id.as_deref(), Some(secondary.element_id.as_str()));
+        assert_eq!(
+            pin.primary_pemc_id.as_deref(),
+            Some(secondary.element_id.as_str())
+        );
         let promoted = ctx.element_find(&secondary.element_id).unwrap();
         assert_eq!(promoted.pemc_rank, Some(PemcRank::Primary));
     }
@@ -1344,14 +1369,22 @@ mod tests {
         let default_gw = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::Gateway, vec!["relay".to_string()], Some("imsi-owner-001".to_string())),
+                reg(
+                    PinElementType::Gateway,
+                    vec!["relay".to_string()],
+                    Some("imsi-owner-001".to_string()),
+                ),
                 Some("imsi-owner-001"),
             )
             .unwrap();
         let backup_gw = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::Gateway, vec!["relay".to_string()], Some("imsi-owner-001".to_string())),
+                reg(
+                    PinElementType::Gateway,
+                    vec!["relay".to_string()],
+                    Some("imsi-owner-001".to_string()),
+                ),
                 Some("imsi-owner-001"),
             )
             .unwrap();
@@ -1365,7 +1398,10 @@ mod tests {
         ctx.element_deregister(&default_gw.element_id, Some("imsi-owner-001"))
             .unwrap();
         let pin = ctx.pin_find(&pin.pin_id).unwrap();
-        assert_eq!(pin.default_pegc_id.as_deref(), Some(backup_gw.element_id.as_str()));
+        assert_eq!(
+            pin.default_pegc_id.as_deref(),
+            Some(backup_gw.element_id.as_str())
+        );
         let promoted = ctx.element_find(&backup_gw.element_id).unwrap();
         assert_eq!(promoted.pegc_rank, Some(PegcRank::Default));
     }
@@ -1381,14 +1417,21 @@ mod tests {
         let gw = ctx
             .element_register(
                 &pin1.pin_id,
-                reg(PinElementType::Gateway, vec!["relay".to_string()], Some("imsi-owner-gw".to_string())),
+                reg(
+                    PinElementType::Gateway,
+                    vec!["relay".to_string()],
+                    Some("imsi-owner-gw".to_string()),
+                ),
                 Some("imsi-owner-gw"),
             )
             .unwrap();
 
         // A new PIN for the same owner selects that gateway as default PEGC.
         let pin2 = ctx.pin_create("Second", "imsi-owner-gw").unwrap();
-        assert_eq!(pin2.default_pegc_id.as_deref(), Some(gw.element_id.as_str()));
+        assert_eq!(
+            pin2.default_pegc_id.as_deref(),
+            Some(gw.element_id.as_str())
+        );
     }
 
     #[test]
@@ -1400,14 +1443,21 @@ mod tests {
         let pemc = ctx
             .element_register(
                 &pin1.pin_id,
-                reg(PinElementType::ManagementEntity, vec![], Some("imsi-owner-pemc".to_string())),
+                reg(
+                    PinElementType::ManagementEntity,
+                    vec![],
+                    Some("imsi-owner-pemc".to_string()),
+                ),
                 Some("imsi-owner-pemc"),
             )
             .unwrap();
 
         // No gateway exists → PEMC-as-PEGC fallback selects the PEMC.
         let pin2 = ctx.pin_create("Second", "imsi-owner-pemc").unwrap();
-        assert_eq!(pin2.default_pegc_id.as_deref(), Some(pemc.element_id.as_str()));
+        assert_eq!(
+            pin2.default_pegc_id.as_deref(),
+            Some(pemc.element_id.as_str())
+        );
     }
 
     #[test]
@@ -1452,7 +1502,10 @@ mod tests {
         }
         ctx.element_heartbeat(&elem.element_id).unwrap();
         let refreshed = ctx.element_find(&elem.element_id).unwrap();
-        assert!(refreshed.last_heartbeat > 0, "heartbeat must refresh last_seen");
+        assert!(
+            refreshed.last_heartbeat > 0,
+            "heartbeat must refresh last_seen"
+        );
     }
 
     #[test]
@@ -1519,14 +1572,22 @@ mod tests {
         let default_gw = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::Gateway, vec!["relay".to_string()], Some("imsi-owner-001".to_string())),
+                reg(
+                    PinElementType::Gateway,
+                    vec!["relay".to_string()],
+                    Some("imsi-owner-001".to_string()),
+                ),
                 Some("imsi-owner-001"),
             )
             .unwrap();
         let backup_gw = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::Gateway, vec!["relay".to_string()], Some("imsi-owner-001".to_string())),
+                reg(
+                    PinElementType::Gateway,
+                    vec!["relay".to_string()],
+                    Some("imsi-owner-001".to_string()),
+                ),
                 Some("imsi-owner-001"),
             )
             .unwrap();
@@ -1537,14 +1598,23 @@ mod tests {
         let base = now_epoch_secs();
         {
             let mut elements = ctx.elements.write().unwrap();
-            elements.get_mut(&default_gw.element_id).unwrap().last_heartbeat = 0;
-            elements.get_mut(&backup_gw.element_id).unwrap().last_heartbeat = base;
+            elements
+                .get_mut(&default_gw.element_id)
+                .unwrap()
+                .last_heartbeat = 0;
+            elements
+                .get_mut(&backup_gw.element_id)
+                .unwrap()
+                .last_heartbeat = base;
         }
         let stats = ctx.reap(base + 30);
         assert_eq!(stats.reaped_elements, 1);
 
         let pin = ctx.pin_find(&pin.pin_id).unwrap();
-        assert_eq!(pin.default_pegc_id.as_deref(), Some(backup_gw.element_id.as_str()));
+        assert_eq!(
+            pin.default_pegc_id.as_deref(),
+            Some(backup_gw.element_id.as_str())
+        );
     }
 
     // ── Relay authorization (carried forward) ───────────────────────────────
@@ -1553,12 +1623,13 @@ mod tests {
         let mut ctx = PinContext::new();
         ctx.init(64);
 
-        let pin = ctx.pin_create("Smart Home", "imsi-001010000000001").unwrap();
+        let pin = ctx
+            .pin_create("Smart Home", "imsi-001010000000001")
+            .unwrap();
         let gw = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::Gateway, vec!["relay".to_string()], None)
-                    .with_host_supi(None),
+                reg(PinElementType::Gateway, vec!["relay".to_string()], None).with_host_supi(None),
                 Some("imsi-001010000000001"),
             )
             .unwrap();
@@ -1575,7 +1646,9 @@ mod tests {
         let mut ctx = PinContext::new();
         ctx.init(64);
 
-        let pin = ctx.pin_create("Smart Home", "imsi-001010000000001").unwrap();
+        let pin = ctx
+            .pin_create("Smart Home", "imsi-001010000000001")
+            .unwrap();
         let elem = ctx
             .element_register(
                 &pin.pin_id,
@@ -1613,7 +1686,11 @@ mod tests {
         let owner_elem = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::ManagementEntity, vec![], Some("imsi-real-owner".to_string())),
+                reg(
+                    PinElementType::ManagementEntity,
+                    vec![],
+                    Some("imsi-real-owner".to_string()),
+                ),
                 Some("imsi-real-owner"),
             )
             .unwrap();
@@ -1623,7 +1700,11 @@ mod tests {
         let other_elem = ctx
             .element_register(
                 &pin.pin_id,
-                reg(PinElementType::ManagementEntity, vec![], Some("imsi-impostor".to_string())),
+                reg(
+                    PinElementType::ManagementEntity,
+                    vec![],
+                    Some("imsi-impostor".to_string()),
+                ),
                 Some("imsi-impostor"),
             )
             .unwrap();
@@ -1635,7 +1716,9 @@ mod tests {
         let mut ctx = PinContext::new();
         ctx.init(64);
 
-        let pin = ctx.pin_create("Smart Home", "imsi-001010000000001").unwrap();
+        let pin = ctx
+            .pin_create("Smart Home", "imsi-001010000000001")
+            .unwrap();
         // Use Gateway type so relay is permitted (owner is authorized → PEGC).
         let elem = ctx
             .element_register(
@@ -1661,7 +1744,10 @@ mod tests {
 
         // An unknown SUPI must yield an empty Vec, never panic.
         let owned = ctx.pins_by_owner("imsi-totally-unknown-999");
-        assert!(owned.is_empty(), "unknown owner must return empty, no panic");
+        assert!(
+            owned.is_empty(),
+            "unknown owner must return empty, no panic"
+        );
     }
 
     #[test]
@@ -1744,14 +1830,21 @@ mod tests {
         // Owner registers a PEMC hosted on a different SUPI.
         ctx.element_register(
             &pin.pin_id,
-            reg(PinElementType::ManagementEntity, vec![], Some("imsi-pemc-host".to_string())),
+            reg(
+                PinElementType::ManagementEntity,
+                vec![],
+                Some("imsi-pemc-host".to_string()),
+            ),
             Some("imsi-owner-001"),
         )
         .unwrap();
 
         // The PEMC host (not the owner) may delete the PIN.
         let removed = ctx.pin_delete(&pin.pin_id, Some("imsi-pemc-host"));
-        assert!(removed.is_ok(), "a registered PEMC must be allowed to delete");
+        assert!(
+            removed.is_ok(),
+            "a registered PEMC must be allowed to delete"
+        );
     }
 
     // ── PIND-04: element deregister authorization ───────────────────────────

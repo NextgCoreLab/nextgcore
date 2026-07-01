@@ -8,14 +8,14 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nextgcore_udmd::{
-    timer_manager, timer_type_to_timer_id, udm_context_final, udm_context_init, udm_sbi_close,
-    udm_sbi_open, udm_self, SbiServerConfig, UdmEvent, UdmSdmSubscription, UdmSmContext,
-};
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as NextgcoreSbiServerConfig,
+};
+use nextgcore_udmd::{
+    timer_manager, timer_type_to_timer_id, udm_context_final, udm_context_init, udm_sbi_close,
+    udm_sbi_open, udm_self, SbiServerConfig, UdmEvent, UdmSdmSubscription, UdmSmContext,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -205,7 +205,10 @@ async fn main() -> Result<()> {
                             let ctx = udm_self();
                             if let Ok(context) = ctx.read() {
                                 context.set_allow_null_scheme(allow);
-                                log::info!("Null-scheme SUCI: {}", if allow { "allowed" } else { "denied" });
+                                log::info!(
+                                    "Null-scheme SUCI: {}",
+                                    if allow { "allowed" } else { "denied" }
+                                );
                             };
                         }
 
@@ -358,7 +361,9 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                     handle_amf_deregistration(supi).await
                 }
                 // udmd-12: AMF non-3GPP access registration (TS 29.503 §5.3.3).
-                ("registrations", "PUT") if parts.len() >= 5 && parts[4] == "amf-non-3gpp-access" => {
+                ("registrations", "PUT")
+                    if parts.len() >= 5 && parts[4] == "amf-non-3gpp-access" =>
+                {
                     handle_amf_non3gpp_registration(supi, &request).await
                 }
                 ("registrations", "PUT") if parts.len() >= 6 && parts[4] == "smf-registrations" => {
@@ -573,7 +578,13 @@ fn split_snpn_supi(supi: &str) -> (&str, Option<&str>) {
 /// to the Nudr_DataRepository GET so UDR can filter/scope the response.
 fn sdm_query_params(request: &SbiRequest) -> std::collections::HashMap<String, String> {
     let mut params = std::collections::HashMap::new();
-    for key in ["plmn-id", "dataset-names", "supported-features", "dnn", "snssai"] {
+    for key in [
+        "plmn-id",
+        "dataset-names",
+        "supported-features",
+        "dnn",
+        "snssai",
+    ] {
         if let Some(v) = request.http.params.get(key) {
             params.insert(key.to_string(), v.clone());
         }
@@ -594,7 +605,8 @@ async fn handle_get_am_data(supi: &str, request: &SbiRequest) -> SbiResponse {
     let udr_result = if params.is_empty() {
         nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "am-data", 0, 0).await
     } else {
-        nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "am-data", &params).await
+        nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "am-data", &params)
+            .await
     };
 
     match udr_result {
@@ -632,13 +644,15 @@ async fn handle_get_smf_select_data(supi: &str, request: &SbiRequest) -> SbiResp
             "smf-selection-subscription-data",
             0,
             0,
-        ).await
+        )
+        .await
     } else {
         nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get_with_params(
             supi,
             "smf-selection-subscription-data",
             &params,
-        ).await
+        )
+        .await
     };
 
     match udr_result {
@@ -679,7 +693,8 @@ async fn handle_get_sm_data(supi: &str, request: &SbiRequest) -> SbiResponse {
     let udr_result = if params.is_empty() {
         nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "sm-data", 0, 0).await
     } else {
-        nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "sm-data", &params).await
+        nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "sm-data", &params)
+            .await
     };
 
     match udr_result {
@@ -1058,7 +1073,9 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
             Some(ue) => ue,
             None => {
                 log::error!("[{supi}] Failed to create/find UE in context");
-                return nextgcore_sbi::server::send_service_unavailable("UE context creation failed");
+                return nextgcore_sbi::server::send_service_unavailable(
+                    "UE context creation failed",
+                );
             }
         };
         ue.clone()
@@ -1108,7 +1125,9 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
         };
         let rand_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(rand_hex);
         let auts_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(auts_hex);
-        if rand_bytes.len() != 16 || auts_bytes.len() != nextgcore_crypt::milenage::NEXTGCORE_AUTS_LEN {
+        if rand_bytes.len() != 16
+            || auts_bytes.len() != nextgcore_crypt::milenage::NEXTGCORE_AUTS_LEN
+        {
             return send_problem(400, "INVALID_FORMAT", "Invalid RAND/AUTS length");
         }
         // The RAND echoed by the UE must be the one we sent
@@ -1119,14 +1138,18 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
         let rand_arr: [u8; 16] = rand_bytes.as_slice().try_into().expect("len checked");
         let mut conc_sqn_ms = [0u8; 6];
         conc_sqn_ms.copy_from_slice(&auts_bytes[..6]);
-        let (sqn_ms, mac_s) =
-            match nextgcore_crypt::kdf::nextgcore_auc_sqn(&ue.opc, &ue.k, &rand_arr, &conc_sqn_ms) {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("[{supi}] SQN extraction failed: {e:?}");
-                    return send_problem(500, "UNSPECIFIED", "SQN extraction failed");
-                }
-            };
+        let (sqn_ms, mac_s) = match nextgcore_crypt::kdf::nextgcore_auc_sqn(
+            &ue.opc,
+            &ue.k,
+            &rand_arr,
+            &conc_sqn_ms,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("[{supi}] SQN extraction failed: {e:?}");
+                return send_problem(500, "UNSPECIFIED", "SQN extraction failed");
+            }
+        };
         if mac_s != auts_bytes[6..nextgcore_crypt::milenage::NEXTGCORE_AUTS_LEN] {
             log::error!("[{supi}] AUTS MAC-S verification failed");
             return send_problem(
@@ -1153,7 +1176,8 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
     ue.rand = rand;
 
     let (autn, ik, ck, _ak, res) =
-        match nextgcore_crypt::milenage::milenage_generate(&ue.opc, &ue.amf, &ue.k, &ue.sqn, &rand) {
+        match nextgcore_crypt::milenage::milenage_generate(&ue.opc, &ue.amf, &ue.k, &ue.sqn, &rand)
+        {
             Ok(result) => result,
             Err(e) => {
                 log::error!("[{supi}] Milenage generate failed: {e:?}");
@@ -1174,17 +1198,24 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
     let sqn_arr: [u8; 6] = ue.sqn.as_slice().try_into().expect("sqn is 6 bytes");
     let new_sqn_arr = advance_sqn_ind(sqn_arr);
     let new_sqn_hex: String = new_sqn_arr.iter().map(|b| format!("{b:02x}")).collect();
-    match nextgcore_udmd::udm_nudr_dr_send_auth_subscription_patch(&supi, &new_sqn_hex, 0, 0).await {
+    match nextgcore_udmd::udm_nudr_dr_send_auth_subscription_patch(&supi, &new_sqn_hex, 0, 0).await
+    {
         Ok(r) if r.is_success() || r.status == 204 => {
             log::debug!("[{supi}] SQN advanced to 0x{new_sqn_hex}");
         }
         Ok(r) if r.status >= 500 => {
-            log::error!("[{supi}] UDR SQN PATCH returned {}: refusing to issue AV", r.status);
+            log::error!(
+                "[{supi}] UDR SQN PATCH returned {}: refusing to issue AV",
+                r.status
+            );
             return nextgcore_sbi::server::send_service_unavailable("UDR SQN update failed");
         }
         Ok(r) => {
             // Non-5xx (e.g. 404): UDR may not have auth-subscription resource; degrade.
-            log::warn!("[{supi}] UDR SQN PATCH returned {} (degraded — AV issued anyway)", r.status);
+            log::warn!(
+                "[{supi}] UDR SQN PATCH returned {} (degraded — AV issued anyway)",
+                r.status
+            );
         }
         Err(e) => {
             // Transport failure: refuse to issue AV to prevent SQN replay.
@@ -1201,8 +1232,12 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
             // transformed AV (RAND, AUTN, XRES, CK', IK') to the AUSF.
             let mut sqn_xor_ak = [0u8; 6];
             sqn_xor_ak.copy_from_slice(&autn[..6]);
-            let (ck_prime, ik_prime) =
-                nextgcore_crypt::kdf::nextgcore_kdf_ck_ik_prime(&ck, &ik, serving_network_name, &sqn_xor_ak);
+            let (ck_prime, ik_prime) = nextgcore_crypt::kdf::nextgcore_kdf_ck_ik_prime(
+                &ck,
+                &ik,
+                serving_network_name,
+                &sqn_xor_ak,
+            );
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "authType": "EAP_AKA_PRIME",
@@ -1220,9 +1255,15 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
         }
         _ => {
             // 5G-AKA: derive KAUSF and XRES* (TS 33.501 Annex A.2/A.4)
-            let kausf = nextgcore_crypt::kdf::nextgcore_kdf_kausf(&ck, &ik, serving_network_name, &autn);
-            let xres_star =
-                nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, serving_network_name, &rand, &res);
+            let kausf =
+                nextgcore_crypt::kdf::nextgcore_kdf_kausf(&ck, &ik, serving_network_name, &autn);
+            let xres_star = nextgcore_crypt::kdf::nextgcore_kdf_xres_star(
+                &ck,
+                &ik,
+                serving_network_name,
+                &rand,
+                &res,
+            );
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "authType": "5G_AKA",
@@ -1315,7 +1356,10 @@ async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse {
             log::debug!("[{supi}] Auth status persisted to UDR ({})", r.status);
         }
         Ok(r) => {
-            log::warn!("[{supi}] UDR auth-status PUT returned {} (degraded)", r.status);
+            log::warn!(
+                "[{supi}] UDR auth-status PUT returned {} (degraded)",
+                r.status
+            );
         }
         Err(e) => {
             log::warn!("[{supi}] UDR auth-status PUT failed: {e} (degraded)");
@@ -1811,7 +1855,8 @@ mod tests {
             opc.copy_from_slice(&unhex(TEST_OPC_HEX));
             let (res, ck, ik, _ak, _akstar) =
                 nextgcore_crypt::milenage::milenage_f2345(&opc, &k, &rand).unwrap();
-            let xres_star = nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+            let xres_star =
+                nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
             assert_eq!(
                 av.get("xresStar").and_then(|v| v.as_str()),
                 Some(nextgcore_udmd::nudm_handler::bytes_to_hex(&xres_star).as_str())
@@ -2063,10 +2108,10 @@ mod tests {
         assert!(sdm_query_params(&request).is_empty());
 
         // Known SDM keys are forwarded; unknown keys are not.
-        request
-            .http
-            .params
-            .insert("plmn-id".to_string(), r#"{"mcc":"001","mnc":"01"}"#.to_string());
+        request.http.params.insert(
+            "plmn-id".to_string(),
+            r#"{"mcc":"001","mnc":"01"}"#.to_string(),
+        );
         request
             .http
             .params
@@ -2077,8 +2122,14 @@ mod tests {
             .insert("irrelevant-param".to_string(), "ignored".to_string());
 
         let params = sdm_query_params(&request);
-        assert_eq!(params.get("plmn-id").map(String::as_str), Some(r#"{"mcc":"001","mnc":"01"}"#));
-        assert_eq!(params.get("supported-features").map(String::as_str), Some("ff"));
+        assert_eq!(
+            params.get("plmn-id").map(String::as_str),
+            Some(r#"{"mcc":"001","mnc":"01"}"#)
+        );
+        assert_eq!(
+            params.get("supported-features").map(String::as_str),
+            Some("ff")
+        );
         assert!(
             !params.contains_key("irrelevant-param"),
             "non-SDM params must not be forwarded to UDR"
@@ -2122,9 +2173,17 @@ mod tests {
         let resp = handle_sdm_subscribe(supi, &request).await;
         assert_eq!(resp.status, 201, "subscribe must return 201");
         // set_header lowercases header keys (HTTP/2 convention).
-        let loc = resp.http.headers.get("location").cloned().unwrap_or_default();
+        let loc = resp
+            .http
+            .headers
+            .get("location")
+            .cloned()
+            .unwrap_or_default();
         assert!(loc.contains(supi), "Location must contain SUPI");
-        assert!(loc.contains("sdm-subscriptions"), "Location must reference sdm-subscriptions");
+        assert!(
+            loc.contains("sdm-subscriptions"),
+            "Location must reference sdm-subscriptions"
+        );
 
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
@@ -2183,10 +2242,7 @@ mod tests {
         let supi = "imsi-udmd09-0001";
 
         let request = SbiRequest {
-            header: SbiHeader::with_method_uri(
-                "POST",
-                format!("/nudm-ueau/v1/{supi}/auth-events"),
-            ),
+            header: SbiHeader::with_method_uri("POST", format!("/nudm-ueau/v1/{supi}/auth-events")),
             http: SbiHttpMessage {
                 content: Some(
                     serde_json::json!({
@@ -2208,7 +2264,12 @@ mod tests {
 
         // udmd-09: Location header must reference the auth-events sub-resource.
         // set_header lowercases all keys (HTTP/2 convention).
-        let loc = resp.http.headers.get("location").cloned().unwrap_or_default();
+        let loc = resp
+            .http
+            .headers
+            .get("location")
+            .cloned()
+            .unwrap_or_default();
         assert!(
             loc.contains("auth-events"),
             "Location must reference auth-events resource; got: {loc}"

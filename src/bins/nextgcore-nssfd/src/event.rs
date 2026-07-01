@@ -61,7 +61,9 @@ impl NssfTimerId {
             NssfTimerId::NfInstanceRegistrationInterval => {
                 "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            NssfTimerId::NfInstanceHeartbeatInterval => "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
+            NssfTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
             NssfTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
             NssfTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
             NssfTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",

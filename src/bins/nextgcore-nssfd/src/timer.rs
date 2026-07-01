@@ -54,7 +54,9 @@ impl NssfTimerManager {
     }
 
     /// Process expired timers and return them for dispatch to the state machine
-    pub fn process_expired(&self) -> Vec<nextgcore_core::async_timer::AsyncTimerEntry<NssfTimerId>> {
+    pub fn process_expired(
+        &self,
+    ) -> Vec<nextgcore_core::async_timer::AsyncTimerEntry<NssfTimerId>> {
         self.inner.process_expired()
     }
 

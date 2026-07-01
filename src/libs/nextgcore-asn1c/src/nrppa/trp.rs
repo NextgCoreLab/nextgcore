@@ -15,7 +15,9 @@
 
 use super::ies::{CgiNr, NgRanAccessPointPosition};
 use super::types::{Criticality, ProtocolIeId, MAX_NO_TRPS, MAX_NO_TRP_INFO_TYPES};
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError, PerResult};
+use crate::per::{
+    AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError, PerResult,
+};
 
 // ---------------------------------------------------------------------------
 // TRP-ID / TRPItem / TRPList
@@ -720,7 +722,12 @@ mod tests {
     #[test]
     fn test_trp_list_and_resp_list_roundtrip() {
         roundtrip(TrpList {
-            items: vec![TrpItem { trp_id: TrpId(1) }, TrpItem { trp_id: TrpId(65535) }],
+            items: vec![
+                TrpItem { trp_id: TrpId(1) },
+                TrpItem {
+                    trp_id: TrpId(65535),
+                },
+            ],
         });
         roundtrip(TrpInformationListTrpResp {
             items: vec![

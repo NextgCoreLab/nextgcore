@@ -1219,10 +1219,7 @@ mod tests {
     #[test]
     fn test_negotiate_kdf_pure() {
         // Matching offer -> Accept.
-        assert_eq!(
-            negotiate_kdf(1, &[1], 1, false),
-            KdfNegotiation::Accept
-        );
+        assert_eq!(negotiate_kdf(1, &[1], 1, false), KdfNegotiation::Accept);
         // Different but supported KDF, first round -> one renegotiation.
         assert_eq!(
             negotiate_kdf(1, &[1, 2], 2, false),

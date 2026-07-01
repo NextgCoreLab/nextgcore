@@ -469,7 +469,10 @@ mod tests {
     fn test_nextgcore_id_parsing() {
         let supi = "imsi-123456789012345";
         assert_eq!(nextgcore_id_get_type(supi), Some("imsi".to_string()));
-        assert_eq!(nextgcore_id_get_value(supi), Some("123456789012345".to_string()));
+        assert_eq!(
+            nextgcore_id_get_value(supi),
+            Some("123456789012345".to_string())
+        );
 
         let supi2 = "nai-user@example.com";
         assert_eq!(nextgcore_id_get_type(supi2), Some("nai".to_string()));

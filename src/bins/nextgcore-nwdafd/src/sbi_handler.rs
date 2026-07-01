@@ -76,8 +76,11 @@ fn parse_query(uri: &str) -> HashMap<String, String> {
 fn parse_snssai(v: &serde_json::Value) -> Option<SNssai> {
     let sst = v.get("sst").and_then(|x| x.as_u64())? as u8;
     let sd = v.get("sd").and_then(|x| {
-        x.as_u64()
-            .or_else(|| x.as_str().and_then(|s| u32::from_str_radix(s, 16).ok()).map(u64::from))
+        x.as_u64().or_else(|| {
+            x.as_str()
+                .and_then(|s| u32::from_str_radix(s, 16).ok())
+                .map(u64::from)
+        })
     });
     Some(SNssai {
         sst,
@@ -299,10 +302,7 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         .as_secs();
 
     // Derive periodicity + target from the events before they are moved.
-    let rep_period = events
-        .first()
-        .and_then(|e| e.rep_period_secs)
-        .or(Some(60));
+    let rep_period = events.first().and_then(|e| e.rep_period_secs).or(Some(60));
     let first_snssai = events.first().and_then(|e| e.snssais.first()).cloned();
     let tgt_supi = data
         .get("eventSubscriptions")
@@ -564,7 +564,8 @@ mod tests {
     /// keys.
     #[tokio::test]
     async fn test_analytics_info_get_returns_analytics_data() {
-        let req = SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD&tgt-ue=imsi-001");
+        let req =
+            SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD&tgt-ue=imsi-001");
         let resp = handle_analytics_info_query(&req).await;
         assert_eq!(resp.status, 200, "GET with a valid event-id must be 200");
 
@@ -584,7 +585,10 @@ mod tests {
 
         // Legacy bespoke keys must be gone.
         assert!(body.get("modelCount").is_none(), "no modelCount key");
-        assert!(body.get("analyticsReport").is_none(), "no analyticsReport key");
+        assert!(
+            body.get("analyticsReport").is_none(),
+            "no analyticsReport key"
+        );
         assert!(body.get("models").is_none(), "no models key");
     }
 
@@ -640,7 +644,10 @@ mod tests {
         );
 
         let body = body_json(&resp);
-        assert!(body.get("subscriptionId").and_then(|v| v.as_str()).is_some());
+        assert!(body
+            .get("subscriptionId")
+            .and_then(|v| v.as_str())
+            .is_some());
         assert_eq!(
             body.get("notificationURI").and_then(|v| v.as_str()),
             Some("http://amf.example.org:8080/nnwdaf-notify"),
@@ -656,7 +663,10 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("eventSubscriptions must be echoed as an array");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].get("event").and_then(|v| v.as_str()), Some("NF_LOAD"));
+        assert_eq!(
+            events[0].get("event").and_then(|v| v.as_str()),
+            Some("NF_LOAD")
+        );
     }
 
     /// `eventSubscriptions` absent → 400 (mandatory IE, minItems 1).
@@ -794,7 +804,10 @@ mod tests {
             .get("mLEventSubscs")
             .and_then(|v| v.as_array())
             .expect("mLEventSubscs echoed as an array");
-        assert_eq!(events[0].get("mLEvent").and_then(|v| v.as_str()), Some("NF_LOAD"));
+        assert_eq!(
+            events[0].get("mLEvent").and_then(|v| v.as_str()),
+            Some("NF_LOAD")
+        );
     }
 
     /// Missing `notifUri` (a required IE) → 400.
@@ -856,7 +869,13 @@ mod tests {
         assert_eq!(put_missing_resp.status, 404);
 
         // DELETE the known id → 204, then 404 on the second attempt.
-        assert_eq!(handle_ml_prov_subscription_delete(&sub_id).await.status, 204);
-        assert_eq!(handle_ml_prov_subscription_delete(&sub_id).await.status, 404);
+        assert_eq!(
+            handle_ml_prov_subscription_delete(&sub_id).await.status,
+            204
+        );
+        assert_eq!(
+            handle_ml_prov_subscription_delete(&sub_id).await.status,
+            404
+        );
     }
 }

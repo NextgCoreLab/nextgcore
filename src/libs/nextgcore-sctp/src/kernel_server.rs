@@ -46,8 +46,8 @@ use crate::kernel::{
     KernelSctpSocket, SCTP_ASSOC_CHANGE, SCTP_CANT_STR_ASSOC, SCTP_COMM_LOST, SCTP_SHUTDOWN_COMP,
     SCTP_SHUTDOWN_EVENT,
 };
-use crate::server::{ServerError, ServerEvent, SctpServerConfig};
-use crate::{ReceivedMessage, SctpError, MSG_NOTIFICATION, NGAP_PPID, NEXTGCORE_MAX_SDU_LEN};
+use crate::server::{SctpServerConfig, ServerError, ServerEvent};
+use crate::{ReceivedMessage, SctpError, MSG_NOTIFICATION, NEXTGCORE_MAX_SDU_LEN, NGAP_PPID};
 
 type Result<T> = std::result::Result<T, ServerError>;
 
@@ -86,9 +86,7 @@ impl KernelSctpServer {
     /// Bind a non-blocking listening SCTP socket on `addr`.
     pub async fn bind(addr: SocketAddr, config: SctpServerConfig) -> Result<Self> {
         let listener = KernelSctpSocket::server(addr).map_err(sctp_to_server_err)?;
-        listener
-            .set_nonblocking(true)
-            .map_err(sctp_to_server_err)?;
+        listener.set_nonblocking(true).map_err(sctp_to_server_err)?;
         let local_addr = listener.local_addr();
 
         log::info!("Kernel-SCTP NGAP server listening on {local_addr} (native one-to-one SCTP)");

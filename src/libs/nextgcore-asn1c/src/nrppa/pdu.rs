@@ -15,7 +15,10 @@ use super::ies::{
     CellPortionId, ECidMeasurementResult, MeasurementPeriodicity, MeasurementQuantities,
     ProtocolIeContainer, ProtocolIeField, ReportCharacteristics, UeMeasurementId,
 };
-use super::trp::{TrpId, TrpInformation, TrpInformationListTrpResp, TrpInformationTypeListTrpReq, TrpInformationTypeItem, TrpItem, TrpList};
+use super::trp::{
+    TrpId, TrpInformation, TrpInformationListTrpResp, TrpInformationTypeItem,
+    TrpInformationTypeListTrpReq, TrpItem, TrpList,
+};
 use super::types::{Criticality, NrppaTransactionId, ProcedureCode, ProtocolIeId};
 use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, PerError, PerResult};
 
@@ -386,7 +389,11 @@ fn decode_ie_value<T: AperDecode>(bytes: &[u8]) -> PerResult<T> {
     T::decode_aper(&mut decoder)
 }
 
-fn ie<T: AperEncode>(id: ProtocolIeId, criticality: Criticality, value: &T) -> PerResult<ProtocolIeField> {
+fn ie<T: AperEncode>(
+    id: ProtocolIeId,
+    criticality: Criticality,
+    value: &T,
+) -> PerResult<ProtocolIeField> {
     Ok(ProtocolIeField {
         id,
         criticality,
@@ -703,21 +710,30 @@ mod tests {
         // Response carries LMF + RAN measurement IDs (mandatory) and an optional
         // E-CID-MeasurementResult; the typed values ride inside the container.
         let mut container = ProtocolIeContainer::new();
-        container.push(ie(
-            ProtocolIeId::LMF_UE_MEASUREMENT_ID,
-            Criticality::Reject,
-            &UeMeasurementId(3),
-        ).unwrap());
-        container.push(ie(
-            ProtocolIeId::RAN_UE_MEASUREMENT_ID,
-            Criticality::Reject,
-            &UeMeasurementId(9),
-        ).unwrap());
-        container.push(ie(
-            ProtocolIeId::E_CID_MEASUREMENT_RESULT,
-            Criticality::Ignore,
-            &sample_result(),
-        ).unwrap());
+        container.push(
+            ie(
+                ProtocolIeId::LMF_UE_MEASUREMENT_ID,
+                Criticality::Reject,
+                &UeMeasurementId(3),
+            )
+            .unwrap(),
+        );
+        container.push(
+            ie(
+                ProtocolIeId::RAN_UE_MEASUREMENT_ID,
+                Criticality::Reject,
+                &UeMeasurementId(9),
+            )
+            .unwrap(),
+        );
+        container.push(
+            ie(
+                ProtocolIeId::E_CID_MEASUREMENT_RESULT,
+                Criticality::Ignore,
+                &sample_result(),
+            )
+            .unwrap(),
+        );
 
         let pdu = NrppaPdu::SuccessfulOutcome(SuccessfulOutcome {
             procedure_code: ProcedureCode::E_CID_MEASUREMENT_INITIATION,
@@ -734,16 +750,22 @@ mod tests {
     #[test]
     fn test_ecid_measurement_initiation_failure_roundtrip() {
         let mut container = ProtocolIeContainer::new();
-        container.push(ie(
-            ProtocolIeId::LMF_UE_MEASUREMENT_ID,
-            Criticality::Reject,
-            &UeMeasurementId(3),
-        ).unwrap());
-        container.push(ie(
-            ProtocolIeId::CAUSE,
-            Criticality::Ignore,
-            &Cause::RadioNetwork(CauseRadioNetwork::RequestedItemNotSupported),
-        ).unwrap());
+        container.push(
+            ie(
+                ProtocolIeId::LMF_UE_MEASUREMENT_ID,
+                Criticality::Reject,
+                &UeMeasurementId(3),
+            )
+            .unwrap(),
+        );
+        container.push(
+            ie(
+                ProtocolIeId::CAUSE,
+                Criticality::Ignore,
+                &Cause::RadioNetwork(CauseRadioNetwork::RequestedItemNotSupported),
+            )
+            .unwrap(),
+        );
 
         let pdu = NrppaPdu::UnsuccessfulOutcome(UnsuccessfulOutcome {
             procedure_code: ProcedureCode::E_CID_MEASUREMENT_INITIATION,
@@ -921,7 +943,10 @@ mod tests {
         let pdu = build_trp_information_request(
             NrppaTransactionId(7),
             Some(vec![TrpId(1), TrpId(2)]),
-            vec![TrpInformationTypeItem::NrPci, TrpInformationTypeItem::GeoCoord],
+            vec![
+                TrpInformationTypeItem::NrPci,
+                TrpInformationTypeItem::GeoCoord,
+            ],
         )
         .unwrap();
 
@@ -1068,8 +1093,7 @@ mod tests {
                     let field = c
                         .find(ProtocolIeId::TRP_INFORMATION_TYPE_LIST_TRP_REQ)
                         .unwrap();
-                    let list: TrpInformationTypeListTrpReq =
-                        decode_ie_value(&field.value).unwrap();
+                    let list: TrpInformationTypeListTrpReq = decode_ie_value(&field.value).unwrap();
                     assert_eq!(list.items, vec![TrpInformationTypeItem::NrPci]);
                 }
                 _ => panic!("expected TrpInformationRequest"),

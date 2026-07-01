@@ -30,8 +30,10 @@ pub struct NextgcoreDbiAuthInfo {
 /// * `Ok(NextgcoreDbiAuthInfo)` with authentication data
 /// * `Err(DbiError)` on failure
 pub fn nextgcore_dbi_auth_info(supi: &str) -> DbiResult<NextgcoreDbiAuthInfo> {
-    let supi_type = nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id = nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_type =
+        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id =
+        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };
@@ -86,8 +88,10 @@ pub fn nextgcore_dbi_auth_info(supi: &str) -> DbiResult<NextgcoreDbiAuthInfo> {
 /// * `supi` - Subscriber Permanent Identifier
 /// * `sqn` - New sequence number
 pub fn nextgcore_dbi_update_sqn(supi: &str, sqn: u64) -> DbiResult<()> {
-    let supi_type = nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id = nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_type =
+        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id =
+        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };
@@ -106,8 +110,10 @@ pub fn nextgcore_dbi_update_sqn(supi: &str, sqn: u64) -> DbiResult<()> {
 /// # Arguments
 /// * `supi` - Subscriber Permanent Identifier
 pub fn nextgcore_dbi_increment_sqn(supi: &str) -> DbiResult<()> {
-    let supi_type = nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id = nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_type =
+        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id =
+        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };
@@ -139,8 +145,10 @@ pub fn nextgcore_dbi_increment_sqn(supi: &str) -> DbiResult<()> {
 /// * `supi` - Subscriber Permanent Identifier
 /// * `imeisv` - IMEISV string
 pub fn nextgcore_dbi_update_imeisv(supi: &str, imeisv: &str) -> DbiResult<()> {
-    let supi_type = nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id = nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_type =
+        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id =
+        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     log::debug!("SUPI type: {supi_type}, SUPI id: {supi_id}, imeisv: {imeisv}");
 
@@ -181,9 +189,14 @@ pub struct NextgcoreDbiAuthProvision {
 /// Upserts the `security` sub-document of the subscriber document. Returns
 /// `Ok(true)` when a new subscriber document was created (HTTP 201 path) and
 /// `Ok(false)` when an existing document was updated (HTTP 204 path).
-pub fn nextgcore_dbi_provision_auth_info(supi: &str, p: &NextgcoreDbiAuthProvision) -> DbiResult<bool> {
-    let supi_type = nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id = nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+pub fn nextgcore_dbi_provision_auth_info(
+    supi: &str,
+    p: &NextgcoreDbiAuthProvision,
+) -> DbiResult<bool> {
+    let supi_type =
+        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id =
+        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };
@@ -240,8 +253,10 @@ pub fn nextgcore_dbi_update_mme(
     mme_realm: &str,
     purge_flag: bool,
 ) -> DbiResult<()> {
-    let supi_type = nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id = nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_type =
+        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id =
+        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     log::debug!(
         "SUPI type: {supi_type}, SUPI id: {supi_id}, mme_host: {mme_host}, mme_realm: {mme_realm}"
@@ -274,8 +289,10 @@ pub fn nextgcore_dbi_update_mme(
 /// # Arguments
 /// * `supi` - Subscriber Permanent Identifier
 pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscriptionData> {
-    let supi_type = nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id = nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_type =
+        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id =
+        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };
@@ -432,7 +449,9 @@ pub async fn nextgcore_dbi_update_imeisv_async(supi: String, imeisv: String) -> 
 }
 
 /// Async, non-blocking wrapper for [`nextgcore_dbi_subscription_data`].
-pub async fn nextgcore_dbi_subscription_data_async(supi: String) -> DbiResult<NextgcoreSubscriptionData> {
+pub async fn nextgcore_dbi_subscription_data_async(
+    supi: String,
+) -> DbiResult<NextgcoreSubscriptionData> {
     tokio::task::spawn_blocking(move || nextgcore_dbi_subscription_data(&supi))
         .await
         .unwrap_or_else(|e| {
@@ -443,7 +462,9 @@ pub async fn nextgcore_dbi_subscription_data_async(supi: String) -> DbiResult<Ne
 }
 
 /// Async, non-blocking wrapper for [`nextgcore_dbi_subscription_data_5g`].
-pub async fn nextgcore_dbi_subscription_data_5g_async(supi: String) -> DbiResult<NextgcoreSubscriptionData> {
+pub async fn nextgcore_dbi_subscription_data_5g_async(
+    supi: String,
+) -> DbiResult<NextgcoreSubscriptionData> {
     tokio::task::spawn_blocking(move || nextgcore_dbi_subscription_data_5g(&supi))
         .await
         .unwrap_or_else(|e| {
@@ -454,7 +475,9 @@ pub async fn nextgcore_dbi_subscription_data_5g_async(supi: String) -> DbiResult
 }
 
 /// Async, non-blocking wrapper for [`nextgcore_dbi_policy_subscription`].
-pub async fn nextgcore_dbi_policy_subscription_async(supi: String) -> DbiResult<NextgcoreSubscriptionData> {
+pub async fn nextgcore_dbi_policy_subscription_async(
+    supi: String,
+) -> DbiResult<NextgcoreSubscriptionData> {
     tokio::task::spawn_blocking(move || nextgcore_dbi_policy_subscription(&supi))
         .await
         .unwrap_or_else(|e| {
@@ -676,8 +699,10 @@ pub fn nextgcore_dbi_subscription_data_5g(supi: &str) -> DbiResult<NextgcoreSubs
 /// * `Ok(NextgcoreSubscriptionData)` with policy-related subscription data
 /// * `Err(DbiError)` on failure
 pub fn nextgcore_dbi_policy_subscription(supi: &str) -> DbiResult<NextgcoreSubscriptionData> {
-    let supi_type = nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id = nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_type =
+        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id =
+        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };

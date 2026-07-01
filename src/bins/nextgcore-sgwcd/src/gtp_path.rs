@@ -1193,7 +1193,9 @@ fn dispatch_bearer_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nextgcore_gtp::v2::ie::{Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2FTeidIe, Gtp2Ie};
+    use nextgcore_gtp::v2::ie::{
+        Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2FTeidIe, Gtp2Ie,
+    };
     use std::net::UdpSocket;
 
     fn test_server(t3_ms: u64, n3: u32) -> GtpcServer {

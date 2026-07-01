@@ -737,7 +737,8 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
             log::info!("SMF registered with NRF (id={nf_instance_id})");
 
             // Store self instance in SBI context
-            let mut self_instance = NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Smf);
+            let mut self_instance =
+                NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Smf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = NfService::new(
                 "nsmf-pdusession",
@@ -1715,10 +1716,9 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // The N1 container arrives either as a multipart 5gnas binary part
     // (resolved via its RefToBinaryData contentId) or, from a legacy peer, as
     // a base64 string. `resolve_binary_ref` accepts both.
-    let (pti, requested_type, requested_ssc) = match resolve_binary_ref(request, &req_body["n1SmMsg"])
-    {
-        Some(n1_bytes) => {
-            match policy::parse_establishment_request(&n1_bytes) {
+    let (pti, requested_type, requested_ssc) =
+        match resolve_binary_ref(request, &req_body["n1SmMsg"]) {
+            Some(n1_bytes) => match policy::parse_establishment_request(&n1_bytes) {
                 Some(req) => {
                     if req.psi != pdu_session_id {
                         log::warn!(
@@ -1748,15 +1748,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         "n1SmMsg is not a PDU Session Establishment Request",
                     )
                 }
+            },
+            None => {
+                // The n1SmMsg attribute passed validation but its referenced
+                // binary part is absent / not decodable — reject (smfd-06).
+                log::error!("SmContextCreateData n1SmMsg present but binary part missing/invalid");
+                return problem_400("N1_SM_ERROR", "n1SmMsg binary part missing or invalid");
             }
-        }
-        None => {
-            // The n1SmMsg attribute passed validation but its referenced
-            // binary part is absent / not decodable — reject (smfd-06).
-            log::error!("SmContextCreateData n1SmMsg present but binary part missing/invalid");
-            return problem_400("N1_SM_ERROR", "n1SmMsg binary part missing or invalid");
-        }
-    };
+        };
 
     // Selected PDU session type: this SMF serves IPv4 (and the IPv4 leg of
     // IPv4v6). IPv6-only/Ethernet/Unstructured → reject, 5GSM cause #50.
@@ -1867,9 +1866,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     );
                 }
                 policy::NsacAdmission::Unavailable => {
-                    log::warn!(
-                        "NSACF unreachable for slice admission — proceeding (fail-open)"
-                    );
+                    log::warn!("NSACF unreachable for slice admission — proceeding (fail-open)");
                     false
                 }
             }
@@ -2705,7 +2702,9 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
 
     // Notify the AMF the SM context is RELEASED (TS 29.502 §5.2.2.8). No-op
     // when the AMF supplied no smContextStatusUri (the matched-sim AMF). smfd-07.
-    let status_uri = binding.as_ref().and_then(|b| b.sm_context_status_uri.clone());
+    let status_uri = binding
+        .as_ref()
+        .and_then(|b| b.sm_context_status_uri.clone());
     send_sm_context_status_notification(status_uri.as_deref(), "RELEASED", None).await;
 
     SbiResponse::with_status(204)
@@ -3070,8 +3069,11 @@ mod tests {
         // Serialize exactly as the SBI client serializes parts (multipart/
         // related), then decode it back to prove the wire shape.
         let boundary = nextgcore_sbi::multipart::generate_boundary();
-        let body =
-            nextgcore_sbi::multipart::encode(resp.http.content.as_deref(), &resp.http.parts, &boundary);
+        let body = nextgcore_sbi::multipart::encode(
+            resp.http.content.as_deref(),
+            &resp.http.parts,
+            &boundary,
+        );
         let ct = nextgcore_sbi::multipart::content_type_with_boundary(&boundary);
         let decoded = nextgcore_sbi::multipart::decode(&ct, &body).expect("decode multipart");
 
@@ -3137,9 +3139,9 @@ mod tests {
     fn smfd_resolves_n1_multipart_same_as_base64() {
         // Multipart form: JSON root holds a RefToBinaryData pointer; bytes in a part.
         let mut multipart_req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts");
-        multipart_req.http.set_content(
-            serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } }).to_string(),
-        );
+        multipart_req
+            .http
+            .set_content(serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } }).to_string());
         multipart_req.http.add_part(SbiPart::with_content(
             "n1SmMsg",
             content_type::APPLICATION_5GNAS,
@@ -3258,10 +3260,7 @@ mod tests {
 
         let mut no_n1 = matched_sim.clone();
         no_n1["n1SmMsg"] = serde_json::Value::Null;
-        assert_eq!(
-            validate_sm_context_create_data(&no_n1),
-            Some("N1_SM_ERROR")
-        );
+        assert_eq!(validate_sm_context_create_data(&no_n1), Some("N1_SM_ERROR"));
     }
 
     // ----------------------------- smfd-07 ------------------------------

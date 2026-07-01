@@ -1544,7 +1544,8 @@ mod tests {
                 // Fresh security context: NCC advanced from 0 to 1, NH
                 // derived from KeNB per TS 33.401 Annex A.4
                 assert_eq!(ack.security_context.next_hop_chaining_count, 1);
-                let expected_nh = nextgcore_crypt::kdf::nextgcore_kdf_nh_enb(&[0x11; 32], &[0x22; 32]);
+                let expected_nh =
+                    nextgcore_crypt::kdf::nextgcore_kdf_nh_enb(&[0x11; 32], &[0x22; 32]);
                 assert_eq!(ack.security_context.next_hop_parameter, expected_nh);
                 assert_eq!(ack.erab_switched_ul_list.len(), 1);
                 assert_eq!(ack.erab_switched_ul_list[0].gtp_teid, 0x5555);

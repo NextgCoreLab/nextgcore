@@ -141,7 +141,10 @@ pub async fn start_ecs_registration(
 
 /// POST the `EESRegistration` to the ECS once; returns the assigned
 /// `registrationId` (from the `Location` header or response body) on success.
-async fn register_once(ecs_uri: &str, registration: &EesRegistration) -> Result<Option<String>, String> {
+async fn register_once(
+    ecs_uri: &str,
+    registration: &EesRegistration,
+) -> Result<Option<String>, String> {
     let (host, port) = parse_host_port(ecs_uri).ok_or_else(|| "invalid --ecs-uri".to_string())?;
     let client = global_context().get_client(&host, port).await;
     let path = ecs_registration_collection_path();

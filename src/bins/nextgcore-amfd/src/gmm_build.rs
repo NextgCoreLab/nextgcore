@@ -360,13 +360,15 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     // 5G-GUTI (optional, IEI 0x77 TLV-E) — only when a next-GUTI has been assigned.
     let guti = if amf_ue.next_guti.tmsi != 0 {
         let g = &amf_ue.next_guti;
-        Some(nextgcore_ftypes::MobileIdentity::FiveGGuti(nextgcore_ftypes::FiveGGuti {
-            plmn_id: to_nextgcore_plmn(&g.plmn_id),
-            amf_region_id: g.amf_region_id,
-            amf_set_id: g.amf_set_id,
-            amf_pointer: g.amf_pointer,
-            tmsi: g.tmsi,
-        }))
+        Some(nextgcore_ftypes::MobileIdentity::FiveGGuti(
+            nextgcore_ftypes::FiveGGuti {
+                plmn_id: to_nextgcore_plmn(&g.plmn_id),
+                amf_region_id: g.amf_region_id,
+                amf_set_id: g.amf_set_id,
+                amf_pointer: g.amf_pointer,
+                tmsi: g.tmsi,
+            },
+        ))
     } else {
         None
     };
@@ -409,18 +411,19 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     // T3512 value (IEI 0x5E): 9 minutes — unit 010 (multiples of 1 minute), value 9.
     let t3512_value = Some(nextgcore_types::GprsTimer3::new(2, 9));
 
-    let msg = nextgcore_msg::FiveGmmMessage::RegistrationAccept(nextgcore_msg::RegistrationAccept {
-        registration_result,
-        presencemask: 0,
-        guti,
-        equivalent_plmns: None,
-        tai_list,
-        allowed_nssai,
-        rejected_nssai: None,
-        pdu_session_status: None,
-        t3512_value,
-        t3502_value: None,
-    });
+    let msg =
+        nextgcore_msg::FiveGmmMessage::RegistrationAccept(nextgcore_msg::RegistrationAccept {
+            registration_result,
+            presencemask: 0,
+            guti,
+            equivalent_plmns: None,
+            tai_list,
+            allowed_nssai,
+            rejected_nssai: None,
+            pdu_session_status: None,
+            t3512_value,
+            t3502_value: None,
+        });
     Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
@@ -477,10 +480,11 @@ pub fn encode_nssai_value(snssais: &[crate::context::SNssai]) -> Vec<u8> {
 /// optional T3346/T3502/EAP IEs are not emitted by amfd). Locked by
 /// `drift_registration_reject_through_nextgcore_nas` and `golden_registration_reject`.
 pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
-    let msg = nextgcore_msg::FiveGmmMessage::RegistrationReject(nextgcore_msg::RegistrationReject {
-        gmm_cause: gmm_cause as u8,
-        ..Default::default()
-    });
+    let msg =
+        nextgcore_msg::FiveGmmMessage::RegistrationReject(nextgcore_msg::RegistrationReject {
+            gmm_cause: gmm_cause as u8,
+            ..Default::default()
+        });
     nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
@@ -493,9 +497,10 @@ pub fn build_security_mode_reject(gmm_cause: GmmCause) -> Vec<u8> {
     // nas-06 Phase 1: encoded via nextgcore-nas (plain header + mandatory 5GMM cause).
     // Byte-identical to the prior hand-rolled output; locked by
     // `drift_security_mode_reject_through_nextgcore_nas` + `golden_security_mode_reject`.
-    let msg = nextgcore_msg::FiveGmmMessage::SecurityModeReject(nextgcore_msg::SecurityModeReject {
-        gmm_cause: gmm_cause as u8,
-    });
+    let msg =
+        nextgcore_msg::FiveGmmMessage::SecurityModeReject(nextgcore_msg::SecurityModeReject {
+            gmm_cause: gmm_cause as u8,
+        });
     nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
@@ -633,13 +638,15 @@ pub fn build_authentication_request(amf_ue: &AmfUe) -> Vec<u8> {
     let n = amf_ue.autn.len().min(NEXTGCORE_AUTN_LEN);
     autn[..n].copy_from_slice(&amf_ue.autn[..n]);
 
-    let msg = nextgcore_msg::FiveGmmMessage::AuthenticationRequest(nextgcore_msg::AuthenticationRequest {
-        ngksi: nextgcore_types::KeySetIdentifier::new(amf_ue.nas_tsc, amf_ue.nas_ksi),
-        abba: nextgcore_types::Abba::new(amf_ue.abba[..amf_ue.abba_len as usize].to_vec()),
-        rand: Some(amf_ue.rand),
-        autn: Some(autn),
-        eap_message: None,
-    });
+    let msg = nextgcore_msg::FiveGmmMessage::AuthenticationRequest(
+        nextgcore_msg::AuthenticationRequest {
+            ngksi: nextgcore_types::KeySetIdentifier::new(amf_ue.nas_tsc, amf_ue.nas_ksi),
+            abba: nextgcore_types::Abba::new(amf_ue.abba[..amf_ue.abba_len as usize].to_vec()),
+            rand: Some(amf_ue.rand),
+            autn: Some(autn),
+            eap_message: None,
+        },
+    );
     nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
@@ -650,9 +657,10 @@ pub fn build_authentication_request(amf_ue: &AmfUe) -> Vec<u8> {
 /// prior hand-rolled output. Locked by `drift_authentication_reject_through_nextgcore_nas`
 /// + `golden_authentication_reject`.
 pub fn build_authentication_reject() -> Vec<u8> {
-    let msg = nextgcore_msg::FiveGmmMessage::AuthenticationReject(nextgcore_msg::AuthenticationReject {
-        eap_message: None,
-    });
+    let msg =
+        nextgcore_msg::FiveGmmMessage::AuthenticationReject(nextgcore_msg::AuthenticationReject {
+            eap_message: None,
+        });
     nextgcore_msg::build_5gmm_message(&msg).to_vec()
 }
 
@@ -681,20 +689,21 @@ pub fn build_security_mode_command(amf_ue: &AmfUe) -> Option<Vec<u8>> {
         nextgcore_types::UeSecurityCapability::new(cap.ea, cap.ia)
     };
 
-    let msg = nextgcore_msg::FiveGmmMessage::SecurityModeCommand(nextgcore_msg::SecurityModeCommand {
-        selected_nas_security_algorithms: nextgcore_types::SecurityAlgorithms::new(
-            amf_ue.selected_enc_algorithm,
-            amf_ue.selected_int_algorithm,
-        ),
-        ngksi: nextgcore_types::KeySetIdentifier::new(amf_ue.nas_tsc, amf_ue.nas_ksi),
-        replayed_ue_security_capabilities: replayed,
-        imeisv_request: Some(1),
-        selected_eps_nas_security_algorithms: None,
-        additional_5g_security_information: Some(1),
-        eap_message: None,
-        abba: None,
-        replayed_s1_ue_security_capabilities: None,
-    });
+    let msg =
+        nextgcore_msg::FiveGmmMessage::SecurityModeCommand(nextgcore_msg::SecurityModeCommand {
+            selected_nas_security_algorithms: nextgcore_types::SecurityAlgorithms::new(
+                amf_ue.selected_enc_algorithm,
+                amf_ue.selected_int_algorithm,
+            ),
+            ngksi: nextgcore_types::KeySetIdentifier::new(amf_ue.nas_tsc, amf_ue.nas_ksi),
+            replayed_ue_security_capabilities: replayed,
+            imeisv_request: Some(1),
+            selected_eps_nas_security_algorithms: None,
+            additional_5g_security_information: Some(1),
+            eap_message: None,
+            abba: None,
+            replayed_s1_ue_security_capabilities: None,
+        });
     Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
@@ -724,32 +733,36 @@ pub fn build_configuration_update_command(
 
     let guti = if param.guti && amf_ue.next_guti.tmsi != 0 {
         let g = &amf_ue.next_guti;
-        Some(nextgcore_ftypes::MobileIdentity::FiveGGuti(nextgcore_ftypes::FiveGGuti {
-            plmn_id: to_nextgcore_plmn(&g.plmn_id),
-            amf_region_id: g.amf_region_id,
-            amf_set_id: g.amf_set_id,
-            amf_pointer: g.amf_pointer,
-            tmsi: g.tmsi,
-        }))
+        Some(nextgcore_ftypes::MobileIdentity::FiveGGuti(
+            nextgcore_ftypes::FiveGGuti {
+                plmn_id: to_nextgcore_plmn(&g.plmn_id),
+                amf_region_id: g.amf_region_id,
+                amf_set_id: g.amf_set_id,
+                amf_pointer: g.amf_pointer,
+                tmsi: g.tmsi,
+            },
+        ))
     } else {
         None
     };
 
-    let msg = nextgcore_msg::FiveGmmMessage::ConfigurationUpdateCommand(nextgcore_msg::ConfigurationUpdateCommand {
-        configuration_update_indication,
-        guti,
-        tai_list: None,
-        allowed_nssai: None,
-        service_area_list: None,
-        full_name_for_network: None,
-        short_name_for_network: None,
-        local_time_zone: None,
-        universal_time_and_local_time_zone: None,
-        network_daylight_saving_time: None,
-        ladn_information: None,
-        configured_nssai: None,
-        rejected_nssai: None,
-    });
+    let msg = nextgcore_msg::FiveGmmMessage::ConfigurationUpdateCommand(
+        nextgcore_msg::ConfigurationUpdateCommand {
+            configuration_update_indication,
+            guti,
+            tai_list: None,
+            allowed_nssai: None,
+            service_area_list: None,
+            full_name_for_network: None,
+            short_name_for_network: None,
+            local_time_zone: None,
+            universal_time_and_local_time_zone: None,
+            network_daylight_saving_time: None,
+            ladn_information: None,
+            configured_nssai: None,
+            rejected_nssai: None,
+        },
+    );
     Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
@@ -1262,7 +1275,10 @@ mod tests {
 
         let out = build_registration_accept(&ue).unwrap();
         assert_eq!(out, expected);
-        assert!(!out.contains(&0x77) || out[5] != 0x77, "GUTI must be omitted");
+        assert!(
+            !out.contains(&0x77) || out[5] != 0x77,
+            "GUTI must be omitted"
+        );
     }
 
     #[test]

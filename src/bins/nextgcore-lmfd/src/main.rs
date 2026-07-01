@@ -311,7 +311,13 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
 
     let body = match &request.http.content {
         Some(c) => c,
-        None => return problem(400, nlmf::cause::MANDATORY_IE_MISSING, "Missing request body"),
+        None => {
+            return problem(
+                400,
+                nlmf::cause::MANDATORY_IE_MISSING,
+                "Missing request body",
+            )
+        }
     };
 
     // lmfd-03: typed InputData deserialization (replaces serde_json::Value +
@@ -378,8 +384,13 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         .and_then(|q| q.vertical_requested)
         .unwrap_or(false);
     let shape = nlmf::negotiate_gad_shape(input.supported_gad_shapes.as_deref(), want_ellipse);
-    let location_estimate =
-        nlmf::to_gad(est.latitude, est.longitude, est.horizontal_accuracy, 95, shape);
+    let location_estimate = nlmf::to_gad(
+        est.latitude,
+        est.longitude,
+        est.horizontal_accuracy,
+        95,
+        shape,
+    );
 
     // Accuracy fulfilment vs the requested horizontal accuracy.
     let accuracy_fulfilment_indicator = match input.location_qos.as_ref().and_then(|q| q.h_accuracy)
@@ -432,7 +443,13 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
 async fn handle_measurement_request(request: &SbiRequest) -> SbiResponse {
     let body = match &request.http.content {
         Some(c) => c,
-        None => return problem(400, nlmf::cause::MANDATORY_IE_MISSING, "Missing request body"),
+        None => {
+            return problem(
+                400,
+                nlmf::cause::MANDATORY_IE_MISSING,
+                "Missing request body",
+            )
+        }
     };
     let data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
@@ -962,8 +979,10 @@ async fn register_with_nrf(
         200 | 201 => {
             log::info!("LMF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance =
-                nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Lmf);
+            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
+                nf_instance_id,
+                nextgcore_sbi::types::NfType::Lmf,
+            );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = nextgcore_sbi::context::NfService::new(
                 "nlmf-loc",
@@ -1045,7 +1064,10 @@ mod tests {
             parse_nr_method("MULTI-RTT"),
             Some(NrPositioningMethod::MultiRtt)
         );
-        assert_eq!(parse_nr_method("DL_TDOA"), Some(NrPositioningMethod::DlTdoa));
+        assert_eq!(
+            parse_nr_method("DL_TDOA"),
+            Some(NrPositioningMethod::DlTdoa)
+        );
         assert_eq!(parse_nr_method("MULTI_RTT"), None); // wrong spelling rejected
         assert_eq!(parse_nr_method("unknown"), None);
     }
@@ -1110,8 +1132,8 @@ mod tests {
             "locationQoS": { "hAccuracy": 100.0 },
             "supportedGADShapes": ["POINT_UNCERTAINTY_CIRCLE"]
         }"#;
-        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
-            .with_body(body, "application/json");
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let resp = handle_determine_location(&req).await;
         assert_eq!(resp.status, 200);
 
@@ -1140,8 +1162,8 @@ mod tests {
             "locationQoS": { "verticalRequested": true },
             "supportedGADShapes": ["POINT_UNCERTAINTY_ELLIPSE", "POINT_UNCERTAINTY_CIRCLE"]
         }"#;
-        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
-            .with_body(body, "application/json");
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let resp = handle_determine_location(&req).await;
         assert_eq!(resp.status, 200);
         let v = body_json(&resp);
@@ -1155,8 +1177,8 @@ mod tests {
             "ecgi": { "plmnId": { "mcc": "001", "mnc": "01" }, "eutraCellId": "0000001" },
             "ncgi": { "plmnId": { "mcc": "001", "mnc": "01" }, "nrCellId": "000000001" }
         }"#;
-        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
-            .with_body(body, "application/json");
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let resp = handle_determine_location(&req).await;
         assert_eq!(resp.status, 400);
         assert_eq!(
@@ -1183,8 +1205,8 @@ mod tests {
     #[tokio::test]
     async fn test_determine_location_timeout_504() {
         let body = r#"{ "supi": "imsi-001010000000003", "maxRespTime": 0 }"#;
-        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
-            .with_body(body, "application/json");
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let resp = handle_determine_location(&req).await;
         assert_eq!(resp.status, 504);
         assert_eq!(
@@ -1200,8 +1222,7 @@ mod tests {
     async fn test_measurement_request_unknown_method_400() {
         lmf_context_init(1024);
         let body = r#"{ "amfUeNgapId": 1, "positioningMethod": "BOGUS" }"#;
-        let req = SbiRequest::post("/nlmf-loc/v1/measurements")
-            .with_body(body, "application/json");
+        let req = SbiRequest::post("/nlmf-loc/v1/measurements").with_body(body, "application/json");
         let resp = handle_measurement_request(&req).await;
         assert_eq!(resp.status, 400);
         let v = body_json(&resp);

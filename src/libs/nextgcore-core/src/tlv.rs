@@ -311,13 +311,15 @@ impl NextgcoreTlvMsg {
 
     /// Add a TLV element
     pub fn add(&mut self, tlv_type: u32, value: Vec<u8>) {
-        self.elements.push(NextgcoreTlv::new(self.mode, tlv_type, value));
+        self.elements
+            .push(NextgcoreTlv::new(self.mode, tlv_type, value));
     }
 
     /// Add a TLV element with instance
     pub fn add_with_instance(&mut self, tlv_type: u32, instance: u8, value: Vec<u8>) {
-        self.elements
-            .push(NextgcoreTlv::with_instance(self.mode, tlv_type, instance, value));
+        self.elements.push(NextgcoreTlv::with_instance(
+            self.mode, tlv_type, instance, value,
+        ));
     }
 
     /// Encode all TLV elements (identical to nextgcore_tlv_render)
@@ -383,7 +385,8 @@ mod tests {
         assert_eq!(buf[1], 4); // length
         assert_eq!(&buf[2..6], &[1, 2, 3, 4]); // value
 
-        let (decoded, decoded_len) = NextgcoreTlv::decode(&buf[..len], NEXTGCORE_TLV_MODE_T1_L1).unwrap();
+        let (decoded, decoded_len) =
+            NextgcoreTlv::decode(&buf[..len], NEXTGCORE_TLV_MODE_T1_L1).unwrap();
         assert_eq!(decoded_len, len);
         assert_eq!(decoded.tlv_type, 0x42);
         assert_eq!(decoded.length, 4);
@@ -409,7 +412,8 @@ mod tests {
 
     #[test]
     fn test_tlv_t1_l2_i1() {
-        let tlv = NextgcoreTlv::with_instance(NEXTGCORE_TLV_MODE_T1_L2_I1, 0x42, 0x03, vec![1, 2, 3, 4]);
+        let tlv =
+            NextgcoreTlv::with_instance(NEXTGCORE_TLV_MODE_T1_L2_I1, 0x42, 0x03, vec![1, 2, 3, 4]);
 
         let mut buf = [0u8; 100];
         let len = tlv.encode(&mut buf).unwrap();

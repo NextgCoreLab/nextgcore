@@ -500,8 +500,7 @@ pub async fn udm_nudr_dr_send_smf_context_put(
     psi: &str,
     body: &serde_json::Value,
 ) -> Result<SbiResponse, String> {
-    let path =
-        format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}");
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}");
     let request = SbiRequest::put(&path)
         .with_json_body(body)
         .map_err(|e| format!("Failed to serialize SMF registration: {e}"))?;
@@ -517,8 +516,7 @@ pub async fn udm_nudr_dr_send_context_delete(
     supi: &str,
     relative_path: &str,
 ) -> Result<SbiResponse, String> {
-    let path =
-        format!("/nudr-dr/v1/subscription-data/{supi}/context-data/{relative_path}");
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/{relative_path}");
     udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::delete(&path)).await
 }
 
@@ -543,8 +541,7 @@ pub async fn udm_nudr_dr_send_smf_context_get(
     supi: &str,
     psi: &str,
 ) -> Result<SbiResponse, String> {
-    let path =
-        format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}");
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}");
     udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::get(&path)).await
 }
 
@@ -555,9 +552,8 @@ pub async fn udm_nudr_dr_send_auth_status_put(
     supi: &str,
     body: &serde_json::Value,
 ) -> Result<SbiResponse, String> {
-    let path = format!(
-        "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status"
-    );
+    let path =
+        format!("/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status");
     let request = SbiRequest::put(&path)
         .with_json_body(body)
         .map_err(|e| format!("Failed to serialize auth status body: {e}"))?;

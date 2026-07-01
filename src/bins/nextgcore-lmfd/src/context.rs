@@ -795,13 +795,47 @@ mod tests_real_solve {
 
     /// Build a 4-cell scene at known ENU offsets, plus a UE at a known point.
     /// Returns (ctx_with_registry, trp_coords, true_ue_geodetic, true_ue_enu, origin).
-    fn scene() -> (LmfContext, Vec<(String, TrpCoord)>, TrpCoord, EnuPoint, TrpCoord) {
+    fn scene() -> (
+        LmfContext,
+        Vec<(String, TrpCoord)>,
+        TrpCoord,
+        EnuPoint,
+        TrpCoord,
+    ) {
         let origin = TrpCoord::new(ORIGIN_LAT, ORIGIN_LON, 0.0);
         let trp_enu = [
-            ("cell-a", EnuPoint { e: 0.0, n: 0.0, u: 0.0 }),
-            ("cell-b", EnuPoint { e: 1000.0, n: 0.0, u: 0.0 }),
-            ("cell-c", EnuPoint { e: 0.0, n: 1000.0, u: 0.0 }),
-            ("cell-d", EnuPoint { e: 1000.0, n: 1000.0, u: 0.0 }),
+            (
+                "cell-a",
+                EnuPoint {
+                    e: 0.0,
+                    n: 0.0,
+                    u: 0.0,
+                },
+            ),
+            (
+                "cell-b",
+                EnuPoint {
+                    e: 1000.0,
+                    n: 0.0,
+                    u: 0.0,
+                },
+            ),
+            (
+                "cell-c",
+                EnuPoint {
+                    e: 0.0,
+                    n: 1000.0,
+                    u: 0.0,
+                },
+            ),
+            (
+                "cell-d",
+                EnuPoint {
+                    e: 1000.0,
+                    n: 1000.0,
+                    u: 0.0,
+                },
+            ),
         ];
         let entries: Vec<(String, TrpCoord)> = trp_enu
             .iter()
@@ -814,7 +848,11 @@ mod tests_real_solve {
             ctx.set_cell_coord(id.clone(), *coord);
         }
 
-        let true_enu = EnuPoint { e: 350.0, n: 600.0, u: 0.0 };
+        let true_enu = EnuPoint {
+            e: 350.0,
+            n: 600.0,
+            u: 0.0,
+        };
         let true_geo = enu_to_geodetic(true_enu, origin);
         (ctx, entries, true_geo, true_enu, origin)
     }
@@ -996,8 +1034,7 @@ mod tests_real_solve {
                 let range_m = exact_range_m(*coord, true_enu, origin);
                 let rtt_ns = (range_m * 2.0 / SPEED_OF_LIGHT_M_S * 1e9) as u64;
                 let p = geodetic_to_enu(*coord, origin);
-                let azimuth_deg =
-                    (true_enu.e - p.e).atan2(true_enu.n - p.n).to_degrees();
+                let azimuth_deg = (true_enu.e - p.e).atan2(true_enu.n - p.n).to_degrees();
                 CellMeasurement {
                     nr_cgi: id.clone(),
                     rsrp: Some(-80),

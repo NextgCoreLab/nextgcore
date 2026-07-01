@@ -675,8 +675,9 @@ async fn main() -> Result<()> {
     let sbi_sock: SocketAddr = format!("{sbi_addr}:{sbi_port}")
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;
-    let sbi_server =
-        nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(sbi_sock));
+    let sbi_server = nextgcore_sbi::server::SbiServer::new(
+        nextgcore_sbi::server::SbiServerConfig::new(sbi_sock),
+    );
     sbi_server
         .start(namf_server::namf_request_handler)
         .await

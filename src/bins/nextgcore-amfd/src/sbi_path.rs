@@ -286,13 +286,15 @@ pub fn amf_sbi_open() -> SbiResult<()> {
     nf_instance.ipv4_addresses.push(sbi_addr.clone());
 
     // Register Namf services: namf-comm, namf-evts, namf-mt, namf-loc
-    let mut comm_service = NfService::new("namf-comm", nextgcore_sbi::types::SbiServiceType::NamfComm);
+    let mut comm_service =
+        NfService::new("namf-comm", nextgcore_sbi::types::SbiServiceType::NamfComm);
     comm_service.versions = vec!["v1".to_string()];
     comm_service.port = sbi_port;
     comm_service.ip_addresses.push(sbi_addr.clone());
     nf_instance.add_service(comm_service);
 
-    let mut evts_service = NfService::new("namf-evts", nextgcore_sbi::types::SbiServiceType::NamfEvts);
+    let mut evts_service =
+        NfService::new("namf-evts", nextgcore_sbi::types::SbiServiceType::NamfEvts);
     evts_service.versions = vec!["v1".to_string()];
     evts_service.port = sbi_port;
     nf_instance.add_service(evts_service);
@@ -384,9 +386,11 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
             log::info!("AMF registered with NRF (id={nf_instance_id})");
 
             // Update self instance in SBI context
-            let mut self_instance = NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Amf);
+            let mut self_instance =
+                NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Amf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = NfService::new("namf-comm", nextgcore_sbi::types::SbiServiceType::NamfComm);
+            let mut svc =
+                NfService::new("namf-comm", nextgcore_sbi::types::SbiServiceType::NamfComm);
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
             self_instance.add_service(svc);
@@ -472,7 +476,9 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
                         .get("serviceName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if let Some(svc_type) = nextgcore_sbi::types::SbiServiceType::from_name(svc_name) {
+                    if let Some(svc_type) =
+                        nextgcore_sbi::types::SbiServiceType::from_name(svc_name)
+                    {
                         let mut svc = NfService::new(svc_name, svc_type);
                         if let Some(endpoints) =
                             svc_json.get("ipEndPoints").and_then(|v| v.as_array())
@@ -885,13 +891,11 @@ pub async fn call_smf_create_sm_context(
     // tunnel info) from the SMF response: multipart 5gnas/ngap binary parts
     // (smfd-01) or, from a legacy SMF, base64-in-JSON. `extract_binary_ref`
     // accepts both.
-    let n1_sm_msg = extract_binary_ref(&response, &response_body, "n1SmMsg").ok_or_else(|| {
-        SbiError::ResponseParseError("SMF response missing n1SmMsg".to_string())
-    })?;
+    let n1_sm_msg = extract_binary_ref(&response, &response_body, "n1SmMsg")
+        .ok_or_else(|| SbiError::ResponseParseError("SMF response missing n1SmMsg".to_string()))?;
 
-    let n2_sm_info = extract_binary_ref(&response, &response_body, "n2SmInfo").ok_or_else(|| {
-        SbiError::ResponseParseError("SMF response missing n2SmInfo".to_string())
-    })?;
+    let n2_sm_info = extract_binary_ref(&response, &response_body, "n2SmInfo")
+        .ok_or_else(|| SbiError::ResponseParseError("SMF response missing n2SmInfo".to_string()))?;
 
     log::info!(
         "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
@@ -1309,7 +1313,9 @@ pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResul
     };
 
     let sbi_ctx = global_context();
-    let instances = sbi_ctx.find_nf_instances_by_service(nextgcore_service_type).await;
+    let instances = sbi_ctx
+        .find_nf_instances_by_service(nextgcore_service_type)
+        .await;
     if let Some(inst) = instances.first() {
         if let Some(svc) = inst.find_service(nextgcore_service_type) {
             let host = svc
@@ -1694,7 +1700,9 @@ mod tests {
     /// Stub NSACF: validates the nested UeACRequestData shape (TS 29.536), then
     /// answers by SUPI — "imsi-reject" -> 403 (total failure), "imsi-partial" ->
     /// 200 with an acuFailureList naming that SUPI, otherwise 204 (admitted).
-    async fn stub_nsacf_ue(req: nextgcore_sbi::message::SbiRequest) -> nextgcore_sbi::message::SbiResponse {
+    async fn stub_nsacf_ue(
+        req: nextgcore_sbi::message::SbiRequest,
+    ) -> nextgcore_sbi::message::SbiResponse {
         let path = req.header.uri.split('?').next().unwrap_or("").to_string();
         if !path.ends_with("/nnsacf-nsac/v1/slices/ues") {
             return nextgcore_sbi::message::SbiResponse::with_status(404);
@@ -1740,14 +1748,22 @@ mod tests {
     async fn nsacf_ue_admission_204_403_200_failure_list() {
         let port = nsacf_free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(addr));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+        );
         server.start(stub_nsacf_ue).await.expect("start stub NSACF");
 
         let run = async {
             // 204 No Content -> admitted (registration proceeds).
             let r = call_nsacf_ue_admission(
-                "127.0.0.1", port, "amf-1", "imsi-admit", 1, None, "3GPP_ACCESS", true,
+                "127.0.0.1",
+                port,
+                "amf-1",
+                "imsi-admit",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
             )
             .await
             .expect("ok");
@@ -1755,7 +1771,14 @@ mod tests {
 
             // 403 ProblemDetails (total failure) -> not admitted.
             let r = call_nsacf_ue_admission(
-                "127.0.0.1", port, "amf-1", "imsi-reject", 1, None, "3GPP_ACCESS", true,
+                "127.0.0.1",
+                port,
+                "amf-1",
+                "imsi-reject",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
             )
             .await
             .expect("ok");
@@ -1763,7 +1786,14 @@ mod tests {
 
             // 200 acuFailureList naming our SUPI -> not admitted.
             let r = call_nsacf_ue_admission(
-                "127.0.0.1", port, "amf-1", "imsi-partial", 1, None, "3GPP_ACCESS", true,
+                "127.0.0.1",
+                port,
+                "amf-1",
+                "imsi-partial",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
             )
             .await
             .expect("ok");
@@ -1783,7 +1813,14 @@ mod tests {
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(8),
             call_nsacf_ue_admission(
-                "127.0.0.1", port, "amf-1", "imsi-x", 1, None, "3GPP_ACCESS", true,
+                "127.0.0.1",
+                port,
+                "amf-1",
+                "imsi-x",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
             ),
         )
         .await
@@ -1848,7 +1885,8 @@ mod tests {
     /// UE's N1 travels in a 5gnas binary part with the exact UE bytes.
     #[test]
     fn amfd_create_request_is_multipart_with_n1_part() {
-        let request = build_create_sm_context_request(5, 1, None, "internet", &UE_N1_REQUEST, false);
+        let request =
+            build_create_sm_context_request(5, 1, None, "internet", &UE_N1_REQUEST, false);
 
         // Serialize the request's parts exactly as the SBI client would, then
         // decode it back to prove the wire shape the SMF receives.

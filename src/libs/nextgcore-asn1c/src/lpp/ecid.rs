@@ -342,8 +342,7 @@ impl UperDecode for ProvideLocationInformationR9 {
                         Some(NrMultiRttProvideLocationInformation::decode_uper(&mut g2)?);
                 }
                 if g_opts[3] {
-                    nr_dl_tdoa =
-                        Some(NrDlTdoaProvideLocationInformation::decode_uper(&mut g2)?);
+                    nr_dl_tdoa = Some(NrDlTdoaProvideLocationInformation::decode_uper(&mut g2)?);
                 }
             }
             // groups[0] (r13) and groups[2] (r19), if present, are ignored
@@ -471,10 +470,8 @@ impl EcidSignalMeasurementInformation {
 
 impl UperEncode for EcidSignalMeasurementInformation {
     fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
-        encoder.encode_sequence_preamble(
-            Some(false),
-            &[self.primary_cell_measured_results.is_some()],
-        );
+        encoder
+            .encode_sequence_preamble(Some(false), &[self.primary_cell_measured_results.is_some()]);
         if let Some(primary) = &self.primary_cell_measured_results {
             primary.encode_uper(encoder)?;
         }
@@ -583,7 +580,8 @@ impl UperDecode for MeasuredResultsElement {
         // opts = [cellGlobalId, systemFrameNumber, rsrp, rsrq, ueRxTx]
         if opts[0] {
             return Err(PerError::DecodeError(
-                "LPP MeasuredResultsElement cellGlobalId not supported in v1 foundation".to_string(),
+                "LPP MeasuredResultsElement cellGlobalId not supported in v1 foundation"
+                    .to_string(),
             ));
         }
         let phys_cell_id = decoder.decode_constrained_whole_number(&Self::PHYS_CELL_ID)? as u16;
@@ -1193,7 +1191,10 @@ mod tests {
         // Framing prefix (cleanly byte-aligned): root preamble + normally-small-
         // length(2) + 2-bit group bitmap. The G2 open type follows bit-unaligned
         // (correct UPER) and is verified by the round-trip below.
-        assert_eq!(bytes[0], 0x80, "ext-marker 1 + 5 root presence bits (all 0)");
+        assert_eq!(
+            bytes[0], 0x80,
+            "ext-marker 1 + 5 root presence bits (all 0)"
+        );
         assert_eq!(
             bytes[1], 0x0A,
             "normally-small-length(2) tail + group presence bitmap 01 (trailing G3 trimmed)"

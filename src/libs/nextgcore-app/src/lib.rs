@@ -44,12 +44,13 @@ pub use config::{
     NEXTGCORE_MAX_NUM_OF_SLICE,
 };
 pub use context::{
-    nextgcore_app, nextgcore_app_context_final, nextgcore_app_context_init, nextgcore_global_conf, nextgcore_local_conf,
-    LoggerConf, MetricsConf, NextgcoreApp, NextgcoreAppContext, NextgcoreLogTs, PoolConf,
+    nextgcore_app, nextgcore_app_context_final, nextgcore_app_context_init, nextgcore_global_conf,
+    nextgcore_local_conf, LoggerConf, MetricsConf, NextgcoreApp, NextgcoreAppContext,
+    NextgcoreLogTs, PoolConf,
 };
 pub use init::{
-    nf_common_init, nextgcore_app_config_read, nextgcore_app_initialize, nextgcore_app_terminate, CommandLineOptions,
-    InitError, NextgcoreAppInitializer,
+    nextgcore_app_config_read, nextgcore_app_initialize, nextgcore_app_terminate, nf_common_init,
+    CommandLineOptions, InitError, NextgcoreAppInitializer,
 };
 #[cfg(feature = "6g-extensions")]
 pub use intent::{

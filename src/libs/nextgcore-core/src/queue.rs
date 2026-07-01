@@ -6,7 +6,9 @@ use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
-use crate::errno::{NEXTGCORE_DONE, NEXTGCORE_ERROR, NEXTGCORE_OK, NEXTGCORE_RETRY, NEXTGCORE_TIMEUP};
+use crate::errno::{
+    NEXTGCORE_DONE, NEXTGCORE_ERROR, NEXTGCORE_OK, NEXTGCORE_RETRY, NEXTGCORE_TIMEUP,
+};
 use crate::time::NextgcoreTime;
 
 /// Infinite time constant for blocking operations

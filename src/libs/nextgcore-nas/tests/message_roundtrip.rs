@@ -1563,8 +1563,9 @@ fn strict_5gmm_mandatory_ie_cut_mid_value() {
     // but the 11 value bytes are completely absent.
     let mut bytes = Bytes::from_static(&[
         0x7E, 0x00, 0x41, // 5GMM plain Registration Request
-        0x71, 0x0B, // mobile identity IE: IEI + length byte claiming 11 bytes
-        // value entirely missing
+        0x71,
+        0x0B, // mobile identity IE: IEI + length byte claiming 11 bytes
+              // value entirely missing
     ]);
     assert!(
         parse_5gmm_message(&mut bytes).is_err(),

@@ -105,7 +105,9 @@ impl TimerManager {
     }
 
     /// Process expired timers and return them for dispatch to the state machine
-    pub fn process_expired(&self) -> Vec<nextgcore_core::async_timer::AsyncTimerEntry<SeppTimerId>> {
+    pub fn process_expired(
+        &self,
+    ) -> Vec<nextgcore_core::async_timer::AsyncTimerEntry<SeppTimerId>> {
         self.inner.process_expired()
     }
 

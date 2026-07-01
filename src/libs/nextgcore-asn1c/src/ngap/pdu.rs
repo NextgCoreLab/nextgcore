@@ -477,7 +477,11 @@ fn build_ue_associated_container(
         Criticality::Reject,
         &ran_ue_ngap_id,
     )?);
-    container.push(ie(ProtocolIeId::ROUTING_ID, Criticality::Reject, routing_id)?);
+    container.push(ie(
+        ProtocolIeId::ROUTING_ID,
+        Criticality::Reject,
+        routing_id,
+    )?);
     container.push(ie(ProtocolIeId::NRPPA_PDU, Criticality::Reject, nrppa_pdu)?);
     Ok(container)
 }
@@ -488,7 +492,11 @@ fn build_non_ue_associated_container(
     nrppa_pdu: &NrppaPdu,
 ) -> PerResult<ProtocolIeContainer> {
     let mut container = ProtocolIeContainer::new();
-    container.push(ie(ProtocolIeId::ROUTING_ID, Criticality::Reject, routing_id)?);
+    container.push(ie(
+        ProtocolIeId::ROUTING_ID,
+        Criticality::Reject,
+        routing_id,
+    )?);
     container.push(ie(ProtocolIeId::NRPPA_PDU, Criticality::Reject, nrppa_pdu)?);
     Ok(container)
 }
@@ -551,12 +559,12 @@ pub fn build_uplink_non_ue_associated_nrppa_transport(
 fn parse_ue_associated_container(
     container: &ProtocolIeContainer,
 ) -> PerResult<UeAssociatedNrppaTransport> {
-    let amf = container.find(ProtocolIeId::AMF_UE_NGAP_ID).ok_or_else(|| {
-        PerError::DecodeError("missing mandatory AMF-UE-NGAP-ID".to_string())
-    })?;
-    let ran = container.find(ProtocolIeId::RAN_UE_NGAP_ID).ok_or_else(|| {
-        PerError::DecodeError("missing mandatory RAN-UE-NGAP-ID".to_string())
-    })?;
+    let amf = container
+        .find(ProtocolIeId::AMF_UE_NGAP_ID)
+        .ok_or_else(|| PerError::DecodeError("missing mandatory AMF-UE-NGAP-ID".to_string()))?;
+    let ran = container
+        .find(ProtocolIeId::RAN_UE_NGAP_ID)
+        .ok_or_else(|| PerError::DecodeError("missing mandatory RAN-UE-NGAP-ID".to_string()))?;
     let routing = container
         .find(ProtocolIeId::ROUTING_ID)
         .ok_or_else(|| PerError::DecodeError("missing mandatory RoutingID".to_string()))?;
@@ -589,9 +597,7 @@ fn parse_non_ue_associated_container(
 
 /// Parse a decoded `NgapPdu` as a UE-associated NRPPa-transport message
 /// (downlink procedure 8 or uplink procedure 50).
-pub fn parse_ue_associated_nrppa_transport(
-    pdu: &NgapPdu,
-) -> PerResult<UeAssociatedNrppaTransport> {
+pub fn parse_ue_associated_nrppa_transport(pdu: &NgapPdu) -> PerResult<UeAssociatedNrppaTransport> {
     let container = match pdu {
         NgapPdu::InitiatingMessage(m) => match &m.value {
             InitiatingMessageValue::DownlinkUeAssociatedNrppaTransport(c)
@@ -719,7 +725,10 @@ mod nrppa_transport_tests {
         let decoded = decode(&encode(&pdu));
         assert_eq!(decoded, pdu);
         let parsed = parse_non_ue_associated_nrppa_transport(&decoded).unwrap();
-        assert_eq!(parsed.nrppa_pdu, NrppaPdu(vec![0x01, 0x02, 0x03, 0x04, 0x05]));
+        assert_eq!(
+            parsed.nrppa_pdu,
+            NrppaPdu(vec![0x01, 0x02, 0x03, 0x04, 0x05])
+        );
         match &decoded {
             NgapPdu::InitiatingMessage(m) => assert_eq!(
                 m.procedure_code,
@@ -791,7 +800,10 @@ mod nrppa_transport_tests {
         let bytes = encode(&pdu);
 
         // OUTER framing (byte-aligned, hand-derived).
-        assert_eq!(bytes[0], 0x00, "CHOICE initiatingMessage + procCode align pad");
+        assert_eq!(
+            bytes[0], 0x00,
+            "CHOICE initiatingMessage + procCode align pad"
+        );
         assert_eq!(bytes[1], 0x08, "procedureCode = 8");
         assert_eq!(bytes[2], 0x40, "criticality ignore (01) + pad");
         // bytes[3] is the open-type length determinant for the message value.
@@ -817,7 +829,12 @@ mod nrppa_transport_tests {
         // no typed variant; it must still decode as `Other`.
         let mut container = ProtocolIeContainer::new();
         container.push(
-            ie(ProtocolIeId::NRPPA_PDU, Criticality::Reject, &NrppaPdu(vec![0x01])).unwrap(),
+            ie(
+                ProtocolIeId::NRPPA_PDU,
+                Criticality::Reject,
+                &NrppaPdu(vec![0x01]),
+            )
+            .unwrap(),
         );
         let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
             procedure_code: ProcedureCode::PAGING,

@@ -2096,16 +2096,14 @@ mod tests {
                 "n1MessageContent": { "contentId": "lpp-pdu" }
             }
         });
-        let req = SbiRequest::post(format!(
-            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
-        ))
-        .with_json_body(&body)
-        .expect("json")
-        .with_part(SbiPart::with_content(
-            "lpp-pdu",
-            "application/vnd.3gpp.lpp",
-            bytes::Bytes::from_static(&[0x90, 0x01, 0x20, 0x09, 0x30]),
-        ));
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "lpp-pdu",
+                "application/vnd.3gpp.lpp",
+                bytes::Bytes::from_static(&[0x90, 0x01, 0x20, 0x09, 0x30]),
+            ));
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 200);
         assert_eq!(
@@ -2134,16 +2132,14 @@ mod tests {
                 }
             }
         });
-        let req = SbiRequest::post(format!(
-            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
-        ))
-        .with_json_body(&body)
-        .expect("json")
-        .with_part(SbiPart::with_content(
-            "nrppa-pdu",
-            "application/vnd.3gpp.ngap",
-            bytes::Bytes::from_static(&[0x00, 0x00, 0x01, 0x00, 0x1d, 0x00]),
-        ));
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "nrppa-pdu",
+                "application/vnd.3gpp.ngap",
+                bytes::Bytes::from_static(&[0x00, 0x00, 0x01, 0x00, 0x1d, 0x00]),
+            ));
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 200);
         assert_eq!(

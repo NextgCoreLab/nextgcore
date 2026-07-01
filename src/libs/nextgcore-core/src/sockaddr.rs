@@ -357,7 +357,10 @@ pub fn nextgcore_ipstrdup(addr: &NextgcoreSockaddr) -> String {
 }
 
 /// Parse IP subnet (identical to nextgcore_ipsubnet)
-pub fn nextgcore_ipsubnet(ipstr: &str, mask_or_numbits: Option<&str>) -> Result<NextgcoreIpsubnet, i32> {
+pub fn nextgcore_ipsubnet(
+    ipstr: &str,
+    mask_or_numbits: Option<&str>,
+) -> Result<NextgcoreIpsubnet, i32> {
     let mut ipsub = NextgcoreIpsubnet::default();
 
     // Check if it looks like an IP address

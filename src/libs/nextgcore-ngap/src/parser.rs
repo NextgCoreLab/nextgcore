@@ -2039,10 +2039,12 @@ fn parse_handover_command(container: ProtocolIeContainer) -> NgapResult<Handover
                 pdu_session_list = Some(
                     ie::decode_id_transfer_list(field)?
                         .into_iter()
-                        .map(|(pdu_session_id, transfer)| PduSessionResourceHandoverItem {
-                            pdu_session_id,
-                            transfer,
-                        })
+                        .map(
+                            |(pdu_session_id, transfer)| PduSessionResourceHandoverItem {
+                                pdu_session_id,
+                                transfer,
+                            },
+                        )
                         .collect(),
                 );
             }

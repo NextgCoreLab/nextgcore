@@ -225,9 +225,7 @@ fn handle_exchange_capability(body: &str, cid: &str) -> HttpResponse {
     let json: SecurityCapabilityRequestJson = match serde_json::from_str(body) {
         Ok(j) => j,
         Err(e) => {
-            log::warn!(
-                "cid={cid} reason=MALFORMED_EXCHANGE_CAPABILITY: {e}"
-            );
+            log::warn!("cid={cid} reason=MALFORMED_EXCHANGE_CAPABILITY: {e}");
             return send_error(
                 400,
                 "Bad Request",
@@ -299,9 +297,7 @@ fn handle_exchange_params(body: &str, tls_secret: Option<&[u8]>, cid: &str) -> H
     let req: SecParamExchReqData = match serde_json::from_str(body) {
         Ok(j) => j,
         Err(e) => {
-            log::warn!(
-                "cid={cid} reason=MALFORMED_EXCHANGE_PARAMS: {e}"
-            );
+            log::warn!("cid={cid} reason=MALFORMED_EXCHANGE_PARAMS: {e}");
             return send_error(
                 400,
                 "Bad Request",
@@ -496,7 +492,9 @@ fn enforce_tls_mode_peer(sender_sepp: Option<&str>) -> Option<HttpResponse> {
     };
     let node = {
         let ctx = sepp_self();
-        ctx.read().ok().and_then(|c| c.node_find_by_receiver(sender))
+        ctx.read()
+            .ok()
+            .and_then(|c| c.node_find_by_receiver(sender))
     };
     let Some(node) = node else {
         log::error!("[DROP] TLS-mode N32-f message from unknown peer SEPP [{sender}]");
@@ -770,7 +768,10 @@ fn authority_from_url(url: &str) -> Option<String> {
 /// Extract the path (with query) from an absolute URL, or return a relative
 /// path unchanged.
 fn path_and_query_from_url(url: &str) -> String {
-    match url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+    match url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
         Some(rest) => match rest.find('/') {
             Some(idx) => rest[idx..].to_string(),
             None => "/".to_string(),

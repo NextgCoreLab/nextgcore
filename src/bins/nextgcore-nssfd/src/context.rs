@@ -1015,9 +1015,7 @@ pub fn nssf_context_init_with_state(state_path: Option<PathBuf>) -> bool {
         Some(p) => NssfContext::with_state_path(p),
         None => NssfContext::new(),
     };
-    GLOBAL_NSSF_CONTEXT
-        .set(Arc::new(RwLock::new(ctx)))
-        .is_ok()
+    GLOBAL_NSSF_CONTEXT.set(Arc::new(RwLock::new(ctx))).is_ok()
 }
 
 /// Initialize the global NSSF context

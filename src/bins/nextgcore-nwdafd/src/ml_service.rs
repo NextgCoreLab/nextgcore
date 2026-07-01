@@ -654,7 +654,10 @@ mod tests {
         assert_eq!(parsed.notif_uri, "http://anlf.local/ml-cb");
         assert_eq!(parsed.notif_corr_id.as_deref(), Some("corr-7"));
         // Duplicate NF_LOAD collapses to one distinct event.
-        assert_eq!(parsed.ml_events, vec![AnalyticsId::NfLoad, AnalyticsId::UeMobility]);
+        assert_eq!(
+            parsed.ml_events,
+            vec![AnalyticsId::NfLoad, AnalyticsId::UeMobility]
+        );
     }
 
     /// Missing `notifUri` or empty `mLEventSubscs` are rejected (the two spec

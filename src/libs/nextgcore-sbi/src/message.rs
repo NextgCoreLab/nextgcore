@@ -942,10 +942,7 @@ pub struct ProblemDetails {
     pub access_token_error: Option<crate::oauth::AccessTokenError>,
     /// OAuth2 access token request to be (re)tried by the consumer
     /// (TS 29.571 §5.2.4.1, TS 29.510 AccessTokenReq).
-    #[serde(
-        rename = "accessTokenRequest",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "accessTokenRequest", skip_serializing_if = "Option::is_none")]
     pub access_token_request: Option<crate::oauth::AccessTokenRequest>,
     /// NF Instance ID of the NRF that returned an OAuth2 problem
     /// (TS 29.571 §5.2.4.1 `nrfId`).
@@ -1012,10 +1009,7 @@ impl ProblemDetails {
 
     /// Attach the OAuth2 access token request the consumer should (re)try
     /// (TS 29.571 `accessTokenRequest`).
-    pub fn with_access_token_request(
-        mut self,
-        request: crate::oauth::AccessTokenRequest,
-    ) -> Self {
+    pub fn with_access_token_request(mut self, request: crate::oauth::AccessTokenRequest) -> Self {
         self.access_token_request = Some(request);
         self
     }
@@ -1304,8 +1298,7 @@ mod tests {
         );
 
         // An explicit type is preserved verbatim.
-        let typed = ProblemDetails::with_status(403)
-            .with_type("https://example.com/probs/oauth2");
+        let typed = ProblemDetails::with_status(403).with_type("https://example.com/probs/oauth2");
         let json = serde_json::to_string(&typed).unwrap();
         assert!(json.contains(r#""type":"https://example.com/probs/oauth2""#));
 
@@ -1341,11 +1334,11 @@ mod tests {
         // A spec example with the new members deserializes successfully.
         let parsed: ProblemDetails = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.nrf_id.as_deref(), Some("nrf-1"));
-        assert_eq!(parsed.target_scp.as_deref(), Some("https://scp1.operator.com"));
         assert_eq!(
-            parsed.access_token_request.unwrap().nf_instance_id,
-            "amf-1"
+            parsed.target_scp.as_deref(),
+            Some("https://scp1.operator.com")
         );
+        assert_eq!(parsed.access_token_request.unwrap().nf_instance_id, "amf-1");
 
         // Unset members are skipped entirely.
         let bare = serde_json::to_string(&ProblemDetails::with_status(404)).unwrap();

@@ -349,9 +349,12 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                         "cause": "PAYLOAD_TOO_LARGE",
                     })
                     .to_string();
-                    let resp = SbiResponse::with_status(413)
-                        .with_body(body, "application/problem+json");
-                    return Ok(convert_response_with_identity(resp, server_identity.as_ref()));
+                    let resp =
+                        SbiResponse::with_status(413).with_body(body, "application/problem+json");
+                    return Ok(convert_response_with_identity(
+                        resp,
+                        server_identity.as_ref(),
+                    ));
                 }
             };
 
@@ -377,7 +380,10 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                     .to_string();
                     let resp = SbiResponse::with_status(status)
                         .with_body(body, "application/problem+json");
-                    return Ok(convert_response_with_identity(resp, server_identity.as_ref()));
+                    return Ok(convert_response_with_identity(
+                        resp,
+                        server_identity.as_ref(),
+                    ));
                 }
             }
 
@@ -569,7 +575,9 @@ async fn convert_request(
         Err(e) => {
             // Limited returns a boxed LengthLimitError once the cap is passed;
             // distinguish that from a generic transport error.
-            if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
                 log::warn!(
                     "cid={correlation_id} method={method} path={uri} \
                      reason=PAYLOAD_TOO_LARGE: body exceeds {max_body_size}-byte limit"
@@ -704,10 +712,9 @@ fn convert_response_with_identity(
 ) -> Response<Full<Bytes>> {
     if let Some((nf_type, nf_id)) = identity {
         if sbi_response.http.get_header("Server").is_none() {
-            sbi_response.http.set_header(
-                "Server",
-                format!("{}-{}", nf_type.as_server_token(), nf_id),
-            );
+            sbi_response
+                .http
+                .set_header("Server", format!("{}-{}", nf_type.as_server_token(), nf_id));
         }
     }
     convert_response(sbi_response)
@@ -1063,10 +1070,7 @@ mod tests {
     fn test_correlation_id_x_request_id_takes_precedence_over_traceparent() {
         // x-request-id wins over traceparent when both are present (priority 1).
         let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        let http = http_with_headers(&[
-            ("x-request-id", "explicit-id"),
-            ("traceparent", tp),
-        ]);
+        let http = http_with_headers(&[("x-request-id", "explicit-id"), ("traceparent", tp)]);
         let cid = extract_or_generate_correlation_id(&http);
         assert_eq!(cid, "explicit-id");
     }
@@ -1077,7 +1081,11 @@ mod tests {
         let http = crate::message::SbiHttpMessage::new();
         let cid = extract_or_generate_correlation_id(&http);
         // The generated ID is 32 hex chars (128-bit nanoseconds in hex).
-        assert_eq!(cid.len(), 32, "generated cid must be 32 hex chars, got: {cid}");
+        assert_eq!(
+            cid.len(),
+            32,
+            "generated cid must be 32 hex chars, got: {cid}"
+        );
         assert!(
             cid.chars().all(|c| c.is_ascii_hexdigit()),
             "generated cid must be all hex digits, got: {cid}"
@@ -1240,7 +1248,10 @@ mod tests {
         let ok = SbiResponse::ok().with_body("{}", "application/json");
         let hyper_ok = convert_response_with_identity(ok, Some(&identity));
         assert_eq!(
-            hyper_ok.headers().get("server").and_then(|v| v.to_str().ok()),
+            hyper_ok
+                .headers()
+                .get("server")
+                .and_then(|v| v.to_str().ok()),
             Some("SMF-54804518-abcd")
         );
     }
@@ -1536,15 +1547,13 @@ mod tests {
     async fn test_panicking_handler_yields_500() {
         use crate::client::SbiClient;
 
-        let (server, port) = start_test_server(
-            SbiServerConfig::default(),
-            |_req: SbiRequest| async move {
+        let (server, port) =
+            start_test_server(SbiServerConfig::default(), |_req: SbiRequest| async move {
                 panic!("handler blew up");
                 #[allow(unreachable_code)]
                 SbiResponse::ok()
-            },
-        )
-        .await;
+            })
+            .await;
 
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
@@ -1590,7 +1599,10 @@ mod tests {
         });
         let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
         let sig: Signature = sk.sign(format!("{header}.{payload}").as_bytes());
-        let token = format!("{header}.{payload}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
+        let token = format!(
+            "{header}.{payload}.{}",
+            URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        );
 
         let point = sk.verifying_key().to_encoded_point(false);
         let jwks = serde_json::json!({"keys":[{

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nextgcore_sctp::{
-    KernelSctpServer, KernelSctpSocket, ServerEvent, SctpServerConfig, MSG_NOTIFICATION, NGAP_PPID,
+    KernelSctpServer, KernelSctpSocket, SctpServerConfig, ServerEvent, MSG_NOTIFICATION, NGAP_PPID,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;

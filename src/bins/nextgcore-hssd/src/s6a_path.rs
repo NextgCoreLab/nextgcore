@@ -382,7 +382,9 @@ pub struct UlrResponse {
 
 /// Convert the database subscription record into the S6a typed model
 /// (TS 29.272 7.3.2 Subscription-Data).
-pub fn subscription_data_from_db(db: &nextgcore_dbi::NextgcoreSubscriptionData) -> s6a::SubscriptionData {
+pub fn subscription_data_from_db(
+    db: &nextgcore_dbi::NextgcoreSubscriptionData,
+) -> s6a::SubscriptionData {
     let mut sub = s6a::SubscriptionData {
         subscriber_status: db.subscriber_status as u32,
         operator_determined_barring: if db.subscriber_status == 1 {
@@ -731,7 +733,10 @@ pub fn dispatch_s6a_request(request: &DiameterMessage) -> Option<DiameterMessage
                 return Some(build_failure_answer(request, &S6aFailure::MissingAvp));
             };
             if request
-                .find_vendor_avp(nextgcore_diameter::common::avp_code::RAT_TYPE, NEXTGCORE_3GPP_VENDOR_ID)
+                .find_vendor_avp(
+                    nextgcore_diameter::common::avp_code::RAT_TYPE,
+                    NEXTGCORE_3GPP_VENDOR_ID,
+                )
                 .is_none()
             {
                 diam_stats().s6a.inc_rx_ulr_error();
@@ -1228,7 +1233,10 @@ mod tests {
 
     #[test]
     fn test_subscription_data_from_db_mapping() {
-        use nextgcore_dbi::{NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSession, NextgcoreSliceData, NextgcoreSubscriptionData};
+        use nextgcore_dbi::{
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSession, NextgcoreSliceData,
+            NextgcoreSubscriptionData,
+        };
 
         let db = NextgcoreSubscriptionData {
             subscriber_status: 0,
@@ -1272,7 +1280,10 @@ mod tests {
         let apn = &sub.apn_configs[0];
         assert_eq!(apn.context_identifier, 1);
         assert_eq!(apn.service_selection, "internet");
-        assert_eq!(apn.pdn_type, nextgcore_diameter::s6a::pdn_type::IPV4V6 as u8);
+        assert_eq!(
+            apn.pdn_type,
+            nextgcore_diameter::s6a::pdn_type::IPV4V6 as u8
+        );
         assert_eq!(apn.qci, 9);
         assert_eq!(apn.arp_priority_level, 8);
         assert!(!apn.arp_pre_emption_capability);
@@ -1348,18 +1359,19 @@ mod tests {
             all_apn_configs_included: true,
             ..Default::default()
         };
-        sub.apn_configs.push(nextgcore_diameter::s6a::ApnConfiguration {
-            context_identifier: 1,
-            service_selection: "internet".to_string(),
-            pdn_type: nextgcore_diameter::s6a::pdn_type::IPV4V6 as u8,
-            qci: 9,
-            arp_priority_level: 8,
-            arp_pre_emption_capability: false,
-            arp_pre_emption_vulnerability: true,
-            ambr_uplink: 50_000_000,
-            ambr_downlink: 100_000_000,
-            charging_characteristics: None,
-        });
+        sub.apn_configs
+            .push(nextgcore_diameter::s6a::ApnConfiguration {
+                context_identifier: 1,
+                service_selection: "internet".to_string(),
+                pdn_type: nextgcore_diameter::s6a::pdn_type::IPV4V6 as u8,
+                qci: 9,
+                arp_priority_level: 8,
+                arp_pre_emption_capability: false,
+                arp_pre_emption_vulnerability: true,
+                ambr_uplink: 50_000_000,
+                ambr_downlink: 100_000_000,
+                charging_characteristics: None,
+            });
         let resp = UlrResponse {
             subscription_data: sub.clone(),
         };
@@ -1397,9 +1409,15 @@ mod tests {
         let mut bytes = encoded.freeze();
         let decoded = DiameterMessage::decode(&mut bytes).unwrap();
         let flags = decoded
-            .find_vendor_avp(nextgcore_diameter::s6a::avp::PUA_FLAGS, NEXTGCORE_3GPP_VENDOR_ID)
+            .find_vendor_avp(
+                nextgcore_diameter::s6a::avp::PUA_FLAGS,
+                NEXTGCORE_3GPP_VENDOR_ID,
+            )
             .and_then(|a| a.as_u32());
-        assert_eq!(flags, Some(nextgcore_diameter::s6a::pua_flags::FREEZE_MTMSI));
+        assert_eq!(
+            flags,
+            Some(nextgcore_diameter::s6a::pua_flags::FREEZE_MTMSI)
+        );
     }
 
     #[test]
@@ -1543,9 +1561,15 @@ mod tests {
             .and_then(|a| a.as_i32());
         assert_eq!(ct, Some(2));
         let flags = clr
-            .find_vendor_avp(nextgcore_diameter::s6a::avp::CLR_FLAGS, NEXTGCORE_3GPP_VENDOR_ID)
+            .find_vendor_avp(
+                nextgcore_diameter::s6a::avp::CLR_FLAGS,
+                NEXTGCORE_3GPP_VENDOR_ID,
+            )
             .and_then(|a| a.as_u32());
-        assert_eq!(flags, Some(nextgcore_diameter::s6a::clr_flags::REATTACH_REQUIRED));
+        assert_eq!(
+            flags,
+            Some(nextgcore_diameter::s6a::clr_flags::REATTACH_REQUIRED)
+        );
     }
 
     #[test]
@@ -1555,11 +1579,12 @@ mod tests {
             ambr_downlink: 2000,
             ..Default::default()
         };
-        sub.apn_configs.push(nextgcore_diameter::s6a::ApnConfiguration {
-            context_identifier: 1,
-            service_selection: "internet".to_string(),
-            ..Default::default()
-        });
+        sub.apn_configs
+            .push(nextgcore_diameter::s6a::ApnConfiguration {
+                context_identifier: 1,
+                service_selection: "internet".to_string(),
+                ..Default::default()
+            });
         let idr = build_idr_request(
             "001010123456789",
             "mme.example.com",

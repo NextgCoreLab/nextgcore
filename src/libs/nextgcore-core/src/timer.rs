@@ -34,7 +34,11 @@ pub struct NextgcoreTimer<T> {
 }
 
 impl<T> NextgcoreTimer<T> {
-    fn new(id: NextgcoreTimerId, callback: Option<NextgcoreTimerCallback<T>>, data: Option<T>) -> Self {
+    fn new(
+        id: NextgcoreTimerId,
+        callback: Option<NextgcoreTimerCallback<T>>,
+        data: Option<T>,
+    ) -> Self {
         NextgcoreTimer {
             id,
             callback,
@@ -68,7 +72,7 @@ impl<T> NextgcoreTimer<T> {
 /// Timer entry in the tree (for ordering by timeout)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TimerKey {
-    timeout: u128,  // nanoseconds since epoch for ordering
+    timeout: u128,        // nanoseconds since epoch for ordering
     id: NextgcoreTimerId, // tie-breaker for same timeout
 }
 
@@ -110,7 +114,11 @@ impl<T> NextgcoreTimerMgr<T> {
     }
 
     /// Add a new timer (identical to nextgcore_timer_add)
-    pub fn add(&mut self, callback: NextgcoreTimerCallback<T>, data: T) -> Option<NextgcoreTimerId> {
+    pub fn add(
+        &mut self,
+        callback: NextgcoreTimerCallback<T>,
+        data: T,
+    ) -> Option<NextgcoreTimerId> {
         let index = self.free_indices.pop()?;
 
         let id = self.next_id;

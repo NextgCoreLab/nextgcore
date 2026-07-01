@@ -25,7 +25,9 @@ use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
-use nextgcore_sbi::server::{send_method_not_allowed, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig};
+use nextgcore_sbi::server::{
+    send_method_not_allowed, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig,
+};
 use nextgcore_sbi::types::NfType;
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -281,14 +283,16 @@ async fn main() -> Result<()> {
         sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
             .as_deref()
             .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
-        sbi_server_config =
-            sbi_server_config.with_expected_audience_nf_type(NfType::Nsacf);
+        sbi_server_config = sbi_server_config.with_expected_audience_nf_type(NfType::Nsacf);
 
         // Client side (T1.1): install the process-wide OAuth2 client so
         // outbound SBI calls acquire and attach an NRF-issued Bearer token.
         if let Some(nrf_uri) = nrf_uri_cfg.as_deref() {
-            let oauth2 =
-                Arc::new(OAuth2Client::new(nrf_uri, nf_instance_id.clone(), NfType::Nsacf));
+            let oauth2 = Arc::new(OAuth2Client::new(
+                nrf_uri,
+                nf_instance_id.clone(),
+                NfType::Nsacf,
+            ));
             let _ = OAUTH2_CLIENT.set(Some(oauth2));
         }
         log::info!(
@@ -570,7 +574,12 @@ struct AcFailure {
 }
 
 impl AcFailure {
-    fn new(supi: &str, s_nssai: &SNssai, reason: AcuFailureReason, pdu_session_id: Option<u64>) -> Self {
+    fn new(
+        supi: &str,
+        s_nssai: &SNssai,
+        reason: AcuFailureReason,
+        pdu_session_id: Option<u64>,
+    ) -> Self {
         let mut item = serde_json::json!({
             "snssai": s_nssai.to_json(),
             "reason": reason.as_str(),
@@ -595,9 +604,13 @@ fn rejection_reason(result: AdmissionResult, is_pdu: bool) -> AcuFailureReason {
         (RejectedQuotaExceeded, true) => AcuFailureReason::ExceedMaxPduNum,
         (RejectedQuotaExceeded, false) => AcuFailureReason::ExceedMaxUeNum,
         (RejectedQuotaExceededPerAccess(ThreeGpp), true) => AcuFailureReason::ExceedMaxPduNum3Gpp,
-        (RejectedQuotaExceededPerAccess(NonThreeGpp), true) => AcuFailureReason::ExceedMaxPduNumN3Gpp,
+        (RejectedQuotaExceededPerAccess(NonThreeGpp), true) => {
+            AcuFailureReason::ExceedMaxPduNumN3Gpp
+        }
         (RejectedQuotaExceededPerAccess(ThreeGpp), false) => AcuFailureReason::ExceedMaxUeNum3Gpp,
-        (RejectedQuotaExceededPerAccess(NonThreeGpp), false) => AcuFailureReason::ExceedMaxUeNumN3Gpp,
+        (RejectedQuotaExceededPerAccess(NonThreeGpp), false) => {
+            AcuFailureReason::ExceedMaxUeNumN3Gpp
+        }
         // Slice not NSAC-subject / unknown.
         _ => AcuFailureReason::SliceNotFound,
     }
@@ -696,7 +709,12 @@ fn parse_request_body<T: for<'de> Deserialize<'de>>(
         } else {
             "INVALID_MSG_FORMAT"
         };
-        problem_details(400, "Bad Request", &format!("Invalid request body: {msg}"), Some(cause))
+        problem_details(
+            400,
+            "Bad Request",
+            &format!("Invalid request body: {msg}"),
+            Some(cause),
+        )
     })
 }
 
@@ -868,10 +886,8 @@ async fn handle_pdu_ac_update(request: &SbiRequest) -> SbiResponse {
                     }
                 }
                 "UPDATE" => {
-                    match with_nsacf_context(|c| {
-                        c.update_pdu_access(s_nssai, &session_key, access)
-                    })
-                    .unwrap_or(UpdateOutcome::NotFound)
+                    match with_nsacf_context(|c| c.update_pdu_access(s_nssai, &session_key, access))
+                        .unwrap_or(UpdateOutcome::NotFound)
                     {
                         UpdateOutcome::Updated => spawn_event_reports(s_nssai),
                         UpdateOutcome::NotFound => failures.push(AcFailure::new(
@@ -1194,10 +1210,9 @@ async fn handle_local_configs_update(request: &SbiRequest) -> SbiResponse {
             .and_then(|v| v.as_u64())
             .unwrap_or(50000);
         let limits = parse_access_limits(cfg);
-        if let Some(quota) = with_nsacf_context(|c| {
-            c.quota_update_or_add(s_nssai.clone(), max_ues, max_pdu, limits)
-        })
-        .flatten()
+        if let Some(quota) =
+            with_nsacf_context(|c| c.quota_update_or_add(s_nssai.clone(), max_ues, max_pdu, limits))
+                .flatten()
         {
             applied.push(local_config_json(&quota));
         }
@@ -1455,7 +1470,10 @@ fn spawn_eac_notifications(eac: EacTransition) {
         subs.len()
     );
     let mut eac_mode_list = serde_json::Map::new();
-    eac_mode_list.insert(eac.s_nssai.to_key(), serde_json::Value::String(mode.to_string()));
+    eac_mode_list.insert(
+        eac.s_nssai.to_key(),
+        serde_json::Value::String(mode.to_string()),
+    );
     let eac_mode_list = serde_json::Value::Object(eac_mode_list);
     for sub in subs {
         let body = serde_json::json!({
@@ -1566,8 +1584,10 @@ async fn register_with_nrf(
         200 | 201 => {
             log::info!("NSACF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance =
-                nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Nsacf);
+            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
+                nf_instance_id,
+                nextgcore_sbi::types::NfType::Nsacf,
+            );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = nextgcore_sbi::context::NfService::new(
                 "nnsacf-nsac",
@@ -1733,7 +1753,8 @@ mod tests {
 
     #[test]
     fn test_yaml_oauth2_require_parses() {
-        let yaml = "nsacf:\n  sbi:\n    oauth2:\n      require: true\n  nrf:\n    uri: http://nrf:7777\n";
+        let yaml =
+            "nsacf:\n  sbi:\n    oauth2:\n      require: true\n  nrf:\n    uri: http://nrf:7777\n";
         let parsed: NsacfYaml = serde_yaml::from_str(yaml).unwrap();
         let nsacf = parsed.nsacf.unwrap();
         let require = nsacf
@@ -1883,7 +1904,12 @@ mod tests {
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["cause"], "ALL_SLICE_FAILED");
         assert!(
-            !resp.http.content.as_deref().unwrap().contains("admittedFlag"),
+            !resp
+                .http
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("admittedFlag"),
             "admittedFlag must not appear"
         );
 
@@ -2187,7 +2213,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_eac_active, "expected EacNotification eacModeList ACTIVE");
+        assert!(
+            saw_eac_active,
+            "expected EacNotification eacModeList ACTIVE"
+        );
 
         // Release below threshold -> EacNotification eacModeList "DEACTIVE"
         let resp = client
@@ -2211,7 +2240,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_eac_inactive, "expected EacNotification eacModeList DEACTIVE");
+        assert!(
+            saw_eac_inactive,
+            "expected EacNotification eacModeList DEACTIVE"
+        );
 
         // Unsubscribe -> 204, repeat -> 404
         let resp = client
@@ -2237,8 +2269,14 @@ mod tests {
     fn test_acu_failure_reason_strings() {
         // TS 29.536 §6.1.6.3.5 exact enum strings.
         assert_eq!(AcuFailureReason::SliceNotFound.as_str(), "SLICE_NOT_FOUND");
-        assert_eq!(AcuFailureReason::ExceedMaxUeNum.as_str(), "EXCEED_MAX_UE_NUM");
-        assert_eq!(AcuFailureReason::ExceedMaxPduNum.as_str(), "EXCEED_MAX_PDU_NUM");
+        assert_eq!(
+            AcuFailureReason::ExceedMaxUeNum.as_str(),
+            "EXCEED_MAX_UE_NUM"
+        );
+        assert_eq!(
+            AcuFailureReason::ExceedMaxPduNum.as_str(),
+            "EXCEED_MAX_PDU_NUM"
+        );
     }
 
     #[test]
@@ -2384,7 +2422,12 @@ mod tests {
             "EXCEED_MAX_UE_NUM"
         );
         assert_eq!(v["acuFailureList"]["imsi-83-B"][0]["snssai"]["sst"], 83);
-        assert!(!resp.http.content.as_deref().unwrap().contains("admittedFlag"));
+        assert!(!resp
+            .http
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("admittedFlag"));
 
         server.stop().await.expect("stop");
     }
@@ -2776,7 +2819,10 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(resp.status, 204, "idempotent release of absent member -> 204");
+        assert_eq!(
+            resp.status, 204,
+            "idempotent release of absent member -> 204"
+        );
 
         // Mixed: DECREASE on a known slice + DECREASE on an unconfigured slice
         // -> partial 200 with acuFailureList reason SLICE_NOT_FOUND for the

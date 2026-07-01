@@ -225,7 +225,10 @@ impl EesContext {
         registration_id: &str,
         mut reg: EasRegistration,
     ) -> Result<EasRegistration, UpdateError> {
-        let mut regs = self.registrations.write().map_err(|_| UpdateError::Internal)?;
+        let mut regs = self
+            .registrations
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
         let existing = regs.get(registration_id).ok_or(UpdateError::NotFound)?;
         if existing.eas_prof.eas_id != reg.eas_prof.eas_id {
             return Err(UpdateError::IdImmutable);
@@ -244,7 +247,10 @@ impl EesContext {
         registration_id: &str,
         patch: &serde_json::Value,
     ) -> Result<EasRegistration, UpdateError> {
-        let mut regs = self.registrations.write().map_err(|_| UpdateError::Internal)?;
+        let mut regs = self
+            .registrations
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
         let stored = regs.get(registration_id).ok_or(UpdateError::NotFound)?;
         let old_eas_id = stored.eas_prof.eas_id.clone();
 
@@ -386,7 +392,10 @@ impl EesContext {
     }
 
     pub fn disc_sub_delete(&self, subscription_id: &str) -> Option<EasDiscoverySubscription> {
-        self.disc_subscriptions.write().ok()?.remove(subscription_id)
+        self.disc_subscriptions
+            .write()
+            .ok()?
+            .remove(subscription_id)
     }
 
     pub fn disc_sub_update(
@@ -485,7 +494,10 @@ impl EesContext {
     /// [`AcrContextError::NoTEasAvailable`]). Records `DETERMINED` state keyed
     /// by the UE and returns it.
     pub fn acr_determine(&self, req: &AcrDetermReq) -> Result<AcrState, AcrContextError> {
-        let regs = self.registrations.read().map_err(|_| AcrContextError::Internal)?;
+        let regs = self
+            .registrations
+            .read()
+            .map_err(|_| AcrContextError::Internal)?;
 
         if let Some(eid) = req.eas_id.as_deref() {
             if !regs.values().any(|r| r.eas_prof.eas_id == eid) {
@@ -545,7 +557,11 @@ impl EesContext {
             }
             states.insert(key, state.clone());
         }
-        log::debug!("ACR initiated: requestorId={} ueId={:?}", req.requestor_id, req.ue_id);
+        log::debug!(
+            "ACR initiated: requestorId={} ueId={:?}",
+            req.requestor_id,
+            req.ue_id
+        );
         state
     }
 
@@ -567,14 +583,21 @@ impl EesContext {
         if let Ok(mut states) = self.acr_states.write() {
             states.insert(key, state.clone());
         }
-        log::info!("ACR completed (stub notify): ueId={} tEasId={}", req.ue_id, req.t_eas_id);
+        log::info!(
+            "ACR completed (stub notify): ueId={} tEasId={}",
+            req.ue_id,
+            req.t_eas_id
+        );
         state
     }
 
     /// EEL-managed ACR (TS 29.558 §8.8) — determine + initiate internally for
     /// the UE, selecting a T-EAS from the registered pool. Records `INITIATED`.
     pub fn acr_eel_request(&self, ue_id: &str) -> Result<AcrState, AcrContextError> {
-        let regs = self.registrations.read().map_err(|_| AcrContextError::Internal)?;
+        let regs = self
+            .registrations
+            .read()
+            .map_err(|_| AcrContextError::Internal)?;
         let (t_eas_id, t_endpoint) = match regs.values().map(|r| &r.eas_prof).next() {
             Some(p) => (Some(p.eas_id.clone()), Some(p.end_pt.clone())),
             None => return Err(AcrContextError::NoTEasAvailable),
@@ -628,12 +651,19 @@ impl EesContext {
         let id = Uuid::new_v4().to_string();
         ann.announcement_id = Some(id.clone());
         anns.insert(id.clone(), ann.clone());
-        log::info!("CEA announcement created: announcementId={id} easId={}", ann.eas_id);
+        log::info!(
+            "CEA announcement created: announcementId={id} easId={}",
+            ann.eas_id
+        );
         Some(ann)
     }
 
     pub fn cea_find(&self, announcement_id: &str) -> Option<CeaAnnouncement> {
-        self.cea_announcements.read().ok()?.get(announcement_id).cloned()
+        self.cea_announcements
+            .read()
+            .ok()?
+            .get(announcement_id)
+            .cloned()
     }
 
     pub fn cea_list(&self) -> Vec<CeaAnnouncement> {
@@ -688,10 +718,7 @@ impl EesContext {
     // ---- eesd-13: eees-acrmgntevent — ACR Management Event subscriptions -----
 
     /// Create an ACR management event subscription; mints a `subscriptionId`.
-    pub fn acrmgnt_sub_create(
-        &self,
-        mut sub: AcrMgntEventSubsc,
-    ) -> Option<AcrMgntEventSubsc> {
+    pub fn acrmgnt_sub_create(&self, mut sub: AcrMgntEventSubsc) -> Option<AcrMgntEventSubsc> {
         let mut subs = self.acr_mgnt_subscriptions.write().ok()?;
         if subs.len() >= self.max_eas {
             return None;
@@ -707,7 +734,11 @@ impl EesContext {
     }
 
     pub fn acrmgnt_sub_find(&self, subscription_id: &str) -> Option<AcrMgntEventSubsc> {
-        self.acr_mgnt_subscriptions.read().ok()?.get(subscription_id).cloned()
+        self.acr_mgnt_subscriptions
+            .read()
+            .ok()?
+            .get(subscription_id)
+            .cloned()
     }
 
     pub fn acrmgnt_sub_list(&self) -> Vec<AcrMgntEventSubsc> {
@@ -736,9 +767,15 @@ impl EesContext {
     }
 
     pub fn acrmgnt_sub_delete(&self, subscription_id: &str) -> Option<AcrMgntEventSubsc> {
-        let removed = self.acr_mgnt_subscriptions.write().ok()?.remove(subscription_id);
+        let removed = self
+            .acr_mgnt_subscriptions
+            .write()
+            .ok()?
+            .remove(subscription_id);
         if removed.is_some() {
-            log::info!("ACR management event subscription deleted: subscriptionId={subscription_id}");
+            log::info!(
+                "ACR management event subscription deleted: subscriptionId={subscription_id}"
+            );
         }
         removed
     }
@@ -756,8 +793,14 @@ impl EesContext {
         };
         let mut matched = 0;
         for sub in subs.values() {
-            let eec_match = sub.eec_id.as_deref().is_none_or(|id| Some(id) == event_eec_id);
-            let eas_match = sub.eas_id.as_deref().is_none_or(|id| Some(id) == event_eas_id);
+            let eec_match = sub
+                .eec_id
+                .as_deref()
+                .is_none_or(|id| Some(id) == event_eec_id);
+            let eas_match = sub
+                .eas_id
+                .as_deref()
+                .is_none_or(|id| Some(id) == event_eas_id);
             if eec_match && eas_match {
                 matched += 1;
                 log::debug!(
@@ -777,7 +820,8 @@ impl Default for EesContext {
 }
 
 /// Global EES context (thread-safe singleton).
-static GLOBAL_EES_CONTEXT: std::sync::OnceLock<Arc<RwLock<EesContext>>> = std::sync::OnceLock::new();
+static GLOBAL_EES_CONTEXT: std::sync::OnceLock<Arc<RwLock<EesContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global EES context.
 pub fn ees_self() -> Arc<RwLock<EesContext>> {
@@ -851,7 +895,9 @@ mod tests {
         let mut ctx = EesContext::new();
         ctx.init(128);
 
-        let stored = ctx.eas_register(make_reg("eas1.example.com", "VIDEO")).unwrap();
+        let stored = ctx
+            .eas_register(make_reg("eas1.example.com", "VIDEO"))
+            .unwrap();
         let reg_id = stored.registration_id.clone().unwrap();
         assert_ne!(reg_id, "eas1.example.com");
         assert_eq!(stored.eas_prof.eas_id, "eas1.example.com");
@@ -867,7 +913,9 @@ mod tests {
         let mut ctx = EesContext::new();
         ctx.init(128);
 
-        let stored = ctx.eas_register(make_reg("eas2.example.com", "AR")).unwrap();
+        let stored = ctx
+            .eas_register(make_reg("eas2.example.com", "AR"))
+            .unwrap();
         let reg_id = stored.registration_id.unwrap();
         assert!(ctx.eas_find(&reg_id).is_some());
 
@@ -895,8 +943,12 @@ mod tests {
     fn test_eas_register_capacity_limit() {
         let mut ctx = EesContext::new();
         ctx.init(1);
-        assert!(ctx.eas_register(make_reg("a.example.com", "VIDEO")).is_some());
-        assert!(ctx.eas_register(make_reg("b.example.com", "VIDEO")).is_none());
+        assert!(ctx
+            .eas_register(make_reg("a.example.com", "VIDEO"))
+            .is_some());
+        assert!(ctx
+            .eas_register(make_reg("b.example.com", "VIDEO"))
+            .is_none());
     }
 
     /// eesd-04: PUT full-replace preserves the registrationId and rejects an
@@ -905,7 +957,9 @@ mod tests {
     fn test_eas_update_replace_and_reject_eas_id_change() {
         let mut ctx = EesContext::new();
         ctx.init(8);
-        let stored = ctx.eas_register(make_reg("eas1.example.com", "VIDEO")).unwrap();
+        let stored = ctx
+            .eas_register(make_reg("eas1.example.com", "VIDEO"))
+            .unwrap();
         let reg_id = stored.registration_id.unwrap();
 
         // Replace svc/type, keep easId → 200-equivalent Ok.
@@ -918,7 +972,10 @@ mod tests {
 
         // Changing easId is rejected.
         let changed = make_reg("eas2.example.com", "AR");
-        assert_eq!(ctx.eas_update(&reg_id, changed), Err(UpdateError::IdImmutable));
+        assert_eq!(
+            ctx.eas_update(&reg_id, changed),
+            Err(UpdateError::IdImmutable)
+        );
 
         // Unknown registrationId → NotFound.
         assert_eq!(
@@ -932,7 +989,9 @@ mod tests {
     fn test_eas_modify_merge_patch() {
         let mut ctx = EesContext::new();
         ctx.init(8);
-        let stored = ctx.eas_register(make_reg("eas1.example.com", "VIDEO")).unwrap();
+        let stored = ctx
+            .eas_register(make_reg("eas1.example.com", "VIDEO"))
+            .unwrap();
         let reg_id = stored.registration_id.unwrap();
 
         let patch = serde_json::json!({"easProf": {"type": "AR"}});
@@ -1035,9 +1094,12 @@ mod tests {
 
         assert_eq!(ctx.eas_count(), 2);
         // now well past 2000 → only the lapsed entry is dropped.
-        let removed = ctx.sweep_expired(crate::types::parse_rfc3339_to_epoch("2020-01-01T00:00:00Z").unwrap());
+        let removed = ctx
+            .sweep_expired(crate::types::parse_rfc3339_to_epoch("2020-01-01T00:00:00Z").unwrap());
         assert_eq!(removed, 1);
         assert_eq!(ctx.eas_count(), 1);
-        assert!(!ctx.eas_discover(Some("forever.example.com"), None).is_empty());
+        assert!(!ctx
+            .eas_discover(Some("forever.example.com"), None)
+            .is_empty());
     }
 }

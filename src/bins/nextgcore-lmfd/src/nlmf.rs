@@ -239,7 +239,9 @@ impl GeographicArea {
             GeographicArea::PointUncertaintyEllipse { .. } => gad_shape::POINT_UNCERTAINTY_ELLIPSE,
             GeographicArea::Polygon { .. } => gad_shape::POLYGON,
             GeographicArea::PointAltitude { .. } => gad_shape::POINT_ALTITUDE,
-            GeographicArea::PointAltitudeUncertainty { .. } => gad_shape::POINT_ALTITUDE_UNCERTAINTY,
+            GeographicArea::PointAltitudeUncertainty { .. } => {
+                gad_shape::POINT_ALTITUDE_UNCERTAINTY
+            }
             GeographicArea::EllipsoidArc { .. } => gad_shape::ELLIPSOID_ARC,
         }
     }
@@ -304,7 +306,13 @@ pub struct LocationDataExt {
 /// back to `POINT_UNCERTAINTY_CIRCLE` (the universally-supported default per
 /// TS 29.572). `uncertainty_m` is the horizontal uncertainty in metres;
 /// `confidence` is the 0..100 % confidence.
-pub fn to_gad(lat: f64, lon: f64, uncertainty_m: f64, confidence: u8, shape: &str) -> GeographicArea {
+pub fn to_gad(
+    lat: f64,
+    lon: f64,
+    uncertainty_m: f64,
+    confidence: u8,
+    shape: &str,
+) -> GeographicArea {
     let point = GeographicalCoordinates { lon, lat };
     match shape {
         gad_shape::POINT => GeographicArea::Point { point },
@@ -331,11 +339,7 @@ pub fn to_gad(lat: f64, lon: f64, uncertainty_m: f64, confidence: u8, shape: &st
 /// `POINT_UNCERTAINTY_ELLIPSE` when the consumer advertises it (and either an
 /// ellipse is wanted or the circle is not advertised).
 pub fn negotiate_gad_shape(supported: Option<&[String]>, want_ellipse: bool) -> &'static str {
-    let supports = |s: &str| {
-        supported
-            .map(|v| v.iter().any(|x| x == s))
-            .unwrap_or(false)
-    };
+    let supports = |s: &str| supported.map(|v| v.iter().any(|x| x == s)).unwrap_or(false);
     if want_ellipse && supports(gad_shape::POINT_UNCERTAINTY_ELLIPSE) {
         gad_shape::POINT_UNCERTAINTY_ELLIPSE
     } else if supported.is_none() || supports(gad_shape::POINT_UNCERTAINTY_CIRCLE) {
@@ -554,13 +558,7 @@ mod tests {
     fn test_location_data_ext_roundtrip() {
         let resp = LocationDataExt {
             location_data: LocationData {
-                location_estimate: to_gad(
-                    1.0,
-                    2.0,
-                    30.0,
-                    95,
-                    gad_shape::POINT_UNCERTAINTY_CIRCLE,
-                ),
+                location_estimate: to_gad(1.0, 2.0, 30.0, 95, gad_shape::POINT_UNCERTAINTY_CIRCLE),
                 accuracy_fulfilment_indicator: Some(accuracy_fulfilment::FULFILLED.to_string()),
                 age_of_location_estimate: Some(0),
                 positioning_data_list: Some(vec![PositioningMethodAndUsage {

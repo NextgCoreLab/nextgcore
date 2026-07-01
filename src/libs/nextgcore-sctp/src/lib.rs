@@ -945,7 +945,10 @@ mod tests {
         nextgcore_sctp_set_ppid_in_pkbuf(&mut pkbuf, NEXTGCORE_SCTP_NGAP_PPID);
         nextgcore_sctp_set_stream_no_in_pkbuf(&mut pkbuf, 5);
 
-        assert_eq!(nextgcore_sctp_ppid_in_pkbuf(&pkbuf), NEXTGCORE_SCTP_NGAP_PPID);
+        assert_eq!(
+            nextgcore_sctp_ppid_in_pkbuf(&pkbuf),
+            NEXTGCORE_SCTP_NGAP_PPID
+        );
         assert_eq!(nextgcore_sctp_stream_no_in_pkbuf(&pkbuf), 5);
     }
 
@@ -953,7 +956,10 @@ mod tests {
     fn test_pkbuf_ppid_s1ap() {
         let mut pkbuf = NextgcorePkbuf::new(100);
         nextgcore_sctp_set_ppid_in_pkbuf(&mut pkbuf, NEXTGCORE_SCTP_S1AP_PPID);
-        assert_eq!(nextgcore_sctp_ppid_in_pkbuf(&pkbuf), NEXTGCORE_SCTP_S1AP_PPID);
+        assert_eq!(
+            nextgcore_sctp_ppid_in_pkbuf(&pkbuf),
+            NEXTGCORE_SCTP_S1AP_PPID
+        );
     }
 
     #[test]

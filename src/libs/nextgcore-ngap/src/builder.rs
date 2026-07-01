@@ -721,9 +721,7 @@ pub fn build_handover_cancel(msg: &HandoverCancel) -> NgapResult<Vec<u8>> {
 }
 
 /// Build a Handover Cancel Acknowledge PDU (TS 38.413 Section 9.2.3.9)
-pub fn build_handover_cancel_acknowledge(
-    msg: &HandoverCancelAcknowledge,
-) -> NgapResult<Vec<u8>> {
+pub fn build_handover_cancel_acknowledge(msg: &HandoverCancelAcknowledge) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)

@@ -616,9 +616,8 @@ mod tests {
         // The label constant used by both glue paths must be
         // N32_MASTER_EXPORTER_LABEL. A different label produces different
         // material — confirming the label selection is significant.
-        let wrong_label =
-            export_keying_material(&server, b"WRONG-LABEL", None, N32_MASTER_KEY_LEN)
-                .expect("export with wrong label");
+        let wrong_label = export_keying_material(&server, b"WRONG-LABEL", None, N32_MASTER_KEY_LEN)
+            .expect("export with wrong label");
         assert_ne!(
             server_secret, wrong_label,
             "different label must produce different material"
@@ -628,7 +627,11 @@ mod tests {
         // N32-f session-key export (different label and length).
         let legacy = export_n32f_session_key(&server, None).expect("legacy export");
         assert_eq!(legacy.len(), N32F_EXPORTER_KEY_LEN);
-        assert_ne!(server_secret[..32], legacy[..], "master != legacy session key");
+        assert_ne!(
+            server_secret[..32],
+            legacy[..],
+            "master != legacy session key"
+        );
     }
 
     /// Completed in-memory TLS 1.3 handshake, exposing both rustls connections
@@ -646,8 +649,7 @@ mod tests {
         // Self-signed leaf cert + key for "localhost".
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-        let key_der =
-            PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key");
+        let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key");
 
         let server_config = build_server_config(vec![cert_der.clone()], key_der).unwrap();
 

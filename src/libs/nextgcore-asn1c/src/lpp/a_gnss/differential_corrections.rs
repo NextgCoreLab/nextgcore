@@ -75,8 +75,7 @@ impl UperDecode for GnssDifferentialCorrections {
                 "GNSS-DifferentialCorrections extension additions not supported".into(),
             ));
         }
-        let dgnss_ref_time =
-            d.decode_constrained_whole_number(&Self::DGNSS_REF_TIME)? as u16;
+        let dgnss_ref_time = d.decode_constrained_whole_number(&Self::DGNSS_REF_TIME)? as u16;
         let dgnss_sgn_type_list = DgnssSgnTypeList::decode_uper(d)?;
         Ok(GnssDifferentialCorrections {
             dgnss_ref_time,

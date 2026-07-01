@@ -75,7 +75,10 @@ impl UperEncode for GnssTimeModelElement {
                 self.delta_t.is_some(),
             ],
         );
-        encoder.encode_constrained_whole_number(self.gnss_time_model_ref_time as i64, &Self::REF_TIME)?;
+        encoder.encode_constrained_whole_number(
+            self.gnss_time_model_ref_time as i64,
+            &Self::REF_TIME,
+        )?;
         encoder.encode_constrained_whole_number(self.ta0 as i64, &Self::TA0)?;
         if let Some(ta1) = self.ta1 {
             encoder.encode_constrained_whole_number(ta1 as i64, &Self::TA1)?;

@@ -70,7 +70,9 @@ impl AusfTimerId {
             AusfTimerId::NfInstanceRegistrationInterval => {
                 "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            AusfTimerId::NfInstanceHeartbeatInterval => "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
+            AusfTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
             AusfTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
             AusfTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
             AusfTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",

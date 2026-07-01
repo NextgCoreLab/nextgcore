@@ -3,8 +3,8 @@
 //! Port of src/nrf/sbi-path.c - SBI server open/close and notification sending
 
 use crate::nnrf_build::{
-    nrf_nnrf_nfm_build_nf_profile_changed_notify, nrf_nnrf_nfm_build_nf_status_notify,
-    ChangeItem, NotificationEventType,
+    nrf_nnrf_nfm_build_nf_profile_changed_notify, nrf_nnrf_nfm_build_nf_status_notify, ChangeItem,
+    NotificationEventType,
 };
 use crate::nnrf_handler::{nf_manager, NfProfile, SubscriptionData};
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
@@ -317,7 +317,9 @@ pub async fn nrf_nnrf_nfm_send_nf_profile_changed_notify_async(
         Some(req) => req,
         None => {
             log::error!("nrf_nnrf_nfm_build_nf_profile_changed_notify() failed");
-            return NotifySendResult::Failed("Failed to build profile-changed notification".to_string());
+            return NotifySendResult::Failed(
+                "Failed to build profile-changed notification".to_string(),
+            );
         }
     };
 

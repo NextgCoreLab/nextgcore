@@ -72,10 +72,8 @@ pub struct ProvideAssistanceDataR9 {
 impl UperEncode for ProvideAssistanceDataR9 {
     fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
         // Extensible SEQUENCE, 4 root optionals; only a-gnss ([1]) supported.
-        encoder.encode_sequence_preamble(
-            Some(false),
-            &[false, self.a_gnss.is_some(), false, false],
-        );
+        encoder
+            .encode_sequence_preamble(Some(false), &[false, self.a_gnss.is_some(), false, false]);
         if let Some(a) = &self.a_gnss {
             a.encode_uper(encoder)?;
         }
@@ -88,7 +86,8 @@ impl UperDecode for ProvideAssistanceDataR9 {
         let (_ext, opts) = decoder.decode_sequence_preamble(true, 4)?;
         if opts[0] || opts[2] || opts[3] {
             return Err(PerError::DecodeError(
-                "unsupported LPP ProvideAssistanceData method (v1 supports a-gnss only)".to_string(),
+                "unsupported LPP ProvideAssistanceData method (v1 supports a-gnss only)"
+                    .to_string(),
             ));
         }
         let a_gnss = if opts[1] {
@@ -168,7 +167,8 @@ impl UperDecode for RequestAssistanceDataR9 {
         let (_ext, opts) = decoder.decode_sequence_preamble(true, 3)?;
         if opts[0] || opts[2] {
             return Err(PerError::DecodeError(
-                "unsupported LPP RequestAssistanceData method (v1 supports a-gnss only)".to_string(),
+                "unsupported LPP RequestAssistanceData method (v1 supports a-gnss only)"
+                    .to_string(),
             ));
         }
         let a_gnss = if opts[1] {

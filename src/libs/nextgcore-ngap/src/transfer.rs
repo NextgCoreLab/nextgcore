@@ -1198,8 +1198,7 @@ impl PduSessionResourceSetupRequestTransfer {
                     // retained on the public struct — adding a field would force
                     // amfd/smfd construction-site churn outside this crate, and a
                     // single-connectivity SMF ignores additional UL tunnels.
-                    let _additional =
-                        decode_additional_ul_ngu_up_tnl_information(&mut decoder)?;
+                    let _additional = decode_additional_ul_ngu_up_tnl_information(&mut decoder)?;
                 }
                 IE_ID_DATA_FORWARDING_NOT_POSSIBLE => {
                     let constraint = Constraint::extensible(0, 0);

@@ -611,9 +611,7 @@ impl SbiClient {
         // server glue when the request arrived from a peer), echo it as
         // `x-request-id` so the downstream NF can correlate log entries.
         // Do not overwrite a caller-supplied `x-request-id`.
-        if !request.correlation_id.is_empty()
-            && request.http.get_header("x-request-id").is_none()
-        {
+        if !request.correlation_id.is_empty() && request.http.get_header("x-request-id").is_none() {
             request
                 .http
                 .set_header("x-request-id", request.correlation_id.clone());
@@ -790,8 +788,7 @@ impl SbiClient {
         let mut multipart_content_type: Option<String> = None;
         let body_bytes: Bytes = if !request.http.parts.is_empty() {
             let boundary = crate::multipart::generate_boundary();
-            multipart_content_type =
-                Some(crate::multipart::content_type_with_boundary(&boundary));
+            multipart_content_type = Some(crate::multipart::content_type_with_boundary(&boundary));
             Bytes::from(crate::multipart::encode(
                 request.http.content.as_deref(),
                 &request.http.parts,
@@ -964,10 +961,7 @@ fn derive_scope_from_uri(uri: &str) -> String {
 /// communication), otherwise from the `Location` authority. The new request URI
 /// is the absolute `Location` (307/308 preserve method + body).
 fn next_redirect(response: &SbiResponse) -> SbiResult<Option<(String, ConnectTarget)>> {
-    let location = match response
-        .http
-        .get_header(crate::constants::header::LOCATION)
-    {
+    let location = match response.http.get_header(crate::constants::header::LOCATION) {
         Some(l) if !l.trim().is_empty() => l.trim().to_string(),
         _ => return Ok(None),
     };
@@ -1266,7 +1260,10 @@ mod tests {
         let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data");
         let response = client.send_request(request).await.expect("request sent");
         let body = response.http.content.as_deref().expect("echo body");
-        assert!(body.contains("<none>"), "expected no User-Agent, got: {body}");
+        assert!(
+            body.contains("<none>"),
+            "expected no User-Agent, got: {body}"
+        );
     }
 
     #[tokio::test]
@@ -1290,8 +1287,8 @@ mod tests {
         let addr = serve_token_and_echo("nrf-token").await;
         let nrf_uri = format!("http://{addr}");
         let oauth2 = Arc::new(OAuth2Client::new(nrf_uri, "amf-instance-1", NfType::Amf));
-        let client = SbiClient::with_host_port("127.0.0.1", addr.port())
-            .with_oauth2(oauth2, NfType::Udm);
+        let client =
+            SbiClient::with_host_port("127.0.0.1", addr.port()).with_oauth2(oauth2, NfType::Udm);
 
         // A caller-supplied Authorization header is respected (not replaced by
         // an NRF-acquired token).
@@ -1533,11 +1530,17 @@ mod tests {
         let client = SbiClient::with_host_port("127.0.0.1", redir_addr.port());
         let request =
             SbiRequest::post("/nudm-sdm/v1/imsi-1/x").with_body("payload-307", "text/plain");
-        let response = client.send_request(request).await.expect("redirect followed");
+        let response = client
+            .send_request(request)
+            .await
+            .expect("redirect followed");
 
         assert_eq!(response.status, 200);
         let body = response.http.content.as_deref().unwrap();
-        assert!(body.contains(r#""method":"POST""#), "method preserved: {body}");
+        assert!(
+            body.contains(r#""method":"POST""#),
+            "method preserved: {body}"
+        );
         assert!(body.contains("payload-307"), "body preserved: {body}");
         assert_eq!(redir_count.load(Ordering::SeqCst), 1);
         assert_eq!(final_count.load(Ordering::SeqCst), 1);
@@ -1664,6 +1667,10 @@ mod tests {
             .await
             .expect("returns last 503");
         assert_eq!(response.status, 503);
-        assert_eq!(count.load(Ordering::SeqCst), 2, "exactly max_attempts tries");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "exactly max_attempts tries"
+        );
     }
 }

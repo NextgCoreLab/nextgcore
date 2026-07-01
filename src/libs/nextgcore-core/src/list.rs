@@ -121,7 +121,11 @@ impl NextgcoreList {
     ///
     /// # Safety
     /// The caller must ensure both nodes are valid and `after` is in this list.
-    pub unsafe fn insert_next(&mut self, after: NonNull<NextgcoreLnode>, node: NonNull<NextgcoreLnode>) {
+    pub unsafe fn insert_next(
+        &mut self,
+        after: NonNull<NextgcoreLnode>,
+        node: NonNull<NextgcoreLnode>,
+    ) {
         let after_ptr = after.as_ptr();
         let node_ptr = node.as_ptr();
 
@@ -140,7 +144,11 @@ impl NextgcoreList {
     ///
     /// # Safety
     /// The caller must ensure both nodes are valid and `before` is in this list.
-    pub unsafe fn insert_prev(&mut self, before: NonNull<NextgcoreLnode>, node: NonNull<NextgcoreLnode>) {
+    pub unsafe fn insert_prev(
+        &mut self,
+        before: NonNull<NextgcoreLnode>,
+        node: NonNull<NextgcoreLnode>,
+    ) {
         let before_ptr = before.as_ptr();
         let node_ptr = node.as_ptr();
 
@@ -618,7 +626,8 @@ mod proptests {
         while let Some(node) = current {
             // Find the value by matching the node pointer
             for stored in &storage.nodes {
-                let stored_ptr = NonNull::new(&stored.lnode as *const _ as *mut NextgcoreLnode).unwrap();
+                let stored_ptr =
+                    NonNull::new(&stored.lnode as *const _ as *mut NextgcoreLnode).unwrap();
                 if stored_ptr == node {
                     values.push(stored.value);
                     break;

@@ -364,9 +364,8 @@ fn extract_set_and_group(
         .get("nfInstances")
         .and_then(|v| v.as_array())
         .and_then(|arr| {
-            arr.iter().find(|i| {
-                i.get("nfInstanceId").and_then(|x| x.as_str()) == Some(nf_instance_id)
-            })
+            arr.iter()
+                .find(|i| i.get("nfInstanceId").and_then(|x| x.as_str()) == Some(nf_instance_id))
         });
     let set = inst
         .and_then(|i| i.get("nfSetIdList"))
@@ -587,9 +586,7 @@ impl ScpProxy {
     /// error response (TS 29.500 §6.10.8.2). Never applied to relayed producer
     /// responses (those keep the producer's `Server`).
     fn stamp_server(&self, mut response: SbiResponse) -> SbiResponse {
-        response
-            .http
-            .set_header(SERVER_HEADER, self.scp_node_id());
+        response.http.set_header(SERVER_HEADER, self.scp_node_id());
         response
     }
 
@@ -1029,7 +1026,9 @@ impl ScpProxy {
         // 401/403 + a Bearer `WWW-Authenticate`, the cached token was refused —
         // invalidate it, mint a fresh one, and retry exactly once
         // (TS 29.500 §6.10.11.2.3). If it still fails, the response is relayed.
-        if delegated && matches!(upstream.status, 401 | 403) && www_authenticate_is_bearer(&upstream)
+        if delegated
+            && matches!(upstream.status, 401 | 403)
+            && www_authenticate_is_bearer(&upstream)
         {
             if let (Some(oauth2), Some(retry)) = (self.oauth2.as_ref(), retry_fwd) {
                 oauth2.clear_cache().await;
@@ -1058,7 +1057,9 @@ impl ScpProxy {
                 relayed.http.set_header(custom_header::PRODUCER_ID, id);
             }
             if let Some(g) = group_id.filter(|s| !s.is_empty()) {
-                relayed.http.set_header(custom_header::TARGET_NF_GROUP_ID, g);
+                relayed
+                    .http
+                    .set_header(custom_header::TARGET_NF_GROUP_ID, g);
             }
         }
 
@@ -1395,9 +1396,9 @@ mod tests {
     /// Start a mock producer that echoes the request (method, uri, body and
     /// selected headers) as JSON and returns Binding/Oci headers.
     async fn start_mock_producer(port: u16) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-        ));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
         server
             .start(|request: SbiRequest| async move {
                 let echoed = serde_json::json!({
@@ -1433,9 +1434,9 @@ mod tests {
     /// Start the SCP itself: an SbiServer fronting a ScpProxy.
     async fn start_scp(port: u16, config: ScpProxyConfig) -> nextgcore_sbi::server::SbiServer {
         let proxy = Arc::new(ScpProxy::new(config));
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-        ));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
         server
             .start(move |request: SbiRequest| {
                 let proxy = proxy.clone();
@@ -1516,9 +1517,9 @@ mod tests {
         producer_port: u16,
         hits: Arc<AtomicU64>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-        ));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
         server
             .start(move |request: SbiRequest| {
                 let hits = hits.clone();
@@ -1632,9 +1633,10 @@ mod tests {
         // the SCP must relay it verbatim, not replace it.
         let producer_port = ephemeral_port();
         let scp_port = ephemeral_port();
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], producer_port)),
-        ));
+        let server =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], producer_port)),
+            ));
         server
             .start(|_request: SbiRequest| async move {
                 SbiResponse::with_status(409).with_body(
@@ -1687,9 +1689,10 @@ mod tests {
     async fn test_slow_producer_is_504_within_bounded_timeout() {
         // A producer that never answers within the SCP's request timeout.
         let producer_port = ephemeral_port();
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], producer_port)),
-        ));
+        let server =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], producer_port)),
+            ));
         server
             .start(|_request: SbiRequest| async move {
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1722,9 +1725,10 @@ mod tests {
     #[tokio::test]
     async fn test_nrf_returning_no_candidates_is_502() {
         let nrf_port = ephemeral_port();
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], nrf_port)),
-        ));
+        let server =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], nrf_port)),
+            ));
         server
             .start(|_request: SbiRequest| async move {
                 SbiResponse::ok().with_body(r#"{"nfInstances":[]}"#, "application/json")
@@ -1790,9 +1794,9 @@ mod tests {
         token: &'static str,
         token_hits: Arc<AtomicU64>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-        ));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
         server
             .start(move |request: SbiRequest| {
                 let token_hits = token_hits.clone();
@@ -1845,9 +1849,9 @@ mod tests {
     /// A producer that echoes back the Authorization header it received, so a
     /// test can assert the SCP attached a delegated Bearer token.
     async fn start_auth_echo_producer(port: u16) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-        ));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
         server
             .start(|request: SbiRequest| async move {
                 let auth = request
@@ -2043,9 +2047,9 @@ mod tests {
 
     /// A producer that always answers a fixed error status with a small body.
     async fn start_status_producer(port: u16, status: u16) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-        ));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
         server
             .start(move |_request: SbiRequest| async move {
                 SbiResponse::with_status(status).with_body(
@@ -2064,9 +2068,9 @@ mod tests {
         port: u16,
         fail_count: u64,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-        ));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
         let calls = Arc::new(AtomicU64::new(0));
         server
             .start(move |_request: SbiRequest| {
@@ -2100,9 +2104,9 @@ mod tests {
         producer_port: u16,
         captured: Arc<std::sync::Mutex<HashMap<String, String>>>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-        ));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
         server
             .start(move |request: SbiRequest| {
                 let captured = captured.clone();
@@ -2320,7 +2324,10 @@ mod tests {
 
         // Snapshot the captured params (releasing the lock) before any await.
         let params: HashMap<String, String> = captured.lock().unwrap().clone();
-        assert_eq!(params.get("target-nf-type").map(String::as_str), Some("UDM"));
+        assert_eq!(
+            params.get("target-nf-type").map(String::as_str),
+            Some("UDM")
+        );
         assert_eq!(
             params.get("requester-nf-type").map(String::as_str),
             Some("AMF")
@@ -2486,9 +2493,10 @@ mod tests {
         let scp_port = ephemeral_port();
 
         let producer = start_mock_producer(producer_port).await;
-        let nrf_server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], nrf_port)),
-        ));
+        let nrf_server =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], nrf_port)),
+            ));
         nrf_server
             .start(move |_request: SbiRequest| async move {
                 let search_result = serde_json::json!({
@@ -2562,7 +2570,10 @@ mod tests {
         assert_eq!(response.status, 200);
         let echoed: serde_json::Value = response.json_body().unwrap();
         assert_eq!(echoed["sawTargetApiroot"], true);
-        assert_eq!(echoed["targetApiroot"].as_str(), Some(producer_apiroot.as_str()));
+        assert_eq!(
+            echoed["targetApiroot"].as_str(),
+            Some(producer_apiroot.as_str())
+        );
 
         scp.stop().await.expect("scp stop");
         producer.stop().await.expect("producer stop");
@@ -2657,9 +2668,10 @@ mod tests {
         let scp_port = ephemeral_port();
 
         let producer = start_mock_producer(producer_port).await;
-        let nrf_server = nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], nrf_port)),
-        ));
+        let nrf_server =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], nrf_port)),
+            ));
         nrf_server
             .start(move |_request: SbiRequest| async move {
                 let search_result = serde_json::json!({

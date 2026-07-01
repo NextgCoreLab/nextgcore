@@ -158,7 +158,12 @@ pub fn nextgcore_send(fd: NextgcoreSocket, buf: &[u8], flags: i32) -> isize {
 }
 
 /// Send data to address (identical to nextgcore_sendto)
-pub fn nextgcore_sendto(fd: NextgcoreSocket, buf: &[u8], flags: i32, to: &NextgcoreSockaddr) -> isize {
+pub fn nextgcore_sendto(
+    fd: NextgcoreSocket,
+    buf: &[u8],
+    flags: i32,
+    to: &NextgcoreSockaddr,
+) -> isize {
     let (sockaddr, addrlen) = sockaddr_to_raw(to);
 
     unsafe {
@@ -179,7 +184,11 @@ pub fn nextgcore_recv(fd: NextgcoreSocket, buf: &mut [u8], flags: i32) -> isize 
 }
 
 /// Receive data with source address (identical to nextgcore_recvfrom)
-pub fn nextgcore_recvfrom(fd: NextgcoreSocket, buf: &mut [u8], flags: i32) -> (isize, Option<NextgcoreSockaddr>) {
+pub fn nextgcore_recvfrom(
+    fd: NextgcoreSocket,
+    buf: &mut [u8],
+    flags: i32,
+) -> (isize, Option<NextgcoreSockaddr>) {
     let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut addrlen: libc::socklen_t =
         std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;

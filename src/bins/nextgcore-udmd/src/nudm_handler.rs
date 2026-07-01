@@ -262,14 +262,14 @@ pub fn udm_nudm_ueau_handle_get(
                 return (HandlerResult::bad_request("RAND conversion failed"), None);
             }
         };
-        let (sqn_ms, mac_s) = match kdf::nextgcore_auc_sqn(&udm_ue.opc, &udm_ue.k, rand_arr, &conc_sqn_ms)
-        {
-            Ok(result) => result,
-            Err(e) => {
-                log::error!("[{}] SQN extraction failed: {:?}", udm_ue.suci, e);
-                return (HandlerResult::bad_request("SQN extraction failed"), None);
-            }
-        };
+        let (sqn_ms, mac_s) =
+            match kdf::nextgcore_auc_sqn(&udm_ue.opc, &udm_ue.k, rand_arr, &conc_sqn_ms) {
+                Ok(result) => result,
+                Err(e) => {
+                    log::error!("[{}] SQN extraction failed: {:?}", udm_ue.suci, e);
+                    return (HandlerResult::bad_request("SQN extraction failed"), None);
+                }
+            };
 
         // Verify MAC-S matches the MAC-S in AUTS (bytes 6..14)
         if mac_s != auts_bytes[NEXTGCORE_SQN_LEN..NEXTGCORE_AUTS_LEN] {

@@ -275,7 +275,8 @@ mod tests {
 
     #[test]
     fn test_fsm_with_handlers() {
-        let fsm: NextgcoreFsm<TestContext, TestEvent> = NextgcoreFsm::with_handlers(state_init, state_fini);
+        let fsm: NextgcoreFsm<TestContext, TestEvent> =
+            NextgcoreFsm::with_handlers(state_init, state_fini);
         assert!(fsm.init.is_some());
         assert!(fsm.fini.is_some());
         assert!(fsm.state.is_none());
@@ -283,7 +284,8 @@ mod tests {
 
     #[test]
     fn test_fsm_init() {
-        let mut fsm: NextgcoreFsm<TestContext, TestEvent> = NextgcoreFsm::with_handlers(state_init, state_fini);
+        let mut fsm: NextgcoreFsm<TestContext, TestEvent> =
+            NextgcoreFsm::with_handlers(state_init, state_fini);
         let mut ctx = TestContext {
             value: 0,
             transitions: RefCell::new(Vec::new()),
@@ -359,7 +361,8 @@ mod tests {
 
     #[test]
     fn test_fsm_fini() {
-        let mut fsm: NextgcoreFsm<TestContext, TestEvent> = NextgcoreFsm::with_handlers(state_init, state_fini);
+        let mut fsm: NextgcoreFsm<TestContext, TestEvent> =
+            NextgcoreFsm::with_handlers(state_init, state_fini);
         let mut ctx = TestContext {
             value: 0,
             transitions: RefCell::new(Vec::new()),

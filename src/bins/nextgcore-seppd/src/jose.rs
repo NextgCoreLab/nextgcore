@@ -139,12 +139,24 @@ fn gcm_encrypt(
         JweEnc::A128Gcm => {
             let cipher =
                 Aes128Gcm::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
-            cipher.encrypt(Nonce::from_slice(iv), Payload { msg: plaintext, aad })
+            cipher.encrypt(
+                Nonce::from_slice(iv),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
         }
         JweEnc::A256Gcm => {
             let cipher =
                 Aes256Gcm::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
-            cipher.encrypt(Nonce::from_slice(iv), Payload { msg: plaintext, aad })
+            cipher.encrypt(
+                Nonce::from_slice(iv),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
         }
     }
     .map_err(|e| JoseError::Crypto(e.to_string()))?;
@@ -172,12 +184,24 @@ fn gcm_decrypt(
         JweEnc::A128Gcm => {
             let cipher =
                 Aes128Gcm::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
-            cipher.decrypt(Nonce::from_slice(iv), Payload { msg: &ct_and_tag, aad })
+            cipher.decrypt(
+                Nonce::from_slice(iv),
+                Payload {
+                    msg: &ct_and_tag,
+                    aad,
+                },
+            )
         }
         JweEnc::A256Gcm => {
             let cipher =
                 Aes256Gcm::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
-            cipher.decrypt(Nonce::from_slice(iv), Payload { msg: &ct_and_tag, aad })
+            cipher.decrypt(
+                Nonce::from_slice(iv),
+                Payload {
+                    msg: &ct_and_tag,
+                    aad,
+                },
+            )
         }
     }
     .map_err(|_| JoseError::Tampered)
@@ -467,10 +491,7 @@ pub fn jws_sign_es256(
 
 /// Verify a flattened ES256 JWS against the signer's public key and return
 /// the raw payload bytes. Rejects any alg other than ES256.
-pub fn jws_verify_es256(
-    verifying_key: &VerifyingKey,
-    jws: &FlatJws,
-) -> Result<Vec<u8>, JoseError> {
+pub fn jws_verify_es256(verifying_key: &VerifyingKey, jws: &FlatJws) -> Result<Vec<u8>, JoseError> {
     let header_bytes = b64url_decode(&jws.protected)?;
     let header: JwsHeader = serde_json::from_slice(&header_bytes)
         .map_err(|e| JoseError::Format(format!("JWS header: {e}")))?;
@@ -622,11 +643,15 @@ mod tests {
     fn jwe_nonce_is_iv_salt_concat_seq() {
         let salt: [u8; 8] = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7];
         let seq: u32 = 0x0001_02ff;
-        let jwe = jwe_encrypt_with_iv_salt(&KEY, JweEnc::A256Gcm, &salt, seq, b"pt", None, None)
-            .unwrap();
+        let jwe =
+            jwe_encrypt_with_iv_salt(&KEY, JweEnc::A256Gcm, &salt, seq, b"pt", None, None).unwrap();
         let iv = b64url_decode(&jwe.iv).unwrap();
         assert_eq!(&iv[..8], &salt, "leading 8 octets are the IV salt");
-        assert_eq!(&iv[8..], &seq.to_be_bytes(), "trailing 4 octets are SEQ (BE)");
+        assert_eq!(
+            &iv[8..],
+            &seq.to_be_bytes(),
+            "trailing 4 octets are SEQ (BE)"
+        );
         // And the recovered (salt, seq) round-trips.
         let (rsalt, rseq) = jwe_iv_salt_and_seq(&jwe).unwrap();
         assert_eq!(rsalt, salt);
@@ -638,8 +663,10 @@ mod tests {
     #[test]
     fn jwe_same_salt_distinct_seq_distinct_nonces() {
         let salt: [u8; 8] = [9u8; 8];
-        let a = jwe_encrypt_with_iv_salt(&KEY, JweEnc::A256Gcm, &salt, 0, b"x", None, None).unwrap();
-        let b = jwe_encrypt_with_iv_salt(&KEY, JweEnc::A256Gcm, &salt, 1, b"x", None, None).unwrap();
+        let a =
+            jwe_encrypt_with_iv_salt(&KEY, JweEnc::A256Gcm, &salt, 0, b"x", None, None).unwrap();
+        let b =
+            jwe_encrypt_with_iv_salt(&KEY, JweEnc::A256Gcm, &salt, 1, b"x", None, None).unwrap();
         assert_ne!(a.iv, b.iv, "SEQ 0 and 1 must yield different nonces");
     }
 
@@ -650,9 +677,16 @@ mod tests {
     fn jwe_enc_profile_roundtrip_a128_and_a256() {
         let salt = [3u8; 8];
         for enc in [JweEnc::A128Gcm, JweEnc::A256Gcm] {
-            let jwe =
-                jwe_encrypt_with_iv_salt(&KEY, enc, &salt, 7, b"secret-supi", Some(b"aad"), Some("k"))
-                    .unwrap();
+            let jwe = jwe_encrypt_with_iv_salt(
+                &KEY,
+                enc,
+                &salt,
+                7,
+                b"secret-supi",
+                Some(b"aad"),
+                Some("k"),
+            )
+            .unwrap();
             // Header advertises the selected enc.
             let hdr: JweHeader =
                 serde_json::from_slice(&b64url_decode(&jwe.protected).unwrap()).unwrap();
@@ -667,7 +701,8 @@ mod tests {
         // The leading 16 octets of `KEY` must decrypt an A128GCM JWE made with
         // the full key (proves "session-key length follows the selected enc").
         let salt = [1u8; 8];
-        let jwe = jwe_encrypt_with_iv_salt(&KEY, JweEnc::A128Gcm, &salt, 0, b"m", None, None).unwrap();
+        let jwe =
+            jwe_encrypt_with_iv_salt(&KEY, JweEnc::A128Gcm, &salt, 0, b"m", None, None).unwrap();
         let mut k16 = [0u8; 32];
         k16[..16].copy_from_slice(&KEY[..16]);
         assert_eq!(jwe_decrypt(&k16, &jwe).unwrap(), b"m");

@@ -142,7 +142,10 @@ impl UperEncode for GnssReferenceTimeForOneCell {
         // Extensible SEQUENCE (no extension additions emitted) + 1 optional.
         e.encode_sequence_preamble(Some(false), &[self.bs_align.is_some()]);
         self.network_time.encode_uper(e)?;
-        e.encode_constrained_whole_number(self.reference_time_unc as i64, &Self::REFERENCE_TIME_UNC)?;
+        e.encode_constrained_whole_number(
+            self.reference_time_unc as i64,
+            &Self::REFERENCE_TIME_UNC,
+        )?;
         // bsAlign is ENUMERATED {true}: range = 1, so it contributes 0 content
         // bits — its presence is conveyed entirely by the preamble bit above.
         Ok(())

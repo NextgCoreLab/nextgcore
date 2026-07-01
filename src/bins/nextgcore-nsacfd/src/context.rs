@@ -428,8 +428,8 @@ impl NsacfContext {
             }
 
             let id = self.next_quota_id.fetch_add(1, Ordering::SeqCst) as u64;
-            let quota =
-                SliceQuota::new(id, s_nssai.clone(), max_ues, max_pdu_sessions).with_access_limits(limits);
+            let quota = SliceQuota::new(id, s_nssai.clone(), max_ues, max_pdu_sessions)
+                .with_access_limits(limits);
             quota_list.insert(id, quota.clone());
             quota
         }; // quota_list guard dropped before taking snssai_hash (no two-map hold)
@@ -566,7 +566,10 @@ impl NsacfContext {
             } else if quota.current_ues() >= quota.max_ues {
                 (AdmissionResult::RejectedQuotaExceeded, None)
             } else if over_per_access {
-                (AdmissionResult::RejectedQuotaExceededPerAccess(an_type), None)
+                (
+                    AdmissionResult::RejectedQuotaExceededPerAccess(an_type),
+                    None,
+                )
             } else {
                 quota.ues.insert(supi.to_string());
                 quota.ue_access.insert(supi.to_string(), an_type);
@@ -835,12 +838,16 @@ impl NsacfContext {
                     let ues_access: serde_json::Map<String, serde_json::Value> = q
                         .ue_access
                         .iter()
-                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.as_str().to_string())))
+                        .map(|(k, v)| {
+                            (k.clone(), serde_json::Value::String(v.as_str().to_string()))
+                        })
                         .collect();
                     let pdu_access: serde_json::Map<String, serde_json::Value> = q
                         .pdu_access
                         .iter()
-                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.as_str().to_string())))
+                        .map(|(k, v)| {
+                            (k.clone(), serde_json::Value::String(v.as_str().to_string()))
+                        })
                         .collect();
                     serde_json::json!({
                         "id": q.id,
@@ -1216,7 +1223,11 @@ mod tests {
         // NOT cross the threshold is Released(None); the crossing carries the
         // EacTransition.
         let out = ctx.release_ue(&s_nssai, "imsi-9");
-        assert_eq!(out, ReleaseOutcome::Released(None), "8/10 still at threshold");
+        assert_eq!(
+            out,
+            ReleaseOutcome::Released(None),
+            "8/10 still at threshold"
+        );
         let out = ctx.release_ue(&s_nssai, "imsi-8");
         assert_eq!(
             out,
@@ -1274,8 +1285,8 @@ mod tests {
         // Under a tokio runtime, save_state() offloads the file write to the
         // blocking pool (fire-and-forget) instead of blocking the worker.
         // Confirm the state still lands and reloads correctly.
-        let path = std::env::temp_dir()
-            .join(format!("nsacf-state-async-{}.json", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("nsacf-state-async-{}.json", uuid::Uuid::new_v4()));
         let mut ctx = NsacfContext::new();
         ctx.init(64);
         ctx.set_state_file(Some(path.clone()));
@@ -1299,7 +1310,9 @@ mod tests {
         ctx2.set_state_file(Some(path.clone()));
         assert!(ctx2.load_state());
         assert_eq!(
-            ctx2.quota_find_by_snssai(&s_nssai).expect("restored").max_ues,
+            ctx2.quota_find_by_snssai(&s_nssai)
+                .expect("restored")
+                .max_ues,
             5
         );
 

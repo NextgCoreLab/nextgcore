@@ -4,7 +4,9 @@
 
 use crate::errno::{NEXTGCORE_ERROR, NEXTGCORE_OK};
 use crate::sockaddr::NextgcoreSockaddr;
-use crate::socket::{nextgcore_sock_bind, nextgcore_sock_connect, nextgcore_sock_socket, NextgcoreSock};
+use crate::socket::{
+    nextgcore_sock_bind, nextgcore_sock_connect, nextgcore_sock_socket, NextgcoreSock,
+};
 use crate::sockopt::{nextgcore_bind_to_device, NextgcoreSockopt};
 
 /// Create a UDP server socket (identical to nextgcore_udp_server)
@@ -18,7 +20,9 @@ pub fn nextgcore_udp_server(
 
     while let Some(addr) = current {
         // Create socket
-        if let Some(mut sock) = nextgcore_sock_socket(addr.family, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+        if let Some(mut sock) =
+            nextgcore_sock_socket(addr.family, libc::SOCK_DGRAM, libc::IPPROTO_UDP)
+        {
             // Bind
             if nextgcore_sock_bind(&mut sock, addr) == NEXTGCORE_OK {
                 // Bind to device if specified
@@ -50,7 +54,9 @@ pub fn nextgcore_udp_client(
 
     while let Some(addr) = current {
         // Create socket
-        if let Some(mut sock) = nextgcore_sock_socket(addr.family, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+        if let Some(mut sock) =
+            nextgcore_sock_socket(addr.family, libc::SOCK_DGRAM, libc::IPPROTO_UDP)
+        {
             // Connect
             if nextgcore_sock_connect(&mut sock, addr) == NEXTGCORE_OK {
                 return Some(sock);

@@ -88,7 +88,13 @@ impl UperEncode for RequestCapabilitiesR9 {
         // Root presence bits: [commonIEs, a-gnss, otdoa, ecid, epdu].
         encoder.encode_sequence_preamble(
             Some(false),
-            &[self.common.is_some(), false, false, self.ecid.is_some(), false],
+            &[
+                self.common.is_some(),
+                false,
+                false,
+                self.ecid.is_some(),
+                false,
+            ],
         );
         if let Some(common) = &self.common {
             common.encode_uper(encoder)?;
@@ -186,7 +192,13 @@ impl UperEncode for ProvideCapabilitiesR9 {
     fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
         encoder.encode_sequence_preamble(
             Some(false),
-            &[self.common.is_some(), false, false, self.ecid.is_some(), false],
+            &[
+                self.common.is_some(),
+                false,
+                false,
+                self.ecid.is_some(),
+                false,
+            ],
         );
         if let Some(common) = &self.common {
             common.encode_uper(encoder)?;

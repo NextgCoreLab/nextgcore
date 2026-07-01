@@ -396,14 +396,14 @@ impl UperEncode for NrDlTdoaMeasElement {
         encoder.encode_sequence_preamble(
             Some(false),
             &[
-                self.nr_phys_cell_id.is_some(), // opt0
-                false,                          // opt1 nr-CellGlobalID UNSUPPORTED
-                self.nr_arfcn.is_some(),        // opt2
-                false,                          // opt3 nr-DL-PRS-ResourceID UNSUPPORTED
-                false,                          // opt4 nr-DL-PRS-ResourceSetID UNSUPPORTED
-                false,                          // opt5 nr-AdditionalPathList UNSUPPORTED
+                self.nr_phys_cell_id.is_some(),       // opt0
+                false,                                // opt1 nr-CellGlobalID UNSUPPORTED
+                self.nr_arfcn.is_some(),              // opt2
+                false,                                // opt3 nr-DL-PRS-ResourceID UNSUPPORTED
+                false,                                // opt4 nr-DL-PRS-ResourceSetID UNSUPPORTED
+                false,                                // opt5 nr-AdditionalPathList UNSUPPORTED
                 self.nr_dl_prs_rsrp_result.is_some(), // opt6
-                false,                          // opt7 nr-DL-TDOA-AdditionalMeasurements UNSUPPORTED
+                false, // opt7 nr-DL-TDOA-AdditionalMeasurements UNSUPPORTED
             ],
         );
         encoder.encode_constrained_whole_number(self.dl_prs_id as i64, &Self::DL_PRS_ID)?;

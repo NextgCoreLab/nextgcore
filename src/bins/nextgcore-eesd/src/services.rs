@@ -234,7 +234,10 @@ mod tests {
     /// Missing mandatory `easId` fails to deserialize → handler maps to 400.
     #[test]
     fn test_cea_announcement_missing_eas_id_fails() {
-        assert!(serde_json::from_str::<CeaAnnouncement>(r#"{"expTime":"2030-01-01T00:00:00Z"}"#).is_err());
+        assert!(
+            serde_json::from_str::<CeaAnnouncement>(r#"{"expTime":"2030-01-01T00:00:00Z"}"#)
+                .is_err()
+        );
     }
 
     /// Full round-trip including `announcementId` (server-populated in response).
@@ -297,7 +300,8 @@ mod tests {
     /// Mandatory `notificationUri` round-trips; missing it fails.
     #[test]
     fn test_acr_mgnt_event_subsc_roundtrip() {
-        let body = r#"{"notificationUri":"http://eec/cb","acrEvents":["ACR_COMPLETED","EAS_RELOCATED"]}"#;
+        let body =
+            r#"{"notificationUri":"http://eec/cb","acrEvents":["ACR_COMPLETED","EAS_RELOCATED"]}"#;
         let sub: AcrMgntEventSubsc = serde_json::from_str(body).expect("deserializes");
         assert_eq!(sub.notification_uri, "http://eec/cb");
         let events = sub.acr_events.unwrap();
@@ -308,18 +312,28 @@ mod tests {
 
     #[test]
     fn test_acr_mgnt_event_subsc_missing_uri_fails() {
-        assert!(
-            serde_json::from_str::<AcrMgntEventSubsc>(r#"{"eecId":"eec1"}"#).is_err()
-        );
+        assert!(serde_json::from_str::<AcrMgntEventSubsc>(r#"{"eecId":"eec1"}"#).is_err());
     }
 
     /// `AcrMgntEvent` enum serializes as SCREAMING_SNAKE_CASE.
     #[test]
     fn test_acr_mgnt_event_serialization() {
-        assert_eq!(serde_json::to_string(&AcrMgntEvent::AcrCompleted).unwrap(), r#""ACR_COMPLETED""#);
-        assert_eq!(serde_json::to_string(&AcrMgntEvent::AcrFailed).unwrap(), r#""ACR_FAILED""#);
-        assert_eq!(serde_json::to_string(&AcrMgntEvent::AcrInitiated).unwrap(), r#""ACR_INITIATED""#);
-        assert_eq!(serde_json::to_string(&AcrMgntEvent::EasRelocated).unwrap(), r#""EAS_RELOCATED""#);
+        assert_eq!(
+            serde_json::to_string(&AcrMgntEvent::AcrCompleted).unwrap(),
+            r#""ACR_COMPLETED""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AcrMgntEvent::AcrFailed).unwrap(),
+            r#""ACR_FAILED""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AcrMgntEvent::AcrInitiated).unwrap(),
+            r#""ACR_INITIATED""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AcrMgntEvent::EasRelocated).unwrap(),
+            r#""EAS_RELOCATED""#
+        );
     }
 
     // ---- EecCtxtRelReq / EecCtxtRelResp -------------------------------------
@@ -338,9 +352,10 @@ mod tests {
     /// Missing `srcEesId` fails.
     #[test]
     fn test_eec_ctxt_rel_req_missing_src_ees_id_fails() {
-        assert!(serde_json::from_str::<EecCtxtRelReq>(
-            r#"{"eecId":"eec1","tgtEesId":"ees-tgt"}"#
-        ).is_err());
+        assert!(
+            serde_json::from_str::<EecCtxtRelReq>(r#"{"eecId":"eec1","tgtEesId":"ees-tgt"}"#)
+                .is_err()
+        );
     }
 
     /// `EecCtxtRelResp` serializes `relocResult` as SCREAMING_SNAKE_CASE.
@@ -361,8 +376,14 @@ mod tests {
     /// `RelocResult` enum round-trips.
     #[test]
     fn test_reloc_result_serialization() {
-        assert_eq!(serde_json::to_string(&RelocResult::Success).unwrap(), r#""SUCCESS""#);
-        assert_eq!(serde_json::to_string(&RelocResult::Failure).unwrap(), r#""FAILURE""#);
+        assert_eq!(
+            serde_json::to_string(&RelocResult::Success).unwrap(),
+            r#""SUCCESS""#
+        );
+        assert_eq!(
+            serde_json::to_string(&RelocResult::Failure).unwrap(),
+            r#""FAILURE""#
+        );
         let s: RelocResult = serde_json::from_str(r#""SUCCESS""#).unwrap();
         assert_eq!(s, RelocResult::Success);
     }

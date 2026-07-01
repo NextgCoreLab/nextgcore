@@ -814,7 +814,11 @@ impl ApplyAction {
     pub fn encode_ie(&self, buf: &mut BytesMut) {
         use crate::ie::{encode_bytes_ie, IeType};
         let v = self.encode();
-        encode_bytes_ie(buf, IeType::ApplyAction, &[(v & 0xFF) as u8, (v >> 8) as u8]);
+        encode_bytes_ie(
+            buf,
+            IeType::ApplyAction,
+            &[(v & 0xFF) as u8, (v >> 8) as u8],
+        );
     }
 
     /// Decode the Apply Action IE payload from its wire octets (octet 5 first,
@@ -4226,8 +4230,7 @@ mod tests {
                 // Application ID IE (type 24): len 4, "app1"
                 0x00, 0x18, 0x00, 0x04, b'a', b'p', b'p', b'1',
                 // PFD context IE (type 59): len 11
-                0x00, 0x3B, 0x00, 0x0B,
-                // PFD Contents IE (type 61): len 7
+                0x00, 0x3B, 0x00, 0x0B, // PFD Contents IE (type 61): len 7
                 0x00, 0x3D, 0x00, 0x07, //
                 0x01, 0x00, 0x00, 0x03, b'a', b'b', b'c',
             ]
@@ -4301,7 +4304,11 @@ mod tests {
 
     #[test]
     fn test_fq_csid_ipv6_multi_csid_round_trip() {
-        let fq = FqCsid::new_ipv6([0x20; 16], vec![0x0001, 0x0002, 0x0003], FqCsidNodeType::Mme);
+        let fq = FqCsid::new_ipv6(
+            [0x20; 16],
+            vec![0x0001, 0x0002, 0x0003],
+            FqCsidNodeType::Mme,
+        );
         let mut buf = BytesMut::new();
         fq.encode(&mut buf);
         // octet5 = type1<<4 | 3 = 0x13, then 16 addr octets, 3x2 CSIDs, node-type.
@@ -4351,8 +4358,7 @@ mod tests {
             let mut buf = BytesMut::new();
             cp.encode(&mut buf);
             // V4 flag = bit2 (0x02), V6 flag = bit1 (0x01).
-            let expected_flags =
-                (cp.ipv6.is_some() as u8) | ((cp.ipv4.is_some() as u8) << 1);
+            let expected_flags = (cp.ipv6.is_some() as u8) | ((cp.ipv4.is_some() as u8) << 1);
             assert_eq!(buf[0], expected_flags);
             assert_eq!(CpIpAddress::decode(&buf.freeze()).unwrap(), cp);
         }

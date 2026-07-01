@@ -202,7 +202,9 @@ impl NextgcoreAppInitializer {
                 }
                 _ => {
                     // Count NF configuration sections
-                    nextgcore_app().global_conf_mut().count_nf_conf_section(&root_key);
+                    nextgcore_app()
+                        .global_conf_mut()
+                        .count_nf_conf_section(&root_key);
                 }
             }
         }
@@ -235,7 +237,10 @@ impl NextgcoreAppInitializer {
     }
 
     /// Parse logger configuration
-    fn parse_logger(&self, root_iter: &mut crate::yaml::NextgcoreYamlIter) -> Result<(), InitError> {
+    fn parse_logger(
+        &self,
+        root_iter: &mut crate::yaml::NextgcoreYamlIter,
+    ) -> Result<(), InitError> {
         if let Some(mut logger_iter) = root_iter.recurse() {
             while logger_iter.next() {
                 let logger_key = match logger_iter.key() {
@@ -250,7 +255,8 @@ impl NextgcoreAppInitializer {
                             // Legacy format: logger.file: /path/to/file
                             if let Some(child) = logger_iter.recurse() {
                                 if let Some(file) = child.value() {
-                                    nextgcore_app().context_mut().logger.file = Some(file.to_string());
+                                    nextgcore_app().context_mut().logger.file =
+                                        Some(file.to_string());
                                 }
                             }
                         } else {
@@ -311,14 +317,16 @@ impl NextgcoreAppInitializer {
                     "level" => {
                         if let Some(child) = logger_iter.recurse() {
                             if let Some(level) = child.value() {
-                                nextgcore_app().context_mut().logger.level = Some(level.to_string());
+                                nextgcore_app().context_mut().logger.level =
+                                    Some(level.to_string());
                             }
                         }
                     }
                     "domain" => {
                         if let Some(child) = logger_iter.recurse() {
                             if let Some(domain) = child.value() {
-                                nextgcore_app().context_mut().logger.domain = Some(domain.to_string());
+                                nextgcore_app().context_mut().logger.domain =
+                                    Some(domain.to_string());
                             }
                         }
                     }

@@ -9,7 +9,9 @@
 //! (2 bits) with no leading extension bit. NRPPa has no `transport` or `nas`
 //! cause category (unlike NGAP).
 
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError, PerResult};
+use crate::per::{
+    AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError, PerResult,
+};
 
 /// CauseRadioNetwork
 /// ASN.1: ENUMERATED { unspecified, requested-item-not-supported,
@@ -194,7 +196,9 @@ impl AperDecode for Cause {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let index = decoder.decode_choice_index(Self::NUM_ALTERNATIVES, Self::EXTENSIBLE)?;
         match index {
-            0 => Ok(Cause::RadioNetwork(CauseRadioNetwork::decode_aper(decoder)?)),
+            0 => Ok(Cause::RadioNetwork(CauseRadioNetwork::decode_aper(
+                decoder,
+            )?)),
             1 => Ok(Cause::Protocol(CauseProtocol::decode_aper(decoder)?)),
             2 => Ok(Cause::Misc(CauseMisc::decode_aper(decoder)?)),
             3 => Err(PerError::DecodeError(
@@ -225,7 +229,9 @@ mod tests {
     #[test]
     fn test_cause_all_alternatives_roundtrip() {
         roundtrip(Cause::RadioNetwork(CauseRadioNetwork::Unspecified));
-        roundtrip(Cause::RadioNetwork(CauseRadioNetwork::ServingNgRanNodeChanged));
+        roundtrip(Cause::RadioNetwork(
+            CauseRadioNetwork::ServingNgRanNodeChanged,
+        ));
         roundtrip(Cause::Protocol(CauseProtocol::SemanticError));
         roundtrip(Cause::Misc(CauseMisc::Unspecified));
     }

@@ -1191,7 +1191,10 @@ mod tests {
         let result = builder.build();
 
         assert_eq!(result.len(), 4);
-        assert_eq!(result[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        assert_eq!(
+            result[0],
+            NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM
+        );
         assert_eq!(result[1], 5); // PSI
         assert_eq!(result[2], 1); // PTI
         assert_eq!(result[3], message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT);

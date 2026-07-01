@@ -296,14 +296,15 @@ impl UperEncode for GnssSystemTime {
         encoder.encode_sequence_preamble(
             Some(false),
             &[
-                self.gnss_time_of_day_frac_msec.is_some(), // opt0
+                self.gnss_time_of_day_frac_msec.is_some(),  // opt0
                 self.notification_of_leap_second.is_some(), // opt1
-                false,                                     // opt2 gps-TOW-Assist UNSUPPORTED
+                false,                                      // opt2 gps-TOW-Assist UNSUPPORTED
             ],
         );
         self.gnss_time_id.encode_uper(encoder)?;
         encoder.encode_constrained_whole_number(self.gnss_day_number as i64, &Self::DAY_NUMBER)?;
-        encoder.encode_constrained_whole_number(self.gnss_time_of_day as i64, &Self::TIME_OF_DAY)?;
+        encoder
+            .encode_constrained_whole_number(self.gnss_time_of_day as i64, &Self::TIME_OF_DAY)?;
         if let Some(frac) = self.gnss_time_of_day_frac_msec {
             encoder.encode_constrained_whole_number(frac as i64, &Self::TIME_OF_DAY_FRAC)?;
         }
@@ -404,7 +405,10 @@ impl UperDecode for NetworkTimeEUtra {
         if ext {
             decoder.decode_extension_additions()?;
         }
-        Ok(NetworkTimeEUtra { phys_cell_id, earfcn })
+        Ok(NetworkTimeEUtra {
+            phys_cell_id,
+            earfcn,
+        })
     }
 }
 
@@ -438,7 +442,9 @@ impl UperDecode for NetworkCellId {
     fn decode_uper(decoder: &mut UperDecoder) -> PerResult<Self> {
         let index = decoder.decode_choice_index(Self::NUM_ALTERNATIVES, Self::EXTENSIBLE)?;
         match index {
-            0 => Ok(NetworkCellId::EUtra(NetworkTimeEUtra::decode_uper(decoder)?)),
+            0 => Ok(NetworkCellId::EUtra(NetworkTimeEUtra::decode_uper(
+                decoder,
+            )?)),
             other => Err(PerError::DecodeError(format!(
                 "NetworkTime cellID alternative {other} (uTRA/gSM/nR-r15) not supported in v1"
             ))),
@@ -566,14 +572,14 @@ impl UperDecode for GnssCommonAssistData {
     fn decode_uper(decoder: &mut UperDecoder) -> PerResult<Self> {
         let (ext, opts) = decoder.decode_sequence_preamble(true, 4)?;
         let gnss_reference_time = if opts[0] {
-            Some(super::reference_time::GnssReferenceTime::decode_uper(decoder)?)
+            Some(super::reference_time::GnssReferenceTime::decode_uper(
+                decoder,
+            )?)
         } else {
             None
         };
         let gnss_reference_location = if opts[1] {
-            Some(super::reference_location::GnssReferenceLocation::decode_uper(
-                decoder,
-            )?)
+            Some(super::reference_location::GnssReferenceLocation::decode_uper(decoder)?)
         } else {
             None
         };
@@ -585,11 +591,7 @@ impl UperDecode for GnssCommonAssistData {
             None
         };
         let gnss_earth_orientation_parameters = if opts[3] {
-            Some(
-                super::earth_orientation::GnssEarthOrientationParameters::decode_uper(
-                    decoder,
-                )?,
-            )
+            Some(super::earth_orientation::GnssEarthOrientationParameters::decode_uper(decoder)?)
         } else {
             None
         };
@@ -641,8 +643,7 @@ pub struct GnssGenericAssistDataElement {
         Option<super::acquisition_assistance::GnssAcquisitionAssistance>,
     pub gnss_almanac: Option<super::almanac::GnssAlmanac>,
     pub gnss_utc_model: Option<super::utc_model::GnssUtcModel>,
-    pub gnss_auxiliary_information:
-        Option<super::auxiliary_information::GnssAuxiliaryInformation>,
+    pub gnss_auxiliary_information: Option<super::auxiliary_information::GnssAuxiliaryInformation>,
 }
 
 impl UperEncode for GnssGenericAssistDataElement {
@@ -726,23 +727,17 @@ impl UperDecode for GnssGenericAssistDataElement {
             None
         };
         let gnss_real_time_integrity = if opts[4] {
-            Some(super::real_time_integrity::GnssRealTimeIntegrity::decode_uper(
-                decoder,
-            )?)
+            Some(super::real_time_integrity::GnssRealTimeIntegrity::decode_uper(decoder)?)
         } else {
             None
         };
         let gnss_data_bit_assistance = if opts[5] {
-            Some(super::data_bit_assistance::GnssDataBitAssistance::decode_uper(
-                decoder,
-            )?)
+            Some(super::data_bit_assistance::GnssDataBitAssistance::decode_uper(decoder)?)
         } else {
             None
         };
         let gnss_acquisition_assistance = if opts[6] {
-            Some(
-                super::acquisition_assistance::GnssAcquisitionAssistance::decode_uper(decoder)?,
-            )
+            Some(super::acquisition_assistance::GnssAcquisitionAssistance::decode_uper(decoder)?)
         } else {
             None
         };

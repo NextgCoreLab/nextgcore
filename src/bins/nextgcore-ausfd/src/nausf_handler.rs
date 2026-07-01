@@ -382,12 +382,18 @@ mod tests {
             0xe1, 0xf0,
         ];
         let res_star = xres_star;
-        assert!(compare_res_star(&res_star, &xres_star), "exact match -> true");
+        assert!(
+            compare_res_star(&res_star, &xres_star),
+            "exact match -> true"
+        );
 
         // Flip a single byte -> failure.
         let mut wrong = xres_star;
         wrong[7] ^= 0x01;
-        assert!(!compare_res_star(&wrong, &xres_star), "one-byte flip -> false");
+        assert!(
+            !compare_res_star(&wrong, &xres_star),
+            "one-byte flip -> false"
+        );
 
         // Length mismatch -> false (no panic).
         assert!(!compare_res_star(&xres_star[..8], &xres_star));

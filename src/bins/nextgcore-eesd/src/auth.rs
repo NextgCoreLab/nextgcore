@@ -183,7 +183,8 @@ mod tests {
     fn test_require_oauth2_invalid_token_401() {
         let sk = signing_key();
         let jwks = jwks_for(&sk, "k1");
-        let resp = require_oauth2_with(Some("Bearer not.a.jwt"), SCOPE_EASREGISTRATION, Some(&jwks));
+        let resp =
+            require_oauth2_with(Some("Bearer not.a.jwt"), SCOPE_EASREGISTRATION, Some(&jwks));
         assert_eq!(resp.unwrap().status, 401);
     }
 
@@ -204,7 +205,10 @@ mod tests {
         let token = mint_token(&sk, "k1", "eees-easregistration");
         let header = format!("Bearer {token}");
         let resp = require_oauth2_with(Some(&header), SCOPE_EASREGISTRATION, Some(&jwks));
-        assert!(resp.is_none(), "valid token with correct scope is authorized");
+        assert!(
+            resp.is_none(),
+            "valid token with correct scope is authorized"
+        );
     }
 
     #[test]

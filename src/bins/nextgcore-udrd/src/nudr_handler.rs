@@ -268,9 +268,11 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                                         } else {
                                             pei
                                         };
-                                        if let Err(e) = nextgcore_dbi::subscription::nextgcore_dbi_update_imeisv(
-                                            supi, imeisv,
-                                        ) {
+                                        if let Err(e) =
+                                            nextgcore_dbi::subscription::nextgcore_dbi_update_imeisv(
+                                                supi, imeisv,
+                                            )
+                                        {
                                             log::error!("[{supi}] DB update_imeisv failed: {e:?}");
                                         }
                                     }
@@ -387,7 +389,8 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
     }
 
     // Get subscription data from database
-    let subscription_data = match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data(supi) {
+    let subscription_data = match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data(supi)
+    {
         Ok(data) => data,
         Err(e) => {
             log::error!("[{supi}] DB subscription_data query failed: {e:?}");
@@ -539,7 +542,9 @@ fn build_am_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serd
 }
 
 /// Build SmfSelectionSubscriptionData JSON from subscription data
-fn build_smf_selection_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serde_json::Value {
+fn build_smf_selection_data(
+    data: &nextgcore_dbi::types::NextgcoreSubscriptionData,
+) -> serde_json::Value {
     let mut smf_sel = serde_json::Map::new();
     let mut snssai_infos = serde_json::Map::new();
 

@@ -154,7 +154,10 @@ async fn main() -> Result<()> {
     )
     .ok();
 
-    log::info!("NextGCore PIN application server v{}", env!("CARGO_PKG_VERSION"));
+    log::info!(
+        "NextGCore PIN application server v{}",
+        env!("CARGO_PKG_VERSION")
+    );
     log::info!("Application-layer Personal IoT Network server (TS 23.542; PIN-6/7/8)");
 
     pin_context_init(
@@ -325,7 +328,11 @@ fn caller_supi_from_token(request: &SbiRequest) -> Option<String> {
 ///
 /// With neither trusted source available the caller is anonymous (`None`) and
 /// every management/state-changing operation denies it.
-fn extract_caller_supi(request: &SbiRequest, trust_token: bool, trust_header: bool) -> Option<String> {
+fn extract_caller_supi(
+    request: &SbiRequest,
+    trust_token: bool,
+    trust_header: bool,
+) -> Option<String> {
     // 1. Verified JWT sub claim (highest priority).
     if trust_token {
         if let Some(sub) = caller_supi_from_token(request) {
@@ -375,9 +382,7 @@ fn send_pin_forbidden(err: &PinContextError, problem_type: &str) -> SbiResponse 
         "cause": err.cause(),
     });
     if let Ok(json) = serde_json::to_string(&body) {
-        response
-            .http
-            .set_content(json);
+        response.http.set_content(json);
         response
             .http
             .set_header("Content-Type", "application/problem+json");
@@ -449,12 +454,7 @@ async fn handle_pin_create(request: &SbiRequest) -> SbiResponse {
     // UE Identifier (M).
     let ue_id = match data.get("ueId").and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => s.trim(),
-        _ => {
-            return send_bad_request(
-                "Missing UE Identifier (ueId)",
-                Some("MANDATORY_IE_MISSING"),
-            )
-        }
+        _ => return send_bad_request("Missing UE Identifier (ueId)", Some("MANDATORY_IE_MISSING")),
     };
     // Security credentials (M). Presence + non-empty format check; full
     // authorization validation is tracked under PIND-10.
@@ -1068,8 +1068,8 @@ mod tests {
     /// trusted via `--trust-caller-supi-header`.
     #[test]
     fn extract_caller_supi_header_ignored_when_not_trusted() {
-        let request = SbiRequest::post("/pinapp/v1/pins")
-            .with_header("x-caller-supi", "imsi-forged");
+        let request =
+            SbiRequest::post("/pinapp/v1/pins").with_header("x-caller-supi", "imsi-forged");
         assert_eq!(extract_caller_supi(&request, false, false), None);
     }
 
@@ -1094,7 +1094,10 @@ mod tests {
             serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["status"], 403);
         assert_eq!(body["cause"], "PEMC_REQUIRES_OWNER");
-        assert_eq!(body["type"], "urn:nextgcore:pin:element-authorization-failed");
+        assert_eq!(
+            body["type"],
+            "urn:nextgcore:pin:element-authorization-failed"
+        );
     }
 
     #[test]
@@ -1190,7 +1193,10 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert!(body["pinId"].as_str().is_some(), "201 must carry pinId");
-        assert_eq!(body["ownerSupi"], caller, "owner is the authenticated caller");
+        assert_eq!(
+            body["ownerSupi"], caller,
+            "owner is the authenticated caller"
+        );
         assert!(
             body["expirationTime"].as_u64().unwrap() > 0,
             "201 must carry a mandatory Expiration time"
@@ -1260,7 +1266,9 @@ mod tests {
         let elem_id = {
             let ctx = pin_self();
             let guard = ctx.read().expect("ctx read");
-            let pin = guard.pin_create("Home", "imsi-owner-dereg").expect("seed pin");
+            let pin = guard
+                .pin_create("Home", "imsi-owner-dereg")
+                .expect("seed pin");
             guard
                 .element_register(
                     &pin.pin_id,

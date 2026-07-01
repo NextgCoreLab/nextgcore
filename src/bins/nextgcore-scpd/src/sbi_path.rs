@@ -363,7 +363,11 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
-                .or_else(|| inst.get("fqdn").and_then(|v| v.as_str()).map(str::to_string))
+                .or_else(|| {
+                    inst.get("fqdn")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
                 .or_else(|| {
                     inst.get("ipv6Addresses")
                         .and_then(|v| v.as_array())
@@ -819,5 +823,4 @@ mod tests {
         let candidates = parse_search_result(&body);
         assert_eq!(candidates[0].host, "ausf.5gc.example.org");
     }
-
 }

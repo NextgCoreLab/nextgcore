@@ -358,8 +358,10 @@ async fn register_with_nrf(
         200 | 201 => {
             log::info!("DCCF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance =
-                nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Dccf);
+            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
+                nf_instance_id,
+                nextgcore_sbi::types::NfType::Dccf,
+            );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = nextgcore_sbi::context::NfService::new(
                 "ndccf-datamanagement",

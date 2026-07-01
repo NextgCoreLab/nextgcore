@@ -121,9 +121,9 @@ impl MediaType {
     /// non-GBR default bearer 5QI 9.
     pub fn default_5qi(self) -> u8 {
         match self {
-            MediaType::Audio => 1,       // conversational voice (GBR)
-            MediaType::Video => 2,       // conversational video / live (GBR)
-            MediaType::Control => 5,     // IMS signalling (non-GBR)
+            MediaType::Audio => 1,   // conversational voice (GBR)
+            MediaType::Video => 2,   // conversational video / live (GBR)
+            MediaType::Control => 5, // IMS signalling (non-GBR)
             MediaType::Application | MediaType::Message | MediaType::Other => 9,
         }
     }
@@ -638,8 +638,7 @@ pub fn pcf_npcf_smpolicycontrol_handle_create(
 
     // Determine V-PCF/H-PCF role from the session's serving PLMN vs. the
     // configured local PLMN (pcfd-10).
-    let is_vplmn =
-        is_serving_plmn_vplmn(&sess.serving.plmn_id.mcc, &sess.serving.plmn_id.mnc);
+    let is_vplmn = is_serving_plmn_vplmn(&sess.serving.plmn_id.mcc, &sess.serving.plmn_id.mnc);
 
     if is_vplmn {
         // Visited PLMN - register with BSF

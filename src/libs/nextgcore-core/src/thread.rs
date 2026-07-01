@@ -26,7 +26,9 @@ pub fn nextgcore_thread_mutex_init<T>(data: T) -> NextgcoreThreadMutex<T> {
 
 /// Lock a mutex and return the guard
 #[inline]
-pub fn nextgcore_thread_mutex_lock<T>(mutex: &NextgcoreThreadMutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub fn nextgcore_thread_mutex_lock<T>(
+    mutex: &NextgcoreThreadMutex<T>,
+) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 

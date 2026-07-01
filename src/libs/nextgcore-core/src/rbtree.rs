@@ -358,7 +358,11 @@ impl NextgcoreRbtree {
         (*node).parent = left;
     }
 
-    unsafe fn delete_color(&mut self, mut node: *mut NextgcoreRbnode, mut parent: *mut NextgcoreRbnode) {
+    unsafe fn delete_color(
+        &mut self,
+        mut node: *mut NextgcoreRbnode,
+        mut parent: *mut NextgcoreRbnode,
+    ) {
         fn is_black(node: *mut NextgcoreRbnode) -> bool {
             node.is_null() || unsafe { (*node).color == NextgcoreRbtreeColor::Black }
         }

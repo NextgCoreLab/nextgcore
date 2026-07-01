@@ -1108,10 +1108,7 @@ impl BsfContext {
 
     /// Return all MBS bindings keyed by the given mbs_session_id.
     /// TS 29.521 §4.2.2.4: a duplicate is 403; multi-match is 400.
-    pub fn mbs_binding_find_by_mbs_session_id(
-        &self,
-        mbs_session_id: &str,
-    ) -> Vec<PcfMbsBinding> {
+    pub fn mbs_binding_find_by_mbs_session_id(&self, mbs_session_id: &str) -> Vec<PcfMbsBinding> {
         match self.mbs_binding_list.read() {
             Ok(list) => list
                 .values()
@@ -1999,8 +1996,14 @@ mod tests {
         assert_eq!(restored.pcf_id.as_deref(), Some("pcf-uuid-1234"));
         assert_eq!(restored.pcf_set_id.as_deref(), Some("pcfSet-01"));
         assert_eq!(restored.bind_level.as_deref(), Some("NF_INSTANCE"));
-        assert_eq!(restored.recovery_time.as_deref(), Some("2026-06-01T00:00:00Z"));
-        assert_eq!(restored.pcf_diam_host.as_deref(), Some("pcf.diam.example.com"));
+        assert_eq!(
+            restored.recovery_time.as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
+        assert_eq!(
+            restored.pcf_diam_host.as_deref(),
+            Some("pcf.diam.example.com")
+        );
         assert_eq!(restored.pcf_diam_realm.as_deref(), Some("example.com"));
     }
 
@@ -2035,11 +2038,7 @@ mod tests {
             .is_some());
         // Different SUPI: no match.
         assert!(ctx
-            .sess_find_by_dnn_snssai_supi(
-                "internet",
-                &SNssai::new(1, Some(0x010203)),
-                "imsi-999"
-            )
+            .sess_find_by_dnn_snssai_supi("internet", &SNssai::new(1, Some(0x010203)), "imsi-999")
             .is_none());
         // Different DNN: no match.
         assert!(ctx
@@ -2083,14 +2082,19 @@ mod tests {
         assert_eq!(found[0].pcf_fqdn.as_deref(), Some("pcf.example.com"));
 
         // No match on supi filter.
-        assert!(ctx.ue_binding_find_matching(Some("imsi-000"), None).is_empty());
+        assert!(ctx
+            .ue_binding_find_matching(Some("imsi-000"), None)
+            .is_empty());
 
         // Update.
         let mut updated = b.clone();
         updated.pcf_fqdn = Some("pcf2.example.com".to_string());
         assert!(ctx.ue_binding_update(&updated));
         assert_eq!(
-            ctx.ue_binding_find_by_id("ue-1").unwrap().pcf_fqdn.as_deref(),
+            ctx.ue_binding_find_by_id("ue-1")
+                .unwrap()
+                .pcf_fqdn
+                .as_deref(),
             Some("pcf2.example.com")
         );
 
@@ -2141,7 +2145,9 @@ mod tests {
         assert_eq!(ctx.mbs_binding_find_by_mbs_session_id("TMGI-ABC").len(), 1);
 
         // Different mbs_session_id: no match.
-        assert!(ctx.mbs_binding_find_by_mbs_session_id("TMGI-XYZ").is_empty());
+        assert!(ctx
+            .mbs_binding_find_by_mbs_session_id("TMGI-XYZ")
+            .is_empty());
     }
 
     #[test]

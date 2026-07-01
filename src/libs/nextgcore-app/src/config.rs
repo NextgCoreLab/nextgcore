@@ -670,8 +670,9 @@ impl NextgcoreLocalConf {
 
                                 if let (Some(mcc_val), Some(mnc_val)) = (mcc, mnc) {
                                     if self.serving_plmn_id.len() < NEXTGCORE_MAX_NUM_OF_PLMN {
-                                        self.serving_plmn_id
-                                            .push(NextgcorePlmnId::build(mcc_val, mnc_val, mnc_len));
+                                        self.serving_plmn_id.push(NextgcorePlmnId::build(
+                                            mcc_val, mnc_val, mnc_len,
+                                        ));
                                     }
                                 }
                             }
@@ -753,7 +754,8 @@ impl NextgcoreLocalConf {
                                 if msg_key == "duration" {
                                     if let Some(child) = msg_iter.recurse() {
                                         if let Some(v) = child.int_value() {
-                                            self.time.message.duration = nextgcore_time_from_msec(v);
+                                            self.time.message.duration =
+                                                nextgcore_time_from_msec(v);
                                             self.regenerate_timer_durations();
                                         }
                                     }
@@ -772,7 +774,8 @@ impl NextgcoreLocalConf {
                                 if ho_key == "duration" {
                                     if let Some(child) = ho_iter.recurse() {
                                         if let Some(v) = child.int_value() {
-                                            self.time.handover.duration = nextgcore_time_from_msec(v);
+                                            self.time.handover.duration =
+                                                nextgcore_time_from_msec(v);
                                         }
                                     }
                                 }

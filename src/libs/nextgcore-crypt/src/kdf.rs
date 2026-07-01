@@ -367,7 +367,10 @@ pub fn nextgcore_auc_kasme(
 /// TS33.401 Annex A.3: KeNB derivation function
 ///
 /// Derives KeNB from KASME and uplink NAS COUNT.
-pub fn nextgcore_kdf_kenb(kasme: &[u8; SHA256_DIGEST_SIZE], ul_count: u32) -> [u8; SHA256_DIGEST_SIZE] {
+pub fn nextgcore_kdf_kenb(
+    kasme: &[u8; SHA256_DIGEST_SIZE],
+    ul_count: u32,
+) -> [u8; SHA256_DIGEST_SIZE] {
     let ul_count_be = ul_count.to_be_bytes();
 
     let mut params = [KdfParam::default()];

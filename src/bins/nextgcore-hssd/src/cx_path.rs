@@ -108,7 +108,8 @@ pub fn handle_uar(
 
     // 1. Check if user exists in DB
     let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
-    let _ims_data = nextgcore_dbi_ims_data(&supi).map_err(|e| format!("Failed to get IMS data: {e}"))?;
+    let _ims_data =
+        nextgcore_dbi_ims_data(&supi).map_err(|e| format!("Failed to get IMS data: {e}"))?;
 
     // 2. Associate identity if needed
     let ctx = hss_self();
@@ -247,8 +248,8 @@ pub fn handle_sar(
         ServerAssignmentType::Registration | ServerAssignmentType::ReRegistration => {
             // Get IMS user data from DB
             let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
-            let _ims_data =
-                nextgcore_dbi_ims_data(&supi).map_err(|e| format!("Failed to get IMS data: {e}"))?;
+            let _ims_data = nextgcore_dbi_ims_data(&supi)
+                .map_err(|e| format!("Failed to get IMS data: {e}"))?;
 
             // 3. Return SAA with User-Data (XML)
             // Note: In full implementation, this would build IMS user profile XML

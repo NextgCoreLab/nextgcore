@@ -282,7 +282,9 @@ impl From<nextgcore_diameter::error::DiameterError> for DiameterError {
         match e {
             nextgcore_diameter::error::DiameterError::Io(_) => DiameterError::ConnectionFailed,
             nextgcore_diameter::error::DiameterError::Protocol(_) => DiameterError::SendFailed,
-            nextgcore_diameter::error::DiameterError::InvalidMessage(_) => DiameterError::InvalidResponse,
+            nextgcore_diameter::error::DiameterError::InvalidMessage(_) => {
+                DiameterError::InvalidResponse
+            }
             _ => DiameterError::SendFailed,
         }
     }
@@ -654,7 +656,10 @@ pub async fn mme_s6a_send_pur(mme_ue: &MmeUe) -> DiameterResult<(u32, u32)> {
 
     let result_code = answer.result_code().unwrap_or(0);
     let pua_flags = answer
-        .find_vendor_avp(avp_code::PUA_FLAGS, nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID)
+        .find_vendor_avp(
+            avp_code::PUA_FLAGS,
+            nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID,
+        )
         .and_then(|a| a.as_u32())
         .unwrap_or(0);
 
@@ -757,7 +762,10 @@ pub async fn mme_fd_recv_inbound(
                 return Ok(None);
             };
             let clr_flags = request
-                .find_vendor_avp(avp_code::CLR_FLAGS, nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID)
+                .find_vendor_avp(
+                    avp_code::CLR_FLAGS,
+                    nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID,
+                )
                 .and_then(|a| a.as_u32())
                 .unwrap_or(0);
 
@@ -785,7 +793,10 @@ pub async fn mme_fd_recv_inbound(
             };
             let subscription_data = s6a::parse_subscription_data_avp(sub_avp);
             let idr_flags = request
-                .find_vendor_avp(avp_code::IDR_FLAGS, nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID)
+                .find_vendor_avp(
+                    avp_code::IDR_FLAGS,
+                    nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID,
+                )
                 .and_then(|a| a.as_u32())
                 .unwrap_or(0);
 

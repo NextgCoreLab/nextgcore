@@ -2354,7 +2354,11 @@ mod tests {
             false,
         );
         let msg2 = b2.build();
-        assert_eq!(msg2[4] & 0x01, 0x01, "V6 flag (Bit1=0x01) must be set for IPv6");
+        assert_eq!(
+            msg2[4] & 0x01,
+            0x01,
+            "V6 flag (Bit1=0x01) must be set for IPv6"
+        );
     }
 
     /// upfd-05: TS 29.244 §8.2.3 — CHID flag (Bit4=0x08) must be set in F-TEID
@@ -2374,7 +2378,11 @@ mod tests {
         let msg = b.build();
         let octet5 = msg[4];
         assert_eq!(octet5 & 0x04, 0x04, "CH flag (0x04) must be set");
-        assert_eq!(octet5 & 0x08, 0x08, "CHID flag (0x08) must be set when choose_id is Some");
+        assert_eq!(
+            octet5 & 0x08,
+            0x08,
+            "CHID flag (0x08) must be set when choose_id is Some"
+        );
         // CHOOSE ID byte is the last byte of the IE value
         assert_eq!(*msg.last().unwrap(), 7, "CHOOSE ID byte must be 7");
 
@@ -2384,6 +2392,10 @@ mod tests {
         let parsed = ParsedFTeid::parse(ie_value).expect("CH+CHID F-TEID must parse");
         assert!(parsed.ch, "parsed CH must be true");
         assert!(parsed.chid, "parsed CHID must be true");
-        assert_eq!(parsed.choose_id, Some(7), "parsed choose_id must be Some(7)");
+        assert_eq!(
+            parsed.choose_id,
+            Some(7),
+            "parsed choose_id must be Some(7)"
+        );
     }
 }

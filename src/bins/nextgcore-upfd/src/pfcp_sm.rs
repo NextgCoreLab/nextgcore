@@ -41,8 +41,7 @@ pub mod pfcp_msg_type {
 // ============================================================================
 
 /// PFCP FSM state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PfcpState {
     /// Initial state
     #[default]
@@ -56,7 +55,6 @@ pub enum PfcpState {
     /// Exception state
     Exception,
 }
-
 
 // ============================================================================
 // PFCP State Machine Context

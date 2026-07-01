@@ -307,8 +307,10 @@ async fn register_with_nrf(
         200 | 201 => {
             log::info!("NWDAF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance =
-                nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Nwdaf);
+            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
+                nf_instance_id,
+                nextgcore_sbi::types::NfType::Nwdaf,
+            );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = nextgcore_sbi::context::NfService::new(
                 "nnwdaf-eventssubscription",
@@ -397,7 +399,10 @@ mod tests {
         // A GET with a valid event-id reaches the handler and yields 200.
         let req = SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD");
         let resp = nwdaf_sbi_request_handler(req).await;
-        assert_eq!(resp.status, 200, "GET /analytics?event-id=NF_LOAD must be 200");
+        assert_eq!(
+            resp.status, 200,
+            "GET /analytics?event-id=NF_LOAD must be 200"
+        );
     }
 
     // --- nwafd-05: Nnwdaf_MLModelProvision is Subscribe/Notify, not /models ---

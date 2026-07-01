@@ -195,7 +195,10 @@ impl fmt::Display for PositioningError {
             PositioningError::UnknownTrp(id) => write!(f, "unknown TRP id: {id}"),
             PositioningError::DegenerateGeometry(d) => write!(f, "degenerate geometry: {d}"),
             PositioningError::NoConvergence { iterations } => {
-                write!(f, "least-squares did not converge in {iterations} iterations")
+                write!(
+                    f,
+                    "least-squares did not converge in {iterations} iterations"
+                )
             }
             PositioningError::InvalidMeasurement(d) => write!(f, "invalid measurement: {d}"),
         }
@@ -279,8 +282,7 @@ impl TrpRegistry {
 
     /// ENU position of a TRP relative to the registry origin, if registered.
     pub fn enu_of(&self, id: &str) -> Option<EnuPoint> {
-        self.lookup(id)
-            .map(|c| geodetic_to_enu(c, self.origin))
+        self.lookup(id).map(|c| geodetic_to_enu(c, self.origin))
     }
 
     /// Map a geodetic coordinate to ENU relative to the registry origin.
@@ -465,7 +467,7 @@ fn eigen_2x2_sym(m: [[f64; 2]; 2]) -> (f64, f64, f64) {
     let disc = (((a - c) * 0.5).powi(2) + b * b).max(0.0).sqrt();
     let l1 = tr * 0.5 + disc; // major
     let l2 = (tr * 0.5 - disc).max(0.0); // minor (clamp tiny negatives)
-    // Eigenvector for l1: (b, l1 - a) unless b ~ 0 (already diagonal).
+                                         // Eigenvector for l1: (b, l1 - a) unless b ~ 0 (already diagonal).
     let (ve, vn) = if b.abs() > 1e-15 {
         (b, l1 - a)
     } else if a >= c {
@@ -810,10 +812,7 @@ pub fn solve_aoa(
 
 /// Build `sigma^2 (A^T A)^-1`, flooring a singular/near-zero σ² so noiseless
 /// solutions report a tiny (non-degenerate) ellipse instead of failing.
-fn scaled_covariance(
-    at_a: [[f64; 2]; 2],
-    sigma2: f64,
-) -> Result<[[f64; 2]; 2], PositioningError> {
+fn scaled_covariance(at_a: [[f64; 2]; 2], sigma2: f64) -> Result<[[f64; 2]; 2], PositioningError> {
     let inv = invert_2x2_sym(at_a).ok_or_else(|| {
         PositioningError::DegenerateGeometry("information matrix is singular".to_string())
     })?;
@@ -905,10 +904,38 @@ mod tests {
         let origin = TrpCoord::new(ORIGIN_LAT, ORIGIN_LON, 0.0);
         // TRP ENU layout (metres): a non-collinear quad around the area.
         let trp_enu = [
-            ("trp-a", EnuPoint { e: 0.0, n: 0.0, u: 0.0 }),
-            ("trp-b", EnuPoint { e: 1000.0, n: 0.0, u: 0.0 }),
-            ("trp-c", EnuPoint { e: 0.0, n: 1000.0, u: 0.0 }),
-            ("trp-d", EnuPoint { e: 1000.0, n: 1000.0, u: 0.0 }),
+            (
+                "trp-a",
+                EnuPoint {
+                    e: 0.0,
+                    n: 0.0,
+                    u: 0.0,
+                },
+            ),
+            (
+                "trp-b",
+                EnuPoint {
+                    e: 1000.0,
+                    n: 0.0,
+                    u: 0.0,
+                },
+            ),
+            (
+                "trp-c",
+                EnuPoint {
+                    e: 0.0,
+                    n: 1000.0,
+                    u: 0.0,
+                },
+            ),
+            (
+                "trp-d",
+                EnuPoint {
+                    e: 1000.0,
+                    n: 1000.0,
+                    u: 0.0,
+                },
+            ),
         ];
         let entries: Vec<(String, TrpCoord)> = trp_enu
             .iter()
@@ -1064,7 +1091,10 @@ mod tests {
             })
             .collect();
         let err = solve_multi_rtt(&registry, &obs).unwrap_err();
-        assert_eq!(err, PositioningError::InsufficientTrps { needed: 3, got: 2 });
+        assert_eq!(
+            err,
+            PositioningError::InsufficientTrps { needed: 3, got: 2 }
+        );
     }
 
     #[test]
@@ -1072,15 +1102,40 @@ mod tests {
         // Three TRPs on a straight East line => collinear geometry rejected.
         let origin = TrpCoord::new(ORIGIN_LAT, ORIGIN_LON, 0.0);
         let entries: Vec<(String, TrpCoord)> = [
-            ("c0", EnuPoint { e: 0.0, n: 0.0, u: 0.0 }),
-            ("c1", EnuPoint { e: 500.0, n: 0.0, u: 0.0 }),
-            ("c2", EnuPoint { e: 1000.0, n: 0.0, u: 0.0 }),
+            (
+                "c0",
+                EnuPoint {
+                    e: 0.0,
+                    n: 0.0,
+                    u: 0.0,
+                },
+            ),
+            (
+                "c1",
+                EnuPoint {
+                    e: 500.0,
+                    n: 0.0,
+                    u: 0.0,
+                },
+            ),
+            (
+                "c2",
+                EnuPoint {
+                    e: 1000.0,
+                    n: 0.0,
+                    u: 0.0,
+                },
+            ),
         ]
         .iter()
         .map(|(id, p)| (id.to_string(), enu_to_geodetic(*p, origin)))
         .collect();
         let registry = TrpRegistry::with_origin(entries, origin);
-        let ue = EnuPoint { e: 400.0, n: 300.0, u: 0.0 };
+        let ue = EnuPoint {
+            e: 400.0,
+            n: 300.0,
+            u: 0.0,
+        };
         let obs: Vec<RttObservation> = ["c0", "c1", "c2"]
             .iter()
             .map(|id| RttObservation {
@@ -1185,7 +1240,10 @@ mod tests {
             },
         ];
         let err = solve_tdoa(&registry, &obs).unwrap_err();
-        assert_eq!(err, PositioningError::InsufficientTrps { needed: 3, got: 2 });
+        assert_eq!(
+            err,
+            PositioningError::InsufficientTrps { needed: 3, got: 2 }
+        );
     }
 
     // -- AoA bearing intersection -------------------------------------------
@@ -1279,7 +1337,10 @@ mod tests {
             azimuth_deg: bearing("trp-a"),
         }];
         let err = solve_aoa(&registry, &obs).unwrap_err();
-        assert_eq!(err, PositioningError::InsufficientTrps { needed: 2, got: 1 });
+        assert_eq!(
+            err,
+            PositioningError::InsufficientTrps { needed: 2, got: 1 }
+        );
     }
 
     #[test]
@@ -1287,8 +1348,22 @@ mod tests {
         // Two TRPs with identical bearings (parallel lines) => singular system.
         let origin = TrpCoord::new(ORIGIN_LAT, ORIGIN_LON, 0.0);
         let entries: Vec<(String, TrpCoord)> = [
-            ("p0", EnuPoint { e: 0.0, n: 0.0, u: 0.0 }),
-            ("p1", EnuPoint { e: 0.0, n: 500.0, u: 0.0 }),
+            (
+                "p0",
+                EnuPoint {
+                    e: 0.0,
+                    n: 0.0,
+                    u: 0.0,
+                },
+            ),
+            (
+                "p1",
+                EnuPoint {
+                    e: 0.0,
+                    n: 500.0,
+                    u: 0.0,
+                },
+            ),
         ]
         .iter()
         .map(|(id, p)| (id.to_string(), enu_to_geodetic(*p, origin)))
@@ -1325,9 +1400,21 @@ mod tests {
         // from_entries anchors the origin at the TRP centroid.
         let origin = TrpCoord::new(ORIGIN_LAT, ORIGIN_LON, 0.0);
         let pts = [
-            EnuPoint { e: -100.0, n: -100.0, u: 0.0 },
-            EnuPoint { e: 100.0, n: -100.0, u: 0.0 },
-            EnuPoint { e: 0.0, n: 200.0, u: 0.0 },
+            EnuPoint {
+                e: -100.0,
+                n: -100.0,
+                u: 0.0,
+            },
+            EnuPoint {
+                e: 100.0,
+                n: -100.0,
+                u: 0.0,
+            },
+            EnuPoint {
+                e: 0.0,
+                n: 200.0,
+                u: 0.0,
+            },
         ];
         let entries: Vec<(String, TrpCoord)> = pts
             .iter()
@@ -1349,7 +1436,7 @@ mod tests {
         let k = (-2.0 * (1.0f64 - 0.95).ln()).sqrt();
         assert!((e.semi_major_m - k * 4.0).abs() < 1e-9); // sqrt(16)=4
         assert!((e.semi_minor_m - k * 2.0).abs() < 1e-9); // sqrt(4)=2
-        // Major axis along North => orientation 0 deg.
+                                                          // Major axis along North => orientation 0 deg.
         assert!(e.orientation_deg.abs() < 1e-6 || (e.orientation_deg - 180.0).abs() < 1e-6);
     }
 
@@ -1364,7 +1451,10 @@ mod tests {
     fn test_method_spec_strings() {
         assert_eq!(PositioningMethodKind::MultiRtt.as_spec_str(), "MULTI-RTT");
         assert_eq!(PositioningMethodKind::Tdoa.as_spec_str(), "UL_TDOA");
-        assert_eq!(PositioningMethodKind::AngleOfArrival.as_spec_str(), "UL_AOA");
+        assert_eq!(
+            PositioningMethodKind::AngleOfArrival.as_spec_str(),
+            "UL_AOA"
+        );
         assert_eq!(PositioningMethodKind::Ecid.as_spec_str(), "NR_ECID");
     }
 }

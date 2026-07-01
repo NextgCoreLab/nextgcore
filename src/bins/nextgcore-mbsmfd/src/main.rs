@@ -214,10 +214,7 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             match method {
                 "PUT" => handle_ctx_status_subscribe_update(sub_id, &request).await,
                 "DELETE" => handle_ctx_status_unsubscribe(sub_id).await,
-                _ => send_method_not_allowed(
-                    method,
-                    "mbs-sessions/contexts/subscriptions/{id}",
-                ),
+                _ => send_method_not_allowed(method, "mbs-sessions/contexts/subscriptions/{id}"),
             }
         }
         // Status subscriptions (TS 29.532 §5.3.2.6/7, NEF/MBSF/AF-facing). [mbsmfd-05]
@@ -343,7 +340,9 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
     // mbsmfd-06: parse the spec CreateReqData{ mbsSession: ExtMbsSession }.
     let req: types::CreateReqData = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid CreateReqData: {e}"), Some("INVALID_JSON")),
+        Err(e) => {
+            return send_bad_request(&format!("Invalid CreateReqData: {e}"), Some("INVALID_JSON"))
+        }
     };
 
     // Read mbsSession.serviceType (the spec field name).
@@ -492,7 +491,9 @@ async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> Sb
     // mbsmfd-08: parse the spec PatchData (array of PatchItem).
     let patch: types::PatchData = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid PatchData: {e}"), Some("INVALID_JSON")),
+        Err(e) => {
+            return send_bad_request(&format!("Invalid PatchData: {e}"), Some("INVALID_JSON"))
+        }
     };
 
     let pool_id = parse_session_id(session_id);
@@ -603,7 +604,10 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
         Some(session) => {
             let Some(n4mb) = session.n4mb_session.as_ref() else {
                 log::error!("MBS Session {session_id} has no N4mb session after activation");
-                return send_bad_request("N4mb session not initialized", Some("N4MB_SESSION_MISSING"));
+                return send_bad_request(
+                    "N4mb session not initialized",
+                    Some("N4MB_SESSION_MISSING"),
+                );
             };
             let local_seid = n4mb.local_seid;
             let dl_teid = n4mb.dl_teid;
@@ -789,7 +793,10 @@ async fn handle_mbs_session_context_update(request: &SbiRequest) -> SbiResponse 
                 Some("CONTEXT_NOT_FOUND"),
             );
         }
-        log::info!("ContextUpdate Terminate (TMGI {:02x?})", tmgi.mbs_service_id);
+        log::info!(
+            "ContextUpdate Terminate (TMGI {:02x?})",
+            tmgi.mbs_service_id
+        );
         return SbiResponse::with_status(204);
     }
 
@@ -928,7 +935,10 @@ async fn handle_tmgi_allocate(request: &SbiRequest) -> SbiResponse {
         expiration_time: unix_to_rfc3339(expiry),
         nid: None,
     };
-    log::info!("TMGI Allocate: {} TMGI(s) (expiry={expiry})", allocated.len());
+    log::info!(
+        "TMGI Allocate: {} TMGI(s) (expiry={expiry})",
+        allocated.len()
+    );
     SbiResponse::with_status(200)
         .with_json_body(&rsp)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
@@ -943,8 +953,7 @@ async fn handle_tmgi_deallocate(request: &SbiRequest) -> SbiResponse {
     let freed = if let Some(raw) = request.http.get_param("tmgi-list") {
         match serde_json::from_str::<Vec<types::Tmgi>>(raw) {
             Ok(list) => {
-                let ctmgis: Vec<Tmgi> =
-                    list.iter().map(|t| context_tmgi_from(Some(t))).collect();
+                let ctmgis: Vec<Tmgi> = list.iter().map(|t| context_tmgi_from(Some(t))).collect();
                 ctx.read().map(|c| c.tmgi_deallocate(&ctmgis)).unwrap_or(0)
             }
             Err(e) => {
@@ -1132,7 +1141,11 @@ async fn handle_status_subscribe_update(sub_id: &str, request: &SbiRequest) -> S
         nf_instance_id: req.nf_instance_id.clone(),
     };
     let ctx = mbsmf_self();
-    let updated = ctx.read().ok().map(|c| c.status_sub_update(sub_id, entry)).unwrap_or(false);
+    let updated = ctx
+        .read()
+        .ok()
+        .map(|c| c.status_sub_update(sub_id, entry))
+        .unwrap_or(false);
     if updated {
         log::debug!("[sub] Status subscription updated: {sub_id}");
         SbiResponse::with_status(200)
@@ -1150,7 +1163,11 @@ async fn handle_status_subscribe_update(sub_id: &str, request: &SbiRequest) -> S
 /// (TS 29.532 §5.3.2.7).
 async fn handle_status_unsubscribe(sub_id: &str) -> SbiResponse {
     let ctx = mbsmf_self();
-    let removed = ctx.read().ok().map(|c| c.status_sub_remove(sub_id)).unwrap_or(false);
+    let removed = ctx
+        .read()
+        .ok()
+        .map(|c| c.status_sub_remove(sub_id))
+        .unwrap_or(false);
     if removed {
         log::info!("[sub] Status subscription removed: {sub_id}");
         SbiResponse::with_status(204)
@@ -1222,7 +1239,11 @@ async fn handle_ctx_status_subscribe_update(sub_id: &str, request: &SbiRequest) 
         nf_instance_id: req.nf_instance_id.clone(),
     };
     let ctx = mbsmf_self();
-    let updated = ctx.read().ok().map(|c| c.ctx_sub_update(sub_id, entry)).unwrap_or(false);
+    let updated = ctx
+        .read()
+        .ok()
+        .map(|c| c.ctx_sub_update(sub_id, entry))
+        .unwrap_or(false);
     if updated {
         log::debug!("[sub] ContextStatus subscription updated: {sub_id}");
         SbiResponse::with_status(200)
@@ -1240,7 +1261,11 @@ async fn handle_ctx_status_subscribe_update(sub_id: &str, request: &SbiRequest) 
 /// (TS 29.532 §5.3.2.10).
 async fn handle_ctx_status_unsubscribe(sub_id: &str) -> SbiResponse {
     let ctx = mbsmf_self();
-    let removed = ctx.read().ok().map(|c| c.ctx_sub_remove(sub_id)).unwrap_or(false);
+    let removed = ctx
+        .read()
+        .ok()
+        .map(|c| c.ctx_sub_remove(sub_id))
+        .unwrap_or(false);
     if removed {
         log::info!("[sub] ContextStatus subscription removed: {sub_id}");
         SbiResponse::with_status(204)
@@ -1356,8 +1381,10 @@ async fn register_with_nrf(
         200 | 201 => {
             log::info!("MB-SMF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance =
-                nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Mbsmf);
+            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
+                nf_instance_id,
+                nextgcore_sbi::types::NfType::Mbsmf,
+            );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = nextgcore_sbi::context::NfService::new(
                 "nmbsmf-mbssession",
@@ -1434,9 +1461,7 @@ mod tests {
     /// Locate a byte subsequence (used to assert specific IE windows on the
     /// encoded N4mb establishment packet).
     fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|w| w == needle)
+        haystack.windows(needle.len()).position(|w| w == needle)
     }
 
     // ---- mbsmfd-01: N4mb PFCP establishment encoded via nextgcore-pfcp ----
@@ -1585,7 +1610,9 @@ mod tests {
 
         // Resolving the same spec TMGI maps back to the created internal id.
         let resolve_tmgi = context_tmgi_from(spec_id.tmgi.as_ref());
-        let found = ctx.session_find_by_tmgi(&resolve_tmgi).expect("resolved by TMGI");
+        let found = ctx
+            .session_find_by_tmgi(&resolve_tmgi)
+            .expect("resolved by TMGI");
         assert_eq!(found.id, created.id);
         assert_eq!(found.tmgi.mbs_service_id, [0x0A, 0x0B, 0x0C]);
     }
@@ -1686,7 +1713,8 @@ mod tests {
     async fn test_router_tmgi_allocate_deallocate() {
         mbsmf_context_init(256);
         let rsp = mbsmf_sbi_request_handler(
-            SbiRequest::post("/nmbsmf-tmgi/v1/tmgi").with_body(r#"{"tmgiNumber":3}"#, "application/json"),
+            SbiRequest::post("/nmbsmf-tmgi/v1/tmgi")
+                .with_body(r#"{"tmgiNumber":3}"#, "application/json"),
         )
         .await;
         assert_eq!(rsp.status, 200);
@@ -1769,8 +1797,7 @@ mod tests {
     #[tokio::test]
     async fn test_router_status_subscribe_update() {
         mbsmf_context_init(256);
-        let create_body =
-            r#"{"notifyUri":"http://nef/cb","notifyCorrelationId":"corr-orig"}"#;
+        let create_body = r#"{"notifyUri":"http://nef/cb","notifyCorrelationId":"corr-orig"}"#;
         let rsp = mbsmf_sbi_request_handler(
             SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/subscriptions")
                 .with_body(create_body, "application/json"),
@@ -1781,8 +1808,7 @@ mod tests {
         let sub_id = loc.rsplit('/').next().unwrap().to_string();
 
         // Update with a new correlationId → 200.
-        let upd_body =
-            r#"{"notifyUri":"http://nef/cb","notifyCorrelationId":"corr-updated"}"#;
+        let upd_body = r#"{"notifyUri":"http://nef/cb","notifyCorrelationId":"corr-updated"}"#;
         let upd = mbsmf_sbi_request_handler(
             SbiRequest::put(format!(
                 "/nmbsmf-mbssession/v1/mbs-sessions/subscriptions/{sub_id}"
@@ -1807,19 +1833,18 @@ mod tests {
     #[tokio::test]
     async fn test_router_ctx_status_subscribe_and_unsubscribe() {
         mbsmf_context_init(256);
-        let body =
-            r#"{"notifyUri":"http://smf:8080/ctx-notify","notifyCorrelationId":"ctx-corr-1","eventList":["SESSION_RELEASE"]}"#;
+        let body = r#"{"notifyUri":"http://smf:8080/ctx-notify","notifyCorrelationId":"ctx-corr-1","eventList":["SESSION_RELEASE"]}"#;
         let rsp = mbsmf_sbi_request_handler(
-            SbiRequest::post(
-                "/nmbsmf-mbssession/v1/mbs-sessions/contexts/subscriptions",
-            )
-            .with_body(body, "application/json"),
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/subscriptions")
+                .with_body(body, "application/json"),
         )
         .await;
         assert_eq!(rsp.status, 201, "ContextStatus subscribe → 201");
         let loc = rsp.http.get_header("location").cloned();
         assert!(
-            loc.as_deref().unwrap_or("").contains("/contexts/subscriptions/"),
+            loc.as_deref()
+                .unwrap_or("")
+                .contains("/contexts/subscriptions/"),
             "Location under /contexts/subscriptions/"
         );
         let sub_id = loc.unwrap().rsplit('/').next().unwrap().to_string();
@@ -1865,8 +1890,7 @@ mod tests {
         assert_eq!(sub_rsp.status, 201);
 
         // Release the session — should return 204 (notify is spawned async).
-        let del_rsp = mbsmf_sbi_request_handler(SbiRequest::delete(session_path.clone()))
-        .await;
+        let del_rsp = mbsmf_sbi_request_handler(SbiRequest::delete(session_path.clone())).await;
         assert_eq!(del_rsp.status, 204, "Release → 204");
     }
 

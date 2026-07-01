@@ -586,7 +586,10 @@ mod tests {
         {
             let ctx = ctx_arc.read().unwrap();
             let sub = ctx.get_subscription(&sub_id).unwrap();
-            assert!(sub.is_due_for_notification(), "one-shot must be due before first notification");
+            assert!(
+                sub.is_due_for_notification(),
+                "one-shot must be due before first notification"
+            );
         }
 
         // Simulate notification sent
@@ -623,11 +626,16 @@ mod tests {
                 100,
             ));
         }
-        let result = engine.compute_nf_load("amf-01").expect("should produce analytics");
+        let result = engine
+            .compute_nf_load("amf-01")
+            .expect("should produce analytics");
 
         // All expected fields present and in valid ranges
         assert!(!result.nf_type.is_empty(), "nf_type must be non-empty");
-        assert!(!result.nf_instance_id.is_empty(), "nf_instance_id must be non-empty");
+        assert!(
+            !result.nf_instance_id.is_empty(),
+            "nf_instance_id must be non-empty"
+        );
         assert!(
             (0.0..=1.0).contains(&result.mean_cpu),
             "mean_cpu must be in [0,1]"
@@ -685,19 +693,59 @@ mod tests {
     #[test]
     fn test_threshold_predicate_directions() {
         // ASCENDING: fires only on the rising edge to/above the threshold.
-        assert!(!threshold_crossed(None, 30.0, 80.0, MatchingDirection::Ascending));
-        assert!(threshold_crossed(None, 90.0, 80.0, MatchingDirection::Ascending));
+        assert!(!threshold_crossed(
+            None,
+            30.0,
+            80.0,
+            MatchingDirection::Ascending
+        ));
+        assert!(threshold_crossed(
+            None,
+            90.0,
+            80.0,
+            MatchingDirection::Ascending
+        ));
         // Already above → no re-fire.
-        assert!(!threshold_crossed(Some(90.0), 95.0, 80.0, MatchingDirection::Ascending));
+        assert!(!threshold_crossed(
+            Some(90.0),
+            95.0,
+            80.0,
+            MatchingDirection::Ascending
+        ));
 
         // DESCENDING: fires on the falling edge to/below the threshold.
-        assert!(threshold_crossed(None, 30.0, 80.0, MatchingDirection::Descending));
-        assert!(!threshold_crossed(None, 90.0, 80.0, MatchingDirection::Descending));
+        assert!(threshold_crossed(
+            None,
+            30.0,
+            80.0,
+            MatchingDirection::Descending
+        ));
+        assert!(!threshold_crossed(
+            None,
+            90.0,
+            80.0,
+            MatchingDirection::Descending
+        ));
 
         // CROSSED: fires on a crossing in either direction, not otherwise.
-        assert!(threshold_crossed(Some(30.0), 90.0, 80.0, MatchingDirection::Crossed));
-        assert!(threshold_crossed(Some(90.0), 30.0, 80.0, MatchingDirection::Crossed));
-        assert!(!threshold_crossed(Some(85.0), 95.0, 80.0, MatchingDirection::Crossed));
+        assert!(threshold_crossed(
+            Some(30.0),
+            90.0,
+            80.0,
+            MatchingDirection::Crossed
+        ));
+        assert!(threshold_crossed(
+            Some(90.0),
+            30.0,
+            80.0,
+            MatchingDirection::Crossed
+        ));
+        assert!(!threshold_crossed(
+            Some(85.0),
+            95.0,
+            80.0,
+            MatchingDirection::Crossed
+        ));
     }
 
     /// A THRESHOLD event is suppressed below its threshold and emitted at/above

@@ -380,7 +380,10 @@ mod tests {
         }"#;
         let req: AcrDetermReq = serde_json::from_str(body).expect("deserializes");
         assert_eq!(req.requestor_id, "eec1.example.com");
-        assert_eq!(req.s_eas_endpoint.fqdn.as_deref(), Some("eas-s.edge.example.com"));
+        assert_eq!(
+            req.s_eas_endpoint.fqdn.as_deref(),
+            Some("eas-s.edge.example.com")
+        );
         assert_eq!(req.ue_id.as_deref(), Some("imsi-999700000000001"));
         let back = serde_json::to_string(&req).unwrap();
         assert!(back.contains(r#""requestorId":"eec1.example.com""#));
@@ -406,7 +409,10 @@ mod tests {
     fn test_acr_determ_req_tunnel_info_name() {
         let req = AcrDetermReq {
             requestor_id: "eec1".into(),
-            s_eas_endpoint: EndPoint { fqdn: Some("eas-s".into()), ..Default::default() },
+            s_eas_endpoint: EndPoint {
+                fqdn: Some("eas-s".into()),
+                ..Default::default()
+            },
             ue_id: None,
             eas_id: None,
             ac_id: None,
@@ -414,7 +420,10 @@ mod tests {
             tunnel_info: Some(serde_json::json!({"anchor":"upf1"})),
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains(r#""tunnel_Info""#), "must serialize as tunnel_Info: {json}");
+        assert!(
+            json.contains(r#""tunnel_Info""#),
+            "must serialize as tunnel_Info: {json}"
+        );
         assert!(!json.contains("tunnelInfo"));
     }
 
@@ -431,7 +440,10 @@ mod tests {
         }"#;
         let req: AcrInitReq = serde_json::from_str(body).unwrap();
         assert_eq!(req.requestor_id, "eec1");
-        assert_eq!(req.t_eas_endpoint.fqdn.as_deref(), Some("eas-t.edge.example.com"));
+        assert_eq!(
+            req.t_eas_endpoint.fqdn.as_deref(),
+            Some("eas-t.edge.example.com")
+        );
         assert!(req.eas_notif_ind);
     }
 
@@ -464,7 +476,10 @@ mod tests {
         let req: AcrDecReq = serde_json::from_str(body).unwrap();
         assert_eq!(req.ue_id, "imsi-999700000000001");
         assert_eq!(req.t_eas_id, "eas-t.example.com");
-        assert_eq!(req.t_eas_endpoint.fqdn.as_deref(), Some("eas-t.edge.example.com"));
+        assert_eq!(
+            req.t_eas_endpoint.fqdn.as_deref(),
+            Some("eas-t.edge.example.com")
+        );
         assert_eq!(req.requestor_id.as_deref(), Some("eas-s.example.com"));
     }
 
@@ -480,13 +495,18 @@ mod tests {
     /// `AcrParameters` carries only `predictExpTime`.
     #[test]
     fn test_acr_parameters_predict_exp_time() {
-        let p = AcrParameters { predict_exp_time: Some("2026-07-01T12:00:00Z".into()) };
+        let p = AcrParameters {
+            predict_exp_time: Some("2026-07-01T12:00:00Z".into()),
+        };
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains(r#""predictExpTime":"2026-07-01T12:00:00Z""#));
         let back: AcrParameters = serde_json::from_str(&json).unwrap();
         assert_eq!(back, p);
         // Empty object is valid (all-optional).
-        assert_eq!(serde_json::to_string(&AcrParameters::default()).unwrap(), "{}");
+        assert_eq!(
+            serde_json::to_string(&AcrParameters::default()).unwrap(),
+            "{}"
+        );
     }
 
     // ---- EELACRReq (TS 29.558 §8.8.6.2.2) -----------------------------------
@@ -502,7 +522,10 @@ mod tests {
         let req: EELACRReq = serde_json::from_str(body).unwrap();
         assert_eq!(req.ue_id, "imsi-999700000000001");
         assert_eq!(req.eas_characs.len(), 1);
-        assert_eq!(req.app_ctxt_store_addr.as_deref(), Some("https://store.example.com/ctx/1"));
+        assert_eq!(
+            req.app_ctxt_store_addr.as_deref(),
+            Some("https://store.example.com/ctx/1")
+        );
     }
 
     /// Missing mandatory `easCharacs` fails to deserialize.
@@ -537,10 +560,22 @@ mod tests {
     /// `AcrStatus` serializes as SCREAMING_SNAKE_CASE.
     #[test]
     fn test_acr_status_serialization() {
-        assert_eq!(serde_json::to_string(&AcrStatus::Determined).unwrap(), r#""DETERMINED""#);
-        assert_eq!(serde_json::to_string(&AcrStatus::Initiated).unwrap(), r#""INITIATED""#);
-        assert_eq!(serde_json::to_string(&AcrStatus::Completed).unwrap(), r#""COMPLETED""#);
-        assert_eq!(serde_json::to_string(&AcrStatus::Failed).unwrap(), r#""FAILED""#);
+        assert_eq!(
+            serde_json::to_string(&AcrStatus::Determined).unwrap(),
+            r#""DETERMINED""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AcrStatus::Initiated).unwrap(),
+            r#""INITIATED""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AcrStatus::Completed).unwrap(),
+            r#""COMPLETED""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AcrStatus::Failed).unwrap(),
+            r#""FAILED""#
+        );
     }
 
     /// The UE-scoped state key prefers the GPSI, then the requestor identity.

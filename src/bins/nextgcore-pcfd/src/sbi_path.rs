@@ -610,7 +610,10 @@ pub async fn pcf_discover_endpoint(
     if response.status != 200 {
         return Err(format!("NRF discovery returned status {}", response.status));
     }
-    let body = response.http.content.ok_or("Empty NRF discovery response")?;
+    let body = response
+        .http
+        .content
+        .ok_or("Empty NRF discovery response")?;
     let json: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
     Ok(parse_first_endpoint(&json, service_name))
@@ -658,8 +661,8 @@ pub async fn pcf_udr_get_sm_policy_data(
     match resp.status {
         200 => {
             let body = resp.http.content.ok_or("empty nudr-dr body")?;
-            let json = serde_json::from_str(&body)
-                .map_err(|e| format!("invalid nudr-dr body: {e}"))?;
+            let json =
+                serde_json::from_str(&body).map_err(|e| format!("invalid nudr-dr body: {e}"))?;
             Ok(Some(json))
         }
         404 => {
@@ -912,10 +915,11 @@ mod tests {
             assert_eq!(ep.port, port);
 
             // nudr-dr GET SmPolicyData → decoded body.
-            let data = pcf_udr_get_sm_policy_data("imsi-001010000000777", 1, Some(0x010203), "internet")
-                .await
-                .expect("udr GET ok")
-                .expect("policy data present");
+            let data =
+                pcf_udr_get_sm_policy_data("imsi-001010000000777", 1, Some(0x010203), "internet")
+                    .await
+                    .expect("udr GET ok")
+                    .expect("policy data present");
             assert!(data.get("smPolicySnssaiData").is_some());
 
             // nbsf-management register → binding id from the Location header.

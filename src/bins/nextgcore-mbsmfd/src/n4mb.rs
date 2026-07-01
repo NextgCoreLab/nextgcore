@@ -30,7 +30,7 @@ use nextgcore_pfcp::message::{
 };
 use nextgcore_pfcp::types::{
     ApplyAction, CreateFar, CreatePdr, DestinationInterface, FSeid, FTeid, ForwardingParameters,
-    NodeId, OuterHeaderCreation, PfcpCause, Pdi, SourceInterface,
+    NodeId, OuterHeaderCreation, Pdi, PfcpCause, SourceInterface,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
@@ -293,10 +293,8 @@ impl N4mbPfcpNode {
         if self.is_associated() {
             return Ok(());
         }
-        let req = AssociationSetupRequest::new(
-            NodeId::new_ipv4(self.cp_addr),
-            self.recovery_time_stamp,
-        );
+        let req =
+            AssociationSetupRequest::new(NodeId::new_ipv4(self.cp_addr), self.recovery_time_stamp);
         let (_h, resp) = self
             .transact(PfcpMessage::AssociationSetupRequest(req), None)
             .await?;

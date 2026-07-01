@@ -573,9 +573,7 @@ impl UdmContext {
                                 && ri.len() <= 4
                                 && ri.bytes().all(|b| b.is_ascii_digit()))
                         {
-                            log::warn!(
-                                "[{suci_or_supi}] Invalid routing indicator '{ri}'"
-                            );
+                            log::warn!("[{suci_or_supi}] Invalid routing indicator '{ri}'");
                             return None;
                         }
                     }
@@ -1162,27 +1160,31 @@ mod tests {
 
         // Default: allow_null_scheme=true → null-scheme accepted
         assert!(
-            ctx.deconceal_suci("suci-0-001-01-0000-0-0-0000000001").is_some(),
+            ctx.deconceal_suci("suci-0-001-01-0000-0-0-0000000001")
+                .is_some(),
             "null scheme must be accepted when allow_null_scheme=true (default)"
         );
 
         // Disable null scheme → rejected
         ctx.set_allow_null_scheme(false);
         assert!(
-            ctx.deconceal_suci("suci-0-001-01-0000-0-0-0000000001").is_none(),
+            ctx.deconceal_suci("suci-0-001-01-0000-0-0-0000000001")
+                .is_none(),
             "null scheme must be rejected when allow_null_scheme=false"
         );
 
         // Profile A/B unaffected by the flag (require key material, fail with no key)
         assert!(
-            ctx.deconceal_suci("suci-0-001-01-0000-1-1-deadbeef").is_none(),
+            ctx.deconceal_suci("suci-0-001-01-0000-1-1-deadbeef")
+                .is_none(),
             "Profile A without key must still be rejected (no key provisioned)"
         );
 
         // Re-enable → accepted again
         ctx.set_allow_null_scheme(true);
         assert!(
-            ctx.deconceal_suci("suci-0-001-01-0000-0-0-0000000001").is_some(),
+            ctx.deconceal_suci("suci-0-001-01-0000-0-0-0000000001")
+                .is_some(),
             "null scheme must be accepted after re-enabling"
         );
 
@@ -1241,7 +1243,8 @@ mod tests {
 
         let msin = "0123456789";
         let bcd = msin_to_bcd(msin);
-        let (eph_pub, ct, tag) = nextgcore_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &bcd).unwrap();
+        let (eph_pub, ct, tag) =
+            nextgcore_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &bcd).unwrap();
         let mut scheme_output = Vec::new();
         scheme_output.extend_from_slice(&eph_pub);
         scheme_output.extend_from_slice(&ct);
@@ -1270,7 +1273,8 @@ mod tests {
 
         let msin = "0123456789";
         let bcd = msin_to_bcd(msin);
-        let (eph_pub, ct, tag) = nextgcore_crypt::ecc::ecies_profile_b_encrypt(&hn_pub, &bcd).unwrap();
+        let (eph_pub, ct, tag) =
+            nextgcore_crypt::ecc::ecies_profile_b_encrypt(&hn_pub, &bcd).unwrap();
         let mut scheme_output = Vec::new();
         scheme_output.extend_from_slice(&eph_pub);
         scheme_output.extend_from_slice(&ct);
@@ -1298,7 +1302,8 @@ mod tests {
         let hn_priv = [0x42u8; 32];
         let hn_pub = nextgcore_crypt::ecies::x25519_public_key(&hn_priv);
         let bcd = msin_to_bcd("0123456789");
-        let (eph_pub, ct, tag) = nextgcore_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &bcd).unwrap();
+        let (eph_pub, ct, tag) =
+            nextgcore_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &bcd).unwrap();
         let mut scheme_output = Vec::new();
         scheme_output.extend_from_slice(&eph_pub);
         scheme_output.extend_from_slice(&ct);

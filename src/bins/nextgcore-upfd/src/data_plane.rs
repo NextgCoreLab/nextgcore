@@ -2078,7 +2078,11 @@ impl DataPlane {
                 };
                 let counter = recovery.unwrap_or(0);
                 log::debug!("GTP-U Echo Response from {from}, Recovery={counter}");
-                let restarted = self.path_table.write().unwrap().on_echo_response(from, counter);
+                let restarted = self
+                    .path_table
+                    .write()
+                    .unwrap()
+                    .on_echo_response(from, counter);
                 if restarted {
                     log::warn!(
                         "GTP-U peer {from} restarted (Recovery counter changed to {counter}) \
@@ -2834,12 +2838,13 @@ impl DataPlane {
             log::debug!("GTP-U path management disabled");
             return;
         }
-        log::info!("GTP-U path management started (interval={}s, threshold={} misses)",
+        log::info!(
+            "GTP-U path management started (interval={}s, threshold={} misses)",
             interval_secs,
-            self.path_table.read().unwrap().miss_threshold);
+            self.path_table.read().unwrap().miss_threshold
+        );
 
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
 
         loop {
             interval.tick().await;
@@ -4146,7 +4151,16 @@ mod tests {
             ..dp
         };
         let gnb_addr: SocketAddr = "127.0.0.1:2152".parse().unwrap();
-        dp.add_session_from_pfcp(0x55, 0x1055, ue_ip, ul_teid, 0x200, gnb_addr, Some(1), Some(9));
+        dp.add_session_from_pfcp(
+            0x55,
+            0x1055,
+            ue_ip,
+            ul_teid,
+            0x200,
+            gnb_addr,
+            Some(1),
+            Some(9),
+        );
         dp
     }
 
@@ -4172,7 +4186,8 @@ mod tests {
         let mut inner = make_ipv4_udp_packet([10, 45, 0, 99], [8, 8, 8, 8], 1234, 53);
         finalize_ipv4(&mut inner);
         let gpdu = encapsulate_dl_gpdu(&inner, 0x100, None);
-        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1).await;
+        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1)
+            .await;
 
         assert_eq!(
             dp.stats.spoofed_packets.load(Ordering::Relaxed),
@@ -4202,7 +4217,8 @@ mod tests {
         let mut inner = make_ipv4_udp_packet(ue_ip.octets(), [8, 8, 8, 8], 1234, 53);
         finalize_ipv4(&mut inner);
         let gpdu = encapsulate_dl_gpdu(&inner, 0x100, None);
-        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1).await;
+        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1)
+            .await;
 
         assert_eq!(
             dp.stats.spoofed_packets.load(Ordering::Relaxed),
@@ -4223,7 +4239,8 @@ mod tests {
         inner.resize(TUN_MTU as usize + 100, 0);
         finalize_ipv4(&mut inner);
         let gpdu = encapsulate_dl_gpdu(&inner, 0x100, None);
-        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1).await;
+        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1)
+            .await;
 
         assert_eq!(
             dp.stats.oversize_packets.load(Ordering::Relaxed),
@@ -4252,7 +4269,16 @@ mod tests {
             gtpu_socket: Some(Arc::new(upf_sock)),
             ..dp
         };
-        dp.add_session_from_pfcp(0x66, 0x1066, ue_ip, 0x100, 0x200, gnb_addr, Some(1), Some(9));
+        dp.add_session_from_pfcp(
+            0x66,
+            0x1066,
+            ue_ip,
+            0x100,
+            0x200,
+            gnb_addr,
+            Some(1),
+            Some(9),
+        );
 
         let mut pkt = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
         pkt.resize(TUN_MTU as usize + 50, 0);
@@ -4290,7 +4316,16 @@ mod tests {
             gtpu_socket: Some(Arc::new(upf_sock)),
             ..dp
         };
-        dp.add_session_from_pfcp(0x66, 0x1066, ue_ip, 0x100, 0x200, gnb_addr, Some(1), Some(9));
+        dp.add_session_from_pfcp(
+            0x66,
+            0x1066,
+            ue_ip,
+            0x100,
+            0x200,
+            gnb_addr,
+            Some(1),
+            Some(9),
+        );
 
         // Attach a QER (id 5) carrying a DSCP and bind it to the DL PDR.
         let session = dp.sessions.find_by_seid(0x66).unwrap();
@@ -4567,9 +4602,16 @@ mod tests {
     fn test_gtpu_echo_response_has_recovery_ie() {
         let resp = build_gtpu_echo_response(Some(0x1234));
         assert_eq!(resp.len(), 14, "Echo Response must be 14 bytes");
-        assert_eq!(resp[1], gtpu_msg_type::ECHO_RESPONSE, "msg type must be ECHO_RESPONSE (2)");
+        assert_eq!(
+            resp[1],
+            gtpu_msg_type::ECHO_RESPONSE,
+            "msg type must be ECHO_RESPONSE (2)"
+        );
         let length = u16::from_be_bytes([resp[2], resp[3]]);
-        assert_eq!(length, 6, "length field must be 6 (4 opt-hdr + 2 Recovery IE)");
+        assert_eq!(
+            length, 6,
+            "length field must be 6 (4 opt-hdr + 2 Recovery IE)"
+        );
         assert_eq!(resp[0] & 0x02, 0x02, "S flag (0x02) must be set");
         let teid = u32::from_be_bytes([resp[4], resp[5], resp[6], resp[7]]);
         assert_eq!(teid, 0, "TEID must be 0 for Echo Response");
@@ -4584,7 +4626,11 @@ mod tests {
     fn test_gtpu_echo_response_no_seq_uses_s_flag() {
         let resp = build_gtpu_echo_response(None);
         assert_eq!(resp.len(), 14);
-        assert_eq!(resp[0] & 0x02, 0x02, "S flag must be set even without inbound seq");
+        assert_eq!(
+            resp[0] & 0x02,
+            0x02,
+            "S flag must be set even without inbound seq"
+        );
         assert_eq!(&resp[8..10], &[0, 0], "seq must default to 0");
         assert_eq!(resp[12], GTPU_IE_RECOVERY);
     }
@@ -4598,7 +4644,11 @@ mod tests {
     fn test_gtpu_echo_request_layout() {
         let req = build_gtpu_echo_request(0xABCD, 42);
         assert_eq!(req.len(), 14, "Echo Request must be 14 bytes");
-        assert_eq!(req[1], gtpu_msg_type::ECHO_REQUEST, "msg type must be ECHO_REQUEST (1)");
+        assert_eq!(
+            req[1],
+            gtpu_msg_type::ECHO_REQUEST,
+            "msg type must be ECHO_REQUEST (1)"
+        );
         let length = u16::from_be_bytes([req[2], req[3]]);
         assert_eq!(length, 6, "length must be 6");
         assert_eq!(req[0] & 0x02, 0x02, "S flag must be set");
@@ -4650,7 +4700,10 @@ mod tests {
                 break;
             }
         }
-        assert!(failure_seen, "path must be declared failed after 3 missed responses");
+        assert!(
+            failure_seen,
+            "path must be declared failed after 3 missed responses"
+        );
         let state = pt.peers.get(&peer).unwrap();
         assert!(state.path_failed);
     }
@@ -4717,7 +4770,10 @@ mod tests {
         assert_eq!(header.teid, 0, "header.teid must be 0 for TEID=0 guard");
         // The actual guard is: `if header.teid != 0 { … send Error Indication … }`
         // We verify the condition is false (no send) for teid==0.
-        assert!(header.teid == 0, "TEID==0 means no Error Indication should be sent");
+        assert!(
+            header.teid == 0,
+            "TEID==0 means no Error Indication should be sent"
+        );
     }
 
     /// Non-zero unknown TEID: the guard condition is true → Error Indication
@@ -4726,6 +4782,9 @@ mod tests {
     fn test_nonzero_teid_triggers_error_indication_path() {
         let pkt = make_gpdu_header(0xDEADBEEF);
         let header = crate::gtp_path::parse_gtpu_header(&pkt).unwrap();
-        assert_ne!(header.teid, 0, "non-zero TEID must trigger Error Indication path");
+        assert_ne!(
+            header.teid, 0,
+            "non-zero TEID must trigger Error Indication path"
+        );
     }
 }

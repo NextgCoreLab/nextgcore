@@ -1531,7 +1531,11 @@ impl UpfContext {
         // trie. In each step DROP the index/trie guard before locking sess_list:
         // sess_add/sess_remove lock sess_list before ipv4_hash/ipv4_framed_routes,
         // so holding either before sess_list would be an AB-BA deadlock.
-        let direct_id = self.ipv4_hash.read().ok().and_then(|h| h.get(&addr).copied());
+        let direct_id = self
+            .ipv4_hash
+            .read()
+            .ok()
+            .and_then(|h| h.get(&addr).copied());
         if let Some(id) = direct_id {
             if let Some(sess) = self.sess_list.read().ok().and_then(|l| l.get(&id).cloned()) {
                 return Some(sess);
@@ -1567,7 +1571,11 @@ impl UpfContext {
             }
         }
 
-        let route_id = self.ipv6_framed_routes.read().ok().and_then(|t| t.find(addr, true));
+        let route_id = self
+            .ipv6_framed_routes
+            .read()
+            .ok()
+            .and_then(|t| t.find(addr, true));
         if let Some(id) = route_id {
             if let Some(sess) = self.sess_list.read().ok().and_then(|l| l.get(&id).cloned()) {
                 return Some(sess);

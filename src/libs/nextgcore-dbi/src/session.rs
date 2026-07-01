@@ -23,8 +23,10 @@ pub fn nextgcore_dbi_session_data(
     s_nssai: Option<&NextgcoreSNssai>,
     dnn: &str,
 ) -> DbiResult<NextgcoreSessionData> {
-    let supi_type = nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id = nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_type =
+        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id =
+        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };

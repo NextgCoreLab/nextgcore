@@ -1288,7 +1288,10 @@ mod tests {
         let header = format!("Bearer {token}");
 
         // Matching aud through the cache path.
-        assert!(cache.authorize_aud(Some(&header), Some("UDM")).await.is_ok());
+        assert!(cache
+            .authorize_aud(Some(&header), Some("UDM"))
+            .await
+            .is_ok());
         // Wrong aud rejected.
         assert!(matches!(
             cache.authorize_aud(Some(&header), Some("AMF")).await,
@@ -1585,9 +1588,9 @@ mod tests {
                                         )),
                                     )
                                 } else {
-                                    hyper::Response::builder().status(404).body(
-                                        http_body_util::Full::new(bytes::Bytes::from("nope")),
-                                    )
+                                    hyper::Response::builder()
+                                        .status(404)
+                                        .body(http_body_util::Full::new(bytes::Bytes::from("nope")))
                                 };
                                 Ok::<_, std::convert::Infallible>(resp.unwrap())
                             }

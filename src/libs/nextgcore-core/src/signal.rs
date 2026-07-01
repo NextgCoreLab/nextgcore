@@ -337,15 +337,24 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(nextgcore_signal_description_get(libc::SIGINT), "Interrupt");
-            assert_eq!(nextgcore_signal_description_get(libc::SIGTERM), "Terminated");
+            assert_eq!(
+                nextgcore_signal_description_get(libc::SIGTERM),
+                "Terminated"
+            );
             assert_eq!(
                 nextgcore_signal_description_get(libc::SIGSEGV),
                 "Segmentation fault"
             );
         }
 
-        assert_eq!(nextgcore_signal_description_get(-1), "unknown signal (number)");
-        assert_eq!(nextgcore_signal_description_get(1000), "unknown signal (number)");
+        assert_eq!(
+            nextgcore_signal_description_get(-1),
+            "unknown signal (number)"
+        );
+        assert_eq!(
+            nextgcore_signal_description_get(1000),
+            "unknown signal (number)"
+        );
     }
 
     #[test]

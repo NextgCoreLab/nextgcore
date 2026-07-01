@@ -42,7 +42,10 @@ impl UperDecode for BadSignalElement {
         } else {
             None
         };
-        Ok(BadSignalElement { bad_svid, bad_signal_id })
+        Ok(BadSignalElement {
+            bad_svid,
+            bad_signal_id,
+        })
     }
 }
 
@@ -84,7 +87,9 @@ impl UperDecode for GnssRealTimeIntegrity {
         for _ in 0..count {
             gnss_bad_signal_list.push(BadSignalElement::decode_uper(d)?);
         }
-        Ok(GnssRealTimeIntegrity { gnss_bad_signal_list })
+        Ok(GnssRealTimeIntegrity {
+            gnss_bad_signal_list,
+        })
     }
 }
 
@@ -97,9 +102,18 @@ mod tests {
     fn round_trip_gnss_real_time_integrity() {
         let original = GnssRealTimeIntegrity {
             gnss_bad_signal_list: vec![
-                BadSignalElement { bad_svid: SvId { satellite_id: 12 }, bad_signal_id: None },
-                BadSignalElement { bad_svid: SvId { satellite_id: 63 }, bad_signal_id: Some(GnssSignalIds { signals: 0x81 }) },
-                BadSignalElement { bad_svid: SvId { satellite_id: 0 }, bad_signal_id: Some(GnssSignalIds { signals: 0x40 }) },
+                BadSignalElement {
+                    bad_svid: SvId { satellite_id: 12 },
+                    bad_signal_id: None,
+                },
+                BadSignalElement {
+                    bad_svid: SvId { satellite_id: 63 },
+                    bad_signal_id: Some(GnssSignalIds { signals: 0x81 }),
+                },
+                BadSignalElement {
+                    bad_svid: SvId { satellite_id: 0 },
+                    bad_signal_id: Some(GnssSignalIds { signals: 0x40 }),
+                },
             ],
         };
         let mut e = UperEncoder::new();

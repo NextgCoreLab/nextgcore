@@ -456,7 +456,9 @@ mod tests {
 
         assert_eq!(body["event"], "NF_PROFILE_CHANGED");
         assert!(body["nfProfile"].is_object(), "nfProfile must be present");
-        let pc = body["profileChanges"].as_array().expect("profileChanges array");
+        let pc = body["profileChanges"]
+            .as_array()
+            .expect("profileChanges array");
         assert_eq!(pc.len(), 1);
         assert_eq!(pc[0]["op"], "replace");
         assert_eq!(pc[0]["path"], "/load");
@@ -477,8 +479,7 @@ mod tests {
             vec![],
         );
 
-        let body: serde_json::Value =
-            serde_json::from_str(&request.unwrap().body).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&request.unwrap().body).unwrap();
         assert_eq!(body["event"], "NF_PROFILE_CHANGED");
         assert!(
             body.get("profileChanges").is_none(),

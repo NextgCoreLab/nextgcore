@@ -117,11 +117,7 @@ fn send_seq_counters() -> &'static RwLock<HashMap<String, Arc<AtomicU32>>> {
 
 /// Next SEQ for the (kid, originator, direction) sequence space (starts at 0).
 /// Errors when the 32-bit space is exhausted (force rekey / new context).
-fn next_send_seq(
-    kid: &str,
-    originator: N32fRole,
-    dir: N32fDirection,
-) -> Result<u32, JoseError> {
+fn next_send_seq(kid: &str, originator: N32fRole, dir: N32fDirection) -> Result<u32, JoseError> {
     let key = seq_key(kid, originator, dir);
     let counter = {
         let mut map = send_seq_counters()
@@ -1280,7 +1276,10 @@ fn unprotect_common(
                         N32fUnprotectError::new(
                             N32fErrorType::MessageReconstructionFailed,
                             Some(message_id.clone()),
-                            format!("header [{}] encBlockIndex {enc_block_index} out of range", h.header),
+                            format!(
+                                "header [{}] encBlockIndex {enc_block_index} out of range",
+                                h.header
+                            ),
                         )
                     })?;
                 match v {
@@ -1570,10 +1569,7 @@ mod tests {
     /// Shared N32-f key material both peers derive from the same 64-octet
     /// master and canonical context ID (TS 33.501 §13.2.4.4.1).
     fn shared_material() -> N32fKeyMaterial {
-        crate::n32c_handler::derive_n32f_key_material(
-            &[0x42u8; 64],
-            "ctx-local-1111-ctx-peer-2222",
-        )
+        crate::n32c_handler::derive_n32f_key_material(&[0x42u8; 64], "ctx-local-1111-ctx-peer-2222")
     }
 
     /// Build a sender/receiver PrinsContext pair sharing the N32-f key
@@ -2239,7 +2235,11 @@ mod tests {
 
         let err = unprotect_message(&receiver, &msg).unwrap_err();
         assert_eq!(err.error_type, N32fErrorType::MessageReconstructionFailed);
-        assert!(err.detail.contains("INVALID_JSON_POINTER"), "got: {}", err.detail);
+        assert!(
+            err.detail.contains("INVALID_JSON_POINTER"),
+            "got: {}",
+            err.detail
+        );
     }
 
     /// `set_at_json_pointer` creates intermediates, replaces whole-document on
@@ -2277,10 +2277,22 @@ mod tests {
     #[test]
     fn protect_increments_seq_per_message() {
         let (sender, _receiver) = ctx_pair();
-        let m0 =
-            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
-        let m1 =
-            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let m0 = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
+        let m1 = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         let (s0, seq0) = jose::jwe_iv_salt_and_seq(&m0.reformatted_data).unwrap();
         let (s1, seq1) = jose::jwe_iv_salt_and_seq(&m1.reformatted_data).unwrap();
         assert_eq!(s0, s1, "same IV salt for the same (role, direction)");
@@ -2293,8 +2305,14 @@ mod tests {
     #[test]
     fn replayed_message_rejected() {
         let (sender, receiver) = ctx_pair();
-        let msg =
-            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         // First receive succeeds and commits the SEQ.
         assert!(unprotect_message(&receiver, &msg).is_ok());
         // Replay of the identical message is rejected.
@@ -2397,7 +2415,10 @@ mod tests {
             modifications_block: vec![jws],
         };
         let rec = unprotect_message(&receiver, &msg).unwrap();
-        assert_eq!(rec.headers.get("authorization").unwrap(), "Bearer secret-token");
+        assert_eq!(
+            rec.headers.get("authorization").unwrap(),
+            "Bearer secret-token"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2406,8 +2427,14 @@ mod tests {
     #[test]
     fn metadata_authorized_ipx_id_defaults_to_null_and_roundtrips() {
         let (sender, receiver) = ctx_pair();
-        let msg =
-            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         let aad = b64url_decode(msg.reformatted_data.aad.as_ref().unwrap()).unwrap();
         let block: DataToIntegrityProtectBlock = serde_json::from_slice(&aad).unwrap();
         assert_eq!(block.meta_data.authorized_ipx_id, "NULL");
@@ -2431,34 +2458,43 @@ mod tests {
         receiver.register_verifying_key(ipx_id, ipx_vk);
 
         // A 2nd entry whose tag is the JWE tag (NOT the prior signature) passes.
-        let mut msg =
-            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let mut msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         let patch = ModificationsBlockPayload {
             identity: ipx_id.to_string(),
             operations: vec![serde_json::json!({"op":"replace","path":"/nssai/sst","value":5})],
             tag: msg.reformatted_data.tag.clone(),
         };
-        let jws = jose::jws_sign_es256(
-            &ipx_sk,
-            &serde_json::to_vec(&patch).unwrap(),
-            Some(ipx_id),
-        )
-        .unwrap();
+        let jws = jose::jws_sign_es256(&ipx_sk, &serde_json::to_vec(&patch).unwrap(), Some(ipx_id))
+            .unwrap();
         msg.modifications_block.push(jws);
         let rec = unprotect_message(&receiver, &msg).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&rec.body.unwrap()).unwrap();
         assert_eq!(body["nssai"]["sst"], 5);
 
         // An entry carrying a WRONG tag is rejected.
-        let mut msg2 =
-            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let mut msg2 = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         let bad = ModificationsBlockPayload {
             identity: ipx_id.to_string(),
             operations: vec![],
             tag: "not-the-jwe-tag".to_string(),
         };
         let jws_bad =
-            jose::jws_sign_es256(&ipx_sk, &serde_json::to_vec(&bad).unwrap(), Some(ipx_id)).unwrap();
+            jose::jws_sign_es256(&ipx_sk, &serde_json::to_vec(&bad).unwrap(), Some(ipx_id))
+                .unwrap();
         msg2.modifications_block.push(jws_bad);
         let err = unprotect_message(&receiver, &msg2).unwrap_err();
         assert_eq!(
@@ -2476,24 +2512,42 @@ mod tests {
         let (mut sender, mut receiver) = ctx_pair();
         sender.local_plmn_ids = vec![PlmnId::new(999, 70, 2)];
         receiver.peer_plmn_ids = vec![PlmnId::new(999, 70, 2)];
-        let msg =
-            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         assert!(unprotect_message(&receiver, &msg).is_ok());
 
         // Mismatching PLMN: sender stamps 999-70, receiver binds 001-01 => reject.
         let (mut sender2, mut receiver2) = ctx_pair();
         sender2.local_plmn_ids = vec![PlmnId::new(999, 70, 2)];
         receiver2.peer_plmn_ids = vec![PlmnId::new(1, 1, 2)];
-        let msg2 =
-            protect_message(&sender2, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let msg2 = protect_message(
+            &sender2,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         let err = unprotect_message(&receiver2, &msg2).unwrap_err();
         assert_eq!(err.error_type, N32fErrorType::PolicyMismatch);
 
         // No binding (receiver has no peer PLMNs) => check skipped (compat).
         let (mut sender3, receiver3) = ctx_pair();
         sender3.local_plmn_ids = vec![PlmnId::new(999, 70, 2)];
-        let msg3 =
-            protect_message(&sender3, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let msg3 = protect_message(
+            &sender3,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         assert!(unprotect_message(&receiver3, &msg3).is_ok());
     }
 
@@ -2505,8 +2559,14 @@ mod tests {
         let (mut sender, mut receiver) = ctx_pair();
         sender.jwe_enc = JweEnc::A128Gcm;
         receiver.jwe_enc = JweEnc::A128Gcm; // enc is also read from the header
-        let msg =
-            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         // The JWE header advertises A128GCM.
         let hdr = b64url_decode(&msg.reformatted_data.protected).unwrap();
         assert!(String::from_utf8(hdr).unwrap().contains("A128GCM"));

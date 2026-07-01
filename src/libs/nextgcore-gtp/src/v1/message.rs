@@ -521,7 +521,9 @@ impl SupportedExtHeadersNotification {
     pub fn decode(msg: &Gtp1Message) -> GtpResult<Self> {
         let ie = msg
             .get_ie(Gtp1IeTypeTlv::ExtensionHeaderTypeList as u8)
-            .ok_or_else(|| GtpError::MissingMandatoryIe("Extension Header Type List".to_string()))?;
+            .ok_or_else(|| {
+                GtpError::MissingMandatoryIe("Extension Header Type List".to_string())
+            })?;
         Ok(Self {
             ext_types: ie.value.to_vec(),
         })
@@ -905,10 +907,7 @@ mod tests {
         let udp = decoded
             .get_extension_header(ExtensionHeaderType::UdpPort as u8)
             .unwrap();
-        assert_eq!(
-            u16::from_be_bytes([udp.content[0], udp.content[1]]),
-            2152
-        );
+        assert_eq!(u16::from_be_bytes([udp.content[0], udp.content[1]]), 2152);
     }
 
     #[test]

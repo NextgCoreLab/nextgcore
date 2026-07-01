@@ -362,7 +362,9 @@ async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     match (service, resource, method) {
         // bsfd-13 stub: subscription sub-resource (any method) -> 501.
         // Must be checked BEFORE the generic pcfBindings/POST arm.
-        ("nbsf-management", "pcfBindings", _) if parts.len() >= 5 && parts[4] == "subscriptions" => {
+        ("nbsf-management", "pcfBindings", _)
+            if parts.len() >= 5 && parts[4] == "subscriptions" =>
+        {
             nextgcore_sbi::server::send_error(
                 501,
                 "Not Implemented",
@@ -371,16 +373,12 @@ async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             )
         }
         // BSF Management Service (nbsf-management) — PDU-session bindings
-        ("nbsf-management", "pcfBindings", "POST") => {
-            handle_pcf_binding_create(&request).await
-        }
+        ("nbsf-management", "pcfBindings", "POST") => handle_pcf_binding_create(&request).await,
         ("nbsf-management", "pcfBindings", "GET") if parts.len() >= 4 => {
             let binding_id = parts[3];
             handle_pcf_binding_get(binding_id).await
         }
-        ("nbsf-management", "pcfBindings", "GET") => {
-            handle_pcf_binding_discovery(&request).await
-        }
+        ("nbsf-management", "pcfBindings", "GET") => handle_pcf_binding_discovery(&request).await,
         ("nbsf-management", "pcfBindings", "DELETE") if parts.len() >= 4 => {
             let binding_id = parts[3];
             handle_pcf_binding_delete(binding_id).await
@@ -714,68 +712,68 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
     // Only fires when the SamePcf feature was negotiated AND paraCom is present.
     if negotiated_features & SAME_PCF_BIT != 0 && binding_data.get("paraCom").is_some() {
         if let Some(supi_val) = binding_data.get("supi").and_then(|v| v.as_str()) {
-                let check_sd = binding_data
-                    .get("snssai")
-                    .and_then(|s| s.get("sd"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| u32::from_str_radix(s, 16).ok());
-                let check_snssai = context::SNssai::new(sst as u8, check_sd);
-                let dup = {
-                    let ctx = bsf_self();
-                    ctx.read()
-                        .ok()
-                        .and_then(|g| g.sess_find_by_dnn_snssai_supi(dnn, &check_snssai, supi_val))
-                };
-                if let Some(dup) = dup {
-                    let mut ext = serde_json::Map::new();
-                    ext.insert("status".to_string(), serde_json::json!(403));
+            let check_sd = binding_data
+                .get("snssai")
+                .and_then(|s| s.get("sd"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| u32::from_str_radix(s, 16).ok());
+            let check_snssai = context::SNssai::new(sst as u8, check_sd);
+            let dup = {
+                let ctx = bsf_self();
+                ctx.read()
+                    .ok()
+                    .and_then(|g| g.sess_find_by_dnn_snssai_supi(dnn, &check_snssai, supi_val))
+            };
+            if let Some(dup) = dup {
+                let mut ext = serde_json::Map::new();
+                ext.insert("status".to_string(), serde_json::json!(403));
+                ext.insert(
+                    "cause".to_string(),
+                    serde_json::json!("EXISTING_BINDING_INFO_FOUND"),
+                );
+                if let Some(ref fqdn) = dup.pcf_fqdn {
                     ext.insert(
-                        "cause".to_string(),
-                        serde_json::json!("EXISTING_BINDING_INFO_FOUND"),
+                        "pcfSmFqdn".to_string(),
+                        serde_json::Value::String(fqdn.clone()),
                     );
-                    if let Some(ref fqdn) = dup.pcf_fqdn {
-                        ext.insert(
-                            "pcfSmFqdn".to_string(),
-                            serde_json::Value::String(fqdn.clone()),
-                        );
-                    }
-                    if !dup.pcf_ip.is_empty() {
-                        let eps: Vec<serde_json::Value> = dup
-                            .pcf_ip
-                            .iter()
-                            .map(|ep| {
-                                let mut e = serde_json::Map::new();
-                                if let Some(ref a) = ep.addr {
-                                    e.insert(
-                                        "ipv4Address".to_string(),
-                                        serde_json::Value::String(a.clone()),
-                                    );
-                                }
-                                if let Some(ref a6) = ep.addr6 {
-                                    e.insert(
-                                        "ipv6Address".to_string(),
-                                        serde_json::Value::String(a6.clone()),
-                                    );
-                                }
-                                if ep.is_port {
-                                    e.insert(
-                                        "port".to_string(),
-                                        serde_json::Value::Number(ep.port.into()),
-                                    );
-                                }
-                                serde_json::Value::Object(e)
-                            })
-                            .collect();
-                        ext.insert(
-                            "pcfSmIpEndPoints".to_string(),
-                            serde_json::Value::Array(eps),
-                        );
-                    }
-                    return SbiResponse::with_status(403)
-                        .with_json_body(&serde_json::Value::Object(ext))
-                        .unwrap_or_else(|_| SbiResponse::with_status(403));
                 }
+                if !dup.pcf_ip.is_empty() {
+                    let eps: Vec<serde_json::Value> = dup
+                        .pcf_ip
+                        .iter()
+                        .map(|ep| {
+                            let mut e = serde_json::Map::new();
+                            if let Some(ref a) = ep.addr {
+                                e.insert(
+                                    "ipv4Address".to_string(),
+                                    serde_json::Value::String(a.clone()),
+                                );
+                            }
+                            if let Some(ref a6) = ep.addr6 {
+                                e.insert(
+                                    "ipv6Address".to_string(),
+                                    serde_json::Value::String(a6.clone()),
+                                );
+                            }
+                            if ep.is_port {
+                                e.insert(
+                                    "port".to_string(),
+                                    serde_json::Value::Number(ep.port.into()),
+                                );
+                            }
+                            serde_json::Value::Object(e)
+                        })
+                        .collect();
+                    ext.insert(
+                        "pcfSmIpEndPoints".to_string(),
+                        serde_json::Value::Array(eps),
+                    );
+                }
+                return SbiResponse::with_status(403)
+                    .with_json_body(&serde_json::Value::Object(ext))
+                    .unwrap_or_else(|_| SbiResponse::with_status(403));
             }
+        }
     }
 
     // Add session to context
@@ -1516,7 +1514,11 @@ async fn handle_pcf_ue_binding_discovery(request: &SbiRequest) -> SbiResponse {
 
 async fn handle_pcf_ue_binding_delete(binding_id: &str) -> SbiResponse {
     let ctx = bsf_self();
-    match ctx.read().ok().and_then(|g| g.ue_binding_remove(binding_id)) {
+    match ctx
+        .read()
+        .ok()
+        .and_then(|g| g.ue_binding_remove(binding_id))
+    {
         Some(_) => {
             log::info!("PCF UE Binding {binding_id} deleted");
             SbiResponse::with_status(204)
@@ -2950,7 +2952,10 @@ mod tests {
             )
             .await
             .expect("POST without SamePcf");
-        assert_ne!(resp.status, 403, "SamePcf not negotiated → no duplicate 403");
+        assert_ne!(
+            resp.status, 403,
+            "SamePcf not negotiated → no duplicate 403"
+        );
 
         server.stop().await.expect("server stops");
     }
@@ -2997,17 +3002,18 @@ mod tests {
         assert_eq!(got["bindLevel"], "NF_INSTANCE");
 
         // PATCH clears pcfId (null remove).
-        let mut req =
-            SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{id}"));
-        req.http
-            .set_content(json!({"pcfId": null}).to_string());
+        let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{id}"));
+        req.http.set_content(json!({"pcfId": null}).to_string());
         req.http
             .set_header("Content-Type", "application/merge-patch+json");
         let resp = client.send_request(req).await.expect("PATCH pcfId null");
         assert_eq!(resp.status, 200);
         let patched: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert!(patched.get("pcfId").is_none(), "pcfId cleared by null patch");
+        assert!(
+            patched.get("pcfId").is_none(),
+            "pcfId cleared by null patch"
+        );
 
         server.stop().await.expect("server stops");
     }
@@ -3070,10 +3076,7 @@ mod tests {
         // Discovery by supi → 200 with array.
         let mut req = SbiRequest::get("/nbsf-management/v1/pcf-ue-bindings");
         req.http.set_param("supi", "imsi-001019900111001");
-        let resp = client
-            .send_request(req)
-            .await
-            .expect("discover ue supi");
+        let resp = client.send_request(req).await.expect("discover ue supi");
         assert_eq!(resp.status, 200);
         let arr: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
@@ -3081,13 +3084,15 @@ mod tests {
 
         // Discovery without supi|gpsi → 400.
         let req = SbiRequest::get("/nbsf-management/v1/pcf-ue-bindings");
-        let resp = client.send_request(req).await.expect("discover ue no filter");
+        let resp = client
+            .send_request(req)
+            .await
+            .expect("discover ue no filter");
         assert_eq!(resp.status, 400);
         assert_eq!(problem(&resp)["cause"], "MANDATORY_QUERY_PARAM_MISSING");
 
         // PATCH pcfFqdn → 200.
-        let mut req =
-            SbiRequest::patch(format!("/nbsf-management/v1/pcf-ue-bindings/{ue_id}"));
+        let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcf-ue-bindings/{ue_id}"));
         req.http
             .set_content(json!({"pcfFqdn": "pcf.ue2.example.com"}).to_string());
         req.http
@@ -3113,7 +3118,10 @@ mod tests {
         // Discovery after delete → 204 (empty).
         let mut req = SbiRequest::get("/nbsf-management/v1/pcf-ue-bindings");
         req.http.set_param("supi", "imsi-001019900111001");
-        let resp = client.send_request(req).await.expect("discover ue after delete");
+        let resp = client
+            .send_request(req)
+            .await
+            .expect("discover ue after delete");
         assert_eq!(resp.status, 204);
 
         server.stop().await.expect("server stops");
@@ -3202,8 +3210,7 @@ mod tests {
         assert_eq!(resp.status, 204);
 
         // PATCH → 200.
-        let mut req =
-            SbiRequest::patch(format!("/nbsf-management/v1/pcf-mbs-bindings/{mbs_id}"));
+        let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcf-mbs-bindings/{mbs_id}"));
         req.http
             .set_content(json!({"pcfFqdn": "pcf.mbs-patched.example.com"}).to_string());
         req.http

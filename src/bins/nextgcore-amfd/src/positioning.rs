@@ -34,8 +34,8 @@
 
 use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
 use nextgcore_asn1c::ngap::pdu::{
-    build_downlink_non_ue_associated_nrppa_transport,
-    build_downlink_ue_associated_nrppa_transport, NgapPdu,
+    build_downlink_non_ue_associated_nrppa_transport, build_downlink_ue_associated_nrppa_transport,
+    NgapPdu,
 };
 use nextgcore_asn1c::per::{AperEncode, AperEncoder};
 

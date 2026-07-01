@@ -181,7 +181,10 @@ pub fn create_mar(
 
     // Vendor-Specific-Application-Id
     let vsai = vec![
-        Avp::mandatory(avp_code::VENDOR_ID, AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID)),
+        Avp::mandatory(
+            avp_code::VENDOR_ID,
+            AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID),
+        ),
         Avp::mandatory(
             avp_code::AUTH_APPLICATION_ID,
             AvpData::Unsigned32(SWX_APPLICATION_ID),
@@ -264,7 +267,10 @@ pub fn create_sar(
 
     // Vendor-Specific-Application-Id
     let vsai = vec![
-        Avp::mandatory(avp_code::VENDOR_ID, AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID)),
+        Avp::mandatory(
+            avp_code::VENDOR_ID,
+            AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID),
+        ),
         Avp::mandatory(
             avp_code::AUTH_APPLICATION_ID,
             AvpData::Unsigned32(SWX_APPLICATION_ID),

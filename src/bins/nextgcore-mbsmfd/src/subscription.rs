@@ -209,7 +209,10 @@ pub async fn send_notify_post(notify_uri: &str, body: &impl Serialize) {
 
     match client.post_json(&path, &body_val).await {
         Ok(rsp) if rsp.status / 100 == 2 => {
-            log::debug!("[sub] notification delivered to {notify_uri} ({})", rsp.status);
+            log::debug!(
+                "[sub] notification delivered to {notify_uri} ({})",
+                rsp.status
+            );
         }
         Ok(rsp) => {
             log::warn!("[sub] notification to {notify_uri} returned {}", rsp.status);

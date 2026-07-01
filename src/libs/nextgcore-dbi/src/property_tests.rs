@@ -251,14 +251,20 @@ mod unit_tests {
     fn test_supi_parsing_imsi() {
         let supi = "imsi-123456789012345";
         assert_eq!(nextgcore_id_get_type(supi), Some("imsi".to_string()));
-        assert_eq!(nextgcore_id_get_value(supi), Some("123456789012345".to_string()));
+        assert_eq!(
+            nextgcore_id_get_value(supi),
+            Some("123456789012345".to_string())
+        );
     }
 
     #[test]
     fn test_supi_parsing_nai() {
         let supi = "nai-user@example.com";
         assert_eq!(nextgcore_id_get_type(supi), Some("nai".to_string()));
-        assert_eq!(nextgcore_id_get_value(supi), Some("user@example.com".to_string()));
+        assert_eq!(
+            nextgcore_id_get_value(supi),
+            Some("user@example.com".to_string())
+        );
     }
 
     #[test]

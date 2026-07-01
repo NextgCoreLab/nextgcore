@@ -598,7 +598,12 @@ fn n32_kdf(master: &[u8], n32_context_id: &str, label: &str, out: &mut [u8]) {
     use hkdf::Hkdf;
     use sha2::Sha256;
     let hk = Hkdf::<Sha256>::from_prk(master).expect("master >= 32 bytes (PRK length)");
-    let info = [b"N32".as_slice(), n32_context_id.as_bytes(), label.as_bytes()].concat();
+    let info = [
+        b"N32".as_slice(),
+        n32_context_id.as_bytes(),
+        label.as_bytes(),
+    ]
+    .concat();
     hk.expand(&info, out)
         .expect("valid HKDF-SHA256 Expand output length");
 }
@@ -619,13 +624,19 @@ pub fn derive_n32f_key_material(master: &[u8], n32_context_id: &str) -> N32fKeyM
         out
     };
     N32fKeyMaterial {
-        parallel_req: (key("parallel_request_key"), salt("parallel_request_iv_salt")),
+        parallel_req: (
+            key("parallel_request_key"),
+            salt("parallel_request_iv_salt"),
+        ),
         parallel_resp: (
             key("parallel_response_key"),
             salt("parallel_response_iv_salt"),
         ),
         reverse_req: (key("reverse_request_key"), salt("reverse_request_iv_salt")),
-        reverse_resp: (key("reverse_response_key"), salt("reverse_response_iv_salt")),
+        reverse_resp: (
+            key("reverse_response_key"),
+            salt("reverse_response_iv_salt"),
+        ),
     }
 }
 
@@ -819,8 +830,7 @@ pub fn handle_exchange_params_response(
         &rsp.n32f_context_id,
         allow_insecure_no_tls(),
     )?;
-    let n32_context_id =
-        canonical_n32f_context_id(&sent_req.n32f_context_id, &rsp.n32f_context_id);
+    let n32_context_id = canonical_n32f_context_id(&sent_req.n32f_context_id, &rsp.n32f_context_id);
     let key_material = derive_n32f_key_material(&master, &n32_context_id);
 
     // Adopt the protection policy the responder selected, projecting its
@@ -1056,23 +1066,45 @@ mod tests {
         // Independent reference: HKDF-Expand-only over the same PRK + info.
         let expand = |label: &str, len: usize| -> Vec<u8> {
             let hk = Hkdf::<Sha256>::from_prk(&master).unwrap();
-            let info =
-                [b"N32".as_slice(), n32_context_id.as_bytes(), label.as_bytes()].concat();
+            let info = [
+                b"N32".as_slice(),
+                n32_context_id.as_bytes(),
+                label.as_bytes(),
+            ]
+            .concat();
             let mut out = vec![0u8; len];
             hk.expand(&info, &mut out).unwrap();
             out
         };
 
-        assert_eq!(km.parallel_req.0.as_slice(), expand("parallel_request_key", 32));
-        assert_eq!(km.parallel_req.1.as_slice(), expand("parallel_request_iv_salt", 8));
-        assert_eq!(km.parallel_resp.0.as_slice(), expand("parallel_response_key", 32));
+        assert_eq!(
+            km.parallel_req.0.as_slice(),
+            expand("parallel_request_key", 32)
+        );
+        assert_eq!(
+            km.parallel_req.1.as_slice(),
+            expand("parallel_request_iv_salt", 8)
+        );
+        assert_eq!(
+            km.parallel_resp.0.as_slice(),
+            expand("parallel_response_key", 32)
+        );
         assert_eq!(
             km.parallel_resp.1.as_slice(),
             expand("parallel_response_iv_salt", 8)
         );
-        assert_eq!(km.reverse_req.0.as_slice(), expand("reverse_request_key", 32));
-        assert_eq!(km.reverse_req.1.as_slice(), expand("reverse_request_iv_salt", 8));
-        assert_eq!(km.reverse_resp.0.as_slice(), expand("reverse_response_key", 32));
+        assert_eq!(
+            km.reverse_req.0.as_slice(),
+            expand("reverse_request_key", 32)
+        );
+        assert_eq!(
+            km.reverse_req.1.as_slice(),
+            expand("reverse_request_iv_salt", 8)
+        );
+        assert_eq!(
+            km.reverse_resp.0.as_slice(),
+            expand("reverse_response_key", 32)
+        );
         assert_eq!(
             km.reverse_resp.1.as_slice(),
             expand("reverse_response_iv_salt", 8)
@@ -1158,8 +1190,10 @@ mod tests {
     #[test]
     fn test_resolve_exporter_secret_fallback_is_64_octets() {
         // No secret deposited for this peer, fallback allowed => fallback path.
-        let s1 = resolve_exporter_secret("no-tls-peer.example.com", "ctx-i", "ctx-r", true).unwrap();
-        let s2 = resolve_exporter_secret("no-tls-peer.example.com", "ctx-r", "ctx-i", true).unwrap();
+        let s1 =
+            resolve_exporter_secret("no-tls-peer.example.com", "ctx-i", "ctx-r", true).unwrap();
+        let s2 =
+            resolve_exporter_secret("no-tls-peer.example.com", "ctx-r", "ctx-i", true).unwrap();
         assert_eq!(s1.len(), 64);
         assert_eq!(s1, s2, "fallback is order-independent across the ctx pair");
     }
@@ -1231,7 +1265,10 @@ mod tests {
         };
         let rsp = handle_exchange_params_request(&mut node_b, &req).unwrap();
         assert_eq!(rsp.selected_jwe_cipher_suite, "A128GCM");
-        assert_eq!(crate::jose::JweEnc::from_name("A128GCM").unwrap().key_len(), 16);
+        assert_eq!(
+            crate::jose::JweEnc::from_name("A128GCM").unwrap().key_len(),
+            16
+        );
     }
 
     /// C6: with the SAME TLS exporter secret deposited for both peers (as a
@@ -1289,7 +1326,10 @@ mod tests {
         assert_eq!(sec_a.peer_context_id, sec_b.local_context_id);
         // Both kids equal the canonical `{initiator}-{responder}` context ID.
         assert_eq!(sec_a.kid, sec_b.kid);
-        assert_eq!(sec_a.kid, format!("{}-{}", a_ctx_id, sec_b.local_context_id));
+        assert_eq!(
+            sec_a.kid,
+            format!("{}-{}", a_ctx_id, sec_b.local_context_id)
+        );
     }
 
     #[test]
@@ -1351,7 +1391,10 @@ mod tests {
         let mut peer = local_protection_policy();
         peer.data_type_enc_policy = Some(vec![IeType::Ueid]);
         let (sel, profiles) = negotiate_protection_policy(Some(&peer));
-        assert_eq!(sel.data_type_enc_policy.as_deref(), Some(&[IeType::Ueid][..]));
+        assert_eq!(
+            sel.data_type_enc_policy.as_deref(),
+            Some(&[IeType::Ueid][..])
+        );
 
         let nausf = profiles
             .iter()
@@ -1411,8 +1454,14 @@ mod tests {
         // The response carries the selected policy with the intersected types
         // and echoes the selected security profiles.
         let sel = rsp.sel_protection_policy_info.as_ref().unwrap();
-        assert_eq!(sel.data_type_enc_policy.as_deref(), Some(&[IeType::Ueid][..]));
-        assert_eq!(rsp.sel_sec_profiles.as_deref(), Some(&["profA".to_string()][..]));
+        assert_eq!(
+            sel.data_type_enc_policy.as_deref(),
+            Some(&[IeType::Ueid][..])
+        );
+        assert_eq!(
+            rsp.sel_sec_profiles.as_deref(),
+            Some(&["profA".to_string()][..])
+        );
 
         // The stored runtime profiles encrypt exactly the negotiated UEID, not
         // the (un-negotiated) AUTHENTICATION_MATERIAL.

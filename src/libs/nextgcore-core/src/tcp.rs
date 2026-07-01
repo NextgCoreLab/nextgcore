@@ -4,8 +4,13 @@
 
 use crate::errno::NEXTGCORE_OK;
 use crate::sockaddr::NextgcoreSockaddr;
-use crate::socket::{nextgcore_sock_bind, nextgcore_sock_connect, nextgcore_sock_listen, nextgcore_sock_socket, NextgcoreSock};
-use crate::sockopt::{nextgcore_listen_reusable, nextgcore_so_linger, nextgcore_tcp_nodelay, NextgcoreSockopt};
+use crate::socket::{
+    nextgcore_sock_bind, nextgcore_sock_connect, nextgcore_sock_listen, nextgcore_sock_socket,
+    NextgcoreSock,
+};
+use crate::sockopt::{
+    nextgcore_listen_reusable, nextgcore_so_linger, nextgcore_tcp_nodelay, NextgcoreSockopt,
+};
 
 /// Create a TCP server socket (identical to nextgcore_tcp_server)
 pub fn nextgcore_tcp_server(
@@ -18,7 +23,9 @@ pub fn nextgcore_tcp_server(
 
     while let Some(addr) = current {
         // Create socket
-        if let Some(mut sock) = nextgcore_sock_socket(addr.family, libc::SOCK_STREAM, libc::IPPROTO_TCP) {
+        if let Some(mut sock) =
+            nextgcore_sock_socket(addr.family, libc::SOCK_STREAM, libc::IPPROTO_TCP)
+        {
             // Set TCP_NODELAY
             if option.tcp_nodelay {
                 let rv = nextgcore_tcp_nodelay(sock.fd, true);
@@ -72,7 +79,9 @@ pub fn nextgcore_tcp_client(
 
     while let Some(addr) = current {
         // Create socket
-        if let Some(mut sock) = nextgcore_sock_socket(addr.family, libc::SOCK_STREAM, libc::IPPROTO_TCP) {
+        if let Some(mut sock) =
+            nextgcore_sock_socket(addr.family, libc::SOCK_STREAM, libc::IPPROTO_TCP)
+        {
             // Set TCP_NODELAY (note: original code uses sctp_nodelay for tcp_client, likely a bug)
             if option.sctp_nodelay {
                 let rv = nextgcore_tcp_nodelay(sock.fd, true);

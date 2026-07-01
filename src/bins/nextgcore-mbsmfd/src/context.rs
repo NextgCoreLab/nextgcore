@@ -732,7 +732,10 @@ impl MbSmfContext {
 
     /// Number of active ContextStatus subscriptions.
     pub fn ctx_sub_count(&self) -> usize {
-        self.context_status_subs.lock().map(|s| s.len()).unwrap_or(0)
+        self.context_status_subs
+            .lock()
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 
     // ---- mbsmfd-03: ContextUpdate Start / Terminate ----

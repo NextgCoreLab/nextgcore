@@ -995,7 +995,20 @@ mod tests {
 
     #[test]
     fn rt_unconstrained_whole_number() {
-        for v in [0i64, 1, -1, 127, 128, -128, 255, -255, 65535, -65536, i64::MIN, i64::MAX] {
+        for v in [
+            0i64,
+            1,
+            -1,
+            127,
+            128,
+            -128,
+            255,
+            -255,
+            65535,
+            -65536,
+            i64::MIN,
+            i64::MAX,
+        ] {
             let mut enc = UperEncoder::new();
             enc.encode_unconstrained_whole_number(v).unwrap();
             let bytes = enc.into_bytes();
@@ -1169,7 +1182,8 @@ mod tests {
         let mut sub = UperEncoder::new();
         sub.encode_constrained_whole_number(0xCD, &c).unwrap();
         let member = sub.into_bytes().to_vec();
-        enc.encode_extension_additions(&[Some(member.clone())]).unwrap();
+        enc.encode_extension_additions(&[Some(member.clone())])
+            .unwrap();
         let bytes = enc.into_bytes();
 
         let mut dec = UperDecoder::new(&bytes);

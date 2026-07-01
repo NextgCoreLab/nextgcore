@@ -1156,15 +1156,17 @@ async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
             // maps (pcfd-11). The decision is rebuilt from the same subscription
             // data used at create so the GET body matches the create response.
             let dnn = sess.dnn.as_deref().unwrap_or("internet");
-            let session_data = pcf_get_session_data("", None, &sess.s_nssai, dnn)
-                .unwrap_or_else(|| nudr_handler::SessionData {
-                    qos_index: 9,
-                    arp_priority_level: 8,
-                    arp_preempt_cap: false,
-                    arp_preempt_vuln: true,
-                    ambr_uplink: 100_000_000,
-                    ambr_downlink: 100_000_000,
-                    pcc_rules: vec![],
+            let session_data =
+                pcf_get_session_data("", None, &sess.s_nssai, dnn).unwrap_or_else(|| {
+                    nudr_handler::SessionData {
+                        qos_index: 9,
+                        arp_priority_level: 8,
+                        arp_preempt_cap: false,
+                        arp_preempt_vuln: true,
+                        ambr_uplink: 100_000_000,
+                        ambr_downlink: 100_000_000,
+                        pcc_rules: vec![],
+                    }
                 });
             let decision = build_sm_policy_decision(&sess.sm_policy_id, &session_data);
             SbiResponse::with_status(200)
@@ -1711,10 +1713,7 @@ async fn handle_app_session_modify(app_session_id: &str, request: &SbiRequest) -
             // Always reflect the stored notifUri on the resource representation.
             if let Some(obj) = resp_body.as_object_mut() {
                 if obj.get("notifUri").map(|v| v.is_null()).unwrap_or(true) {
-                    obj.insert(
-                        "notifUri".to_string(),
-                        serde_json::json!(app.notif_uri),
-                    );
+                    obj.insert("notifUri".to_string(), serde_json::json!(app.notif_uri));
                 }
             }
             SbiResponse::with_status(200)
@@ -2400,7 +2399,10 @@ mod tests {
             notify["smPolicyDecision"]["qosDecs"][qos_id]["maxbrDl"],
             "256 Kbps"
         );
-        assert_eq!(notify["smPolicyDecision"]["qosDecs"][qos_id]["qosId"], qos_id);
+        assert_eq!(
+            notify["smPolicyDecision"]["qosDecs"][qos_id]["qosId"],
+            qos_id
+        );
     }
 
     /// pcfd-02 backward-compat: an app-session create WITHOUT medComponents
@@ -2603,7 +2605,10 @@ mod tests {
             let arp = qos
                 .get("arp")
                 .unwrap_or_else(|| panic!("QosData {key} missing arp"));
-            assert!(arp.get("priorityLevel").is_some(), "{key} arp.priorityLevel");
+            assert!(
+                arp.get("priorityLevel").is_some(),
+                "{key} arp.priorityLevel"
+            );
             assert!(arp.get("preemptCap").is_some(), "{key} arp.preemptCap");
             assert!(arp.get("preemptVuln").is_some(), "{key} arp.preemptVuln");
         }

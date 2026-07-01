@@ -312,7 +312,9 @@ impl UperDecode for GnssOrbitModel {
     fn decode_uper(d: &mut UperDecoder) -> PerResult<Self> {
         let idx = d.decode_choice_index(Self::NUM_ROOT, true)?;
         if idx == Self::KEPLERIAN_INDEX {
-            Ok(GnssOrbitModel::Keplerian(NavModelKeplerianSet::decode_uper(d)?))
+            Ok(GnssOrbitModel::Keplerian(
+                NavModelKeplerianSet::decode_uper(d)?,
+            ))
         } else {
             // DEFERRED: nav-/cnav-KeplerianSet, GLONASS-ECEF, SBAS-ECEF and any
             // extension alternative are not supported.
@@ -390,7 +392,8 @@ impl UperDecode for GnssNavModelSatelliteElement {
             ));
         }
         let sv_id = SvId::decode_uper(d)?;
-        let sv_health = d.decode_bit_string(Some(Self::SV_HEALTH_LEN), Some(Self::SV_HEALTH_LEN))?;
+        let sv_health =
+            d.decode_bit_string(Some(Self::SV_HEALTH_LEN), Some(Self::SV_HEALTH_LEN))?;
         let iod = d.decode_bit_string(Some(Self::IOD_LEN), Some(Self::IOD_LEN))?;
         let gnss_clock_model = GnssClockModel::decode_uper(d)?;
         let gnss_orbit_model = GnssOrbitModel::decode_uper(d)?;
@@ -471,7 +474,10 @@ impl UperEncode for GnssNavigationModel {
     fn encode_uper(&self, e: &mut UperEncoder) -> PerResult<()> {
         // Extensible SEQUENCE, no root OPTIONAL fields; no extension additions.
         e.encode_sequence_preamble(Some(false), &[]);
-        e.encode_constrained_whole_number(self.non_broadcast_ind_flag as i64, &Self::NON_BROADCAST)?;
+        e.encode_constrained_whole_number(
+            self.non_broadcast_ind_flag as i64,
+            &Self::NON_BROADCAST,
+        )?;
         self.gnss_satellite_list.encode_uper(e)?;
         Ok(())
     }
@@ -486,8 +492,7 @@ impl UperDecode for GnssNavigationModel {
                 "GNSS-NavigationModel extension additions not supported".into(),
             ));
         }
-        let non_broadcast_ind_flag =
-            d.decode_constrained_whole_number(&Self::NON_BROADCAST)? as u8;
+        let non_broadcast_ind_flag = d.decode_constrained_whole_number(&Self::NON_BROADCAST)? as u8;
         let gnss_satellite_list = GnssNavModelSatelliteList::decode_uper(d)?;
         Ok(GnssNavigationModel {
             non_broadcast_ind_flag,

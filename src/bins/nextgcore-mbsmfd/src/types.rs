@@ -159,7 +159,10 @@ pub fn apply_patch_data(patch: &PatchData, tacs: &mut Vec<u32>) -> PatchOutcome 
                 // Persist any TAC list carried in the new service area so a
                 // subsequent GET reflects the change.
                 if let Some(arr) = value.as_array() {
-                    *tacs = arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+                    *tacs = arr
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as u32))
+                        .collect();
                 }
                 reduced = Some(value.clone());
             }
@@ -332,7 +335,8 @@ mod tests {
         let id: MbsSessionId = serde_json::from_str(json).unwrap();
         assert!(id.tmgi.is_some());
         assert!(id.ssm.is_some());
-        let back: MbsSessionId = serde_json::from_str(&serde_json::to_string(&id).unwrap()).unwrap();
+        let back: MbsSessionId =
+            serde_json::from_str(&serde_json::to_string(&id).unwrap()).unwrap();
         assert_eq!(back, id);
     }
 
@@ -347,7 +351,10 @@ mod tests {
             }
         }"#;
         let req: CreateReqData = serde_json::from_str(json).unwrap();
-        assert_eq!(req.mbs_session.service_type, Some(MbsServiceType::Multicast));
+        assert_eq!(
+            req.mbs_session.service_type,
+            Some(MbsServiceType::Multicast)
+        );
         assert_eq!(
             req.mbs_session
                 .mbs_session_id
@@ -362,7 +369,10 @@ mod tests {
     fn test_create_req_data_service_type_broadcast() {
         let json = r#"{"mbsSession":{"serviceType":"BROADCAST"}}"#;
         let req: CreateReqData = serde_json::from_str(json).unwrap();
-        assert_eq!(req.mbs_session.service_type, Some(MbsServiceType::Broadcast));
+        assert_eq!(
+            req.mbs_session.service_type,
+            Some(MbsServiceType::Broadcast)
+        );
     }
 
     #[test]
@@ -432,7 +442,10 @@ mod tests {
         assert!(req.dl_tunnel_info.is_none());
         assert!(req.ran_node_id.is_none());
         assert_eq!(
-            req.mbs_session_id.tmgi.as_ref().map(|t| t.service_id_bytes()),
+            req.mbs_session_id
+                .tmgi
+                .as_ref()
+                .map(|t| t.service_id_bytes()),
             Some([0x01, 0x02, 0x03])
         );
     }
@@ -479,7 +492,10 @@ mod tests {
         let json = serde_json::to_string(&rsp).unwrap();
         // cTeid serializes as an integer (Uint32), not a string.
         assert!(json.contains(&format!("\"cTeid\":{}", 0x0BCA_0001u32)));
-        assert!(!json.contains("\"cTeid\":\""), "cTeid is an integer, not a string");
+        assert!(
+            !json.contains("\"cTeid\":\""),
+            "cTeid is an integer, not a string"
+        );
         assert!(json.contains("\"llSsm\""));
         let back: ContextUpdateRspData = serde_json::from_str(&json).unwrap();
         assert_eq!(back, rsp);

@@ -1474,7 +1474,10 @@ mod tests {
         );
         ccr.add_avp(sub_id);
         nextgcore_diameter::gx::add_called_station_id(&mut ccr, "internet");
-        nextgcore_diameter::gx::add_framed_ip_address(&mut ccr, std::net::Ipv4Addr::new(10, 45, 0, 2));
+        nextgcore_diameter::gx::add_framed_ip_address(
+            &mut ccr,
+            std::net::Ipv4Addr::new(10, 45, 0, 2),
+        );
         ccr
     }
 
@@ -1906,7 +1909,10 @@ mod tests {
         raa.add_avp(Avp::mandatory(
             avp_code::EXPERIMENTAL_RESULT,
             AvpData::Grouped(vec![
-                Avp::mandatory(avp_code::VENDOR_ID, AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID)),
+                Avp::mandatory(
+                    avp_code::VENDOR_ID,
+                    AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID),
+                ),
                 Avp::mandatory(
                     avp_code::EXPERIMENTAL_RESULT_CODE,
                     AvpData::Unsigned32(nextgcore_diameter::gx::exp_result::PCC_RULE_EVENT),

@@ -108,7 +108,8 @@ impl UperEncode for GnssAcquisitionAssistElement {
             &Self::DOPPLER_UNCERTAINTY,
         )?;
         encoder.encode_constrained_whole_number(self.code_phase as i64, &Self::CODE_PHASE)?;
-        encoder.encode_constrained_whole_number(self.int_code_phase as i64, &Self::INT_CODE_PHASE)?;
+        encoder
+            .encode_constrained_whole_number(self.int_code_phase as i64, &Self::INT_CODE_PHASE)?;
         encoder.encode_constrained_whole_number(
             self.code_phase_search_window as i64,
             &Self::CODE_PHASE_SEARCH_WINDOW,
