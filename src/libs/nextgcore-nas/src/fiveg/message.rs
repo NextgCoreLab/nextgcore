@@ -10,6 +10,24 @@ use crate::common::types::*;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+/// Returns true if `iei` denotes a type-6 (TLV-E) IE in the 5GS NAS protocol,
+/// i.e. one whose length field is 2 octets rather than 1 (TS 24.007 §11.2.5).
+///
+/// These are the TLV-E IEIs defined across the TS 24.501 5GMM/5GSM message
+/// tables: NAS message container (0x71), Additional GUTI (0x77), EAP message
+/// (0x78), LADN information (0x79), Payload container (0x7B), and the other
+/// container-style IEs in the 0x70..=0x7F band (SOR transparent container 0x73,
+/// operator-defined access category definitions 0x76, extended emergency number
+/// list 0x7A, ciphering key data 0x74, CAG information list 0x75, mapped/EPS
+/// bearer contexts 0x7A/0x7C, extended PCO 0x7B). Consuming the correct number
+/// of length octets keeps the IE loop in sync when such an IE is not modelled.
+fn is_tlv_e_iei(iei: u8) -> bool {
+    matches!(
+        iei,
+        0x71 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7A | 0x7B | 0x7C
+    )
+}
+
 /// Skip an unknown / unhandled optional IE in a default IE-loop arm, per
 /// TS 24.501 §7.6.1 (unknown IEs are ignored, not errored) and the TS 24.007
 /// IE-format rules. `buf` must be positioned at the IEI octet; `iei` is the
@@ -18,14 +36,24 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 /// - `iei >= 0x80`: type-1 (TV, half-octet IEI in the high nibble) or type-2
 ///   (T) — the whole IE is the single IEI octet; consume 1 octet, no length,
 ///   no value.
-/// - `iei <  0x80`: treated as type-4 (TLV) — consume the IEI octet, a 1-octet
-///   length, then `len` value octets (clamped to remaining for well-formed
-///   inputs). NOTE: unknown type-3 (fixed-length TV) and type-6 (TLV-E) IEs
-///   share the `< 0x80` space and are not distinguishable here; all *known*
-///   such IEIs are matched explicitly, so this only affects unknown ones.
+/// - `iei <  0x80` and TLV-E (see `is_tlv_e_iei`): consume the IEI octet, a
+///   2-octet length, then that many value octets.
+/// - other `iei <  0x80`: treated as type-4 (TLV) — consume the IEI octet, a
+///   1-octet length, then `len` value octets. NOTE: unknown type-3 (fixed
+///   length TV) IEs still cannot be distinguished, but all *known* such IEIs
+///   are matched explicitly, so this only affects unknown ones.
 fn skip_unknown_ie(buf: &mut Bytes, iei: u8) -> NasResult<()> {
     buf.advance(1); // consume the IEI octet (peeked, not yet advanced by caller)
-    if iei < 0x80 && buf.remaining() > 0 {
+    if iei >= 0x80 {
+        return Ok(());
+    }
+    if is_tlv_e_iei(iei) {
+        if buf.remaining() >= 2 {
+            let len = buf.get_u16() as usize;
+            let take = len.min(buf.remaining());
+            buf.advance(take);
+        }
+    } else if buf.remaining() > 0 {
         let len = buf.get_u8() as usize;
         let take = len.min(buf.remaining());
         buf.advance(take);
@@ -99,6 +127,10 @@ pub struct RegistrationRequest {
     pub pdu_session_status: Option<PduSessionStatus>,
     /// Uplink data status
     pub uplink_data_status: Option<UplinkDataStatus>,
+    /// NAS message container (IEI 0x71, TLV-E) — carries the ciphered/cleartext
+    /// initial NAS message for the cleartext-IE registration flow (TS 24.501
+    /// §4.4.6 / §9.11.3.33).
+    pub nas_message_container: Option<NasMessageContainer>,
 }
 
 impl RegistrationRequest {
@@ -144,6 +176,10 @@ impl RegistrationRequest {
         if let Some(ref guti) = self.additional_guti {
             buf.put_u8(0x77); // IEI (TLV-E)
             guti.encode(buf);
+        }
+        if let Some(ref nmc) = self.nas_message_container {
+            buf.put_u8(0x71); // IEI (TLV-E)
+            nmc.encode(buf);
         }
     }
 
@@ -221,6 +257,11 @@ impl RegistrationRequest {
                     // Additional GUTI
                     buf.advance(1);
                     msg.additional_guti = Some(MobileIdentity::decode(buf)?);
+                }
+                0x71 => {
+                    // NAS message container (TLV-E), cleartext-IE reg (§4.4.6)
+                    buf.advance(1);
+                    msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -712,7 +753,8 @@ impl ServiceAccept {
         if let Some(result) = self.pdu_session_reactivation_result {
             buf.put_u8(0x26); // IEI
             buf.put_u8(2); // Length
-            buf.put_u16(result);
+                           // TS 24.501 §9.11.3.42: PSI(0)-PSI(15) bitmap, octet 3 = PSI(0)-PSI(7) => little-endian.
+            buf.put_u16_le(result);
         }
         if let Some(ref eap) = self.eap_message {
             buf.put_u8(0x78); // IEI
@@ -737,7 +779,7 @@ impl ServiceAccept {
                     buf.advance(1);
                     if buf.remaining() >= 3 {
                         let _len = buf.get_u8();
-                        msg.pdu_session_reactivation_result = Some(buf.get_u16());
+                        msg.pdu_session_reactivation_result = Some(buf.get_u16_le());
                     }
                 }
                 0x78 => {
@@ -3542,5 +3584,77 @@ mod nas08_tests {
             parse_5gsm_message(&mut Bytes::from(bytes)),
             Err(NasError::InvalidProtocolDiscriminator(0x7e))
         ));
+    }
+}
+
+#[cfg(test)]
+mod tlv_e_skip_tests {
+    //! TS 24.501 §9.11.3.33 / §4.4.6 / TS 24.007 §11.2.5 — TLV-E IEs carry a
+    //! 2-octet length; the unknown-IE skipper must consume that correctly, and
+    //! REGISTRATION REQUEST must model the NAS message container (IEI 0x71) so
+    //! the cleartext-IE initial registration flow round-trips.
+    use super::*;
+
+    #[test]
+    fn test_registration_request_nas_message_container_roundtrip() {
+        let inner = vec![0xAA; 300]; // >255 so a 1-octet length would truncate
+        let mut rr = RegistrationRequest {
+            mobile_identity: MobileIdentity::default(),
+            ..Default::default()
+        };
+        rr.nas_message_container = Some(NasMessageContainer::new(inner.clone()));
+
+        let mut buf = BytesMut::new();
+        rr.encode(&mut buf);
+        // IEI 0x71 present with a 2-octet big-endian length (300 = 0x012C).
+        let pos = buf
+            .windows(3)
+            .position(|w| w == [0x71, 0x01, 0x2C])
+            .expect("NAS message container must use IEI 0x71 + 2-octet length");
+        assert!(pos > 0);
+
+        let mut b = buf.freeze();
+        let decoded = RegistrationRequest::decode(&mut b).unwrap();
+        assert_eq!(decoded.nas_message_container.map(|c| c.data), Some(inner));
+    }
+
+    #[test]
+    fn test_skip_unknown_tlv_e_ie_does_not_desync() {
+        // Build an RR whose optional-IE area is: an UNKNOWN TLV-E IE (0x74, a
+        // TLV-E IEI not modelled here) with a 2-octet length, followed by a
+        // known 1-octet UE-status IE (0x2B). If the skipper mis-reads the TLV-E
+        // length as 1 octet it desyncs and never sees the UE-status IE.
+        let mut buf = BytesMut::new();
+        // Registration type/ngKSI + a minimal mobile identity (NO-IDENTITY),
+        // encoded LV-E: 2-octet length then the type octet.
+        buf.put_u8(0x01);
+        buf.put_u16(1); // mobile identity length = 1 (2-octet length field)
+        buf.put_u8(0x00); // NO-IDENTITY type octet
+                          // Unknown TLV-E IE 0x74, length 0x0003, 3 value octets
+        buf.put_u8(0x74);
+        buf.put_u16(3);
+        buf.put_slice(&[0xDE, 0xAD, 0xBE]);
+        // Known UE-status IE (0x2B, len 1, value 1)
+        buf.put_u8(0x2B);
+        buf.put_u8(1);
+        buf.put_u8(0x01);
+
+        let mut b = buf.freeze();
+        let decoded = RegistrationRequest::decode(&mut b).unwrap();
+        assert_eq!(
+            decoded.ue_status,
+            Some(0x01),
+            "UE-status IE after an unknown TLV-E IE must still be parsed"
+        );
+    }
+
+    #[test]
+    fn test_is_tlv_e_iei_classification() {
+        for iei in [0x71u8, 0x77, 0x78, 0x79, 0x7B, 0x7C] {
+            assert!(is_tlv_e_iei(iei), "0x{iei:02x} is a TLV-E IEI");
+        }
+        for iei in [0x40u8, 0x50, 0x2E, 0x2B, 0x80, 0xC0] {
+            assert!(!is_tlv_e_iei(iei), "0x{iei:02x} is not TLV-E");
+        }
     }
 }

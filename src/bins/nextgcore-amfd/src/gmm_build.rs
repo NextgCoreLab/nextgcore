@@ -506,9 +506,9 @@ pub fn build_security_mode_reject(gmm_cause: GmmCause) -> Vec<u8> {
 
 /// Build Service Accept message (plain inner; wrap with nas_5gs_security_encode).
 ///
-/// nas-06 Phase 2 (Tier C): encoded via nextgcore-nas. Byte-identical to the prior hand-
-/// rolled output — bare header, plus the optional PDU session status (0x50, LV: len
-/// 2 + the rotate_right(8)-swapped PSI bitmap). Locked by `golden_service_accept`.
+/// nas-06 Phase 2 (Tier C): encoded via nextgcore-nas — bare header, plus the
+/// optional PDU session status (0x50, LV: len 2 + the PSI bitmap little-endian
+/// on the wire per TS 24.501 §9.11.3.44). Locked by `golden_service_accept`.
 pub fn build_service_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     let msg = nextgcore_msg::FiveGmmMessage::ServiceAccept(nextgcore_msg::ServiceAccept {
         pdu_session_status: pdu_session_status_ie(amf_ue),
@@ -535,9 +535,9 @@ pub fn build_service_reject(amf_ue: &AmfUe, gmm_cause: GmmCause) -> Vec<u8> {
 }
 
 /// The optional PDU-session-status IE (0x50) shared by Service Accept/Reject:
-/// present only when the UE has session status to report, carrying the
-/// rotate_right(8)-swapped PSI bitmap verbatim (the nextgcore-nas encoder writes the
-/// fixed length octet 2 and the u16 with no further byte-swap).
+/// present only when the UE has session status to report, carrying the semantic
+/// PSI bitmap (bit n == PSI n); the nextgcore-nas encoder writes the fixed length
+/// octet 2 and the u16 little-endian on the wire (TS 24.501 §9.11.3.44).
 fn pdu_session_status_ie(amf_ue: &AmfUe) -> Option<PduSessionStatus> {
     if amf_ue.pdu_session_status_present {
         Some(PduSessionStatus {
@@ -857,7 +857,11 @@ fn encode_guti(guti: &Guti5gs) -> Vec<u8> {
     data
 }
 
-/// Get PDU session status bitmap
+/// Get PDU session status bitmap (bit n == PSI n).
+///
+/// The value is the semantic bitmap; the nextgcore-nas encoder writes it
+/// little-endian on the wire (TS 24.501 §9.11.3.44: octet 3 carries PSI 0-7),
+/// so no byte-swap is applied here.
 fn get_pdu_session_status(amf_ue: &AmfUe) -> u16 {
     let mut psimask: u16 = 0;
 
@@ -865,8 +869,7 @@ fn get_pdu_session_status(amf_ue: &AmfUe) -> u16 {
         psimask |= 1 << sess.psi;
     }
 
-    // Swap bytes for NAS encoding
-    psimask.rotate_right(8)
+    psimask
 }
 
 // ============================================================================
@@ -1323,9 +1326,9 @@ mod tests {
         // PSS absent -> bare header.
         ue.pdu_session_status_present = false;
         assert_eq!(build_service_accept(&ue), Some(vec![0x7e, 0x00, 0x4e]));
-        // PSS present, one session PSI=1 -> bitmap 0x0002, byte-swapped (rotate_right
-        // 8) to 0x0200. Hard-coded asymmetric expected independently locks the
-        // 0x50 / length-2 / big-endian framing (a swap regression would not pass).
+        // PSS present, one session PSI=1 -> bitmap 0x0002, little-endian on the
+        // wire (TS 24.501 §9.11.3.44: octet 3 = PSI 0-7) -> 0x02 0x00. Hard-coded
+        // expected independently locks the 0x50 / length-2 / LE framing.
         ue.pdu_session_status_present = true;
         ue.sessions = vec![crate::context::AmfSessRef {
             psi: 1,
@@ -1346,7 +1349,8 @@ mod tests {
             build_service_reject(&ue, GmmCause::Congestion),
             vec![0x7e, 0x00, 0x4d, 22]
         );
-        // PSS present, one session PSI=1 -> cause + 0x50 LV with swapped 0x0200.
+        // PSS present, one session PSI=1 -> cause + 0x50 LV, PSI bitmap 0x0002
+        // little-endian on the wire -> 0x02 0x00 (TS 24.501 §9.11.3.44).
         ue.pdu_session_status_present = true;
         ue.sessions = vec![crate::context::AmfSessRef {
             psi: 1,

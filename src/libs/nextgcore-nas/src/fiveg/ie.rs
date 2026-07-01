@@ -149,7 +149,9 @@ impl PduSessionStatus {
     /// Encode to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(2); // Length
-        buf.put_u16(self.psi);
+                       // TS 24.501 Fig 9.11.3.44.1: octet 3 carries PSI(0)-PSI(7), octet 4 PSI(8)-PSI(15).
+                       // With bit n == PSI n in `psi`, that is the little-endian byte order on the wire.
+        buf.put_u16_le(self.psi);
     }
 
     /// Decode from bytes
@@ -161,7 +163,7 @@ impl PduSessionStatus {
             });
         }
         let length = buf.get_u8();
-        let psi = buf.get_u16();
+        let psi = buf.get_u16_le();
         // Skip any additional bytes
         if length > 2 {
             buf.advance((length - 2) as usize);
@@ -183,7 +185,8 @@ impl UplinkDataStatus {
     /// Encode to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(2);
-        buf.put_u16(self.psi);
+        // TS 24.501 §9.11.3.57: octet 3 carries PSI(0)-PSI(7) => little-endian on the wire.
+        buf.put_u16_le(self.psi);
     }
 
     /// Decode from bytes
@@ -195,7 +198,7 @@ impl UplinkDataStatus {
             });
         }
         let length = buf.get_u8();
-        let psi = buf.get_u16();
+        let psi = buf.get_u16_le();
         if length > 2 {
             buf.advance((length - 2) as usize);
         }
@@ -216,7 +219,8 @@ impl AllowedPduSessionStatus {
     /// Encode to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(2);
-        buf.put_u16(self.psi);
+        // TS 24.501 §9.11.3.13: octet 3 carries PSI(0)-PSI(7) => little-endian on the wire.
+        buf.put_u16_le(self.psi);
     }
 
     /// Decode from bytes
@@ -228,7 +232,7 @@ impl AllowedPduSessionStatus {
             });
         }
         let length = buf.get_u8();
-        let psi = buf.get_u16();
+        let psi = buf.get_u16_le();
         if length > 2 {
             buf.advance((length - 2) as usize);
         }
@@ -917,5 +921,62 @@ impl NtnAccessBarring {
             barring_time_seconds,
             ac_barring_flags,
         })
+    }
+}
+
+#[cfg(test)]
+mod psi_wire_tests {
+    use super::*;
+
+    // TS 24.501 §9.11.3.44: octet 3 carries PSI(0)-PSI(7), octet 4 PSI(8)-PSI(15).
+    // Golden: length octet 0x02 then PSI-bitmap little-endian on the wire.
+    #[test]
+    fn test_pdu_session_status_psi1_golden() {
+        let mut s = PduSessionStatus::default();
+        s.set_active(1, true); // PSI 1 -> bit 1 -> octet 3 bit 2
+        let mut buf = BytesMut::new();
+        s.encode(&mut buf);
+        // length=2, octet3=0x02 (PSI 0-7 low byte), octet4=0x00 (PSI 8-15 high byte)
+        assert_eq!(&buf[..], &[0x02, 0x02, 0x00]);
+
+        let mut b = buf.freeze();
+        let decoded = PduSessionStatus::decode(&mut b).unwrap();
+        assert!(decoded.is_active(1));
+        assert!(!decoded.is_active(9));
+    }
+
+    #[test]
+    fn test_pdu_session_status_psi9_golden() {
+        let mut s = PduSessionStatus::default();
+        s.set_active(9, true); // PSI 9 -> bit 9 -> octet 4 bit 2
+        let mut buf = BytesMut::new();
+        s.encode(&mut buf);
+        assert_eq!(&buf[..], &[0x02, 0x00, 0x02]);
+    }
+
+    #[test]
+    fn test_uplink_data_status_psi1_golden() {
+        let s = UplinkDataStatus {
+            length: 2,
+            psi: 0x0002,
+        };
+        let mut buf = BytesMut::new();
+        s.encode(&mut buf);
+        assert_eq!(&buf[..], &[0x02, 0x02, 0x00]);
+        let mut b = buf.freeze();
+        assert_eq!(UplinkDataStatus::decode(&mut b).unwrap().psi, 0x0002);
+    }
+
+    #[test]
+    fn test_allowed_pdu_session_status_psi1_golden() {
+        let s = AllowedPduSessionStatus {
+            length: 2,
+            psi: 0x0002,
+        };
+        let mut buf = BytesMut::new();
+        s.encode(&mut buf);
+        assert_eq!(&buf[..], &[0x02, 0x02, 0x00]);
+        let mut b = buf.freeze();
+        assert_eq!(AllowedPduSessionStatus::decode(&mut b).unwrap().psi, 0x0002);
     }
 }

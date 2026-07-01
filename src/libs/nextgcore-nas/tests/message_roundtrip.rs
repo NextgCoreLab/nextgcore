@@ -175,6 +175,7 @@ fn gmm_registration_request_all_optional_ies() {
             length: 2,
             psi: 0x0004,
         }),
+        nas_message_container: Some(NasMessageContainer::new(vec![0x7e, 0x00, 0x41, 0x01])),
     }));
 }
 
