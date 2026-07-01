@@ -430,12 +430,13 @@ async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 // PCF Binding handlers
 
 /// BSF-supported SBI feature bitmask (TS 29.521 Table 5.8-1, hex encoding).
-/// Bit 0 (0x1) = BindingUpdate (PATCH already wired).
-/// Bit 1 (0x2) = SamePcf (duplicate detection, bsfd-07).
-const BSF_SUPPORTED_FEATURES: u64 = 0x3;
+/// Feature 1 = MultiUeAddr (bit 0 / 0x1, not supported); feature 2 =
+/// BindingUpdate (bit 1 / 0x2, PATCH wired); feature 3 = SamePcf (bit 2 / 0x4,
+/// duplicate detection, bsfd-07). BSF advertises BindingUpdate + SamePcf.
+const BSF_SUPPORTED_FEATURES: u64 = 0x6;
 
-/// SamePcf feature bit (TS 29.521 Table 5.8-1, Feature 2).
-const SAME_PCF_BIT: u64 = 0x2;
+/// SamePcf feature bit (TS 29.521 Table 5.8-1, feature 3 = bit 2).
+const SAME_PCF_BIT: u64 = 0x4;
 
 /// 400 ProblemDetails for a missing mandatory PcfBinding attribute.
 fn missing_mandatory(attr: &str) -> SbiResponse {
@@ -1770,9 +1771,16 @@ async fn handle_pcf_mbs_binding_get(binding_id: &str) -> SbiResponse {
 }
 
 async fn handle_pcf_mbs_binding_discovery(request: &SbiRequest) -> SbiResponse {
-    let Some(mbs_session_id) = request.http.params.get("mbsSessionId") else {
+    // TS 29.521 §4.2.4.4: the query parameter is `mbs-session-id`; accept the
+    // legacy `mbsSessionId` spelling only as a lenient fallback.
+    let Some(mbs_session_id) = request
+        .http
+        .params
+        .get("mbs-session-id")
+        .or_else(|| request.http.params.get("mbsSessionId"))
+    else {
         return send_bad_request(
-            "Discovery query must include mbsSessionId",
+            "Discovery query must include mbs-session-id",
             Some("MANDATORY_QUERY_PARAM_MISSING"),
         );
     };
@@ -2828,7 +2836,7 @@ mod tests {
     async fn test_http_supp_feat_negotiation() {
         let (server, client) = start_bsf().await;
 
-        // Consumer sends "3" (bits 0+1), BSF supports 0x3 → echoed "3".
+        // Consumer sends "6" (BindingUpdate+SamePcf), BSF supports 0x6 → "6".
         let resp = client
             .post_json(
                 "/nbsf-management/v1/pcfBindings",
@@ -2837,17 +2845,17 @@ mod tests {
                     "snssai": {"sst": 1},
                     "ipv4Addr": "10.45.6.1",
                     "pcfFqdn": "pcf.example.com",
-                    "suppFeat": "3"
+                    "suppFeat": "6"
                 }),
             )
             .await
-            .expect("POST suppFeat 3");
+            .expect("POST suppFeat 6");
         assert_eq!(resp.status, 201);
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(body["suppFeat"], "3", "intersection of 3 & 3 = 3");
+        assert_eq!(body["suppFeat"], "6", "intersection of 6 & 6 = 6");
 
-        // Consumer sends "F" (all low bits), BSF supports 0x3 → echoed "3".
+        // Consumer sends "F" (all low bits), BSF supports 0x6 → echoed "6".
         let resp = client
             .post_json(
                 "/nbsf-management/v1/pcfBindings",
@@ -2864,7 +2872,7 @@ mod tests {
         assert_eq!(resp.status, 201);
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(body["suppFeat"], "3", "intersection of F & 3 = 3");
+        assert_eq!(body["suppFeat"], "6", "intersection of F & 6 = 6");
 
         // No suppFeat sent → intersection = 0 → suppFeat omitted from response.
         let resp = client
@@ -2905,7 +2913,7 @@ mod tests {
                     "ipv4Addr": "10.45.7.1",
                     "supi": "imsi-001019900700001",
                     "pcfFqdn": "pcf-a.example.com",
-                    "suppFeat": "2"
+                    "suppFeat": "4"
                 }),
             )
             .await
@@ -2922,7 +2930,7 @@ mod tests {
                     "ipv4Addr": "10.45.7.2",
                     "supi": "imsi-001019900700001",
                     "pcfFqdn": "pcf-b.example.com",
-                    "suppFeat": "2",
+                    "suppFeat": "4",
                     "paraCom": {}
                 }),
             )
@@ -3052,7 +3060,7 @@ mod tests {
                 &json!({
                     "supi": "imsi-001019900111001",
                     "pcfFqdn": "pcf.ue.example.com",
-                    "suppFeat": "1"
+                    "suppFeat": "2"
                 }),
             )
             .await
@@ -3064,7 +3072,7 @@ mod tests {
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["supi"], "imsi-001019900111001");
         assert_eq!(body["pcfFqdn"], "pcf.ue.example.com");
-        assert_eq!(body["suppFeat"], "1");
+        assert_eq!(body["suppFeat"], "2");
 
         // GET by id → 200.
         let resp = client

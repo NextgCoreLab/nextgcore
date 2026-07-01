@@ -815,10 +815,12 @@ pub fn notify_subscription_data_change(ue_id: &str, changed_path: &str, new_valu
         ue_match || uri_match
     });
     for sub in subs {
-        // TS 29.505 ChangeItem: op + optional path (omitted = full resource).
+        // TS 29.571 §5.2.4.8: ChangeItem.path is MANDATORY. Use "" (whole
+        // resource, per the ChangeItem NOTE / RFC 6901) for a full-resource
+        // replace or remove.
         let change = match new_value {
-            Some(v) => serde_json::json!({"op": "REPLACE", "newValue": v}),
-            None => serde_json::json!({"op": "REMOVE"}),
+            Some(v) => serde_json::json!({"op": "REPLACE", "path": "", "newValue": v}),
+            None => serde_json::json!({"op": "REMOVE", "path": ""}),
         };
         // `originalCallbackReference` is conditional per TS 29.505 DataChangeNotify:
         // include it only when the subscription body carried a `callbackReference`.
