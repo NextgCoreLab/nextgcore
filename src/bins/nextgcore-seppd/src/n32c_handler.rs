@@ -224,13 +224,10 @@ pub struct SecParamExchReqData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sec_profiles: Option<Vec<String>>,
     /// IPX provider security info (raw public keys / certificates) of the RIs
-    /// on the requester's side (TS 29.573 §6.1.5.2.18).
+    /// on the requester's side, incl. this SEPP's own ES256 modifications-
+    /// signing raw public key (TS 29.573 §6.1.5.2.15; TS 33.501 §13.2.4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipx_provider_sec_info_list: Option<Vec<IpxProviderSecInfo>>,
-    /// Requester's ES256 public key (PEM, SubjectPublicKeyInfo) used to sign
-    /// its modificationsBlock entries.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub modifications_signing_public_key: Option<String>,
     /// Requester's N32-c API root so the responder can deliver n32f-error
     /// reports (practical extension; the spec resolves the sender FQDN)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,12 +253,10 @@ pub struct SecParamExchRspData {
     /// The security profiles selected by the responder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sel_sec_profiles: Option<Vec<String>>,
-    /// IPX provider security info on the responder's side.
+    /// IPX provider security info on the responder's side, incl. this SEPP's own
+    /// ES256 modifications-signing raw public key (TS 29.573 §6.1.5.2.15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipx_provider_sec_info_list: Option<Vec<IpxProviderSecInfo>>,
-    /// Responder's ES256 public key (PEM) for modificationsBlock verification
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub modifications_signing_public_key: Option<String>,
 }
 
 // ============================================================================
@@ -730,7 +725,7 @@ pub fn handle_exchange_params_request(
 
     // Register the requester's ES256 modifications-signing public key so we
     // can verify its modificationsBlock entries (TS 33.501 §13.2.4.6).
-    register_peer_signing_key(&req.sender, req.modifications_signing_public_key.as_deref())?;
+    register_peer_ipx_sec_info(&req.sender, req.ipx_provider_sec_info_list.as_deref())?;
 
     // TS 33.501 §13.2.4.4.1: derive the full N32-f key hierarchy from the
     // 64-octet N32 master (RFC 5705 exporter). The requester is the N32-c
@@ -774,6 +769,7 @@ pub fn handle_exchange_params_request(
         req.n32f_context_id
     );
 
+    let local_ipx = local_ipx_provider_sec_info(&local_fqdn);
     Ok(SecParamExchRspData {
         sender: local_fqdn,
         n32f_context_id: local_context_id,
@@ -781,8 +777,7 @@ pub fn handle_exchange_params_request(
         selected_jws_cipher_suite: jws,
         sel_protection_policy_info: Some(sel_policy),
         sel_sec_profiles: req.sec_profiles.clone(),
-        ipx_provider_sec_info_list: None,
-        modifications_signing_public_key: local_signing_public_key_pem(),
+        ipx_provider_sec_info_list: local_ipx,
     })
 }
 
@@ -817,7 +812,7 @@ pub fn handle_exchange_params_response(
 
     // Register the responder's ES256 modifications-signing public key so we
     // can verify its modificationsBlock entries (TS 33.501 §13.2.4.6).
-    register_peer_signing_key(&rsp.sender, rsp.modifications_signing_public_key.as_deref())?;
+    register_peer_ipx_sec_info(&rsp.sender, rsp.ipx_provider_sec_info_list.as_deref())?;
 
     // TS 33.501 §13.2.4.4.1: derive the full N32-f key hierarchy from the
     // 64-octet N32 master (RFC 5705 exporter). We (the request sender) are the
@@ -880,12 +875,6 @@ fn local_identity() -> Result<(String, ()), String> {
     Ok((sender, ()))
 }
 
-/// Public wrapper for the initiator path (n32_server) to obtain this SEPP's
-/// ES256 modifications-signing public key PEM for the exchange-params request.
-pub fn local_signing_public_key_pem_pub() -> Option<String> {
-    local_signing_public_key_pem()
-}
-
 /// PEM-encode this SEPP's ES256 modifications-signing public key for the
 /// exchange-params message, ensuring a local identity exists first.
 fn local_signing_public_key_pem() -> Option<String> {
@@ -900,17 +889,57 @@ fn local_signing_public_key_pem() -> Option<String> {
     vk.to_public_key_pem(LineEnding::LF).ok()
 }
 
-/// Register a peer's ES256 modifications-signing public key (from the PEM in
-/// an exchange-params message) under its sender FQDN. The key is REQUIRED:
-/// without it we could not verify the peer's modificationsBlock entries
-/// (TS 33.501 §13.2.4.6), so a missing/invalid key fails the handshake.
-fn register_peer_signing_key(sender: &str, pem: Option<&str>) -> Result<(), String> {
-    let pem = pem.ok_or_else(|| {
-        format!("peer [{sender}] sent no modificationsSigningPublicKey (PRINS requires ES256)")
-    })?;
-    let vk = crate::jose::parse_es256_public_key_pem(pem)
-        .map_err(|e| format!("peer [{sender}] sent bad ES256 public key: {e}"))?;
-    crate::prins::register_verifying_key(sender, vk);
+/// Build this SEPP's `IpxProviderSecInfo` advertising its ES256 modifications-
+/// signing raw public key (RFC 7468 SubjectPublicKeyInfo PEM) under `fqdn`. In
+/// this deployment the SEPP is the sole reformatting entity (RI) on its side, so
+/// it advertises its own signing key so the peer can verify the modificationsBlock
+/// entries it originates (TS 29.573 §6.1.5.2.15, TS 33.501 §13.2.4.6).
+pub fn local_ipx_provider_sec_info(fqdn: &str) -> Option<Vec<IpxProviderSecInfo>> {
+    local_signing_public_key_pem().map(|pem| {
+        vec![IpxProviderSecInfo {
+            ipx_provider_id: fqdn.to_string(),
+            raw_public_key_list: Some(vec![pem]),
+            certificate_list: None,
+        }]
+    })
+}
+
+/// Register the ES256 modifications-signing public keys a peer advertises in its
+/// `ipxProviderSecInfoList` (TS 29.573 §6.1.5.2.15). Each RI's raw public keys
+/// (RFC 7468 PEM) are stored under its `ipxProviderId` so the modificationsBlock
+/// JWS entries that RI signs can be verified (TS 33.501 §13.2.4.6). The list is
+/// OPTIONAL per spec (only `n32fContextId` is mandatory in SecParamExchReqData),
+/// so a missing/empty list is accepted; any later modificationsBlock from an
+/// unregistered signer is still rejected at unprotect time. A malformed raw
+/// public key fails the handshake.
+fn register_peer_ipx_sec_info(
+    peer: &str,
+    list: Option<&[IpxProviderSecInfo]>,
+) -> Result<(), String> {
+    let Some(list) = list else {
+        return Ok(());
+    };
+    for info in list {
+        if let Some(keys) = info.raw_public_key_list.as_ref() {
+            for pem in keys {
+                let vk = crate::jose::parse_es256_public_key_pem(pem).map_err(|e| {
+                    format!(
+                        "peer [{peer}] RI [{}] sent bad ES256 raw public key: {e}",
+                        info.ipx_provider_id
+                    )
+                })?;
+                crate::prins::register_verifying_key(info.ipx_provider_id.clone(), vk);
+            }
+        } else if info.certificate_list.is_some() {
+            // certificateList (RFC 7468 X.509) key extraction is not yet
+            // supported; such RIs are left unregistered and any modificationsBlock
+            // they sign will fail verification at unprotect time.
+            log::warn!(
+                "[{peer}] RI [{}] advertised only certificateList; X.509 key extraction unsupported, ignoring",
+                info.ipx_provider_id
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1232,7 +1261,6 @@ mod tests {
             protection_policy_info: None,
             sec_profiles: None,
             ipx_provider_sec_info_list: None,
-            modifications_signing_public_key: Some(test_es256_pubkey_pem()),
             sender_api_root: None,
         };
         let err = handle_exchange_params_request(&mut node_b, &req).unwrap_err();
@@ -1260,7 +1288,6 @@ mod tests {
             protection_policy_info: None,
             sec_profiles: None,
             ipx_provider_sec_info_list: None,
-            modifications_signing_public_key: Some(test_es256_pubkey_pem()),
             sender_api_root: None,
         };
         let rsp = handle_exchange_params_request(&mut node_b, &req).unwrap();
@@ -1296,8 +1323,11 @@ mod tests {
             jws_cipher_suite_list: vec!["ES256".to_string()],
             protection_policy_info: None,
             sec_profiles: None,
-            ipx_provider_sec_info_list: None,
-            modifications_signing_public_key: Some(test_es256_pubkey_pem()),
+            ipx_provider_sec_info_list: Some(vec![IpxProviderSecInfo {
+                ipx_provider_id: "sepp-a.example.com".to_string(),
+                raw_public_key_list: Some(vec![test_es256_pubkey_pem()]),
+                certificate_list: None,
+            }]),
             sender_api_root: None,
         };
 
@@ -1307,8 +1337,9 @@ mod tests {
         let rsp = handle_exchange_params_request(&mut node_b, &req).unwrap();
         assert_eq!(rsp.selected_jwe_cipher_suite, "A256GCM");
         assert_eq!(rsp.selected_jws_cipher_suite, "ES256");
-        // The responder advertises its own signing pubkey back.
-        assert!(rsp.modifications_signing_public_key.is_some());
+        // The responder advertises its own signing pubkey back via ipxProviderSecInfoList.
+        let rsp_ipx = rsp.ipx_provider_sec_info_list.as_ref().unwrap();
+        assert!(rsp_ipx.iter().any(|i| i.raw_public_key_list.is_some()));
 
         // A (initiator) handles the response
         let mut node_a = SeppNode::new(11, "sepp.local.example.com");
@@ -1333,28 +1364,52 @@ mod tests {
     }
 
     #[test]
-    fn test_exchange_params_rejects_missing_signing_key() {
+    fn test_exchange_params_accepts_missing_ipx_sec_info() {
+        // ipxProviderSecInfoList is OPTIONAL (only n32fContextId is mandatory in
+        // SecParamExchReqData, TS 29.573 §6.1.5.2.4); its absence must NOT reject
+        // the handshake.
+        set_allow_insecure_no_tls(true);
         {
             let ctx = sepp_self();
             let mut context = ctx.write().unwrap();
             context.set_sender("sepp.local.example.com");
         }
-        let mut node_b = SeppNode::new(13, "sepp-a.example.com");
+        let mut node_b = SeppNode::new(13, "sepp-noipx.example.com");
         node_b.negotiated_security_scheme = SecurityCapability::Prins;
-        // No modifications_signing_public_key => handshake must be rejected.
         let req = SecParamExchReqData {
-            sender: "sepp-a.example.com".to_string(),
-            n32f_context_id: "ctx".to_string(),
+            sender: "sepp-noipx.example.com".to_string(),
+            n32f_context_id: "00ab00ab00ab00ab".to_string(),
             jwe_cipher_suite_list: vec!["A256GCM".to_string()],
             jws_cipher_suite_list: vec!["ES256".to_string()],
             protection_policy_info: None,
             sec_profiles: None,
             ipx_provider_sec_info_list: None,
-            modifications_signing_public_key: None,
             sender_api_root: None,
         };
-        let err = handle_exchange_params_request(&mut node_b, &req).unwrap_err();
-        assert!(err.contains("modificationsSigningPublicKey"), "got: {err}");
+        let rsp = handle_exchange_params_request(&mut node_b, &req).unwrap();
+        assert_eq!(rsp.selected_jws_cipher_suite, "ES256");
+        // And the responder advertises ITS signing key via ipxProviderSecInfoList.
+        assert!(rsp.ipx_provider_sec_info_list.is_some());
+    }
+
+    #[test]
+    fn test_register_peer_ipx_sec_info_registers_raw_keys() {
+        let list = vec![IpxProviderSecInfo {
+            ipx_provider_id: "ri-unit.example.com".to_string(),
+            raw_public_key_list: Some(vec![test_es256_pubkey_pem()]),
+            certificate_list: None,
+        }];
+        register_peer_ipx_sec_info("sepp-peer.example.com", Some(&list)).unwrap();
+        assert!(crate::prins::all_verifying_keys().contains_key("ri-unit.example.com"));
+        // Missing list accepted (optional IE).
+        register_peer_ipx_sec_info("sepp-peer.example.com", None).unwrap();
+        // Malformed raw public key fails the handshake.
+        let bad = vec![IpxProviderSecInfo {
+            ipx_provider_id: "ri-bad.example.com".to_string(),
+            raw_public_key_list: Some(vec!["not-a-pem".to_string()]),
+            certificate_list: None,
+        }];
+        assert!(register_peer_ipx_sec_info("p", Some(&bad)).is_err());
     }
 
     #[test]
@@ -1374,7 +1429,6 @@ mod tests {
             protection_policy_info: None,
             sec_profiles: None,
             ipx_provider_sec_info_list: None,
-            modifications_signing_public_key: Some(test_es256_pubkey_pem()),
             sender_api_root: None,
         };
         assert!(handle_exchange_params_request(&mut node_b, &req).is_err());
@@ -1443,7 +1497,6 @@ mod tests {
             protection_policy_info: Some(peer_policy),
             sec_profiles: Some(vec!["profA".to_string()]),
             ipx_provider_sec_info_list: None,
-            modifications_signing_public_key: Some(test_es256_pubkey_pem()),
             sender_api_root: None,
         };
 
@@ -1495,7 +1548,6 @@ mod tests {
                 raw_public_key_list: Some(vec!["rawkey".to_string()]),
                 certificate_list: None,
             }]),
-            modifications_signing_public_key: None,
             sender_api_root: None,
         };
         let v = serde_json::to_value(&req).unwrap();
@@ -1508,5 +1560,7 @@ mod tests {
         assert!(s.contains("UEID"));
         assert!(s.contains("AUTHENTICATION_MATERIAL"));
         assert!(!s.contains("modificationPolicyAllowedPaths"));
+        // The bespoke modificationsSigningPublicKey IE must be gone (TS 29.573).
+        assert!(!s.contains("modificationsSigningPublicKey"));
     }
 }

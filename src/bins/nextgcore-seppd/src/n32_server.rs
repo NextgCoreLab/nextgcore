@@ -927,6 +927,10 @@ pub async fn initiate_n32c_handshake(
                 let context = ctx.read().map_err(|_| "context poisoned".to_string())?;
                 context.sender.clone().ok_or("sender not configured")?
             };
+            // Advertise our ES256 modifications-signing raw public key inside
+            // ipxProviderSecInfoList so the peer can verify our modificationsBlock
+            // entries (TS 29.573 §6.1.5.2.15, TS 33.501 §13.2.4.6).
+            let local_ipx = n32c_handler::local_ipx_provider_sec_info(&local_sender);
             let params_req = SecParamExchReqData {
                 sender: local_sender,
                 n32f_context_id: prins::generate_n32f_context_id(),
@@ -942,10 +946,7 @@ pub async fn initiate_n32c_handshake(
                 // the dataTypeEncPolicy (TS 29.573 §6.1.5.2.4).
                 protection_policy_info: Some(n32c_handler::local_protection_policy()),
                 sec_profiles: None,
-                ipx_provider_sec_info_list: None,
-                // Our ES256 modifications-signing public key so the peer can
-                // verify our modificationsBlock entries (TS 33.501 §13.2.4.6).
-                modifications_signing_public_key: n32c_handler::local_signing_public_key_pem_pub(),
+                ipx_provider_sec_info_list: local_ipx,
                 sender_api_root: local_api_root.map(|s| s.to_string()),
             };
             let params_body = serde_json::to_string(&params_req).map_err(|e| e.to_string())?;
