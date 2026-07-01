@@ -205,9 +205,9 @@ pub struct AcrParamInfoReq {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AcrParamInfoResp {
-    /// ACR parameters from a prior Determine/Initiate (absent if none).
+    /// ACR relocation identity from a prior Determine/Initiate (absent if none).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub acr_params: Option<crate::acr::AcrParameters>,
+    pub acr_params: Option<crate::acr::AcrRelocationInfo>,
     /// Supported features (echoed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supp_feat: Option<String>,
@@ -400,8 +400,8 @@ mod tests {
     #[test]
     fn test_acr_param_info_resp_with_params() {
         let resp = AcrParamInfoResp {
-            acr_params: Some(crate::acr::AcrParameters {
-                s_eas_id: "eas-s".into(),
+            acr_params: Some(crate::acr::AcrRelocationInfo {
+                s_eas_id: Some("eas-s".into()),
                 t_eas_id: Some("eas-t".into()),
                 s_eas_endpoint: None,
                 t_eas_endpoint: None,

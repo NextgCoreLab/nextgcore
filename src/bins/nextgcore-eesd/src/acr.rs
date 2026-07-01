@@ -1,59 +1,81 @@
 //! Application Context Relocation (ACR) data model — eesd-07.
 //!
-//! Implements the three ACR service APIs per TS 24.558 / TS 29.558:
+//! Data types modelled from the 3GPP tables (attribute names, mandatory /
+//! optional presence, JSON casing) rather than a bespoke shape:
 //!
-//! * `eees-appctxtreloc` (TS 24.558 §5.5): EEC-triggered Determine /
-//!   Initiate / Declare flow (S-EAS → T-EAS coordination, TS 23.558 §8.8
-//!   Scenario A).
-//! * `eees-eel-acr` (TS 29.558 §5.11): EEL-managed ACR request
-//!   (`RequestEELManagedACR`, Scenario C) — the EEL requests the EES to
-//!   orchestrate the relocation internally.
-//! * `eees-acrstatus-update` (TS 29.558 §5.12): ACR status update
-//!   (`RequestACRUpdate`) from an EAS or the EEL.
+//! * `eees-appctxtreloc` (**TS 24.558 §6.5.5**): the EEC/EAS-triggered
+//!   Determine / Initiate / Declare flow. Request bodies are
+//!   [`AcrDetermReq`] (§6.5.5.2.2), [`AcrInitReq`] (§6.5.5.2.3) and
+//!   [`AcrDecReq`] (§6.5.5.2.4). Success is **204 No Content** (no response
+//!   body) per the API tables (§8.x), so there are no `*Resp` body types.
+//! * `eees-eelmanagedacr` (**TS 29.558 §8.8**): [`EELACRReq`] (§8.8.6.2.2) /
+//!   [`EELACRResp`] (§8.8.6.2.3).
+//! * `eees-acrstatus-update` (**TS 29.558 §8.9**): [`ACRUpdateData`]
+//!   (§8.9.6.2.2), with [`ACRDataStatus`] (§8.9.6.2.3) as the optional
+//!   response body.
 //!
-//! The EES maintains a per-(eecId, sEasId) state machine (see [`AcrStatus`])
-//! whose transitions are: `None` → `DETERMINED` → `INITIATED` → `COMPLETED`
-//! (or `FAILED`). State is held in `EesContext::acr_states`. ACR status
-//! notifications to EAS/EEC endpoints are STUB (logged, no live peer).
+//! Rarely-used attributes whose data types live in other specs (e.g.
+//! `ExpectedLocationArea`, `TunnelInfo`, `RouteToLocation`, `EasCharacteristics`,
+//! `ACTResultInfo`) are carried as passthrough JSON ([`serde_json::Value`]) so
+//! the wire representation is preserved without fabricating a local structure;
+//! full local models for those are a follow-up.
+//!
+//! The EES maintains a per-UE ACR state machine (see [`AcrStatus`]) whose
+//! transitions are `DETERMINED` → `INITIATED` → `COMPLETED` (or `FAILED`),
+//! held in `EesContext::acr_states`. Notifications to EAS/EEC endpoints are
+//! STUB (logged, no live peer).
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::EndPoint;
+
 // ---------------------------------------------------------------------------
-// Shared sub-types
+// Shared sub-types (TS 24.558 §6.5.5)
 // ---------------------------------------------------------------------------
 
-/// S-EAS / T-EAS endpoint pair (TS 24.558 / TS 29.558 `AcrParameters`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// `AcrParameters` (TS 24.558 §6.5.5.2.7) — ACR parameters specific to an ACR
+/// request initiated for service-continuity planning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AcrParameters {
-    /// Source EAS identifier (mandatory; the current serving EAS).
-    pub s_eas_id: String,
-    /// Target EAS identifier (mandatory once Determine has run).
+    /// Predicted expiration time of the current EAS's usefulness (DateTime,
+    /// optional).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub t_eas_id: Option<String>,
-    /// Source EAS reachability (optional; echoed from EASProfile).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub s_eas_endpoint: Option<crate::types::EndPoint>,
-    /// Target EAS reachability (optional; filled from T-EAS registration).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub t_eas_endpoint: Option<crate::types::EndPoint>,
+    pub predict_exp_time: Option<String>,
 }
 
-/// `AcrModificationParams` — application context state to migrate from
-/// S-EAS to T-EAS (TS 24.558). Carried as passthrough JSON.
+/// `AcrModificationParams` (TS 24.558 §6.5.5.2.8) — parameters for an ACR
+/// modification request. Per the spec the endpoints and `acrParams` "shall be
+/// present although they are not specified as mandatory due to backward
+/// compatibility reasons".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AcrModificationParams {
-    /// Application-specific context data (passthrough).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_ctx: Option<serde_json::Value>,
-    /// EAS relocation metadata (passthrough).
+    pub s_eas_endpoint: Option<EndPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub eas_reloc_info: Option<serde_json::Value>,
+    pub t_eas_endpoint: Option<EndPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acr_params: Option<AcrParameters>,
 }
 
-/// ACR status — the progression through the relocation state machine
-/// (TS 29.558 §5.12 / TS 24.558 §5.5).
+/// `EecCtxtReloc` (TS 24.558 §6.5.5.2.5) — EEC context relocation information.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EecCtxtReloc {
+    /// EEC context identifier (mandatory).
+    pub eec_ctxt_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_ees_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_eec_endpoint: Option<EndPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_ees_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_eec_endpoint: Option<EndPoint>,
+}
+
+/// ACR status — the progression through the relocation state machine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AcrStatus {
@@ -67,212 +89,263 @@ pub enum AcrStatus {
     Failed,
 }
 
-/// TS 23.558 §8.8 ACR scenario identifier.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum AcrScenario {
-    /// Scenario A: EEC-triggered (Determine → Initiate → Declare).
-    EecTriggered,
-    /// Scenario B: EES-triggered.
-    EesTriggered,
-    /// Scenario C: EEL-managed (via `eees-eel-acr`).
-    EelManaged,
-    /// Scenario D: 5GC-triggered.
-    FiveGcTriggered,
-}
-
 // ---------------------------------------------------------------------------
-// eees-appctxtreloc: Determine / Initiate / Declare (TS 24.558 §5.5)
+// eees-appctxtreloc: Determine / Initiate / Declare (TS 24.558 §6.5.5)
 // ---------------------------------------------------------------------------
 
-/// `AcrDetermReq` — body of `Determine`
+/// `AcrDetermReq` (TS 24.558 §6.5.5.2.2) — body of `Determine`
 /// (`POST .../eees-appctxtreloc/v1/determine`).
 ///
-/// Mandatory IEs: `eecId`, `sEasId`. The EES selects a T-EAS from the
-/// registered pool (first registered EAS ≠ S-EAS) and records the
-/// relocation state as `DETERMINED`.
+/// Required IEs (OpenAPI): `requestorId`, `sEasEndpoint`. `ueId` "shall be
+/// present although it is not specified as mandatory due to backward
+/// compatibility reasons", hence modelled as optional.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AcrDetermReq {
-    /// EEC identifier (mandatory).
-    pub eec_id: String,
-    /// Source EAS identifier — current serving EAS (mandatory).
-    pub s_eas_id: String,
-    /// UE identifier (GPSI/SUPI; optional).
+    /// Identifier of the EEC or EAS sending the request (mandatory).
+    pub requestor_id: String,
+    /// Endpoint of the selected S-EAS (mandatory).
+    pub s_eas_endpoint: EndPoint,
+    /// UE identifier (GPSI); SHALL be present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ue_id: Option<String>,
-    /// Requested ACR scenario (optional; defaults to EEC-triggered).
+    /// Application identifier of the EAS (e.g. FQDN/URI), optional.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub acr_scenario: Option<AcrScenario>,
-    /// Supported features (optional).
+    pub eas_id: Option<String>,
+    /// Identifier of the AC, optional.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
+    pub ac_id: Option<String>,
+    /// Predicted/expected UE location or service area (ExpectedLocationArea);
+    /// passthrough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_loc_area: Option<serde_json::Value>,
+    /// Target tunnel information (TunnelInfo); passthrough.
+    #[serde(rename = "tunnel_Info", skip_serializing_if = "Option::is_none")]
+    pub tunnel_info: Option<serde_json::Value>,
 }
 
-/// Response to `AcrDetermReq` — carries the determined T-EAS and ACR
-/// parameters.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AcrDetermResp {
-    /// ACR parameters (S-EAS + selected T-EAS with endpoints).
-    pub acr_params: AcrParameters,
-    /// Negotiated supported features (echoed).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
-}
-
-/// `AcrInitReq` — body of `Initiate`
+/// `AcrInitReq` (TS 24.558 §6.5.5.2.3) — body of `Initiate`
 /// (`POST .../eees-appctxtreloc/v1/initiate`).
 ///
-/// Mandatory IEs: `eecId`, `acrParams.sEasId`. `acrParams.tEasId` MUST be
-/// present (set during Determine, or supplied by the EEC directly). The EES
-/// transitions the relocation state to `INITIATED`.
+/// Required IEs (OpenAPI): `requestorId`, `tEasEndpoint`, `easNotifInd`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AcrInitReq {
-    /// EEC identifier (mandatory).
-    pub eec_id: String,
-    /// ACR parameters (sEasId mandatory; tEasId must be present).
-    pub acr_params: AcrParameters,
-    /// ACR scenario (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acr_scenario: Option<AcrScenario>,
-    /// Supported features (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
-}
-
-/// Response to `AcrInitReq`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AcrInitResp {
-    /// Updated ACR parameters.
-    pub acr_params: AcrParameters,
-    /// Negotiated supported features (echoed).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
-}
-
-/// `AcrDeclareReq` — body of `Declare`
-/// (`POST .../eees-appctxtreloc/v1/declare`).
-///
-/// Mandatory IEs: `eecId`, `sEasId`, `tEasId`. Marks the relocation
-/// `COMPLETED`; the EES (stub) notifies the T-EAS and any ACR-status
-/// subscribers.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AcrDeclareReq {
-    /// EEC identifier (mandatory).
-    pub eec_id: String,
-    /// Source EAS identifier (mandatory).
-    pub s_eas_id: String,
-    /// Target EAS identifier — the new serving EAS (mandatory).
-    pub t_eas_id: String,
-    /// Application context modification parameters (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acr_mod_params: Option<AcrModificationParams>,
-    /// Supported features (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
-}
-
-/// Response to `AcrDeclareReq`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AcrDeclareResp {
-    /// Final ACR parameters (completed relocation).
-    pub acr_params: AcrParameters,
-    /// Negotiated supported features (echoed).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// eees-eel-acr: EEL-managed ACR request (TS 29.558 §5.11)
-// ---------------------------------------------------------------------------
-
-/// `EelManagedAcrReq` — body of `RequestEELManagedACR`
-/// (`POST .../eees-eel-acr/v1/request-eelacr`).
-///
-/// The EEL requests the EES to orchestrate an ACR (Scenario C): the EES
-/// performs Determine + Initiate internally and returns the resulting T-EAS.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct EelManagedAcrReq {
-    /// EEC identifier (mandatory).
-    pub eec_id: String,
-    /// Source EAS identifier (mandatory).
-    pub s_eas_id: String,
-    /// UE identifier (optional).
+    /// Identifier of the EEC sending the request (mandatory).
+    pub requestor_id: String,
+    /// Endpoint of the T-EAS (mandatory).
+    pub t_eas_endpoint: EndPoint,
+    /// Whether the EAS should be notified about the need for ACR
+    /// (mandatory; default false).
+    #[serde(default)]
+    pub eas_notif_ind: bool,
+    /// UE identifier (GPSI); SHALL be present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ue_id: Option<String>,
-    /// Supported features (optional).
+    /// Application identifier of the EAS, optional.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
+    pub eas_id: Option<String>,
+    /// Identifier of the AC, optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ac_id: Option<String>,
+    /// Endpoint of the S-EAS; conditional (present when `easNotifInd` or
+    /// `prevEasNotifInd` is true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_eas_endpoint: Option<EndPoint>,
+    /// Endpoint of the previous T-EAS; conditional (present when re-sending to
+    /// cancel a previous ACR).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_t_eas_endpoint: Option<EndPoint>,
+    /// Whether the EAS should be notified about ACR cancellation; conditional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_eas_notif_ind: Option<bool>,
+    /// T-EAS DNAI / N6 routing (RouteToLocation); passthrough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_req: Option<serde_json::Value>,
+    /// Simultaneous-connectivity inactivity time guidance (DurationSec).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sim_inact_time: Option<i64>,
+    /// EEC context relocation information, optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eec_ctxt_reloc: Option<EecCtxtReloc>,
+    /// Predicted/expected UE location or service area; passthrough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_loc_area: Option<serde_json::Value>,
+    /// Service-continuity ACR parameters, optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acr_params: Option<AcrParameters>,
+    /// ACR modification parameters, optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acr_modification_params: Option<AcrModificationParams>,
+    /// EAS bundle information (EASBundleInfo); passthrough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_bundle_info: Option<serde_json::Value>,
+    /// T-EAS endpoints for the EAS bundle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_eas_end_point_bundle_list: Option<Vec<EndPoint>>,
+    /// List of UE identifiers (EdgeApp_3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ue_ids: Option<Vec<String>>,
+    /// List of predicted/expected location areas (EdgeApp_3); passthrough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_loc_areas: Option<Vec<serde_json::Value>>,
 }
 
-/// Response to `EelManagedAcrReq`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct EelManagedAcrResp {
-    /// ACR parameters with the selected and initiated T-EAS.
-    pub acr_params: AcrParameters,
-    /// Negotiated supported features (echoed).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// eees-acrstatus-update: ACR status notification (TS 29.558 §5.12)
-// ---------------------------------------------------------------------------
-
-/// `AcrStatusUpdateReq` — body of `RequestACRUpdate`
-/// (`POST .../eees-acrstatus-update/v1/request-acrupdate`).
+/// `AcrDecReq` (TS 24.558 §6.5.5.2.4) — body of `Declare`
+/// (`POST .../eees-appctxtreloc/v1/declare`).
 ///
-/// An EAS (S-EAS or T-EAS) or the EEL reports an ACR status change to the
-/// EES. The EES updates its internal relocation state and (stub) notifies
-/// interested parties.
+/// Required IEs (OpenAPI): `ueId`, `tEasId`, `tEasEndpoint`. `requestorId`
+/// SHALL be included but is not mandatory for backward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct AcrStatusUpdateReq {
-    /// EEC identifier (mandatory).
-    pub eec_id: String,
-    /// ACR parameters identifying the relocation (sEasId mandatory;
-    /// tEasId expected when status ≠ DETERMINED).
-    pub acr_params: AcrParameters,
-    /// Updated ACR status (mandatory).
-    pub acr_status: AcrStatus,
-    /// Supported features (optional).
+pub struct AcrDecReq {
+    /// UE identifier (GPSI) (mandatory).
+    pub ue_id: String,
+    /// Target EAS identifier — the new serving EAS (mandatory).
+    pub t_eas_id: String,
+    /// Endpoint of the T-EAS (mandatory).
+    pub t_eas_endpoint: EndPoint,
+    /// Identifier of the AC, optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ac_id: Option<String>,
+    /// Identifier of the EAS sending the request; SHALL be included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requestor_id: Option<String>,
+    /// Predicted/expected UE location or service area; passthrough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_loc_area: Option<serde_json::Value>,
+    /// EAS bundle information (EASBundleInfo); passthrough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_bundle_info: Option<serde_json::Value>,
+    /// T-EAS endpoints for the EAS bundle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_eas_end_point_bundle_list: Option<Vec<EndPoint>>,
+    /// List of UE identifiers in the application group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_grp_ue_ids: Option<Vec<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// eees-eelmanagedacr: EEL-managed ACR request (TS 29.558 §8.8)
+// ---------------------------------------------------------------------------
+
+/// `EELACRReq` (TS 29.558 §8.8.6.2.2) — body of `Eees_EELManagedACR_Request`
+/// (`POST .../eees-eelmanagedacr/v1/eel-managed-acr`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EELACRReq {
+    /// UE identifier in the form of a GPSI (mandatory).
+    pub ue_id: String,
+    /// Set of EAS characteristics used to determine the required EASs
+    /// (mandatory, 1..N; EasCharacteristics passthrough).
+    pub eas_characs: Vec<serde_json::Value>,
+    /// URI via which the Application Context can be accessed for ACT, optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_ctxt_store_addr: Option<String>,
+    /// Supported features, conditional.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supp_feat: Option<String>,
 }
 
-/// Response to `AcrStatusUpdateReq`.
+/// `EELACRResp` (TS 29.558 §8.8.6.2.3) — response body of
+/// `Eees_EELManagedACR_Request`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct AcrStatusUpdateResp {
-    /// Negotiated supported features (echoed).
+pub struct EELACRResp {
+    /// URI via which the Application Context can be accessed for ACT
+    /// (included if not received in the request).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_ctxt_store_addr: Option<String>,
+    /// Negotiated supported features.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supp_feat: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// eees-acrstatus-update: ACR status update (TS 29.558 §8.9)
+// ---------------------------------------------------------------------------
+
+/// `ACRUpdateData` (TS 29.558 §8.9.6.2.2) — body of
+/// `Eees_ACRStatusUpdate_Request`
+/// (`POST .../eees-acrstatus-update/v1/update`).
+///
+/// At least one of `actResultInfo`, `e3SubscIds` or `e3NotificationUri` shall
+/// be present (NOTE).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ACRUpdateData {
+    /// Application identifier of the service consumer (EAS/EES) sending the
+    /// request (mandatory).
+    pub eas_id: String,
+    /// Identifier of the concerned AC, optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ac_id: Option<String>,
+    /// Status of ACT (success/failure and related info); conditional
+    /// (ACTResultInfo passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act_result_info: Option<serde_json::Value>,
+    /// List of EDGE-3 subscription identifiers; conditional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e3_subsc_ids: Option<Vec<String>>,
+    /// Updated notification URI for EDGE-3 subscriptions; conditional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e3_notification_uri: Option<String>,
+}
+
+/// `ACRDataStatus` (TS 29.558 §8.9.6.2.3) — optional response body of
+/// `Eees_ACRStatusUpdate_Request`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ACRDataStatus {
+    /// Status of the initialization of EDGE-3 subscriptions (E3SubscsStatus:
+    /// `SUCCESSFUL`/`FAILED`).
+    pub e3_subscs_status: String,
+    /// Updated list of EDGE-3 subscription identifiers, optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e3_subsc_ids: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
 // ACR state machine (stored in EesContext::acr_states)
 // ---------------------------------------------------------------------------
 
-/// Per-(eecId, sEasId) ACR relocation state maintained by the EES.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AcrState {
-    pub eec_id: String,
-    pub s_eas_id: String,
+/// Relocation identity reported by the bespoke `eees-acr-param` query helper
+/// (a non-3GPP convenience API): the S-EAS/T-EAS identifiers and endpoints of a
+/// tracked ACR. Distinct from the spec [`AcrParameters`] (§6.5.5.2.7), which
+/// carries only `predictExpTime` and cannot hold relocation identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AcrRelocationInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_eas_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub t_eas_id: Option<String>,
-    pub status: AcrStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_eas_endpoint: Option<EndPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_eas_endpoint: Option<EndPoint>,
+}
+
+/// Per-UE ACR relocation state maintained by the EES.
+///
+/// Keyed (in `acr_states`) by the UE identity where available (see
+/// [`super::context`]); the `eees-acrstatus-update` path, which carries no
+/// `ueId`, keys its record by `easId`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AcrState {
+    pub requestor_id: Option<String>,
+    pub ue_id: Option<String>,
+    pub eas_id: Option<String>,
+    pub s_eas_endpoint: Option<EndPoint>,
+    pub t_eas_id: Option<String>,
+    pub t_eas_endpoint: Option<EndPoint>,
+    pub status: Option<AcrStatus>,
 }
 
 /// Error outcomes from ACR context operations.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AcrContextError {
-    /// S-EAS `easId` is not registered with the EES → 404.
+    /// S-EAS is not registered with the EES → 404.
     SEasNotFound,
     /// No eligible T-EAS found in the registered pool → 503.
     NoTEasAvailable,
@@ -280,151 +353,186 @@ pub enum AcrContextError {
     Internal,
 }
 
+/// Build the `acr_states` map key for a UE-scoped ACR record: the GPSI when
+/// present, otherwise the requestor identity.
+pub fn acr_ue_key(ue_id: Option<&str>, requestor_id: Option<&str>) -> String {
+    match (ue_id, requestor_id) {
+        (Some(u), _) if !u.trim().is_empty() => format!("ue:{u}"),
+        (_, Some(r)) if !r.trim().is_empty() => format!("req:{r}"),
+        _ => "acr:unknown".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---- AcrDetermReq -------------------------------------------------------
+    // ---- AcrDetermReq (TS 24.558 §6.5.5.2.2) --------------------------------
 
-    /// Spec-minimal body round-trips (camelCase: `eecId`, `sEasId`).
+    /// Spec-minimal body round-trips: required `requestorId` + `sEasEndpoint`.
     #[test]
     fn test_acr_determ_req_roundtrip() {
-        let body = r#"{"eecId":"eec1.example.com","sEasId":"eas-s.example.com"}"#;
+        let body = r#"{
+            "requestorId":"eec1.example.com",
+            "sEasEndpoint":{"fqdn":"eas-s.edge.example.com"},
+            "ueId":"imsi-999700000000001",
+            "easId":"eas-s.example.com"
+        }"#;
         let req: AcrDetermReq = serde_json::from_str(body).expect("deserializes");
-        assert_eq!(req.eec_id, "eec1.example.com");
-        assert_eq!(req.s_eas_id, "eas-s.example.com");
-        assert!(req.ue_id.is_none());
-        assert!(req.acr_scenario.is_none());
+        assert_eq!(req.requestor_id, "eec1.example.com");
+        assert_eq!(req.s_eas_endpoint.fqdn.as_deref(), Some("eas-s.edge.example.com"));
+        assert_eq!(req.ue_id.as_deref(), Some("imsi-999700000000001"));
         let back = serde_json::to_string(&req).unwrap();
-        assert!(back.contains(r#""eecId":"eec1.example.com""#));
-        assert!(back.contains(r#""sEasId":"eas-s.example.com""#));
+        assert!(back.contains(r#""requestorId":"eec1.example.com""#));
+        assert!(back.contains(r#""sEasEndpoint""#));
     }
 
-    /// Missing mandatory `sEasId` fails to deserialize → handler maps to 400.
+    /// Missing mandatory `requestorId` fails to deserialize → handler maps 400.
     #[test]
-    fn test_acr_determ_req_missing_s_eas_id_fails() {
-        let body = r#"{"eecId":"eec1.example.com"}"#;
+    fn test_acr_determ_req_missing_requestor_id_fails() {
+        let body = r#"{"sEasEndpoint":{"fqdn":"eas-s"}}"#;
         assert!(serde_json::from_str::<AcrDetermReq>(body).is_err());
     }
 
-    /// Missing mandatory `eecId` fails to deserialize.
+    /// Missing mandatory `sEasEndpoint` fails to deserialize.
     #[test]
-    fn test_acr_determ_req_missing_eec_id_fails() {
-        let body = r#"{"sEasId":"eas-s.example.com"}"#;
+    fn test_acr_determ_req_missing_s_eas_endpoint_fails() {
+        let body = r#"{"requestorId":"eec1"}"#;
         assert!(serde_json::from_str::<AcrDetermReq>(body).is_err());
     }
 
-    /// `AcrDetermResp` round-trips with nested `acrParams.tEasId`.
+    /// `tunnel_Info` keeps its exact (non-camelCase) spec attribute name.
     #[test]
-    fn test_acr_determ_resp_roundtrip() {
-        let resp = AcrDetermResp {
-            acr_params: AcrParameters {
-                s_eas_id: "eas-s".into(),
-                t_eas_id: Some("eas-t".into()),
-                s_eas_endpoint: None,
-                t_eas_endpoint: None,
-            },
-            supp_feat: Some("1".into()),
+    fn test_acr_determ_req_tunnel_info_name() {
+        let req = AcrDetermReq {
+            requestor_id: "eec1".into(),
+            s_eas_endpoint: EndPoint { fqdn: Some("eas-s".into()), ..Default::default() },
+            ue_id: None,
+            eas_id: None,
+            ac_id: None,
+            expected_loc_area: None,
+            tunnel_info: Some(serde_json::json!({"anchor":"upf1"})),
         };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""sEasId":"eas-s""#));
-        assert!(json.contains(r#""tEasId":"eas-t""#));
-        assert!(json.contains(r#""suppFeat":"1""#));
-        let back: AcrDetermResp = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, resp);
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""tunnel_Info""#), "must serialize as tunnel_Info: {json}");
+        assert!(!json.contains("tunnelInfo"));
     }
 
-    // ---- AcrInitReq ---------------------------------------------------------
+    // ---- AcrInitReq (TS 24.558 §6.5.5.2.3) ----------------------------------
 
-    /// Body with nested `acrParams` (sEasId + tEasId) round-trips.
+    /// Required `requestorId` + `tEasEndpoint` + `easNotifInd` round-trip.
     #[test]
     fn test_acr_init_req_roundtrip() {
         let body = r#"{
-            "eecId":"eec1",
-            "acrParams":{"sEasId":"eas-s.example.com","tEasId":"eas-t.example.com"}
+            "requestorId":"eec1",
+            "tEasEndpoint":{"fqdn":"eas-t.edge.example.com"},
+            "easNotifInd":true,
+            "ueId":"imsi-999700000000001"
         }"#;
         let req: AcrInitReq = serde_json::from_str(body).unwrap();
-        assert_eq!(req.eec_id, "eec1");
-        assert_eq!(req.acr_params.s_eas_id, "eas-s.example.com");
-        assert_eq!(req.acr_params.t_eas_id.as_deref(), Some("eas-t.example.com"));
+        assert_eq!(req.requestor_id, "eec1");
+        assert_eq!(req.t_eas_endpoint.fqdn.as_deref(), Some("eas-t.edge.example.com"));
+        assert!(req.eas_notif_ind);
     }
 
-    /// Missing `acrParams` fails to deserialize.
+    /// Missing mandatory `tEasEndpoint` fails to deserialize.
     #[test]
-    fn test_acr_init_req_missing_acr_params_fails() {
-        let body = r#"{"eecId":"eec1"}"#;
+    fn test_acr_init_req_missing_t_eas_endpoint_fails() {
+        let body = r#"{"requestorId":"eec1","easNotifInd":false}"#;
         assert!(serde_json::from_str::<AcrInitReq>(body).is_err());
     }
 
-    // ---- AcrDeclareReq ------------------------------------------------------
-
-    /// Minimal body (eecId, sEasId, tEasId) round-trips.
+    /// `easNotifInd` defaults to false when omitted (documented default).
     #[test]
-    fn test_acr_declare_req_roundtrip() {
-        let body =
-            r#"{"eecId":"eec1","sEasId":"eas-s.example.com","tEasId":"eas-t.example.com"}"#;
-        let req: AcrDeclareReq = serde_json::from_str(body).unwrap();
-        assert_eq!(req.eec_id, "eec1");
-        assert_eq!(req.s_eas_id, "eas-s.example.com");
+    fn test_acr_init_req_eas_notif_ind_defaults_false() {
+        let body = r#"{"requestorId":"eec1","tEasEndpoint":{"fqdn":"eas-t"}}"#;
+        let req: AcrInitReq = serde_json::from_str(body).unwrap();
+        assert!(!req.eas_notif_ind);
+    }
+
+    // ---- AcrDecReq (TS 24.558 §6.5.5.2.4) -----------------------------------
+
+    /// Required `ueId` + `tEasId` + `tEasEndpoint` round-trip.
+    #[test]
+    fn test_acr_dec_req_roundtrip() {
+        let body = r#"{
+            "ueId":"imsi-999700000000001",
+            "tEasId":"eas-t.example.com",
+            "tEasEndpoint":{"fqdn":"eas-t.edge.example.com"},
+            "requestorId":"eas-s.example.com"
+        }"#;
+        let req: AcrDecReq = serde_json::from_str(body).unwrap();
+        assert_eq!(req.ue_id, "imsi-999700000000001");
         assert_eq!(req.t_eas_id, "eas-t.example.com");
-        assert!(req.acr_mod_params.is_none());
+        assert_eq!(req.t_eas_endpoint.fqdn.as_deref(), Some("eas-t.edge.example.com"));
+        assert_eq!(req.requestor_id.as_deref(), Some("eas-s.example.com"));
     }
 
-    /// Optional `acrModParams.appCtx` passthrough JSON is preserved.
+    /// Missing mandatory `tEasId` fails to deserialize.
     #[test]
-    fn test_acr_declare_req_with_mod_params() {
+    fn test_acr_dec_req_missing_t_eas_id_fails() {
+        let body = r#"{"ueId":"imsi-1","tEasEndpoint":{"fqdn":"eas-t"}}"#;
+        assert!(serde_json::from_str::<AcrDecReq>(body).is_err());
+    }
+
+    // ---- AcrParameters (TS 24.558 §6.5.5.2.7) -------------------------------
+
+    /// `AcrParameters` carries only `predictExpTime`.
+    #[test]
+    fn test_acr_parameters_predict_exp_time() {
+        let p = AcrParameters { predict_exp_time: Some("2026-07-01T12:00:00Z".into()) };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains(r#""predictExpTime":"2026-07-01T12:00:00Z""#));
+        let back: AcrParameters = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+        // Empty object is valid (all-optional).
+        assert_eq!(serde_json::to_string(&AcrParameters::default()).unwrap(), "{}");
+    }
+
+    // ---- EELACRReq (TS 29.558 §8.8.6.2.2) -----------------------------------
+
+    /// Required `ueId` + `easCharacs` round-trip.
+    #[test]
+    fn test_eel_acr_req_roundtrip() {
         let body = r#"{
-            "eecId":"eec1","sEasId":"s","tEasId":"t",
-            "acrModParams":{"appCtx":{"sessionKey":"abc123"}}
+            "ueId":"imsi-999700000000001",
+            "easCharacs":[{"easId":"eas-t"}],
+            "appCtxtStoreAddr":"https://store.example.com/ctx/1"
         }"#;
-        let req: AcrDeclareReq = serde_json::from_str(body).unwrap();
-        let params = req.acr_mod_params.unwrap();
-        let ctx = params.app_ctx.unwrap();
-        assert_eq!(ctx["sessionKey"], "abc123");
+        let req: EELACRReq = serde_json::from_str(body).unwrap();
+        assert_eq!(req.ue_id, "imsi-999700000000001");
+        assert_eq!(req.eas_characs.len(), 1);
+        assert_eq!(req.app_ctxt_store_addr.as_deref(), Some("https://store.example.com/ctx/1"));
     }
 
-    // ---- EelManagedAcrReq ---------------------------------------------------
-
-    /// Mandatory `eecId` + `sEasId` round-trips.
+    /// Missing mandatory `easCharacs` fails to deserialize.
     #[test]
-    fn test_eel_managed_acr_req_roundtrip() {
-        let body = r#"{"eecId":"eec-eel","sEasId":"eas-src.example.com"}"#;
-        let req: EelManagedAcrReq = serde_json::from_str(body).unwrap();
-        assert_eq!(req.eec_id, "eec-eel");
-        assert_eq!(req.s_eas_id, "eas-src.example.com");
-        assert!(req.ue_id.is_none());
+    fn test_eel_acr_req_missing_eas_characs_fails() {
+        assert!(serde_json::from_str::<EELACRReq>(r#"{"ueId":"imsi-1"}"#).is_err());
     }
 
-    /// Missing `sEasId` fails to deserialize.
-    #[test]
-    fn test_eel_managed_acr_req_missing_s_eas_id_fails() {
-        assert!(serde_json::from_str::<EelManagedAcrReq>(r#"{"eecId":"eec"}"#).is_err());
-    }
+    // ---- ACRUpdateData (TS 29.558 §8.9.6.2.2) -------------------------------
 
-    // ---- AcrStatusUpdateReq -------------------------------------------------
-
-    /// Full body with `COMPLETED` status round-trips.
+    /// Required `easId` + `actResultInfo` round-trip.
     #[test]
-    fn test_acr_status_update_req_roundtrip() {
+    fn test_acr_update_data_roundtrip() {
         let body = r#"{
-            "eecId":"eec1",
-            "acrParams":{"sEasId":"eas-s.example.com","tEasId":"eas-t.example.com"},
-            "acrStatus":"COMPLETED"
+            "easId":"eas-t.example.com",
+            "actResultInfo":{"actResult":"ACT_SUCCESSFUL"}
         }"#;
-        let req: AcrStatusUpdateReq = serde_json::from_str(body).unwrap();
-        assert_eq!(req.eec_id, "eec1");
-        assert_eq!(req.acr_status, AcrStatus::Completed);
-        assert_eq!(req.acr_params.t_eas_id.as_deref(), Some("eas-t.example.com"));
+        let req: ACRUpdateData = serde_json::from_str(body).unwrap();
+        assert_eq!(req.eas_id, "eas-t.example.com");
+        assert!(req.act_result_info.is_some());
     }
 
-    /// Missing `acrStatus` fails to deserialize.
+    /// Missing mandatory `easId` fails to deserialize.
     #[test]
-    fn test_acr_status_update_req_missing_status_fails() {
-        let body = r#"{"eecId":"eec1","acrParams":{"sEasId":"s","tEasId":"t"}}"#;
-        assert!(serde_json::from_str::<AcrStatusUpdateReq>(body).is_err());
+    fn test_acr_update_data_missing_eas_id_fails() {
+        let body = r#"{"actResultInfo":{"actResult":"ACT_SUCCESSFUL"}}"#;
+        assert!(serde_json::from_str::<ACRUpdateData>(body).is_err());
     }
 
-    // ---- Enum serialization -------------------------------------------------
+    // ---- AcrStatus ----------------------------------------------------------
 
     /// `AcrStatus` serializes as SCREAMING_SNAKE_CASE.
     #[test]
@@ -435,54 +543,12 @@ mod tests {
         assert_eq!(serde_json::to_string(&AcrStatus::Failed).unwrap(), r#""FAILED""#);
     }
 
-    /// `AcrStatus` deserializes from SCREAMING_SNAKE_CASE.
+    /// The UE-scoped state key prefers the GPSI, then the requestor identity.
     #[test]
-    fn test_acr_status_deserialization() {
-        let s: AcrStatus = serde_json::from_str(r#""DETERMINED""#).unwrap();
-        assert_eq!(s, AcrStatus::Determined);
-        let s: AcrStatus = serde_json::from_str(r#""FAILED""#).unwrap();
-        assert_eq!(s, AcrStatus::Failed);
-    }
-
-    /// `AcrScenario` serializes as SCREAMING_SNAKE_CASE.
-    #[test]
-    fn test_acr_scenario_serialization() {
-        assert_eq!(
-            serde_json::to_string(&AcrScenario::EecTriggered).unwrap(),
-            r#""EEC_TRIGGERED""#
-        );
-        assert_eq!(
-            serde_json::to_string(&AcrScenario::EelManaged).unwrap(),
-            r#""EEL_MANAGED""#
-        );
-        assert_eq!(
-            serde_json::to_string(&AcrScenario::FiveGcTriggered).unwrap(),
-            r#""FIVE_GC_TRIGGERED""#
-        );
-    }
-
-    /// `AcrParameters` with all optional fields round-trips.
-    #[test]
-    fn test_acr_parameters_roundtrip() {
-        use crate::types::EndPoint;
-        let params = AcrParameters {
-            s_eas_id: "eas-s".into(),
-            t_eas_id: Some("eas-t".into()),
-            s_eas_endpoint: Some(EndPoint {
-                fqdn: Some("eas-s.edge".into()),
-                ..Default::default()
-            }),
-            t_eas_endpoint: Some(EndPoint {
-                fqdn: Some("eas-t.edge".into()),
-                ..Default::default()
-            }),
-        };
-        let json = serde_json::to_string(&params).unwrap();
-        assert!(json.contains(r#""sEasId":"eas-s""#));
-        assert!(json.contains(r#""tEasId":"eas-t""#));
-        assert!(json.contains(r#""sEasEndpoint""#));
-        assert!(json.contains(r#""tEasEndpoint""#));
-        let back: AcrParameters = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, params);
+    fn test_acr_ue_key() {
+        assert_eq!(acr_ue_key(Some("imsi-1"), Some("eec1")), "ue:imsi-1");
+        assert_eq!(acr_ue_key(None, Some("eec1")), "req:eec1");
+        assert_eq!(acr_ue_key(Some("  "), Some("eec1")), "req:eec1");
+        assert_eq!(acr_ue_key(None, None), "acr:unknown");
     }
 }
