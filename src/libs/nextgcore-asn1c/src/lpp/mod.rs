@@ -31,6 +31,7 @@
 //! reference vector in [`message`] is hand-derived bit-by-bit from X.691 and is
 //! self-attesting.
 
+pub mod a_gnss;
 pub mod capabilities;
 pub mod ecid;
 pub mod message;

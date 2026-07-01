@@ -10,6 +10,7 @@
 
 use bytes::Bytes;
 
+use super::a_gnss::body::{ProvideAssistanceData, RequestAssistanceData};
 use super::capabilities::{ProvideCapabilities, RequestCapabilities};
 use super::ecid::{ProvideLocationInformation, RequestLocationInformation};
 use super::types::{Acknowledgement, LppTransactionId, SequenceNumber};
@@ -171,6 +172,8 @@ impl UperDecode for LppMessageBody {
 pub enum MessageBodyC1 {
     RequestCapabilities(RequestCapabilities),
     ProvideCapabilities(ProvideCapabilities),
+    RequestAssistanceData(RequestAssistanceData),
+    ProvideAssistanceData(ProvideAssistanceData),
     RequestLocationInformation(RequestLocationInformation),
     ProvideLocationInformation(ProvideLocationInformation),
 }
@@ -179,6 +182,8 @@ impl MessageBodyC1 {
     const NUM_ALTERNATIVES: usize = 16;
     const IDX_REQUEST_CAPABILITIES: usize = 0;
     const IDX_PROVIDE_CAPABILITIES: usize = 1;
+    const IDX_REQUEST_ASSISTANCE_DATA: usize = 2;
+    const IDX_PROVIDE_ASSISTANCE_DATA: usize = 3;
     const IDX_REQUEST_LOCATION_INFORMATION: usize = 4;
     const IDX_PROVIDE_LOCATION_INFORMATION: usize = 5;
 }
@@ -197,6 +202,22 @@ impl UperEncode for MessageBodyC1 {
             MessageBodyC1::ProvideCapabilities(body) => {
                 encoder.encode_choice_index(
                     Self::IDX_PROVIDE_CAPABILITIES,
+                    Self::NUM_ALTERNATIVES,
+                    false,
+                )?;
+                body.encode_uper(encoder)
+            }
+            MessageBodyC1::RequestAssistanceData(body) => {
+                encoder.encode_choice_index(
+                    Self::IDX_REQUEST_ASSISTANCE_DATA,
+                    Self::NUM_ALTERNATIVES,
+                    false,
+                )?;
+                body.encode_uper(encoder)
+            }
+            MessageBodyC1::ProvideAssistanceData(body) => {
+                encoder.encode_choice_index(
+                    Self::IDX_PROVIDE_ASSISTANCE_DATA,
                     Self::NUM_ALTERNATIVES,
                     false,
                 )?;
@@ -231,6 +252,12 @@ impl UperDecode for MessageBodyC1 {
             )),
             1 => Ok(MessageBodyC1::ProvideCapabilities(
                 ProvideCapabilities::decode_uper(decoder)?,
+            )),
+            2 => Ok(MessageBodyC1::RequestAssistanceData(
+                RequestAssistanceData::decode_uper(decoder)?,
+            )),
+            3 => Ok(MessageBodyC1::ProvideAssistanceData(
+                ProvideAssistanceData::decode_uper(decoder)?,
             )),
             4 => Ok(MessageBodyC1::RequestLocationInformation(
                 RequestLocationInformation::decode_uper(decoder)?,
@@ -447,6 +474,32 @@ mod tests {
                     },
                 }),
             )),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_provide_assistance_data_a_gnss() {
+        // A full LppMessage carrying ProvideAssistanceData -> a-gnss (c1 index 3),
+        // end to end through the top-level message codec.
+        use crate::lpp::a_gnss::body::ProvideAssistanceDataR9;
+        use crate::lpp::a_gnss::AGnssProvideAssistanceData;
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(4),
+            }),
+            end_transaction: false,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(MessageBodyC1::ProvideAssistanceData(
+                ProvideAssistanceData {
+                    ies: ProvideAssistanceDataR9 {
+                        a_gnss: Some(AGnssProvideAssistanceData::default()),
+                    },
+                },
+            ))),
         };
         let bytes = msg.encode().unwrap();
         assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);

@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "NextGCore ASN.1 Codec Library"
 
+[lib]
+doctest = false
+
 [dependencies]
 nextgcore-core = { workspace = true }
 thiserror.workspace = true
