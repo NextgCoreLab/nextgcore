@@ -548,13 +548,10 @@ async fn handle_auth_data(
                 Ok(v) => v,
                 Err(resp) => return *resp,
             };
-            if body
-                .get("authenticationMethod")
-                .and_then(|v| v.as_str())
-                .is_none()
-            {
-                return missing_mandatory("authenticationMethod");
-            }
+            let auth_method = match body.get("authenticationMethod").and_then(|v| v.as_str()) {
+                Some(m) => m.to_string(),
+                None => return missing_mandatory("authenticationMethod"),
+            };
             let k_hex = match body.get("encPermanentKey").and_then(|v| v.as_str()) {
                 Some(k) if k.len() == 32 && k.bytes().all(|b| b.is_ascii_hexdigit()) => {
                     k.to_string()
@@ -587,6 +584,7 @@ async fn handle_auth_data(
                     .and_then(|v| v.as_str())
                     .and_then(|s| u64::from_str_radix(s, 16).ok())
                     .unwrap_or(0),
+                auth_method,
             };
             match nextgcore_dbi::subscription::nextgcore_dbi_provision_auth_info_async(
                 supi.to_string(),
@@ -2152,10 +2150,14 @@ fn build_auth_subscription_json(
     supi: &str,
     auth_info: &nextgcore_dbi::subscription::NextgcoreDbiAuthInfo,
 ) -> serde_json::Value {
-    // TS 29.505 §5.4.2.2: NextgcoreDbiAuthInfo does not surface the provisioned
-    // authenticationMethod from the DB schema; default to "5G_AKA" per
-    // TS 33.501 §6.1.2 (most deployments use 5G-AKA). (udrd-10)
-    let auth_method = "5G_AKA";
+    // TS 29.505 §5.4.2.2: serve the provisioned authenticationMethod (AuthMethod).
+    // Legacy subscriber docs lack the field (empty) -> default to "5G_AKA" per
+    // TS 33.501 §6.1.2. (udrd-10 / udrd#1)
+    let auth_method = if auth_info.authentication_method.is_empty() {
+        "5G_AKA"
+    } else {
+        auth_info.authentication_method.as_str()
+    };
 
     // TS 29.505 §5.4.2.23 / TS 33.102 SQN array management: with indLength=5
     // the low 5 bits of the 48-bit SQN are the IND component and must be
@@ -3456,6 +3458,22 @@ udr:
             doc["authenticationMethod"].as_str().unwrap(),
             "5G_AKA",
             "default authenticationMethod must be 5G_AKA"
+        );
+    }
+
+    /// udrd#1: a provisioned non-default authenticationMethod (e.g. EAP_AKA_PRIME)
+    /// must be served verbatim, not overwritten with 5G_AKA.
+    #[test]
+    fn test_authentication_method_served_from_db() {
+        let info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo {
+            authentication_method: "EAP_AKA_PRIME".to_string(),
+            ..Default::default()
+        };
+        let doc = build_auth_subscription_json("imsi-001010000000003", &info);
+        assert_eq!(
+            doc["authenticationMethod"].as_str().unwrap(),
+            "EAP_AKA_PRIME",
+            "provisioned authenticationMethod must be served verbatim",
         );
     }
 

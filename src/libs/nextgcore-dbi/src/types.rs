@@ -45,6 +45,7 @@ pub const NEXTGCORE_OP_STRING: &str = "op";
 pub const NEXTGCORE_AMF_STRING: &str = "amf";
 pub const NEXTGCORE_RAND_STRING: &str = "rand";
 pub const NEXTGCORE_SQN_STRING: &str = "sqn";
+pub const NEXTGCORE_AUTH_METHOD_STRING: &str = "authenticationMethod";
 pub const NEXTGCORE_MME_HOST_STRING: &str = "mme_host";
 pub const NEXTGCORE_MME_REALM_STRING: &str = "mme_realm";
 pub const NEXTGCORE_MME_TIMESTAMP_STRING: &str = "mme_timestamp";

@@ -19,6 +19,10 @@ pub struct NextgcoreDbiAuthInfo {
     pub amf: [u8; NEXTGCORE_AMF_LEN],
     pub rand: [u8; NEXTGCORE_RAND_LEN],
     pub sqn: u64,
+    /// Provisioned authentication method (TS 29.505 AuthMethod), e.g. "5G_AKA"
+    /// or "EAP_AKA_PRIME". Empty for subscriber docs provisioned before this
+    /// field existed; the UDR GET builder then defaults to "5G_AKA".
+    pub authentication_method: String,
 }
 
 /// Get authentication info for a subscriber
@@ -77,6 +81,12 @@ pub fn nextgcore_dbi_auth_info(supi: &str) -> DbiResult<NextgcoreDbiAuthInfo> {
     // Parse SQN
     if let Ok(sqn) = security.get_i64(NEXTGCORE_SQN_STRING) {
         auth_info.sqn = sqn as u64;
+    }
+
+    // Parse authenticationMethod (TS 29.505 AuthMethod). Absent in legacy
+    // subscriber docs -> left empty and defaulted by the UDR GET builder.
+    if let Ok(m) = security.get_str(NEXTGCORE_AUTH_METHOD_STRING) {
+        auth_info.authentication_method = m.to_string();
     }
 
     Ok(auth_info)
@@ -182,6 +192,8 @@ pub struct NextgcoreDbiAuthProvision {
     pub amf_hex: String,
     /// Initial sequence number
     pub sqn: u64,
+    /// Authentication method (TS 29.505 AuthMethod), e.g. "5G_AKA" / "EAP_AKA_PRIME".
+    pub auth_method: String,
 }
 
 /// Create or replace the authentication subscription for a subscriber.
@@ -205,6 +217,7 @@ pub fn nextgcore_dbi_provision_auth_info(
         format!("{}.{}", NEXTGCORE_SECURITY_STRING, NEXTGCORE_K_STRING): &p.k_hex,
         format!("{}.{}", NEXTGCORE_SECURITY_STRING, NEXTGCORE_AMF_STRING): &p.amf_hex,
         format!("{}.{}", NEXTGCORE_SECURITY_STRING, NEXTGCORE_SQN_STRING): p.sqn as i64,
+        format!("{}.{}", NEXTGCORE_SECURITY_STRING, NEXTGCORE_AUTH_METHOD_STRING): &p.auth_method,
     };
     if let Some(opc) = &p.opc_hex {
         set.insert(
