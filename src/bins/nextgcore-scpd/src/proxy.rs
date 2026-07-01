@@ -28,7 +28,9 @@ use std::time::Duration;
 
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use nextgcore_sbi::constants::{custom_header, discovery_header};
-use nextgcore_sbi::message::{ProblemDetails, SbiHttpMessage, SbiRequest, SbiResponse};
+use nextgcore_sbi::message::{
+    ProblemDetails, SbiHttpMessage, SbiRequest, SbiResponse, UriComponents,
+};
 use nextgcore_sbi::oauth::OAuth2Client;
 use nextgcore_sbi::types::{NfType, UriScheme};
 use nextgcore_sbi::SbiError;
@@ -512,6 +514,58 @@ fn upstream_error_response(target: &str, err: &SbiError) -> SbiResponse {
     }
 }
 
+/// Build the discovery-cache discriminator from the routing-relevant
+/// 3gpp-Sbi-Discovery-* factors (TS 29.500 §6.10.3.2 / §6.10.3.4 NOTE 2):
+/// S-NSSAI, DNN, GUAMI, TAI, target-PLMN-list and target-NF-instance-id.
+/// Requests differing in any of these must not share a cached producer set, so
+/// their values (empty when absent) are folded into the cache key. The unit
+/// separator (0x1F) cannot appear in an HTTP header value, so it is an
+/// unambiguous field delimiter.
+fn discovery_cache_discriminator(http: &SbiHttpMessage) -> String {
+    [
+        discovery_header::SNSSAIS,
+        discovery_header::DNN,
+        discovery_header::GUAMI,
+        discovery_header::TAI,
+        discovery_header::TARGET_PLMN_LIST,
+        discovery_header::TARGET_NF_INSTANCE_ID,
+    ]
+    .iter()
+    .map(|h| http.get_header(h).map(String::as_str).unwrap_or(""))
+    .collect::<Vec<_>>()
+    .join("\u{1f}")
+}
+
+/// Map a delegated OAuth2 access-token acquisition failure to the mandated
+/// SCP ProblemDetails (TS 29.500 §6.10.11.2.2 / §6.10.11.2.2A):
+///
+/// * the SCP cannot form a valid Access Token Request, or the NRF rejects it
+///   with `MISSING_PARAMETER` (missing requester info) → 400 with cause
+///   `MISSING_ACCESS_TOKEN_INFO`;
+/// * any other NRF rejection / failure to obtain a token → 403 with cause
+///   `ACCESS_TOKEN_DENIED`.
+///
+/// The NRF's own error body (carried in `SbiError::AuthorizationFailed`) is
+/// inspected for the `MISSING_PARAMETER` OAuth2 error code to pick between them.
+fn token_acquisition_failure_response(err: &SbiError) -> SbiResponse {
+    let detail = err.to_string();
+    if detail.to_ascii_uppercase().contains("MISSING_PARAMETER") {
+        problem_response(
+            400,
+            "Bad Request",
+            &format!("SCP could not issue the access token request: {detail}"),
+            "MISSING_ACCESS_TOKEN_INFO",
+        )
+    } else {
+        problem_response(
+            403,
+            "Forbidden",
+            &format!("SCP could not obtain an access token for the producer: {detail}"),
+            "ACCESS_TOKEN_DENIED",
+        )
+    }
+}
+
 /// How the proxy decided where to route a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RouteDecision {
@@ -837,13 +891,21 @@ impl ScpProxy {
             })?;
 
         // scpd-08: serve un-expired SearchResults from the per-instance cache,
-        // keyed on (target-nf-type, service-names), without re-querying the NRF.
+        // keyed on (target-nf-type, service-names, discriminator) without
+        // re-querying the NRF. The discriminator folds in every routing-relevant
+        // Discovery-* factor (TS 29.500 §6.10.3.2 / §6.10.3.4 NOTE 2) so a
+        // different slice / DNN / area / pinned instance never reuses another
+        // request's cached producer set.
         let service_key = request
             .http
             .get_header(discovery_header::SERVICE_NAMES)
             .cloned()
             .unwrap_or_default();
-        if let Some(cached) = self.discovery_cache.get(&target_nf_type, &service_key) {
+        let cache_discriminator = discovery_cache_discriminator(&request.http);
+        if let Some(cached) =
+            self.discovery_cache
+                .get(&target_nf_type, &service_key, &cache_discriminator)
+        {
             if let Some(selected) = select_nf_instance(&cached) {
                 return Ok(DiscoveredProducer {
                     target: ApiRoot {
@@ -926,6 +988,7 @@ impl ScpProxy {
             self.discovery_cache.put(
                 &target_nf_type,
                 &service_key,
+                &cache_discriminator,
                 candidates.clone(),
                 Duration::from_secs(validity),
             );
@@ -1012,6 +1075,27 @@ impl ScpProxy {
                 }
                 None => (self.client_for(target), false),
             };
+
+        // scpd: on the Model D delegated path the SCP must obtain a valid OAuth2
+        // access token for the producer *before* forwarding (TS 33.501 §13). If
+        // the token cannot be acquired — the NRF rejects the Access Token Request
+        // or is unreachable — surface the mandated 400 MISSING_ACCESS_TOKEN_INFO /
+        // 403 ACCESS_TOKEN_DENIED ProblemDetails instead of silently forwarding
+        // tokenless (TS 29.500 §6.10.11.2.2 / §6.10.11.2.2A). Acquiring here
+        // primes the token cache, so L1's attach step reuses it (no double NRF
+        // round-trip). A no-scope request (no service name) needs no token.
+        if delegated {
+            if let (Some(oauth2), Some(nf)) = (self.oauth2.as_ref(), delegated_nf_type) {
+                let scope = UriComponents::parse(&request.header.uri)
+                    .api_name
+                    .unwrap_or_default();
+                if !scope.is_empty() {
+                    if let Err(e) = oauth2.get_token(nf, &scope).await {
+                        return self.stamp_server(token_acquisition_failure_response(&e));
+                    }
+                }
+            }
+        }
 
         // scpd-07: keep a pristine (pre-token) copy for a single refresh-and-
         // retry on a delegated 401/403 Bearer challenge.
@@ -1158,6 +1242,39 @@ mod tests {
     // ------------------------------------------------------------------
     // Unit tests: parsing, header stripping, binding normalization
     // ------------------------------------------------------------------
+
+    #[test]
+    fn test_token_acquisition_failure_mapping() {
+        // NRF MISSING_PARAMETER (or the SCP lacking requester info) -> 400
+        // MISSING_ACCESS_TOKEN_INFO (TS 29.500 §6.10.11.2.2).
+        let missing = token_acquisition_failure_response(&SbiError::AuthorizationFailed(
+            "NRF token request failed (HTTP 400): {\"error\":\"MISSING_PARAMETER\"}".into(),
+        ));
+        assert_eq!(missing.status, 400);
+        assert!(missing
+            .http
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("MISSING_ACCESS_TOKEN_INFO"));
+
+        // Any other rejection / unreachable NRF -> 403 ACCESS_TOKEN_DENIED.
+        for e in [
+            SbiError::AuthorizationFailed(
+                "NRF token request failed (HTTP 403): {\"error\":\"invalid_client\"}".into(),
+            ),
+            SbiError::Timeout,
+        ] {
+            let denied = token_acquisition_failure_response(&e);
+            assert_eq!(denied.status, 403);
+            assert!(denied
+                .http
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACCESS_TOKEN_DENIED"));
+        }
+    }
 
     #[test]
     fn test_apiroot_parse_variants() {
@@ -1524,6 +1641,14 @@ mod tests {
             .start(move |request: SbiRequest| {
                 let hits = hits.clone();
                 async move {
+                    // A real NRF serves both nnrf-disc and nnrf-oauth2; the SCP
+                    // acquires a delegated token before forwarding (TS 33.501 §13).
+                    if request.header.uri == "/nnrf-oauth2/v1/access-token" {
+                        return SbiResponse::ok().with_body(
+                            r#"{"access_token":"scp-test-token","token_type":"Bearer","expires_in":3600}"#.to_string(),
+                            "application/json",
+                        );
+                    }
                     assert_eq!(request.header.uri, "/nnrf-disc/v1/nf-instances");
                     // The SCP must put the requester identity from the
                     // Discovery-requester-nf-type header into the query.
@@ -2111,6 +2236,14 @@ mod tests {
             .start(move |request: SbiRequest| {
                 let captured = captured.clone();
                 async move {
+                    // Serve the SCP's delegated OAuth2 token before discovery
+                    // capture, so the token request is not recorded as a factor.
+                    if request.header.uri == "/nnrf-oauth2/v1/access-token" {
+                        return SbiResponse::ok().with_body(
+                            r#"{"access_token":"scp-test-token","token_type":"Bearer","expires_in":3600}"#.to_string(),
+                            "application/json",
+                        );
+                    }
                     if let Ok(mut map) = captured.lock() {
                         for (k, v) in &request.http.params {
                             map.insert(k.clone(), v.clone());
@@ -2484,6 +2617,76 @@ mod tests {
         producer.stop().await.expect("producer stop");
     }
 
+    /// scpd (TS 29.500 §6.10.11.2.2A): on the Model D delegated path, if the NRF
+    /// rejects the SCP's access-token request, the SCP must surface 403 with
+    /// cause ACCESS_TOKEN_DENIED rather than forwarding tokenless.
+    #[tokio::test]
+    async fn test_delegated_token_rejection_maps_to_403() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+
+        let producer = start_mock_producer(producer_port).await;
+        // NRF answers discovery but rejects the access-token request (not with
+        // MISSING_PARAMETER) — the SCP must map this to 403 ACCESS_TOKEN_DENIED.
+        let nrf_server =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], nrf_port)),
+            ));
+        nrf_server
+            .start(move |request: SbiRequest| async move {
+                if request.header.uri == "/nnrf-oauth2/v1/access-token" {
+                    return SbiResponse::with_status(403).with_body(
+                        r#"{"error":"invalid_client"}"#.to_string(),
+                        "application/json",
+                    );
+                }
+                let search_result = serde_json::json!({
+                    "validityPeriod": 3600,
+                    "nfInstances": [{
+                        "nfInstanceId": "udm-instance-1",
+                        "nfType": "UDM",
+                        "nfStatus": "REGISTERED",
+                        "ipv4Addresses": ["127.0.0.1"],
+                        "nfServices": [{
+                            "serviceName": "nudm-uecm",
+                            "ipEndPoints": [{"ipv4Address": "127.0.0.1", "port": producer_port}]
+                        }]
+                    }]
+                });
+                SbiResponse::ok().with_body(search_result.to_string(), "application/json")
+            })
+            .await
+            .expect("nrf start");
+
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let client = fast_client(scp_port);
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header("3gpp-Sbi-Discovery-target-nf-type", "UDM")
+            .with_header("3gpp-Sbi-Discovery-requester-nf-type", "AMF")
+            .with_header("3gpp-Sbi-Discovery-service-names", "nudm-uecm");
+        let response = client.send_request(request).await.expect("roundtrip");
+        assert_eq!(response.status, 403);
+        assert!(response
+            .http
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ACCESS_TOKEN_DENIED"));
+
+        scp.stop().await.expect("scp stop");
+        nrf_server.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
     /// scpd-09: a discovered `apiPrefix` is prepended to the forwarded request
     /// URI seen by the producer.
     #[tokio::test]
@@ -2498,7 +2701,15 @@ mod tests {
                 SocketAddr::from(([127, 0, 0, 1], nrf_port)),
             ));
         nrf_server
-            .start(move |_request: SbiRequest| async move {
+            .start(move |request: SbiRequest| async move {
+                // A real NRF serves both nnrf-disc and nnrf-oauth2; the SCP
+                // acquires a delegated token before forwarding (TS 33.501 §13).
+                if request.header.uri == "/nnrf-oauth2/v1/access-token" {
+                    return SbiResponse::ok().with_body(
+                        r#"{"access_token":"scp-test-token","token_type":"Bearer","expires_in":3600}"#.to_string(),
+                        "application/json",
+                    );
+                }
                 let search_result = serde_json::json!({
                     "validityPeriod": 3600,
                     "nfInstances": [{
@@ -2673,7 +2884,15 @@ mod tests {
                 SocketAddr::from(([127, 0, 0, 1], nrf_port)),
             ));
         nrf_server
-            .start(move |_request: SbiRequest| async move {
+            .start(move |request: SbiRequest| async move {
+                // A real NRF serves both nnrf-disc and nnrf-oauth2; the SCP
+                // acquires a delegated token before forwarding (TS 33.501 §13).
+                if request.header.uri == "/nnrf-oauth2/v1/access-token" {
+                    return SbiResponse::ok().with_body(
+                        r#"{"access_token":"scp-test-token","token_type":"Bearer","expires_in":3600}"#.to_string(),
+                        "application/json",
+                    );
+                }
                 let search_result = serde_json::json!({
                     "validityPeriod": 3600,
                     "nfInstances": [{

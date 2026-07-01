@@ -234,9 +234,14 @@ impl DiscoveryCacheEntry {
 /// NF discovery result cache.
 ///
 /// Caches NF discovery results with TTL to avoid repeated NRF queries.
-/// Cache key is (target_nf_type, service_name).
+/// The cache key is (target_nf_type, service_name, discriminator), where
+/// `discriminator` folds in every routing-relevant 3gpp-Sbi-Discovery-* factor
+/// (S-NSSAI, DNN, GUAMI, TAI, target-PLMN-list, target-NF-instance-id) so that
+/// two delegated requests for the same NF type + service but a different slice,
+/// DNN, area, or pinned instance are not served each other's producer set
+/// (TS 29.500 §6.10.3.2 / §6.10.3.4 NOTE 2).
 pub struct DiscoveryCache {
-    entries: std::sync::RwLock<HashMap<(String, String), DiscoveryCacheEntry>>,
+    entries: std::sync::RwLock<HashMap<(String, String, String), DiscoveryCacheEntry>>,
 }
 
 impl DiscoveryCache {
@@ -246,14 +251,20 @@ impl DiscoveryCache {
         }
     }
 
-    /// Look up a cached discovery result.
+    /// Look up a cached discovery result. `discriminator` must be built the same
+    /// way for lookup and store (see `DiscoveryCache` docs).
     pub fn get(
         &self,
         target_nf_type: &str,
         service_name: &str,
+        discriminator: &str,
     ) -> Option<Vec<NfInstanceCandidate>> {
         let entries = self.entries.read().ok()?;
-        let key = (target_nf_type.to_string(), service_name.to_string());
+        let key = (
+            target_nf_type.to_string(),
+            service_name.to_string(),
+            discriminator.to_string(),
+        );
         entries.get(&key).and_then(|entry| {
             if entry.is_expired() {
                 None
@@ -268,11 +279,16 @@ impl DiscoveryCache {
         &self,
         target_nf_type: &str,
         service_name: &str,
+        discriminator: &str,
         candidates: Vec<NfInstanceCandidate>,
         ttl: std::time::Duration,
     ) {
         if let Ok(mut entries) = self.entries.write() {
-            let key = (target_nf_type.to_string(), service_name.to_string());
+            let key = (
+                target_nf_type.to_string(),
+                service_name.to_string(),
+                discriminator.to_string(),
+            );
             entries.insert(
                 key,
                 DiscoveryCacheEntry {
@@ -646,7 +662,7 @@ mod tests {
     fn test_discovery_cache() {
         let cache = DiscoveryCache::new();
 
-        assert!(cache.get("SMF", "nsmf-pdusession").is_none());
+        assert!(cache.get("SMF", "nsmf-pdusession", "").is_none());
 
         let candidates = vec![NfInstanceCandidate {
             nf_instance_id: "smf-1".to_string(),
@@ -664,16 +680,22 @@ mod tests {
         cache.put(
             "SMF",
             "nsmf-pdusession",
+            "",
             candidates.clone(),
             std::time::Duration::from_secs(3600),
         );
 
-        let cached = cache.get("SMF", "nsmf-pdusession");
+        let cached = cache.get("SMF", "nsmf-pdusession", "");
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().len(), 1);
 
-        assert!(cache.get("AMF", "nsmf-pdusession").is_none());
-        assert!(cache.get("SMF", "other").is_none());
+        assert!(cache.get("AMF", "nsmf-pdusession", "").is_none());
+        assert!(cache.get("SMF", "other", "").is_none());
+        // A different discriminator (e.g. a different S-NSSAI) must miss even
+        // for the same NF type + service (TS 29.500 §6.10.3.2).
+        assert!(cache
+            .get("SMF", "nsmf-pdusession", "sst=1,sd=000001")
+            .is_none());
     }
 
     #[test]
