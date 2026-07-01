@@ -25,6 +25,7 @@ serde_json.workspace = true
 uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+chrono = "0.4"
 
 [dev-dependencies]
 proptest.workspace = true

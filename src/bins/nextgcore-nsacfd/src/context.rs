@@ -327,6 +327,8 @@ pub struct NsacfContext {
     snssai_hash: RwLock<HashMap<(u8, Option<u32>), u64>>,
     /// SliceEventExposure subscriptions by subscriptionId
     subscriptions: RwLock<HashMap<String, SacSubscription>>,
+    /// EAC implicit subscriptions: AMF nfId -> eacNotificationUri (TS 29.536 §5.2.2.3.2)
+    eac_subscriptions: RwLock<HashMap<String, String>>,
     /// Next quota ID generator
     next_quota_id: AtomicUsize,
     /// Maximum number of slice quotas
@@ -345,6 +347,7 @@ impl NsacfContext {
             quota_list: RwLock::new(HashMap::new()),
             snssai_hash: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
+            eac_subscriptions: RwLock::new(HashMap::new()),
             next_quota_id: AtomicUsize::new(1),
             max_quotas: 0,
             eac_threshold_percent: RwLock::new(80),
@@ -375,8 +378,34 @@ impl NsacfContext {
         if let Ok(mut subs) = self.subscriptions.write() {
             subs.clear();
         }
+        if let Ok(mut eac) = self.eac_subscriptions.write() {
+            eac.clear();
+        }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("NSACF context finalized");
+    }
+
+    /// Register (or replace) an EAC notification callback for an AMF nfId.
+    pub fn eac_subscription_set(&self, nf_id: &str, uri: &str) {
+        if let Ok(mut m) = self.eac_subscriptions.write() {
+            m.insert(nf_id.to_string(), uri.to_string());
+        }
+    }
+
+    /// Remove the EAC notification callback for an AMF nfId (null unsubscribe).
+    pub fn eac_subscription_remove(&self, nf_id: &str) -> bool {
+        self.eac_subscriptions
+            .write()
+            .map(|mut m| m.remove(nf_id).is_some())
+            .unwrap_or(false)
+    }
+
+    /// All registered EAC notification callback URIs.
+    pub fn eac_notification_uris(&self) -> Vec<String> {
+        self.eac_subscriptions
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -1191,6 +1220,21 @@ mod tests {
             ctx.admit_pdu_session(&s_nssai, "imsi-2:1", AccessType::ThreeGpp),
             AdmissionResult::Admitted
         );
+    }
+
+    #[test]
+    fn test_eac_subscription_set_and_null_unsubscribe() {
+        // TS 29.536 §5.2.2.3.2: a value registers the EAC callback keyed by nfId;
+        // an explicit null (modeled as eac_subscription_remove) unsubscribes.
+        let ctx = NsacfContext::new();
+        ctx.eac_subscription_set("amf-1", "http://amf-1/cb");
+        assert_eq!(
+            ctx.eac_notification_uris(),
+            vec!["http://amf-1/cb".to_string()]
+        );
+        assert!(ctx.eac_subscription_remove("amf-1"));
+        assert!(ctx.eac_notification_uris().is_empty());
+        assert!(!ctx.eac_subscription_remove("amf-1"));
     }
 
     #[test]

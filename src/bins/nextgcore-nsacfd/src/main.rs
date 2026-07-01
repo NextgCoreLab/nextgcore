@@ -513,6 +513,10 @@ struct UeACRequestData {
     ue_ac_request_info: Vec<UeACRequestInfo>,
     /// NF instance id of the requesting consumer (M, TS 29.536 §6.1.6.2.2).
     nf_id: String,
+    /// EAC notification callback URI (O, TS 29.536 §6.1.6.2.2). Absent = no
+    /// change; explicit JSON null = unsubscribe; a value = (implicit) subscribe.
+    #[serde(default, deserialize_with = "double_option")]
+    eac_notification_uri: Option<Option<String>>,
 }
 
 /// PduACRequestInfo (TS 29.536 §6.1.6.2.10): SUPI + pduSessionId + ops.
@@ -687,6 +691,17 @@ fn validate_flags<'a>(ops: impl Iterator<Item = &'a AcuOperationItem>) -> Result
     Ok(())
 }
 
+/// serde helper distinguishing an absent field (`None`) from an explicit JSON
+/// `null` (`Some(None)`) and a present value (`Some(Some(v))`) — needed so a
+/// null `eacNotificationUri` can unsubscribe (TS 29.536 §5.2.2.3.2).
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
+}
+
 /// Parse a request body of type `T` (UeACRequestData / PduACRequestData),
 /// mapping a missing mandatory field to `MANDATORY_IE_MISSING` and any other
 /// shape/value error to `INVALID_MSG_FORMAT`.
@@ -747,6 +762,17 @@ async fn handle_ue_ac_update(request: &SbiRequest) -> SbiResponse {
     }
 
     log::debug!("UE AC request from nfId={}", req.nf_id);
+    // EAC implicit subscription (TS 29.536 §5.2.2.3.2): a value registers the
+    // callback keyed by AMF nfId; an explicit null unsubscribes; absent = no change.
+    match &req.eac_notification_uri {
+        Some(Some(uri)) => {
+            with_nsacf_context(|c| c.eac_subscription_set(&req.nf_id, uri));
+        }
+        Some(None) => {
+            with_nsacf_context(|c| c.eac_subscription_remove(&req.nf_id));
+        }
+        None => {}
+    }
     let mut failures: Vec<AcFailure> = Vec::new();
     let mut total_ops = 0usize;
     for info in &req.ue_ac_request_info {
@@ -1322,14 +1348,28 @@ async fn handle_slice_ee_subscribe(request: &SbiRequest) -> SbiResponse {
         }
     };
 
+    // TS 29.536 §6.2.6.2.2 SACEventSubscription: required { event, eventNotifyUri,
+    // nfId }; event is a SACEvent { eventType, eventFilter=array(Snssai) }.
     let mut missing = Vec::new();
-    let notification_uri = data.get("notificationUri").and_then(|v| v.as_str());
+    let notification_uri = data.get("eventNotifyUri").and_then(|v| v.as_str());
     if notification_uri.is_none() {
-        missing.push("notificationUri");
+        missing.push("eventNotifyUri");
     }
-    let events = data.get("events").and_then(|v| v.as_array());
-    if events.map(|e| e.is_empty()).unwrap_or(true) {
-        missing.push("events");
+    if data.get("nfId").and_then(|v| v.as_str()).is_none() {
+        missing.push("nfId");
+    }
+    let event = data.get("event");
+    let event_type = event
+        .and_then(|e| e.get("eventType"))
+        .and_then(|v| v.as_str());
+    if event_type.is_none() {
+        missing.push("event.eventType");
+    }
+    let event_filter = event
+        .and_then(|e| e.get("eventFilter"))
+        .and_then(|v| v.as_array());
+    if event_filter.map(|a| a.is_empty()).unwrap_or(true) {
+        missing.push("event.eventFilter");
     }
     if !missing.is_empty() {
         return problem_details(
@@ -1340,22 +1380,28 @@ async fn handle_slice_ee_subscribe(request: &SbiRequest) -> SbiResponse {
         );
     }
 
-    let events: Vec<String> = events
+    // TS 29.536 §6.2.6.3.3 SACEventType: only the two count events are supported.
+    let event_type = event_type.expect("checked above");
+    if event_type != "NUM_OF_REGD_UES" && event_type != "NUM_OF_ESTD_PDU_SESSIONS" {
+        return problem_details(
+            400,
+            "Bad Request",
+            &format!("Unsupported eventType: {event_type}"),
+            Some("INVALID_MSG_FORMAT"),
+        );
+    }
+
+    let snssais: Vec<SNssai> = event_filter
         .expect("checked above")
         .iter()
-        .filter_map(|v| v.as_str().map(String::from))
+        .filter_map(SNssai::from_json)
         .collect();
-    let snssais: Vec<SNssai> = data
-        .get("snssais")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(SNssai::from_json).collect())
-        .unwrap_or_default();
 
     let subscription_id = uuid::Uuid::new_v4().to_string();
     let sub = SacSubscription {
         subscription_id: subscription_id.clone(),
         notification_uri: notification_uri.expect("checked above").to_string(),
-        events: events.clone(),
+        events: vec![event_type.to_string()],
         snssais,
         expiry: data
             .get("expiry")
@@ -1366,16 +1412,16 @@ async fn handle_slice_ee_subscribe(request: &SbiRequest) -> SbiResponse {
 
     log::info!("SliceEventExposure subscription created: {subscription_id}");
 
+    // 201 CreatedSACEventSubscription { subscription, subscriptionId }: echo the
+    // received SACEventSubscription verbatim (TS 29.536 §6.2.6.2.3).
     SbiResponse::with_status(201)
         .with_header(
             "Location",
             format!("/nnsacf-slice-ee/v1/subscriptions/{subscription_id}"),
         )
         .with_json_body(&serde_json::json!({
+            "subscription": data,
             "subscriptionId": subscription_id,
-            "notificationUri": data.get("notificationUri"),
-            "events": events,
-            "expiry": data.get("expiry"),
         }))
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
@@ -1457,8 +1503,11 @@ async fn deliver_notification(notification_uri: String, body: serde_json::Value)
 /// subscription's notificationUri is the EAC callback URI conveyed at
 /// subscription time. `plmnIdNid` is optional and omitted (not tracked here).
 fn spawn_eac_notifications(eac: EacTransition) {
-    let subs = with_nsacf_context(|c| c.subscriptions_matching(&eac.s_nssai)).unwrap_or_default();
-    if subs.is_empty() {
+    // EAC is an IMPLICIT subscription (TS 29.536 §5.2.2.3.2): the AMF supplies
+    // eacNotificationUri in NumOfUEsUpdate; deliver to every registered EAC
+    // callback URI, keyed by AMF nfId at subscription time.
+    let uris = with_nsacf_context(|c| c.eac_notification_uris()).unwrap_or_default();
+    if uris.is_empty() {
         return;
     }
     let mode = if eac.activated { "ACTIVE" } else { "DEACTIVE" };
@@ -1467,22 +1516,17 @@ fn spawn_eac_notifications(eac: EacTransition) {
         mode,
         eac.s_nssai.sst,
         eac.s_nssai.sd,
-        subs.len()
+        uris.len()
     );
     let mut eac_mode_list = serde_json::Map::new();
     eac_mode_list.insert(
         eac.s_nssai.to_key(),
         serde_json::Value::String(mode.to_string()),
     );
-    let eac_mode_list = serde_json::Value::Object(eac_mode_list);
-    for sub in subs {
-        let body = serde_json::json!({
-            "subscriptionId": sub.subscription_id,
-            "eacNotification": {
-                "eacModeList": eac_mode_list.clone(),
-            }
-        });
-        tokio::spawn(deliver_notification(sub.notification_uri, body));
+    // Bare EacNotification (TS 29.536 §6.1.6.2.4): { eacModeList: map(EACMode) }.
+    let body = serde_json::json!({ "eacModeList": eac_mode_list });
+    for uri in uris {
+        tokio::spawn(deliver_notification(uri, body.clone()));
     }
 }
 
@@ -1498,21 +1542,42 @@ fn spawn_event_reports(s_nssai: &SNssai) {
     let Some((subs, Some(quota))) = snapshot else {
         return;
     };
+    // SACInfo percentages are the spec's 0..100 integer of current/max.
+    let perc_ues = (quota.current_ues() * 100)
+        .checked_div(quota.max_ues)
+        .unwrap_or(0)
+        .min(100);
+    let perc_pdu = (quota.current_pdu_sessions() * 100)
+        .checked_div(quota.max_pdu_sessions)
+        .unwrap_or(0)
+        .min(100);
+    let time_stamp = chrono::Utc::now().to_rfc3339();
     for sub in subs {
-        let wants_counts = sub
-            .events
-            .iter()
-            .any(|e| e == "NUM_OF_REGISTERED_UES" || e == "NUM_OF_ESTABLISHED_PDU_SESSIONS");
-        if !wants_counts {
-            continue;
-        }
+        // TS 29.536 §6.2.6.3.3 SACEventType: only the two count events report here.
+        let event_type = match sub.events.first() {
+            Some(t) if t == "NUM_OF_REGD_UES" || t == "NUM_OF_ESTD_PDU_SESSIONS" => t.clone(),
+            _ => continue,
+        };
+        // TS 29.536 §6.2.6.2.4 SACEventReport { report: SACEventReportItem } with
+        // mandatory eventType/eventState/timeStamp/eventFilter and the SACEventStatus
+        // counts (note the spec's `sliceStautsInfo` typo, emitted verbatim).
         let body = serde_json::json!({
-            "subscriptionId": sub.subscription_id,
-            "eventReports": [{
-                "snssai": quota.s_nssai.to_json(),
-                "nbrRegisteredUes": quota.current_ues(),
-                "nbrEstablishedPduSessions": quota.current_pdu_sessions(),
-            }]
+            "report": {
+                "eventType": event_type,
+                "eventState": { "active": true },
+                "timeStamp": time_stamp.clone(),
+                "eventFilter": quota.s_nssai.to_json(),
+                "sliceStautsInfo": {
+                    "reachedNumUes": {
+                        "numericValNumUes": quota.current_ues(),
+                        "percValueNumUes": perc_ues,
+                    },
+                    "reachedNumPduSess": {
+                        "numericValNumPduSess": quota.current_pdu_sessions(),
+                        "percValueNumPduSess": perc_pdu,
+                    },
+                },
+            }
         });
         tokio::spawn(deliver_notification(sub.notification_uri, body));
     }
@@ -2144,25 +2209,28 @@ mod tests {
             .await
             .expect("receiver start");
 
-        // Missing mandatory events -> 400
+        // Missing mandatory nfId/event -> 400
         let resp = client
             .post_json(
                 "/nnsacf-slice-ee/v1/subscriptions",
-                &json!({"notificationUri": format!("http://127.0.0.1:{recv_port}/cb")}),
+                &json!({"eventNotifyUri": format!("http://127.0.0.1:{recv_port}/cb")}),
             )
             .await
             .expect("response");
         assert_eq!(resp.status, 400);
-        assert!(resp.http.content.as_deref().unwrap().contains("events"));
+        assert!(resp.http.content.as_deref().unwrap().contains("nfId"));
 
-        // Valid subscription for slice 74
+        // Valid SACEventSubscription for slice 74 (TS 29.536 §6.2.6.2.2)
         let resp = client
             .post_json(
                 "/nnsacf-slice-ee/v1/subscriptions",
                 &json!({
-                    "notificationUri": format!("http://127.0.0.1:{recv_port}/cb"),
-                    "events": ["NUM_OF_REGISTERED_UES"],
-                    "snssais": [{"sst": 74}]
+                    "eventNotifyUri": format!("http://127.0.0.1:{recv_port}/cb"),
+                    "nfId": "amf-1",
+                    "event": {
+                        "eventType": "NUM_OF_REGD_UES",
+                        "eventFilter": [{"sst": 74}]
+                    }
                 }),
             )
             .await
@@ -2170,6 +2238,11 @@ mod tests {
         assert_eq!(resp.status, 201);
         let created: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        // 201 CreatedSACEventSubscription echoes the SACEventSubscription.
+        assert_eq!(
+            created["subscription"]["event"]["eventType"],
+            "NUM_OF_REGD_UES"
+        );
         let sub_id = created["subscriptionId"].as_str().unwrap().to_string();
         let location = resp
             .http
@@ -2183,10 +2256,20 @@ mod tests {
         // Quota of 5 with default EAC threshold 80% -> 4th admission activates EAC
         create_quota(&client, 74, 5, 100).await;
         for i in 1..=4 {
+            // Each NumOfUEsUpdate carries the EAC callback URI -> implicit EAC
+            // subscription for amf-1 (TS 29.536 §5.2.2.3.2).
             let resp = client
                 .post_json(
                     "/nnsacf-nsac/v1/slices/ues",
-                    &ue_ac_body(&format!("imsi-74-{i}"), "INCREASE", 74),
+                    &json!({
+                        "nfId": "amf-1",
+                        "eacNotificationUri": format!("http://127.0.0.1:{recv_port}/cb"),
+                        "ueACRequestInfo": [{
+                            "supi": format!("imsi-74-{i}"),
+                            "anType": "3GPP_ACCESS",
+                            "acuOperationList": [{ "updateFlag": "INCREASE", "snssai": {"sst": 74} }]
+                        }]
+                    }),
                 )
                 .await
                 .expect("response");
@@ -2208,7 +2291,16 @@ mod tests {
                 "old EAC scalar shape must be gone"
             );
             let v: serde_json::Value = serde_json::from_str(&notif).unwrap();
-            if v["eacNotification"]["eacModeList"]["74"] == "ACTIVE" {
+            // A SACEventReport (TS 29.536 §6.2.6.2.4), when present, must carry the
+            // spec shape: report.eventState.active + sliceStautsInfo counts.
+            if v.get("report").is_some() {
+                assert_eq!(v["report"]["eventState"]["active"], true);
+                assert_eq!(v["report"]["eventFilter"]["sst"], 74);
+                assert!(
+                    v["report"]["sliceStautsInfo"]["reachedNumUes"]["numericValNumUes"].is_number()
+                );
+            }
+            if v["eacModeList"]["74"] == "ACTIVE" {
                 saw_eac_active = true;
                 break;
             }
@@ -2235,7 +2327,7 @@ mod tests {
                 break;
             };
             let v: serde_json::Value = serde_json::from_str(&notif).unwrap();
-            if v["eacNotification"]["eacModeList"]["74"] == "DEACTIVE" {
+            if v["eacModeList"]["74"] == "DEACTIVE" {
                 saw_eac_inactive = true;
                 break;
             }
