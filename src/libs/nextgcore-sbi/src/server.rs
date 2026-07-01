@@ -378,8 +378,19 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                         "title": title, "status": status, "detail": e.to_string()
                     })
                     .to_string();
-                    let resp = SbiResponse::with_status(status)
+                    let mut resp = SbiResponse::with_status(status)
                         .with_body(body, "application/problem+json");
+                    if status == 401 {
+                        // RFC 6750 §3 (TS 29.500 Table 5.2.2.2-1): a rejected or
+                        // absent bearer token MUST carry a WWW-Authenticate: Bearer
+                        // challenge so the consumer/SCP can classify and retry.
+                        resp = resp.with_header(
+                            "WWW-Authenticate",
+                            format!(
+                                "Bearer realm=\"5gc-sbi\", error=\"invalid_token\", error_description=\"{e}\""
+                            ),
+                        );
+                    }
                     return Ok(convert_response_with_identity(
                         resp,
                         server_identity.as_ref(),
