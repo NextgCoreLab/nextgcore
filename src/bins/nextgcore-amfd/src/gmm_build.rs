@@ -562,15 +562,13 @@ pub fn build_deregistration_accept(_amf_ue: &AmfUe) -> Option<Vec<u8>> {
 /// Build Deregistration Request message (network-initiated; plain inner,
 /// TS 24.501 Section 8.2.11; wrap with nas_5gs_security_encode).
 ///
-/// nas-06: NOT migrated to nextgcore-nas (deferred). amfd writes the de-registration
-/// type as a bare 0x00 (non-re-reg) / 0x01 (re-reg) byte — its own non-conformant
-/// convention (re-reg flag placed in bit 0 rather than the spec's bit 3, switch-off
-/// bit never set, access-type sub-field left 0). nextgcore-nas `DeRegistrationType` packs
-/// a real `AccessType` whose minimum value is 1, so it cannot represent the 0x00
-/// access-type sub-field; an amfd-built non-re-reg request does not round-trip
-/// byte-equal through nextgcore-nas (0x00 -> 0x01). Locked by
-/// `drift_deregistration_request_divergence_locked`; migrate once amfd adopts the
-/// conformant de-reg-type bit layout (or nextgcore-nas gains a raw-byte escape).
+/// The De-registration type IE (TS 24.501 §9.11.3.20) is encoded conformantly:
+/// bit 3 = Re-registration required, bits 2-1 = Access type (01 = 3GPP access).
+/// In the network-to-UE direction bit 4 (Switch off) is spare and set to 0, so a
+/// re-registration-required request encodes 0x05 and a plain one 0x01. Still
+/// hand-rolled (not routed through nextgcore-nas, whose network-direction
+/// De-registration type is not yet modelled); the byte layout is locked by
+/// `golden_deregistration_request_type`.
 pub fn build_deregistration_request(
     _amf_ue: &AmfUe,
     dereg_reason: DeregistrationReason,
@@ -583,10 +581,13 @@ pub fn build_deregistration_request(
     builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::DEREGISTRATION_REQUEST_TO_UE);
 
-    // De-registration type
+    // De-registration type (TS 24.501 §9.11.3.20): bit 3 = re-registration required,
+    // bits 2-1 = access type (01 = 3GPP); bit 4 (switch off) is spare in the N->UE
+    // direction and set to 0.
     let re_registration_required =
         matches!(dereg_reason, DeregistrationReason::ReregistrationRequired);
-    let dereg_type = if re_registration_required { 0x01 } else { 0x00 };
+    const ACCESS_TYPE_3GPP: u8 = 0x01;
+    let dereg_type = ((re_registration_required as u8) << 2) | ACCESS_TYPE_3GPP;
     builder.write_u8(dereg_type);
 
     // 5GMM cause (optional, IEI = 0x58)
@@ -1400,30 +1401,34 @@ mod tests {
         );
     }
 
-    /// KNOWN DIVERGENCE LOCK (nas-06 Tier D): amfd encodes the de-registration type
-    /// as a bare 0x00 (non-re-reg) byte, but nextgcore-nas `DeRegistrationType` packs a real
-    /// `AccessType` whose minimum value is 1, so it cannot represent the 0x00 access-
-    /// type sub-field — an amfd-built non-re-reg Deregistration Request does NOT round-
-    /// trip byte-equal through nextgcore-nas (0x00 -> 0x01). This guard fails the moment the
-    /// divergence is fixed (amfd adopts the conformant de-reg-type bit layout, or
-    /// nextgcore-nas gains a raw-byte escape); convert it into a positive drift test then.
+    /// TS 24.501 §9.11.3.20: the network-initiated Deregistration Request encodes the
+    /// De-registration type as bit 3 = re-registration required, bits 2-1 = access type
+    /// (01 = 3GPP), bit 4 (switch off) spare in the N->UE direction. So a plain request
+    /// emits 0x01 and a re-registration-required one 0x05. The de-reg-type byte is the
+    /// 4th octet (after EPD, security-header, message-type). The matched sim UE decodes
+    /// this per spec (nextgsim-nas IeDeRegistrationType: re-reg = bit 2, access = bits
+    /// 1-0), so the conformant layout is required for it to read re-registration.
     #[test]
-    fn drift_deregistration_request_divergence_locked() {
-        use nextgcore_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
-        let amfd = build_deregistration_request(
-            &create_test_amf_ue(),
-            DeregistrationReason::UeNotSwitchOff, // non-re-reg -> de-reg-type byte 0x00
+    fn golden_deregistration_request_type() {
+        let amf_ue = create_test_amf_ue();
+
+        let plain =
+            build_deregistration_request(&amf_ue, DeregistrationReason::UeNotSwitchOff, None)
+                .unwrap();
+        assert_eq!(
+            plain[3], 0x01,
+            "plain de-reg-type must be access-type 3GPP (bits 2-1 = 01)"
+        );
+
+        let rereg = build_deregistration_request(
+            &amf_ue,
+            DeregistrationReason::ReregistrationRequired,
             None,
         )
         .unwrap();
-        let roundtrips = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd))
-            .map(|parsed| build_5gmm_message(&parsed)[..] == amfd[..])
-            .unwrap_or(false);
-        assert!(
-            !roundtrips,
-            "Deregistration Request now round-trips through nextgcore-nas — the de-reg-type \
-             0x00 / AccessType divergence is fixed; convert this guard into a byte-equal \
-             drift test and migrate build_deregistration_request"
+        assert_eq!(
+            rereg[3], 0x05,
+            "re-registration-required must set bit 3 (0x04) plus access-type 3GPP (0x01)"
         );
     }
 
