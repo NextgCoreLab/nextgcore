@@ -400,9 +400,10 @@ assert_log_contains "nextgcore-ausf" "authentication succeeded" \
 assert_log_contains "nextgcore-udm" "Generate Auth Data" \
     "UDM generated authentication data"
 
-# --- UDR subscription data ---
-assert_log_contains "nextgcore-udr" "Converted SUCI.*SUPI" \
-    "UDR converted SUCI to SUPI"
+# --- SUCI de-concealment (TS 33.501 §6.12: SIDF is co-located with UDM;
+# --- the UDR must only ever see the SUPI, never the SUCI) ---
+assert_log_contains "nextgcore-udm" "SIDF de-concealed SUCI.*SUPI" \
+    "UDM (SIDF) de-concealed SUCI to SUPI"
 
 assert_log_contains "nextgcore-udr" "GET authentication-subscription" \
     "UDR retrieved auth subscription"
