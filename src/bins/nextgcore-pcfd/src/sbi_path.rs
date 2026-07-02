@@ -716,6 +716,54 @@ pub async fn pcf_udr_sm_policy_dnn_data(
     }
 }
 
+/// Discover a UDR and GET the UE PolicySet for `supi`
+/// (TS 29.519 §5.4: `GET /nudr-dr/v1/policy-data/ues/{ueId}/ue-policy-set`;
+/// the ue-policy-set resource is served at v1 by udrd, TS29519_Policy_Data.yaml
+/// / udrd `handle_policy_data`). Returns the decoded UePolicySet body on 200,
+/// `Ok(None)` on 404 or when no UDR is reachable — the caller (E3 rule source)
+/// then falls back to the static default rule set, fail-closed.
+pub async fn pcf_udr_get_ue_policy_set(
+    supi: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
+        return Ok(None);
+    };
+    let client = client_for(&ep);
+    let path = format!(
+        "/nudr-dr/v1/policy-data/ues/{}/ue-policy-set",
+        percent_encode(supi),
+    );
+    let resp = client
+        .get(&path)
+        .await
+        .map_err(|e| format!("nudr-dr ue-policy-set GET failed: {e}"))?;
+    match resp.status {
+        200 => {
+            let body = resp.http.content.ok_or("empty ue-policy-set body")?;
+            let json = serde_json::from_str(&body)
+                .map_err(|e| format!("invalid ue-policy-set body: {e}"))?;
+            Ok(Some(json))
+        }
+        404 => {
+            log::warn!("nudr-dr returned 404 for ue-policy-set SUPI {supi}; using static defaults");
+            Ok(None)
+        }
+        other => Err(format!("nudr-dr ue-policy-set GET returned status {other}")),
+    }
+}
+
+/// Live-path bounded Nudr_DataRepository GET of the UE's provisioned UePolicySet
+/// (TS 29.519 §5.4), returning the doc when provisioned. `None` on
+/// 404 / unreachable / timeout — the E3 rule source then falls back to the
+/// static default set (fail-closed against a stuck UDR blocking delivery).
+pub async fn pcf_udr_ue_policy_set(supi: &str) -> Option<serde_json::Value> {
+    let fut = pcf_udr_get_ue_policy_set(supi);
+    match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
+        Ok(Ok(Some(v))) => Some(v),
+        _ => None,
+    }
+}
+
 /// Register a PCF binding with a discovered BSF
 /// (TS 29.521 Nbsf_Management: `POST /nbsf-management/v1/pcfBindings`).
 /// Returns the binding id (from the Location header, else the response
@@ -767,6 +815,146 @@ pub async fn pcf_deregister_bsf_binding(binding_id: &str) -> Result<bool, String
         .delete(&path)
         .await
         .map_err(|e| format!("nbsf-management delete failed: {e}"))?;
+    Ok(resp.status == 204 || resp.status == 200)
+}
+
+// --- Wave-6 E4: UE-policy (URSP) delivery via Namf_Communication N1N2 ---
+
+/// contentId of the binary UPDP part inside the multipart/related N1N2
+/// request. Referenced by `n1MessageContent.contentId` (TS 29.500 §6.1.2.3).
+const UPDP_CONTENT_ID: &str = "updp-pdu";
+
+/// Build pcfd's production `Namf_Communication_N1N2MessageTransfer` request
+/// carrying a UE policy container (TS 29.518 §5.2.2.3.1; TS 29.525 §4.2.2.2:
+/// the PCF delivers UE policies via N1N2MessageTransfer). Root JSON =
+/// `n1MessageContainer{n1MessageClass:"UPDP", n1MessageContent{contentId}}`;
+/// the MANAGE UE POLICY COMMAND (`updp_pdu`) is the binary part. Kept as a
+/// standalone builder so both the delivery task and the strict-peer test
+/// (against amfd's REAL handler) use identical bytes.
+pub fn build_ue_policy_n1n2_request(
+    supi: &str,
+    updp_pdu: &[u8],
+) -> nextgcore_sbi::message::SbiRequest {
+    use nextgcore_sbi::message::{SbiPart, SbiRequest};
+    let body = serde_json::json!({
+        "n1MessageContainer": {
+            "n1MessageClass": "UPDP",
+            "n1MessageContent": { "contentId": UPDP_CONTENT_ID }
+        }
+    });
+    SbiRequest::post(format!(
+        "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
+    ))
+    .with_json_body(&body)
+    .expect("n1n2 UPDP root JSON serializes")
+    .with_part(SbiPart::with_content(
+        UPDP_CONTENT_ID,
+        // 5GS NAS message media type (TS 29.500 Table 6.1.2.3-1).
+        "application/vnd.3gpp.5gnas",
+        bytes::Bytes::copy_from_slice(updp_pdu),
+    ))
+}
+
+/// Discover an AMF and POST the UE policy container over
+/// `Namf_Communication_N1N2MessageTransfer` (multipart/related, class UPDP).
+/// `Ok(())` when the AMF accepts the transfer (200/202 — delivery still awaits
+/// the UE's MANAGE UE POLICY COMPLETE, item E6); `Err` on no reachable AMF or
+/// a non-2xx (e.g. 504 UE_NOT_REACHABLE), which the caller records as
+/// `DeliveryState::Failed` (fail-closed — never a fake `Delivered`).
+///
+/// AMF discovery: single-AMF matched sim uses NRF discovery by NF type. E4
+/// risk note — for multi-AMF, the PolicyAssociationRequest `guami`/`servingNfId`
+/// must be honoured to target the serving AMF; that is flagged, not solved here.
+pub async fn pcf_deliver_ue_policy(supi: &str, updp_pdu: &[u8]) -> Result<(), String> {
+    let Some(ep) = pcf_discover_endpoint("AMF", "namf-comm").await? else {
+        return Err("no AMF reachable (NRF discovery found no namf-comm endpoint)".into());
+    };
+    let client = client_for(&ep);
+    let req = build_ue_policy_n1n2_request(supi, updp_pdu);
+    let resp = client
+        .send_request(req)
+        .await
+        .map_err(|e| format!("namf-comm N1N2MessageTransfer failed: {e}"))?;
+    match resp.status {
+        200 | 202 => Ok(()),
+        other => Err(format!(
+            "namf-comm N1N2MessageTransfer returned status {other}"
+        )),
+    }
+}
+
+// --- Wave-6 E6: N1N2MessageSubscribe for the UE-policy delivery-result loop --
+
+/// Subscribe to the AMF's uplink UE-policy (`n1MessageClass == "UPDP"`)
+/// notifications for `supi` (TS 29.518 §5.2.2.6 N1N2MessageSubscribe; TS 29.525
+/// §4.2.2.2 subscribe-BEFORE-transfer order): the AMF will POST an
+/// `N1MessageNotify` to `callback_uri` when the UE returns a MANAGE UE POLICY
+/// COMPLETE/REJECT. Returns the AMF-minted `n1n2NotifySubscriptionId` (from the
+/// response body or the Location header) on 201; `Ok(None)` when no AMF is
+/// reachable; `Err` on a non-2xx. The subscription is per-UE and bound to the
+/// UE context lifetime at the AMF.
+pub async fn pcf_subscribe_ue_policy_notify(
+    supi: &str,
+    callback_uri: &str,
+) -> Result<Option<String>, String> {
+    let Some(ep) = pcf_discover_endpoint("AMF", "namf-comm").await? else {
+        return Ok(None);
+    };
+    let client = client_for(&ep);
+    // UeN1N2InfoSubscriptionCreateData (TS29518_Namf_Communication.yaml): the
+    // (n1MessageClass, n1NotifyCallbackUri) pair — the AMF fail-closed-rejects a
+    // half-pair (Wave-6 A3).
+    let body = serde_json::json!({
+        "n1MessageClass": "UPDP",
+        "n1NotifyCallbackUri": callback_uri,
+    });
+    let path = format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions");
+    let resp = client
+        .post_json(&path, &body)
+        .await
+        .map_err(|e| format!("N1N2MessageSubscribe failed: {e}"))?;
+    match resp.status {
+        200 | 201 => {
+            let id = resp
+                .http
+                .content
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                .and_then(|v| {
+                    v.get("n1n2NotifySubscriptionId")
+                        .and_then(|b| b.as_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    resp.http
+                        .get_header("location")
+                        .and_then(|loc| loc.rsplit('/').next())
+                        .map(str::to_string)
+                });
+            Ok(id)
+        }
+        other => Err(format!("N1N2MessageSubscribe returned status {other}")),
+    }
+}
+
+/// Unsubscribe a previously created UE-policy N1N2 notification
+/// (`DELETE .../n1-n2-messages/subscriptions/{subscriptionId}`, TS 29.518
+/// §5.2.2.7), called on association delete. `Ok(true)` on 204/200.
+pub async fn pcf_unsubscribe_ue_policy_notify(
+    supi: &str,
+    subscription_id: &str,
+) -> Result<bool, String> {
+    let Some(ep) = pcf_discover_endpoint("AMF", "namf-comm").await? else {
+        return Ok(false);
+    };
+    let client = client_for(&ep);
+    let path = format!(
+        "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{subscription_id}"
+    );
+    let resp = client
+        .delete(&path)
+        .await
+        .map_err(|e| format!("N1N2MessageUnSubscribe failed: {e}"))?;
     Ok(resp.status == 204 || resp.status == 200)
 }
 
@@ -1132,6 +1320,14 @@ mod tests {
                     .expect("udr GET ok")
                     .expect("policy data present");
             assert!(data.get("smPolicySnssaiData").is_some());
+
+            // E3: nudr-dr GET UePolicySet (v1) → decoded body carrying our
+            // structured `urspRules` provisioning extension.
+            let ue = pcf_udr_get_ue_policy_set("imsi-001010000000777")
+                .await
+                .expect("udr ue-policy-set GET ok")
+                .expect("ue-policy-set present");
+            assert!(ue.get("urspRules").is_some());
         };
         tokio::time::timeout(Duration::from_secs(15), run)
             .await
@@ -1179,6 +1375,25 @@ mod tests {
                         "smPolicyDnnData": { "internet": { "dnn": "internet" } }
                     }
                 }
+            });
+            return nextgcore_sbi::message::SbiResponse::with_status(200)
+                .with_json_body(&body)
+                .unwrap_or_else(|_| nextgcore_sbi::message::SbiResponse::with_status(500));
+        }
+        // E3: ue-policy-set is served at v1 by udrd. The body carries the
+        // 3GPP subscPolicySections alongside our structured `urspRules`
+        // provisioning extension (compiled to wire by the E2 codec).
+        if path.starts_with("/nudr-dr/v1/policy-data/") && path.ends_with("/ue-policy-set") {
+            let body = serde_json::json!({
+                "subscPolicySections": {},
+                "urspRules": [{
+                    "precedence": 10,
+                    "trafficDescriptor": { "dnn": "ims" },
+                    "routeSelectionDescriptors": [{
+                        "precedence": 10, "sscMode": 1, "snssai": {"sst": 1},
+                        "dnn": "ims", "pduSessionType": "ipv4v6", "preferredAccess": "3gpp"
+                    }]
+                }]
             });
             return nextgcore_sbi::message::SbiResponse::with_status(200)
                 .with_json_body(&body)

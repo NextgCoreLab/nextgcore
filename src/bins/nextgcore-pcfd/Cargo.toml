@@ -23,6 +23,11 @@ nextgcore-sbi = { workspace = true }
 nextgcore-metrics = { workspace = true }
 nextgcore-dbi = { workspace = true }
 nextgcore-app = { workspace = true }
+# Wave-6 E4: the UE-policy-delivery (UPDP) codec (TS 24.501 Annex D +
+# TS 24.526 §5.2) lives in nextgcore-nas; pcfd encodes the MANAGE UE POLICY
+# COMMAND it delivers over Namf N1N2 through it (item E2).
+nextgcore-nas = { workspace = true }
+bytes = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
@@ -36,9 +41,19 @@ ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+base64.workspace = true
 # WSB-1/H2 strict-peer tests: drive the REAL bsfd SBI request handler
 # in-process (and over a real HTTP/2 socket) instead of a lenient mock.
 nextgcore-bsfd = { path = "../nextgcore-bsfd" }
+# Wave-6 E4 strict-peer tests: drive amfd's REAL N1N2MessageTransfer handler
+# (`handle_n1_n2_message_transfer_request`, item E5's UPDP branch) in-process
+# with pcfd's production multipart request — no lenient mock.
+nextgcore-amfd = { path = "../nextgcore-amfd" }
+# Wave-6 E3 strict-peer tests: round-trip the provisioning UePolicySet through
+# udrd's REAL data_store (`policy_ue_put`/`policy_ue_get`, the persistence its
+# ue-policy-set PUT/GET handler delegates to) — no lenient JSON mock of the UDR.
+nextgcore-udrd = { path = "../nextgcore-udrd" }
 
 [lints]
 workspace = true
