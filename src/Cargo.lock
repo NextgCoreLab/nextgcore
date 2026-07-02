@@ -2124,6 +2124,7 @@ dependencies = [
  "nextgcore-sbi",
  "nextgcore-sctp",
  "once_cell",
+ "p256",
  "proptest",
  "serde",
  "serde_json",
@@ -2166,6 +2167,7 @@ name = "nextgcore-ausfd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "ctrlc",
  "env_logger",
@@ -2176,6 +2178,7 @@ dependencies = [
  "nextgcore-crypt",
  "nextgcore-metrics",
  "nextgcore-sbi",
+ "p256",
  "proptest",
  "serde",
  "serde_json",
@@ -2266,6 +2269,7 @@ name = "nextgcore-dccfd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "ctrlc",
  "env_logger",
@@ -2274,8 +2278,10 @@ dependencies = [
  "nextgcore-core",
  "nextgcore-metrics",
  "nextgcore-sbi",
+ "p256",
  "proptest",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "uuid",
 ]
@@ -2396,19 +2402,23 @@ name = "nextgcore-lmfd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "ctrlc",
  "env_logger",
  "log",
+ "nextgcore-amfd",
  "nextgcore-app",
  "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-metrics",
  "nextgcore-sbi",
+ "p256",
  "proptest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "uuid",
 ]
@@ -2418,6 +2428,7 @@ name = "nextgcore-mbsmfd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "ctrlc",
@@ -2431,9 +2442,11 @@ dependencies = [
  "nextgcore-ngap",
  "nextgcore-pfcp",
  "nextgcore-sbi",
+ "p256",
  "proptest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "uuid",
 ]
@@ -2575,6 +2588,7 @@ name = "nextgcore-nwdafd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "ctrlc",
@@ -2585,9 +2599,11 @@ dependencies = [
  "nextgcore-metrics",
  "nextgcore-nrfd",
  "nextgcore-sbi",
+ "p256",
  "proptest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "uuid",
 ]
@@ -2597,16 +2613,22 @@ name = "nextgcore-pcfd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "bytes",
  "clap",
  "ctrlc",
  "env_logger",
  "log",
+ "nextgcore-amfd",
  "nextgcore-app",
  "nextgcore-bsfd",
  "nextgcore-core",
  "nextgcore-dbi",
  "nextgcore-metrics",
+ "nextgcore-nas",
  "nextgcore-sbi",
+ "nextgcore-udrd",
+ "p256",
  "proptest",
  "serde",
  "serde_json",
@@ -2829,6 +2851,7 @@ dependencies = [
  "nextgcore-ngap",
  "nextgcore-pfcp",
  "nextgcore-sbi",
+ "p256",
  "proptest",
  "serde",
  "serde_json",
@@ -2852,16 +2875,19 @@ name = "nextgcore-udmd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "ctrlc",
  "env_logger",
  "log",
+ "nextgcore-amfd",
  "nextgcore-app",
  "nextgcore-core",
  "nextgcore-crypt",
  "nextgcore-dbi",
  "nextgcore-metrics",
  "nextgcore-sbi",
+ "p256",
  "proptest",
  "serde",
  "serde_json",
