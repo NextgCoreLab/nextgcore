@@ -11,50 +11,50 @@ use std::sync::{Arc, RwLock};
 // ============================================================================
 
 /// Maximum number of served GUAMI
-pub const OGS_MAX_NUM_OF_SERVED_GUAMI: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_SERVED_GUAMI: usize = 8;
 /// Maximum number of supported TA
-pub const OGS_MAX_NUM_OF_SUPPORTED_TA: usize = 16;
+pub const NEXTGCORE_MAX_NUM_OF_SUPPORTED_TA: usize = 16;
 /// Maximum number of PLMN
-pub const OGS_MAX_NUM_OF_PLMN: usize = 6;
+pub const NEXTGCORE_MAX_NUM_OF_PLMN: usize = 6;
 /// Maximum number of slice support
-pub const OGS_MAX_NUM_OF_SLICE_SUPPORT: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_SLICE_SUPPORT: usize = 8;
 /// Maximum number of BPLMN
-pub const OGS_MAX_NUM_OF_BPLMN: usize = 12;
+pub const NEXTGCORE_MAX_NUM_OF_BPLMN: usize = 12;
 /// Maximum number of algorithms
-pub const OGS_MAX_NUM_OF_ALGORITHM: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_ALGORITHM: usize = 8;
 /// Maximum number of slices
-pub const OGS_MAX_NUM_OF_SLICE: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_SLICE: usize = 8;
 /// Maximum number of MSISDN
-pub const OGS_MAX_NUM_OF_MSISDN: usize = 2;
+pub const NEXTGCORE_MAX_NUM_OF_MSISDN: usize = 2;
 
 /// Key length
-pub const OGS_KEY_LEN: usize = 16;
+pub const NEXTGCORE_KEY_LEN: usize = 16;
 /// RAND length
-pub const OGS_RAND_LEN: usize = 16;
+pub const NEXTGCORE_RAND_LEN: usize = 16;
 /// AUTN length
-pub const OGS_AUTN_LEN: usize = 16;
+pub const NEXTGCORE_AUTN_LEN: usize = 16;
 /// MAX RES length
-pub const OGS_MAX_RES_LEN: usize = 16;
+pub const NEXTGCORE_MAX_RES_LEN: usize = 16;
 /// SHA256 digest size
-pub const OGS_SHA256_DIGEST_SIZE: usize = 32;
+pub const NEXTGCORE_SHA256_DIGEST_SIZE: usize = 32;
 /// NAS MAX ABBA length
-pub const OGS_NAS_MAX_ABBA_LEN: usize = 2;
+pub const NEXTGCORE_NAS_MAX_ABBA_LEN: usize = 2;
 /// MAX IMEISV length
-pub const OGS_MAX_IMEISV_LEN: usize = 8;
+pub const NEXTGCORE_MAX_IMEISV_LEN: usize = 8;
 /// MAX IMEISV BCD length
-pub const OGS_MAX_IMEISV_BCD_LEN: usize = 16;
+pub const NEXTGCORE_MAX_IMEISV_BCD_LEN: usize = 16;
 
 /// Invalid UE NGAP ID
 pub const INVALID_UE_NGAP_ID: u64 = 0xffffffffffffffff;
 /// Invalid pool ID
-pub const OGS_INVALID_POOL_ID: u64 = 0;
+pub const NEXTGCORE_INVALID_POOL_ID: u64 = 0;
 /// Minimum pool ID
-pub const OGS_MIN_POOL_ID: u64 = 1;
+pub const NEXTGCORE_MIN_POOL_ID: u64 = 1;
 /// Maximum pool ID
-pub const OGS_MAX_POOL_ID: u64 = u64::MAX - 1;
+pub const NEXTGCORE_MAX_POOL_ID: u64 = u64::MAX - 1;
 
 /// NAS KSI no key available
-pub const OGS_NAS_KSI_NO_KEY_IS_AVAILABLE: u8 = 7;
+pub const NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE: u8 = 7;
 
 // ============================================================================
 // Basic Types
@@ -472,6 +472,128 @@ pub struct AmfContext {
     /// Namf_EventExposure subscriptions: subscriptionId -> EventSubscription
     /// (TS 29.518 §5.3). Persisted across requests; expiry-aware.
     event_subscriptions: RwLock<HashMap<String, EventSubscription>>,
+
+    /// LCS positioning downlink queue (TS 23.273): positioning payloads the LMF
+    /// asked the AMF to relay (NRPPa→gNB / LPP→UE), enqueued by the Namf SBI
+    /// handler and drained + delivered by the NGAP server task. Wave-6 E5 also
+    /// carries UPDP UE-policy downlinks (TS 29.518 n1MessageClass "UPDP" →
+    /// DL NAS Transport, payload container type 0x05) on this queue. Empty on
+    /// the reg/PDU/ping path — only populated by positioning/UPDP N1N2
+    /// transfers.
+    positioning_dl_queue: RwLock<Vec<PendingPositioningDl>>,
+
+    /// Namf_Communication N1N2 message subscriptions (TS 29.518 §5.2.2.6):
+    /// ueContextId -> the consumer-registered uplink notify callbacks
+    /// (n1NotifyCallbackUri / n2NotifyCallbackUri per message class). This is
+    /// the registry the uplink NRPPa/LPP notify producers key off. Empty on
+    /// the reg/PDU/ping path — only populated by N1N2MessageSubscribe.
+    n1n2_subscriptions: RwLock<HashMap<String, Vec<UeN1N2InfoSubscription>>>,
+
+    /// Fallback LCS correlation records (TS 29.518 N1N2MessageTransferReqData
+    /// lcsCorrelationId / servingLMFIdentification): ueContextId -> the most
+    /// recent correlation captured from an incoming positioning
+    /// N1N2MessageTransfer, so the uplink leg can route back to the
+    /// originating LMF even without an explicit subscription.
+    lcs_correlations: RwLock<HashMap<String, LcsCorrelationRecord>>,
+
+    /// Network-initiated deregistration queue (WSB-4, TS 23.502 §4.2.2.3.3 /
+    /// TS 24.501 §5.5.2.3): deregistrations the Namf_Callback dereg-notify
+    /// handler (Nudm_UECM DeregistrationNotification, TS 29.503 §5.3.2.3.2)
+    /// asked the NGAP server task to execute. Enqueued by the Namf SBI handler
+    /// task and drained + sent (protected DEREGISTRATION REQUEST 0x47 + T3522)
+    /// by the NGAP server task, mirroring `positioning_dl_queue`. Empty on the
+    /// reg/PDU/ping path — only populated when the serving AMF changes.
+    network_dereg_queue: RwLock<Vec<PendingNetworkDereg>>,
+}
+
+/// A positioning payload the LMF asked the AMF to relay downlink (TS 23.273),
+/// enqueued by the Namf SBI handler task and delivered by the NGAP server task.
+#[derive(Debug, Clone)]
+pub struct PendingPositioningDl {
+    /// Target UE (AMF-UE-NGAP-ID). The NGAP task resolves the serving SCTP
+    /// association + RAN-UE-NGAP-ID from its per-UE state at delivery time.
+    pub amf_ue_ngap_id: u64,
+    /// What to deliver and over which interface.
+    pub kind: PositioningDlKind,
+}
+
+/// Downlink positioning payload variants (TS 23.273).
+#[derive(Debug, Clone)]
+pub enum PositioningDlKind {
+    /// NRPPa PDU → serving gNB (N2, UE-associated NRPPa transport). `routing_id`
+    /// is the LMF's opaque RoutingID, echoed so the gNB's uplink reply routes
+    /// back to the originating LMF.
+    NrppaToGnb {
+        routing_id: Vec<u8>,
+        nrppa_pdu: Vec<u8>,
+    },
+    /// LPP message → UE (N1, DL NAS Transport with payload container type LPP).
+    LppToUe { lpp_pdu: Vec<u8> },
+    /// UPDP message (e.g. MANAGE UE POLICY COMMAND, TS 24.501 Annex D) → UE
+    /// (N1, DL NAS Transport with payload container type "UE policy
+    /// container" 0x05, TS 24.501 §9.11.3.40). Wave-6 E5: the PCF pushes it
+    /// via Namf_Communication N1N2MessageTransfer with n1MessageClass "UPDP"
+    /// (TS 29.518, TS29518_Namf_Communication.yaml:4453); the payload is
+    /// opaque to the AMF and relayed verbatim.
+    UePolicyToUe { updp_pdu: Vec<u8> },
+}
+
+/// A network-initiated deregistration the Nudm_UECM DeregistrationNotification
+/// callback (TS 29.503 §5.3.2.3.2) asked the AMF to execute (WSB-4), enqueued
+/// by the Namf SBI handler task and carried out by the NGAP server task
+/// (TS 23.502 §4.2.2.3.3 → DEREGISTRATION REQUEST, TS 24.501 §5.5.2.3).
+#[derive(Debug, Clone)]
+pub struct PendingNetworkDereg {
+    /// Target UE (AMF-UE-NGAP-ID). The NGAP task resolves the serving SCTP
+    /// association + RAN-UE-NGAP-ID from its per-UE state at send time.
+    pub amf_ue_ngap_id: u64,
+    /// Re-registration-required flag for the DEREGISTRATION REQUEST
+    /// de-registration type (TS 24.501 §9.11.3.20). Set when the UDM's
+    /// `deregReason` is `UE_INITIAL_REGISTRATION` (the UE registered in a new
+    /// AMF), so the old AMF tells the UE to re-register (TS 23.502 §4.2.2.3.3).
+    pub reregistration_required: bool,
+    /// Optional 5GMM cause (TS 24.501 §9.11.3.2), carried as the raw cause
+    /// value to keep this container decoupled from `gmm_build::GmmCause`. The
+    /// UDM-triggered path passes `None` per TS 23.502 §4.2.2.3.3.
+    pub gmm_cause: Option<u8>,
+}
+
+/// Namf_Communication N1N2 message subscription stored per ueContextId
+/// (TS 29.518 §5.2.2.6 N1N2MessageSubscribe,
+/// UeN1N2InfoSubscriptionCreateData — TS29518_Namf_Communication.yaml:2609).
+/// Registers where the AMF must deliver uplink N1 (e.g. LPP) / N2 (e.g.
+/// NRPPa) payloads for this UE. Classes are stored verbatim; producers do
+/// exact-class lookups so a class that was never stored is never notified
+/// (fail-closed).
+#[derive(Debug, Clone)]
+pub struct UeN1N2InfoSubscription {
+    /// Subscription ID minted by the AMF (returned as
+    /// `n1n2NotifySubscriptionId` and in the Location header)
+    pub subscription_id: String,
+    /// N1 message class filter (`n1MessageClass`, e.g. "LPP")
+    pub n1_message_class: Option<String>,
+    /// Callback URI for N1MessageNotify (`n1NotifyCallbackUri`)
+    pub n1_notify_callback_uri: Option<String>,
+    /// N2 information class filter (`n2InformationClass`, e.g. "NRPPa")
+    pub n2_information_class: Option<String>,
+    /// Callback URI for N2InfoNotify (`n2NotifyCallbackUri`)
+    pub n2_notify_callback_uri: Option<String>,
+    /// LCS correlation identifier supplied by the consumer, echoed back in
+    /// notifications (TS 29.572 CorrelationID)
+    pub lcs_correlation_id: Option<String>,
+}
+
+/// Fallback LCS correlation captured from an incoming
+/// N1N2MessageTransferReqData (`lcsCorrelationId` /
+/// `servingLMFIdentification`, TS29518_Namf_Communication.yaml:2771-2774):
+/// identifies the LMF that originated the latest positioning downlink for a
+/// UE when no explicit N1N2 subscription exists (last-writer-wins).
+#[derive(Debug, Clone)]
+pub struct LcsCorrelationRecord {
+    /// LCS correlation identifier (TS 29.572 CorrelationID, 1..255 chars)
+    pub lcs_correlation_id: String,
+    /// Serving LMF identification (TS 29.572 LMFIdentification)
+    pub serving_lmf_identification: Option<String>,
 }
 
 /// Namf_EventExposure subscription stored in the AMF context
@@ -501,18 +623,18 @@ impl AmfContext {
     pub fn new() -> Self {
         Self {
             num_of_served_guami: 0,
-            served_guami: Vec::with_capacity(OGS_MAX_NUM_OF_SERVED_GUAMI),
+            served_guami: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SERVED_GUAMI),
             num_of_served_tai: 0,
-            served_tai: Vec::with_capacity(OGS_MAX_NUM_OF_SUPPORTED_TA),
+            served_tai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SUPPORTED_TA),
             num_of_plmn_support: 0,
-            plmn_support: Vec::with_capacity(OGS_MAX_NUM_OF_PLMN),
+            plmn_support: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_PLMN),
             default_reject_cause: 0,
             num_of_access_control: 0,
-            access_control: Vec::with_capacity(OGS_MAX_NUM_OF_PLMN),
+            access_control: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_PLMN),
             num_of_ciphering_order: 0,
-            ciphering_order: Vec::with_capacity(OGS_MAX_NUM_OF_ALGORITHM),
+            ciphering_order: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_ALGORITHM),
             num_of_integrity_order: 0,
-            integrity_order: Vec::with_capacity(OGS_MAX_NUM_OF_ALGORITHM),
+            integrity_order: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_ALGORITHM),
             short_name: NetworkName::default(),
             full_name: NetworkName::default(),
             amf_name: None,
@@ -542,6 +664,10 @@ impl AmfContext {
             initialized: AtomicBool::new(false),
             paging_map: RwLock::new(HashMap::new()),
             event_subscriptions: RwLock::new(HashMap::new()),
+            positioning_dl_queue: RwLock::new(Vec::new()),
+            n1n2_subscriptions: RwLock::new(HashMap::new()),
+            lcs_correlations: RwLock::new(HashMap::new()),
+            network_dereg_queue: RwLock::new(Vec::new()),
         }
     }
 
@@ -858,7 +984,10 @@ impl AmfContext {
         }
 
         let id = self.next_amf_ue_id.fetch_add(1, Ordering::SeqCst) as u64;
-        let amf_ue = AmfUe::new(id, ran_ue_id);
+        let mut amf_ue = AmfUe::new(id, ran_ue_id);
+        // Wave-6 H9 runtime canary: newly created UEs adopt the process-wide
+        // NAS-security setting (default OFF → legacy byte-for-byte path).
+        amf_ue.use_nextgcore_nas_security = nas_security_canary();
         amf_ue_list.insert(id, amf_ue.clone());
 
         log::debug!("AMF UE added (id={id})");
@@ -867,12 +996,13 @@ impl AmfContext {
 
     /// Remove an AMF UE by ID
     pub fn amf_ue_remove(&self, id: u64) -> Option<AmfUe> {
-        let mut amf_ue_list = self.amf_ue_list.write().ok()?;
-        let mut suci_hash = self.suci_hash.write().ok()?;
-        let mut supi_hash = self.supi_hash.write().ok()?;
-        let mut guti_ue_hash = self.guti_ue_hash.write().ok()?;
+        let removed = {
+            let mut amf_ue_list = self.amf_ue_list.write().ok()?;
+            let mut suci_hash = self.suci_hash.write().ok()?;
+            let mut supi_hash = self.supi_hash.write().ok()?;
+            let mut guti_ue_hash = self.guti_ue_hash.write().ok()?;
 
-        if let Some(amf_ue) = amf_ue_list.remove(&id) {
+            let amf_ue = amf_ue_list.remove(&id)?;
             if let Some(ref suci) = amf_ue.suci {
                 suci_hash.remove(suci);
             }
@@ -880,14 +1010,24 @@ impl AmfContext {
                 supi_hash.remove(supi);
             }
             guti_ue_hash.remove(&amf_ue.current_guti);
+            amf_ue
+        };
 
-            // Remove all sessions for this UE
-            self.sess_remove_all_for_ue(id);
+        // Remove all sessions for this UE (locks taken after the UE guards
+        // above are dropped — never nested)
+        self.sess_remove_all_for_ue(id);
 
-            log::debug!("AMF UE removed (id={id})");
-            return Some(amf_ue);
+        // Drop N1N2 message subscriptions + the fallback LCS correlation for
+        // this UE so the uplink notify registry cannot leak across UE-context
+        // lifetimes (TS 29.518 §5.2.2.6 — subscription lifetime is bound to
+        // the UE context)
+        if let Some(ref supi) = removed.supi {
+            self.n1n2_subscriptions_remove_for_ue(supi);
+            self.lcs_correlation_remove(supi);
         }
-        None
+
+        log::debug!("AMF UE removed (id={id})");
+        Some(removed)
     }
 
     /// Remove all AMF UEs
@@ -907,6 +1047,14 @@ impl AmfContext {
         // Clear sessions
         if let Ok(mut sess_list) = self.sess_list.write() {
             sess_list.clear();
+        }
+
+        // Clear the N1N2 uplink notify registry + LCS correlation fallbacks
+        if let Ok(mut subs) = self.n1n2_subscriptions.write() {
+            subs.clear();
+        }
+        if let Ok(mut corr) = self.lcs_correlations.write() {
+            corr.clear();
         }
     }
 
@@ -1036,10 +1184,10 @@ impl AmfContext {
         let mut ran_ue_list = self.ran_ue_list.write().unwrap();
 
         if let Some(amf_ue) = amf_ue_list.get_mut(&amf_ue_id) {
-            amf_ue.ran_ue_id = OGS_INVALID_POOL_ID;
+            amf_ue.ran_ue_id = NEXTGCORE_INVALID_POOL_ID;
         }
         if let Some(ran_ue) = ran_ue_list.get_mut(&ran_ue_id) {
-            ran_ue.amf_ue_id = OGS_INVALID_POOL_ID;
+            ran_ue.amf_ue_id = NEXTGCORE_INVALID_POOL_ID;
         }
         true
     }
@@ -1190,6 +1338,38 @@ impl AmfContext {
             return paging_map.get(&amf_ue_ngap_id).cloned();
         }
         None
+    }
+
+    /// Enqueue a positioning downlink for NGAP-task egress (TS 23.273).
+    pub fn positioning_dl_add(&self, item: PendingPositioningDl) {
+        if let Ok(mut q) = self.positioning_dl_queue.write() {
+            q.push(item);
+        }
+    }
+
+    /// Drain all pending positioning downlinks (called by the NGAP server pump).
+    pub fn positioning_dl_drain(&self) -> Vec<PendingPositioningDl> {
+        match self.positioning_dl_queue.write() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Enqueue a network-initiated deregistration for NGAP-task egress (WSB-4,
+    /// TS 23.502 §4.2.2.3.3 / TS 24.501 §5.5.2.3).
+    pub fn network_dereg_add(&self, item: PendingNetworkDereg) {
+        if let Ok(mut q) = self.network_dereg_queue.write() {
+            q.push(item);
+        }
+    }
+
+    /// Drain all pending network-initiated deregistrations (called by the NGAP
+    /// server pump).
+    pub fn network_dereg_drain(&self) -> Vec<PendingNetworkDereg> {
+        match self.network_dereg_queue.write() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Increment retransmit count, returns false if max reached
@@ -1346,6 +1526,183 @@ impl AmfContext {
     }
 
     // ========================================================================
+    // Namf_Communication N1N2 Message Subscription Management
+    // (TS 29.518 §5.2.2.6/§5.2.2.7 — the uplink notify-callback registry)
+    //
+    // Lock-order rule (nf-context-lock-deadlock sweep): these methods only
+    // ever take the single `n1n2_subscriptions` / `lcs_correlations` lock and
+    // never call into other lock-taking methods while holding it. Finders
+    // clone results out so callers never hold the lock.
+    // ========================================================================
+
+    /// Store an N1N2 message subscription for a UE. Returns false when a
+    /// subscription with the same ID already exists for that UE.
+    pub fn n1n2_subscription_add(&self, ue_context_id: &str, sub: UeN1N2InfoSubscription) -> bool {
+        if let Ok(mut subs) = self.n1n2_subscriptions.write() {
+            let list = subs.entry(ue_context_id.to_string()).or_default();
+            if list
+                .iter()
+                .any(|s| s.subscription_id == sub.subscription_id)
+            {
+                return false;
+            }
+            list.push(sub);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove an N1N2 message subscription by (ueContextId, subscriptionId).
+    /// Returns the removed subscription, or None when it does not exist.
+    pub fn n1n2_subscription_remove(
+        &self,
+        ue_context_id: &str,
+        subscription_id: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        let mut subs = self.n1n2_subscriptions.write().ok()?;
+        let list = subs.get_mut(ue_context_id)?;
+        let idx = list
+            .iter()
+            .position(|s| s.subscription_id == subscription_id)?;
+        let removed = list.remove(idx);
+        if list.is_empty() {
+            subs.remove(ue_context_id);
+        }
+        Some(removed)
+    }
+
+    /// Find an N1N2 message subscription by (ueContextId, subscriptionId)
+    /// (clone-out, lock dropped)
+    pub fn n1n2_subscription_find(
+        &self,
+        ue_context_id: &str,
+        subscription_id: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        self.n1n2_subscriptions.read().ok().and_then(|subs| {
+            subs.get(ue_context_id)?
+                .iter()
+                .find(|s| s.subscription_id == subscription_id)
+                .cloned()
+        })
+    }
+
+    /// Find the subscription registered for an N1 message class on a UE
+    /// (exact-class match, fail-closed: a class that was never stored is
+    /// never returned). When several match, the most recent wins.
+    pub fn n1n2_subscription_find_n1(
+        &self,
+        ue_context_id: &str,
+        n1_message_class: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        self.n1n2_subscriptions.read().ok().and_then(|subs| {
+            subs.get(ue_context_id)?
+                .iter()
+                .rev()
+                .find(|s| {
+                    s.n1_message_class.as_deref() == Some(n1_message_class)
+                        && s.n1_notify_callback_uri.is_some()
+                })
+                .cloned()
+        })
+    }
+
+    /// Find the subscription registered for an N2 information class on a UE
+    /// (exact-class match, fail-closed). When several match, the most recent
+    /// wins.
+    pub fn n1n2_subscription_find_n2(
+        &self,
+        ue_context_id: &str,
+        n2_information_class: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        self.n1n2_subscriptions.read().ok().and_then(|subs| {
+            subs.get(ue_context_id)?
+                .iter()
+                .rev()
+                .find(|s| {
+                    s.n2_information_class.as_deref() == Some(n2_information_class)
+                        && s.n2_notify_callback_uri.is_some()
+                })
+                .cloned()
+        })
+    }
+
+    /// Find a subscription registered for an N2 information class across ALL
+    /// UEs (exact-class match, fail-closed). Used by the uplink
+    /// non-UE-associated NRPPa relay (TS 38.413 §8.15.5 / TS 23.273 §6.11):
+    /// that procedure carries no UE identity, only an opaque RoutingID, so
+    /// the consumer is resolved from the registry alone. When several
+    /// subscriptions with distinct callback URIs coexist the choice is
+    /// ambiguous: the lexicographically greatest subscriptionId wins
+    /// (deterministic tie-break) and a WARN is logged.
+    pub fn n1n2_subscription_find_any_n2(
+        &self,
+        n2_information_class: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        let subs = self.n1n2_subscriptions.read().ok()?;
+        let mut matches: Vec<&UeN1N2InfoSubscription> = subs
+            .values()
+            .flatten()
+            .filter(|s| {
+                s.n2_information_class.as_deref() == Some(n2_information_class)
+                    && s.n2_notify_callback_uri.is_some()
+            })
+            .collect();
+        matches.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+        let distinct_uris = matches
+            .iter()
+            .filter_map(|s| s.n2_notify_callback_uri.as_deref())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if distinct_uris > 1 {
+            log::warn!(
+                "n1n2_subscription_find_any_n2({n2_information_class}): {distinct_uris} \
+                 distinct callback URIs registered; picking max-subscriptionId \
+                 (ambiguous non-UE-associated uplink routing)"
+            );
+        }
+        matches.last().map(|s| (*s).clone())
+    }
+
+    /// Drop all N1N2 message subscriptions for a UE (UE-context release path)
+    pub fn n1n2_subscriptions_remove_for_ue(&self, ue_context_id: &str) {
+        if let Ok(mut subs) = self.n1n2_subscriptions.write() {
+            subs.remove(ue_context_id);
+        }
+    }
+
+    /// Number of N1N2 message subscriptions stored for a UE
+    pub fn n1n2_subscription_count(&self, ue_context_id: &str) -> usize {
+        self.n1n2_subscriptions
+            .read()
+            .map(|subs| subs.get(ue_context_id).map(Vec::len).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// Record the fallback LCS correlation for a UE (last-writer-wins),
+    /// captured from an incoming positioning N1N2MessageTransferReqData
+    pub fn lcs_correlation_set(&self, ue_context_id: &str, record: LcsCorrelationRecord) {
+        if let Ok(mut corr) = self.lcs_correlations.write() {
+            corr.insert(ue_context_id.to_string(), record);
+        }
+    }
+
+    /// Look up the fallback LCS correlation for a UE (clone-out)
+    pub fn lcs_correlation_find(&self, ue_context_id: &str) -> Option<LcsCorrelationRecord> {
+        self.lcs_correlations
+            .read()
+            .ok()
+            .and_then(|corr| corr.get(ue_context_id).cloned())
+    }
+
+    /// Drop the fallback LCS correlation for a UE (UE-context release path)
+    pub fn lcs_correlation_remove(&self, ue_context_id: &str) {
+        if let Ok(mut corr) = self.lcs_correlations.write() {
+            corr.remove(ue_context_id);
+        }
+    }
+
+    // ========================================================================
     // Utility Methods
     // ========================================================================
 
@@ -1453,7 +1810,7 @@ impl AmfGnb {
             max_num_of_ostreams: 0,
             ostream_id: 0,
             num_of_supported_ta_list: 0,
-            supported_ta_list: Vec::with_capacity(OGS_MAX_NUM_OF_SUPPORTED_TA),
+            supported_ta_list: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SUPPORTED_TA),
             rat_type: RatType::Nr,
         }
     }
@@ -1529,8 +1886,8 @@ impl RanUe {
             initial_context_setup_request_sent: false,
             initial_context_setup_response_received: false,
             ue_ambr_sent: false,
-            source_ue_id: OGS_INVALID_POOL_ID,
-            target_ue_id: OGS_INVALID_POOL_ID,
+            source_ue_id: NEXTGCORE_INVALID_POOL_ID,
+            target_ue_id: NEXTGCORE_INVALID_POOL_ID,
             saved_nr_tai: Tai5gs::default(),
             saved_nr_cgi: NrCgi::default(),
             ue_ctx_rel_action: NgapUeCtxRelAction::Invalid,
@@ -1538,7 +1895,7 @@ impl RanUe {
             psimask_activated: 0,
             deactivation: NgapCause::default(),
             gnb_id,
-            amf_ue_id: OGS_INVALID_POOL_ID,
+            amf_ue_id: NEXTGCORE_INVALID_POOL_ID,
         }
     }
 }
@@ -1561,31 +1918,33 @@ pub struct AmfUeMemento {
     /// UE network capability
     pub ue_network_capability: UeNetworkCapability,
     /// Random challenge value
-    pub rand: [u8; OGS_RAND_LEN],
+    pub rand: [u8; NEXTGCORE_RAND_LEN],
     /// Authentication token
-    pub autn: [u8; OGS_AUTN_LEN],
+    pub autn: [u8; NEXTGCORE_AUTN_LEN],
     /// Expected auth response
-    pub xres_star: [u8; OGS_MAX_RES_LEN],
+    pub xres_star: [u8; NEXTGCORE_MAX_RES_LEN],
     /// ABBA value
-    pub abba: [u8; OGS_NAS_MAX_ABBA_LEN],
+    pub abba: [u8; NEXTGCORE_NAS_MAX_ABBA_LEN],
     /// ABBA length
     pub abba_len: u8,
     /// Hash of XRES*
-    pub hxres_star: [u8; OGS_MAX_RES_LEN],
+    pub hxres_star: [u8; NEXTGCORE_MAX_RES_LEN],
     /// Key for AMF derived from NAS key
-    pub kamf: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kamf: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Integrity key
-    pub knas_int: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_int: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// Ciphering key
-    pub knas_enc: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_enc: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// Downlink counter
     pub dl_count: u32,
     /// Uplink counter
     pub ul_count: u32,
+    /// nas-06 Phase-6 strict-path replay baseline (persisted with ul_count).
+    pub ul_count_established: bool,
     /// gNB key
-    pub kgnb: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kgnb: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Next hop key
-    pub nh: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub nh: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Selected encryption algorithm
     pub selected_enc_algorithm: u8,
     /// Selected integrity algorithm
@@ -1697,7 +2056,7 @@ pub struct AmfUe {
     /// PEI (Permanent Equipment Identifier)
     pub pei: Option<String>,
     /// Masked IMEISV
-    pub masked_imeisv: [u8; OGS_MAX_IMEISV_LEN],
+    pub masked_imeisv: [u8; NEXTGCORE_MAX_IMEISV_LEN],
     /// Masked IMEISV length
     pub masked_imeisv_len: usize,
     /// IMEISV BCD
@@ -1738,6 +2097,10 @@ pub struct AmfUe {
     pub rejected_nssai: Vec<SNssai>,
     /// Policy association
     pub policy_association: PolicyAssociation,
+    /// UE Policy Association (Npcf_UEPolicyControl, TS 29.525 §4.2.2 —
+    /// Wave-6 E7): created at registration alongside the AM policy
+    /// association, deleted at deregistration.
+    pub ue_policy_association: PolicyAssociation,
     /// GMM capability
     pub gmm_capability: GmmCapability,
     /// Security context available flag
@@ -1755,33 +2118,46 @@ pub struct AmfUe {
     /// 5G AKA confirmation
     pub confirmation_for_5g_aka: Confirmation5gAka,
     /// Random challenge value
-    pub rand: [u8; OGS_RAND_LEN],
+    pub rand: [u8; NEXTGCORE_RAND_LEN],
     /// Expected auth response
-    pub xres_star: [u8; OGS_MAX_RES_LEN],
+    pub xres_star: [u8; NEXTGCORE_MAX_RES_LEN],
     /// ABBA value
-    pub abba: [u8; OGS_NAS_MAX_ABBA_LEN],
+    pub abba: [u8; NEXTGCORE_NAS_MAX_ABBA_LEN],
     /// ABBA length
     pub abba_len: u8,
     /// Hash of XRES*
-    pub hxres_star: [u8; OGS_MAX_RES_LEN],
+    pub hxres_star: [u8; NEXTGCORE_MAX_RES_LEN],
     /// Key for AMF
-    pub kamf: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kamf: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Auth result
     pub auth_result: AuthResult,
     /// Integrity key
-    pub knas_int: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_int: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// Ciphering key
-    pub knas_enc: [u8; OGS_SHA256_DIGEST_SIZE / 2],
+    pub knas_enc: [u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
     /// Downlink counter
     pub dl_count: u32,
     /// Uplink counter
     pub ul_count: u32,
+    /// nas-06 Phase-6 CANARY (default false): when true, the NAS security
+    /// ENCODE/DECODE path delegates to the conformant nextgcore-nas
+    /// protect/unprotect adapter (strict MAC + replay) instead of the
+    /// hand-rolled lenient path. Default-OFF keeps production behavior
+    /// byte-for-byte unchanged. Flipping the default + removing the
+    /// hand-rolled path is DEFERRED pending matched-sim + Open5GS E2E
+    /// (reg + PDU + ping). See `nas_security.rs`.
+    pub use_nextgcore_nas_security: bool,
+    /// nas-06 Phase-6 strict-path state: true once an uplink NAS message has
+    /// been successfully integrity-verified. Gates replay rejection so the
+    /// first (COUNT 0) message is not self-rejected. Only consulted on the
+    /// `use_nextgcore_nas_security` path; persisted via the memento.
+    pub ul_count_established: bool,
     /// gNB key
-    pub kgnb: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub kgnb: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Next hop chaining counter
     pub nhcc: u8,
     /// Next hop key
-    pub nh: [u8; OGS_SHA256_DIGEST_SIZE],
+    pub nh: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Selected encryption algorithm
     pub selected_enc_algorithm: u8,
     /// Selected integrity algorithm
@@ -2198,11 +2574,11 @@ impl AmfUe {
             supi: None,
             home_plmn_id: PlmnId::default(),
             pei: None,
-            masked_imeisv: [0u8; OGS_MAX_IMEISV_LEN],
+            masked_imeisv: [0u8; NEXTGCORE_MAX_IMEISV_LEN],
             masked_imeisv_len: 0,
             imeisv_bcd: String::new(),
             num_of_msisdn: 0,
-            msisdn: Vec::with_capacity(OGS_MAX_NUM_OF_MSISDN),
+            msisdn: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_MSISDN),
             current_m_tmsi: None,
             current_guti: Guti5gs::default(),
             next_m_tmsi: None,
@@ -2215,10 +2591,11 @@ impl AmfUe {
             nr_cgi: NrCgi::default(),
             ue_location_timestamp: 0,
             last_visited_plmn_id: PlmnId::default(),
-            requested_nssai: Vec::with_capacity(OGS_MAX_NUM_OF_SLICE),
-            allowed_nssai: Vec::with_capacity(OGS_MAX_NUM_OF_SLICE),
-            rejected_nssai: Vec::with_capacity(OGS_MAX_NUM_OF_SLICE),
+            requested_nssai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SLICE),
+            allowed_nssai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SLICE),
+            rejected_nssai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SLICE),
             policy_association: PolicyAssociation::default(),
+            ue_policy_association: PolicyAssociation::default(),
             gmm_capability: GmmCapability::default(),
             security_context_available: false,
             mac_failed: false,
@@ -2227,28 +2604,30 @@ impl AmfUe {
             ue_security_capability: UeSecurityCapability::default(),
             ue_network_capability: UeNetworkCapability::default(),
             confirmation_for_5g_aka: Confirmation5gAka::default(),
-            rand: [0u8; OGS_RAND_LEN],
-            xres_star: [0u8; OGS_MAX_RES_LEN],
-            abba: [0u8; OGS_NAS_MAX_ABBA_LEN],
+            rand: [0u8; NEXTGCORE_RAND_LEN],
+            xres_star: [0u8; NEXTGCORE_MAX_RES_LEN],
+            abba: [0u8; NEXTGCORE_NAS_MAX_ABBA_LEN],
             abba_len: 0,
-            hxres_star: [0u8; OGS_MAX_RES_LEN],
-            kamf: [0u8; OGS_SHA256_DIGEST_SIZE],
+            hxres_star: [0u8; NEXTGCORE_MAX_RES_LEN],
+            kamf: [0u8; NEXTGCORE_SHA256_DIGEST_SIZE],
             auth_result: AuthResult::default(),
-            knas_int: [0u8; OGS_SHA256_DIGEST_SIZE / 2],
-            knas_enc: [0u8; OGS_SHA256_DIGEST_SIZE / 2],
+            knas_int: [0u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
+            knas_enc: [0u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
             dl_count: 0,
             ul_count: 0,
-            kgnb: [0u8; OGS_SHA256_DIGEST_SIZE],
+            use_nextgcore_nas_security: false,
+            ul_count_established: false,
+            kgnb: [0u8; NEXTGCORE_SHA256_DIGEST_SIZE],
             nhcc: 0,
-            nh: [0u8; OGS_SHA256_DIGEST_SIZE],
+            nh: [0u8; NEXTGCORE_SHA256_DIGEST_SIZE],
             selected_enc_algorithm: 0,
             selected_int_algorithm: 0,
             ue_ambr: Bitrate::default(),
             num_of_slice: 0,
-            slice: Vec::with_capacity(OGS_MAX_NUM_OF_SLICE),
+            slice: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SLICE),
             am_policy_control_features: 0,
             ran_ue_id,
-            ran_ue_holding_id: OGS_INVALID_POOL_ID,
+            ran_ue_holding_id: NEXTGCORE_INVALID_POOL_ID,
             ue_radio_capability: Vec::new(),
             handover: HandoverInfo::default(),
             data_change_subscription: DataChangeSubscription::default(),
@@ -2258,9 +2637,9 @@ impl AmfUe {
             registration_type: 0,
             nas_message_type: 0,
             nas_tsc: 0,
-            nas_ksi: OGS_NAS_KSI_NO_KEY_IS_AVAILABLE,
+            nas_ksi: NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE,
             nas_ue_tsc: 0,
-            nas_ue_ksi: OGS_NAS_KSI_NO_KEY_IS_AVAILABLE,
+            nas_ue_ksi: NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE,
             pdu_session_status_present: false,
             pdu_session_status: 0,
             uplink_data_status_present: false,
@@ -2271,11 +2650,13 @@ impl AmfUe {
             pending_n1_sm_msg: None,
             pending_psi: None,
             sessions: Vec::new(),
-            autn: vec![0u8; OGS_AUTN_LEN],
+            autn: vec![0u8; NEXTGCORE_AUTN_LEN],
             redcap_indication: false,
             snpn_nid: None,
             cag_id: None,
-            slice_admission_granted: true,
+            // Default deny: slice admission is granted only by an explicit
+            // Nnsacf_NSAC admittedFlag=true response (TS 29.536), never assumed.
+            slice_admission_granted: false,
             ursp_rules: Vec::new(),
             prose_capable: false,
             pin_role: None,
@@ -2287,7 +2668,7 @@ impl AmfUe {
     pub fn security_context_is_valid(&self) -> bool {
         self.security_context_available
             && !self.mac_failed
-            && self.nas.ue_ksi != OGS_NAS_KSI_NO_KEY_IS_AVAILABLE
+            && self.nas.ue_ksi != NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE
     }
 
     /// Clear security context
@@ -2317,6 +2698,18 @@ impl AmfUe {
         self.policy_association.id = None;
     }
 
+    /// Check if a PCF UE Policy Association exists (Npcf_UEPolicyControl,
+    /// TS 29.525 — Wave-6 E7)
+    pub fn pcf_ue_policy_associated(&self) -> bool {
+        self.ue_policy_association.id.is_some()
+    }
+
+    /// Clear the PCF UE Policy Association (Wave-6 E7)
+    pub fn pcf_ue_policy_clear(&mut self) {
+        self.ue_policy_association.resource_uri = None;
+        self.ue_policy_association.id = None;
+    }
+
     /// Check if 5G AKA confirmation exists
     pub fn check_5g_aka_confirmation(&self) -> bool {
         self.confirmation_for_5g_aka.resource_uri.is_some()
@@ -2344,7 +2737,7 @@ impl AmfUe {
         self.memento.ue_network_capability = self.ue_network_capability.clone();
         self.memento.rand = self.rand;
         // Copy from Vec to fixed-size array
-        let len = self.autn.len().min(OGS_AUTN_LEN);
+        let len = self.autn.len().min(NEXTGCORE_AUTN_LEN);
         self.memento.autn[..len].copy_from_slice(&self.autn[..len]);
         self.memento.xres_star = self.xres_star;
         self.memento.abba = self.abba;
@@ -2355,6 +2748,7 @@ impl AmfUe {
         self.memento.knas_enc = self.knas_enc;
         self.memento.dl_count = self.dl_count;
         self.memento.ul_count = self.ul_count;
+        self.memento.ul_count_established = self.ul_count_established;
         self.memento.kgnb = self.kgnb;
         self.memento.nh = self.nh;
         self.memento.selected_enc_algorithm = self.selected_enc_algorithm;
@@ -2376,6 +2770,7 @@ impl AmfUe {
         self.knas_enc = self.memento.knas_enc;
         self.dl_count = self.memento.dl_count;
         self.ul_count = self.memento.ul_count;
+        self.ul_count_established = self.memento.ul_count_established;
         self.kgnb = self.memento.kgnb;
         self.nh = self.memento.nh;
         self.selected_enc_algorithm = self.memento.selected_enc_algorithm;
@@ -2622,7 +3017,7 @@ impl AmfSess {
             payload_container_type: 0,
             payload_container: None,
             amf_ue_id,
-            ran_ue_id: OGS_INVALID_POOL_ID,
+            ran_ue_id: NEXTGCORE_INVALID_POOL_ID,
             s_nssai: SNssai::default(),
             mapped_hplmn: SNssai::default(),
             mapped_hplmn_presence: false,
@@ -2745,6 +3140,73 @@ pub fn amf_context_final() {
     if let Ok(mut context) = ctx.write() {
         context.fini();
     };
+}
+
+// ============================================================================
+// NAS-security runtime canary (Wave-6 H9, nas-06 Phase-6)
+// ============================================================================
+
+/// Process-wide default applied to `AmfUe::use_nextgcore_nas_security` when a UE
+/// context is created.
+///
+/// Default `false`: every AMF UE keeps the byte-for-byte legacy hand-rolled NAS
+/// protect/unprotect path (see `nas_security.rs`), so the plain matched-sim
+/// docker E2E is untouched. When `true`, newly created UEs use the conformant
+/// nextgcore-nas adapter (strict MAC verify + replay rejection, TS 24.501 §4.4 /
+/// TS 33.501 §6.4.3-6.4.4).
+///
+/// This is the RUNTIME ENABLE KNOB the H9 A/B runbook needs: it is seeded ONCE
+/// at AMF startup from the `amf.nas.use_nextgcore_security` yaml key or the
+/// `AMF_NAS_SECURITY` env override (docker-friendly), so an operator can run the
+/// canary-OFF vs canary-ON A/B in docker WITHOUT a code edit. The DEFAULT-FLIP
+/// (making `true` the shipped default + deleting the legacy encoder) is a
+/// separate, HOST-gated commit that lands only after the docker A/B signs off —
+/// see `.context/remediation/wave6/WS-H-oracle-e2e.md` H9.
+static NAS_SECURITY_CANARY: AtomicBool = AtomicBool::new(false);
+
+/// Set the process-wide NAS-security canary default (Wave-6 H9 runtime knob).
+///
+/// Called once at AMF startup after config load. Newly created `AmfUe`s adopt
+/// this value; the AMF holds no UE contexts at startup so there is nothing to
+/// migrate. Does NOT change the shipped default — an operator must opt in.
+pub fn set_nas_security_canary(enabled: bool) {
+    NAS_SECURITY_CANARY.store(enabled, Ordering::SeqCst);
+    if enabled {
+        log::warn!(
+            "[nas-06 H9] NAS-security canary ENABLED (amf.nas.use_nextgcore_security / \
+             AMF_NAS_SECURITY): new UEs use the conformant nextgcore-nas strict path"
+        );
+    } else {
+        log::debug!(
+            "[nas-06 H9] NAS-security canary disabled (default): new UEs use the legacy path"
+        );
+    }
+}
+
+/// Read the process-wide NAS-security canary default (Wave-6 H9). Consulted by
+/// the production `AmfUe` creation sites (`amf_ue_add`, `UeNasContext::new`).
+pub fn nas_security_canary() -> bool {
+    NAS_SECURITY_CANARY.load(Ordering::SeqCst)
+}
+
+/// Resolve the NAS-security canary from configuration (Wave-6 H9), env-first.
+///
+/// Precedence (fail-safe — default OFF): the `AMF_NAS_SECURITY` env override
+/// wins when it is a recognized token, else the yaml
+/// `amf.nas.use_nextgcore_security` bool, else `false`. Env tokens
+/// (case-insensitive, trimmed): `nextgcore` / `1` / `true` / `yes` / `on`
+/// enable; `legacy` / `0` / `false` / `no` / `off` disable; any other value is
+/// ignored (falls through to the yaml value). Pure function (no globals) so it
+/// is unit-testable in isolation.
+pub fn resolve_nas_security_canary(env_val: Option<&str>, yaml_val: Option<bool>) -> bool {
+    if let Some(raw) = env_val {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "nextgcore" | "1" | "true" | "yes" | "on" => return true,
+            "legacy" | "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    yaml_val.unwrap_or(false)
 }
 
 /// Get UE load (for NF instance load reporting)
@@ -2968,6 +3430,165 @@ mod tests {
     }
 
     #[test]
+    fn test_positioning_dl_queue_add_drain() {
+        let ctx = AmfContext::new();
+
+        // Empty queue drains to nothing.
+        assert!(ctx.positioning_dl_drain().is_empty());
+
+        ctx.positioning_dl_add(PendingPositioningDl {
+            amf_ue_ngap_id: 7,
+            kind: PositioningDlKind::NrppaToGnb {
+                routing_id: vec![0x00, 0x01],
+                nrppa_pdu: vec![0xAA, 0xBB],
+            },
+        });
+        ctx.positioning_dl_add(PendingPositioningDl {
+            amf_ue_ngap_id: 9,
+            kind: PositioningDlKind::LppToUe {
+                lpp_pdu: vec![0x90, 0x01],
+            },
+        });
+        // Wave-6 E5: the UPDP UE-policy downlink rides the same queue.
+        ctx.positioning_dl_add(PendingPositioningDl {
+            amf_ue_ngap_id: 11,
+            kind: PositioningDlKind::UePolicyToUe {
+                updp_pdu: vec![0x80, 0x01, 0x00],
+            },
+        });
+
+        // Drain returns all items in FIFO order and leaves the queue empty.
+        let drained = ctx.positioning_dl_drain();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[0].amf_ue_ngap_id, 7);
+        assert!(matches!(
+            drained[0].kind,
+            PositioningDlKind::NrppaToGnb { .. }
+        ));
+        assert_eq!(drained[1].amf_ue_ngap_id, 9);
+        assert!(matches!(drained[1].kind, PositioningDlKind::LppToUe { .. }));
+        assert_eq!(drained[2].amf_ue_ngap_id, 11);
+        match &drained[2].kind {
+            PositioningDlKind::UePolicyToUe { updp_pdu } => {
+                assert_eq!(updp_pdu, &vec![0x80, 0x01, 0x00]);
+            }
+            other => panic!("expected UePolicyToUe, got {other:?}"),
+        }
+        assert!(ctx.positioning_dl_drain().is_empty());
+    }
+
+    /// Two N1N2 subscriptions on one UE coexist; lookup by (ueContextId,
+    /// class) returns the right callback URI; unknown classes are never
+    /// returned (fail-closed).
+    #[test]
+    fn test_n1n2_subscription_add_find_by_class_remove() {
+        let ctx = AmfContext::new();
+        let supi = "imsi-001010000070001";
+
+        assert!(ctx.n1n2_subscription_add(
+            supi,
+            UeN1N2InfoSubscription {
+                subscription_id: "sub-lpp".to_string(),
+                n1_message_class: Some("LPP".to_string()),
+                n1_notify_callback_uri: Some("http://lmf:7777/nlmf-loc/v1/notify/n1".to_string()),
+                n2_information_class: None,
+                n2_notify_callback_uri: None,
+                lcs_correlation_id: Some("corr-1".to_string()),
+            }
+        ));
+        assert!(ctx.n1n2_subscription_add(
+            supi,
+            UeN1N2InfoSubscription {
+                subscription_id: "sub-nrppa".to_string(),
+                n1_message_class: None,
+                n1_notify_callback_uri: None,
+                n2_information_class: Some("NRPPa".to_string()),
+                n2_notify_callback_uri: Some("http://lmf:7777/nlmf-loc/v1/notify/n2".to_string()),
+                lcs_correlation_id: None,
+            }
+        ));
+        // Duplicate subscription ID on the same UE is rejected
+        assert!(!ctx.n1n2_subscription_add(
+            supi,
+            UeN1N2InfoSubscription {
+                subscription_id: "sub-lpp".to_string(),
+                n1_message_class: Some("LPP".to_string()),
+                n1_notify_callback_uri: Some("http://other/cb".to_string()),
+                n2_information_class: None,
+                n2_notify_callback_uri: None,
+                lcs_correlation_id: None,
+            }
+        ));
+        assert_eq!(ctx.n1n2_subscription_count(supi), 2);
+
+        // Class-keyed lookups return the right callback URI
+        let n1 = ctx.n1n2_subscription_find_n1(supi, "LPP").expect("LPP sub");
+        assert_eq!(
+            n1.n1_notify_callback_uri.as_deref(),
+            Some("http://lmf:7777/nlmf-loc/v1/notify/n1")
+        );
+        assert_eq!(n1.lcs_correlation_id.as_deref(), Some("corr-1"));
+        let n2 = ctx
+            .n1n2_subscription_find_n2(supi, "NRPPa")
+            .expect("NRPPa sub");
+        assert_eq!(
+            n2.n2_notify_callback_uri.as_deref(),
+            Some("http://lmf:7777/nlmf-loc/v1/notify/n2")
+        );
+        // Fail-closed: classes never stored are never returned
+        assert!(ctx.n1n2_subscription_find_n1(supi, "SMS").is_none());
+        assert!(ctx.n1n2_subscription_find_n2(supi, "PWS").is_none());
+        assert!(ctx
+            .n1n2_subscription_find_n1("imsi-unknown", "LPP")
+            .is_none());
+
+        // Remove one — the other coexists
+        assert!(ctx.n1n2_subscription_remove(supi, "sub-lpp").is_some());
+        assert!(ctx.n1n2_subscription_remove(supi, "sub-lpp").is_none());
+        assert_eq!(ctx.n1n2_subscription_count(supi), 1);
+        assert!(ctx.n1n2_subscription_find(supi, "sub-nrppa").is_some());
+    }
+
+    /// Subscriptions + the fallback LCS correlation are dropped when the UE
+    /// context is released (no registry leak across UE lifetimes).
+    #[test]
+    fn test_n1n2_subscription_dropped_on_ue_release() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+
+        let supi = "imsi-001010000070002";
+        let gnb = ctx.gnb_add("192.168.0.9:38412").unwrap();
+        let ran_ue = ctx.ran_ue_add(gnb.id, 2001).unwrap();
+        let amf_ue = ctx.amf_ue_add(ran_ue.id).unwrap();
+        ctx.amf_ue_set_supi(amf_ue.id, supi);
+
+        assert!(ctx.n1n2_subscription_add(
+            supi,
+            UeN1N2InfoSubscription {
+                subscription_id: "sub-1".to_string(),
+                n1_message_class: Some("LPP".to_string()),
+                n1_notify_callback_uri: Some("http://lmf:7777/cb".to_string()),
+                n2_information_class: None,
+                n2_notify_callback_uri: None,
+                lcs_correlation_id: None,
+            }
+        ));
+        ctx.lcs_correlation_set(
+            supi,
+            LcsCorrelationRecord {
+                lcs_correlation_id: "corr-42".to_string(),
+                serving_lmf_identification: Some("LMF-1".to_string()),
+            },
+        );
+        assert_eq!(ctx.n1n2_subscription_count(supi), 1);
+        assert!(ctx.lcs_correlation_find(supi).is_some());
+
+        ctx.amf_ue_remove(amf_ue.id);
+        assert_eq!(ctx.n1n2_subscription_count(supi), 0);
+        assert!(ctx.lcs_correlation_find(supi).is_none());
+    }
+
+    #[test]
     fn test_paging_retransmit_limit() {
         let mut ctx = AmfContext::new();
         ctx.init(64, 1024, 4096);
@@ -2983,5 +3604,76 @@ mod tests {
         assert!(ctx.paging_retransmit(10)); // 1/2
         assert!(ctx.paging_retransmit(10)); // 2/2
         assert!(!ctx.paging_retransmit(10)); // exceeded
+    }
+
+    // ========================================================================
+    // Wave-6 H9 NAS-security runtime canary
+    // ========================================================================
+
+    /// The pure config resolver: `AMF_NAS_SECURITY` env override wins over the
+    /// yaml value; absent everywhere is the fail-safe default OFF.
+    #[test]
+    fn test_resolve_nas_security_canary_precedence() {
+        // Absent everywhere / yaml-false -> OFF (fail-safe default).
+        assert!(!resolve_nas_security_canary(None, None));
+        assert!(!resolve_nas_security_canary(None, Some(false)));
+        // yaml true, no env -> ON.
+        assert!(resolve_nas_security_canary(None, Some(true)));
+        // env enable tokens -> ON regardless of yaml.
+        for v in ["nextgcore", "NextGCore", " 1 ", "true", "YES", "on"] {
+            assert!(
+                resolve_nas_security_canary(Some(v), Some(false)),
+                "env {v:?} must enable"
+            );
+        }
+        // env disable tokens -> OFF even when yaml says true.
+        for v in ["legacy", "0", "false", "no", "OFF"] {
+            assert!(
+                !resolve_nas_security_canary(Some(v), Some(true)),
+                "env {v:?} must disable"
+            );
+        }
+        // Unrecognized env falls through to the yaml value.
+        assert!(resolve_nas_security_canary(Some("maybe"), Some(true)));
+        assert!(!resolve_nas_security_canary(Some("maybe"), Some(false)));
+    }
+
+    /// Knob plumbing (yaml/env -> AmfUe flag): `set_nas_security_canary(true)`
+    /// makes the next `amf_ue_add()` stamp `use_nextgcore_nas_security=true`;
+    /// OFF (the default) yields the legacy UE. Serialized on the shared context
+    /// guard (the canary is process-wide) and restored to OFF so no other test
+    /// bleeds.
+    #[test]
+    fn test_nas_security_canary_knob_seeds_new_ue() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Default: OFF -> legacy UE.
+        set_nas_security_canary(false);
+        assert!(!nas_security_canary());
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+        let gnb = ctx.gnb_add("10.0.0.1:38412").unwrap();
+        let ran_ue = ctx.ran_ue_add(gnb.id, 5001).unwrap();
+        let ue_off = ctx.amf_ue_add(ran_ue.id).unwrap();
+        assert!(
+            !ue_off.use_nextgcore_nas_security,
+            "OFF canary must create a legacy UE"
+        );
+
+        // Flip ON at runtime: the NEXT UE picks it up.
+        set_nas_security_canary(true);
+        assert!(nas_security_canary());
+        let ran_ue2 = ctx.ran_ue_add(gnb.id, 5002).unwrap();
+        let ue_on = ctx.amf_ue_add(ran_ue2.id).unwrap();
+        assert!(
+            ue_on.use_nextgcore_nas_security,
+            "ON canary must create a nextgcore-security UE"
+        );
+
+        // Restore the process-wide default (never leave the canary ON).
+        set_nas_security_canary(false);
+        assert!(!nas_security_canary());
     }
 }

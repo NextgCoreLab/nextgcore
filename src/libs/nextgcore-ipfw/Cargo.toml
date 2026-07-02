@@ -1,0 +1,17 @@
+[package]
+name = "nextgcore-ipfw"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore IP Firewall Library"
+
+[dependencies]
+nextgcore-core = { workspace = true }
+libc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

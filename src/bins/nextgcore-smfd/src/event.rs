@@ -6,10 +6,10 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
-pub const OGS_FSM_USER_SIG: i32 = 2;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for SMF
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +56,8 @@ impl SmfEventId {
     /// Get the name of the event
     pub fn name(&self) -> &'static str {
         match self {
-            SmfEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            SmfEventId::FsmExit => "OGS_FSM_EXIT_SIG",
+            SmfEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            SmfEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
             SmfEventId::S5cMessage => "SMF_EVT_S5C_MESSAGE",
             SmfEventId::S6bMessage => "SMF_EVT_S6B_MESSAGE",
             SmfEventId::GnMessage => "SMF_EVT_GN_MESSAGE",
@@ -71,17 +71,17 @@ impl SmfEventId {
             SmfEventId::GsmMessage => "SMF_EVT_5GSM_MESSAGE",
             SmfEventId::GsmTimer => "SMF_EVT_5GSM_TIMER",
             SmfEventId::SessionRelease => "SMF_EVT_SESSION_RELEASE",
-            SmfEventId::SbiServer => "OGS_EVENT_SBI_SERVER",
-            SmfEventId::SbiClient => "OGS_EVENT_SBI_CLIENT",
-            SmfEventId::SbiTimer => "OGS_EVENT_SBI_TIMER",
+            SmfEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
+            SmfEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
+            SmfEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
         }
     }
 
     /// Convert from i32 signal
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => SmfEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => SmfEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => SmfEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => SmfEventId::FsmExit,
             _ => SmfEventId::SbiServer,
         }
     }
@@ -90,7 +90,7 @@ impl SmfEventId {
 /// Timer IDs for SMF
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SmfTimerId {
-    // SBI timers (from ogs-proto)
+    // SBI timers (from nextgcore-proto)
     /// NF instance registration interval timer
     NfInstanceRegistrationInterval,
     /// NF instance heartbeat interval timer
@@ -122,14 +122,16 @@ impl SmfTimerId {
     pub fn name(&self) -> &'static str {
         match self {
             SmfTimerId::NfInstanceRegistrationInterval => {
-                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+                "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            SmfTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
-            SmfTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
-            SmfTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",
-            SmfTimerId::SubscriptionValidity => "OGS_TIMER_SUBSCRIPTION_VALIDITY",
-            SmfTimerId::SubscriptionPatch => "OGS_TIMER_SUBSCRIPTION_PATCH",
-            SmfTimerId::SbiClientWait => "OGS_TIMER_SBI_CLIENT_WAIT",
+            SmfTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
+            SmfTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
+            SmfTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
+            SmfTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",
+            SmfTimerId::SubscriptionPatch => "NEXTGCORE_TIMER_SUBSCRIPTION_PATCH",
+            SmfTimerId::SbiClientWait => "NEXTGCORE_TIMER_SBI_CLIENT_WAIT",
             SmfTimerId::PfcpAssociation => "SMF_TIMER_PFCP_ASSOCIATION",
             SmfTimerId::PfcpNoHeartbeat => "SMF_TIMER_PFCP_NO_HEARTBEAT",
             SmfTimerId::PfcpNoEstablishmentResponse => "SMF_TIMER_PFCP_NO_ESTABLISHMENT_RESPONSE",

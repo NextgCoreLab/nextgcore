@@ -459,22 +459,37 @@ impl PfcpMessageBuilder {
     pub fn add_f_teid(&mut self, f_teid: &FTeid) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        if f_teid.ipv6.is_some() {
+        // TS 29.244 §8.2.3 Fig 8.2.3-1, octet 5: Bit1=V4 (0x01), Bit2=V6 (0x02),
+        // Bit3=CH (0x04), Bit4=CHID (0x08). NOTE: this bit order is SPECIFIC to
+        // F-TEID. It is the OPPOSITE of F-SEID (§8.2.37) and UE IP Address
+        // (§8.2.62), which both use Bit1=V6/Bit2=V4 — do not "harmonize" them.
+        if f_teid.ipv4.is_some() {
             flags |= 0x01;
         }
-        if f_teid.ipv4.is_some() {
+        if f_teid.ipv6.is_some() {
             flags |= 0x02;
         }
         if f_teid.choose {
             flags |= 0x04;
         }
-        value.put_u8(flags);
-        value.put_u32(f_teid.teid);
-        if let Some(addr) = f_teid.ipv4 {
-            value.put_slice(&addr.octets());
+        if f_teid.choose_id.is_some() {
+            // TS 29.244 §8.2.3: CHID (Bit4 = 0x08) MUST be set when a CHOOSE ID
+            // octet is appended. CHID is only valid together with CH (Bit3 = 0x04).
+            debug_assert!(f_teid.choose, "upfd-05: CHID flag requires CH to be set");
+            flags |= 0x08;
         }
-        if let Some(addr) = f_teid.ipv6 {
-            value.put_slice(&addr.octets());
+        value.put_u8(flags);
+        // TS 29.244 §8.2.3: when CH (CHOOSE) is set the TEID and address fields
+        // are OMITTED on the wire. Only the optional CHOOSE ID octet (Bit4=CHID)
+        // may follow. The parser mirrors this (see ParsedFTeid::parse).
+        if !f_teid.choose {
+            value.put_u32(f_teid.teid);
+            if let Some(addr) = f_teid.ipv4 {
+                value.put_slice(&addr.octets());
+            }
+            if let Some(addr) = f_teid.ipv6 {
+                value.put_slice(&addr.octets());
+            }
         }
         if let Some(id) = f_teid.choose_id {
             value.put_u8(id);
@@ -496,7 +511,12 @@ impl PfcpMessageBuilder {
             flags |= 0x04;
         }
         if ue_ip.ipv6_prefix_len > 0 {
-            flags |= 0x08;
+            // TS 29.244 §8.2.62 Fig 8.2.62-1, octet-5: Bit7 (0x40) = IP6PL
+            // (IPv6 Prefix Length field present). Bit4 (0x08) = IPv6D (Prefix
+            // Delegation Bits) is a DISTINCT flag for a different optional field.
+            // Using 0x08 here was wrong: a conformant peer reading IPv6D=1 would
+            // expect a Prefix Delegation Bits octet, not a prefix length.
+            flags |= 0x40; // IP6PL
         }
         value.put_u8(flags);
         if let Some(addr) = ue_ip.ipv4 {
@@ -754,7 +774,7 @@ pub fn build_session_deletion_response(msg_type: u8, usage_reports: &[UsageRepor
 }
 
 /// Build Session Report Request
-/// Port of ogs_pfcp_build_session_report_request
+/// Port of nextgcore_pfcp_build_session_report_request
 pub fn build_session_report_request(msg_type: u8, report: &UserPlaneReport) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
 
@@ -986,8 +1006,11 @@ impl ParsedFTeid {
             return Err("F-TEID IE empty");
         }
         let flags = data[0];
-        let v6 = (flags & 0x01) != 0;
-        let v4 = (flags & 0x02) != 0;
+        // TS 29.244 §8.2.3 Fig 8.2.3-1, octet 5: Bit1=V4 (0x01), Bit2=V6 (0x02),
+        // Bit3=CH (0x04), Bit4=CHID (0x08). This F-TEID bit order is the OPPOSITE
+        // of F-SEID (§8.2.37) and UE IP Address (§8.2.62) which use Bit1=V6.
+        let v4 = (flags & 0x01) != 0;
+        let v6 = (flags & 0x02) != 0;
         let ch = (flags & 0x04) != 0;
         let chid = (flags & 0x08) != 0;
 
@@ -1437,12 +1460,15 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
     // Gate Status (IE type 25)
     if let Some(ie) = ParsedIe::find_ie(&ies, 25) {
         if !ie.value.is_empty() {
-            qer.ul_gate = ie.value[0] & 0x03; // bits 0-1
-            qer.dl_gate = (ie.value[0] >> 2) & 0x03; // bits 2-3
+            // TS 29.244 §8.2.7 (Fig 8.2.7-1): octet 5 bits 1-2 = DL Gate,
+            // bits 3-4 = UL Gate (matches smfd's add_gate_status encode).
+            qer.dl_gate = ie.value[0] & 0x03; // bits 1-2
+            qer.ul_gate = (ie.value[0] >> 2) & 0x03; // bits 3-4
         }
     }
 
-    // MBR (IE type 26)
+    // MBR (IE type 26). TS 29.244 §8.2.8: the 5-octet fields are kbit/s;
+    // convert to bit/s for the internal rate policer.
     if let Some(ie) = ParsedIe::find_ie(&ies, 26) {
         if ie.value.len() >= 10 {
             qer.ul_mbr = u64::from_be_bytes([
@@ -1454,7 +1480,8 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[2],
                 ie.value[3],
                 ie.value[4],
-            ]);
+            ])
+            .saturating_mul(1000);
             qer.dl_mbr = u64::from_be_bytes([
                 0,
                 0,
@@ -1464,11 +1491,12 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[7],
                 ie.value[8],
                 ie.value[9],
-            ]);
+            ])
+            .saturating_mul(1000);
         }
     }
 
-    // GBR (IE type 27)
+    // GBR (IE type 27). TS 29.244 §8.2.9: kbit/s on the wire -> bit/s internal.
     if let Some(ie) = ParsedIe::find_ie(&ies, 27) {
         if ie.value.len() >= 10 {
             qer.ul_gbr = u64::from_be_bytes([
@@ -1480,7 +1508,8 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[2],
                 ie.value[3],
                 ie.value[4],
-            ]);
+            ])
+            .saturating_mul(1000);
             qer.dl_gbr = u64::from_be_bytes([
                 0,
                 0,
@@ -1490,7 +1519,8 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[7],
                 ie.value[8],
                 ie.value[9],
-            ]);
+            ])
+            .saturating_mul(1000);
         }
     }
 
@@ -1673,15 +1703,15 @@ pub fn build_heartbeat_request(recovery_time_stamp: u32) -> Vec<u8> {
 /// - FTUP: F-TEID allocation in the UP function (CHOOSE flag handling)
 /// - EMPU: sending of End Marker packets
 ///
-/// Encoded with the ogs-pfcp library codec (full 8 feature octets).
+/// Encoded with the nextgcore-pfcp library codec (full 8 feature octets).
 pub fn upf_function_features() -> Vec<u8> {
     use bytes::BytesMut;
-    let features = ogs_pfcp::types::UpFunctionFeatures {
+    let features = nextgcore_pfcp::types::UpFunctionFeatures {
         ftup: true,
         empu: true,
         ..Default::default()
     };
-    let mut buf = BytesMut::with_capacity(ogs_pfcp::types::UpFunctionFeatures::ENCODED_LEN);
+    let mut buf = BytesMut::with_capacity(nextgcore_pfcp::types::UpFunctionFeatures::ENCODED_LEN);
     features.encode(&mut buf);
     buf.to_vec()
 }
@@ -2014,6 +2044,68 @@ mod tests {
         assert_eq!(msg.len(), 13);
     }
 
+    /// TS 29.244 §8.2.3 Fig 8.2.3-1 octet-5 flag conformance: Bit1 (0x01) = V4,
+    /// Bit2 (0x02) = V6, Bit3 (0x04) = CH, Bit4 (0x08) = CHID. Pins the wire
+    /// bytes so the V4/V6 transposition (upfd-01) cannot regress. The F-TEID
+    /// flags byte sits at index 4 of the built message (2-byte type + 2-byte
+    /// length TLV header precede it).
+    #[test]
+    fn test_f_teid_octet5_flags_spec_conformant() {
+        // V4-only -> octet-5 == 0x01
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(&FTeid {
+            teid: 0x11223344,
+            ipv4: Some(Ipv4Addr::new(10, 45, 0, 7)),
+            ipv6: None,
+            choose: false,
+            choose_id: None,
+        });
+        assert_eq!(b.build()[4], 0x01, "V4-only F-TEID octet-5 must be 0x01");
+
+        // V6-only -> octet-5 == 0x02
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(&FTeid {
+            teid: 0x11223344,
+            ipv4: None,
+            ipv6: Some(Ipv6Addr::from([0xAB; 16])),
+            choose: false,
+            choose_id: None,
+        });
+        assert_eq!(b.build()[4], 0x02, "V6-only F-TEID octet-5 must be 0x02");
+
+        // V4+V6 (dual-stack) -> octet-5 == 0x03
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(&FTeid {
+            teid: 0x11223344,
+            ipv4: Some(Ipv4Addr::new(10, 45, 0, 7)),
+            ipv6: Some(Ipv6Addr::from([0xAB; 16])),
+            choose: false,
+            choose_id: None,
+        });
+        assert_eq!(b.build()[4], 0x03, "dual-stack F-TEID octet-5 must be 0x03");
+    }
+
+    /// Decode side of upfd-01: a hand-built spec-conformant F-TEID with octet-5
+    /// V4=0x01 parses as IPv4 (not IPv6), and the V6=0x02 + 16-byte address case
+    /// parses as IPv6 (not IPv4). TS 29.244 §8.2.3.
+    #[test]
+    fn test_parse_f_teid_v4_v6_bits_spec_conformant() {
+        // octet5 = 0x01 (V4), 4-byte TEID, 4-byte IPv4 address.
+        let v4 = [0x01u8, 0x00, 0x01, 0x00, 0x01, 192, 168, 1, 1];
+        let parsed = ParsedFTeid::parse(&v4).expect("V4 F-TEID must parse");
+        assert_eq!(parsed.ipv4, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(parsed.ipv6.is_none(), "V4=Bit1 must NOT decode as IPv6");
+        assert_eq!(parsed.teid, 0x0001_0001);
+
+        // Negative guard: octet5 = 0x02 (V6) + 4-byte TEID + 16-byte IPv6 must
+        // decode as IPv6, never IPv4.
+        let mut v6 = vec![0x02u8, 0x00, 0x00, 0x00, 0x02];
+        v6.extend_from_slice(&[0xFE; 16]);
+        let parsed = ParsedFTeid::parse(&v6).expect("V6 F-TEID must parse");
+        assert!(parsed.ipv4.is_none(), "V6=Bit2 must NOT decode as IPv4");
+        assert_eq!(parsed.ipv6, Some(Ipv6Addr::from([0xFE; 16])));
+    }
+
     #[test]
     fn test_ue_ip_address_encoding() {
         let mut builder = PfcpMessageBuilder::new();
@@ -2198,8 +2290,9 @@ mod tests {
         let created_pdr_ie_value = builder.build();
 
         // 3. Decode exactly as the SMF does: find inner F-TEID (type 21),
-        //    require non-zero TEID and an IPv4 (V4 flag 0x02). The outer bytes
-        //    here are the Created PDR IE itself (type 8).
+        //    require non-zero TEID and an IPv4 (V4 flag 0x01 per TS 29.244
+        //    §8.2.3 octet 5 Bit1). The outer bytes here are the Created PDR IE
+        //    itself (type 8).
         let ies = ParsedIe::parse_all(&created_pdr_ie_value);
         let created_ie =
             ParsedIe::find_ie(&ies, pfcp_ie::CREATED_PDR).expect("Created PDR IE must be present");
@@ -2213,7 +2306,103 @@ mod tests {
         assert_ne!(teid, 0, "SMF requires a non-zero allocated F-TEID");
         assert_eq!(teid, allocated_teid);
         assert_eq!(flags & 0x04, 0, "response F-TEID must have CH cleared");
-        assert_ne!(flags & 0x02, 0, "response F-TEID must carry IPv4");
+        // Re-baselined to the spec-correct V4 bit: TS 29.244 §8.2.3 octet 5
+        // Bit1 (0x01) = V4 (was previously asserting the swapped 0x02 bug).
+        assert_ne!(flags & 0x01, 0, "response F-TEID must carry IPv4 (V4=Bit1)");
         assert_eq!(&fteid_val[5..9], &upf_n3.octets());
+    }
+
+    /// upfd-03: TS 29.244 §8.2.62 Fig 8.2.62-1 — octet-5 Bit7 (0x40) = IP6PL
+    /// (IPv6 Prefix Length present). The old code set Bit4 (0x08 = IPv6D) which
+    /// is a DISTINCT flag for Prefix Delegation Bits. A conformant SMF reading
+    /// 0x08 would expect a different field format and misparse the IE.
+    #[test]
+    fn test_ue_ip_address_ipv6_prefix_len_uses_ip6pl_flag() {
+        // IPv4 + ipv6_prefix_len=64: octet-5 must be V4 (0x02) | IP6PL (0x40) = 0x42
+        let mut b = PfcpMessageBuilder::new();
+        b.add_ue_ip_address(
+            &UeIpAddress {
+                ipv4: Some(Ipv4Addr::new(10, 45, 0, 2)),
+                ipv6: None,
+                ipv6_prefix_len: 64,
+            },
+            false,
+        );
+        let msg = b.build();
+        // TLV header=4 bytes, then octet-5 at index 4
+        let octet5 = msg[4];
+        assert_eq!(
+            octet5 & 0x40,
+            0x40,
+            "IP6PL flag (Bit7=0x40) must be set when ipv6_prefix_len>0"
+        );
+        assert_eq!(
+            octet5 & 0x08,
+            0,
+            "IPv6D flag (Bit4=0x08) must NOT be set for prefix length"
+        );
+        assert_eq!(octet5 & 0x02, 0x02, "V4 flag (Bit2=0x02) must be set");
+        // Trailing byte is the prefix length value
+        let expected_len = msg.len();
+        assert_eq!(
+            msg[expected_len - 1],
+            64,
+            "trailing byte must be the IPv6 prefix length"
+        );
+
+        // V6-only: octet-5 Bit1 (0x01) = V6
+        let mut b2 = PfcpMessageBuilder::new();
+        b2.add_ue_ip_address(
+            &UeIpAddress {
+                ipv4: None,
+                ipv6: Some(Ipv6Addr::from([0xAB; 16])),
+                ipv6_prefix_len: 0,
+            },
+            false,
+        );
+        let msg2 = b2.build();
+        assert_eq!(
+            msg2[4] & 0x01,
+            0x01,
+            "V6 flag (Bit1=0x01) must be set for IPv6"
+        );
+    }
+
+    /// upfd-05: TS 29.244 §8.2.3 — CHID flag (Bit4=0x08) must be set in F-TEID
+    /// octet-5 whenever a CHOOSE ID octet is appended. The old code appended the
+    /// CHOOSE ID byte but never set CHID, causing a peer to misalign the IE.
+    #[test]
+    fn test_f_teid_chid_flag_set_when_choose_id_present() {
+        // CH=true, choose_id=Some(7): octet-5 must have CH (0x04) | CHID (0x08) = 0x0C
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(&FTeid {
+            teid: 0,
+            ipv4: None,
+            ipv6: None,
+            choose: true,
+            choose_id: Some(7),
+        });
+        let msg = b.build();
+        let octet5 = msg[4];
+        assert_eq!(octet5 & 0x04, 0x04, "CH flag (0x04) must be set");
+        assert_eq!(
+            octet5 & 0x08,
+            0x08,
+            "CHID flag (0x08) must be set when choose_id is Some"
+        );
+        // CHOOSE ID byte is the last byte of the IE value
+        assert_eq!(*msg.last().unwrap(), 7, "CHOOSE ID byte must be 7");
+
+        // Round-trip through ParsedFTeid::parse
+        // IE value starts at offset 4 in the built message (2-byte type + 2-byte len)
+        let ie_value = &msg[4..];
+        let parsed = ParsedFTeid::parse(ie_value).expect("CH+CHID F-TEID must parse");
+        assert!(parsed.ch, "parsed CH must be true");
+        assert!(parsed.chid, "parsed CHID must be true");
+        assert_eq!(
+            parsed.choose_id,
+            Some(7),
+            "parsed choose_id must be Some(7)"
+        );
     }
 }

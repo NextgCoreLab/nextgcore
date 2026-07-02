@@ -3,7 +3,7 @@
 //! Port of src/amf/gmm-handler.c - GMM message handling functions for 5G NAS
 
 use crate::context::{
-    AmfUe, Guti5gs, PlmnId, RanUe, UeSecurityCapability, OGS_NAS_KSI_NO_KEY_IS_AVAILABLE,
+    AmfUe, Guti5gs, PlmnId, RanUe, UeSecurityCapability, NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE,
 };
 use crate::gmm_build::{mobile_identity_type, GmmCause};
 
@@ -12,7 +12,7 @@ use crate::gmm_build::{mobile_identity_type, GmmCause};
 // ============================================================================
 
 /// Minimum SUCI length
-pub const OGS_NAS_5GS_MOBILE_IDENTITY_SUCI_MIN_SIZE: usize = 8;
+pub const NEXTGCORE_NAS_5GS_MOBILE_IDENTITY_SUCI_MIN_SIZE: usize = 8;
 
 /// Protection scheme IDs
 pub mod protection_scheme {
@@ -140,7 +140,7 @@ pub fn handle_registration_request(
     amf_ue.nas_ue_tsc = request.tsc;
     amf_ue.nas_ue_ksi = request.ksi;
 
-    if amf_ue.nas_ue_ksi < OGS_NAS_KSI_NO_KEY_IS_AVAILABLE {
+    if amf_ue.nas_ue_ksi < NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE {
         amf_ue.nas_tsc = amf_ue.nas_ue_tsc;
         amf_ue.nas_ksi = amf_ue.nas_ue_ksi;
     }
@@ -196,12 +196,19 @@ pub fn handle_registration_request(
         log::info!("UE indicates ProSe/Sidelink capability");
     }
 
-    // Network slice admission control (NSACF, TS 29.536)
-    // In production: would query NSACF for each requested S-NSSAI
-    amf_ue.slice_admission_granted = true;
+    // Network slice admission control (NSACF, TS 29.536 / TS 23.501 §5.15.11).
+    //
+    // The authoritative admission decision is taken on the live registration
+    // path (`ngap_path::complete_registration`), which performs the asynchronous
+    // Nnsacf_NSAC UE-admission query per Allowed S-NSSAI and gates Registration
+    // Accept on `admittedFlag`. This synchronous handler runs before the SBI
+    // calls and cannot issue the network query itself, so it leaves
+    // `slice_admission_granted` unset (false) here; the live path sets it from
+    // the NSACF response. No admission is fabricated.
+    amf_ue.slice_admission_granted = false;
     for snssai in &amf_ue.requested_nssai {
         log::debug!(
-            "Slice admission check: SST={}, SD={:?}",
+            "Slice pending NSACF admission: SST={}, SD={:?}",
             snssai.sst,
             snssai.sd
         );
@@ -267,7 +274,7 @@ pub fn handle_service_request(
     amf_ue.nas_ue_tsc = request.tsc;
     amf_ue.nas_ue_ksi = request.ksi;
 
-    if amf_ue.nas_ue_ksi < OGS_NAS_KSI_NO_KEY_IS_AVAILABLE {
+    if amf_ue.nas_ue_ksi < NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE {
         amf_ue.nas_tsc = amf_ue.nas_ue_tsc;
         amf_ue.nas_ksi = amf_ue.nas_ue_ksi;
     }
@@ -334,7 +341,7 @@ pub fn handle_deregistration_request(
     amf_ue.nas_ue_tsc = request.tsc;
     amf_ue.nas_ue_ksi = request.ksi;
 
-    if amf_ue.nas_ue_ksi < OGS_NAS_KSI_NO_KEY_IS_AVAILABLE {
+    if amf_ue.nas_ue_ksi < NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE {
         amf_ue.nas_tsc = amf_ue.nas_ue_tsc;
         amf_ue.nas_ksi = amf_ue.nas_ue_ksi;
     }
@@ -531,6 +538,19 @@ pub enum UlTransportAction {
     /// reply with DL NAS Transport echoing the container with
     /// 5GMM cause #90 "payload was not forwarded" (Section 5.4.5.3.1)
     PayloadNotForwarded,
+    /// LPP positioning container (TS 23.273): forward the uplink LPP message to
+    /// the serving LMF over Nlmf. Until an LMF association exists (lmfd-07) the
+    /// caller falls back to the #90 abnormal action, so the wire is unchanged.
+    ForwardLppToLmf { lpp: Vec<u8> },
+    /// UE policy container (TS 24.501 Annex D, e.g. MANAGE UE POLICY COMPLETE /
+    /// COMMAND REJECT): forward the uplink UE-policy message to the PCF over
+    /// Namf `N1MessageNotify` (Wave-6 E6, TS 29.525 §4.2.2.2 delivery-result
+    /// loop). The payload is opaque to the AMF and forwarded verbatim. Exactly
+    /// mirrors `ForwardLppToLmf`: unless a PCF registered an `n1MessageClass ==
+    /// "UPDP"` notify callback for this UE (Wave-6 A3 `N1N2MessageSubscribe`),
+    /// the caller falls back to the #90 abnormal action, so the default wire
+    /// (no subscription) is byte-identical to today.
+    ForwardUpdpToPcf { container: Vec<u8> },
 }
 
 /// Handle UL NAS transport (TS 24.501 Section 8.2.10)
@@ -580,10 +600,39 @@ pub fn handle_ul_nas_transport(
             amf_ue.pending_psi = Some(psi);
             Ok(UlTransportAction::RouteToSmf { psi })
         }
+        payload_container_type::LPP => {
+            // LPP positioning (TS 23.273): the uplink LPP message is destined
+            // for the serving LMF. Recognised distinctly from the unsupported
+            // containers below; the caller forwards it (or, with no LMF
+            // association yet, falls back to the #90 abnormal action).
+            log::info!(
+                "[{}] UL NAS Transport - LPP positioning container ({} bytes) for the LMF",
+                amf_ue.supi.as_deref().unwrap_or("Unknown"),
+                transport.payload_container.len()
+            );
+            Ok(UlTransportAction::ForwardLppToLmf {
+                lpp: transport.payload_container.clone(),
+            })
+        }
+        payload_container_type::UE_POLICY_CONTAINER => {
+            // UE policy container (TS 24.501 Annex D): the uplink UE-policy
+            // message (MANAGE UE POLICY COMPLETE / COMMAND REJECT / UE STATE
+            // INDICATION) is destined for the PCF (Wave-6 E6). Recognised
+            // distinctly from the unsupported containers below; the caller
+            // forwards it to the PCF's registered notify callback (or, with no
+            // "UPDP" subscription, falls back to the #90 abnormal action —
+            // byte-identical to the pre-E6 default).
+            log::info!(
+                "[{}] UL NAS Transport - UE policy container ({} bytes) for the PCF",
+                amf_ue.supi.as_deref().unwrap_or("Unknown"),
+                transport.payload_container.len()
+            );
+            Ok(UlTransportAction::ForwardUpdpToPcf {
+                container: transport.payload_container.clone(),
+            })
+        }
         payload_container_type::SMS
-        | payload_container_type::LPP
         | payload_container_type::SOR_TRANSPARENT_CONTAINER
-        | payload_container_type::UE_POLICY_CONTAINER
         | payload_container_type::UE_PARAMETERS_UPDATE
         | payload_container_type::MULTIPLE_PAYLOADS => {
             log::info!(
@@ -645,7 +694,7 @@ pub fn registration_request_from_old_amf(
 
 /// Parse SUCI from mobile identity buffer
 pub fn parse_suci(buffer: &[u8]) -> Option<(String, PlmnId)> {
-    if buffer.len() < OGS_NAS_5GS_MOBILE_IDENTITY_SUCI_MIN_SIZE {
+    if buffer.len() < NEXTGCORE_NAS_5GS_MOBILE_IDENTITY_SUCI_MIN_SIZE {
         return None;
     }
 
@@ -949,6 +998,49 @@ mod tests {
 
         let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
         assert_eq!(result, Ok(UlTransportAction::PayloadNotForwarded));
+    }
+
+    #[test]
+    fn test_handle_ul_nas_transport_lpp_forwards_to_lmf() {
+        let mut amf_ue = create_test_amf_ue();
+        let ran_ue = create_test_ran_ue();
+
+        // LPP positioning container (TS 23.273): recognised distinctly from the
+        // unsupported containers and routed toward the LMF, not lumped into #90.
+        let lpp = vec![0x90u8, 0x01, 0x20, 0x09, 0x30];
+        let transport = UlNasTransport {
+            payload_container_type: payload_container_type::LPP,
+            payload_container: lpp.clone(),
+            pdu_session_id: None,
+            ..Default::default()
+        };
+
+        let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
+        assert_eq!(result, Ok(UlTransportAction::ForwardLppToLmf { lpp }));
+    }
+
+    #[test]
+    fn test_handle_ul_nas_transport_ue_policy_forwards_to_pcf() {
+        let mut amf_ue = create_test_amf_ue();
+        let ran_ue = create_test_ran_ue();
+
+        // UE policy container (TS 24.501 Annex D, e.g. MANAGE UE POLICY COMPLETE
+        // = [PTI, 0x02]): recognised distinctly from the unsupported containers
+        // and routed toward the PCF (Wave-6 E6), NOT lumped into #90. The caller
+        // still falls back to #90 when no "UPDP" subscription exists.
+        let container = vec![0x80u8, 0x02];
+        let transport = UlNasTransport {
+            payload_container_type: payload_container_type::UE_POLICY_CONTAINER,
+            payload_container: container.clone(),
+            pdu_session_id: None,
+            ..Default::default()
+        };
+
+        let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
+        assert_eq!(
+            result,
+            Ok(UlTransportAction::ForwardUpdpToPcf { container })
+        );
     }
 
     #[test]

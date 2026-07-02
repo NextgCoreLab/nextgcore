@@ -12,10 +12,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::client::SbiClient;
-use ogs_sbi::context::global_context;
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{send_method_not_allowed, send_not_found, SbiServer, SbiServerConfig};
+use nextgcore_sbi::client::SbiClient;
+use nextgcore_sbi::context::global_context;
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{send_method_not_allowed, send_not_found, SbiServer, SbiServerConfig};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -240,13 +240,86 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OAuth2 rollout (Wave-6 H8): opt-in producer verification + outbound consumer
+// token install. Default OFF so the matched-sim E2E path is byte-unchanged;
+// enabled per-NF via `NEXTGCORE_SBI_OAUTH2_REQUIRE=1` (overlay-friendly) or the
+// `dccf.sbi.oauth2.require: true` yaml knob. TS 33.501 §13.4.1, TS 29.510 §5.4.2.
+// ---------------------------------------------------------------------------
+
+/// Process-wide OAuth2 client for automatic Bearer-token acquisition on
+/// outbound SBI calls (installed only when OAuth2 enforcement is enabled).
+static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>> =
+    std::sync::OnceLock::new();
+
+/// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
+/// Phase A). Outbound SBI clients attach a token via `client.with_oauth2`.
+#[allow(dead_code)]
+fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the
+/// matched-sim path is untouched. Honors `NEXTGCORE_SBI_OAUTH2_REQUIRE` first
+/// (overlay-friendly), then the yaml `<nf>.sbi.oauth2.require` (root-key
+/// agnostic: true iff any top-level section sets it).
+fn oauth2_required(config_path: &str) -> bool {
+    if let Ok(v) = std::env::var("NEXTGCORE_SBI_OAUTH2_REQUIRE") {
+        return matches!(v.trim(), "1" | "true" | "TRUE" | "yes");
+    }
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
+        return false;
+    };
+    value.as_mapping().is_some_and(|map| {
+        map.values().any(|section| {
+            section
+                .get("sbi")
+                .and_then(|s| s.get("oauth2"))
+                .and_then(|o| o.get("require"))
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// Apply OAuth2 producer enforcement to `cfg` and install the outbound OAuth2
+/// client (Wave-6 H8). The server verifies incoming Bearer tokens against the
+/// NRF JWKS and requires `aud` to include NfType::Dccf; with no NRF URI it
+/// fails closed (503). `nrf_uri` empty ⇒ unconfigured ⇒ fail-closed.
+fn apply_oauth2_enforcement(mut cfg: SbiServerConfig, nrf_uri: &str) -> SbiServerConfig {
+    cfg.require_oauth2 = true;
+    let uri = (!nrf_uri.is_empty()).then_some(nrf_uri);
+    cfg.oauth2_jwks_uri = uri.map(|u| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(u)
+            .jwks_uri()
+            .to_string()
+    });
+    cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Dccf);
+    if let Some(u) = uri {
+        let nf_instance_id = format!("dccf-{}", uuid::Uuid::new_v4());
+        let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
+            u,
+            nf_instance_id,
+            nextgcore_sbi::types::NfType::Dccf,
+        ))));
+    }
+    log::info!(
+        "OAuth2 enforcement enabled (JWKS: {})",
+        cfg.oauth2_jwks_uri.as_deref().unwrap_or("UNCONFIGURED")
+    );
+    cfg
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -274,6 +347,9 @@ async fn main() -> Result<()> {
             sbi_config = sbi_config.with_tls(key, cert);
         }
     }
+    if oauth2_required(&args.config) {
+        sbi_config = apply_oauth2_enforcement(sbi_config, &args.nrf_uri);
+    }
 
     let sbi_server = SbiServer::new(sbi_config);
     sbi_server
@@ -287,7 +363,15 @@ async fn main() -> Result<()> {
     if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
-        ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
+        // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+        // (active data-collection subscriptions, saturated at 100;
+        // TS 29.510 §5.2.2.3.2). Honest subscription-count proxy — no
+        // fabricated CPU numbers.
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+            nf_instance_id.clone(),
+            5,
+            || dccf_context_subscription_count().min(100) as u8,
+        );
     }
 
     log::info!("NextGCore DCCF ready (instance: {nf_instance_id})");
@@ -358,12 +442,14 @@ async fn register_with_nrf(
         200 | 201 => {
             log::info!("DCCF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance =
-                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Dccf);
+            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
+                nf_instance_id,
+                nextgcore_sbi::types::NfType::Dccf,
+            );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = ogs_sbi::context::NfService::new(
+            let mut svc = nextgcore_sbi::context::NfService::new(
                 "ndccf-datamanagement",
-                ogs_sbi::types::SbiServiceType::NdccfDatamanagement,
+                nextgcore_sbi::types::SbiServiceType::NdccfDatamanagement,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
@@ -394,5 +480,148 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
     } else {
         let default_port = if uri.starts_with("https://") { 443 } else { 80 };
         Some((host_port.to_string(), default_port))
+    }
+}
+
+#[cfg(test)]
+mod oauth2_h8_tests {
+    //! Wave-6 H8 (Phase B) strict-peer OAuth2 enforcement triplet: the real
+    //! `dccf_request_handler` is mounted behind nextgcore-sbi's server-side
+    //! OAuth2 verification (TS 33.501 §13.4.1). A missing or wrong-audience
+    //! Bearer is rejected (401) before the handler runs; a valid NRF-audience
+    //! token (aud=DCCF, ES256-signed against the served JWKS) passes through.
+    use super::dccf_request_handler;
+    use nextgcore_sbi::client::SbiClient;
+    use nextgcore_sbi::message::SbiRequest;
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    use nextgcore_sbi::types::NfType;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature};
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
+        let claims = serde_json::json!({
+            "iss": "NRF", "sub": "dccf-1", "aud": aud,
+            "scope": scope, "exp": exp, "iat": 0
+        })
+        .to_string();
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("{h}.{p}.{s}")
+    }
+
+    fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let point = sk.verifying_key().to_encoded_point(false);
+        serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":kid,
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }]})
+    }
+
+    async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
+        super::dccf_context_init(256);
+        let port = free_port();
+        let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(jwks);
+        cfg = cfg.with_expected_audience_nf_type(NfType::Dccf);
+        let server = SbiServer::new(cfg);
+        server
+            .start(dccf_request_handler)
+            .await
+            .expect("server start");
+        (server, port)
+    }
+
+    #[test]
+    fn test_oauth2_require_knob_parses_and_defaults_off() {
+        let dir = std::env::temp_dir();
+        let off = dir.join(format!("dccf-h8-off-{}.yaml", std::process::id()));
+        std::fs::write(
+            &off,
+            "dccf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n",
+        )
+        .unwrap();
+        assert!(!super::oauth2_required(off.to_str().unwrap()));
+        let on = dir.join(format!("dccf-h8-on-{}.yaml", std::process::id()));
+        std::fs::write(&on, "dccf:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();
+        assert!(super::oauth2_required(on.to_str().unwrap()));
+        let _ = std::fs::remove_file(off);
+        let _ = std::fs::remove_file(on);
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_missing_token_rejected_401() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get("/ndccf-datamanagement/v1/subscriptions"),
+        )
+        .await
+        .expect("bounded")
+        .expect("response");
+        assert_eq!(resp.status, 401, "unauthenticated request must be 401");
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_wrong_audience_rejected_401() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let token = build_es256_token(&sk, "nrf-es256", "AMF", "ndccf-datamanagement");
+        let req = SbiRequest::get("/ndccf-datamanagement/v1/subscriptions")
+            .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_valid_token_reaches_handler() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let token = build_es256_token(&sk, "nrf-es256", "DCCF", "ndccf-datamanagement");
+        let req = SbiRequest::get("/ndccf-datamanagement/v1/subscriptions/does-not-exist")
+            .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_ne!(resp.status, 401, "valid token must not be 401");
+        assert_ne!(resp.status, 403, "valid token must not be 403");
+        server.stop().await.expect("stop");
     }
 }

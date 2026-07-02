@@ -710,11 +710,15 @@ impl PfcpMessageBuilder {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
 
-        if ipv6.is_some() {
-            flags |= 0x01; // V6 flag
-        }
+        // TS 29.244 §8.2.3 Fig 8.2.3-1, octet 5: Bit1=V4 (0x01), Bit2=V6 (0x02),
+        // Bit3=CH (0x04), Bit4=CHID (0x08). NOTE: this bit order is SPECIFIC to
+        // F-TEID. It is the OPPOSITE of F-SEID (§8.2.37) and UE IP Address
+        // (§8.2.62), which both use Bit1=V6/Bit2=V4 — do not "harmonize" them.
         if ipv4.is_some() {
-            flags |= 0x02; // V4 flag
+            flags |= 0x01; // V4 flag (Bit1)
+        }
+        if ipv6.is_some() {
+            flags |= 0x02; // V6 flag (Bit2)
         }
         if choose_id.is_some() {
             flags |= 0x04; // CH flag (CHOOSE)
@@ -737,6 +741,17 @@ impl PfcpMessageBuilder {
     }
 
     /// Add UE IP Address IE
+    ///
+    /// TS 29.244 §8.2.62, octet 5: Bit1 = V6 (0x01), Bit2 = V4 (0x02),
+    /// Bit3 = S/D (0x04) with 0 = Source and 1 = Destination (the S/D flag
+    /// is only meaningful in a PDI). A UL PDR (PDI source-interface =
+    /// Access) carries the UE IP as the packet SOURCE, so its S/D bit MUST
+    /// be 0; a DL PDR carries it as the DESTINATION, so its S/D bit is 1.
+    //
+    // TODO(follow-up refactor, out of WSB-2 batch scope): converge the
+    // smfd/upfd inline PFCP builders onto the shared
+    // libs/nextgcore-pfcp UeIpAddress codec instead of hand-rolling the
+    // IE here.
     pub fn add_ue_ip_address(
         &mut self,
         ipv4: Option<[u8; 4]>,
@@ -753,9 +768,11 @@ impl PfcpMessageBuilder {
         if ipv4.is_some() {
             flags |= 0x02; // V4 flag
         }
-        if source {
-            flags |= 0x04; // S/D flag = 0 for source
-        }
+        // S/D flag = 0 for source (TS 29.244 §8.2.62): the bit stays CLEAR.
+        debug_assert!(
+            !(source && destination),
+            "UE IP Address S/D flag: source and destination are mutually exclusive"
+        );
         if destination {
             flags |= 0x04; // S/D flag = 1 for destination
         }
@@ -794,21 +811,21 @@ impl PfcpMessageBuilder {
         self.add_tlv(pfcp_ie::OUTER_HEADER_CREATION, &value)
     }
 
-    /// Add MBR (Maximum Bit Rate) IE
+    /// Add MBR (Maximum Bit Rate) IE. `uplink`/`downlink` are in bit/s; the
+    /// TS 29.244 §8.2.8 field is kbit/s (5 octets each), so convert (round up).
     pub fn add_mbr(&mut self, uplink: u64, downlink: u64) -> &mut Self {
         let mut value = BytesMut::new();
-        // MBR is encoded as 5 bytes each for UL and DL
-        value.put_slice(&uplink.to_be_bytes()[3..8]); // 5 bytes
-        value.put_slice(&downlink.to_be_bytes()[3..8]); // 5 bytes
+        value.put_slice(&uplink.div_ceil(1000).to_be_bytes()[3..8]); // 5 bytes, kbit/s
+        value.put_slice(&downlink.div_ceil(1000).to_be_bytes()[3..8]); // 5 bytes, kbit/s
         self.add_tlv(pfcp_ie::MBR, &value)
     }
 
-    /// Add GBR (Guaranteed Bit Rate) IE
+    /// Add GBR (Guaranteed Bit Rate) IE. `uplink`/`downlink` are in bit/s; the
+    /// TS 29.244 §8.2.9 field is kbit/s (5 octets each), so convert (round up).
     pub fn add_gbr(&mut self, uplink: u64, downlink: u64) -> &mut Self {
         let mut value = BytesMut::new();
-        // GBR is encoded as 5 bytes each for UL and DL
-        value.put_slice(&uplink.to_be_bytes()[3..8]); // 5 bytes
-        value.put_slice(&downlink.to_be_bytes()[3..8]); // 5 bytes
+        value.put_slice(&uplink.div_ceil(1000).to_be_bytes()[3..8]); // 5 bytes, kbit/s
+        value.put_slice(&downlink.div_ceil(1000).to_be_bytes()[3..8]); // 5 bytes, kbit/s
         self.add_tlv(pfcp_ie::GBR, &value)
     }
 
@@ -1768,7 +1785,34 @@ mod tests {
 
         // Type (2) + Length (2) + Flags (1) + SEID (8) + IPv4 (4) = 17
         assert_eq!(data.len(), 17);
-        assert_eq!(data[4], 0x02); // V4 flag
+        // F-SEID (§8.2.37) legitimately uses Bit1=V6/Bit2=V4, so an IPv4-only
+        // F-SEID has octet-5 == 0x02. This is the OPPOSITE of F-TEID (§8.2.3,
+        // see test_add_f_teid_octet5_flags_spec_conformant) — do NOT "fix" it.
+        assert_eq!(data[4], 0x02); // V4 flag (F-SEID Bit2)
+    }
+
+    /// TS 29.244 §8.2.3 Fig 8.2.3-1 octet-5 flag conformance for F-TEID:
+    /// Bit1 (0x01) = V4, Bit2 (0x02) = V6, Bit3 (0x04) = CH. Pins the wire
+    /// byte so the smfd↔upfd N4 path stays spec-correct AND mutually
+    /// consistent (matches nextgcore-upfd add_f_teid). Earlier code SWAPPED
+    /// these (V4=0x02/V6=0x01); this guards the regression.
+    #[test]
+    fn test_add_f_teid_octet5_flags_spec_conformant() {
+        // octet-5 lands at data[4]: TLV type(2) + length(2) precede the value.
+        // V4-only -> octet-5 == 0x01
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(0x0001_0001, Some([192, 168, 1, 1]), None, None);
+        assert_eq!(b.build()[4], 0x01, "V4-only F-TEID octet-5 must be 0x01");
+
+        // V6-only -> octet-5 == 0x02
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(0x0002_0002, None, Some([0u8; 16]), None);
+        assert_eq!(b.build()[4], 0x02, "V6-only F-TEID octet-5 must be 0x02");
+
+        // V4+V6 (dual-stack) -> octet-5 == 0x03
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(0x0003_0003, Some([10, 0, 0, 1]), Some([0u8; 16]), None);
+        assert_eq!(b.build()[4], 0x03, "dual-stack F-TEID octet-5 must be 0x03");
     }
 
     #[test]
@@ -1844,6 +1888,179 @@ mod tests {
 
         let data = build_create_pdr(&params);
         assert!(!data.is_empty());
+    }
+
+    /// TS 29.244 §8.2.62 octet-5 flag conformance for UE IP Address:
+    /// Bit1 (0x01) = V6, Bit2 (0x02) = V4, Bit3 (0x04) = S/D where
+    /// 0 = Source, 1 = Destination. Earlier code set the S/D bit in BOTH
+    /// branches (UL flags byte was 0x06 instead of 0x02); this guards the
+    /// regression (Wave-6 WSB-2).
+    #[test]
+    fn test_add_ue_ip_address_octet5_flags_spec_conformant() {
+        // octet-5 lands at data[4]: TLV type(2) + length(2) precede the value.
+        // IPv4 + Source -> V4 only, S/D CLEAR -> 0x02
+        let mut b = PfcpMessageBuilder::new();
+        b.add_ue_ip_address(Some([10, 45, 0, 2]), None, true, false);
+        assert_eq!(b.build()[4], 0x02, "IPv4 Source UE IP octet-5 must be 0x02");
+
+        // IPv4 + Destination -> V4 | S/D -> 0x06
+        let mut b = PfcpMessageBuilder::new();
+        b.add_ue_ip_address(Some([10, 45, 0, 2]), None, false, true);
+        assert_eq!(
+            b.build()[4],
+            0x06,
+            "IPv4 Destination UE IP octet-5 must be 0x06"
+        );
+
+        // IPv6 + Source -> V6 only -> 0x01
+        let mut b = PfcpMessageBuilder::new();
+        b.add_ue_ip_address(None, Some([0u8; 16]), true, false);
+        assert_eq!(b.build()[4], 0x01, "IPv6 Source UE IP octet-5 must be 0x01");
+
+        // IPv6 + Destination -> V6 | S/D -> 0x05
+        let mut b = PfcpMessageBuilder::new();
+        b.add_ue_ip_address(None, Some([0u8; 16]), false, true);
+        assert_eq!(
+            b.build()[4],
+            0x05,
+            "IPv6 Destination UE IP octet-5 must be 0x05"
+        );
+
+        // Dual-stack + Source -> V4 | V6 -> 0x03
+        let mut b = PfcpMessageBuilder::new();
+        b.add_ue_ip_address(Some([10, 45, 0, 2]), Some([0u8; 16]), true, false);
+        assert_eq!(
+            b.build()[4],
+            0x03,
+            "dual-stack Source UE IP octet-5 must be 0x03"
+        );
+    }
+
+    /// Golden byte-vector for the LIVE UL PDR shape (main.rs `ul_pdr`,
+    /// PDU-session establishment): pdr_id=1, precedence=100,
+    /// source-interface=Access(0), F-TEID teid=0 (UPF allocates),
+    /// UE IP = 10.45.0.2 as SOURCE, OHR=GTP-U/UDP/IPv4(0), FAR=1, QER=1,
+    /// QFI=9.
+    ///
+    /// Every byte below is HAND-DERIVED from TS 29.244 (NOT captured from
+    /// the encoder): §8.1.2 IE TLV = type(u16 BE) | length(u16 BE) | value;
+    /// IE types §8.1.2 Table 8.1.2-1 (PDR ID=56, Precedence=29, PDI=2,
+    /// Source Interface=20, F-TEID=21, UE IP Address=93, QFI=124, Outer
+    /// Header Removal=95, FAR ID=108, QER ID=109); UE IP Address octet 5
+    /// per §8.2.62 (Bit1=V6, Bit2=V4, Bit3=S/D 0=Source/1=Destination) so
+    /// the UL (Source) v4 flags byte is 0x02 — the pre-WSB-2 encoder
+    /// emitted 0x06 here, which this test MUST fail on.
+    #[test]
+    fn test_golden_ul_pdr_ue_ip_source_sd_bit_clear() {
+        let ul_pdr = PdrParams {
+            pdr_id: 1,
+            precedence: 100,
+            source_interface: 0,                                     // Access
+            f_teid: Some((0, None, None)),                           // teid=0: UPF allocates
+            ue_ip_address: Some((Some([10, 45, 0, 2]), None, true)), // source
+            outer_header_removal: Some(0),                           // GTP-U/UDP/IPv4
+            far_id: Some(1),
+            qer_id: Some(1),
+            qfi: Some(9),
+            ..Default::default()
+        };
+        let data = build_create_pdr(&ul_pdr);
+
+        #[rustfmt::skip]
+        let expected: [u8; 67] = [
+            // PDR ID (type 56, len 2): 1
+            0x00, 0x38, 0x00, 0x02, 0x00, 0x01,
+            // Precedence (type 29, len 4): 100
+            0x00, 0x1D, 0x00, 0x04, 0x00, 0x00, 0x00, 0x64,
+            // PDI (type 2, grouped, len 28)
+            0x00, 0x02, 0x00, 0x1C,
+            //   Source Interface (type 20, len 1): 0 = Access (§8.2.2)
+            0x00, 0x14, 0x00, 0x01, 0x00,
+            //   F-TEID (type 21, len 5): flags 0x00, TEID 0 (§8.2.3)
+            0x00, 0x15, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+            //   UE IP Address (type 93, len 5): flags 0x02 = V4, S/D=0
+            //   (SOURCE, §8.2.62) + 10.45.0.2
+            0x00, 0x5D, 0x00, 0x05, 0x02, 0x0A, 0x2D, 0x00, 0x02,
+            //   QFI (type 124, len 1): 9 (§8.2.89)
+            0x00, 0x7C, 0x00, 0x01, 0x09,
+            // Outer Header Removal (type 95, len 1): 0 = GTP-U/UDP/IPv4 (§8.2.64)
+            0x00, 0x5F, 0x00, 0x01, 0x00,
+            // FAR ID (type 108, len 4): 1
+            0x00, 0x6C, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
+            // QER ID (type 109, len 4): 1
+            0x00, 0x6D, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
+        ];
+        assert_eq!(
+            data, expected,
+            "UL Create PDR bytes must match the hand-derived golden vector"
+        );
+
+        // Explicit anchor on the full UE IP Address IE TLV and its flags byte:
+        assert_eq!(
+            &data[32..41],
+            &[0x00, 0x5D, 0x00, 0x05, 0x02, 0x0A, 0x2D, 0x00, 0x02],
+            "UL UE IP Address IE TLV must advertise S/D=0 (Source)"
+        );
+        assert_eq!(
+            data[36], 0x02,
+            "UL UE IP Address value[0] must be 0x02 (V4, S/D=0)"
+        );
+    }
+
+    /// Golden byte-vector for the LIVE DL PDR shape (main.rs `dl_pdr`):
+    /// pdr_id=2, precedence=100, source-interface=Core(1), UE IP =
+    /// 10.45.0.2 as DESTINATION, FAR=2, QER=1, QFI=9. Hand-derived exactly
+    /// as in the UL test; the DL (Destination) v4 flags byte is 0x06
+    /// (V4 | S/D=1) per TS 29.244 §8.2.62.
+    #[test]
+    fn test_golden_dl_pdr_ue_ip_destination_sd_bit_set() {
+        let dl_pdr = PdrParams {
+            pdr_id: 2,
+            precedence: 100,
+            source_interface: 1,                                      // Core
+            ue_ip_address: Some((Some([10, 45, 0, 2]), None, false)), // destination
+            far_id: Some(2),
+            qer_id: Some(1),
+            qfi: Some(9),
+            ..Default::default()
+        };
+        let data = build_create_pdr(&dl_pdr);
+
+        #[rustfmt::skip]
+        let expected: [u8; 53] = [
+            // PDR ID (type 56, len 2): 2
+            0x00, 0x38, 0x00, 0x02, 0x00, 0x02,
+            // Precedence (type 29, len 4): 100
+            0x00, 0x1D, 0x00, 0x04, 0x00, 0x00, 0x00, 0x64,
+            // PDI (type 2, grouped, len 19)
+            0x00, 0x02, 0x00, 0x13,
+            //   Source Interface (type 20, len 1): 1 = Core (§8.2.2)
+            0x00, 0x14, 0x00, 0x01, 0x01,
+            //   UE IP Address (type 93, len 5): flags 0x06 = V4 | S/D=1
+            //   (DESTINATION, §8.2.62) + 10.45.0.2
+            0x00, 0x5D, 0x00, 0x05, 0x06, 0x0A, 0x2D, 0x00, 0x02,
+            //   QFI (type 124, len 1): 9 (§8.2.89)
+            0x00, 0x7C, 0x00, 0x01, 0x09,
+            // FAR ID (type 108, len 4): 2
+            0x00, 0x6C, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02,
+            // QER ID (type 109, len 4): 1
+            0x00, 0x6D, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
+        ];
+        assert_eq!(
+            data, expected,
+            "DL Create PDR bytes must match the hand-derived golden vector"
+        );
+
+        // Explicit anchor on the full UE IP Address IE TLV and its flags byte:
+        assert_eq!(
+            &data[23..32],
+            &[0x00, 0x5D, 0x00, 0x05, 0x06, 0x0A, 0x2D, 0x00, 0x02],
+            "DL UE IP Address IE TLV must advertise S/D=1 (Destination)"
+        );
+        assert_eq!(
+            data[27], 0x06,
+            "DL UE IP Address value[0] must be 0x06 (V4, S/D=1)"
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 //! NSSF Timer Management
 //!
 //! Timer management for NSSF operations using the shared AsyncTimerMgr
-//! from ogs-core.
+//! from nextgcore-core.
 
 use crate::event::NssfTimerId;
-use ogs_core::async_timer::{AsyncTimerMgr, TimerMode};
+use nextgcore_core::async_timer::{AsyncTimerMgr, TimerMode};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,7 +54,9 @@ impl NssfTimerManager {
     }
 
     /// Process expired timers and return them for dispatch to the state machine
-    pub fn process_expired(&self) -> Vec<ogs_core::async_timer::AsyncTimerEntry<NssfTimerId>> {
+    pub fn process_expired(
+        &self,
+    ) -> Vec<nextgcore_core::async_timer::AsyncTimerEntry<NssfTimerId>> {
         self.inner.process_expired()
     }
 

@@ -3,10 +3,10 @@
 //! Port of src/upf/pfcp-sm.c - PFCP state machine for UPF
 
 use crate::event::{UpfEvent, UpfEventId, UpfTimerId};
-use ogs_core::fsm::StateMachine;
+use nextgcore_core::fsm::StateMachine;
 
 // ============================================================================
-// PFCP Message Types (from ogs-pfcp)
+// PFCP Message Types (from nextgcore-pfcp)
 // ============================================================================
 
 /// PFCP message types
@@ -41,9 +41,10 @@ pub mod pfcp_msg_type {
 // ============================================================================
 
 /// PFCP FSM state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PfcpState {
     /// Initial state
+    #[default]
     Initial,
     /// Will associate state (attempting association)
     WillAssociate,
@@ -53,12 +54,6 @@ pub enum PfcpState {
     Final,
     /// Exception state
     Exception,
-}
-
-impl Default for PfcpState {
-    fn default() -> Self {
-        Self::Initial
-    }
 }
 
 // ============================================================================

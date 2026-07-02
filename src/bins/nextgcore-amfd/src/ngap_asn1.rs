@@ -1,20 +1,20 @@
 //! NGAP ASN.1 Encoding for AMF
 //!
 //! This module provides ASN.1 APER encoding for NGAP messages
-//! using the ogs-ngap crate. This ensures wire compatibility with
+//! using the nextgcore-ngap crate. This ensures wire compatibility with
 //! the gNB (nextgsim-gnb) which also uses proper ASN.1 encoding.
 
-use ogs_asn1c::ngap::cause::{
+use nextgcore_asn1c::ngap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
 };
-use ogs_ngap::transfer::{
+use nextgcore_ngap::transfer::{
     AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
     PduSessionResourceReleaseCommandTransfer, PduSessionResourceSetupRequestTransfer,
     PduSessionResourceSetupResponseTransfer, PduSessionType, PreEmptionCapability,
     PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters,
     QosFlowSetupRequestItem, TransportLayerAddress, UpTransportLayerInformation,
 };
-use ogs_ngap::{builder, parser, types::*, NgapMessage};
+use nextgcore_ngap::{builder, parser, types::*, NgapMessage};
 
 use crate::context::AmfContext;
 
@@ -73,6 +73,21 @@ pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
             }
         })
         .collect();
+
+    // amfd-09 (TS 38.413 §9.2.6.2): a strict-peer gNB needs a non-empty
+    // PLMNSupportList with slice support for load-balancing / slice selection.
+    // An empty list is an AMF misconfiguration; surface it loudly at build time
+    // rather than letting the gNB reject the response on the wire.
+    if ctx.num_of_plmn_support == 0 {
+        log::error!(
+            "NG Setup Response built with an EMPTY PLMNSupportList \
+             (num_of_plmn_support=0); check AMF slice configuration"
+        );
+        debug_assert!(
+            ctx.num_of_plmn_support > 0,
+            "NGSetupResponse PLMNSupportList must not be empty (TS 38.413 §9.2.6.2)"
+        );
+    }
 
     let msg = NgSetupResponse {
         amf_name,
@@ -148,12 +163,9 @@ fn build_cause(group: u8, value: i64) -> Cause {
 }
 
 fn radio_network_cause(v: u8) -> CauseRadioNetwork {
-    // SAFETY: CauseRadioNetwork is #[repr(u8)] with values 0..=46
-    if v <= 46 {
-        unsafe { std::mem::transmute(v) }
-    } else {
-        CauseRadioNetwork::Unspecified
-    }
+    // Safe conversion via the library's TryFrom; unknown values map to the
+    // 3GPP "unspecified" fallback rather than invoking undefined behaviour.
+    CauseRadioNetwork::try_from(v as i64).unwrap_or(CauseRadioNetwork::Unspecified)
 }
 
 fn transport_cause(v: u8) -> CauseTransport {
@@ -173,21 +185,15 @@ fn nas_cause(v: u8) -> CauseNas {
 }
 
 fn protocol_cause(v: u8) -> CauseProtocol {
-    // SAFETY: CauseProtocol is #[repr(u8)] with values 0..=6
-    if v <= 6 {
-        unsafe { std::mem::transmute(v) }
-    } else {
-        CauseProtocol::Unspecified
-    }
+    // Safe conversion via the library's TryFrom; unknown values map to the
+    // 3GPP "unspecified" fallback rather than invoking undefined behaviour.
+    CauseProtocol::try_from(v as i64).unwrap_or(CauseProtocol::Unspecified)
 }
 
 fn misc_cause(v: u8) -> CauseMisc {
-    // SAFETY: CauseMisc is #[repr(u8)] with values 0..=5
-    if v <= 5 {
-        unsafe { std::mem::transmute(v) }
-    } else {
-        CauseMisc::Unspecified
-    }
+    // Safe conversion via the library's TryFrom; unknown values map to the
+    // 3GPP "unspecified" fallback rather than invoking undefined behaviour.
+    CauseMisc::try_from(v as i64).unwrap_or(CauseMisc::Unspecified)
 }
 
 /// Encode PLMN ID to 3-byte format per 3GPP TS 24.501
@@ -471,6 +477,147 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     }
 }
 
+/// Convert an AMF-context S-NSSAI (SD packed as a u32) to the nextgcore-ngap wire
+/// S-NSSAI (SD as a 3-byte big-endian array).
+fn amf_snssai_to_ngap(s: &crate::context::SNssai) -> SNssai {
+    SNssai {
+        sst: s.sst,
+        sd: s.sd.map(|sd_val| {
+            [
+                ((sd_val >> 16) & 0xFF) as u8,
+                ((sd_val >> 8) & 0xFF) as u8,
+                (sd_val & 0xFF) as u8,
+            ]
+        }),
+    }
+}
+
+/// Map the 8-bit replayed NAS UE security capability octet (TS 24.501
+/// §9.11.3.54, bit 8 / 0x80 = the null algorithm xEA0/xIA0) onto the 16-bit
+/// NGAP BIT STRING field (TS 38.413 §9.3.1.86). In NGAP the null algorithm is
+/// NOT representable ("all bits equal to 0 – UE supports no other algorithm
+/// than NEA0") and the first/most-significant bit is 128-xEA1. So we drop the
+/// NAS MSB (xEA0) and left-align: NAS bit 7 (0x40, 128-xEA1) lands on the NGAP
+/// MSB (0x8000). A left shift of 9 does exactly this — the xEA0 bit shifts out
+/// of the u16 and each remaining algorithm bit moves to its NGAP position.
+fn nas_caps_octet_to_ngap_bits(octet: u8) -> u16 {
+    (octet as u16) << 9
+}
+
+/// Build an Initial Context Setup Request with proper ASN.1 APER encoding
+/// (TS 38.413 §8.3.1 / §9.2.2.1).
+///
+/// The GUAMI is taken from the AMF's first served GUAMI. The replayed UE
+/// security capabilities and KgNB (the UE Security Key) come from the live
+/// AMF UE security context — nothing is hardcoded. The protected initial
+/// Registration Accept rides inside the request as the NAS-PDU
+/// (TS 23.502 §4.2.2.2.2 step 16).
+///
+/// amfd-08 (FLAGGED / blocked on nextgcore-ngap): the OPTIONAL Mobility Restriction
+/// List and Masked IMEISV IEs are not emitted. Both are optional in
+/// TS 38.413 §9.2.2.1, so omitting them is conformant for the non-roaming /
+/// no-forbidden-area case (the matched-sim path). Emitting them requires the
+/// shared `nextgcore_ngap::types::InitialContextSetupRequest` struct + builder to
+/// expose those fields first (an additive shared-lib change, out of this
+/// amfd-only change's scope). Tracked for a follow-up that lands the nextgcore-ngap
+/// fields, then populates MobilityRestrictionList from the UE's roaming/
+/// forbidden-area policy and Masked IMEISV from the 5GMM context.
+#[allow(clippy::too_many_arguments)]
+pub fn build_initial_context_setup_request_asn1(
+    ctx: &AmfContext,
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    allowed_nssai: &[crate::context::SNssai],
+    ue_security_capability: &crate::context::UeSecurityCapability,
+    security_key: &[u8; 32],
+    nas_pdu: Option<&[u8]>,
+    ue_ambr: Option<(u64, u64)>,
+) -> Option<Vec<u8>> {
+    // GUAMI (mandatory): the AMF's first served GUAMI.
+    let served = ctx.served_guami.first()?;
+    let guami = Guami {
+        plmn_identity: encode_plmn_id(&served.plmn_id),
+        amf_region_id: served.amf_id.region,
+        amf_set_id: served.amf_id.set,
+        amf_pointer: served.amf_id.pointer,
+    };
+
+    let allowed: Vec<SNssai> = allowed_nssai.iter().map(amf_snssai_to_ngap).collect();
+
+    // Replayed UE security capabilities (TS 38.413 §9.3.1.86). 5G fields carry
+    // the verbatim NAS algorithm octets; E-UTRA fields carry the EEA/EIA octets.
+    let ue_security_capabilities = UeSecurityCapabilities {
+        nr_encryption_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.ea),
+        nr_integrity_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.ia),
+        eutra_encryption_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.eea),
+        eutra_integrity_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.eia),
+    };
+
+    let msg = InitialContextSetupRequest {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        guami,
+        allowed_nssai: allowed,
+        ue_security_capabilities,
+        security_key: *security_key,
+        nas_pdu: nas_pdu.map(|p| p.to_vec()),
+        ue_ambr: ue_ambr.map(|(dl, ul)| UeAmbrInfo { dl, ul }),
+    };
+
+    match builder::build_initial_context_setup_request(&msg) {
+        Ok(bytes) => {
+            log::debug!(
+                "Built Initial Context Setup Request: {} bytes, amf_ue_ngap_id={amf_ue_ngap_id}, \
+                 ran_ue_ngap_id={ran_ue_ngap_id}, allowed_nssai={}, nas_pdu={}",
+                bytes.len(),
+                allowed_nssai.len(),
+                nas_pdu.map(|p| p.len()).unwrap_or(0)
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode Initial Context Setup Request: {e:?}");
+            None
+        }
+    }
+}
+
+/// Decode an Initial Context Setup Response (gNB -> AMF, TS 38.413 §9.2.2.2).
+/// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
+pub fn parse_initial_context_setup_response_asn1(data: &[u8]) -> Option<(u64, u32)> {
+    match parser::decode_ngap_pdu(data) {
+        Ok(NgapMessage::InitialContextSetupResponse(resp)) => {
+            Some((resp.amf_ue_ngap_id, resp.ran_ue_ngap_id))
+        }
+        Ok(other) => {
+            log::warn!("Expected InitialContextSetupResponse, got {other:?}");
+            None
+        }
+        Err(e) => {
+            log::warn!("Failed to decode Initial Context Setup Response: {e:?}");
+            None
+        }
+    }
+}
+
+/// Decode an Initial Context Setup Failure (gNB -> AMF, TS 38.413 §9.2.2.3).
+/// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
+pub fn parse_initial_context_setup_failure_asn1(data: &[u8]) -> Option<(u64, u32)> {
+    match parser::decode_ngap_pdu(data) {
+        Ok(NgapMessage::InitialContextSetupFailure(fail)) => {
+            Some((fail.amf_ue_ngap_id, fail.ran_ue_ngap_id))
+        }
+        Ok(other) => {
+            log::warn!("Expected InitialContextSetupFailure, got {other:?}");
+            None
+        }
+        Err(e) => {
+            log::warn!("Failed to decode Initial Context Setup Failure: {e:?}");
+            None
+        }
+    }
+}
+
 /// Build a PDU Session Resource Release Command with proper ASN.1 APER encoding
 ///
 /// Sent by AMF to gNB to release PDU session resources.
@@ -480,7 +627,7 @@ pub fn build_pdu_session_resource_release_command_asn1(
     pdu_session_ids: &[u8],
 ) -> Option<Vec<u8>> {
     // Per-session PDUSessionResourceReleaseCommandTransfer with mandatory Cause
-    // (TS 38.413 Section 9.3.4.11), APER-encoded via ogs-ngap::transfer
+    // (TS 38.413 Section 9.3.4.11), APER-encoded via nextgcore-ngap::transfer
     let release_transfer = PduSessionResourceReleaseCommandTransfer {
         cause: Cause::Nas(CauseNas::NormalRelease),
     };
@@ -742,6 +889,32 @@ pub fn build_ng_reset_acknowledge_asn1(
     }
 }
 
+/// Build an AMF-initiated OverloadStart (TS 38.413 Section 9.2.6.10) carrying a
+/// percentage traffic-load reduction request (1..99).
+pub fn build_overload_start_asn1(reduce_percent: u8) -> Option<Vec<u8>> {
+    let msg = OverloadStart {
+        traffic_load_reduction: Some(reduce_percent.clamp(1, 99)),
+    };
+    match builder::build_overload_start(&msg) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode OverloadStart: {e:?}");
+            None
+        }
+    }
+}
+
+/// Build an AMF-initiated OverloadStop (TS 38.413 Section 9.2.6.11).
+pub fn build_overload_stop_asn1() -> Option<Vec<u8>> {
+    match builder::build_overload_stop(&OverloadStop {}) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode OverloadStop: {e:?}");
+            None
+        }
+    }
+}
+
 /// Build an APER-encoded PDUSessionResourceSetupRequestTransfer
 /// (TS 38.413 Section 9.3.4.1) carrying the UPF N3 tunnel endpoint.
 ///
@@ -876,6 +1049,44 @@ mod tests {
             }
             _ => panic!("Expected NgSetupResponse"),
         }
+    }
+
+    /// amfd-09 — NG Setup Response field-completeness regression guard
+    /// (TS 38.413 §9.2.6.2). Every NGSetupResponse must carry amfName, a
+    /// non-empty servedGUAMIList, a non-empty PLMNSupportList with slice
+    /// support, and a relativeAMFCapacity in range, so a strict-peer gNB can
+    /// load-balance and select slices.
+    #[test]
+    fn amfd09_ng_setup_response_field_completeness() {
+        let ctx = create_test_context();
+        let bytes = build_ng_setup_response_asn1(&ctx).expect("build NG Setup Response");
+
+        let decoded = parser::decode_ngap_pdu(&bytes).expect("decode");
+        let NgapMessage::NgSetupResponse(resp) = decoded else {
+            panic!("expected NgSetupResponse");
+        };
+
+        // amfName present and as configured.
+        assert_eq!(resp.amf_name, "AMF-Test", "amfName missing/incorrect");
+        // servedGUAMIList non-empty.
+        assert!(
+            !resp.served_guami_list.is_empty(),
+            "servedGUAMIList must be present and non-empty"
+        );
+        // relativeAMFCapacity in range 0..=255 (u8) — assert the configured value.
+        assert_eq!(resp.relative_amf_capacity, 255, "relativeAMFCapacity");
+        // PLMNSupportList non-empty, with at least one slice in slice support.
+        assert!(
+            !resp.plmn_support_list.is_empty(),
+            "PLMNSupportList must be present and non-empty"
+        );
+        assert!(
+            resp.plmn_support_list
+                .iter()
+                .all(|p| !p.slice_support_list.is_empty()),
+            "every PLMNSupportItem must carry at least one S-NSSAI"
+        );
+        assert_eq!(resp.plmn_support_list[0].slice_support_list[0].sst, 1);
     }
 
     #[test]
@@ -1022,7 +1233,7 @@ mod tests {
 
     #[test]
     fn test_parse_n2_sm_setup_response_transfer() {
-        use ogs_ngap::transfer::{AssociatedQosFlowItem, QosFlowPerTnlInformation};
+        use nextgcore_ngap::transfer::{AssociatedQosFlowItem, QosFlowPerTnlInformation};
 
         let response = PduSessionResourceSetupResponseTransfer {
             dl_qos_flow_per_tnl_information: QosFlowPerTnlInformation {
@@ -1052,13 +1263,13 @@ mod tests {
 
     #[test]
     fn test_release_command_carries_release_transfer() {
-        use ogs_asn1c::ngap::pdu::{InitiatingMessageValue, NgapPdu};
-        use ogs_asn1c::per::{AperDecode, AperDecoder};
+        use nextgcore_asn1c::ngap::pdu::{InitiatingMessageValue, NgapPdu};
+        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
 
         let bytes = build_pdu_session_resource_release_command_asn1(42, 1001, &[5]).expect("build");
 
-        // ogs-asn1c maps InitiatingMessage procedure code 28 to the generic
-        // `Other` container and the ogs-ngap dispatch does not cover it (lib
+        // nextgcore-asn1c maps InitiatingMessage procedure code 28 to the generic
+        // `Other` container and the nextgcore-ngap dispatch does not cover it (lib
         // gap, reported); re-tag the value so the typed release-command parse
         // path is exercised via decode_ngap_pdu_raw.
         let mut decoder = AperDecoder::new(&bytes);
@@ -1084,5 +1295,211 @@ mod tests {
             }
             other => panic!("Expected PduSessionResourceReleaseCommand, got {other:?}"),
         }
+    }
+
+    // ========================================================================
+    // T0.1: Initial Context Setup Request (TS 38.413 §8.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_build_initial_context_setup_request_mandatory_ies_and_kgnb() {
+        let ctx = create_test_context();
+
+        // A non-zero KgNB (would be the KDF output in production).
+        let kgnb = [0xABu8; 32];
+        // Replayed UE security capabilities (EA0-3 / IA0-3 on the wire octet).
+        let sec_cap = crate::context::UeSecurityCapability {
+            ea: 0xF0,
+            ia: 0xF0,
+            eea: 0x00,
+            eia: 0x00,
+        };
+        let allowed = vec![crate::context::SNssai {
+            sst: 1,
+            sd: Some(0x010203),
+        }];
+        // Piggybacked (already-protected) Registration Accept stand-in.
+        let nas_pdu = vec![0x7E, 0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0x42];
+
+        let bytes = build_initial_context_setup_request_asn1(
+            &ctx,
+            0x0000_0001,
+            0x0000_0002,
+            &allowed,
+            &sec_cap,
+            &kgnb,
+            Some(&nas_pdu),
+            Some((1_000_000_000, 500_000_000)),
+        )
+        .expect("build ICS request");
+        assert!(!bytes.is_empty());
+
+        // Strict peer: the gNB-side parser must accept it and recover every IE.
+        let decoded = parser::decode_ngap_pdu(&bytes).expect("decode ICS request");
+        let req = match decoded {
+            NgapMessage::InitialContextSetupRequest(r) => r,
+            other => panic!("Expected InitialContextSetupRequest, got {other:?}"),
+        };
+
+        // Mandatory IEs
+        assert_eq!(req.amf_ue_ngap_id, 1);
+        assert_eq!(req.ran_ue_ngap_id, 2);
+        // GUAMI from the AMF's served GUAMI (region 2, set 1, pointer 0)
+        assert_eq!(req.guami.amf_region_id, 2);
+        assert_eq!(req.guami.amf_set_id, 1);
+        assert_eq!(req.guami.amf_pointer, 0);
+        assert_eq!(
+            req.guami.plmn_identity,
+            encode_plmn_id(&PlmnId::new("999", "70"))
+        );
+        // Allowed NSSAI round-trips with the SD packed as 3 bytes
+        assert_eq!(req.allowed_nssai.len(), 1);
+        assert_eq!(req.allowed_nssai[0].sst, 1);
+        assert_eq!(req.allowed_nssai[0].sd, Some([0x01, 0x02, 0x03]));
+        // Replayed UE security capabilities: NGAP §9.3.1.86 drops the null
+        // algorithm (NAS 0xF0 = EA0|EA1|EA2|EA3 -> NEA1|NEA2|NEA3 = 0xE000).
+        assert_eq!(
+            req.ue_security_capabilities.nr_encryption_algorithms,
+            0xE000
+        );
+        assert_eq!(req.ue_security_capabilities.nr_integrity_algorithms, 0xE000);
+        // UE Security Key = KgNB, non-zero and exactly the derived value
+        assert_eq!(req.security_key, kgnb);
+        assert_ne!(req.security_key, [0u8; 32]);
+        // Piggybacked Registration Accept survives the round-trip
+        assert_eq!(req.nas_pdu.as_deref(), Some(nas_pdu.as_slice()));
+        // UE-AMBR survives the round-trip
+        let ambr = req.ue_ambr.expect("UE-AMBR present");
+        assert_eq!(ambr.dl, 1_000_000_000);
+        assert_eq!(ambr.ul, 500_000_000);
+    }
+
+    #[test]
+    fn test_build_initial_context_setup_request_requires_served_guami() {
+        // No served GUAMI -> cannot build a valid ICS request (mandatory IE).
+        let mut ctx = AmfContext::new();
+        ctx.num_of_served_guami = 0;
+        let sec_cap = crate::context::UeSecurityCapability::default();
+        let result = build_initial_context_setup_request_asn1(
+            &ctx,
+            1,
+            2,
+            &[],
+            &sec_cap,
+            &[0u8; 32],
+            None,
+            None,
+        );
+        assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // T1.7: Cause conversion safety (no unsafe transmute on wire-decoded data)
+    // ========================================================================
+
+    #[test]
+    fn test_cause_value_conversions_in_range() {
+        // Every group maps a known wire value to the expected typed cause.
+        // group 0 = RadioNetwork, value 20 = user-inactivity
+        assert_eq!(
+            build_cause(0, 20),
+            Cause::RadioNetwork(CauseRadioNetwork::UserInactivity)
+        );
+        // RadioNetwork extension boundary (value 46)
+        assert_eq!(
+            build_cause(0, 46),
+            Cause::RadioNetwork(CauseRadioNetwork::ReleaseDueToPreEmption)
+        );
+        // group 1 = Transport
+        assert_eq!(
+            build_cause(1, 0),
+            Cause::Transport(CauseTransport::TransportResourceUnavailable)
+        );
+        // group 2 = NAS
+        assert_eq!(
+            build_cause(2, 1),
+            Cause::Nas(CauseNas::AuthenticationFailure)
+        );
+        // group 3 = Protocol, value 4 = semantic-error
+        assert_eq!(
+            build_cause(3, 4),
+            Cause::Protocol(CauseProtocol::SemanticError)
+        );
+        // group 4 = Misc, value 4 = unknown-PLMN-or-SNPN
+        assert_eq!(build_cause(4, 4), Cause::Misc(CauseMisc::UnknownPlmnOrSnpn));
+    }
+
+    #[test]
+    fn test_out_of_range_cause_values_fall_back_safely() {
+        // Out-of-range values (would have been UB under the old transmute) must
+        // map to the per-group "unspecified" fallback, not undefined behaviour.
+
+        // RadioNetwork: valid 0..=46; 47 and the max u8 fall back.
+        assert_eq!(radio_network_cause(47), CauseRadioNetwork::Unspecified);
+        assert_eq!(radio_network_cause(u8::MAX), CauseRadioNetwork::Unspecified);
+        assert_eq!(
+            build_cause(0, 200),
+            Cause::RadioNetwork(CauseRadioNetwork::Unspecified)
+        );
+
+        // Protocol: valid 0..=6; 7 and beyond fall back.
+        assert_eq!(protocol_cause(7), CauseProtocol::Unspecified);
+        assert_eq!(protocol_cause(u8::MAX), CauseProtocol::Unspecified);
+        assert_eq!(
+            build_cause(3, 7),
+            Cause::Protocol(CauseProtocol::Unspecified)
+        );
+
+        // Misc: valid 0..=5; 6 and beyond fall back.
+        assert_eq!(misc_cause(6), CauseMisc::Unspecified);
+        assert_eq!(misc_cause(u8::MAX), CauseMisc::Unspecified);
+        assert_eq!(build_cause(4, 99), Cause::Misc(CauseMisc::Unspecified));
+
+        // Unknown cause group falls back to Misc/Unspecified.
+        assert_eq!(build_cause(9, 0), Cause::Misc(CauseMisc::Unspecified));
+    }
+
+    #[test]
+    fn test_out_of_range_cause_value_encodes_and_decodes_safely() {
+        // End-to-end: an out-of-range RadioNetwork value must not UB; it
+        // degrades to Unspecified and still round-trips through the encoder.
+        let bytes = build_ng_setup_failure_asn1(0, 250, Some(0));
+        match parser::decode_ngap_pdu(&bytes).expect("decode") {
+            NgapMessage::NgSetupFailure(f) => {
+                assert_eq!(f.cause, Cause::RadioNetwork(CauseRadioNetwork::Unspecified));
+            }
+            other => panic!("Expected NgSetupFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_initial_context_setup_response_failure_roundtrip() {
+        // Build a Response/Failure with the nextgcore-ngap builder, then ensure the
+        // AMF-side parse helpers recover the UE NGAP IDs (used to gate the
+        // registration on the ICS Response).
+        let resp = builder::build_initial_context_setup_response(
+            &nextgcore_ngap::types::InitialContextSetupResponse {
+                amf_ue_ngap_id: 7,
+                ran_ue_ngap_id: 9,
+            },
+        )
+        .expect("build ICS response");
+        assert_eq!(
+            parse_initial_context_setup_response_asn1(&resp),
+            Some((7, 9))
+        );
+
+        let fail = builder::build_initial_context_setup_failure(
+            &nextgcore_ngap::types::InitialContextSetupFailure {
+                amf_ue_ngap_id: 11,
+                ran_ue_ngap_id: 13,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            },
+        )
+        .expect("build ICS failure");
+        assert_eq!(
+            parse_initial_context_setup_failure_asn1(&fail),
+            Some((11, 13))
+        );
     }
 }

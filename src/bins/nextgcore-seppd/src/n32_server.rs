@@ -14,13 +14,13 @@
 //! mTLS: the listener supports TLS with client-certificate verification
 //! (`verify_client_cacert`) and the client presents a certificate when
 //! `client_cert`/`client_key` are configured — both via the existing
-//! rustls plumbing in ogs-sbi.
+//! rustls plumbing in nextgcore-sbi.
 
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use ogs_sbi::message::{SbiRequest as HttpRequest, SbiResponse as HttpResponse};
-use ogs_sbi::server::{send_error, SbiServer, SbiServerConfig};
+use nextgcore_sbi::message::{SbiRequest as HttpRequest, SbiResponse as HttpResponse};
+use nextgcore_sbi::server::{send_error, SbiServer, SbiServerConfig};
 
 use crate::context::{sepp_self, PlmnId, SecurityCapability, SeppNode};
 use crate::n32c_build::{
@@ -55,6 +55,23 @@ pub struct N32TlsConfig {
     pub client_key: Option<String>,
     /// CA bundle for verifying the peer server certificate
     pub ca_cert: Option<String>,
+    /// Explicitly disable mTLS client verification on the N32-c listener.
+    /// mTLS is REQUIRED by default whenever TLS is configured (TS 33.501:
+    /// N32-c is a mutually-authenticated TLS connection); this escape hatch
+    /// is for constrained lab setups only.
+    pub allow_insecure_no_mtls: bool,
+}
+
+impl N32TlsConfig {
+    /// The effective CA bundle used to verify peer-SEPP client certificates.
+    /// Defaults to the explicit `verify_client_cacert`, falling back to the
+    /// peer server CA bundle (`ca_cert`), so mTLS is on by default whenever
+    /// any CA material is configured.
+    pub fn effective_client_cacert(&self) -> Option<&str> {
+        self.verify_client_cacert
+            .as_deref()
+            .or(self.ca_cert.as_deref())
+    }
 }
 
 /// Start the N32 listener. Returns the server handle (caller stops it).
@@ -66,13 +83,38 @@ pub async fn start_n32_listener(
     let mut config = SbiServerConfig::with_host_port(host, port).map_err(|e| e.to_string())?;
     config = config.with_interface("n32");
 
+    let mut mtls_on = false;
     if let Some(tls_cfg) = tls {
         if let (Some(key), Some(cert)) = (&tls_cfg.key, &tls_cfg.cert) {
             config = config.with_tls(key.clone(), cert.clone());
-            if let Some(ca) = &tls_cfg.verify_client_cacert {
-                // mTLS on N32-c/N32-f: require and verify peer-SEPP client certs
-                config.verify_client = true;
-                config.verify_client_cacert = Some(ca.clone());
+            // N32-c MUST be mutually-authenticated TLS (TS 33.501). mTLS is
+            // ON by default whenever TLS is configured; it is only skipped
+            // when explicitly opted out, and even then we warn loudly.
+            match tls_cfg.effective_client_cacert() {
+                Some(ca) if !tls_cfg.allow_insecure_no_mtls => {
+                    config.verify_client = true;
+                    config.verify_client_cacert = Some(ca.to_string());
+                    mtls_on = true;
+                }
+                Some(_) => {
+                    log::warn!(
+                        "N32-c mTLS explicitly DISABLED (allow_insecure_no_mtls) on \
+                         {host}:{port}; peer SEPPs will NOT be client-authenticated"
+                    );
+                }
+                None if !tls_cfg.allow_insecure_no_mtls => {
+                    return Err(format!(
+                        "N32-c on {host}:{port} requires mTLS but no client CA bundle \
+                         (n32_mtls_cacert / n32_ca_cert) is configured; provide one or set \
+                         allow_insecure_no_mtls for lab use"
+                    ));
+                }
+                None => {
+                    log::warn!(
+                        "N32-c mTLS DISABLED with no client CA on {host}:{port} \
+                         (allow_insecure_no_mtls)"
+                    );
+                }
             }
         }
     }
@@ -82,10 +124,7 @@ pub async fn start_n32_listener(
         .start(n32_request_handler)
         .await
         .map_err(|e| format!("N32 listener start failed: {e}"))?;
-    log::info!(
-        "N32 listener on {host}:{port} (mTLS={})",
-        tls.is_some_and(|t| t.verify_client_cacert.is_some())
-    );
+    log::info!("N32 listener on {host}:{port} (mTLS={mtls_on})");
     Ok(server)
 }
 
@@ -94,12 +133,24 @@ async fn n32_request_handler(request: HttpRequest) -> HttpResponse {
     let method = request.header.method.clone();
     let path = request.header.uri.clone();
     let body = request.http.content.clone().unwrap_or_default();
+    // T1.5b: real RFC 5705 exporter secret threaded in by the server glue.
+    let tls_secret = request.tls_exporter_secret.clone();
+    // T6.4: correlation id from inbound request.
+    let cid = request.correlation_id.clone();
 
-    log::debug!("N32 request: {method} {path} ({}B)", body.len());
+    if !cid.is_empty() {
+        log::debug!("N32 request: cid={cid} {method} {path} ({}B)", body.len());
+    } else {
+        log::debug!("N32 request: {method} {path} ({}B)", body.len());
+    }
 
     match (method.as_str(), path.as_str()) {
-        ("POST", "/n32c-handshake/v1/exchange-capability") => handle_exchange_capability(&body),
-        ("POST", "/n32c-handshake/v1/exchange-params") => handle_exchange_params(&body),
+        ("POST", "/n32c-handshake/v1/exchange-capability") => {
+            handle_exchange_capability(&body, &cid)
+        }
+        ("POST", "/n32c-handshake/v1/exchange-params") => {
+            handle_exchange_params(&body, tls_secret.as_deref(), &cid)
+        }
         ("POST", "/n32c-handshake/v1/n32f-error") => handle_n32f_error_report(&body),
         ("POST", "/n32f-forward/v1/n32f-process") => handle_n32f_process(&body).await,
         _ => send_error(
@@ -170,16 +221,17 @@ fn update_node(node: &SeppNode) {
     };
 }
 
-fn handle_exchange_capability(body: &str) -> HttpResponse {
+fn handle_exchange_capability(body: &str, cid: &str) -> HttpResponse {
     let json: SecurityCapabilityRequestJson = match serde_json::from_str(body) {
         Ok(j) => j,
         Err(e) => {
+            log::warn!("cid={cid} reason=MALFORMED_EXCHANGE_CAPABILITY: {e}");
             return send_error(
                 400,
                 "Bad Request",
                 &format!("Malformed SecNegotiateReqData: {e}"),
                 Some("MANDATORY_IE_INCORRECT"),
-            )
+            );
         }
     };
     let req_data = req_data_from_json(&json);
@@ -204,6 +256,13 @@ fn handle_exchange_capability(body: &str) -> HttpResponse {
                 _ => crate::handshake_sm::HandshakeState::WillEstablish,
             };
             update_node(&node);
+            // Peer-initiated TLS handshake completes here; register its
+            // forwarding client if we learned its apiRoot.
+            if node.negotiated_security_scheme == SecurityCapability::Tls
+                && node.peer_api_root.is_some()
+            {
+                register_n32f_client_for_node(&node, false);
+            }
 
             match build_security_capability_response(&node) {
                 Some(rsp) => {
@@ -222,24 +281,41 @@ fn handle_exchange_capability(body: &str) -> HttpResponse {
         }
         Err(e) => {
             // Capability mismatch => negotiation failure per TS 29.573
-            log::warn!("exchange-capability rejected: {e}");
+            log::warn!("cid={cid} reason=NEGOTIATION_NOT_ALLOWED: {e}");
             send_error(400, "Bad Request", &e, Some("NEGOTIATION_NOT_ALLOWED"))
         }
     }
 }
 
-fn handle_exchange_params(body: &str) -> HttpResponse {
+/// Handle an exchange-params request (responder side, T1.5b).
+///
+/// `tls_secret` is the RFC 5705 exporter secret extracted by the server
+/// glue from the N32-c TLS connection. When present (real TLS transport), we
+/// deposit it into the n32c_handler store keyed by the sender FQDN so
+/// `resolve_exporter_secret` picks it up instead of the no-TLS fallback.
+fn handle_exchange_params(body: &str, tls_secret: Option<&[u8]>, cid: &str) -> HttpResponse {
     let req: SecParamExchReqData = match serde_json::from_str(body) {
         Ok(j) => j,
         Err(e) => {
+            log::warn!("cid={cid} reason=MALFORMED_EXCHANGE_PARAMS: {e}");
             return send_error(
                 400,
                 "Bad Request",
                 &format!("Malformed SecParamExchReqData: {e}"),
                 Some("MANDATORY_IE_INCORRECT"),
-            )
+            );
         }
     };
+
+    // T1.5b: deposit the real TLS exporter secret before the handler calls
+    // `resolve_exporter_secret`, replacing the deterministic fallback.
+    if let Some(secret) = tls_secret {
+        log::debug!(
+            "cid={cid} depositing N32-c TLS exporter secret for peer [{}] (T1.5b)",
+            req.sender
+        );
+        n32c_handler::set_n32c_tls_exporter_secret(&req.sender, secret.to_vec());
+    }
 
     let mut node = match find_or_add_node(&req.sender) {
         Some(n) => n,
@@ -257,12 +333,18 @@ fn handle_exchange_params(body: &str) -> HttpResponse {
         Ok(rsp) => {
             node.handshake_state = crate::handshake_sm::HandshakeState::Established;
             update_node(&node);
+            // Peer-initiated PRINS handshake completes here; register the
+            // forwarding client (apiRoot learned from exchange-params).
+            register_n32f_client_for_node(&node, false);
             HttpResponse::ok()
                 .with_json_body(&rsp)
                 .unwrap_or_else(|_| HttpResponse::internal_error())
         }
         Err(e) => {
-            log::warn!("exchange-params rejected: {e}");
+            log::warn!(
+                "cid={cid} peer=[{}] reason=NEGOTIATION_NOT_ALLOWED: {e}",
+                req.sender
+            );
             send_error(400, "Bad Request", &e, Some("NEGOTIATION_NOT_ALLOWED"))
         }
     }
@@ -350,6 +432,16 @@ async fn handle_n32f_process(body: &str) -> HttpResponse {
         // TLS-mode pass-through envelope
         match crate::n32c_build::parse_n32f_message(body.as_bytes()) {
             Ok(msg) => {
+                // Identify the sending peer from the carried sender-SEPP
+                // header and enforce: TLS negotiated + handshake established.
+                let sender_sepp = msg
+                    .header
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("3gpp-sbi-sender-sepp"))
+                    .map(|h| h.value.clone());
+                if let Some(resp) = enforce_tls_mode_peer(sender_sepp.as_deref()) {
+                    return resp;
+                }
                 let headers = msg
                     .header
                     .iter()
@@ -381,6 +473,63 @@ async fn handle_n32f_process(body: &str) -> HttpResponse {
             Some("MANDATORY_IE_INCORRECT"),
         )
     }
+}
+
+/// Enforce that a TLS-mode N32-f message comes from a known peer SEPP whose
+/// N32-c handshake is Established and whose negotiated scheme is TLS. With a
+/// real N32 listener mTLS verifies the transport; this additionally binds
+/// the message to a completed N32-c negotiation (TS 29.573 sec 5.3).
+/// Returns `Some(error_response)` to reject, `None` to accept.
+fn enforce_tls_mode_peer(sender_sepp: Option<&str>) -> Option<HttpResponse> {
+    let Some(sender) = sender_sepp else {
+        log::error!("[DROP] TLS-mode N32-f message without 3gpp-sbi-sender-sepp header");
+        return Some(send_error(
+            400,
+            "Bad Request",
+            "Missing sender SEPP identity",
+            Some("MANDATORY_IE_INCORRECT"),
+        ));
+    };
+    let node = {
+        let ctx = sepp_self();
+        ctx.read()
+            .ok()
+            .and_then(|c| c.node_find_by_receiver(sender))
+    };
+    let Some(node) = node else {
+        log::error!("[DROP] TLS-mode N32-f message from unknown peer SEPP [{sender}]");
+        return Some(send_error(
+            403,
+            "Forbidden",
+            "Unknown sender SEPP (no N32-c handshake)",
+            Some("NEGOTIATION_NOT_ALLOWED"),
+        ));
+    };
+    if node.handshake_state != crate::handshake_sm::HandshakeState::Established {
+        log::error!(
+            "[DROP] TLS-mode N32-f message from peer [{sender}] with unestablished handshake ({:?})",
+            node.handshake_state
+        );
+        return Some(send_error(
+            403,
+            "Forbidden",
+            "N32-c handshake not established for this peer",
+            Some("NEGOTIATION_NOT_ALLOWED"),
+        ));
+    }
+    if node.negotiated_security_scheme != SecurityCapability::Tls {
+        log::error!(
+            "[DROP] TLS-shaped N32-f message from peer [{sender}] but negotiated scheme is {:?}",
+            node.negotiated_security_scheme
+        );
+        return Some(send_error(
+            403,
+            "Forbidden",
+            "Negotiated N32-f scheme is not TLS",
+            Some("NEGOTIATION_NOT_ALLOWED"),
+        ));
+    }
+    None
 }
 
 /// Extract the n32fContextId from the (not yet authenticated) JWE AAD so
@@ -416,6 +565,37 @@ async fn handle_prins_message(msg: &N32fReformattedMessage) -> HttpResponse {
         );
     };
 
+    // Enforce: the N32-c handshake with this peer must be Established and
+    // PRINS must be the negotiated scheme (TS 29.573 / TS 33.501). Reject a
+    // PRINS-shaped N32-f message on a peer that did not negotiate PRINS or
+    // whose handshake never completed.
+    if node.handshake_state != crate::handshake_sm::HandshakeState::Established {
+        log::error!(
+            "[DROP] N32-f PRINS message from peer [{}] with unestablished handshake ({:?})",
+            node.receiver,
+            node.handshake_state
+        );
+        return send_error(
+            403,
+            "Forbidden",
+            "N32-c handshake not established for this peer",
+            Some("UNAVAILABLE_PRINS_CONTEXT"),
+        );
+    }
+    if node.negotiated_security_scheme != SecurityCapability::Prins {
+        log::error!(
+            "[DROP] PRINS-shaped N32-f message from peer [{}] but negotiated scheme is {:?}",
+            node.receiver,
+            node.negotiated_security_scheme
+        );
+        return send_error(
+            403,
+            "Forbidden",
+            "Negotiated N32-f scheme is not PRINS",
+            Some("UNAVAILABLE_PRINS_CONTEXT"),
+        );
+    }
+
     let Some(prins_ctx) = crate::sbi_path::build_prins_context(node.id) else {
         return send_error(
             400,
@@ -427,21 +607,11 @@ async fn handle_prins_message(msg: &N32fReformattedMessage) -> HttpResponse {
 
     match prins::unprotect_message(&prins_ctx, msg) {
         Ok(rec) => {
-            let rec_json = ReconstructedRequestJson {
-                method: rec.method,
-                url: rec.url,
-                headers: rec.headers,
-                body: rec.body.as_deref().map(crate::jose::b64url_encode),
-                message_id: Some(rec.message_id),
-            };
-            log::info!(
-                "N32-f PRINS message verified: {} {}",
-                rec_json.method,
-                rec_json.url
-            );
-            HttpResponse::ok()
-                .with_json_body(&rec_json)
-                .unwrap_or_else(|_| HttpResponse::internal_error())
+            log::info!("N32-f PRINS request verified: {} {}", rec.method, rec.url);
+            // TS 29.573 §6.2.4.2: forward the reconstructed request to the
+            // target NF, then reformat + PRINS-protect the NF's response as an
+            // N32fReformattedRspMsg and return it over N32-f.
+            forward_and_protect_response(&prins_ctx, rec).await
         }
         Err(e) => {
             log::error!("N32-f PRINS verification failed: {e}");
@@ -480,6 +650,136 @@ async fn handle_prins_message(msg: &N32fReformattedMessage) -> HttpResponse {
     }
 }
 
+/// The receiving SEPP forwards the reconstructed SBI request to the target NF,
+/// then reformats and PRINS-protects the NF's HTTP response as an
+/// N32fReformattedRspMsg to return over N32-f (TS 29.573 §6.2.4.2). An
+/// unresolvable/unreachable target yields a protected gateway-error response.
+async fn forward_and_protect_response(
+    prins_ctx: &prins::PrinsContext,
+    rec: prins::ReconstructedRequest,
+) -> HttpResponse {
+    let (status, resp_headers, resp_body) = forward_to_target_nf(&rec).await;
+    match prins::protect_response_message(prins_ctx, status, &resp_headers, resp_body.as_deref()) {
+        Ok(reformatted) => HttpResponse::ok()
+            .with_json_body(&reformatted)
+            .unwrap_or_else(|_| HttpResponse::internal_error()),
+        Err(e) => {
+            log::error!("N32-f: failed to protect target-NF response: {e}");
+            HttpResponse::internal_error()
+        }
+    }
+}
+
+/// Resolve and reach the target NF for a reconstructed N32-f request, returning
+/// (status, headers, body). Resolution prefers the `3gpp-Sbi-Target-apiRoot`
+/// header, then the absolute URL authority. Unresolvable/unreachable targets
+/// map to a synthesized problem+json response.
+async fn forward_to_target_nf(
+    rec: &prins::ReconstructedRequest,
+) -> (u16, Vec<(String, String)>, Option<Vec<u8>>) {
+    let api_root = rec
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("3gpp-Sbi-Target-apiRoot"))
+        .map(|(_, v)| v.clone())
+        .or_else(|| authority_from_url(&rec.url));
+
+    let Some(api_root) = api_root else {
+        return problem_response(400, "target NF apiRoot could not be resolved");
+    };
+    let client = match n32_client(&api_root, None) {
+        Ok(c) => c,
+        Err(e) => return problem_response(400, &format!("bad target apiRoot: {e}")),
+    };
+
+    let path = path_and_query_from_url(&rec.url);
+    let mut request = match rec.method.to_ascii_uppercase().as_str() {
+        "GET" => HttpRequest::get(&path),
+        "POST" => HttpRequest::post(&path),
+        "PUT" => HttpRequest::put(&path),
+        "PATCH" => HttpRequest::patch(&path),
+        "DELETE" => HttpRequest::delete(&path),
+        other => return problem_response(405, &format!("unsupported method {other}")),
+    };
+    for (k, v) in &rec.headers {
+        // Do not forward the SEPP routing header to the NF.
+        if k.eq_ignore_ascii_case("3gpp-Sbi-Target-apiRoot") {
+            continue;
+        }
+        request.http.set_header(k.clone(), v.clone());
+    }
+    if let Some(body) = &rec.body {
+        if let Ok(s) = String::from_utf8(body.clone()) {
+            request.http.set_content(s);
+        }
+    }
+
+    match client.send_request(request).await {
+        Ok(resp) => {
+            let headers: Vec<(String, String)> = resp
+                .http
+                .headers
+                .iter()
+                // Drop hop-by-hop / length headers the sending side regenerates.
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.to_ascii_lowercase().as_str(),
+                        "content-length" | "transfer-encoding" | "connection"
+                    )
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let body = resp.http.content.map(|c| c.into_bytes());
+            (resp.status, headers, body)
+        }
+        Err(e) => {
+            log::warn!("N32-f: forward to target NF [{api_root}] failed: {e}");
+            problem_response(504, &format!("target NF unreachable: {e}"))
+        }
+    }
+}
+
+fn problem_response(status: u16, detail: &str) -> (u16, Vec<(String, String)>, Option<Vec<u8>>) {
+    let body = serde_json::json!({ "status": status, "detail": detail });
+    (
+        status,
+        vec![(
+            "content-type".to_string(),
+            "application/problem+json".to_string(),
+        )],
+        serde_json::to_vec(&body).ok(),
+    )
+}
+
+/// Extract the `scheme://authority` prefix from an absolute URL, or `None` for
+/// a relative path.
+fn authority_from_url(url: &str) -> Option<String> {
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return None;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    (!authority.is_empty()).then(|| format!("{scheme}://{authority}"))
+}
+
+/// Extract the path (with query) from an absolute URL, or return a relative
+/// path unchanged.
+fn path_and_query_from_url(url: &str) -> String {
+    match url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        Some(rest) => match rest.find('/') {
+            Some(idx) => rest[idx..].to_string(),
+            None => "/".to_string(),
+        },
+        None => url.to_string(),
+    }
+}
+
 // ============================================================================
 // Client side (initiator)
 // ============================================================================
@@ -507,9 +807,9 @@ fn parse_api_root(api_root: &str) -> Result<(bool, String, u16), String> {
 fn n32_client(
     api_root: &str,
     tls: Option<&N32TlsConfig>,
-) -> Result<ogs_sbi::client::SbiClient, String> {
+) -> Result<nextgcore_sbi::client::SbiClient, String> {
     let (https, host, port) = parse_api_root(api_root)?;
-    let mut config = ogs_sbi::client::SbiClientConfig::new(&host, port)
+    let mut config = nextgcore_sbi::client::SbiClientConfig::new(&host, port)
         .with_connect_timeout(N32_CONNECT_TIMEOUT)
         .with_request_timeout(N32_REQUEST_TIMEOUT);
     if https {
@@ -521,11 +821,11 @@ fn n32_client(
             config.ca_cert = tls_cfg.ca_cert.clone();
         }
     }
-    Ok(ogs_sbi::client::SbiClient::new(config))
+    Ok(nextgcore_sbi::client::SbiClient::new(config))
 }
 
 async fn post_json(
-    client: &ogs_sbi::client::SbiClient,
+    client: &nextgcore_sbi::client::SbiClient,
     path: &str,
     body: String,
 ) -> Result<(u16, String), String> {
@@ -544,6 +844,35 @@ async fn post_json(
 pub struct HandshakeOutcome {
     pub node_id: u64,
     pub security: SecurityCapability,
+}
+
+/// Register the consumer-facing N32-f forwarding client for a node whose
+/// N32-c handshake just completed, so the SBI server can forward outbound
+/// VPLMN requests to this peer SEPP. Idempotent.
+fn register_n32f_client_for_node(node: &SeppNode, tls_enabled: bool) {
+    let Some(api_root) = node.peer_api_root.as_deref() else {
+        log::warn!(
+            "[{}] handshake complete but no peer apiRoot; N32-f client not registered",
+            node.receiver
+        );
+        return;
+    };
+    match parse_api_root(api_root) {
+        Ok((https, host, port)) => {
+            crate::sbi_path::register_n32f_client(
+                node.id,
+                &node.receiver,
+                &host,
+                port,
+                https || tls_enabled,
+                node.negotiated_security_scheme,
+            );
+        }
+        Err(e) => log::warn!(
+            "[{}] cannot register N32-f client (bad apiRoot [{api_root}]): {e}",
+            node.receiver
+        ),
+    }
 }
 
 /// Drive the full N32-c handshake against a peer SEPP:
@@ -584,6 +913,7 @@ pub async fn initiate_n32c_handshake(
         SecurityCapability::Tls => {
             node.handshake_state = crate::handshake_sm::HandshakeState::Established;
             update_node(&node);
+            register_n32f_client_for_node(&node, tls.is_some());
             log::info!("[{peer_fqdn}] N32-c handshake complete: TLS");
             Ok(HandshakeOutcome {
                 node_id: node.id,
@@ -597,6 +927,10 @@ pub async fn initiate_n32c_handshake(
                 let context = ctx.read().map_err(|_| "context poisoned".to_string())?;
                 context.sender.clone().ok_or("sender not configured")?
             };
+            // Advertise our ES256 modifications-signing raw public key inside
+            // ipxProviderSecInfoList so the peer can verify our modificationsBlock
+            // entries (TS 29.573 §6.1.5.2.15, TS 33.501 §13.2.4.6).
+            let local_ipx = n32c_handler::local_ipx_provider_sec_info(&local_sender);
             let params_req = SecParamExchReqData {
                 sender: local_sender,
                 n32f_context_id: prins::generate_n32f_context_id(),
@@ -608,8 +942,11 @@ pub async fn initiate_n32c_handshake(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
-                modification_policy_allowed_paths: Vec::new(),
-                key_nonce: n32c_handler::generate_key_nonce(),
+                // Advertise our protection policy so the responder can negotiate
+                // the dataTypeEncPolicy (TS 29.573 §6.1.5.2.4).
+                protection_policy_info: Some(n32c_handler::local_protection_policy()),
+                sec_profiles: None,
+                ipx_provider_sec_info_list: local_ipx,
                 sender_api_root: local_api_root.map(|s| s.to_string()),
             };
             let params_body = serde_json::to_string(&params_req).map_err(|e| e.to_string())?;
@@ -627,6 +964,7 @@ pub async fn initiate_n32c_handshake(
 
             node.handshake_state = crate::handshake_sm::HandshakeState::Established;
             update_node(&node);
+            register_n32f_client_for_node(&node, tls.is_some());
             log::info!("[{peer_fqdn}] N32-c handshake complete: PRINS (keys established)");
             Ok(HandshakeOutcome {
                 node_id: node.id,
@@ -671,14 +1009,150 @@ pub async fn forward_via_n32f(
             serde_json::to_string(&msg).map_err(|e| e.to_string())?
         }
         SecurityCapability::Tls => {
-            let msg = crate::n32c_build::build_n32f_tls_message(method, url, headers, body);
+            // Carry our sender-SEPP identity so the receiver can bind the
+            // message to the established N32-c TLS negotiation.
+            let local_sender = {
+                let ctx = sepp_self();
+                ctx.read().ok().and_then(|c| c.sender.clone())
+            };
+            let mut tls_headers = headers.to_vec();
+            if let Some(sender) = local_sender {
+                if !tls_headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("3gpp-sbi-sender-sepp"))
+                {
+                    tls_headers.push(("3gpp-sbi-sender-sepp".to_string(), sender));
+                }
+            }
+            let msg = crate::n32c_build::build_n32f_tls_message(method, url, &tls_headers, body);
             serde_json::to_string(&msg).map_err(|e| e.to_string())?
         }
         other => return Err(format!("No N32-f security established ({other:?})")),
     };
 
     let client = n32_client(&api_root, tls)?;
-    post_json(&client, "/n32f-forward/v1/n32f-process", n32f_body).await
+    let (status, resp_body) =
+        post_json(&client, "/n32f-forward/v1/n32f-process", n32f_body).await?;
+
+    // TS 29.573 §6.2.4.2: in PRINS the peer SEPP returns a protected
+    // N32fReformattedRspMsg carrying the target NF's HTTP response. Unprotect
+    // it to recover the real (status, body) before returning to the caller.
+    if node.negotiated_security_scheme == SecurityCapability::Prins && status == 200 {
+        if let Ok(reformatted) = serde_json::from_str::<N32fReformattedMessage>(&resp_body) {
+            let prins_ctx = crate::sbi_path::build_prins_context(node_id)
+                .ok_or("PRINS negotiated but no N32-f security context")?;
+            let rec = prins::unprotect_response_message(&prins_ctx, &reformatted)
+                .map_err(|e| format!("N32-f response unprotect failed: {e}"))?;
+            let body = rec
+                .body
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            return Ok((rec.status_code, body));
+        }
+    }
+    Ok((status, resp_body))
+}
+
+// ============================================================================
+// Consumer-facing SBI server (C8)
+//
+// NFs in the home PLMN send outbound roaming requests to this server. It
+// runs the SEPP forwarding pipeline: detect the VPLMN from the
+// 3gpp-sbi-target-apiroot, select the peer SEPP for that PLMN, apply the
+// negotiated N32-f protection (PRINS JWE/JWS or TLS pass-through), POST to
+// the peer's /n32f-process, and relay the response back to the NF.
+// ============================================================================
+
+/// Start the consumer-facing SBI server on `host:port`. Returns the handle
+/// the caller stops on shutdown.
+pub async fn start_sbi_server(
+    host: &str,
+    port: u16,
+    tls: Option<&N32TlsConfig>,
+) -> Result<SbiServer, String> {
+    let mut config = SbiServerConfig::with_host_port(host, port).map_err(|e| e.to_string())?;
+    config = config.with_interface("sbi");
+    if let Some(tls_cfg) = tls {
+        if let (Some(key), Some(cert)) = (&tls_cfg.key, &tls_cfg.cert) {
+            config = config.with_tls(key.clone(), cert.clone());
+        }
+    }
+    let server = SbiServer::new(config);
+    server
+        .start(sbi_consumer_handler)
+        .await
+        .map_err(|e| format!("SBI server start failed: {e}"))?;
+    log::info!("SEPP consumer SBI server on {host}:{port}");
+    Ok(server)
+}
+
+/// Consumer SBI handler: forward outbound VPLMN requests through the peer
+/// SEPP via N32-f, relaying the peer's response.
+async fn sbi_consumer_handler(request: HttpRequest) -> HttpResponse {
+    let method = request.header.method.clone();
+    let uri = request.header.uri.clone();
+
+    // Liveness/local endpoints are handled by nextgcore-sbi; everything else with a
+    // target-apiroot is a forwarding request.
+    let target_apiroot = request
+        .http
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(crate::sbi_path::headers::TARGET_APIROOT))
+        .map(|(_, v): (&String, &String)| v.clone());
+
+    let Some(target_apiroot) = target_apiroot else {
+        log::debug!("SBI request without target-apiRoot handled locally: {method} {uri}");
+        return send_error(
+            400,
+            "Bad Request",
+            "Missing 3gpp-sbi-target-apiroot (not a roaming request)",
+            Some("MANDATORY_IE_INCORRECT"),
+        );
+    };
+
+    // Select the peer SEPP by the VPLMN encoded in the target-apiRoot.
+    let node = match crate::sbi_path::select_peer_for_target(&target_apiroot) {
+        Ok(node) => node,
+        Err(e) => {
+            log::error!("SBI forward: {e}");
+            return send_error(404, "Not Found", &e, Some("TARGET_NF_NOT_REACHABLE"));
+        }
+    };
+
+    if node.handshake_state != crate::handshake_sm::HandshakeState::Established {
+        return send_error(
+            503,
+            "Service Unavailable",
+            &format!("N32-c to peer [{}] not established", node.receiver),
+            Some("TARGET_NF_NOT_REACHABLE"),
+        );
+    }
+
+    let headers: Vec<(String, String)> = request
+        .http
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let body = request.http.content.clone().map(|c| c.into_bytes());
+
+    match forward_via_n32f(node.id, &method, &uri, &headers, body.as_deref(), None).await {
+        Ok((status, rsp_body)) => {
+            log::info!(
+                "SBI forward {method} {uri} -> peer [{}] status={status}",
+                node.receiver
+            );
+            let mut resp = HttpResponse::with_status(status);
+            resp.http.set_content(rsp_body);
+            resp.http.set_header("Content-Type", "application/json");
+            resp
+        }
+        Err(e) => {
+            log::error!("SBI forward to peer [{}] failed: {e}", node.receiver);
+            send_error(502, "Bad Gateway", &e, Some("TARGET_NF_NOT_REACHABLE"))
+        }
+    }
 }
 
 /// POST an N32fErrorInfo report to the peer SEPP (TS 29.573 sec 6.1.5.4)
@@ -696,6 +1170,7 @@ pub async fn send_n32f_error(peer_api_root: &str, info: &N32fErrorInfo) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sbi_path::select_peer_for_target;
 
     #[test]
     fn test_parse_api_root() {
@@ -716,7 +1191,7 @@ mod tests {
 
     #[test]
     fn test_mtls_listener_config_mapping() {
-        // Verify the TLS/mTLS knobs map through to the ogs-sbi config
+        // Verify the TLS/mTLS knobs map through to the nextgcore-sbi config
         let tls = N32TlsConfig {
             cert: Some("/tls/server.crt".into()),
             key: Some("/tls/server.key".into()),
@@ -728,8 +1203,180 @@ mod tests {
         config.verify_client = true;
         config.verify_client_cacert = tls.verify_client_cacert.clone();
 
-        assert_eq!(config.scheme, ogs_sbi::types::UriScheme::Https);
+        assert_eq!(config.scheme, nextgcore_sbi::types::UriScheme::Https);
         assert!(config.verify_client);
         assert_eq!(config.verify_client_cacert.as_deref(), Some("/tls/ca.crt"));
+    }
+
+    // --- C4: mTLS is mandatory on N32-c whenever TLS is configured ---
+
+    #[test]
+    fn test_effective_client_cacert_falls_back_to_ca_cert() {
+        // mTLS CA defaults to verify_client_cacert, else the server CA bundle
+        let tls = N32TlsConfig {
+            ca_cert: Some("/tls/peer-ca.crt".into()),
+            ..Default::default()
+        };
+        assert_eq!(tls.effective_client_cacert(), Some("/tls/peer-ca.crt"));
+        let tls2 = N32TlsConfig {
+            verify_client_cacert: Some("/tls/explicit-ca.crt".into()),
+            ca_cert: Some("/tls/peer-ca.crt".into()),
+            ..Default::default()
+        };
+        assert_eq!(tls2.effective_client_cacert(), Some("/tls/explicit-ca.crt"));
+    }
+
+    #[tokio::test]
+    async fn test_n32_listener_requires_mtls_when_tls_configured() {
+        // TLS configured, but NO client CA and not opted out => must refuse
+        // to start (N32-c MUST be mutually authenticated, TS 33.501).
+        let tls = N32TlsConfig {
+            cert: Some("/tls/server.crt".into()),
+            key: Some("/tls/server.key".into()),
+            // no verify_client_cacert, no ca_cert, allow_insecure_no_mtls=false
+            ..Default::default()
+        };
+        let res = start_n32_listener("127.0.0.1", 0, Some(&tls)).await;
+        match res {
+            Err(err) => assert!(
+                err.contains("requires mTLS"),
+                "expected mTLS-required error, got: {err}"
+            ),
+            Ok(server) => {
+                let _ = server.stop().await;
+                panic!("listener must refuse to start without mTLS");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_n32_listener_mtls_opt_out_allowed_for_lab() {
+        // Same as above but explicitly opted out => allowed (loads will fail
+        // later on the bogus cert path, but the mTLS gate must not block).
+        let tls = N32TlsConfig {
+            cert: Some("/tls/server.crt".into()),
+            key: Some("/tls/server.key".into()),
+            allow_insecure_no_mtls: true,
+            ..Default::default()
+        };
+        let res = start_n32_listener("127.0.0.1", 0, Some(&tls)).await;
+        // The mTLS gate does not reject; any failure must be a TLS-load error,
+        // never the "requires mTLS" gate.
+        if let Err(e) = res {
+            assert!(!e.contains("requires mTLS"), "mTLS gate wrongly fired: {e}");
+        }
+    }
+
+    // --- C5: /n32f-process enforcement ---
+
+    /// Ensure the shared global context is initialized. Deliberately does NOT
+    /// mutate the global sender/serving-PLMN list, which other (parallel)
+    /// tests rely on; these enforcement tests don't depend on a specific
+    /// sender FQDN.
+    fn ensure_ctx_initialized() {
+        let ctx = sepp_self();
+        let mut c = ctx.write().unwrap();
+        if !c.is_initialized() {
+            c.init(64, 256);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_n32f_process_rejects_unestablished_prins_peer() {
+        ensure_ctx_initialized();
+        // Add a peer node that negotiated PRINS but is NOT established, with a
+        // security context so peek-by-context-id resolves it.
+        let node_id;
+        {
+            let ctx = sepp_self();
+            let c = ctx.read().unwrap();
+            let mut node = c.node_add("sepp-unestab.example.com").unwrap();
+            node.negotiated_security_scheme = SecurityCapability::Prins;
+            node.handshake_state = crate::handshake_sm::HandshakeState::WillEstablish;
+            node.n32f_security = Some(crate::context::N32fSecurityInfo {
+                local_context_id: "unestab-local-ctx".to_string(),
+                peer_context_id: "unestab-peer-ctx".to_string(),
+                key_material: crate::n32c_handler::derive_n32f_key_material(
+                    &[0u8; 64],
+                    "unestab-local-ctx-unestab-peer-ctx",
+                ),
+                role: crate::n32c_handler::N32fRole::Responder,
+                kid: "unestab-kid".to_string(),
+                jwe_cipher_suite: "A256GCM".to_string(),
+                jws_cipher_suite: "ES256".to_string(),
+                enc_profiles: Vec::new(),
+            });
+            c.node_update(&node);
+            node_id = node.id;
+        }
+        assert!(node_id > 0);
+
+        // Craft a PRINS-shaped message whose AAD names that local context id.
+        let aad = serde_json::json!({
+            "metaData": { "n32fContextId": "unestab-local-ctx" }
+        });
+        let msg = serde_json::json!({
+            "reformattedData": {
+                "protected": crate::jose::b64url_encode(br#"{"alg":"dir","enc":"A256GCM"}"#),
+                "aad": crate::jose::b64url_encode(&serde_json::to_vec(&aad).unwrap()),
+                "iv": crate::jose::b64url_encode(&[0u8; 12]),
+                "ciphertext": crate::jose::b64url_encode(b"x"),
+                "tag": crate::jose::b64url_encode(&[0u8; 16])
+            }
+        });
+        let resp = handle_n32f_process(&serde_json::to_string(&msg).unwrap()).await;
+        // Rejected at the handshake-state gate (403), not processed.
+        assert_eq!(resp.status, 403, "unestablished peer must be rejected");
+    }
+
+    #[test]
+    fn test_enforce_tls_mode_peer_unknown_sender_rejected() {
+        ensure_ctx_initialized();
+        // No node registered for this sender => rejected (403).
+        let resp = enforce_tls_mode_peer(Some("sepp-stranger.example.com"))
+            .expect("unknown sender must be rejected");
+        assert_eq!(resp.status, 403);
+    }
+
+    #[test]
+    fn test_enforce_tls_mode_peer_missing_header_rejected() {
+        let resp =
+            enforce_tls_mode_peer(None).expect("missing sender-sepp header must be rejected");
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn test_enforce_tls_mode_peer_established_tls_accepted() {
+        ensure_ctx_initialized();
+        {
+            let ctx = sepp_self();
+            let c = ctx.read().unwrap();
+            let mut node = c.node_add("sepp-tls-ok.example.com").unwrap();
+            node.negotiated_security_scheme = SecurityCapability::Tls;
+            node.handshake_state = crate::handshake_sm::HandshakeState::Established;
+            c.node_update(&node);
+        }
+        assert!(enforce_tls_mode_peer(Some("sepp-tls-ok.example.com")).is_none());
+    }
+
+    #[test]
+    fn test_select_peer_for_target() {
+        ensure_ctx_initialized();
+        {
+            let ctx = sepp_self();
+            let c = ctx.read().unwrap();
+            let mut node = c.node_add("sepp-vplmn.example.com").unwrap();
+            node.add_plmn_id(crate::context::PlmnId::new(310, 260, 3));
+            c.node_update(&node);
+        }
+        // A VPLMN target resolves to the peer serving that PLMN.
+        let node =
+            select_peer_for_target("nrf.5gc.mnc260.mcc310.3gppnetwork.org").expect("peer found");
+        assert_eq!(node.receiver, "sepp-vplmn.example.com");
+
+        // A non-3gppnetwork target is not in a VPLMN.
+        assert!(select_peer_for_target("nf.local.example.com").is_err());
+        // A VPLMN with no peer SEPP errors.
+        assert!(select_peer_for_target("nrf.5gc.mnc999.mcc999.3gppnetwork.org").is_err());
     }
 }

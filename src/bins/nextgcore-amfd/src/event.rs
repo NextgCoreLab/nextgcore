@@ -2,10 +2,10 @@
 //!
 //! Port of src/amf/event.h and event.c - Event definitions for AMF
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
-pub const OGS_FSM_USER_SIG: i32 = 2;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for AMF
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,11 +32,11 @@ impl AmfEventId {
     /// Get the name of the event
     pub fn name(&self) -> &'static str {
         match self {
-            AmfEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            AmfEventId::FsmExit => "OGS_FSM_EXIT_SIG",
-            AmfEventId::SbiServer => "OGS_EVENT_SBI_SERVER",
-            AmfEventId::SbiClient => "OGS_EVENT_SBI_CLIENT",
-            AmfEventId::SbiTimer => "OGS_EVENT_SBI_TIMER",
+            AmfEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            AmfEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
+            AmfEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
+            AmfEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
+            AmfEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
             AmfEventId::NgapMessage => "AMF_EVENT_NGAP_MESSAGE",
             AmfEventId::NgapTimer => "AMF_EVENT_NGAP_TIMER",
             AmfEventId::GmmTimer => "AMF_EVENT_5GMM_TIMER",
@@ -46,8 +46,8 @@ impl AmfEventId {
     /// Convert from i32 signal
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => AmfEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => AmfEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => AmfEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => AmfEventId::FsmExit,
             _ => AmfEventId::SbiServer,
         }
     }
@@ -56,7 +56,7 @@ impl AmfEventId {
 /// Timer IDs for AMF
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmfTimerId {
-    // SBI timers (from ogs-proto)
+    // SBI timers (from nextgcore-proto)
     /// NF instance registration interval timer
     NfInstanceRegistrationInterval,
     /// NF instance heartbeat interval timer
@@ -100,14 +100,16 @@ impl AmfTimerId {
     pub fn name(&self) -> &'static str {
         match self {
             AmfTimerId::NfInstanceRegistrationInterval => {
-                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+                "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            AmfTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
-            AmfTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
-            AmfTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",
-            AmfTimerId::SubscriptionValidity => "OGS_TIMER_SUBSCRIPTION_VALIDITY",
-            AmfTimerId::SubscriptionPatch => "OGS_TIMER_SUBSCRIPTION_PATCH",
-            AmfTimerId::SbiClientWait => "OGS_TIMER_SBI_CLIENT_WAIT",
+            AmfTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
+            AmfTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
+            AmfTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
+            AmfTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",
+            AmfTimerId::SubscriptionPatch => "NEXTGCORE_TIMER_SUBSCRIPTION_PATCH",
+            AmfTimerId::SbiClientWait => "NEXTGCORE_TIMER_SBI_CLIENT_WAIT",
             AmfTimerId::NgDelayedSend => "AMF_TIMER_NG_DELAYED_SEND",
             AmfTimerId::NgHolding => "AMF_TIMER_NG_HOLDING",
             AmfTimerId::T3513 => "AMF_TIMER_T3513",
@@ -171,7 +173,7 @@ pub struct SbiEventData {
 }
 
 /// Simplified SBI request for AMF internal event passing.
-/// Distinct from `ogs_sbi::message::SbiRequest` (full HTTP/2 request).
+/// Distinct from `nextgcore_sbi::message::SbiRequest` (full HTTP/2 request).
 #[derive(Debug, Clone)]
 pub struct AmfSbiRequest {
     /// HTTP method
@@ -183,7 +185,7 @@ pub struct AmfSbiRequest {
 }
 
 /// Simplified SBI response for AMF internal event passing.
-/// Distinct from `ogs_sbi::message::SbiResponse` (full HTTP/2 response).
+/// Distinct from `nextgcore_sbi::message::SbiResponse` (full HTTP/2 response).
 #[derive(Debug, Clone)]
 pub struct AmfSbiResponse {
     /// HTTP status code
@@ -559,7 +561,7 @@ mod tests {
     #[test]
     fn test_event_name() {
         let event = AmfEvent::new(AmfEventId::SbiServer);
-        assert_eq!(event.name(), "OGS_EVENT_SBI_SERVER");
+        assert_eq!(event.name(), "NEXTGCORE_EVENT_SBI_SERVER");
     }
 
     #[test]

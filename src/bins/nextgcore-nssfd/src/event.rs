@@ -2,11 +2,11 @@
 //!
 //! Port of src/nssf/event.h and event.c - Event definitions for NSSF
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
 #[allow(dead_code)]
-pub const OGS_FSM_USER_SIG: i32 = 2;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for NSSF
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,18 +26,18 @@ pub enum NssfEventId {
 impl NssfEventId {
     pub fn name(&self) -> &'static str {
         match self {
-            NssfEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            NssfEventId::FsmExit => "OGS_FSM_EXIT_SIG",
-            NssfEventId::SbiServer => "OGS_EVENT_SBI_SERVER",
-            NssfEventId::SbiClient => "OGS_EVENT_SBI_CLIENT",
-            NssfEventId::SbiTimer => "OGS_EVENT_SBI_TIMER",
+            NssfEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            NssfEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
+            NssfEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
+            NssfEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
+            NssfEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
         }
     }
 
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => NssfEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => NssfEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => NssfEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => NssfEventId::FsmExit,
             _ => NssfEventId::SbiServer,
         }
     }
@@ -59,14 +59,16 @@ impl NssfTimerId {
     pub fn name(&self) -> &'static str {
         match self {
             NssfTimerId::NfInstanceRegistrationInterval => {
-                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+                "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            NssfTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
-            NssfTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
-            NssfTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",
-            NssfTimerId::SubscriptionValidity => "OGS_TIMER_SUBSCRIPTION_VALIDITY",
-            NssfTimerId::SubscriptionPatch => "OGS_TIMER_SUBSCRIPTION_PATCH",
-            NssfTimerId::SbiClientWait => "OGS_TIMER_SBI_CLIENT_WAIT",
+            NssfTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
+            NssfTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
+            NssfTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
+            NssfTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",
+            NssfTimerId::SubscriptionPatch => "NEXTGCORE_TIMER_SUBSCRIPTION_PATCH",
+            NssfTimerId::SbiClientWait => "NEXTGCORE_TIMER_SBI_CLIENT_WAIT",
         }
     }
 }
@@ -293,7 +295,7 @@ mod tests {
     #[test]
     fn test_event_name() {
         let event = NssfEvent::new(NssfEventId::SbiServer);
-        assert_eq!(event.name(), "OGS_EVENT_SBI_SERVER");
+        assert_eq!(event.name(), "NEXTGCORE_EVENT_SBI_SERVER");
     }
 
     #[test]

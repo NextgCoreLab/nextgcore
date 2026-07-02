@@ -2,6 +2,8 @@
 
 > Generated: 2026-02-07 | Scope: 5 EPC NFs ported from Open5GS C to Rust
 
+> **Note (2026-07):** EPC (4G/LTE) is RETAINED - nextgcore is a dual 5G/LTE core, not 5G-SA-only. This 2026-02-07 snapshot remains broadly accurate for the EPC NFs (scaffolding-to-partial); the 5GC Wave-6 PRs did not change EPC functional completeness, though NF-context lock-ordering (AB-BA deadlock) fixes were applied across hssd/pcrfd. The per-NF percentages below are a historical baseline.
+
 ## Executive Summary
 
 This document analyzes the implementation status of 5 EPC (4G LTE) Network Functions

@@ -6,7 +6,7 @@ use crate::context::sgwu_self;
 use crate::event::{SgwuEvent, SgwuEventId, SgwuTimerId};
 
 // ============================================================================
-// PFCP Message Types (from ogs-pfcp)
+// PFCP Message Types (from nextgcore-pfcp)
 // ============================================================================
 
 /// PFCP message types

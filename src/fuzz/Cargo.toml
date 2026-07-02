@@ -13,12 +13,12 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 
 # Protocol libraries to fuzz
-ogs-pfcp = { path = "../libs/ogs-pfcp" }
-ogs-gtp = { path = "../libs/ogs-gtp" }
-ogs-nas = { path = "../libs/ogs-nas" }
-ogs-ngap = { path = "../libs/ogs-ngap" }
-ogs-s1ap = { path = "../libs/ogs-s1ap" }
-ogs-diameter = { path = "../libs/ogs-diameter" }
+nextgcore-pfcp = { path = "../libs/nextgcore-pfcp" }
+nextgcore-gtp = { path = "../libs/nextgcore-gtp" }
+nextgcore-nas = { path = "../libs/nextgcore-nas" }
+nextgcore-ngap = { path = "../libs/nextgcore-ngap" }
+nextgcore-s1ap = { path = "../libs/nextgcore-s1ap" }
+nextgcore-diameter = { path = "../libs/nextgcore-diameter" }
 
 # Workspace members used for fuzzing
 bytes = "1"
@@ -52,6 +52,20 @@ bench = false
 [[bin]]
 name = "fuzz_diameter_message"
 path = "fuzz_targets/fuzz_diameter_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ngap_message"
+path = "fuzz_targets/fuzz_ngap_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_s1ap_message"
+path = "fuzz_targets/fuzz_s1ap_message.rs"
 test = false
 doc = false
 bench = false

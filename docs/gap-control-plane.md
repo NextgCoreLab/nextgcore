@@ -2,6 +2,8 @@
 
 > Generated: 2026-02-07 | Scope: AMF, SMF, NRF, SCP
 
+> **STALENESS NOTICE (updated 2026-07):** This 2026-02-07 snapshot is superseded. The per-NF "completeness %" and "stubbed/scaffolding" claims below are STALE. Since then the matched-sim Docker E2E (our gNB+UE <-> our 22-NF core) is 84/84 GREEN with full registration + PDU session + user-plane data (UE gets IP 10.45.0.2, ping through the GTP-U tunnel, 0% loss). AMF/PCF/UDM/AUSF/BSF are now lib+bin crates (src/lib.rs|app.rs expose `<nf>_sbi_request_handler`; src/main.rs is a ~10-line wrapper). AMF does on-demand NRF discovery on endpoint-cache miss (TS 29.510) and ingests NSACF profiles; NRF has an OAuth2 `/nnrf-oauth2/*` token endpoint with CCA JWS ES256 verification and optional mTLS client-auth. Treat the tables below as a historical baseline, not current state.
+
 ---
 
 ## Summary
@@ -57,8 +59,8 @@
 
 - GMM handlers: Registration/auth/security mode logic scaffolded but core processing stubbed
 - NGAP handlers: NG Setup response, Initial UE Message dispatch scaffolded but incomplete
-- SBI client: All outbound calls (to AUSF, UDM, PCF, NSSF) are stubs
-- NRF integration: Registration/discovery not implemented
+- SBI client: outbound calls to AUSF/UDM/PCF/NSSF are implemented; AMF performs on-demand NRF discovery on endpoint-cache miss (TS 29.510) and ingests NSACF profiles for slice admission
+- NRF integration: registration and on-demand discovery implemented
 - NGAP ASN.1: Helpers exist but not wired to full encode/decode
 
 ### Completeness: **35%**
@@ -74,7 +76,7 @@ Strong context model and FSM hierarchy. Multiple handler modules with function s
 ### Architecture
 
 - 19 source files with dedicated modules for N4/PFCP, GSM, GTP, binding
-- HTTP/2 SBI server using `ogs-sbi` crate
+- HTTP/2 SBI server using `nextgcore-sbi` crate
 - Supports both 5GC and EPC modes (GTP-C Gn interface)
 - Property tests included
 
@@ -149,7 +151,7 @@ SBI server with comprehensive HTTP/2 routing, full context model with UE/Session
 
 ### Completeness: **65%**
 
-The most functional NF in nextgcore. Full NF lifecycle management with HTTP/2 server. Weakened by: notification delivery not fully implemented, no TLS/mTLS, no OAuth2 token management.
+The most functional NF in nextgcore. Full NF lifecycle management with HTTP/2 server. Since this snapshot NRF added an OAuth2 access-token endpoint (`handle_access_token_request`, `/nnrf-oauth2/*`) with CCA JWS ES256 verification and optional mTLS client-certificate binding (nrfd-05/I2), plus OAuth2 Bearer-token attachment on outbound notifications (`sbi_path::attach_oauth2`).
 
 ---
 

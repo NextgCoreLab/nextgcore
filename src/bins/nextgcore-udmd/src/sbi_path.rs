@@ -4,9 +4,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ogs_sbi::context::{global_context, NfInstance, NfService};
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::types::{NfType, SbiServiceType};
+use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::types::{NfType, SbiServiceType};
 
 /// SBI server configuration
 #[derive(Debug, Clone)]
@@ -383,7 +383,9 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
         log::info!("Using UDR env var fallback: {host_str}:{port}");
     }
 
-    let client = sbi_ctx.get_client(&host_str, port).await;
+    // Attach an NRF-issued Bearer token to the Nudr_DataRepository call when
+    // OAuth2 enforcement is on (Wave-6 H8 Phase A); pooled/no-op otherwise.
+    let client = crate::app::peer_client(&host_str, port, NfType::Udr).await;
 
     log::debug!(
         "Sending NUDR-DR request for UE [{udm_ue_id}] stream [{stream_id}] to UDR at {host_str}:{port}"
@@ -446,6 +448,284 @@ pub async fn udm_nudr_dr_send_provisioned_data_get(
     let path = format!("/nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}");
     let request = SbiRequest::get(&path);
     udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
+}
+
+/// Build and send provisioned data GET to UDR with forwarded query parameters (udmd-08).
+///
+/// Forwards standardised SDM query params (`plmn-id`, `dataset-names`,
+/// `supported-features`, `single-nssai`) to the UDR so the response is
+/// already scoped.
+pub async fn udm_nudr_dr_send_provisioned_data_get_with_params(
+    supi: &str,
+    dataset: &str,
+    params: &std::collections::HashMap<String, String>,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}");
+    let mut request = SbiRequest::get(&path);
+    for (k, v) in params {
+        request = request.with_param(k, v);
+    }
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+// ---------------------------------------------------------------------------
+// UECM context-data persistence (Nudr_DataRepository, TS 29.505) — udmd-01/02
+// ---------------------------------------------------------------------------
+
+/// GET the stored AMF 3GPP-access registration from UDR (udmd-02 prior read).
+///
+/// Builds: `GET /nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access`
+pub async fn udm_nudr_dr_send_amf_context_get(supi: &str) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+    udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::get(&path)).await
+}
+
+/// PUT the AMF 3GPP-access registration to UDR (udmd-01).
+///
+/// Builds: `PUT /nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access`
+pub async fn udm_nudr_dr_send_amf_context_put(
+    supi: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+    let request = SbiRequest::put(&path)
+        .with_json_body(body)
+        .map_err(|e| format!("Failed to serialize AMF context: {e}"))?;
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+/// PUT a per-PDU-session SMF registration to UDR (udmd-01).
+///
+/// Builds: `PUT /nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}`
+pub async fn udm_nudr_dr_send_smf_context_put(
+    supi: &str,
+    psi: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}");
+    let request = SbiRequest::put(&path)
+        .with_json_body(body)
+        .map_err(|e| format!("Failed to serialize SMF registration: {e}"))?;
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+/// DELETE a UECM context-data resource from UDR (udmd-01 deregistration).
+///
+/// `relative_path` is the resource under `context-data/`, e.g.
+/// `amf-3gpp-access` or `smf-registrations/{psi}`. Builds:
+/// `DELETE /nudr-dr/v1/subscription-data/{supi}/context-data/{relative_path}`
+pub async fn udm_nudr_dr_send_context_delete(
+    supi: &str,
+    relative_path: &str,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/{relative_path}");
+    udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::delete(&path)).await
+}
+
+/// PATCH the AMF 3GPP-access registration in UDR (udmd-05: purgeFlag / modification).
+///
+/// Builds: `PATCH /nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access`
+pub async fn udm_nudr_dr_send_amf_context_patch(
+    supi: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+    let request = SbiRequest::patch(&path)
+        .with_json_body(body)
+        .map_err(|e| format!("Failed to serialize AMF context patch: {e}"))?;
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+/// GET the stored SMF registration from UDR (udmd-06: create vs update check).
+///
+/// Builds: `GET /nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}`
+pub async fn udm_nudr_dr_send_smf_context_get(
+    supi: &str,
+    psi: &str,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}");
+    udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::get(&path)).await
+}
+
+/// PUT an AuthEvent to the UDR authentication-status resource (udmd-09).
+///
+/// Builds: `PUT /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status`
+pub async fn udm_nudr_dr_send_auth_status_put(
+    supi: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path =
+        format!("/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status");
+    let request = SbiRequest::put(&path)
+        .with_json_body(body)
+        .map_err(|e| format!("Failed to serialize auth status body: {e}"))?;
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+/// Parse an absolute SBI callback URI into `(host, port, path)`.
+///
+/// Returns `None` for a relative URI (no scheme/authority) since a host cannot
+/// be resolved — the caller treats that as a best-effort skip.
+fn parse_callback_uri(uri: &str) -> Option<(String, u16, String)> {
+    let (default_port, without_scheme) = if let Some(rest) = uri.strip_prefix("https://") {
+        (443u16, rest)
+    } else if let Some(rest) = uri.strip_prefix("http://") {
+        (80u16, rest)
+    } else {
+        return None;
+    };
+    let (authority, path) = match without_scheme.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (without_scheme, "/".to_string()),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (authority.to_string(), default_port),
+    };
+    Some((host, port, path))
+}
+
+/// POST a `DeregistrationData` to an old AMF's deregistration callback URI
+/// (udmd-02, TS 29.503 §5.3.2.3.2). Best-effort: the caller logs failures and
+/// does not fail the new registration.
+pub async fn udm_sbi_send_dereg_notification(
+    callback_uri: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let (host, port, path) = parse_callback_uri(callback_uri)
+        .ok_or_else(|| format!("deregCallbackUri is not an absolute URI: {callback_uri}"))?;
+    let client = global_context().get_client(&host, port).await;
+    client
+        .post_json(&path, body)
+        .await
+        .map_err(|e| format!("Dereg notification POST to {callback_uri} failed: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Nausf_SoRProtection client (Wave-6 F-04, TS 29.509 / TS 33.501 §6.14.2.1)
+// ---------------------------------------------------------------------------
+
+/// POST a `SorInfo` to the AUSF's Nausf_SoRProtection Protect custom operation
+/// (`POST /nausf-sorprotection/v1/{supi}/ue-sor`, specs/TS29509_Nausf_SoRProtection.yaml:27).
+///
+/// AUSF selection (TS 33.501 §6.14.2.1 step 8 — "the AUSF that holds the latest
+/// K_AUSF"): prefer the `ausf_instance_id` captured at authentication time;
+/// fall back to a cached AUSF instance, then to the `AUSF_SBI_ADDR`/
+/// `AUSF_SBI_PORT` env vars (mirrors the UDR fallback). When none resolves the
+/// call errors and the caller withholds `sorInfo` (fail-closed).
+pub async fn udm_ausf_send_sor_protect(
+    supi: &str,
+    ausf_instance_id: Option<&str>,
+    sor_info: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nausf-sorprotection/v1/{supi}/ue-sor");
+    let build_request = || {
+        SbiRequest::post(&path)
+            .with_json_body(sor_info)
+            .map_err(|e| format!("Failed to serialize SorInfo: {e}"))
+    };
+
+    // 1. Prefer the AUSF that authenticated this UE (holds the latest KAUSF).
+    if let Some(id) = ausf_instance_id {
+        if global_context().get_nf_instance(id).await.is_some() {
+            return udm_sbi_send_request(id, build_request()?).await;
+        }
+    }
+
+    let sbi_ctx = global_context();
+
+    // 2. Any cached AUSF instance discovered via NRF.
+    let ausf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Ausf).await;
+    if let Some(ausf) = ausf_instances.first() {
+        let host = ausf
+            .ipv4_addresses
+            .first()
+            .ok_or("AUSF instance has no IPv4 address")?;
+        let port = ausf.services.first().map(|s| s.port).unwrap_or(80);
+        let client = sbi_ctx.get_client(host, port).await;
+        return client
+            .send_request(build_request()?)
+            .await
+            .map_err(|e| format!("Nausf_SoRProtection request to AUSF failed: {e}"));
+    }
+
+    // 3. Env-var fallback (matches the UDR env fallback pattern).
+    let host = std::env::var("AUSF_SBI_ADDR")
+        .map_err(|_| "No AUSF instance discovered and AUSF_SBI_ADDR not set".to_string())?;
+    let port: u16 = std::env::var("AUSF_SBI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    let client = sbi_ctx.get_client(&host, port).await;
+    client
+        .send_request(build_request()?)
+        .await
+        .map_err(|e| format!("Nausf_SoRProtection request to AUSF failed: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Nausf_UPUProtection client (Wave-6 F-05, TS 29.509 / TS 33.501 §6.15.2.1)
+// ---------------------------------------------------------------------------
+
+/// POST a `UpuInfo` to the AUSF's Nausf_UPUProtection Protect custom operation
+/// (`POST /nausf-upuprotection/v1/{supi}/ue-upu`, specs/TS29509_Nausf_UPUProtection.yaml:27).
+///
+/// AUSF selection (TS 33.501 §6.15.2.1 — "the AUSF that holds the latest
+/// K_AUSF"): prefer the `ausf_instance_id` captured at authentication time;
+/// fall back to a cached AUSF instance, then to the `AUSF_SBI_ADDR`/
+/// `AUSF_SBI_PORT` env vars (mirrors the SoR helper). When none resolves the
+/// call errors and the caller withholds `upuInfo` (fail-closed).
+pub async fn udm_ausf_send_upu_protect(
+    supi: &str,
+    ausf_instance_id: Option<&str>,
+    upu_info: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nausf-upuprotection/v1/{supi}/ue-upu");
+    let build_request = || {
+        SbiRequest::post(&path)
+            .with_json_body(upu_info)
+            .map_err(|e| format!("Failed to serialize UpuInfo: {e}"))
+    };
+
+    // 1. Prefer the AUSF that authenticated this UE (holds the latest KAUSF).
+    if let Some(id) = ausf_instance_id {
+        if global_context().get_nf_instance(id).await.is_some() {
+            return udm_sbi_send_request(id, build_request()?).await;
+        }
+    }
+
+    let sbi_ctx = global_context();
+
+    // 2. Any cached AUSF instance discovered via NRF.
+    let ausf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Ausf).await;
+    if let Some(ausf) = ausf_instances.first() {
+        let host = ausf
+            .ipv4_addresses
+            .first()
+            .ok_or("AUSF instance has no IPv4 address")?;
+        let port = ausf.services.first().map(|s| s.port).unwrap_or(80);
+        let client = sbi_ctx.get_client(host, port).await;
+        return client
+            .send_request(build_request()?)
+            .await
+            .map_err(|e| format!("Nausf_UPUProtection request to AUSF failed: {e}"));
+    }
+
+    // 3. Env-var fallback (matches the SoR env fallback pattern).
+    let host = std::env::var("AUSF_SBI_ADDR")
+        .map_err(|_| "No AUSF instance discovered and AUSF_SBI_ADDR not set".to_string())?;
+    let port: u16 = std::env::var("AUSF_SBI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    let client = sbi_ctx.get_client(&host, port).await;
+    client
+        .send_request(build_request()?)
+        .await
+        .map_err(|e| format!("Nausf_UPUProtection request to AUSF failed: {e}"))
 }
 
 /// SBI transaction for tracking requests
@@ -578,5 +858,27 @@ mod tests {
         assert_eq!(xact.sbi_object_id, 100);
         assert_eq!(xact.service_type, "nudm-ueau");
         assert_eq!(xact.state, 0);
+    }
+
+    /// WSB-4: amfd now registers an ABSOLUTE deregCallbackUri (it was relative,
+    /// which `parse_callback_uri` rejected -> the DeregistrationNotification
+    /// round trip was broken). The absolute URI must parse; the old relative
+    /// form must still be rejected (fail-closed, TS 29.503 §5.3.2.3.2 Uri).
+    #[test]
+    fn parse_callback_uri_accepts_absolute_amf_dereg_uri() {
+        let uri = "http://127.0.0.1:7777/namf-callback/v1/imsi-001010000000001/dereg-notify";
+        assert_eq!(
+            parse_callback_uri(uri),
+            Some((
+                "127.0.0.1".to_string(),
+                7777,
+                "/namf-callback/v1/imsi-001010000000001/dereg-notify".to_string(),
+            ))
+        );
+        // The pre-WSB-4 relative amfd URI is still rejected (no host to POST).
+        assert_eq!(
+            parse_callback_uri("/namf-callback/v1/imsi-001010000000001/dereg-notify"),
+            None
+        );
     }
 }

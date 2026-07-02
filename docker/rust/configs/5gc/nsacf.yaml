@@ -12,7 +12,10 @@ nsacf:
   slice_quotas:
     - sst: 1
       max_ues: 1000
+      max_pdu_sessions: 2000
     - sst: 2
       max_ues: 500
+      max_pdu_sessions: 1000
     - sst: 3
       max_ues: 2000
+      max_pdu_sessions: 4000

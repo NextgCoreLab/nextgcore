@@ -9,18 +9,18 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::JwksCache;
+use nextgcore_sbi::server::{
+    send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
+    SbiServerConfig as NextgcoreSbiServerConfig,
+};
 use nextgcore_udrd::data_store::{
     self, merge_patch, notify_application_data_change, notify_exposure_data_change,
     notify_influence_data_change, notify_subscription_data_change, SubKind,
 };
 use nextgcore_udrd::{
     udr_context_final, udr_context_init, udr_sbi_close, udr_sbi_open, SbiServerConfig, UdrSmContext,
-};
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::oauth::JwksCache;
-use ogs_sbi::server::{
-    send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -73,6 +73,13 @@ struct Args {
     /// TLS key path
     #[arg(long)]
     tls_key: Option<String>,
+
+    /// Path to the JSON snapshot file for non-subscriber resource trees
+    /// (exposure-data, application-data, smf-registrations, subs-to-notify).
+    /// When unset (the default), these trees are kept purely in-memory and are
+    /// lost on restart. Also settable via NEXTGCORE_UDR_STATE_FILE.
+    #[arg(long)]
+    state_file: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +129,19 @@ struct UdrYaml {
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Process-wide OAuth2 client for automatic Bearer-token acquisition on
+/// outbound SBI calls (Wave-6 H8 Phase A). Installed only when the existing
+/// `udr.sbi.oauth2.require` producer knob is enabled; attaching a Bearer to a
+/// non-verifying producer is a no-op, so this is matched-sim-E2E safe.
+static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>> =
+    std::sync::OnceLock::new();
+
+/// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled.
+#[allow(dead_code)]
+fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
@@ -129,8 +149,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -153,6 +173,25 @@ async fn main() -> Result<()> {
     udr_context_init();
     log::info!("UDR context initialized");
 
+    // Initialise the persistent data store for non-subscriber resource trees.
+    // Path precedence: --state-file flag, then NEXTGCORE_UDR_STATE_FILE env.
+    // With neither set the store stays purely in-memory (previous behaviour).
+    let state_file = args
+        .state_file
+        .clone()
+        .or_else(|| std::env::var("NEXTGCORE_UDR_STATE_FILE").ok())
+        .filter(|s| !s.is_empty());
+    match &state_file {
+        Some(path) => {
+            nextgcore_udrd::data_store::init_store(Some(std::path::PathBuf::from(path)));
+            log::info!("UDR resource-tree persistence enabled: {path}");
+        }
+        None => {
+            nextgcore_udrd::data_store::init_store(None);
+            log::info!("UDR resource-tree persistence disabled (in-memory only)");
+        }
+    }
+
     // Initialize UDR state machine
     let mut udr_sm = UdrSmContext::new();
     udr_sm.init();
@@ -161,7 +200,7 @@ async fn main() -> Result<()> {
     // Parse configuration to get db_uri and seed NRF URI
     let db_uri = parse_db_uri(&args.config);
     if !db_uri.is_empty() {
-        match ogs_dbi::ogs_dbi_init_async(db_uri.clone()).await {
+        match nextgcore_dbi::nextgcore_dbi_init_async(db_uri.clone()).await {
             Ok(()) => log::info!("MongoDB connected: {}", mask_uri(&db_uri)),
             Err(e) => log::warn!("MongoDB init failed (will use defaults): {e:?}"),
         }
@@ -201,7 +240,9 @@ async fn main() -> Result<()> {
     }
     if let Some(uri) = &nrf_uri_cfg {
         log::info!("NRF URI configured: {uri}");
-        ogs_sbi::context::global_context().set_nrf_uri(uri).await;
+        nextgcore_sbi::context::global_context()
+            .set_nrf_uri(uri)
+            .await;
     }
 
     // Build SBI server configuration (legacy, for context)
@@ -216,11 +257,11 @@ async fn main() -> Result<()> {
     // Open legacy SBI context (for context initialization)
     udr_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Start actual HTTP/2 SBI server using ogs-sbi
+    // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let mut sbi_server_config = OgsSbiServerConfig::new(sbi_addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
     if require_oauth2 {
         // Verify bearer tokens against the NRF's published keys (auth stage
         // 4b). With no NRF URI configured the server fails closed.
@@ -228,6 +269,17 @@ async fn main() -> Result<()> {
         sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
             .as_deref()
             .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
+        // Wave-6 H8 Phase A: install the process-wide OAuth2 client so outbound
+        // SBI calls acquire and attach an NRF-issued Bearer token.
+        if let Some(nrf_uri) = nrf_uri_cfg.as_deref() {
+            let nf_instance_id = format!("udr-{}", uuid::Uuid::new_v4());
+            let oauth2 = Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
+                nrf_uri,
+                nf_instance_id,
+                nextgcore_sbi::types::NfType::Udr,
+            ));
+            let _ = OAUTH2_CLIENT.set(Some(oauth2));
+        }
         log::info!(
             "OAuth2 enforcement enabled (JWKS: {})",
             sbi_server_config
@@ -248,7 +300,13 @@ async fn main() -> Result<()> {
     // Register with NRF and start heartbeat worker
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+            // (tracked subscribers, saturated at 100; TS 29.510 §5.2.2.3.2).
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
+                let ctx = nextgcore_udrd::context::udr_self();
+                let load = ctx.read().map(|c| c.get_load()).unwrap_or(0);
+                load.clamp(0, 100) as u8
+            });
         }
         Ok(_) => {}
         Err(e) => {
@@ -284,7 +342,7 @@ async fn main() -> Result<()> {
     log::info!("UDR context finalized");
 
     // Cleanup database
-    ogs_dbi::ogs_dbi_final();
+    nextgcore_dbi::nextgcore_dbi_final();
 
     log::info!("NextGCore UDR stopped");
     Ok(())
@@ -416,6 +474,28 @@ async fn handle_subscription_data(
         }
     } else if supi_or_suci.starts_with("imsi-") {
         supi_or_suci.to_string()
+    } else if supi_or_suci.starts_with("nai-")
+        || supi_or_suci.starts_with("gci-")
+        || supi_or_suci.starts_with("gli-")
+    {
+        // TS 29.571 VarUeId forms: NAI / GCI / GLI are spec-valid identifiers
+        // but are not backed by the subscriber DB in this UDR instance.
+        // Return 404 NOT_FOUND (not 400) so the caller knows the form is
+        // syntactically valid but not provisioned (udrd-06).
+        log::info!("VarUeId form not in subscriber DB, returning 404: {supi_or_suci}");
+        return send_not_found(
+            &format!("VarUeId form not in subscriber DB: {supi_or_suci}"),
+            Some("NOT_FOUND"),
+        );
+    } else if supi_or_suci.starts_with("extgroupid-") {
+        // TS 29.571 external group identifiers target group subscriptions;
+        // not supported in this Nudr_DataRepository instance (udrd-06).
+        return send_error(
+            501,
+            "Not Implemented",
+            "External group identifiers (extgroupid-) are not supported",
+            Some("NOT_SUPPORTED"),
+        );
     } else {
         log::warn!("Invalid SUPI type: {supi_or_suci}");
         return send_bad_request(
@@ -431,7 +511,7 @@ async fn handle_subscription_data(
 
     match sub_resource {
         "authentication-data" => handle_auth_data(supi, parts, method, request).await,
-        "provisioned-data" => handle_provisioned_data(supi, parts, 5, method).await,
+        "provisioned-data" => handle_provisioned_data(supi, parts, 5, method, request).await,
         "context-data" => handle_context_data(supi, parts, method, request).await,
         _ => {
             // Check if parts[4] is a PLMN ID and parts[5] = "provisioned-data"
@@ -446,7 +526,7 @@ async fn handle_subscription_data(
                         Some("MANDATORY_IE_INCORRECT"),
                     );
                 }
-                handle_provisioned_data(supi, parts, 6, method).await
+                handle_provisioned_data(supi, parts, 6, method, request).await
             } else if parts.get(5).copied() == Some("context-data") {
                 handle_context_data(supi, parts, method, request).await
             } else {
@@ -476,7 +556,8 @@ async fn handle_auth_data(
         ("authentication-subscription", "GET") => {
             log::info!("[{supi}] GET authentication-subscription");
 
-            match ogs_dbi::subscription::ogs_dbi_auth_info_async(supi.to_string()).await {
+            match nextgcore_dbi::subscription::nextgcore_dbi_auth_info_async(supi.to_string()).await
+            {
                 Ok(auth_info) => {
                     let response_json = build_auth_subscription_json(supi, &auth_info);
                     log::info!("[{supi}] Returning auth subscription data");
@@ -497,13 +578,10 @@ async fn handle_auth_data(
                 Ok(v) => v,
                 Err(resp) => return *resp,
             };
-            if body
-                .get("authenticationMethod")
-                .and_then(|v| v.as_str())
-                .is_none()
-            {
-                return missing_mandatory("authenticationMethod");
-            }
+            let auth_method = match body.get("authenticationMethod").and_then(|v| v.as_str()) {
+                Some(m) => m.to_string(),
+                None => return missing_mandatory("authenticationMethod"),
+            };
             let k_hex = match body.get("encPermanentKey").and_then(|v| v.as_str()) {
                 Some(k) if k.len() == 32 && k.bytes().all(|b| b.is_ascii_hexdigit()) => {
                     k.to_string()
@@ -518,7 +596,7 @@ async fn handle_auth_data(
                 }
                 None => return missing_mandatory("encPermanentKey"),
             };
-            let provision = ogs_dbi::subscription::OgsDbiAuthProvision {
+            let provision = nextgcore_dbi::subscription::NextgcoreDbiAuthProvision {
                 k_hex,
                 opc_hex: body
                     .get("encOpcKey")
@@ -536,8 +614,9 @@ async fn handle_auth_data(
                     .and_then(|v| v.as_str())
                     .and_then(|s| u64::from_str_radix(s, 16).ok())
                     .unwrap_or(0),
+                auth_method,
             };
-            match ogs_dbi::subscription::ogs_dbi_provision_auth_info_async(
+            match nextgcore_dbi::subscription::nextgcore_dbi_provision_auth_info_async(
                 supi.to_string(),
                 provision,
             )
@@ -556,7 +635,7 @@ async fn handle_auth_data(
                         SbiResponse::with_status(204)
                     }
                 }
-                Err(ogs_dbi::DbiError::NotInitialized) => send_error(
+                Err(nextgcore_dbi::DbiError::NotInitialized) => send_error(
                     503,
                     "Service Unavailable",
                     "Subscriber database unavailable",
@@ -576,7 +655,14 @@ async fn handle_auth_data(
         ("authentication-subscription", "PATCH") => {
             log::info!("[{supi}] PATCH authentication-subscription");
 
-            // Parse PatchItemList from request body to extract new SQN
+            // TS 29.505 (Nudr subscription-data): PATCH applies the
+            // PatchItemList and nothing else — the UDR must store exactly
+            // what is written.  SQN generation/advancement is the
+            // authentication-centre (UDM/ARPF) function per TS 33.102
+            // Annex C.3; udmd already advances the SQN itself before
+            // PATCHing the new value (advance_sqn_ind).  The previous
+            // unconditional SQN-increment side effect here corrupted every
+            // stored SQN by an extra +32 SEQ step (WSB-6).
             if let Some(content) = &request.http.content {
                 if let Ok(patches) = serde_json::from_str::<serde_json::Value>(content) {
                     if let Some(arr) = patches.as_array() {
@@ -585,11 +671,12 @@ async fn handle_auth_data(
                             if path == "/sequenceNumber/sqn" {
                                 if let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) {
                                     let sqn = u64::from_str_radix(sqn_hex, 16).unwrap_or(0);
-                                    if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_sqn_async(
-                                        supi.to_string(),
-                                        sqn,
-                                    )
-                                    .await
+                                    if let Err(e) =
+                                        nextgcore_dbi::subscription::nextgcore_dbi_update_sqn_async(
+                                            supi.to_string(),
+                                            sqn,
+                                        )
+                                        .await
                                     {
                                         log::error!("[{supi}] DB update_sqn failed: {e:?}");
                                     }
@@ -600,24 +687,18 @@ async fn handle_auth_data(
                 }
             }
 
-            // Increment SQN for next use
-            if let Err(e) =
-                ogs_dbi::subscription::ogs_dbi_increment_sqn_async(supi.to_string()).await
-            {
-                log::error!("[{supi}] DB increment_sqn failed: {e:?}");
-            }
-
             SbiResponse::with_status(204)
         }
         ("authentication-status", "PUT") | ("authentication-status", "DELETE") => {
             log::info!("[{supi}] {method} authentication-status");
 
-            if let Err(e) =
-                ogs_dbi::subscription::ogs_dbi_increment_sqn_async(supi.to_string()).await
-            {
-                log::error!("[{supi}] DB increment_sqn failed: {e:?}");
-            }
-
+            // TS 29.505 §6.3.3 / TS 29.503 §5.4.2: the authentication-status
+            // resource carries the AuthEvent from the UDM on auth
+            // confirmation.  It has NO SQN semantics — the previous
+            // unconditional SQN-increment side effect here advanced the
+            // stored SQN by another +32 SEQ step on every confirmation
+            // (WSB-6).  Follow-up (noted, out of WSB-6 scope): persist the
+            // AuthEvent body, which is currently acknowledged but discarded.
             SbiResponse::with_status(204)
         }
         _ => {
@@ -703,9 +784,11 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
             // blocking Mongo call moved to the spawn_blocking wrapper).
             if let Some(pei) = reg_data.get("pei").and_then(|v| v.as_str()) {
                 let imeisv = pei.strip_prefix("imeisv-").unwrap_or(pei).to_string();
-                if let Err(e) =
-                    ogs_dbi::subscription::ogs_dbi_update_imeisv_async(supi.to_string(), imeisv)
-                        .await
+                if let Err(e) = nextgcore_dbi::subscription::nextgcore_dbi_update_imeisv_async(
+                    supi.to_string(),
+                    imeisv,
+                )
+                .await
                 {
                     log::debug!("[{supi}] DB update_imeisv unavailable: {e:?}");
                 }
@@ -789,7 +872,22 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
     }
 }
 
-/// Handle SMF registration context
+/// TS 29.505 SmfRegistration mandatory IEs (Table 6.1.6.2.3-1: smfInstanceId,
+/// pduSessionId, singleNssai, dnn, plmnId).
+const SMF_REGISTRATION_MANDATORY_IES: [&str; 5] = [
+    "smfInstanceId",
+    "pduSessionId",
+    "singleNssai",
+    "dnn",
+    "plmnId",
+];
+
+/// Handle SMF registration context.
+///
+/// Stores and returns the ACTUAL registered SmfRegistration document (the full
+/// PUT body: smfInstanceId, singleNssai, dnn, pduSessionId, plmnId, ...), not a
+/// hardcoded summary. Backed by the persistent [`data_store`] so registrations
+/// survive a UDR restart.
 fn handle_smf_registrations(
     supi: &str,
     method: &str,
@@ -797,45 +895,19 @@ fn handle_smf_registrations(
     pdu_session_id: &str,
 ) -> SbiResponse {
     let udr_ctx = nextgcore_udrd::context::udr_self();
+    let ds = nextgcore_udrd::data_store::store();
     match method {
         "GET" => {
             if pdu_session_id.is_empty() {
-                let registrations = udr_ctx
-                    .read()
-                    .ok()
-                    .and_then(|ctx| {
-                        ctx.ue_find(supi).map(|ue| {
-                            ue.sessions
-                                .values()
-                                .map(|sess| {
-                                    serde_json::json!({
-                                        "smfInstanceId": "00000000-0000-0000-0000-000000000000",
-                                        "pduSessionId": sess.psi,
-                                        "singleNssai": {"sst": 1},
-                                        "dnn": sess.dnn.as_deref().unwrap_or("internet")
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .expect("value expected");
+                // Collection GET: every stored registration for the SUPI.
+                // Unknown UE -> empty array (TS 29.505), never a panic.
+                let registrations = ds.smf_registrations_for_supi(supi);
                 SbiResponse::with_status(200).with_body(
                     serde_json::Value::Array(registrations).to_string(),
                     "application/json",
                 )
             } else {
-                let psi: u8 = pdu_session_id.parse().unwrap_or(0);
-                let response = udr_ctx.read().ok().and_then(|ctx| {
-                    ctx.sess_find(supi, psi).map(|sess| {
-                        serde_json::json!({
-                            "smfInstanceId": "00000000-0000-0000-0000-000000000000",
-                            "pduSessionId": sess.psi,
-                            "singleNssai": {"sst": 1},
-                            "dnn": sess.dnn.as_deref().unwrap_or("internet")
-                        })
-                    })
-                });
-                match response {
+                match ds.smf_registration_get(supi, pdu_session_id) {
                     Some(json) => SbiResponse::with_status(200)
                         .with_body(json.to_string(), "application/json"),
                     None => send_not_found("SMF registration not found", Some("CONTEXT_NOT_FOUND")),
@@ -843,16 +915,76 @@ fn handle_smf_registrations(
             }
         }
         "PUT" => {
-            let psi: u8 = pdu_session_id.parse().unwrap_or(5);
-            let dnn = request.http.content.as_ref().and_then(|c| {
-                serde_json::from_str::<serde_json::Value>(c)
-                    .ok()
-                    .and_then(|v| v.get("dnn").and_then(|d| d.as_str()).map(|s| s.to_string()))
-            });
+            if pdu_session_id.is_empty() {
+                return send_bad_request("Missing pduSessionId", Some("MANDATORY_IE_MISSING"));
+            }
+            // Parse the SmfRegistration document from the request body.
+            let Some(content) = request.http.content.as_ref() else {
+                return send_bad_request(
+                    "Missing SmfRegistration body",
+                    Some("MANDATORY_IE_MISSING"),
+                );
+            };
+            let mut doc: serde_json::Value = match serde_json::from_str(content) {
+                Ok(v @ serde_json::Value::Object(_)) => v,
+                _ => {
+                    return send_bad_request(
+                        "Invalid SmfRegistration document",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+            };
+            // Validate mandatory IEs (TS 29.505 SmfRegistration).
+            let missing: Vec<&str> = SMF_REGISTRATION_MANDATORY_IES
+                .iter()
+                .filter(|ie| match doc.get(**ie) {
+                    None | Some(serde_json::Value::Null) => true,
+                    Some(serde_json::Value::String(s)) => s.is_empty(),
+                    Some(_) => false,
+                })
+                .copied()
+                .collect();
+            if !missing.is_empty() {
+                return send_bad_request(
+                    &format!("Missing mandatory IE(s): {}", missing.join(", ")),
+                    Some("MANDATORY_IE_MISSING"),
+                );
+            }
+            // The pduSessionId in the body must match the URI path segment
+            // (TS 29.505 §6.1.3.1.3.1) so the stored key is consistent.
+            let body_psi = doc.get("pduSessionId").and_then(|v| v.as_u64());
+            if let Some(bp) = body_psi {
+                if bp.to_string() != pdu_session_id {
+                    return send_bad_request(
+                        "pduSessionId in body does not match URI",
+                        Some("INVALID_MSG_FORMAT"),
+                    );
+                }
+            }
+            // Normalise pduSessionId to the URI value as a numeric IE.
+            if let Ok(num) = pdu_session_id.parse::<u64>() {
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.insert("pduSessionId".to_string(), serde_json::json!(num));
+                }
+            }
+            // Keep the context UE/session tracking in sync (for
+            // subscription-data change notifications and request correlation).
+            let psi: u8 = pdu_session_id.parse().unwrap_or(0);
+            let dnn = doc
+                .get("dnn")
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string());
             if let Ok(mut ctx) = udr_ctx.write() {
                 ctx.sess_find_or_add(supi, psi, dnn.as_deref());
             }
-            SbiResponse::with_status(204)
+            // Store the actual registered document (created vs. replaced).
+            let created = ds.smf_registration_put(supi, pdu_session_id, doc);
+            // TS 29.505: 201 Created for a new registration, 204 for replace.
+            if created {
+                SbiResponse::with_status(201)
+            } else {
+                SbiResponse::with_status(204)
+            }
         }
         "DELETE" => {
             if !pdu_session_id.is_empty() {
@@ -860,11 +992,106 @@ fn handle_smf_registrations(
                 if let Ok(mut ctx) = udr_ctx.write() {
                     ctx.sess_remove(supi, psi);
                 }
+                ds.smf_registration_remove(supi, pdu_session_id);
+            } else {
+                // Collection DELETE removes all registrations for the SUPI.
+                ds.smf_registrations_remove_by_supi(supi);
             }
             SbiResponse::with_status(204)
         }
         _ => send_method_not_allowed(method, "context-data/smf-registrations"),
     }
+}
+
+/// Parse a `dataset-names` query parameter value into a set of requested
+/// dataset names.  Handles both comma-separated (`AM,SM`) and percent-encoded
+/// forms.  Returns `None` when the parameter is absent (→ return all datasets).
+///
+/// TS 29.504 §6.1 / TS 29.505 §5.4.2.8 `ProvisionedDataSetName` enum.
+fn parse_dataset_names(raw: &str) -> Option<std::collections::HashSet<String>> {
+    let decoded = pct_decode(raw);
+    let names: std::collections::HashSet<String> = decoded
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
+/// TS 29.504 §6.1.4.2 partial retrieval: project a JSON object value down to
+/// the requested attribute paths (JSON Pointer syntax, e.g. `/a/b`).
+///
+/// Non-object top-level values (e.g. arrays) are returned unchanged.
+/// A segment of `/` alone means the whole document — also returned unchanged.
+/// Unknown paths are silently omitted from the result.
+fn project_fields(value: &serde_json::Value, paths: &[String]) -> serde_json::Value {
+    if paths.is_empty() {
+        return value.clone();
+    }
+    if !value.is_object() {
+        return value.clone(); // arrays / scalars cannot be path-projected
+    }
+    let mut out = serde_json::Map::new();
+    for path in paths {
+        let stripped = path.strip_prefix('/').unwrap_or(path.as_str());
+        if stripped.is_empty() {
+            // "/" or "" refers to the whole document
+            return value.clone();
+        }
+        let segments: Vec<&str> = stripped.split('/').collect();
+        if let Some(extracted) = project_extract(value, &segments) {
+            project_insert(&mut out, &segments, extracted);
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+fn project_extract(value: &serde_json::Value, segments: &[&str]) -> Option<serde_json::Value> {
+    if segments.is_empty() {
+        return Some(value.clone());
+    }
+    project_extract(value.as_object()?.get(segments[0])?, &segments[1..])
+}
+
+fn project_insert(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    segments: &[&str],
+    value: serde_json::Value,
+) {
+    if segments.is_empty() {
+        return;
+    }
+    if segments.len() == 1 {
+        out.insert(segments[0].to_string(), value);
+        return;
+    }
+    let entry = out
+        .entry(segments[0].to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(obj) = entry.as_object_mut() {
+        project_insert(obj, &segments[1..], value);
+    }
+}
+
+/// Apply the `fields` query parameter (TS 29.504 §6.1.4.2 partial retrieval)
+/// when present.  Returns `value` unchanged when `fields` is absent.
+fn apply_fields_param(value: serde_json::Value, request: &SbiRequest) -> serde_json::Value {
+    let Some(raw) = request.http.params.get("fields") else {
+        return value;
+    };
+    let paths: Vec<String> = pct_decode(raw)
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if paths.is_empty() {
+        return value;
+    }
+    project_fields(&value, &paths)
 }
 
 /// Handle provisioned-data requests
@@ -874,6 +1101,7 @@ async fn handle_provisioned_data(
     parts: &[&str],
     dataset_idx: usize,
     method: &str,
+    request: &SbiRequest,
 ) -> SbiResponse {
     if method != "GET" {
         return send_method_not_allowed(method, "provisioned-data");
@@ -884,7 +1112,9 @@ async fn handle_provisioned_data(
     log::info!("[{supi}] GET provisioned-data/{dataset}");
 
     let subscription_data =
-        match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string()).await {
+        match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(supi.to_string())
+            .await
+        {
             Ok(data) => data,
             Err(e) => {
                 log::error!("[{supi}] DB subscription_data query failed: {e:?}");
@@ -897,14 +1127,31 @@ async fn handle_provisioned_data(
         "smf-selection-subscription-data" => build_smf_selection_data(&subscription_data),
         "sm-data" => build_sm_data(&subscription_data),
         "" => {
-            // Combined provisioned data
+            // Combined provisioned-data GET (TS 29.504 §6.1 / TS 29.505 §5.4.2.8).
+            // When `dataset-names` is present, return only the requested members;
+            // absent param returns the full default set (udrd-03).
+            let requested = request
+                .http
+                .params
+                .get("dataset-names")
+                .and_then(|raw| parse_dataset_names(raw));
+
+            let include =
+                |name: &str| -> bool { requested.as_ref().is_none_or(|set| set.contains(name)) };
+
             let mut combined = serde_json::Map::new();
-            combined.insert("amData".to_string(), build_am_data(&subscription_data));
-            combined.insert(
-                "smfSelData".to_string(),
-                build_smf_selection_data(&subscription_data),
-            );
-            combined.insert("smData".to_string(), build_sm_data(&subscription_data));
+            if include("AM") {
+                combined.insert("amData".to_string(), build_am_data(&subscription_data));
+            }
+            if include("SMF_SEL") {
+                combined.insert(
+                    "smfSelData".to_string(),
+                    build_smf_selection_data(&subscription_data),
+                );
+            }
+            if include("SM") {
+                combined.insert("smData".to_string(), build_sm_data(&subscription_data));
+            }
             serde_json::Value::Object(combined)
         }
         _ => {
@@ -912,6 +1159,9 @@ async fn handle_provisioned_data(
             return send_not_found(&format!("Unknown dataset: {dataset}"), None);
         }
     };
+
+    // TS 29.504 §6.1.4.2 partial retrieval via `fields` param (udrd-07).
+    let response = apply_fields_param(response, request);
 
     SbiResponse::with_status(200).with_body(response.to_string(), "application/json")
 }
@@ -944,9 +1194,38 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
             match method {
                 "GET" => {
                     log::debug!("[{supi}] GET policy am-data");
-                    // AmPolicyData - per 3GPP spec, AM policy is typically derived
-                    // from subscription data, not stored separately
-                    SbiResponse::with_status(200).with_body("{}".to_string(), "application/json")
+                    // udrd-05: return stored AmPolicyData when provisioned (udrd-04);
+                    // fall back to `{}` per TS 29.519 (no default AM policy data).
+                    let ds = nextgcore_udrd::data_store::store();
+                    let body = ds
+                        .policy_am_get(supi)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let body = apply_fields_param(body, request);
+                    SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
+                }
+                "PUT" => {
+                    log::debug!("[{supi}] PUT policy am-data");
+                    let body = match parse_json_body(request) {
+                        Ok(v) => v,
+                        Err(resp) => return *resp,
+                    };
+                    if !body.is_object() {
+                        return send_bad_request(
+                            "Body must be a JSON object",
+                            Some("INVALID_MSG_FORMAT"),
+                        );
+                    }
+                    let ds = nextgcore_udrd::data_store::store();
+                    let created = ds.policy_am_put(supi, body.clone());
+                    let path = format!("/nudr-dr/v1/policy-data/ues/{supi}/am-data");
+                    notify_subscription_data_change(supi, &path, Some(&body));
+                    if created {
+                        SbiResponse::with_status(201)
+                            .with_header("Location", path)
+                            .with_body(body.to_string(), "application/json")
+                    } else {
+                        SbiResponse::with_status(204)
+                    }
                 }
                 _ => send_method_not_allowed(method, "policy-data/ues/am-data"),
             }
@@ -955,13 +1234,24 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
             match method {
                 "GET" => {
                     log::debug!("[{supi}] GET policy sm-data");
-                    match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string())
-                        .await
+                    let ds = nextgcore_udrd::data_store::store();
+                    // udrd-05: prefer stored SmPolicyData when provisioned (udrd-04);
+                    // fall back to the derived default from subscription data.
+                    if let Some(stored) = ds.policy_sm_get(supi) {
+                        let stored = apply_fields_param(stored, request);
+                        return SbiResponse::with_status(200)
+                            .with_body(stored.to_string(), "application/json");
+                    }
+                    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(
+                        supi.to_string(),
+                    )
+                    .await
                     {
                         Ok(data) => {
                             let sm_policy_snssai_data = build_sm_policy_data(&data);
                             let response =
                                 serde_json::json!({"smPolicySnssaiData": sm_policy_snssai_data});
+                            let response = apply_fields_param(response, request);
                             SbiResponse::with_status(200)
                                 .with_body(response.to_string(), "application/json")
                         }
@@ -970,12 +1260,28 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                 }
                 "PUT" => {
                     log::debug!("[{supi}] PUT policy sm-data");
-                    // Accept and acknowledge SM policy data update
-                    // The PCF writes SM policy decisions back to UDR
-                    if let Some(content) = &request.http.content {
-                        log::debug!("[{supi}] SM policy data update: {} bytes", content.len());
+                    let body = match parse_json_body(request) {
+                        Ok(v) => v,
+                        Err(resp) => return *resp,
+                    };
+                    if !body.is_object() {
+                        return send_bad_request(
+                            "Body must be a JSON object",
+                            Some("INVALID_MSG_FORMAT"),
+                        );
                     }
-                    SbiResponse::with_status(204)
+                    // udrd-04: persist the provisioned SmPolicyData.
+                    let ds = nextgcore_udrd::data_store::store();
+                    let created = ds.policy_sm_put(supi, body.clone());
+                    let path = format!("/nudr-dr/v1/policy-data/ues/{supi}/sm-data");
+                    notify_subscription_data_change(supi, &path, Some(&body));
+                    if created {
+                        SbiResponse::with_status(201)
+                            .with_header("Location", path)
+                            .with_body(body.to_string(), "application/json")
+                    } else {
+                        SbiResponse::with_status(204)
+                    }
                 }
                 _ => send_method_not_allowed(method, "policy-data/ues/sm-data"),
             }
@@ -984,10 +1290,18 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
             match method {
                 "GET" => {
                     log::debug!("[{supi}] GET ue-policy-set");
-                    // UePolicySet - contains URSP rules, ANDSP, etc.
-                    // Per TS 29.519, return UE policy set from DB or defaults
-                    match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string())
-                        .await
+                    let ds = nextgcore_udrd::data_store::store();
+                    // udrd-05: prefer stored UePolicySet when provisioned (udrd-04);
+                    // fall back to a minimal derived default built from subscription slices.
+                    if let Some(stored) = ds.policy_ue_get(supi) {
+                        let stored = apply_fields_param(stored, request);
+                        return SbiResponse::with_status(200)
+                            .with_body(stored.to_string(), "application/json");
+                    }
+                    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(
+                        supi.to_string(),
+                    )
+                    .await
                     {
                         Ok(data) => {
                             // Build a minimal UePolicySet with subscribed S-NSSAIs
@@ -1009,11 +1323,12 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                             let response = serde_json::json!({
                                 "subscPolicySections": subscribed_ue_pol_sections
                             });
+                            let response = apply_fields_param(response, request);
                             SbiResponse::with_status(200)
                                 .with_body(response.to_string(), "application/json")
                         }
                         Err(_) => {
-                            // Return empty UePolicySet as default
+                            // Return empty UePolicySet as default (TS 29.519)
                             SbiResponse::with_status(200)
                                 .with_body("{}".to_string(), "application/json")
                         }
@@ -1021,8 +1336,28 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                 }
                 "PUT" => {
                     log::debug!("[{supi}] PUT ue-policy-set");
-                    // Accept UE policy set update from PCF
-                    SbiResponse::with_status(204)
+                    let body = match parse_json_body(request) {
+                        Ok(v) => v,
+                        Err(resp) => return *resp,
+                    };
+                    if !body.is_object() {
+                        return send_bad_request(
+                            "Body must be a JSON object",
+                            Some("INVALID_MSG_FORMAT"),
+                        );
+                    }
+                    // udrd-04: persist the provisioned UePolicySet.
+                    let ds = nextgcore_udrd::data_store::store();
+                    let created = ds.policy_ue_put(supi, body.clone());
+                    let path = format!("/nudr-dr/v1/policy-data/ues/{supi}/ue-policy-set");
+                    notify_subscription_data_change(supi, &path, Some(&body));
+                    if created {
+                        SbiResponse::with_status(201)
+                            .with_header("Location", path)
+                            .with_body(body.to_string(), "application/json")
+                    } else {
+                        SbiResponse::with_status(204)
+                    }
                 }
                 _ => send_method_not_allowed(method, "policy-data/ues/ue-policy-set"),
             }
@@ -1033,7 +1368,7 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
 
 /// Build SM policy data from subscription data
 fn build_sm_policy_data(
-    data: &ogs_dbi::types::OgsSubscriptionData,
+    data: &nextgcore_dbi::types::NextgcoreSubscriptionData,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut sm_policy_snssai_data = serde_json::Map::new();
     for slice in &data.slice {
@@ -1661,7 +1996,7 @@ async fn handle_application_data(
 // Data builders (from nudr_handler.rs, adapted for direct SBI response)
 // ============================================================================
 
-fn build_am_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+fn build_am_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serde_json::Value {
     let mut am = serde_json::Map::new();
     if data.num_of_msisdn > 0 {
         let gpsis: Vec<serde_json::Value> = data
@@ -1720,7 +2055,9 @@ fn build_am_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Valu
     serde_json::Value::Object(am)
 }
 
-fn build_smf_selection_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+fn build_smf_selection_data(
+    data: &nextgcore_dbi::types::NextgcoreSubscriptionData,
+) -> serde_json::Value {
     let mut smf_sel = serde_json::Map::new();
     let mut snssai_infos = serde_json::Map::new();
     for slice in &data.slice {
@@ -1751,7 +2088,34 @@ fn build_smf_selection_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde
     serde_json::Value::Object(smf_sel)
 }
 
-fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+/// Build the TS 29.571 §5.5.3 `Arp` JSON object.
+///
+/// All three members (`priorityLevel`, `preemptCap`, `preemptVuln`) are
+/// required by the schema; a strict OpenAPI-validating SMF rejects the
+/// DnnConfiguration when either pre-emption field is absent.
+///
+/// Mapping (mirrors the legacy `nudr_handler.rs:636-648`):
+/// - `pre_emption_capability == 1`   → `"MAY_PREEMPT"`, else `"NOT_PREEMPT"`
+/// - `pre_emption_vulnerability == 1` → `"PREEMPTABLE"`, else `"NOT_PREEMPTABLE"`
+fn arp_json(arp: &nextgcore_dbi::types::NextgcoreArp) -> serde_json::Value {
+    let preempt_cap = if arp.pre_emption_capability == 1 {
+        "MAY_PREEMPT"
+    } else {
+        "NOT_PREEMPT"
+    };
+    let preempt_vuln = if arp.pre_emption_vulnerability == 1 {
+        "PREEMPTABLE"
+    } else {
+        "NOT_PREEMPTABLE"
+    };
+    serde_json::json!({
+        "priorityLevel": arp.priority_level,
+        "preemptCap": preempt_cap,
+        "preemptVuln": preempt_vuln,
+    })
+}
+
+fn build_sm_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serde_json::Value {
     let mut sm_data_list = Vec::new();
     for slice in &data.slice {
         let mut sm_entry = serde_json::Map::new();
@@ -1776,10 +2140,17 @@ fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Valu
                     3 => "IPV4V6",
                     _ => "IPV4V6",
                 };
+                // TS 29.505 §5.4.4 sscModes: NextgcoreSession carries no provisioned
+                // SSC-mode field in the current DB schema.  The legacy
+                // nudr_handler.rs:627 emitted the full set {1,2,3} as the
+                // documented default, which is used here. (udrd-12)
                 dnn_configs.insert(dnn.clone(), serde_json::json!({
                     "pduSessionTypes": { "defaultSessionType": pdu_type, "allowedSessionTypes": [pdu_type] },
-                    "sscModes": { "defaultSscMode": "SSC_MODE_1", "allowedSscModes": ["SSC_MODE_1"] },
-                    "5gQosProfile": { "5qi": sess.qos.index, "arp": { "priorityLevel": sess.qos.arp.priority_level } },
+                    "sscModes": {
+                        "defaultSscMode": "SSC_MODE_1",
+                        "allowedSscModes": ["SSC_MODE_1", "SSC_MODE_2", "SSC_MODE_3"]
+                    },
+                    "5gQosProfile": { "5qi": sess.qos.index, "arp": arp_json(&sess.qos.arp) },
                     "sessionAmbr": { "uplink": format_ambr(sess.ambr.uplink), "downlink": format_ambr(sess.ambr.downlink) }
                 }));
             }
@@ -1806,29 +2177,64 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 /// is 5 bits per TS 33.102 SQN array management).
 fn build_auth_subscription_json(
     supi: &str,
-    auth_info: &ogs_dbi::subscription::OgsDbiAuthInfo,
+    auth_info: &nextgcore_dbi::subscription::NextgcoreDbiAuthInfo,
 ) -> serde_json::Value {
+    // TS 29.505 §5.4.2.2: serve the provisioned authenticationMethod (AuthMethod).
+    // Legacy subscriber docs lack the field (empty) -> default to "5G_AKA" per
+    // TS 33.501 §6.1.2. (udrd-10 / udrd#1)
+    let auth_method = if auth_info.authentication_method.is_empty() {
+        "5G_AKA"
+    } else {
+        auth_info.authentication_method.as_str()
+    };
+
+    // TS 29.505 §5.4.2.23 / TS 33.102 SQN array management: with indLength=5
+    // the low 5 bits of the 48-bit SQN are the IND component and must be
+    // zeroed in the stored/served representation. (udrd-08)
+    const IND_LENGTH: u64 = 5;
+    const SQN_48_MASK: u64 = 0xFFFF_FFFF_FFFF;
+    const IND_MASK: u64 = (1u64 << IND_LENGTH) - 1; // 0x1F
+    let sqn_zeroed = (auth_info.sqn & SQN_48_MASK) & !IND_MASK;
+
     serde_json::json!({
-        "authenticationMethod": "5G_AKA",
+        "authenticationMethod": auth_method,
         "encPermanentKey": bytes_to_hex(&auth_info.k),
         "encOpcKey": bytes_to_hex(if auth_info.use_opc { &auth_info.opc } else { &auth_info.op }),
         "authenticationManagementField": bytes_to_hex(&auth_info.amf),
         "supi": supi,
         "sequenceNumber": {
             "sqnScheme": "NON_TIME_BASED",
-            "sqn": format!("{:012x}", auth_info.sqn & 0xFFFFFFFFFFFF),
-            "indLength": 5
+            "sqn": format!("{sqn_zeroed:012x}"),
+            "indLength": IND_LENGTH
         }
     })
 }
 
+/// Lossless AMBR formatter (udrd-02).
+///
+/// Chooses the largest SI unit (`Tbps` → `Gbps` → `Mbps` → `Kbps` → `bps`)
+/// that divides `bps` exactly, producing a value that round-trips back to the
+/// original bit-rate.  Truncating integer division is intentionally avoided —
+/// `1_500_000_000 bps` becomes `"1500 Mbps"`, not `"1 Gbps"`.
+///
+/// The output always matches the TS 29.571 `BitRate` pattern
+/// `^\d+(\.\d+)? (bps|Kbps|Mbps|Gbps|Tbps)$`.
 fn format_ambr(bps: u64) -> String {
-    if bps >= 1_000_000_000 {
-        format!("{} Gbps", bps / 1_000_000_000)
-    } else if bps >= 1_000_000 {
-        format!("{} Mbps", bps / 1_000_000)
-    } else if bps >= 1_000 {
-        format!("{} Kbps", bps / 1_000)
+    if bps == 0 {
+        return "0 bps".to_string();
+    }
+    const TBPS: u64 = 1_000_000_000_000;
+    const GBPS: u64 = 1_000_000_000;
+    const MBPS: u64 = 1_000_000;
+    const KBPS: u64 = 1_000;
+    if bps.is_multiple_of(TBPS) {
+        format!("{} Tbps", bps / TBPS)
+    } else if bps.is_multiple_of(GBPS) {
+        format!("{} Gbps", bps / GBPS)
+    } else if bps.is_multiple_of(MBPS) {
+        format!("{} Mbps", bps / MBPS)
+    } else if bps.is_multiple_of(KBPS) {
+        format!("{} Kbps", bps / KBPS)
     } else {
         format!("{bps} bps")
     }
@@ -1929,7 +2335,7 @@ async fn run_event_loop_async(shutdown: Arc<AtomicBool>) -> Result<()> {
 /// Returns the NF instance ID on success so the caller can start a heartbeat
 /// worker.
 async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -2106,7 +2512,8 @@ udr:
     fn test_auth_subscription_sequence_number_shape() {
         // TS 29.505 AuthenticationSubscription / SequenceNumber round-trip:
         // sqnScheme + indLength + 12-hex-digit sqn must be present.
-        let mut info = ogs_dbi::subscription::OgsDbiAuthInfo::default();
+        // udrd-08: the low 5 IND bits must be zeroed — 0x1F21 → 0x1F20.
+        let mut info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo::default();
         info.sqn = 0x1F21;
         info.use_opc = true;
         let doc = build_auth_subscription_json("imsi-001010000000001", &info);
@@ -2117,7 +2524,11 @@ udr:
         let sqn = seq["sqn"].as_str().unwrap();
         assert_eq!(sqn.len(), 12);
         assert!(sqn.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(sqn, "000000001f21");
+        // IND bits [4:0] of 0x1F21 = 0x01 → zeroed → 0x1F20
+        assert_eq!(sqn, "000000001f20");
+        // Confirm low 5 bits are zero
+        let sqn_val = u64::from_str_radix(sqn, 16).unwrap();
+        assert_eq!(sqn_val & 0x1F, 0, "IND bits must be zeroed");
         assert_eq!(doc["supi"], "imsi-001010000000001");
     }
 
@@ -2132,7 +2543,7 @@ udr:
     // HTTP-level tests over a real HTTP/2 SBI server on ephemeral ports.
     // ------------------------------------------------------------------
 
-    use ogs_sbi::client::SbiClient;
+    use nextgcore_sbi::client::SbiClient;
     use serde_json::json;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -2145,6 +2556,34 @@ udr:
         addr
     }
 
+    /// Serializes tests that depend on the global nextgcore-dbi backend
+    /// state: the WSB-6 tests enable the in-memory dbi test store while
+    /// `test_http_auth_provisioning_and_plmn_validation` asserts the
+    /// fail-closed no-DB 503 path — the two must not overlap in time.
+    static DBI_BACKEND_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// RAII guard (WSB-6): holds `DBI_BACKEND_LOCK` with the nextgcore-dbi
+    /// in-memory test store enabled, and disables the store again on drop —
+    /// including on panic/unwind, so a failing test cannot leak the store
+    /// into the fail-closed 503 test.
+    struct DbiTestStore {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DbiTestStore {
+        async fn enable() -> Self {
+            let lock = DBI_BACKEND_LOCK.lock().await;
+            nextgcore_dbi::test_store::enable();
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for DbiTestStore {
+        fn drop(&mut self) {
+            nextgcore_dbi::test_store::disable();
+        }
+    }
+
     /// Start the UDR SBI server plus a local notification listener that
     /// forwards (path, body) of every received POST into a channel.
     async fn start_udr_and_listener() -> (
@@ -2155,7 +2594,7 @@ udr:
         mpsc::UnboundedReceiver<(String, String)>,
     ) {
         let udr_addr = ephemeral_addr();
-        let udr_server = SbiServer::new(OgsSbiServerConfig::new(udr_addr));
+        let udr_server = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
         udr_server
             .start(udr_sbi_request_handler)
             .await
@@ -2163,7 +2602,7 @@ udr:
 
         let listener_addr = ephemeral_addr();
         let (tx, rx) = mpsc::unbounded_channel::<(String, String)>();
-        let listener = SbiServer::new(OgsSbiServerConfig::new(listener_addr));
+        let listener = SbiServer::new(NextgcoreSbiServerConfig::new(listener_addr));
         listener
             .start(move |req: SbiRequest| {
                 let tx = tx.clone();
@@ -2324,6 +2763,91 @@ udr:
         req.http.set_param("ue-id", supi);
         let resp = client.send_request(req).await.expect("DELETE subs");
         assert_eq!(resp.status, 204);
+
+        udr.stop().await.expect("udr stops");
+        listener.stop().await.expect("listener stops");
+    }
+
+    /// Regression (C5 / remote DoS): GET smf-registrations for a SUPI that
+    /// the UDR has never seen must return 200 with an empty array, NOT panic
+    /// (the handler previously `.expect()`-ed on a missing UE, crashing the
+    /// NF on a crafted GET). Also covers the per-PDU GET (404) and the PUT ->
+    /// GET-list round-trip so the success path stays intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_smf_registrations_unknown_ue_no_panic() {
+        let (udr, client, listener, _cb_port, _rx) = start_udr_and_listener().await;
+
+        // Unknown UE, collection GET -> 200 + empty JSON array (no panic).
+        let unknown = "imsi-001019999999999";
+        let coll =
+            format!("/nudr-dr/v1/subscription-data/{unknown}/context-data/smf-registrations");
+        let resp = client.get(&coll).await.expect("GET unknown smf-regs");
+        assert_eq!(resp.status, 200, "unknown UE collection GET must be 200");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!([]),
+            "unknown UE must yield an empty array, not a panic"
+        );
+
+        // Unknown UE, per-PDU GET -> 404 ProblemDetails (also no panic).
+        let single = format!("{coll}/5");
+        let resp = client.get(&single).await.expect("GET unknown smf-reg/5");
+        assert_eq!(resp.status, 404);
+
+        // Success path: PUT a full SmfRegistration then GET the actual stored
+        // values back (not a hardcoded summary). A new registration is 201.
+        let supi = "imsi-001019900000077";
+        let coll = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations");
+        let single = format!("{coll}/5");
+        let reg = json!({
+            "smfInstanceId": "11111111-2222-3333-4444-555555555555",
+            "pduSessionId": 5,
+            "singleNssai": {"sst": 2, "sd": "000001"},
+            "dnn": "ims",
+            "plmnId": {"mcc": "001", "mnc": "01"}
+        });
+        let resp = client.put_json(&single, &reg).await.expect("PUT smf-reg");
+        assert_eq!(resp.status, 201, "new SmfRegistration must be 201 Created");
+
+        // Per-PDU GET returns the ACTUAL registered document.
+        let resp = client.get(&single).await.expect("GET smf-reg/5");
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got["smfInstanceId"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(got["singleNssai"], json!({"sst": 2, "sd": "000001"}));
+        assert_eq!(got["dnn"], "ims");
+        assert_eq!(got["plmnId"], json!({"mcc": "001", "mnc": "01"}));
+        assert_eq!(got["pduSessionId"], 5);
+
+        let resp = client.get(&coll).await.expect("GET smf-regs list");
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let arr = body.as_array().expect("array");
+        assert_eq!(arr.len(), 1, "one registration after PUT");
+        assert_eq!(arr[0]["pduSessionId"], 5);
+        assert_eq!(arr[0]["dnn"], "ims");
+        assert_eq!(
+            arr[0]["smfInstanceId"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+
+        // Replacing the same registration is 204 (not created).
+        let resp = client
+            .put_json(&single, &reg)
+            .await
+            .expect("re-PUT smf-reg");
+        assert_eq!(resp.status, 204, "replace must be 204");
+
+        // Missing mandatory IEs -> 400 MANDATORY_IE_MISSING.
+        let resp = client
+            .put_json(&single, &json!({"dnn": "ims"}))
+            .await
+            .expect("PUT incomplete smf-reg");
+        assert_eq!(resp.status, 400, "missing mandatory IEs must be 400");
 
         udr.stop().await.expect("udr stops");
         listener.stop().await.expect("listener stops");
@@ -2574,8 +3098,12 @@ udr:
     /// success path requires MongoDB and is covered by E2E).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_auth_provisioning_and_plmn_validation() {
+        // WSB-6: this test asserts the fail-closed no-DB 503 path; take the
+        // backend lock so it cannot overlap with the WSB-6 tests that enable
+        // the in-memory dbi test store.
+        let _backend = DBI_BACKEND_LOCK.lock().await;
         let udr_addr = ephemeral_addr();
-        let udr = SbiServer::new(OgsSbiServerConfig::new(udr_addr));
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
         udr.start(udr_sbi_request_handler)
             .await
             .expect("UDR SBI server starts");
@@ -2647,6 +3175,742 @@ udr:
             .await
             .expect("GET good plmn");
         assert_eq!(resp.status, 404);
+
+        udr.stop().await.expect("udr stops");
+    }
+
+    // ------------------------------------------------------------------
+    // udrd-01: arp_json / build_sm_data pre-emption fields
+    // ------------------------------------------------------------------
+
+    /// TS 29.571 §5.5.3 Arp schema requires priorityLevel + preemptCap +
+    /// preemptVuln.  Verify that build_sm_data emits all three and that
+    /// the pre-emption mappings are correct:
+    ///   pre_emption_capability == 1  → "MAY_PREEMPT"
+    ///   pre_emption_vulnerability == 0 → "NOT_PREEMPTABLE"
+    #[test]
+    fn test_build_sm_data_arp_all_three_fields() {
+        use nextgcore_dbi::types::{
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSNssai, NextgcoreSession,
+            NextgcoreSliceData, NextgcoreSubscriptionData,
+        };
+
+        let arp = NextgcoreArp {
+            priority_level: 8,
+            pre_emption_capability: 1,
+            pre_emption_vulnerability: 0,
+        };
+        let sess = NextgcoreSession {
+            name: Some("internet".to_string()),
+            session_type: 1, // IPV4
+            qos: NextgcoreQos {
+                index: 9,
+                arp,
+                ..Default::default()
+            },
+            ambr: NextgcoreAmbr {
+                uplink: 1_000_000_000,
+                downlink: 1_000_000_000,
+            },
+            ..Default::default()
+        };
+        let slice = NextgcoreSliceData {
+            s_nssai: NextgcoreSNssai::new(1, None),
+            session: vec![sess],
+            ..Default::default()
+        };
+        let data = NextgcoreSubscriptionData {
+            slice: vec![slice],
+            ..Default::default()
+        };
+
+        let result = build_sm_data(&data);
+
+        let arr = result.as_array().expect("sm-data is array");
+        assert_eq!(arr.len(), 1);
+        let arp_val = &arr[0]["dnnConfigurations"]["internet"]["5gQosProfile"]["arp"];
+
+        assert_eq!(arp_val["priorityLevel"], 8_u64, "priorityLevel must be 8");
+        assert_eq!(
+            arp_val["preemptCap"], "MAY_PREEMPT",
+            "capability==1 → MAY_PREEMPT"
+        );
+        assert_eq!(
+            arp_val["preemptVuln"], "NOT_PREEMPTABLE",
+            "vulnerability==0 → NOT_PREEMPTABLE"
+        );
+    }
+
+    /// Complementary case: capability==0 / vulnerability==1 flips both strings.
+    #[test]
+    fn test_build_sm_data_arp_not_preempt_preemptable() {
+        use nextgcore_dbi::types::{
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSNssai, NextgcoreSession,
+            NextgcoreSliceData, NextgcoreSubscriptionData,
+        };
+
+        let arp = NextgcoreArp {
+            priority_level: 1,
+            pre_emption_capability: 0,
+            pre_emption_vulnerability: 1,
+        };
+        let sess = NextgcoreSession {
+            name: Some("ims".to_string()),
+            session_type: 3, // IPV4V6
+            qos: NextgcoreQos {
+                index: 5,
+                arp,
+                ..Default::default()
+            },
+            ambr: NextgcoreAmbr {
+                uplink: 0,
+                downlink: 0,
+            },
+            ..Default::default()
+        };
+        let slice = NextgcoreSliceData {
+            s_nssai: NextgcoreSNssai::new(1, None),
+            session: vec![sess],
+            ..Default::default()
+        };
+        let data = NextgcoreSubscriptionData {
+            slice: vec![slice],
+            ..Default::default()
+        };
+
+        let result = build_sm_data(&data);
+        let arr = result.as_array().unwrap();
+        let arp_val = &arr[0]["dnnConfigurations"]["ims"]["5gQosProfile"]["arp"];
+
+        assert_eq!(
+            arp_val["preemptCap"], "NOT_PREEMPT",
+            "capability==0 → NOT_PREEMPT"
+        );
+        assert_eq!(
+            arp_val["preemptVuln"], "PREEMPTABLE",
+            "vulnerability==1 → PREEMPTABLE"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // udrd-02: format_ambr lossless unit selection
+    // ------------------------------------------------------------------
+
+    /// TS 29.571 BitRate — exact unit chosen so no precision is lost.
+    #[test]
+    fn test_format_ambr_precision() {
+        // Round values pick the largest exact unit
+        assert_eq!(format_ambr(1_000_000_000_000), "1 Tbps");
+        assert_eq!(format_ambr(1_000_000_000), "1 Gbps");
+        assert_eq!(format_ambr(1_000_000), "1 Mbps");
+        assert_eq!(format_ambr(1_000), "1 Kbps");
+        assert_eq!(format_ambr(1), "1 bps");
+        assert_eq!(format_ambr(0), "0 bps");
+
+        // Non-round values must NOT truncate: drop to next exact unit
+        assert_eq!(
+            format_ambr(1_500_000_000),
+            "1500 Mbps",
+            "1.5 Gbps must not truncate to 1 Gbps"
+        );
+        assert_eq!(
+            format_ambr(1_200_000),
+            "1200 Kbps",
+            "1.2 Mbps must not truncate to 1 Mbps"
+        );
+        assert_eq!(
+            format_ambr(12_345),
+            "12345 bps",
+            "non-round bps falls through to bps"
+        );
+
+        // All outputs must match the TS 29.571 BitRate pattern
+        for bps in [
+            1u64,
+            999,
+            1_000,
+            1_001,
+            1_500_000,
+            2_000_000_000,
+            5_000_000_000_000,
+        ] {
+            let s = format_ambr(bps);
+            let valid_suffix = s.ends_with(" bps")
+                || s.ends_with(" Kbps")
+                || s.ends_with(" Mbps")
+                || s.ends_with(" Gbps")
+                || s.ends_with(" Tbps");
+            assert!(valid_suffix, "BitRate pattern violated: {s}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // udrd-03: parse_dataset_names
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_dataset_names() {
+        // Single name
+        let set = parse_dataset_names("AM").unwrap();
+        assert!(set.contains("AM"));
+        assert!(!set.contains("SM"));
+
+        // Comma-separated, case-insensitive
+        let set = parse_dataset_names("AM,SM").unwrap();
+        assert!(set.contains("AM"));
+        assert!(set.contains("SM"));
+        assert!(!set.contains("SMF_SEL"));
+
+        // Mixed case
+        let set = parse_dataset_names("smf_sel").unwrap();
+        assert!(set.contains("SMF_SEL"));
+
+        // Empty → None
+        assert!(parse_dataset_names("").is_none());
+
+        // Whitespace trimming
+        let set = parse_dataset_names("AM , SM").unwrap();
+        assert!(set.contains("AM"));
+        assert!(set.contains("SM"));
+    }
+
+    // ------------------------------------------------------------------
+    // udrd-06: VarUeId routing
+    // ------------------------------------------------------------------
+
+    /// Recognized VarUeId forms that are not DB-backed must return 404,
+    /// not 400 INVALID_SUPI.  extgroupid- must return 501.
+    /// imsi- and suci- must be unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_varueid_routing() {
+        let udr_addr = ephemeral_addr();
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+
+        // imsi- is unchanged (404 when no DB, not 400)
+        let resp = client
+            .get("/nudr-dr/v1/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription")
+            .await
+            .expect("GET imsi");
+        assert_eq!(resp.status, 404, "imsi- should 404 (no DB), not 400");
+
+        // nai- is a valid VarUeId, returns 404 (not 400 INVALID_SUPI)
+        let resp = client
+            .get("/nudr-dr/v1/subscription-data/nai-user@example.com/authentication-data/authentication-subscription")
+            .await
+            .expect("GET nai");
+        assert_eq!(resp.status, 404, "nai- should be 404, not 400");
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_ne!(
+            problem["cause"], "INVALID_SUPI",
+            "nai- must not be rejected as INVALID_SUPI"
+        );
+
+        // gci- is a valid VarUeId, returns 404
+        let resp = client
+            .get("/nudr-dr/v1/subscription-data/gci-001010000000001/authentication-data/authentication-subscription")
+            .await
+            .expect("GET gci");
+        assert_eq!(resp.status, 404, "gci- should be 404");
+
+        // extgroupid- returns 501 Not Implemented
+        let resp = client
+            .get("/nudr-dr/v1/subscription-data/extgroupid-grp001/authentication-data/authentication-subscription")
+            .await
+            .expect("GET extgroupid");
+        assert_eq!(resp.status, 501, "extgroupid- must return 501");
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "NOT_SUPPORTED");
+
+        // Unknown prefix still returns 400 INVALID_SUPI
+        let resp = client
+            .get("/nudr-dr/v1/subscription-data/bogus-12345/authentication-data/authentication-subscription")
+            .await
+            .expect("GET bogus");
+        assert_eq!(resp.status, 400, "unknown prefix must still be 400");
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "INVALID_SUPI");
+
+        udr.stop().await.expect("udr stops");
+    }
+
+    // ------------------------------------------------------------------
+    // udrd-07: project_fields
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_project_fields_nested() {
+        let value = json!({"a": {"b": 1, "c": 2}, "d": 3});
+
+        // Single nested path
+        let paths = vec!["/a/b".to_string()];
+        let result = project_fields(&value, &paths);
+        assert_eq!(result, json!({"a": {"b": 1}}));
+
+        // Two paths at different levels
+        let paths = vec!["/a/b".to_string(), "/d".to_string()];
+        let result = project_fields(&value, &paths);
+        assert_eq!(result, json!({"a": {"b": 1}, "d": 3}));
+
+        // Root path returns whole doc
+        let paths = vec!["/".to_string()];
+        let result = project_fields(&value, &paths);
+        assert_eq!(result, value);
+
+        // Non-existent path silently omitted
+        let paths = vec!["/z/y".to_string()];
+        let result = project_fields(&value, &paths);
+        assert_eq!(result, json!({}));
+
+        // Empty paths → unchanged
+        let result = project_fields(&value, &[]);
+        assert_eq!(result, value);
+    }
+
+    // ------------------------------------------------------------------
+    // udrd-08: SQN IND-zeroed normalization
+    // ------------------------------------------------------------------
+
+    /// TS 29.505 §5.4.2.23: SQN must have the low 5 (indLength) bits zeroed.
+    #[test]
+    fn test_sqn_ind_zeroed() {
+        let mut info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo::default();
+        // 0x23 = 0b100011 → IND bits [4:0] = 0b00011 = 3 → must be zeroed → 0x20
+        info.sqn = 0x23;
+        info.use_opc = true;
+        let doc = build_auth_subscription_json("imsi-001010000000001", &info);
+        let seq = &doc["sequenceNumber"];
+        assert_eq!(seq["indLength"], 5);
+        let sqn = seq["sqn"].as_str().unwrap();
+        assert_eq!(sqn, "000000000020", "IND bits must be zeroed: 0x23 → 0x20");
+        // Verify the low 5 bits of the parsed value are zero
+        let sqn_val = u64::from_str_radix(sqn, 16).unwrap();
+        assert_eq!(sqn_val & 0x1F, 0, "low 5 bits must be zero");
+    }
+
+    #[test]
+    fn test_sqn_ind_zeroed_already_clean() {
+        let mut info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo::default();
+        // 0x20 already has IND bits zeroed → no change
+        info.sqn = 0x20;
+        info.use_opc = true;
+        let doc = build_auth_subscription_json("imsi-001010000000002", &info);
+        let sqn = doc["sequenceNumber"]["sqn"].as_str().unwrap();
+        assert_eq!(sqn, "000000000020");
+    }
+
+    // ------------------------------------------------------------------
+    // udrd-10: authenticationMethod defaults to 5G_AKA
+    // ------------------------------------------------------------------
+
+    /// NextgcoreDbiAuthInfo does not carry the provisioned authenticationMethod;
+    /// the emitted value must default to "5G_AKA" per TS 33.501 §6.1.2.
+    #[test]
+    fn test_authentication_method_default_5g_aka() {
+        let info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo::default();
+        let doc = build_auth_subscription_json("imsi-001010000000001", &info);
+        assert_eq!(
+            doc["authenticationMethod"].as_str().unwrap(),
+            "5G_AKA",
+            "default authenticationMethod must be 5G_AKA"
+        );
+    }
+
+    /// udrd#1: a provisioned non-default authenticationMethod (e.g. EAP_AKA_PRIME)
+    /// must be served verbatim, not overwritten with 5G_AKA.
+    #[test]
+    fn test_authentication_method_served_from_db() {
+        let info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo {
+            authentication_method: "EAP_AKA_PRIME".to_string(),
+            ..Default::default()
+        };
+        let doc = build_auth_subscription_json("imsi-001010000000003", &info);
+        assert_eq!(
+            doc["authenticationMethod"].as_str().unwrap(),
+            "EAP_AKA_PRIME",
+            "provisioned authenticationMethod must be served verbatim",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // udrd-12: sscModes derive documented default (SSC_MODE_1/2/3)
+    // ------------------------------------------------------------------
+
+    /// TS 29.505 §5.4.4: when no SSC-mode provisioning is in the DB schema,
+    /// the default emitted must include SSC_MODE_1/2/3 (matching the legacy
+    /// handler at nudr_handler.rs:627).
+    #[test]
+    fn test_ssc_modes_default() {
+        use nextgcore_dbi::types::{
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSNssai, NextgcoreSession,
+            NextgcoreSliceData, NextgcoreSubscriptionData,
+        };
+        let sess = NextgcoreSession {
+            name: Some("internet".to_string()),
+            session_type: 1,
+            qos: NextgcoreQos {
+                index: 9,
+                arp: NextgcoreArp::default(),
+                ..Default::default()
+            },
+            ambr: NextgcoreAmbr {
+                uplink: 1_000_000,
+                downlink: 1_000_000,
+            },
+            ..Default::default()
+        };
+        let data = NextgcoreSubscriptionData {
+            slice: vec![NextgcoreSliceData {
+                s_nssai: NextgcoreSNssai::new(1, None),
+                session: vec![sess],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let result = build_sm_data(&data);
+        let ssc = &result[0]["dnnConfigurations"]["internet"]["sscModes"];
+        assert_eq!(ssc["defaultSscMode"], "SSC_MODE_1");
+        let allowed = ssc["allowedSscModes"].as_array().unwrap();
+        let modes: Vec<&str> = allowed.iter().filter_map(|v| v.as_str()).collect();
+        assert!(modes.contains(&"SSC_MODE_1"), "must include SSC_MODE_1");
+        assert!(modes.contains(&"SSC_MODE_2"), "must include SSC_MODE_2");
+        assert!(modes.contains(&"SSC_MODE_3"), "must include SSC_MODE_3");
+    }
+
+    // ------------------------------------------------------------------
+    // udrd-04/05: policy-data HTTP round-trip (store and retrieve)
+    // ------------------------------------------------------------------
+
+    /// PUT policy sm-data then GET returns the stored doc (not derived default).
+    /// PUT am-data then GET returns stored doc.
+    /// PUT ue-policy-set then GET returns stored doc.
+    /// With no PUT, GET returns the documented default (derived or `{}`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_policy_data_store_and_retrieve() {
+        let (udr, client, listener, _cb_port, _rx) = start_udr_and_listener().await;
+        let supi = "imsi-001019900000042";
+
+        // --- am-data ---
+        let am_path = format!("/nudr-dr/v1/policy-data/ues/{supi}/am-data");
+        // No PUT yet → GET returns {} default
+        let resp = client.get(&am_path).await.expect("GET am-data default");
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body, json!({}), "default am-data must be {{}}");
+
+        // PUT → 201 Created
+        let am_doc = json!({"suppFeat": "0", "rfsp": 1});
+        let resp = client
+            .put_json(&am_path, &am_doc)
+            .await
+            .expect("PUT am-data");
+        assert_eq!(resp.status, 201, "first PUT must be 201");
+
+        // GET now returns stored doc
+        let resp = client.get(&am_path).await.expect("GET am-data stored");
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got, am_doc, "GET must return stored am-data");
+
+        // Second PUT → 204 Replace
+        let resp = client
+            .put_json(&am_path, &am_doc)
+            .await
+            .expect("PUT am-data replace");
+        assert_eq!(resp.status, 204, "second PUT must be 204");
+
+        // --- sm-data ---
+        let sm_path = format!("/nudr-dr/v1/policy-data/ues/{supi}/sm-data");
+        let sm_doc = json!({"smPolicySnssaiData": {"01": {"snssai": {"sst": 1}}}});
+        let resp = client
+            .put_json(&sm_path, &sm_doc)
+            .await
+            .expect("PUT sm-data");
+        assert_eq!(resp.status, 201, "first PUT must be 201");
+        let resp = client.get(&sm_path).await.expect("GET sm-data");
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got, sm_doc, "GET must return stored sm-data");
+
+        // --- ue-policy-set ---
+        let ue_path = format!("/nudr-dr/v1/policy-data/ues/{supi}/ue-policy-set");
+        let ue_doc = json!({"subscPolicySections": {"01": {"upsi": []}}});
+        let resp = client
+            .put_json(&ue_path, &ue_doc)
+            .await
+            .expect("PUT ue-policy-set");
+        assert_eq!(resp.status, 201, "first PUT must be 201");
+        let resp = client.get(&ue_path).await.expect("GET ue-policy-set");
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got, ue_doc, "GET must return stored ue-policy-set");
+
+        udr.stop().await.expect("udr stops");
+        listener.stop().await.expect("listener stops");
+    }
+
+    // ------------------------------------------------------------------
+    // WSB-6: UDR must store exactly the SQN that is written — no
+    // side-effect increments (TS 29.505 PATCH = apply PatchItemList only;
+    // TS 33.102 Annex C.3: SQN advancement is the UDM/ARPF function).
+    // ------------------------------------------------------------------
+
+    /// Local copy of udmd's SQN advance (nextgcore-udmd main.rs
+    /// `advance_sqn_ind`, TS 33.102 Annex C.3.2): SQN = SEQ[47:5] || IND[4:0],
+    /// SEQ increments by 1 (one +32 step on the packed value), IND kept,
+    /// masked to 48 bits. udmd is a bin-only crate so the function cannot be
+    /// linked from here; the arithmetic is replicated verbatim.
+    fn udm_advance_sqn_ind(sqn: u64) -> u64 {
+        let seq = sqn >> 5;
+        let ind = sqn & 0x1F;
+        (((seq + 1) << 5) | ind) & 0x0000_FFFF_FFFF_FFFF
+    }
+
+    /// Provision an authentication subscription through the REAL PUT handler
+    /// (TS 29.505 AuthenticationSubscription shape) and return the auth path.
+    async fn wsb6_provision(client: &SbiClient, supi: &str, sqn: u64) -> String {
+        let auth_path = format!(
+            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+        );
+        let resp = client
+            .put_json(
+                &auth_path,
+                &json!({
+                    "authenticationMethod": "5G_AKA",
+                    "encPermanentKey": "465b5ce8b199b49faa5f0a2ee238a6bc",
+                    "encOpcKey": "e8ed289deba952e4283b54e88e6183ca",
+                    "authenticationManagementField": "8000",
+                    "sequenceNumber": {
+                        "sqnScheme": "NON_TIME_BASED",
+                        "sqn": format!("{sqn:012x}"),
+                        "indLength": 5
+                    }
+                }),
+            )
+            .await
+            .expect("PUT provision");
+        assert_eq!(resp.status, 201, "provisioning PUT must create (201)");
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(sqn),
+            "provisioned SQN must be stored exactly"
+        );
+        auth_path
+    }
+
+    /// WSB-6 acceptance test: PATCH /sequenceNumber/sqn = X through the real
+    /// SBI server + router + handler → the stored SQN is EXACTLY X (the old
+    /// PATCH arm corrupted it to X+32 via an unconditional SQN increment).
+    /// Reintroducing the increment makes this test fail.
+    #[tokio::test]
+    async fn wsb6_patch_stores_exact_sqn_no_side_effect() {
+        let _store = DbiTestStore::enable().await;
+        let udr_addr = ephemeral_addr();
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let supi = "imsi-999990000000601";
+        let auth_path = wsb6_provision(&client, supi, 0x20).await;
+
+        // udmd-shaped PATCH body — byte-identical PatchItemList to
+        // udm_nudr_dr_send_auth_subscription_patch (nextgcore-udmd
+        // sbi_path.rs): [{"op":"replace","path":"/sequenceNumber/sqn",...}].
+        let x: u64 = 0x2020; // IND bits zero, so the served form is exact too
+        let resp = client
+            .patch_json(
+                &auth_path,
+                &json!([{
+                    "op": "replace",
+                    "path": "/sequenceNumber/sqn",
+                    "value": format!("{x:012x}")
+                }]),
+            )
+            .await
+            .expect("PATCH sqn");
+        assert_eq!(resp.status, 204);
+
+        // Stored value must be exactly X — not X+32.
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(x),
+            "UDR must store exactly the PATCHed SQN (TS 29.505); +32 means the \
+             WSB-6 side-effect increment was reintroduced"
+        );
+
+        // And the real GET handler serves it back exactly.
+        let resp = client.get(&auth_path).await.expect("GET auth-subscription");
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(doc["sequenceNumber"]["sqn"], format!("{x:012x}"));
+
+        udr.stop().await.expect("udr stops");
+    }
+
+    /// WSB-6: the authentication-status PUT/DELETE arm must have NO SQN side
+    /// effect (it previously incremented by +32 on every UDM confirmation).
+    #[tokio::test]
+    async fn wsb6_auth_status_put_delete_no_sqn_side_effect() {
+        let _store = DbiTestStore::enable().await;
+        let udr_addr = ephemeral_addr();
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let supi = "imsi-999990000000602";
+        let s0: u64 = 0x40;
+        wsb6_provision(&client, supi, s0).await;
+        let status_path = format!(
+            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status"
+        );
+
+        // TS 29.503 AuthEvent body, as udmd PUTs it on auth confirmation
+        // (udm_nudr_dr_send_auth_status_put passes the AUSF body verbatim).
+        let resp = client
+            .put_json(
+                &status_path,
+                &json!({
+                    "nfInstanceId": "6874ed4b-262c-4a53-a8a4-e846a41ad0e8",
+                    "success": true,
+                    "timeStamp": "2026-07-01T00:00:00Z",
+                    "authType": "5G_AKA",
+                    "servingNetworkName": "5G:mnc001.mcc001.3gppnetwork.org"
+                }),
+            )
+            .await
+            .expect("PUT auth-status");
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(s0),
+            "auth-status PUT must not advance the stored SQN"
+        );
+
+        let resp = client
+            .delete(&status_path)
+            .await
+            .expect("DELETE auth-status");
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(s0),
+            "auth-status DELETE must not advance the stored SQN"
+        );
+
+        udr.stop().await.expect("udr stops");
+    }
+
+    /// WSB-6 strict-peer sequence: emulate udmd's generate-AV flow (GET →
+    /// client-side advance_sqn_ind → PATCH exact value → auth-status PUT on
+    /// confirmation) N times against the REAL udrd handler stack. The stored
+    /// SQN must advance EXACTLY one SEQ step per AV (previously 3: udmd's
+    /// intended advance + PATCH-side +32 + auth-status +32). Includes one
+    /// AUTS-resync iteration (TS 33.102 §6.3.5: resume from SQN_MS+1, then
+    /// one advance) whose exact value — including nonzero IND bits — must be
+    /// stored verbatim.
+    #[tokio::test]
+    async fn wsb6_udm_av_flow_advances_sqn_one_step_per_av() {
+        let _store = DbiTestStore::enable().await;
+        let udr_addr = ephemeral_addr();
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let supi = "imsi-999990000000603";
+        let s0: u64 = 0x20;
+        let auth_path = wsb6_provision(&client, supi, s0).await;
+        let status_path = format!(
+            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status"
+        );
+        let auth_event = json!({
+            "nfInstanceId": "6874ed4b-262c-4a53-a8a4-e846a41ad0e8",
+            "success": true,
+            "timeStamp": "2026-07-01T00:00:00Z",
+            "authType": "5G_AKA",
+            "servingNetworkName": "5G:mnc001.mcc001.3gppnetwork.org"
+        });
+
+        const N: u32 = 3;
+        for _ in 0..N {
+            // udmd reads the served SQN (GET), advances it client-side per
+            // TS 33.102 C.3.2 and PATCHes the advanced value (udmd main.rs
+            // step 6), then PUTs the AuthEvent on confirmation.
+            let resp = client.get(&auth_path).await.expect("GET auth-subscription");
+            assert_eq!(resp.status, 200);
+            let doc: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let served =
+                u64::from_str_radix(doc["sequenceNumber"]["sqn"].as_str().expect("sqn hex"), 16)
+                    .expect("sqn parses");
+            let advanced = udm_advance_sqn_ind(served);
+            let resp = client
+                .patch_json(
+                    &auth_path,
+                    &json!([{
+                        "op": "replace",
+                        "path": "/sequenceNumber/sqn",
+                        "value": format!("{advanced:012x}")
+                    }]),
+                )
+                .await
+                .expect("PATCH sqn");
+            assert_eq!(resp.status, 204);
+            let resp = client
+                .put_json(&status_path, &auth_event)
+                .await
+                .expect("PUT auth-status");
+            assert_eq!(resp.status, 204);
+        }
+
+        // Exactly one SEQ step (+32) per AV — nothing more.
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(s0 + u64::from(N) * 32),
+            "stored SQN must advance exactly one advance_sqn_ind step per AV"
+        );
+
+        // AUTS resync iteration: udmd resumes from SQN_MS+1 (main.rs resync
+        // branch), then step 6 advances once and PATCHes; the exact value —
+        // IND bits included — must be stored verbatim.
+        let sqn_ms: u64 = 0xA0C5; // nonzero IND (5)
+        let resync_next = udm_advance_sqn_ind((sqn_ms + 1) & 0x0000_FFFF_FFFF_FFFF);
+        let resp = client
+            .patch_json(
+                &auth_path,
+                &json!([{
+                    "op": "replace",
+                    "path": "/sequenceNumber/sqn",
+                    "value": format!("{resync_next:012x}")
+                }]),
+            )
+            .await
+            .expect("PATCH resync sqn");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .put_json(&status_path, &auth_event)
+            .await
+            .expect("PUT auth-status after resync");
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(resync_next),
+            "resynchronized SQN must be stored exactly (IND bits preserved, \
+             no +32 corruption)"
+        );
 
         udr.stop().await.expect("udr stops");
     }

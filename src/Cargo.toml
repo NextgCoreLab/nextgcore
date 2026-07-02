@@ -3,24 +3,23 @@ resolver = "2"
 
 members = [
     # Library crates (mirrors lib/)
-    "libs/ogs-core",
-    "libs/ogs-crypt",
-    "libs/ogs-asn1c",
-    "libs/ogs-gtp",
-    "libs/ogs-pfcp",
-    "libs/ogs-nas",
-    "libs/ogs-sbi",
-    "libs/ogs-diameter",
-    "libs/ogs-sctp",
-    "libs/ogs-ngap",
-    "libs/ogs-s1ap",
-    "libs/ogs-dbi",
-    "libs/ogs-app",
-    "libs/ogs-metrics",
-    "libs/ogs-proto",
-    "libs/ogs-ipfw",
-    "libs/ogs-tun",
-    # "libs/ogs-ffi",  # excluded: requires clang, no crate depends on it
+    "libs/nextgcore-core",
+    "libs/nextgcore-crypt",
+    "libs/nextgcore-asn1c",
+    "libs/nextgcore-gtp",
+    "libs/nextgcore-pfcp",
+    "libs/nextgcore-nas",
+    "libs/nextgcore-sbi",
+    "libs/nextgcore-diameter",
+    "libs/nextgcore-sctp",
+    "libs/nextgcore-ngap",
+    "libs/nextgcore-s1ap",
+    "libs/nextgcore-dbi",
+    "libs/nextgcore-app",
+    "libs/nextgcore-metrics",
+    "libs/nextgcore-proto",
+    "libs/nextgcore-ipfw",
+    "libs/nextgcore-tun",
 
     # Binary crates (mirrors src/)
     "bins/nextgcore-amfd",
@@ -129,9 +128,6 @@ diameter-rs = "0.5"            # Diameter protocol (AAA)
 # Pure Rust SCTP (userspace over UDP - no C dependencies)
 sctp-proto = "0.6"             # SCTP protocol (same as nextgsim for wire compatibility)
 
-# FFI and bindgen (optional - only for C interop testing)
-bindgen = "0.69"
-
 # Testing
 proptest = "1.4"
 hex-literal = "0.4"
@@ -157,24 +153,23 @@ tower-http = { version = "0.5", features = ["fs", "cors"] }
 mime_guess = "2"
 
 # Internal crates
-ogs-core = { path = "libs/ogs-core" }
-ogs-crypt = { path = "libs/ogs-crypt" }
-ogs-asn1c = { path = "libs/ogs-asn1c" }
-ogs-gtp = { path = "libs/ogs-gtp" }
-ogs-pfcp = { path = "libs/ogs-pfcp" }
-ogs-nas = { path = "libs/ogs-nas" }
-ogs-sbi = { path = "libs/ogs-sbi" }
-ogs-diameter = { path = "libs/ogs-diameter" }
-ogs-sctp = { path = "libs/ogs-sctp" }
-ogs-ngap = { path = "libs/ogs-ngap" }
-ogs-s1ap = { path = "libs/ogs-s1ap" }
-ogs-dbi = { path = "libs/ogs-dbi" }
-ogs-app = { path = "libs/ogs-app" }
-ogs-metrics = { path = "libs/ogs-metrics" }
-ogs-proto = { path = "libs/ogs-proto" }
-ogs-ipfw = { path = "libs/ogs-ipfw" }
-ogs-tun = { path = "libs/ogs-tun" }
-ogs-ffi = { path = "libs/ogs-ffi" }
+nextgcore-core = { path = "libs/nextgcore-core" }
+nextgcore-crypt = { path = "libs/nextgcore-crypt" }
+nextgcore-asn1c = { path = "libs/nextgcore-asn1c" }
+nextgcore-gtp = { path = "libs/nextgcore-gtp" }
+nextgcore-pfcp = { path = "libs/nextgcore-pfcp" }
+nextgcore-nas = { path = "libs/nextgcore-nas" }
+nextgcore-sbi = { path = "libs/nextgcore-sbi" }
+nextgcore-diameter = { path = "libs/nextgcore-diameter" }
+nextgcore-sctp = { path = "libs/nextgcore-sctp" }
+nextgcore-ngap = { path = "libs/nextgcore-ngap" }
+nextgcore-s1ap = { path = "libs/nextgcore-s1ap" }
+nextgcore-dbi = { path = "libs/nextgcore-dbi" }
+nextgcore-app = { path = "libs/nextgcore-app" }
+nextgcore-metrics = { path = "libs/nextgcore-metrics" }
+nextgcore-proto = { path = "libs/nextgcore-proto" }
+nextgcore-ipfw = { path = "libs/nextgcore-ipfw" }
+nextgcore-tun = { path = "libs/nextgcore-tun" }
 
 # Workspace-wide lint configuration
 # 3GPP protocol implementations naturally have many parameters and complex types.

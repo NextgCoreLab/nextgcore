@@ -5,11 +5,11 @@
 //! with the offending IE type when absent; conditional IEs needed by the SGW
 //! procedures produce `CONDITIONAL_IE_MISSING` (cause 71).
 
-use ogs_gtp::v2::ie::{
+use nextgcore_gtp::v2::ie::{
     Gtp2AmbrIe, Gtp2ApnIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2EbiIe,
     Gtp2FTeidIe, Gtp2IeType, Gtp2IndicationIe, Gtp2PaaIe,
 };
-use ogs_gtp::v2::message::Gtp2Message;
+use nextgcore_gtp::v2::message::Gtp2Message;
 
 use crate::s11_handler::gtp_cause;
 
@@ -48,7 +48,7 @@ fn require(
     msg: &Gtp2Message,
     ie_type: Gtp2IeType,
     instance: u8,
-) -> Result<&ogs_gtp::v2::ie::Gtp2Ie, IeError> {
+) -> Result<&nextgcore_gtp::v2::ie::Gtp2Ie, IeError> {
     msg.get_ie(ie_type as u8, instance)
         .ok_or_else(|| IeError::missing_mandatory(ie_type))
 }
@@ -301,8 +301,8 @@ pub fn parse_bearer_response(msg: &Gtp2Message) -> Result<ParsedBearerResponse, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ogs_gtp::v2::header::{Gtp2Header, Gtp2MessageType};
-    use ogs_gtp::v2::ie::Gtp2Ie;
+    use nextgcore_gtp::v2::header::{Gtp2Header, Gtp2MessageType};
+    use nextgcore_gtp::v2::ie::Gtp2Ie;
 
     fn csr_message() -> Gtp2Message {
         let mut msg = Gtp2Message::new(Gtp2Header::new(

@@ -517,7 +517,7 @@ pub fn query_nrf_slice_availability(
 pub fn validate_slice_selection(s_nssai: &SNssai, supi: Option<&str>, nrf_uri: &str) -> bool {
     // Step 1: Check subscription if SUPI available
     if let Some(supi) = supi {
-        match ogs_dbi::ogs_dbi_subscription_data(supi) {
+        match nextgcore_dbi::nextgcore_dbi_subscription_data(supi) {
             Ok(sub_data) => {
                 let subscribed = sub_data.slice.iter().any(|s| {
                     s.s_nssai.sst == s_nssai.sst && {

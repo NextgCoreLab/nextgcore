@@ -1,0 +1,702 @@
+//! LPP message envelope (3GPP TS 37.355 §6.1), UNALIGNED PER.
+//!
+//! `LPP-Message` is the top-level PDU exchanged between the LMF (location
+//! server) and the UE (target device). It carries optional transaction
+//! management (transaction id / sequence number / acknowledgement) plus an
+//! optional `LPP-MessageBody`. v1 types the `c1` message-body indices 0/1
+//! (request / provide capabilities) and 4/5 (request / provide location
+//! information); the other 12 `c1` alternatives and the `messageClassExtension`
+//! arm are carried by follow-on chunks.
+
+use bytes::Bytes;
+
+use super::a_gnss::body::{ProvideAssistanceData, RequestAssistanceData};
+use super::capabilities::{ProvideCapabilities, RequestCapabilities};
+use super::ecid::{ProvideLocationInformation, RequestLocationInformation};
+use super::types::{Acknowledgement, LppTransactionId, SequenceNumber};
+use crate::per::{PerError, PerResult};
+use crate::uper::{UperDecode, UperDecoder, UperEncode, UperEncoder};
+
+/// LPP-Message ::= SEQUENCE {              -- NON-extensible
+///     transactionID   LPP-TransactionID OPTIONAL,
+///     endTransaction  BOOLEAN,
+///     sequenceNumber  SequenceNumber OPTIONAL,
+///     acknowledgement Acknowledgement OPTIONAL,
+///     lpp-MessageBody LPP-MessageBody OPTIONAL }
+///
+/// The four OPTIONAL fields produce four presence bits in the preamble, in
+/// declaration order `[transactionID, sequenceNumber, acknowledgement,
+/// lpp-MessageBody]`. The mandatory `endTransaction` BOOLEAN is written between
+/// `transactionID` and `sequenceNumber`, i.e. after the preamble.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LppMessage {
+    pub transaction_id: Option<LppTransactionId>,
+    pub end_transaction: bool,
+    pub sequence_number: Option<SequenceNumber>,
+    pub acknowledgement: Option<Acknowledgement>,
+    pub message_body: Option<LppMessageBody>,
+}
+
+impl LppMessage {
+    /// Encode this message to UPER octets (final octet padding applied).
+    pub fn encode(&self) -> PerResult<Bytes> {
+        let mut encoder = UperEncoder::new();
+        self.encode_uper(&mut encoder)?;
+        Ok(encoder.into_bytes())
+    }
+
+    /// Decode an `LPP-Message` from UPER octets.
+    pub fn decode(bytes: &[u8]) -> PerResult<Self> {
+        let mut decoder = UperDecoder::new(bytes);
+        Self::decode_uper(&mut decoder)
+    }
+}
+
+impl UperEncode for LppMessage {
+    fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
+        encoder.encode_sequence_preamble(
+            None,
+            &[
+                self.transaction_id.is_some(),
+                self.sequence_number.is_some(),
+                self.acknowledgement.is_some(),
+                self.message_body.is_some(),
+            ],
+        );
+        if let Some(tid) = &self.transaction_id {
+            tid.encode_uper(encoder)?;
+        }
+        encoder.write_bit(self.end_transaction);
+        if let Some(seq) = &self.sequence_number {
+            seq.encode_uper(encoder)?;
+        }
+        if let Some(ack) = &self.acknowledgement {
+            ack.encode_uper(encoder)?;
+        }
+        if let Some(body) = &self.message_body {
+            body.encode_uper(encoder)?;
+        }
+        Ok(())
+    }
+}
+
+impl UperDecode for LppMessage {
+    fn decode_uper(decoder: &mut UperDecoder) -> PerResult<Self> {
+        let (_ext, opts) = decoder.decode_sequence_preamble(false, 4)?;
+        // opts = [transactionID, sequenceNumber, acknowledgement, lpp-MessageBody]
+        let transaction_id = if opts[0] {
+            Some(LppTransactionId::decode_uper(decoder)?)
+        } else {
+            None
+        };
+        let end_transaction = decoder.read_bit()?;
+        let sequence_number = if opts[1] {
+            Some(SequenceNumber::decode_uper(decoder)?)
+        } else {
+            None
+        };
+        let acknowledgement = if opts[2] {
+            Some(Acknowledgement::decode_uper(decoder)?)
+        } else {
+            None
+        };
+        let message_body = if opts[3] {
+            Some(LppMessageBody::decode_uper(decoder)?)
+        } else {
+            None
+        };
+        Ok(LppMessage {
+            transaction_id,
+            end_transaction,
+            sequence_number,
+            acknowledgement,
+            message_body,
+        })
+    }
+}
+
+/// LPP-MessageBody ::= CHOICE {            -- NON-extensible, 2 alternatives
+///     c1 CHOICE { ...16 alternatives... },
+///     messageClassExtension SEQUENCE {} }
+#[derive(Debug, Clone, PartialEq)]
+pub enum LppMessageBody {
+    C1(MessageBodyC1),
+    /// messageClassExtension SEQUENCE {} — an empty SEQUENCE (no content bits).
+    MessageClassExtension,
+}
+
+impl LppMessageBody {
+    const NUM_ALTERNATIVES: usize = 2;
+}
+
+impl UperEncode for LppMessageBody {
+    fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
+        match self {
+            LppMessageBody::C1(c1) => {
+                encoder.encode_choice_index(0, Self::NUM_ALTERNATIVES, false)?;
+                c1.encode_uper(encoder)
+            }
+            LppMessageBody::MessageClassExtension => {
+                encoder.encode_choice_index(1, Self::NUM_ALTERNATIVES, false)?;
+                // Empty SEQUENCE {} -> no further bits.
+                Ok(())
+            }
+        }
+    }
+}
+
+impl UperDecode for LppMessageBody {
+    fn decode_uper(decoder: &mut UperDecoder) -> PerResult<Self> {
+        let index = decoder.decode_choice_index(Self::NUM_ALTERNATIVES, false)?;
+        match index {
+            0 => Ok(LppMessageBody::C1(MessageBodyC1::decode_uper(decoder)?)),
+            1 => Ok(LppMessageBody::MessageClassExtension),
+            _ => Err(PerError::InvalidChoiceIndex {
+                index,
+                max: Self::NUM_ALTERNATIVES - 1,
+            }),
+        }
+    }
+}
+
+/// The `c1` inner CHOICE of `LPP-MessageBody` (16 alternatives in TS 37.355):
+///   0 requestCapabilities         1 provideCapabilities
+///   2 requestAssistanceData       3 provideAssistanceData
+///   4 requestLocationInformation  5 provideLocationInformation
+///   6 abort                       7 error
+///   8..15 spare7 NULL .. spare0 NULL
+///
+/// v1 implements only the location-information request/provide pair (indices 4
+/// and 5); all other indices are carried by a follow-on chunk.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessageBodyC1 {
+    RequestCapabilities(RequestCapabilities),
+    ProvideCapabilities(ProvideCapabilities),
+    RequestAssistanceData(RequestAssistanceData),
+    ProvideAssistanceData(ProvideAssistanceData),
+    RequestLocationInformation(RequestLocationInformation),
+    ProvideLocationInformation(ProvideLocationInformation),
+}
+
+impl MessageBodyC1 {
+    const NUM_ALTERNATIVES: usize = 16;
+    const IDX_REQUEST_CAPABILITIES: usize = 0;
+    const IDX_PROVIDE_CAPABILITIES: usize = 1;
+    const IDX_REQUEST_ASSISTANCE_DATA: usize = 2;
+    const IDX_PROVIDE_ASSISTANCE_DATA: usize = 3;
+    const IDX_REQUEST_LOCATION_INFORMATION: usize = 4;
+    const IDX_PROVIDE_LOCATION_INFORMATION: usize = 5;
+}
+
+impl UperEncode for MessageBodyC1 {
+    fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
+        match self {
+            MessageBodyC1::RequestCapabilities(body) => {
+                encoder.encode_choice_index(
+                    Self::IDX_REQUEST_CAPABILITIES,
+                    Self::NUM_ALTERNATIVES,
+                    false,
+                )?;
+                body.encode_uper(encoder)
+            }
+            MessageBodyC1::ProvideCapabilities(body) => {
+                encoder.encode_choice_index(
+                    Self::IDX_PROVIDE_CAPABILITIES,
+                    Self::NUM_ALTERNATIVES,
+                    false,
+                )?;
+                body.encode_uper(encoder)
+            }
+            MessageBodyC1::RequestAssistanceData(body) => {
+                encoder.encode_choice_index(
+                    Self::IDX_REQUEST_ASSISTANCE_DATA,
+                    Self::NUM_ALTERNATIVES,
+                    false,
+                )?;
+                body.encode_uper(encoder)
+            }
+            MessageBodyC1::ProvideAssistanceData(body) => {
+                encoder.encode_choice_index(
+                    Self::IDX_PROVIDE_ASSISTANCE_DATA,
+                    Self::NUM_ALTERNATIVES,
+                    false,
+                )?;
+                body.encode_uper(encoder)
+            }
+            MessageBodyC1::RequestLocationInformation(body) => {
+                encoder.encode_choice_index(
+                    Self::IDX_REQUEST_LOCATION_INFORMATION,
+                    Self::NUM_ALTERNATIVES,
+                    false,
+                )?;
+                body.encode_uper(encoder)
+            }
+            MessageBodyC1::ProvideLocationInformation(body) => {
+                encoder.encode_choice_index(
+                    Self::IDX_PROVIDE_LOCATION_INFORMATION,
+                    Self::NUM_ALTERNATIVES,
+                    false,
+                )?;
+                body.encode_uper(encoder)
+            }
+        }
+    }
+}
+
+impl UperDecode for MessageBodyC1 {
+    fn decode_uper(decoder: &mut UperDecoder) -> PerResult<Self> {
+        let index = decoder.decode_choice_index(Self::NUM_ALTERNATIVES, false)?;
+        match index {
+            0 => Ok(MessageBodyC1::RequestCapabilities(
+                RequestCapabilities::decode_uper(decoder)?,
+            )),
+            1 => Ok(MessageBodyC1::ProvideCapabilities(
+                ProvideCapabilities::decode_uper(decoder)?,
+            )),
+            2 => Ok(MessageBodyC1::RequestAssistanceData(
+                RequestAssistanceData::decode_uper(decoder)?,
+            )),
+            3 => Ok(MessageBodyC1::ProvideAssistanceData(
+                ProvideAssistanceData::decode_uper(decoder)?,
+            )),
+            4 => Ok(MessageBodyC1::RequestLocationInformation(
+                RequestLocationInformation::decode_uper(decoder)?,
+            )),
+            5 => Ok(MessageBodyC1::ProvideLocationInformation(
+                ProvideLocationInformation::decode_uper(decoder)?,
+            )),
+            n => Err(PerError::DecodeError(format!(
+                "LPP c1 body index {n} not implemented in v1 foundation"
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lpp::capabilities::{
+        CommonIEsProvideCapabilities, CommonIEsRequestCapabilities, EcidProvideCapabilities,
+        EcidRequestCapabilities, ProvideCapabilitiesR9, RequestCapabilitiesR9,
+    };
+    use crate::lpp::ecid::{
+        EcidProvideLocationInformation, EcidRequestLocationInformation,
+        EcidSignalMeasurementInformation, MeasuredResultsElement, ProvideLocationInformationR9,
+        RequestLocationInformationR9,
+    };
+    use crate::lpp::nr_dl_tdoa::{
+        DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList, NrDlTdoaProvideLocationInformation,
+        NrDlTdoaRequestLocationInformation, NrDlTdoaSignalMeasurementInformation, NrRstd, NrSlot,
+        NrTimeStamp, NrTimingQuality,
+    };
+    use crate::lpp::nr_multi_rtt::{
+        NrMultiRttMeasElement, NrMultiRttMeasList, NrMultiRttProvideLocationInformation,
+        NrMultiRttSignalMeasurementInformation, NrUeRxTxTimeDiff,
+    };
+    use crate::lpp::types::{Initiator, TransactionNumber};
+    use bitvec::prelude::*;
+
+    fn measurements(values: &[bool]) -> BitVec<u8, Msb0> {
+        let mut bv: BitVec<u8, Msb0> = BitVec::new();
+        for &b in values {
+            bv.push(b);
+        }
+        bv
+    }
+
+    fn sample_element() -> MeasuredResultsElement {
+        MeasuredResultsElement {
+            phys_cell_id: 42,
+            arfcn_eutra: 1850,
+            system_frame_number: None,
+            rsrp_result: Some(50),
+            rsrq_result: Some(20),
+            ue_rx_tx_time_diff: None,
+        }
+    }
+
+    /// Hand-derived UPER reference vector (no golden capture exists; LPP is
+    /// UNALIGNED PER with no network egress here, so this is self-attesting from
+    /// X.691 + TS 37.355). The message is:
+    ///
+    ///   LPP-Message {
+    ///     transactionID   = { initiator locationServer, transactionNumber 0 }
+    ///     endTransaction  = TRUE
+    ///     (sequenceNumber / acknowledgement absent)
+    ///     lpp-MessageBody = c1 : requestLocationInformation :
+    ///       criticalExtensions c1 : requestLocationInformation-r9 :
+    ///         { ecid-RequestLocationInformation { requestedMeasurements '11000'B } }
+    ///   }
+    ///
+    /// requestedMeasurements `11000` sets rsrpReq(0) + rsrqReq(1), length 5.
+    ///
+    /// Bit-by-bit derivation (39 bits, padded to 40 = 5 octets):
+    ///   LPP-Message preamble (non-ext, opts [tid,seq,ack,body]):  1 0 0 1
+    ///   transactionID (LPP-TransactionID, ext SEQ, 0 opt):
+    ///     SEQUENCE ext-marker:                                    0
+    ///     initiator locationServer (ext ENUM): ext-bit 0 + 0     0 0
+    ///     transactionNumber 0 (INTEGER 0..255, 8 bits):          0 0 0 0 0 0 0 0
+    ///   endTransaction TRUE:                                      1
+    ///   lpp-MessageBody:
+    ///     outer CHOICE -> c1 (index 0 of 2, 1 bit):              0
+    ///     c1 CHOICE -> reqLocInfo (index 4 of 16, 4 bits):       0 1 0 0
+    ///     RequestLocationInformation (non-ext SEQ, no preamble):
+    ///       criticalExtensions CHOICE -> c1 (index 0 of 2):      0
+    ///       c1 CHOICE -> r9 (index 0 of 4, 2 bits):              0 0
+    ///       r9-IEs (ext SEQ, 5 opts): ext 0 + [0,0,0,ecid=1,0]:  0 0 0 0 1 0
+    ///         ECID-RequestLocationInformation (ext SEQ, 0 opt):
+    ///           SEQUENCE ext-marker:                             0
+    ///           requestedMeasurements BIT STRING(1..8) = 11000:
+    ///             constrained length offset (5-1=4, 3 bits):    1 0 0
+    ///             content (5 bits):                             1 1 0 0 0
+    ///   ----------------------------------------------------------------
+    ///   Concatenated and grouped into octets (last 0 is trailing pad):
+    ///     1001 0000 | 0000 0001 | 0010 0000 | 0000 1001 | 0011 0000
+    ///     = 0x90      0x01        0x20        0x09        0x30
+    #[test]
+    fn test_request_location_information_reference_hex() {
+        let reference: [u8; 5] = [0x90, 0x01, 0x20, 0x09, 0x30];
+
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::LocationServer,
+                transaction_number: TransactionNumber(0),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::RequestLocationInformation(RequestLocationInformation {
+                    ies: RequestLocationInformationR9 {
+                        ecid: Some(EcidRequestLocationInformation {
+                            requested_measurements: measurements(&[
+                                true, true, false, false, false,
+                            ]),
+                        }),
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+
+        // Encode must equal the hand-derived vector...
+        assert_eq!(msg.encode().unwrap().as_ref(), &reference[..]);
+        // ...and the vector must decode back to the same value.
+        assert_eq!(LppMessage::decode(&reference).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_request_path() {
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::LocationServer,
+                transaction_number: TransactionNumber(11),
+            }),
+            end_transaction: false,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::RequestLocationInformation(RequestLocationInformation {
+                    ies: RequestLocationInformationR9 {
+                        ecid: Some(EcidRequestLocationInformation {
+                            requested_measurements: measurements(&[true, false, true]),
+                        }),
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_request_path_nr_dl_tdoa() {
+        // A full LppMessage (LMF -> UE) carrying RequestLocationInformation ->
+        // nr-DL-TDOA (the r16 extension-addition group), end to end.
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::LocationServer,
+                transaction_number: TransactionNumber(4),
+            }),
+            end_transaction: false,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::RequestLocationInformation(RequestLocationInformation {
+                    ies: RequestLocationInformationR9 {
+                        ecid: None,
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: Some(NrDlTdoaRequestLocationInformation {
+                            rstd_measurement_info_request: true,
+                            requested_measurements: measurements(&[true, false, true]),
+                            assistance_availability: true,
+                            additional_paths: false,
+                        }),
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_provide_path_full_envelope() {
+        // Exercises every envelope OPTIONAL plus the provide body.
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(7),
+            }),
+            end_transaction: true,
+            sequence_number: Some(SequenceNumber(3)),
+            acknowledgement: Some(Acknowledgement {
+                ack_requested: true,
+                ack_indicator: Some(SequenceNumber(2)),
+            }),
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        nr_multi_rtt: None,
+                        ecid: Some(EcidProvideLocationInformation {
+                            signal_measurement_information: Some(
+                                EcidSignalMeasurementInformation {
+                                    primary_cell_measured_results: Some(sample_element()),
+                                    measured_results_list: vec![sample_element()],
+                                },
+                            ),
+                            ecid_error: None,
+                        }),
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_provide_assistance_data_a_gnss() {
+        // A full LppMessage carrying ProvideAssistanceData -> a-gnss (c1 index 3),
+        // end to end through the top-level message codec.
+        use crate::lpp::a_gnss::body::ProvideAssistanceDataR9;
+        use crate::lpp::a_gnss::AGnssProvideAssistanceData;
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(4),
+            }),
+            end_transaction: false,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(MessageBodyC1::ProvideAssistanceData(
+                ProvideAssistanceData {
+                    ies: ProvideAssistanceDataR9 {
+                        a_gnss: Some(AGnssProvideAssistanceData::default()),
+                    },
+                },
+            ))),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_provide_path_nr_dl_tdoa() {
+        // A full LppMessage carrying ProvideLocationInformation -> nr-DL-TDOA
+        // (the r16 extension-addition group), end to end.
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(9),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        nr_multi_rtt: None,
+                        ecid: None,
+                        nr_dl_tdoa: Some(NrDlTdoaProvideLocationInformation {
+                            signal_measurement_information: Some(
+                                NrDlTdoaSignalMeasurementInformation {
+                                    dl_prs_reference_info: DlPrsIdInfo { dl_prs_id: 5 },
+                                    meas_list: NrDlTdoaMeasList {
+                                        items: vec![NrDlTdoaMeasElement {
+                                            dl_prs_id: 5,
+                                            nr_phys_cell_id: Some(123),
+                                            nr_arfcn: Some(640_000),
+                                            nr_time_stamp: NrTimeStamp {
+                                                dl_prs_id: 5,
+                                                nr_phys_cell_id: Some(123),
+                                                nr_arfcn: None,
+                                                nr_sfn: 700,
+                                                nr_slot: NrSlot::Scs30(11),
+                                            },
+                                            nr_rstd: NrRstd::K1(500_000),
+                                            nr_timing_quality: NrTimingQuality {
+                                                timing_quality_value: 12,
+                                                timing_quality_resolution: 2,
+                                            },
+                                            nr_dl_prs_rsrp_result: Some(80),
+                                        }],
+                                    },
+                                },
+                            ),
+                        }),
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_provide_path_nr_multi_rtt() {
+        // A full LppMessage carrying ProvideLocationInformation -> nr-Multi-RTT
+        // (the r16 extension-addition group, member index 1), end to end.
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(13),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: None,
+                        nr_multi_rtt: Some(NrMultiRttProvideLocationInformation {
+                            signal_measurement_information: Some(
+                                NrMultiRttSignalMeasurementInformation {
+                                    meas_list: NrMultiRttMeasList {
+                                        items: vec![NrMultiRttMeasElement {
+                                            dl_prs_id: 5,
+                                            nr_phys_cell_id: Some(123),
+                                            nr_arfcn: Some(640_000),
+                                            nr_ue_rx_tx_time_diff: NrUeRxTxTimeDiff::K2(300_000),
+                                            nr_time_stamp: NrTimeStamp {
+                                                dl_prs_id: 5,
+                                                nr_phys_cell_id: Some(123),
+                                                nr_arfcn: None,
+                                                nr_sfn: 700,
+                                                nr_slot: NrSlot::Scs30(11),
+                                            },
+                                            nr_timing_quality: NrTimingQuality {
+                                                timing_quality_value: 12,
+                                                timing_quality_resolution: 2,
+                                            },
+                                            nr_dl_prs_rsrp_result: Some(80),
+                                        }],
+                                    },
+                                },
+                            ),
+                        }),
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_minimal() {
+        // Only the mandatory endTransaction BOOLEAN; everything else absent.
+        // Preamble 0000 + endTransaction 0 = 5 bits -> one zero octet.
+        let msg = LppMessage {
+            transaction_id: None,
+            end_transaction: false,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: None,
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(bytes.as_ref(), &[0x00]);
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_class_extension() {
+        let msg = LppMessage {
+            transaction_id: None,
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::MessageClassExtension),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_request_capabilities_path() {
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(1),
+            }),
+            end_transaction: false,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(MessageBodyC1::RequestCapabilities(
+                RequestCapabilities {
+                    ies: RequestCapabilitiesR9 {
+                        common: Some(CommonIEsRequestCapabilities),
+                        ecid: Some(EcidRequestCapabilities),
+                    },
+                },
+            ))),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_provide_capabilities_path() {
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(1),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(MessageBodyC1::ProvideCapabilities(
+                ProvideCapabilities {
+                    ies: ProvideCapabilitiesR9 {
+                        common: Some(CommonIEsProvideCapabilities),
+                        ecid: Some(EcidProvideCapabilities {
+                            ecid_meas_supported: measurements(&[true, true, false, false, false]),
+                        }),
+                    },
+                },
+            ))),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn err_unsupported_c1_body_index() {
+        // c1 CHOICE index 2 (requestAssistanceData) is not implemented in v1, so
+        // the catch-all decode arm must reject it (indices 0/1/4/5 are typed).
+        // Stream: LPP-Message preamble [0,0,0,body=1] + endTransaction 0 +
+        // outer choice c1 (0) + c1 index 2 (0010).
+        let mut enc = UperEncoder::new();
+        enc.encode_sequence_preamble(None, &[false, false, false, true]);
+        enc.write_bit(false); // endTransaction
+        enc.encode_choice_index(0, 2, false).unwrap(); // outer -> c1
+        enc.encode_choice_index(2, 16, false).unwrap(); // c1 -> requestAssistanceData (index 2)
+        let bytes = enc.into_bytes();
+        assert!(LppMessage::decode(&bytes).is_err());
+    }
+}

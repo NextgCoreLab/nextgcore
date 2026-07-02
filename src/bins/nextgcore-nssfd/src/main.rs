@@ -11,14 +11,18 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::client::{SbiClient, SbiClientConfig};
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{send_method_not_allowed, SbiServer, SbiServerConfig as OgsSbiServerConfig};
+use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
+use nextgcore_sbi::server::{
+    send_method_not_allowed, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig,
+};
+use nextgcore_sbi::types::NfType;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 mod context;
@@ -100,6 +104,12 @@ struct Args {
     /// (format <MCC>-<MNC>-<RegionId>-<SetId>, TS 29.531 targetAmfSet)
     #[arg(long)]
     target_amf_set: Option<String>,
+
+    /// Path to the JSON snapshot file for NSSAI-availability subscriptions and
+    /// availability data. When unset (the default) these are purely in-memory
+    /// and lost on restart. Also settable via NEXTGCORE_NSSF_STATE_FILE.
+    #[arg(long)]
+    state_file: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,10 +132,48 @@ struct SbiServerYaml {
     port: Option<u16>,
 }
 
+/// SBI OAuth2 enforcement knob (`nssf.sbi.oauth2.require`).
+///
+/// Defaults to disabled so the existing dev/E2E path keeps working without
+/// tokens; the production/docker `nssf-oauth2.yaml` variant sets it true.
+#[derive(Debug, Default, Deserialize)]
+struct SbiOauth2Yaml {
+    require: Option<bool>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct SbiYaml {
     server: Option<Vec<SbiServerYaml>>,
     client: Option<SbiClientYaml>,
+    oauth2: Option<SbiOauth2Yaml>,
+}
+
+/// Process-wide OAuth2 client for automatic Bearer-token acquisition on
+/// outbound SBI calls (set only when `nssf.sbi.oauth2.require` is true).
+static OAUTH2_CLIENT: OnceLock<Option<Arc<OAuth2Client>>> = OnceLock::new();
+
+/// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled. Outbound
+/// SBI clients attach tokens via [`attach_oauth2`].
+fn oauth2_client() -> Option<Arc<OAuth2Client>> {
+    OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Attach the process-wide OAuth2 client (when enforcement is on) so the
+/// outbound request carries an NRF-issued Bearer token scoped to `target`.
+/// A no-op (returns the client unchanged) when enforcement is off.
+fn attach_oauth2(client: SbiClient, target: NfType) -> SbiClient {
+    match oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, target),
+        None => client,
+    }
+}
+
+/// A single configured S-NSSAI (`{ sst: <u8>, sd: "<6 hex>" }`), used by the
+/// optional PLMN-supported-S-NSSAI restriction (nssfd-01).
+#[derive(Debug, Default, Deserialize)]
+struct SnssaiYaml {
+    sst: u8,
+    sd: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -133,6 +181,12 @@ struct NssfSection {
     sbi: Option<SbiYaml>,
     /// Target AMF Set ID used for AMF re-selection in registration scenarios
     amf_set_id: Option<String>,
+    /// Optional explicit set of S-NSSAIs supported in this PLMN
+    /// (TS 29.531 §6.2.3.2.3.1). ABSENT (the default) => NO restriction =>
+    /// allow-all (matched-sim back-compat). When present, an NSSAIAvailability
+    /// PUT/PATCH reporting an S-NSSAI outside this set is rejected with 403
+    /// SNSSAI_NOT_SUPPORTED.
+    supported_snssai_list: Option<Vec<SnssaiYaml>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -154,8 +208,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -174,6 +228,27 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone())?;
 
+    // Initialise the NSSF context, optionally restoring persisted
+    // NSSAI-availability subscriptions and availability data. Path precedence:
+    // --state-file, then NEXTGCORE_NSSF_STATE_FILE. With neither set the
+    // context stays purely in-memory (previous behaviour). This must run before
+    // nssf_context_init() so the persisting context backs the singleton.
+    let nssf_state_file = args
+        .state_file
+        .clone()
+        .or_else(|| std::env::var("NEXTGCORE_NSSF_STATE_FILE").ok())
+        .filter(|s| !s.is_empty());
+    match &nssf_state_file {
+        Some(path) => {
+            nssf_context_init_with_state(Some(std::path::PathBuf::from(path)));
+            log::info!("NSSF availability persistence enabled: {path}");
+        }
+        None => {
+            nssf_context_init_with_state(None);
+            log::info!("NSSF availability persistence disabled (in-memory only)");
+        }
+    }
+
     // Initialize NSSF context
     nssf_context_init(args.max_nf);
     log::info!("NSSF context initialized (max_nf={})", args.max_nf);
@@ -184,6 +259,8 @@ async fn main() -> Result<()> {
     log::info!("NSSF state machine initialized");
 
     // Parse configuration (if file exists) and seed NRF URI
+    let mut nrf_uri_cfg: Option<String> = None;
+    let mut require_oauth2 = false;
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         match std::fs::read_to_string(&args.config) {
@@ -196,6 +273,32 @@ async fn main() -> Result<()> {
                             log::info!("Target AMF Set configured: {set_id}");
                             if let Ok(ctx) = nssf_self().read() {
                                 ctx.set_target_amf_set(&set_id);
+                            }
+                        }
+                        // nssfd-01: optional PLMN-supported S-NSSAI restriction.
+                        // When ABSENT (the default) the NSSF imposes no
+                        // restriction (allow-all, matched-sim back-compat); when
+                        // present, an availability update reporting an S-NSSAI
+                        // outside this set is rejected with 403
+                        // SNSSAI_NOT_SUPPORTED (TS 29.531 §6.2.3.2.3.1).
+                        if let Some(list) = nssf.supported_snssai_list {
+                            let snssais: Vec<context::SNssai> = list
+                                .iter()
+                                .map(|s| {
+                                    let sd = s
+                                        .sd
+                                        .as_deref()
+                                        .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                        .and_then(|v| if v == 0xFF_FFFF { None } else { Some(v) });
+                                    context::SNssai::new(s.sst, sd)
+                                })
+                                .collect();
+                            log::info!(
+                                "PLMN-supported S-NSSAI restriction configured: {} entries",
+                                snssais.len()
+                            );
+                            if let Ok(ctx) = nssf_self().read() {
+                                ctx.set_plmn_supported_snssais(Some(snssais));
                             }
                         }
                         if let Some(sbi) = nssf.sbi {
@@ -214,12 +317,15 @@ async fn main() -> Result<()> {
                                 if let Some(nrf_list) = client.nrf {
                                     if let Some(nrf) = nrf_list.first() {
                                         log::info!("NRF URI configured: {}", nrf.uri);
-                                        ogs_sbi::context::global_context()
+                                        nrf_uri_cfg = Some(nrf.uri.clone());
+                                        nextgcore_sbi::context::global_context()
                                             .set_nrf_uri(&nrf.uri)
                                             .await;
                                     }
                                 }
                             }
+                            // SBI OAuth2 enforcement knob (nssf.sbi.oauth2.require).
+                            require_oauth2 = sbi.oauth2.and_then(|o| o.require).unwrap_or(false);
                         }
                     }
                 }
@@ -251,11 +357,38 @@ async fn main() -> Result<()> {
     // Open legacy SBI server (for context initialization)
     nssf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Start actual HTTP/2 SBI server using ogs-sbi
+    // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
+    if require_oauth2 {
+        // Server side (TS 33.501 §13.4.1): verify incoming Bearer tokens
+        // against the NRF's published JWKS and require the token's `aud` to
+        // include this NF's own type ("NSSF"). With no NRF URI configured the
+        // server fails closed (503).
+        sbi_server_config.require_oauth2 = true;
+        sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
+            .as_deref()
+            .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
+        sbi_server_config = sbi_server_config.with_expected_audience_nf_type(NfType::Nssf);
+
+        // Client side (T1.1): install the process-wide OAuth2 client so
+        // outbound SBI calls acquire and attach an NRF-issued Bearer token.
+        if let Some(nrf_uri) = nrf_uri_cfg.as_deref() {
+            let nf_instance_id = format!("nssf-{}", uuid::Uuid::new_v4());
+            let oauth2 = Arc::new(OAuth2Client::new(nrf_uri, nf_instance_id, NfType::Nssf));
+            let _ = OAUTH2_CLIENT.set(Some(oauth2));
+        }
+        log::info!(
+            "OAuth2 enforcement enabled (JWKS: {})",
+            sbi_server_config
+                .oauth2_jwks_uri
+                .as_deref()
+                .unwrap_or("UNCONFIGURED")
+        );
+    }
+    let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server
         .start(nssf_sbi_request_handler)
@@ -267,7 +400,13 @@ async fn main() -> Result<()> {
     // Register with NRF (B24.3)
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+            // (NSI count vs configured capacity; TS 29.510 §5.2.2.3.2).
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
+                let ctx = crate::context::nssf_self();
+                let load = ctx.read().map(|c| c.get_nsi_load()).unwrap_or(0);
+                load.clamp(0, 100) as u8
+            });
         }
         Ok(_) => {}
         Err(e) => {
@@ -515,7 +654,7 @@ async fn nssf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 // ---------------------------------------------------------------------------
 
 async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
-    // The ogs-sbi server glue strips the query string from header.uri and
+    // The nextgcore-sbi server glue strips the query string from header.uri and
     // stores the RAW (still percent-encoded) values in http.params, so
     // decode on access. parse_query_params covers callers that kept the
     // full URI (e.g. direct handler invocation).
@@ -560,21 +699,37 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
     let sip = get_param("slice-info-request-for-pdu-session");
     let sicu = get_param("slice-info-request-for-ue-cu");
 
-    if let Some(raw) = sir.or(sicu) {
-        // Registration and UE-configuration-update use the same authorization
-        // algorithm (SliceInfoForUEConfigurationUpdate is a subset).
+    if let Some(raw) = sir {
         let info_json: serde_json::Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(e) => {
                 return problem_details(
                     400,
                     "Bad Request",
-                    &format!("Invalid slice-info-request JSON: {e}"),
+                    &format!("Invalid slice-info-request-for-registration JSON: {e}"),
                     Some("INVALID_QUERY_PARAM"),
                 )
             }
         };
         return handle_ns_selection_registration(&nf_id, &info_json, tai.as_ref());
+    }
+
+    // nssfd-06: UE-Configuration-Update uses a dedicated handler
+    // (TS 29.531 §5.2.2.2.4). When requestedNssai is absent the response
+    // MUST NOT include allowedNssaiList — a distinct handler enforces this.
+    if let Some(raw) = sicu {
+        let info_json: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                return problem_details(
+                    400,
+                    "Bad Request",
+                    &format!("Invalid slice-info-request-for-ue-cu JSON: {e}"),
+                    Some("INVALID_QUERY_PARAM"),
+                )
+            }
+        };
+        return handle_ns_selection_ue_cu(&nf_id, &info_json, tai.as_ref());
     }
 
     if let Some(raw) = sip {
@@ -761,13 +916,86 @@ fn handle_ns_selection_registration(
 
     if !sel.candidate_amf_list.is_empty() {
         response["candidateAmfList"] = serde_json::json!(sel.candidate_amf_list);
-        if let Some(set) = sel.target_amf_set {
-            response["targetAmfSet"] = serde_json::json!(set);
-        }
+    }
+    // nssfd-07: populate targetAmfSet whenever one is configured
+    // (TS 29.531 §5.2.2.2.2 step 2a). sel.target_amf_set is populated
+    // by the selection algorithm only when a candidate AMF list is found;
+    // fall back to the context-configured / TAI-derived value so the field
+    // is also emitted on plain-success responses (no candidateAmfList).
+    //
+    // REROUTE non-support: the NSSF does NOT advertise the "REROUTE"
+    // capability in supportedFeatures (TS 29.531 §6.1.6.3). targetAmfSet
+    // is emitted for AMF-set selection only; REROUTE initiation (which
+    // requires explicit feature negotiation) is out of scope.
+    let effective_amf_set = sel
+        .target_amf_set
+        .or_else(|| snapshot.target_amf_set.clone());
+    if let Some(set) = effective_amf_set {
+        response["targetAmfSet"] = serde_json::json!(set);
     }
 
     SbiResponse::with_status(200)
         .with_json_body(&response)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// UE-Configuration-Update (UE-CU) scenario NS selection
+/// (TS 29.531 §5.2.2.2.4 / §5.2.3.2 SliceInfoForUEConfigurationUpdate).
+///
+/// When `requestedNssai` is absent: return `configuredNssai` /
+/// `rejectedNssai*` only — do NOT synthesize `allowedNssaiList`
+/// ("provide Configured/Rejected NSSAI without synthesizing an Allowed
+/// NSSAI", TS 29.531 §5.2.2.2.4).
+///
+/// When `requestedNssai` is present: full response identical to
+/// the registration scenario.
+fn handle_ns_selection_ue_cu(
+    nf_id: &str,
+    info_json: &serde_json::Value,
+    tai: Option<&context::Tai>,
+) -> SbiResponse {
+    let has_requested_nssai = info_json
+        .get("requestedNssai")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
+    // Reuse the registration algorithm; strip allowedNssaiList when
+    // requestedNssai was absent (UE-CU-specific rule per §5.2.2.2.4).
+    let reg_resp = handle_ns_selection_registration(nf_id, info_json, tai);
+
+    if has_requested_nssai {
+        // requestedNssai present → full response (same as registration).
+        return reg_resp;
+    }
+
+    if reg_resp.status != 200 {
+        return reg_resp;
+    }
+
+    // Strip allowedNssaiList from the registration response body.
+    let body: serde_json::Value = reg_resp
+        .http
+        .content
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::json!({}));
+
+    let mut ue_cu_body = serde_json::json!({ "supportedFeatures": "1" });
+    for field in [
+        "configuredNssai",
+        "rejectedNssaiInPlmn",
+        "rejectedNssaiInTa",
+        "targetAmfSet",
+        "candidateAmfList",
+    ] {
+        if let Some(v) = body.get(field) {
+            ue_cu_body[field] = v.clone();
+        }
+    }
+    // allowedNssaiList intentionally omitted per TS 29.531 §5.2.2.2.4.
+    SbiResponse::with_status(200)
+        .with_json_body(&ue_cu_body)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
@@ -878,23 +1106,19 @@ async fn handle_ns_selection_pdu_session(
                     }
                 };
 
-                // Build allowedNssaiList from configured NSIs
-                let mut list: Vec<serde_json::Value> = context
-                    .nsi_get_all()
-                    .iter()
-                    .map(|nsi| {
-                        serde_json::json!({
-                            "allowedSnssai": context::snssai_to_json(&nsi.s_nssai)
-                        })
-                    })
-                    .collect();
-
-                // If no NSIs configured, use the matched one from the request
-                if list.is_empty() {
-                    list.push(serde_json::json!({
-                        "allowedSnssai": context::snssai_to_json(&snssai)
-                    }));
+                // nssfd-04: seed allowedNssaiList from the validated requested
+                // S-NSSAI only (TS 29.531 §5.2.2.2.3 step 2a: "the allowed
+                // NSSAI corresponds to the requested S-NSSAI, not the full
+                // catalogue"). For home-routed roaming include the mapped home
+                // S-NSSAI when present. The subscription + availability retain
+                // filters below apply as defence-in-depth narrowing.
+                let mut allowed_item = serde_json::json!({
+                    "allowedSnssai": context::snssai_to_json(&snssai)
+                });
+                if let Some(ref hs) = param.home_snssai {
+                    allowed_item["mappedHomeSnssai"] = context::snssai_to_json(hs);
                 }
+                let list = vec![allowed_item];
 
                 // Snapshot TAI-supported S-NSSAIs as owned (sst, sd) tuples
                 // (TS 29.531 6.1.3.2.3.2) so we can filter after dropping the lock.
@@ -914,7 +1138,9 @@ async fn handle_ns_selection_pdu_session(
             // Subscription-based filtering: if SUPI provided, query UDR for
             // subscribed NSSAIs and filter (TS 29.531 6.1.3.2.3.1).
             if let Some(ref supi_val) = supi {
-                match ogs_dbi::ogs_dbi_subscription_data_async(supi_val.to_string()).await {
+                match nextgcore_dbi::nextgcore_dbi_subscription_data_async(supi_val.to_string())
+                    .await
+                {
                     Ok(sub_data) => {
                         let subscribed: Vec<(u8, Option<u32>)> = sub_data
                             .slice
@@ -1092,10 +1318,176 @@ fn validate_availability_doc(doc: &serde_json::Value) -> Result<Vec<context::Tai
     Ok(tais)
 }
 
+/// Outcome of the NSSAIAvailability authorization / PLMN-support cross-check
+/// (TS 29.531 §6.2.3.2.3.1, TS 33.521). Both variants map to 403 Forbidden;
+/// only the ProblemDetails `cause` differs.
+enum AvailabilityAuthError {
+    /// NF service consumer (identified by NF Id) is not authorized to update
+    /// the NSSAI availability information -> cause `NOT_AUTHORIZED`.
+    Unauthorized(String),
+    /// A reported S-NSSAI is not supported in the PLMN -> `SNSSAI_NOT_SUPPORTED`.
+    UnsupportedSnssai(String),
+}
+
+impl AvailabilityAuthError {
+    /// Render the 403 ProblemDetails (TS 29.531 §6.2.3.2.3.1 Table
+    /// 6.2.3.2.3.1-2) carrying the appropriate `cause`.
+    fn into_problem(self) -> SbiResponse {
+        match self {
+            AvailabilityAuthError::Unauthorized(detail) => {
+                problem_details(403, "Forbidden", &detail, Some("NOT_AUTHORIZED"))
+            }
+            AvailabilityAuthError::UnsupportedSnssai(detail) => {
+                problem_details(403, "Forbidden", &detail, Some("SNSSAI_NOT_SUPPORTED"))
+            }
+        }
+    }
+}
+
+/// Cross-check an NssaiAvailabilityInfo document against the consumer's
+/// authorization and the PLMN-supported S-NSSAI set (TS 29.531 §6.2.3.2.3.1,
+/// TS 33.521). Pure (no global state) so it is unit-testable in isolation.
+///
+/// Default-allow stance (matched-sim back-compat, TS 29.531 §6.2.3.2.3.1):
+///   * `authorized == true` is the default for any non-empty NF Id; only a
+///     missing/empty NF Id yields `NOT_AUTHORIZED`. We deliberately do NOT
+///     require an NRF lookup here, which would otherwise reject the matched
+///     simulator's AMF.
+///   * `restriction == None` means NO PLMN restriction is configured, so EVERY
+///     reported S-NSSAI is accepted (the matched-sim registers default slices,
+///     e.g. sst=1, and must not be newly rejected). `SNSSAI_NOT_SUPPORTED` is
+///     returned ONLY when a restriction is explicitly configured AND a reported
+///     S-NSSAI falls outside it.
+///
+/// Authorization is checked before PLMN support so a forbidden consumer is
+/// rejected regardless of slice contents.
+fn authorize_availability_doc(
+    nf_id: &str,
+    doc: &serde_json::Value,
+    authorized: bool,
+    restriction: Option<&[context::SNssai]>,
+) -> Result<(), AvailabilityAuthError> {
+    if !authorized {
+        return Err(AvailabilityAuthError::Unauthorized(format!(
+            "NF Id '{nf_id}' is not authorized to update NSSAI availability information"
+        )));
+    }
+    let Some(allowed) = restriction else {
+        // No restriction configured -> allow all (default-allow, see above).
+        return Ok(());
+    };
+    for (_tais, snssais) in context::availability_entries(doc) {
+        for s in &snssais {
+            if !allowed.contains(s) {
+                let sd =
+                    s.sd.map(|v| format!("{v:06x}"))
+                        .unwrap_or_else(|| "none".to_string());
+                return Err(AvailabilityAuthError::UnsupportedSnssai(format!(
+                    "S-NSSAI (sst={}, sd={sd}) is not supported in the PLMN",
+                    s.sst
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Snapshot the NSSF's availability-authorization config from the global
+/// context and run [`authorize_availability_doc`]. Returns the 403
+/// ProblemDetails response on failure, `None` when the update is permitted.
+fn check_availability_authorization(
+    nf_id: &str,
+    doc: &serde_json::Value,
+    affected_tais: &[context::Tai],
+) -> Option<SbiResponse> {
+    let tai = affected_tais.first().cloned().unwrap_or_default();
+    let (authorized, restriction) = with_nssf_context(|context| {
+        let restriction = if context.has_plmn_snssai_restriction() {
+            Some(context.plmn_supported_snssais())
+        } else {
+            None
+        };
+        (
+            context.nf_authorized_for_availability(nf_id, &tai),
+            restriction,
+        )
+    })
+    // If the context lock is poisoned, fall back to the default-allow policy
+    // (authorize any non-empty NF Id; impose no S-NSSAI restriction).
+    .unwrap_or_else(|| (!nf_id.trim().is_empty(), None));
+
+    authorize_availability_doc(nf_id, doc, authorized, restriction.as_deref())
+        .err()
+        .map(AvailabilityAuthError::into_problem)
+}
+
 /// Build the AuthorizedNssaiAvailabilityInfo response for a stored doc
+/// (TS 29.531 §5.3.2.2 / §6.2.6.2.4).
+///
+/// nssfd-02: For each TA entry, include `restrictedSnssaiList` when the
+/// NSSF configuration restricts S-NSSAIs per home PLMN (§6.2.6.2.4
+/// RestrictedSnssai). Default empty map → field absent (matched-sim
+/// back-compat: the matched-sim AMF does not expect this field).
+///
+/// nssfd-03: Return `204 No Content` when no S-NSSAIs remain
+/// authorized/supported across all TAs ("No supported slices after
+/// Successful update", TS 29.531 §6.2.3.2.3.1 Table 6.2.3.2.3.1-2).
+/// Notifications are NOT affected (storage is already committed by callers
+/// before this function is invoked).
 fn authorized_availability_response(doc: &serde_json::Value) -> SbiResponse {
+    let entries = doc
+        .get("supportedNssaiAvailabilityData")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut authorized_entries: Vec<serde_json::Value> = Vec::new();
+    for entry in &entries {
+        let tai = entry.get("tai").and_then(context::tai_from_json);
+
+        // nssfd-02: lookup per-home-PLMN restrictions from NSSF config for
+        // this TAI (TS 29.531 §6.2.6.2.4 RestrictedSnssai per home PLMN).
+        let restrictions: Vec<(context::PlmnId, Vec<context::SNssai>)> = tai
+            .as_ref()
+            .and_then(|t| with_nssf_context(|c| c.restricted_snssais_for_tai(t)))
+            .unwrap_or_default();
+
+        let mut out = serde_json::json!({});
+        if let Some(tai_val) = entry.get("tai") {
+            out["tai"] = tai_val.clone();
+        }
+        if let Some(snssai_list) = entry.get("supportedSnssaiList") {
+            out["supportedSnssaiList"] = snssai_list.clone();
+        }
+        if !restrictions.is_empty() {
+            out["restrictedSnssaiList"] = serde_json::json!(restrictions
+                .iter()
+                .map(|(plmn, snssais)| {
+                    serde_json::json!({
+                        "homePlmnId": { "mcc": plmn.mcc, "mnc": plmn.mnc },
+                        "sNssais": snssais.iter().map(context::snssai_to_json).collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>());
+        }
+        authorized_entries.push(out);
+    }
+
+    // nssfd-03: 204 No Content when no S-NSSAIs remain authorized/supported
+    // across all TAs (TS 29.531 §6.2.3.2.3.1 Table 6.2.3.2.3.1-2 "No
+    // supported slices after Successful update").
+    let any_supported = authorized_entries.iter().any(|e| {
+        e.get("supportedSnssaiList")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    });
+    if !any_supported {
+        return SbiResponse::with_status(204);
+    }
+
     let response = serde_json::json!({
-        "authorizedNssaiAvailabilityData": doc.get("supportedNssaiAvailabilityData"),
+        "authorizedNssaiAvailabilityData": authorized_entries,
         "supportedFeatures": "1"
     });
     SbiResponse::with_status(200)
@@ -1135,6 +1527,14 @@ async fn handle_nssai_availability_update(nf_id: &str, request: &SbiRequest) -> 
         Err(e) => return problem_details(400, "Bad Request", &e, Some("MANDATORY_IE_MISSING")),
     };
 
+    // nssfd-01: authorize the consumer + cross-check every reported S-NSSAI
+    // against the PLMN-supported set BEFORE storing or notifying (TS 29.531
+    // §6.2.3.2.3.1, TS 33.521). On failure the 403 returns here, so nothing is
+    // stored and no notification is spawned.
+    if let Some(resp) = check_availability_authorization(nf_id, &doc, &affected_tais) {
+        return resp;
+    }
+
     let info = context::availability_info_from_doc(nf_id, doc.clone());
     with_nssf_context(|context| context.set_nssai_availability(nf_id, info));
 
@@ -1150,6 +1550,25 @@ async fn handle_nssai_availability_update(nf_id: &str, request: &SbiRequest) -> 
 
 async fn handle_nssai_availability_patch(nf_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("NSSAI Availability Patch: nf_id={nf_id}");
+
+    // nssfd-05: RFC 6902 / TS 29.531 §6.2 PatchDocument mandate
+    // Content-Type: application/json-patch+json. Reject any other media type
+    // (or missing Content-Type) with 415 Unsupported Media Type before
+    // attempting to parse or apply the patch.
+    let ct = request
+        .http
+        .get_header("content-type")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let ct_base = ct.split(';').next().unwrap_or("").trim();
+    if !ct_base.eq_ignore_ascii_case("application/json-patch+json") {
+        return problem_details(
+            415,
+            "Unsupported Media Type",
+            "PATCH requires Content-Type: application/json-patch+json (RFC 6902, TS 29.531 §6.2)",
+            None,
+        );
+    }
 
     let existing = with_nssf_context(|context| context.get_nssai_availability(nf_id)).flatten();
     let existing = match existing {
@@ -1211,6 +1630,14 @@ async fn handle_nssai_availability_patch(nf_id: &str, request: &SbiRequest) -> S
             )
         }
     };
+
+    // nssfd-01: apply the identical authorization + PLMN-support cross-check to
+    // the POST-PATCH document before committing (TS 29.531 §6.2.3.2.3.1). A
+    // patch that introduces an S-NSSAI unsupported in the PLMN is rejected with
+    // 403 and the previously stored document is left unchanged.
+    if let Some(resp) = check_availability_authorization(nf_id, &patched, &affected_tais) {
+        return resp;
+    }
 
     let info = context::availability_info_from_doc(nf_id, patched.clone());
     with_nssf_context(|context| context.set_nssai_availability(nf_id, info));
@@ -1386,6 +1813,9 @@ async fn send_availability_notification(
             .with_connect_timeout(NOTIFY_CONNECT_TIMEOUT)
             .with_request_timeout(NOTIFY_REQUEST_TIMEOUT),
     );
+    // NSSAI-availability notifications are consumed by AMFs; attach an
+    // NRF-issued token when OAuth2 enforcement is on (no-op otherwise).
+    let client = attach_oauth2(client, NfType::Amf);
 
     match client.post_json(&path, &body).await {
         Ok(resp) if resp.status == 204 || resp.is_success() => {
@@ -1583,11 +2013,11 @@ async fn send_hnssf_query(
     home_id: u64,
     param: &nnssf_handler::NsSelectionParam,
 ) -> Result<nnssf_handler::NsiInformation, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     // Find NSSF instances for H-NSSF query
     let nssf_instances = sbi_ctx
-        .find_nf_instances_by_service(ogs_sbi::types::SbiServiceType::NnssfNsselection)
+        .find_nf_instances_by_service(nextgcore_sbi::types::SbiServiceType::NnssfNsselection)
         .await;
 
     let nssf_instance = nssf_instances
@@ -1595,7 +2025,7 @@ async fn send_hnssf_query(
         .ok_or_else(|| "No H-NSSF instance available for nnssf-nsselection service".to_string())?;
 
     let nssf_service = nssf_instance
-        .find_service(ogs_sbi::types::SbiServiceType::NnssfNsselection)
+        .find_service(nextgcore_sbi::types::SbiServiceType::NnssfNsselection)
         .ok_or("H-NSSF instance has no nnssf-nsselection service")?;
 
     let host = nssf_service
@@ -1705,7 +2135,7 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 ///
 /// Returns the NF instance ID so callers can start a heartbeat worker.
 async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -1766,21 +2196,23 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
         200 | 201 => {
             log::info!("NSSF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance =
-                ogs_sbi::context::NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Nssf);
+            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
+                &nf_instance_id,
+                nextgcore_sbi::types::NfType::Nssf,
+            );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
 
-            let mut svc = ogs_sbi::context::NfService::new(
+            let mut svc = nextgcore_sbi::context::NfService::new(
                 "nnssf-nsselection",
-                ogs_sbi::types::SbiServiceType::NnssfNsselection,
+                nextgcore_sbi::types::SbiServiceType::NnssfNsselection,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
             self_instance.add_service(svc);
 
-            let mut svc2 = ogs_sbi::context::NfService::new(
+            let mut svc2 = nextgcore_sbi::context::NfService::new(
                 "nnssf-nssaiavailability",
-                ogs_sbi::types::SbiServiceType::NnssfNssaiavailability,
+                nextgcore_sbi::types::SbiServiceType::NnssfNssaiavailability,
             );
             svc2.port = sbi_port;
             svc2.ip_addresses = vec![sbi_addr.to_string()];
@@ -1799,7 +2231,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
 /// Discover NF services from NRF (B24.3)
 async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Result<(), String> {
-    let sbi_ctx = ogs_sbi::context::global_context();
+    let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -1840,13 +2272,13 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
             let nf_type_str = nf_json.get("nfType").and_then(|v| v.as_str()).unwrap_or("");
 
             let nf_type = match nf_type_str {
-                "NSSF" => ogs_sbi::types::NfType::Nssf,
-                "NRF" => ogs_sbi::types::NfType::Nrf,
-                "AMF" => ogs_sbi::types::NfType::Amf,
+                "NSSF" => nextgcore_sbi::types::NfType::Nssf,
+                "NRF" => nextgcore_sbi::types::NfType::Nrf,
+                "AMF" => nextgcore_sbi::types::NfType::Amf,
                 _ => continue,
             };
 
-            let mut instance = ogs_sbi::context::NfInstance::new(nf_id, nf_type);
+            let mut instance = nextgcore_sbi::context::NfInstance::new(nf_id, nf_type);
 
             if let Some(fqdn) = nf_json.get("fqdn").and_then(|v| v.as_str()) {
                 instance.fqdn = Some(fqdn.to_string());
@@ -1864,8 +2296,10 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                         .get("serviceName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if let Some(svc_type) = ogs_sbi::types::SbiServiceType::from_name(svc_name) {
-                        let mut svc = ogs_sbi::context::NfService::new(svc_name, svc_type);
+                    if let Some(svc_type) =
+                        nextgcore_sbi::types::SbiServiceType::from_name(svc_name)
+                    {
+                        let mut svc = nextgcore_sbi::context::NfService::new(svc_name, svc_type);
                         if let Some(endpoints) =
                             svc_json.get("ipEndPoints").and_then(|v| v.as_array())
                         {
@@ -1942,7 +2376,7 @@ async fn run_event_loop_async(
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
         // Compute optimal sleep duration based on pending timers
-        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+        let poll_interval = nextgcore_core::async_timer::compute_poll_interval(
             timer_mgr.inner(),
             Duration::from_millis(100),
         );
@@ -1982,8 +2416,8 @@ async fn run_event_loop_async(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ogs_sbi::client::SbiClient;
-    use ogs_sbi::server::{SbiServer, SbiServerConfig};
+    use nextgcore_sbi::client::SbiClient;
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     use serde_json::json;
 
     #[test]
@@ -2081,6 +2515,18 @@ mod tests {
         port
     }
 
+    /// Serializes tests that mutate the *global* NSSF availability/restriction
+    /// state (the context is a process-wide singleton). Without this, the
+    /// PLMN-supported restriction one test installs could leak into another
+    /// running concurrently and flip an expected 200 into a 403 (or vice
+    /// versa). An async-aware `tokio::sync::Mutex` is used so the guard may be
+    /// held across the handler `.await` points (clippy `await_holding_lock`),
+    /// and it does not poison on a failing test.
+    async fn availability_state_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        GUARD.lock().await
+    }
+
     async fn start_nssf_server() -> (SbiServer, u16) {
         nssf_context_init(512);
         let port = free_port();
@@ -2093,6 +2539,154 @@ mod tests {
             .await
             .expect("server start");
         (server, port)
+    }
+
+    // -----------------------------------------------------------------
+    // OAuth2 enforcement (T1.1): server-side require_oauth2 + aud check
+    // -----------------------------------------------------------------
+
+    /// Mint an ES256 access token (matching the NRF's token shape) with the
+    /// given `aud`, signed by `sk` and tagged with `kid`.
+    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature};
+
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
+        let claims = serde_json::json!({
+            "iss": "NRF", "sub": "amf-1", "aud": aud,
+            "scope": "nnssf-nsselection", "exp": exp, "iat": 0
+        })
+        .to_string();
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("{h}.{p}.{s}")
+    }
+
+    /// Public JWKS for the signing key `sk` under `kid`.
+    fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let point = sk.verifying_key().to_encoded_point(false);
+        serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":kid,
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }]})
+    }
+
+    /// Start an NSSF SBI server with OAuth2 enforcement keyed to a static JWKS
+    /// and the NSSF audience.
+    async fn start_nssf_server_oauth2(jwks: serde_json::Value) -> (SbiServer, u16) {
+        nssf_context_init(512);
+        let port = free_port();
+        let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(jwks);
+        cfg = cfg.with_expected_audience_nf_type(NfType::Nssf);
+        let server = SbiServer::new(cfg);
+        server
+            .start(nssf_sbi_request_handler)
+            .await
+            .expect("server start");
+        (server, port)
+    }
+
+    #[test]
+    fn test_yaml_oauth2_require_parses() {
+        let yaml = "nssf:\n  sbi:\n    oauth2:\n      require: true\n";
+        let parsed: NssfYaml = serde_yaml::from_str(yaml).unwrap();
+        let require = parsed
+            .nssf
+            .and_then(|n| n.sbi)
+            .and_then(|s| s.oauth2)
+            .and_then(|o| o.require)
+            .unwrap_or(false);
+        assert!(require, "oauth2.require should parse to true");
+    }
+
+    #[test]
+    fn test_yaml_oauth2_absent_defaults_off() {
+        // Default config (no oauth2 block) leaves enforcement off, preserving
+        // the dev/E2E path.
+        let yaml = "nssf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: 7777\n";
+        let parsed: NssfYaml = serde_yaml::from_str(yaml).unwrap();
+        let require = parsed
+            .nssf
+            .and_then(|n| n.sbi)
+            .and_then(|s| s.oauth2)
+            .and_then(|o| o.require)
+            .unwrap_or(false);
+        assert!(!require, "absent oauth2 block must default to off");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_missing_token_rejected() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let (server, port) = start_nssf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // No Authorization header -> 401 (missing Bearer token).
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get("/nnssf-nsselection/v2/network-slice-information?nf-type=AMF&nf-id=x"),
+        )
+        .await
+        .expect("bounded")
+        .expect("response");
+        assert_eq!(resp.status, 401, "unauthenticated request must be 401");
+
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_valid_token_accepted() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let (server, port) = start_nssf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // Valid token whose aud includes "NSSF" passes enforcement; the
+        // request reaches the handler (400 for the missing mandatory params,
+        // NOT 401/403 — i.e. authorization succeeded).
+        let token = build_es256_token(&sk, "nrf-es256", "NSSF");
+        let req = SbiRequest::get("/nnssf-nsselection/v2/network-slice-information?nf-type=AMF")
+            .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_ne!(resp.status, 401, "valid token must not be 401");
+        assert_ne!(resp.status, 403, "valid token must not be 403");
+        assert_eq!(resp.status, 400, "request reached handler (missing nf-id)");
+
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_wrong_audience_rejected() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let (server, port) = start_nssf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // Token addressed to a different NF (aud="UDM") is rejected (401).
+        let token = build_es256_token(&sk, "nrf-es256", "UDM");
+        let req =
+            SbiRequest::get("/nnssf-nsselection/v2/network-slice-information?nf-type=AMF&nf-id=x")
+                .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+
+        server.stop().await.expect("stop");
     }
 
     #[tokio::test]
@@ -2185,7 +2779,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_availability_lifecycle_with_notifications() {
+        // Serialize against the nssfd-01 restriction tests and clear any
+        // restriction so this lifecycle PUT/PATCH path sees the default
+        // allow-all (matched-sim back-compat).
+        let _state_guard = availability_state_guard().await;
         let (server, port) = start_nssf_server().await;
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None));
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Notification receiver on its own ephemeral port
@@ -2294,17 +2893,23 @@ mod tests {
             .is_empty());
 
         // 5. PATCH with RFC 6902 document -> 200 + second notification
-        let resp = client
-            .patch_json(
-                "/nnssf-nssaiavailability/v1/nssai-availability/amf-av-1",
-                &json!([{
-                    "op": "add",
-                    "path": "/supportedNssaiAvailabilityData/0/supportedSnssaiList/-",
-                    "value": {"sst": 53}
-                }]),
-            )
-            .await
-            .expect("response");
+        // (nssfd-05: must use application/json-patch+json content type)
+        let patch_body = json!([{
+            "op": "add",
+            "path": "/supportedNssaiAvailabilityData/0/supportedSnssaiList/-",
+            "value": {"sst": 53}
+        }])
+        .to_string();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send_request(
+                SbiRequest::patch("/nnssf-nssaiavailability/v1/nssai-availability/amf-av-1")
+                    .with_body(patch_body, "application/json-patch+json"),
+            ),
+        )
+        .await
+        .expect("bounded")
+        .expect("response");
         assert_eq!(resp.status, 200);
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
@@ -2320,23 +2925,38 @@ mod tests {
         assert!(notif2.contains(&sub_id));
 
         // 6. Bad PATCH (replace of non-existent member) -> 400
-        let resp = client
-            .patch_json(
-                "/nnssf-nssaiavailability/v1/nssai-availability/amf-av-1",
-                &json!([{"op": "replace", "path": "/nonexistent", "value": 1}]),
-            )
-            .await
-            .expect("response");
+        // (nssfd-05: use application/json-patch+json to reach the 400 path)
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send_request(
+                SbiRequest::patch("/nnssf-nssaiavailability/v1/nssai-availability/amf-av-1")
+                    .with_body(
+                        json!([{"op": "replace", "path": "/nonexistent", "value": 1}]).to_string(),
+                        "application/json-patch+json",
+                    ),
+            ),
+        )
+        .await
+        .expect("bounded")
+        .expect("response");
         assert_eq!(resp.status, 400);
 
         // 7. PATCH on unknown nfId -> 404
-        let resp = client
-            .patch_json(
-                "/nnssf-nssaiavailability/v1/nssai-availability/amf-unknown",
-                &json!([{"op": "remove", "path": "/supportedNssaiAvailabilityData/0"}]),
-            )
-            .await
-            .expect("response");
+        // (nssfd-05: use application/json-patch+json to reach the 404 path)
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send_request(
+                SbiRequest::patch("/nnssf-nssaiavailability/v1/nssai-availability/amf-unknown")
+                    .with_body(
+                        json!([{"op": "remove", "path": "/supportedNssaiAvailabilityData/0"}])
+                            .to_string(),
+                        "application/json-patch+json",
+                    ),
+            ),
+        )
+        .await
+        .expect("bounded")
+        .expect("response");
         assert_eq!(resp.status, 404);
 
         // 8. Subscription PATCH (replace expiry) -> 200
@@ -2386,5 +3006,512 @@ mod tests {
 
         server.stop().await.expect("stop");
         receiver.stop().await.expect("stop receiver");
+    }
+
+    // -----------------------------------------------------------------
+    // nssfd-01: NSSAIAvailability PUT/PATCH PLMN-support + authorization
+    // (TS 29.531 §6.2.3.2.3.1, TS 33.521). Handlers are driven directly so
+    // the 403-before-store/notify ordering is observable.
+    // -----------------------------------------------------------------
+
+    /// (a) With a configured restricted set, PUT an S-NSSAI outside it ->
+    /// 403 SNSSAI_NOT_SUPPORTED; nothing stored, no notification spawned.
+    #[tokio::test]
+    async fn test_availability_put_unsupported_snssai_403() {
+        let _state_guard = availability_state_guard().await;
+        nssf_context_init(512);
+        // Restrict the PLMN to sst=1 only; the PUT reports sst=2 (outside it).
+        with_nssf_context(|c| {
+            c.set_plmn_supported_snssais(Some(vec![context::SNssai::new(1, None)]))
+        });
+
+        let nf_id = "amf-nssfd01-unsupported";
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(nf_id));
+
+        let body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 2, "sd": "0a0b0c"}]
+            }]
+        });
+        let req = SbiRequest::put(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
+        ))
+        .with_json_body(&body)
+        .unwrap();
+        let resp = handle_nssai_availability_update(nf_id, &req).await;
+
+        assert_eq!(resp.status, 403);
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pd["status"], 403);
+        assert_eq!(pd["cause"], "SNSSAI_NOT_SUPPORTED");
+        // Nothing stored. The 403 returns before set_nssai_availability + the
+        // spawn_availability_notifications call, so no notification is spawned.
+        assert!(with_nssf_context(|c| c.get_nssai_availability(nf_id))
+            .flatten()
+            .is_none());
+
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None));
+    }
+
+    /// (b) PUT with an empty NF Id -> 403 NOT_AUTHORIZED.
+    #[tokio::test]
+    async fn test_availability_put_empty_nf_id_403_not_authorized() {
+        let _state_guard = availability_state_guard().await;
+        nssf_context_init(512);
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None)); // no restriction
+
+        let body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let req = SbiRequest::put("/nnssf-nssaiavailability/v1/nssai-availability/")
+            .with_json_body(&body)
+            .unwrap();
+        // Empty NF Id is unauthorized regardless of slice contents.
+        let resp = handle_nssai_availability_update("", &req).await;
+
+        assert_eq!(resp.status, 403);
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pd["status"], 403);
+        assert_eq!(pd["cause"], "NOT_AUTHORIZED");
+        assert!(with_nssf_context(|c| c.get_nssai_availability(""))
+            .flatten()
+            .is_none());
+    }
+
+    /// (c) PUT with all-supported S-NSSAIs (here: no restriction configured)
+    /// -> 200 and stored.
+    #[tokio::test]
+    async fn test_availability_put_all_supported_200_stored() {
+        let _state_guard = availability_state_guard().await;
+        nssf_context_init(512);
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None)); // default allow-all
+
+        let nf_id = "amf-nssfd01-ok";
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(nf_id));
+
+        let body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let req = SbiRequest::put(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
+        ))
+        .with_json_body(&body)
+        .unwrap();
+        let resp = handle_nssai_availability_update(nf_id, &req).await;
+
+        assert_eq!(resp.status, 200);
+        let stored = with_nssf_context(|c| c.get_nssai_availability(nf_id)).flatten();
+        assert!(stored.is_some(), "supported PUT must be stored");
+        assert_eq!(
+            stored.unwrap().supported_snssai_list,
+            vec![context::SNssai::new(1, None)]
+        );
+
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(nf_id));
+    }
+
+    /// (d) PATCH producing an unsupported S-NSSAI -> 403; original doc
+    /// unchanged.
+    #[tokio::test]
+    async fn test_availability_patch_unsupported_snssai_403_original_unchanged() {
+        let _state_guard = availability_state_guard().await;
+        nssf_context_init(512);
+        // Restrict to sst=1: the initial PUT (sst=1) is accepted; the PATCH
+        // that appends sst=2 must be rejected and leave the stored doc intact.
+        with_nssf_context(|c| {
+            c.set_plmn_supported_snssais(Some(vec![context::SNssai::new(1, None)]))
+        });
+
+        let nf_id = "amf-nssfd01-patch";
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(nf_id));
+
+        let put_body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let put_req = SbiRequest::put(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
+        ))
+        .with_json_body(&put_body)
+        .unwrap();
+        assert_eq!(
+            handle_nssai_availability_update(nf_id, &put_req)
+                .await
+                .status,
+            200
+        );
+
+        // PATCH appends an unsupported S-NSSAI (sst=2) -> 403, doc unchanged.
+        let patch = json!([{
+            "op": "add",
+            "path": "/supportedNssaiAvailabilityData/0/supportedSnssaiList/-",
+            "value": {"sst": 2}
+        }]);
+        let patch_req = SbiRequest::patch(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
+        ))
+        .with_body(patch.to_string(), "application/json-patch+json");
+        let resp = handle_nssai_availability_patch(nf_id, &patch_req).await;
+
+        assert_eq!(resp.status, 403);
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pd["status"], 403);
+        assert_eq!(pd["cause"], "SNSSAI_NOT_SUPPORTED");
+
+        // Original document unchanged: still exactly [sst=1].
+        let stored = with_nssf_context(|c| c.get_nssai_availability(nf_id))
+            .flatten()
+            .expect("original doc must remain stored after a rejected PATCH");
+        assert_eq!(
+            stored.supported_snssai_list,
+            vec![context::SNssai::new(1, None)]
+        );
+        let arr = stored.doc["supportedNssaiAvailabilityData"][0]["supportedSnssaiList"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            arr.len(),
+            1,
+            "rejected PATCH must not mutate the stored doc"
+        );
+
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None));
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(nf_id));
+    }
+
+    // -----------------------------------------------------------------
+    // nssfd-02: AuthorizedNssaiAvailabilityData restrictedSnssaiList
+    // (TS 29.531 §5.3.2.2 / §6.2.6.2.4)
+    // -----------------------------------------------------------------
+
+    /// With a configured per-PLMN restriction, authorized_availability_response
+    /// includes restrictedSnssaiList containing the expected RestrictedSnssai.
+    #[tokio::test]
+    async fn test_availability_authorized_response_restricted_snssai_list() {
+        let _guard = availability_state_guard().await;
+        nssf_context_init(512);
+        with_nssf_context(|c| {
+            c.set_plmn_snssai_restrictions(
+                &context::PlmnId::new("001", "01"),
+                vec![context::SNssai::new(99, None)],
+            )
+        });
+
+        let doc = serde_json::json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let resp = authorized_availability_response(&doc);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+
+        let entries = body["authorizedNssaiAvailabilityData"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        // restrictedSnssaiList must be present with homePlmnId 001/01 + sst=99.
+        let restricted = entries[0]["restrictedSnssaiList"].as_array().unwrap();
+        assert_eq!(
+            restricted.len(),
+            1,
+            "one home-PLMN restriction entry expected"
+        );
+        assert_eq!(restricted[0]["homePlmnId"]["mcc"], "001");
+        assert_eq!(restricted[0]["homePlmnId"]["mnc"], "01");
+        assert_eq!(restricted[0]["sNssais"][0]["sst"], 99);
+        // supportedSnssaiList must still equal the input.
+        assert_eq!(entries[0]["supportedSnssaiList"][0]["sst"], 1);
+
+        with_nssf_context(|c| c.clear_plmn_snssai_restrictions());
+    }
+
+    /// Without restriction config, restrictedSnssaiList is absent and
+    /// supportedSnssaiList equals the input (back-compat).
+    #[tokio::test]
+    async fn test_availability_authorized_response_no_restriction_no_restricted_list() {
+        let _guard = availability_state_guard().await;
+        nssf_context_init(512);
+        with_nssf_context(|c| c.clear_plmn_snssai_restrictions());
+
+        let doc = serde_json::json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}, {"sst": 2}]
+            }]
+        });
+        let resp = authorized_availability_response(&doc);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let entries = body["authorizedNssaiAvailabilityData"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].get("restrictedSnssaiList").is_none(),
+            "restrictedSnssaiList must be absent when no restriction configured"
+        );
+        assert_eq!(
+            entries[0]["supportedSnssaiList"].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // nssfd-03: 204 No Content when authorized availability is empty
+    // (TS 29.531 §6.2.3.2.3.1 Table 6.2.3.2.3.1-2)
+    // -----------------------------------------------------------------
+
+    /// authorized_availability_response returns 204 when no entries remain.
+    #[test]
+    fn test_availability_authorized_response_empty_entries_is_204() {
+        nssf_context_init(512);
+        let doc = serde_json::json!({"supportedNssaiAvailabilityData": []});
+        let resp = authorized_availability_response(&doc);
+        assert_eq!(
+            resp.status, 204,
+            "empty authorized data must yield 204 No Content"
+        );
+        let body = resp.http.content.as_deref().unwrap_or("");
+        assert!(body.is_empty(), "204 must carry no body");
+    }
+
+    /// authorized_availability_response returns 200 when entries are present.
+    #[tokio::test]
+    async fn test_availability_authorized_response_nonempty_is_200() {
+        let _guard = availability_state_guard().await;
+        nssf_context_init(512);
+        with_nssf_context(|c| c.clear_plmn_snssai_restrictions());
+        let doc = serde_json::json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let resp = authorized_availability_response(&doc);
+        assert_eq!(resp.status, 200);
+        assert!(resp.http.content.is_some(), "200 must carry a body");
+    }
+
+    // -----------------------------------------------------------------
+    // nssfd-04: PDU-session NSSelection narrows allowedNssaiList to the
+    // requested S-NSSAI (TS 29.531 §5.2.2.2.3 step 2a)
+    // -----------------------------------------------------------------
+
+    /// PDU-session request for sNssai A while NSIs {A, B, C} are configured
+    /// → response allowedSnssaiList contains only A.
+    #[tokio::test]
+    async fn test_pdu_nsselection_allowed_narrowed_to_requested_snssai() {
+        let _state_guard = availability_state_guard().await;
+        nssf_context_init(512);
+        // Configure three NSIs so the old all-NSIs path would have returned 3.
+        with_nssf_context(|c| {
+            c.nsi_add("http://nrf.example.com", 1, None);
+            c.nsi_add("http://nrf.example.com", 2, None);
+            c.nsi_add("http://nrf.example.com", 3, None);
+        });
+
+        // Request sst=1 → only sst=1 in allowedSnssaiList.
+        let si = serde_json::json!({"sNssai": {"sst": 1}, "roamingIndication": "NON_ROAMING"});
+        let resp = handle_ns_selection_pdu_session("amf-1", "AMF", &si, None, None, None).await;
+        assert_eq!(resp.status, 200, "PDU session selection must succeed");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let allowed = body["allowedNssaiList"][0]["allowedSnssaiList"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            allowed.len(),
+            1,
+            "allowedSnssaiList must be narrowed to the requested sNssai, not all NSIs"
+        );
+        assert_eq!(allowed[0]["allowedSnssai"]["sst"], 1);
+
+        // Request sst=2 → only sst=2 returned (not sst=1 or sst=3).
+        let si2 = serde_json::json!({"sNssai": {"sst": 2}, "roamingIndication": "NON_ROAMING"});
+        let resp2 = handle_ns_selection_pdu_session("amf-2", "AMF", &si2, None, None, None).await;
+        assert_eq!(resp2.status, 200);
+        let body2: serde_json::Value =
+            serde_json::from_str(resp2.http.content.as_deref().unwrap()).unwrap();
+        let allowed2 = body2["allowedNssaiList"][0]["allowedSnssaiList"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            allowed2.len(),
+            1,
+            "allowedSnssaiList must be narrowed to sst=2"
+        );
+        assert_eq!(allowed2[0]["allowedSnssai"]["sst"], 2);
+
+        // Requesting an S-NSSAI with no NSI → existing 403 SNSSAI_NOT_SUPPORTED.
+        let si3 = serde_json::json!({"sNssai": {"sst": 99}, "roamingIndication": "NON_ROAMING"});
+        let resp3 = handle_ns_selection_pdu_session("amf-3", "AMF", &si3, None, None, None).await;
+        assert_eq!(resp3.status, 403, "unsupported sNssai must yield 403");
+
+        with_nssf_context(|c| c.nsi_remove_all());
+    }
+
+    // -----------------------------------------------------------------
+    // nssfd-05: PATCH Content-Type enforcement (415 Unsupported Media Type)
+    // (TS 29.531 §6.2 / RFC 6902)
+    // -----------------------------------------------------------------
+
+    /// PATCH with wrong Content-Type → 415; with correct Content-Type the
+    /// request proceeds past the media-type check (404 here because no doc
+    /// is stored for the test nfId).
+    #[tokio::test]
+    async fn test_availability_patch_wrong_content_type_415() {
+        nssf_context_init(512);
+
+        let wrong_ct_req =
+            SbiRequest::patch("/nnssf-nssaiavailability/v1/nssai-availability/amf-ct-test")
+                .with_body(
+                    serde_json::json!([{"op": "add", "path": "/x", "value": 1}]).to_string(),
+                    "application/json",
+                );
+        let resp = handle_nssai_availability_patch("amf-ct-test", &wrong_ct_req).await;
+        assert_eq!(resp.status, 415, "wrong Content-Type must yield 415");
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pd["status"], 415);
+
+        // Correct content type → proceeds past 415 check; 404 (no stored doc).
+        let correct_ct_req =
+            SbiRequest::patch("/nnssf-nssaiavailability/v1/nssai-availability/amf-ct-test")
+                .with_body(
+                    serde_json::json!([{"op": "add", "path": "/x", "value": 1}]).to_string(),
+                    "application/json-patch+json",
+                );
+        let resp = handle_nssai_availability_patch("amf-ct-test", &correct_ct_req).await;
+        assert_ne!(resp.status, 415, "correct Content-Type must not return 415");
+        assert_eq!(resp.status, 404, "no stored doc → 404");
+
+        // Missing Content-Type → also 415.
+        let no_ct_req =
+            SbiRequest::patch("/nnssf-nssaiavailability/v1/nssai-availability/amf-ct-test");
+        let resp = handle_nssai_availability_patch("amf-ct-test", &no_ct_req).await;
+        assert_eq!(resp.status, 415, "missing Content-Type must yield 415");
+    }
+
+    // -----------------------------------------------------------------
+    // nssfd-06: UE-Configuration-Update scenario branch
+    // (TS 29.531 §5.2.2.2.4)
+    // -----------------------------------------------------------------
+
+    /// UE-CU without requestedNssai → configuredNssai present, no
+    /// allowedNssaiList (TS 29.531 §5.2.2.2.4).
+    #[test]
+    fn test_nsselection_ue_cu_no_requested_nssai_no_allowed_list() {
+        nssf_context_init(512);
+        let info_json = serde_json::json!({
+            "subscribedNssai": [
+                {"subscribedSnssai": {"sst": 1}, "defaultIndication": true}
+            ]
+            // requestedNssai deliberately absent
+        });
+        let resp = handle_ns_selection_ue_cu("nf-ue-cu-1", &info_json, None);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("allowedNssaiList").is_none(),
+            "UE-CU without requestedNssai must NOT include allowedNssaiList"
+        );
+        assert!(
+            body.get("configuredNssai").is_some(),
+            "UE-CU must include configuredNssai derived from subscribedNssai"
+        );
+    }
+
+    /// UE-CU with requestedNssai → full response including allowedNssaiList
+    /// (same as registration scenario).
+    #[test]
+    fn test_nsselection_ue_cu_with_requested_nssai_includes_allowed_list() {
+        nssf_context_init(512);
+        let info_json = serde_json::json!({
+            "subscribedNssai": [
+                {"subscribedSnssai": {"sst": 1}, "defaultIndication": true}
+            ],
+            "requestedNssai": [{"sst": 1}]
+        });
+        let resp = handle_ns_selection_ue_cu("nf-ue-cu-2", &info_json, None);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("allowedNssaiList").is_some(),
+            "UE-CU with requestedNssai must include allowedNssaiList"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // nssfd-07: Registration success populates targetAmfSet when configured
+    // (TS 29.531 §5.2.2.2.2 step 2a)
+    // -----------------------------------------------------------------
+
+    /// With a configured target AMF set, a successful registration response
+    /// includes targetAmfSet even when no candidateAmfList is produced.
+    #[tokio::test]
+    async fn test_registration_success_includes_target_amf_set_when_configured() {
+        let _guard = availability_state_guard().await;
+        nssf_context_init(512);
+        with_nssf_context(|c| c.set_target_amf_set("001-01-01-001"));
+
+        let info_json = serde_json::json!({
+            "subscribedNssai": [
+                {"subscribedSnssai": {"sst": 1}, "defaultIndication": true}
+            ],
+            "requestedNssai": [{"sst": 1}]
+        });
+        let resp = handle_ns_selection_registration("nf-reg-7a", &info_json, None);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("targetAmfSet").is_some(),
+            "targetAmfSet must be present when configured (TS 29.531 §5.2.2.2.2)"
+        );
+        assert_eq!(
+            body["targetAmfSet"], "001-01-01-001",
+            "targetAmfSet must match the configured value"
+        );
+
+        with_nssf_context(|c| c.clear_target_amf_set());
+    }
+
+    /// Without configured target AMF set and no TAI (no fallback), targetAmfSet
+    /// is absent from the registration response.
+    #[tokio::test]
+    async fn test_registration_success_no_target_amf_set_when_not_configured() {
+        let _guard = availability_state_guard().await;
+        nssf_context_init(512);
+        with_nssf_context(|c| c.clear_target_amf_set());
+
+        let info_json = serde_json::json!({
+            "subscribedNssai": [
+                {"subscribedSnssai": {"sst": 1}, "defaultIndication": true}
+            ],
+            "requestedNssai": [{"sst": 1}]
+        });
+        // No TAI → no TAI-derived fallback; no config → no targetAmfSet.
+        let resp = handle_ns_selection_registration("nf-reg-7b", &info_json, None);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("targetAmfSet").is_none(),
+            "targetAmfSet must be absent when not configured and no TAI provided"
+        );
     }
 }

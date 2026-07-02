@@ -5,6 +5,8 @@
 **Workspace**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/`
 **Implementation Status**: Phase 1 Complete
 
+> **⚠️ STALE (2026-02-08 Phase-1 snapshot).** Covers only 6 infrastructure features (6/30). Superseded by later Wave-1..6 work: the workspace now ships **24 NF binaries (19 5GC + 5 EPC)** and **17 libraries**, incl. NWDAF/NSACF/DCCF/EES/LMF/MBSMF/PIN. All 6G-oriented items remain research-/prototype-level and are **NOT Rel-20-conformant** (no frozen 6G stage-3 spec). Retained for historical context.
+
 ---
 
 ## Executive Summary
@@ -27,9 +29,9 @@ This report documents the implementation of 6G-ready features across the nextgco
 
 ## Completed Implementations
 
-### 1. ogs-core: Distributed Timer Coordination (B2.2)
+### 1. nextgcore-core: Distributed Timer Coordination (B2.2)
 
-**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/ogs-core/src/timer.rs`
+**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/nextgcore-core/src/timer.rs`
 
 #### Features Implemented
 - **DistributedTimerCoordinator**: Core coordination structure for multi-instance timer synchronization
@@ -63,9 +65,9 @@ Enables horizontally scaled NF instances to coordinate timer expiration across r
 
 ---
 
-### 2. ogs-core: OpenTelemetry-Compatible Logging (B2.3)
+### 2. nextgcore-core: OpenTelemetry-Compatible Logging (B2.3)
 
-**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/ogs-core/src/log.rs`
+**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/nextgcore-core/src/log.rs`
 
 #### Features Implemented
 - **OtelLogRecord**: Full OTLP-compatible log record structure
@@ -107,9 +109,9 @@ Provides cloud-native observability integration for 6G NFs, enabling seamless in
 
 ---
 
-### 3. ogs-app: Intent-Based Configuration (B3.2)
+### 3. nextgcore-app: Intent-Based Configuration (B3.2)
 
-**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/ogs-app/src/intent.rs`
+**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/nextgcore-app/src/intent.rs`
 
 #### Features Implemented
 - **High-Level Intent Specification**:
@@ -149,9 +151,9 @@ Enables operators to define network behavior through high-level business intent 
 
 ---
 
-### 4. ogs-app: Configuration Versioning & Rollback (B3.3)
+### 4. nextgcore-app: Configuration Versioning & Rollback (B3.3)
 
-**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/ogs-app/src/config.rs` (lines 1287-1589)
+**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/nextgcore-app/src/config.rs` (lines 1287-1589)
 
 #### Features Implemented
 - **ConfigHistoryManager**: Snapshot-based configuration versioning
@@ -198,9 +200,9 @@ Provides GitOps-style configuration management for 6G NFs, enabling safe configu
 
 ---
 
-### 5. ogs-dbi: Graph Database Support (B4.4)
+### 5. nextgcore-dbi: Graph Database Support (B4.4)
 
-**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/ogs-dbi/src/graphdb.rs`
+**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/nextgcore-dbi/src/graphdb.rs`
 
 #### Features Implemented
 - **Graph Data Model**:
@@ -246,9 +248,9 @@ Models complex 6G network relationships (UE-NF-Slice topologies, service depende
 
 ---
 
-### 6. ogs-dbi: Time-Series Database Support (B4.5)
+### 6. nextgcore-dbi: Time-Series Database Support (B4.5)
 
-**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/ogs-dbi/src/tsdb.rs`
+**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/nextgcore-dbi/src/tsdb.rs`
 
 #### Features Implemented
 - **Time-Series Data Model**:
@@ -294,9 +296,9 @@ Stores and analyzes temporal 6G network metrics for performance monitoring, SLA 
 
 ---
 
-### 7. ogs-dbi: Distributed Database Support (B4.6)
+### 7. nextgcore-dbi: Distributed Database Support (B4.6)
 
-**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/ogs-dbi/src/mongoc.rs` (lines 231-686)
+**File**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/libs/nextgcore-dbi/src/mongoc.rs` (lines 231-686)
 
 #### Features Implemented
 - **DistributedDbCoordinator**: Replica set and sharding management
@@ -351,13 +353,13 @@ All implemented features have been verified to compile successfully:
 
 ```bash
 $ cd /Users/parlakisik/projects/github/nextg/nextgcore/src
-$ cargo check -p ogs-core
+$ cargo check -p nextgcore-core
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
 
-$ cargo check -p ogs-app
+$ cargo check -p nextgcore-app
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.46s
 
-$ cargo check -p ogs-dbi
+$ cargo check -p nextgcore-dbi
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.14s
 ```
 
@@ -420,15 +422,15 @@ $ cargo check -p ogs-dbi
 ## Remaining Implementation Work
 
 ### Phase 2: Observability & Messaging (Est. 1000 LoC)
-- B5.2: AI-Native Observability (anomaly detection in `ogs-metrics/ai_obs.rs`)
-- B5.3: Distributed Tracing (span propagation in `ogs-metrics/tracing.rs`)
-- B5.4: SLA Metric Enforcement (`ogs-metrics/sla.rs`)
-- B8.5: SBI 2.0 / gRPC Support (`ogs-sbi/grpc.rs`)
-- B8.6: Event-Driven Pub-Sub (`ogs-sbi/events.rs`)
+- B5.2: AI-Native Observability (anomaly detection in `nextgcore-metrics/ai_obs.rs`)
+- B5.3: Distributed Tracing (span propagation in `nextgcore-metrics/tracing.rs`)
+- B5.4: SLA Metric Enforcement (`nextgcore-metrics/sla.rs`)
+- B8.5: SBI 2.0 / gRPC Support (`nextgcore-sbi/grpc.rs`)
+- B8.6: Event-Driven Pub-Sub (`nextgcore-sbi/events.rs`)
 
 ### Phase 3: NAS & ASN.1 (Est. 1500 LoC)
-- B9.4-B9.6: 6G NAS IEs (AI/ML, ISAC, sub-THz in `ogs-nas/fiveg/`)
-- B16.3-B16.5: XnAP/F1AP/E1AP codecs (new directories in `ogs-asn1c/`)
+- B9.4-B9.6: 6G NAS IEs (AI/ML, ISAC, sub-THz in `nextgcore-nas/fiveg/`)
+- B16.3-B16.5: XnAP/F1AP/E1AP codecs (new directories in `nextgcore-asn1c/`)
 
 ### Phase 4: NF-Specific Features (Est. 2000 LoC)
 - B20.5: SCP service mesh sidecar
@@ -473,7 +475,7 @@ $ cargo check -p ogs-dbi
 
 ### Workspace Dependencies (already present)
 - `uuid`: For instance ID generation
-- `serde_json`: For config import/export (added to ogs-app)
+- `serde_json`: For config import/export (added to nextgcore-app)
 
 **No new external dependencies introduced** - all implementations use existing workspace crates.
 

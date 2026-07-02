@@ -30,10 +30,9 @@ pub use proxy::{
     forwardable_request_headers, relayable_response_headers, ApiRoot, ScpProxy, ScpProxyConfig,
 };
 pub use sbi_path::{
-    build_forwarded_request, copy_request_headers, discovery_cache, headers,
-    parse_discovery_headers, parse_search_result, route_request, scp_sbi_close, scp_sbi_is_running,
-    scp_sbi_open, select_nf_instance, select_nf_instance_round_robin, DiscoveryCache,
-    NfInstanceCandidate, SbiRequest, SbiServerConfig,
+    discovery_cache, headers, parse_search_result, scp_sbi_close, scp_sbi_is_running, scp_sbi_open,
+    select_nf_instance, select_nf_instance_round_robin, DiscoveryCache, NfInstanceCandidate,
+    SbiServerConfig,
 };
 pub use scp_sm::{ScpSmContext, ScpState};
 pub use timer::{timer_manager, ScpTimerManager};
@@ -93,6 +92,24 @@ struct Args {
     /// (falls back to the NRF_URI environment variable)
     #[arg(long)]
     nrf_uri: Option<String>,
+
+    /// The SCP's own NF Instance ID, used as `nfInstanceId` when the SCP
+    /// acquires delegated OAuth2 access tokens for Model D requests
+    /// (falls back to the NF_INSTANCE_ID environment variable)
+    #[arg(long)]
+    nf_instance_id: Option<String>,
+
+    /// The SCP's own FQDN/identity, used for the `Via`/`Server` headers and
+    /// `SCP-<FQDN>` loop detection (TS 29.500 §6.10.8/§6.10.10). Falls back to
+    /// the SCP_FQDN environment variable, then to a built-in default.
+    #[arg(long)]
+    scp_fqdn: Option<String>,
+
+    /// Treat the next hop on forwarded requests as another SCP: convey the
+    /// selected producer apiRoot in `3gpp-Sbi-Target-apiRoot` instead of
+    /// stripping it (TS 29.500 §6.10.2.5).
+    #[arg(long)]
+    next_hop_scp: bool,
 }
 
 /// Global shutdown flag
@@ -105,8 +122,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -174,12 +191,24 @@ async fn main() -> Result<()> {
              Model D delegated discovery is disabled"
         );
     }
+    let nf_instance_id = args
+        .nf_instance_id
+        .clone()
+        .or_else(|| std::env::var("NF_INSTANCE_ID").ok());
+    let own_fqdn = args
+        .scp_fqdn
+        .clone()
+        .or_else(|| std::env::var("SCP_FQDN").ok())
+        .unwrap_or_else(|| ScpProxyConfig::default().own_fqdn);
     let scp_proxy = Arc::new(ScpProxy::new(ScpProxyConfig {
         nrf_uri,
+        nf_instance_id,
+        own_fqdn,
+        next_hop_scp: args.next_hop_scp,
         ..Default::default()
     }));
     let mut http_config =
-        ogs_sbi::server::SbiServerConfig::with_host_port(&args.sbi_addr, args.sbi_port)
+        nextgcore_sbi::server::SbiServerConfig::with_host_port(&args.sbi_addr, args.sbi_port)
             .map_err(|e| anyhow::anyhow!("Invalid SBI listen address: {e}"))?;
     if args.tls {
         match (&args.tls_key, &args.tls_cert) {
@@ -189,10 +218,10 @@ async fn main() -> Result<()> {
             _ => anyhow::bail!("--tls requires both --tls-cert and --tls-key"),
         }
     }
-    let http_server = ogs_sbi::server::SbiServer::new(http_config);
+    let http_server = nextgcore_sbi::server::SbiServer::new(http_config);
     let handler_proxy = scp_proxy.clone();
     http_server
-        .start(move |request: ogs_sbi::message::SbiRequest| {
+        .start(move |request: nextgcore_sbi::message::SbiRequest| {
             let proxy = handler_proxy.clone();
             async move { proxy.handle(request).await }
         })
@@ -280,7 +309,7 @@ async fn run_event_loop_async(scp_sm: &mut ScpSmContext, shutdown: Arc<AtomicBoo
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
         // Compute optimal sleep duration based on pending timers
-        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+        let poll_interval = nextgcore_core::async_timer::compute_poll_interval(
             timer_mgr.inner(),
             Duration::from_millis(100),
         );

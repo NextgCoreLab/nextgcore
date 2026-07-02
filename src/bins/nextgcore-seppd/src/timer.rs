@@ -1,11 +1,11 @@
 //! SEPP Timer Management
 //!
 //! Timer management for SEPP operations using the shared AsyncTimerMgr
-//! from ogs-core. Handles peer establishment retries, NRF heartbeats,
+//! from nextgcore-core. Handles peer establishment retries, NRF heartbeats,
 //! and subscription validity.
 
 use crate::event::SeppTimerId;
-use ogs_core::async_timer::{AsyncTimerMgr, TimerMode};
+use nextgcore_core::async_timer::{AsyncTimerMgr, TimerMode};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -105,7 +105,9 @@ impl TimerManager {
     }
 
     /// Process expired timers and return them for dispatch to the state machine
-    pub fn process_expired(&self) -> Vec<ogs_core::async_timer::AsyncTimerEntry<SeppTimerId>> {
+    pub fn process_expired(
+        &self,
+    ) -> Vec<nextgcore_core::async_timer::AsyncTimerEntry<SeppTimerId>> {
         self.inner.process_expired()
     }
 

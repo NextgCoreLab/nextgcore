@@ -26,6 +26,21 @@ impl NotificationEventType {
     }
 }
 
+/// RFC 6902-style change item for NF_PROFILE_CHANGED notifications
+/// (TS 29.510 §5.2.2.6 — each applied PatchItem is relayed to subscribers)
+#[derive(Debug, Clone)]
+pub struct ChangeItem {
+    /// Operation: "add", "remove", "replace", "move", "copy"
+    pub op: String,
+    /// JSON Pointer path (RFC 6901)
+    pub path: String,
+    /// New value (for "add" / "replace")
+    pub value: Option<serde_json::Value>,
+    /// Original value before the operation (for "replace" / "remove" —
+    /// TS 29.510 extension on top of RFC 6902)
+    pub orig_value: Option<serde_json::Value>,
+}
+
 /// Notification data for NF status notify
 #[derive(Debug, Clone)]
 pub struct NotificationData {
@@ -35,6 +50,8 @@ pub struct NotificationData {
     pub nf_instance_uri: String,
     /// NF profile (optional, not included for deregistration)
     pub nf_profile: Option<NfProfile>,
+    /// RFC 6902-style change items (NF_PROFILE_CHANGED only, TS 29.510 §5.2.2.6)
+    pub profile_changes: Option<Vec<ChangeItem>>,
 }
 
 /// SBI request for notification
@@ -61,6 +78,34 @@ pub fn nrf_nnrf_nfm_build_nf_status_notify(
     nf_instance: &NfProfile,
     server_uri: &str,
 ) -> Option<SbiNotifyRequest> {
+    build_nf_status_notify_inner(subscription_data, event, nf_instance, server_uri, None)
+}
+
+/// Build an NF_PROFILE_CHANGED notification carrying the RFC 6902-style
+/// `profileChanges` list derived from the applied PATCH (TS 29.510 §5.2.2.6).
+pub fn nrf_nnrf_nfm_build_nf_profile_changed_notify(
+    subscription_data: &SubscriptionData,
+    nf_instance: &NfProfile,
+    server_uri: &str,
+    profile_changes: Vec<ChangeItem>,
+) -> Option<SbiNotifyRequest> {
+    build_nf_status_notify_inner(
+        subscription_data,
+        NotificationEventType::NfProfileChanged,
+        nf_instance,
+        server_uri,
+        Some(profile_changes),
+    )
+}
+
+/// Internal builder shared by the public notify-build functions.
+fn build_nf_status_notify_inner(
+    subscription_data: &SubscriptionData,
+    event: NotificationEventType,
+    nf_instance: &NfProfile,
+    server_uri: &str,
+    profile_changes: Option<Vec<ChangeItem>>,
+) -> Option<SbiNotifyRequest> {
     // Build NF instance URI
     let nf_instance_uri = format!(
         "{}/nnrf-nfm/v1/nf-instances/{}",
@@ -76,6 +121,7 @@ pub fn nrf_nnrf_nfm_build_nf_status_notify(
         } else {
             None
         },
+        profile_changes,
     };
 
     // Serialize to JSON
@@ -107,9 +153,40 @@ fn build_notification_json(data: &NotificationData) -> Option<String> {
         json.push_str(&build_nf_profile_json(profile)?);
     }
 
+    // RFC 6902-style profileChanges (NF_PROFILE_CHANGED, TS 29.510 §5.2.2.6)
+    if let Some(ref changes) = data.profile_changes {
+        if !changes.is_empty() {
+            json.push_str(",\"profileChanges\":");
+            json.push_str(&build_profile_changes_json(changes));
+        }
+    }
+
     json.push('}');
 
     Some(json)
+}
+
+/// Serialize a slice of `ChangeItem` to the `profileChanges` JSON array.
+fn build_profile_changes_json(changes: &[ChangeItem]) -> String {
+    let items: Vec<String> = changes
+        .iter()
+        .map(|c| {
+            let mut obj = format!("{{\"op\":\"{}\",\"path\":\"{}\"", c.op, c.path);
+            if let Some(ref v) = c.value {
+                if let Ok(s) = serde_json::to_string(v) {
+                    obj.push_str(&format!(",\"newValue\":{s}"));
+                }
+            }
+            if let Some(ref v) = c.orig_value {
+                if let Ok(s) = serde_json::to_string(v) {
+                    obj.push_str(&format!(",\"origValue\":{s}"));
+                }
+            }
+            obj.push('}');
+            obj
+        })
+        .collect();
+    format!("[{}]", items.join(","))
 }
 
 /// Build NF profile JSON
@@ -294,6 +371,7 @@ mod tests {
             event: NotificationEventType::NfRegistered,
             nf_instance_uri: "http://nrf.example.com/nf-instances/test-nf-123".to_string(),
             nf_profile: Some(profile),
+            profile_changes: None,
         };
 
         let json = build_notification_json(&data);
@@ -305,5 +383,130 @@ mod tests {
             json.contains("\"nfInstanceUri\":\"http://nrf.example.com/nf-instances/test-nf-123\"")
         );
         assert!(json.contains("\"nfProfile\":{"));
+    }
+
+    // ------------------------------------------------------------------
+    // nrfd-02: NF_PROFILE_CHANGED notification builder
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_build_profile_changes_json_replace() {
+        let changes = vec![ChangeItem {
+            op: "replace".to_string(),
+            path: "/load".to_string(),
+            value: Some(serde_json::json!(75)),
+            orig_value: Some(serde_json::json!(50)),
+        }];
+        let json = build_profile_changes_json(&changes);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let item = &parsed[0];
+        assert_eq!(item["op"], "replace");
+        assert_eq!(item["path"], "/load");
+        assert_eq!(item["newValue"], 75);
+        assert_eq!(item["origValue"], 50);
+    }
+
+    #[test]
+    fn test_build_profile_changes_json_add_remove() {
+        let changes = vec![
+            ChangeItem {
+                op: "add".to_string(),
+                path: "/priority".to_string(),
+                value: Some(serde_json::json!(1)),
+                orig_value: None,
+            },
+            ChangeItem {
+                op: "remove".to_string(),
+                path: "/fqdn".to_string(),
+                value: None,
+                orig_value: Some(serde_json::json!("amf.example.com")),
+            },
+        ];
+        let json = build_profile_changes_json(&changes);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed[0]["op"], "add");
+        assert_eq!(parsed[0]["newValue"], 1);
+        assert!(parsed[0].get("origValue").is_none());
+        assert_eq!(parsed[1]["op"], "remove");
+        assert_eq!(parsed[1]["origValue"], "amf.example.com");
+        assert!(parsed[1].get("newValue").is_none());
+    }
+
+    #[test]
+    fn test_build_nf_profile_changed_notify_includes_profile_changes() {
+        let subscription = create_test_subscription();
+        let profile = create_test_profile();
+        let changes = vec![ChangeItem {
+            op: "replace".to_string(),
+            path: "/load".to_string(),
+            value: Some(serde_json::json!(80)),
+            orig_value: Some(serde_json::json!(40)),
+        }];
+
+        let request = nrf_nnrf_nfm_build_nf_profile_changed_notify(
+            &subscription,
+            &profile,
+            "http://nrf.example.com",
+            changes,
+        );
+
+        assert!(request.is_some());
+        let request = request.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+
+        assert_eq!(body["event"], "NF_PROFILE_CHANGED");
+        assert!(body["nfProfile"].is_object(), "nfProfile must be present");
+        let pc = body["profileChanges"]
+            .as_array()
+            .expect("profileChanges array");
+        assert_eq!(pc.len(), 1);
+        assert_eq!(pc[0]["op"], "replace");
+        assert_eq!(pc[0]["path"], "/load");
+        assert_eq!(pc[0]["newValue"], 80);
+        assert_eq!(pc[0]["origValue"], 40);
+    }
+
+    #[test]
+    fn test_build_nf_profile_changed_notify_empty_changes_omits_field() {
+        // profileChanges omitted (not serialized as empty array) when none exist.
+        let subscription = create_test_subscription();
+        let profile = create_test_profile();
+
+        let request = nrf_nnrf_nfm_build_nf_profile_changed_notify(
+            &subscription,
+            &profile,
+            "http://nrf.example.com",
+            vec![],
+        );
+
+        let body: serde_json::Value = serde_json::from_str(&request.unwrap().body).unwrap();
+        assert_eq!(body["event"], "NF_PROFILE_CHANGED");
+        assert!(
+            body.get("profileChanges").is_none(),
+            "empty changes must not serialize profileChanges"
+        );
+    }
+
+    #[test]
+    fn test_build_notification_json_with_profile_changes() {
+        let profile = create_test_profile();
+        let data = NotificationData {
+            event: NotificationEventType::NfProfileChanged,
+            nf_instance_uri: "http://nrf.example.com/nf-instances/test-nf-123".to_string(),
+            nf_profile: Some(profile),
+            profile_changes: Some(vec![ChangeItem {
+                op: "replace".to_string(),
+                path: "/nfStatus".to_string(),
+                value: Some(serde_json::json!("REGISTERED")),
+                orig_value: Some(serde_json::json!("SUSPENDED")),
+            }]),
+        };
+
+        let json = build_notification_json(&data).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "NF_PROFILE_CHANGED");
+        let pc = parsed["profileChanges"].as_array().unwrap();
+        assert_eq!(pc[0]["newValue"], "REGISTERED");
+        assert_eq!(pc[0]["origValue"], "SUSPENDED");
     }
 }

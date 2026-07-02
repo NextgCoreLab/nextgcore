@@ -1,22 +1,24 @@
 # NextGCore 6G Gap Analysis Report
 
 **Date:** 2026-02-07
-**Scope:** Comprehensive source code analysis of all 17 network functions and 18 shared libraries
+**Scope:** Comprehensive source code analysis of the network functions and shared libraries *(as of 2026-02-07: 17 NFs / 18 libs; the workspace now ships **24 NF binaries** and **17 libraries** — see stale-snapshot banner)*
 **Standards Reference:** 3GPP Rel-18/19, ITU-R IMT-2030 Framework
+
+> **⚠️ STALE SNAPSHOT (2026-02-07).** This report predates the Wave-1..6 remediation and the peripheral-NF build-out; it is retained for historical context only and several "does not exist" / "0%" statements below are now FALSE. As of 2026-07 the workspace ships **24 NF binaries (19 5GC + 5 EPC)** and **17 shared libraries** — including NWDAF (`nextgcore-nwdafd`: NRF-driven NF_LOAD collection, analytics, ML-service and federation scaffolding), NSACF (`nextgcore-nsacfd`: config-provisioned slice quotas per TS 29.536), plus DCCF, EES, LMF, MBSMF and PIN NFs; SBI OAuth2 (`/oauth2/token`); and wired NAS security (`bins/nextgcore-amfd/src/nas_security.rs`). A matched-sim Docker E2E (`docker/rust/e2e-test.sh`) exercises full registration + PDU session + data plane. These 6G-oriented items remain **research-/prototype-level and are NOT Rel-20 conformant — no frozen 6G stage-3 spec exists.**
 
 ---
 
 ## Executive Summary
 
-NextGCore is a pure Rust port of the Open5GS C codebase implementing 12 5G Core (5GC) network functions and 5 EPC network functions, supported by 18 shared libraries. The project has established strong foundational infrastructure -- FSM frameworks, SBI HTTP/2 server/client, PFCP protocol library, NAS message encoding/decoding, and a working UPF data plane -- but the majority of service-specific handlers remain stubbed. There are **316 documented TODOs** across 8 phases required to reach basic 5G operational parity, and **zero 6G-specific features** exist in the codebase.
+NextGCore is a pure Rust port of the Open5GS C codebase implementing **19 5G Core (5GC) network functions and 5 EPC network functions, supported by 17 shared libraries** *(counts as of 2026-07; this report was written against an earlier 12+5 / 18-lib layout)*. The project has established strong foundational infrastructure -- FSM frameworks, SBI HTTP/2 server/client, PFCP protocol library, NAS message encoding/decoding, and a working UPF data plane -- but the majority of service-specific handlers remain stubbed. There are **316 documented TODOs** across 8 phases required to reach basic 5G operational parity, and (at the time of writing) no 6G-specific features existed in the codebase. *(Historical: as of 2026-07 several 6G-oriented research NFs/features have since landed — NWDAF `nextgcore-nwdafd`, NSACF `nextgcore-nsacfd`, DCCF `nextgcore-dccfd`, plus ISAC/FL prototypes in nextgsim — all prototype-level, not Rel-20-conformant. See banner.)*
 
 The gap to a 6G-ready core network is therefore two-layered:
 
 1. **Layer 1 (5G Completion):** ~17 weeks of work to implement timer management, SBI infrastructure, error responses, NRF integration, and service-specific handlers across all NFs.
 2. **Layer 2 (6G Evolution):** Entirely new capabilities required for AI-native networking, SBA 2.0, compute-aware networking, digital twins, intent-driven management, enhanced slicing, zero-trust security, green networking, NTN support, and TSN integration.
 
-**Overall 5G Implementation Completeness: ~25%**
-**6G Readiness: 0%**
+**Overall 5G Implementation Completeness: ~25%** *(as of 2026-02-07; substantially higher after Wave-1..6 remediation — see banner)*
+**6G Readiness: 0%** *(STALE — 6G-oriented research NFs/features have since landed; still prototype-level, not Rel-20-conformant)*
 
 ---
 
@@ -53,24 +55,24 @@ The gap to a 6G-ready core network is therefore two-layered:
 
 | Library | Purpose | Status | Key Types/Features |
 |---------|---------|--------|-------------------|
-| **ogs-sbi** | SBI HTTP/2 | **Functional** | Client, Server (hyper/h2), ProblemDetails, NfInstance, discovery context, TLS config |
-| **ogs-pfcp** | PFCP protocol | **Functional** | Header/IE/Message encode/decode, Session/Association/Heartbeat types, TS 29.244 |
-| **ogs-nas** | NAS protocol | **Functional** | 5GMM + EPS message build/parse, security context, Registration/Auth/SMC messages |
-| **ogs-core** | Core utilities | **Functional** | 26 modules: list, hash, pool, pkbuf, timer, FSM, TLV, socket, poll, TCP/UDP |
-| **ogs-metrics** | Prometheus metrics | **Functional** | Counter/Gauge/Histogram, labels, Prometheus HTTP server |
-| **ogs-ngap** | NGAP protocol | **Minimal** | Only lib.rs stub (ASN.1 APER note) |
-| **ogs-s1ap** | S1AP protocol | Scaffolding | ASN.1 encoding via ogs-asn1c |
-| **ogs-sctp** | SCTP transport | **Working** | sctp-proto 0.6 integration (migration complete per must_be_implemented.txt) |
-| **ogs-gtp** | GTPv2-C protocol | Scaffolding | GTP-C message building |
-| **ogs-diameter** | Diameter protocol | Scaffolding | FreeDiameter integration stubs |
-| **ogs-crypt** | Crypto functions | Scaffolding | Auth vector generation |
-| **ogs-dbi** | Database interface | Scaffolding | MongoDB integration stubs |
-| **ogs-tun** | TUN device | **Working** | Used by UPF for data plane |
-| **ogs-ipfw** | IP firewall/NAT | **Working** | Used by UPF for NAT |
-| **ogs-ffi** | C FFI bindings | Scaffolding | FreeDiameter/ASN.1 C library bridges |
-| **ogs-asn1c** | ASN.1 compiler | Scaffolding | NGAP/S1AP ASN.1 types |
-| **ogs-app** | Application framework | Scaffolding | Common app initialization |
-| **ogs-proto** | Protocol definitions | Scaffolding | Shared protocol types |
+| **nextgcore-sbi** | SBI HTTP/2 | **Functional** | Client, Server (hyper/h2), ProblemDetails, NfInstance, discovery context, TLS config |
+| **nextgcore-pfcp** | PFCP protocol | **Functional** | Header/IE/Message encode/decode, Session/Association/Heartbeat types, TS 29.244 |
+| **nextgcore-nas** | NAS protocol | **Functional** | 5GMM + EPS message build/parse, security context, Registration/Auth/SMC messages |
+| **nextgcore-core** | Core utilities | **Functional** | 26 modules: list, hash, pool, pkbuf, timer, FSM, TLV, socket, poll, TCP/UDP |
+| **nextgcore-metrics** | Prometheus metrics | **Functional** | Counter/Gauge/Histogram, labels, Prometheus HTTP server |
+| **nextgcore-ngap** | NGAP protocol | **Minimal** | Only lib.rs stub (ASN.1 APER note) |
+| **nextgcore-s1ap** | S1AP protocol | Scaffolding | ASN.1 encoding via nextgcore-asn1c |
+| **nextgcore-sctp** | SCTP transport | **Working** | sctp-proto 0.6 integration (migration complete per must_be_implemented.txt) |
+| **nextgcore-gtp** | GTPv2-C protocol | Scaffolding | GTP-C message building |
+| **nextgcore-diameter** | Diameter protocol | Scaffolding | FreeDiameter integration stubs |
+| **nextgcore-crypt** | Crypto functions | Scaffolding | Auth vector generation |
+| **nextgcore-dbi** | Database interface | Scaffolding | MongoDB integration stubs |
+| **nextgcore-tun** | TUN device | **Working** | Used by UPF for data plane |
+| **nextgcore-ipfw** | IP firewall/NAT | **Working** | Used by UPF for NAT |
+| **nextgcore-ffi** | C FFI bindings | Scaffolding | FreeDiameter/ASN.1 C library bridges |
+| **nextgcore-asn1c** | ASN.1 compiler | Scaffolding | NGAP/S1AP ASN.1 types |
+| **nextgcore-app** | Application framework | Scaffolding | Common app initialization |
+| **nextgcore-proto** | Protocol definitions | Scaffolding | Shared protocol types |
 
 ---
 
@@ -84,7 +86,7 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 - **Impact:** Without timers, no NF can perform registration retries, heartbeats, or session timeouts.
 
 ### Phase 2: Error Response Framework (HIGH, ~50 TODOs)
-- **ProblemDetails:** Library type exists in ogs-sbi but no NF generates proper 3GPP error responses.
+- **ProblemDetails:** Library type exists in nextgcore-sbi but no NF generates proper 3GPP error responses.
 - **HTTP Status Codes:** Server helper functions exist (`send_bad_request`, `send_not_found`, etc.) but are unused.
 - **Impact:** No interoperability with compliant clients; no error recovery.
 
@@ -106,12 +108,12 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 - **Impact:** No inter-PLMN roaming or service mesh support.
 
 ### Phase 6: Protocol Libraries - NGAP/S1AP (MEDIUM, ~20 TODOs)
-- **ogs-ngap:** Only a single-line stub. ASN.1 APER encoding not implemented.
-- **ogs-s1ap:** Scaffolding only.
+- **nextgcore-ngap:** Only a single-line stub. ASN.1 APER encoding not implemented.
+- **nextgcore-s1ap:** Scaffolding only.
 - **Impact:** AMF cannot communicate with gNBs; MME cannot communicate with eNBs.
 
 ### Phase 7: EPC/Diameter (LOW, ~25 TODOs)
-- **ogs-diameter:** FreeDiameter integration is stub-only.
+- **nextgcore-diameter:** FreeDiameter integration is stub-only.
 - **HSS/PCRF:** S6a, Cx, SWx, Gx, Rx handlers are all stubbed.
 - **Impact:** No EPC authentication or policy control.
 
@@ -124,7 +126,7 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 
 ### 3.1 AI/ML-Native Network Automation (NWDAF)
 
-**Current State:** No NWDAF NF exists. No AI/ML infrastructure. No data collection pipelines. No analytics framework.
+**Current State (2026-02-07 — now STALE):** No NWDAF NF existed at the time of writing. *Update: NWDAF now exists as `nextgcore-nwdafd` with an NRF-driven NF_LOAD collector (`nrf_collector.rs`), analytics (`analytics.rs`), ML service (`ml_service.rs`) and federation scaffolding (`federation.rs`) — research/prototype-level, not Rel-18/Rel-20 conformant.*
 
 **Gaps:**
 - No NWDAF binary or scaffolding in `src/bins/`
@@ -159,7 +161,7 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 
 ### 3.3 Service-Based Architecture (SBA) 2.0
 
-**Current State:** ogs-sbi library provides functional HTTP/2 client/server with hyper. NRF has working NF registration and discovery. No other NF uses SBI client for NRF registration or service discovery.
+**Current State:** nextgcore-sbi library provides functional HTTP/2 client/server with hyper. NRF has working NF registration and discovery. No other NF uses SBI client for NRF registration or service discovery.
 
 **Gaps:**
 - No service mesh capabilities (SCP is minimal stub)
@@ -221,7 +223,7 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 - No network topology modeling
 - No protocol behavior simulation
 - **6G Requirement:** Digital twins of physical network for planning, optimization, and autonomous operations
-- Requires integration with AI/ML (3.1), metrics collection (partially exists via ogs-metrics), and comprehensive state export
+- Requires integration with AI/ML (3.1), metrics collection (partially exists via nextgcore-metrics), and comprehensive state export
 
 **Priority:** MEDIUM-HIGH -- Emerging 6G requirement per ITU-R IMT-2030.
 
@@ -320,7 +322,7 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 ## 4. Cross-Cutting Infrastructure Gaps
 
 ### 4.1 Observability Stack
-- **Metrics:** ogs-metrics provides Prometheus Counter/Gauge/Histogram framework. Not wired to any NF except AMF (has metrics field).
+- **Metrics:** nextgcore-metrics provides Prometheus Counter/Gauge/Histogram framework. Not wired to any NF except AMF (has metrics field).
 - **Logging:** Uses `env_logger` + `log` crate. No structured logging (JSON). No distributed tracing.
 - **Tracing:** No OpenTelemetry integration. No span propagation across NF boundaries.
 - **Gap:** Need structured logging, distributed tracing (OpenTelemetry), and metrics integration across all NFs.
@@ -338,7 +340,7 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 - **Gap:** Need integration test framework (multi-NF), protocol conformance tests, performance benchmarks, chaos testing.
 
 ### 4.5 Database Layer
-- **Current:** ogs-dbi has MongoDB stubs. HSS and PCRF reference MongoDB for subscriber data.
+- **Current:** nextgcore-dbi has MongoDB stubs. HSS and PCRF reference MongoDB for subscriber data.
 - **Gap:** No working database integration. Need MongoDB driver implementation, schema management, connection pooling.
 
 ---
@@ -417,8 +419,8 @@ The following NFs do not exist in the codebase and must be created for 6G:
 
 ### 7.1 Immediate (0-3 months)
 1. **Complete Phase A1-A3** (timer management, SBI event loop, error responses, NRF integration). This unblocks all other work.
-2. **Implement ogs-ngap** ASN.1 encoding to enable AMF-gNB communication.
-3. **Wire ogs-metrics** to all NFs for basic observability.
+2. **Implement nextgcore-ngap** ASN.1 encoding to enable AMF-gNB communication.
+3. **Wire nextgcore-metrics** to all NFs for basic observability.
 4. **Add mTLS** between NFs as a security baseline.
 
 ### 7.2 Short-term (3-6 months)

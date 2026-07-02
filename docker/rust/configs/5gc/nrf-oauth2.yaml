@@ -1,0 +1,43 @@
+# NRF (Network Repository Function) Configuration — OAuth2 variant
+# Same as nrf.yaml but with the SBI OAuth2 knob enabled.
+# Used via docker-compose.oauth2.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.oauth2.yml up -d
+#
+# IMPORTANT (TS 33.501 / TS 29.510): the NRF is itself the OAuth2
+# Authorization Server. Its /nnrf-oauth2/v1/access-token and
+# /nnrf-oauth2/v1/jwks endpoints MUST stay reachable WITHOUT a bearer token
+# (no NF can obtain a token before calling the token endpoint). The SBI server
+# middleware has no per-path exemption, so the NRF never blanket-enables
+# require_oauth2 on its own server. This knob therefore drives the CLIENT side
+# only: the NRF acquires and attaches NRF-issued tokens on its own outbound
+# calls (NF status notifications to consumers). The default nrf.yaml leaves it
+# off so the dev/E2E data-plane path keeps working.
+
+logger:
+  file:
+    path: /var/log/nextgcore/nrf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+nrf:
+  serving:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: 172.23.0.10
+        port: 7777
+        tls:
+          enabled: false
+          cert: /etc/nextgcore/certs/nrf.crt
+          key: /etc/nextgcore/certs/nrf.key
+          ca: /etc/nextgcore/certs/ca.crt
+          min_version: "1.2"
+    oauth2:
+      require: true

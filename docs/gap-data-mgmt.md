@@ -2,6 +2,8 @@
 
 This report covers four nextgcore network functions responsible for subscriber data, authentication, and slice selection.
 
+> **STALENESS NOTICE (updated 2026-07):** This 2026-02-07 snapshot is superseded. UDR now depends on `nextgcore-dbi` (with an in-memory Nudr `data_store`; enabled for tests via the `test-helpers` feature) - it is no longer db-less. UDM generates real Milenage + 5G-KDF auth vectors (not zeroed placeholders) and SUCI de-concealment is logged at the SIDF (TS 33.501 6.12; UDR only sees SUPI); UDM/AUSF implement SoR and UPU Part B (TS 33.501 6.14/6.15, Nausf_UPUProtection). AUSF implements EAP-AKA' (RFC 9048, `eap_aka_prime.rs`). Slice Admission Control (NSACF, `nextgcore-nsacfd`) exists and provisions quotas from `nsacf.slice_quotas` (TS 29.536). Treat the "completeness %" / "stub" claims below as a historical baseline.
+
 | NF | Binary | Primary 3GPP Service | Source Files | Lines (approx) |
 |----|--------|---------------------|-------------|----------------|
 | UDM | nextgcore-udmd | nudm-uecm, nudm-sdm, nudm-ueau | 13 (.rs + Cargo.toml) | ~5,700 |
@@ -15,7 +17,7 @@ This report covers four nextgcore network functions responsible for subscriber d
 
 ### 1.1 Dependencies
 
-`ogs-core`, `ogs-crypt`, `ogs-sbi`, `ogs-dbi`, `ogs-app`, `tokio`, `clap`, `serde`, `serde_json`, `env_logger`, `log`, `ctrlc`, `anyhow`, `uuid`
+`nextgcore-core`, `nextgcore-crypt`, `nextgcore-sbi`, `nextgcore-dbi`, `nextgcore-app`, `tokio`, `clap`, `serde`, `serde_json`, `env_logger`, `log`, `ctrlc`, `anyhow`, `uuid`
 
 ### 1.2 FSM States & Transitions
 
@@ -53,7 +55,7 @@ Three-level FSM hierarchy. The main SM creates/destroys UE sub-SMs which in turn
 
 | Handler Module | Functions | Implementation Level |
 |---------------|-----------|---------------------|
-| nudm_handler.rs (1067 lines) | 10 handlers (UEAU get/confirm, UECM amf-reg/update/get/dereg, smf-reg/dereg, SDM sub create/delete) | **Functional** -- input validation, context updates, response building. Auth vector generation uses zeroed placeholder bytes. |
+| nudm_handler.rs (1067 lines) | 10 handlers (UEAU get/confirm, UECM amf-reg/update/get/dereg, smf-reg/dereg, SDM sub create/delete) | **Functional** -- input validation, context updates, response building. Auth vector generation now uses real 3GPP Milenage + 5G KDFs (`nudr_handler::generate_auth_vector` -> `nextgcore_crypt::milenage::milenage_generate`). |
 | nudr_handler.rs (779 lines) | 6 handlers (auth GET/PATCH, context, provisioned am/smf-sel/sm) | **Partial** -- processes responses, updates UE context, but auth key material is placeholder. SQN management is stubbed. |
 
 ### 1.6 Stub / Placeholder Indicators
@@ -72,7 +74,7 @@ Three-level FSM hierarchy. The main SM creates/destroys UE sub-SMs which in turn
 
 ### 2.1 Dependencies
 
-`ogs-sbi` only. **No `ogs-dbi`** -- the database integration crate is missing entirely.
+`nextgcore-sbi` **and `nextgcore-dbi`** (path dep; a `data_store` module provides an in-memory Nudr store, enabled for tests via the `nextgcore-dbi` `test-helpers` feature).
 
 ### 2.2 FSM States & Transitions
 
@@ -105,7 +107,7 @@ None. UDR is a data-serving NF that does not initiate outbound SBI calls.
 
 ### 2.6 Completeness: **~20%**
 
-**Evidence:** Has correct SBI routing structure and handler dispatch, but every handler is a stub. The absence of `ogs-dbi` in Cargo.toml means zero database capability.
+**Evidence (2026-02 snapshot):** correct SBI routing structure and handler dispatch. Since this snapshot `nextgcore-dbi` was added to Cargo.toml and a `data_store` backing store was wired in (udr_sm/ue_sm/sess_sm), so the handlers are no longer uniformly log-only stubs.
 
 ---
 
@@ -124,12 +126,12 @@ None. UDR is a data-serving NF that does not initiate outbound SBI calls.
 |---------|----------|---------|--------|
 | nausf-auth | ue-authentications | POST | Implemented (discovers UDM, returns auth context) |
 | nausf-auth | ue-authentications/{id}/5g-aka-confirmation | PUT | Implemented (validates RES*, returns KSEAF) |
-| nausf-auth | ue-authentications/{id}/eap-session | POST | Stub (returns mock EAP success) |
+| nausf-auth | ue-authentications/{id}/eap-session | POST | Implemented (EAP-AKA', `eap_aka_prime.rs`, RFC 9048/5448) |
 | nausf-auth | ue-authentications/{id} | DELETE | Implemented (removes auth context) |
 
 ### 3.3 Completeness: **~55%**
 
-**Evidence:** Uses real `ogs_crypt::kdf` for HXRES* and KSEAF calculation. Weakened by: RES* comparison always succeeds, EAP-AKA' fully stubbed, SBI client HTTP sending not implemented.
+**Evidence:** Uses real `nextgcore_crypt::kdf` for HXRES*/KSEAF. Since this snapshot AUSF added EAP-AKA' (`eap_aka_prime.rs`, RFC 9048/5448: PRF', CK'/IK', AT_MAC) and SoR/UPU protection producers (`sor_protection.rs`/`upu_protection.rs`).
 
 ---
 
@@ -174,7 +176,7 @@ None. UDR is a data-serving NF that does not initiate outbound SBI calls.
 
 | Gap | Current State | Required for 6G |
 |-----|--------------|----------------|
-| NSACF (Slice Admission Control) | Not present | UDM/NSSF must interact with NSACF |
+| NSACF (Slice Admission Control) | Present (`nextgcore-nsacfd`): provisions per-slice quotas from `nsacf.slice_quotas` (TS 29.536 6.1.3.4); AMF ingests NSACF profiles via NRF | Dynamic slice-quota management |
 | Dynamic slice instantiation | Static NSI information | Runtime slice creation/deletion |
 | Slice SLA monitoring | No SLA metrics | QoS/SLA monitoring per slice |
 | Quantum-safe crypto | Placeholder crypto | Must support CRYSTALS-Kyber, CRYSTALS-Dilithium |
@@ -185,7 +187,7 @@ None. UDR is a data-serving NF that does not initiate outbound SBI calls.
 
 ### Critical (must-fix for 5G compliance)
 
-1. **UDR database integration** -- Add `ogs-dbi` dependency, implement actual database queries
+1. **UDR database integration** -- Add `nextgcore-dbi` dependency, implement actual database queries
 2. **AUSF real auth verification** -- Implement actual RES* comparison
 3. **UDM Milenage/TUAK** -- Replace placeholder auth vector generation
 4. **SBI client HTTP sending** -- Implement actual HTTP/2 client calls

@@ -14,7 +14,7 @@ use bytes::{BufMut, BytesMut};
 // ============================================================================
 
 /// Extended protocol discriminator for 5GSM
-pub const OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM: u8 = 0x2e;
+pub const NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM: u8 = 0x2e;
 
 /// 5GSM message types
 pub mod message_type {
@@ -275,7 +275,7 @@ impl GsmMessageBuilder {
         let mut builder = Self::new();
         builder
             .buffer
-            .put_u8(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+            .put_u8(NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
         builder.buffer.put_u8(psi);
         builder.buffer.put_u8(pti);
         builder.buffer.put_u8(message_type);
@@ -1191,7 +1191,10 @@ mod tests {
         let result = builder.build();
 
         assert_eq!(result.len(), 4);
-        assert_eq!(result[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        assert_eq!(
+            result[0],
+            NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM
+        );
         assert_eq!(result[1], 5); // PSI
         assert_eq!(result[2], 1); // PTI
         assert_eq!(result[3], message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT);
@@ -1336,7 +1339,7 @@ mod tests {
 
         let msg = result.unwrap();
         assert!(msg.len() > 4);
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
         assert_eq!(msg[1], 5); // PSI
         assert_eq!(msg[2], 1); // PTI
         assert_eq!(msg[3], message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT);
@@ -1350,7 +1353,7 @@ mod tests {
         let msg = build_pdu_session_establishment_reject(&sess, GsmCause::InsufficientResources);
 
         assert_eq!(msg.len(), 5);
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
         assert_eq!(msg[1], 5); // PSI
         assert_eq!(msg[2], 1); // PTI
         assert_eq!(msg[3], message_type::PDU_SESSION_ESTABLISHMENT_REJECT);
@@ -1537,7 +1540,7 @@ mod tests {
         let msg = build_pdu_session_modification_complete(&sess);
 
         assert_eq!(msg.len(), 4);
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
         assert_eq!(msg[3], message_type::PDU_SESSION_MODIFICATION_COMPLETE);
     }
 
@@ -1547,7 +1550,7 @@ mod tests {
         let msg = build_pdu_session_release_complete(&sess);
 
         assert_eq!(msg.len(), 4);
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
         assert_eq!(msg[3], message_type::PDU_SESSION_RELEASE_COMPLETE);
     }
 
@@ -1563,7 +1566,7 @@ mod tests {
 
         let msg = result.unwrap();
         assert!(msg.len() > 4);
-        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
         assert_eq!(msg[3], message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT);
         assert_eq!(msg[4], pdu_session_type::IPV4);
     }

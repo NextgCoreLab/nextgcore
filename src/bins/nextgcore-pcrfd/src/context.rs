@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Maximum number of PCC rules per session
-pub const OGS_MAX_NUM_OF_PCC_RULE: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_PCC_RULE: usize = 8;
 
 /// IPv6 address length in bytes
-pub const OGS_IPV6_LEN: usize = 16;
+pub const NEXTGCORE_IPV6_LEN: usize = 16;
 
 /// PCRF Rx Session State - represents an Rx session linked to a Gx session
 #[derive(Debug, Clone)]
@@ -72,7 +72,7 @@ pub struct PcrfGxSession {
     /// Has IPv6 address
     pub has_ipv6: bool,
     /// Framed IPv6 prefix
-    pub ipv6_addr: Option<[u8; OGS_IPV6_LEN]>,
+    pub ipv6_addr: Option<[u8; NEXTGCORE_IPV6_LEN]>,
     /// RAT type
     pub rat_type: u32,
     /// List of Rx session indices
@@ -118,7 +118,7 @@ impl PcrfGxSession {
     }
 
     /// Set IPv6 prefix
-    pub fn set_ipv6(&mut self, addr: [u8; OGS_IPV6_LEN]) {
+    pub fn set_ipv6(&mut self, addr: [u8; NEXTGCORE_IPV6_LEN]) {
         self.ipv6_addr = Some(addr);
         self.has_ipv6 = true;
     }
@@ -168,7 +168,7 @@ pub struct PcrfContext {
     /// IPv4 to Gx Session-Id mapping
     ipv4_hash: RwLock<HashMap<u32, String>>,
     /// IPv6 to Gx Session-Id mapping
-    ipv6_hash: RwLock<HashMap<[u8; OGS_IPV6_LEN], String>>,
+    ipv6_hash: RwLock<HashMap<[u8; NEXTGCORE_IPV6_LEN], String>>,
 
     /// Rx session list
     rx_sessions: RwLock<Vec<PcrfRxSession>>,
@@ -286,13 +286,15 @@ impl PcrfContext {
 
     /// Remove Gx session
     pub fn gx_session_remove(&self, sid: &str) -> bool {
+        // AB-BA: primary list (gx_sessions) before index/IP hashes — canonical order
+        let sessions = self.gx_sessions.read();
         let mut hash = self.gx_sid_hash.write().unwrap();
         let mut ipv4_hash = self.ipv4_hash.write().unwrap();
         let mut ipv6_hash = self.ipv6_hash.write().unwrap();
 
         if let Some(&idx) = hash.get(sid) {
             // Remove IP mappings
-            if let Ok(sessions) = self.gx_sessions.read() {
+            if let Ok(ref sessions) = sessions {
                 if let Some(session) = sessions.get(idx) {
                     if let Some(addr) = session.ipv4_addr {
                         ipv4_hash.remove(&u32::from(addr));
@@ -346,7 +348,7 @@ impl PcrfContext {
     }
 
     /// Set IPv6 to Session-Id mapping
-    pub fn set_ipv6_mapping(&self, addr: &[u8; OGS_IPV6_LEN], sid: Option<&str>) {
+    pub fn set_ipv6_mapping(&self, addr: &[u8; NEXTGCORE_IPV6_LEN], sid: Option<&str>) {
         let mut hash = self.ipv6_hash.write().unwrap();
 
         if let Some(sid) = sid {
@@ -366,7 +368,7 @@ impl PcrfContext {
     }
 
     /// Find Session-Id by IPv6 address
-    pub fn find_sid_by_ipv6(&self, addr: &[u8; OGS_IPV6_LEN]) -> Option<String> {
+    pub fn find_sid_by_ipv6(&self, addr: &[u8; NEXTGCORE_IPV6_LEN]) -> Option<String> {
         let hash = self.ipv6_hash.read().ok()?;
         hash.get(addr).cloned()
     }
@@ -450,11 +452,13 @@ impl PcrfContext {
 
     /// Remove Rx session
     pub fn rx_session_remove(&self, sid: &str) -> bool {
+        // AB-BA: primary list (rx_sessions) before index (rx_sid_hash) — canonical order
+        let rx_sessions = self.rx_sessions.read();
         let mut hash = self.rx_sid_hash.write().unwrap();
 
         if let Some(&idx) = hash.get(sid) {
             // Remove from Gx session's rx_sessions list
-            if let Ok(rx_sessions) = self.rx_sessions.read() {
+            if let Ok(ref rx_sessions) = rx_sessions {
                 if let Some(rx_session) = rx_sessions.get(idx) {
                     let gx_idx = rx_session.gx_session_idx;
                     if let Ok(mut gx_sessions) = self.gx_sessions.write() {
@@ -546,7 +550,7 @@ pub fn pcrf_sess_set_ipv4(addr: &[u8; 4], sid: Option<&str>) {
 }
 
 /// Set IPv6 to Session-Id mapping (global function)
-pub fn pcrf_sess_set_ipv6(addr: &[u8; OGS_IPV6_LEN], sid: Option<&str>) {
+pub fn pcrf_sess_set_ipv6(addr: &[u8; NEXTGCORE_IPV6_LEN], sid: Option<&str>) {
     let ctx = pcrf_self();
     let result = ctx.read();
     if let Ok(context) = result {
@@ -565,7 +569,7 @@ pub fn pcrf_sess_find_by_ipv4(addr: &[u8; 4]) -> Option<String> {
 }
 
 /// Find Session-Id by IPv6 address (global function)
-pub fn pcrf_sess_find_by_ipv6(addr: &[u8; OGS_IPV6_LEN]) -> Option<String> {
+pub fn pcrf_sess_find_by_ipv6(addr: &[u8; NEXTGCORE_IPV6_LEN]) -> Option<String> {
     let ctx = pcrf_self();
     let result = ctx.read();
     if let Ok(context) = result {
@@ -654,7 +658,7 @@ mod tests {
 
         ctx.gx_session_add("gx-session-1");
 
-        let addr: [u8; OGS_IPV6_LEN] = [
+        let addr: [u8; NEXTGCORE_IPV6_LEN] = [
             0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x01,
         ];

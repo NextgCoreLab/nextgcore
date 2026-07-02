@@ -1,0 +1,27 @@
+[package]
+name = "nextgcore-dbi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore Database Interface Library"
+
+[dependencies]
+nextgcore-core = { workspace = true }
+thiserror.workspace = true
+mongodb = { version = "2.8", default-features = false, features = ["sync"] }
+serde.workspace = true
+tokio.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[features]
+# Test-only helpers: `reset_for_tests` and the in-memory `test_store`
+# subscriber backend (hermetic unit tests without a MongoDB instance).
+# Never enabled by production builds; NF crates opt in via dev-dependencies.
+test-helpers = []
+
+[lints]
+workspace = true

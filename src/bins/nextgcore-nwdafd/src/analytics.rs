@@ -6,6 +6,15 @@
 //! - QoS Sustainability (§6.9): predicted QoS degradation
 //! - Slice Load (§6.10): per-slice resource utilization
 //! - Abnormal Behaviour (§6.5): anomaly detection
+//!
+//! # OPERATIONAL ALGORITHM
+//!
+//! **All analytics in this module use ordinary least-squares linear regression
+//! on the last N samples.** The `confidence` field is the regression R² (the
+//! fraction of variance the linear fit explains, nwafd-10) — it reflects how
+//! well the predictor fits the observed data, NOT trained-model accuracy. No ML
+//! model is used. When `Nnwdaf_MLModelProvision` models are integrated, the
+//! prediction path should switch to model-accuracy metrics (TS 23.288 §6.14).
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -42,6 +51,21 @@ impl NfLoadSample {
             timestamp: ts,
         }
     }
+}
+
+/// Cached per-NF-instance profile metadata sourced from NRF
+/// NFStatusSubscribe/Notify (TS 29.510 §5.2.2.5/§5.2.2.6). This is the
+/// authoritative record of what the NRF last told us about an instance —
+/// `nf_status` feeds the emitted `NfLoadLevelInformation.nfStatus` and
+/// `last_load` is the base value `profileChanges` `/load` deltas apply to.
+#[derive(Debug, Clone)]
+pub struct NfProfileMeta {
+    /// NF type from the NRF profile (e.g., "AMF")
+    pub nf_type: String,
+    /// NF status token from the NRF profile ("REGISTERED" / "SUSPENDED" / ...)
+    pub nf_status: String,
+    /// Last known NFProfile.load (0..=100), when the profile carried one
+    pub last_load: Option<u8>,
 }
 
 /// NF load analytics report
@@ -103,6 +127,9 @@ pub struct AbnormalBehaviourRecord {
 pub struct AnalyticsEngine {
     /// NF load samples, keyed by NF instance ID, bounded circular buffer (last 100)
     nf_samples: HashMap<String, Vec<NfLoadSample>>,
+    /// Cached NRF profile metadata per NF instance (G2-1: fed by the
+    /// Nnrf_NFManagement NFStatusNotify ingestion path)
+    nf_meta: HashMap<String, NfProfileMeta>,
     /// UE mobility history: last observed cell per SUPI
     ue_cells: HashMap<String, Vec<(u64, u64)>>, // (cell_id, timestamp)
     /// Anomaly scores per SUPI
@@ -126,7 +153,51 @@ impl AnalyticsEngine {
         buf.push(sample);
     }
 
-    /// Compute NF load analytics for a given instance
+    /// Upsert the cached NRF profile metadata for an NF instance (G2-1).
+    pub fn upsert_nf_meta(&mut self, nf_instance_id: &str, meta: NfProfileMeta) {
+        self.nf_meta.insert(nf_instance_id.to_string(), meta);
+    }
+
+    /// Cached NRF profile metadata for an NF instance, if any.
+    pub fn nf_meta(&self, nf_instance_id: &str) -> Option<&NfProfileMeta> {
+        self.nf_meta.get(nf_instance_id)
+    }
+
+    /// Drop everything known about an NF instance (samples + cached profile
+    /// metadata). Called on NF_DEREGISTERED so analytics never report data
+    /// for an instance the NRF says is gone (G2-1 fail-closed).
+    pub fn remove_nf_instance(&mut self, nf_instance_id: &str) {
+        self.nf_samples.remove(nf_instance_id);
+        self.nf_meta.remove(nf_instance_id);
+    }
+
+    /// All NF instance IDs that currently have at least one load sample,
+    /// sorted for deterministic emission order.
+    pub fn nf_instance_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .nf_samples
+            .iter()
+            .filter(|(_, samples)| !samples.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Compute NF load analytics for a given instance.
+    ///
+    /// OPERATIONAL ALGORITHM: ordinary least-squares linear regression over the
+    /// last N samples (up to 5). `predicted_load` is the fitted value projected
+    /// one step ahead, clamped to [0, 1].
+    ///
+    /// `confidence` (nwafd-10) is the regression **coefficient of determination
+    /// (R²)** — the fraction of the window's CPU variance explained by the
+    /// linear fit — clamped to [0, 1]. It therefore reflects how well the
+    /// straight-line predictor actually fits the observed samples (high for a
+    /// clean trend, low for noisy input), instead of the previous synthetic
+    /// sample-count ratio. HONESTY NOTE: this remains linear regression, NOT a
+    /// trained ML model; when `Nnwdaf_MLModelProvision` models are integrated
+    /// this should switch to model-accuracy metrics (TS 23.288 §6.14).
     pub fn compute_nf_load(&self, nf_instance_id: &str) -> Option<NfLoadAnalytics> {
         let samples = self.nf_samples.get(nf_instance_id)?;
         if samples.is_empty() {
@@ -135,17 +206,48 @@ impl AnalyticsEngine {
         let mean_cpu = samples.iter().map(|s| s.cpu_usage).sum::<f64>() / samples.len() as f64;
         let peak_cpu = samples.iter().map(|s| s.cpu_usage).fold(0.0f64, f64::max);
 
-        // Simple linear prediction: slope of last 5 samples
+        // Least-squares linear fit y = a + b·x over the last N (≤5) samples,
+        // with x = 0..N-1. `predicted_load` projects to x = N; `confidence` is
+        // the R² of the fit.
         let n = samples.len().min(5);
-        let predicted_load = if n >= 2 {
+        let (predicted_load, confidence) = if n >= 2 {
             let last = &samples[samples.len() - n..];
-            let slope = (last[n - 1].cpu_usage - last[0].cpu_usage) / (n - 1) as f64;
-            (last[n - 1].cpu_usage + slope).clamp(0.0, 1.0)
-        } else {
-            mean_cpu
-        };
+            let nf = n as f64;
+            let sum_x: f64 = (0..n).map(|i| i as f64).sum();
+            let sum_y: f64 = last.iter().map(|s| s.cpu_usage).sum();
+            let sum_xx: f64 = (0..n).map(|i| (i as f64).powi(2)).sum();
+            let sum_xy: f64 = last
+                .iter()
+                .enumerate()
+                .map(|(i, s)| i as f64 * s.cpu_usage)
+                .sum();
 
-        let confidence = (samples.len() as f64 / MAX_SAMPLES as f64).min(1.0);
+            // denom = N·Σx² − (Σx)² is strictly positive for N ≥ 2 distinct x.
+            let denom = nf * sum_xx - sum_x * sum_x;
+            let b = (nf * sum_xy - sum_x * sum_y) / denom;
+            let a = (sum_y - b * sum_x) / nf;
+            let predicted = (a + b * nf).clamp(0.0, 1.0);
+
+            // R² = 1 − SS_res / SS_tot.
+            let mean_y = sum_y / nf;
+            let ss_tot: f64 = last.iter().map(|s| (s.cpu_usage - mean_y).powi(2)).sum();
+            let ss_res: f64 = last
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.cpu_usage - (a + b * i as f64)).powi(2))
+                .sum();
+            let r_squared = if ss_tot <= f64::EPSILON {
+                // Flat series: the predictor reproduces it exactly → R² = 1.
+                1.0
+            } else {
+                (1.0 - ss_res / ss_tot).clamp(0.0, 1.0)
+            };
+
+            (predicted, r_squared)
+        } else {
+            // A single sample yields no residual basis; report no confidence.
+            (mean_cpu, 0.0)
+        };
 
         Some(NfLoadAnalytics {
             nf_type: samples[0].nf_type.clone(),
@@ -234,6 +336,47 @@ mod tests {
         assert!(analytics.mean_cpu > 0.3);
         assert!(analytics.peak_cpu <= 1.0);
         assert!(analytics.confidence > 0.0);
+    }
+
+    /// nwafd-10: confidence is the regression R² — high for a clean linear
+    /// trend, much lower for noisy zig-zag input, and never the old constant.
+    #[test]
+    fn test_confidence_reflects_fit_quality() {
+        let mut clean = AnalyticsEngine::new();
+        for i in 0..5 {
+            clean.ingest_nf_load(NfLoadSample::now(
+                "AMF",
+                "amf-clean",
+                0.3 + i as f64 * 0.05,
+                0.4,
+                0,
+            ));
+        }
+        let clean_r = clean.compute_nf_load("amf-clean").expect("analytics");
+
+        let mut noisy = AnalyticsEngine::new();
+        for v in [0.3, 0.7, 0.3, 0.7, 0.3] {
+            noisy.ingest_nf_load(NfLoadSample::now("AMF", "amf-noisy", v, 0.4, 0));
+        }
+        let noisy_r = noisy.compute_nf_load("amf-noisy").expect("analytics");
+
+        assert!(
+            clean_r.confidence > 0.9,
+            "a clean linear trend must yield near-1.0 R² confidence, got {}",
+            clean_r.confidence
+        );
+        assert!(
+            noisy_r.confidence < clean_r.confidence,
+            "noisy input must yield lower confidence than a clean trend"
+        );
+        assert!(
+            noisy_r.confidence < 0.5,
+            "a trendless zig-zag must yield low R², got {}",
+            noisy_r.confidence
+        );
+        // The previous synthetic constant (sample-count ratio) is gone: with 5
+        // of 100 samples it would have been 0.05, not ~1.0 for the clean trend.
+        assert!((clean_r.confidence - 0.05).abs() > 0.1);
     }
 
     #[test]

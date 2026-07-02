@@ -215,7 +215,7 @@ pub fn mme_s6a_handle_clr(mme_ue: &mut MmeUe, clr_message: &ClrMessage) -> S6aRe
     );
 
     let reattach_required =
-        clr_message.clr_flags & ogs_diameter::s6a::clr_flags::REATTACH_REQUIRED != 0;
+        clr_message.clr_flags & nextgcore_diameter::s6a::clr_flags::REATTACH_REQUIRED != 0;
 
     let action = match clr_message.cancellation_type {
         cancellation_type::MME_UPDATE_PROCEDURE => {
@@ -609,7 +609,7 @@ mod tests {
         // With CLR-Flags Reattach-Required set
         let clr_message = ClrMessage {
             cancellation_type: cancellation_type::SUBSCRIPTION_WITHDRAWAL,
-            clr_flags: ogs_diameter::s6a::clr_flags::REATTACH_REQUIRED,
+            clr_flags: nextgcore_diameter::s6a::clr_flags::REATTACH_REQUIRED,
         };
         let action = mme_s6a_handle_clr(&mut mme_ue, &clr_message).unwrap();
         assert_eq!(

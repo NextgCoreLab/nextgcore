@@ -3,7 +3,7 @@
 //! Replaces the former dead parallel-builder module: all PFCP messages now
 //! leave the SMF through exactly one code path. Session message bodies are
 //! built by `n4_build`; node-level messages (Heartbeat, Association
-//! Setup/Release) use the ogs-pfcp library codec directly.
+//! Setup/Release) use the nextgcore-pfcp library codec directly.
 //!
 //! Responsibilities:
 //! - request/response transaction matching by sequence number
@@ -20,11 +20,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ogs_pfcp::message::{
+use nextgcore_pfcp::message::{
     build_message, AssociationReleaseRequest, AssociationSetupRequest, AssociationSetupResponse,
     HeartbeatRequest, HeartbeatResponse, PfcpMessage,
 };
-use ogs_pfcp::types::{CpFunctionFeatures, NodeId, UpFunctionFeatures};
+use nextgcore_pfcp::types::{CpFunctionFeatures, NodeId, UpFunctionFeatures};
 use tokio::net::UdpSocket;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
@@ -464,9 +464,9 @@ impl PfcpClient {
                 log::warn!("PFCP Association Release Request from {from}");
                 // Respond Node ID + Cause accepted via the library codec
                 let msg = PfcpMessage::AssociationReleaseResponse(
-                    ogs_pfcp::message::AssociationReleaseResponse::new(
+                    nextgcore_pfcp::message::AssociationReleaseResponse::new(
                         NodeId::new_ipv4(self.node_ip),
-                        ogs_pfcp::types::PfcpCause::RequestAccepted,
+                        nextgcore_pfcp::types::PfcpCause::RequestAccepted,
                     ),
                 );
                 let resp = build_message(&msg, header.sequence_number, None);
@@ -532,7 +532,7 @@ impl PfcpClient {
         let resp = AssociationSetupResponse::decode(&mut body)
             .map_err(|e| PfcpRequestError::Local(format!("malformed response: {e}")))?;
 
-        if resp.cause != ogs_pfcp::types::PfcpCause::RequestAccepted {
+        if resp.cause != nextgcore_pfcp::types::PfcpCause::RequestAccepted {
             return Err(PfcpRequestError::Rejected {
                 cause: resp.cause as u8,
             });
@@ -717,7 +717,7 @@ mod tests {
 
             let mut resp = AssociationSetupResponse::new(
                 NodeId::new_ipv4([127, 0, 0, 4]),
-                ogs_pfcp::types::PfcpCause::RequestAccepted,
+                nextgcore_pfcp::types::PfcpCause::RequestAccepted,
                 777,
             );
             resp.up_function_features = Some(UpFunctionFeatures {
@@ -748,7 +748,7 @@ mod tests {
             let h = parse_wire_header(&buf[..len]).unwrap();
             let resp = AssociationSetupResponse::new(
                 NodeId::new_ipv4([127, 0, 0, 4]),
-                ogs_pfcp::types::PfcpCause::NoResourcesAvailable,
+                nextgcore_pfcp::types::PfcpCause::NoResourcesAvailable,
                 778,
             );
             let msg = PfcpMessage::AssociationSetupResponse(resp);
@@ -760,7 +760,7 @@ mod tests {
             Err(PfcpRequestError::Rejected { cause }) => {
                 assert_eq!(
                     cause,
-                    ogs_pfcp::types::PfcpCause::NoResourcesAvailable as u8
+                    nextgcore_pfcp::types::PfcpCause::NoResourcesAvailable as u8
                 )
             }
             other => panic!("expected rejection, got {other:?}"),

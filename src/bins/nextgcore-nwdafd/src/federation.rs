@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(mgr.peer_count(), 1);
         let found = mgr.find_peers_for(AnalyticsId::NfLoad);
         assert_eq!(found.len(), 1);
-        let not_found = mgr.find_peers_for(AnalyticsId::SliceLoad);
+        let not_found = mgr.find_peers_for(AnalyticsId::SliceLoadLevel);
         assert!(not_found.is_empty());
     }
 

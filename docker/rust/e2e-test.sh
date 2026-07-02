@@ -5,9 +5,19 @@
 # triggers UE registration + PDU session, verifies data plane with ping.
 #
 # Usage:
-#   ./e2e-test.sh              # Run full E2E test
-#   ./e2e-test.sh --no-build   # Skip Docker image build
-#   ./e2e-test.sh --keep       # Don't tear down after test
+#   ./e2e-test.sh                  # Run full E2E test
+#   ./e2e-test.sh --no-build       # Skip Docker image build
+#   ./e2e-test.sh --keep           # Don't tear down after test
+#   ./e2e-test.sh --no-preflight   # Skip the disk preflight (preflight.sh)
+#   ./e2e-test.sh --overlay NAME   # Also apply docker-compose.NAME.yml
+#                                  # (e.g. oauth2, kernel-sctp)
+#
+# Prefer the one-command entrypoint ./e2e.sh (preflight + build + this script).
+#
+# NOTE on log assertions: always capture `docker logs` to a file and grep the
+# FILE. Never `docker logs | grep -q`: with pipefail, grep -q exits on first
+# match, docker logs dies with SIGPIPE and the pipeline reports failure —
+# turning a real match into a false negative.
 #
 # Exit codes:
 #   0 - All tests passed
@@ -20,7 +30,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 TIMEOUT_HEALTH=120    # seconds to wait for all services healthy
 TIMEOUT_REGISTER=60   # seconds to wait for UE registration
-TIMEOUT_PING=30       # seconds to wait for ping success
 
 # Colors
 RED='\033[0;31m'
@@ -30,6 +39,8 @@ NC='\033[0m'
 
 SKIP_BUILD=false
 KEEP_RUNNING=false
+SKIP_PREFLIGHT=false
+OVERLAY=""
 PASSED=0
 FAILED=0
 TOTAL=0
@@ -37,11 +48,23 @@ TOTAL=0
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no-build) SKIP_BUILD=true; shift ;;
-        --keep)     KEEP_RUNNING=true; shift ;;
-        *)          echo "Unknown option: $1"; exit 2 ;;
+        --no-build)     SKIP_BUILD=true; shift ;;
+        --keep)         KEEP_RUNNING=true; shift ;;
+        --no-preflight) SKIP_PREFLIGHT=true; shift ;;
+        --overlay)      OVERLAY="$2"; shift 2 ;;
+        *)              echo "Unknown option: $1"; exit 2 ;;
     esac
 done
+
+# Compose file set: baseline + optional overlay (oauth2, kernel-sctp, ...)
+COMPOSE_ARGS=(-f "$COMPOSE_FILE")
+if [ -n "$OVERLAY" ]; then
+    OVERLAY_FILE="$SCRIPT_DIR/docker-compose.$OVERLAY.yml"
+    if [ ! -f "$OVERLAY_FILE" ]; then
+        echo "Unknown overlay '$OVERLAY' (no $OVERLAY_FILE)"; exit 2
+    fi
+    COMPOSE_ARGS+=(-f "$OVERLAY_FILE")
+fi
 
 # ============================================================================
 # Helpers
@@ -80,10 +103,22 @@ assert_log_contains() {
     rm -f "$tmplog"
 }
 
+# log_grep <container> <pattern>: capture logs to a file, grep the file.
+# (See header note: `docker logs | grep -q` false-negatives via SIGPIPE.)
+log_grep() {
+    local tmplog rc
+    tmplog=$(mktemp)
+    docker logs "$1" >"$tmplog" 2>&1 || true
+    grep -q "$2" "$tmplog" && rc=0 || rc=1
+    rm -f "$tmplog"
+    return $rc
+}
+
+# shellcheck disable=SC2329  # invoked via the EXIT trap below
 cleanup() {
     if [ "$KEEP_RUNNING" = false ]; then
         log_info "Tearing down..."
-        docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+        docker compose "${COMPOSE_ARGS[@]}" down -v --remove-orphans 2>/dev/null || true
     else
         log_warn "Keeping containers running (--keep)"
     fi
@@ -91,19 +126,30 @@ cleanup() {
 trap cleanup EXIT
 
 # ============================================================================
+# Step 0: Disk preflight (hazard #269: image-store wipe under disk pressure)
+# ============================================================================
+if [ "$SKIP_PREFLIGHT" = false ]; then
+    "$SCRIPT_DIR/preflight.sh" || {
+        log_error "Preflight refused (low disk?) - aborting. Use --no-preflight to override."
+        exit 2
+    }
+fi
+
+# ============================================================================
 # Step 1: Build (optional)
 # ============================================================================
 if [ "$SKIP_BUILD" = false ]; then
     log_info "Building Docker images..."
-    "$SCRIPT_DIR/build.sh" || { log_error "Build failed"; exit 2; }
+    # Preflight already ran above (or was explicitly skipped) - don't repeat it.
+    "$SCRIPT_DIR/build.sh" --no-preflight || { log_error "Build failed"; exit 2; }
 fi
 
 # ============================================================================
 # Step 2: Start services
 # ============================================================================
-log_info "Starting 5G core stack..."
-docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
-docker compose -f "$COMPOSE_FILE" up -d
+log_info "Starting 5G core stack${OVERLAY:+ (overlay: $OVERLAY)}..."
+docker compose "${COMPOSE_ARGS[@]}" down -v --remove-orphans 2>/dev/null || true
+docker compose "${COMPOSE_ARGS[@]}" up -d
 
 # ============================================================================
 # Step 3: Wait for all services to be healthy
@@ -151,7 +197,7 @@ if [ "$all_healthy" = false ]; then
     done
     exit 2
 fi
-log_info "All $( echo $SERVICES | wc -w | tr -d ' ') services healthy"
+log_info "All $( echo "$SERVICES" | wc -w | tr -d ' ') services healthy"
 
 # ============================================================================
 # Step 4: Wait for UE registration + PDU session
@@ -161,7 +207,7 @@ log_info "Waiting for UE registration (timeout: ${TIMEOUT_REGISTER}s)..."
 deadline=$((SECONDS + TIMEOUT_REGISTER))
 registered=false
 while [ $SECONDS -lt $deadline ]; do
-    if docker logs nextgsim-ue 2>&1 | grep -q "Registration Accept"; then
+    if log_grep nextgsim-ue "Registration Accept"; then
         registered=true
         break
     fi
@@ -179,7 +225,8 @@ log_info "Waiting for PDU session establishment..."
 deadline=$((SECONDS + 30))
 pdu_done=false
 while [ $SECONDS -lt $deadline ]; do
-    if docker logs nextgsim-ue 2>&1 | grep -q "PDU Session.*ACTIVE"; then
+    # Live UE log line: "PDU session {psi} is now ACTIVE (IPv4: ...)"
+    if log_grep nextgsim-ue "is now ACTIVE"; then
         pdu_done=true
         break
     fi
@@ -254,38 +301,44 @@ assert_log_contains "nextgcore-amf" "NG Setup successful" \
     "AMF NG Setup successful"
 
 # --- AMF Registration flow ---
+# Pattern refresh 2026-07-01 (Wave-6 H10): every pattern below was verified
+# against a log line that fires on the CURRENT success path (source-anchored).
+# Stale asserts removed, with rationale:
+#  * Identity Request/Response: the UE sends its SUCI in the initial
+#    Registration Request, so the AMF never runs the identity procedure
+#    (the old asserts could only fail; confirmed stale at the 2026-06-13 run).
+#  * "HXRES* verification passed" / "NAS security context established" /
+#    "PDU Session Establishment Accept sent": amfd logs no such lines; the
+#    facts are asserted via the log lines that DO fire (see below).
 assert_log_contains "nextgcore-amf" "Initial UE Message" \
     "AMF received Initial UE Message"
 
-assert_log_contains "nextgcore-amf" "Sending Identity Request" \
-    "AMF sent Identity Request"
+# ngap_path.rs: "Registration Request: type={}, ngKSI={}/{}, identity_type={}, suci={:?}"
+assert_log_contains "nextgcore-amf" "Registration Request: type=" \
+    "AMF parsed Registration Request (SUCI in initial message)"
 
-assert_log_contains "nextgcore-amf" "Received Identity Response" \
-    "AMF received Identity Response"
-
-assert_log_contains "nextgcore-amf" "SUCI:" \
-    "AMF extracted SUCI from Identity Response"
+# sbi_path.rs: "Calling AUSF authenticate: {host}:{port}, SUCI={suci}, SNN=..."
+assert_log_contains "nextgcore-amf" "SUCI=suci-" \
+    "AMF extracted SUCI from Registration Request"
 
 assert_log_contains "nextgcore-amf" "Calling AUSF authenticate" \
     "AMF called AUSF SBI for authentication"
 
-assert_log_contains "nextgcore-amf" "AUSF auth.*success" \
-    "AMF got AUSF auth success"
-
 assert_log_contains "nextgcore-amf" "Authentication Request sent" \
     "AMF sent Authentication Request to UE"
 
-assert_log_contains "nextgcore-amf" "Received Authentication Response" \
-    "AMF received Authentication Response from UE"
+# Fires only after the Authentication Response arrived AND HRES* == HXRES*
+# (ngap_path.rs handle_authentication_response_nas -> sbi_path.rs)
+assert_log_contains "nextgcore-amf" "Calling AUSF 5G-AKA confirmation" \
+    "AMF verified HXRES* and called AUSF 5G-AKA confirmation"
 
-assert_log_contains "nextgcore-amf" "HXRES.*verification passed" \
-    "AMF HXRES* verification passed"
+# sbi_path.rs: "AUSF 5G-AKA confirmation: result={auth_result}, supi={supi:?}"
+assert_log_contains "nextgcore-amf" "result=AUTHENTICATION_SUCCESS" \
+    "AUSF reported AUTHENTICATION_SUCCESS to AMF"
 
-assert_log_contains "nextgcore-amf" "AUTHENTICATION_SUCCESS" \
-    "AUSF 5G-AKA authentication succeeded"
-
-assert_log_contains "nextgcore-amf" "NAS security context established" \
-    "AMF NAS security context established"
+# ngap_path.rs: "[{supi}] keys derived; selected NIA{} / NEA{}"
+assert_log_contains "nextgcore-amf" "keys derived; selected NIA" \
+    "AMF derived NAS keys (5G-AKA success, algorithms selected)"
 
 assert_log_contains "nextgcore-amf" "Security Mode Command sent" \
     "AMF sent Security Mode Command"
@@ -293,8 +346,17 @@ assert_log_contains "nextgcore-amf" "Security Mode Command sent" \
 assert_log_contains "nextgcore-amf" "Security Mode Complete" \
     "AMF received Security Mode Complete"
 
-assert_log_contains "nextgcore-amf" "Registration Accept" \
-    "AMF sent Registration Accept"
+# ngap_path.rs: "Initial Context Setup Request sent to gNB for UE {} (KgNB
+# derived, Registration Accept piggybacked, 5G-TMSI=...)"
+assert_log_contains "nextgcore-amf" "Initial Context Setup Request sent to gNB" \
+    "AMF sent Initial Context Setup Request (KgNB derived)"
+
+assert_log_contains "nextgcore-amf" "Registration Accept piggybacked" \
+    "AMF sent Registration Accept (piggybacked on Initial Context Setup)"
+
+# ngap_path.rs: "UE {} context established (AS-layer security up)" on ICS Response
+assert_log_contains "nextgcore-amf" "context established (AS-layer security up)" \
+    "AMF UE context established (Initial Context Setup Response)"
 
 # --- AMF PDU Session flow ---
 assert_log_contains "nextgcore-amf" "PDU Session Establishment Request" \
@@ -306,9 +368,9 @@ assert_log_contains "nextgcore-amf" "Calling SMF SM Context Create" \
 assert_log_contains "nextgcore-amf" "SMF SM Context Created" \
     "AMF received SMF SM Context response"
 
-assert_log_contains "nextgcore-amf" "PDU Session Establishment Accept sent" \
-    "AMF sent PDU Session Accept to UE"
-
+# (No "PDU Session Establishment Accept sent" assert: amfd relays the Accept
+# inside DL NAS Transport without a dedicated log line; the UE-side receipt
+# is asserted below in the UE section.)
 assert_log_contains "nextgcore-amf" "PDU Session Resource Setup Request sent" \
     "AMF sent NGAP PDU Session Resource Setup to gNB"
 
@@ -338,9 +400,10 @@ assert_log_contains "nextgcore-ausf" "authentication succeeded" \
 assert_log_contains "nextgcore-udm" "Generate Auth Data" \
     "UDM generated authentication data"
 
-# --- UDR subscription data ---
-assert_log_contains "nextgcore-udr" "Converted SUCI.*SUPI" \
-    "UDR converted SUCI to SUPI"
+# --- SUCI de-concealment (TS 33.501 §6.12: SIDF is co-located with UDM;
+# --- the UDR must only ever see the SUPI, never the SUCI) ---
+assert_log_contains "nextgcore-udm" "SIDF de-concealed SUCI.*SUPI" \
+    "UDM (SIDF) de-concealed SUCI to SUPI"
 
 assert_log_contains "nextgcore-udr" "GET authentication-subscription" \
     "UDR retrieved auth subscription"
@@ -409,26 +472,24 @@ assert_log_contains "nextgsim-gnb" "PDU Session Resource Setup Response sent" \
     "gNB sent PDU Session Resource Setup Response"
 
 # --- UE NAS + session ---
+# Pattern refresh 2026-07-01 (Wave-6 H10): aligned to the W5.1 MmOrchestrator
+# log strings (nextgsim-ue/src/nas/mm/orchestrator.rs, sm/orchestrator.rs,
+# main.rs). Stale asserts removed, with rationale:
+#  * Identity Request/Response: never happens (SUCI is in the initial
+#    Registration Request; the AMF never asks for identity).
+#  * "Authentication Request received"/"AUTN MAC verified"/"Sending
+#    Authentication Response": the orchestrator logs one consolidated
+#    success line ("5G-AKA succeeded: RES* computed, key hierarchy derived");
+#    the AMF-side confirmation asserts cover the response delivery.
 assert_log_contains "nextgsim-ue" "Cell discovered" \
     "UE discovered cell"
 
 assert_log_contains "nextgsim-ue" "Sending Registration Request" \
     "UE sent Registration Request"
 
-assert_log_contains "nextgsim-ue" "Identity Request" \
-    "UE received Identity Request"
-
-assert_log_contains "nextgsim-ue" "Sending Identity Response" \
-    "UE sent Identity Response"
-
-assert_log_contains "nextgsim-ue" "Authentication Request received" \
-    "UE received Authentication Request"
-
-assert_log_contains "nextgsim-ue" "AUTN MAC verified" \
-    "UE verified AUTN MAC"
-
-assert_log_contains "nextgsim-ue" "Sending Authentication Response" \
-    "UE sent Authentication Response"
+# orchestrator.rs: "5G-AKA succeeded: RES* computed, key hierarchy derived (...)"
+assert_log_contains "nextgsim-ue" "5G-AKA succeeded" \
+    "UE 5G-AKA success (AUTN verified, RES* computed, keys derived)"
 
 assert_log_contains "nextgsim-ue" "Security Mode Command" \
     "UE received Security Mode Command"
@@ -436,8 +497,12 @@ assert_log_contains "nextgsim-ue" "Security Mode Command" \
 assert_log_contains "nextgsim-ue" "Sending Security Mode Complete" \
     "UE sent Security Mode Complete"
 
-assert_log_contains "nextgsim-ue" "Received Registration Accept" \
-    "UE received Registration Accept"
+# orchestrator.rs: "Registration Accept: UE is now {state}"
+assert_log_contains "nextgsim-ue" "Registration Accept: UE is now" \
+    "UE processed Registration Accept (state transition)"
+
+assert_log_contains "nextgsim-ue" "Sending Registration Complete" \
+    "UE sent Registration Complete"
 
 assert_log_contains "nextgsim-ue" "Sending PDU Session Establishment Request" \
     "UE sent PDU Session Establishment Request"
@@ -445,11 +510,9 @@ assert_log_contains "nextgsim-ue" "Sending PDU Session Establishment Request" \
 assert_log_contains "nextgsim-ue" "PDU Session Establishment Accept" \
     "UE received PDU Session Establishment Accept"
 
-assert_log_contains "nextgsim-ue" "PDU Session 1 established with IP" \
-    "UE PDU Session 1 got IP address"
-
-assert_log_contains "nextgsim-ue" "PDU Session.*ACTIVE" \
-    "UE PDU session is ACTIVE"
+# main.rs: "PDU session {psi} is now ACTIVE (IPv4: {ipv4:?})"
+assert_log_contains "nextgsim-ue" "PDU session 1 is now ACTIVE (IPv4: Some" \
+    "UE PDU session 1 ACTIVE with IPv4 address"
 
 assert_log_contains "nextgsim-ue" "Creating TUN interface" \
     "UE creating TUN interface"

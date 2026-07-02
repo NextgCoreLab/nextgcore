@@ -17,8 +17,8 @@ use anyhow::Result;
 fn main() -> Result<()> {
     env_logger::init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     log::info!("NextGCore SGWU initialized successfully");
 
     // Note: Main event loop implementation
-    // Event loop runs via ogs_pollset_poll processing PFCP and GTP-U messages:
+    // Event loop runs via nextgcore_pollset_poll processing PFCP and GTP-U messages:
     // 1. PFCP messages dispatched to pfcp_sm via SXA events
     // 2. GTP-U packets forwarded between S1-U/S5-U interfaces via gtp_handler
     // 3. Session operations handled by pfcp_handler for PFCP Session messages

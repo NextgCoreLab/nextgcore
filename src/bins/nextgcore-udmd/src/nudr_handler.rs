@@ -4,13 +4,13 @@
 //! Handles responses from UDR for authentication, context, and provisioned data
 
 use crate::context::{
-    udm_self, Amf3GppAccessRegistration, AuthType, SmfRegistration, UdmUe, OGS_AMF_LEN,
-    OGS_KEY_LEN, OGS_RAND_LEN, OGS_SQN_LEN,
+    udm_self, Amf3GppAccessRegistration, AuthType, SmfRegistration, UdmUe, NEXTGCORE_AMF_LEN,
+    NEXTGCORE_KEY_LEN, NEXTGCORE_RAND_LEN, NEXTGCORE_SQN_LEN,
 };
 use crate::nudm_handler::{bytes_to_hex, hex_to_bytes, http_status, HandlerResult};
 
-use ogs_crypt::kdf;
-use ogs_crypt::milenage;
+use nextgcore_crypt::kdf;
+use nextgcore_crypt::milenage;
 
 /// UDM SBI state for multi-step operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,10 +113,10 @@ pub struct SessionManagementSubscriptionData {
 }
 
 /// AUC (Authentication Center) constants
-pub const OGS_AUTN_LEN: usize = 16;
-pub const OGS_AK_LEN: usize = 6;
-pub const OGS_MAX_RES_LEN: usize = 16;
-pub const OGS_SHA256_DIGEST_SIZE: usize = 32;
+pub const NEXTGCORE_AUTN_LEN: usize = 16;
+pub const NEXTGCORE_AK_LEN: usize = 6;
+pub const NEXTGCORE_MAX_RES_LEN: usize = 16;
+pub const NEXTGCORE_SHA256_DIGEST_SIZE: usize = 32;
 
 /// Query subscription provisioned data from UDR
 pub fn udm_nudr_dr_query_subscription_provisioned(
@@ -264,17 +264,17 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
                     let amf_bytes = hex_to_bytes(amf_field);
                     let sqn_bytes = hex_to_bytes(sqn_str);
 
-                    if opc_bytes.len() >= OGS_KEY_LEN {
-                        udm_ue.opc.copy_from_slice(&opc_bytes[..OGS_KEY_LEN]);
+                    if opc_bytes.len() >= NEXTGCORE_KEY_LEN {
+                        udm_ue.opc.copy_from_slice(&opc_bytes[..NEXTGCORE_KEY_LEN]);
                     }
-                    if k_bytes.len() >= OGS_KEY_LEN {
-                        udm_ue.k.copy_from_slice(&k_bytes[..OGS_KEY_LEN]);
+                    if k_bytes.len() >= NEXTGCORE_KEY_LEN {
+                        udm_ue.k.copy_from_slice(&k_bytes[..NEXTGCORE_KEY_LEN]);
                     }
-                    if amf_bytes.len() >= OGS_AMF_LEN {
-                        udm_ue.amf.copy_from_slice(&amf_bytes[..OGS_AMF_LEN]);
+                    if amf_bytes.len() >= NEXTGCORE_AMF_LEN {
+                        udm_ue.amf.copy_from_slice(&amf_bytes[..NEXTGCORE_AMF_LEN]);
                     }
-                    if sqn_bytes.len() >= OGS_SQN_LEN {
-                        udm_ue.sqn.copy_from_slice(&sqn_bytes[..OGS_SQN_LEN]);
+                    if sqn_bytes.len() >= NEXTGCORE_SQN_LEN {
+                        udm_ue.sqn.copy_from_slice(&sqn_bytes[..NEXTGCORE_SQN_LEN]);
                     }
 
                     // Update UE in context
@@ -711,8 +711,8 @@ pub fn udm_nudr_dr_handle_smf_registration(
 /// 4. Derive XRES* via TS 33.501 A.4
 fn generate_authentication_vector(udm_ue: &mut UdmUe) -> Result<AuthenticationInfoResult, String> {
     // Generate cryptographically random RAND
-    let mut rand = [0u8; OGS_RAND_LEN];
-    ogs_core::rand::ogs_random(&mut rand);
+    let mut rand = [0u8; NEXTGCORE_RAND_LEN];
+    nextgcore_core::rand::nextgcore_random(&mut rand);
     udm_ue.rand = rand;
 
     // Run Milenage: produces AUTN, IK, CK, AK, RES
@@ -727,15 +727,15 @@ fn generate_authentication_vector(udm_ue: &mut UdmUe) -> Result<AuthenticationIn
         .ok_or_else(|| "No serving network name".to_string())?;
 
     // TS 33.501 A.2: Derive KAUSF from CK, IK, serving network name, AUTN
-    let ck_arr = <&[u8; OGS_KEY_LEN]>::try_from(&ck[..OGS_KEY_LEN])
+    let ck_arr = <&[u8; NEXTGCORE_KEY_LEN]>::try_from(&ck[..NEXTGCORE_KEY_LEN])
         .map_err(|_| "CK key length mismatch".to_string())?;
-    let ik_arr = <&[u8; OGS_KEY_LEN]>::try_from(&ik[..OGS_KEY_LEN])
+    let ik_arr = <&[u8; NEXTGCORE_KEY_LEN]>::try_from(&ik[..NEXTGCORE_KEY_LEN])
         .map_err(|_| "IK key length mismatch".to_string())?;
 
-    let kausf = kdf::ogs_kdf_kausf(ck_arr, ik_arr, serving_network_name, &autn);
+    let kausf = kdf::nextgcore_kdf_kausf(ck_arr, ik_arr, serving_network_name, &autn);
 
     // TS 33.501 A.4: Derive XRES* from CK, IK, serving network name, RAND, RES
-    let xres_star = kdf::ogs_kdf_xres_star(ck_arr, ik_arr, serving_network_name, &rand, &res);
+    let xres_star = kdf::nextgcore_kdf_xres_star(ck_arr, ik_arr, serving_network_name, &rand, &res);
 
     // Build authentication info result
     Ok(AuthenticationInfoResult {

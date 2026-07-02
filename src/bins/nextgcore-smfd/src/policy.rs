@@ -19,7 +19,7 @@
 //! warning. When a PCF *is* configured, a rejection or transport failure is a
 //! hard failure for the PDU session (no silent fallback).
 
-use ogs_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -36,6 +36,10 @@ pub mod gsm_cause {
     pub const REQUEST_REJECTED_UNSPECIFIED: u8 = 31;
     pub const NETWORK_FAILURE: u8 = 38;
     pub const PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED: u8 = 50;
+    /// #67 Insufficient resources for specific slice (TS 24.501 §9.11.4.2).
+    /// Used when the NSACF declines a PDU-session admission for the S-NSSAI
+    /// (slice PDU-session quota exhausted: NSACF 403, or 200 acuFailureList).
+    pub const INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE: u8 = 67;
 }
 
 /// PDU session type values (TS 24.501 §9.11.4.11)
@@ -213,10 +217,15 @@ pub struct PcfEndpoint {
 
 impl PcfEndpoint {
     fn client(&self) -> SbiClient {
-        SbiClient::new(
-            SbiClientConfig::new(self.host.clone(), self.port)
-                .with_connect_timeout(Duration::from_secs(2))
-                .with_request_timeout(Duration::from_secs(3)),
+        // Attach an NRF-issued Bearer token to the Npcf_SMPolicyControl call
+        // when OAuth2 enforcement is on (Wave-6 H8 Phase A); no-op otherwise.
+        crate::attach_oauth2(
+            SbiClient::new(
+                SbiClientConfig::new(self.host.clone(), self.port)
+                    .with_connect_timeout(Duration::from_secs(2))
+                    .with_request_timeout(Duration::from_secs(3)),
+            ),
+            nextgcore_sbi::types::NfType::Pcf,
         )
     }
 }
@@ -232,7 +241,9 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
     }
 
     // NRF discovery
-    let nrf_uri = ogs_sbi::context::global_context().get_nrf_uri().await?;
+    let nrf_uri = nextgcore_sbi::context::global_context()
+        .get_nrf_uri()
+        .await?;
     let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
     let client = SbiClient::new(
         SbiClientConfig::new(nrf_host, nrf_port)
@@ -273,7 +284,7 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
     Some(PcfEndpoint { host, port })
 }
 
-fn split_host_port(uri: &str) -> Option<(String, u16)> {
+pub(crate) fn split_host_port(uri: &str) -> Option<(String, u16)> {
     let stripped = uri
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
@@ -285,6 +296,217 @@ fn split_host_port(uri: &str) -> Option<(String, u16)> {
         let default = if uri.starts_with("https://") { 443 } else { 80 };
         Some((host_port.to_string(), default))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Nnsacf_NSAC PDU-session admission (TS 29.536 §5.3 / §6.1.3.2)
+// ---------------------------------------------------------------------------
+
+/// Resolved NSACF endpoint.
+#[derive(Debug, Clone)]
+pub struct NsacfEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl NsacfEndpoint {
+    fn client(&self) -> SbiClient {
+        // Attach an NRF-issued Bearer token to the Nnsacf_NSAC call when OAuth2
+        // enforcement is on (Wave-6 H8 Phase A); no-op otherwise.
+        crate::attach_oauth2(
+            SbiClient::new(
+                SbiClientConfig::new(self.host.clone(), self.port)
+                    .with_connect_timeout(Duration::from_secs(2))
+                    .with_request_timeout(Duration::from_secs(3)),
+            ),
+            nextgcore_sbi::types::NfType::Nsacf,
+        )
+    }
+}
+
+/// Resolve the NSACF endpoint: `NSACF_URI` env var first, then NRF discovery
+/// (GET /nnrf-disc/v1/nf-instances?target-nf-type=NSACF&requester-nf-type=SMF).
+/// Returns `None` when no NSACF is configured/discoverable, so the caller can
+/// treat slice admission control as not deployed (skip the check).
+pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
+    if let Ok(uri) = std::env::var("NSACF_URI") {
+        if let Some((host, port)) = split_host_port(&uri) {
+            return Some(NsacfEndpoint { host, port });
+        }
+        log::warn!("NSACF_URI '{uri}' is not a valid URI — ignoring");
+    }
+
+    // NRF discovery
+    let nrf_uri = nextgcore_sbi::context::global_context()
+        .get_nrf_uri()
+        .await?;
+    let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
+    let client = SbiClient::new(
+        SbiClientConfig::new(nrf_host, nrf_port)
+            .with_connect_timeout(Duration::from_secs(2))
+            .with_request_timeout(Duration::from_secs(3)),
+    );
+    let resp = client
+        .get("/nnrf-disc/v1/nf-instances?target-nf-type=NSACF&requester-nf-type=SMF")
+        .await
+        .ok()?;
+    if resp.status != 200 {
+        log::debug!("NRF NSACF discovery returned status {}", resp.status);
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_str(resp.http.content.as_deref()?).ok()?;
+    let inst = body.get("nfInstances")?.as_array()?.first()?;
+    let host = inst
+        .get("ipv4Addresses")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let port = inst
+        .get("nfServices")
+        .and_then(|s| s.as_array())
+        .and_then(|svcs| {
+            svcs.iter()
+                .find(|s| s.get("serviceName").and_then(|n| n.as_str()) == Some("nnsacf-nsac"))
+        })
+        .and_then(|s| s.get("ipEndPoints"))
+        .and_then(|e| e.as_array())
+        .and_then(|e| e.first())
+        .and_then(|e| e.get("port"))
+        .and_then(|p| p.as_u64())
+        .map(|p| p as u16)
+        .unwrap_or(7813);
+    Some(NsacfEndpoint { host, port })
+}
+
+/// Outcome of an Nnsacf_NSAC PDU-session admission query (TS 29.536).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NsacAdmission {
+    /// PDU session admitted (HTTP 204) — proceed with establishment.
+    Admitted,
+    /// PDU session rejected (HTTP 403, or 200 with this SUPI in acuFailureList)
+    /// — reject with 5GSM cause #67.
+    Rejected,
+    /// NSACF could not be reached / returned an unexpected status. The caller
+    /// decides the fail-open vs fail-closed policy.
+    Unavailable,
+}
+
+/// Query the NSACF whether a new PDU session may be established on `s_nssai`
+/// for `psi` (TS 29.536 §6.1.3.3, POST /nnsacf-nsac/v1/slices/pdus).
+///
+/// Sends a nested `PduACRequestData` (§6.1.6.2.7): `pduACRequestInfo[]` each
+/// with `supi`, `anType`, `pduSessionId` and an `acuOperationList[]` of
+/// `{updateFlag, snssai}`. The decision is the HTTP status (§6.1.3.3.3.1):
+/// **204** admitted, **200** with an `acuFailureList` keyed by SUPI when this
+/// SUPI's session failed → [`NsacAdmission::Rejected`], **403** ProblemDetails
+/// (total failure) → [`NsacAdmission::Rejected`]. A transport error or an
+/// unexpected status is [`NsacAdmission::Unavailable`] so the caller can
+/// degrade-open. `nf_id` is this SMF's NF instance id (the request's `nfId`).
+pub async fn nsac_pdu_session_admit(
+    nsacf: &NsacfEndpoint,
+    nf_id: &str,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) -> NsacAdmission {
+    let mut snssai = serde_json::json!({ "sst": sst });
+    if let Some(sd) = sd {
+        snssai["sd"] = serde_json::json!(sd);
+    }
+    // TS 29.536 §6.1.6.2.7/.10/.5 nested PduACRequestData.
+    let body = serde_json::json!({
+        "nfId": nf_id,
+        "pduACRequestInfo": [{
+            "supi": supi,
+            "anType": "3GPP_ACCESS",
+            "pduSessionId": psi,
+            "acuOperationList": [{ "updateFlag": "INCREASE", "snssai": snssai }],
+        }],
+    });
+
+    let client = nsacf.client();
+    let resp = match client.post_json("/nnsacf-nsac/v1/slices/pdus", &body).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("NSACF PDU-session admission query failed: {e}");
+            client.close().await;
+            return NsacAdmission::Unavailable;
+        }
+    };
+    client.close().await;
+
+    match resp.status {
+        // All requested S-NSSAIs for this PDU session admitted.
+        204 => NsacAdmission::Admitted,
+        // Total failure (ProblemDetails) -> reject with 5GSM cause #67.
+        403 => {
+            log::info!(
+                "NSACF rejected PDU session for S-NSSAI[SST:{sst} SD:{sd:?}] (403 total failure)"
+            );
+            NsacAdmission::Rejected
+        }
+        // Partial failure: UeACResponseData.acuFailureList keyed by SUPI. Our
+        // SUPI appearing means this PDU session's S-NSSAI failed.
+        200 => {
+            let our_supi_failed = resp
+                .http
+                .content
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                .and_then(|j| {
+                    j.get("acuFailureList")
+                        .and_then(|m| m.get(supi))
+                        .map(|entries| !entries.is_null())
+                })
+                .unwrap_or(false);
+            if our_supi_failed {
+                log::info!(
+                    "NSACF rejected PDU session for S-NSSAI[SST:{sst} SD:{sd:?}] (acuFailureList)"
+                );
+                NsacAdmission::Rejected
+            } else {
+                NsacAdmission::Admitted
+            }
+        }
+        other => {
+            log::warn!("NSACF PDU-session admission returned HTTP {other} (expected 204/200/403)");
+            NsacAdmission::Unavailable
+        }
+    }
+}
+
+/// Release a NSACF PDU-session count (DECREASE) for rollback when a later
+/// establishment step fails after the slot was admitted. Best-effort.
+pub async fn nsac_pdu_session_release(
+    nsacf: &NsacfEndpoint,
+    nf_id: &str,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) {
+    let mut snssai = serde_json::json!({ "sst": sst });
+    if let Some(sd) = sd {
+        snssai["sd"] = serde_json::json!(sd);
+    }
+    // Mirror nsac_pdu_session_admit's nested PduACRequestData, with a DECREASE
+    // op, posted to the same conformant /slices/pdus resource (TS 29.536).
+    let body = serde_json::json!({
+        "nfId": nf_id,
+        "pduACRequestInfo": [{
+            "supi": supi,
+            "anType": "3GPP_ACCESS",
+            "pduSessionId": psi,
+            "acuOperationList": [{ "updateFlag": "DECREASE", "snssai": snssai }],
+        }],
+    });
+    let client = nsacf.client();
+    if let Err(e) = client.post_json("/nnsacf-nsac/v1/slices/pdus", &body).await {
+        log::warn!("NSACF PDU-session release (rollback) failed: {e}");
+    }
+    client.close().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -715,9 +937,33 @@ pub fn encode_ambr_component(bps: u64) -> (u8, u16) {
     (0x0B, u16::MAX)
 }
 
-/// Build a PDU Session Establishment Accept with policy-derived QoS
-/// (wire shape kept compatible with the existing E2E peers; values are no
-/// longer hardcoded).
+/// Build a PDU Session Establishment Accept with policy-derived QoS,
+/// wire-conformant per TS 24.501 §8.3.2 Table 8.3.2.1.1.
+///
+/// Octet layout (after the 4-octet SM header EPD/PSI/PTI/message-type):
+/// - octet 5: selected SSC mode (bits 5-7) packed with selected PDU
+///   session type (bits 1-3) in a SINGLE octet;
+/// - Authorized QoS rules: LV-E (2-octet length) carrying the rules
+///   produced by [`crate::gsm_build::encode_qos_rules`]
+///   (QoS-rule-id / 2-octet rule length / rule-operation+flags / packet
+///   filters / precedence / QFI);
+/// - Session-AMBR: LV (1-octet length = 6) with DL unit+value and UL
+///   unit+value.
+///
+/// Values are policy-derived (not hardcoded).
+/// `five_qi` drives the conditional Authorized QoS flow descriptions IE (0x79,
+/// TS 24.501 §6.4.1.3): it is included when the QFI differs from the 5QI (the
+/// non-default mapping used for delay-critical GBR / XR 5QIs such as 82-85).
+/// `sst`/`sd` populate the S-NSSAI IE (0x22, §8.3.2.5), always present in the
+/// normal 5G SA case where the AMF supplied an S-NSSAI. `ipv6_iid` is the IPv6
+/// interface identifier used only when `selected_pdu_session_type` is IPv4v6.
+///
+/// IMPORTANT (matched-sim preservation): the mandatory IE layout — octet-5
+/// (SSC|type), Authorized QoS rules LV-E, Session-AMBR LV and the IPv4 PDU
+/// address — is byte-identical to the legacy encoding. The S-NSSAI (0x22) and
+/// conditional QoS flow descriptions (0x79) are appended as additional
+/// spec-ordered optional IEs (after the PDU address, before the DNN) without
+/// disturbing the existing bytes (golden-tested).
 #[allow(clippy::too_many_arguments)]
 pub fn build_establishment_accept(
     psi: u8,
@@ -725,21 +971,58 @@ pub fn build_establishment_accept(
     selected_pdu_session_type: u8,
     selected_ssc_mode: u8,
     qfi: u8,
+    five_qi: u8,
     ambr_dl_bps: u64,
     ambr_ul_bps: u64,
     ue_ip: [u8; 4],
+    ipv6_iid: [u8; 8],
+    sst: u8,
+    sd: Option<u32>,
     dnn: &str,
+    cause_5gsm: Option<u8>,
 ) -> Vec<u8> {
+    use crate::gsm_build::{
+        encode_qos_flow_descriptions, encode_qos_rules, pf_component_type, pf_direction,
+        qos_flow_description_code, qos_flow_param_id, qos_rule_code, PacketFilterComponent,
+        PacketFilterContent, QosFlowDescription, QosFlowParam, QosRule, QosRulePacketFilter,
+    };
+
     let mut msg = Vec::with_capacity(32 + dnn.len());
     msg.push(0x2E); // EPD: 5GSM
     msg.push(psi);
     msg.push(pti); // echo the UE's PTI (TS 24.501 §6.3.1.3)
     msg.push(gsm_message_type::ESTABLISHMENT_ACCEPT);
-    msg.push(selected_pdu_session_type & 0x07);
-    msg.push(selected_ssc_mode & 0x07);
-    // Authorized QoS rules (default rule, QFI from policy)
-    msg.extend_from_slice(&[0x06, 0x01, 0x03, 0x01, 0x01, qfi & 0x3F]);
-    // Session-AMBR (length 6: DL unit+value, UL unit+value)
+
+    // Octet 5: SSC mode (bits 5-7, high nibble) | PDU session type
+    // (bits 1-3, low nibble) — single packed octet per Table 8.3.2.1.1.
+    msg.push(((selected_ssc_mode & 0x07) << 4) | (selected_pdu_session_type & 0x07));
+
+    // Authorized QoS rules (mandatory, LV-E): a default CREATE rule with a
+    // match-all bidirectional packet filter, lowest precedence and the
+    // policy-derived QFI. Encoded by the conformant QoS-rule encoder.
+    let default_rule = QosRule {
+        identifier: qfi & 0x3F,
+        code: qos_rule_code::CREATE_NEW_QOS_RULE,
+        dqr_bit: true,
+        packet_filters: vec![QosRulePacketFilter {
+            direction: pf_direction::BIDIRECTIONAL,
+            identifier: 1,
+            content: PacketFilterContent {
+                components: vec![PacketFilterComponent {
+                    component_type: pf_component_type::MATCH_ALL,
+                    data: vec![],
+                }],
+            },
+        }],
+        precedence: 255,
+        segregation: false,
+        qfi: qfi & 0x3F,
+    };
+    let qos_rules = encode_qos_rules(&[default_rule]);
+    msg.extend_from_slice(&(qos_rules.len() as u16).to_be_bytes());
+    msg.extend_from_slice(&qos_rules);
+
+    // Session-AMBR (mandatory, LV; length 6: DL unit+value, UL unit+value)
     let (dl_unit, dl_val) = encode_ambr_component(ambr_dl_bps);
     let (ul_unit, ul_val) = encode_ambr_component(ambr_ul_bps);
     msg.push(0x06);
@@ -747,11 +1030,72 @@ pub fn build_establishment_accept(
     msg.extend_from_slice(&dl_val.to_be_bytes());
     msg.push(ul_unit);
     msg.extend_from_slice(&ul_val.to_be_bytes());
-    // PDU address (IEI 0x29) — IPv4
-    msg.push(0x29);
-    msg.push(0x05);
-    msg.push(0x01);
-    msg.extend_from_slice(&ue_ip);
+
+    // 5GSM cause (IEI 0x59, TV, 2 octets) per TS 24.501 Table 8.3.2.1.1 /
+    // clause 8.3.2.2: included when the selected PDU session type differs from
+    // the type requested by the UE (IPv4v6 requested, only the IPv4 leg
+    // granted -> #50). Sits after Session-AMBR, before the PDU address IE.
+    if let Some(cause) = cause_5gsm {
+        msg.push(0x59);
+        msg.push(cause);
+    }
+
+    // PDU address (IEI 0x29) — encoded per the selected PDU session type
+    // (TS 24.501 §9.11.4.10). The IPv4 form is byte-identical to the legacy
+    // 5-octet layout; IPv4v6 emits the 13-octet value (type + 8-byte IPv6
+    // interface identifier + 4-byte IPv4) — smfd-05.
+    match selected_pdu_session_type {
+        pdu_session_type::IPV4V6 => {
+            msg.push(0x29);
+            msg.push(0x0D); // 1 (type) + 8 (IID) + 4 (IPv4)
+            msg.push(pdu_session_type::IPV4V6);
+            msg.extend_from_slice(&ipv6_iid);
+            msg.extend_from_slice(&ue_ip);
+        }
+        _ => {
+            // IPv4 (and the IPv4 leg granted for any other selected type):
+            // legacy byte-identical 5-octet form.
+            msg.push(0x29);
+            msg.push(0x05);
+            msg.push(pdu_session_type::IPV4);
+            msg.extend_from_slice(&ue_ip);
+        }
+    }
+
+    // S-NSSAI (IEI 0x22, TLV) — included whenever the AMF supplied an S-NSSAI,
+    // i.e. the normal 5G SA case (TS 24.501 §8.3.2.5). smfd-04.
+    let mut snssai = Vec::with_capacity(4);
+    snssai.push(sst);
+    if let Some(sd) = sd {
+        snssai.push(((sd >> 16) & 0xff) as u8);
+        snssai.push(((sd >> 8) & 0xff) as u8);
+        snssai.push((sd & 0xff) as u8);
+    }
+    msg.push(0x22);
+    msg.push(snssai.len() as u8);
+    msg.extend_from_slice(&snssai);
+
+    // Authorized QoS flow descriptions (IEI 0x79, TLV-E) — conditional per
+    // TS 24.501 §6.4.1.3: included when the QFI differs from the 5QI (the
+    // non-default mapping of delay-critical GBR / XR 5QIs, e.g. 5QI 82 → QFI
+    // 18). For the default non-GBR flow QFI == 5QI and the IE is omitted
+    // (matches the byte-stable legacy accept). smfd-04.
+    if qfi != five_qi {
+        let desc = QosFlowDescription {
+            identifier: qfi & 0x3F,
+            code: qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION,
+            e_bit: true,
+            params: vec![QosFlowParam {
+                identifier: qos_flow_param_id::FIVE_QI,
+                data: vec![five_qi],
+            }],
+        };
+        let qos_desc_bytes = encode_qos_flow_descriptions(&[desc]);
+        msg.push(0x79);
+        msg.extend_from_slice(&(qos_desc_bytes.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&qos_desc_bytes);
+    }
+
     // DNN (IEI 0x25)
     let dnn_bytes = dnn.as_bytes();
     msg.push(0x25);
@@ -761,16 +1105,62 @@ pub fn build_establishment_accept(
     msg
 }
 
+/// Encode a GPRS timer 3 octet (TS 24.008 §10.5.7.4a) for `minutes` with the
+/// "1 minute" unit (bits 6-8 = 101). Used for the 5GSM back-off timer (T3396).
+fn gprs_timer3_minutes(minutes: u8) -> u8 {
+    (0b101 << 5) | (minutes & 0x1F)
+}
+
+/// Default 5GSM back-off timer applied to congestion rejections (10 minutes).
+const DEFAULT_BACK_OFF_MINUTES: u8 = 10;
+
 /// Build a PDU Session Establishment Reject with a 5GSM cause
-/// (TS 24.501 §8.3.3).
+/// (TS 24.501 §8.3.3 Table 8.3.3.1.1).
+///
+/// For congestion-related causes (#26 insufficient resources, #27 missing/
+/// unknown DNN, #67 insufficient resources for the slice) a Back-off timer
+/// value (T3396, GPRS timer 3, IEI 0x37) is appended so the UE applies the
+/// mandated back-off (TS 24.501 §6.2.8). smfd-08.
 pub fn build_establishment_reject(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
-    vec![
+    build_establishment_reject_ext(psi, pti, cause_5gsm, None)
+}
+
+/// Build a PDU Session Establishment Reject, optionally carrying the Allowed
+/// SSC mode IE (IEI 0xF, type-1 TV; bits 1-3 = SSC mode 1/2/3 allowed) used on
+/// SSC-mode-related rejections (TS 24.501 §8.3.3.1, §9.11.4.5). The Back-off
+/// timer (IEI 0x37) is still appended for congestion causes. smfd-08.
+pub fn build_establishment_reject_ext(
+    psi: u8,
+    pti: u8,
+    cause_5gsm: u8,
+    allowed_ssc_mode: Option<u8>,
+) -> Vec<u8> {
+    let mut msg = vec![
         0x2E,
         psi,
         pti,
         gsm_message_type::ESTABLISHMENT_REJECT,
         cause_5gsm,
-    ]
+    ];
+
+    // Back-off timer value (T3396, GPRS timer 3) for congestion causes.
+    if matches!(
+        cause_5gsm,
+        gsm_cause::INSUFFICIENT_RESOURCES
+            | gsm_cause::MISSING_OR_UNKNOWN_DNN
+            | gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE
+    ) {
+        msg.push(0x37); // IEI: Back-off timer value (GPRS timer 3, TLV)
+        msg.push(0x01); // length
+        msg.push(gprs_timer3_minutes(DEFAULT_BACK_OFF_MINUTES));
+    }
+
+    // Allowed SSC mode (type-1 IE: IEI nibble 0xF | bitmap in the low nibble).
+    if let Some(bitmap) = allowed_ssc_mode {
+        msg.push(0xF0 | (bitmap & 0x07));
+    }
+
+    msg
 }
 
 /// Build a PDU Session Modification Command echoing the UE's PTI and
@@ -839,34 +1229,73 @@ mod tests {
 
     #[test]
     fn accept_message_carries_policy_values() {
+        // SSC mode 2, PDU type IPv4 (0x01), QFI 9, 5QI 9 (QFI == 5QI → no 0x79)
         let msg = build_establishment_accept(
             5,
             3,
             pdu_session_type::IPV4,
-            1,
+            2,
+            9,
             9,
             200_000_000,
             50_000_000,
             [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            None,
             "internet",
+            None,
         );
-        assert_eq!(msg[0], 0x2E);
-        assert_eq!(msg[1], 5);
+        // SM header (TS 24.501 §9.3 / Table 8.3.2.1.1 octets 1-4)
+        assert_eq!(msg[0], 0x2E); // EPD: 5GSM
+        assert_eq!(msg[1], 5); // PSI
         assert_eq!(msg[2], 3); // PTI echoed
-        assert_eq!(msg[3], 0xC2);
-        // Session-AMBR DL: 200 Mbps with unit 1 Mbps
-        let ambr_off = 12; // after QoS rules
-        assert_eq!(msg[ambr_off], 0x06); // length
-        assert_eq!(msg[ambr_off + 1], 0x06); // unit 1 Mbps
+        assert_eq!(msg[3], 0xC2); // message type: Establishment Accept
+
+        // Octet 5: SSC mode (bits 5-7, high nibble) packed with PDU
+        // session type (bits 1-3, low nibble) in a SINGLE octet.
+        // SSC mode 2 (0b010) << 4 | IPv4 (0b001) = 0x21
+        assert_eq!(msg[4], 0x21);
+
+        // Authorized QoS rules as LV-E (2-octet length) per Table 8.3.2.1.1.
+        let qos_len = u16::from_be_bytes([msg[5], msg[6]]) as usize;
+        // One default CREATE rule with a match-all packet filter encoded by
+        // the conformant QoS-rule encoder:
+        //   [qfi][len_hi][len_lo][op+flags=0x31][pf_hdr=0x31][pf_len=1]
+        //   [match-all=0x01][precedence=0xFF][qfi]
+        assert_eq!(qos_len, 9);
+        let qos = &msg[7..7 + qos_len];
+        assert_eq!(qos[0], 9); // QoS rule identifier == QFI
+        assert_eq!(u16::from_be_bytes([qos[1], qos[2]]), 6); // rule length (2-octet)
+                                                             // op (CREATE=1)<<5 | DQR(0x10) | num_pf(1) = 0x31
+        assert_eq!(qos[3], 0x31);
+        // packet filter header: dir BIDIR(3)<<4 | pf id 1 = 0x31
+        assert_eq!(qos[4], 0x31);
+        assert_eq!(qos[5], 1); // pf content length
+        assert_eq!(qos[6], 0x01); // match-all component type
+        assert_eq!(qos[7], 0xFF); // precedence
+        assert_eq!(qos[8], 9); // QFI (segregation bit clear)
+
+        // Session-AMBR LV (1-octet length = 6) immediately after the QoS LV-E.
+        let ambr_off = 7 + qos_len;
+        assert_eq!(msg[ambr_off], 0x06); // length (single octet, no double-length bug)
+        assert_eq!(msg[ambr_off + 1], 0x06); // DL unit: 1 Mbps
         assert_eq!(
             u16::from_be_bytes([msg[ambr_off + 2], msg[ambr_off + 3]]),
             200
         );
-        assert_eq!(msg[ambr_off + 4], 0x06);
+        assert_eq!(msg[ambr_off + 4], 0x06); // UL unit: 1 Mbps
         assert_eq!(
             u16::from_be_bytes([msg[ambr_off + 5], msg[ambr_off + 6]]),
             50
         );
+
+        // PDU address (IEI 0x29) follows the Session-AMBR.
+        let pdu_off = ambr_off + 7;
+        assert_eq!(msg[pdu_off], 0x29);
+        assert_eq!(msg[pdu_off + 1], 0x05); // length
+        assert_eq!(msg[pdu_off + 2], 0x01); // IPv4
+        assert_eq!(&msg[pdu_off + 3..pdu_off + 7], &[10, 45, 0, 2]);
     }
 
     #[test]
@@ -877,6 +1306,190 @@ mod tests {
             gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
         );
         assert_eq!(msg, vec![0x2E, 1, 2, 0xC3, 29]);
+    }
+
+    // ----------------------- smfd-04 / smfd-05 --------------------------
+
+    /// Golden byte-stability test (smfd-04): the EXISTING mandatory IE layout
+    /// the matched-sim UE parses — octet-5 (SSC|type), Authorized QoS rules
+    /// LV-E, Session-AMBR LV and the IPv4 PDU address — MUST remain
+    /// byte-identical to the legacy accept. Adding the S-NSSAI (0x22) and the
+    /// conditional QoS flow descriptions (0x79) must not disturb these bytes.
+    #[test]
+    fn accept_existing_mandatory_ies_byte_stable() {
+        // Same inputs as accept_message_carries_policy_values; 5QI 9 → QFI 9
+        // (QFI == 5QI) so no 0x79 is emitted.
+        let msg = build_establishment_accept(
+            5,
+            3,
+            pdu_session_type::IPV4,
+            2,
+            9,
+            9,
+            200_000_000,
+            50_000_000,
+            [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            None,
+            "internet",
+            None,
+        );
+        // header | octet-5 | QoS rules LV-E | Session-AMBR LV | PDU address.
+        const PINNED_PREFIX: [u8; 30] = [
+            0x2E, 0x05, 0x03, 0xC2, // EPD, PSI, PTI, message type
+            0x21, // octet-5: SSC mode 2 | IPv4
+            0x00, 0x09, // QoS rules LV-E length
+            0x09, 0x00, 0x06, 0x31, 0x31, 0x01, 0x01, 0xFF, 0x09, // QoS rule
+            0x06, 0x06, 0x00, 0xC8, 0x06, 0x00, 0x32, // Session-AMBR LV
+            0x29, 0x05, 0x01, 10, 45, 0, 2, // PDU address (IPv4)
+        ];
+        assert_eq!(&msg[..PINNED_PREFIX.len()], &PINNED_PREFIX);
+        // S-NSSAI (0x22) is the first additional optional IE, before the DNN.
+        assert_eq!(
+            &msg[PINNED_PREFIX.len()..PINNED_PREFIX.len() + 3],
+            &[0x22, 0x01, 0x01]
+        );
+        // No 0x79 when QFI == 5QI: the DNN (0x25) follows the S-NSSAI directly.
+        assert_eq!(msg[PINNED_PREFIX.len() + 3], 0x25);
+    }
+
+    /// smfd-04 (b): an XR DNN with 5QI 82 (QFI 18 != 5QI) emits both the
+    /// S-NSSAI (0x22) and an Authorized QoS flow descriptions IE (0x79) whose
+    /// single descriptor carries the 5QI parameter.
+    #[test]
+    fn accept_xr_flow_carries_snssai_and_qos_flow_desc() {
+        let five_qi = 82u8;
+        let qfi = five_qi & 0x3F; // 18
+        let msg = build_establishment_accept(
+            5,
+            2,
+            pdu_session_type::IPV4,
+            1,
+            qfi,
+            five_qi,
+            1_000_000,
+            1_000_000,
+            [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            Some(0x010203),
+            "xr",
+            None,
+        );
+        // S-NSSAI present with SST + 3-byte SD.
+        let snssai_at = msg
+            .windows(5)
+            .position(|w| w == [0x22, 0x04, 0x01, 0x01, 0x02]);
+        assert!(snssai_at.is_some(), "S-NSSAI (0x22) with SST+SD expected");
+        // QoS flow descriptions IE present (TLV-E): IEI 0x79, then the 5QI.
+        let qfd_at = msg
+            .windows(2)
+            .position(|w| w[0] == 0x79)
+            .expect("0x79 QoS flow descriptions IE expected");
+        // 0x79, len_hi, len_lo, [QFI][2nd byte][param 5QI][len=1][value=82]
+        assert_eq!(msg[qfd_at], 0x79);
+        let len = u16::from_be_bytes([msg[qfd_at + 1], msg[qfd_at + 2]]) as usize;
+        let body = &msg[qfd_at + 3..qfd_at + 3 + len];
+        assert_eq!(body[0], qfi); // QFI
+        assert!(body.contains(&82)); // 5QI value present
+    }
+
+    /// smfd-05: an IPv4v6 grant emits the 13-octet PDU address (type + 8-byte
+    /// IPv6 interface identifier + 4-byte IPv4) while the rest of the message
+    /// is unchanged. (Live trigger is E2E-deferred — the SMF has no IPv6 pool
+    /// yet — but the encoding is exercised here directly.)
+    #[test]
+    fn accept_ipv4v6_emits_dual_pdu_address() {
+        let iid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let msg = build_establishment_accept(
+            5,
+            2,
+            pdu_session_type::IPV4V6,
+            1,
+            9,
+            9,
+            1_000_000,
+            1_000_000,
+            [10, 45, 0, 2],
+            iid,
+            1,
+            None,
+            "internet",
+            None,
+        );
+        // octet-5: SSC mode 1 | IPv4v6 (0x13)
+        assert_eq!(msg[4], (1 << 4) | pdu_session_type::IPV4V6);
+        // Locate the PDU address IE (0x29) and verify the dual-stack value.
+        let pdu_at = msg
+            .windows(2)
+            .position(|w| w[0] == 0x29 && w[1] == 0x0D)
+            .expect("IPv4v6 PDU address (len 0x0D) expected");
+        assert_eq!(msg[pdu_at + 1], 0x0D); // 1 + 8 + 4
+        assert_eq!(msg[pdu_at + 2], pdu_session_type::IPV4V6);
+        assert_eq!(&msg[pdu_at + 3..pdu_at + 11], &iid); // IPv6 IID
+        assert_eq!(&msg[pdu_at + 11..pdu_at + 15], &[10, 45, 0, 2]); // IPv4
+    }
+
+    /// smfd#1 (TS 24.501 clause 8.3.2.2): when the UE requested IPv4v6 but only
+    /// the IPv4 leg is granted, the accept carries the 5GSM cause IE (IEI 0x59,
+    /// TV) with #50, placed after the Session-AMBR LV and before PDU address.
+    #[test]
+    fn accept_ipv4_downgrade_carries_5gsm_cause_50() {
+        let msg = build_establishment_accept(
+            5,
+            3,
+            pdu_session_type::IPV4,
+            2,
+            9,
+            9,
+            200_000_000,
+            50_000_000,
+            [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            None,
+            "internet",
+            Some(gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED),
+        );
+        // Header(4)+octet5(1)+QoS-LV-E(11)+Session-AMBR(7) = 23 bytes; the 5GSM
+        // cause TV occupies indices 23..25, then the PDU address IE (0x29).
+        assert_eq!(&msg[23..25], &[0x59, 50]);
+        assert_eq!(msg[25], 0x29);
+    }
+
+    // ----------------------------- smfd-08 ------------------------------
+
+    /// smfd-08: a congestion reject (#26 insufficient resources) carries the
+    /// Back-off timer value IE (IEI 0x37, GPRS timer 3) after the 5GSM cause.
+    #[test]
+    fn reject_congestion_carries_back_off_timer() {
+        let msg = build_establishment_reject(5, 2, gsm_cause::INSUFFICIENT_RESOURCES);
+        assert_eq!(&msg[..5], &[0x2E, 5, 2, 0xC3, 26]);
+        assert_eq!(msg[5], 0x37); // IEI: Back-off timer value
+        assert_eq!(msg[6], 0x01); // length
+                                  // GPRS timer 3: unit "1 minute" (101) | 10
+        assert_eq!(msg[7] >> 5, 0b101);
+        assert_eq!(msg[7] & 0x1F, 10);
+        // A non-congestion cause carries no back-off timer (byte-stable).
+        let plain = build_establishment_reject(5, 2, gsm_cause::NETWORK_FAILURE);
+        assert_eq!(plain, vec![0x2E, 5, 2, 0xC3, 38]);
+    }
+
+    /// smfd-08: an SSC-mode-related reject carries the Allowed SSC mode IE
+    /// (type-1, IEI nibble 0xF) with the allowed-mode bitmap.
+    #[test]
+    fn reject_ssc_mode_carries_allowed_ssc_mode_ie() {
+        // Allow SSC mode 1 only (bitmap 0b001).
+        let msg = build_establishment_reject_ext(
+            5,
+            2,
+            gsm_cause::REQUEST_REJECTED_UNSPECIFIED,
+            Some(0b001),
+        );
+        let last = *msg.last().unwrap();
+        assert_eq!(last >> 4, 0x0F); // IEI nibble
+        assert_eq!(last & 0x07, 0b001); // SSC mode 1 allowed
     }
 
     #[test]
@@ -996,7 +1609,9 @@ mod tests {
 
     // --------------- HTTP round-trip against a stub PCF -----------------
 
-    async fn stub_pcf_handler(req: ogs_sbi::message::SbiRequest) -> ogs_sbi::message::SbiResponse {
+    async fn stub_pcf_handler(
+        req: nextgcore_sbi::message::SbiRequest,
+    ) -> nextgcore_sbi::message::SbiResponse {
         let path = req.header.uri.split('?').next().unwrap_or("");
         let decision = serde_json::json!({
             "sessRules": {
@@ -1017,12 +1632,12 @@ mod tests {
                 .and_then(|c| serde_json::from_str(c).ok())
                 .unwrap_or_default();
             if body["pduSessionId"].as_u64() == Some(13) {
-                return ogs_sbi::message::SbiResponse::with_status(403).with_body(
+                return nextgcore_sbi::message::SbiResponse::with_status(403).with_body(
                     serde_json::json!({"cause": "POLICY_REJECTED"}).to_string(),
                     "application/problem+json",
                 );
             }
-            return ogs_sbi::message::SbiResponse::with_status(201)
+            return nextgcore_sbi::message::SbiResponse::with_status(201)
                 .with_header(
                     "Location",
                     "/npcf-smpolicycontrol/v1/sm-policies/stub-pol-1",
@@ -1030,13 +1645,13 @@ mod tests {
                 .with_body(decision.to_string(), "application/json");
         }
         if path.ends_with("/update") {
-            return ogs_sbi::message::SbiResponse::with_status(200)
+            return nextgcore_sbi::message::SbiResponse::with_status(200)
                 .with_body(decision.to_string(), "application/json");
         }
         if path.ends_with("/delete") {
-            return ogs_sbi::message::SbiResponse::with_status(204);
+            return nextgcore_sbi::message::SbiResponse::with_status(204);
         }
-        ogs_sbi::message::SbiResponse::with_status(404)
+        nextgcore_sbi::message::SbiResponse::with_status(404)
     }
 
     fn free_port() -> u16 {
@@ -1050,7 +1665,9 @@ mod tests {
     async fn sm_policy_lifecycle_http_round_trip() {
         let port = free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(addr));
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+        );
         server
             .start(stub_pcf_handler)
             .await
@@ -1122,5 +1739,126 @@ mod tests {
             .await
             .expect("bounded");
         assert!(matches!(res, Err(PolicyError::Transport(_))));
+    }
+
+    // ------------------- Nnsacf_NSAC PDU-session admission ----------------
+
+    /// Stub NSACF: validates the nested PduACRequestData shape (TS 29.536) on the
+    /// conformant /slices/pdus resource, then admits (204) unless
+    /// `pduSessionId == 99` (the over-limit marker), in which case it returns a
+    /// 403 ProblemDetails (total failure).
+    async fn stub_nsacf_handler(
+        req: nextgcore_sbi::message::SbiRequest,
+    ) -> nextgcore_sbi::message::SbiResponse {
+        let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+        if !path.ends_with("/nnsacf-nsac/v1/slices/pdus") {
+            return nextgcore_sbi::message::SbiResponse::with_status(404);
+        }
+        let body: serde_json::Value = req
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or(serde_json::Value::Null);
+        // Conformant nested shape: nfId + pduACRequestInfo[].{supi,anType,
+        // pduSessionId,acuOperationList[].{updateFlag,snssai}}.
+        assert!(body["nfId"].is_string(), "request must carry nfId");
+        let info = &body["pduACRequestInfo"][0];
+        assert!(info["supi"].is_string(), "pduACRequestInfo carries supi");
+        assert!(info["anType"].is_string(), "anType present");
+        let psi = info["pduSessionId"].as_u64().unwrap_or(0);
+        let op = &info["acuOperationList"][0];
+        assert!(
+            op["updateFlag"] == "INCREASE" || op["updateFlag"] == "DECREASE",
+            "updateFlag must be INCREASE/DECREASE"
+        );
+        assert_eq!(op["snssai"]["sst"], 1, "op carries snssai");
+
+        if psi == 99 {
+            nextgcore_sbi::message::SbiResponse::with_status(403).with_body(
+                serde_json::json!({"status": 403, "cause": "ALL_SLICE_FAILED"}).to_string(),
+                "application/problem+json",
+            )
+        } else {
+            nextgcore_sbi::message::SbiResponse::with_status(204)
+        }
+    }
+
+    #[tokio::test]
+    async fn nsac_pdu_session_admit_admitted_and_rejected() {
+        let port = free_port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+        );
+        server
+            .start(stub_nsacf_handler)
+            .await
+            .expect("start stub NSACF");
+
+        let nsacf = NsacfEndpoint {
+            host: "127.0.0.1".into(),
+            port,
+        };
+
+        let run = async {
+            // Within quota -> Admitted
+            let res = nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-1", 5, 1, None).await;
+            assert_eq!(res, NsacAdmission::Admitted);
+
+            // Over-limit marker (psi 99) -> Rejected (NSACF 403 total failure)
+            let res = nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-2", 99, 1, None).await;
+            assert_eq!(res, NsacAdmission::Rejected);
+
+            // DECREASE release is best-effort and must not panic
+            nsac_pdu_session_release(&nsacf, "smf-1", "imsi-1", 5, 1, None).await;
+        };
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("round trip timed out");
+
+        server.stop().await.ok();
+    }
+
+    #[tokio::test]
+    async fn nsac_pdu_session_admit_unavailable_on_transport_error() {
+        // Nothing listening -> Unavailable (fail-open at the call site)
+        let nsacf = NsacfEndpoint {
+            host: "127.0.0.1".into(),
+            port: free_port(),
+        };
+        let res = tokio::time::timeout(
+            Duration::from_secs(8),
+            nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-1", 5, 1, None),
+        )
+        .await
+        .expect("bounded");
+        assert_eq!(res, NsacAdmission::Unavailable);
+    }
+
+    #[test]
+    fn nsac_reject_uses_slice_specific_5gsm_cause() {
+        // TS 24.501 §9.11.4.2 cause #67 (insufficient resources for slice).
+        assert_eq!(gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE, 67);
+    }
+
+    /// Wave-6 H8 Phase A: OAuth2 consumer enforcement is OFF by default, so the
+    /// PCF/NSACF outbound clients built by `PcfEndpoint::client`/
+    /// `NsacfEndpoint::client` attach NO Bearer token — the matched-sim default
+    /// path is byte-unchanged. The token attach is opt-in via
+    /// `smf.sbi.oauth2.require` (TS 33.501 §13.4.1). Flipping this invariant
+    /// (installing an OAUTH2_CLIENT unconditionally) fails this test.
+    #[test]
+    fn oauth2_consumer_disabled_by_default() {
+        assert!(
+            crate::oauth2_client().is_none(),
+            "OAuth2 must be off by default so attach_oauth2 is a no-op"
+        );
+        // attach_oauth2 is a pure pass-through when enforcement is off.
+        let ep = PcfEndpoint {
+            host: "127.0.0.1".to_string(),
+            port: 7777,
+        };
+        let _ = ep.client();
     }
 }

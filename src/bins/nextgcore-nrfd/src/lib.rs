@@ -25,20 +25,24 @@ pub use timer::{nrf_timer_get_name, timer_manager, NrfTimerManager};
 
 // Re-export handler types
 pub use nnrf_handler::{
-    apply_json_patch, discover_profiles, json_merge_patch, nf_manager, nrf_nnrf_handle_nf_discover,
-    nrf_nnrf_handle_nf_register, nrf_nnrf_handle_nf_status_subscribe,
+    apply_json_patch, discover_profiles, init_nf_manager, json_merge_patch, nf_manager,
+    nrf_nnrf_handle_nf_discover, nrf_nnrf_handle_nf_register, nrf_nnrf_handle_nf_status_subscribe,
     nrf_nnrf_handle_nf_status_unsubscribe, DiscoveryOptions, DiscoveryQuery, HandlerResult,
     NfInstanceManager, NfProfile, PatchError, SubscriptionData,
 };
 
 // Re-export build types
 pub use nnrf_build::{
-    nrf_nnrf_nfm_build_nf_status_notify, NotificationData, NotificationEventType, SbiNotifyRequest,
+    nrf_nnrf_nfm_build_nf_profile_changed_notify, nrf_nnrf_nfm_build_nf_status_notify, ChangeItem,
+    NotificationData, NotificationEventType, SbiNotifyRequest,
 };
 
 // Re-export SBI path functions
 pub use sbi_path::{
-    nrf_nnrf_nfm_send_nf_status_notify, nrf_nnrf_nfm_send_nf_status_notify_all,
-    nrf_nnrf_nfm_send_nf_status_notify_all_async, nrf_nnrf_nfm_send_nf_status_notify_async,
-    nrf_sbi_close, nrf_sbi_is_running, nrf_sbi_open, SbiServer, SbiServerConfig,
+    nrf_nnrf_nfm_send_nf_profile_changed_notify_all,
+    nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async,
+    nrf_nnrf_nfm_send_nf_profile_changed_notify_async, nrf_nnrf_nfm_send_nf_status_notify,
+    nrf_nnrf_nfm_send_nf_status_notify_all, nrf_nnrf_nfm_send_nf_status_notify_all_async,
+    nrf_nnrf_nfm_send_nf_status_notify_async, nrf_sbi_close, nrf_sbi_is_running, nrf_sbi_open,
+    SbiServer, SbiServerConfig,
 };

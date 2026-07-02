@@ -2,11 +2,11 @@
 //!
 //! Port of src/scp/event.h and event.c - Event definitions for SCP
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
 #[allow(dead_code)]
-pub const OGS_FSM_USER_SIG: i32 = 2;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for SCP
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,18 +26,18 @@ pub enum ScpEventId {
 impl ScpEventId {
     pub fn name(&self) -> &'static str {
         match self {
-            ScpEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            ScpEventId::FsmExit => "OGS_FSM_EXIT_SIG",
-            ScpEventId::SbiServer => "OGS_EVENT_SBI_SERVER",
-            ScpEventId::SbiClient => "OGS_EVENT_SBI_CLIENT",
-            ScpEventId::SbiTimer => "OGS_EVENT_SBI_TIMER",
+            ScpEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            ScpEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
+            ScpEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
+            ScpEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
+            ScpEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
         }
     }
 
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => ScpEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => ScpEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => ScpEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => ScpEventId::FsmExit,
             _ => ScpEventId::SbiServer,
         }
     }
@@ -59,14 +59,16 @@ impl ScpTimerId {
     pub fn name(&self) -> &'static str {
         match self {
             ScpTimerId::NfInstanceRegistrationInterval => {
-                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+                "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            ScpTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
-            ScpTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
-            ScpTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",
-            ScpTimerId::SubscriptionValidity => "OGS_TIMER_SUBSCRIPTION_VALIDITY",
-            ScpTimerId::SubscriptionPatch => "OGS_TIMER_SUBSCRIPTION_PATCH",
-            ScpTimerId::SbiClientWait => "OGS_TIMER_SBI_CLIENT_WAIT",
+            ScpTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
+            ScpTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
+            ScpTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
+            ScpTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",
+            ScpTimerId::SubscriptionPatch => "NEXTGCORE_TIMER_SUBSCRIPTION_PATCH",
+            ScpTimerId::SbiClientWait => "NEXTGCORE_TIMER_SBI_CLIENT_WAIT",
         }
     }
 }
@@ -293,7 +295,7 @@ mod tests {
     #[test]
     fn test_event_name() {
         let event = ScpEvent::new(ScpEventId::SbiServer);
-        assert_eq!(event.name(), "OGS_EVENT_SBI_SERVER");
+        assert_eq!(event.name(), "NEXTGCORE_EVENT_SBI_SERVER");
     }
 
     #[test]

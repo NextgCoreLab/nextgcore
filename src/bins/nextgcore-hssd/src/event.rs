@@ -2,10 +2,10 @@
 //!
 //! Port of src/hss/hss-event.h and hss-event.c - Event definitions for HSS
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
-pub const OGS_FSM_USER_SIG: i32 = 2;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for HSS
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,8 +24,8 @@ impl HssEventId {
     /// Get the name of the event
     pub fn name(&self) -> &'static str {
         match self {
-            HssEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            HssEventId::FsmExit => "OGS_FSM_EXIT_SIG",
+            HssEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            HssEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
             HssEventId::DbiPollTimer => "HSS_EVENT_DBI_POLL_TIMER",
             HssEventId::DbiMessage => "HSS_EVENT_DBI_MESSAGE",
         }
@@ -34,8 +34,8 @@ impl HssEventId {
     /// Convert from i32 signal
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => HssEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => HssEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => HssEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => HssEventId::FsmExit,
             _ => HssEventId::DbiPollTimer, // Default
         }
     }

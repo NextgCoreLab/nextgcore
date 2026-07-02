@@ -41,15 +41,15 @@ pub fn nssf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     log::info!("Opening NSSF SBI server on {}:{}", config.addr, config.port);
 
     // Note: Initialize SELF NF instance
-    // In C: ogs_sbi_nf_instance_build_default(nf_instance)
+    // In C: nextgcore_sbi_nf_instance_build_default(nf_instance)
     // - Add allowed NF types: SCP, AMF, NSSF
     // - Build NF service for nnssf-nsselection (v2)
 
     // Note: Initialize NRF NF Instance if configured
-    // In C: ogs_sbi_nf_fsm_init(nf_instance)
+    // In C: nextgcore_sbi_nf_fsm_init(nf_instance)
 
     // Note: Setup subscription data
-    // In C: ogs_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL)
+    // In C: nextgcore_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL)
 
     // Note: Start SBI server - handled by main.rs HTTP server startup
 
@@ -69,10 +69,10 @@ pub fn nssf_sbi_close() {
     log::info!("Closing NSSF SBI server");
 
     // Note: Stop SBI client - handled by HTTP client shutdown
-    // In C: ogs_sbi_client_stop_all()
+    // In C: nextgcore_sbi_client_stop_all()
 
     // Note: Stop SBI server - handled by main.rs HTTP server shutdown
-    // In C: ogs_sbi_server_stop_all()
+    // In C: nextgcore_sbi_server_stop_all()
 
     SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
@@ -117,7 +117,7 @@ pub fn nssf_sbi_send_request(nf_instance_id: &str, request: PathSbiRequest) -> R
     );
 
     // Note: SBI request sending requires HTTP client integration
-    // In C: ogs_sbi_send_request_to_nf_instance(nf_instance, xact)
+    // In C: nextgcore_sbi_send_request_to_nf_instance(nf_instance, xact)
 
     // Return transaction ID (placeholder)
     Ok(1)
@@ -136,8 +136,8 @@ pub fn nssf_sbi_discover_and_send(
     );
 
     // Note: SBI transaction tracking and NF discovery require NRF integration
-    // In C: ogs_sbi_xact_add(...) creates a transaction
-    // In C: ogs_sbi_discover_and_send(xact) discovers and sends to target NF
+    // In C: nextgcore_sbi_xact_add(...) creates a transaction
+    // In C: nextgcore_sbi_discover_and_send(xact) discovers and sends to target NF
 
     // Return transaction ID (placeholder)
     Ok(1)

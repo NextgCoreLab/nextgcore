@@ -1,0 +1,27 @@
+# Kernel-SCTP NGAP e2e override (production remediation T0.2b)
+#
+# Runs the gNB <-> AMF N2/NGAP path over NATIVE kernel SCTP (IP proto 132)
+# instead of the default sctp-proto-over-UDP. No Open5GS — our own nextgsim gNB
+# associates with our own nextgcore AMF over real kernel SCTP, validating the
+# AMF's native kernel-SCTP backend end-to-end.
+#
+# The minimal proof needs only the amf + gnb services (the AMF answers NG Setup
+# from static config, before any NRF/UDM/AUSF dependency), so:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.kernel-sctp.yml \
+#     up -d --no-deps amf gnb
+#
+# then confirm a REAL kernel association (not a userspace false-positive):
+#   docker exec nextgcore-amf cat /proc/net/sctp/assocs
+#   docker logs nextgcore-amf | grep 'NG Setup successful'
+#
+# Requires images built from the kernel-capable binaries (Dockerfile.builder
+# now compiles amfd + nr-gnb with --features kernel-sctp) and libsctp at runtime
+# (added to Dockerfile.core and nextgsim/Dockerfile.gnb-local).
+services:
+  amf:
+    # Select the native kernel-SCTP NGAP backend at launch.
+    command: ["-c", "/etc/nextgcore/amf.yaml", "--sctp-backend", "kernel"]
+  gnb:
+    # Point the gNB at the kernel-SCTP variant config (sctp_backend: kernel).
+    command: ["-c", "/etc/nextgsim/gnb-kernel.yaml"]

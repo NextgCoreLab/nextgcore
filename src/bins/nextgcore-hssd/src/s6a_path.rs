@@ -9,18 +9,18 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
-use ogs_diameter::s6a::{self, EUtranVector};
-use ogs_diameter::{avp_code, Avp, AvpData, DiameterMessage, OGS_3GPP_VENDOR_ID};
+use nextgcore_diameter::s6a::{self, EUtranVector};
+use nextgcore_diameter::{avp_code, Avp, AvpData, DiameterMessage, NEXTGCORE_3GPP_VENDOR_ID};
 
 use crate::fd_path::diam_stats;
 
 /// S6a Application ID
-pub const OGS_DIAM_S6A_APPLICATION_ID: u32 = 16777251;
+pub const NEXTGCORE_DIAM_S6A_APPLICATION_ID: u32 = 16777251;
 
 /// 48-bit SQN mask (TS 33.102)
 const SQN_MASK: u64 = 0xFFFF_FFFF_FFFF;
 
-/// SQN increment per generated vector (matches ogs_dbi_increment_sqn step)
+/// SQN increment per generated vector (matches nextgcore_dbi_increment_sqn step)
 const SQN_STEP: u64 = 32;
 
 /// Maximum number of E-UTRAN vectors generated per AIR
@@ -55,19 +55,19 @@ impl From<u32> for CancellationType {
 }
 
 /// S6a Subscription Data Mask flags
-pub const OGS_DIAM_S6A_SUBDATA_MSISDN: u32 = 0x0001;
-pub const OGS_DIAM_S6A_SUBDATA_ARD: u32 = 0x0002;
-pub const OGS_DIAM_S6A_SUBDATA_SUB_STATUS: u32 = 0x0004;
-pub const OGS_DIAM_S6A_SUBDATA_OP_DET_BARRING: u32 = 0x0008;
-pub const OGS_DIAM_S6A_SUBDATA_NAM: u32 = 0x0010;
-pub const OGS_DIAM_S6A_SUBDATA_UEAMBR: u32 = 0x0020;
-pub const OGS_DIAM_S6A_SUBDATA_RAU_TAU_TIMER: u32 = 0x0040;
-pub const OGS_DIAM_S6A_SUBDATA_APN_CONFIG: u32 = 0x0080;
-pub const OGS_DIAM_S6A_SUBDATA_ALL: u32 = 0xFFFF;
+pub const NEXTGCORE_DIAM_S6A_SUBDATA_MSISDN: u32 = 0x0001;
+pub const NEXTGCORE_DIAM_S6A_SUBDATA_ARD: u32 = 0x0002;
+pub const NEXTGCORE_DIAM_S6A_SUBDATA_SUB_STATUS: u32 = 0x0004;
+pub const NEXTGCORE_DIAM_S6A_SUBDATA_OP_DET_BARRING: u32 = 0x0008;
+pub const NEXTGCORE_DIAM_S6A_SUBDATA_NAM: u32 = 0x0010;
+pub const NEXTGCORE_DIAM_S6A_SUBDATA_UEAMBR: u32 = 0x0020;
+pub const NEXTGCORE_DIAM_S6A_SUBDATA_RAU_TAU_TIMER: u32 = 0x0040;
+pub const NEXTGCORE_DIAM_S6A_SUBDATA_APN_CONFIG: u32 = 0x0080;
+pub const NEXTGCORE_DIAM_S6A_SUBDATA_ALL: u32 = 0xFFFF;
 
 /// S6a Result Codes
-pub const OGS_DIAM_S6A_ERROR_USER_UNKNOWN: u32 = 5001;
-pub const OGS_DIAM_S6A_AUTHENTICATION_DATA_UNAVAILABLE: u32 = 4181;
+pub const NEXTGCORE_DIAM_S6A_ERROR_USER_UNKNOWN: u32 = 5001;
+pub const NEXTGCORE_DIAM_S6A_AUTHENTICATION_DATA_UNAVAILABLE: u32 = 4181;
 
 // ============================================================================
 // Failure model (TS 29.272 7.4 + RFC 6733 7.1)
@@ -113,9 +113,9 @@ impl S6aFailure {
     }
 }
 
-fn map_dbi_error(e: &ogs_dbi::DbiError) -> S6aFailure {
+fn map_dbi_error(e: &nextgcore_dbi::DbiError) -> S6aFailure {
     match e {
-        ogs_dbi::DbiError::SubscriberNotFound(_) => S6aFailure::UserUnknown,
+        nextgcore_dbi::DbiError::SubscriberNotFound(_) => S6aFailure::UserUnknown,
         other => S6aFailure::UnableToComply(other.to_string()),
     }
 }
@@ -263,7 +263,7 @@ pub fn process_resync(
     rand: &[u8; 16],
     auts: &[u8; 14],
 ) -> Result<u64, S6aFailure> {
-    use ogs_crypt::milenage::milenage_auts;
+    use nextgcore_crypt::milenage::milenage_auts;
 
     let sqn_ms = milenage_auts(opc, k, rand, auts).map_err(|_| {
         log::warn!("AUTS re-synchronisation failed: MAC-S mismatch");
@@ -299,13 +299,13 @@ pub fn handle_air(
 ) -> Result<AirResponse, S6aFailure> {
     log::debug!("[{imsi_bcd}] Handling AIR (vectors={num_vectors})");
 
-    use ogs_crypt::kdf::ogs_auc_kasme;
-    use ogs_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
-    use ogs_dbi::{ogs_dbi_auth_info, ogs_dbi_update_sqn};
+    use nextgcore_crypt::kdf::nextgcore_auc_kasme;
+    use nextgcore_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
+    use nextgcore_dbi::{nextgcore_dbi_auth_info, nextgcore_dbi_update_sqn};
 
     // 1. Get auth info from DB (K, OPc, SQN, AMF)
     let supi = format!("imsi-{imsi_bcd}");
-    let auth_info = ogs_dbi_auth_info(&supi).map_err(|e| map_dbi_error(&e))?;
+    let auth_info = nextgcore_dbi_auth_info(&supi).map_err(|e| map_dbi_error(&e))?;
 
     // 2. Compute OPc from OP if needed
     let opc = if auth_info.use_opc {
@@ -353,7 +353,7 @@ pub fn handle_air(
         autn[6..8].copy_from_slice(&auth_info.amf);
         autn[8..16].copy_from_slice(&mac_a);
 
-        let kasme = ogs_auc_kasme(&ck, &ik, &plmn_id, &sqn_bytes, &ak);
+        let kasme = nextgcore_auc_kasme(&ck, &ik, &plmn_id, &sqn_bytes, &ak);
 
         vectors.push(EUtranVector {
             rand,
@@ -364,7 +364,7 @@ pub fn handle_air(
     }
 
     // 5. Persist the new SQN
-    ogs_dbi_update_sqn(&supi, sqn).map_err(|e| map_dbi_error(&e))?;
+    nextgcore_dbi_update_sqn(&supi, sqn).map_err(|e| map_dbi_error(&e))?;
 
     Ok(AirResponse { vectors })
 }
@@ -382,7 +382,9 @@ pub struct UlrResponse {
 
 /// Convert the database subscription record into the S6a typed model
 /// (TS 29.272 7.3.2 Subscription-Data).
-pub fn subscription_data_from_db(db: &ogs_dbi::OgsSubscriptionData) -> s6a::SubscriptionData {
+pub fn subscription_data_from_db(
+    db: &nextgcore_dbi::NextgcoreSubscriptionData,
+) -> s6a::SubscriptionData {
     let mut sub = s6a::SubscriptionData {
         subscriber_status: db.subscriber_status as u32,
         operator_determined_barring: if db.subscriber_status == 1 {
@@ -448,14 +450,14 @@ pub fn handle_ulr(
 ) -> Result<UlrResponse, S6aFailure> {
     log::debug!("[{imsi_bcd}] Handling ULR from {mme_host}.{mme_realm} (flags={ulr_flags:#x})");
 
-    use ogs_dbi::{ogs_dbi_subscription_data, ogs_dbi_update_mme};
+    use nextgcore_dbi::{nextgcore_dbi_subscription_data, nextgcore_dbi_update_mme};
 
     // 1. Update serving MME in DB
     let supi = format!("imsi-{imsi_bcd}");
-    ogs_dbi_update_mme(&supi, mme_host, mme_realm, true).map_err(|e| map_dbi_error(&e))?;
+    nextgcore_dbi_update_mme(&supi, mme_host, mme_realm, true).map_err(|e| map_dbi_error(&e))?;
 
     // 2. Get subscription data from DB
-    let db_data = ogs_dbi_subscription_data(&supi).map_err(|e| map_dbi_error(&e))?;
+    let db_data = nextgcore_dbi_subscription_data(&supi).map_err(|e| map_dbi_error(&e))?;
 
     // 3. Convert to S6a Subscription-Data; a subscriber without any APN
     //    configuration has no EPS subscription (TS 29.272 5.2.1.1.3)
@@ -485,7 +487,7 @@ pub struct PurResponse {
 pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, S6aFailure> {
     log::debug!("[{imsi_bcd}] Handling PUR (flags={pur_flags:#x})");
 
-    use ogs_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
+    use nextgcore_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
 
     let collection = get_subscriber_collection()
         .map_err(|e| S6aFailure::UnableToComply(format!("subscriber collection: {e}")))?;
@@ -569,7 +571,7 @@ pub fn build_aia_answer(request: &DiameterMessage, resp: &AirResponse) -> Diamet
         .collect();
     answer.add_avp(Avp::vendor_mandatory(
         s6a::avp::AUTHENTICATION_INFO,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Grouped(vector_avps),
     ));
     answer
@@ -591,7 +593,7 @@ pub fn build_ula_answer(request: &DiameterMessage, resp: &UlrResponse) -> Diamet
     // ULA-Flags: Separation Indication (TS 29.272 7.3.8)
     answer.add_avp(Avp::vendor_mandatory(
         s6a::avp::ULA_FLAGS,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Unsigned32(1),
     ));
     answer.add_avp(s6a::build_subscription_data_avp(&resp.subscription_data));
@@ -612,7 +614,7 @@ pub fn build_pua_answer(request: &DiameterMessage, resp: &PurResponse) -> Diamet
     add_origin_avps(&mut answer);
     answer.add_avp(Avp::vendor_mandatory(
         s6a::avp::PUA_FLAGS,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Unsigned32(resp.pua_flags),
     ));
     answer
@@ -656,7 +658,7 @@ pub fn build_failure_answer(request: &DiameterMessage, failure: &S6aFailure) -> 
 /// [`dispatch_s6a_request_async`], which moves the work off the Diameter
 /// dispatch thread.
 pub fn dispatch_s6a_request(request: &DiameterMessage) -> Option<DiameterMessage> {
-    use ogs_diameter::s6a::{avp as s6a_avp, cmd};
+    use nextgcore_diameter::s6a::{avp as s6a_avp, cmd};
 
     let cmd_code = request.header.command_code;
 
@@ -687,7 +689,7 @@ pub fn dispatch_s6a_request(request: &DiameterMessage) -> Option<DiameterMessage
 
             // Visited-PLMN-Id is mandatory in AIR (TS 29.272 Table 7.2.5/1)
             let Some(visited_plmn_id) = request
-                .find_vendor_avp(s6a_avp::VISITED_PLMN_ID, OGS_3GPP_VENDOR_ID)
+                .find_vendor_avp(s6a_avp::VISITED_PLMN_ID, NEXTGCORE_3GPP_VENDOR_ID)
                 .and_then(|a| a.as_octet_string())
                 .map(|b| b.to_vec())
             else {
@@ -723,7 +725,7 @@ pub fn dispatch_s6a_request(request: &DiameterMessage) -> Option<DiameterMessage
             // Visited-PLMN-Id, RAT-Type and ULR-Flags are mandatory in ULR
             // (TS 29.272 Table 7.2.3/1)
             let Some(visited_plmn_id) = request
-                .find_vendor_avp(s6a_avp::VISITED_PLMN_ID, OGS_3GPP_VENDOR_ID)
+                .find_vendor_avp(s6a_avp::VISITED_PLMN_ID, NEXTGCORE_3GPP_VENDOR_ID)
                 .and_then(|a| a.as_octet_string())
                 .map(|b| b.to_vec())
             else {
@@ -731,14 +733,17 @@ pub fn dispatch_s6a_request(request: &DiameterMessage) -> Option<DiameterMessage
                 return Some(build_failure_answer(request, &S6aFailure::MissingAvp));
             };
             if request
-                .find_vendor_avp(ogs_diameter::common::avp_code::RAT_TYPE, OGS_3GPP_VENDOR_ID)
+                .find_vendor_avp(
+                    nextgcore_diameter::common::avp_code::RAT_TYPE,
+                    NEXTGCORE_3GPP_VENDOR_ID,
+                )
                 .is_none()
             {
                 diam_stats().s6a.inc_rx_ulr_error();
                 return Some(build_failure_answer(request, &S6aFailure::MissingAvp));
             }
             let Some(ulr_flags_val) = request
-                .find_vendor_avp(s6a_avp::ULR_FLAGS, OGS_3GPP_VENDOR_ID)
+                .find_vendor_avp(s6a_avp::ULR_FLAGS, NEXTGCORE_3GPP_VENDOR_ID)
                 .and_then(|a| a.as_u32())
             else {
                 diam_stats().s6a.inc_rx_ulr_error();
@@ -772,7 +777,7 @@ pub fn dispatch_s6a_request(request: &DiameterMessage) -> Option<DiameterMessage
 
             // PUR-Flags is optional in PUR (TS 29.272 Table 7.2.13/1)
             let pur_flags = request
-                .find_vendor_avp(s6a_avp::PUR_FLAGS, OGS_3GPP_VENDOR_ID)
+                .find_vendor_avp(s6a_avp::PUR_FLAGS, NEXTGCORE_3GPP_VENDOR_ID)
                 .and_then(|a| a.as_u32())
                 .unwrap_or(0);
 
@@ -813,7 +818,7 @@ pub async fn dispatch_s6a_request_async(request: DiameterMessage) -> Option<Diam
 
 /// Handle an answer to an HSS-initiated request (CLA / IDA).
 pub fn handle_s6a_answer(answer: &DiameterMessage) {
-    use ogs_diameter::s6a::cmd;
+    use nextgcore_diameter::s6a::cmd;
     let result_code = answer.result_code();
     let exp_code = s6a::experimental_result_code(answer);
     let success = result_code == Some(2001);
@@ -850,9 +855,9 @@ pub fn handle_s6a_answer(answer: &DiameterMessage) {
 /// [`hss_s6a_send_clr`]/[`hss_s6a_send_idr`] over the peer's connection.
 pub async fn hss_s6a_run_server(
     addr: std::net::SocketAddr,
-    config: ogs_diameter::config::DiameterConfig,
+    config: nextgcore_diameter::config::DiameterConfig,
 ) -> Result<(), String> {
-    use ogs_diameter::transport::DiameterListener;
+    use nextgcore_diameter::transport::DiameterListener;
 
     let listener = DiameterListener::bind(addr)
         .await
@@ -863,8 +868,8 @@ pub async fn hss_s6a_run_server(
 
 /// Serve S6a on an already-bound listener (see [`hss_s6a_run_server`]).
 pub async fn hss_s6a_serve(
-    listener: ogs_diameter::transport::DiameterListener,
-    config: ogs_diameter::config::DiameterConfig,
+    listener: nextgcore_diameter::transport::DiameterListener,
+    config: nextgcore_diameter::config::DiameterConfig,
 ) -> Result<(), String> {
     hss_s6a_set_identity(&config.diameter_id, &config.diameter_realm);
 
@@ -885,10 +890,10 @@ pub async fn hss_s6a_serve(
 }
 
 async fn run_s6a_peer(
-    transport: ogs_diameter::transport::DiameterTransport,
-    config: ogs_diameter::config::DiameterConfig,
+    transport: nextgcore_diameter::transport::DiameterTransport,
+    config: nextgcore_diameter::config::DiameterConfig,
 ) -> Result<(), String> {
-    use ogs_diameter::peer::{DiameterPeer, PeerEvent};
+    use nextgcore_diameter::peer::{DiameterPeer, PeerEvent};
 
     let mut peer = DiameterPeer::new_responder(transport, &config);
     peer.start().await.map_err(|e| e.to_string())?;
@@ -938,7 +943,7 @@ async fn run_s6a_peer(
 ///
 /// NOTE: blocking MongoDB I/O; call from a blocking-safe context.
 fn lookup_serving_mme(imsi_bcd: &str) -> Result<(String, String), String> {
-    use ogs_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
+    use nextgcore_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
 
     let collection = get_subscriber_collection()
         .map_err(|e| format!("Failed to get subscriber collection: {e}"))?;
@@ -969,7 +974,7 @@ pub fn build_clr_request(
     cancellation_type: CancellationType,
     clr_flags: Option<u32>,
 ) -> DiameterMessage {
-    use ogs_diameter::s6a::{avp, cmd};
+    use nextgcore_diameter::s6a::{avp, cmd};
 
     let mut msg = DiameterMessage::new_request(cmd::CANCEL_LOCATION, s6a::S6A_APPLICATION_ID);
     let (hbh, e2e) = next_request_ids();
@@ -999,13 +1004,13 @@ pub fn build_clr_request(
     ));
     msg.add_avp(Avp::vendor_mandatory(
         avp::CANCELLATION_TYPE,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Enumerated(cancellation_type as i32),
     ));
     if let Some(flags) = clr_flags {
         msg.add_avp(Avp::vendor_mandatory(
             avp::CLR_FLAGS,
-            OGS_3GPP_VENDOR_ID,
+            NEXTGCORE_3GPP_VENDOR_ID,
             AvpData::Unsigned32(flags),
         ));
     }
@@ -1024,28 +1029,28 @@ pub fn build_idr_request(
     subscription_data: &s6a::SubscriptionData,
     subdata_mask: u32,
 ) -> DiameterMessage {
-    use ogs_diameter::s6a::{avp, cmd};
+    use nextgcore_diameter::s6a::{avp, cmd};
 
     // Apply the subdata mask
     let mut sub = subscription_data.clone();
-    if subdata_mask & OGS_DIAM_S6A_SUBDATA_MSISDN == 0 {
+    if subdata_mask & NEXTGCORE_DIAM_S6A_SUBDATA_MSISDN == 0 {
         sub.msisdn.clear();
         sub.a_msisdn.clear();
     }
-    if subdata_mask & OGS_DIAM_S6A_SUBDATA_ARD == 0 {
+    if subdata_mask & NEXTGCORE_DIAM_S6A_SUBDATA_ARD == 0 {
         sub.access_restriction_data = None;
     }
-    if subdata_mask & OGS_DIAM_S6A_SUBDATA_OP_DET_BARRING == 0 {
+    if subdata_mask & NEXTGCORE_DIAM_S6A_SUBDATA_OP_DET_BARRING == 0 {
         sub.operator_determined_barring = None;
     }
-    if subdata_mask & OGS_DIAM_S6A_SUBDATA_RAU_TAU_TIMER == 0 {
+    if subdata_mask & NEXTGCORE_DIAM_S6A_SUBDATA_RAU_TAU_TIMER == 0 {
         sub.subscribed_rau_tau_timer = 0;
     }
-    if subdata_mask & OGS_DIAM_S6A_SUBDATA_UEAMBR == 0 {
+    if subdata_mask & NEXTGCORE_DIAM_S6A_SUBDATA_UEAMBR == 0 {
         sub.ambr_uplink = 0;
         sub.ambr_downlink = 0;
     }
-    if subdata_mask & OGS_DIAM_S6A_SUBDATA_APN_CONFIG == 0 {
+    if subdata_mask & NEXTGCORE_DIAM_S6A_SUBDATA_APN_CONFIG == 0 {
         sub.apn_configs.clear();
     }
 
@@ -1081,7 +1086,7 @@ pub fn build_idr_request(
     if idr_flags != 0 {
         msg.add_avp(Avp::vendor_mandatory(
             avp::IDR_FLAGS,
-            OGS_3GPP_VENDOR_ID,
+            NEXTGCORE_3GPP_VENDOR_ID,
             AvpData::Unsigned32(idr_flags),
         ));
     }
@@ -1128,12 +1133,12 @@ pub fn hss_s6a_send_idr(imsi_bcd: &str, idr_flags: u32, subdata_mask: u32) -> Re
         "[{imsi_bcd}] Sending Insert-Subscriber-Data-Request (flags={idr_flags:#x}, mask={subdata_mask:#x})"
     );
 
-    use ogs_dbi::ogs_dbi_subscription_data;
+    use nextgcore_dbi::nextgcore_dbi_subscription_data;
 
     let (dest_host, dest_realm) = lookup_serving_mme(imsi_bcd)?;
 
     let supi = format!("imsi-{imsi_bcd}");
-    let db_data = ogs_dbi_subscription_data(&supi)
+    let db_data = nextgcore_dbi_subscription_data(&supi)
         .map_err(|e| format!("Failed to get subscription data: {e}"))?;
     let subscription_data = subscription_data_from_db(&db_data);
 
@@ -1155,7 +1160,7 @@ pub fn hss_s6a_send_idr(imsi_bcd: &str, idr_flags: u32, subdata_mask: u32) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ogs_crypt::milenage::{milenage_f1, milenage_f2345};
+    use nextgcore_crypt::milenage::{milenage_f1, milenage_f2345};
 
     #[test]
     fn test_cancellation_type_from_u32() {
@@ -1228,31 +1233,34 @@ mod tests {
 
     #[test]
     fn test_subscription_data_from_db_mapping() {
-        use ogs_dbi::{OgsAmbr, OgsArp, OgsQos, OgsSession, OgsSliceData, OgsSubscriptionData};
+        use nextgcore_dbi::{
+            NextgcoreAmbr, NextgcoreArp, NextgcoreQos, NextgcoreSession, NextgcoreSliceData,
+            NextgcoreSubscriptionData,
+        };
 
-        let db = OgsSubscriptionData {
+        let db = NextgcoreSubscriptionData {
             subscriber_status: 0,
             network_access_mode: 2,
             subscribed_rau_tau_timer: 12, // minutes
             access_restriction_data: 0x20,
-            ambr: OgsAmbr {
+            ambr: NextgcoreAmbr {
                 uplink: 50_000_000,
                 downlink: 100_000_000,
             },
-            slice: vec![OgsSliceData {
-                session: vec![OgsSession {
+            slice: vec![NextgcoreSliceData {
+                session: vec![NextgcoreSession {
                     name: Some("internet".to_string()),
                     session_type: 3, // IPv4v6
-                    qos: OgsQos {
+                    qos: NextgcoreQos {
                         index: 9,
-                        arp: OgsArp {
+                        arp: NextgcoreArp {
                             priority_level: 8,
                             pre_emption_capability: 0,
                             pre_emption_vulnerability: 1,
                         },
                         ..Default::default()
                     },
-                    ambr: OgsAmbr {
+                    ambr: NextgcoreAmbr {
                         uplink: 1_000_000,
                         downlink: 2_000_000,
                     },
@@ -1272,7 +1280,10 @@ mod tests {
         let apn = &sub.apn_configs[0];
         assert_eq!(apn.context_identifier, 1);
         assert_eq!(apn.service_selection, "internet");
-        assert_eq!(apn.pdn_type, ogs_diameter::s6a::pdn_type::IPV4V6 as u8);
+        assert_eq!(
+            apn.pdn_type,
+            nextgcore_diameter::s6a::pdn_type::IPV4V6 as u8
+        );
         assert_eq!(apn.qci, 9);
         assert_eq!(apn.arp_priority_level, 8);
         assert!(!apn.arp_pre_emption_capability);
@@ -1280,7 +1291,7 @@ mod tests {
     }
 
     fn make_air() -> DiameterMessage {
-        ogs_diameter::s6a::create_air(
+        nextgcore_diameter::s6a::create_air(
             "test-session-1",
             "mme.epc.mnc001.mcc001.3gppnetwork.org",
             "epc.mnc001.mcc001.3gppnetwork.org",
@@ -1320,7 +1331,7 @@ mod tests {
         let decoded = DiameterMessage::decode(&mut bytes).unwrap();
         assert_eq!(decoded.result_code(), Some(2001));
 
-        let vectors = ogs_diameter::s6a::parse_authentication_info(&decoded);
+        let vectors = nextgcore_diameter::s6a::parse_authentication_info(&decoded);
         assert_eq!(vectors.len(), 2);
         assert_eq!(vectors[0].rand, [1; 16]);
         assert_eq!(vectors[1].kasme, [8; 32]);
@@ -1329,7 +1340,7 @@ mod tests {
     /// ULA Subscription-Data must be a real grouped AVP that survives the wire.
     #[test]
     fn test_build_ula_answer_wire_roundtrip() {
-        let ulr = ogs_diameter::s6a::create_ulr(
+        let ulr = nextgcore_diameter::s6a::create_ulr(
             "test-session-2",
             "mme.epc.mnc001.mcc001.3gppnetwork.org",
             "epc.mnc001.mcc001.3gppnetwork.org",
@@ -1339,7 +1350,7 @@ mod tests {
             0x22,
             1004,
         );
-        let mut sub = ogs_diameter::s6a::SubscriptionData {
+        let mut sub = nextgcore_diameter::s6a::SubscriptionData {
             network_access_mode: 2,
             subscribed_rau_tau_timer: 720,
             ambr_uplink: 50_000_000,
@@ -1348,18 +1359,19 @@ mod tests {
             all_apn_configs_included: true,
             ..Default::default()
         };
-        sub.apn_configs.push(ogs_diameter::s6a::ApnConfiguration {
-            context_identifier: 1,
-            service_selection: "internet".to_string(),
-            pdn_type: ogs_diameter::s6a::pdn_type::IPV4V6 as u8,
-            qci: 9,
-            arp_priority_level: 8,
-            arp_pre_emption_capability: false,
-            arp_pre_emption_vulnerability: true,
-            ambr_uplink: 50_000_000,
-            ambr_downlink: 100_000_000,
-            charging_characteristics: None,
-        });
+        sub.apn_configs
+            .push(nextgcore_diameter::s6a::ApnConfiguration {
+                context_identifier: 1,
+                service_selection: "internet".to_string(),
+                pdn_type: nextgcore_diameter::s6a::pdn_type::IPV4V6 as u8,
+                qci: 9,
+                arp_priority_level: 8,
+                arp_pre_emption_capability: false,
+                arp_pre_emption_vulnerability: true,
+                ambr_uplink: 50_000_000,
+                ambr_downlink: 100_000_000,
+                charging_characteristics: None,
+            });
         let resp = UlrResponse {
             subscription_data: sub.clone(),
         };
@@ -1371,25 +1383,25 @@ mod tests {
 
         assert_eq!(decoded.result_code(), Some(2001));
         let sub_avp = decoded
-            .find_avp(ogs_diameter::s6a::avp::SUBSCRIPTION_DATA)
+            .find_avp(nextgcore_diameter::s6a::avp::SUBSCRIPTION_DATA)
             .expect("Subscription-Data AVP");
         assert!(sub_avp.is_vendor_specific());
-        let parsed = ogs_diameter::s6a::parse_subscription_data_avp(sub_avp);
+        let parsed = nextgcore_diameter::s6a::parse_subscription_data_avp(sub_avp);
         assert_eq!(parsed, sub);
     }
 
     #[test]
     fn test_build_pua_answer_has_pua_flags() {
         let mut pur = DiameterMessage::new_request(
-            ogs_diameter::s6a::cmd::PURGE_UE,
-            OGS_DIAM_S6A_APPLICATION_ID,
+            nextgcore_diameter::s6a::cmd::PURGE_UE,
+            NEXTGCORE_DIAM_S6A_APPLICATION_ID,
         );
         pur.add_avp(Avp::mandatory(
             avp_code::SESSION_ID,
             AvpData::Utf8String("pur-session".to_string()),
         ));
         let resp = PurResponse {
-            pua_flags: ogs_diameter::s6a::pua_flags::FREEZE_MTMSI,
+            pua_flags: nextgcore_diameter::s6a::pua_flags::FREEZE_MTMSI,
         };
         let pua = build_pua_answer(&pur, &resp);
 
@@ -1397,9 +1409,15 @@ mod tests {
         let mut bytes = encoded.freeze();
         let decoded = DiameterMessage::decode(&mut bytes).unwrap();
         let flags = decoded
-            .find_vendor_avp(ogs_diameter::s6a::avp::PUA_FLAGS, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(
+                nextgcore_diameter::s6a::avp::PUA_FLAGS,
+                NEXTGCORE_3GPP_VENDOR_ID,
+            )
             .and_then(|a| a.as_u32());
-        assert_eq!(flags, Some(ogs_diameter::s6a::pua_flags::FREEZE_MTMSI));
+        assert_eq!(
+            flags,
+            Some(nextgcore_diameter::s6a::pua_flags::FREEZE_MTMSI)
+        );
     }
 
     #[test]
@@ -1410,7 +1428,7 @@ mod tests {
         let answer = build_failure_answer(&air, &S6aFailure::UserUnknown);
         assert_eq!(answer.result_code(), None);
         assert_eq!(
-            ogs_diameter::s6a::experimental_result_code(&answer),
+            nextgcore_diameter::s6a::experimental_result_code(&answer),
             Some(5001)
         );
         assert!(!answer.header.is_error());
@@ -1428,7 +1446,7 @@ mod tests {
         // Resync failure: Experimental 4181
         let answer = build_failure_answer(&air, &S6aFailure::AuthDataUnavailable);
         assert_eq!(
-            ogs_diameter::s6a::experimental_result_code(&answer),
+            nextgcore_diameter::s6a::experimental_result_code(&answer),
             Some(4181)
         );
     }
@@ -1447,7 +1465,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_s6a_missing_username() {
-        let mut msg = DiameterMessage::new_request(318, OGS_DIAM_S6A_APPLICATION_ID);
+        let mut msg = DiameterMessage::new_request(318, NEXTGCORE_DIAM_S6A_APPLICATION_ID);
         msg.add_avp(Avp::mandatory(
             avp_code::SESSION_ID,
             AvpData::Utf8String("test-session".to_string()),
@@ -1458,7 +1476,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_s6a_air_missing_visited_plmn() {
-        let mut msg = DiameterMessage::new_request(318, OGS_DIAM_S6A_APPLICATION_ID);
+        let mut msg = DiameterMessage::new_request(318, NEXTGCORE_DIAM_S6A_APPLICATION_ID);
         msg.add_avp(Avp::mandatory(
             avp_code::SESSION_ID,
             AvpData::Utf8String("test-session".to_string()),
@@ -1473,7 +1491,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_s6a_air_missing_requested_auth_info() {
-        let mut msg = DiameterMessage::new_request(318, OGS_DIAM_S6A_APPLICATION_ID);
+        let mut msg = DiameterMessage::new_request(318, NEXTGCORE_DIAM_S6A_APPLICATION_ID);
         msg.add_avp(Avp::mandatory(
             avp_code::SESSION_ID,
             AvpData::Utf8String("test-session".to_string()),
@@ -1483,8 +1501,8 @@ mod tests {
             AvpData::Utf8String("001010123456789".to_string()),
         ));
         msg.add_avp(Avp::vendor_mandatory(
-            ogs_diameter::s6a::avp::VISITED_PLMN_ID,
-            OGS_3GPP_VENDOR_ID,
+            nextgcore_diameter::s6a::avp::VISITED_PLMN_ID,
+            NEXTGCORE_3GPP_VENDOR_ID,
             AvpData::OctetString(bytes::Bytes::from_static(&[0x00, 0xF1, 0x10])),
         ));
         let answer = dispatch_s6a_request(&msg).unwrap();
@@ -1494,7 +1512,7 @@ mod tests {
     #[test]
     fn test_dispatch_s6a_ulr_missing_mandatory_avps() {
         // ULR without RAT-Type / ULR-Flags / Visited-PLMN-Id -> 5005
-        let mut msg = DiameterMessage::new_request(316, OGS_DIAM_S6A_APPLICATION_ID);
+        let mut msg = DiameterMessage::new_request(316, NEXTGCORE_DIAM_S6A_APPLICATION_ID);
         msg.add_avp(Avp::mandatory(
             avp_code::SESSION_ID,
             AvpData::Utf8String("test-session".to_string()),
@@ -1509,7 +1527,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_s6a_unknown_command() {
-        let mut msg = DiameterMessage::new_request(999, OGS_DIAM_S6A_APPLICATION_ID);
+        let mut msg = DiameterMessage::new_request(999, NEXTGCORE_DIAM_S6A_APPLICATION_ID);
         msg.add_avp(Avp::mandatory(
             avp_code::USER_NAME,
             AvpData::Utf8String("001010123456789".to_string()),
@@ -1526,7 +1544,7 @@ mod tests {
             "mme.example.com",
             "example.com",
             CancellationType::SubscriptionWithdrawal,
-            Some(ogs_diameter::s6a::clr_flags::REATTACH_REQUIRED),
+            Some(nextgcore_diameter::s6a::clr_flags::REATTACH_REQUIRED),
         );
         assert!(clr.header.is_request());
         assert_eq!(clr.header.command_code, 317);
@@ -1537,69 +1555,76 @@ mod tests {
         assert_eq!(clr.destination_realm(), Some("example.com"));
         let ct = clr
             .find_vendor_avp(
-                ogs_diameter::s6a::avp::CANCELLATION_TYPE,
-                OGS_3GPP_VENDOR_ID,
+                nextgcore_diameter::s6a::avp::CANCELLATION_TYPE,
+                NEXTGCORE_3GPP_VENDOR_ID,
             )
             .and_then(|a| a.as_i32());
         assert_eq!(ct, Some(2));
         let flags = clr
-            .find_vendor_avp(ogs_diameter::s6a::avp::CLR_FLAGS, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(
+                nextgcore_diameter::s6a::avp::CLR_FLAGS,
+                NEXTGCORE_3GPP_VENDOR_ID,
+            )
             .and_then(|a| a.as_u32());
-        assert_eq!(flags, Some(ogs_diameter::s6a::clr_flags::REATTACH_REQUIRED));
+        assert_eq!(
+            flags,
+            Some(nextgcore_diameter::s6a::clr_flags::REATTACH_REQUIRED)
+        );
     }
 
     #[test]
     fn test_build_idr_request_carries_subscription_data() {
-        let mut sub = ogs_diameter::s6a::SubscriptionData {
+        let mut sub = nextgcore_diameter::s6a::SubscriptionData {
             ambr_uplink: 1000,
             ambr_downlink: 2000,
             ..Default::default()
         };
-        sub.apn_configs.push(ogs_diameter::s6a::ApnConfiguration {
-            context_identifier: 1,
-            service_selection: "internet".to_string(),
-            ..Default::default()
-        });
+        sub.apn_configs
+            .push(nextgcore_diameter::s6a::ApnConfiguration {
+                context_identifier: 1,
+                service_selection: "internet".to_string(),
+                ..Default::default()
+            });
         let idr = build_idr_request(
             "001010123456789",
             "mme.example.com",
             "example.com",
-            ogs_diameter::s6a::idr_flags::RAT_TYPE,
+            nextgcore_diameter::s6a::idr_flags::RAT_TYPE,
             &sub,
-            OGS_DIAM_S6A_SUBDATA_ALL,
+            NEXTGCORE_DIAM_S6A_SUBDATA_ALL,
         );
         assert_eq!(idr.header.command_code, 319);
         // Subscription-Data must be present (M in IDR) and parse back
         let sub_avp = idr
-            .find_avp(ogs_diameter::s6a::avp::SUBSCRIPTION_DATA)
+            .find_avp(nextgcore_diameter::s6a::avp::SUBSCRIPTION_DATA)
             .expect("Subscription-Data");
-        let parsed = ogs_diameter::s6a::parse_subscription_data_avp(sub_avp);
+        let parsed = nextgcore_diameter::s6a::parse_subscription_data_avp(sub_avp);
         assert_eq!(parsed.ambr_uplink, 1000);
         assert_eq!(parsed.apn_configs.len(), 1);
     }
 
     #[test]
     fn test_build_idr_request_subdata_mask_filters() {
-        let mut sub = ogs_diameter::s6a::SubscriptionData {
+        let mut sub = nextgcore_diameter::s6a::SubscriptionData {
             ambr_uplink: 1000,
             ambr_downlink: 2000,
             subscribed_rau_tau_timer: 720,
             ..Default::default()
         };
         sub.apn_configs
-            .push(ogs_diameter::s6a::ApnConfiguration::default());
+            .push(nextgcore_diameter::s6a::ApnConfiguration::default());
         let idr = build_idr_request(
             "001010123456789",
             "mme.example.com",
             "example.com",
             0,
             &sub,
-            OGS_DIAM_S6A_SUBDATA_UEAMBR, // only the UE-AMBR
+            NEXTGCORE_DIAM_S6A_SUBDATA_UEAMBR, // only the UE-AMBR
         );
         let sub_avp = idr
-            .find_avp(ogs_diameter::s6a::avp::SUBSCRIPTION_DATA)
+            .find_avp(nextgcore_diameter::s6a::avp::SUBSCRIPTION_DATA)
             .unwrap();
-        let parsed = ogs_diameter::s6a::parse_subscription_data_avp(sub_avp);
+        let parsed = nextgcore_diameter::s6a::parse_subscription_data_avp(sub_avp);
         assert_eq!(parsed.ambr_uplink, 1000);
         assert_eq!(parsed.subscribed_rau_tau_timer, 0);
         assert!(parsed.apn_configs.is_empty());
@@ -1642,7 +1667,7 @@ mod tests {
     #[test]
     fn test_send_idr_without_db_fails() {
         // IDR requires the subscriber DB; without it the call must error
-        let result = hss_s6a_send_idr("123456789012345", 0, OGS_DIAM_S6A_SUBDATA_ALL);
+        let result = hss_s6a_send_idr("123456789012345", 0, NEXTGCORE_DIAM_S6A_SUBDATA_ALL);
         assert!(result.is_err());
     }
 
@@ -1683,8 +1708,8 @@ mod tests {
     /// connected MME peer and answered with a CLA.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_s6a_server_end_to_end_air_and_clr() {
-        use ogs_diameter::config::DiameterConfig;
-        use ogs_diameter::transport::{DiameterClient, DiameterListener};
+        use nextgcore_diameter::config::DiameterConfig;
+        use nextgcore_diameter::transport::{DiameterClient, DiameterListener};
 
         let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
             .await
@@ -1712,7 +1737,7 @@ mod tests {
         client.connect().await.unwrap();
 
         // AIR -> answered (no DB: well-formed failure, never silence)
-        let air = ogs_diameter::s6a::create_air(
+        let air = nextgcore_diameter::s6a::create_air(
             "e2e-session-1",
             "mme.e2e.example.org",
             "e2e.example.org",
@@ -1753,8 +1778,8 @@ mod tests {
         assert_eq!(inbound.user_name(), Some("001010000000042"));
         let ct = inbound
             .find_vendor_avp(
-                ogs_diameter::s6a::avp::CANCELLATION_TYPE,
-                OGS_3GPP_VENDOR_ID,
+                nextgcore_diameter::s6a::avp::CANCELLATION_TYPE,
+                NEXTGCORE_3GPP_VENDOR_ID,
             )
             .and_then(|a| a.as_i32());
         assert_eq!(ct, Some(CancellationType::SubscriptionWithdrawal as i32));

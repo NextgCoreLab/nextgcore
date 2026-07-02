@@ -80,6 +80,10 @@ impl ChildSepp {
         if prins {
             cmd.arg("--prins");
         }
+        // sepp-10: these peer SEPPs run over plaintext HTTP (no N32-c TLS), so
+        // permit the deterministic no-TLS N32-f key-derivation fallback. In
+        // production this is off and exchange-params requires the TLS exporter.
+        cmd.arg("--allow-insecure-no-tls");
         if let Some(peer) = peer {
             cmd.args(["--peer-sepp", peer]);
         }
@@ -122,6 +126,9 @@ impl Drop for ChildSepp {
 
 /// Configure the in-process SEPP-A identity and capabilities
 fn configure_local_sepp(tls: bool, prins: bool) {
+    // sepp-10: the in-process SEPP-A also runs over plaintext HTTP here, so
+    // permit the no-TLS N32-f key-derivation fallback (off by default).
+    nextgcore_seppd::n32c_handler::set_allow_insecure_no_tls(true);
     let ctx = sepp_self();
     let mut context = ctx.write().expect("context lock");
     if !context.is_initialized() {
@@ -136,11 +143,11 @@ fn configure_local_sepp(tls: bool, prins: bool) {
 async fn raw_post(api_root: &str, path: &str, body: String) -> (u16, String) {
     let rest = api_root.strip_prefix("http://").expect("http api root");
     let (host, port) = rest.split_once(':').expect("host:port");
-    let config = ogs_sbi::client::SbiClientConfig::new(host, port.parse().unwrap())
+    let config = nextgcore_sbi::client::SbiClientConfig::new(host, port.parse().unwrap())
         .with_connect_timeout(Duration::from_secs(3))
         .with_request_timeout(Duration::from_secs(5));
-    let client = ogs_sbi::client::SbiClient::new(config);
-    let mut request = ogs_sbi::message::SbiRequest::post(path);
+    let client = nextgcore_sbi::client::SbiClient::new(config);
+    let mut request = nextgcore_sbi::message::SbiRequest::post(path);
     request.http.set_content(body);
     request.http.set_header("Content-Type", "application/json");
     let response = client.send_request(request).await.expect("raw POST");
@@ -193,39 +200,53 @@ async fn two_sepp_n32_handshake_and_forwarding() {
         assert!(!security.local_context_id.is_empty());
         assert!(!security.peer_context_id.is_empty());
         assert_eq!(security.jwe_cipher_suite, "A256GCM");
-        assert_eq!(security.jws_cipher_suite, "HS256");
+        // modificationsBlock is signed with the asymmetric ES256 key
+        // (TS 33.501 §13.2.4.6), not the symmetric session key.
+        assert_eq!(security.jws_cipher_suite, "ES256");
         // Peer learned our serving PLMN list (sent in the handshake)
         // and we learned the peer's (configured as 999:70 on the child)
         assert!(node.has_plmn_id(999, 70), "peer serving PLMNs not learned");
 
         // ------------------------------------------------------------------
-        // Phase 2: PRINS-protected N32-f forward round trip
+        // Phase 2: full PRINS request + response round trip (TS 29.573
+        // §6.2.4.2). The receiving SEPP (B1) unprotects the request, forwards
+        // it to the target NF — here routed back to B1's own HTTP server via
+        // 3gpp-Sbi-Target-apiRoot — then PRINS-protects the NF's HTTP response
+        // as an N32fReformattedRspMsg and returns it; forward_via_n32f
+        // unprotects that response. B1 exposes no /nudm-sdm resource, so it
+        // answers 404 RESOURCE_NOT_FOUND: end-to-end proof that the request
+        // path was reconstructed + forwarded and the response was PRINS-
+        // protected, returned, and unprotected.
         // ------------------------------------------------------------------
         let body = serde_json::json!({
             "supi": "imsi-999700000000001",
             "nssai": {"sst": 1}
         });
-        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            // Route the reconstructed request back to B1's own HTTP server.
+            ("3gpp-Sbi-Target-apiRoot".to_string(), b1.api_root()),
+        ];
+        // Include a query string so the spec RequestLine (sepp-03,
+        // scheme/authority/path/queryFragment) round-trips over real HTTP.
+        let forward_url = "/nudm-sdm/v1/supi?supported-features=1";
         let (status, rsp_body) = forward_via_n32f(
             outcome.node_id,
             "POST",
-            "/nudm-sdm/v1/supi",
+            forward_url,
             &headers,
             Some(serde_json::to_vec(&body).unwrap().as_slice()),
             None,
         )
         .await
-        .expect("N32-f forward");
-        assert_eq!(status, 200, "peer rejected protected message: {rsp_body}");
-
-        let rec: ReconstructedJson = serde_json::from_str(&rsp_body).unwrap();
-        assert_eq!(rec.method, "POST");
-        assert_eq!(rec.url, "/nudm-sdm/v1/supi");
-        assert!(rec.message_id.is_some());
-        let rec_body = b64url_decode(&rec.body.expect("body")).unwrap();
-        let rec_json: serde_json::Value = serde_json::from_slice(&rec_body).unwrap();
-        assert_eq!(rec_json["supi"], "imsi-999700000000001");
-        assert_eq!(rec_json["nssai"]["sst"], 1);
+        .expect("N32-f forward round trip");
+        // The unprotected response is the target NF's (B1's) answer to the
+        // forwarded request.
+        assert_eq!(status, 404, "unexpected N32-f response status: {rsp_body}");
+        assert!(
+            rsp_body.contains("RESOURCE_NOT_FOUND"),
+            "expected forwarded 404 from target NF, got: {rsp_body}"
+        );
 
         // ------------------------------------------------------------------
         // Phase 3: tampered message -> 400 + n32f-error report back to A
@@ -362,7 +383,7 @@ async fn two_sepp_n32_handshake_and_forwarding() {
         );
         let sec_b3 = node_b3.n32f_security.unwrap();
         assert_eq!(sec_b3.jwe_cipher_suite, "A256GCM");
-        assert_eq!(sec_b3.jws_cipher_suite, "HS256");
+        assert_eq!(sec_b3.jws_cipher_suite, "ES256");
 
         let _ = a_server.stop().await;
         drop(b1);

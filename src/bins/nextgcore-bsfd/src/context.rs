@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use ogs_dbi::mongoc::{ogs_mongoc, DbiResult};
+use nextgcore_dbi::mongoc::{nextgcore_mongoc, DbiResult};
 
 /// Maximum number of IP addresses for PCF
 pub const MAX_NUM_OF_PCF_IP: usize = 8;
@@ -51,6 +51,38 @@ pub struct PcfIpEndpoint {
     pub port: u16,
 }
 
+/// PCF for UE binding (TS 29.521 §4.2.2.3, pcf-ue-bindings resource).
+/// Keyed by `binding_id`; discoverable by supi or gpsi.
+#[derive(Debug, Clone)]
+pub struct PcfUeBinding {
+    pub binding_id: String,
+    pub supi: Option<String>,
+    pub gpsi: Option<String>,
+    pub pcf_fqdn: Option<String>,
+    pub pcf_ip: Vec<PcfIpEndpoint>,
+    pub pcf_id: Option<String>,
+    pub pcf_set_id: Option<String>,
+    pub bind_level: Option<String>,
+    pub recovery_time: Option<String>,
+    pub pcf_diam_host: Option<String>,
+    pub pcf_diam_realm: Option<String>,
+    pub management_features: u64,
+}
+
+/// PCF for MBS binding (TS 29.521 §4.2.2.4, pcf-mbs-bindings resource).
+/// Keyed by `binding_id`; discoverable by `mbs_session_id`.
+#[derive(Debug, Clone)]
+pub struct PcfMbsBinding {
+    pub binding_id: String,
+    /// Opaque MBS Session ID (TMGI or SSM form per TS 29.571).
+    pub mbs_session_id: String,
+    pub pcf_fqdn: Option<String>,
+    pub pcf_ip: Vec<PcfIpEndpoint>,
+    pub pcf_id: Option<String>,
+    pub pcf_set_id: Option<String>,
+    pub management_features: u64,
+}
+
 /// IPv6 prefix structure
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Ipv6Prefix {
@@ -80,6 +112,37 @@ impl Ipv6Prefix {
         let mut key = vec![self.len];
         key.extend_from_slice(&self.addr6[..key_len.min(16)]);
         key
+    }
+
+    /// TS 29.521 §4.2.4.2: true when `addr` is within the address range covered
+    /// by this prefix, i.e. the first `len` bits of `addr` equal the first `len`
+    /// bits of the prefix. The final partial byte (when `len` is not a multiple
+    /// of 8) is compared under a high-bit mask.
+    pub fn contains(&self, addr: &Ipv6Addr) -> bool {
+        let len = self.len as usize;
+        if len > 128 {
+            return false;
+        }
+        let octets = addr.octets();
+        let full_bytes = len / 8;
+        if self.addr6[..full_bytes] != octets[..full_bytes] {
+            return false;
+        }
+        let rem_bits = len % 8;
+        if rem_bits != 0 {
+            let mask: u8 = 0xFFu8 << (8 - rem_bits);
+            if (self.addr6[full_bytes] & mask) != (octets[full_bytes] & mask) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True when the (typically /128) `query` prefix's address falls within this
+    /// prefix. The query's own length is ignored; its address is treated as a
+    /// single host address per the longest-prefix-match rule.
+    pub fn contains_prefix(&self, query: &Ipv6Prefix) -> bool {
+        self.contains(&Ipv6Addr::from(query.addr6))
     }
 }
 
@@ -223,6 +286,47 @@ impl BindingFilter {
             || self.supi.is_some()
             || self.gpsi.is_some()
     }
+
+    /// TS 29.521 §4.2.4.2: a discovery query "shall include: UE address",
+    /// where a UE address is one of `ipv4Addr` / `ipv6Prefix` / `macAddr48`.
+    /// SUPI/GPSI/DNN/S-NSSAI are supplementary "may include" filters and do
+    /// not by themselves satisfy the mandatory UE-address requirement.
+    pub fn has_ue_address(&self) -> bool {
+        self.ipv4addr.is_some() || self.ipv6prefix.is_some() || self.mac_addr48.is_some()
+    }
+}
+
+/// Parse a discovery IPv6 query value into a host address, accepting both the
+/// bare-address form (`2001:db8::1`) and the `addr/len` form (`2001:db8::1/128`)
+/// the TS 29.521 spec describes ("formatted as … /128"). The prefix length, if
+/// present, is ignored — the query is always treated as a single host address.
+fn parse_query_ipv6(v: &str) -> Option<Ipv6Addr> {
+    let addr_part = v.split('/').next().unwrap_or(v);
+    addr_part.parse::<Ipv6Addr>().ok()
+}
+
+/// True when `addr` falls within the IPv4 CIDR `cidr` (`a.b.c.d/n`).
+fn ipv4_in_cidr(addr: Ipv4Addr, cidr: &str) -> bool {
+    let (net_str, len_str) = match cidr.split_once('/') {
+        Some(parts) => parts,
+        None => return cidr.parse::<Ipv4Addr>().map(|n| n == addr).unwrap_or(false),
+    };
+    let Ok(net) = net_str.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(len) = len_str.parse::<u8>() else {
+        return false;
+    };
+    if len > 32 {
+        return false;
+    }
+    let mask: u32 = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    (u32::from(addr) & mask) == (u32::from(net) & mask)
+}
+
+/// True when `addr` falls within the IPv6 CIDR `cidr` (`addr/len`).
+fn ipv6_in_cidr(addr: &Ipv6Addr, cidr: &str) -> bool {
+    Ipv6Prefix::from_string(cidr).is_some_and(|p| p.contains(addr))
 }
 
 /// BSF Session structure
@@ -272,6 +376,18 @@ pub struct BsfSess {
     pub pcf_fqdn: Option<String>,
     /// PCF IP endpoints
     pub pcf_ip: Vec<PcfIpEndpoint>,
+    /// PCF instance ID (TS 29.512 NF instance ID, bsfd-08)
+    pub pcf_id: Option<String>,
+    /// PCF set ID (bsfd-08)
+    pub pcf_set_id: Option<String>,
+    /// PCF binding level: NF_SET or NF_INSTANCE (bsfd-08)
+    pub bind_level: Option<String>,
+    /// PCF recovery time as RFC 3339 DateTime (TS 23.527, bsfd-08)
+    pub recovery_time: Option<String>,
+    /// PCF Diameter host for Rx interface (bsfd-08)
+    pub pcf_diam_host: Option<String>,
+    /// PCF Diameter realm for Rx interface (bsfd-08)
+    pub pcf_diam_realm: Option<String>,
 
     /// SBI management features
     pub management_features: u64,
@@ -301,6 +417,12 @@ impl BsfSess {
             dnn: None,
             pcf_fqdn: None,
             pcf_ip: Vec::new(),
+            pcf_id: None,
+            pcf_set_id: None,
+            bind_level: None,
+            recovery_time: None,
+            pcf_diam_host: None,
+            pcf_diam_realm: None,
             management_features: SBI_NBSF_MANAGEMENT_BINDING_UPDATE,
         }
     }
@@ -369,14 +491,68 @@ impl BsfSess {
         self.expiry_epoch.is_some_and(|e| e <= now)
     }
 
+    /// TS 29.521 §4.2.4.2: true when an IPv4 query address is covered by any of
+    /// this binding's `ipv4FrameRouteList` CIDRs.
+    pub fn ipv4_in_frame_routes(&self, addr: Ipv4Addr) -> bool {
+        self.ipv4_frame_route_list
+            .iter()
+            .any(|r| ipv4_in_cidr(addr, r))
+    }
+
+    /// TS 29.521 §4.2.4.2: true when an IPv6 query address is covered by any of
+    /// this binding's `ipv6FrameRouteList` CIDRs.
+    pub fn ipv6_in_frame_routes(&self, addr: &Ipv6Addr) -> bool {
+        self.ipv6_frame_route_list
+            .iter()
+            .any(|r| ipv6_in_cidr(addr, r))
+    }
+
+    /// Longest prefix length (0..=128) by which this binding matches the IPv6
+    /// query `addr`, considering both the primary UE prefix and any
+    /// `ipv6FrameRouteList` route that contains it. Used for longest-prefix
+    /// selection across candidate bindings (TS 29.521 §4.2.4.2).
+    pub fn ipv6_best_match_len(&self, addr: &Ipv6Addr) -> Option<u8> {
+        let mut best: Option<u8> = None;
+        if let Some(ref p) = self.ipv6prefix {
+            if p.contains(addr) {
+                best = Some(best.map_or(p.len, |b| b.max(p.len)));
+            }
+        }
+        for r in &self.ipv6_frame_route_list {
+            if let Some(p) = Ipv6Prefix::from_string(r) {
+                if p.contains(addr) {
+                    best = Some(best.map_or(p.len, |b| b.max(p.len)));
+                }
+            }
+        }
+        best
+    }
+
     /// True when this binding matches every provided discovery filter.
+    ///
+    /// IPv4/IPv6 addresses match either the binding's primary UE address (exact
+    /// for IPv4, longest-prefix containment for IPv6) or any framed route. MAC
+    /// and the remaining identity filters match exactly (DNN case-insensitively).
     pub fn matches(&self, f: &BindingFilter) -> bool {
         f.ipv4addr
             .as_deref()
-            .is_none_or(|v| self.ipv4addr_string.as_deref() == Some(v))
+            .is_none_or(|v| match v.parse::<Ipv4Addr>() {
+                Ok(addr) => {
+                    self.ipv4addr_string.as_deref() == Some(v) || self.ipv4_in_frame_routes(addr)
+                }
+                // Unparseable query: fall back to exact string comparison.
+                Err(_) => self.ipv4addr_string.as_deref() == Some(v),
+            })
             && f.ipv6prefix
                 .as_deref()
-                .is_none_or(|v| self.ipv6prefix_string.as_deref() == Some(v))
+                .is_none_or(|v| match parse_query_ipv6(v) {
+                    Some(addr) => {
+                        self.ipv6prefix.as_ref().is_some_and(|p| p.contains(&addr))
+                            || self.ipv6_in_frame_routes(&addr)
+                    }
+                    // Unparseable query: fall back to exact string comparison.
+                    None => self.ipv6prefix_string.as_deref() == Some(v),
+                })
             && f.mac_addr48
                 .as_deref()
                 .is_none_or(|v| normalize_mac(v).as_deref() == self.mac_addr48.as_deref())
@@ -427,6 +603,10 @@ pub struct BsfContext {
     max_num_of_sess: usize,
     /// Context initialized flag
     initialized: AtomicBool,
+    /// UE policy bindings (pcf-ue-bindings, keyed by binding_id, bsfd-11)
+    ue_binding_list: RwLock<HashMap<String, PcfUeBinding>>,
+    /// MBS bindings (pcf-mbs-bindings, keyed by binding_id, bsfd-12)
+    mbs_binding_list: RwLock<HashMap<String, PcfMbsBinding>>,
 }
 
 impl BsfContext {
@@ -439,6 +619,8 @@ impl BsfContext {
             next_sess_id: AtomicUsize::new(1),
             max_num_of_sess: 0,
             initialized: AtomicBool::new(false),
+            ue_binding_list: RwLock::new(HashMap::new()),
+            mbs_binding_list: RwLock::new(HashMap::new()),
         }
     }
 
@@ -582,6 +764,12 @@ impl BsfContext {
             ipv6_hash.clear();
             mac_hash.clear();
         }
+        if let Ok(mut list) = self.ue_binding_list.write() {
+            list.clear();
+        }
+        if let Ok(mut list) = self.mbs_binding_list.write() {
+            list.clear();
+        }
     }
 
     /// Find session by MAC address (any accepted format)
@@ -601,11 +789,35 @@ impl BsfContext {
             Ok(l) => l,
             Err(_) => return Vec::new(),
         };
-        sess_list
+        let matches: Vec<BsfSess> = sess_list
             .values()
             .filter(|s| !s.is_expired(now) && s.matches(filter))
             .cloned()
-            .collect()
+            .collect();
+        drop(sess_list);
+
+        // TS 29.521 §4.2.4.2: for an IPv6 query, select the binding(s) with the
+        // longest matching prefix. A single longest match wins (200); an
+        // equal-length true multi-match is left for the caller to reject (400).
+        if let Some(query) = filter.ipv6prefix.as_deref() {
+            if let Some(addr) = parse_query_ipv6(query) {
+                if matches.len() > 1 {
+                    let scored: Vec<(Option<u8>, BsfSess)> = matches
+                        .into_iter()
+                        .map(|s| (s.ipv6_best_match_len(&addr), s))
+                        .collect();
+                    if let Some(max_len) = scored.iter().filter_map(|(l, _)| *l).max() {
+                        return scored
+                            .into_iter()
+                            .filter(|(l, _)| *l == Some(max_len))
+                            .map(|(_, s)| s)
+                            .collect();
+                    }
+                    return scored.into_iter().map(|(_, s)| s).collect();
+                }
+            }
+        }
+        matches
     }
 
     /// Remove every expired binding; returns the removed binding ids so the
@@ -647,10 +859,12 @@ impl BsfContext {
         let addr: Ipv4Addr = ipv4addr_string.parse().ok()?;
         let addr_u32 = u32::from(addr);
 
+        // Lock order sess_list < ipv4addr_hash (matches sess_add_binding/sess_remove,
+        // which hold sess_list while inserting into the hash). Acquiring the hash
+        // before sess_list would be an AB-BA deadlock vs sess_add_binding.
+        let sess_list = self.sess_list.read().ok()?;
         let ipv4_hash = self.ipv4addr_hash.read().ok()?;
         let sess_id = ipv4_hash.get(&addr_u32)?;
-
-        let sess_list = self.sess_list.read().ok()?;
         sess_list.get(sess_id).cloned()
     }
 
@@ -659,10 +873,10 @@ impl BsfContext {
         let prefix = Ipv6Prefix::from_string(ipv6prefix_string)?;
         let key = prefix.hash_key();
 
+        // Lock order sess_list < ipv6prefix_hash (matches sess_add_binding/sess_remove).
+        let sess_list = self.sess_list.read().ok()?;
         let ipv6_hash = self.ipv6prefix_hash.read().ok()?;
         let sess_id = ipv6_hash.get(&key)?;
-
-        let sess_list = self.sess_list.read().ok()?;
         sess_list.get(sess_id).cloned()
     }
 
@@ -692,6 +906,100 @@ impl BsfContext {
         false
     }
 
+    /// Set or clear a binding's UE IPv4 address, keeping the `ipv4addr_hash`
+    /// lookup index consistent (bsfd-10).
+    ///
+    /// `Some(addr)` parses and sets the address, removing the old hash key and
+    /// inserting the new one; `None` clears the address (and, per
+    /// TS 29.521 §4.2.5.2, the dependent `ipDomain`) and drops the old hash key.
+    /// Returns `false` only when a provided address fails to parse (the session
+    /// is left unchanged in that case).
+    pub fn set_ue_ipv4(&self, sess: &mut BsfSess, value: Option<&str>) -> bool {
+        let old = sess.ipv4addr;
+        match value {
+            Some(v) => {
+                if !sess.set_ipv4addr(v) {
+                    return false;
+                }
+                if let Ok(mut hash) = self.ipv4addr_hash.write() {
+                    if let Some(o) = old {
+                        hash.remove(&o);
+                    }
+                    if let Some(addr) = sess.ipv4addr {
+                        hash.insert(addr, sess.id);
+                    }
+                }
+            }
+            None => {
+                sess.ipv4addr = None;
+                sess.ipv4addr_string = None;
+                // ipv4 removal also clears ipDomain (TS 29.521 §4.2.5.2).
+                sess.ip_domain = None;
+                if let (Ok(mut hash), Some(o)) = (self.ipv4addr_hash.write(), old) {
+                    hash.remove(&o);
+                }
+            }
+        }
+        true
+    }
+
+    /// Set or clear a binding's UE IPv6 prefix, keeping the `ipv6prefix_hash`
+    /// lookup index consistent (bsfd-10).
+    pub fn set_ue_ipv6(&self, sess: &mut BsfSess, value: Option<&str>) -> bool {
+        let old_key = sess.ipv6prefix.as_ref().map(|p| p.hash_key());
+        match value {
+            Some(v) => {
+                if !sess.set_ipv6prefix(v) {
+                    return false;
+                }
+                if let Ok(mut hash) = self.ipv6prefix_hash.write() {
+                    if let Some(k) = old_key {
+                        hash.remove(&k);
+                    }
+                    if let Some(ref p) = sess.ipv6prefix {
+                        hash.insert(p.hash_key(), sess.id);
+                    }
+                }
+            }
+            None => {
+                sess.ipv6prefix = None;
+                sess.ipv6prefix_string = None;
+                if let (Ok(mut hash), Some(k)) = (self.ipv6prefix_hash.write(), old_key) {
+                    hash.remove(&k);
+                }
+            }
+        }
+        true
+    }
+
+    /// Set or clear a binding's UE MAC address, keeping the `mac_hash` lookup
+    /// index consistent (bsfd-10).
+    pub fn set_ue_mac(&self, sess: &mut BsfSess, value: Option<&str>) -> bool {
+        let old = sess.mac_addr48.clone();
+        match value {
+            Some(v) => {
+                if !sess.set_mac_addr48(v) {
+                    return false;
+                }
+                if let Ok(mut hash) = self.mac_hash.write() {
+                    if let Some(ref o) = old {
+                        hash.remove(o);
+                    }
+                    if let Some(ref m) = sess.mac_addr48 {
+                        hash.insert(m.clone(), sess.id);
+                    }
+                }
+            }
+            None => {
+                sess.mac_addr48 = None;
+                if let (Ok(mut hash), Some(ref o)) = (self.mac_hash.write(), old) {
+                    hash.remove(o);
+                }
+            }
+        }
+        true
+    }
+
     /// Get session load percentage
     pub fn get_sess_load(&self) -> i32 {
         let sess_count = self.sess_list.read().map(|l| l.len()).unwrap_or(0);
@@ -704,6 +1012,125 @@ impl BsfContext {
     /// Get session count
     pub fn sess_count(&self) -> usize {
         self.sess_list.read().map(|l| l.len()).unwrap_or(0)
+    }
+
+    // ------------------------------------------------------------------
+    // bsfd-07: duplicate detection for SamePcf feature
+    // ------------------------------------------------------------------
+
+    /// Find a PDU-session binding with matching dnn + snssai + supi (used by
+    /// the SamePcf duplicate-detection check in `handle_pcf_binding_create`).
+    pub fn sess_find_by_dnn_snssai_supi(
+        &self,
+        dnn: &str,
+        snssai: &SNssai,
+        supi: &str,
+    ) -> Option<BsfSess> {
+        let sess_list = self.sess_list.read().ok()?;
+        for sess in sess_list.values() {
+            if sess
+                .dnn
+                .as_deref()
+                .is_some_and(|d| d.eq_ignore_ascii_case(dnn))
+                && sess.s_nssai.sst == snssai.sst
+                && sess.s_nssai.sd == snssai.sd
+                && sess.supi.as_deref() == Some(supi)
+            {
+                return Some(sess.clone());
+            }
+        }
+        None
+    }
+
+    // ------------------------------------------------------------------
+    // bsfd-11: pcf-ue-bindings CRUD
+    // ------------------------------------------------------------------
+
+    pub fn ue_binding_add(&self, binding: PcfUeBinding) {
+        if let Ok(mut list) = self.ue_binding_list.write() {
+            list.insert(binding.binding_id.clone(), binding);
+        }
+    }
+
+    pub fn ue_binding_find_by_id(&self, id: &str) -> Option<PcfUeBinding> {
+        let list = self.ue_binding_list.read().ok()?;
+        list.get(id).cloned()
+    }
+
+    /// Return all UE bindings whose supi/gpsi match the provided filters
+    /// (None means "no filter on this field").
+    pub fn ue_binding_find_matching(
+        &self,
+        supi: Option<&str>,
+        gpsi: Option<&str>,
+    ) -> Vec<PcfUeBinding> {
+        match self.ue_binding_list.read() {
+            Ok(list) => list
+                .values()
+                .filter(|b| {
+                    supi.is_none_or(|s| b.supi.as_deref() == Some(s))
+                        && gpsi.is_none_or(|g| b.gpsi.as_deref() == Some(g))
+                })
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn ue_binding_remove(&self, id: &str) -> Option<PcfUeBinding> {
+        self.ue_binding_list.write().ok()?.remove(id)
+    }
+
+    pub fn ue_binding_update(&self, binding: &PcfUeBinding) -> bool {
+        if let Ok(mut list) = self.ue_binding_list.write() {
+            if let Some(existing) = list.get_mut(&binding.binding_id) {
+                *existing = binding.clone();
+                return true;
+            }
+        }
+        false
+    }
+
+    // ------------------------------------------------------------------
+    // bsfd-12: pcf-mbs-bindings CRUD
+    // ------------------------------------------------------------------
+
+    pub fn mbs_binding_add(&self, binding: PcfMbsBinding) {
+        if let Ok(mut list) = self.mbs_binding_list.write() {
+            list.insert(binding.binding_id.clone(), binding);
+        }
+    }
+
+    pub fn mbs_binding_find_by_id(&self, id: &str) -> Option<PcfMbsBinding> {
+        let list = self.mbs_binding_list.read().ok()?;
+        list.get(id).cloned()
+    }
+
+    /// Return all MBS bindings keyed by the given mbs_session_id.
+    /// TS 29.521 §4.2.2.4: a duplicate is 403; multi-match is 400.
+    pub fn mbs_binding_find_by_mbs_session_id(&self, mbs_session_id: &str) -> Vec<PcfMbsBinding> {
+        match self.mbs_binding_list.read() {
+            Ok(list) => list
+                .values()
+                .filter(|b| b.mbs_session_id == mbs_session_id)
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn mbs_binding_remove(&self, id: &str) -> Option<PcfMbsBinding> {
+        self.mbs_binding_list.write().ok()?.remove(id)
+    }
+
+    pub fn mbs_binding_update(&self, binding: &PcfMbsBinding) -> bool {
+        if let Ok(mut list) = self.mbs_binding_list.write() {
+            if let Some(existing) = list.get_mut(&binding.binding_id) {
+                *existing = binding.clone();
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -746,14 +1173,14 @@ impl BsfContext {
 
 /// Get the BSF bindings collection from MongoDB
 fn get_bsf_bindings_collection(
-) -> DbiResult<ogs_dbi::mongodb::sync::Collection<ogs_dbi::mongodb::bson::Document>> {
-    let dbi = ogs_mongoc();
+) -> DbiResult<nextgcore_dbi::mongodb::sync::Collection<nextgcore_dbi::mongodb::bson::Document>> {
+    let dbi = nextgcore_mongoc();
     let dbi_guard = dbi.lock().unwrap();
     let db = dbi_guard
         .mongoc
         .database
         .as_ref()
-        .ok_or(ogs_dbi::DbiError::NotInitialized)?;
+        .ok_or(nextgcore_dbi::DbiError::NotInitialized)?;
     Ok(db.collection("bsf_bindings"))
 }
 
@@ -762,8 +1189,8 @@ fn get_bsf_bindings_collection(
 /// Pure function (no I/O) so the round-trip can be unit-tested without a
 /// database. Persists pcfIpEndPoints, MAC, ipDomain, and expiry so
 /// bindings survive BSF restarts intact.
-pub fn sess_to_doc(sess: &BsfSess) -> ogs_dbi::mongodb::bson::Document {
-    use ogs_dbi::mongodb::bson::{doc, Bson, Document};
+pub fn sess_to_doc(sess: &BsfSess) -> nextgcore_dbi::mongodb::bson::Document {
+    use nextgcore_dbi::mongodb::bson::{doc, Bson, Document};
 
     let mut d = doc! {
         "binding_id": &sess.binding_id,
@@ -800,6 +1227,24 @@ pub fn sess_to_doc(sess: &BsfSess) -> ogs_dbi::mongodb::bson::Document {
     if let Some(ref pcf_fqdn) = sess.pcf_fqdn {
         d.insert("pcf_fqdn", pcf_fqdn);
     }
+    if let Some(ref v) = sess.pcf_id {
+        d.insert("pcf_id", v);
+    }
+    if let Some(ref v) = sess.pcf_set_id {
+        d.insert("pcf_set_id", v);
+    }
+    if let Some(ref v) = sess.bind_level {
+        d.insert("bind_level", v);
+    }
+    if let Some(ref v) = sess.recovery_time {
+        d.insert("recovery_time", v);
+    }
+    if let Some(ref v) = sess.pcf_diam_host {
+        d.insert("pcf_diam_host", v);
+    }
+    if let Some(ref v) = sess.pcf_diam_realm {
+        d.insert("pcf_diam_realm", v);
+    }
     if !sess.pcf_ip.is_empty() {
         let endpoints: Vec<Bson> = sess
             .pcf_ip
@@ -824,7 +1269,7 @@ pub fn sess_to_doc(sess: &BsfSess) -> ogs_dbi::mongodb::bson::Document {
 }
 
 /// Reconstruct a session from its MongoDB document representation.
-pub fn doc_to_sess(doc: &ogs_dbi::mongodb::bson::Document) -> BsfSess {
+pub fn doc_to_sess(doc: &nextgcore_dbi::mongodb::bson::Document) -> BsfSess {
     let id = doc.get_i64("id").unwrap_or(0) as u64;
     let mut sess = BsfSess::new(id);
 
@@ -864,6 +1309,24 @@ pub fn doc_to_sess(doc: &ogs_dbi::mongodb::bson::Document) -> BsfSess {
     if let Ok(pcf_fqdn) = doc.get_str("pcf_fqdn") {
         sess.pcf_fqdn = Some(pcf_fqdn.to_string());
     }
+    if let Ok(v) = doc.get_str("pcf_id") {
+        sess.pcf_id = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("pcf_set_id") {
+        sess.pcf_set_id = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("bind_level") {
+        sess.bind_level = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("recovery_time") {
+        sess.recovery_time = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("pcf_diam_host") {
+        sess.pcf_diam_host = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("pcf_diam_realm") {
+        sess.pcf_diam_realm = Some(v.to_string());
+    }
     if let Ok(endpoints) = doc.get_array("pcfIpEndPoints") {
         sess.pcf_ip = endpoints
             .iter()
@@ -882,10 +1345,10 @@ pub fn doc_to_sess(doc: &ogs_dbi::mongodb::bson::Document) -> BsfSess {
 /// Upsert a BSF binding to MongoDB
 fn bsf_db_upsert_binding(sess: &BsfSess) -> DbiResult<()> {
     let collection = get_bsf_bindings_collection()?;
-    let filter = ogs_dbi::mongodb::bson::doc! { "binding_id": &sess.binding_id };
+    let filter = nextgcore_dbi::mongodb::bson::doc! { "binding_id": &sess.binding_id };
     let doc = sess_to_doc(sess);
 
-    let opts = ogs_dbi::mongodb::options::ReplaceOptions::builder()
+    let opts = nextgcore_dbi::mongodb::options::ReplaceOptions::builder()
         .upsert(true)
         .build();
     collection.replace_one(filter, doc, opts)?;
@@ -897,7 +1360,7 @@ fn bsf_db_upsert_binding(sess: &BsfSess) -> DbiResult<()> {
 /// Delete a BSF binding from MongoDB
 fn bsf_db_delete_binding(binding_id: &str) -> DbiResult<()> {
     let collection = get_bsf_bindings_collection()?;
-    let filter = ogs_dbi::mongodb::bson::doc! { "binding_id": binding_id };
+    let filter = nextgcore_dbi::mongodb::bson::doc! { "binding_id": binding_id };
     collection.delete_one(filter, None)?;
     log::debug!("BSF binding {binding_id} removed from DB");
     Ok(())
@@ -906,7 +1369,7 @@ fn bsf_db_delete_binding(binding_id: &str) -> DbiResult<()> {
 /// Load all BSF bindings from MongoDB
 fn bsf_db_load_all_bindings() -> DbiResult<Vec<BsfSess>> {
     let collection = get_bsf_bindings_collection()?;
-    let cursor = collection.find(ogs_dbi::mongodb::bson::doc! {}, None)?;
+    let cursor = collection.find(nextgcore_dbi::mongodb::bson::doc! {}, None)?;
 
     let mut bindings = Vec::new();
     for result in cursor {
@@ -920,7 +1383,7 @@ fn bsf_db_load_all_bindings() -> DbiResult<Vec<BsfSess>> {
 //
 // The mongodb sync driver blocks; calling it from SBI handlers stalls the
 // tokio runtime. These wrappers offload to `tokio::task::spawn_blocking`,
-// mirroring the ogs-dbi `*_async` pattern. Failures are logged at debug level
+// mirroring the nextgcore-dbi `*_async` pattern. Failures are logged at debug level
 // (DB persistence is best-effort; bindings remain in memory).
 // ---------------------------------------------------------------------------
 
@@ -1238,12 +1701,16 @@ mod tests {
         ctx.sess_update(&sess);
 
         let now = 1_000_000;
+        // SUPI-only is a UE *identifier* but NOT a UE *address* (bsfd-02):
+        // such a query is rejected 400 by the discovery handler, though the
+        // matcher itself still narrows correctly when combined with a UE address.
         let mut f = BindingFilter {
             supi: Some("imsi-001010000000001".to_string()),
             dnn: Some("INTERNET".to_string()), // case-insensitive DNN
             ..Default::default()
         };
         assert!(f.has_ue_identifier());
+        assert!(!f.has_ue_address());
         assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
 
         f.snssai = Some(SNssai::new(1, Some(0x010203)));
@@ -1255,10 +1722,186 @@ mod tests {
             mac_addr48: Some("AA-BB-CC-DD-EE-FF".to_string()),
             ..Default::default()
         };
+        assert!(f.has_ue_address());
         assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+
+        // ipv4 alone is a UE address; supi/gpsi alone is not.
+        assert!(BindingFilter {
+            ipv4addr: Some("10.45.0.2".to_string()),
+            ..Default::default()
+        }
+        .has_ue_address());
+        assert!(!BindingFilter {
+            gpsi: Some("msisdn-1".to_string()),
+            ..Default::default()
+        }
+        .has_ue_address());
 
         let f = BindingFilter::default();
         assert!(!f.has_ue_identifier());
+        assert!(!f.has_ue_address());
+    }
+
+    #[test]
+    fn test_ipv6_prefix_contains() {
+        let p64 = Ipv6Prefix::from_string("2001:db8::/64").unwrap();
+        assert!(p64.contains(&"2001:db8::1".parse().unwrap()));
+        assert!(p64.contains(&"2001:db8:0:0:ffff::1".parse().unwrap()));
+        assert!(!p64.contains(&"2001:db9::1".parse().unwrap()));
+
+        // Non-byte-aligned prefix length masks the final partial byte. /60
+        // fixes the first 60 bits, i.e. group3 in the range 0a00..=0a0f.
+        let p60 = Ipv6Prefix::from_string("2001:db8:0:0a00::/60").unwrap();
+        assert!(p60.contains(&"2001:db8:0:0a0f::5".parse().unwrap()));
+        assert!(!p60.contains(&"2001:db8:0:0a10::5".parse().unwrap()));
+        assert!(!p60.contains(&"2001:db8:0:0b00::5".parse().unwrap()));
+
+        // contains_prefix treats a /128 query as a host address.
+        let q = Ipv6Prefix::from_string("2001:db8::1/128").unwrap();
+        assert!(p64.contains_prefix(&q));
+    }
+
+    #[test]
+    fn test_binding_filter_ipv6_prefix_match() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let _ = ctx
+            .sess_add_by_ip_address(None, Some("2001:db8::/64"))
+            .unwrap();
+        let now = 1_000_000;
+
+        // /128 query inside the stored /64 matches.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:db8::1/128".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+
+        // Bare-address form also matches.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:db8::abcd".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+
+        // Out-of-prefix query does not match.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:db9::1/128".to_string()),
+            ..Default::default()
+        };
+        assert!(ctx.sess_find_matching(&f, now).is_empty());
+    }
+
+    #[test]
+    fn test_longest_prefix_selection() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        // Two nested prefixes covering the same base address: the /64 is the
+        // longest match, nested inside the broader /32.
+        ctx.sess_add_by_ip_address(None, Some("2001:db8::/32"))
+            .unwrap();
+        let specific = ctx
+            .sess_add_by_ip_address(None, Some("2001:db8::/64"))
+            .unwrap();
+        let now = 1_000_000;
+
+        // Query inside both prefixes: the longest (/64) wins -> single result.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:db8::5/128".to_string()),
+            ..Default::default()
+        };
+        let found = ctx.sess_find_matching(&f, now);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, specific.id);
+
+        // Query inside only the broader /32 (4th hextet != 0): single result.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:db8:0:1::5/128".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+    }
+
+    #[test]
+    fn test_framed_route_match() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let sess = ctx.sess_add_by_ip_address(Some("10.45.0.2"), None).unwrap();
+        let mut sess = sess;
+        sess.ipv4_frame_route_list = vec!["10.0.0.0/24".to_string()];
+        sess.ipv6_frame_route_list = vec!["2001:dbf::/48".to_string()];
+        ctx.sess_update(&sess);
+        let now = 1_000_000;
+
+        // IPv4 inside the framed route matches even though it is not the
+        // binding's primary UE address.
+        let f = BindingFilter {
+            ipv4addr: Some("10.0.0.5".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+        // Outside the route: no match.
+        let f = BindingFilter {
+            ipv4addr: Some("10.1.0.5".to_string()),
+            ..Default::default()
+        };
+        assert!(ctx.sess_find_matching(&f, now).is_empty());
+
+        // IPv6 inside the framed route matches.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:dbf::1234/128".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+    }
+
+    #[test]
+    fn test_context_rekey_ipv4() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let mut sess = ctx.sess_add_by_ip_address(Some("10.45.1.1"), None).unwrap();
+        sess.ip_domain = Some("domain1".to_string());
+        ctx.sess_update(&sess);
+        assert!(ctx.sess_find_by_ipv4addr("10.45.1.1").is_some());
+
+        // Change A -> B: hash follows.
+        assert!(ctx.set_ue_ipv4(&mut sess, Some("10.45.1.2")));
+        ctx.sess_update(&sess);
+        assert!(ctx.sess_find_by_ipv4addr("10.45.1.1").is_none());
+        assert!(ctx.sess_find_by_ipv4addr("10.45.1.2").is_some());
+
+        // Clear: hash key dropped and ipDomain cleared.
+        assert!(ctx.set_ue_ipv4(&mut sess, None));
+        ctx.sess_update(&sess);
+        assert!(ctx.sess_find_by_ipv4addr("10.45.1.2").is_none());
+        assert!(sess.ip_domain.is_none());
+        assert!(sess.ipv4addr_string.is_none());
+
+        // Invalid address leaves the session unchanged.
+        let mut s2 = ctx.sess_add_by_ip_address(Some("10.45.1.3"), None).unwrap();
+        assert!(!ctx.set_ue_ipv4(&mut s2, Some("not-an-ip")));
+        assert_eq!(s2.ipv4addr_string.as_deref(), Some("10.45.1.3"));
+    }
+
+    #[test]
+    fn test_context_rekey_ipv6_and_mac() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let mut sess = ctx
+            .sess_add_binding(None, Some("2001:db8::/64"), Some("aa:bb:cc:dd:ee:01"))
+            .unwrap();
+
+        // Re-key IPv6 prefix.
+        assert!(ctx.set_ue_ipv6(&mut sess, Some("2001:db8:1::/64")));
+        ctx.sess_update(&sess);
+        assert!(ctx.sess_find_by_ipv6prefix("2001:db8::/64").is_none());
+        assert!(ctx.sess_find_by_ipv6prefix("2001:db8:1::/64").is_some());
+
+        // Clear MAC: mac_hash drops the key.
+        assert!(ctx.set_ue_mac(&mut sess, None));
+        ctx.sess_update(&sess);
+        assert!(ctx.sess_find_by_mac("aa-bb-cc-dd-ee-01").is_none());
+        assert!(sess.mac_addr48.is_none());
     }
 
     #[test]
@@ -1320,6 +1963,13 @@ mod tests {
                 port: 0,
             },
         ];
+        // bsfd-08: new optional PCF identity fields
+        sess.pcf_id = Some("pcf-uuid-1234".to_string());
+        sess.pcf_set_id = Some("pcfSet-01".to_string());
+        sess.bind_level = Some("NF_INSTANCE".to_string());
+        sess.recovery_time = Some("2026-06-01T00:00:00Z".to_string());
+        sess.pcf_diam_host = Some("pcf.diam.example.com".to_string());
+        sess.pcf_diam_realm = Some("example.com".to_string());
 
         let doc = sess_to_doc(&sess);
         let restored = doc_to_sess(&doc);
@@ -1342,6 +1992,162 @@ mod tests {
         assert_eq!(restored.pcf_ip[0].port, 7777);
         assert_eq!(restored.pcf_ip[1].addr6.as_deref(), Some("2001:db8::10"));
         assert!(!restored.pcf_ip[1].is_port);
+        // bsfd-08: new fields round-trip through Mongo doc
+        assert_eq!(restored.pcf_id.as_deref(), Some("pcf-uuid-1234"));
+        assert_eq!(restored.pcf_set_id.as_deref(), Some("pcfSet-01"));
+        assert_eq!(restored.bind_level.as_deref(), Some("NF_INSTANCE"));
+        assert_eq!(
+            restored.recovery_time.as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
+        assert_eq!(
+            restored.pcf_diam_host.as_deref(),
+            Some("pcf.diam.example.com")
+        );
+        assert_eq!(restored.pcf_diam_realm.as_deref(), Some("example.com"));
+    }
+
+    // bsfd-07: sess_find_by_dnn_snssai_supi
+    #[test]
+    fn test_sess_find_by_dnn_snssai_supi() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+
+        let sess = ctx.sess_add_binding(Some("10.45.3.1"), None, None).unwrap();
+        let mut sess = sess;
+        sess.dnn = Some("internet".to_string());
+        sess.s_nssai = SNssai::new(1, Some(0x010203));
+        sess.supi = Some("imsi-001010000007001".to_string());
+        ctx.sess_update(&sess);
+
+        // Exact match.
+        assert!(ctx
+            .sess_find_by_dnn_snssai_supi(
+                "internet",
+                &SNssai::new(1, Some(0x010203)),
+                "imsi-001010000007001"
+            )
+            .is_some());
+        // DNN case-insensitive.
+        assert!(ctx
+            .sess_find_by_dnn_snssai_supi(
+                "INTERNET",
+                &SNssai::new(1, Some(0x010203)),
+                "imsi-001010000007001"
+            )
+            .is_some());
+        // Different SUPI: no match.
+        assert!(ctx
+            .sess_find_by_dnn_snssai_supi("internet", &SNssai::new(1, Some(0x010203)), "imsi-999")
+            .is_none());
+        // Different DNN: no match.
+        assert!(ctx
+            .sess_find_by_dnn_snssai_supi(
+                "ims",
+                &SNssai::new(1, Some(0x010203)),
+                "imsi-001010000007001"
+            )
+            .is_none());
+    }
+
+    // bsfd-11: pcf-ue-bindings CRUD
+    #[test]
+    fn test_ue_binding_crud() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+
+        let b = PcfUeBinding {
+            binding_id: "ue-1".to_string(),
+            supi: Some("imsi-001010000008001".to_string()),
+            gpsi: None,
+            pcf_fqdn: Some("pcf.example.com".to_string()),
+            pcf_ip: Vec::new(),
+            pcf_id: None,
+            pcf_set_id: None,
+            bind_level: None,
+            recovery_time: None,
+            pcf_diam_host: None,
+            pcf_diam_realm: None,
+            management_features: 0x1,
+        };
+        ctx.ue_binding_add(b.clone());
+
+        // Find by ID.
+        assert!(ctx.ue_binding_find_by_id("ue-1").is_some());
+        assert!(ctx.ue_binding_find_by_id("ue-2").is_none());
+
+        // Find by supi.
+        let found = ctx.ue_binding_find_matching(Some("imsi-001010000008001"), None);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].pcf_fqdn.as_deref(), Some("pcf.example.com"));
+
+        // No match on supi filter.
+        assert!(ctx
+            .ue_binding_find_matching(Some("imsi-000"), None)
+            .is_empty());
+
+        // Update.
+        let mut updated = b.clone();
+        updated.pcf_fqdn = Some("pcf2.example.com".to_string());
+        assert!(ctx.ue_binding_update(&updated));
+        assert_eq!(
+            ctx.ue_binding_find_by_id("ue-1")
+                .unwrap()
+                .pcf_fqdn
+                .as_deref(),
+            Some("pcf2.example.com")
+        );
+
+        // Remove.
+        assert!(ctx.ue_binding_remove("ue-1").is_some());
+        assert!(ctx.ue_binding_find_by_id("ue-1").is_none());
+    }
+
+    // bsfd-12: pcf-mbs-bindings CRUD + duplicate detection
+    #[test]
+    fn test_mbs_binding_crud() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+
+        let b1 = PcfMbsBinding {
+            binding_id: "mbs-1".to_string(),
+            mbs_session_id: "TMGI-ABC".to_string(),
+            pcf_fqdn: Some("pcf.example.com".to_string()),
+            pcf_ip: Vec::new(),
+            pcf_id: None,
+            pcf_set_id: None,
+            management_features: 0x1,
+        };
+        ctx.mbs_binding_add(b1.clone());
+
+        // Find by id.
+        assert!(ctx.mbs_binding_find_by_id("mbs-1").is_some());
+
+        // Find by mbs_session_id (single match).
+        let found = ctx.mbs_binding_find_by_mbs_session_id("TMGI-ABC");
+        assert_eq!(found.len(), 1);
+
+        // Duplicate mbs_session_id: two bindings → caller detects multi-match.
+        let b2 = PcfMbsBinding {
+            binding_id: "mbs-2".to_string(),
+            mbs_session_id: "TMGI-ABC".to_string(),
+            pcf_fqdn: Some("pcf2.example.com".to_string()),
+            pcf_ip: Vec::new(),
+            pcf_id: None,
+            pcf_set_id: None,
+            management_features: 0x1,
+        };
+        ctx.mbs_binding_add(b2);
+        assert_eq!(ctx.mbs_binding_find_by_mbs_session_id("TMGI-ABC").len(), 2);
+
+        // Remove one; only one left.
+        ctx.mbs_binding_remove("mbs-1");
+        assert_eq!(ctx.mbs_binding_find_by_mbs_session_id("TMGI-ABC").len(), 1);
+
+        // Different mbs_session_id: no match.
+        assert!(ctx
+            .mbs_binding_find_by_mbs_session_id("TMGI-XYZ")
+            .is_empty());
     }
 
     #[test]

@@ -1,8 +1,15 @@
-//! UDR NUDR Handler Functions
+//! UDR NUDR Handler Functions — NON-SERVING LEGACY PATH (udrd-09)
 //!
-//! Port of src/udr/nudr-handler.c - Handler functions for NUDR DR service
+//! **This module produces no wire responses.** It is a ported C implementation
+//! (`src/udr/nudr-handler.c`) that diverges from the live SBI builders in
+//! `main.rs` and is never reached from `udr_sbi_request_handler`.  It is
+//! retained as a crate-internal (non-public) module only because `udr_sm`
+//! still references its symbols; it will be deleted once those references are
+//! removed.
 //!
-//! These handlers process requests from UDM and PCF for:
+//! Do NOT add new logic here — extend the live builders in `main.rs` instead.
+//!
+//! Original port handled requests from UDM and PCF for:
 //! - Authentication subscription data
 //! - Context data (AMF/SMF registrations)
 //! - Provisioned data (AM data, SMF selection, SM data)
@@ -73,7 +80,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
     };
 
     // Validate SUPI type
-    // In C: if (strncmp(supi, OGS_ID_SUPI_TYPE_IMSI, strlen(OGS_ID_SUPI_TYPE_IMSI)) != 0)
+    // In C: if (strncmp(supi, NEXTGCORE_ID_SUPI_TYPE_IMSI, strlen(NEXTGCORE_ID_SUPI_TYPE_IMSI)) != 0)
     if !supi.starts_with("imsi-") {
         log::error!("[{supi}] Unknown SUPI Type");
         send_error_response(stream_id, 403, "Forbidden", "Unknown SUPI type");
@@ -81,14 +88,14 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
     }
 
     // Get auth info from database
-    // In C: rv = ogs_dbi_auth_info(supi, &auth_info);
-    // if (rv != OGS_OK) { ... send NOT_FOUND ... }
+    // In C: rv = nextgcore_dbi_auth_info(supi, &auth_info);
+    // if (rv != NEXTGCORE_OK) { ... send NOT_FOUND ... }
 
     // Route based on resource component[3]
     let resource3 = resource_components.get(3).map(|s| s.as_str());
 
     // Query auth info from database
-    let auth_info = match ogs_dbi::subscription::ogs_dbi_auth_info(supi) {
+    let auth_info = match nextgcore_dbi::subscription::nextgcore_dbi_auth_info(supi) {
         Ok(info) => info,
         Err(e) => {
             log::error!("[{supi}] DB auth_info query failed: {e:?}");
@@ -142,7 +149,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                                                     let sqn = u64::from_str_radix(sqn_hex, 16)
                                                         .unwrap_or(0);
                                                     if let Err(e) =
-                                                        ogs_dbi::subscription::ogs_dbi_update_sqn(
+                                                        nextgcore_dbi::subscription::nextgcore_dbi_update_sqn(
                                                             supi, sqn,
                                                         )
                                                     {
@@ -159,10 +166,10 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                         }
                     }
 
-                    // Increment SQN by 32 for next use
-                    if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
-                        log::error!("[{supi}] DB increment_sqn failed: {e:?}");
-                    }
+                    // WSB-6: no SQN side effect — TS 29.505 PATCH applies the
+                    // PatchItemList only; SQN advancement is the UDM/ARPF
+                    // function (TS 33.102 Annex C.3), mirrored from the live
+                    // handler fix in main.rs.
 
                     send_success_response(stream_id, 204, None);
                 }
@@ -182,10 +189,9 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                 "PUT" | "DELETE" => {
                     log::debug!("[{supi}] {method} authentication-status (stream={stream_id})");
 
-                    // Increment SQN on auth status update
-                    if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
-                        log::error!("[{supi}] DB increment_sqn failed: {e:?}");
-                    }
+                    // WSB-6: no SQN side effect — authentication-status
+                    // carries the AuthEvent (TS 29.505 §6.3.3) and has no SQN
+                    // semantics, mirrored from the live handler fix in main.rs.
 
                     send_success_response(stream_id, 204, None);
                 }
@@ -261,9 +267,11 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                                         } else {
                                             pei
                                         };
-                                        if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_imeisv(
-                                            supi, imeisv,
-                                        ) {
+                                        if let Err(e) =
+                                            nextgcore_dbi::subscription::nextgcore_dbi_update_imeisv(
+                                                supi, imeisv,
+                                            )
+                                        {
                                             log::error!("[{supi}] DB update_imeisv failed: {e:?}");
                                         }
                                     }
@@ -296,7 +304,7 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                                                     log::debug!(
                                                         "[{supi}] Setting purge flag to {purge}"
                                                     );
-                                                    // Update purge flag via ogs_dbi_update_mme if needed
+                                                    // Update purge flag via nextgcore_dbi_update_mme if needed
                                                 }
                                             }
                                         }
@@ -380,7 +388,8 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
     }
 
     // Get subscription data from database
-    let subscription_data = match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+    let subscription_data = match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data(supi)
+    {
         Ok(data) => data,
         Err(e) => {
             log::error!("[{supi}] DB subscription_data query failed: {e:?}");
@@ -462,7 +471,7 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
 }
 
 /// Build AccessAndMobilitySubscriptionData JSON from subscription data
-fn build_am_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+fn build_am_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serde_json::Value {
     let mut am = serde_json::Map::new();
 
     // GPSIs (msisdn-xxx)
@@ -532,7 +541,9 @@ fn build_am_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Valu
 }
 
 /// Build SmfSelectionSubscriptionData JSON from subscription data
-fn build_smf_selection_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+fn build_smf_selection_data(
+    data: &nextgcore_dbi::types::NextgcoreSubscriptionData,
+) -> serde_json::Value {
     let mut smf_sel = serde_json::Map::new();
     let mut snssai_infos = serde_json::Map::new();
 
@@ -578,7 +589,7 @@ fn build_smf_selection_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde
 }
 
 /// Build SessionManagementSubscriptionData list JSON from subscription data
-fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+fn build_sm_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serde_json::Value {
     let mut sm_data_list = Vec::new();
 
     for slice in &data.slice {
@@ -694,7 +705,7 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
     let resource1 = resource_components.get(1).map(|s| s.as_str());
 
     match resource1 {
-        // In C: CASE(OGS_SBI_RESOURCE_NAME_UES)
+        // In C: CASE(NEXTGCORE_SBI_RESOURCE_NAME_UES)
         Some("ues") => {
             // Get SUPI from resource component[2]
             let supi = match resource_components.get(2) {
@@ -717,7 +728,7 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
                 "GET" => {
                     // Get subscription data from database
                     let subscription_data =
-                        match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+                        match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data(supi) {
                             Ok(data) => data,
                             Err(e) => {
                                 log::error!("[{supi}] DB subscription_data query failed: {e:?}");

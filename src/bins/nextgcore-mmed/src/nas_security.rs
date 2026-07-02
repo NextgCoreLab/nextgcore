@@ -24,7 +24,7 @@ pub const NAS_SECURITY_DOWNLINK_DIRECTION: u32 = 1;
 pub const NAS_SECURITY_UPLINK_DIRECTION: u32 = 0;
 
 /// NAS headroom for security header
-pub const OGS_NAS_HEADROOM: usize = 16;
+pub const NEXTGCORE_NAS_HEADROOM: usize = 16;
 
 // ============================================================================
 // Security Header Type Parsing
@@ -160,7 +160,7 @@ pub fn nas_mac_calculate(
             }
             let key: [u8; 16] = knas_int[..16].try_into().unwrap_or([0u8; 16]);
             let fresh = bearer << 27;
-            ogs_crypt::snow3g::snow_3g_f9(
+            nextgcore_crypt::snow3g::snow_3g_f9(
                 &key,
                 count,
                 fresh,
@@ -184,7 +184,7 @@ pub fn nas_mac_calculate(
             input.extend_from_slice(&[0u8; 3]); // Padding
             input.extend_from_slice(message);
 
-            let cmac = ogs_crypt::aes_cmac::aes_cmac_calculate(&key, &input);
+            let cmac = nextgcore_crypt::aes_cmac::aes_cmac_calculate(&key, &input);
             [cmac[0], cmac[1], cmac[2], cmac[3]]
         }
         3 => {
@@ -193,7 +193,7 @@ pub fn nas_mac_calculate(
                 return [0u8; 4];
             }
             let key: [u8; 16] = knas_int[..16].try_into().unwrap_or([0u8; 16]);
-            let mac = ogs_crypt::zuc::zuc_eia3(
+            let mac = nextgcore_crypt::zuc::zuc_eia3(
                 &key,
                 count,
                 bearer,
@@ -245,7 +245,7 @@ pub fn nas_encrypt(
                 return;
             }
             let key: [u8; 16] = knas_enc[..16].try_into().unwrap_or([0u8; 16]);
-            ogs_crypt::snow3g::snow_3g_f8(
+            nextgcore_crypt::snow3g::snow_3g_f8(
                 &key,
                 count,
                 bearer,
@@ -271,7 +271,8 @@ pub fn nas_encrypt(
             // iv[5..16] are zeros
 
             let mut output = vec![0u8; message.len()];
-            if ogs_crypt::aes::aes_ctr128_encrypt(&key, &mut iv, message, &mut output).is_ok() {
+            if nextgcore_crypt::aes::aes_ctr128_encrypt(&key, &mut iv, message, &mut output).is_ok()
+            {
                 message.copy_from_slice(&output);
             }
         }
@@ -282,7 +283,7 @@ pub fn nas_encrypt(
             }
             let key: [u8; 16] = knas_enc[..16].try_into().unwrap_or([0u8; 16]);
             let mut output = vec![0u8; message.len()];
-            ogs_crypt::zuc::zuc_eea3(
+            nextgcore_crypt::zuc::zuc_eea3(
                 &key,
                 count,
                 bearer,

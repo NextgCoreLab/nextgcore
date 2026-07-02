@@ -3,8 +3,10 @@
 //! Port of src/amf/sbi-path.c - SBI service discovery and message routing
 
 use base64::Engine;
-use ogs_sbi::client::SbiClient;
-use ogs_sbi::context::{global_context, NfInstance, NfService};
+use nextgcore_sbi::client::SbiClient;
+use nextgcore_sbi::constants::content_type;
+use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+use nextgcore_sbi::message::{SbiPart, SbiRequest, SbiResponse};
 
 use crate::context::{AmfSess, AmfUe, RanUe};
 
@@ -24,6 +26,7 @@ pub mod service_name {
     pub const NSMF_PDUSESSION: &str = "nsmf-pdusession";
     pub const NNSSF_NSSELECTION: &str = "nnssf-nsselection";
     pub const NPCF_AM_POLICY_CONTROL: &str = "npcf-am-policy-control";
+    pub const NNSACF_NSAC: &str = "nnsacf-nsac";
     pub const NNRF_NFM: &str = "nnrf-nfm";
     pub const NNRF_DISC: &str = "nnrf-disc";
 }
@@ -152,6 +155,8 @@ pub enum SbiServiceType {
     NnssfNsselection,
     /// NPCF AM policy control
     NpcfAmPolicyControl,
+    /// NNSACF network slice admission control
+    NnsacfNsac,
     /// NNRF NF management
     NnrfNfm,
     /// NNRF discovery
@@ -168,6 +173,7 @@ impl SbiServiceType {
             Self::NsmfPdusession => service_name::NSMF_PDUSESSION,
             Self::NnssfNsselection => service_name::NNSSF_NSSELECTION,
             Self::NpcfAmPolicyControl => service_name::NPCF_AM_POLICY_CONTROL,
+            Self::NnsacfNsac => service_name::NNSACF_NSAC,
             Self::NnrfNfm => service_name::NNRF_NFM,
             Self::NnrfDisc => service_name::NNRF_DISC,
         }
@@ -276,17 +282,19 @@ pub fn amf_sbi_open() -> SbiResult<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
 
-    let mut nf_instance = NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Amf);
+    let mut nf_instance = NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Amf);
     nf_instance.ipv4_addresses.push(sbi_addr.clone());
 
     // Register Namf services: namf-comm, namf-evts, namf-mt, namf-loc
-    let mut comm_service = NfService::new("namf-comm", ogs_sbi::types::SbiServiceType::NamfComm);
+    let mut comm_service =
+        NfService::new("namf-comm", nextgcore_sbi::types::SbiServiceType::NamfComm);
     comm_service.versions = vec!["v1".to_string()];
     comm_service.port = sbi_port;
     comm_service.ip_addresses.push(sbi_addr.clone());
     nf_instance.add_service(comm_service);
 
-    let mut evts_service = NfService::new("namf-evts", ogs_sbi::types::SbiServiceType::NamfEvts);
+    let mut evts_service =
+        NfService::new("namf-evts", nextgcore_sbi::types::SbiServiceType::NamfEvts);
     evts_service.versions = vec!["v1".to_string()];
     evts_service.port = sbi_port;
     nf_instance.add_service(evts_service);
@@ -378,9 +386,11 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
             log::info!("AMF registered with NRF (id={nf_instance_id})");
 
             // Update self instance in SBI context
-            let mut self_instance = NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Amf);
+            let mut self_instance =
+                NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Amf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = NfService::new("namf-comm", ogs_sbi::types::SbiServiceType::NamfComm);
+            let mut svc =
+                NfService::new("namf-comm", nextgcore_sbi::types::SbiServiceType::NamfComm);
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
             self_instance.add_service(svc);
@@ -439,12 +449,16 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
             let nf_type_str = nf_json.get("nfType").and_then(|v| v.as_str()).unwrap_or("");
 
             let nf_type = match nf_type_str {
-                "AUSF" => ogs_sbi::types::NfType::Ausf,
-                "UDM" => ogs_sbi::types::NfType::Udm,
-                "SMF" => ogs_sbi::types::NfType::Smf,
-                "PCF" => ogs_sbi::types::NfType::Pcf,
-                "NSSF" => ogs_sbi::types::NfType::Nssf,
-                "NRF" => ogs_sbi::types::NfType::Nrf,
+                "AUSF" => nextgcore_sbi::types::NfType::Ausf,
+                "UDM" => nextgcore_sbi::types::NfType::Udm,
+                "SMF" => nextgcore_sbi::types::NfType::Smf,
+                "PCF" => nextgcore_sbi::types::NfType::Pcf,
+                "NSSF" => nextgcore_sbi::types::NfType::Nssf,
+                "NRF" => nextgcore_sbi::types::NfType::Nrf,
+                // NSAC (TS 23.501 §5.15.11): without this arm a discovered
+                // NSACF profile was silently DROPPED here, so UE admission
+                // always fell back to degrade-open.
+                "NSACF" => nextgcore_sbi::types::NfType::Nsacf,
                 _ => continue,
             };
 
@@ -466,7 +480,9 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
                         .get("serviceName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if let Some(svc_type) = ogs_sbi::types::SbiServiceType::from_name(svc_name) {
+                    if let Some(svc_type) =
+                        nextgcore_sbi::types::SbiServiceType::from_name(svc_name)
+                    {
                         let mut svc = NfService::new(svc_name, svc_type);
                         if let Some(endpoints) =
                             svc_json.get("ipEndPoints").and_then(|v| v.as_array())
@@ -514,46 +530,46 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 /// Send SBI request to NF instance
 pub fn amf_sbi_send_request(_nf_instance_id: &str, _xact: &SbiXact) -> SbiResult<()> {
     // Note: Implement actual SBI request sending
-    // HTTP/2 request transmission handled by ogs_sbi client module
+    // HTTP/2 request transmission handled by nextgcore_sbi client module
     Ok(())
 }
 
 /// Discover NF endpoint for the given service type using SbiContext cache + env var fallback
 fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
-    // Map AMF SbiServiceType to ogs_sbi SbiServiceType and env var names
-    let (ogs_service_type, env_addr, env_port, default_port) = match service_type {
+    // Map AMF SbiServiceType to nextgcore_sbi SbiServiceType and env var names
+    let (nextgcore_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
-            ogs_sbi::types::SbiServiceType::NausfAuth,
+            nextgcore_sbi::types::SbiServiceType::NausfAuth,
             "AUSF_SBI_ADDR",
             "AUSF_SBI_PORT",
             7777u16,
         ),
         SbiServiceType::NudmUecm => (
-            ogs_sbi::types::SbiServiceType::NudmUecm,
+            nextgcore_sbi::types::SbiServiceType::NudmUecm,
             "UDM_SBI_ADDR",
             "UDM_SBI_PORT",
             7777,
         ),
         SbiServiceType::NudmSdm => (
-            ogs_sbi::types::SbiServiceType::NudmSdm,
+            nextgcore_sbi::types::SbiServiceType::NudmSdm,
             "UDM_SBI_ADDR",
             "UDM_SBI_PORT",
             7777,
         ),
         SbiServiceType::NsmfPdusession => (
-            ogs_sbi::types::SbiServiceType::NsmfPdusession,
+            nextgcore_sbi::types::SbiServiceType::NsmfPdusession,
             "SMF_SBI_ADDR",
             "SMF_SBI_PORT",
             7777,
         ),
         SbiServiceType::NnssfNsselection => (
-            ogs_sbi::types::SbiServiceType::NnssfNsselection,
+            nextgcore_sbi::types::SbiServiceType::NnssfNsselection,
             "NSSF_SBI_ADDR",
             "NSSF_SBI_PORT",
             7777,
         ),
         SbiServiceType::NpcfAmPolicyControl => (
-            ogs_sbi::types::SbiServiceType::NpcfAmPolicyControl,
+            nextgcore_sbi::types::SbiServiceType::NpcfAmPolicyControl,
             "PCF_SBI_ADDR",
             "PCF_SBI_PORT",
             7777,
@@ -568,7 +584,7 @@ fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)>
     let sbi_ctx = global_context();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         // We're inside a tokio runtime, spawn a blocking task
-        let svc_type = ogs_service_type;
+        let svc_type = nextgcore_service_type;
         let ctx = sbi_ctx.clone();
         if let Ok(result) = handle.block_on(async {
             let instances = ctx.find_nf_instances_by_service(svc_type).await;
@@ -739,6 +755,73 @@ pub struct SmContextCreateResponse {
     pub sm_context_ref: String,
 }
 
+/// Extract an N1/N2 binary payload referenced from the JSON root of an SMF
+/// response, accepting BOTH the conformant multipart/related form and the
+/// legacy base64-in-JSON form.
+///
+/// Per TS 29.502 §6.1.2.2.2 / §6.1.2.4 the JSON attribute is a RefToBinaryData
+/// pointer (`{ "contentId": "<id>" }`) whose bytes live in the multipart binary
+/// part with the matching `Content-Id` (decoded by `SbiClient` into
+/// `response.http.parts`). When no matching part is present the attribute is
+/// read as a base64 string, so a legacy SMF still interoperates.
+fn extract_binary_ref(
+    response: &SbiResponse,
+    root: &serde_json::Value,
+    field: &str,
+) -> Option<Vec<u8>> {
+    let attr = &root[field];
+    if let Some(content_id) = attr["contentId"].as_str() {
+        if let Some(part) = response
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some(content_id))
+        {
+            return Some(part.data.to_vec());
+        }
+    }
+    if let Some(b64) = attr.as_str() {
+        return base64::engine::general_purpose::STANDARD.decode(b64).ok();
+    }
+    None
+}
+
+/// Build the multipart/related `Nsmf_PDUSession_CreateSMContext` request: the
+/// JSON root carries the SmContextCreateData with the N1 container as a
+/// RefToBinaryData pointer, and the UE's PDU Session Establishment Request
+/// travels as a 5gnas binary part (TS 29.502 §6.1.2.2.2). The `SbiClient`
+/// serializes the attached part into the multipart/related body.
+fn build_create_sm_context_request(
+    pdu_session_id: u8,
+    sst: u8,
+    sd: Option<u32>,
+    dnn: &str,
+    n1_sm_msg_from_ue: &[u8],
+    redcap_indication: bool,
+) -> SbiRequest {
+    let body = serde_json::json!({
+        "pduSessionId": pdu_session_id,
+        "sNssai": {
+            "sst": sst,
+            "sd": sd.map(|v| format!("{v:06x}"))
+        },
+        "dnn": dnn,
+        "n1SmMsg": { "contentId": "n1SmMsg" },
+        "redcapIndication": redcap_indication,
+        "servingNetwork": {
+            "mcc": "001",
+            "mnc": "01"
+        }
+    });
+    SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(n1_sm_msg_from_ue),
+        ))
+}
+
 /// Call SMF to create SM context (POST /nsmf-pdusession/v1/sm-contexts)
 ///
 /// Returns the N1 SM message (PDU Session Accept), N2 SM Info (UPF TEID/addr),
@@ -758,28 +841,26 @@ pub async fn call_smf_create_sm_context(
          DNN={dnn}, redcap={redcap_indication}"
     );
 
-    let client = SbiClient::with_host_port(smf_host, smf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
 
     // redcapIndication propagates the UE's Reduced-Capability status to the SMF
     // (TS 29.502 SmContextCreateData) so the SMF can apply a reduced
-    // session-AMBR for RedCap devices (Rel-17).
-    let body = serde_json::json!({
-        "pduSessionId": pdu_session_id,
-        "sNssai": {
-            "sst": sst,
-            "sd": sd.map(|v| format!("{v:06x}"))
-        },
-        "dnn": dnn,
-        "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(n1_sm_msg_from_ue),
-        "redcapIndication": redcap_indication,
-        "servingNetwork": {
-            "mcc": "001",
-            "mnc": "01"
-        }
-    });
+    // session-AMBR for RedCap devices (Rel-17). The N1 container is sent as a
+    // multipart/related 5gnas binary part (smfd-01).
+    let request = build_create_sm_context_request(
+        pdu_session_id,
+        sst,
+        sd,
+        dnn,
+        n1_sm_msg_from_ue,
+        redcap_indication,
+    );
 
     let response = client
-        .post_json("/nsmf-pdusession/v1/sm-contexts", &body)
+        .send_request(request)
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF request failed: {e}")))?;
 
@@ -813,17 +894,15 @@ pub async fn call_smf_create_sm_context(
         })
         .unwrap_or_else(|| "1".to_string());
 
-    // Extract N1 SM message (base64-encoded PDU Session Accept from SMF)
-    let n1_sm_msg = response_body["n1SmMsg"]
-        .as_str()
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .expect("value expected");
+    // Extract N1 SM message (PDU Session Accept) and N2 SM Information (UPF
+    // tunnel info) from the SMF response: multipart 5gnas/ngap binary parts
+    // (smfd-01) or, from a legacy SMF, base64-in-JSON. `extract_binary_ref`
+    // accepts both.
+    let n1_sm_msg = extract_binary_ref(&response, &response_body, "n1SmMsg")
+        .ok_or_else(|| SbiError::ResponseParseError("SMF response missing n1SmMsg".to_string()))?;
 
-    // Extract N2 SM Information (base64-encoded UPF tunnel info from SMF)
-    let n2_sm_info = response_body["n2SmInfo"]
-        .as_str()
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .expect("value expected");
+    let n2_sm_info = extract_binary_ref(&response, &response_body, "n2SmInfo")
+        .ok_or_else(|| SbiError::ResponseParseError("SMF response missing n2SmInfo".to_string()))?;
 
     log::info!(
         "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
@@ -854,16 +933,28 @@ pub async fn call_smf_update_sm_context(
         n2_sm_info.len()
     );
 
-    let client = SbiClient::with_host_port(smf_host, smf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
 
+    // N2 SM transfer (gNB DL F-TEID) carried as a multipart/related ngap binary
+    // part referenced by RefToBinaryData (smfd-02).
     let body = serde_json::json!({
-        "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(n2_sm_info),
+        "n2SmInfo": { "contentId": "n2SmInfo" },
         "n2SmInfoType": "PDU_RES_SETUP_RSP"
     });
 
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let request = SbiRequest::post(&path)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n2SmInfo",
+            content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(n2_sm_info),
+        ));
     let response = client
-        .post_json(&path, &body)
+        .send_request(request)
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {e}")))?;
 
@@ -902,16 +993,29 @@ pub async fn call_smf_update_sm_context_with_n1(
         n1_sm_msg.len()
     );
 
-    let client = SbiClient::with_host_port(smf_host, smf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
 
+    // UE-initiated modification: the UE's N1 container is carried as a
+    // multipart/related 5gnas binary part referenced by RefToBinaryData
+    // (smfd-02).
     let body = serde_json::json!({
-        "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(n1_sm_msg),
+        "n1SmMsg": { "contentId": "n1SmMsg" },
         "n2SmInfoType": "PDU_RES_MOD_REQ"
     });
 
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let request = SbiRequest::post(&path)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(n1_sm_msg),
+        ));
     let response = client
-        .post_json(&path, &body)
+        .send_request(request)
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {e}")))?;
 
@@ -927,15 +1031,10 @@ pub async fn call_smf_update_sm_context_with_n1(
         None => serde_json::json!({}),
     };
 
-    let n1_sm_msg = response_body["n1SmMsg"]
-        .as_str()
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .expect("value expected");
-
-    let n2_sm_info = response_body["n2SmInfo"]
-        .as_str()
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .expect("value expected");
+    // N1 (PDU Session Modification Command) + N2 (QoS flow mod) from the SMF:
+    // multipart binary parts or legacy base64-in-JSON.
+    let n1_sm_msg = extract_binary_ref(&response, &response_body, "n1SmMsg").unwrap_or_default();
+    let n2_sm_info = extract_binary_ref(&response, &response_body, "n2SmInfo").unwrap_or_default();
 
     log::info!(
         "SMF SM Context Updated (N1): ref={sm_context_ref}, n1_len={}, n2_len={}",
@@ -960,7 +1059,10 @@ pub async fn call_smf_release_sm_context(
 ) -> SbiResult<()> {
     log::info!("Calling SMF SM Context Release: ref={sm_context_ref}");
 
-    let client = SbiClient::with_host_port(smf_host, smf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
 
     let body = serde_json::json!({
         "cause": "REL_DUE_TO_UE_REQUEST"
@@ -1027,7 +1129,10 @@ pub async fn call_ausf_authenticate_with_resync(
         resync.is_some()
     );
 
-    let client = SbiClient::with_host_port(ausf_host, ausf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(ausf_host, ausf_port),
+        nextgcore_sbi::types::NfType::Ausf,
+    );
 
     let mut body = serde_json::json!({
         "supiOrSuci": suci,
@@ -1118,7 +1223,10 @@ pub async fn call_ausf_5g_aka_confirm(
         hex::encode(&res_star[..4])
     );
 
-    let client = SbiClient::with_host_port(ausf_host, ausf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(ausf_host, ausf_port),
+        nextgcore_sbi::types::NfType::Ausf,
+    );
 
     let body = serde_json::json!({
         "resStar": hex::encode(res_star)
@@ -1180,59 +1288,96 @@ pub async fn call_ausf_5g_aka_confirm(
 /// Unlike `resolve_nf_endpoint`, this is safe to call from async context
 /// (no `Handle::block_on`).
 pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
-    let (ogs_service_type, env_addr, env_port, default_port) = match service_type {
+    let (nextgcore_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
-            ogs_sbi::types::SbiServiceType::NausfAuth,
+            nextgcore_sbi::types::SbiServiceType::NausfAuth,
             "AUSF_SBI_ADDR",
             "AUSF_SBI_PORT",
             7777u16,
         ),
         SbiServiceType::NudmUecm => (
-            ogs_sbi::types::SbiServiceType::NudmUecm,
+            nextgcore_sbi::types::SbiServiceType::NudmUecm,
             "UDM_SBI_ADDR",
             "UDM_SBI_PORT",
             7777,
         ),
         SbiServiceType::NudmSdm => (
-            ogs_sbi::types::SbiServiceType::NudmSdm,
+            nextgcore_sbi::types::SbiServiceType::NudmSdm,
             "UDM_SBI_ADDR",
             "UDM_SBI_PORT",
             7777,
         ),
         SbiServiceType::NsmfPdusession => (
-            ogs_sbi::types::SbiServiceType::NsmfPdusession,
+            nextgcore_sbi::types::SbiServiceType::NsmfPdusession,
             "SMF_SBI_ADDR",
             "SMF_SBI_PORT",
             7777,
         ),
         SbiServiceType::NnssfNsselection => (
-            ogs_sbi::types::SbiServiceType::NnssfNsselection,
+            nextgcore_sbi::types::SbiServiceType::NnssfNsselection,
             "NSSF_SBI_ADDR",
             "NSSF_SBI_PORT",
             7777,
         ),
         SbiServiceType::NpcfAmPolicyControl => (
-            ogs_sbi::types::SbiServiceType::NpcfAmPolicyControl,
+            nextgcore_sbi::types::SbiServiceType::NpcfAmPolicyControl,
             "PCF_SBI_ADDR",
             "PCF_SBI_PORT",
+            7777,
+        ),
+        SbiServiceType::NnsacfNsac => (
+            nextgcore_sbi::types::SbiServiceType::NnsacfNsac,
+            "NSACF_SBI_ADDR",
+            "NSACF_SBI_PORT",
             7777,
         ),
         _ => return Err(SbiError::ServiceNotFound(format!("{service_type:?}"))),
     };
 
     let sbi_ctx = global_context();
-    let instances = sbi_ctx.find_nf_instances_by_service(ogs_service_type).await;
-    if let Some(inst) = instances.first() {
-        if let Some(svc) = inst.find_service(ogs_service_type) {
-            let host = svc
-                .ip_addresses
-                .first()
-                .or(inst.ipv4_addresses.first())
-                .or(svc.fqdn.as_ref())
-                .or(inst.fqdn.as_ref());
-            if let Some(h) = host {
-                return Ok((h.clone(), svc.port));
-            }
+    let endpoint_from_cache = |instances: Vec<NfInstance>| {
+        let inst = instances.first()?;
+        let svc = inst.find_service(nextgcore_service_type)?;
+        let host = svc
+            .ip_addresses
+            .first()
+            .or(inst.ipv4_addresses.first())
+            .or(svc.fqdn.as_ref())
+            .or(inst.fqdn.as_ref())?;
+        Some((host.clone(), svc.port))
+    };
+
+    let instances = sbi_ctx
+        .find_nf_instances_by_service(nextgcore_service_type)
+        .await;
+    if let Some(ep) = endpoint_from_cache(instances) {
+        return Ok(ep);
+    }
+
+    // Cache miss: perform on-demand NRF discovery (TS 29.510 §5.3.2) for this
+    // exact service and re-check. Without this, an NF that registered with the
+    // NRF after this AMF populated its cache (e.g. the NSACF) was never found
+    // and the resolver silently fell back to env/localhost — which is how
+    // slice admission control ended up permanently degrade-open in the E2E.
+    let target_nf_type = match service_type {
+        SbiServiceType::NausfAuth => "AUSF",
+        SbiServiceType::NudmUecm | SbiServiceType::NudmSdm => "UDM",
+        SbiServiceType::NsmfPdusession => "SMF",
+        SbiServiceType::NnssfNsselection => "NSSF",
+        SbiServiceType::NpcfAmPolicyControl => "PCF",
+        SbiServiceType::NnsacfNsac => "NSACF",
+        _ => "",
+    };
+    if !target_nf_type.is_empty()
+        && amf_nrf_discover(target_nf_type, service_type.service_name())
+            .await
+            .is_ok()
+    {
+        let instances = sbi_ctx
+            .find_nf_instances_by_service(nextgcore_service_type)
+            .await;
+        if let Some(ep) = endpoint_from_cache(instances) {
+            return Ok(ep);
         }
     }
 
@@ -1242,6 +1387,36 @@ pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResul
         .and_then(|p| p.parse().ok())
         .unwrap_or(default_port);
     Ok((host, port))
+}
+
+/// Base URL (`http://{advertised_sbi_addr}:{port}`) the AMF advertises for its
+/// own SBI server — the same address/port `run()` binds the Namf HTTP/2 server
+/// to and the NRF NFProfile advertises (env `AMF_SBI_ADDR`/`AMF_SBI_PORT`,
+/// defaults `127.0.0.1:7777`, matching [`amf_sbi_open`]).
+///
+/// WSB-4: callback URIs the AMF registers with peers (e.g. the Nudm_UECM
+/// `deregCallbackUri`, TS 29.503 §5.3.2.2.2) MUST be absolute so the peer can
+/// POST to them — a relative URI is rejected by udmd's `parse_callback_uri`,
+/// which is exactly what broke the network-initiated deregistration round trip.
+/// Shared helper for every amfd inbound SBI callback (dereg-notify, and the
+/// still-unserved am-policy-notify / sdmsubscription-notify — WS-A reuses this).
+pub fn advertised_sbi_base() -> String {
+    let addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("AMF_SBI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    format!("http://{addr}:{port}")
+}
+
+/// The absolute Nudm_UECM `deregCallbackUri` the AMF registers for `supi`
+/// (WSB-4, TS 29.503 §5.3.2.3.2). Routed by `namf_server` at
+/// `POST /namf-callback/v1/{supi}/dereg-notify`.
+pub fn dereg_callback_uri(supi: &str) -> String {
+    format!(
+        "{}/namf-callback/v1/{supi}/dereg-notify",
+        advertised_sbi_base()
+    )
 }
 
 /// Nudm_UECM_Registration (amf3gpp-access):
@@ -1255,11 +1430,16 @@ pub async fn call_udm_uecm_registration(
     guami_plmn_mnc: &str,
     amf_id_hex: &str,
 ) -> SbiResult<()> {
-    let client = SbiClient::with_host_port(udm_host, udm_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(udm_host, udm_port),
+        nextgcore_sbi::types::NfType::Udm,
+    );
 
     let body = serde_json::json!({
         "amfInstanceId": amf_instance_id,
-        "deregCallbackUri": format!("/namf-callback/v1/{supi}/dereg-notify"),
+        // WSB-4: absolute URI (was relative) so udmd can POST the
+        // DeregistrationNotification back (TS 29.503 §5.3.2.3.2).
+        "deregCallbackUri": dereg_callback_uri(supi),
         "guami": {
             "plmnId": { "mcc": guami_plmn_mcc, "mnc": guami_plmn_mnc },
             "amfId": amf_id_hex,
@@ -1300,7 +1480,10 @@ pub async fn call_udm_sdm_get_am_data(
     udm_port: u16,
     supi: &str,
 ) -> SbiResult<AmDataResponse> {
-    let client = SbiClient::with_host_port(udm_host, udm_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(udm_host, udm_port),
+        nextgcore_sbi::types::NfType::Udm,
+    );
     let path = format!("/nudm-sdm/v1/{supi}/am-data");
     let response = client
         .get(&path)
@@ -1351,7 +1534,10 @@ pub async fn call_udm_sdm_subscribe(
     supi: &str,
     amf_instance_id: &str,
 ) -> SbiResult<String> {
-    let client = SbiClient::with_host_port(udm_host, udm_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(udm_host, udm_port),
+        nextgcore_sbi::types::NfType::Udm,
+    );
 
     let body = serde_json::json!({
         "nfInstanceId": amf_instance_id,
@@ -1400,7 +1586,10 @@ pub async fn call_pcf_am_policy_create(
     serving_plmn_mcc: &str,
     serving_plmn_mnc: &str,
 ) -> SbiResult<String> {
-    let client = SbiClient::with_host_port(pcf_host, pcf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
 
     let body = serde_json::json!({
         "notificationUri": format!("/namf-callback/v1/{supi}/am-policy-notify"),
@@ -1439,6 +1628,218 @@ pub async fn call_pcf_am_policy_create(
     Ok(assoc_id)
 }
 
+/// Wave-6 E7 kill-switch for the UE Policy Association at registration:
+/// `AMF_UE_POLICY_ASSOC=off` (also `0`/`false`, case-insensitive) restores
+/// the pre-E7 registration byte-flow (no Npcf_UEPolicyControl create/delete).
+/// Default (unset or any other value) is enabled.
+pub fn ue_policy_assoc_enabled() -> bool {
+    ue_policy_assoc_enabled_value(std::env::var("AMF_UE_POLICY_ASSOC").ok().as_deref())
+}
+
+/// Pure classifier behind [`ue_policy_assoc_enabled`] (env-free for tests).
+fn ue_policy_assoc_enabled_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("off") | Some("0") | Some("false")
+    )
+}
+
+/// Npcf_UEPolicyControl_Create: POST /npcf-ue-policy-control/v1/policies
+/// (TS 29.525 §4.2.2 — the AMF is the NF service consumer creating the UE
+/// Policy Association at registration; Wave-6 E7). The body is a
+/// PolicyAssociationRequest (TS29525_Npcf_UEPolicyControl.yaml:381-461):
+/// `notificationUri`/`supi`/`suppFeat` (the members pcfd validates as
+/// mandatory) plus the `servingPlmn` and `guami` optionals so the PCF can
+/// address the serving AMF for the Namf N1N2 delivery leg (E4). Returns the
+/// policy association ID parsed from the Location header (fallback:
+/// `polAssoId` in the body).
+#[allow(clippy::too_many_arguments)]
+pub async fn call_pcf_ue_policy_create(
+    pcf_host: &str,
+    pcf_port: u16,
+    supi: &str,
+    serving_plmn_mcc: &str,
+    serving_plmn_mnc: &str,
+    guami_mcc: &str,
+    guami_mnc: &str,
+    guami_amf_id_hex: &str,
+) -> SbiResult<String> {
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
+
+    let body = serde_json::json!({
+        "notificationUri": format!("/namf-callback/v1/{supi}/ue-policy-notify"),
+        "supi": supi,
+        "suppFeat": "",
+        "servingPlmn": { "mcc": serving_plmn_mcc, "mnc": serving_plmn_mnc },
+        "guami": {
+            "plmnId": { "mcc": guami_mcc, "mnc": guami_mnc },
+            "amfId": guami_amf_id_hex,
+        },
+    });
+
+    let response = client
+        .post_json("/npcf-ue-policy-control/v1/policies", &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("UE policy create failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "UE policy create returned status {}",
+            response.status
+        )));
+    }
+
+    let assoc_id = response
+        .http
+        .headers
+        .get("location")
+        .and_then(|loc| loc.rsplit('/').next().map(String::from))
+        .or_else(|| {
+            response.http.content.as_ref().and_then(|c| {
+                serde_json::from_str::<serde_json::Value>(c)
+                    .ok()
+                    .and_then(|j| j["polAssoId"].as_str().map(String::from))
+            })
+        })
+        .ok_or_else(|| {
+            SbiError::RequestFailed(
+                "UE policy create: no Location header and no polAssoId in body".to_string(),
+            )
+        })?;
+
+    log::info!("[{supi}] Npcf_UEPolicyControl_Create OK (polAssoId={assoc_id})");
+    Ok(assoc_id)
+}
+
+/// Npcf_UEPolicyControl_Delete: DELETE
+/// /npcf-ue-policy-control/v1/policies/{polAssoId} (TS 29.525 §4.2.4 —
+/// Wave-6 E7, the deregistration leg of the UE Policy Association).
+pub async fn call_pcf_ue_policy_delete(
+    pcf_host: &str,
+    pcf_port: u16,
+    pol_asso_id: &str,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
+
+    let response = client
+        .delete(&format!(
+            "/npcf-ue-policy-control/v1/policies/{pol_asso_id}"
+        ))
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("UE policy delete failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "UE policy delete returned status {}",
+            response.status
+        )));
+    }
+
+    log::info!("Npcf_UEPolicyControl_Delete OK (polAssoId={pol_asso_id})");
+    Ok(())
+}
+
+/// Result of an Nnsacf UE-admission query (TS 29.536).
+#[derive(Debug, Clone)]
+pub struct NsacfUeAdmissionResult {
+    /// Whether the UE was admitted for the requested S-NSSAI.
+    pub admitted: bool,
+}
+
+/// Nnsacf_NSAC UE-admission query (TS 29.536 §6.1.3.2).
+///
+/// POST {apiRoot}/nnsacf-nsac/v1/slices/ues with a nested `UeACRequestData`
+/// (§6.1.6.2.2): `ueACRequestInfo[]` each with a mandatory `supi`, `anType` and
+/// an `acuOperationList[]` of `{updateFlag, snssai}`. The admission RESULT is
+/// the HTTP status (§6.1.3.2.3.1): **204** all requested S-NSSAIs admitted,
+/// **200** `UeACResponseData.acuFailureList` (a map keyed by SUPI) for partial
+/// failure, **403** ProblemDetails for total failure. `update_flag=true`
+/// requests INCREASE (enforce the per-slice UE count); false requests DECREASE.
+///
+/// Degrade-open: any transport error or unexpected status returns
+/// `admitted=true`, so a missing/failing NSACF never blocks registration.
+pub async fn call_nsacf_ue_admission(
+    nsacf_host: &str,
+    nsacf_port: u16,
+    nf_id: &str,
+    supi: &str,
+    snssai_sst: u8,
+    snssai_sd: Option<u32>,
+    access_type: &str,
+    update_flag: bool,
+) -> SbiResult<NsacfUeAdmissionResult> {
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(nsacf_host, nsacf_port),
+        nextgcore_sbi::types::NfType::Nsacf,
+    );
+
+    let mut snssai = serde_json::json!({ "sst": snssai_sst });
+    if let Some(sd) = snssai_sd {
+        snssai["sd"] = serde_json::Value::String(format!("{sd:06X}"));
+    }
+
+    // TS 29.536 §6.1.6.2.2/.9/.5 nested UeACRequestData.
+    let body = serde_json::json!({
+        "nfId": nf_id,
+        "ueACRequestInfo": [{
+            "supi": supi,
+            "anType": access_type,
+            "acuOperationList": [{
+                "updateFlag": if update_flag { "INCREASE" } else { "DECREASE" },
+                "snssai": snssai,
+            }],
+        }],
+    });
+
+    let response = match client.post_json("/nnsacf-nsac/v1/slices/ues", &body).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Degrade-open: NSACF unreachable -> admit.
+            log::warn!("NSACF UE admission unreachable, admitting (degrade-open): {e}");
+            return Ok(NsacfUeAdmissionResult { admitted: true });
+        }
+    };
+
+    let admitted = match response.status {
+        // All requested S-NSSAIs admitted.
+        204 => true,
+        // Total failure (ProblemDetails) -> not admitted.
+        403 => false,
+        // Partial failure: UeACResponseData.acuFailureList keyed by SUPI. Our
+        // SUPI appearing means our single requested S-NSSAI failed.
+        200 => {
+            let our_supi_failed = response
+                .http
+                .content
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                .and_then(|j| {
+                    j.get("acuFailureList")
+                        .and_then(|m| m.get(supi))
+                        .map(|entries| !entries.is_null())
+                })
+                .unwrap_or(false);
+            !our_supi_failed
+        }
+        // Unexpected status: degrade-open rather than block registration.
+        other => {
+            log::warn!("NSACF UE admission returned status {other}, admitting (degrade-open)");
+            true
+        }
+    };
+
+    log::info!(
+        "Nnsacf UE admission (SST={snssai_sst}, SD={snssai_sd:?}, supi={supi}): admitted={admitted}"
+    );
+    Ok(NsacfUeAdmissionResult { admitted })
+}
+
 /// Nudm_UECM_DeregistrationNotification cleanup: PATCH purge on deregistration
 /// (TS 29.503 5.3.2.4: AMF sets purgeFlag when the UE deregisters).
 pub async fn call_udm_uecm_deregistration(
@@ -1446,7 +1847,10 @@ pub async fn call_udm_uecm_deregistration(
     udm_port: u16,
     supi: &str,
 ) -> SbiResult<()> {
-    let client = SbiClient::with_host_port(udm_host, udm_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(udm_host, udm_port),
+        nextgcore_sbi::types::NfType::Udm,
+    );
 
     let body = serde_json::json!({ "purgeFlag": true });
     let path = format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access");
@@ -1495,6 +1899,155 @@ mod tests {
     }
 
     #[test]
+    fn test_nsacf_service_name() {
+        assert_eq!(SbiServiceType::NnsacfNsac.service_name(), "nnsacf-nsac");
+    }
+
+    // ------------------------------------------------------------------
+    // nsacf-01/02 pairing: call_nsacf_ue_admission sends a nested
+    // UeACRequestData and maps 204 / 200-acuFailureList / 403, degrade-open.
+    // ------------------------------------------------------------------
+
+    fn nsacf_free_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        port
+    }
+
+    /// Stub NSACF: validates the nested UeACRequestData shape (TS 29.536), then
+    /// answers by SUPI — "imsi-reject" -> 403 (total failure), "imsi-partial" ->
+    /// 200 with an acuFailureList naming that SUPI, otherwise 204 (admitted).
+    async fn stub_nsacf_ue(
+        req: nextgcore_sbi::message::SbiRequest,
+    ) -> nextgcore_sbi::message::SbiResponse {
+        let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+        if !path.ends_with("/nnsacf-nsac/v1/slices/ues") {
+            return nextgcore_sbi::message::SbiResponse::with_status(404);
+        }
+        let body: serde_json::Value = req
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or(serde_json::Value::Null);
+        // Conformant nested shape (no flat data.snssai/updateFlag/supi).
+        assert!(body["nfId"].is_string(), "request must carry nfId");
+        let info = &body["ueACRequestInfo"][0];
+        assert!(info["anType"].is_string(), "anType present");
+        let supi = info["supi"].as_str().unwrap_or("").to_string();
+        let op = &info["acuOperationList"][0];
+        assert!(
+            op["updateFlag"] == "INCREASE" || op["updateFlag"] == "DECREASE",
+            "updateFlag INCREASE/DECREASE"
+        );
+        assert!(op["snssai"]["sst"].is_u64(), "op carries snssai");
+
+        match supi.as_str() {
+            "imsi-reject" => nextgcore_sbi::message::SbiResponse::with_status(403).with_body(
+                serde_json::json!({"status": 403, "cause": "ALL_SLICE_FAILED"}).to_string(),
+                "application/problem+json",
+            ),
+            "imsi-partial" => {
+                let resp = serde_json::json!({
+                    "acuFailureList": {
+                        supi: [{ "snssai": op["snssai"].clone(), "reason": "EXCEED_MAX_UE_NUM" }]
+                    }
+                });
+                nextgcore_sbi::message::SbiResponse::with_status(200)
+                    .with_json_body(&resp)
+                    .unwrap_or_else(|_| nextgcore_sbi::message::SbiResponse::with_status(200))
+            }
+            _ => nextgcore_sbi::message::SbiResponse::with_status(204),
+        }
+    }
+
+    #[tokio::test]
+    async fn nsacf_ue_admission_204_403_200_failure_list() {
+        let port = nsacf_free_port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+        );
+        server.start(stub_nsacf_ue).await.expect("start stub NSACF");
+
+        let run = async {
+            // 204 No Content -> admitted (registration proceeds).
+            let r = call_nsacf_ue_admission(
+                "127.0.0.1",
+                port,
+                "amf-1",
+                "imsi-admit",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
+            )
+            .await
+            .expect("ok");
+            assert!(r.admitted, "204 -> admitted");
+
+            // 403 ProblemDetails (total failure) -> not admitted.
+            let r = call_nsacf_ue_admission(
+                "127.0.0.1",
+                port,
+                "amf-1",
+                "imsi-reject",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
+            )
+            .await
+            .expect("ok");
+            assert!(!r.admitted, "403 -> not admitted");
+
+            // 200 acuFailureList naming our SUPI -> not admitted.
+            let r = call_nsacf_ue_admission(
+                "127.0.0.1",
+                port,
+                "amf-1",
+                "imsi-partial",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
+            )
+            .await
+            .expect("ok");
+            assert!(!r.admitted, "200 acuFailureList[supi] -> not admitted");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("round trip timed out");
+        server.stop().await.ok();
+    }
+
+    #[tokio::test]
+    async fn nsacf_ue_admission_degrade_open_on_transport_error() {
+        // Nothing listening -> degrade-open: admitted=true so registration is
+        // never blocked by a missing/unreachable NSACF.
+        let port = nsacf_free_port();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            call_nsacf_ue_admission(
+                "127.0.0.1",
+                port,
+                "amf-1",
+                "imsi-x",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
+            ),
+        )
+        .await
+        .expect("bounded")
+        .expect("degrade-open returns Ok");
+        assert!(r.admitted, "transport error must degrade-open to admitted");
+    }
+
+    #[test]
     fn test_sbi_discovery_option() {
         let mut opt = SbiDiscoveryOption::new();
         opt.add_target_plmn("310260");
@@ -1533,5 +2086,365 @@ mod tests {
     async fn test_amf_sbi_open_close() {
         assert!(amf_sbi_open().is_ok());
         amf_sbi_close();
+    }
+
+    // ------------------------------------------------------------------
+    // smfd-01 / smfd-02 pairing: multipart/related N1/N2 carriage on the
+    // amfd↔smfd Nsmf_PDUSession path (TS 29.502 §6.1.2.2.2 / §6.1.2.4)
+    // ------------------------------------------------------------------
+
+    /// A UE PDU Session Establishment Request N1 container (PSI=5, PTI=2).
+    const UE_N1_REQUEST: [u8; 14] = [
+        0x2E, 0x05, 0x02, 0xC1, 0xFF, 0xFF, 0x93, 0xA2, 0x28, 0x01, 0x00, 0x55, 0x00, 0x10,
+    ];
+
+    /// amfd's CreateSmContext request is multipart/related: the JSON root holds
+    /// the SmContextCreateData with the N1 as a RefToBinaryData pointer, and the
+    /// UE's N1 travels in a 5gnas binary part with the exact UE bytes.
+    #[test]
+    fn amfd_create_request_is_multipart_with_n1_part() {
+        let request =
+            build_create_sm_context_request(5, 1, None, "internet", &UE_N1_REQUEST, false);
+
+        // Serialize the request's parts exactly as the SBI client would, then
+        // decode it back to prove the wire shape the SMF receives.
+        let boundary = nextgcore_sbi::multipart::generate_boundary();
+        let body = nextgcore_sbi::multipart::encode(
+            request.http.content.as_deref(),
+            &request.http.parts,
+            &boundary,
+        );
+        let ct = nextgcore_sbi::multipart::content_type_with_boundary(&boundary);
+        let decoded = nextgcore_sbi::multipart::decode(&ct, &body).expect("decode multipart");
+
+        let root: serde_json::Value =
+            serde_json::from_str(decoded.json.as_deref().unwrap()).unwrap();
+        assert_eq!(root["n1SmMsg"]["contentId"].as_str(), Some("n1SmMsg"));
+        assert_eq!(root["pduSessionId"].as_u64(), Some(5));
+        assert_eq!(root["dnn"].as_str(), Some("internet"));
+
+        let n1_part = decoded
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("n1 part");
+        assert_eq!(n1_part.data.as_ref(), UE_N1_REQUEST.as_slice());
+        assert_eq!(
+            n1_part.content_type.as_deref(),
+            Some(content_type::APPLICATION_5GNAS)
+        );
+    }
+
+    /// Cross-decode: bytes shaped exactly as smfd emits a multipart
+    /// SmContextCreatedData response (JSON root with N1/N2 RefToBinaryData +
+    /// 5gnas/ngap parts) are parsed by amfd's `extract_binary_ref` to the exact
+    /// N1/N2 containers.
+    #[test]
+    fn amfd_parses_smfd_multipart_response() {
+        let n1 = vec![0x2E, 0x05, 0x02, 0xC2, 0x00, 0x09]; // accept-ish N1
+        let n2 = vec![0x00, 0x00, 0x03, 0x00, 0x8b, 0x00]; // ngap transfer-ish
+
+        // Reproduce smfd's response wire emission via the shared encoder.
+        let root = serde_json::json!({
+            "smContextRef": "7",
+            "pduSessionId": 5,
+            "upCnxState": "ACTIVATING",
+            "n1SmMsg": { "contentId": "n1SmMsg" },
+            "n2SmInfo": { "contentId": "n2SmInfo" },
+            "n2SmInfoType": "PDU_RES_SETUP_REQ"
+        });
+        let parts = vec![
+            SbiPart::with_content(
+                "n1SmMsg",
+                content_type::APPLICATION_5GNAS,
+                bytes::Bytes::copy_from_slice(&n1),
+            ),
+            SbiPart::with_content(
+                "n2SmInfo",
+                content_type::APPLICATION_NGAP,
+                bytes::Bytes::copy_from_slice(&n2),
+            ),
+        ];
+        let boundary = nextgcore_sbi::multipart::generate_boundary();
+        let body = nextgcore_sbi::multipart::encode(Some(&root.to_string()), &parts, &boundary);
+        let ct = nextgcore_sbi::multipart::content_type_with_boundary(&boundary);
+
+        // Client-side: decode into the response amfd's caller would see.
+        let decoded = nextgcore_sbi::multipart::decode(&ct, &body).unwrap();
+        let mut response = SbiResponse::with_status(201);
+        response.http.content = decoded.json.clone();
+        response.http.parts = decoded.parts;
+        let response_body: serde_json::Value =
+            serde_json::from_str(decoded.json.as_deref().unwrap()).unwrap();
+
+        assert_eq!(
+            extract_binary_ref(&response, &response_body, "n1SmMsg").unwrap(),
+            n1
+        );
+        assert_eq!(
+            extract_binary_ref(&response, &response_body, "n2SmInfo").unwrap(),
+            n2
+        );
+    }
+
+    /// Backward compatibility: amfd still extracts N1/N2 from a legacy
+    /// base64-in-JSON SMF response (no multipart parts).
+    #[test]
+    fn amfd_parses_legacy_base64_response() {
+        let n1 = vec![0x2E, 0x05, 0x02, 0xC2];
+        let n2 = vec![0x00, 0x00, 0x03];
+        let response_body = serde_json::json!({
+            "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(&n1),
+            "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(&n2),
+        });
+        // No parts on the response → falls back to the base64 strings.
+        let response = SbiResponse::with_status(201);
+        assert_eq!(
+            extract_binary_ref(&response, &response_body, "n1SmMsg").unwrap(),
+            n1
+        );
+        assert_eq!(
+            extract_binary_ref(&response, &response_body, "n2SmInfo").unwrap(),
+            n2
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Wave-6 E7 — Npcf_UEPolicyControl consumer (TS 29.525 §4.2.2/§4.2.4)
+    // ------------------------------------------------------------------
+
+    /// Kill-switch classifier: AMF_UE_POLICY_ASSOC=off/0/false disables the
+    /// UE Policy Association leg; unset or anything else keeps it enabled
+    /// (env-free pure-function test to avoid process-global env races).
+    #[test]
+    fn ue_policy_assoc_kill_switch_classifier() {
+        assert!(ue_policy_assoc_enabled_value(None), "default (unset) = on");
+        assert!(!ue_policy_assoc_enabled_value(Some("off")));
+        assert!(!ue_policy_assoc_enabled_value(Some("OFF")));
+        assert!(!ue_policy_assoc_enabled_value(Some(" off ")));
+        assert!(!ue_policy_assoc_enabled_value(Some("0")));
+        assert!(!ue_policy_assoc_enabled_value(Some("false")));
+        assert!(ue_policy_assoc_enabled_value(Some("on")));
+        assert!(ue_policy_assoc_enabled_value(Some("1")));
+        assert!(ue_policy_assoc_enabled_value(Some("")));
+    }
+
+    /// Paired-emit stub of pcfd's REAL `handle_ue_policy_create`
+    /// (bins/nextgcore-pcfd/src/main.rs:677-713). It re-asserts, with line
+    /// citations, exactly what the real handler validates and answers:
+    ///
+    /// * mandatory PolicyAssociationRequest members `notificationUri`,
+    ///   `supi`, `suppFeat` → 400 MANDATORY_IE_MISSING when absent
+    ///   (main.rs:686-695, TS 29.525);
+    /// * 201 + `Location: /npcf-ue-policy-control/v1/policies/{polAssoId}`
+    ///   (main.rs:706-710) with the PolicyAssociation body shape
+    ///   (main.rs:701-705).
+    ///
+    /// NOTE: this is a cross-check of the emitted request against the peer's
+    /// contract, not the in-process strict-peer test — pcfd's handler lives
+    /// only in its binary target (not its lib), so it cannot be mounted here.
+    async fn stub_pcf_ue_policy(
+        req: nextgcore_sbi::message::SbiRequest,
+    ) -> nextgcore_sbi::message::SbiResponse {
+        let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+
+        // DELETE /npcf-ue-policy-control/v1/policies/{id} → 204 (pcfd
+        // main.rs:731-740 via ue_policy_remove).
+        if req.header.method == "DELETE" {
+            return if path.ends_with("/npcf-ue-policy-control/v1/policies/pol-ue-42") {
+                nextgcore_sbi::message::SbiResponse::with_status(204)
+            } else {
+                nextgcore_sbi::message::SbiResponse::with_status(404)
+            };
+        }
+
+        if !path.ends_with("/npcf-ue-policy-control/v1/policies") {
+            return nextgcore_sbi::message::SbiResponse::with_status(404);
+        }
+        let body: serde_json::Value = req
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or(serde_json::Value::Null);
+
+        // The three members pcfd's real handler requires (main.rs:686-695).
+        for mandatory in ["notificationUri", "supi", "suppFeat"] {
+            if !body[mandatory].is_string() {
+                return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
+                    serde_json::json!({
+                        "status": 400,
+                        "cause": "MANDATORY_IE_MISSING",
+                        "detail": format!("{mandatory} is required"),
+                    })
+                    .to_string(),
+                    "application/problem+json",
+                );
+            }
+        }
+        // SUPI-keyed behavior so the error path is drivable per test case.
+        if body["supi"].as_str() == Some("imsi-pcf-unavailable") {
+            return nextgcore_sbi::message::SbiResponse::with_status(503);
+        }
+
+        // amfd's notification URI convention (mirrors the AM-policy one):
+        // /namf-callback/v1/{supi}/ue-policy-notify.
+        let supi = body["supi"].as_str().unwrap_or_default();
+        if body["notificationUri"].as_str()
+            != Some(format!("/namf-callback/v1/{supi}/ue-policy-notify").as_str())
+        {
+            return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
+                serde_json::json!({
+                    "status": 400,
+                    "cause": "INVALID_NOTIFICATION_URI",
+                })
+                .to_string(),
+                "application/problem+json",
+            );
+        }
+
+        // The optionals amfd promises so the PCF can address the serving AMF
+        // for the E4 Namf delivery leg: servingPlmn (PlmnIdNid) and guami
+        // (Guami — TS29525 yaml:427-428/452-453). Reject drift so the test
+        // fails if amfd stops sending them well-formed.
+        if !(body["servingPlmn"]["mcc"].is_string() && body["servingPlmn"]["mnc"].is_string()) {
+            return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
+                serde_json::json!({
+                    "status": 400,
+                    "cause": "INVALID_SERVING_PLMN",
+                })
+                .to_string(),
+                "application/problem+json",
+            );
+        }
+        if !(body["guami"]["plmnId"]["mcc"].is_string()
+            && body["guami"]["plmnId"]["mnc"].is_string()
+            && body["guami"]["amfId"].is_string())
+        {
+            return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
+                serde_json::json!({
+                    "status": 400,
+                    "cause": "INVALID_GUAMI",
+                })
+                .to_string(),
+                "application/problem+json",
+            );
+        }
+
+        // pcfd's real 201 (main.rs:701-712): PolicyAssociation body + Location.
+        let resp = serde_json::json!({
+            "suppFeat": "0",
+            "triggers": ["UE_POLICY"],
+            "request": {
+                "notificationUri": body["notificationUri"],
+                "supi": body["supi"],
+                "suppFeat": body["suppFeat"],
+            },
+        });
+        nextgcore_sbi::message::SbiResponse::with_status(201)
+            .with_header(
+                "Location",
+                "/npcf-ue-policy-control/v1/policies/pol-ue-42".to_string(),
+            )
+            .with_json_body(&resp)
+            .unwrap_or_else(|_| nextgcore_sbi::message::SbiResponse::with_status(201))
+    }
+
+    async fn start_pcf_ue_policy_stub() -> (nextgcore_sbi::server::SbiServer, u16) {
+        let port = nsacf_free_port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+        );
+        server
+            .start(stub_pcf_ue_policy)
+            .await
+            .expect("start stub PCF");
+        (server, port)
+    }
+
+    /// call_pcf_ue_policy_create sends a schema-exact PolicyAssociationRequest
+    /// (TS29525_Npcf_UEPolicyControl.yaml:381-461) — the pcfd-mandatory
+    /// members plus servingPlmn (PlmnIdNid) and guami (Guami) — and parses
+    /// the polAssoId out of the Location header.
+    #[tokio::test]
+    async fn ue_policy_create_posts_spec_body_and_parses_location() {
+        let (server, port) = start_pcf_ue_policy_stub().await;
+
+        let assoc = call_pcf_ue_policy_create(
+            "127.0.0.1",
+            port,
+            "imsi-001010000060040",
+            "001",
+            "01",
+            "001",
+            "01",
+            "020040",
+        )
+        .await
+        .expect("UE policy create against paired stub");
+        assert_eq!(assoc, "pol-ue-42", "polAssoId parsed from Location");
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// A PCF 5xx yields Err — the registration call site logs a WARN and
+    /// continues, so registration outcome is unchanged by construction
+    /// (fire-and-forget, ngap_path.rs complete_registration step 3b).
+    #[tokio::test]
+    async fn ue_policy_create_5xx_is_err_not_panic() {
+        let (server, port) = start_pcf_ue_policy_stub().await;
+
+        let result = call_pcf_ue_policy_create(
+            "127.0.0.1",
+            port,
+            "imsi-pcf-unavailable",
+            "001",
+            "01",
+            "001",
+            "01",
+            "020040",
+        )
+        .await;
+        assert!(result.is_err(), "5xx from PCF must surface as Err");
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// An unreachable PCF (connection refused) also yields Err, not a panic.
+    #[tokio::test]
+    async fn ue_policy_create_unreachable_is_err() {
+        let port = nsacf_free_port(); // nothing listening
+        let result = call_pcf_ue_policy_create(
+            "127.0.0.1",
+            port,
+            "imsi-001010000060041",
+            "001",
+            "01",
+            "001",
+            "01",
+            "020040",
+        )
+        .await;
+        assert!(result.is_err(), "unreachable PCF must surface as Err");
+    }
+
+    /// The deregistration leg DELETEs the association resource (TS 29.525
+    /// §4.2.4) and maps 204 → Ok, 404 → Err.
+    #[tokio::test]
+    async fn ue_policy_delete_deletes_resource() {
+        let (server, port) = start_pcf_ue_policy_stub().await;
+
+        call_pcf_ue_policy_delete("127.0.0.1", port, "pol-ue-42")
+            .await
+            .expect("delete existing association");
+        assert!(
+            call_pcf_ue_policy_delete("127.0.0.1", port, "pol-ue-does-not-exist")
+                .await
+                .is_err(),
+            "404 must surface as Err"
+        );
+
+        server.stop().await.expect("server stop");
     }
 }

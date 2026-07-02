@@ -141,6 +141,20 @@ struct Args {
     /// CA bundle for verifying peer-SEPP server certificates
     #[arg(long)]
     n32_ca_cert: Option<String>,
+
+    /// Disable mandatory mTLS on the N32-c listener (LAB USE ONLY). N32-c is
+    /// a mutually-authenticated TLS connection per TS 33.501; mTLS is on by
+    /// default whenever --tls is set and a client CA is available.
+    #[arg(long)]
+    n32_allow_insecure_no_mtls: bool,
+
+    /// Permit deriving the N32-f key hierarchy from a deterministic, no-TLS
+    /// fallback when the N32-c TLS RFC 5705 exporter secret is unavailable
+    /// (LAB/TEST ONLY). Strict-by-default (off): in production the N32-f master
+    /// MUST come from the TLS exporter per TS 33.501 §13.2.4.4.1, else
+    /// exchange-params fails (sepp-10).
+    #[arg(long)]
+    allow_insecure_no_tls: bool,
 }
 
 /// Parse "mcc:mnc" into a PlmnId
@@ -163,8 +177,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -190,6 +204,12 @@ async fn main() -> Result<()> {
         args.max_node,
         args.max_assoc
     );
+
+    // T1.5b: Register the TLS exporter hook so the SBI client deposits the
+    // RFC 5705 N32-f exporter secret into the n32c_handler store after every
+    // successful outbound TLS handshake. The hook is a plain fn pointer so it
+    // is Send+Sync and requires no heap allocation.
+    nextgcore_sbi::client::register_tls_exporter_hook(n32c_handler::set_n32c_tls_exporter_secret);
 
     // Set sender FQDN if provided
     if let Some(ref sender) = args.sender {
@@ -226,6 +246,16 @@ async fn main() -> Result<()> {
         };
     }
 
+    // sepp-10: the N32-f no-TLS key-derivation fallback is strict-by-default
+    // (off). Enable only for plaintext lab/test transports.
+    if args.allow_insecure_no_tls {
+        n32c_handler::set_allow_insecure_no_tls(true);
+        log::warn!(
+            "N32-f no-TLS key-derivation fallback ENABLED (allow_insecure_no_tls); \
+             LAB/TEST ONLY — production requires the N32-c TLS RFC 5705 exporter"
+        );
+    }
+
     // Initialize SEPP state machine
     let mut sepp_sm = SeppSmContext::new();
     sepp_sm.init();
@@ -259,15 +289,11 @@ async fn main() -> Result<()> {
         n32_port: args.n32_port,
     };
 
-    // Open SBI server
+    // Mark SBI state open (context-level bookkeeping)
     sepp_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
-    log::info!(
-        "SBI server listening on {}:{}",
-        args.sbi_addr,
-        args.sbi_port
-    );
 
-    // N32 TLS/mTLS settings shared by the listener and the N32-c client
+    // N32 TLS/mTLS settings shared by the listener and the N32-c client.
+    // mTLS is mandatory by default whenever TLS is enabled (TS 33.501).
     let n32_tls = n32_server::N32TlsConfig {
         cert: args.tls_cert.clone(),
         key: args.tls_key.clone(),
@@ -275,8 +301,21 @@ async fn main() -> Result<()> {
         client_cert: args.n32_client_cert.clone(),
         client_key: args.n32_client_key.clone(),
         ca_cert: args.n32_ca_cert.clone(),
+        allow_insecure_no_mtls: args.n32_allow_insecure_no_mtls,
     };
     let n32_tls_opt = if args.tls { Some(&n32_tls) } else { None };
+
+    // Start the consumer-facing SBI server (C8): home-PLMN NFs send outbound
+    // roaming requests here; the handler runs the forwarding pipeline through
+    // the selected peer SEPP over N32-f.
+    let sbi_server = n32_server::start_sbi_server(&args.sbi_addr, args.sbi_port, n32_tls_opt)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    log::info!(
+        "SBI server listening on {}:{}",
+        args.sbi_addr,
+        args.sbi_port
+    );
 
     // Start the N32 listener (N32-c handshake + N32-f forwarding endpoints)
     let mut n32_listener = None;
@@ -334,7 +373,8 @@ async fn main() -> Result<()> {
         log::info!("N32 listener stopped");
     }
 
-    // Close SBI server
+    // Stop the consumer-facing SBI server
+    let _ = sbi_server.stop().await;
     sepp_sbi_close();
     log::info!("SBI server closed");
 
@@ -402,7 +442,7 @@ async fn run_event_loop_async(
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
         // Compute optimal sleep duration based on pending timers
-        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+        let poll_interval = nextgcore_core::async_timer::compute_poll_interval(
             timer_mgr.inner(),
             Duration::from_millis(100),
         );

@@ -18,13 +18,13 @@ use std::net::Ipv4Addr;
 // ============================================================================
 
 /// Maximum number of QoS rules in NAS
-pub const OGS_NAS_MAX_NUM_OF_QOS_RULE: usize = 8;
+pub const NEXTGCORE_NAS_MAX_NUM_OF_QOS_RULE: usize = 8;
 
 /// Maximum number of packet filters per QoS rule
-pub const OGS_MAX_NUM_OF_FLOW_IN_NAS: usize = 16;
+pub const NEXTGCORE_MAX_NUM_OF_FLOW_IN_NAS: usize = 16;
 
 /// Maximum number of QoS flow descriptions
-pub const OGS_NAS_MAX_NUM_OF_QOS_FLOW_DESCRIPTION: usize = 8;
+pub const NEXTGCORE_NAS_MAX_NUM_OF_QOS_FLOW_DESCRIPTION: usize = 8;
 
 /// Integrity protection maximum data rate values
 pub mod integrity_protection_rate {

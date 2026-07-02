@@ -7,7 +7,7 @@
 use crate::fd_path::diam_stats;
 
 /// Cx Application ID
-pub const OGS_DIAM_CX_APPLICATION_ID: u32 = 16777216;
+pub const NEXTGCORE_DIAM_CX_APPLICATION_ID: u32 = 16777216;
 
 /// Server Assignment Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,13 +66,13 @@ impl From<u32> for UserAuthorizationType {
 }
 
 /// Cx Result Codes
-pub const OGS_DIAM_CX_FIRST_REGISTRATION: u32 = 2001;
-pub const OGS_DIAM_CX_SUBSEQUENT_REGISTRATION: u32 = 2002;
-pub const OGS_DIAM_CX_UNREGISTERED_SERVICE: u32 = 2003;
-pub const OGS_DIAM_CX_ERROR_USER_UNKNOWN: u32 = 5001;
-pub const OGS_DIAM_CX_ERROR_IDENTITIES_DONT_MATCH: u32 = 5002;
-pub const OGS_DIAM_CX_ERROR_IDENTITY_NOT_REGISTERED: u32 = 5003;
-pub const OGS_DIAM_CX_ERROR_ROAMING_NOT_ALLOWED: u32 = 5004;
+pub const NEXTGCORE_DIAM_CX_FIRST_REGISTRATION: u32 = 2001;
+pub const NEXTGCORE_DIAM_CX_SUBSEQUENT_REGISTRATION: u32 = 2002;
+pub const NEXTGCORE_DIAM_CX_UNREGISTERED_SERVICE: u32 = 2003;
+pub const NEXTGCORE_DIAM_CX_ERROR_USER_UNKNOWN: u32 = 5001;
+pub const NEXTGCORE_DIAM_CX_ERROR_IDENTITIES_DONT_MATCH: u32 = 5002;
+pub const NEXTGCORE_DIAM_CX_ERROR_IDENTITY_NOT_REGISTERED: u32 = 5003;
+pub const NEXTGCORE_DIAM_CX_ERROR_ROAMING_NOT_ALLOWED: u32 = 5004;
 
 /// Initialize Cx interface
 pub fn hss_cx_init() -> Result<(), String> {
@@ -104,11 +104,12 @@ pub fn handle_uar(
     diam_stats().cx.inc_rx_uar();
 
     use crate::context::hss_self;
-    use ogs_dbi::ogs_dbi_ims_data;
+    use nextgcore_dbi::nextgcore_dbi_ims_data;
 
     // 1. Check if user exists in DB
     let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
-    let _ims_data = ogs_dbi_ims_data(&supi).map_err(|e| format!("Failed to get IMS data: {e}"))?;
+    let _ims_data =
+        nextgcore_dbi_ims_data(&supi).map_err(|e| format!("Failed to get IMS data: {e}"))?;
 
     // 2. Associate identity if needed
     let ctx = hss_self();
@@ -120,9 +121,9 @@ pub fn handle_uar(
     // 3. Return UAA with server capabilities or assigned S-CSCF
     let mut response = UarResponse::default();
     response.result_code = 2001; // DIAMETER_SUCCESS
-    response.experimental_result_code = OGS_DIAM_CX_FIRST_REGISTRATION;
+    response.experimental_result_code = NEXTGCORE_DIAM_CX_FIRST_REGISTRATION;
 
-    // Return default server capabilities (no scscf_name field in OgsImsData)
+    // Return default server capabilities (no scscf_name field in NextgcoreImsData)
     response.server_capabilities = Some(ServerCapabilities {
         mandatory_capability: vec![0], // No mandatory capabilities
         optional_capability: vec![0],  // No optional capabilities
@@ -147,13 +148,13 @@ pub fn handle_mar(
     log::debug!("[{user_name}] Handling MAR for {public_identity} (scheme={sip_auth_scheme})");
     diam_stats().cx.inc_rx_mar();
 
-    use ogs_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
-    use ogs_dbi::ogs_dbi_auth_info;
+    use nextgcore_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
+    use nextgcore_dbi::nextgcore_dbi_auth_info;
 
     // 1. Get auth info from DB
     let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
     let auth_info =
-        ogs_dbi_auth_info(&supi).map_err(|e| format!("Failed to get auth info: {e}"))?;
+        nextgcore_dbi_auth_info(&supi).map_err(|e| format!("Failed to get auth info: {e}"))?;
 
     // 2. Generate SIP authentication vectors (AKA or Digest)
     let rand = auth_info.rand;
@@ -228,7 +229,7 @@ pub fn handle_sar(
     diam_stats().cx.inc_rx_sar();
 
     use crate::context::hss_self;
-    use ogs_dbi::ogs_dbi_ims_data;
+    use nextgcore_dbi::nextgcore_dbi_ims_data;
 
     // 1. Update server assignment in context
     let ctx = hss_self();
@@ -247,8 +248,8 @@ pub fn handle_sar(
         ServerAssignmentType::Registration | ServerAssignmentType::ReRegistration => {
             // Get IMS user data from DB
             let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
-            let _ims_data =
-                ogs_dbi_ims_data(&supi).map_err(|e| format!("Failed to get IMS data: {e}"))?;
+            let _ims_data = nextgcore_dbi_ims_data(&supi)
+                .map_err(|e| format!("Failed to get IMS data: {e}"))?;
 
             // 3. Return SAA with User-Data (XML)
             // Note: In full implementation, this would build IMS user profile XML
@@ -319,7 +320,7 @@ pub fn handle_lir(public_identity: &str) -> Result<LirResponse, String> {
     if let Some(server_name) = context.cx_get_server_name(public_identity) {
         // User is registered - return assigned S-CSCF
         response.server_name = Some(server_name);
-        response.experimental_result_code = OGS_DIAM_CX_SUBSEQUENT_REGISTRATION;
+        response.experimental_result_code = NEXTGCORE_DIAM_CX_SUBSEQUENT_REGISTRATION;
     } else {
         // User not registered - return server capabilities for selection
         response.server_capabilities = Some(ServerCapabilities {
@@ -330,7 +331,7 @@ pub fn handle_lir(public_identity: &str) -> Result<LirResponse, String> {
                 "sip:scscf2.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
             ],
         });
-        response.experimental_result_code = OGS_DIAM_CX_ERROR_IDENTITY_NOT_REGISTERED;
+        response.experimental_result_code = NEXTGCORE_DIAM_CX_ERROR_IDENTITY_NOT_REGISTERED;
     }
 
     log::debug!("LIR processed for {public_identity}");

@@ -4,9 +4,7 @@
 
 use crate::context::udm_self;
 use crate::event::{UdmEvent, UdmEventId};
-use crate::nudm_handler;
-use crate::nudr_handler;
-use crate::sbi_response::{send_error_response, send_method_not_allowed_response};
+use crate::sbi_response::send_error_response;
 
 /// UDM UE state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,291 +224,52 @@ impl UdmUeSmContext {
     }
 
     /// Handle NUDM UEAU requests
+    ///
+    /// udmd-04: UECM/SDM/UEAU operations are handled by the live async HTTP
+    /// dispatcher in `main.rs`. The state-machine branch is a legacy Open5GS
+    /// port that was never wired to the HTTP path. All handler calls have been
+    /// removed; the structure is kept for future extension only.
     fn handle_nudm_ueau_request(
         &mut self,
-        method: &str,
-        resource_components: &[String],
-        stream_id: u64,
+        _method: &str,
+        _resource_components: &[String],
+        _stream_id: u64,
     ) {
-        let ctx = udm_self();
-        let context = ctx.read().unwrap();
-        let udm_ue = context.ue_find_by_id(self.udm_ue_id);
-        let suci = match udm_ue.as_ref().map(|u| u.suci.clone()) {
-            Some(s) => s,
-            None => {
-                log::error!("UDM UE {} not found for ueau request", self.udm_ue_id);
-                send_error_response(stream_id, 404, "UE not found");
-                return;
-            }
-        };
-        drop(context);
-
-        match method {
-            "POST" => {
-                let resource = resource_components.get(1).map(|s| s.as_str());
-                match resource {
-                    Some("security-information") => {
-                        // Note: In production, parse AuthenticationInfoRequest from HTTP body
-                        let request = nudm_handler::AuthenticationInfoRequest::default();
-                        let (_result, _state) = nudm_handler::udm_nudm_ueau_handle_get(
-                            self.udm_ue_id,
-                            stream_id,
-                            &request,
-                        );
-                    }
-                    Some("auth-events") => {
-                        // Note: In production, parse AuthEventRequest from HTTP body
-                        let request = nudm_handler::AuthEventRequest::default();
-                        let _result = nudm_handler::udm_nudm_ueau_handle_result_confirmation_inform(
-                            self.udm_ue_id,
-                            stream_id,
-                            &request,
-                        );
-                    }
-                    _ => {
-                        log::error!("[{suci}] Invalid resource name [{resource:?}]");
-                        send_error_response(
-                            stream_id,
-                            404,
-                            &format!("Resource not found: {resource:?}"),
-                        );
-                    }
-                }
-            }
-            "PUT" => {
-                let resource = resource_components.get(1).map(|s| s.as_str());
-                match resource {
-                    Some("auth-events") => {
-                        // Note: In production, parse AuthEventRequest from HTTP body
-                        let request = nudm_handler::AuthEventRequest::default();
-                        let _result = nudm_handler::udm_nudm_ueau_handle_result_confirmation_inform(
-                            self.udm_ue_id,
-                            stream_id,
-                            &request,
-                        );
-                    }
-                    _ => {
-                        log::error!("[{suci}] Invalid resource name [{resource:?}]");
-                        send_error_response(
-                            stream_id,
-                            404,
-                            &format!("Resource not found: {resource:?}"),
-                        );
-                    }
-                }
-            }
-            _ => {
-                log::error!("[{suci}] Invalid HTTP method [{method}]");
-                send_method_not_allowed_response(stream_id, method, "nudm-ueau");
-            }
-        }
+        log::debug!(
+            "UDM UE SM [{}]: UEAU request on state-machine path — handled by HTTP dispatcher",
+            self.udm_ue_id
+        );
     }
 
     /// Handle NUDM UECM requests
+    ///
+    /// udmd-04: see `handle_nudm_ueau_request`.
     fn handle_nudm_uecm_request(
         &mut self,
-        method: &str,
-        resource_components: &[String],
-        stream_id: u64,
+        _method: &str,
+        _resource_components: &[String],
+        _stream_id: u64,
     ) {
-        let ctx = udm_self();
-        let context = ctx.read().unwrap();
-        let udm_ue = context.ue_find_by_id(self.udm_ue_id);
-        let suci = match udm_ue.as_ref().map(|u| u.suci.clone()) {
-            Some(s) => s,
-            None => {
-                log::error!("UDM UE {} not found for uecm request", self.udm_ue_id);
-                send_error_response(stream_id, 404, "UE not found");
-                return;
-            }
-        };
-        drop(context);
-
-        let resource = resource_components.get(1).map(|s| s.as_str());
-
-        match method {
-            "PUT" => match resource {
-                Some("registrations") => {
-                    // Note: In production, parse Amf3GppAccessRegistrationRequest from HTTP body
-                    let request = nudm_handler::Amf3GppAccessRegistrationRequest::default();
-                    let _result = nudm_handler::udm_nudm_uecm_handle_amf_registration(
-                        self.udm_ue_id,
-                        stream_id,
-                        &request,
-                    );
-                }
-                _ => {
-                    log::error!("[{suci}] Invalid resource name [{resource:?}]");
-                    send_error_response(
-                        stream_id,
-                        404,
-                        &format!("Resource not found: {resource:?}"),
-                    );
-                }
-            },
-            "PATCH" => match resource {
-                Some("registrations") => {
-                    // Note: In production, parse Amf3GppAccessRegistrationModificationRequest from HTTP body
-                    let request =
-                        nudm_handler::Amf3GppAccessRegistrationModificationRequest::default();
-                    let _result = nudm_handler::udm_nudm_uecm_handle_amf_registration_update(
-                        self.udm_ue_id,
-                        stream_id,
-                        &request,
-                    );
-                }
-                _ => {
-                    log::error!("[{suci}] Invalid resource name [{resource:?}]");
-                    send_error_response(
-                        stream_id,
-                        404,
-                        &format!("Resource not found: {resource:?}"),
-                    );
-                }
-            },
-            "GET" => match resource {
-                Some("registrations") => {
-                    let resource_name = resource_components
-                        .get(2)
-                        .map(|s| s.as_str())
-                        .unwrap_or("registrations");
-                    let (result, _registration) =
-                        nudm_handler::udm_nudm_uecm_handle_amf_registration_get(
-                            self.udm_ue_id,
-                            stream_id,
-                            resource_name,
-                        );
-                    if !result.success {
-                        log::error!("[{suci}] Invalid UE Identifier");
-                        send_error_response(stream_id, 403, "Invalid UE Identifier");
-                    }
-                }
-                _ => {
-                    log::error!("[{suci}] Invalid resource name [{resource:?}]");
-                    send_error_response(
-                        stream_id,
-                        404,
-                        &format!("Resource not found: {resource:?}"),
-                    );
-                }
-            },
-            _ => {
-                log::error!("[{suci}] Invalid HTTP method [{method}]");
-                send_method_not_allowed_response(stream_id, method, "nudm-uecm");
-            }
-        }
+        log::debug!(
+            "UDM UE SM [{}]: UECM request on state-machine path — handled by HTTP dispatcher",
+            self.udm_ue_id
+        );
     }
 
     /// Handle NUDM SDM requests
+    ///
+    /// udmd-04: see `handle_nudm_ueau_request`.
     fn handle_nudm_sdm_request(
         &mut self,
-        method: &str,
-        resource_components: &[String],
-        stream_id: u64,
-        num_of_dataset_names: usize,
+        _method: &str,
+        _resource_components: &[String],
+        _stream_id: u64,
+        _num_of_dataset_names: usize,
     ) {
-        let ctx = udm_self();
-        let context = ctx.read().unwrap();
-        let udm_ue = context.ue_find_by_id(self.udm_ue_id);
-        let suci = match udm_ue.as_ref().map(|u| u.suci.clone()) {
-            Some(s) => s,
-            None => {
-                log::error!("UDM UE {} not found for sdm request", self.udm_ue_id);
-                send_error_response(stream_id, 404, "UE not found");
-                return;
-            }
-        };
-        drop(context);
-
-        let resource = resource_components.get(1).map(|s| s.as_str());
-
-        match method {
-            "GET" => {
-                // Check for dataset names query
-                if num_of_dataset_names > 0 && resource.is_none() {
-                    let _result = nudr_handler::udm_nudr_dr_query_subscription_provisioned(
-                        self.udm_ue_id,
-                        stream_id,
-                        nudr_handler::UdmSbiState::UeProvisionedDatasets,
-                    );
-                    return;
-                }
-
-                match resource {
-                    Some("am-data") | Some("smf-select-data") | Some("sm-data") => {
-                        let _result = nudr_handler::udm_nudr_dr_query_subscription_provisioned(
-                            self.udm_ue_id,
-                            stream_id,
-                            nudr_handler::UdmSbiState::NoState,
-                        );
-                    }
-                    Some("nssai") => {
-                        let _result = nudr_handler::udm_nudr_dr_query_subscription_provisioned(
-                            self.udm_ue_id,
-                            stream_id,
-                            nudr_handler::UdmSbiState::UeProvisionedNssaiOnly,
-                        );
-                    }
-                    Some("ue-context-in-smf-data") => {
-                        let _result = nudm_handler::udm_nudm_sdm_handle_subscription_provisioned(
-                            self.udm_ue_id,
-                            stream_id,
-                            "ue-context-in-smf-data",
-                        );
-                    }
-                    _ => {
-                        log::error!("[{suci}] Invalid resource name [{resource:?}]");
-                        send_error_response(
-                            stream_id,
-                            404,
-                            &format!("Resource not found: {resource:?}"),
-                        );
-                    }
-                }
-            }
-            "POST" => match resource {
-                Some("sdm-subscriptions") => {
-                    // Note: In production, parse SdmSubscriptionRequest from HTTP body
-                    let request = nudm_handler::SdmSubscriptionRequest::default();
-                    let (_result, _subscription) =
-                        nudm_handler::udm_nudm_sdm_handle_subscription_create(
-                            self.udm_ue_id,
-                            stream_id,
-                            &request,
-                        );
-                }
-                _ => {
-                    log::error!("[{suci}] Invalid resource name [{resource:?}]");
-                    send_error_response(
-                        stream_id,
-                        404,
-                        &format!("Resource not found: {resource:?}"),
-                    );
-                }
-            },
-            "DELETE" => match resource {
-                Some("sdm-subscriptions") => {
-                    let subscription_id = resource_components.get(2).map(|s| s.as_str());
-                    let _result = nudm_handler::udm_nudm_sdm_handle_subscription_delete(
-                        self.udm_ue_id,
-                        stream_id,
-                        subscription_id,
-                    );
-                }
-                _ => {
-                    log::error!("[{suci}] Invalid resource name [{resource:?}]");
-                    send_error_response(
-                        stream_id,
-                        404,
-                        &format!("Resource not found: {resource:?}"),
-                    );
-                }
-            },
-            _ => {
-                log::error!("[{suci}] Invalid HTTP method [{method}]");
-                send_method_not_allowed_response(stream_id, method, "nudm-sdm");
-            }
-        }
+        log::debug!(
+            "UDM UE SM [{}]: SDM request on state-machine path — handled by HTTP dispatcher",
+            self.udm_ue_id
+        );
     }
 
     /// Handle SBI client events in operational state
@@ -569,84 +328,19 @@ impl UdmUeSmContext {
     }
 
     /// Handle NUDR DR responses
+    ///
+    /// udmd-04: see `handle_nudm_ueau_request`.
     fn handle_nudr_dr_response(
         &mut self,
-        suci: &str,
-        resource_components: &[String],
-        stream_id: u64,
-        state: Option<i32>,
+        _suci: &str,
+        _resource_components: &[String],
+        _stream_id: u64,
+        _state: Option<i32>,
     ) {
-        let resource = resource_components.first().map(|s| s.as_str());
-
-        match resource {
-            Some("subscription-data") => {
-                let resource2 = resource_components.get(2).map(|s| s.as_str());
-                match resource2 {
-                    Some("authentication-data") => {
-                        let resource3 =
-                            resource_components.get(3).map(|s| s.as_str()).unwrap_or("");
-                        // Note: HTTP method and status extracted from SBI response message headers
-                        let (result, _auth_info) =
-                            nudr_handler::udm_nudr_dr_handle_subscription_authentication(
-                                self.udm_ue_id,
-                                stream_id,
-                                "GET", // HTTP method
-                                resource3,
-                                200,  // HTTP status
-                                None, // AuthenticationSubscription from response
-                            );
-                        if !result.success {
-                            log::warn!("udm_nudr_dr_handle_subscription_authentication() failed");
-                            self.transition(UdmUeState::Exception);
-                        }
-                    }
-                    Some("context-data") => {
-                        let resource3 =
-                            resource_components.get(3).map(|s| s.as_str()).unwrap_or("");
-                        // Note: HTTP method and status extracted from SBI response message headers
-                        let (_result, _registration) =
-                            nudr_handler::udm_nudr_dr_handle_subscription_context(
-                                self.udm_ue_id,
-                                stream_id,
-                                "PUT", // HTTP method
-                                resource3,
-                                204, // HTTP status
-                            );
-                    }
-                    _ => {
-                        // Check for provisioned-data
-                        let resource3 = resource_components.get(3).map(|s| s.as_str());
-                        match resource3 {
-                            Some("provisioned-data") => {
-                                let resource4 =
-                                    resource_components.get(4).map(|s| s.as_str()).unwrap_or("");
-                                let sbi_state: nudr_handler::UdmSbiState =
-                                    state.unwrap_or(0).into();
-                                // Note: Provisioned data parsed from SBI response JSON body
-                                let _result =
-                                    nudr_handler::udm_nudr_dr_handle_subscription_provisioned(
-                                        self.udm_ue_id,
-                                        stream_id,
-                                        sbi_state,
-                                        resource4,
-                                        200,  // HTTP status
-                                        None, // ProvisionedDataSets
-                                        None, // AccessAndMobilitySubscriptionData
-                                        None, // SmfSelectionSubscriptionData
-                                        None, // SessionManagementSubscriptionData
-                                    );
-                            }
-                            _ => {
-                                log::error!("[{suci}] Invalid resource name [{resource2:?}]");
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {
-                log::error!("[{suci}] Invalid resource name [{resource:?}]");
-            }
-        }
+        log::debug!(
+            "UDM UE SM [{}]: NUDR-DR response on state-machine path — handled by HTTP dispatcher",
+            self.udm_ue_id
+        );
     }
 
     /// Handle exception state

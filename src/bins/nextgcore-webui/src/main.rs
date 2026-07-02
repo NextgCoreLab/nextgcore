@@ -250,7 +250,7 @@ async fn subscriber_count(State(state): State<SharedState>) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Database operations (using ogs-dbi patterns via direct MongoDB)
+// Database operations (using nextgcore-dbi patterns via direct MongoDB)
 // ---------------------------------------------------------------------------
 
 fn db_list_subscribers(uri: &str, db_name: &str) -> Result<Vec<Subscriber>> {

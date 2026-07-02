@@ -162,21 +162,30 @@ impl PlmnId {
 }
 
 /// N32-f security material established via the N32-c exchange-params
-/// handshake (TS 29.573 sec 6.1.5.3, TS 33.501 sec 13.2)
+/// handshake (TS 29.573 sec 6.1.5.3, TS 33.501 §13.2.4.4.1)
 #[derive(Debug, Clone)]
 pub struct N32fSecurityInfo {
     /// N32-f context ID allocated by the local SEPP (peer addresses us with it)
     pub local_context_id: String,
     /// N32-f context ID allocated by the peer SEPP (we address the peer with it)
     pub peer_context_id: String,
-    /// Established session key (HKDF-SHA256-derived, A256GCM)
-    pub session_key: [u8; 32],
-    /// Key identifier for JOSE headers
+    /// The full N32-f key hierarchy (four A256GCM session keys + four IV
+    /// salts) derived from the 64-octet N32 master via the N32-KDF.
+    pub key_material: crate::n32c_handler::N32fKeyMaterial,
+    /// This SEPP's N32-c role: selects which half of the key hierarchy we use
+    /// to protect the messages we originate (initiator → parallel,
+    /// responder → reverse).
+    pub role: crate::n32c_handler::N32fRole,
+    /// Key identifier for JOSE headers (the canonical N32-f context ID)
     pub kid: String,
     /// Selected JWE cipher suite (e.g. "A256GCM")
     pub jwe_cipher_suite: String,
-    /// Selected JWS cipher suite (e.g. "HS256")
+    /// Selected JWS cipher suite (e.g. "ES256")
     pub jws_cipher_suite: String,
+    /// Runtime data-type encryption profiles, projected from the NEGOTIATED
+    /// protection policy (TS 29.573 §6.1.5.2): which IEs of which APIs this
+    /// N32-f context encrypts. Drives `build_prins_context`'s PrinsContext.
+    pub enc_profiles: Vec<crate::prins::DataTypeProfile>,
 }
 
 /// SEPP Node structure - represents a peer SEPP

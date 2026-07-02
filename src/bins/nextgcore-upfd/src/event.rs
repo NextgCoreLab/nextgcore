@@ -2,10 +2,10 @@
 //!
 //! Port of src/upf/event.h and event.c - Event definitions for UPF
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
-pub const OGS_FSM_USER_SIG: i32 = 2;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for UPF
 /// Port of upf_event_e from event.h
@@ -27,8 +27,8 @@ impl UpfEventId {
     /// Get the name of the event
     pub fn name(&self) -> &'static str {
         match self {
-            UpfEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            UpfEventId::FsmExit => "OGS_FSM_EXIT_SIG",
+            UpfEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            UpfEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
             UpfEventId::N4Message => "UPF_EVT_N4_MESSAGE",
             UpfEventId::N4Timer => "UPF_EVT_N4_TIMER",
             UpfEventId::N4NoHeartbeat => "UPF_EVT_N4_NO_HEARTBEAT",
@@ -38,8 +38,8 @@ impl UpfEventId {
     /// Convert from i32 signal
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => UpfEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => UpfEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => UpfEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => UpfEventId::FsmExit,
             _ => UpfEventId::N4Message,
         }
     }
@@ -191,8 +191,8 @@ mod tests {
 
     #[test]
     fn test_event_id_names() {
-        assert_eq!(UpfEventId::FsmEntry.name(), "OGS_FSM_ENTRY_SIG");
-        assert_eq!(UpfEventId::FsmExit.name(), "OGS_FSM_EXIT_SIG");
+        assert_eq!(UpfEventId::FsmEntry.name(), "NEXTGCORE_FSM_ENTRY_SIG");
+        assert_eq!(UpfEventId::FsmExit.name(), "NEXTGCORE_FSM_EXIT_SIG");
         assert_eq!(UpfEventId::N4Message.name(), "UPF_EVT_N4_MESSAGE");
         assert_eq!(UpfEventId::N4Timer.name(), "UPF_EVT_N4_TIMER");
         assert_eq!(UpfEventId::N4NoHeartbeat.name(), "UPF_EVT_N4_NO_HEARTBEAT");
@@ -236,11 +236,11 @@ mod tests {
     #[test]
     fn test_from_signal() {
         assert_eq!(
-            UpfEventId::from_signal(OGS_FSM_ENTRY_SIG),
+            UpfEventId::from_signal(NEXTGCORE_FSM_ENTRY_SIG),
             UpfEventId::FsmEntry
         );
         assert_eq!(
-            UpfEventId::from_signal(OGS_FSM_EXIT_SIG),
+            UpfEventId::from_signal(NEXTGCORE_FSM_EXIT_SIG),
             UpfEventId::FsmExit
         );
         assert_eq!(UpfEventId::from_signal(99), UpfEventId::N4Message);

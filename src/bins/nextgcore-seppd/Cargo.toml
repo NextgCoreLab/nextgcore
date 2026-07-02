@@ -15,10 +15,10 @@ name = "nextgcore_seppd"
 path = "src/lib.rs"
 
 [dependencies]
-ogs-core = { workspace = true }
-ogs-sbi = { workspace = true }
-ogs-metrics = { workspace = true }
-ogs-app = { workspace = true }
+nextgcore-core = { workspace = true }
+nextgcore-sbi = { workspace = true }
+nextgcore-metrics = { workspace = true }
+nextgcore-app = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
@@ -33,6 +33,11 @@ sha2.workspace = true
 hmac.workspace = true
 hkdf.workspace = true
 base64.workspace = true
+# Asymmetric JWS (ES256) for the modificationsBlock per TS 33.501: each
+# SEPP/IPX entry is signed with its own asymmetric key, not the shared
+# symmetric session key.
+p256 = { workspace = true, features = ["ecdsa", "pem", "pkcs8"] }
+elliptic-curve = { workspace = true, features = ["sec1", "pem"] }
 
 [dev-dependencies]
 proptest.workspace = true

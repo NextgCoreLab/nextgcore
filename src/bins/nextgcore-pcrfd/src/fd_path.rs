@@ -20,13 +20,13 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
-use ogs_diameter::config::DiameterConfig;
-use ogs_diameter::error::DiameterResult;
-use ogs_diameter::gx::{cmd as gx_cmd, GX_APPLICATION_ID};
-use ogs_diameter::message::DiameterMessage;
-use ogs_diameter::peer::{DiameterPeer, PeerEvent, PeerState};
-use ogs_diameter::rx::{cmd as rx_cmd, RX_APPLICATION_ID};
-use ogs_diameter::transport::{DiameterListener, DiameterTransport};
+use nextgcore_diameter::config::DiameterConfig;
+use nextgcore_diameter::error::DiameterResult;
+use nextgcore_diameter::gx::{cmd as gx_cmd, GX_APPLICATION_ID};
+use nextgcore_diameter::message::DiameterMessage;
+use nextgcore_diameter::peer::{DiameterPeer, PeerEvent, PeerState};
+use nextgcore_diameter::rx::{cmd as rx_cmd, RX_APPLICATION_ID};
+use nextgcore_diameter::transport::{DiameterListener, DiameterTransport};
 
 use crate::gx_path;
 use crate::rx_path;
@@ -332,7 +332,7 @@ pub fn pcrf_fd_peer_connected(origin_host: &str) -> bool {
 
 /// Timeout waiting for an answer to a PCRF-initiated request.
 /// Mirrors the Tc-scale timers used by the Diameter base machinery in
-/// `ogs-diameter`; there is no application-level retransmission (the
+/// `nextgcore-diameter`; there is no application-level retransmission (the
 /// transport is reliable; on timeout the error is surfaced to the caller).
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -551,7 +551,7 @@ pub fn pcrf_fd_init() -> Result<(), String> {
 ///
 /// Binds the listener, spawns the accept loop and returns the bound local
 /// address. Peer connections (CER/CEA, DWR/DWA, DPR/DPA) are handled per
-/// RFC 6733 by `ogs_diameter::peer::DiameterPeer`; application messages
+/// RFC 6733 by `nextgcore_diameter::peer::DiameterPeer`; application messages
 /// are dispatched to the Gx / Rx handlers.
 pub async fn pcrf_fd_listen(
     identity: LocalIdentity,

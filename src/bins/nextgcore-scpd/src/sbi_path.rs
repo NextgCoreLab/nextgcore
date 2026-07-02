@@ -16,7 +16,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::context::{DiscoveryOption, NfType, SbiServiceType};
+use nextgcore_sbi::types::UriScheme;
+
+use crate::context::NfType;
 
 /// SBI server configuration
 #[derive(Debug, Clone)]
@@ -78,7 +80,7 @@ pub fn scp_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     log::info!("Opening SCP SBI server on {}:{}", config.addr, config.port);
 
     // The HTTP/2 listener itself is started in main.rs
-    // (ogs_sbi::server::SbiServer fronting crate::proxy::ScpProxy); this
+    // (nextgcore_sbi::server::SbiServer fronting crate::proxy::ScpProxy); this
     // function tracks the lifecycle state used by the state machine.
     SBI_SERVER_RUNNING.store(true, Ordering::SeqCst);
 
@@ -107,155 +109,6 @@ pub fn scp_sbi_is_running() -> bool {
     SBI_SERVER_RUNNING.load(Ordering::SeqCst)
 }
 
-/// Simplified SBI request
-#[derive(Debug, Clone)]
-pub struct SbiRequest {
-    pub method: String,
-    pub uri: String,
-    pub headers: HashMap<String, String>,
-    pub body: Option<Vec<u8>>,
-}
-
-impl SbiRequest {
-    pub fn new(method: &str, uri: &str) -> Self {
-        Self {
-            method: method.to_string(),
-            uri: uri.to_string(),
-            headers: HashMap::new(),
-            body: None,
-        }
-    }
-
-    pub fn set_header(&mut self, key: &str, value: &str) {
-        self.headers.insert(key.to_string(), value.to_string());
-    }
-
-    pub fn get_header(&self, key: &str) -> Option<&String> {
-        // Case-insensitive header lookup
-        for (k, v) in &self.headers {
-            if k.eq_ignore_ascii_case(key) {
-                return Some(v);
-            }
-        }
-        None
-    }
-}
-
-/// Simplified SBI response
-#[derive(Debug, Clone)]
-pub struct SbiResponse {
-    pub status: u16,
-    pub headers: HashMap<String, String>,
-    pub body: Option<Vec<u8>>,
-}
-
-impl SbiResponse {
-    pub fn new(status: u16) -> Self {
-        Self {
-            status,
-            headers: HashMap::new(),
-            body: None,
-        }
-    }
-
-    pub fn set_header(&mut self, key: &str, value: &str) {
-        self.headers.insert(key.to_string(), value.to_string());
-    }
-}
-
-/// Parse discovery parameters from request headers
-/// Port of header extraction in request_handler
-pub fn parse_discovery_headers(
-    request: &SbiRequest,
-) -> (
-    Option<NfType>,
-    Option<NfType>,
-    Option<SbiServiceType>,
-    DiscoveryOption,
-) {
-    let mut target_nf_type: Option<NfType> = None;
-    let mut requester_nf_type: Option<NfType> = None;
-    let mut service_type: Option<SbiServiceType> = None;
-    let mut discovery_option = DiscoveryOption::new();
-
-    // Requester identity comes from 3gpp-Sbi-Discovery-requester-nf-type
-    // (TS 29.500 §5.2.3.2.7) — NOT from User-Agent.
-    if let Some(val) = request.get_header(headers::DISCOVERY_REQUESTER_NF_TYPE) {
-        requester_nf_type = Some(NfType::from_string(val));
-    }
-
-    // Parse target NF type
-    if let Some(val) = request.get_header(headers::DISCOVERY_TARGET_NF_TYPE) {
-        target_nf_type = Some(NfType::from_string(val));
-    }
-
-    // Parse target NF instance ID
-    if let Some(val) = request.get_header(headers::DISCOVERY_TARGET_NF_INSTANCE_ID) {
-        discovery_option.set_target_nf_instance_id(val);
-    }
-
-    // Parse requester NF instance ID
-    if let Some(val) = request.get_header(headers::DISCOVERY_REQUESTER_NF_INSTANCE_ID) {
-        discovery_option.set_requester_nf_instance_id(val);
-    }
-
-    // Parse service names
-    if let Some(val) = request.get_header(headers::DISCOVERY_SERVICE_NAMES) {
-        discovery_option.parse_service_names(val);
-        // Use first service name to determine service type
-        if let Some(first_service) = discovery_option.service_names.first() {
-            service_type = Some(SbiServiceType::from_name(first_service));
-        }
-    }
-
-    // Parse DNN
-    if let Some(val) = request.get_header(headers::DISCOVERY_DNN) {
-        discovery_option.set_dnn(val);
-    }
-
-    // Parse HNRF URI
-    if let Some(val) = request.get_header(headers::DISCOVERY_HNRF_URI) {
-        discovery_option.set_hnrf_uri(val);
-    }
-
-    (
-        target_nf_type,
-        requester_nf_type,
-        service_type,
-        discovery_option,
-    )
-}
-
-/// Copy request headers, optionally removing custom discovery headers
-/// Port of copy_request from sbi-path.c
-pub fn copy_request_headers(
-    source: &SbiRequest,
-    do_not_remove_custom_header: bool,
-) -> HashMap<String, String> {
-    let mut target = HashMap::new();
-
-    for (key, val) in &source.headers {
-        // Skip scheme and authority (will be set by client)
-        if key.eq_ignore_ascii_case(":scheme") || key.eq_ignore_ascii_case(":authority") {
-            continue;
-        }
-
-        // Optionally skip custom discovery headers
-        if !do_not_remove_custom_header {
-            if key.eq_ignore_ascii_case(headers::TARGET_APIROOT) {
-                continue;
-            }
-            if key.to_lowercase().starts_with("3gpp-sbi-discovery-") {
-                continue;
-            }
-        }
-
-        target.insert(key.clone(), val.clone());
-    }
-
-    target
-}
-
 // ============================================================================
 // NF Instance Selection & Request Routing
 // ============================================================================
@@ -272,6 +125,12 @@ pub struct NfInstanceCandidate {
     pub load: u16,
     /// Whether the instance is considered healthy
     pub healthy: bool,
+    /// URI scheme derived from `nfServices[].scheme` (TS 29.510 §6.1.6.2.x).
+    /// Defaults to `Http` when no TLS indicator is present in the NF profile.
+    pub scheme: UriScheme,
+    /// Optional deployment-specific API prefix from `nfServices[].apiPrefix`
+    /// (TS 29.501 §4.4.1 / TS 29.500 §6.10.2.5).
+    pub prefix: String,
 }
 
 /// Select the best NF instance from a list of candidates using weighted round-robin.
@@ -375,9 +234,14 @@ impl DiscoveryCacheEntry {
 /// NF discovery result cache.
 ///
 /// Caches NF discovery results with TTL to avoid repeated NRF queries.
-/// Cache key is (target_nf_type, service_name).
+/// The cache key is (target_nf_type, service_name, discriminator), where
+/// `discriminator` folds in every routing-relevant 3gpp-Sbi-Discovery-* factor
+/// (S-NSSAI, DNN, GUAMI, TAI, target-PLMN-list, target-NF-instance-id) so that
+/// two delegated requests for the same NF type + service but a different slice,
+/// DNN, area, or pinned instance are not served each other's producer set
+/// (TS 29.500 §6.10.3.2 / §6.10.3.4 NOTE 2).
 pub struct DiscoveryCache {
-    entries: std::sync::RwLock<HashMap<(String, String), DiscoveryCacheEntry>>,
+    entries: std::sync::RwLock<HashMap<(String, String, String), DiscoveryCacheEntry>>,
 }
 
 impl DiscoveryCache {
@@ -387,14 +251,20 @@ impl DiscoveryCache {
         }
     }
 
-    /// Look up a cached discovery result.
+    /// Look up a cached discovery result. `discriminator` must be built the same
+    /// way for lookup and store (see `DiscoveryCache` docs).
     pub fn get(
         &self,
         target_nf_type: &str,
         service_name: &str,
+        discriminator: &str,
     ) -> Option<Vec<NfInstanceCandidate>> {
         let entries = self.entries.read().ok()?;
-        let key = (target_nf_type.to_string(), service_name.to_string());
+        let key = (
+            target_nf_type.to_string(),
+            service_name.to_string(),
+            discriminator.to_string(),
+        );
         entries.get(&key).and_then(|entry| {
             if entry.is_expired() {
                 None
@@ -409,11 +279,16 @@ impl DiscoveryCache {
         &self,
         target_nf_type: &str,
         service_name: &str,
+        discriminator: &str,
         candidates: Vec<NfInstanceCandidate>,
         ttl: std::time::Duration,
     ) {
         if let Ok(mut entries) = self.entries.write() {
-            let key = (target_nf_type.to_string(), service_name.to_string());
+            let key = (
+                target_nf_type.to_string(),
+                service_name.to_string(),
+                discriminator.to_string(),
+            );
             entries.insert(
                 key,
                 DiscoveryCacheEntry {
@@ -457,7 +332,17 @@ pub fn discovery_cache() -> &'static DiscoveryCache {
 /// Parse NF discovery search result JSON into NfInstanceCandidate list.
 ///
 /// Parses the SearchResult response from NRF discovery
-/// (TS 29.510 Section 6.2.3.2.3.1).
+/// (TS 29.510 §6.2.3.2.3.1).  For each nfInstance the following fields are
+/// extracted per TS 29.510 §6.1.6.2.x and TS 29.500 §6.10.2.5:
+///
+/// - **scheme**: from `nfServices[0].scheme`; `https` → `UriScheme::Https`,
+///   absent/other → `UriScheme::Http` (backward-compat default).
+/// - **host**: `ipv4Addresses[0]` → `fqdn` → `ipv6Addresses[0]` (bracketed
+///   as `[addr]` so it is valid in an authority component).
+/// - **port**: from the first `ipEndPoints` entry whose `transport` is `TCP`
+///   (case-insensitive), falling back to `ipEndPoints[0]` if none specifies
+///   a transport.
+/// - **prefix**: from `nfServices[0].apiPrefix` (empty string when absent).
 pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
     let value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -485,23 +370,69 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("REGISTERED");
 
-            // Extract host/port from ipv4Addresses or fqdn
+            // Host resolution: ipv4Addresses[0] → fqdn → ipv6Addresses[0].
+            // IPv6 literals are bracketed (e.g. `[2001:db8::1]`) so they are
+            // valid inside an HTTP authority component (RFC 3986 §3.2.2).
             let host = inst
                 .get("ipv4Addresses")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
-                .or_else(|| inst.get("fqdn").and_then(|v| v.as_str()))
-                .unwrap_or("127.0.0.1")
-                .to_string();
+                .map(str::to_string)
+                .or_else(|| {
+                    inst.get("fqdn")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    inst.get("ipv6Addresses")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str())
+                        .map(|v6| format!("[{v6}]"))
+                })
+                .unwrap_or_else(|| "127.0.0.1".to_string());
 
-            let port = inst
+            // Service-level fields: scheme, port, and apiPrefix come from
+            // nfServices[0].  Port is taken from the first ipEndPoints entry
+            // whose transport is TCP (case-insensitive); falls back to [0].
+            let first_service = inst
                 .get("nfServices")
                 .and_then(|v| v.as_array())
-                .and_then(|services| services.first())
+                .and_then(|s| s.first());
+
+            let scheme = first_service
+                .and_then(|svc| svc.get("scheme"))
+                .and_then(|v| v.as_str())
+                .map(|s| {
+                    if s.eq_ignore_ascii_case("https") {
+                        UriScheme::Https
+                    } else {
+                        UriScheme::Http
+                    }
+                })
+                .unwrap_or(UriScheme::Http);
+
+            let prefix = first_service
+                .and_then(|svc| svc.get("apiPrefix"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let port = first_service
                 .and_then(|svc| svc.get("ipEndPoints"))
                 .and_then(|v| v.as_array())
-                .and_then(|eps| eps.first())
+                .and_then(|eps| {
+                    // Prefer an endpoint explicitly marked as TCP.
+                    eps.iter()
+                        .find(|ep| {
+                            ep.get("transport")
+                                .and_then(|t| t.as_str())
+                                .map(|t| t.eq_ignore_ascii_case("TCP"))
+                                .unwrap_or(false)
+                        })
+                        .or_else(|| eps.first())
+                })
                 .and_then(|ep| ep.get("port"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(7777) as u16;
@@ -519,81 +450,13 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
                 capacity,
                 load,
                 healthy: nf_status == "REGISTERED",
+                scheme,
+                prefix,
             });
         }
     }
 
     candidates
-}
-
-/// Route an SBI request to the appropriate NF instance
-/// Returns the target host:port to forward to
-pub fn route_request(
-    request: &SbiRequest,
-    candidates: &[NfInstanceCandidate],
-) -> Result<(String, u16, HashMap<String, String>), String> {
-    // If Target-apiRoot is present, use it directly
-    if let Some(target_apiroot) = request.get_header(headers::TARGET_APIROOT) {
-        // Parse host:port from target_apiroot URL
-        let (host, port) = parse_apiroot_url(target_apiroot)?;
-        let fwd_headers = copy_request_headers(request, false);
-        return Ok((host, port, fwd_headers));
-    }
-
-    // Otherwise, select from candidates via NF discovery
-    let selected = select_nf_instance(candidates)
-        .ok_or_else(|| "No NF instance available for routing".to_string())?;
-
-    log::debug!(
-        "Selected NF instance {} ({}:{}) for routing",
-        selected.nf_instance_id,
-        selected.host,
-        selected.port
-    );
-
-    let fwd_headers = copy_request_headers(request, false);
-    Ok((selected.host.clone(), selected.port, fwd_headers))
-}
-
-/// Parse a URL to extract host and port
-fn parse_apiroot_url(url: &str) -> Result<(String, u16), String> {
-    // Strip scheme
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-
-    // Strip path
-    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
-
-    if let Some(colon_idx) = host_port.rfind(':') {
-        let host = &host_port[..colon_idx];
-        let port: u16 = host_port[colon_idx + 1..]
-            .parse()
-            .map_err(|_| "Invalid port in URL".to_string())?;
-        Ok((host.to_string(), port))
-    } else {
-        // Default ports
-        let port = if url.starts_with("https://") { 443 } else { 80 };
-        Ok((host_port.to_string(), port))
-    }
-}
-
-/// Build a forwarded SBI request with updated authority
-pub fn build_forwarded_request(
-    original: &SbiRequest,
-    target_host: &str,
-    target_port: u16,
-    headers: HashMap<String, String>,
-) -> SbiRequest {
-    let mut fwd = SbiRequest {
-        method: original.method.clone(),
-        uri: original.uri.clone(),
-        headers,
-        body: original.body.clone(),
-    };
-    fwd.set_header(":authority", &format!("{target_host}:{target_port}"));
-    fwd
 }
 
 #[cfg(test)]
@@ -634,68 +497,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sbi_request() {
-        let mut request = SbiRequest::new("POST", "/test");
-        request.set_header("Content-Type", "application/json");
-
-        assert_eq!(request.method, "POST");
-        assert_eq!(request.uri, "/test");
-        assert_eq!(
-            request.get_header("content-type"),
-            Some(&"application/json".to_string())
-        );
-    }
-
-    #[test]
-    fn test_sbi_response() {
-        let mut response = SbiResponse::new(200);
-        response.set_header("Content-Type", "application/json");
-
-        assert_eq!(response.status, 200);
-    }
-
-    #[test]
-    fn test_parse_discovery_headers() {
-        let mut request = SbiRequest::new("GET", "/test");
-        // Requester identity is carried in the Discovery-requester-nf-type
-        // header (TS 29.500 §5.2.3.2.7), not in User-Agent.
-        request.set_header(headers::DISCOVERY_REQUESTER_NF_TYPE, "AMF");
-        request.set_header(headers::DISCOVERY_TARGET_NF_TYPE, "UDM");
-        request.set_header(headers::DISCOVERY_SERVICE_NAMES, "nudm-uecm,nudm-sdm");
-        request.set_header(headers::DISCOVERY_DNN, "internet");
-
-        let (target_nf_type, requester_nf_type, service_type, discovery_option) =
-            parse_discovery_headers(&request);
-
-        assert_eq!(target_nf_type, Some(NfType::Udm));
-        assert_eq!(requester_nf_type, Some(NfType::Amf));
-        assert_eq!(service_type, Some(SbiServiceType::NudmUecm));
-        assert_eq!(discovery_option.dnn, Some("internet".to_string()));
-        assert_eq!(discovery_option.service_names.len(), 2);
-    }
-
-    #[test]
-    fn test_copy_request_headers() {
-        let mut request = SbiRequest::new("GET", "/test");
-        request.set_header(":scheme", "https");
-        request.set_header(":authority", "example.com");
-        request.set_header("Content-Type", "application/json");
-        request.set_header(headers::TARGET_APIROOT, "https://target.com");
-        request.set_header(headers::DISCOVERY_TARGET_NF_TYPE, "UDM");
-
-        // With custom headers removed
-        let headers = copy_request_headers(&request, false);
-        assert!(!headers.contains_key(":scheme"));
-        assert!(!headers.contains_key(":authority"));
-        assert!(headers.contains_key("Content-Type"));
-        assert!(!headers.contains_key(headers::TARGET_APIROOT));
-
-        // With custom headers preserved
-        let headers = copy_request_headers(&request, true);
-        assert!(headers.contains_key(headers::TARGET_APIROOT));
-    }
-
-    #[test]
     fn test_select_nf_instance_empty() {
         let result = select_nf_instance(&[]);
         assert!(result.is_none());
@@ -712,6 +513,8 @@ mod tests {
             capacity: 100,
             load: 50,
             healthy: true,
+            scheme: UriScheme::Http,
+            prefix: String::new(),
         }];
         let selected = select_nf_instance(&candidates);
         assert!(selected.is_some());
@@ -730,6 +533,8 @@ mod tests {
                 capacity: 100,
                 load: 10,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-high".to_string(),
@@ -740,6 +545,8 @@ mod tests {
                 capacity: 100,
                 load: 90,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -758,6 +565,8 @@ mod tests {
                 capacity: 100,
                 load: 90,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-idle".to_string(),
@@ -768,6 +577,8 @@ mod tests {
                 capacity: 100,
                 load: 10,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -786,6 +597,8 @@ mod tests {
                 capacity: 100,
                 load: 0,
                 healthy: false,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-healthy".to_string(),
@@ -796,6 +609,8 @@ mod tests {
                 capacity: 100,
                 load: 50,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -814,6 +629,8 @@ mod tests {
                 capacity: 100,
                 load: 50,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-b".to_string(),
@@ -824,6 +641,8 @@ mod tests {
                 capacity: 100,
                 load: 50,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
         ];
         // Call twice to see round-robin switching
@@ -843,7 +662,7 @@ mod tests {
     fn test_discovery_cache() {
         let cache = DiscoveryCache::new();
 
-        assert!(cache.get("SMF", "nsmf-pdusession").is_none());
+        assert!(cache.get("SMF", "nsmf-pdusession", "").is_none());
 
         let candidates = vec![NfInstanceCandidate {
             nf_instance_id: "smf-1".to_string(),
@@ -854,21 +673,29 @@ mod tests {
             capacity: 100,
             load: 0,
             healthy: true,
+            scheme: UriScheme::Http,
+            prefix: String::new(),
         }];
 
         cache.put(
             "SMF",
             "nsmf-pdusession",
+            "",
             candidates.clone(),
             std::time::Duration::from_secs(3600),
         );
 
-        let cached = cache.get("SMF", "nsmf-pdusession");
+        let cached = cache.get("SMF", "nsmf-pdusession", "");
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().len(), 1);
 
-        assert!(cache.get("AMF", "nsmf-pdusession").is_none());
-        assert!(cache.get("SMF", "other").is_none());
+        assert!(cache.get("AMF", "nsmf-pdusession", "").is_none());
+        assert!(cache.get("SMF", "other", "").is_none());
+        // A different discriminator (e.g. a different S-NSSAI) must miss even
+        // for the same NF type + service (TS 29.500 §6.10.3.2).
+        assert!(cache
+            .get("SMF", "nsmf-pdusession", "sst=1,sd=000001")
+            .is_none());
     }
 
     #[test]
@@ -899,47 +726,123 @@ mod tests {
         assert_eq!(candidates[0].nf_instance_id, "smf-001");
         assert_eq!(candidates[0].host, "10.0.0.1");
         assert!(candidates[0].healthy);
+        // No scheme in the profile → defaults to Http (backward-compat).
+        assert_eq!(candidates[0].scheme, UriScheme::Http);
+        assert_eq!(candidates[0].prefix, "");
         assert_eq!(candidates[1].nf_instance_id, "smf-002");
         assert!(!candidates[1].healthy);
     }
 
+    /// scpd-01 acceptance: an `https` profile with an IPv6 address and
+    /// apiPrefix yields `ApiRoot` `https://[v6]:port/prefix`.
     #[test]
-    fn test_parse_apiroot_url() {
-        let (host, port) = parse_apiroot_url("https://amf.example.com:8443").unwrap();
-        assert_eq!(host, "amf.example.com");
-        assert_eq!(port, 8443);
-
-        let (host, port) = parse_apiroot_url("https://smf.local").unwrap();
-        assert_eq!(host, "smf.local");
-        assert_eq!(port, 443);
-
-        let (host, port) = parse_apiroot_url("http://127.0.0.1:7777/path").unwrap();
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 7777);
+    fn test_parse_search_result_https_ipv6_apiprefix() {
+        let json = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "udm-tls-1",
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "ipv6Addresses": ["2001:db8::1"],
+                "priority": 1,
+                "capacity": 100,
+                "load": 0,
+                "nfServices": [{
+                    "serviceInstanceId": "nudm-sdm-1",
+                    "serviceName": "nudm-sdm",
+                    "scheme": "https",
+                    "apiPrefix": "/nudm",
+                    "ipEndPoints": [{"transport": "TCP", "port": 8443}]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let candidates = parse_search_result(&body);
+        assert_eq!(candidates.len(), 1);
+        let c = &candidates[0];
+        // IPv6 literal must be bracketed for use in an authority component.
+        assert_eq!(c.host, "[2001:db8::1]");
+        assert_eq!(c.port, 8443);
+        assert_eq!(c.scheme, UriScheme::Https);
+        assert_eq!(c.prefix, "/nudm");
     }
 
+    /// scpd-01 acceptance: a plain http/ipv4 profile yields the current
+    /// default scheme and empty prefix (backward-compat).
     #[test]
-    fn test_route_request_with_target_apiroot() {
-        let mut request = SbiRequest::new("POST", "/nsmf-pdusession/v1/sm-contexts");
-        request.set_header(headers::TARGET_APIROOT, "https://smf.local:7778");
-
-        let result = route_request(&request, &[]);
-        assert!(result.is_ok());
-        let (host, port, _) = result.unwrap();
-        assert_eq!(host, "smf.local");
-        assert_eq!(port, 7778);
+    fn test_parse_search_result_http_ipv4_default() {
+        let json = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "udm-plain-1",
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": ["10.0.0.2"],
+                "priority": 1,
+                "capacity": 100,
+                "load": 0,
+                "nfServices": [{
+                    "serviceInstanceId": "nudm-uecm-1",
+                    "serviceName": "nudm-uecm",
+                    "ipEndPoints": [{"port": 7777}]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let candidates = parse_search_result(&body);
+        assert_eq!(candidates.len(), 1);
+        let c = &candidates[0];
+        assert_eq!(c.host, "10.0.0.2");
+        assert_eq!(c.port, 7777);
+        assert_eq!(c.scheme, UriScheme::Http);
+        assert_eq!(c.prefix, "");
     }
 
+    /// scpd-01: when multiple ipEndPoints are present, the one with
+    /// `transport: TCP` is preferred over the first entry.
     #[test]
-    fn test_build_forwarded_request() {
-        let original = SbiRequest::new("GET", "/nudm-sdm/v1/imsi-123/sm-data");
-        let headers = HashMap::new();
-        let fwd = build_forwarded_request(&original, "udm.local", 7777, headers);
-        assert_eq!(fwd.method, "GET");
-        assert_eq!(fwd.uri, "/nudm-sdm/v1/imsi-123/sm-data");
-        assert_eq!(
-            fwd.headers.get(":authority"),
-            Some(&"udm.local:7777".to_string())
-        );
+    fn test_parse_search_result_prefers_tcp_endpoint() {
+        let json = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "smf-multi-ep",
+                "nfType": "SMF",
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": ["10.0.0.3"],
+                "nfServices": [{
+                    "serviceName": "nsmf-pdusession",
+                    "ipEndPoints": [
+                        {"transport": "SCTP", "port": 9999},
+                        {"transport": "TCP",  "port": 8888}
+                    ]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let candidates = parse_search_result(&body);
+        assert_eq!(candidates.len(), 1);
+        // TCP endpoint (port 8888) wins over the first (SCTP, port 9999).
+        assert_eq!(candidates[0].port, 8888);
+    }
+
+    /// scpd-01: fqdn is chosen when ipv4Addresses is absent.
+    #[test]
+    fn test_parse_search_result_fqdn_fallback() {
+        let json = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "ausf-fqdn",
+                "nfType": "AUSF",
+                "nfStatus": "REGISTERED",
+                "fqdn": "ausf.5gc.example.org",
+                "nfServices": [{
+                    "serviceName": "nausf-auth",
+                    "ipEndPoints": [{"port": 8443}]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let candidates = parse_search_result(&body);
+        assert_eq!(candidates[0].host, "ausf.5gc.example.org");
     }
 }

@@ -2,10 +2,10 @@
 //!
 //! Port of src/ausf/event.h and event.c - Event definitions for AUSF
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
-pub const OGS_FSM_USER_SIG: i32 = 2;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for AUSF
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,19 +26,19 @@ impl AusfEventId {
     /// Get the name of the event
     pub fn name(&self) -> &'static str {
         match self {
-            AusfEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            AusfEventId::FsmExit => "OGS_FSM_EXIT_SIG",
-            AusfEventId::SbiServer => "OGS_EVENT_SBI_SERVER",
-            AusfEventId::SbiClient => "OGS_EVENT_SBI_CLIENT",
-            AusfEventId::SbiTimer => "OGS_EVENT_SBI_TIMER",
+            AusfEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            AusfEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
+            AusfEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
+            AusfEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
+            AusfEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
         }
     }
 
     /// Convert from i32 signal
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => AusfEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => AusfEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => AusfEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => AusfEventId::FsmExit,
             _ => AusfEventId::SbiServer,
         }
     }
@@ -68,14 +68,16 @@ impl AusfTimerId {
     pub fn name(&self) -> &'static str {
         match self {
             AusfTimerId::NfInstanceRegistrationInterval => {
-                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+                "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            AusfTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
-            AusfTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
-            AusfTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",
-            AusfTimerId::SubscriptionValidity => "OGS_TIMER_SUBSCRIPTION_VALIDITY",
-            AusfTimerId::SubscriptionPatch => "OGS_TIMER_SUBSCRIPTION_PATCH",
-            AusfTimerId::SbiClientWait => "OGS_TIMER_SBI_CLIENT_WAIT",
+            AusfTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
+            AusfTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
+            AusfTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
+            AusfTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",
+            AusfTimerId::SubscriptionPatch => "NEXTGCORE_TIMER_SUBSCRIPTION_PATCH",
+            AusfTimerId::SbiClientWait => "NEXTGCORE_TIMER_SBI_CLIENT_WAIT",
         }
     }
 }
@@ -331,7 +333,7 @@ mod tests {
     #[test]
     fn test_event_name() {
         let event = AusfEvent::new(AusfEventId::SbiServer);
-        assert_eq!(event.name(), "OGS_EVENT_SBI_SERVER");
+        assert_eq!(event.name(), "NEXTGCORE_EVENT_SBI_SERVER");
     }
 
     #[test]

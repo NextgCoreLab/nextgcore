@@ -1,6 +1,6 @@
 # NextGCore - Pure Rust 5G/LTE Core Network
 
-NextGCore is a pure Rust implementation of a 5G/LTE mobile core network, derived from the Open5GS project. It provides a complete, production-ready 5G Standalone (SA) core with zero C library dependencies.
+NextGCore is a pure Rust implementation of a 5G/LTE mobile core network, derived from the Open5GS project. It provides a complete 5G Standalone (SA) core with zero C library dependencies, validated end-to-end against the companion nextgsim gNB/UE simulator (registration + PDU session + user-plane data). It is a research/interop implementation, not a production-certified core.
 
 ## Key Features
 
@@ -23,24 +23,24 @@ The fastest way to deploy a complete 5G core:
 git clone https://github.com/nextgcore/nextgcore.git
 cd nextgcore/docker/rust
 
-# Build optimized images (uses pre-built binaries)
-docker compose -f docker-compose-5gc-optimized.yml build
+# Build all images (compiles both workspaces in a builder container)
+docker compose -f docker-compose.yml build
 
 # Start the 5G core
-docker compose -f docker-compose-5gc-optimized.yml up -d
+docker compose -f docker-compose.yml up -d
 
 # Verify all services are running
-docker ps --filter "name=nextgcore-5gc" --format "table {{.Names}}\t{{.Status}}"
+docker ps --filter "name=nextgcore-" --format "table {{.Names}}\t{{.Status}}"
 
 # Check AMF logs
-docker logs nextgcore-5gc-amf 2>&1 | tail -20
+docker logs nextgcore-amf 2>&1 | tail -20
 ```
 
 Expected output:
 ```
-nextgcore-5gc-amf       Up 2 minutes (healthy)
-nextgcore-5gc-smf       Up 2 minutes (healthy)
-nextgcore-5gc-upf       Up 2 minutes (healthy)
+nextgcore-amf       Up 2 minutes (healthy)
+nextgcore-smf       Up 2 minutes (healthy)
+nextgcore-upf       Up 2 minutes (healthy)
 ...
 ```
 
@@ -48,7 +48,7 @@ nextgcore-5gc-upf       Up 2 minutes (healthy)
 
 ```bash
 # Prerequisites: Rust 1.85+
-cd rust_src
+cd src
 cargo build --release
 
 # Start network functions individually
@@ -63,7 +63,7 @@ cargo build --release
 ```bash
 # Start the 5G core
 cd nextgcore/docker/rust
-docker compose -f docker-compose-5gc-optimized.yml up -d
+docker compose -f docker-compose.yml up -d
 
 # Start the UE/gNB simulator (from nextgsim repository)
 cd ../../nextgsim
@@ -130,10 +130,11 @@ docker logs nextgsim-ue 2>&1 | grep "REGISTERED"
 
 | File | Description |
 |------|-------------|
-| `docker-compose-5gc-optimized.yml` | 5G Core with pre-built binaries (recommended) |
-| `docker-compose-5gc.yml` | 5G Core with in-container build |
+| `docker-compose.yml` | Full 22-NF 5GC + nextgsim gNB/UE matched-sim E2E stack (recommended) |
 | `docker-compose-epc.yml` | 4G EPC deployment |
-| `docker-compose.yml` | Full 5GC + EPC deployment |
+| `docker-compose.features.yml` | Rel-17/18 feature-knobs overlay |
+| `docker-compose.oauth2.yml` | SBI OAuth2 token-enforcement overlay |
+| `docker-compose.kernel-sctp.yml` | Native kernel-SCTP N2 overlay |
 
 ### Environment Variables
 
@@ -146,7 +147,7 @@ RUST_BACKTRACE=1        # Enable backtraces for debugging
 
 ```
 nextgcore/
-├── rust_src/           # Rust source code
+├── src/           # Rust source code
 │   ├── bins/           # Network function binaries
 │   │   ├── nextgcore-amfd/    # Access and Mobility Management Function
 │   │   ├── nextgcore-ausfd/   # Authentication Server Function
@@ -191,6 +192,13 @@ nextgcore/
 | **AMF** | Access and Mobility Management Function | TS 29.518 |
 | **SMF** | Session Management Function | TS 29.502 |
 | **UPF** | User Plane Function - Data forwarding | TS 29.244 |
+| **NSACF** | Network Slice Admission Control Function | TS 29.536 |
+| **NWDAF** | Network Data Analytics Function | TS 29.520 |
+| **LMF** | Location Management Function | TS 29.572 |
+| **EES** | Edge Enabler Server | TS 29.558 |
+| **MBSMF** | MBS Session Management Function | TS 29.532 |
+| **PIN** | Personal IoT Network server | TS 23.542 |
+| **DCCF** | Data Collection Coordination Function | TS 23.288 |
 
 ### Evolved Packet Core (EPC)
 
@@ -265,16 +273,22 @@ upf:
 ### Unit Tests
 
 ```bash
-cd rust_src
+cd src
 cargo test
 ```
 
-### Integration Tests
+### End-to-End (matched-sim)
+
+The one-command matched-sim E2E runs our nextgsim gNB+UE against our 22-NF 5G
+core (no Open5GS): disk preflight -> build -> full registration + PDU session
++ user-plane ping through the GTP-U tunnel (UE gets 10.45.0.2 on `uesimtun0`).
+See `docker/rust/CI.md`.
 
 ```bash
-# With Docker running
 cd docker/rust
-./validate-deployment.sh
+./e2e.sh            # preflight -> build -> E2E  (exit 0/1/2)
+./e2e.sh --quick    # reuse prebuilt binaries (fast re-run)
+./e2e.sh --overlay features   # baseline + Rel-17/18 feature harness
 ```
 
 ### Protocol Conformance
@@ -291,7 +305,7 @@ The implementation follows 3GPP Release 17 specifications:
 ### Building
 
 ```bash
-cd rust_src
+cd src
 
 # Debug build
 cargo build
@@ -341,7 +355,7 @@ cd nextgcore
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Build and test
-cd rust_src
+cd src
 cargo build
 cargo test
 ```
@@ -428,24 +442,24 @@ Open http://localhost:9999 in your browser.
 **AMF not accepting gNB connections**
 ```bash
 # Check AMF is listening on NGAP port
-docker logs nextgcore-5gc-amf | grep "NGAP"
+docker logs nextgcore-amf | grep "NGAP"
 # Should show: "NGAP server listening on 0.0.0.0:38412"
 ```
 
 **UPF not forwarding traffic**
 ```bash
 # Verify UPF has TUN interface
-docker exec nextgcore-5gc-upf ip addr show
+docker exec nextgcore-upf ip addr show
 # Verify IP forwarding
-docker exec nextgcore-5gc-upf sysctl net.ipv4.ip_forward
+docker exec nextgcore-upf sysctl net.ipv4.ip_forward
 ```
 
 **MongoDB connection issues**
 ```bash
 # Check MongoDB health
-docker logs nextgcore-5gc-mongodb
+docker logs nextgcore-mongodb
 # Verify connectivity
-docker exec nextgcore-5gc-amf ping -c 1 172.23.0.2
+docker exec nextgcore-amf ping -c 1 172.23.0.2
 ```
 
 ## License

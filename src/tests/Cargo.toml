@@ -29,7 +29,7 @@ hyper = { version = "1.1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 
-# MongoDB - using sync feature to be compatible with ogs-dbi
+# MongoDB - using sync feature to be compatible with nextgcore-dbi
 mongodb = { version = "2.8", default-features = false, features = ["sync"] }
 bson = "2.9"
 
@@ -44,16 +44,16 @@ uuid = { version = "1.6", features = ["v4"] }
 bytes = "1.5"
 
 # Internal crates
-ogs-core = { path = "../libs/ogs-core" }
-ogs-crypt = { path = "../libs/ogs-crypt" }
-ogs-nas = { path = "../libs/ogs-nas" }
-ogs-ngap = { path = "../libs/ogs-ngap" }
-ogs-s1ap = { path = "../libs/ogs-s1ap" }
-ogs-gtp = { path = "../libs/ogs-gtp" }
-ogs-pfcp = { path = "../libs/ogs-pfcp" }
-ogs-sbi = { path = "../libs/ogs-sbi" }
-ogs-diameter = { path = "../libs/ogs-diameter" }
-ogs-app = { path = "../libs/ogs-app" }
+nextgcore-core = { path = "../libs/nextgcore-core" }
+nextgcore-crypt = { path = "../libs/nextgcore-crypt" }
+nextgcore-nas = { path = "../libs/nextgcore-nas" }
+nextgcore-ngap = { path = "../libs/nextgcore-ngap" }
+nextgcore-s1ap = { path = "../libs/nextgcore-s1ap" }
+nextgcore-gtp = { path = "../libs/nextgcore-gtp" }
+nextgcore-pfcp = { path = "../libs/nextgcore-pfcp" }
+nextgcore-sbi = { path = "../libs/nextgcore-sbi" }
+nextgcore-diameter = { path = "../libs/nextgcore-diameter" }
+nextgcore-app = { path = "../libs/nextgcore-app" }
 
 [[test]]
 name = "integration"

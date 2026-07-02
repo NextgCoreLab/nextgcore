@@ -3,16 +3,16 @@
 //! Port of src/mme/mme-fd-path.c - Diameter S6a interface functions
 //!
 //! Implements Diameter S6a interface for HSS communication.
-//! Wires the MME to HSS via ogs-diameter DiameterClient for S6a requests.
+//! Wires the MME to HSS via nextgcore-diameter DiameterClient for S6a requests.
 
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 
 use tokio::sync::Mutex;
 
-use ogs_diameter::config::DiameterConfig;
-use ogs_diameter::s6a;
-use ogs_diameter::transport::DiameterClient;
+use nextgcore_diameter::config::DiameterConfig;
+use nextgcore_diameter::s6a;
+use nextgcore_diameter::transport::DiameterClient;
 
 use crate::context::MmeUe;
 use crate::emm_build::EmmCause;
@@ -176,7 +176,7 @@ pub mod cancellation_type {
 // E-UTRAN authentication vector, Subscription-Data and APN-Configuration are
 // shared with the HSS via the S6a library module so both sides encode/parse
 // the same grouped-AVP wire format (TS 29.272 7.3.x).
-pub use ogs_diameter::s6a::{ApnConfiguration, EUtranVector, SubscriptionData};
+pub use nextgcore_diameter::s6a::{ApnConfiguration, EUtranVector, SubscriptionData};
 
 /// Authentication Information Answer message
 #[derive(Debug, Clone, Default)]
@@ -277,12 +277,14 @@ impl std::fmt::Display for DiameterError {
 
 impl std::error::Error for DiameterError {}
 
-impl From<ogs_diameter::error::DiameterError> for DiameterError {
-    fn from(e: ogs_diameter::error::DiameterError) -> Self {
+impl From<nextgcore_diameter::error::DiameterError> for DiameterError {
+    fn from(e: nextgcore_diameter::error::DiameterError) -> Self {
         match e {
-            ogs_diameter::error::DiameterError::Io(_) => DiameterError::ConnectionFailed,
-            ogs_diameter::error::DiameterError::Protocol(_) => DiameterError::SendFailed,
-            ogs_diameter::error::DiameterError::InvalidMessage(_) => DiameterError::InvalidResponse,
+            nextgcore_diameter::error::DiameterError::Io(_) => DiameterError::ConnectionFailed,
+            nextgcore_diameter::error::DiameterError::Protocol(_) => DiameterError::SendFailed,
+            nextgcore_diameter::error::DiameterError::InvalidMessage(_) => {
+                DiameterError::InvalidResponse
+            }
             _ => DiameterError::SendFailed,
         }
     }
@@ -608,53 +610,56 @@ pub async fn mme_s6a_send_pur(mme_ue: &MmeUe) -> DiameterResult<(u32, u32)> {
 
     log::debug!("[{}] Sending Purge-UE-Request", mme_ue.imsi_bcd);
 
-    let mut pur = ogs_diameter::message::DiameterMessage::new_request(
+    let mut pur = nextgcore_diameter::message::DiameterMessage::new_request(
         s6a::cmd::PURGE_UE,
         s6a::S6A_APPLICATION_ID,
     );
 
     // Session-Id
-    pur.add_avp(ogs_diameter::avp::Avp::mandatory(
-        ogs_diameter::common::avp_code::SESSION_ID,
-        ogs_diameter::avp::AvpData::Utf8String(session_id),
+    pur.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+        nextgcore_diameter::common::avp_code::SESSION_ID,
+        nextgcore_diameter::avp::AvpData::Utf8String(session_id),
     ));
     // Origin-Host
-    pur.add_avp(ogs_diameter::avp::Avp::mandatory(
-        ogs_diameter::common::avp_code::ORIGIN_HOST,
-        ogs_diameter::avp::AvpData::DiameterIdentity(state.config.diameter_id.clone()),
+    pur.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+        nextgcore_diameter::common::avp_code::ORIGIN_HOST,
+        nextgcore_diameter::avp::AvpData::DiameterIdentity(state.config.diameter_id.clone()),
     ));
     // Origin-Realm
-    pur.add_avp(ogs_diameter::avp::Avp::mandatory(
-        ogs_diameter::common::avp_code::ORIGIN_REALM,
-        ogs_diameter::avp::AvpData::DiameterIdentity(state.config.diameter_realm.clone()),
+    pur.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+        nextgcore_diameter::common::avp_code::ORIGIN_REALM,
+        nextgcore_diameter::avp::AvpData::DiameterIdentity(state.config.diameter_realm.clone()),
     ));
     // Destination-Realm
-    pur.add_avp(ogs_diameter::avp::Avp::mandatory(
-        ogs_diameter::common::avp_code::DESTINATION_REALM,
-        ogs_diameter::avp::AvpData::DiameterIdentity(state.config.diameter_realm.clone()),
+    pur.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+        nextgcore_diameter::common::avp_code::DESTINATION_REALM,
+        nextgcore_diameter::avp::AvpData::DiameterIdentity(state.config.diameter_realm.clone()),
     ));
     // User-Name (IMSI)
-    pur.add_avp(ogs_diameter::avp::Avp::mandatory(
-        ogs_diameter::common::avp_code::USER_NAME,
-        ogs_diameter::avp::AvpData::Utf8String(mme_ue.imsi_bcd.clone()),
+    pur.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+        nextgcore_diameter::common::avp_code::USER_NAME,
+        nextgcore_diameter::avp::AvpData::Utf8String(mme_ue.imsi_bcd.clone()),
     ));
     // Auth-Session-State (NO_STATE_MAINTAINED)
-    pur.add_avp(ogs_diameter::avp::Avp::mandatory(
-        ogs_diameter::common::avp_code::AUTH_SESSION_STATE,
-        ogs_diameter::avp::AvpData::Enumerated(1),
+    pur.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+        nextgcore_diameter::common::avp_code::AUTH_SESSION_STATE,
+        nextgcore_diameter::avp::AvpData::Enumerated(1),
     ));
     // PUR-Flags: UE purged in the MME (TS 29.272 7.3.149)
-    pur.add_avp(ogs_diameter::avp::Avp::vendor_mandatory(
+    pur.add_avp(nextgcore_diameter::avp::Avp::vendor_mandatory(
         s6a::avp::PUR_FLAGS,
-        ogs_diameter::OGS_3GPP_VENDOR_ID,
-        ogs_diameter::avp::AvpData::Unsigned32(s6a::pur_flags::UE_PURGED_IN_MME),
+        nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID,
+        nextgcore_diameter::avp::AvpData::Unsigned32(s6a::pur_flags::UE_PURGED_IN_MME),
     ));
 
     let answer = state.client.send_request(&pur).await?;
 
     let result_code = answer.result_code().unwrap_or(0);
     let pua_flags = answer
-        .find_vendor_avp(avp_code::PUA_FLAGS, ogs_diameter::OGS_3GPP_VENDOR_ID)
+        .find_vendor_avp(
+            avp_code::PUA_FLAGS,
+            nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID,
+        )
         .and_then(|a| a.as_u32())
         .unwrap_or(0);
 
@@ -703,29 +708,29 @@ pub async fn mme_fd_recv_inbound(
     );
 
     let build_answer =
-        |req: &ogs_diameter::message::DiameterMessage, result: u32, protocol_error: bool| {
-            let mut answer = ogs_diameter::message::DiameterMessage::new_answer(req);
+        |req: &nextgcore_diameter::message::DiameterMessage, result: u32, protocol_error: bool| {
+            let mut answer = nextgcore_diameter::message::DiameterMessage::new_answer(req);
             if let Some(sid) = req.session_id() {
-                answer.add_avp(ogs_diameter::avp::Avp::mandatory(
-                    ogs_diameter::common::avp_code::SESSION_ID,
-                    ogs_diameter::avp::AvpData::Utf8String(sid.to_string()),
+                answer.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+                    nextgcore_diameter::common::avp_code::SESSION_ID,
+                    nextgcore_diameter::avp::AvpData::Utf8String(sid.to_string()),
                 ));
             }
-            answer.add_avp(ogs_diameter::avp::Avp::mandatory(
-                ogs_diameter::common::avp_code::RESULT_CODE,
-                ogs_diameter::avp::AvpData::Unsigned32(result),
+            answer.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+                nextgcore_diameter::common::avp_code::RESULT_CODE,
+                nextgcore_diameter::avp::AvpData::Unsigned32(result),
             ));
-            answer.add_avp(ogs_diameter::avp::Avp::mandatory(
-                ogs_diameter::common::avp_code::AUTH_SESSION_STATE,
-                ogs_diameter::avp::AvpData::Enumerated(1),
+            answer.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+                nextgcore_diameter::common::avp_code::AUTH_SESSION_STATE,
+                nextgcore_diameter::avp::AvpData::Enumerated(1),
             ));
-            answer.add_avp(ogs_diameter::avp::Avp::mandatory(
-                ogs_diameter::common::avp_code::ORIGIN_HOST,
-                ogs_diameter::avp::AvpData::DiameterIdentity(origin_host.clone()),
+            answer.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+                nextgcore_diameter::common::avp_code::ORIGIN_HOST,
+                nextgcore_diameter::avp::AvpData::DiameterIdentity(origin_host.clone()),
             ));
-            answer.add_avp(ogs_diameter::avp::Avp::mandatory(
-                ogs_diameter::common::avp_code::ORIGIN_REALM,
-                ogs_diameter::avp::AvpData::DiameterIdentity(origin_realm.clone()),
+            answer.add_avp(nextgcore_diameter::avp::Avp::mandatory(
+                nextgcore_diameter::common::avp_code::ORIGIN_REALM,
+                nextgcore_diameter::avp::AvpData::DiameterIdentity(origin_realm.clone()),
             ));
             if protocol_error {
                 answer.header.set_error();
@@ -746,7 +751,7 @@ pub async fn mme_fd_recv_inbound(
             let cancellation_type = request
                 .find_vendor_avp(
                     avp_code::CANCELLATION_TYPE,
-                    ogs_diameter::OGS_3GPP_VENDOR_ID,
+                    nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID,
                 )
                 .and_then(|a| a.as_u32());
             // Cancellation-Type is mandatory in CLR (TS 29.272 Table 7.2.7/1)
@@ -757,7 +762,10 @@ pub async fn mme_fd_recv_inbound(
                 return Ok(None);
             };
             let clr_flags = request
-                .find_vendor_avp(avp_code::CLR_FLAGS, ogs_diameter::OGS_3GPP_VENDOR_ID)
+                .find_vendor_avp(
+                    avp_code::CLR_FLAGS,
+                    nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID,
+                )
                 .and_then(|a| a.as_u32())
                 .unwrap_or(0);
 
@@ -785,7 +793,10 @@ pub async fn mme_fd_recv_inbound(
             };
             let subscription_data = s6a::parse_subscription_data_avp(sub_avp);
             let idr_flags = request
-                .find_vendor_avp(avp_code::IDR_FLAGS, ogs_diameter::OGS_3GPP_VENDOR_ID)
+                .find_vendor_avp(
+                    avp_code::IDR_FLAGS,
+                    nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID,
+                )
                 .and_then(|a| a.as_u32())
                 .unwrap_or(0);
 
@@ -997,19 +1008,19 @@ mod tests {
     }
 
     #[test]
-    fn test_diameter_error_from_ogs() {
-        let io_err = ogs_diameter::error::DiameterError::Io(std::io::Error::new(
+    fn test_diameter_error_from_nextgcore() {
+        let io_err = nextgcore_diameter::error::DiameterError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "refused",
         ));
         let local: DiameterError = io_err.into();
         assert_eq!(local, DiameterError::ConnectionFailed);
 
-        let proto_err = ogs_diameter::error::DiameterError::Protocol("test".to_string());
+        let proto_err = nextgcore_diameter::error::DiameterError::Protocol("test".to_string());
         let local: DiameterError = proto_err.into();
         assert_eq!(local, DiameterError::SendFailed);
 
-        let inv_err = ogs_diameter::error::DiameterError::InvalidMessage("bad".to_string());
+        let inv_err = nextgcore_diameter::error::DiameterError::InvalidMessage("bad".to_string());
         let local: DiameterError = inv_err.into();
         assert_eq!(local, DiameterError::InvalidResponse);
     }
@@ -1107,12 +1118,12 @@ mod tests {
         });
 
         // Simulate the HSS side: ULA with grouped Subscription-Data over the wire
-        let mut ula = ogs_diameter::message::DiameterMessage::new_request(316, 16777251);
-        ula.header.flags &= !ogs_diameter::message::cmd_flags::REQUEST;
+        let mut ula = nextgcore_diameter::message::DiameterMessage::new_request(316, 16777251);
+        ula.header.flags &= !nextgcore_diameter::message::cmd_flags::REQUEST;
         ula.add_avp(s6a::build_subscription_data_avp(&sub));
         let encoded = ula.encode();
         let mut bytes = encoded.freeze();
-        let decoded = ogs_diameter::message::DiameterMessage::decode(&mut bytes).unwrap();
+        let decoded = nextgcore_diameter::message::DiameterMessage::decode(&mut bytes).unwrap();
 
         // MME side parse: AMBR and APN config must NOT be lost
         let parsed = decoded
@@ -1129,7 +1140,7 @@ mod tests {
     /// Parsing a message without Subscription-Data yields empty defaults.
     #[test]
     fn test_parse_subscription_data_empty() {
-        let msg = ogs_diameter::message::DiameterMessage::new_request(316, 16777251);
+        let msg = nextgcore_diameter::message::DiameterMessage::new_request(316, 16777251);
         let sub = msg
             .find_avp(avp_code::SUBSCRIPTION_DATA)
             .map(s6a::parse_subscription_data_avp)
@@ -1159,7 +1170,7 @@ mod tests {
 
         let encoded = air.encode();
         let mut bytes = encoded.freeze();
-        let decoded = ogs_diameter::message::DiameterMessage::decode(&mut bytes).unwrap();
+        let decoded = nextgcore_diameter::message::DiameterMessage::decode(&mut bytes).unwrap();
 
         assert!(decoded.find_avp(s6a::avp::RE_SYNC_INFO).is_none());
         let (r, a) = s6a::find_resync_info(&decoded).expect("resync info inside grouped AVP");

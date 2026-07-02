@@ -11,21 +11,24 @@ name = "nextgcore-dccfd"
 path = "src/main.rs"
 
 [dependencies]
-ogs-core = { workspace = true }
-ogs-sbi = { workspace = true }
-ogs-metrics = { workspace = true }
-ogs-app = { workspace = true }
+nextgcore-core = { workspace = true }
+nextgcore-sbi = { workspace = true }
+nextgcore-metrics = { workspace = true }
+nextgcore-app = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+base64.workspace = true
 
 [lints]
 workspace = true

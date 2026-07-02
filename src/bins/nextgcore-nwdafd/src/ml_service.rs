@@ -1,14 +1,37 @@
 //! NWDAF ML Model Provisioning Service (TS 23.288 §6.12, Rel-17)
 //!
-//! Implements Nnwdaf_MLModelProvision service:
-//! - ML model registry (registration, discovery, deployment)
-//! - Model lifecycle: Training → Validation → Deployed → Deprecated
-//! - Model performance tracking
+//! Implements the Nnwdaf_MLModelProvision service as a TS 29.520 **Subscribe /
+//! Notify** resource (nwafd-05):
+//! - `POST /subscriptions` accepts an `NwdafMLModelProvSubsc`
+//!   (`mLEventSubscs[]` + `notifUri`) and returns 201 + `Location`.
+//! - `PUT` / `DELETE` on `/subscriptions/{id}` update / remove it.
+//! - The NWDAF later POSTs an `NwdafMLModelProvNotif` callback (an array of
+//!   them) to `notifUri`, each carrying `MLEventNotif`s with the model file
+//!   address (`mLFileAddr.mLModelUrl`).
+//!
+//! The in-process `MlModelRegistry` / `MlModel` lifecycle and the G14 accuracy
+//! feedback loop below remain as internal MTLF bookkeeping; they are no longer
+//! exposed as a bespoke REST `/models` resource.
+//!
+//! # Out of scope (nwafd-11)
+//!
+//! Management-plane ML provisioning is intentionally **not** implemented here:
+//! - **TS 28.104** — Management Data Analytics (MDA): an OAM/management-plane
+//!   analytics service, not an SBI Nnwdaf service.
+//! - **TS 28.105** — AI/ML management (training-job/model lifecycle management
+//!   over the management plane).
+//!
+//! This binary implements only the TS 29.520 control-plane `Nnwdaf_*` SBI
+//! services. The `accuracy` figures it reports are linear-regression residual
+//! quality (see `analytics.rs` / nwafd-10), not 28.104/28.105 MDA/AI-ML
+//! management KPIs, and no MDA/AI-ML management interface is advertised.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::context::AnalyticsId;
+use serde_json::{json, Map, Value};
+
+use crate::context::{AnalyticsId, MlProvSubscription};
 
 /// ML model lifecycle state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +363,130 @@ impl FeedbackRegistry {
     }
 }
 
+// ============================================================================
+// nwafd-05: Nnwdaf_MLModelProvision Subscribe/Notify wire codec (TS 29.520)
+// ============================================================================
+
+/// Parsed result of an `NwdafMLModelProvSubsc` request body.
+#[derive(Debug, Clone)]
+pub struct ParsedMlProvSubsc {
+    /// `notifUri` (mandatory).
+    pub notif_uri: String,
+    /// `notifCorreId` (optional — note the spec's `…CorreId` spelling).
+    pub notif_corr_id: Option<String>,
+    /// Distinct `mLEventSubscs[].mLEvent` values.
+    pub ml_events: Vec<AnalyticsId>,
+}
+
+/// Parse a TS 29.520 `NwdafMLModelProvSubsc` JSON body.
+///
+/// Enforces the two `required` IEs (`notifUri`, `mLEventSubscs` minItems 1) and
+/// maps each `mLEvent` token onto an [`AnalyticsId`]. Returns a human-readable
+/// error string (used as the 400 `ProblemDetails` detail) on any violation.
+pub fn parse_ml_model_prov_subsc(body: &Value) -> Result<ParsedMlProvSubsc, String> {
+    let notif_uri = match body.get("notifUri").and_then(|v| v.as_str()) {
+        Some(u) if !u.is_empty() => u.to_string(),
+        _ => return Err("notifUri is a mandatory IE".to_string()),
+    };
+
+    let event_subs = match body.get("mLEventSubscs").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return Err("mLEventSubscs is a mandatory IE and must be non-empty".to_string()),
+    };
+
+    let mut ml_events: Vec<AnalyticsId> = Vec::with_capacity(event_subs.len());
+    for es in event_subs {
+        let token = es.get("mLEvent").and_then(|v| v.as_str()).unwrap_or("");
+        match AnalyticsId::from_str(token) {
+            Some(ev) => {
+                if !ml_events.contains(&ev) {
+                    ml_events.push(ev);
+                }
+            }
+            None => return Err(format!("Invalid or missing mLEvent: {token}")),
+        }
+    }
+
+    let notif_corr_id = body
+        .get("notifCorreId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Ok(ParsedMlProvSubsc {
+        notif_uri,
+        notif_corr_id,
+        ml_events,
+    })
+}
+
+/// Echo a stored [`MlProvSubscription`] back as a TS 29.520
+/// `NwdafMLModelProvSubsc` JSON object (the 201/200 response representation).
+pub fn ml_prov_subsc_json(sub: &MlProvSubscription) -> Value {
+    let mut obj = Map::new();
+    obj.insert("notifUri".to_string(), json!(sub.notif_uri));
+    if let Some(corr) = &sub.notif_corr_id {
+        obj.insert("notifCorreId".to_string(), json!(corr));
+    }
+    obj.insert(
+        "mLEventSubscs".to_string(),
+        json!(sub
+            .ml_events
+            .iter()
+            .map(|e| json!({ "mLEvent": e.as_str() }))
+            .collect::<Vec<_>>()),
+    );
+    // Convenience echo of the resource id (also conveyed in the Location header).
+    obj.insert("subscriptionId".to_string(), json!(sub.subscription_id));
+    Value::Object(obj)
+}
+
+/// Synthesize the model-file address advertised in a notification.
+///
+/// HONESTY NOTE: this NWDAF is a linear-regression analytics prototype, not an
+/// MTLF that trains and exports real ML model files. The URL is a stable,
+/// well-formed placeholder so a conformant consumer can parse `mLFileAddr`; no
+/// downloadable model artefact exists behind it.
+fn synthetic_model_url(sub_id: &str, event: AnalyticsId) -> String {
+    format!(
+        "http://nwdaf/nnwdaf-mlmodelprovision/v1/models/{}/{}",
+        event.as_str(),
+        sub_id
+    )
+}
+
+/// Build the `Nnwdaf_MLModelProvision` notification callback body for a
+/// subscription.
+///
+/// Per TS 29.520 the callback payload is an **array** of `NwdafMLModelProvNotif`
+/// (minItems 1); each carries the required `subscriptionId` and `eventNotifs[]`
+/// of `MLEventNotif`, where every `MLEventNotif` satisfies the `oneOf` by
+/// supplying `mLFileAddr.mLModelUrl`.
+pub fn build_ml_model_prov_notif_body(sub: &MlProvSubscription) -> Value {
+    let event_notifs: Vec<Value> = sub
+        .ml_events
+        .iter()
+        .map(|ev| {
+            let mut notif = Map::new();
+            notif.insert("event".to_string(), json!(ev.as_str()));
+            if let Some(corr) = &sub.notif_corr_id {
+                notif.insert("notifCorreId".to_string(), json!(corr));
+            }
+            notif.insert(
+                "mLFileAddr".to_string(),
+                json!({ "mLModelUrl": synthetic_model_url(&sub.subscription_id, *ev) }),
+            );
+            Value::Object(notif)
+        })
+        .collect();
+
+    json!([
+        {
+            "subscriptionId": sub.subscription_id,
+            "eventNotifs": event_notifs,
+        }
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +633,80 @@ mod tests {
 
         reg.acknowledge_retrain("m1");
         assert!(reg.models_needing_retrain().is_empty());
+    }
+
+    // ---- nwafd-05: MLModelProvision Subscribe/Notify codec ----
+
+    /// A conformant `NwdafMLModelProvSubsc` parses into the notifUri, the
+    /// optional `notifCorreId`, and the distinct `mLEvent`s.
+    #[test]
+    fn test_parse_ml_prov_subsc_ok() {
+        let body = json!({
+            "notifUri": "http://anlf.local/ml-cb",
+            "notifCorreId": "corr-7",
+            "mLEventSubscs": [
+                { "mLEvent": "NF_LOAD" },
+                { "mLEvent": "UE_MOBILITY" },
+                { "mLEvent": "NF_LOAD" }
+            ]
+        });
+        let parsed = parse_ml_model_prov_subsc(&body).expect("must parse");
+        assert_eq!(parsed.notif_uri, "http://anlf.local/ml-cb");
+        assert_eq!(parsed.notif_corr_id.as_deref(), Some("corr-7"));
+        // Duplicate NF_LOAD collapses to one distinct event.
+        assert_eq!(
+            parsed.ml_events,
+            vec![AnalyticsId::NfLoad, AnalyticsId::UeMobility]
+        );
+    }
+
+    /// Missing `notifUri` or empty `mLEventSubscs` are rejected (the two spec
+    /// `required` IEs).
+    #[test]
+    fn test_parse_ml_prov_subsc_rejects_missing_required() {
+        let no_uri = json!({ "mLEventSubscs": [ { "mLEvent": "NF_LOAD" } ] });
+        assert!(parse_ml_model_prov_subsc(&no_uri).is_err());
+
+        let empty_events = json!({ "notifUri": "http://x/y", "mLEventSubscs": [] });
+        assert!(parse_ml_model_prov_subsc(&empty_events).is_err());
+
+        let bad_event = json!({
+            "notifUri": "http://x/y",
+            "mLEventSubscs": [ { "mLEvent": "NOT_AN_EVENT" } ]
+        });
+        assert!(parse_ml_model_prov_subsc(&bad_event).is_err());
+    }
+
+    /// The notify callback body deserializes as the TS 29.520 array-of-
+    /// `NwdafMLModelProvNotif` shape: `subscriptionId` + `eventNotifs[]`, each
+    /// `MLEventNotif` carrying `event` and `mLFileAddr.mLModelUrl`.
+    #[test]
+    fn test_build_ml_prov_notif_body_shape() {
+        let sub = MlProvSubscription::new(
+            "mlsub-9".to_string(),
+            "http://anlf.local/ml-cb".to_string(),
+            Some("corr-9".to_string()),
+            vec![AnalyticsId::NfLoad],
+        );
+        let body = build_ml_model_prov_notif_body(&sub);
+
+        let arr = body.as_array().expect("callback body is an array");
+        assert_eq!(arr.len(), 1, "minItems 1 array of NwdafMLModelProvNotif");
+
+        let notif = &arr[0];
+        assert_eq!(notif["subscriptionId"].as_str(), Some("mlsub-9"));
+        let evns = notif["eventNotifs"]
+            .as_array()
+            .expect("eventNotifs is a required array");
+        assert_eq!(evns.len(), 1);
+        assert_eq!(evns[0]["event"].as_str(), Some("NF_LOAD"));
+        assert_eq!(evns[0]["notifCorreId"].as_str(), Some("corr-9"));
+        assert!(
+            evns[0]["mLFileAddr"]["mLModelUrl"].as_str().is_some(),
+            "MLEventNotif must satisfy the oneOf via mLFileAddr.mLModelUrl"
+        );
+        // No bespoke registry keys leak into the notification.
+        assert!(notif.get("modelCount").is_none());
+        assert!(notif.get("accuracy").is_none());
     }
 }

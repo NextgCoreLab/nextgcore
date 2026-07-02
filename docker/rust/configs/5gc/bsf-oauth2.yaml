@@ -1,0 +1,37 @@
+# BSF (Binding Support Function) Configuration — OAuth2 variant
+# Same as bsf.yaml but with SBI OAuth2 bearer-token enforcement enabled.
+# Used via docker-compose.oauth2.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.oauth2.yml up -d
+#
+# With bsf.sbi.oauth2.require true, every incoming SBI request must carry a
+# Bearer token issued by the NRF (POST /nnrf-oauth2/v1/access-token) whose
+# audience includes "BSF"; the BSF verifies it against the NRF's JWKS
+# (GET /nnrf-oauth2/v1/jwks). The default bsf.yaml leaves enforcement off so
+# the dev/E2E data-plane path keeps working.
+
+logger:
+  file:
+    path: /var/log/nextgcore/bsf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+bsf:
+  sbi:
+    server:
+      - address: 172.23.0.15
+        port: 7777
+    oauth2:
+      require: true
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
+    tls:
+      enabled: false
+      cert: /etc/nextgcore/certs/bsf.crt
+      key: /etc/nextgcore/certs/bsf.key
+      ca: /etc/nextgcore/certs/ca.crt
+      min_version: "1.2"

@@ -14,9 +14,9 @@ use std::time::Instant;
 // ============================================================================
 
 /// Maximum number of URRs per session
-pub const OGS_MAX_NUM_OF_URR: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_URR: usize = 8;
 /// Maximum number of framed routes in PDI
-pub const OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI: usize = 8;
+pub const NEXTGCORE_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI: usize = 8;
 
 // ============================================================================
 // IP Subnet
@@ -529,8 +529,8 @@ impl PtpTransparentClock {
         let residence = egress_ns.saturating_sub(ingress_ns);
         self.residence_time_ns += residence;
         self.messages_processed += 1;
-        if self.messages_processed > 0 {
-            self.mean_path_delay_ns = self.residence_time_ns / self.messages_processed;
+        if let Some(mean) = self.residence_time_ns.checked_div(self.messages_processed) {
+            self.mean_path_delay_ns = mean;
         }
     }
 }
@@ -898,7 +898,7 @@ impl Pdr {
         // SDF filter matching: compile and check flow description if present
         if let Some(ref sdf) = self.sdf_filter {
             if let Some(ref desc) = sdf.flow_description {
-                if let Ok(rule) = ogs_ipfw::compile_rule(desc) {
+                if let Ok(rule) = nextgcore_ipfw::compile_rule(desc) {
                     // Without actual packet data here, we accept if the rule compiled OK.
                     // Real per-packet SDF matching happens in DataPlaneSession::match_pdr_with_packet.
                     let _ = rule;
@@ -1118,7 +1118,7 @@ impl Clone for RateLimiter {
 // PFCP Session (simplified)
 // ============================================================================
 
-/// PFCP session data (simplified from ogs_pfcp_sess_t)
+/// PFCP session data (simplified from nextgcore_pfcp_sess_t)
 #[derive(Debug, Clone, Default)]
 pub struct PfcpSess {
     /// PDR list IDs
@@ -1197,7 +1197,7 @@ pub struct UpfSess {
     /// PFCP node ID
     pub pfcp_node_id: Option<u64>,
     /// URR accounting data
-    pub urr_acc: [UrrAccounting; OGS_MAX_NUM_OF_URR],
+    pub urr_acc: [UrrAccounting; NEXTGCORE_MAX_NUM_OF_URR],
     /// APN/DNN
     pub apn_dnn: Option<String>,
     /// TSN bridge (Rel-18)
@@ -1240,7 +1240,7 @@ impl UpfSess {
             self.ipv4_framed_routes = Some(Vec::new());
         }
         if let Some(routes) = &mut self.ipv4_framed_routes {
-            if routes.len() < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI {
+            if routes.len() < NEXTGCORE_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI {
                 routes.push(subnet);
             }
         }
@@ -1252,7 +1252,7 @@ impl UpfSess {
             self.ipv6_framed_routes = Some(Vec::new());
         }
         if let Some(routes) = &mut self.ipv6_framed_routes {
-            if routes.len() < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI {
+            if routes.len() < NEXTGCORE_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI {
                 routes.push(subnet);
             }
         }
@@ -1278,14 +1278,14 @@ impl UpfSess {
 
     /// Add URR accounting
     pub fn urr_acc_add(&mut self, urr_idx: usize, size: usize, is_uplink: bool) {
-        if urr_idx < OGS_MAX_NUM_OF_URR {
+        if urr_idx < NEXTGCORE_MAX_NUM_OF_URR {
             self.urr_acc[urr_idx].add(size, is_uplink);
         }
     }
 
     /// Take URR accounting snapshot
     pub fn urr_acc_snapshot(&mut self, urr_idx: usize) {
-        if urr_idx < OGS_MAX_NUM_OF_URR {
+        if urr_idx < NEXTGCORE_MAX_NUM_OF_URR {
             self.urr_acc[urr_idx].snapshot();
         }
     }
@@ -1501,49 +1501,55 @@ impl UpfContext {
 
     /// Find session by SMF N4 SEID
     pub fn sess_find_by_smf_n4_seid(&self, seid: u64) -> Option<UpfSess> {
-        let smf_n4_seid_hash = self.smf_n4_seid_hash.read().ok()?;
-        let sess_id = smf_n4_seid_hash.get(&seid)?;
+        // Resolve the id and DROP the index guard before locking sess_list:
+        // sess_add/sess_remove lock sess_list before the index hashes, so holding
+        // an index lock while acquiring sess_list would be an AB-BA deadlock.
+        let sess_id = *self.smf_n4_seid_hash.read().ok()?.get(&seid)?;
         let sess_list = self.sess_list.read().ok()?;
-        sess_list.get(sess_id).cloned()
+        sess_list.get(&sess_id).cloned()
     }
 
     /// Find session by SMF N4 F-SEID
     pub fn sess_find_by_smf_n4_f_seid(&self, f_seid: &FSeid) -> Option<UpfSess> {
-        let smf_n4_f_seid_hash = self.smf_n4_f_seid_hash.read().ok()?;
-        let sess_id = smf_n4_f_seid_hash.get(f_seid)?;
+        // Drop the index guard before locking sess_list (see sess_find_by_smf_n4_seid).
+        let sess_id = *self.smf_n4_f_seid_hash.read().ok()?.get(f_seid)?;
         let sess_list = self.sess_list.read().ok()?;
-        sess_list.get(sess_id).cloned()
+        sess_list.get(&sess_id).cloned()
     }
 
     /// Find session by UPF N4 SEID
     pub fn sess_find_by_upf_n4_seid(&self, seid: u64) -> Option<UpfSess> {
-        let upf_n4_seid_hash = self.upf_n4_seid_hash.read().ok()?;
-        let sess_id = upf_n4_seid_hash.get(&seid)?;
+        // Drop the index guard before locking sess_list (see sess_find_by_smf_n4_seid).
+        let sess_id = *self.upf_n4_seid_hash.read().ok()?.get(&seid)?;
         let sess_list = self.sess_list.read().ok()?;
-        sess_list.get(sess_id).cloned()
+        sess_list.get(&sess_id).cloned()
     }
 
     /// Find session by IPv4 address
     pub fn sess_find_by_ipv4(&self, addr: u32) -> Option<UpfSess> {
-        // First check direct IP hash
-        if let Ok(ipv4_hash) = self.ipv4_hash.read() {
-            if let Some(sess_id) = ipv4_hash.get(&addr) {
-                if let Ok(sess_list) = self.sess_list.read() {
-                    if let Some(sess) = sess_list.get(sess_id) {
-                        return Some(sess.clone());
-                    }
-                }
+        // Resolve the session id from the direct hash first, then the framed-routes
+        // trie. In each step DROP the index/trie guard before locking sess_list:
+        // sess_add/sess_remove lock sess_list before ipv4_hash/ipv4_framed_routes,
+        // so holding either before sess_list would be an AB-BA deadlock.
+        let direct_id = self
+            .ipv4_hash
+            .read()
+            .ok()
+            .and_then(|h| h.get(&addr).copied());
+        if let Some(id) = direct_id {
+            if let Some(sess) = self.sess_list.read().ok().and_then(|l| l.get(&id).cloned()) {
+                return Some(sess);
             }
         }
 
-        // Then check framed routes trie
-        if let Ok(trie) = self.ipv4_framed_routes.read() {
-            if let Some(sess_id) = trie.find(&[addr, 0, 0, 0], false) {
-                if let Ok(sess_list) = self.sess_list.read() {
-                    if let Some(sess) = sess_list.get(&sess_id) {
-                        return Some(sess.clone());
-                    }
-                }
+        let route_id = self
+            .ipv4_framed_routes
+            .read()
+            .ok()
+            .and_then(|t| t.find(&[addr, 0, 0, 0], false));
+        if let Some(id) = route_id {
+            if let Some(sess) = self.sess_list.read().ok().and_then(|l| l.get(&id).cloned()) {
+                return Some(sess);
             }
         }
 
@@ -1552,25 +1558,27 @@ impl UpfContext {
 
     /// Find session by IPv6 address
     pub fn sess_find_by_ipv6(&self, addr: &[u32; 4]) -> Option<UpfSess> {
-        // First check direct IP hash (using first 64 bits)
-        if let Ok(ipv6_hash) = self.ipv6_hash.read() {
-            if let Some(sess_id) = ipv6_hash.get(&[addr[0], addr[1]]) {
-                if let Ok(sess_list) = self.sess_list.read() {
-                    if let Some(sess) = sess_list.get(sess_id) {
-                        return Some(sess.clone());
-                    }
-                }
+        // See sess_find_by_ipv4: resolve the id from the direct hash then the
+        // framed-routes trie, dropping each guard before locking sess_list.
+        let direct_id = self
+            .ipv6_hash
+            .read()
+            .ok()
+            .and_then(|h| h.get(&[addr[0], addr[1]]).copied());
+        if let Some(id) = direct_id {
+            if let Some(sess) = self.sess_list.read().ok().and_then(|l| l.get(&id).cloned()) {
+                return Some(sess);
             }
         }
 
-        // Then check framed routes trie
-        if let Ok(trie) = self.ipv6_framed_routes.read() {
-            if let Some(sess_id) = trie.find(addr, true) {
-                if let Ok(sess_list) = self.sess_list.read() {
-                    if let Some(sess) = sess_list.get(&sess_id) {
-                        return Some(sess.clone());
-                    }
-                }
+        let route_id = self
+            .ipv6_framed_routes
+            .read()
+            .ok()
+            .and_then(|t| t.find(addr, true));
+        if let Some(id) = route_id {
+            if let Some(sess) = self.sess_list.read().ok().and_then(|l| l.get(&id).cloned()) {
+                return Some(sess);
             }
         }
 
@@ -1648,6 +1656,29 @@ impl UpfContext {
     /// Get session count
     pub fn sess_count(&self) -> usize {
         self.sess_list.read().map(|l| l.len()).unwrap_or(0)
+    }
+
+    /// NFProfile `load` gauge (`0..=100`) reported to the NRF on each
+    /// heartbeat PATCH (TS 29.510 §5.2.2.3.2; `NFProfile.load` is a
+    /// percentage `0..=100`).
+    ///
+    /// Reports active PFCP/N4 session occupancy as a percentage of the
+    /// configured `max_num_of_sess`. When no session ceiling is configured
+    /// (`max_num_of_sess == 0`) the raw session count is reported, saturated
+    /// at 100. This is an honest occupancy metric derived from real session
+    /// state — the UPF never fabricates a CPU-based load figure (G2-2).
+    pub fn get_load(&self) -> u8 {
+        let sessions = self.sess_count();
+        // `checked_div` yields `None` iff `max_num_of_sess == 0` (no ceiling
+        // configured), in which case we report the raw session count.
+        let load = match sessions
+            .saturating_mul(100)
+            .checked_div(self.max_num_of_sess)
+        {
+            Some(pct) => pct.min(100),
+            None => sessions.min(100),
+        };
+        load as u8
     }
 
     /// Get all sessions (for iteration)
@@ -1924,5 +1955,38 @@ mod tests {
 
         assert_eq!(f_seid1, f_seid2);
         assert_ne!(f_seid1, f_seid3);
+    }
+
+    // G2-2: PFCP-session occupancy load gauge (TS 29.510 §5.2.2.3.2, 0..=100).
+    #[test]
+    fn test_get_load_gauge() {
+        // No sessions → 0 regardless of ceiling.
+        let ctx = UpfContext::new();
+        assert_eq!(ctx.get_load(), 0);
+
+        // With a ceiling, load is percentage occupancy (monotonic in count).
+        let mut ctx = UpfContext::new();
+        ctx.init(10);
+        for i in 0..2u64 {
+            ctx.sess_add(&FSeid::with_ipv4(1000 + i, Ipv4Addr::new(10, 0, 0, 1)))
+                .expect("session added under ceiling");
+        }
+        assert_eq!(ctx.sess_count(), 2);
+        assert_eq!(ctx.get_load(), 20, "2/10 sessions = 20%");
+
+        // At the ceiling → saturates at 100%.
+        let mut ctx = UpfContext::new();
+        ctx.init(2);
+        for i in 0..2u64 {
+            ctx.sess_add(&FSeid::with_ipv4(2000 + i, Ipv4Addr::new(10, 0, 0, 2)));
+        }
+        assert_eq!(ctx.get_load(), 100, "full occupancy = 100%");
+
+        // No ceiling configured (max == 0) → raw count reported, capped at 100.
+        let ctx = UpfContext::new();
+        for i in 0..3u64 {
+            ctx.sess_add(&FSeid::with_ipv4(3000 + i, Ipv4Addr::new(10, 0, 0, 3)));
+        }
+        assert_eq!(ctx.get_load(), 3, "no ceiling → raw session count");
     }
 }

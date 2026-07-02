@@ -5,7 +5,7 @@
 use crate::context::{sgwc_self, SgwcSess, SgwcUe};
 
 // ============================================================================
-// GTP Cause Values (from OGS_GTP2_CAUSE_*)
+// GTP Cause Values (from NEXTGCORE_GTP2_CAUSE_*)
 // ============================================================================
 
 pub mod gtp_cause {
@@ -31,7 +31,7 @@ pub mod gtp_cause {
 }
 
 // ============================================================================
-// GTP Message Types (from OGS_GTP2_*_TYPE)
+// GTP Message Types (from NEXTGCORE_GTP2_*_TYPE)
 // ============================================================================
 
 pub mod gtp_message_type {

@@ -4,8 +4,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ogs_sbi::context::{global_context, NfInstance, NfService};
-use ogs_sbi::types::{NfType, SbiServiceType, UriScheme};
+use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+use nextgcore_sbi::types::{NfType, SbiServiceType, UriScheme};
 
 /// SBI server configuration
 #[derive(Debug, Clone)]
@@ -258,7 +258,7 @@ pub fn bsf_sbi_send_request(nf_instance_id: &str, request: PathSbiRequest) -> Re
     );
 
     // Note: SBI request sending requires HTTP client integration
-    // In C: ogs_sbi_send_request_to_nf_instance(nf_instance, xact)
+    // In C: nextgcore_sbi_send_request_to_nf_instance(nf_instance, xact)
     // The actual HTTP client would send the request and handle the response
 
     // Return transaction ID (placeholder)
@@ -278,8 +278,8 @@ pub fn bsf_sbi_discover_and_send(
     );
 
     // Note: SBI transaction tracking and NF discovery require NRF integration
-    // In C: ogs_sbi_xact_add(...) creates a transaction
-    // In C: ogs_sbi_discover_and_send(xact) discovers and sends to target NF
+    // In C: nextgcore_sbi_xact_add(...) creates a transaction
+    // In C: nextgcore_sbi_discover_and_send(xact) discovers and sends to target NF
 
     // Return transaction ID (placeholder)
     Ok(1)
@@ -291,8 +291,8 @@ pub fn bsf_sbi_send_response(stream_id: u64, status: u16) -> Result<(), String> 
     log::debug!("Sending SBI response: stream_id={stream_id}, status={status}");
 
     // Note: Build and send response through HTTP server
-    // In C: ogs_sbi_build_response(&sendmsg, status)
-    // In C: ogs_sbi_server_send_response(stream, response)
+    // In C: nextgcore_sbi_build_response(&sendmsg, status)
+    // In C: nextgcore_sbi_server_send_response(stream, response)
     // The actual response is sent by the HTTP handler in main.rs
 
     Ok(())

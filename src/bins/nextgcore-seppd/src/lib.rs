@@ -29,7 +29,7 @@ pub use event::{SeppEvent, SeppEventId, SeppTimerId};
 pub use handshake_sm::{HandshakeSmContext, HandshakeState};
 pub use n32_server::{
     forward_via_n32f, initiate_n32c_handshake, send_n32f_error, start_n32_listener,
-    take_received_n32f_errors, HandshakeOutcome, N32TlsConfig,
+    start_sbi_server, take_received_n32f_errors, HandshakeOutcome, N32TlsConfig,
 };
 pub use n32c_build::{
     build_security_capability_request, build_security_capability_response,

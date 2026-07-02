@@ -41,17 +41,13 @@ docker buildx version
 ```bash
 cd docker/rust
 
-# Build images
-./build.sh -5
+# One command: disk preflight -> build -> full matched-sim E2E
+# (UE registration -> PDU session -> data-plane ping). Exit 0 = all green.
+./e2e.sh
 
-# Deploy
-docker compose -f docker-compose-5gc.yml up -d
-
-# Verify deployment
-./validate-deployment.sh -5
-
-# View logs
-docker compose -f docker-compose-5gc.yml logs -f
+# Or bring the stack up manually and follow key logs
+docker compose -f docker-compose.yml up -d
+docker compose -f docker-compose.yml logs -f amf gnb ue
 ```
 
 ### Deploy EPC (4G LTE)
@@ -66,7 +62,7 @@ cd docker/rust
 docker compose -f docker-compose-epc.yml up -d
 
 # Verify deployment
-./validate-deployment.sh -4
+./e2e.sh --overlay epc   # or: docker compose -f docker-compose-epc.yml ps
 
 # View logs
 docker compose -f docker-compose-epc.yml logs -f
@@ -78,13 +74,13 @@ docker compose -f docker-compose-epc.yml logs -f
 cd docker/rust
 
 # Build all images
-./build.sh -a
+./build.sh
 
 # Deploy
 docker compose up -d
 
 # Verify deployment
-./validate-deployment.sh -a
+./e2e.sh            # preflight -> build -> full matched-sim E2E
 
 # View logs
 docker compose logs -f
@@ -95,47 +91,28 @@ docker compose logs -f
 ### Build Script Options
 
 ```bash
-./build.sh [OPTIONS] [NF_NAME...]
+./build.sh [--skip-rust] [--no-preflight]
 
 Options:
-  -t, --tag TAG           Image tag (default: latest)
-  -r, --registry REG      Registry prefix (e.g., ghcr.io/nextgcore)
-  -p, --push              Push images after building
-  -a, --all               Build all network functions
-  -5, --5gc               Build only 5G Core NFs
-  -4, --epc               Build only EPC (4G) NFs
-  -T, --template          Use template Dockerfile
-  -P, --parallel          Build images in parallel
-  -j, --jobs N            Number of parallel jobs (default: 4)
-  --no-cache              Build without using cache
-  --platforms PLATFORMS   Multi-platform build (e.g., linux/amd64,linux/arm64)
-  --build-base            Build base image first
-  --auto-version          Auto-generate version from git
-  --dry-run               Show what would be built
-  -v, --verbose           Enable verbose output
-  -h, --help              Show help message
+  --skip-rust      Reuse the binaries already in ./binaries and only rebuild the
+                   Docker images (fast iteration; no recompile).
+  --no-preflight   Skip the disk preflight (preflight.sh). Not recommended.
+
+build.sh compiles BOTH workspaces (nextgcore + nextgsim) inside a Rust builder
+container (Dockerfile.builder), extracts binaries to ./binaries, then builds one
+slim image per NF (Dockerfile.core + Dockerfile.nf) plus the gNB/UE images. It
+always builds every NF; there are no tag/registry/push/parallel/multi-arch/per-NF
+flags.
 ```
 
 ### Build Examples
 
 ```bash
-# Build all images
-./build.sh -a
+# Full build: compile both workspaces + build every NF/gNB/UE image
+./build.sh
 
-# Build with custom tag
-./build.sh -t v1.0.0 -a
-
-# Build and push to registry
-./build.sh -r ghcr.io/nextgcore -t v1.0.0 -p -a
-
-# Parallel build (faster)
-./build.sh -P -j 8 -a
-
-# Multi-platform build
-./build.sh --platforms linux/amd64,linux/arm64 -a
-
-# Build specific NFs
-./build.sh nextgcore-amfd nextgcore-smfd nextgcore-upfd
+# Fast re-image without recompiling (reuse ./binaries)
+./build.sh --skip-rust
 ```
 
 ### Build Individual Images
@@ -154,21 +131,23 @@ docker build -f Dockerfile.nf-template \
 
 | File | Description |
 |------|-------------|
-| `docker-compose.yml` | Full deployment (5GC + EPC) |
-| `docker-compose-5gc.yml` | 5G Core only |
+| `docker-compose.yml` | Matched-sim E2E: MongoDB + 5GC NFs + nextgsim gNB/UE + advanced NFs + observability (no EPC) |
 | `docker-compose-epc.yml` | EPC (4G) only |
+| `docker-compose.oauth2.yml` | Overlay: OAuth2 SBI enforcement (`./e2e.sh --overlay oauth2`) |
+| `docker-compose.kernel-sctp.yml` | Overlay: native kernel-SCTP N2 (`./e2e.sh --overlay kernel-sctp`) |
+| `docker-compose.features.yml` | Overlay: Rel-17/18 feature harness (`./e2e.sh --overlay features`) |
 
 ### Deployment Profiles
 
 ```bash
 # Basic 5GC deployment
-docker compose -f docker-compose-5gc.yml up -d
+docker compose -f docker-compose.yml up -d
 
 # 5GC with SCP (Service Communication Proxy)
-docker compose -f docker-compose-5gc.yml --profile scp up -d
+docker compose -f docker-compose.yml --profile scp up -d
 
 # 5GC with SEPP (Security Edge Protection Proxy for roaming)
-docker compose -f docker-compose-5gc.yml --profile sepp up -d
+docker compose -f docker-compose.yml --profile sepp up -d
 
 # Full deployment with all optional services
 docker compose --profile scp --profile sepp up -d
@@ -178,7 +157,7 @@ docker compose --profile scp --profile sepp up -d
 
 ```bash
 # Scale UPF instances
-docker compose -f docker-compose-5gc.yml up -d --scale upf=3
+docker compose -f docker-compose.yml up -d --scale upf=3
 ```
 
 ## Configuration
@@ -249,6 +228,26 @@ configs/
 ├── sepp2.yaml             # SEPP2 configuration
 └── tls/                   # TLS certificates
 ```
+
+### NSACF Slice Quotas
+
+`configs/5gc/nsacf.yaml` provisions per-slice admission limits at startup:
+
+```yaml
+nsacf:
+  slice_quotas:
+    - sst: 1
+      # sd: optional (hex); omit for an SST-wide quota
+      max_ues: 1000            # omit -> that count is not NSAC-subject (uncapped)
+      max_pdu_sessions: 2000
+```
+
+Each entry maps to an S-NSSAI `{sst, sd?}`; NSACF admits UEs / PDU sessions up to
+`max_ues` / `max_pdu_sessions` (TS 29.536). An absent limit means that count is
+uncapped for the slice; an S-NSSAI with no matching quota entry is treated as
+not-NSAC-subject (`SLICE_NOT_FOUND`). The other advanced NFs (`nwdaf.yaml`,
+`lmf.yaml`, `mbsmf.yaml`, `ees.yaml`, `pin.yaml`, `dccf.yaml`) also live under
+`configs/5gc/`.
 
 ### Custom Configuration
 
@@ -342,7 +341,7 @@ services:
 | Service | Protocol | Port | Description |
 |---------|----------|------|-------------|
 | NRF | HTTP/2 | 7777 | SBI interface |
-| AMF | SCTP | 38412 | NGAP (N2 to gNB) |
+| AMF | SCTP/UDP | 38412 | NGAP (N2). `docker-compose.yml` publishes 38412/**udp** (default userspace SCTP-over-UDP); real kernel SCTP (proto 132) only via the `kernel-sctp` overlay |
 | AMF | HTTP/2 | 7777 | SBI interface |
 | SMF | UDP | 8805 | PFCP (N4 to UPF) |
 | SMF | HTTP/2 | 7777 | SBI interface |
@@ -351,27 +350,42 @@ services:
 | MME | SCTP | 36412 | S1AP (to eNB) |
 | HSS | TCP | 3868 | Diameter (S6a) |
 | MongoDB | TCP | 27017 | Database |
-| WebUI | TCP | 9999 | Management UI |
+| Prometheus | TCP | 9090 | Metrics |
+| Grafana | TCP | 3000 | Dashboards (admin/nextgcore) |
+| Jaeger | TCP | 16686 | Tracing UI |
 
 ## Validation
+
+### One-command E2E (recommended)
+
+```bash
+# Disk preflight -> build -> full matched-sim E2E (reg + PDU session + ping).
+# Exit 0 = all assertions green, 1 = test failure, 2 = infra/preflight refusal.
+./e2e.sh
+
+# Re-run without recompiling Rust / with an overlay / keeping the stack up
+./e2e.sh --quick
+./e2e.sh --overlay oauth2        # or: kernel-sctp, features
+./e2e.sh --keep
+```
+
+The preflight (`preflight.sh`) refuses to build with < 25 GB free disk and
+trims the BuildKit cache (`docker builder prune --keep-storage=20GB`) — see
+hazard #269 (Docker image-store wipe under disk pressure). On failure, per-NF
+`docker logs` are captured under `artifacts/` before teardown. CI runner
+requirements and artifact layout: [CI.md](CI.md).
 
 ### Automated Validation
 
 ```bash
-# Validate 5GC deployment
-./validate-deployment.sh -5
+# Full baseline E2E (preflight -> build -> registration + PDU session + data-plane ping)
+./e2e.sh
 
-# Validate EPC deployment
-./validate-deployment.sh -4
-
-# Validate both with deployment
-./validate-deployment.sh -d -a
-
-# Validate and cleanup
-./validate-deployment.sh -d -a -c
+# Re-run against an already-built stack without recompiling
+./e2e.sh --quick
 ```
 
-See [VALIDATION.md](VALIDATION.md) for detailed validation procedures.
+CI runner requirements, exit codes, and failure-artifact layout: [CI.md](CI.md).
 
 ### End-to-End Tests
 
@@ -519,12 +533,12 @@ jobs:
       - name: Build images
         run: |
           cd docker/rust
-          ./build.sh -a
+          ./build.sh
       
       - name: Validate deployment
         run: |
           cd docker/rust
-          ./validate-deployment.sh -d -a -c
+          ./e2e.sh
 ```
 
 ### Production Deployment

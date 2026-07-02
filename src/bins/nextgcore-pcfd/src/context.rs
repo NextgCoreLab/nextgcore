@@ -424,6 +424,10 @@ pub struct PcfSess {
     pub pcf_ue_sm_id: u64,
     /// Associated stream ID
     pub stream_id: Option<u64>,
+    /// PCC rules installed for AF application sessions bound to this PDU
+    /// session (TS 29.514 PolicyAuthorization → TS 29.512 SmPolicyDecision).
+    /// Pushed to the SMF in the SM policy update notification.
+    pub af_pcc_rules: Vec<crate::npcf_handler::AfPccRule>,
 }
 
 impl PcfSess {
@@ -452,6 +456,7 @@ impl PcfSess {
             app_ids: Vec::new(),
             pcf_ue_sm_id,
             stream_id: None,
+            af_pcc_rules: Vec::new(),
         }
     }
 
@@ -1121,16 +1126,22 @@ impl PcfContext {
     }
 
     pub fn ue_am_find_by_supi(&self, supi: &str) -> Option<PcfUeAm> {
-        let supi_am_hash = self.supi_am_hash.read().ok()?;
+        // AB-BA: ue_am_list before supi_am_hash (canonical primary-list-first).
+        // ue_am_add/remove take ue_am_list then supi_am_hash, so a hash-first
+        // read here inverts that order and deadlocks a concurrent writer
+        // (read(supi_am_hash) waits on write, while write(ue_am_list) waits on read).
         let ue_am_list = self.ue_am_list.read().ok()?;
+        let supi_am_hash = self.supi_am_hash.read().ok()?;
         supi_am_hash
             .get(supi)
             .and_then(|&id| ue_am_list.get(&id).cloned())
     }
 
     pub fn ue_am_find_by_association_id(&self, association_id: &str) -> Option<PcfUeAm> {
-        let association_id_hash = self.association_id_hash.read().ok()?;
+        // AB-BA: ue_am_list before association_id_hash (canonical
+        // primary-list-first; matches ue_am_add/remove).
         let ue_am_list = self.ue_am_list.read().ok()?;
+        let association_id_hash = self.association_id_hash.read().ok()?;
         association_id_hash
             .get(association_id)
             .and_then(|&id| ue_am_list.get(&id).cloned())
@@ -1173,17 +1184,22 @@ impl PcfContext {
     }
 
     pub fn ue_sm_remove(&self, id: u64) -> Option<PcfUeSm> {
-        let mut ue_sm_list = self.ue_sm_list.write().ok()?;
-        let mut supi_sm_hash = self.supi_sm_hash.write().ok()?;
-
-        if let Some(ue_sm) = ue_sm_list.remove(&id) {
+        // Remove the UE-SM under the ue_sm_list/supi_sm_hash guards, then DROP
+        // them before touching sess_list. Holding ue_sm_list while acquiring
+        // sess_list (via sess_remove_all_for_ue) inverts the canonical
+        // sess_list -> ue_sm_list order used by sess_add/sess_remove and
+        // deadlocks under concurrent SBI requests (AB-BA lock inversion).
+        let ue_sm = {
+            let mut ue_sm_list = self.ue_sm_list.write().ok()?;
+            let mut supi_sm_hash = self.supi_sm_hash.write().ok()?;
+            let ue_sm = ue_sm_list.remove(&id)?;
             supi_sm_hash.remove(&ue_sm.supi);
-            // Remove all sessions for this UE
-            self.sess_remove_all_for_ue(id);
-            log::debug!("[{}] PCF UE SM removed (id={})", ue_sm.supi, id);
-            return Some(ue_sm);
-        }
-        None
+            ue_sm
+        };
+        // Guards released: safe to take sess_list in the canonical order.
+        self.sess_remove_all_for_ue(id);
+        log::debug!("[{}] PCF UE SM removed (id={})", ue_sm.supi, id);
+        Some(ue_sm)
     }
 
     pub fn ue_sm_remove_all(&self) {
@@ -1203,8 +1219,10 @@ impl PcfContext {
     }
 
     pub fn ue_sm_find_by_supi(&self, supi: &str) -> Option<PcfUeSm> {
-        let supi_sm_hash = self.supi_sm_hash.read().ok()?;
+        // AB-BA: ue_sm_list before supi_sm_hash (canonical primary-list-first;
+        // matches ue_sm_add, which takes ue_sm_list then supi_sm_hash).
         let ue_sm_list = self.ue_sm_list.read().ok()?;
+        let supi_sm_hash = self.supi_sm_hash.read().ok()?;
         supi_sm_hash
             .get(supi)
             .and_then(|&id| ue_sm_list.get(&id).cloned())
@@ -1301,8 +1319,13 @@ impl PcfContext {
     }
 
     pub fn sess_find_by_sm_policy_id(&self, sm_policy_id: &str) -> Option<PcfSess> {
-        let sm_policy_id_hash = self.sm_policy_id_hash.read().ok()?;
+        // AB-BA: sess_list before sm_policy_id_hash (canonical primary-list-first).
+        // sess_add/sess_remove take sess_list then sm_policy_id_hash, so a
+        // hash-first read here inverts that order and deadlocks a concurrent
+        // create/delete — this is the cycle the concurrent sm_policy_* handler
+        // tests hit (the 2fbcae0 fix normalized only the list<->list edges).
         let sess_list = self.sess_list.read().ok()?;
+        let sm_policy_id_hash = self.sm_policy_id_hash.read().ok()?;
         sm_policy_id_hash
             .get(sm_policy_id)
             .and_then(|&id| sess_list.get(&id).cloned())
@@ -1319,8 +1342,10 @@ impl PcfContext {
     pub fn sess_find_by_ipv4addr(&self, ipv4addr_string: &str) -> Option<PcfSess> {
         if let Ok(addr) = ipv4addr_string.parse::<std::net::Ipv4Addr>() {
             let ipv4addr = u32::from(addr);
-            let ipv4addr_hash = self.ipv4addr_hash.read().ok()?;
+            // AB-BA: sess_list before ipv4addr_hash (canonical primary-list-first;
+            // sess_remove/sess_update take sess_list then ipv4addr_hash).
             let sess_list = self.sess_list.read().ok()?;
+            let ipv4addr_hash = self.ipv4addr_hash.read().ok()?;
             return ipv4addr_hash
                 .get(&ipv4addr)
                 .and_then(|&id| sess_list.get(&id).cloned());
@@ -1329,8 +1354,10 @@ impl PcfContext {
     }
 
     pub fn sess_find_by_ipv6addr(&self, ipv6prefix_string: &str) -> Option<PcfSess> {
-        let ipv6prefix_hash = self.ipv6prefix_hash.read().ok()?;
+        // AB-BA: sess_list before ipv6prefix_hash (canonical primary-list-first;
+        // sess_remove/sess_update take sess_list then ipv6prefix_hash).
         let sess_list = self.sess_list.read().ok()?;
+        let ipv6prefix_hash = self.ipv6prefix_hash.read().ok()?;
         ipv6prefix_hash
             .get(ipv6prefix_string)
             .and_then(|&id| sess_list.get(&id).cloned())
@@ -1390,9 +1417,14 @@ impl PcfContext {
     // App session management
 
     pub fn app_add(&self, sess_id: u64) -> Option<PcfApp> {
+        // Canonical lock order is sess_list before app_list: sess_remove holds
+        // sess_list then takes app_list (via app_remove_all_for_sess), so
+        // app_add/app_remove MUST take sess_list first too — acquiring app_list
+        // then sess_list here would deadlock against a concurrent sess_remove
+        // (AB-BA lock inversion).
+        let mut sess_list = self.sess_list.write().ok()?;
         let mut app_list = self.app_list.write().ok()?;
         let mut app_session_id_hash = self.app_session_id_hash.write().ok()?;
-        let mut sess_list = self.sess_list.write().ok()?;
 
         let id = self.next_app_id.fetch_add(1, Ordering::SeqCst) as u64;
         let app = PcfApp::new(id, sess_id);
@@ -1410,9 +1442,10 @@ impl PcfContext {
     }
 
     pub fn app_remove(&self, id: u64) -> Option<PcfApp> {
+        // Canonical lock order: sess_list before app_list (see app_add).
+        let mut sess_list = self.sess_list.write().ok()?;
         let mut app_list = self.app_list.write().ok()?;
         let mut app_session_id_hash = self.app_session_id_hash.write().ok()?;
-        let mut sess_list = self.sess_list.write().ok()?;
 
         if let Some(app) = app_list.remove(&id) {
             app_session_id_hash.remove(&app.app_session_id);
@@ -1445,8 +1478,10 @@ impl PcfContext {
     }
 
     pub fn app_find_by_app_session_id(&self, app_session_id: &str) -> Option<PcfApp> {
-        let app_session_id_hash = self.app_session_id_hash.read().ok()?;
+        // AB-BA: app_list before app_session_id_hash (canonical primary-list-first;
+        // app_add/app_remove take sess_list then app_list then app_session_id_hash).
         let app_list = self.app_list.read().ok()?;
+        let app_session_id_hash = self.app_session_id_hash.read().ok()?;
         app_session_id_hash
             .get(app_session_id)
             .and_then(|&id| app_list.get(&id).cloned())

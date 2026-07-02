@@ -6,7 +6,7 @@ use crate::context::{sgwc_self, SgwcSess};
 use crate::s11_handler::gtp_cause;
 
 // ============================================================================
-// PFCP Cause Values (from OGS_PFCP_CAUSE_*)
+// PFCP Cause Values (from NEXTGCORE_PFCP_CAUSE_*)
 // ============================================================================
 
 pub mod pfcp_cause {

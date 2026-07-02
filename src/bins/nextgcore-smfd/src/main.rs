@@ -19,10 +19,10 @@
 //! - S5/S8: GTP-C interface to SGW (EPC mode)
 
 use anyhow::{Context, Result};
-use ogs_sbi::context::{global_context, NfInstance, NfService};
-use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
-    send_bad_request, send_not_found, SbiServer, SbiServerConfig as OgsSbiServerConfig,
+use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::server::{
+    send_bad_request, send_not_found, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -68,12 +68,122 @@ static PFCP_SEQ: AtomicU32 = AtomicU32::new(1);
 /// callback URIs handed to the PCF (notificationUri). Set once in `main`.
 static SELF_SBI_URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+// ---------------------------------------------------------------------------
+// OAuth2 rollout (Wave-6 H8): opt-in producer verification + outbound consumer
+// token install. Default OFF so the matched-sim E2E path is byte-unchanged;
+// the docker `smf-oauth2.yaml` overlay (or NEXTGCORE_SBI_OAUTH2_REQUIRE=1) sets
+// `smf.sbi.oauth2.require: true`. TS 33.501 §13.4.1, TS 29.510 §5.4.2.
+// ---------------------------------------------------------------------------
+
+/// Process-wide OAuth2 client for automatic Bearer-token acquisition on
+/// outbound SBI calls (installed only when OAuth2 enforcement is enabled).
+static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>> =
+    std::sync::OnceLock::new();
+
+/// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
+/// Phase A). Outbound SBI clients attach a token via [`attach_oauth2`].
+fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Attach the process-wide OAuth2 client (when enforcement is on) so the
+/// outbound SBI request carries an NRF-issued Bearer token scoped to `target`
+/// (TS 33.501 §13.4.1, TS 29.510 §5.4.2). A no-op when enforcement is off, so
+/// the matched-sim default path is byte-unchanged (Wave-6 H8 Phase A).
+pub(crate) fn attach_oauth2(
+    client: nextgcore_sbi::client::SbiClient,
+    target: nextgcore_sbi::types::NfType,
+) -> nextgcore_sbi::client::SbiClient {
+    match oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, target),
+        None => client,
+    }
+}
+
+/// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the
+/// matched-sim path is untouched. Honors `NEXTGCORE_SBI_OAUTH2_REQUIRE` first
+/// (overlay-friendly), then the yaml `<nf>.sbi.oauth2.require` (root-key
+/// agnostic: true iff any top-level section sets it).
+fn oauth2_required(config_path: &str) -> bool {
+    if let Ok(v) = std::env::var("NEXTGCORE_SBI_OAUTH2_REQUIRE") {
+        return matches!(v.trim(), "1" | "true" | "TRUE" | "yes");
+    }
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
+        return false;
+    };
+    value.as_mapping().is_some_and(|map| {
+        map.values().any(|section| {
+            section
+                .get("sbi")
+                .and_then(|s| s.get("oauth2"))
+                .and_then(|o| o.get("require"))
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// Apply OAuth2 producer enforcement to `cfg` and install the outbound OAuth2
+/// client (Wave-6 H8). The server verifies incoming Bearer tokens against the
+/// NRF JWKS and requires `aud` to include NfType::Smf; with no NRF URI
+/// configured it fails closed (503, per nextgcore-sbi server.rs).
+async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
+    let nrf_uri = global_context().get_nrf_uri().await;
+    cfg.require_oauth2 = true;
+    cfg.oauth2_jwks_uri = nrf_uri.as_deref().map(|uri| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(uri)
+            .jwks_uri()
+            .to_string()
+    });
+    cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Smf);
+    if let Some(uri) = nrf_uri.as_deref() {
+        let nf_instance_id = format!("smf-{}", uuid::Uuid::new_v4());
+        let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
+            uri,
+            nf_instance_id,
+            nextgcore_sbi::types::NfType::Smf,
+        ))));
+    }
+    log::info!(
+        "OAuth2 enforcement enabled (JWKS: {})",
+        cfg.oauth2_jwks_uri.as_deref().unwrap_or("UNCONFIGURED")
+    );
+    cfg
+}
+
 /// Base URI for callbacks (e.g. `http://10.0.0.5:7777`).
 fn self_sbi_uri() -> String {
     SELF_SBI_URI
         .get()
         .cloned()
         .unwrap_or_else(|| "http://127.0.0.1:7777".to_string())
+}
+
+/// This SMF's NF instance id, used as the `nfId` in Nnsacf_NSAC requests
+/// (TS 29.536). Falls back to a fixed label when the self-instance has not
+/// been registered (e.g. NRF-less dev runs).
+async fn self_nf_id() -> String {
+    global_context()
+        .get_self_instance()
+        .await
+        .map(|i| i.id)
+        .unwrap_or_else(|| "nextgcore-smf".to_string())
+}
+
+/// Roll back a previously-admitted NSACF PDU-session count (DECREASE) when a
+/// later establishment step fails after admission. No-op when `admitted` is
+/// false (no count was taken). Resolves the NSACF endpoint afresh; best-effort.
+async fn rollback_nsac(admitted: bool, supi: &str, psi: u8, sst: u8, sd: Option<&str>) {
+    if !admitted {
+        return;
+    }
+    if let Some(nsacf) = policy::resolve_nsacf_endpoint().await {
+        let nf_id = self_nf_id().await;
+        policy::nsac_pdu_session_release(&nsacf, &nf_id, supi, psi, sst, sd).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -188,8 +298,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
-    let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+    let _otel = nextgcore_metrics::otel::init_otel(
+        nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
@@ -266,7 +376,11 @@ async fn main() -> Result<()> {
     let sbi_addr: SocketAddr = format!("{}:{}", config.sbi_addr, config.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
+    if oauth2_required(&config_path) {
+        sbi_server_config = apply_oauth2_enforcement(sbi_server_config).await;
+    }
+    let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server
         .start(smf_sbi_request_handler)
@@ -278,7 +392,13 @@ async fn main() -> Result<()> {
     // Register with NRF (if configured)
     match smf_nrf_register(&config.sbi_addr, config.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+            // (PDU sessions vs configured capacity; TS 29.510 §5.2.2.3.2).
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
+                let ctx = smf_self();
+                let load = ctx.read().map(|c| c.get_load()).unwrap_or(0);
+                load.clamp(0, 100) as u8
+            });
         }
         Ok(_) => {}
         Err(e) => {
@@ -713,11 +833,12 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
             log::info!("SMF registered with NRF (id={nf_instance_id})");
 
             // Store self instance in SBI context
-            let mut self_instance = NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Smf);
+            let mut self_instance =
+                NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Smf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = NfService::new(
                 "nsmf-pdusession",
-                ogs_sbi::types::SbiServiceType::NsmfPdusession,
+                nextgcore_sbi::types::SbiServiceType::NsmfPdusession,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
@@ -1209,7 +1330,12 @@ async fn pfcp_session_establish(
                         if fteid_val.len() >= 5 {
                             let fteid_flags = fteid_val[0];
                             let teid = u32::from_be_bytes(fteid_val[1..5].try_into().unwrap());
-                            if fteid_flags & 0x02 != 0 && fteid_val.len() >= 9 {
+                            // TS 29.244 §8.2.3 Fig 8.2.3-1, octet 5: Bit1 (0x01) = V4,
+                            // Bit2 (0x02) = V6. The IPv4 address (when present) is the
+                            // first address field, immediately after the 4-byte TEID.
+                            // NOTE: F-TEID's V4=Bit1 is the OPPOSITE of F-SEID (§8.2.37),
+                            // which uses Bit2 for V4 — see the F-SEID parse above.
+                            if fteid_flags & 0x01 != 0 && fteid_val.len() >= 9 {
                                 upf_ip = [fteid_val[5], fteid_val[6], fteid_val[7], fteid_val[8]];
                             }
                             if teid != 0 {
@@ -1356,17 +1482,79 @@ fn problem_400(cause: &str, detail: &str) -> SbiResponse {
     SbiResponse::with_status(400).with_body(body.to_string(), "application/problem+json")
 }
 
+/// Resolve an N1 (NAS) or N2 (NGAP) binary payload referenced from the JSON
+/// root of an inbound SBI request, accepting BOTH the conformant
+/// multipart/related form and the legacy base64-in-JSON form.
+///
+/// Per TS 29.502 §6.1.2.2.2 / §6.1.2.4 the JSON attribute is a RefToBinaryData
+/// pointer (`{ "contentId": "<id>" }`) and the bytes live in the multipart
+/// binary part whose `Content-Id` equals `<id>` (carried on
+/// `request.http.parts`). When no matching part is present the attribute is
+/// read as a base64 string — the form the matched-sim AMF previously emitted —
+/// so both wire encodings interoperate without an E2E flip.
+fn resolve_binary_ref(request: &SbiRequest, field: &serde_json::Value) -> Option<Vec<u8>> {
+    if let Some(content_id) = field["contentId"].as_str() {
+        if let Some(part) = request
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some(content_id))
+        {
+            return Some(part.data.to_vec());
+        }
+    }
+    if let Some(b64) = field.as_str() {
+        use base64::Engine;
+        return base64::engine::general_purpose::STANDARD.decode(b64).ok();
+    }
+    None
+}
+
+/// Build a multipart/related SBI response carrying the N1 (PDU session NAS,
+/// `application/vnd.3gpp.5gnas`) and N2 (NGAP transfer,
+/// `application/vnd.3gpp.ngap`) payloads as binary parts referenced from the
+/// JSON root by RefToBinaryData pointers (TS 29.502 §6.1.2.2.2 / §6.1.2.4).
+///
+/// `json_root` provides the SmContext* JSON attributes (e.g. `smContextRef`,
+/// `n2SmInfoType`); the `n1SmMsg` / `n2SmInfo` attributes are overwritten here
+/// with their `{ "contentId": ... }` references. Keeping N1/N2 IN the response
+/// matches the current SMF behaviour (the separate Namf_Communication transfer
+/// is smfd-03, out of scope).
+fn sbi_response_with_n1_n2(
+    status: u16,
+    mut json_root: serde_json::Value,
+    n1_sm_msg: &[u8],
+    n2_sm_info: &[u8],
+) -> SbiResponse {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
+    json_root["n1SmMsg"] = serde_json::json!({ "contentId": "n1SmMsg" });
+    json_root["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
+    SbiResponse::with_status(status)
+        .with_body(json_root.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(n1_sm_msg),
+        ))
+        .with_part(SbiPart::with_content(
+            "n2SmInfo",
+            content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(n2_sm_info),
+        ))
+}
+
 /// Build the N2 SM `PDUSessionResourceSetupRequestTransfer` (TS 38.413
 /// §9.3.4.1) carrying the UPF N3 GTP-U F-TEID and the QoS flow setup list,
-/// using the real-APER `ogs-ngap` transfer codec (not bespoke bytes).
+/// using the real-APER `nextgcore-ngap` transfer codec (not bespoke bytes).
 fn build_setup_request_transfer(
     upf_teid: u32,
     upf_addr: [u8; 4],
     qfi: u8,
     five_qi: u16,
     arp_priority_level: u8,
-) -> ogs_ngap::NgapResult<Vec<u8>> {
-    use ogs_ngap::transfer::{
+) -> nextgcore_ngap::NgapResult<Vec<u8>> {
+    use nextgcore_ngap::transfer::{
         AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
         PduSessionResourceSetupRequestTransfer, PduSessionType, PreEmptionCapability,
         PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters,
@@ -1404,10 +1592,40 @@ fn build_setup_request_transfer(
     transfer.encode()
 }
 
+/// Build a real-APER `PDUSessionResourceModifyRequestTransfer` (TS 38.413
+/// clause 9.3.4.3) carrying the re-authorized Session-AMBR and the QoS flow to
+/// add/modify. Mirrors [`build_setup_request_transfer`]; the gNB's strict APER
+/// decoder rejects a hand-rolled byte layout (smfd#2).
+fn build_modify_request_transfer(
+    qfi: u8,
+    ambr_dl_bps: u64,
+    ambr_ul_bps: u64,
+) -> nextgcore_ngap::NgapResult<Vec<u8>> {
+    use nextgcore_ngap::transfer::{
+        PduSessionAggregateMaximumBitRate, PduSessionResourceModifyRequestTransfer,
+        QosFlowAddOrModifyRequestItem,
+    };
+    let transfer = PduSessionResourceModifyRequestTransfer {
+        pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
+            dl: ambr_dl_bps,
+            ul: ambr_ul_bps,
+        }),
+        ul_ngu_up_tnl_modify_list: Vec::new(),
+        network_instance: None,
+        qos_flow_add_or_modify_request_list: vec![QosFlowAddOrModifyRequestItem {
+            qos_flow_identifier: qfi,
+            qos_flow_level_qos_parameters: None,
+            e_rab_id: None,
+        }],
+        qos_flow_to_release_list: Vec::new(),
+    };
+    transfer.encode()
+}
+
 /// Extract the gNB DL GTP-U endpoint (TEID, IPv4 address, first QFI) from a
 /// real-APER `PDUSessionResourceSetupResponseTransfer` (TS 38.413 §9.3.4.2).
 fn decode_setup_response_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
-    use ogs_ngap::transfer::{
+    use nextgcore_ngap::transfer::{
         PduSessionResourceSetupResponseTransfer, UpTransportLayerInformation,
     };
 
@@ -1435,7 +1653,7 @@ fn decode_setup_response_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> 
 /// Extract the target-gNB DL GTP-U endpoint from a real-APER
 /// `PathSwitchRequestTransfer` (TS 38.413 §9.3.4.8) during an Xn handover.
 fn decode_path_switch_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
-    use ogs_ngap::transfer::{PathSwitchRequestTransfer, UpTransportLayerInformation};
+    use nextgcore_ngap::transfer::{PathSwitchRequestTransfer, UpTransportLayerInformation};
 
     let transfer = match PathSwitchRequestTransfer::decode(data) {
         Ok(t) => t,
@@ -1478,13 +1696,22 @@ fn sm_context_create_error(
     pti: u8,
     gsm_cause_5gsm: u8,
 ) -> SbiResponse {
-    use base64::Engine;
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
     let n1 = policy::build_establishment_reject(psi, pti, gsm_cause_5gsm);
+    // N1-bearing reject: the PDU Session Establishment Reject travels as a
+    // 5gnas binary part referenced by RefToBinaryData (TS 29.502 §6.1.2.4).
     let body = serde_json::json!({
         "error": { "status": status, "cause": cause },
-        "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(&n1),
+        "n1SmMsg": { "contentId": "n1SmMsg" },
     });
-    SbiResponse::with_status(status).with_body(body.to_string(), "application/json")
+    SbiResponse::with_status(status)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(&n1),
+        ))
 }
 
 /// Dispatch an Npcf_SMPolicyControl client response into a session's GSM FSM
@@ -1499,6 +1726,43 @@ fn fsm_dispatch_policy_response(fsm: &mut gsm_sm::GsmFsm, status: u16) {
         });
     }
     fsm.dispatch(&ev);
+}
+
+/// Validate the mandatory / conditionally-mandatory IEs of an inbound
+/// SmContextCreateData (TS 29.502 Table 6.1.6.2.2-1). Returns the
+/// ProblemDetails `cause` (all map to HTTP 400) for the FIRST violation, or
+/// `None` when the body satisfies the mandatory-IE policy. smfd-06.
+///
+/// DEFAULT-PERMISSIVE on `supi` and `anType`: the matched-sim AMF omits both
+/// (no NF-set / emergency context yet), so they are treated as
+/// conditional-absent rather than rejected — a documented migration shim. The
+/// genuinely-mandatory IEs for a create — `pduSessionId`, `dnn`, `sNssai.sst`
+/// and the `n1SmMsg` container — are enforced strictly (the matched-sim AMF
+/// always supplies them, so the happy path is unaffected).
+fn validate_sm_context_create_data(body: &serde_json::Value) -> Option<&'static str> {
+    // pduSessionId (M, range 1..=15)
+    let psi_ok = body["pduSessionId"]
+        .as_u64()
+        .map(|p| (1..=15).contains(&p))
+        .unwrap_or(false);
+    if !psi_ok {
+        return Some("MANDATORY_IE_INCORRECT");
+    }
+    // dnn (M for this SMF)
+    if body["dnn"].as_str().is_none() {
+        return Some("MANDATORY_IE_MISSING");
+    }
+    // sNssai.sst (M)
+    if body["sNssai"]["sst"].as_u64().is_none() {
+        return Some("MANDATORY_IE_MISSING");
+    }
+    // n1SmMsg (C — required at establishment): present either as a
+    // RefToBinaryData pointer ({contentId}) or as a legacy base64 string.
+    let n1 = &body["n1SmMsg"];
+    if n1["contentId"].as_str().is_none() && n1.as_str().is_none() {
+        return Some("N1_SM_ERROR");
+    }
+    None
 }
 
 /// Handle SM Context Create (from AMF via N11, TS 29.502 §5.2.2.2)
@@ -1516,6 +1780,15 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         },
         None => return problem_400("MANDATORY_IE_MISSING", "SmContextCreateData body required"),
     };
+
+    // ---- Strict mandatory/conditional IE validation (smfd-06) ----
+    // Reject genuinely-missing mandatory IEs up front with the correct
+    // ProblemDetails cause (default-permissive on supi/anType, which the
+    // matched-sim AMF omits).
+    if let Some(cause) = validate_sm_context_create_data(&req_body) {
+        log::warn!("SmContextCreateData rejected: {cause}");
+        return problem_400(cause, "mandatory IE missing or incorrect");
+    }
 
     // ---- SmContextCreateData attributes (TS 29.502 Table 6.1.6.2.2-1) ----
     let Some(pdu_session_id) = req_body["pduSessionId"]
@@ -1566,13 +1839,12 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     );
 
     // ---- N1 SM container: PDU Session Establishment Request (TS 24.501) ----
-    let (pti, requested_type, requested_ssc) = match req_body["n1SmMsg"].as_str() {
-        Some(b64) => {
-            use base64::Engine;
-            let Ok(n1_bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
-                return problem_400("N1_SM_ERROR", "n1SmMsg is not valid base64");
-            };
-            match policy::parse_establishment_request(&n1_bytes) {
+    // The N1 container arrives either as a multipart 5gnas binary part
+    // (resolved via its RefToBinaryData contentId) or, from a legacy peer, as
+    // a base64 string. `resolve_binary_ref` accepts both.
+    let (pti, requested_type, requested_ssc) =
+        match resolve_binary_ref(request, &req_body["n1SmMsg"]) {
+            Some(n1_bytes) => match policy::parse_establishment_request(&n1_bytes) {
                 Some(req) => {
                     if req.psi != pdu_session_id {
                         log::warn!(
@@ -1602,13 +1874,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         "n1SmMsg is not a PDU Session Establishment Request",
                     )
                 }
+            },
+            None => {
+                // The n1SmMsg attribute passed validation but its referenced
+                // binary part is absent / not decodable — reject (smfd-06).
+                log::error!("SmContextCreateData n1SmMsg present but binary part missing/invalid");
+                return problem_400("N1_SM_ERROR", "n1SmMsg binary part missing or invalid");
             }
-        }
-        None => {
-            log::warn!("SmContextCreateData without n1SmMsg — using defaults (PTI=0)");
-            (0u8, policy::pdu_session_type::IPV4, 1u8)
-        }
-    };
+        };
 
     // Selected PDU session type: this SMF serves IPv4 (and the IPv4 leg of
     // IPv4v6). IPv6-only/Ethernet/Unstructured → reject, 5GSM cause #50.
@@ -1673,6 +1946,59 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
+    // ---- Nnsacf_NSAC: per-S-NSSAI PDU-session admission (TS 29.536 §5.3) ----
+    // Before committing PCF/PFCP resources, ask the NSACF (if deployed) whether
+    // a new PDU session may be admitted for this S-NSSAI. A rejection
+    // (admittedFlag=false) is a slice-quota exhaustion → reject the session
+    // with 5GSM cause #67 (insufficient resources for specific slice). The
+    // NSACF is optional: when none is configured/discoverable we skip the check
+    // (fail-open), and a transport/HTTP failure also fails open so a missing
+    // NSACF never blocks the basic data path.
+    let nsac_admitted = match policy::resolve_nsacf_endpoint().await {
+        None => {
+            log::debug!("No NSACF configured/discoverable — skipping slice admission control");
+            false
+        }
+        Some(nsacf) => {
+            let nf_id = self_nf_id().await;
+            match policy::nsac_pdu_session_admit(
+                &nsacf,
+                &nf_id,
+                &supi,
+                pdu_session_id,
+                sst,
+                snssai_sd.as_deref(),
+            )
+            .await
+            {
+                policy::NsacAdmission::Admitted => {
+                    log::info!(
+                        "NSACF admitted PDU session for S-NSSAI[SST:{sst} SD:{snssai_sd:?}]"
+                    );
+                    true
+                }
+                policy::NsacAdmission::Rejected => {
+                    log::warn!(
+                        "NSACF rejected PDU session for S-NSSAI[SST:{sst}] — \
+                         rejecting (5GSM cause 67)"
+                    );
+                    release_ip();
+                    return sm_context_create_error(
+                        403,
+                        "NSAC_PDU_SESSION_REJECTED",
+                        pdu_session_id,
+                        pti,
+                        policy::gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE,
+                    );
+                }
+                policy::NsacAdmission::Unavailable => {
+                    log::warn!("NSACF unreachable for slice admission — proceeding (fail-open)");
+                    false
+                }
+            }
+        }
+    };
+
     // ---- GSM FSM: Initial → Wait5gcSmPolicyAssociation ----
     let sess_idx_u64 = sm_context_ref.parse::<u64>().unwrap_or(0);
     let mut fsm = gsm_sm::GsmFsm::new(sess_idx_u64);
@@ -1732,6 +2058,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     log::error!("PCF rejected SM policy (status={status}): {detail}");
                     fsm_dispatch_policy_response(&mut fsm, status);
                     release_ip();
+                    rollback_nsac(
+                        nsac_admitted,
+                        &supi,
+                        pdu_session_id,
+                        sst,
+                        snssai_sd.as_deref(),
+                    )
+                    .await;
                     return sm_context_create_error(
                         403,
                         "POLICY_REJECTED",
@@ -1746,6 +2080,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     log::error!("SM policy create failed: {e}");
                     fsm.transition_to(gsm_sm::GsmState::Exception);
                     release_ip();
+                    rollback_nsac(
+                        nsac_admitted,
+                        &supi,
+                        pdu_session_id,
+                        sst,
+                        snssai_sd.as_deref(),
+                    )
+                    .await;
                     return sm_context_create_error(
                         504,
                         "PCF_NOT_RESPONDING",
@@ -1884,6 +2226,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     }
                 }
                 release_ip();
+                rollback_nsac(
+                    nsac_admitted,
+                    &supi,
+                    pdu_session_id,
+                    sst,
+                    snssai_sd.as_deref(),
+                )
+                .await;
                 return sm_context_create_error(
                     504,
                     "UPF_NOT_RESPONDING",
@@ -1921,16 +2271,34 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     }
 
     // ---- N1: PDU Session Establishment Accept with authorized QoS ----
+    // S-NSSAI (smfd-04) is taken from the create request's S-NSSAI; the SD hex
+    // string (if any) is parsed back to its 24-bit value. The conditional QoS
+    // flow descriptions IE (0x79) is driven by `def_five_qi` vs the QFI. The
+    // IPv6 interface identifier is unused on the live path (this SMF grants the
+    // IPv4 leg only — see `selected_type`); the IPv4v6 encoding is smfd-05.
+    let snssai_sd_u32 = snssai_sd
+        .as_deref()
+        .and_then(|s| u32::from_str_radix(s, 16).ok());
+    // TS 24.501 clause 8.3.2.2: when the UE requested IPv4v6 but this SMF grants
+    // only the IPv4 leg (selected_type != requested_type), the accept must carry
+    // 5GSM cause #50 "PDU session type IPv4 only allowed".
+    let est_5gsm_cause = (requested_type != selected_type)
+        .then_some(policy::gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED);
     let n1_sm_msg = policy::build_establishment_accept(
         pdu_session_id,
         pti,
         selected_type,
         selected_ssc,
         qfi,
+        decision.def_five_qi,
         decision.sess_ambr_dl_bps,
         decision.sess_ambr_ul_bps,
         ue_ip_octets,
+        [0u8; 8],
+        sst,
+        snssai_sd_u32,
         &dnn,
+        est_5gsm_cause,
     );
 
     // ---- N2 SM Information: real-APER PDUSessionResourceSetupRequestTransfer ----
@@ -1948,6 +2316,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         Err(e) => {
             log::error!("Failed to encode PDUSessionResourceSetupRequestTransfer: {e:?}");
             release_ip();
+            rollback_nsac(
+                nsac_admitted,
+                &supi,
+                pdu_session_id,
+                sst,
+                snssai_sd.as_deref(),
+            )
+            .await;
             return sm_context_create_error(
                 500,
                 "SYSTEM_FAILURE",
@@ -1958,16 +2334,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
-    use base64::Engine;
-    let n1_b64 = base64::engine::general_purpose::STANDARD.encode(&n1_sm_msg);
-    let n2_b64 = base64::engine::general_purpose::STANDARD.encode(&n2_sm_info);
-
+    // SmContextCreatedData root: N1 (PDU Session Establishment Accept) and N2
+    // (PDUSessionResourceSetupRequestTransfer) are carried as multipart/related
+    // binary parts (5gnas + ngap) referenced by RefToBinaryData, per TS 29.502
+    // §6.1.2.2.2 / §6.1.2.4.
     let response_body = serde_json::json!({
         "smContextRef": sm_context_ref,
         "pduSessionId": pdu_session_id,
         "upCnxState": "ACTIVATING",
-        "n1SmMsg": n1_b64,
-        "n2SmInfo": n2_b64,
         "n2SmInfoType": "PDU_RES_SETUP_REQ"
     });
 
@@ -1983,9 +2357,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         upf_teid
     );
 
-    SbiResponse::with_status(201)
+    sbi_response_with_n1_n2(201, response_body, &n1_sm_msg, &n2_sm_info)
         .with_header("Location", location)
-        .with_body(response_body.to_string(), "application/json")
 }
 
 /// Look up the stored UPF SEID for an SM context (copy-then-drop the guards
@@ -2087,15 +2460,13 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // new DL F-TEID that the UPF must forward to, but in different APER
         // transfer containers (TS 38.413 §9.3.4.2 vs §9.3.4.8).
         "PDU_RES_SETUP_RSP" | "PATH_SWITCH_REQ" => {
-            use base64::Engine;
-            let Some(n2_bytes) = req_body["n2SmInfo"]
-                .as_str()
-                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-            else {
+            // N2 SM transfer: multipart ngap part (RefToBinaryData) or legacy
+            // base64 string — `resolve_binary_ref` accepts both.
+            let Some(n2_bytes) = resolve_binary_ref(request, &req_body["n2SmInfo"]) else {
                 return problem_400("N2_SM_ERROR", "n2SmInfo missing or not valid base64");
             };
 
-            // Real-APER decode of the gNB DL N3 endpoint via the ogs-ngap
+            // Real-APER decode of the gNB DL N3 endpoint via the nextgcore-ngap
             // transfer codec (the gNB now emits real APER, not legacy bytes).
             let endpoint = if n2_sm_info_type == "PATH_SWITCH_REQ" {
                 decode_path_switch_dl_endpoint(&n2_bytes)
@@ -2163,11 +2534,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // container; QoS comes from an Npcf_SMPolicyControl_Update — not
         // hardcoded values.
         "PDU_RES_MOD_REQ" => {
-            use base64::Engine;
-            let Some(n1_sm_msg) = req_body["n1SmMsg"]
-                .as_str()
-                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-            else {
+            // N1 SM container: multipart 5gnas part (RefToBinaryData) or legacy
+            // base64 string — `resolve_binary_ref` accepts both.
+            let Some(n1_sm_msg) = resolve_binary_ref(request, &req_body["n1SmMsg"]) else {
                 return problem_400("N1_SM_ERROR", "n1SmMsg missing or not valid base64");
             };
             let Some(hdr) = policy::parse_n1_sm_header(&n1_sm_msg) else {
@@ -2255,15 +2624,24 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // N1: PDU Session Modification Command (PTI echoed, authorized AMBR)
             let n1_mod_cmd = policy::build_modification_command(psi, pti, ambr_dl, ambr_ul);
 
-            // N2 SM Info: QoS flow modification for gNB (QFI + confirm)
-            let n2_sm_info = vec![qfi, 0x01];
+            // N2 SM Info: real-APER PDUSessionResourceModifyRequestTransfer
+            // (TS 38.413 clause 9.3.4.3) carrying the re-authorized Session-AMBR
+            // and the QoS flow to modify; the gNB decodes it with its strict
+            // APER decoder -- a hand-rolled blob is rejected (smfd#2).
+            let n2_sm_info = match build_modify_request_transfer(qfi, ambr_dl, ambr_ul) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::error!("Failed to encode PDUSessionResourceModifyRequestTransfer: {e:?}");
+                    return SbiResponse::with_status(500);
+                }
+            };
 
+            // N1 (PDU Session Modification Command) + N2 (QoS flow mod) carried
+            // as multipart/related binary parts referenced by RefToBinaryData.
             let response_body = serde_json::json!({
-                "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(&n1_mod_cmd),
-                "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(&n2_sm_info),
                 "n2SmInfoType": "PDU_RES_MOD_REQ"
             });
-            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+            sbi_response_with_n1_n2(200, response_body, &n1_mod_cmd, &n2_sm_info)
         }
 
         // gNB confirmed a modification / released resources / reported
@@ -2300,6 +2678,66 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             log::warn!("SM Context Update: unsupported n2SmInfoType '{other}'");
             problem_400("N2_SM_ERROR", &format!("unsupported n2SmInfoType {other}"))
         }
+    }
+}
+
+/// Build the SmContextStatusNotification body (TS 29.502 §6.1.6.2.8): a
+/// `statusInfo` carrying the `resourceStatus` (e.g. `RELEASED`) and an optional
+/// release `cause`. smfd-07.
+fn build_sm_context_status_notification(
+    resource_status: &str,
+    cause: Option<&str>,
+) -> serde_json::Value {
+    let mut status_info = serde_json::json!({ "resourceStatus": resource_status });
+    if let Some(c) = cause {
+        status_info["cause"] = serde_json::json!(c);
+    }
+    serde_json::json!({ "statusInfo": status_info })
+}
+
+/// Extract the path (and query) portion of an absolute or relative URI.
+fn uri_path(uri: &str) -> String {
+    let stripped = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    match stripped.find('/') {
+        Some(idx) => stripped[idx..].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+/// POST an SmContextStatusNotification to the AMF-supplied `smContextStatusUri`
+/// (TS 29.502 §5.2.2.8) on SMF-initiated release / abnormal termination. A
+/// missing URI is a no-op (notifications disabled). Best-effort: transport
+/// failures are logged, not propagated — the local release proceeds regardless.
+/// smfd-07.
+async fn send_sm_context_status_notification(
+    uri: Option<&str>,
+    resource_status: &str,
+    cause: Option<&str>,
+) {
+    let Some(uri) = uri else {
+        log::debug!("No smContextStatusUri — skipping SmContextStatusNotification");
+        return;
+    };
+    let Some((host, port)) = policy::split_host_port(uri) else {
+        log::warn!("smContextStatusUri '{uri}' is not a valid URI — skipping notification");
+        return;
+    };
+    let path = uri_path(uri);
+    let body = build_sm_context_status_notification(resource_status, cause);
+    let client = nextgcore_sbi::client::SbiClient::new(
+        nextgcore_sbi::client::SbiClientConfig::new(host, port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3)),
+    );
+    match client.post_json(&path, &body).await {
+        Ok(resp) => log::info!(
+            "SmContextStatusNotification ({resource_status}) → {uri}: status={}",
+            resp.status
+        ),
+        Err(e) => log::warn!("SmContextStatusNotification to {uri} failed: {e}"),
     }
 }
 
@@ -2402,6 +2840,13 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
             context.sess_remove(sess.id);
         }
     }
+
+    // Notify the AMF the SM context is RELEASED (TS 29.502 §5.2.2.8). No-op
+    // when the AMF supplied no smContextStatusUri (the matched-sim AMF). smfd-07.
+    let status_uri = binding
+        .as_ref()
+        .and_then(|b| b.sm_context_status_uri.clone());
+    send_sm_context_status_notification(status_uri.as_deref(), "RELEASED", None).await;
 
     SbiResponse::with_status(204)
 }
@@ -2652,7 +3097,7 @@ mod tests {
     // ------------------------------------------------------------------
     //
     // The smfd builds the N2 SM PDUSessionResourceSetupRequestTransfer with the
-    // real-APER ogs-ngap codec and decodes the gNB's SetupResponseTransfer with
+    // real-APER nextgcore-ngap codec and decodes the gNB's SetupResponseTransfer with
     // it. These pin the wire bytes against the independent nextgsim-ngap codec
     // (the gNB), mirroring the NG-Setup/ICS reconciliation: the request
     // bytes are byte-identical to the gNB's decoder vector, and the gNB's
@@ -2661,10 +3106,13 @@ mod tests {
     /// smfd's emitted SetupRequestTransfer for UPF F-TEID 0x00010001 /
     /// 10.45.0.1 / QFI 1 / 5QI 9 / ARP 8 — must equal the vector the gNB
     /// (nextgsim-ngap) decodes (capture_tests.rs::SMFD_SETUP_REQUEST_TRANSFER).
-    const GNB_EXPECTED_SETUP_REQUEST: [u8; 32] = [
-        0x00, 0x03, 0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0, 0x0a, 0x2d, 0x00, 0x01, 0x00, 0x01, 0x00,
-        0x01, 0x00, 0x86, 0x00, 0x01, 0x00, 0x00, 0x88, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x09,
-        0x1c, 0x00,
+    /// Leading 0x00 = the outer extensible SEQUENCE's APER extension bit
+    /// (ngap-04, TS 38.413 §9.3.4.1 + §9.5); the remaining 32 octets are the
+    /// ProtocolIE-Container.
+    const GNB_EXPECTED_SETUP_REQUEST: [u8; 33] = [
+        0x00, 0x00, 0x03, 0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0, 0x0a, 0x2d, 0x00, 0x01, 0x00, 0x01,
+        0x00, 0x01, 0x00, 0x86, 0x00, 0x01, 0x00, 0x00, 0x88, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00,
+        0x09, 0x1c, 0x00,
     ];
 
     #[test]
@@ -2679,7 +3127,7 @@ mod tests {
 
     #[test]
     fn setup_request_transfer_self_roundtrips() {
-        use ogs_ngap::transfer::{
+        use nextgcore_ngap::transfer::{
             PduSessionResourceSetupRequestTransfer, UpTransportLayerInformation,
         };
         let bytes = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
@@ -2689,6 +3137,205 @@ mod tests {
         assert_eq!(tun.transport_layer_address.octets, vec![10, 45, 0, 1]);
         assert_eq!(t.qos_flow_setup_request_list.len(), 1);
         assert_eq!(t.qos_flow_setup_request_list[0].qos_flow_identifier, 1);
+    }
+
+    #[test]
+    fn modify_request_transfer_self_roundtrips() {
+        use nextgcore_ngap::transfer::PduSessionResourceModifyRequestTransfer;
+        let bytes = build_modify_request_transfer(1, 200_000_000, 100_000_000).unwrap();
+        let t = PduSessionResourceModifyRequestTransfer::decode(&bytes).expect("decode");
+        assert_eq!(
+            t.pdu_session_aggregate_maximum_bit_rate
+                .map(|a| (a.dl, a.ul)),
+            Some((200_000_000, 100_000_000))
+        );
+        assert_eq!(t.qos_flow_add_or_modify_request_list.len(), 1);
+        assert_eq!(
+            t.qos_flow_add_or_modify_request_list[0].qos_flow_identifier,
+            1
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // H5 golden vectors: PDUSessionResourceModifyRequestTransfer
+    // (TS 38.413 §9.3.4.3, APER per ITU-T X.691, ALIGNED variant)
+    // ------------------------------------------------------------------
+    //
+    // Hand-derived from the ASN.1 in specs/38413-j30.txt — NOT captured from
+    // our own encoder — per the dual-derivation method in
+    // .context/GOLDEN-VECTOR-METHOD.md. Derivation A is the bit table below;
+    // derivation B is an independent from-scratch X.691 recompute (Python
+    // script, full text in the method doc's Appendix B) written without
+    // reading derivation A. Both derivations agree byte-for-byte; the vector
+    // was frozen only after that agreement (this cross-check is what caught
+    // the TUAK set-3 scramble precedent).
+    //
+    // ASN.1 anchors (specs/38413-j30.txt):
+    //   PDUSessionResourceModifyRequestTransfer  line 53689 (extensible SEQUENCE
+    //     of one mandatory ProtocolIE-Container)
+    //   ProtocolIE-Container ::= SEQUENCE (SIZE (0..65535)) OF ProtocolIE-Field
+    //     (line 60634; maxProtocolIEs = 65535, line 59201)
+    //   ProtocolIE-Field ::= SEQUENCE { id INTEGER (0..65535),
+    //     criticality ENUMERATED {reject,ignore,notify}, value <open type> }
+    //   id-PDUSessionAggregateMaximumBitRate = 130, criticality reject (59691)
+    //   id-QosFlowAddOrModifyRequestList     = 135, criticality reject (59701)
+    //   PDUSessionAggregateMaximumBitRate ::= SEQUENCE { DL BitRate, UL BitRate,
+    //     iE-Extensions OPTIONAL, ... } (53236)
+    //   BitRate ::= INTEGER (0..4000000000000, ...) (45660)
+    //   QosFlowAddOrModifyRequestList ::= SEQUENCE (SIZE(1..64)) OF ... (55098;
+    //     maxnoofQosFlows = 64, line 59309)
+    //   QosFlowAddOrModifyRequestItem ::= SEQUENCE { qosFlowIdentifier
+    //     INTEGER (0..63,...), qosFlowLevelQosParameters OPTIONAL,
+    //     e-RAB-ID OPTIONAL, iE-Extensions OPTIONAL, ... } (55101)
+
+    /// Golden vector A — AMBR-only transfer (DL 1 Gbps, UL 250 kbps).
+    ///
+    /// Derivation A bit table (X.691 ALIGNED; bits listed in emission order):
+    /// ```text
+    /// byte 0     0x00  [0]        outer SEQUENCE extension bit = 0 (X.691 §19.7)
+    ///                  [0000000]  pad: container count is a range-65536
+    ///                             constrained int -> 2 octets, octet-aligned
+    ///                             (§13.2.5.4 via §11.9.4.1)
+    /// bytes 1-2  0x0001           protocolIEs count = 1
+    /// bytes 3-4  0x0082           ProtocolIE-ID 130 (range 65536 -> 2 aligned octets)
+    /// byte 5     0x00  [00]       criticality reject = 0 (ENUMERATED root,
+    ///                             range 3 -> 2-bit field, §14.3/§13.2.5.2)
+    ///                  [000000]   pad: open-type length determinant aligns (§11.2/§11.9)
+    /// byte 6     0x09             open-type length = 9 octets (short form, §11.9.3.6)
+    /// --- open-type content: PDUSessionAggregateMaximumBitRate ---
+    /// byte 7     0x0C  [0]        AMBR SEQUENCE extension bit = 0
+    ///                  [0]        iE-Extensions absent (1-bit optional bitmap, §19.2)
+    ///                  [0]        DL BitRate extension bit = 0 (root, §13.1)
+    ///                  [011]      DL length-of-length: range 4e12+1 > 64K ->
+    ///                             §13.2.6: octet count n=4 as constrained int
+    ///                             (1..6) -> 3-bit field, offset 4-1=3
+    ///                  [00]       pad: §13.2.6 value octets are octet-aligned
+    /// bytes 8-11 0x3B9ACA00       DL = 1_000_000_000 in minimal 4 octets
+    /// byte 12    0x20  [0]        UL BitRate extension bit = 0
+    ///                  [010]      UL octet count n=3, offset 3-1=2
+    ///                  [0000]     pad to octet boundary
+    /// bytes13-15 0x03D090         UL = 250_000 in minimal 3 octets
+    /// ```
+    const GOLDEN_MODIFY_REQUEST_AMBR_ONLY: [u8; 16] = [
+        0x00, 0x00, 0x01, 0x00, 0x82, 0x00, 0x09, 0x0C, 0x3B, 0x9A, 0xCA, 0x00, 0x20, 0x03, 0xD0,
+        0x90,
+    ];
+
+    /// Golden vector B — AMBR (DL 200 Mbps, UL 100 Mbps) + one QoS-flow-add
+    /// item (QFI 1, no level parameters, no E-RAB ID) — exactly the shape
+    /// `build_modify_request_transfer(1, 200_000_000, 100_000_000)` emits on
+    /// the live PDU_RES_MOD_REQ path.
+    ///
+    /// Derivation A bit table (deltas from vector A annotated):
+    /// ```text
+    /// byte 0     0x00             ext bit 0 + 7 pad bits (as vector A)
+    /// bytes 1-2  0x0002           protocolIEs count = 2
+    /// bytes 3-4  0x0082           IE 1: ProtocolIE-ID 130 (AMBR)
+    /// byte 5     0x00             criticality reject (2 bits) + 6 pad bits
+    /// byte 6     0x0A             open-type length = 10 octets
+    /// byte 7     0x0C             [0 ext][0 iE-Ext absent][0 DL ext][011 n=4][00 pad]
+    /// bytes 8-11 0x0BEBC200       DL = 200_000_000 in minimal 4 octets
+    /// byte 12    0x30             [0 UL ext][011 n=4][0000 pad]
+    /// bytes13-16 0x05F5E100       UL = 100_000_000 in minimal 4 octets
+    /// bytes17-18 0x0087           IE 2: ProtocolIE-ID 135 (QosFlowAddOrModifyRequestList)
+    /// byte 19    0x00             criticality reject (2 bits) + 6 pad bits
+    /// byte 20    0x03             open-type length = 3 octets
+    /// --- open-type content: QosFlowAddOrModifyRequestList, 17 bits + 7 pad ---
+    /// byte 21    0x00  [000000]   SEQUENCE-OF count = 1 as constrained int
+    ///                             (1..64) -> 6-bit field, offset 0 (§20.6)
+    ///                  [0]        item SEQUENCE extension bit = 0
+    ///                  [0]        qosFlowLevelQosParameters absent
+    /// byte 22    0x00  [0]        e-RAB-ID absent
+    ///                  [0]        iE-Extensions absent
+    ///                  [0]        QosFlowIdentifier extension bit = 0
+    ///                  [00000]    QFI high 5 bits of 6-bit root value 1 (0..63)
+    /// byte 23    0x80  [1]        QFI low bit (value = 0b000001 = 1)
+    ///                  [0000000]  pad to octet boundary (§11.2.1)
+    /// ```
+    const GOLDEN_MODIFY_REQUEST_AMBR_PLUS_QOS_FLOW_ADD: [u8; 24] = [
+        0x00, 0x00, 0x02, 0x00, 0x82, 0x00, 0x0A, 0x0C, 0x0B, 0xEB, 0xC2, 0x00, 0x30, 0x05, 0xF5,
+        0xE1, 0x00, 0x00, 0x87, 0x00, 0x03, 0x00, 0x00, 0x80,
+    ];
+
+    /// Encoder golden A: an AMBR-only ModifyRequestTransfer (the transfer
+    /// codec `build_modify_request_transfer` drives; the builder itself always
+    /// adds the QoS-flow list, so the AMBR-only shape is pinned through the
+    /// same encoder directly) must produce the spec-derived bytes exactly.
+    #[test]
+    fn golden_modify_request_transfer_ambr_only_encodes_ts38413_bytes() {
+        use nextgcore_ngap::transfer::{
+            PduSessionAggregateMaximumBitRate, PduSessionResourceModifyRequestTransfer,
+        };
+        let transfer = PduSessionResourceModifyRequestTransfer {
+            pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
+                dl: 1_000_000_000,
+                ul: 250_000,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            transfer.encode().expect("encode"),
+            GOLDEN_MODIFY_REQUEST_AMBR_ONLY.to_vec(),
+            "AMBR-only ModifyRequestTransfer must match the hand-derived TS 38.413 APER vector"
+        );
+    }
+
+    /// Encoder golden B: the live builder's exact output (AMBR + one
+    /// QoS-flow-add item) must equal the spec-derived bytes. This replaces the
+    /// roundtrip-only oracle for encode-side drift: any bit change in the
+    /// encoder output fails here even if the matched decoder still accepts it.
+    #[test]
+    fn golden_modify_request_transfer_builder_encodes_ts38413_bytes() {
+        let bytes = build_modify_request_transfer(1, 200_000_000, 100_000_000).unwrap();
+        assert_eq!(
+            bytes,
+            GOLDEN_MODIFY_REQUEST_AMBR_PLUS_QOS_FLOW_ADD.to_vec(),
+            "build_modify_request_transfer must match the hand-derived TS 38.413 APER vector"
+        );
+    }
+
+    /// Decoder golden: the frozen spec-derived bytes must decode into exactly
+    /// the expected structs (guards decoder drift independently of encoder
+    /// drift — a symmetric codec bug passes the roundtrip but fails here).
+    #[test]
+    fn golden_modify_request_transfer_decodes_from_frozen_bytes() {
+        use nextgcore_ngap::transfer::{
+            PduSessionAggregateMaximumBitRate, PduSessionResourceModifyRequestTransfer,
+            QosFlowAddOrModifyRequestItem,
+        };
+
+        let a = PduSessionResourceModifyRequestTransfer::decode(&GOLDEN_MODIFY_REQUEST_AMBR_ONLY)
+            .expect("decode golden A");
+        assert_eq!(
+            a,
+            PduSessionResourceModifyRequestTransfer {
+                pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
+                    dl: 1_000_000_000,
+                    ul: 250_000,
+                }),
+                ..Default::default()
+            }
+        );
+
+        let b = PduSessionResourceModifyRequestTransfer::decode(
+            &GOLDEN_MODIFY_REQUEST_AMBR_PLUS_QOS_FLOW_ADD,
+        )
+        .expect("decode golden B");
+        assert_eq!(
+            b,
+            PduSessionResourceModifyRequestTransfer {
+                pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
+                    dl: 200_000_000,
+                    ul: 100_000_000,
+                }),
+                qos_flow_add_or_modify_request_list: vec![QosFlowAddOrModifyRequestItem {
+                    qos_flow_identifier: 1,
+                    qos_flow_level_qos_parameters: None,
+                    e_rab_id: None,
+                }],
+                ..Default::default()
+            }
+        );
     }
 
     /// The gNB (nextgsim-ngap) produces this SetupResponseTransfer for gNB DL
@@ -2706,5 +3353,436 @@ mod tests {
         assert_eq!(teid, 0x0002_0002);
         assert_eq!(addr, [10, 46, 0, 1]);
         assert_eq!(qfi, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // smfd-01 / smfd-02: multipart/related N1/N2 carriage
+    // (TS 29.502 §6.1.2.2.2 / §6.1.2.4)
+    // ------------------------------------------------------------------
+
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
+
+    /// A valid PDU Session Establishment Request N1 container (PSI=5, PTI=2,
+    /// IPv4v6, SSC mode 2) — the vector parsed in the policy unit tests.
+    const N1_ESTABLISHMENT_REQUEST: [u8; 14] = [
+        0x2E, 0x05, 0x02, 0xC1, 0xFF, 0xFF, 0x93, 0xA2, 0x28, 0x01, 0x00, 0x55, 0x00, 0x10,
+    ];
+
+    /// The 201 SmContextCreatedData response is multipart/related: the JSON
+    /// root references N1/N2 via RefToBinaryData, and the two binary parts carry
+    /// the exact bytes produced by smfd's N1-accept and N2-transfer builders,
+    /// with the conformant 5gnas / ngap content types.
+    #[test]
+    fn sm_context_created_response_is_multipart_with_binary_refs() {
+        let n1 = policy::build_establishment_accept(
+            5,
+            2,
+            policy::pdu_session_type::IPV4,
+            1,
+            1,
+            1,
+            1_000_000,
+            1_000_000,
+            [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            None,
+            "internet",
+            None,
+        );
+        let n2 = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
+
+        let resp = sbi_response_with_n1_n2(
+            201,
+            serde_json::json!({
+                "smContextRef": "7",
+                "pduSessionId": 5,
+                "upCnxState": "ACTIVATING",
+                "n2SmInfoType": "PDU_RES_SETUP_REQ"
+            }),
+            &n1,
+            &n2,
+        )
+        .with_header("Location", "/nsmf-pdusession/v1/sm-contexts/7");
+
+        assert_eq!(resp.status, 201);
+        // Serialize exactly as the SBI client serializes parts (multipart/
+        // related), then decode it back to prove the wire shape.
+        let boundary = nextgcore_sbi::multipart::generate_boundary();
+        let body = nextgcore_sbi::multipart::encode(
+            resp.http.content.as_deref(),
+            &resp.http.parts,
+            &boundary,
+        );
+        let ct = nextgcore_sbi::multipart::content_type_with_boundary(&boundary);
+        let decoded = nextgcore_sbi::multipart::decode(&ct, &body).expect("decode multipart");
+
+        // JSON root: N1/N2 are RefToBinaryData pointers; n2SmInfoType preserved.
+        let root: serde_json::Value =
+            serde_json::from_str(decoded.json.as_deref().unwrap()).unwrap();
+        assert_eq!(root["n1SmMsg"]["contentId"].as_str(), Some("n1SmMsg"));
+        assert_eq!(root["n2SmInfo"]["contentId"].as_str(), Some("n2SmInfo"));
+        assert_eq!(root["n2SmInfoType"].as_str(), Some("PDU_RES_SETUP_REQ"));
+        assert_eq!(root["smContextRef"].as_str(), Some("7"));
+
+        // Binary parts: exact builder bytes + conformant content types.
+        let n1_part = decoded
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("n1 part");
+        let n2_part = decoded
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .expect("n2 part");
+        assert_eq!(n1_part.data.as_ref(), n1.as_slice());
+        assert_eq!(n2_part.data.as_ref(), n2.as_slice());
+        assert_eq!(
+            n1_part.content_type.as_deref(),
+            Some(content_type::APPLICATION_5GNAS)
+        );
+        assert_eq!(
+            n2_part.content_type.as_deref(),
+            Some(content_type::APPLICATION_NGAP)
+        );
+    }
+
+    /// The N1-bearing reject (SmContextCreateError) carries the PDU Session
+    /// Establishment Reject as a 5gnas binary part referenced by RefToBinaryData.
+    #[test]
+    fn sm_context_create_error_carries_n1_reject_part() {
+        let resp = sm_context_create_error(403, "PDU_SESSION_TYPE_NOT_SUPPORTED", 5, 2, 50);
+        assert_eq!(resp.status, 403);
+        let root: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(root["n1SmMsg"]["contentId"].as_str(), Some("n1SmMsg"));
+        let part = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("n1 reject part");
+        assert_eq!(
+            part.content_type.as_deref(),
+            Some(content_type::APPLICATION_5GNAS)
+        );
+        assert_eq!(
+            part.data.as_ref(),
+            policy::build_establishment_reject(5, 2, 50).as_slice()
+        );
+    }
+
+    /// smfd resolves the N1 container identically from a multipart 5gnas part
+    /// and from the legacy base64-in-JSON form (backward compatibility).
+    #[test]
+    fn smfd_resolves_n1_multipart_same_as_base64() {
+        // Multipart form: JSON root holds a RefToBinaryData pointer; bytes in a part.
+        let mut multipart_req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts");
+        multipart_req
+            .http
+            .set_content(serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } }).to_string());
+        multipart_req.http.add_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(&N1_ESTABLISHMENT_REQUEST),
+        ));
+        let mp_body: serde_json::Value =
+            serde_json::from_str(multipart_req.http.content.as_deref().unwrap()).unwrap();
+        let from_multipart = resolve_binary_ref(&multipart_req, &mp_body["n1SmMsg"]).unwrap();
+
+        // Legacy form: base64 string, no parts.
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(N1_ESTABLISHMENT_REQUEST);
+        let legacy_req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts");
+        let legacy_body = serde_json::json!({ "n1SmMsg": b64 });
+        let from_base64 = resolve_binary_ref(&legacy_req, &legacy_body["n1SmMsg"]).unwrap();
+
+        assert_eq!(from_multipart, from_base64);
+        assert_eq!(from_multipart, N1_ESTABLISHMENT_REQUEST.to_vec());
+        // ...and the decoded internal result is identical.
+        let a = policy::parse_establishment_request(&from_multipart).unwrap();
+        let b = policy::parse_establishment_request(&from_base64).unwrap();
+        assert_eq!(a.pti, b.pti);
+        assert_eq!(a.requested_pdu_session_type, b.requested_pdu_session_type);
+        assert_eq!(a.requested_ssc_mode, b.requested_ssc_mode);
+    }
+
+    /// Cross-decode: bytes shaped exactly as amfd emits a multipart
+    /// CreateSmContext request (JSON root + N1 5gnas part) are decoded by the
+    /// shared multipart codec and resolved by smfd to the exact N1 container.
+    #[test]
+    fn smfd_parses_amfd_multipart_create_request() {
+        // Reproduce amfd's wire emission via the shared multipart encoder.
+        let root = serde_json::json!({
+            "pduSessionId": 5,
+            "sNssai": { "sst": 1 },
+            "dnn": "internet",
+            "n1SmMsg": { "contentId": "n1SmMsg" },
+            "redcapIndication": false
+        });
+        let part = SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(&N1_ESTABLISHMENT_REQUEST),
+        );
+        let boundary = nextgcore_sbi::multipart::generate_boundary();
+        let body = nextgcore_sbi::multipart::encode(
+            Some(&root.to_string()),
+            std::slice::from_ref(&part),
+            &boundary,
+        );
+        let ct = nextgcore_sbi::multipart::content_type_with_boundary(&boundary);
+
+        // Server-side: decode into the request the smfd handler would see.
+        let decoded = nextgcore_sbi::multipart::decode(&ct, &body).unwrap();
+        let mut request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts");
+        request.http.content = decoded.json.clone();
+        request.http.parts = decoded.parts;
+        let req_body: serde_json::Value =
+            serde_json::from_str(decoded.json.as_deref().unwrap()).unwrap();
+
+        let n1 = resolve_binary_ref(&request, &req_body["n1SmMsg"]).unwrap();
+        assert_eq!(n1, N1_ESTABLISHMENT_REQUEST.to_vec());
+        assert!(policy::parse_establishment_request(&n1).is_some());
+    }
+
+    // ----------------------------- smfd-06 ------------------------------
+
+    /// The exact SmContextCreateData body the matched-sim AMF sends (no supi /
+    /// anType / smContextStatusUri) MUST still pass the strict validator, while
+    /// genuinely-missing mandatory IEs are rejected with the correct cause.
+    #[test]
+    fn validate_sm_context_create_data_table() {
+        // Matched-sim AMF body shape (see amfd build_create_sm_context_request).
+        let matched_sim = serde_json::json!({
+            "pduSessionId": 5,
+            "sNssai": { "sst": 1, "sd": "010203" },
+            "dnn": "internet",
+            "n1SmMsg": { "contentId": "n1SmMsg" },
+            "redcapIndication": false,
+            "servingNetwork": { "mcc": "001", "mnc": "01" }
+        });
+        assert_eq!(validate_sm_context_create_data(&matched_sim), None);
+
+        // supi / anType absent but otherwise complete → still permitted.
+        assert_eq!(
+            validate_sm_context_create_data(&serde_json::json!({
+                "pduSessionId": 1,
+                "sNssai": { "sst": 2 },
+                "dnn": "ims",
+                "n1SmMsg": "BASE64DATA"
+            })),
+            None
+        );
+
+        // Each genuinely-missing mandatory IE → its expected cause.
+        let mut no_psi = matched_sim.clone();
+        no_psi["pduSessionId"] = serde_json::json!(0); // out of 1..=15
+        assert_eq!(
+            validate_sm_context_create_data(&no_psi),
+            Some("MANDATORY_IE_INCORRECT")
+        );
+
+        let mut no_dnn = matched_sim.clone();
+        no_dnn["dnn"] = serde_json::Value::Null;
+        assert_eq!(
+            validate_sm_context_create_data(&no_dnn),
+            Some("MANDATORY_IE_MISSING")
+        );
+
+        let mut no_sst = matched_sim.clone();
+        no_sst["sNssai"] = serde_json::json!({});
+        assert_eq!(
+            validate_sm_context_create_data(&no_sst),
+            Some("MANDATORY_IE_MISSING")
+        );
+
+        let mut no_n1 = matched_sim.clone();
+        no_n1["n1SmMsg"] = serde_json::Value::Null;
+        assert_eq!(validate_sm_context_create_data(&no_n1), Some("N1_SM_ERROR"));
+    }
+
+    // ----------------------------- smfd-07 ------------------------------
+
+    /// The SmContextStatusNotification body carries `statusInfo.resourceStatus`
+    /// and an optional `cause` (TS 29.502 §6.1.6.2.8).
+    #[test]
+    fn sm_context_status_notification_body() {
+        let released = build_sm_context_status_notification("RELEASED", None);
+        assert_eq!(released["statusInfo"]["resourceStatus"], "RELEASED");
+        assert!(released["statusInfo"]["cause"].is_null());
+
+        let with_cause = build_sm_context_status_notification("RELEASED", Some("REL_DUE_TO_HO"));
+        assert_eq!(with_cause["statusInfo"]["resourceStatus"], "RELEASED");
+        assert_eq!(with_cause["statusInfo"]["cause"], "REL_DUE_TO_HO");
+    }
+
+    /// A missing smContextStatusUri is a silent no-op (notifications disabled).
+    #[tokio::test]
+    async fn sm_context_status_notification_absent_uri_is_noop() {
+        // Must return without panicking / without attempting a request.
+        send_sm_context_status_notification(None, "RELEASED", None).await;
+    }
+
+    /// The path portion is extracted from an absolute AMF callback URI.
+    #[test]
+    fn uri_path_extraction() {
+        assert_eq!(
+            uri_path("http://amf.example:7777/namf-comm/v1/ue-contexts/imsi-1/sm-context-status/7"),
+            "/namf-comm/v1/ue-contexts/imsi-1/sm-context-status/7"
+        );
+        assert_eq!(uri_path("/already/a/path"), "/already/a/path");
+        assert_eq!(uri_path("https://amf:443"), "/");
+    }
+}
+
+#[cfg(test)]
+mod oauth2_h8_tests {
+    //! Wave-6 H8 (Phase B) strict-peer OAuth2 enforcement triplet: the real
+    //! `smf_sbi_request_handler` is mounted behind nextgcore-sbi's server-side
+    //! OAuth2 verification (TS 33.501 §13.4.1). A missing or wrong-audience
+    //! Bearer is rejected (401) before the handler runs; a valid NRF-audience
+    //! token (aud=SMF, ES256-signed against the served JWKS) passes through.
+    use super::*;
+    use nextgcore_sbi::client::SbiClient;
+    use nextgcore_sbi::server::SbiServerConfig;
+    use nextgcore_sbi::types::NfType;
+    use std::time::Duration;
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Mint an ES256 access token in the NRF's shape, signed by `sk`.
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature};
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
+        let claims = serde_json::json!({
+            "iss": "NRF", "sub": "smf-1", "aud": aud,
+            "scope": scope, "exp": exp, "iat": 0
+        })
+        .to_string();
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("{h}.{p}.{s}")
+    }
+
+    /// Public JWKS for the signing key `sk` under `kid`.
+    fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let point = sk.verifying_key().to_encoded_point(false);
+        serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":kid,
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }]})
+    }
+
+    async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
+        smf_context_init(64, 256, 512);
+        let port = free_port();
+        let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(jwks);
+        cfg = cfg.with_expected_audience_nf_type(NfType::Smf);
+        let server = SbiServer::new(cfg);
+        server
+            .start(smf_sbi_request_handler)
+            .await
+            .expect("server start");
+        (server, port)
+    }
+
+    #[test]
+    fn test_oauth2_require_knob_parses_and_defaults_off() {
+        let dir = std::env::temp_dir();
+        let off = dir.join(format!("smf-h8-off-{}.yaml", std::process::id()));
+        std::fs::write(
+            &off,
+            "smf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n",
+        )
+        .unwrap();
+        assert!(
+            !oauth2_required(off.to_str().unwrap()),
+            "absent oauth2 block must default off"
+        );
+        let on = dir.join(format!("smf-h8-on-{}.yaml", std::process::id()));
+        std::fs::write(&on, "smf:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();
+        assert!(
+            oauth2_required(on.to_str().unwrap()),
+            "sbi.oauth2.require: true must parse on"
+        );
+        let _ = std::fs::remove_file(off);
+        let _ = std::fs::remove_file(on);
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_missing_token_rejected_401() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get("/nsmf-pdusession/v1/sm-contexts"),
+        )
+        .await
+        .expect("bounded")
+        .expect("response");
+        assert_eq!(resp.status, 401, "unauthenticated request must be 401");
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_wrong_audience_rejected_401() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let token = build_es256_token(&sk, "nrf-es256", "UDM", "nsmf-pdusession");
+        let req = SbiRequest::get("/nsmf-pdusession/v1/sm-contexts")
+            .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_valid_token_reaches_handler() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let token = build_es256_token(&sk, "nrf-es256", "SMF", "nsmf-pdusession");
+        let req = SbiRequest::get("/nsmf-pdusession/v1/sm-contexts/does-not-exist")
+            .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_ne!(resp.status, 401, "valid token must not be 401");
+        assert_ne!(resp.status, 403, "valid token must not be 403");
+        server.stop().await.expect("stop");
     }
 }

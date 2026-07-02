@@ -2,7 +2,7 @@
 //!
 //! Provides utilities for spinning up MongoDB containers for integration tests
 //! using testcontainers. Uses synchronous MongoDB API to be compatible with
-//! ogs-dbi's sync feature.
+//! nextgcore-dbi's sync feature.
 
 use anyhow::Result;
 use mongodb::{

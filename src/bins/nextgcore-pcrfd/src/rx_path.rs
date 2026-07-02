@@ -11,13 +11,13 @@
 
 use bytes::Bytes;
 
-use ogs_diameter::avp::{find_all_avps, find_avp, Avp, AvpData};
-use ogs_diameter::common::avp_code;
-use ogs_diameter::message::DiameterMessage;
-use ogs_diameter::rx::{avp as rx_avp, cmd as rx_cmd, RX_APPLICATION_ID};
-use ogs_diameter::OGS_3GPP_VENDOR_ID;
+use nextgcore_diameter::avp::{find_all_avps, find_avp, Avp, AvpData};
+use nextgcore_diameter::common::avp_code;
+use nextgcore_diameter::message::DiameterMessage;
+use nextgcore_diameter::rx::{avp as rx_avp, cmd as rx_cmd, RX_APPLICATION_ID};
+use nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID;
 
-use crate::context::{pcrf_self, PccRule, OGS_IPV6_LEN};
+use crate::context::{pcrf_self, PccRule, NEXTGCORE_IPV6_LEN};
 use crate::fd_path::{pcrf_diam_stats, LocalIdentity};
 use crate::gx_path::{
     self, base_avp, derive_pcc_rules, result_code as gx_result_code, ImsData, MediaComponent,
@@ -164,7 +164,7 @@ pub struct AarInfo {
     /// Framed-IP-Address of the UE
     pub framed_ipv4: Option<[u8; 4]>,
     /// Framed-IPv6-Prefix of the UE
-    pub framed_ipv6: Option<[u8; OGS_IPV6_LEN]>,
+    pub framed_ipv6: Option<[u8; NEXTGCORE_IPV6_LEN]>,
     /// Media components describing the AF session
     pub media_components: Vec<MediaComponent>,
 }
@@ -216,8 +216,8 @@ pub fn parse_aar(msg: &DiameterMessage) -> Result<AarInfo, RxRequestError> {
             if b.len() < 2 {
                 return None;
             }
-            let mut prefix = [0u8; OGS_IPV6_LEN];
-            let n = (b.len() - 2).min(OGS_IPV6_LEN);
+            let mut prefix = [0u8; NEXTGCORE_IPV6_LEN];
+            let n = (b.len() - 2).min(NEXTGCORE_IPV6_LEN);
             prefix[..n].copy_from_slice(&b[2..2 + n]);
             Some(prefix)
         });
@@ -416,7 +416,10 @@ pub fn build_rx_answer_error(
         answer.add_avp(Avp::mandatory(
             avp_code::EXPERIMENTAL_RESULT,
             AvpData::Grouped(vec![
-                Avp::mandatory(avp_code::VENDOR_ID, AvpData::Unsigned32(OGS_3GPP_VENDOR_ID)),
+                Avp::mandatory(
+                    avp_code::VENDOR_ID,
+                    AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID),
+                ),
                 Avp::mandatory(
                     avp_code::EXPERIMENTAL_RESULT_CODE,
                     AvpData::Unsigned32(exp_code),
@@ -677,7 +680,7 @@ pub fn build_asr(
     ));
     asr.add_avp(Avp::vendor_mandatory(
         rx_avp::ABORT_CAUSE,
-        OGS_3GPP_VENDOR_ID,
+        NEXTGCORE_3GPP_VENDOR_ID,
         AvpData::Enumerated(abort_cause as i32),
     ));
     asr
@@ -762,7 +765,7 @@ mod tests {
     }
 
     fn build_test_aar(session_id: &str, ue_ip: [u8; 4]) -> DiameterMessage {
-        let mut aar = ogs_diameter::rx::create_aar(
+        let mut aar = nextgcore_diameter::rx::create_aar(
             session_id,
             "pcscf.ims.mnc001.mcc001.3gppnetwork.org",
             "ims.mnc001.mcc001.3gppnetwork.org",
@@ -777,23 +780,23 @@ mod tests {
         // One audio media component with two flow descriptions
         let msc = Avp::vendor_mandatory(
             rx_avp::MEDIA_SUB_COMPONENT,
-            OGS_3GPP_VENDOR_ID,
+            NEXTGCORE_3GPP_VENDOR_ID,
             AvpData::Grouped(vec![
                 Avp::vendor_mandatory(
                     rx_avp::FLOW_NUMBER,
-                    OGS_3GPP_VENDOR_ID,
+                    NEXTGCORE_3GPP_VENDOR_ID,
                     AvpData::Unsigned32(1),
                 ),
                 Avp::vendor_mandatory(
                     rx_avp::FLOW_DESCRIPTION,
-                    OGS_3GPP_VENDOR_ID,
+                    NEXTGCORE_3GPP_VENDOR_ID,
                     AvpData::OctetString(Bytes::from_static(
                         b"permit out 17 from 10.0.0.1 5004 to 10.45.0.2 6000",
                     )),
                 ),
                 Avp::vendor_mandatory(
                     rx_avp::FLOW_DESCRIPTION,
-                    OGS_3GPP_VENDOR_ID,
+                    NEXTGCORE_3GPP_VENDOR_ID,
                     AvpData::OctetString(Bytes::from_static(
                         b"permit in 17 from 10.45.0.2 6000 to 10.0.0.1 5004",
                     )),
@@ -802,26 +805,26 @@ mod tests {
         );
         let mcd = Avp::vendor_mandatory(
             rx_avp::MEDIA_COMPONENT_DESCRIPTION,
-            OGS_3GPP_VENDOR_ID,
+            NEXTGCORE_3GPP_VENDOR_ID,
             AvpData::Grouped(vec![
                 Avp::vendor_mandatory(
                     rx_avp::MEDIA_COMPONENT_NUMBER,
-                    OGS_3GPP_VENDOR_ID,
+                    NEXTGCORE_3GPP_VENDOR_ID,
                     AvpData::Unsigned32(1),
                 ),
                 Avp::vendor_mandatory(
                     rx_avp::MEDIA_TYPE,
-                    OGS_3GPP_VENDOR_ID,
+                    NEXTGCORE_3GPP_VENDOR_ID,
                     AvpData::Enumerated(media_type::AUDIO),
                 ),
                 Avp::vendor_mandatory(
                     rx_avp::MAX_REQUESTED_BANDWIDTH_DL,
-                    OGS_3GPP_VENDOR_ID,
+                    NEXTGCORE_3GPP_VENDOR_ID,
                     AvpData::Unsigned32(64000),
                 ),
                 Avp::vendor_mandatory(
                     rx_avp::MAX_REQUESTED_BANDWIDTH_UL,
-                    OGS_3GPP_VENDOR_ID,
+                    NEXTGCORE_3GPP_VENDOR_ID,
                     AvpData::Unsigned32(64000),
                 ),
                 msc,
@@ -832,7 +835,7 @@ mod tests {
     }
 
     fn build_test_str(session_id: &str) -> DiameterMessage {
-        let mut str_msg = ogs_diameter::rx::create_str(
+        let mut str_msg = nextgcore_diameter::rx::create_str(
             session_id,
             "pcscf.ims.mnc001.mcc001.3gppnetwork.org",
             "ims.mnc001.mcc001.3gppnetwork.org",
@@ -981,7 +984,7 @@ mod tests {
             Some("pcscf.ims.mnc001.mcc001.3gppnetwork.org")
         );
         let abort_cause = asr
-            .find_vendor_avp(rx_avp::ABORT_CAUSE, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(rx_avp::ABORT_CAUSE, NEXTGCORE_3GPP_VENDOR_ID)
             .expect("Abort-Cause");
         assert_eq!(
             abort_cause.as_i32(),

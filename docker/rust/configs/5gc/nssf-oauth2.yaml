@@ -1,0 +1,42 @@
+# NSSF (Network Slice Selection Function) Configuration — OAuth2 variant
+# Same as nssf.yaml but with SBI OAuth2 bearer-token enforcement enabled.
+# Used via docker-compose.oauth2.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.oauth2.yml up -d
+#
+# With nssf.sbi.oauth2.require true, every incoming SBI request must carry a
+# Bearer token issued by the NRF (POST /nnrf-oauth2/v1/access-token) whose
+# audience includes "NSSF"; the NSSF verifies it against the NRF's JWKS
+# (GET /nnrf-oauth2/v1/jwks). Outbound SBI calls also acquire and attach a
+# token automatically. The default nssf.yaml leaves enforcement off so the
+# dev/E2E data-plane path keeps working.
+
+logger:
+  file:
+    path: /var/log/nextgcore/nssf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+nssf:
+  sbi:
+    server:
+      - address: 172.23.0.14
+        port: 7777
+    oauth2:
+      require: true
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
+      nsi:
+        - uri: http://172.23.0.10:7777
+          s_nssai:
+            sst: 1
+    tls:
+      enabled: false
+      cert: /etc/nextgcore/certs/nssf.crt
+      key: /etc/nextgcore/certs/nssf.key
+      ca: /etc/nextgcore/certs/ca.crt
+      min_version: "1.2"

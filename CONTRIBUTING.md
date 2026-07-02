@@ -1,6 +1,6 @@
 # Contributing to NextGCore
 
-NextGCore is a 5G Core Network implementation in Rust targeting 3GPP Rel-15 through Rel-20 (6G research).
+NextGCore is a research-faithful 5G Core Network implementation in Rust targeting 3GPP Rel-15 with selected Rel-17/18 features. 6G/Rel-20 items (ISAC, FL, PQC, semantic, agent-native) are non-normative prototypes — no frozen Rel-20 3GPP specs exist.
 
 ## Prerequisites
 
@@ -96,10 +96,10 @@ nextgcore/
 │   │   ├── nextgcore-upfd/  # UPF
 │   │   └── ...              # (all 22 NFs)
 │   ├── libs/                # Shared libraries
-│   │   ├── ogs-core/        # Core types
-│   │   ├── ogs-sbi/         # HTTP/2 SBI client + server
-│   │   ├── ogs-crypt/       # 5G cryptography (SUCI, AKA, PQC)
-│   │   ├── ogs-metrics/     # Prometheus + OpenTelemetry
+│   │   ├── nextgcore-core/        # Core types
+│   │   ├── nextgcore-sbi/         # HTTP/2 SBI client + server
+│   │   ├── nextgcore-crypt/       # 5G cryptography (SUCI, AKA, PQC)
+│   │   ├── nextgcore-metrics/     # Prometheus + OpenTelemetry
 │   │   └── ...
 │   └── tests/               # Integration tests
 ├── k8s/                     # Kubernetes manifests + Helm
@@ -141,7 +141,7 @@ test(upf): add SDF filter 5-tuple matching unit tests
 ## NF Implementation Standards
 
 Each NF binary must:
-- Register with NRF on startup (via `ogs-sbi` NF management)
+- Register with NRF on startup (via `nextgcore-sbi` NF management)
 - Expose `/metrics` (Prometheus, port 9090)
 - Respond to SIGTERM with graceful shutdown
 - Log at `info` level by default, configurable via `RUST_LOG`

@@ -4,10 +4,10 @@
 
 use crate::context::PcfApp;
 
-/// FSM signal types (from ogs-core)
-pub const OGS_FSM_ENTRY_SIG: i32 = 0;
-pub const OGS_FSM_EXIT_SIG: i32 = 1;
-pub const OGS_FSM_USER_SIG: i32 = 2;
+/// FSM signal types (from nextgcore-core)
+pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
+pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
+pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
 
 /// Event types for PCF
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,18 +27,18 @@ pub enum PcfEventId {
 impl PcfEventId {
     pub fn name(&self) -> &'static str {
         match self {
-            PcfEventId::FsmEntry => "OGS_FSM_ENTRY_SIG",
-            PcfEventId::FsmExit => "OGS_FSM_EXIT_SIG",
-            PcfEventId::SbiServer => "OGS_EVENT_SBI_SERVER",
-            PcfEventId::SbiClient => "OGS_EVENT_SBI_CLIENT",
-            PcfEventId::SbiTimer => "OGS_EVENT_SBI_TIMER",
+            PcfEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            PcfEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
+            PcfEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
+            PcfEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
+            PcfEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
         }
     }
 
     pub fn from_signal(signal: i32) -> Self {
         match signal {
-            OGS_FSM_ENTRY_SIG => PcfEventId::FsmEntry,
-            OGS_FSM_EXIT_SIG => PcfEventId::FsmExit,
+            NEXTGCORE_FSM_ENTRY_SIG => PcfEventId::FsmEntry,
+            NEXTGCORE_FSM_EXIT_SIG => PcfEventId::FsmExit,
             _ => PcfEventId::SbiServer,
         }
     }
@@ -60,14 +60,16 @@ impl PcfTimerId {
     pub fn name(&self) -> &'static str {
         match self {
             PcfTimerId::NfInstanceRegistrationInterval => {
-                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+                "NEXTGCORE_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
             }
-            PcfTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
-            PcfTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
-            PcfTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",
-            PcfTimerId::SubscriptionValidity => "OGS_TIMER_SUBSCRIPTION_VALIDITY",
-            PcfTimerId::SubscriptionPatch => "OGS_TIMER_SUBSCRIPTION_PATCH",
-            PcfTimerId::SbiClientWait => "OGS_TIMER_SBI_CLIENT_WAIT",
+            PcfTimerId::NfInstanceHeartbeatInterval => {
+                "NEXTGCORE_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL"
+            }
+            PcfTimerId::NfInstanceNoHeartbeat => "NEXTGCORE_TIMER_NF_INSTANCE_NO_HEARTBEAT",
+            PcfTimerId::NfInstanceValidity => "NEXTGCORE_TIMER_NF_INSTANCE_VALIDITY",
+            PcfTimerId::SubscriptionValidity => "NEXTGCORE_TIMER_SUBSCRIPTION_VALIDITY",
+            PcfTimerId::SubscriptionPatch => "NEXTGCORE_TIMER_SUBSCRIPTION_PATCH",
+            PcfTimerId::SbiClientWait => "NEXTGCORE_TIMER_SBI_CLIENT_WAIT",
         }
     }
 }
@@ -310,7 +312,7 @@ mod tests {
     #[test]
     fn test_event_name() {
         let event = PcfEvent::new(PcfEventId::SbiServer);
-        assert_eq!(event.name(), "OGS_EVENT_SBI_SERVER");
+        assert_eq!(event.name(), "NEXTGCORE_EVENT_SBI_SERVER");
     }
 
     #[test]

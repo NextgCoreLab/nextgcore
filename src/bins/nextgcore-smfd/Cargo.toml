@@ -11,15 +11,15 @@ name = "nextgcore-smfd"
 path = "src/main.rs"
 
 [dependencies]
-ogs-core = { workspace = true }
-ogs-nas = { workspace = true }
-ogs-ngap = { workspace = true }
-ogs-pfcp = { workspace = true }
-ogs-gtp = { workspace = true }
-ogs-sbi = { workspace = true }
-ogs-metrics = { workspace = true }
-ogs-diameter = { workspace = true }
-ogs-app = { workspace = true }
+nextgcore-core = { workspace = true }
+nextgcore-nas = { workspace = true }
+nextgcore-ngap = { workspace = true }
+nextgcore-pfcp = { workspace = true }
+nextgcore-gtp = { workspace = true }
+nextgcore-sbi = { workspace = true }
+nextgcore-metrics = { workspace = true }
+nextgcore-diameter = { workspace = true }
+nextgcore-app = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
@@ -34,6 +34,7 @@ base64.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
 
 [lints]
 workspace = true

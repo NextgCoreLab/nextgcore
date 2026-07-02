@@ -303,20 +303,47 @@ pub fn forward_n32f_request(
 /// Copies the data out of the context locks (no guard is held afterwards).
 pub fn build_prins_context(node_id: u64) -> Option<crate::prins::PrinsContext> {
     let ctx = sepp_self();
-    let (security, local_fqdn) = {
+    let (security, local_fqdn, local_plmns, peer_plmns) = {
         let context = ctx.read().ok()?;
         let node = context.node_find(node_id)?;
         let security = node.n32f_security.clone()?;
         let local_fqdn = context.sender.clone().unwrap_or_default();
-        (security, local_fqdn)
+        let local_plmns = context.serving_plmn_ids.clone();
+        let peer_plmns = node.plmn_ids.clone();
+        (security, local_fqdn, local_plmns, peer_plmns)
     };
-    Some(crate::prins::PrinsContext::new(
+    let enc_profiles = security.enc_profiles;
+    // sepp-12: the negotiated JWE enc profile (A128GCM/A256GCM) selects the
+    // session-key length used for the JWE.
+    let jwe_enc = crate::jose::JweEnc::from_name(&security.jwe_cipher_suite)
+        .unwrap_or(crate::jose::JweEnc::A256Gcm);
+    let mut prins_ctx = crate::prins::PrinsContext::new(
         security.local_context_id,
         security.peer_context_id,
-        security.session_key,
+        security.key_material,
+        security.role,
         security.kid,
         local_fqdn,
-    ))
+    );
+    prins_ctx.jwe_enc = jwe_enc;
+    // sepp-09: stamp our serving PLMN-IDs on messages we originate, and verify
+    // received messages against the peer's PLMN-IDs bound to this N32-f context.
+    prins_ctx.local_plmn_ids = local_plmns;
+    prins_ctx.peer_plmn_ids = peer_plmns;
+    // Drive the encryption profile set from the NEGOTIATED data-type policy
+    // (TS 29.573 §6.1.5.2); the constructor's default profiles are only the
+    // local capability advertisement. An empty set (no policy negotiated)
+    // keeps the defaults for backward compatibility.
+    if !enc_profiles.is_empty() {
+        prins_ctx.profiles = enc_profiles;
+    }
+    // Install our asymmetric signing identity (for the first modificationsBlock
+    // entry) and the registered peer/IPX verifying keys (TS 33.501 §13.2.4.6).
+    if let Some(key) = crate::prins::local_signing_key() {
+        prins_ctx.local_signing_key = Some(key);
+    }
+    prins_ctx.peer_verifying_keys = crate::prins::all_verifying_keys();
+    Some(prins_ctx)
 }
 
 /// Async N32f forwarding - sends the request via HTTP/2 to the peer SEPP.
@@ -348,10 +375,10 @@ pub async fn forward_n32f_request_async(
     let scheme = if tls_enabled { "https" } else { "http" };
     let forward_uri = format!("{scheme}://{host}:{port}/n32f-forward/v1/n32f-process");
 
-    let sbi_config = ogs_sbi::client::SbiClientConfig::new(&host, port);
-    let sbi_client = ogs_sbi::client::SbiClient::new(sbi_config);
+    let sbi_config = nextgcore_sbi::client::SbiClientConfig::new(&host, port);
+    let sbi_client = nextgcore_sbi::client::SbiClient::new(sbi_config);
 
-    let mut sbi_request = ogs_sbi::message::SbiRequest::post(&forward_uri);
+    let mut sbi_request = nextgcore_sbi::message::SbiRequest::post(&forward_uri);
 
     // Set N32f headers
     for (key, value) in &forward_result.headers {
@@ -376,6 +403,35 @@ pub async fn forward_n32f_request_async(
                 "N32f response from {host}:{port}: status={}",
                 response.status
             );
+            // TS 29.573 §6.2.4.2: in PRINS the peer SEPP returns a protected
+            // N32fReformattedRspMsg; unprotect it to recover the target NF's
+            // real HTTP response before relaying to the consumer NF.
+            if security_scheme == SecurityCapability::Prins && response.status == 200 {
+                if let Some(body_str) = response.http.content.as_deref() {
+                    if let Ok(reformatted) =
+                        serde_json::from_str::<crate::prins::N32fReformattedMessage>(body_str)
+                    {
+                        let Some(prins_ctx) = build_prins_context(node_id) else {
+                            return Err("No N32-f security context to unprotect response".into());
+                        };
+                        return match crate::prins::unprotect_response_message(
+                            &prins_ctx,
+                            &reformatted,
+                        ) {
+                            Ok(rec) => Ok(N32fForwardResult {
+                                status: rec.status_code,
+                                headers: rec.headers,
+                                body: rec.body,
+                            }),
+                            Err(e) => {
+                                log::error!("N32f response unprotect failed: {e}");
+                                Err(format!("N32f response unprotect failed: {e}"))
+                            }
+                        };
+                    }
+                }
+            }
+            // TLS mode (or an unexpected non-PRINS body): pass through.
             Ok(N32fForwardResult {
                 status: response.status,
                 headers: forward_result.headers,
@@ -641,8 +697,28 @@ fn remove_assoc(assoc_id: u64) {
     });
 }
 
+/// Select the peer SEPP that serves the VPLMN named by `target_apiroot`.
+/// Used by the consumer-facing SBI server's forwarding pipeline (C8):
+/// VPLMN detect -> peer SEPP select. Returns an error string suitable for an
+/// SBI problem-details `detail` if the target is not a VPLMN or no peer SEPP
+/// serves it.
+pub fn select_peer_for_target(target_apiroot: &str) -> Result<crate::context::SeppNode, String> {
+    if !is_fqdn_in_vplmn(target_apiroot) {
+        return Err(format!(
+            "target-apiRoot [{target_apiroot}] is not in a visited PLMN"
+        ));
+    }
+    let (mcc, mnc) = extract_plmn_from_fqdn(target_apiroot);
+    let ctx = sepp_self();
+    let node = ctx
+        .read()
+        .ok()
+        .and_then(|context| context.node_find_by_plmn_id(mcc, mnc));
+    node.ok_or_else(|| format!("No peer SEPP for VPLMN {mcc}:{mnc} ([{target_apiroot}])"))
+}
+
 /// Check if FQDN is in VPLMN (visited PLMN)
-/// Port of ogs_sbi_fqdn_in_vplmn
+/// Port of nextgcore_sbi_fqdn_in_vplmn
 fn is_fqdn_in_vplmn(fqdn: &str) -> bool {
     // Check if the FQDN contains a different PLMN ID than our serving PLMNs
     // Format: xxx.5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org
@@ -664,7 +740,7 @@ fn is_fqdn_in_vplmn(fqdn: &str) -> bool {
 }
 
 /// Extract PLMN ID from FQDN
-/// Port of ogs_plmn_id_mcc_from_fqdn / ogs_plmn_id_mnc_from_fqdn
+/// Port of nextgcore_plmn_id_mcc_from_fqdn / nextgcore_plmn_id_mnc_from_fqdn
 fn extract_plmn_from_fqdn(fqdn: &str) -> (u16, u16) {
     // Format: xxx.5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org
     let mut mcc: u16 = 0;

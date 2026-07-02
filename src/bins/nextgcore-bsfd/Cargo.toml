@@ -10,12 +10,19 @@ description = "NextGCore BSF (Binding Support Function)"
 name = "nextgcore-bsfd"
 path = "src/main.rs"
 
+# Wave-6 H1 (strict-peer harness foundation): the NF is also a library so
+# peer NF crates can drive the real `bsf_sbi_request_handler` in-process
+# from integration tests instead of hand-rolled lenient mocks.
+[lib]
+name = "nextgcore_bsfd"
+path = "src/lib.rs"
+
 [dependencies]
-ogs-core = { workspace = true }
-ogs-sbi = { workspace = true }
-ogs-metrics = { workspace = true }
-ogs-dbi = { workspace = true }
-ogs-app = { workspace = true }
+nextgcore-core = { workspace = true }
+nextgcore-sbi = { workspace = true }
+nextgcore-metrics = { workspace = true }
+nextgcore-dbi = { workspace = true }
+nextgcore-app = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
@@ -29,6 +36,9 @@ ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+base64.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

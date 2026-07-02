@@ -1,0 +1,19 @@
+[package]
+name = "nextgcore-nas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore NAS Protocol Library"
+
+[dependencies]
+nextgcore-core = { workspace = true }
+nextgcore-crypt = { workspace = true }
+thiserror.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -21,7 +21,7 @@ ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev cmake g++ protobuf-compiler \
-    libstdc++-12-dev libclang-dev clang \
+    libstdc++-12-dev libclang-dev clang libsctp-dev \
     && rm -rf /var/lib/apt/lists/* \
     && rustup component add rustfmt
 
@@ -85,13 +85,32 @@ RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
         fi; \
     done
 
-# Build nextgsim gNB and UE
+# Rebuild amfd WITH the native kernel-SCTP NGAP backend (production
+# remediation T0.2b) so `--sctp-backend kernel` is available at runtime; this
+# overwrites the default (userspace-only) amfd binary in /out. The binary still
+# defaults to the userspace backend, so existing userspace deployments are
+# unaffected — it is merely now *capable* of native kernel SCTP (needs libsctp1
+# at runtime, added to the core image).
+RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
+    if [ "$(uname -m)" != "$(echo $CARGO_TARGET | cut -d- -f1)" ]; then \
+        cargo build --release --target "$CARGO_TARGET" -p nextgcore-amfd --features kernel-sctp 2>&1 && \
+        cp "target/$CARGO_TARGET/release/nextgcore-amfd" /out/nextgcore-amfd; \
+    else \
+        cargo build --release -p nextgcore-amfd --features kernel-sctp 2>&1 && \
+        cp target/release/nextgcore-amfd /out/nextgcore-amfd; \
+    fi
+
+# Build nextgsim gNB and UE. The gNB is built WITH `--features kernel-sctp`
+# (scoped to -p nextgsim-gnb, since the feature is defined on that package) so
+# it too can associate over native kernel SCTP; nr-ue needs no kernel feature.
 WORKDIR /build/nextgsim
 RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
     if [ "$(uname -m)" != "$(echo $CARGO_TARGET | cut -d- -f1)" ]; then \
-        cargo build --release --target "$CARGO_TARGET" --bin nr-gnb --bin nr-ue 2>&1 || true; \
+        cargo build --release --target "$CARGO_TARGET" -p nextgsim-gnb --features kernel-sctp --bin nr-gnb 2>&1 || true; \
+        cargo build --release --target "$CARGO_TARGET" --bin nr-ue 2>&1 || true; \
     else \
-        cargo build --release --bin nr-gnb --bin nr-ue 2>&1 || true; \
+        cargo build --release -p nextgsim-gnb --features kernel-sctp --bin nr-gnb 2>&1 || true; \
+        cargo build --release --bin nr-ue 2>&1 || true; \
     fi && \
     cp target/*/release/nr-gnb /out/ 2>/dev/null || true && \
     cp target/*/release/nr-ue /out/ 2>/dev/null || true && \

@@ -10,16 +10,30 @@ description = "NextGCore AMF (Access and Mobility Management Function)"
 name = "nextgcore-amfd"
 path = "src/main.rs"
 
+# Wave-6 H1 (strict-peer harness foundation): the AMF is also a library so peer
+# NF crates can drive the real `namf_request_handler` in-process from
+# integration tests instead of hand-rolled lenient mocks.
+[lib]
+name = "nextgcore_amfd"
+path = "src/lib.rs"
+
+[features]
+# Native Linux kernel-SCTP NGAP backend (production remediation T0.2b).
+# Enables `--sctp-backend kernel` so an independent RAN can connect over
+# standard SCTP. Requires Linux + libsctp at link/run time; off by default so
+# the host build keeps using the pure-Rust sctp-proto backend.
+kernel-sctp = ["nextgcore-sctp/kernel"]
+
 [dependencies]
-ogs-asn1c = { workspace = true }
-ogs-core = { workspace = true }
-ogs-crypt = { workspace = true }
-ogs-nas = { workspace = true }
-ogs-ngap = { workspace = true }
-ogs-sbi = { workspace = true }
-ogs-sctp = { workspace = true }
-ogs-app = { workspace = true }
-ogs-metrics = { workspace = true }
+nextgcore-asn1c = { workspace = true }
+nextgcore-core = { workspace = true }
+nextgcore-crypt = { workspace = true }
+nextgcore-nas = { workspace = true }
+nextgcore-ngap = { workspace = true }
+nextgcore-sbi = { workspace = true }
+nextgcore-sctp = { workspace = true }
+nextgcore-app = { workspace = true }
+nextgcore-metrics = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
@@ -38,6 +52,8 @@ hex.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+base64.workspace = true
 
 [lints]
 workspace = true
