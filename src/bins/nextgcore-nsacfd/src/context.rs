@@ -508,13 +508,20 @@ impl NsacfContext {
 
     fn quota_id_for(&self, s_nssai: &SNssai) -> Option<u64> {
         // Copy the id and drop the hash guard before any other lock is taken
-        let id = self
-            .snssai_hash
-            .read()
-            .ok()?
-            .get(&(s_nssai.sst, s_nssai.sd))
-            .copied();
-        id
+        let hash = self.snssai_hash.read().ok()?;
+        // An SD-specific quota takes precedence.
+        if let Some(id) = hash.get(&(s_nssai.sst, s_nssai.sd)).copied() {
+            return Some(id);
+        }
+        // Fall back to an SST-wide quota (provisioned with no SD): a per-SST
+        // quota caps all SDs of that SST when no SD-specific quota exists. This
+        // also absorbs the "no SD" vs SD=0x000000 S-NSSAI representation some
+        // NAS encoders emit (TS 23.003 §28.4 — SD is optional). A genuinely
+        // unconfigured SST still returns None and is rejected as before.
+        if s_nssai.sd.is_some() {
+            return hash.get(&(s_nssai.sst, None)).copied();
+        }
+        None
     }
 
     pub fn quota_find_by_snssai(&self, s_nssai: &SNssai) -> Option<SliceQuota> {
@@ -1147,6 +1154,29 @@ mod tests {
         assert_eq!(
             ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp).0,
             AdmissionResult::Admitted
+        );
+    }
+
+    #[test]
+    fn test_admit_pdu_sst_wide_quota_matches_sd_specific_request() {
+        // A quota provisioned SST-only (no SD) must cover a PDU-session request
+        // for that SST carrying SD=0x000000 (the "no SD" value some NAS encoders
+        // emit). Regression for the E2E data-plane break where an SST:1 quota
+        // failed to match an SST:1/SD:000000 admission and wrongly returned 403.
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+        ctx.quota_add(SNssai::new(1, None), 100, 500);
+
+        // Request carries SD=0 → falls back to the SST-wide quota → admitted.
+        let with_sd = SNssai::new(1, Some(0));
+        assert_eq!(
+            ctx.admit_pdu_session(&with_sd, "imsi-1:1", AccessType::ThreeGpp),
+            AdmissionResult::Admitted
+        );
+        // A genuinely unconfigured SST is still rejected (not-subject semantic).
+        assert_eq!(
+            ctx.admit_pdu_session(&SNssai::new(99, Some(0)), "imsi-1:2", AccessType::ThreeGpp),
+            AdmissionResult::RejectedSliceNotAvailable
         );
     }
 

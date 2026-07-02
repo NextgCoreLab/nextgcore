@@ -63,10 +63,25 @@ struct NrfYaml {
     uri: Option<String>,
 }
 
+/// One provisioned slice quota (`nsacf.slice_quotas[]`). Local NSAC
+/// provisioning per TS 29.536 §6.1.3.4 (SliceACConfigData): only the
+/// attributes present are subject to admission control — an absent
+/// `max_ues`/`max_pdu_sessions` means that count is NOT capped for the slice
+/// (u64::MAX), it does NOT mean a zero quota.
+#[derive(Debug, Deserialize)]
+struct SliceQuotaYaml {
+    sst: u8,
+    /// SD as the 6-hex-digit string form of TS 23.003 §28.4.2 (e.g. "000000").
+    sd: Option<String>,
+    max_ues: Option<u64>,
+    max_pdu_sessions: Option<u64>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct NsacfSection {
     sbi: Option<SbiYaml>,
     nrf: Option<NrfYaml>,
+    slice_quotas: Option<Vec<SliceQuotaYaml>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -236,6 +251,38 @@ async fn main() -> Result<()> {
     if let Ok(content) = std::fs::read_to_string(&args.config) {
         if let Ok(yaml) = serde_yaml::from_str::<NsacfYaml>(&content) {
             if let Some(nsacf) = yaml.nsacf {
+                // Provision the locally-configured slice quotas (TS 29.536
+                // §6.1.3.4 local NSAC config). Without this, the NSACF starts
+                // with an EMPTY quota table and every admission request is
+                // rejected SLICE_NOT_AVAILABLE — which breaks the entire PDU
+                // establishment chain of any slice the operator intended to
+                // admit. An absent max_ues/max_pdu_sessions means that count
+                // is not subject to NSAC for the slice (uncapped), per the
+                // "only provisioned attributes are controlled" semantic.
+                for q in nsacf.slice_quotas.as_deref().unwrap_or(&[]) {
+                    let sd =
+                        q.sd.as_deref()
+                            .and_then(|s| u32::from_str_radix(s, 16).ok());
+                    let s_nssai = SNssai::new(q.sst, sd);
+                    let max_ues = q.max_ues.unwrap_or(u64::MAX);
+                    let max_pdu = q.max_pdu_sessions.unwrap_or(u64::MAX);
+                    let added = with_nsacf_context(|c| {
+                        c.quota_add(s_nssai.clone(), max_ues, max_pdu).is_some()
+                    })
+                    .unwrap_or(false);
+                    if added {
+                        log::info!(
+                            "Provisioned slice quota from config: S-NSSAI[SST:{} SD:{:?}] max_ues={} max_pdu_sessions={}",
+                            q.sst, q.sd, max_ues, max_pdu
+                        );
+                    } else {
+                        log::error!(
+                            "Failed to provision slice quota from config: S-NSSAI[SST:{} SD:{:?}]",
+                            q.sst,
+                            q.sd
+                        );
+                    }
+                }
                 if let Some(uri) = nsacf.nrf.and_then(|n| n.uri) {
                     nrf_uri_cfg = Some(uri);
                 }
@@ -1846,6 +1893,27 @@ mod tests {
             nsacf.nrf.and_then(|n| n.uri).as_deref(),
             Some("http://nrf:7777")
         );
+    }
+
+    #[test]
+    fn test_yaml_slice_quotas_parse() {
+        // Regression: the docker/E2E config provisions quotas via
+        // nsacf.slice_quotas; before this parse existed the NSACF booted with
+        // an empty quota table and 403'd every PDU-session admission.
+        let yaml = "nsacf:\n  slice_quotas:\n    - sst: 1\n      max_ues: 1000\n    - sst: 2\n      sd: \"00007b\"\n      max_ues: 500\n      max_pdu_sessions: 200\n";
+        let parsed: NsacfYaml = serde_yaml::from_str(yaml).unwrap();
+        let quotas = parsed.nsacf.unwrap().slice_quotas.unwrap();
+        assert_eq!(quotas.len(), 2);
+        assert_eq!(quotas[0].sst, 1);
+        assert_eq!(quotas[0].sd, None);
+        assert_eq!(quotas[0].max_ues, Some(1000));
+        assert_eq!(quotas[0].max_pdu_sessions, None); // absent => uncapped, NOT zero
+        assert_eq!(quotas[1].sst, 2);
+        assert_eq!(
+            u32::from_str_radix(quotas[1].sd.as_deref().unwrap(), 16).unwrap(),
+            0x7b
+        );
+        assert_eq!(quotas[1].max_pdu_sessions, Some(200));
     }
 
     #[test]
