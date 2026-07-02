@@ -8,6 +8,28 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
+/// G2-3 (supported-events honesty): the analytics events this NWDAF actually
+/// supports — i.e., has a live data collector and computation path for. This is
+/// the SINGLE SOURCE OF TRUTH; the three wire surfaces all derive from it:
+///
+/// 1. NRF `NFProfile.nwdafInfo.eventIds` advertisement
+///    (TS 29.510 `NwdafInfo`, `main.rs::build_nf_profile`) so consumers
+///    discover only supported analytics;
+/// 2. `Nnwdaf_AnalyticsInfo` GET: an unsupported event returns **204 No
+///    Content** (TS 29.520 §4.3.2.2.2 "requested Analytics data does not
+///    exist"), never a fabricated 200 (`sbi_handler.rs`);
+/// 3. `Nnwdaf_EventsSubscription`: unsupported events are declared failed in
+///    the 201/200 body via `failEventReports[]` with
+///    `NwdafFailureCode` = `UNAVAILABLE_DATA` (`sbi_handler.rs`), and the
+///    notification dispatcher skips them entirely
+///    (`notification_dispatcher.rs::build_event_notifications`).
+///
+/// Adding a new collector later only requires adding its variant here (plus
+/// the actual computation arm in `compute_event_infos`).
+///
+/// Initially only NF_LOAD has a live data path (G2-1: NRF-sourced samples).
+pub const SUPPORTED_EVENTS: &[AnalyticsId] = &[AnalyticsId::NfLoad];
+
 /// Analytics event types defined in TS 29.520 `NwdafEvent` (Rel-16/17/18).
 ///
 /// The wire tokens returned by [`as_str`](Self::as_str) / accepted by
@@ -117,6 +139,12 @@ impl AnalyticsId {
             "PDU_SESSION_TRAFFIC" => Some(Self::PduSessionTraffic),
             _ => None,
         }
+    }
+
+    /// G2-3: whether this event has a live collector/computation in this
+    /// build (membership in [`SUPPORTED_EVENTS`], the single source of truth).
+    pub fn is_supported(&self) -> bool {
+        SUPPORTED_EVENTS.contains(self)
     }
 
     /// The per-event `*Infos` array key used in `AnalyticsData`
@@ -898,6 +926,29 @@ mod tests {
         // The old abbreviated tokens are rejected.
         assert_eq!(AnalyticsId::from_str("UE_COMM"), None);
         assert_eq!(AnalyticsId::from_str("SLICE_LOAD"), None);
+    }
+
+    /// G2-3 honesty: `SUPPORTED_EVENTS` is non-empty, a strict subset of the
+    /// recognised `NwdafEvent` tokens, and `is_supported()` reads it — the
+    /// single source of truth the three wire surfaces derive from.
+    #[test]
+    fn test_honesty_supported_events_single_source_of_truth() {
+        assert!(
+            !SUPPORTED_EVENTS.is_empty(),
+            "at least one supported event (NF_LOAD has a live G2-1 collector)"
+        );
+        for e in SUPPORTED_EVENTS {
+            assert!(
+                AnalyticsId::ALL.contains(e),
+                "every supported event must be a recognised NwdafEvent"
+            );
+            assert!(e.is_supported(), "is_supported must read SUPPORTED_EVENTS");
+        }
+        // Initially exactly NF_LOAD (G2-3): update this alongside a new
+        // collector, never independently.
+        assert_eq!(SUPPORTED_EVENTS, &[AnalyticsId::NfLoad]);
+        // A collector-less event must NOT claim support.
+        assert!(!AnalyticsId::UeMobility.is_supported());
     }
 
     #[test]

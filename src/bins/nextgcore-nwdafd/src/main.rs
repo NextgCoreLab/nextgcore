@@ -266,28 +266,18 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     }
 }
 
-/// Register NWDAF with NRF
-async fn register_with_nrf(
-    sbi_ctx: Arc<SbiContext>,
-    sbi_addr: &str,
-    sbi_port: u16,
-    nf_instance_id: &str,
-) -> Result<(), String> {
-    let nrf_uri = sbi_ctx.get_nrf_uri().await;
-    let nrf_uri = match nrf_uri {
-        Some(uri) => uri,
-        None => {
-            log::debug!("No NRF URI configured, skipping NRF registration");
-            return Ok(());
-        }
-    };
-
-    log::info!("Registering NWDAF with NRF at {nrf_uri}");
-
-    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
-
-    let nf_profile = serde_json::json!({
+/// Build the TS 29.510 `NFProfile` this NWDAF registers at the NRF.
+///
+/// G2-3 (supported-events honesty): the profile advertises the analytics
+/// events this NWDAF actually supports via `nwdafInfo.eventIds`
+/// (TS 29.510 `NwdafInfo`, TS29510_Nnrf_NFManagement.yaml `NwdafInfo.eventIds`
+/// → TS 29.520 `EventId`), derived from the single source of truth
+/// [`SUPPORTED_EVENTS`] so consumers discover only analytics with a live
+/// collector. Additive JSON: the NRF ignores unknown NFProfile members, so
+/// registration behavior is otherwise unchanged.
+fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+    let event_ids: Vec<&'static str> = SUPPORTED_EVENTS.iter().map(|e| e.as_str()).collect();
+    serde_json::json!({
         "nfInstanceId": nf_instance_id,
         "nfType": "NWDAF",
         "nfStatus": "REGISTERED",
@@ -318,9 +308,34 @@ async fn register_with_nrf(
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
             }
         ],
+        "nwdafInfo": { "eventIds": event_ids },
         "allowedNfTypes": ["AMF", "SMF", "PCF", "NEF", "SCP"],
         "heartBeatTimer": 10
-    });
+    })
+}
+
+/// Register NWDAF with NRF
+async fn register_with_nrf(
+    sbi_ctx: Arc<SbiContext>,
+    sbi_addr: &str,
+    sbi_port: u16,
+    nf_instance_id: &str,
+) -> Result<(), String> {
+    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => {
+            log::debug!("No NRF URI configured, skipping NRF registration");
+            return Ok(());
+        }
+    };
+
+    log::info!("Registering NWDAF with NRF at {nrf_uri}");
+
+    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+
+    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -410,6 +425,51 @@ mod tests {
         );
     }
 
+    // --- G2-3: NF profile advertises supported events (contract test) ---
+
+    /// G2-3 honesty contract: the registered NFProfile carries
+    /// `nwdafInfo.eventIds` (TS 29.510 `NwdafInfo`), the array equals
+    /// `SUPPORTED_EVENTS` exactly (same tokens, same order), and every token is
+    /// a recognised TS 29.520 `NwdafEvent`/`EventId` value ("NF_LOAD" is valid
+    /// in both enums). Field names pinned against
+    /// TS29510_Nnrf_NFManagement.yaml `NwdafInfo` (eventIds → EventId).
+    #[test]
+    fn test_honesty_profile_advertises_supported_event_ids() {
+        let profile = build_nf_profile("nwdaf-contract-test", "127.0.0.1", 7815);
+
+        let event_ids = profile
+            .get("nwdafInfo")
+            .and_then(|i| i.get("eventIds"))
+            .and_then(|v| v.as_array())
+            .expect("NFProfile must carry nwdafInfo.eventIds (TS 29.510 NwdafInfo)");
+        assert!(
+            !event_ids.is_empty(),
+            "nwdafInfo.eventIds has minItems 1 in the yaml"
+        );
+
+        let tokens: Vec<&str> = event_ids
+            .iter()
+            .map(|v| v.as_str().expect("eventIds entries are strings"))
+            .collect();
+        let supported: Vec<&str> = SUPPORTED_EVENTS.iter().map(|e| e.as_str()).collect();
+        assert_eq!(
+            tokens, supported,
+            "advertised eventIds must equal SUPPORTED_EVENTS exactly"
+        );
+
+        // ⊆ NwdafEvent tokens: every advertised id round-trips through the
+        // recognised event enum (no bespoke tokens on the wire).
+        for t in &tokens {
+            assert!(
+                AnalyticsId::from_str(t).is_some(),
+                "advertised eventId {t} must be a recognised NwdafEvent token"
+            );
+        }
+
+        // Initially exactly NF_LOAD (the only live collector, G2-1).
+        assert_eq!(tokens, vec!["NF_LOAD"]);
+    }
+
     // --- nwafd-02: Nnwdaf_AnalyticsInfo is GET-only at the routing layer ---
 
     #[tokio::test]
@@ -448,6 +508,39 @@ mod tests {
         assert_eq!(
             resp.status, 200,
             "GET /analytics?event-id=NF_LOAD with data must be 200"
+        );
+    }
+
+    /// G2-3 honesty (acceptance check 1, curl-style through the REAL router):
+    /// GET ?event-id=UE_MOBILITY returns 204 with an empty body — a 200 here
+    /// is the empty-200 dishonesty this item removes. The engine is seeded
+    /// with NF_LOAD data first so the 204 provably comes from the
+    /// supported-events gate, not from a globally-empty engine.
+    #[tokio::test]
+    async fn test_honesty_routing_unsupported_event_get_204() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        {
+            let ctx = nwdaf_self();
+            let guard = ctx.read().unwrap();
+            guard
+                .lock_engine()
+                .ingest_nf_load(crate::analytics::NfLoadSample::now(
+                    "AMF",
+                    "amf-honesty-route",
+                    0.5,
+                    0.0,
+                    0,
+                ));
+        }
+        let req = SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=UE_MOBILITY");
+        let resp = nwdaf_sbi_request_handler(req).await;
+        assert_eq!(
+            resp.status, 204,
+            "GET ?event-id=UE_MOBILITY must be 204 No Content (a 200 fails CI)"
+        );
+        assert!(
+            resp.http.content.as_deref().is_none_or(str::is_empty),
+            "the 204 must carry an empty body"
         );
     }
 

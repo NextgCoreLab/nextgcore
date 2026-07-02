@@ -204,9 +204,10 @@ fn nf_status_json(status: &str) -> Value {
 ///
 /// Shared by `Nnwdaf_AnalyticsInfo` (GET → `AnalyticsData`) and the
 /// `Nnwdaf_EventsSubscription_Notify` dispatcher so both stay wire-aligned on
-/// TS 29.520. Only NF_LOAD has a live analytics path today (linear regression);
-/// other events return an empty array of the correct key until their
-/// collectors exist.
+/// TS 29.520. Only NF_LOAD has a live analytics path today (linear
+/// regression); which events are live is declared by
+/// `context::SUPPORTED_EVENTS` (G2-3) and both callers gate on it before
+/// emitting anything for an event.
 ///
 /// G2-1: NF_LOAD is computed from **NRF-sourced samples only** (TS 23.288
 /// §6.5 Table 6.5.2-1: the NF load data source is the NRF). One
@@ -266,8 +267,11 @@ pub fn compute_event_infos(
             }
             Value::Array(infos)
         }
-        // No live collector yet for other events: emit an empty (but correctly
-        // keyed) array so a strict consumer can still parse the notification.
+        // G2-3: events without a live collector never reach an emitted
+        // surface — the AnalyticsInfo GET answers 204 before computing and the
+        // dispatcher skips them (declared failed via failEventReports at
+        // subscription time). This defensive arm only makes the honest
+        // "no data exists" outcome explicit for any future caller.
         _ => Value::Array(Vec::new()),
     }
 }
@@ -283,6 +287,10 @@ pub fn compute_event_infos(
 /// are always emitted **when they have data**: G2-1 suppresses an event whose
 /// computed `*Infos` array is empty — nothing observed means nothing is
 /// reported, never an empty/fabricated entry.
+///
+/// G2-3: events not in `context::SUPPORTED_EVENTS` are skipped outright —
+/// they were declared failed (`failEventReports[]`/`UNAVAILABLE_DATA`) in the
+/// subscription response and must never appear in `eventNotifications[]`.
 fn build_event_notifications(
     ctx: &NwdafContext,
     engine: &AnalyticsEngine,
@@ -295,6 +303,15 @@ fn build_event_notifications(
     sub.events
         .iter()
         .filter_map(|e| {
+            // G2-3 (supported-events honesty): an event without a live
+            // collector was declared failed at subscription time
+            // (failEventReports[] / UNAVAILABLE_DATA in the 201/200 body) —
+            // it is never notified, not even as an empty-array entry.
+            // Derived from context::SUPPORTED_EVENTS.
+            if !e.event.is_supported() {
+                return None;
+            }
+
             let filter = EventInfoFilter::from_event_subscription(e);
             let infos = compute_event_infos(engine, e.event, &filter);
 
@@ -909,6 +926,61 @@ mod tests {
             1,
             "PERIODIC subscription must always report when data exists"
         );
+    }
+
+    // ── G2-3: supported-events honesty in the dispatcher ────────────────────
+
+    /// G2-3: a subscription covering {NF_LOAD, UE_MOBILITY} (UE_MOBILITY was
+    /// declared failed via failEventReports at create time) notifies ONLY
+    /// NF_LOAD: no UE_MOBILITY entry, no empty-array `*Infos` entry, ever —
+    /// even though NF_LOAD data exists in the same engine.
+    #[test]
+    fn test_honesty_dispatcher_skips_unsupported_events() {
+        let ctx = NwdafContext::new("nwdaf-test".to_string());
+        ingest_loads(&ctx, "AMF", "amf-honesty-disp", &[25, 35]);
+
+        let mut sub = AnalyticsSubscription::new(
+            "sub-honesty".into(),
+            AnalyticsId::NfLoad,
+            "http://x/y".into(),
+            u64::MAX,
+        );
+        sub.events = vec![
+            EventSubscription::periodic(AnalyticsId::NfLoad),
+            EventSubscription::periodic(AnalyticsId::UeMobility),
+        ];
+
+        let engine = ctx.lock_engine();
+        let notifications = build_event_notifications(&ctx, &engine, &sub);
+
+        assert_eq!(
+            notifications.len(),
+            1,
+            "only the supported event may be notified"
+        );
+        assert_eq!(
+            notifications[0]["event"].as_str(),
+            Some("NF_LOAD"),
+            "the single EventNotification must be NF_LOAD"
+        );
+        assert!(
+            notifications
+                .iter()
+                .all(|n| n["event"].as_str() != Some("UE_MOBILITY")),
+            "the failed-at-subscribe UE_MOBILITY event must never be notified"
+        );
+        // No entry may carry an empty *Infos array (the old empty-array leak).
+        for n in &notifications {
+            let obj = n.as_object().expect("EventNotification object");
+            for (key, value) in obj {
+                if let Some(arr) = value.as_array() {
+                    assert!(
+                        !arr.is_empty(),
+                        "no EventNotification may carry an empty {key} array"
+                    );
+                }
+            }
+        }
     }
 
     // ── G2-1: NRF-sourced NF_LOAD computation ────────────────────────────────

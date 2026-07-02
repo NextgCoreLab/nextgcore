@@ -175,6 +175,11 @@ fn parse_event_filter(raw: Option<&String>) -> Result<EventInfoFilter, String> {
 /// is the shared G2-1/G2-3 boundary piece, landed here because G2-1 merges
 /// first.
 ///
+/// G2-3 (supported-events honesty): a recognised event with **no live
+/// collector** (not in [`SUPPORTED_EVENTS`]) is also 204 — its analytics data
+/// cannot exist. Only tokens outside the `NwdafEvent` enum are 400
+/// `INVALID_ANALYTICS_TYPE`. The former non-spec `tgtUe` echo is removed.
+///
 /// T5.4 HONESTY NOTE: the analytics engine uses linear regression (slope on
 /// the last N samples), NOT a trained ML model. `confidence` is the regression
 /// R² scaled to a Uinteger, not model accuracy (TS 23.288 §6.14).
@@ -206,6 +211,15 @@ pub async fn handle_analytics_info_query_with_ctx(
         }
     };
 
+    // G2-3 (supported-events honesty): a recognised NwdafEvent token with no
+    // live collector means the requested analytics data cannot exist → 204 No
+    // Content (TS 29.520 §4.3.2.2.2), NOT 400/501 and never an empty-200.
+    // Unrecognised tokens were already rejected above with 400
+    // INVALID_ANALYTICS_TYPE. Derived from context::SUPPORTED_EVENTS.
+    if !analytics_id.is_supported() {
+        return SbiResponse::with_status(204);
+    }
+
     // event-filter (G2-1): nfInstanceIds/nfTypes are honored; malformed JSON
     // fails closed with 400.
     let filter = match parse_event_filter(params.get("event-filter")) {
@@ -213,9 +227,11 @@ pub async fn handle_analytics_info_query_with_ctx(
         Err(detail) => return send_bad_request(&detail, Some("INVALID_QUERY_PARAM")),
     };
 
-    // tgt-ue / ana-req / supported-features are parsed and acknowledged; only
-    // tgt-ue is echoed back. Full filtering by these is out of scope here.
-    let tgt_ue = params.get("tgt-ue").cloned();
+    // tgt-ue / ana-req / supported-features are parsed and acknowledged.
+    // G2-3: the former non-spec `tgtUe` echo into AnalyticsData is removed —
+    // TS 29.520 `AnalyticsData` has no such member (audit LOW). Full filtering
+    // by these parameters is out of scope here.
+    let _tgt_ue = params.get("tgt-ue");
     let _ana_req = params.get("ana-req");
     let _supported_features = params.get("supported-features");
 
@@ -249,9 +265,6 @@ pub async fn handle_analytics_info_query_with_ctx(
         "timeStampGen".to_string(),
         serde_json::json!(now.to_rfc3339()),
     );
-    if let Some(t) = tgt_ue {
-        analytics_data.insert("tgtUe".to_string(), serde_json::json!(t));
-    }
 
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::Value::Object(analytics_data))
@@ -426,18 +439,59 @@ fn parse_events_subscription(
     Ok(subscription)
 }
 
+/// G2-3: build the TS 29.520 `failEventReports[]` array — one
+/// `FailureEventInfo { event, failureCode }` (both mandatory per the yaml)
+/// with `failureCode` = `UNAVAILABLE_DATA` for every subscribed event that is
+/// not in [`SUPPORTED_EVENTS`] (no collector → the necessary data to perform
+/// the service is unavailable). Empty when every event is supported.
+fn fail_event_reports(events: &[EventSubscription]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter(|e| !e.event.is_supported())
+        .map(|e| {
+            serde_json::json!({
+                "event": e.event.as_str(),
+                "failureCode": "UNAVAILABLE_DATA",
+            })
+        })
+        .collect()
+}
+
 /// Build the 200/201 body echoing the stored subscription representation.
+///
+/// G2-3 (partial grant, TS 29.520): the subscription is ACCEPTED as a whole —
+/// even when ALL events are unsupported the create still answers 201 (the yaml
+/// allows every subscribed event to appear in `failEventReports`) — but each
+/// unsupported event is declared failed via `failEventReports[]` with
+/// `UNAVAILABLE_DATA`, and the dispatcher never notifies it.
 fn events_subscription_echo(sub: &AnalyticsSubscription) -> serde_json::Value {
-    serde_json::json!({
-        "subscriptionId": sub.subscription_id,
-        "notificationURI": sub.notification_uri,
-        "notifCorrId": sub.notification_correlation_id,
-        "eventSubscriptions": sub
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "subscriptionId".to_string(),
+        serde_json::json!(sub.subscription_id),
+    );
+    obj.insert(
+        "notificationURI".to_string(),
+        serde_json::json!(sub.notification_uri),
+    );
+    obj.insert(
+        "notifCorrId".to_string(),
+        serde_json::json!(sub.notification_correlation_id),
+    );
+    obj.insert(
+        "eventSubscriptions".to_string(),
+        serde_json::json!(sub
             .events
             .iter()
             .map(event_subscription_json)
-            .collect::<Vec<_>>(),
-    })
+            .collect::<Vec<_>>()),
+    );
+    // failEventReports has minItems 1 in the yaml: omit entirely when empty.
+    let failed = fail_event_reports(&sub.events);
+    if !failed.is_empty() {
+        obj.insert("failEventReports".to_string(), serde_json::json!(failed));
+    }
+    serde_json::Value::Object(obj)
 }
 
 /// Handle analytics subscription creation (POST /subscriptions).
@@ -517,17 +571,10 @@ pub async fn handle_subscription_get(subscription_id: &str) -> SbiResponse {
     };
 
     match subscription {
+        // G2-3: the GET representation is the same echo as 201/200, including
+        // failEventReports for events without a collector.
         Some(sub) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "subscriptionId": sub.subscription_id,
-                "notificationURI": sub.notification_uri,
-                "notifCorrId": sub.notification_correlation_id,
-                "eventSubscriptions": sub
-                    .events
-                    .iter()
-                    .map(event_subscription_json)
-                    .collect::<Vec<_>>(),
-            }))
+            .with_json_body(&events_subscription_echo(&sub))
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(
             &format!("Subscription {subscription_id} not found"),
@@ -761,7 +808,12 @@ mod tests {
         assert!(body.get("start").and_then(|v| v.as_str()).is_some());
         assert!(body.get("expiry").and_then(|v| v.as_str()).is_some());
         assert!(body.get("timeStampGen").and_then(|v| v.as_str()).is_some());
-        assert_eq!(body.get("tgtUe").and_then(|v| v.as_str()), Some("imsi-001"));
+        // G2-3: the non-spec tgtUe echo is removed — TS 29.520 AnalyticsData
+        // has no such member, even when the tgt-ue query parameter is present.
+        assert!(
+            body.get("tgtUe").is_none(),
+            "non-spec tgtUe must not be injected into AnalyticsData"
+        );
 
         // Legacy bespoke keys must be gone.
         assert!(body.get("modelCount").is_none(), "no modelCount key");
@@ -844,6 +896,170 @@ mod tests {
         let uri = "/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD&event-filter=not-json";
         let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(uri)).await;
         assert_eq!(resp.status, 400, "malformed event-filter must be 400");
+    }
+
+    // ── G2-3: supported-events honesty ────────────────────────────────────────
+
+    /// G2-3 honesty: a GET for a recognised but collector-less event
+    /// (UE_MOBILITY) returns **204 No Content** (TS 29.520 §4.3.2.2.2 — the
+    /// requested analytics data does not exist), never an empty-200 — even
+    /// when OTHER events (NF_LOAD) do have data in the same engine.
+    #[tokio::test]
+    async fn test_honesty_unsupported_event_get_204() {
+        // NF_LOAD data exists, so a 204 here can only come from the
+        // supported-events gate, not from the empty-infos path.
+        let ctx = ctx_with_loads("AMF", "amf-honesty-01", &[30, 40]);
+        let req = SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=UE_MOBILITY");
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &req).await;
+        assert_eq!(
+            resp.status, 204,
+            "unsupported event must be 204 No Content, got {}",
+            resp.status
+        );
+        assert!(
+            resp.http.content.as_deref().is_none_or(str::is_empty),
+            "204 must carry no body"
+        );
+
+        // Every recognised-but-unsupported event behaves identically.
+        for event in AnalyticsId::ALL {
+            if event.is_supported() {
+                continue;
+            }
+            let uri =
+                format!("/nnwdaf-analyticsinfo/v1/analytics?event-id={}", event.as_str());
+            let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+            assert_eq!(
+                resp.status,
+                204,
+                "GET {} must be 204 (a 200 here is empty-200 dishonesty)",
+                event.as_str()
+            );
+        }
+    }
+
+    /// G2-3 honesty: POST subscription {NF_LOAD, UE_MOBILITY} → 201 whose body
+    /// carries `failEventReports` of exactly
+    /// `[{event: UE_MOBILITY, failureCode: UNAVAILABLE_DATA}]` (TS 29.520
+    /// `FailureEventInfo`; partial grant, the subscription itself is accepted).
+    #[tokio::test]
+    async fn test_honesty_subscription_fail_event_reports() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let req = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                "eventSubscriptions": [
+                    { "event": "NF_LOAD" },
+                    { "event": "UE_MOBILITY" }
+                ]
+            }))
+            .expect("valid JSON body");
+        let resp = handle_subscription_create(&req).await;
+        assert_eq!(resp.status, 201, "partial grant: subscription accepted");
+
+        let body = body_json(&resp);
+        let failed = body
+            .get("failEventReports")
+            .and_then(|v| v.as_array())
+            .expect("201 body must carry failEventReports for unsupported events");
+        assert_eq!(
+            failed,
+            &vec![json!({ "event": "UE_MOBILITY", "failureCode": "UNAVAILABLE_DATA" })],
+            "exactly one FailureEventInfo: UE_MOBILITY/UNAVAILABLE_DATA"
+        );
+
+        // The GET representation reflects the same declared failure.
+        let sub_id = body["subscriptionId"].as_str().expect("id").to_string();
+        let get_resp = handle_subscription_get(&sub_id).await;
+        assert_eq!(get_resp.status, 200);
+        assert_eq!(
+            body_json(&get_resp)["failEventReports"],
+            json!([{ "event": "UE_MOBILITY", "failureCode": "UNAVAILABLE_DATA" }])
+        );
+    }
+
+    /// G2-3: a fully-supported subscription carries NO failEventReports key
+    /// (minItems 1 in the yaml — an empty array would be schema-invalid).
+    #[tokio::test]
+    async fn test_honesty_supported_only_subscription_has_no_fail_reports() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let req = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                "eventSubscriptions": [ { "event": "NF_LOAD" } ]
+            }))
+            .expect("valid JSON body");
+        let resp = handle_subscription_create(&req).await;
+        assert_eq!(resp.status, 201);
+        assert!(
+            body_json(&resp).get("failEventReports").is_none(),
+            "no failEventReports when every event is supported"
+        );
+    }
+
+    /// G2-3 (documented decision): a subscription whose events are ALL
+    /// unsupported is still accepted with 201 — the yaml allows every event to
+    /// appear in failEventReports — with every event declared failed.
+    #[tokio::test]
+    async fn test_honesty_all_unsupported_still_201_all_failed() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let req = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                "eventSubscriptions": [
+                    { "event": "UE_MOBILITY" },
+                    { "event": "ABNORMAL_BEHAVIOUR" }
+                ]
+            }))
+            .expect("valid JSON body");
+        let resp = handle_subscription_create(&req).await;
+        assert_eq!(resp.status, 201, "all-unsupported is still a 201");
+        let body = body_json(&resp);
+        assert_eq!(
+            body["failEventReports"],
+            json!([
+                { "event": "UE_MOBILITY", "failureCode": "UNAVAILABLE_DATA" },
+                { "event": "ABNORMAL_BEHAVIOUR", "failureCode": "UNAVAILABLE_DATA" }
+            ]),
+            "every unsupported event must be declared failed"
+        );
+    }
+
+    /// G2-3: the PUT (update) response also declares unsupported events failed.
+    #[tokio::test]
+    async fn test_honesty_subscription_update_fail_event_reports() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let create = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                "eventSubscriptions": [ { "event": "NF_LOAD" } ]
+            }))
+            .expect("valid JSON body");
+        let create_resp = handle_subscription_create(&create).await;
+        assert_eq!(create_resp.status, 201);
+        let sub_id = body_json(&create_resp)["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string();
+
+        let put = SbiRequest::put(format!(
+            "/nnwdaf-eventssubscription/v1/subscriptions/{sub_id}"
+        ))
+        .with_json_body(&json!({
+            "notificationURI": "http://amf.example.org/notify",
+            "eventSubscriptions": [
+                { "event": "NF_LOAD" },
+                { "event": "DN_PERFORMANCE" }
+            ]
+        }))
+        .expect("valid JSON body");
+        let put_resp = handle_subscription_update(&sub_id, &put).await;
+        assert_eq!(put_resp.status, 200);
+        assert_eq!(
+            body_json(&put_resp)["failEventReports"],
+            json!([{ "event": "DN_PERFORMANCE", "failureCode": "UNAVAILABLE_DATA" }]),
+            "the 200 update body must declare the unsupported event failed"
+        );
     }
 
     /// A GET with no `event-id` query parameter is rejected with 400.
