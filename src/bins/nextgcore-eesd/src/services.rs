@@ -3,8 +3,10 @@
 //! Implements five `eees-*` service APIs that have no 5GC NEF/PCF-AF
 //! dependency and can be validated entirely with unit tests:
 //!
-//! * `eees-cea` (TS 29.558 §5.14): Common EAS Announcement — EAS announces
-//!   its capability/availability to EECs via the EES broker.
+//! * `eees-cea` (TS 29.558 Eees_CommonEASAnnouncement): Common EAS
+//!   Announcement — an announcing EES pushes the selected common-EAS
+//!   information ([`CommonEASInfo`]) to the receiving EES via the custom
+//!   operation `POST /declare` (→ 204, or 200 [`CommonEASInfoDecResp`]).
 //! * `eees-appclientinformation` (TS 29.558 §8.4): AC Information
 //!   subscriptions — an EAS subscribes for reports about Application Clients.
 //!   Models are spec-exact per `TS29558_Eees_AppClientInformation.yaml`
@@ -14,8 +16,10 @@
 //! * `eees-eeccontextreloc` (TS 29.558 §8.7.2): EEC Contexts — an EES pushes
 //!   ([`EECContextPush`]) / pulls ([`EECContext`]) EEC context information.
 //!   Models are spec-exact per `TS29558_Eees_EECContextRelocation.yaml`.
-//! * `eees-acr-param` (TS 29.558 §5.13): ACR Parameter Information — EAS
-//!   requests the ACR parameters the EES holds for a given EEC/EAS pair.
+//! * `eees-acr-param` (TS 29.558 Eees_ACRParameterInformation): ACR Parameter
+//!   Information — the consumer (S-EAS via EEL) pushes ACR parameter
+//!   information ([`ACRParamsInfo`]) TO the EES via the custom operation
+//!   `POST /send-acrparamsinfo` (→ 204, no response body).
 //!
 //! DEFERRED (eesd-13 subset requiring 5GC NEF/PCF-AF exposure path):
 //! * `eees-session-with-qos` (TS 29.558 §5.6) — needs Nnef_TrafficInfluence
@@ -26,30 +30,72 @@
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
-// eees-cea — Common EAS Announcement (TS 29.558 §5.14)
+// eees-cea — Common EAS Announcement (TS 29.558 Eees_CommonEASAnnouncement,
+// TS29558_Eees_CommonEASAnnouncement.yaml)
 // ============================================================================
 
-/// `CeaAnnouncement` — body of `CreateCeaAnnouncement`
-/// (`POST .../eees-cea/v1/announcements`) and stored resource.
+/// `CommonEASInfo` (TS29558_Eees_CommonEASAnnouncement.yaml:92-120) — body of
+/// the custom operation `Declare`
+/// (`POST {apiRoot}/eees-cea/v1/declare`). The API has NO resources: the
+/// announcing EES pushes the common-EAS information and the receiving EES
+/// answers 204 (or 200 [`CommonEASInfoDecResp`] when it has real group
+/// connection information to return).
 ///
-/// Mandatory IE: `easId`. The server mints an `announcementId` on creation.
+/// Required IEs (yaml:116-120): `requestorId`, `easId`, `easEndPt`, `appGrpId`.
+/// Cross-spec leaves (`EASServiceKPI` from TS 29.558, `EDNInfo` from
+/// TS 29.558 Eecs_EESRegistration) are carried as passthrough JSON values, per
+/// the established `acr.rs` convention (preserve wire bytes without fabricating
+/// a local model).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct CeaAnnouncement {
-    /// EAS identifier (mandatory; consumer-provided).
+pub struct CommonEASInfo {
+    /// Identifier of the announcing EES sending the request (yaml:97-99; REQUIRED).
+    pub requestor_id: String,
+    /// EAS ID of the selected common EAS (yaml:102-104; REQUIRED).
     pub eas_id: String,
-    /// Server-minted announcement resource identifier (read-only on creation).
+    /// Endpoint of the selected common EAS (`EndPoint`, yaml:105-106; REQUIRED).
+    pub eas_end_pt: crate::types::EndPoint,
+    /// Application group identifier (yaml:111-113; REQUIRED).
+    pub app_grp_id: String,
+    /// Endpoint of the announcing EES (`EndPoint`, yaml:100-101).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub announcement_id: Option<String>,
-    /// EAS profile embedded in the announcement (optional).
+    pub requestor_end_pt: Option<crate::types::EndPoint>,
+    /// `EASServiceKPI` of the common EAS (yaml:107-108; passthrough).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub eas_prof: Option<crate::types::EasProfile>,
-    /// Announcement expiration time (RFC 3339; absent ⇒ never expires).
+    pub service_kpis_list: Option<serde_json::Value>,
+    /// `EDNInfo` of the EDN hosting the common EAS (yaml:109-110; passthrough).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub exp_time: Option<String>,
-    /// Supported features (optional, TS 29.558 §7.8).
+    pub edn_info: Option<serde_json::Value>,
+    /// Supported features (yaml:114-115).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supp_feat: Option<String>,
+}
+
+/// `CommonEASInfoDecResp` (TS29558_Eees_CommonEASAnnouncement.yaml:122-135) —
+/// the 200-response body of `Declare`. The `anyOf: [required grpConnInfo]`
+/// constraint (yaml:134-135) means a valid response MUST carry a non-empty
+/// `grpConnInfo` list; the EES answers 204 instead of an empty 200 body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommonEASInfoDecResp {
+    /// Group connection information (yaml:127-131, minItems 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grp_conn_info: Option<Vec<GrpConnInfo>>,
+    /// Supported features (yaml:132-133).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supp_feat: Option<String>,
+}
+
+/// `GrpConnInfo` (TS29558_Eees_CommonEASAnnouncement.yaml:137-154). Required:
+/// `ueId`, `connInd` (yaml:152-154).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpConnInfo {
+    /// UE identifier (`Gpsi`, yaml:142-143; REQUIRED).
+    pub ue_id: String,
+    /// Whether the UE identified by `ueId` should connect to the selected
+    /// common EAS (yaml:144-151; REQUIRED).
+    pub conn_ind: bool,
 }
 
 // ============================================================================
@@ -369,85 +415,158 @@ pub struct EECSrvContinuitySupport {
 }
 
 // ============================================================================
-// eees-acr-param — ACR Parameter Information (TS 29.558 §5.13)
+// eees-acr-param — ACR Parameter Information (TS 29.558
+// Eees_ACRParameterInformation, TS29558_Eees_ACRParameterInformation.yaml)
 // ============================================================================
 
-/// `AcrParamInfoReq` — body of `RequestAcrParamInfo`
-/// (`POST .../eees-acr-param/v1/request-acr-params`).
+/// `ACRParamsInfo` (TS29558_Eees_ACRParameterInformation.yaml:83-106) — body
+/// of the custom operation `Request`
+/// (`POST {apiRoot}/eees-acr-param/v1/send-acrparamsinfo`).
 ///
-/// Mandatory IEs: `eecId`, `sEasId`. The EES looks up any stored ACR state
-/// for the `(eecId, sEasId)` pair and returns the parameters.
+/// The spec REVERSES the legacy bespoke direction: the consumer (S-EAS via EEL)
+/// PUSHES ACR parameter information TO the EES; success is 204 with no response
+/// body (yaml:41-44). All six properties are REQUIRED (yaml:100-106).
+///
+/// NOTE the odd yaml attribute casing `sAsEndPoint`/`tAsEndPoint` (yaml:94-97;
+/// NOT `sEas…`/`tEas…`) — pinned by the byte-level serialization tests below.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct AcrParamInfoReq {
-    /// EEC identifier (mandatory).
+pub struct ACRParamsInfo {
+    /// Identifier of the entity sending the request (yaml:88-89; REQUIRED).
+    pub requestor_id: String,
+    /// EEC identifier (yaml:90-91; REQUIRED).
     pub eec_id: String,
-    /// Source EAS identifier (mandatory).
-    pub s_eas_id: String,
-    /// UE identifier (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ue_id: Option<String>,
-    /// Supported features (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
-}
-
-/// `AcrParamInfoResp` — response to `RequestAcrParamInfo`.
-///
-/// `acrParams` is absent when no prior ACR state exists for the given pair.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct AcrParamInfoResp {
-    /// ACR relocation identity from a prior Determine/Initiate (absent if none).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acr_params: Option<crate::acr::AcrRelocationInfo>,
-    /// Supported features (echoed).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
+    /// AC identifier (yaml:92-93; REQUIRED).
+    pub ac_id: String,
+    /// Source AS endpoint (`EndPoint`, yaml:94-95; REQUIRED). Serializes as
+    /// `sAsEndPoint`.
+    pub s_as_end_point: crate::types::EndPoint,
+    /// Target AS endpoint (`EndPoint`, yaml:96-97; REQUIRED). Serializes as
+    /// `tAsEndPoint`.
+    pub t_as_end_point: crate::types::EndPoint,
+    /// ACR parameters (`ACRParameters` = TS 24.558 `AcrParameters`, yaml:98-99;
+    /// REQUIRED) — reuses the existing spec-exact [`crate::acr::AcrParameters`]
+    /// (`predictExpTime`).
+    pub acr_params: crate::acr::AcrParameters,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---- CeaAnnouncement ----------------------------------------------------
+    // ---- CommonEASInfo (TS29558_Eees_CommonEASAnnouncement.yaml) ------------
 
-    /// Minimal body (mandatory `easId`) round-trips with camelCase fields.
+    /// Spec-exact hand-built JSON literal carrying ALL 8 schema fields
+    /// (yaml:92-120) deserializes; camelCase names are exact (`requestorId`,
+    /// `easEndPt`, `appGrpId`, `serviceKpisList`, `requestorEndPt`).
     #[test]
-    fn test_cea_announcement_roundtrip_minimal() {
-        let body = r#"{"easId":"eas1.example.com"}"#;
-        let ann: CeaAnnouncement = serde_json::from_str(body).expect("deserializes");
-        assert_eq!(ann.eas_id, "eas1.example.com");
-        assert!(ann.announcement_id.is_none());
-        let back = serde_json::to_string(&ann).unwrap();
-        assert!(back.contains(r#""easId":"eas1.example.com""#));
-        assert!(!back.contains("announcementId"));
-    }
-
-    /// Missing mandatory `easId` fails to deserialize → handler maps to 400.
-    #[test]
-    fn test_cea_announcement_missing_eas_id_fails() {
-        assert!(
-            serde_json::from_str::<CeaAnnouncement>(r#"{"expTime":"2030-01-01T00:00:00Z"}"#)
-                .is_err()
+    fn test_common_eas_info_spec_literal_all_fields() {
+        // Hand-derived from CommonEASInfo (yaml:92-120); NOT built via our
+        // own structs.
+        let body = r#"{
+            "requestorId":"ees-src.example.com",
+            "requestorEndPt":{"fqdn":"ees-src.example.com"},
+            "easId":"common-eas.example.com",
+            "easEndPt":{"fqdn":"common-eas.edge.example.com","port":443},
+            "serviceKpisList":{"conBdwth":"100 Mbps"},
+            "ednInfo":{"ednServiceArea":{"tais":[]}},
+            "appGrpId":"grp-1",
+            "suppFeat":"1"
+        }"#;
+        let info: CommonEASInfo = serde_json::from_str(body).expect("deserializes");
+        assert_eq!(info.requestor_id, "ees-src.example.com");
+        assert_eq!(info.eas_id, "common-eas.example.com");
+        assert_eq!(
+            info.eas_end_pt.fqdn.as_deref(),
+            Some("common-eas.edge.example.com")
         );
+        assert_eq!(info.eas_end_pt.port, Some(443));
+        assert_eq!(info.app_grp_id, "grp-1");
+        assert!(info.requestor_end_pt.is_some());
+        assert!(info.service_kpis_list.is_some());
+        assert!(info.edn_info.is_some());
+        assert_eq!(info.supp_feat.as_deref(), Some("1"));
     }
 
-    /// Full round-trip including `announcementId` (server-populated in response).
+    /// Golden byte-vector: the minimal declaration (4 required IEs only)
+    /// serializes to EXACTLY the hand-derived camelCase wire form.
     #[test]
-    fn test_cea_announcement_with_id_roundtrip() {
-        let ann = CeaAnnouncement {
-            eas_id: "eas-cea.example.com".into(),
-            announcement_id: Some("ann-uuid-1".into()),
-            eas_prof: None,
-            exp_time: Some("2030-01-01T00:00:00Z".into()),
-            supp_feat: Some("1".into()),
+    fn test_common_eas_info_golden_serialization() {
+        let info = CommonEASInfo {
+            requestor_id: "ees-src.example.com".into(),
+            eas_id: "eas1.example.com".into(),
+            eas_end_pt: crate::types::EndPoint {
+                fqdn: Some("eas1.example.com".into()),
+                ..Default::default()
+            },
+            app_grp_id: "grp-1".into(),
+            requestor_end_pt: None,
+            service_kpis_list: None,
+            edn_info: None,
+            supp_feat: None,
         };
-        let json = serde_json::to_string(&ann).unwrap();
-        assert!(json.contains(r#""announcementId":"ann-uuid-1""#));
-        assert!(json.contains(r#""expTime""#));
-        let back: CeaAnnouncement = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ann);
+        // Hand-derived from CommonEASInfo yaml:92-120 field names.
+        let expected = concat!(
+            r#"{"requestorId":"ees-src.example.com","#,
+            r#""easId":"eas1.example.com","#,
+            r#""easEndPt":{"fqdn":"eas1.example.com"},"#,
+            r#""appGrpId":"grp-1"}"#
+        );
+        assert_eq!(serde_json::to_string(&info).unwrap(), expected);
+    }
+
+    /// Each of the 4 required IEs (yaml:116-120) individually missing fails to
+    /// deserialize → handler maps to 400 MANDATORY_IE_MISSING. The OLD bespoke
+    /// CeaAnnouncement shape (`easId` only) is exactly such a body.
+    #[test]
+    fn test_common_eas_info_missing_required_fails() {
+        // Missing requestorId.
+        assert!(serde_json::from_str::<CommonEASInfo>(
+            r#"{"easId":"e","easEndPt":{"fqdn":"e"},"appGrpId":"g"}"#
+        )
+        .is_err());
+        // Missing easId.
+        assert!(serde_json::from_str::<CommonEASInfo>(
+            r#"{"requestorId":"r","easEndPt":{"fqdn":"e"},"appGrpId":"g"}"#
+        )
+        .is_err());
+        // Missing easEndPt.
+        assert!(serde_json::from_str::<CommonEASInfo>(
+            r#"{"requestorId":"r","easId":"e","appGrpId":"g"}"#
+        )
+        .is_err());
+        // Missing appGrpId.
+        assert!(serde_json::from_str::<CommonEASInfo>(
+            r#"{"requestorId":"r","easId":"e","easEndPt":{"fqdn":"e"}}"#
+        )
+        .is_err());
+        // Old bespoke CeaAnnouncement shape (`easId` only) → rejected.
+        assert!(serde_json::from_str::<CommonEASInfo>(r#"{"easId":"eas1"}"#).is_err());
+    }
+
+    /// `CommonEASInfoDecResp` + `GrpConnInfo` golden serialization
+    /// (yaml:122-154) and `GrpConnInfo` requiredness (yaml:152-154).
+    #[test]
+    fn test_common_eas_info_dec_resp_golden() {
+        let resp = CommonEASInfoDecResp {
+            grp_conn_info: Some(vec![GrpConnInfo {
+                ue_id: "msisdn-14155550001".into(),
+                conn_ind: true,
+            }]),
+            supp_feat: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&resp).unwrap(),
+            r#"{"grpConnInfo":[{"ueId":"msisdn-14155550001","connInd":true}]}"#
+        );
+        // An all-absent response body is `{}` (the EES answers 204 instead).
+        assert_eq!(
+            serde_json::to_string(&CommonEASInfoDecResp::default()).unwrap(),
+            "{}"
+        );
+        // GrpConnInfo requires both ueId and connInd.
+        assert!(serde_json::from_str::<GrpConnInfo>(r#"{"ueId":"u1"}"#).is_err());
+        assert!(serde_json::from_str::<GrpConnInfo>(r#"{"connInd":true}"#).is_err());
     }
 
     // ---- ACInfoSubscription (TS29558_Eees_AppClientInformation.yaml) --------
@@ -760,51 +879,102 @@ mod tests {
         assert_eq!(ok.eas_id, "eas1.example.com");
     }
 
-    // ---- AcrParamInfoReq / AcrParamInfoResp ---------------------------------
+    // ---- ACRParamsInfo (TS29558_Eees_ACRParameterInformation.yaml) ----------
 
-    /// Mandatory `eecId` + `sEasId` round-trips.
+    /// Spec-exact hand-built JSON literal carrying ALL 6 REQUIRED fields
+    /// (yaml:83-106) deserializes; the odd casing `sAsEndPoint`/`tAsEndPoint`
+    /// (yaml:94-97) is exact.
     #[test]
-    fn test_acr_param_info_req_roundtrip() {
-        let body = r#"{"eecId":"eec1","sEasId":"eas-s.example.com"}"#;
-        let req: AcrParamInfoReq = serde_json::from_str(body).expect("deserializes");
-        assert_eq!(req.eec_id, "eec1");
-        assert_eq!(req.s_eas_id, "eas-s.example.com");
-        assert!(req.ue_id.is_none());
+    fn test_acr_params_info_spec_literal_all_fields() {
+        // Hand-derived from ACRParamsInfo (yaml:83-106); NOT built via our own
+        // structs.
+        let body = r#"{
+            "requestorId":"eas-s.example.com",
+            "eecId":"eec1",
+            "acId":"ac1",
+            "sAsEndPoint":{"fqdn":"s-as.edge.example.com"},
+            "tAsEndPoint":{"fqdn":"t-as.edge.example.com","port":8443},
+            "acrParams":{"predictExpTime":"2030-01-01T00:00:00Z"}
+        }"#;
+        let info: ACRParamsInfo = serde_json::from_str(body).expect("deserializes");
+        assert_eq!(info.requestor_id, "eas-s.example.com");
+        assert_eq!(info.eec_id, "eec1");
+        assert_eq!(info.ac_id, "ac1");
+        assert_eq!(
+            info.s_as_end_point.fqdn.as_deref(),
+            Some("s-as.edge.example.com")
+        );
+        assert_eq!(
+            info.t_as_end_point.fqdn.as_deref(),
+            Some("t-as.edge.example.com")
+        );
+        assert_eq!(info.t_as_end_point.port, Some(8443));
+        assert_eq!(
+            info.acr_params.predict_exp_time.as_deref(),
+            Some("2030-01-01T00:00:00Z")
+        );
     }
 
-    /// Missing `sEasId` fails to deserialize.
+    /// Golden byte-vector: serializing a fully-populated `ACRParamsInfo` emits
+    /// EXACTLY the spec wire form, pinning the `sAsEndPoint`/`tAsEndPoint`
+    /// casing (an easy silent-400 trap) at the byte level.
     #[test]
-    fn test_acr_param_info_req_missing_s_eas_id_fails() {
-        assert!(serde_json::from_str::<AcrParamInfoReq>(r#"{"eecId":"eec1"}"#).is_err());
-    }
-
-    /// `AcrParamInfoResp` with absent `acrParams` serializes without the field.
-    #[test]
-    fn test_acr_param_info_resp_absent_params() {
-        let resp = AcrParamInfoResp::default();
-        let json = serde_json::to_string(&resp).unwrap();
-        // When both fields are absent the body is just `{}`
-        assert!(!json.contains("acrParams"));
-        let back: AcrParamInfoResp = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, resp);
-    }
-
-    /// `AcrParamInfoResp` with an `acrParams` value round-trips.
-    #[test]
-    fn test_acr_param_info_resp_with_params() {
-        let resp = AcrParamInfoResp {
-            acr_params: Some(crate::acr::AcrRelocationInfo {
-                s_eas_id: Some("eas-s".into()),
-                t_eas_id: Some("eas-t".into()),
-                s_eas_endpoint: None,
-                t_eas_endpoint: None,
-            }),
-            supp_feat: Some("1".into()),
+    fn test_acr_params_info_golden_serialization() {
+        let info = ACRParamsInfo {
+            requestor_id: "eas-s.example.com".into(),
+            eec_id: "eec1".into(),
+            ac_id: "ac1".into(),
+            s_as_end_point: crate::types::EndPoint {
+                fqdn: Some("s-as.edge.example.com".into()),
+                ..Default::default()
+            },
+            t_as_end_point: crate::types::EndPoint {
+                fqdn: Some("t-as.edge.example.com".into()),
+                ..Default::default()
+            },
+            acr_params: crate::acr::AcrParameters {
+                predict_exp_time: Some("2030-01-01T00:00:00Z".into()),
+            },
         };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""acrParams""#));
-        assert!(json.contains(r#""sEasId":"eas-s""#));
-        let back: AcrParamInfoResp = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, resp);
+        // Hand-derived from ACRParamsInfo yaml:83-106 field names.
+        let expected = concat!(
+            r#"{"requestorId":"eas-s.example.com","#,
+            r#""eecId":"eec1","#,
+            r#""acId":"ac1","#,
+            r#""sAsEndPoint":{"fqdn":"s-as.edge.example.com"},"#,
+            r#""tAsEndPoint":{"fqdn":"t-as.edge.example.com"},"#,
+            r#""acrParams":{"predictExpTime":"2030-01-01T00:00:00Z"}}"#
+        );
+        assert_eq!(serde_json::to_string(&info).unwrap(), expected);
+    }
+
+    /// Each REQUIRED field missing fails to deserialize, and the WRONG casing
+    /// `sEasEndpoint`/`tEasEndpoint` (not `sAsEndPoint`/`tAsEndPoint`) is a
+    /// silent-400 trap: it leaves `sAsEndPoint` absent → error.
+    #[test]
+    fn test_acr_params_info_missing_required_fails() {
+        let full = r#"{"requestorId":"r","eecId":"e","acId":"a","#.to_string()
+            + r#""sAsEndPoint":{"fqdn":"s"},"tAsEndPoint":{"fqdn":"t"},"acrParams":{}}"#;
+        // Sanity: the complete body deserializes.
+        assert!(serde_json::from_str::<ACRParamsInfo>(&full).is_ok());
+        // Each required field individually removed → error.
+        for missing in [
+            r#"{"eecId":"e","acId":"a","sAsEndPoint":{"fqdn":"s"},"tAsEndPoint":{"fqdn":"t"},"acrParams":{}}"#,
+            r#"{"requestorId":"r","acId":"a","sAsEndPoint":{"fqdn":"s"},"tAsEndPoint":{"fqdn":"t"},"acrParams":{}}"#,
+            r#"{"requestorId":"r","eecId":"e","sAsEndPoint":{"fqdn":"s"},"tAsEndPoint":{"fqdn":"t"},"acrParams":{}}"#,
+            r#"{"requestorId":"r","eecId":"e","acId":"a","tAsEndPoint":{"fqdn":"t"},"acrParams":{}}"#,
+            r#"{"requestorId":"r","eecId":"e","acId":"a","sAsEndPoint":{"fqdn":"s"},"acrParams":{}}"#,
+            r#"{"requestorId":"r","eecId":"e","acId":"a","sAsEndPoint":{"fqdn":"s"},"tAsEndPoint":{"fqdn":"t"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ACRParamsInfo>(missing).is_err(),
+                "expected error for body missing a required IE: {missing}"
+            );
+        }
+        // Wrong casing sEasEndpoint/tEasEndpoint → sAsEndPoint absent → error.
+        assert!(serde_json::from_str::<ACRParamsInfo>(
+            r#"{"requestorId":"r","eecId":"e","acId":"a","sEasEndpoint":{"fqdn":"s"},"tEasEndpoint":{"fqdn":"t"},"acrParams":{}}"#
+        )
+        .is_err());
     }
 }

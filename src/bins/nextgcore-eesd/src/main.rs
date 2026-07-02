@@ -55,6 +55,14 @@
 //!   `EECContextPushRes` when `acrScenariosSelReq` selects scenarios), and
 //!   pull is `GET /eec-contexts?ees-id=..&eec-cntx-id=..` (both REQUIRED);
 //!   the bespoke path-param pull and list are gone (404/405).
+//! - D3: `eees-cea` is the spec custom operation `POST /declare` taking
+//!   `CommonEASInfo` (required requestorId/easId/easEndPt/appGrpId → 204;
+//!   200 `CommonEASInfoDecResp` reserved for a real `grpConnInfo` list);
+//!   the fabricated `/announcements` CRUD collection is gone (404).
+//! - D4: `eees-acr-param` is the spec custom operation `POST /send-acrparamsinfo`
+//!   taking `ACRParamsInfo` (the consumer PUSHES ACR parameters TO the EES →
+//!   204, merged into the eecId-keyed ACR state); the reversed bespoke lookup
+//!   query is gone (404).
 //!
 //! DEFERRED (flagged): eesd-09/10 (UE location/identifier exposure —
 //! NEF-path-blocked), eesd-14 (standalone conformance suite; tests colocated).
@@ -86,8 +94,8 @@ use acr::{
 use context::{ees_context_final, ees_context_init, ees_self, UpdateError};
 use eec::EecRegistration;
 use services::{
-    ACInfoSubscription, AcrMgntEventSubsc, AcrParamInfoReq, AcrParamInfoResp, CeaAnnouncement,
-    EECContextPush, EECContextPushRes, SessionContexts,
+    ACInfoSubscription, ACRParamsInfo, AcrMgntEventSubsc, CommonEASInfo, EECContextPush,
+    EECContextPushRes, SessionContexts,
 };
 use types::{cause, EasDiscoveryReq, EasDiscoveryResp, EasDiscoverySubscription, EasRegistration};
 
@@ -103,9 +111,6 @@ const EASDISC_SUBSCRIPTIONS_PATH: &str = "/eees-easdiscovery/v1/subscriptions";
 /// Resource path prefix (relative to the EES apiRoot) for the individual EAS
 /// registration resources — `{apiRoot}/eees-easregistration/v1/registrations`.
 const EASREG_REGISTRATIONS_PATH: &str = "/eees-easregistration/v1/registrations";
-
-/// Resource path prefix for CEA announcement resources (eesd-13).
-const CEA_ANNOUNCEMENTS_PATH: &str = "/eees-cea/v1/announcements";
 
 /// Resource path prefix for App Client Information subscriptions (eesd-13).
 /// TS 29.558 §8.4.2: the Eees_AppClientInformation API is an AC-information
@@ -443,25 +448,18 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 _ => send_method_not_allowed(method, "request-acrupdate"),
             }
         }
-        // eesd-13: eees-cea (TS 29.558 §5.14) — Common EAS Announcement.
-        ["eees-cea", "v1", "announcements"] => {
+        // D3: eees-cea (TS 29.558 Eees_CommonEASAnnouncement) — Common EAS
+        // Announcement. The yaml defines NO resources: exactly one custom
+        // operation POST /declare (CommonEASInfo → 204 | 200
+        // CommonEASInfoDecResp). This is a DIFFERENT API from the
+        // eees-appctxtreloc /declare op above (distinct first path segment).
+        ["eees-cea", "v1", "declare"] => {
             if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_CEA) {
                 return resp;
             }
             match method {
-                "POST" => handle_cea_create(&request).await,
-                "GET" => handle_cea_list().await,
-                _ => send_method_not_allowed(method, "announcements"),
-            }
-        }
-        ["eees-cea", "v1", "announcements", announcement_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_CEA) {
-                return resp;
-            }
-            match method {
-                "GET" => handle_cea_get(announcement_id).await,
-                "DELETE" => handle_cea_delete(announcement_id).await,
-                _ => send_method_not_allowed(method, "announcements/{announcementId}"),
+                "POST" => handle_cea_declare(&request).await,
+                _ => send_method_not_allowed(method, "declare"),
             }
         }
         // D1: eees-appclientinformation (TS 29.558 §8.4) — AC Information
@@ -529,14 +527,18 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 _ => send_method_not_allowed(method, "eec-contexts"),
             }
         }
-        // eesd-13: eees-acr-param (TS 29.558 §5.13) — ACR Parameter Information.
-        ["eees-acr-param", "v1", "request-acr-params"] => {
+        // D4: eees-acr-param (TS 29.558 Eees_ACRParameterInformation) — ACR
+        // Parameter Information. The yaml defines one custom operation
+        // POST /send-acrparamsinfo (ACRParamsInfo → 204 only): the consumer
+        // PUSHES ACR parameters TO the EES. The reversed bespoke lookup query
+        // is gone (falls through to 404).
+        ["eees-acr-param", "v1", "send-acrparamsinfo"] => {
             if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACR_PARAM) {
                 return resp;
             }
             match method {
-                "POST" => handle_acr_param_info(&request).await,
-                _ => send_method_not_allowed(method, "request-acr-params"),
+                "POST" => handle_acr_param_send(&request).await,
+                _ => send_method_not_allowed(method, "send-acrparamsinfo"),
             }
         }
         _ => send_not_found(&format!("Resource not found: {path}"), None),
@@ -1356,87 +1358,53 @@ async fn handle_acr_status_update(request: &SbiRequest) -> SbiResponse {
     SbiResponse::with_status(204)
 }
 
-// ---- eesd-13: eees-cea handlers ---------------------------------------------
+// ---- D3: eees-cea handler ----------------------------------------------------
 
-/// `CreateCeaAnnouncement` (`POST .../eees-cea/v1/announcements`).
+/// `Declare` (`POST {apiRoot}/eees-cea/v1/declare`,
+/// TS29558_Eees_CommonEASAnnouncement.yaml:29-79).
 ///
-/// Parses `CeaAnnouncement` (mandatory: `easId`), mints an `announcementId`,
-/// and returns 201 + `Location` + echoed body.
-async fn handle_cea_create(request: &SbiRequest) -> SbiResponse {
-    log::info!("CEA announcement create");
+/// Parses the spec `CommonEASInfo` (required: `requestorId`, `easId`,
+/// `easEndPt`, `appGrpId`), fail-closed 400 `MANDATORY_IE_MISSING` on any
+/// missing/empty required IE, records the declared common EAS (accept-and-ack),
+/// and returns 204. A 200 `CommonEASInfoDecResp` is emitted only when a real
+/// `grpConnInfo` list exists (the `anyOf: [required grpConnInfo]` constraint) —
+/// the EES generates none today, so it always answers 204 (never an empty 200).
+async fn handle_cea_declare(request: &SbiRequest) -> SbiResponse {
+    log::info!("Common EAS declare");
     let value = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let ann: CeaAnnouncement = match serde_json::from_value(value) {
-        Ok(a) => a,
+    let info: CommonEASInfo = match serde_json::from_value(value) {
+        Ok(i) => i,
         Err(e) => {
             return send_bad_request(
-                &format!("Missing or invalid mandatory IE (easId): {e}"),
+                &format!(
+                    "Missing or invalid mandatory IE (requestorId/easId/easEndPt/appGrpId): {e}"
+                ),
                 Some(cause::MANDATORY_IE_MISSING),
             );
         }
     };
-    if ann.eas_id.trim().is_empty() {
+    if info.requestor_id.trim().is_empty()
+        || info.eas_id.trim().is_empty()
+        || info.app_grp_id.trim().is_empty()
+    {
         return send_bad_request(
-            "Mandatory IE easId is empty",
+            "Mandatory IE requestorId/easId/appGrpId is empty",
             Some(cause::MANDATORY_IE_MISSING),
         );
     }
-    let ctx = ees_self();
-    match ctx.read().ok().and_then(|c| c.cea_create(ann)) {
-        Some(created) => {
-            let id = created.announcement_id.clone().unwrap_or_default();
-            SbiResponse::with_status(201)
-                .with_header("Location", format!("{CEA_ANNOUNCEMENTS_PATH}/{id}"))
-                .with_json_body(&created)
-                .unwrap_or_else(|_| SbiResponse::with_status(201))
-        }
-        None => send_error(
-            507,
-            "Insufficient Storage",
-            "Failed to create CEA announcement (capacity exhausted)",
-            Some(cause::INSUFFICIENT_RESOURCES),
-        ),
+    if info.eas_end_pt.is_empty() {
+        return send_bad_request(
+            "Mandatory IE easEndPt carries no address",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
     }
-}
-
-async fn handle_cea_list() -> SbiResponse {
-    let anns = ees_self().read().map(|c| c.cea_list()).unwrap_or_default();
-    SbiResponse::with_status(200)
-        .with_json_body(&anns)
-        .unwrap_or_else(|_| SbiResponse::with_status(200))
-}
-
-async fn handle_cea_get(announcement_id: &str) -> SbiResponse {
-    let ann = ees_self()
-        .read()
-        .ok()
-        .and_then(|c| c.cea_find(announcement_id));
-    match ann {
-        Some(ann) => SbiResponse::with_status(200)
-            .with_json_body(&ann)
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        None => send_not_found(
-            &format!("CEA announcement {announcement_id} not found"),
-            Some(cause::SUBSCRIPTION_NOT_FOUND),
-        ),
+    if let Ok(c) = ees_self().read() {
+        c.cea_declare(info);
     }
-}
-
-async fn handle_cea_delete(announcement_id: &str) -> SbiResponse {
-    log::info!("CEA announcement delete: {announcement_id}");
-    let removed = ees_self()
-        .read()
-        .ok()
-        .and_then(|c| c.cea_delete(announcement_id));
-    match removed {
-        Some(_) => SbiResponse::with_status(204),
-        None => send_not_found(
-            &format!("CEA announcement {announcement_id} not found"),
-            Some(cause::SUBSCRIPTION_NOT_FOUND),
-        ),
-    }
+    SbiResponse::with_status(204)
 }
 
 // ---- D1: eees-appclientinformation handlers ----------------------------------
@@ -1899,52 +1867,54 @@ async fn handle_eec_context_pull(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-// ---- eesd-13: eees-acr-param handler ----------------------------------------
+// ---- D4: eees-acr-param handler ---------------------------------------------
 
-/// `RequestAcrParamInfo` (`POST .../eees-acr-param/v1/request-acr-params`).
+/// `Request` (`POST {apiRoot}/eees-acr-param/v1/send-acrparamsinfo`,
+/// TS29558_Eees_ACRParameterInformation.yaml:29-70).
 ///
-/// Parses `AcrParamInfoReq` (mandatory: `eecId`, `sEasId`), looks up any
-/// stored ACR state for the `(eecId, sEasId)` pair, and returns
-/// `AcrParamInfoResp` with the `acrParams` if found (200). When no prior ACR
-/// state exists, returns 200 with an empty `acrParams` (absent field).
-async fn handle_acr_param_info(request: &SbiRequest) -> SbiResponse {
-    log::info!("ACR parameter information request");
+/// The spec direction is REVERSED vs the legacy bespoke query: the consumer
+/// (S-EAS via EEL) PUSHES `ACRParamsInfo` TO the EES. Parses the spec body
+/// (all six IEs REQUIRED), fail-closed 400 `MANDATORY_IE_MISSING`, merges the
+/// received source/target AS endpoints + `acrParams` into the `eecId`-keyed ACR
+/// state, and returns 204 with no response body (the yaml defines no 200/2xx
+/// body).
+async fn handle_acr_param_send(request: &SbiRequest) -> SbiResponse {
+    log::info!("ACR parameter information send");
     let value = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let req: AcrParamInfoReq = match serde_json::from_value(value) {
-        Ok(r) => r,
+    let info: ACRParamsInfo = match serde_json::from_value(value) {
+        Ok(i) => i,
         Err(e) => {
             return send_bad_request(
-                &format!("Missing or invalid mandatory IE (eecId/sEasId): {e}"),
+                &format!(
+                    "Missing or invalid mandatory IE \
+                     (requestorId/eecId/acId/sAsEndPoint/tAsEndPoint/acrParams): {e}"
+                ),
                 Some(cause::MANDATORY_IE_MISSING),
             );
         }
     };
-    if req.eec_id.trim().is_empty() || req.s_eas_id.trim().is_empty() {
+    if info.requestor_id.trim().is_empty()
+        || info.eec_id.trim().is_empty()
+        || info.ac_id.trim().is_empty()
+    {
         return send_bad_request(
-            "Mandatory IE eecId/sEasId is empty",
+            "Mandatory IE requestorId/eecId/acId is empty",
             Some(cause::MANDATORY_IE_MISSING),
         );
     }
-    let acr_params = ees_self()
-        .read()
-        .ok()
-        .and_then(|c| c.acr_find(req.ue_id.as_deref(), Some(&req.eec_id)))
-        .map(|state| acr::AcrRelocationInfo {
-            s_eas_id: state.eas_id,
-            t_eas_id: state.t_eas_id,
-            s_eas_endpoint: state.s_eas_endpoint,
-            t_eas_endpoint: state.t_eas_endpoint,
-        });
-    let resp = AcrParamInfoResp {
-        acr_params,
-        supp_feat: req.supp_feat,
-    };
-    SbiResponse::with_status(200)
-        .with_json_body(&resp)
-        .unwrap_or_else(|_| SbiResponse::with_status(200))
+    if info.s_as_end_point.is_empty() || info.t_as_end_point.is_empty() {
+        return send_bad_request(
+            "Mandatory IE sAsEndPoint/tAsEndPoint carries no address",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    if let Ok(c) = ees_self().read() {
+        c.acr_store_params(&info);
+    }
+    SbiResponse::with_status(204)
 }
 
 #[cfg(test)]
@@ -2707,10 +2677,13 @@ mod tests {
 
     // ---- eesd-13 tests -------------------------------------------------------
 
-    /// eesd-13 eees-cea: POST creates announcement (201 + Location); GET fetches
-    /// it; DELETE removes it (204); second DELETE → 404.
+    /// D3 eees-cea: the spec custom op `POST /declare` (CommonEASInfo) → 204
+    /// with NO body and NO Location; the declaration is stored keyed by
+    /// (appGrpId, easId). The fabricated `/announcements` collection is gone
+    /// (404), `GET /declare` → 405, and the DIFFERENT eees-appctxtreloc
+    /// `/declare` op still routes to its own handler (no arm-ordering mistake).
     #[test]
-    fn test_cea_announcement_lifecycle() {
+    fn test_cea_declare_custom_op() {
         let _g = auth::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2718,42 +2691,65 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        // POST → 201 + Location.
-        let body = r#"{"easId":"cea-eas.example.com","expTime":"2030-01-01T00:00:00Z"}"#;
-        let req = SbiRequest::post("/eees-cea/v1/announcements")
+        // POST /declare with all 4 required IEs → 204 (empty body, no Location).
+        let body = r#"{
+            "requestorId":"ees-src.example.com",
+            "easId":"common-eas.example.com",
+            "easEndPt":{"fqdn":"common-eas.edge.example.com"},
+            "appGrpId":"grp-1"
+        }"#;
+        let req = SbiRequest::post("/eees-cea/v1/declare")
             .with_header("Authorization", bearer(&sk, "k1", "eees-cea"))
             .with_body(body, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
-        assert_eq!(resp.status, 201);
-        let loc = resp.http.get_header("location").cloned().unwrap();
-        assert!(loc.starts_with(CEA_ANNOUNCEMENTS_PATH));
-        let id = loc.rsplit('/').next().unwrap().to_string();
-        let created: CeaAnnouncement =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(created.eas_id, "cea-eas.example.com");
-        assert_eq!(created.announcement_id.as_deref(), Some(id.as_str()));
+        assert_eq!(resp.status, 204);
+        assert!(resp.http.content.as_deref().unwrap_or("").is_empty());
+        assert!(resp.http.get_header("location").is_none());
 
-        // GET → 200.
-        let req = SbiRequest::get(format!("/eees-cea/v1/announcements/{id}"))
-            .with_header("Authorization", bearer(&sk, "k1", "eees-cea"));
-        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
+        // The declaration is recorded (accept-and-ack, keyed by appGrpId:easId).
+        {
+            let stored = ees_self()
+                .read()
+                .unwrap()
+                .cea_declared_find("grp-1", "common-eas.example.com")
+                .expect("declared common EAS is stored");
+            assert_eq!(stored.requestor_id, "ees-src.example.com");
+            assert_eq!(
+                stored.eas_end_pt.fqdn.as_deref(),
+                Some("common-eas.edge.example.com")
+            );
+        }
 
-        // DELETE → 204.
-        let req = SbiRequest::delete(format!("/eees-cea/v1/announcements/{id}"))
-            .with_header("Authorization", bearer(&sk, "k1", "eees-cea"));
-        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
-
-        // Second DELETE → 404.
-        let req = SbiRequest::delete(format!("/eees-cea/v1/announcements/{id}"))
-            .with_header("Authorization", bearer(&sk, "k1", "eees-cea"));
+        // The fabricated /announcements collection is gone → 404.
+        let req = SbiRequest::post("/eees-cea/v1/announcements")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-cea"))
+            .with_body(body, "application/json");
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        // GET /declare → 405 (POST-only custom op).
+        let req = SbiRequest::get("/eees-cea/v1/declare")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-cea"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 405);
+
+        // Regression: the DIFFERENT eees-appctxtreloc /declare op still routes
+        // to handle_acr_declare (a valid AcrDecReq → 204, NOT 404/CEA).
+        let decl_body = r#"{
+            "ueId":"imsi-cea-decl-1",
+            "tEasId":"eas-t.example.com",
+            "tEasEndpoint":{"fqdn":"eas-t.edge.example.com"}
+        }"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/declare")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(decl_body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
 
         auth::clear_auth_jwks();
     }
 
-    /// eesd-13 eees-cea: missing mandatory `easId` → 400.
+    /// D3 eees-cea: each of the 4 required IEs missing → 400
+    /// MANDATORY_IE_MISSING (and an easEndPt with no address form → 400).
     #[test]
-    fn test_cea_missing_eas_id_400() {
+    fn test_cea_declare_missing_required_400() {
         let _g = auth::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2761,11 +2757,29 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        let bad = r#"{"expTime":"2030-01-01T00:00:00Z"}"#;
-        let req = SbiRequest::post("/eees-cea/v1/announcements")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-cea"))
-            .with_body(bad, "application/json");
-        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+        for bad in [
+            // Missing requestorId.
+            r#"{"easId":"e","easEndPt":{"fqdn":"e"},"appGrpId":"g"}"#,
+            // Missing easId.
+            r#"{"requestorId":"r","easEndPt":{"fqdn":"e"},"appGrpId":"g"}"#,
+            // Missing easEndPt.
+            r#"{"requestorId":"r","easId":"e","appGrpId":"g"}"#,
+            // Missing appGrpId.
+            r#"{"requestorId":"r","easId":"e","easEndPt":{"fqdn":"e"}}"#,
+            // easEndPt present but carries no address form.
+            r#"{"requestorId":"r","easId":"e","easEndPt":{},"appGrpId":"g"}"#,
+            // Empty required string.
+            r#"{"requestorId":"","easId":"e","easEndPt":{"fqdn":"e"},"appGrpId":"g"}"#,
+        ] {
+            let req = SbiRequest::post("/eees-cea/v1/declare")
+                .with_header("Authorization", bearer(&sk, "k1", "eees-cea"))
+                .with_body(bad, "application/json");
+            assert_eq!(
+                block_on(ees_sbi_request_handler(req)).status,
+                400,
+                "expected 400 for body {bad}"
+            );
+        }
 
         auth::clear_auth_jwks();
     }
@@ -3204,10 +3218,12 @@ mod tests {
         assert_eq!(query_param(&p, "k"), Some("v%2"));
     }
 
-    /// eesd-13 eees-acr-param: after an ACR Determine, the param request
-    /// returns the stored `acrParams`; for an unknown pair returns empty `acrParams`.
+    /// D4 eees-acr-param: the spec custom op `POST /send-acrparamsinfo`
+    /// (ACRParamsInfo) → 204 and merges the received tAsEndPoint/acrParams into
+    /// the eecId-keyed ACR state. The reversed bespoke `/request-acr-params`
+    /// query is gone (404) and the wrong-casing body 400s.
     #[test]
-    fn test_acr_param_info_returns_stored_state() {
+    fn test_acr_param_send_stores_state() {
         let _g = auth::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3215,52 +3231,71 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        // Register two EASes so ACR Determine can pick a T-EAS.
-        register_eas(&sk, "param-s-eas.example.com", "VIDEO");
-        register_eas(&sk, "param-t-eas.example.com", "VIDEO");
-
-        // Run ACR Determine to populate the ACR state (keyed by requestorId,
-        // no ueId → key `req:eec-param-1`).
-        let det_body = r#"{
-            "requestorId":"eec-param-1",
-            "sEasEndpoint":{"fqdn":"param-s-eas.example.com"},
-            "easId":"param-s-eas.example.com"
+        // Spec body: the consumer PUSHES ACR parameters TO the EES → 204.
+        let body = r#"{
+            "requestorId":"eas-s.example.com",
+            "eecId":"eec-param-1",
+            "acId":"ac1",
+            "sAsEndPoint":{"fqdn":"s-as.edge.example.com"},
+            "tAsEndPoint":{"fqdn":"t-as.edge.example.com"},
+            "acrParams":{"predictExpTime":"2030-01-01T00:00:00Z"}
         }"#;
-        let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
-            .with_body(det_body, "application/json");
-        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
-
-        // ACR parameter information request → 200 with acrParams populated.
-        let body = r#"{"eecId":"eec-param-1","sEasId":"param-s-eas.example.com"}"#;
-        let req = SbiRequest::post("/eees-acr-param/v1/request-acr-params")
+        let req = SbiRequest::post("/eees-acr-param/v1/send-acrparamsinfo")
             .with_header("Authorization", bearer(&sk, "k1", "eees-acr-param"))
             .with_body(body, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
-        assert_eq!(resp.status, 200);
-        let info: AcrParamInfoResp =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        let params = info
-            .acr_params
-            .expect("acrParams must be present after Determine");
-        assert_eq!(params.s_eas_id.as_deref(), Some("param-s-eas.example.com"));
-        assert!(params.t_eas_id.is_some());
+        assert_eq!(resp.status, 204);
+        assert!(resp.http.content.as_deref().unwrap_or("").is_empty());
 
-        // Unknown pair → 200 with absent acrParams.
-        let body = r#"{"eecId":"eec-unknown","sEasId":"nobody.example.com"}"#;
+        // State assertion: acr_find(eecId) carries the received tAsEndPoint +
+        // acrParams (keyed by eecId as the requestor identity).
+        {
+            let state = ees_self()
+                .read()
+                .unwrap()
+                .acr_find(None, Some("eec-param-1"))
+                .expect("ACR state populated by send-acrparamsinfo");
+            assert_eq!(
+                state.t_eas_endpoint.and_then(|e| e.fqdn).as_deref(),
+                Some("t-as.edge.example.com")
+            );
+            assert_eq!(
+                state.s_eas_endpoint.and_then(|e| e.fqdn).as_deref(),
+                Some("s-as.edge.example.com")
+            );
+            assert_eq!(
+                state
+                    .acr_params
+                    .and_then(|p| p.predict_exp_time)
+                    .as_deref(),
+                Some("2030-01-01T00:00:00Z")
+            );
+        }
+
+        // The reversed bespoke /request-acr-params query is gone → 404.
         let req = SbiRequest::post("/eees-acr-param/v1/request-acr-params")
             .with_header("Authorization", bearer(&sk, "k1", "eees-acr-param"))
             .with_body(body, "application/json");
-        let resp = block_on(ees_sbi_request_handler(req));
-        assert_eq!(resp.status, 200);
-        let info: AcrParamInfoResp =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert!(info.acr_params.is_none());
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        // Wrong casing sEasEndpoint/tEasEndpoint (not sAsEndPoint) → 400.
+        let bad = r#"{
+            "requestorId":"eas-s.example.com",
+            "eecId":"eec-param-1",
+            "acId":"ac1",
+            "sEasEndpoint":{"fqdn":"s-as.edge.example.com"},
+            "tEasEndpoint":{"fqdn":"t-as.edge.example.com"},
+            "acrParams":{}
+        }"#;
+        let req = SbiRequest::post("/eees-acr-param/v1/send-acrparamsinfo")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acr-param"))
+            .with_body(bad, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
 
         // No token → 401.
         auth::clear_auth_jwks();
-        let req = SbiRequest::post("/eees-acr-param/v1/request-acr-params")
-            .with_body(r#"{"eecId":"x","sEasId":"y"}"#, "application/json");
+        let req = SbiRequest::post("/eees-acr-param/v1/send-acrparamsinfo")
+            .with_body(body, "application/json");
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 401);
 
         auth::clear_auth_jwks();
@@ -3275,11 +3310,11 @@ mod tests {
         auth::clear_auth_jwks();
 
         for path in [
-            "/eees-cea/v1/announcements",
+            "/eees-cea/v1/declare",
             "/eees-appclientinformation/v1/subscriptions",
             "/eees-acrmgntevent/v1/subscriptions",
             "/eees-eeccontextreloc/v1/eec-contexts",
-            "/eees-acr-param/v1/request-acr-params",
+            "/eees-acr-param/v1/send-acrparamsinfo",
         ] {
             let req = SbiRequest::post(path);
             assert_eq!(

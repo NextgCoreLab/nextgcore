@@ -10,7 +10,8 @@ use crate::acr::{
 };
 use crate::eec::EecRegistration;
 use crate::services::{
-    ACInfoSubscription, AcrMgntEventSubsc, CeaAnnouncement, EECContext, ACINFO_PATCHABLE_FIELDS,
+    ACInfoSubscription, ACRParamsInfo, AcrMgntEventSubsc, CommonEASInfo, EECContext,
+    ACINFO_PATCHABLE_FIELDS,
 };
 use crate::types::{
     apply_merge_patch, is_expired, EasDiscoveryFilter, EasDiscoverySubscription, EasProfile,
@@ -48,8 +49,9 @@ pub struct EesContext {
     disc_subscriptions: RwLock<HashMap<String, EasDiscoverySubscription>>,
     /// ACR relocation states (eesd-07), keyed by `"eecId:sEasId"`.
     acr_states: RwLock<HashMap<String, AcrState>>,
-    /// CEA announcements (eesd-13 `eees-cea`), keyed by server-minted `announcementId`.
-    cea_announcements: RwLock<HashMap<String, CeaAnnouncement>>,
+    /// Declared common EASs (`eees-cea` `POST /declare`, D3), keyed by
+    /// `"{appGrpId}:{easId}"` (the spec op is accept-and-ack with no resource).
+    declared_common_eas: RwLock<HashMap<String, CommonEASInfo>>,
     /// AC Information subscriptions (`eees-appclientinformation`, TS 29.558
     /// §8.4). The spec `ACInfoSubscription` body carries NO id field: the
     /// server-minted `subscriptionId` lives only as this map's key (returned
@@ -74,7 +76,7 @@ impl EesContext {
             eec_registrations: RwLock::new(HashMap::new()),
             disc_subscriptions: RwLock::new(HashMap::new()),
             acr_states: RwLock::new(HashMap::new()),
-            cea_announcements: RwLock::new(HashMap::new()),
+            declared_common_eas: RwLock::new(HashMap::new()),
             app_client_infos: RwLock::new(HashMap::new()),
             acr_mgnt_subscriptions: RwLock::new(HashMap::new()),
             eec_contexts: RwLock::new(HashMap::new()),
@@ -111,8 +113,8 @@ impl EesContext {
         if let Ok(mut states) = self.acr_states.write() {
             states.clear();
         }
-        if let Ok(mut anns) = self.cea_announcements.write() {
-            anns.clear();
+        if let Ok(mut declared) = self.declared_common_eas.write() {
+            declared.clear();
         }
         if let Ok(mut infos) = self.app_client_infos.write() {
             infos.clear();
@@ -535,6 +537,7 @@ impl EesContext {
             t_eas_id: t_eas_id.clone(),
             t_eas_endpoint: t_endpoint,
             status: Some(AcrStatus::Determined),
+            acr_params: None,
         };
         let key = acr_ue_key(req.ue_id.as_deref(), Some(&req.requestor_id));
         if let Ok(mut states) = self.acr_states.write() {
@@ -562,6 +565,7 @@ impl EesContext {
             t_eas_id: None,
             t_eas_endpoint: Some(req.t_eas_endpoint.clone()),
             status: Some(AcrStatus::Initiated),
+            acr_params: None,
         };
         if let Ok(mut states) = self.acr_states.write() {
             if let Some(prev) = states.get(&key) {
@@ -591,6 +595,7 @@ impl EesContext {
             t_eas_id: Some(req.t_eas_id.clone()),
             t_eas_endpoint: Some(req.t_eas_endpoint.clone()),
             status: Some(AcrStatus::Completed),
+            acr_params: None,
         };
         if let Ok(mut states) = self.acr_states.write() {
             states.insert(key, state.clone());
@@ -624,6 +629,7 @@ impl EesContext {
             t_eas_id: t_eas_id.clone(),
             t_eas_endpoint: t_endpoint,
             status: Some(AcrStatus::Initiated),
+            acr_params: None,
         };
         let key = acr_ue_key(Some(ue_id), None);
         if let Ok(mut states) = self.acr_states.write() {
@@ -652,45 +658,51 @@ impl EesContext {
         self.acr_states.read().ok()?.get(&key).cloned()
     }
 
-    // ---- eesd-13: eees-cea — Common EAS Announcement -------------------------
-
-    /// Create a CEA announcement; mints an `announcementId`.
-    pub fn cea_create(&self, mut ann: CeaAnnouncement) -> Option<CeaAnnouncement> {
-        let mut anns = self.cea_announcements.write().ok()?;
-        if anns.len() >= self.max_eas {
-            return None;
+    /// D4 (`eees-acr-param` `POST /send-acrparamsinfo`): merge the pushed
+    /// `ACRParamsInfo` (source/target AS endpoints + `acrParams`) into the
+    /// `eecId`-keyed ACR state (created if absent). Keyed the same way
+    /// [`acr_find`](Self::acr_find)`(None, Some(eecId))` reads it back.
+    pub fn acr_store_params(&self, info: &ACRParamsInfo) {
+        let key = acr_ue_key(None, Some(&info.eec_id));
+        if let Ok(mut states) = self.acr_states.write() {
+            let state = states.entry(key).or_default();
+            state.requestor_id.get_or_insert_with(|| info.eec_id.clone());
+            state.s_eas_endpoint = Some(info.s_as_end_point.clone());
+            state.t_eas_endpoint = Some(info.t_as_end_point.clone());
+            state.acr_params = Some(info.acr_params.clone());
         }
-        let id = Uuid::new_v4().to_string();
-        ann.announcement_id = Some(id.clone());
-        anns.insert(id.clone(), ann.clone());
         log::info!(
-            "CEA announcement created: announcementId={id} easId={}",
-            ann.eas_id
+            "ACR parameters received: eecId={} acId={} requestorId={}",
+            info.eec_id,
+            info.ac_id,
+            info.requestor_id
         );
-        Some(ann)
     }
 
-    pub fn cea_find(&self, announcement_id: &str) -> Option<CeaAnnouncement> {
-        self.cea_announcements
-            .read()
-            .ok()?
-            .get(announcement_id)
-            .cloned()
-    }
+    // ---- D3: eees-cea — Common EAS Announcement (POST /declare) --------------
 
-    pub fn cea_list(&self) -> Vec<CeaAnnouncement> {
-        self.cea_announcements
-            .read()
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    pub fn cea_delete(&self, announcement_id: &str) -> Option<CeaAnnouncement> {
-        let removed = self.cea_announcements.write().ok()?.remove(announcement_id);
-        if removed.is_some() {
-            log::info!("CEA announcement deleted: announcementId={announcement_id}");
+    /// Record a declared common EAS (`eees-cea` `POST /declare`). The custom
+    /// operation is accept-and-ack: the declaration is stored keyed by
+    /// `(appGrpId, easId)` so a redeclaration for the same group+EAS updates in
+    /// place. No resource is minted (there is no `/announcements` collection).
+    pub fn cea_declare(&self, info: CommonEASInfo) {
+        let key = format!("{}:{}", info.app_grp_id, info.eas_id);
+        if let Ok(mut declared) = self.declared_common_eas.write() {
+            log::info!(
+                "Common EAS declared: appGrpId={} easId={}",
+                info.app_grp_id,
+                info.eas_id
+            );
+            declared.insert(key, info);
         }
-        removed
+    }
+
+    /// Look up a declared common EAS by `(appGrpId, easId)` (test-only inspector
+    /// for the D3 accept-and-ack assertion).
+    #[cfg(test)]
+    pub fn cea_declared_find(&self, app_grp_id: &str, eas_id: &str) -> Option<CommonEASInfo> {
+        let key = format!("{app_grp_id}:{eas_id}");
+        self.declared_common_eas.read().ok()?.get(&key).cloned()
     }
 
     // ---- eees-appclientinformation — AC Information subscriptions (§8.4) -----

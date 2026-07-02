@@ -309,23 +309,6 @@ pub struct ACRDataStatus {
 // ACR state machine (stored in EesContext::acr_states)
 // ---------------------------------------------------------------------------
 
-/// Relocation identity reported by the bespoke `eees-acr-param` query helper
-/// (a non-3GPP convenience API): the S-EAS/T-EAS identifiers and endpoints of a
-/// tracked ACR. Distinct from the spec [`AcrParameters`] (§6.5.5.2.7), which
-/// carries only `predictExpTime` and cannot hold relocation identity.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct AcrRelocationInfo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub s_eas_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub t_eas_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub s_eas_endpoint: Option<EndPoint>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub t_eas_endpoint: Option<EndPoint>,
-}
-
 /// Per-UE ACR relocation state maintained by the EES.
 ///
 /// Keyed (in `acr_states`) by the UE identity where available (see
@@ -340,6 +323,9 @@ pub struct AcrState {
     pub t_eas_id: Option<String>,
     pub t_eas_endpoint: Option<EndPoint>,
     pub status: Option<AcrStatus>,
+    /// ACR parameters (`predictExpTime`) received via `eees-acr-param`
+    /// `POST /send-acrparamsinfo` (D4); `None` until such a push arrives.
+    pub acr_params: Option<AcrParameters>,
 }
 
 /// Error outcomes from ACR context operations.
