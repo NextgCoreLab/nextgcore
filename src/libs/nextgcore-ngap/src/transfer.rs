@@ -41,7 +41,7 @@ const BIT_RATE_MAX: i64 = 4_000_000_000_000;
 // ============================================================================
 
 /// Encode an extensible constrained INTEGER (extension bit + root encoding)
-fn encode_ext_constrained(
+pub(crate) fn encode_ext_constrained(
     encoder: &mut AperEncoder,
     value: i64,
     min: i64,
@@ -54,7 +54,11 @@ fn encode_ext_constrained(
 }
 
 /// Decode an extensible constrained INTEGER
-fn decode_ext_constrained(decoder: &mut AperDecoder, min: i64, max: i64) -> NgapResult<i64> {
+pub(crate) fn decode_ext_constrained(
+    decoder: &mut AperDecoder,
+    min: i64,
+    max: i64,
+) -> NgapResult<i64> {
     let extended = decoder.read_bit()?;
     if extended {
         // Extension values are encoded as an unconstrained whole number
@@ -73,7 +77,7 @@ fn decode_bit_rate(decoder: &mut AperDecoder) -> NgapResult<u64> {
     Ok(decode_ext_constrained(decoder, 0, BIT_RATE_MAX)? as u64)
 }
 
-fn invalid(ie_name: &'static str, reason: String) -> NgapError {
+pub(crate) fn invalid(ie_name: &'static str, reason: String) -> NgapError {
     NgapError::InvalidIeValue { ie_name, reason }
 }
 
@@ -105,7 +109,7 @@ impl TransportLayerAddress {
         }
     }
 
-    fn encode(&self, encoder: &mut AperEncoder) -> NgapResult<()> {
+    pub(crate) fn encode(&self, encoder: &mut AperEncoder) -> NgapResult<()> {
         if self.bit_len == 0 || self.bit_len > 160 || self.octets.len() != self.bit_len.div_ceil(8)
         {
             return Err(invalid(
@@ -131,7 +135,7 @@ impl TransportLayerAddress {
         Ok(())
     }
 
-    fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
+    pub(crate) fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
         let extended = decoder.read_bit()?;
         if extended {
             return Err(invalid(
@@ -168,7 +172,7 @@ pub enum UpTransportLayerInformation {
 }
 
 impl UpTransportLayerInformation {
-    fn encode(&self, encoder: &mut AperEncoder) -> NgapResult<()> {
+    pub(crate) fn encode(&self, encoder: &mut AperEncoder) -> NgapResult<()> {
         match self {
             UpTransportLayerInformation::GtpTunnel(tunnel) => {
                 encoder.encode_choice_index(0, 2, false)?;
@@ -181,7 +185,7 @@ impl UpTransportLayerInformation {
         }
     }
 
-    fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
+    pub(crate) fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
         let choice = decoder.decode_choice_index(2, false)?;
         if choice != 0 {
             return Err(invalid(
@@ -601,7 +605,7 @@ pub struct QosFlowLevelQosParameters {
 }
 
 impl QosFlowLevelQosParameters {
-    fn encode(&self, encoder: &mut AperEncoder) -> NgapResult<()> {
+    pub(crate) fn encode(&self, encoder: &mut AperEncoder) -> NgapResult<()> {
         encoder.write_bit(false); // extension
         encoder.write_bit(self.gbr_qos_information.is_some());
         encoder.write_bit(self.reflective_qos_attribute);
@@ -622,7 +626,7 @@ impl QosFlowLevelQosParameters {
         Ok(())
     }
 
-    fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
+    pub(crate) fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
         let _ext = decoder.read_bit()?;
         let gbr_present = decoder.read_bit()?;
         let reflective_present = decoder.read_bit()?;
@@ -652,11 +656,11 @@ impl QosFlowLevelQosParameters {
     }
 }
 
-fn encode_qfi(encoder: &mut AperEncoder, qfi: u8) -> NgapResult<()> {
+pub(crate) fn encode_qfi(encoder: &mut AperEncoder, qfi: u8) -> NgapResult<()> {
     encode_ext_constrained(encoder, qfi as i64, 0, 63)
 }
 
-fn decode_qfi(decoder: &mut AperDecoder) -> NgapResult<u8> {
+pub(crate) fn decode_qfi(decoder: &mut AperDecoder) -> NgapResult<u8> {
     Ok(decode_ext_constrained(decoder, 0, 63)? as u8)
 }
 

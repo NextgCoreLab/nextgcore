@@ -84,6 +84,7 @@
 pub mod builder;
 pub mod error;
 pub mod ie;
+pub mod mbs_transfer;
 pub mod parser;
 pub mod transfer;
 pub mod types;
