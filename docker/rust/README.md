@@ -355,6 +355,25 @@ services:
 
 ## Validation
 
+### One-command E2E (recommended)
+
+```bash
+# Disk preflight -> build -> full matched-sim E2E (reg + PDU session + ping).
+# Exit 0 = all assertions green, 1 = test failure, 2 = infra/preflight refusal.
+./e2e.sh
+
+# Re-run without recompiling Rust / with an overlay / keeping the stack up
+./e2e.sh --quick
+./e2e.sh --overlay oauth2        # or: kernel-sctp, features
+./e2e.sh --keep
+```
+
+The preflight (`preflight.sh`) refuses to build with < 25 GB free disk and
+trims the BuildKit cache (`docker builder prune --keep-storage=20GB`) — see
+hazard #269 (Docker image-store wipe under disk pressure). On failure, per-NF
+`docker logs` are captured under `artifacts/` before teardown. CI runner
+requirements and artifact layout: [CI.md](CI.md).
+
 ### Automated Validation
 
 ```bash

@@ -9,8 +9,9 @@
 #   3. Dockerfile.nf      → Per-NF image (FROM core + binary)
 #
 # Usage:
-#   ./build.sh                # Full build (compile + images)
-#   ./build.sh --skip-rust    # Only rebuild Docker images (use existing binaries)
+#   ./build.sh                 # Full build (compile + images)
+#   ./build.sh --skip-rust     # Only rebuild Docker images (use existing binaries)
+#   ./build.sh --no-preflight  # Skip the disk preflight (preflight.sh)
 
 set -e
 
@@ -20,11 +21,13 @@ NEXTGSIM_DIR="$PROJECT_ROOT/nextgsim"
 BINARIES_DIR="$SCRIPT_DIR/binaries"
 
 SKIP_RUST=false
+SKIP_PREFLIGHT=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-rust) SKIP_RUST=true; shift ;;
+        --no-preflight) SKIP_PREFLIGHT=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -32,6 +35,16 @@ done
 echo "=== NextGCore Docker Build ==="
 echo "Project root: $PROJECT_ROOT"
 echo ""
+
+# ============================================================================
+# Step 0: Disk preflight (hazard #269: image-store wipe under disk pressure)
+# ============================================================================
+if [ "$SKIP_PREFLIGHT" = false ]; then
+    "$SCRIPT_DIR/preflight.sh" || {
+        echo "Preflight refused (low disk?) - aborting build. Use --no-preflight to override." >&2
+        exit 2
+    }
+fi
 
 # ============================================================================
 # Step 1: Build Rust binaries inside Docker
@@ -59,6 +72,7 @@ if [ "$SKIP_RUST" = false ]; then
     docker rm -f nextg-builder-extract >/dev/null
 
     echo "=== Built binaries ==="
+    # shellcheck disable=SC2010  # cosmetic listing; names are build-controlled
     ls -lh "$BINARIES_DIR/" | grep -v "^total" | grep -v "\.d$"
 fi
 

@@ -7,6 +7,9 @@
 # Build artifacts — regenerate via docker/rust/build.sh
 docker/rust/binaries/
 
+# E2E failure artifacts — captured by docker/rust/e2e.sh on a failed run
+docker/rust/artifacts/
+
 # Local tooling (GitNexus code-intelligence index + Claude Code local config)
 .gitnexus
 .claude/
