@@ -18,6 +18,84 @@ use tokio_rustls::TlsConnector;
 use crate::error::{SbiError, SbiResult};
 use crate::types::NfType;
 
+// ============================================================================
+// I4 — flag-gated default OAuth2 resource paths (TS 29.510 §5.4 Nnrf_AccessToken)
+// ============================================================================
+//
+// H8-AB / sbi-06 made the standard TS 29.510 paths (`/oauth2/token`,
+// `/oauth2/retrieve-key`) selectable *per instance* while keeping the bespoke
+// Open5GS-style paths as the compiled-in default. I4 adds a single process-wide
+// flip so a deployment can make the *default* path set the standard one without
+// touching every construction site — shipped OFF (bespoke) so the matched-sim
+// E2E, whose NRF still serves the bespoke endpoints, stays green until the
+// consumers move. Explicit per-instance overrides ([`OAuth2Client::with_token_path`],
+// [`JwksCache::for_nrf_with_path`]) always win over this selector.
+
+/// Environment variable selecting, process-wide, whether newly-constructed
+/// OAuth2 clients and JWKS caches default to the **standard** TS 29.510
+/// resource paths (`/oauth2/token`, `/oauth2/retrieve-key`) instead of the
+/// bespoke Open5GS-style paths (`/nnrf-oauth2/v1/access-token`,
+/// `/nnrf-oauth2/v1/jwks`).
+///
+/// Truthy values (`1`, `true`, `yes`, `on`, case-insensitive) enable the
+/// standard paths; anything else — including the variable being unset — keeps
+/// the bespoke default. A programmatic override via
+/// [`set_oauth2_standard_paths_default`] takes precedence over the env var.
+pub const OAUTH2_STANDARD_PATHS_ENV: &str = "NEXTGCORE_SBI_OAUTH2_STANDARD_PATHS";
+
+/// Tri-state programmatic override of the default-path selector:
+/// `0` = unset (consult [`OAUTH2_STANDARD_PATHS_ENV`]), `1` = force bespoke,
+/// `2` = force standard.
+static OAUTH2_PATH_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force (or clear) the process-wide default OAuth2 resource-path selection,
+/// overriding [`OAUTH2_STANDARD_PATHS_ENV`].
+///
+/// `true` makes every subsequently-constructed [`OAuth2Client::new`] /
+/// [`JwksCache::for_nrf`] default to the TS 29.510 standard paths; `false`
+/// forces the bespoke default. Instances built with an explicit path
+/// ([`OAuth2Client::with_token_path`] / [`JwksCache::for_nrf_with_path`]) are
+/// unaffected. The shipped default is **bespoke** (env unset, no override) so
+/// the matched-sim E2E stays green until the NRF serves the standard paths.
+pub fn set_oauth2_standard_paths_default(enabled: bool) {
+    OAUTH2_PATH_MODE.store(
+        if enabled { 2 } else { 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Clear a programmatic override set by [`set_oauth2_standard_paths_default`],
+/// restoring env-var-driven resolution.
+pub fn reset_oauth2_standard_paths_default() {
+    OAUTH2_PATH_MODE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether newly-constructed OAuth2 clients / JWKS caches default to the
+/// standard TS 29.510 paths. Resolves the programmatic override first, then
+/// [`OAUTH2_STANDARD_PATHS_ENV`], defaulting to `false` (bespoke).
+pub fn oauth2_standard_paths_default() -> bool {
+    match OAUTH2_PATH_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => env_flag_truthy(std::env::var(OAUTH2_STANDARD_PATHS_ENV).ok().as_deref()),
+    }
+}
+
+/// Pure truthiness test for the standard-paths env value (unit-testable without
+/// touching the process environment).
+fn env_flag_truthy(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        }
+        None => false,
+    }
+}
+
 /// OAuth2 access token response per RFC 6749 Section 4.4.3 and 3GPP TS 29.510.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessTokenResponse {
@@ -481,9 +559,12 @@ pub struct OAuth2Client {
     /// `http://` path unchanged (the connector is consulted only for `https`).
     tls: Option<TlsConnector>,
     /// Resource path (appended to `nrf_uri`) of the NRF access-token endpoint
-    /// (sbi-06). Defaults to the bespoke [`OAuth2Client::TOKEN_PATH_BESPOKE`];
-    /// set [`OAuth2Client::TOKEN_PATH_STANDARD`] via
-    /// [`OAuth2Client::with_token_path`] once the NRF serves the TS 29.510 path.
+    /// (sbi-06). [`OAuth2Client::new`] seeds this from
+    /// [`OAuth2Client::default_token_path`], which honours the process-wide
+    /// selector (I4): the standard [`OAuth2Client::TOKEN_PATH_STANDARD`] when
+    /// [`oauth2_standard_paths_default`] is on, else the bespoke
+    /// [`OAuth2Client::TOKEN_PATH_BESPOKE`]. Override per instance with
+    /// [`OAuth2Client::with_token_path`].
     token_path: String,
 }
 
@@ -496,7 +577,22 @@ impl OAuth2Client {
     /// [`OAuth2Client::with_token_path`].
     pub const TOKEN_PATH_STANDARD: &'static str = "/oauth2/token";
 
-    /// Create a new OAuth2 client.
+    /// The access-token resource path a freshly-built client uses by default,
+    /// per the process-wide selector (I4, [`oauth2_standard_paths_default`]):
+    /// the TS 29.510 [`TOKEN_PATH_STANDARD`](Self::TOKEN_PATH_STANDARD) when the
+    /// standard-paths flag is on, else the bespoke
+    /// [`TOKEN_PATH_BESPOKE`](Self::TOKEN_PATH_BESPOKE).
+    pub fn default_token_path() -> &'static str {
+        if oauth2_standard_paths_default() {
+            Self::TOKEN_PATH_STANDARD
+        } else {
+            Self::TOKEN_PATH_BESPOKE
+        }
+    }
+
+    /// Create a new OAuth2 client. Its access-token path defaults to
+    /// [`OAuth2Client::default_token_path`] (the process-wide selector, I4);
+    /// override per instance with [`OAuth2Client::with_token_path`].
     pub fn new(
         nrf_uri: impl Into<String>,
         nf_instance_id: impl Into<String>,
@@ -508,7 +604,7 @@ impl OAuth2Client {
             nf_type,
             cache: TokenCache::new(),
             tls: None,
-            token_path: Self::TOKEN_PATH_BESPOKE.to_string(),
+            token_path: Self::default_token_path().to_string(),
         }
     }
 
@@ -585,9 +681,10 @@ impl OAuth2Client {
             AccessTokenRequest::new(&self.nf_instance_id, self.nf_type, target_nf_type, scope);
 
         let body = request.to_form_body();
-        // sbi-06: the resource path is configurable; the default keeps the
-        // bespoke `/nnrf-oauth2/v1/access-token` so the wire request is
-        // unchanged until the NRF is migrated to the TS 29.510 standard path.
+        // sbi-06/I4: the resource path is configurable; the process-wide
+        // selector defaults it (bespoke `/nnrf-oauth2/v1/access-token` unless
+        // the standard-paths flag is on) so the wire request is unchanged until
+        // the NRF is migrated to the TS 29.510 standard path.
         let uri = format!("{}{}", self.nrf_uri, self.token_path);
 
         // Cleartext for `http://`, TLS for `https://` (scheme-branched).
@@ -797,6 +894,20 @@ impl JwksCache {
     /// [`JwksCache::for_nrf_with_path`].
     pub const NRF_KEY_PATH_STANDARD: &'static str = "/oauth2/retrieve-key";
 
+    /// The NRF key-retrieval resource path [`JwksCache::for_nrf`] uses by
+    /// default, per the process-wide selector (I4,
+    /// [`oauth2_standard_paths_default`]): the TS 29.510
+    /// [`NRF_KEY_PATH_STANDARD`](Self::NRF_KEY_PATH_STANDARD) when the
+    /// standard-paths flag is on, else the bespoke
+    /// [`NRF_JWKS_PATH`](Self::NRF_JWKS_PATH).
+    pub fn default_key_path() -> &'static str {
+        if oauth2_standard_paths_default() {
+            Self::NRF_KEY_PATH_STANDARD
+        } else {
+            Self::NRF_JWKS_PATH
+        }
+    }
+
     /// Create a cache for an explicit JWKS URI.
     pub fn new(jwks_uri: impl Into<String>) -> Self {
         Self {
@@ -807,10 +918,14 @@ impl JwksCache {
         }
     }
 
-    /// Create a cache pointing at the NRF's JWKS endpoint, using the bespoke
-    /// default path ([`JwksCache::NRF_JWKS_PATH`]).
+    /// Create a cache pointing at the NRF's key endpoint, using
+    /// [`JwksCache::default_key_path`] — the process-wide selector (I4): the
+    /// standard TS 29.510 `/oauth2/retrieve-key` when
+    /// [`oauth2_standard_paths_default`] is on, else the bespoke
+    /// [`JwksCache::NRF_JWKS_PATH`]. Use [`JwksCache::for_nrf_with_path`] to
+    /// pin an explicit path regardless of the selector.
     pub fn for_nrf(nrf_uri: &str) -> Self {
-        Self::for_nrf_with_path(nrf_uri, Self::NRF_JWKS_PATH)
+        Self::for_nrf_with_path(nrf_uri, Self::default_key_path())
     }
 
     /// Create a cache pointing at the NRF, with an explicit key resource path
@@ -954,6 +1069,20 @@ pub async fn fetch_jwks(jwks_uri: &str) -> SbiResult<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes every test that reads or mutates the process-wide default
+    /// OAuth2 path selector (I4) so a parallel flip cannot perturb a
+    /// default-asserting test. Poison-tolerant so one panicking test does not
+    /// cascade-fail the rest.
+    static PATH_MODE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_path_mode() -> std::sync::MutexGuard<'static, ()> {
+        let g = PATH_MODE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Clear any override leaked by a previously-panicked guarded test so we
+        // start from the shipped (env-driven) baseline.
+        reset_oauth2_standard_paths_default();
+        g
+    }
 
     #[test]
     fn test_access_token_request_form_body() {
@@ -1356,6 +1485,7 @@ mod tests {
 
     #[test]
     fn test_jwks_cache_uri_construction() {
+        let _g = lock_path_mode(); // for_nrf honours the I4 selector; pin baseline
         assert_eq!(
             JwksCache::for_nrf("http://nrf:7777").jwks_uri(),
             "http://nrf:7777/nnrf-oauth2/v1/jwks"
@@ -1558,6 +1688,7 @@ mod tests {
 
     #[test]
     fn test_token_path_defaults_to_bespoke() {
+        let _g = lock_path_mode(); // pin the I4 baseline (shipped: bespoke)
         // The default keeps the bespoke path so the wire request is unchanged
         // until the NRF is migrated to the TS 29.510 route.
         let c = OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf);
@@ -1571,6 +1702,7 @@ mod tests {
 
     #[test]
     fn test_jwks_path_default_and_standard() {
+        let _g = lock_path_mode(); // pin the I4 baseline (shipped: bespoke)
         // Default `for_nrf` uses the bespoke path.
         assert_eq!(
             JwksCache::for_nrf("http://nrf:7777").jwks_uri(),
@@ -1630,7 +1762,12 @@ mod tests {
     async fn test_default_token_path_used_on_wire() {
         // A server that only answers the bespoke path → default client succeeds.
         let addr = serve_token_on_path("/nnrf-oauth2/v1/access-token").await;
-        let client = OAuth2Client::new(format!("http://{addr}"), "amf-1", NfType::Amf);
+        // The I4 selector is read at construction; hold the guard only over the
+        // (synchronous) build to pin the bespoke baseline, then release before I/O.
+        let client = {
+            let _g = lock_path_mode();
+            OAuth2Client::new(format!("http://{addr}"), "amf-1", NfType::Amf)
+        };
         let resp = client
             .request_token(NfType::Udm, "nudm-sdm")
             .await
@@ -1648,6 +1785,115 @@ mod tests {
             .request_token(NfType::Udm, "nudm-sdm")
             .await
             .expect("standard token path succeeds when configured");
+        assert_eq!(resp.access_token, "tok");
+    }
+
+    // --- I4: flag-gated default OAuth2 resource paths (TS 29.510 §5.4) ---
+
+    #[test]
+    fn test_env_flag_truthy_pure() {
+        // Truthy spellings (trimmed, case-insensitive) select the standard paths.
+        for v in ["1", "true", "TRUE", "Yes", " on ", "On"] {
+            assert!(env_flag_truthy(Some(v)), "{v:?} should be truthy");
+        }
+        // Everything else — including unset — keeps the bespoke default.
+        for v in ["0", "false", "no", "off", "", "bespoke", "2", "enable"] {
+            assert!(!env_flag_truthy(Some(v)), "{v:?} should be falsey");
+        }
+        assert!(!env_flag_truthy(None));
+    }
+
+    #[test]
+    fn test_default_paths_bespoke_out_of_the_box() {
+        let _g = lock_path_mode();
+        // Shipped default (no programmatic override, env unset in the gate):
+        // bespoke on both surfaces, so the matched-sim wire is unchanged.
+        assert!(!oauth2_standard_paths_default());
+        assert_eq!(
+            OAuth2Client::default_token_path(),
+            OAuth2Client::TOKEN_PATH_BESPOKE
+        );
+        assert_eq!(JwksCache::default_key_path(), JwksCache::NRF_JWKS_PATH);
+        assert_eq!(
+            OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf).token_path(),
+            "/nnrf-oauth2/v1/access-token"
+        );
+        assert_eq!(
+            JwksCache::for_nrf("http://nrf:7777").jwks_uri(),
+            "http://nrf:7777/nnrf-oauth2/v1/jwks"
+        );
+    }
+
+    #[test]
+    fn test_flag_flips_default_to_standard() {
+        let _g = lock_path_mode();
+        set_oauth2_standard_paths_default(true);
+        assert!(oauth2_standard_paths_default());
+        assert_eq!(
+            OAuth2Client::default_token_path(),
+            OAuth2Client::TOKEN_PATH_STANDARD
+        );
+        assert_eq!(JwksCache::default_key_path(), JwksCache::NRF_KEY_PATH_STANDARD);
+        // Constructors now default to the TS 29.510 standard paths.
+        assert_eq!(
+            OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf).token_path(),
+            "/oauth2/token"
+        );
+        assert_eq!(
+            JwksCache::for_nrf("http://nrf:7777").jwks_uri(),
+            "http://nrf:7777/oauth2/retrieve-key"
+        );
+        reset_oauth2_standard_paths_default();
+    }
+
+    #[test]
+    fn test_force_bespoke_overrides_env() {
+        let _g = lock_path_mode();
+        // A programmatic `false` forces bespoke even if the env asked for
+        // standard (the override wins over the env var).
+        set_oauth2_standard_paths_default(false);
+        assert!(!oauth2_standard_paths_default());
+        assert_eq!(
+            OAuth2Client::default_token_path(),
+            OAuth2Client::TOKEN_PATH_BESPOKE
+        );
+        assert_eq!(JwksCache::default_key_path(), JwksCache::NRF_JWKS_PATH);
+        reset_oauth2_standard_paths_default();
+    }
+
+    #[test]
+    fn test_per_instance_override_wins_over_flag() {
+        let _g = lock_path_mode();
+        // Even with the standard-paths flag ON, an explicit per-instance path
+        // wins (H8-AB / sbi-06 override semantics preserved, not undone).
+        set_oauth2_standard_paths_default(true);
+        let c = OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf)
+            .with_token_path(OAuth2Client::TOKEN_PATH_BESPOKE);
+        assert_eq!(c.token_path(), "/nnrf-oauth2/v1/access-token");
+        let cache = JwksCache::for_nrf_with_path("http://nrf:7777", JwksCache::NRF_JWKS_PATH);
+        assert_eq!(cache.jwks_uri(), "http://nrf:7777/nnrf-oauth2/v1/jwks");
+        reset_oauth2_standard_paths_default();
+    }
+
+    #[tokio::test]
+    async fn test_flag_default_hits_standard_path_on_wire() {
+        // Server answers ONLY the TS 29.510 standard path; with the flag on, the
+        // default-constructed client (no per-instance override) must request it.
+        let addr = serve_token_on_path("/oauth2/token").await;
+        // The selector is read at construction; flip → build → reset all under
+        // the guard, then release before the network I/O (no lock across await).
+        let client = {
+            let _g = lock_path_mode();
+            set_oauth2_standard_paths_default(true);
+            let c = OAuth2Client::new(format!("http://{addr}"), "amf-1", NfType::Amf);
+            reset_oauth2_standard_paths_default();
+            c
+        };
+        assert_eq!(client.token_path(), "/oauth2/token");
+        let resp = client
+            .request_token(NfType::Udm, "nudm-sdm")
+            .await
+            .expect("standard path used by default when the flag is on");
         assert_eq!(resp.access_token, "tok");
     }
 }

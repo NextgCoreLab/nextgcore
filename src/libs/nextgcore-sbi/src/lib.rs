@@ -78,8 +78,10 @@ pub use message::{
 };
 pub use multipart::MultipartBody;
 pub use oauth::{
-    authorize_bearer, authorize_bearer_aud, check_audience, AccessTokenClaims, AccessTokenError,
-    AccessTokenRequest, AccessTokenResponse, JwksCache, OAuth2Client, TokenCache,
+    authorize_bearer, authorize_bearer_aud, check_audience, oauth2_standard_paths_default,
+    reset_oauth2_standard_paths_default, set_oauth2_standard_paths_default, AccessTokenClaims,
+    AccessTokenError, AccessTokenRequest, AccessTokenResponse, JwksCache, OAuth2Client, TokenCache,
+    OAUTH2_STANDARD_PATHS_ENV,
 };
 pub use overload::{Lci, Oci, OverloadControl};
 #[cfg(feature = "6g-extensions")]
