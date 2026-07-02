@@ -1140,11 +1140,14 @@ mod tests {
     /// for UE_INITIAL_REGISTRATION). A relative URI or a missing router arm
     /// would fail this (the whole point of the WSB-4 round trip).
     #[tokio::test]
+    // The amf-context guard is intentionally held across the async
+    // namf_request_handler await to serialize the shared process-global amf
+    // context (current-thread test runtime, so this is deadlock-free).
+    #[allow(clippy::await_holding_lock)]
     async fn test_dereg_notify_strict_peer_amfd_accepts_udmd_body() {
         use nextgcore_sbi::message::SbiRequest;
 
-        // Capture udmd's production notify body BEFORE any std lock (no lock
-        // held across an await point).
+        // Capture udmd's production notify body BEFORE taking the amf guard.
         let (uri, body) = capture_udmd_dereg_body().await;
 
         // Reverse-shape pins on udmd's production body: absolute URI + both
@@ -1164,11 +1167,12 @@ mod tests {
         );
 
         let supi = "imsi-001010000000399";
-        let ue_id = {
-            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
-            nextgcore_amfd::test_support::init_context();
-            seed_amf_ue(supi, 60_100)
-        };
+        // Hold the guard across seed + real handler + drain so a parallel test
+        // cannot re-init (wipe) the global amf context in between — that race
+        // was the intermittent "0 vs 1 enqueued" failure.
+        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        nextgcore_amfd::test_support::init_context();
+        let ue_id = seed_amf_ue(supi, 60_100);
 
         // Drive udmd's REAL body through amfd's REAL Namf SBI handler at the
         // path amfd itself registers as its absolute deregCallbackUri.
@@ -1199,14 +1203,14 @@ mod tests {
     /// 3GPP network-initiated deregistration — proves the accept above is
     /// discriminating, not a blanket 2xx-and-enqueue.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see the twin test above
     async fn test_dereg_notify_strict_peer_non_3gpp_no_enqueue() {
         use nextgcore_sbi::message::SbiRequest;
         let supi = "imsi-001010000000398";
-        let ue_id = {
-            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
-            nextgcore_amfd::test_support::init_context();
-            seed_amf_ue(supi, 60_101)
-        };
+        // Held across the async handler + drain (see the twin test above).
+        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        nextgcore_amfd::test_support::init_context();
+        let ue_id = seed_amf_ue(supi, 60_101);
         let body =
             json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "NON_3GPP_ACCESS" });
         let path = format!("/namf-callback/v1/{supi}/dereg-notify");
@@ -1222,14 +1226,13 @@ mod tests {
     /// Fail-closed twins: a missing mandatory accessType -> 400; an unknown
     /// SUPI -> 404 CONTEXT_NOT_FOUND (TS 29.500 §5.2.7 / TS 29.518 §6.1.7.3).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // guard held across handler await (see twin above)
     async fn test_dereg_notify_fail_closed_400_and_404() {
         use nextgcore_sbi::message::SbiRequest;
         let supi = "imsi-001010000000397";
-        let _ue_id = {
-            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
-            nextgcore_amfd::test_support::init_context();
-            seed_amf_ue(supi, 60_102)
-        };
+        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        nextgcore_amfd::test_support::init_context();
+        let _ue_id = seed_amf_ue(supi, 60_102);
 
         // 400: mandatory accessType absent (WSB-4 fail-closed).
         let missing = json!({ "deregReason": "UE_INITIAL_REGISTRATION" });
@@ -1313,6 +1316,7 @@ mod tests {
     ///      (reregistration required for UE_INITIAL_REGISTRATION).
     /// A field-name or enum-string drift on either side breaks one direction.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // guard held across handler await (see twin above)
     async fn test_dereg_notify_cross_decode_amfd_struct_and_udmd_body() {
         use nextgcore_amfd::namf_handler::{AccessType, DeregistrationData, DeregistrationReason};
         use nextgcore_sbi::message::SbiRequest;
@@ -1335,11 +1339,9 @@ mod tests {
 
         // Direction 2 (decode pin) — udmd's body through amfd's REAL handler.
         let supi = "imsi-001010000000396";
-        let ue_id = {
-            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
-            nextgcore_amfd::test_support::init_context();
-            seed_amf_ue(supi, 60_103)
-        };
+        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        nextgcore_amfd::test_support::init_context();
+        let ue_id = seed_amf_ue(supi, 60_103);
         let path = format!("/namf-callback/v1/{supi}/dereg-notify");
         let req = SbiRequest::post(path)
             .with_json_body(&build_dereg_notification_body())
@@ -1361,14 +1363,13 @@ mod tests {
     /// blanket accept (TS 23.502 §4.2.2.3.3: only UE_INITIAL_REGISTRATION asks
     /// the UE to re-register).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // guard held across handler await (see twin above)
     async fn test_dereg_notify_strict_peer_non_initial_reason_no_rereg() {
         use nextgcore_sbi::message::SbiRequest;
         let supi = "imsi-001010000000395";
-        let ue_id = {
-            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
-            nextgcore_amfd::test_support::init_context();
-            seed_amf_ue(supi, 60_104)
-        };
+        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        nextgcore_amfd::test_support::init_context();
+        let ue_id = seed_amf_ue(supi, 60_104);
         let body = json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN", "accessType": "3GPP_ACCESS" });
         let path = format!("/namf-callback/v1/{supi}/dereg-notify");
         let resp = nextgcore_amfd::namf_request_handler(
@@ -1392,14 +1393,13 @@ mod tests {
     /// (TS 29.500 §5.2.7). Proves the accept above is discriminating, not a
     /// blanket 2xx.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // guard held across handler await (see twin above)
     async fn test_dereg_notify_strict_peer_rejects_unknown_reason() {
         use nextgcore_sbi::message::SbiRequest;
         let supi = "imsi-001010000000394";
-        let ue_id = {
-            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
-            nextgcore_amfd::test_support::init_context();
-            seed_amf_ue(supi, 60_105)
-        };
+        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        nextgcore_amfd::test_support::init_context();
+        let ue_id = seed_amf_ue(supi, 60_105);
         let body = json!({ "deregReason": "NOT_A_REAL_REASON", "accessType": "3GPP_ACCESS" });
         let path = format!("/namf-callback/v1/{supi}/dereg-notify");
         let resp = nextgcore_amfd::namf_request_handler(
