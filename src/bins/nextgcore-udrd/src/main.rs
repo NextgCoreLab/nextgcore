@@ -129,6 +129,19 @@ struct UdrYaml {
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Process-wide OAuth2 client for automatic Bearer-token acquisition on
+/// outbound SBI calls (Wave-6 H8 Phase A). Installed only when the existing
+/// `udr.sbi.oauth2.require` producer knob is enabled; attaching a Bearer to a
+/// non-verifying producer is a no-op, so this is matched-sim-E2E safe.
+static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>> =
+    std::sync::OnceLock::new();
+
+/// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled.
+#[allow(dead_code)]
+fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
@@ -256,6 +269,17 @@ async fn main() -> Result<()> {
         sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
             .as_deref()
             .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
+        // Wave-6 H8 Phase A: install the process-wide OAuth2 client so outbound
+        // SBI calls acquire and attach an NRF-issued Bearer token.
+        if let Some(nrf_uri) = nrf_uri_cfg.as_deref() {
+            let nf_instance_id = format!("udr-{}", uuid::Uuid::new_v4());
+            let oauth2 = Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
+                nrf_uri,
+                nf_instance_id,
+                nextgcore_sbi::types::NfType::Udr,
+            ));
+            let _ = OAUTH2_CLIENT.set(Some(oauth2));
+        }
         log::info!(
             "OAuth2 enforcement enabled (JWKS: {})",
             sbi_server_config
@@ -276,7 +300,13 @@ async fn main() -> Result<()> {
     // Register with NRF and start heartbeat worker
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+            // (tracked subscribers, saturated at 100; TS 29.510 §5.2.2.3.2).
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
+                let ctx = nextgcore_udrd::context::udr_self();
+                let load = ctx.read().map(|c| c.get_load()).unwrap_or(0);
+                load.clamp(0, 100) as u8
+            });
         }
         Ok(_) => {}
         Err(e) => {

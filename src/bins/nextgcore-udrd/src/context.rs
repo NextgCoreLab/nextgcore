@@ -136,6 +136,14 @@ impl UdrContext {
         self.ues.len()
     }
 
+    /// NF load gauge (`0..=100`) for `NFProfile.load` in the NRF heartbeat
+    /// (TS 29.510 §5.2.2.3.2). UDR has no fixed UE ceiling, so report the
+    /// tracked-subscriber count directly, saturated at 100 (each subscriber
+    /// contributes ~1%). Monotonic in the number of stored subscribers.
+    pub fn get_load(&self) -> i32 {
+        self.ue_count().min(100) as i32
+    }
+
     /// Find or create a session context for a UE
     pub fn sess_find_or_add(
         &mut self,
@@ -222,6 +230,20 @@ mod tests {
     fn test_udr_context_new() {
         let ctx = UdrContext::new();
         assert!(!ctx.is_initialized());
+    }
+
+    #[test]
+    fn test_udr_get_load_monotonic_and_capped() {
+        let mut ctx = UdrContext::new();
+        ctx.init();
+        assert_eq!(ctx.get_load(), 0, "no subscribers -> 0");
+        ctx.ue_find_or_add("imsi-001010000000001");
+        assert_eq!(ctx.get_load(), 1, "1 subscriber -> 1");
+        ctx.ue_find_or_add("imsi-001010000000002");
+        assert_eq!(ctx.get_load(), 2, "2 subscribers -> 2");
+        // Idempotent: same SUPI does not double-count.
+        ctx.ue_find_or_add("imsi-001010000000001");
+        assert_eq!(ctx.get_load(), 2, "duplicate SUPI -> still 2");
     }
 
     #[test]
