@@ -3060,6 +3060,188 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // H5 golden vectors: PDUSessionResourceModifyRequestTransfer
+    // (TS 38.413 §9.3.4.3, APER per ITU-T X.691, ALIGNED variant)
+    // ------------------------------------------------------------------
+    //
+    // Hand-derived from the ASN.1 in specs/38413-j30.txt — NOT captured from
+    // our own encoder — per the dual-derivation method in
+    // .context/GOLDEN-VECTOR-METHOD.md. Derivation A is the bit table below;
+    // derivation B is an independent from-scratch X.691 recompute (Python
+    // script, full text in the method doc's Appendix B) written without
+    // reading derivation A. Both derivations agree byte-for-byte; the vector
+    // was frozen only after that agreement (this cross-check is what caught
+    // the TUAK set-3 scramble precedent).
+    //
+    // ASN.1 anchors (specs/38413-j30.txt):
+    //   PDUSessionResourceModifyRequestTransfer  line 53689 (extensible SEQUENCE
+    //     of one mandatory ProtocolIE-Container)
+    //   ProtocolIE-Container ::= SEQUENCE (SIZE (0..65535)) OF ProtocolIE-Field
+    //     (line 60634; maxProtocolIEs = 65535, line 59201)
+    //   ProtocolIE-Field ::= SEQUENCE { id INTEGER (0..65535),
+    //     criticality ENUMERATED {reject,ignore,notify}, value <open type> }
+    //   id-PDUSessionAggregateMaximumBitRate = 130, criticality reject (59691)
+    //   id-QosFlowAddOrModifyRequestList     = 135, criticality reject (59701)
+    //   PDUSessionAggregateMaximumBitRate ::= SEQUENCE { DL BitRate, UL BitRate,
+    //     iE-Extensions OPTIONAL, ... } (53236)
+    //   BitRate ::= INTEGER (0..4000000000000, ...) (45660)
+    //   QosFlowAddOrModifyRequestList ::= SEQUENCE (SIZE(1..64)) OF ... (55098;
+    //     maxnoofQosFlows = 64, line 59309)
+    //   QosFlowAddOrModifyRequestItem ::= SEQUENCE { qosFlowIdentifier
+    //     INTEGER (0..63,...), qosFlowLevelQosParameters OPTIONAL,
+    //     e-RAB-ID OPTIONAL, iE-Extensions OPTIONAL, ... } (55101)
+
+    /// Golden vector A — AMBR-only transfer (DL 1 Gbps, UL 250 kbps).
+    ///
+    /// Derivation A bit table (X.691 ALIGNED; bits listed in emission order):
+    /// ```text
+    /// byte 0     0x00  [0]        outer SEQUENCE extension bit = 0 (X.691 §19.7)
+    ///                  [0000000]  pad: container count is a range-65536
+    ///                             constrained int -> 2 octets, octet-aligned
+    ///                             (§13.2.5.4 via §11.9.4.1)
+    /// bytes 1-2  0x0001           protocolIEs count = 1
+    /// bytes 3-4  0x0082           ProtocolIE-ID 130 (range 65536 -> 2 aligned octets)
+    /// byte 5     0x00  [00]       criticality reject = 0 (ENUMERATED root,
+    ///                             range 3 -> 2-bit field, §14.3/§13.2.5.2)
+    ///                  [000000]   pad: open-type length determinant aligns (§11.2/§11.9)
+    /// byte 6     0x09             open-type length = 9 octets (short form, §11.9.3.6)
+    /// --- open-type content: PDUSessionAggregateMaximumBitRate ---
+    /// byte 7     0x0C  [0]        AMBR SEQUENCE extension bit = 0
+    ///                  [0]        iE-Extensions absent (1-bit optional bitmap, §19.2)
+    ///                  [0]        DL BitRate extension bit = 0 (root, §13.1)
+    ///                  [011]      DL length-of-length: range 4e12+1 > 64K ->
+    ///                             §13.2.6: octet count n=4 as constrained int
+    ///                             (1..6) -> 3-bit field, offset 4-1=3
+    ///                  [00]       pad: §13.2.6 value octets are octet-aligned
+    /// bytes 8-11 0x3B9ACA00       DL = 1_000_000_000 in minimal 4 octets
+    /// byte 12    0x20  [0]        UL BitRate extension bit = 0
+    ///                  [010]      UL octet count n=3, offset 3-1=2
+    ///                  [0000]     pad to octet boundary
+    /// bytes13-15 0x03D090         UL = 250_000 in minimal 3 octets
+    /// ```
+    const GOLDEN_MODIFY_REQUEST_AMBR_ONLY: [u8; 16] = [
+        0x00, 0x00, 0x01, 0x00, 0x82, 0x00, 0x09, 0x0C, 0x3B, 0x9A, 0xCA, 0x00, 0x20, 0x03, 0xD0,
+        0x90,
+    ];
+
+    /// Golden vector B — AMBR (DL 200 Mbps, UL 100 Mbps) + one QoS-flow-add
+    /// item (QFI 1, no level parameters, no E-RAB ID) — exactly the shape
+    /// `build_modify_request_transfer(1, 200_000_000, 100_000_000)` emits on
+    /// the live PDU_RES_MOD_REQ path.
+    ///
+    /// Derivation A bit table (deltas from vector A annotated):
+    /// ```text
+    /// byte 0     0x00             ext bit 0 + 7 pad bits (as vector A)
+    /// bytes 1-2  0x0002           protocolIEs count = 2
+    /// bytes 3-4  0x0082           IE 1: ProtocolIE-ID 130 (AMBR)
+    /// byte 5     0x00             criticality reject (2 bits) + 6 pad bits
+    /// byte 6     0x0A             open-type length = 10 octets
+    /// byte 7     0x0C             [0 ext][0 iE-Ext absent][0 DL ext][011 n=4][00 pad]
+    /// bytes 8-11 0x0BEBC200       DL = 200_000_000 in minimal 4 octets
+    /// byte 12    0x30             [0 UL ext][011 n=4][0000 pad]
+    /// bytes13-16 0x05F5E100       UL = 100_000_000 in minimal 4 octets
+    /// bytes17-18 0x0087           IE 2: ProtocolIE-ID 135 (QosFlowAddOrModifyRequestList)
+    /// byte 19    0x00             criticality reject (2 bits) + 6 pad bits
+    /// byte 20    0x03             open-type length = 3 octets
+    /// --- open-type content: QosFlowAddOrModifyRequestList, 17 bits + 7 pad ---
+    /// byte 21    0x00  [000000]   SEQUENCE-OF count = 1 as constrained int
+    ///                             (1..64) -> 6-bit field, offset 0 (§20.6)
+    ///                  [0]        item SEQUENCE extension bit = 0
+    ///                  [0]        qosFlowLevelQosParameters absent
+    /// byte 22    0x00  [0]        e-RAB-ID absent
+    ///                  [0]        iE-Extensions absent
+    ///                  [0]        QosFlowIdentifier extension bit = 0
+    ///                  [00000]    QFI high 5 bits of 6-bit root value 1 (0..63)
+    /// byte 23    0x80  [1]        QFI low bit (value = 0b000001 = 1)
+    ///                  [0000000]  pad to octet boundary (§11.2.1)
+    /// ```
+    const GOLDEN_MODIFY_REQUEST_AMBR_PLUS_QOS_FLOW_ADD: [u8; 24] = [
+        0x00, 0x00, 0x02, 0x00, 0x82, 0x00, 0x0A, 0x0C, 0x0B, 0xEB, 0xC2, 0x00, 0x30, 0x05, 0xF5,
+        0xE1, 0x00, 0x00, 0x87, 0x00, 0x03, 0x00, 0x00, 0x80,
+    ];
+
+    /// Encoder golden A: an AMBR-only ModifyRequestTransfer (the transfer
+    /// codec `build_modify_request_transfer` drives; the builder itself always
+    /// adds the QoS-flow list, so the AMBR-only shape is pinned through the
+    /// same encoder directly) must produce the spec-derived bytes exactly.
+    #[test]
+    fn golden_modify_request_transfer_ambr_only_encodes_ts38413_bytes() {
+        use nextgcore_ngap::transfer::{
+            PduSessionAggregateMaximumBitRate, PduSessionResourceModifyRequestTransfer,
+        };
+        let transfer = PduSessionResourceModifyRequestTransfer {
+            pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
+                dl: 1_000_000_000,
+                ul: 250_000,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            transfer.encode().expect("encode"),
+            GOLDEN_MODIFY_REQUEST_AMBR_ONLY.to_vec(),
+            "AMBR-only ModifyRequestTransfer must match the hand-derived TS 38.413 APER vector"
+        );
+    }
+
+    /// Encoder golden B: the live builder's exact output (AMBR + one
+    /// QoS-flow-add item) must equal the spec-derived bytes. This replaces the
+    /// roundtrip-only oracle for encode-side drift: any bit change in the
+    /// encoder output fails here even if the matched decoder still accepts it.
+    #[test]
+    fn golden_modify_request_transfer_builder_encodes_ts38413_bytes() {
+        let bytes = build_modify_request_transfer(1, 200_000_000, 100_000_000).unwrap();
+        assert_eq!(
+            bytes,
+            GOLDEN_MODIFY_REQUEST_AMBR_PLUS_QOS_FLOW_ADD.to_vec(),
+            "build_modify_request_transfer must match the hand-derived TS 38.413 APER vector"
+        );
+    }
+
+    /// Decoder golden: the frozen spec-derived bytes must decode into exactly
+    /// the expected structs (guards decoder drift independently of encoder
+    /// drift — a symmetric codec bug passes the roundtrip but fails here).
+    #[test]
+    fn golden_modify_request_transfer_decodes_from_frozen_bytes() {
+        use nextgcore_ngap::transfer::{
+            PduSessionAggregateMaximumBitRate, PduSessionResourceModifyRequestTransfer,
+            QosFlowAddOrModifyRequestItem,
+        };
+
+        let a = PduSessionResourceModifyRequestTransfer::decode(&GOLDEN_MODIFY_REQUEST_AMBR_ONLY)
+            .expect("decode golden A");
+        assert_eq!(
+            a,
+            PduSessionResourceModifyRequestTransfer {
+                pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
+                    dl: 1_000_000_000,
+                    ul: 250_000,
+                }),
+                ..Default::default()
+            }
+        );
+
+        let b = PduSessionResourceModifyRequestTransfer::decode(
+            &GOLDEN_MODIFY_REQUEST_AMBR_PLUS_QOS_FLOW_ADD,
+        )
+        .expect("decode golden B");
+        assert_eq!(
+            b,
+            PduSessionResourceModifyRequestTransfer {
+                pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
+                    dl: 200_000_000,
+                    ul: 100_000_000,
+                }),
+                qos_flow_add_or_modify_request_list: vec![QosFlowAddOrModifyRequestItem {
+                    qos_flow_identifier: 1,
+                    qos_flow_level_qos_parameters: None,
+                    e_rab_id: None,
+                }],
+                ..Default::default()
+            }
+        );
+    }
+
     /// The gNB (nextgsim-ngap) produces this SetupResponseTransfer for gNB DL
     /// F-TEID 0x00020002 / 10.46.0.1 / QFI 1 (pinned in the gNB test
     /// capture_tests.rs::gnb_setup_response_transfer_roundtrips). smfd must
