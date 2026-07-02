@@ -258,4 +258,74 @@ mod tests {
         let decoded = GnssReferenceTimeForOneCell::decode_uper(&mut dec).unwrap();
         assert_eq!(decoded, original);
     }
+
+    // =====================================================================
+    // GOLDEN VECTOR — GNSS-ReferenceTime (H7, TS 37.355 §6.5.2, UPER)
+    //
+    // Method: `.context/GOLDEN-VECTOR-METHOD.md` (H5 dual derivation).
+    //   Derivation A: the hand X.691-UNALIGNED bit table below.
+    //   Derivation B: independent from-scratch recompute in
+    //     `tests/lpp_agnss_golden_derivation_b.py` (`vector2()`), written
+    //     without reading this table or the Rust encoder.
+    //   A and B agree byte-for-byte; the production encoder is then asserted
+    //   equal (tier-1) and the frozen bytes decode back to the struct (tier-2).
+    //
+    // Value: gnss-SystemTime{ galileo, day=100, tod=5000, frac=500, notif absent },
+    //        referenceTimeUnc=63, gnss-ReferenceTimeForCells absent.
+    //
+    //   bits  value               X.691 clause / ASN.1 production
+    //   ----  ------------------  -------------------------------------------
+    //   0     0                   §19 ext-marker of extensible SEQUENCE (none)
+    //   1     1                   §19.2 presence — referenceTimeUnc PRESENT
+    //   2     0                   §19.2 presence — refTimeForCells ABSENT
+    //   -- gnss-SystemTime (extensible SEQ, 3 root OPTIONAL) --
+    //   3     0                   §19 ext-marker (no additions)
+    //   4     1                   §19.2 gnss-TimeOfDayFrac-msec PRESENT
+    //   5     0                   §19.2 notificationOfLeapSecond ABSENT
+    //   6     0                   §19.2 gps-TOW-Assist ABSENT
+    //   -- gnss-TimeID = GNSS-ID (extensible SEQ, ENUMERATED) --
+    //   7     0                   §19 ext-marker (no additions)
+    //   8     0                   §14 ENUMERATED ext-marker (root value)
+    //   9-11  011                 §11.5 enum idx 3 (galileo), range 6 -> 3 bits
+    //   12-26 000000001100100     §11.5 gnss-DayNumber, range 32768 -> 15 bits, off 100
+    //   27-43 00001001110001000   §11.5 gnss-TimeOfDay, range 86400 -> 17 bits, off 5000
+    //   44-53 0111110100          §11.5 frac-msec, range 1000 -> 10 bits, off 500
+    //   54-60 0111111             §11.5 referenceTimeUnc, range 128 -> 7 bits, off 63
+    //   pad   000                 §11.1 final octet alignment (61 -> 64 bits)
+    //   regroup: 01001000 00110000 00001100 10000001 00111000 10000111 11010001 11111000
+    //         =  0x48     0x30     0x0C     0x81     0x38     0x87     0xD1     0xF8
+    // =====================================================================
+    const GOLDEN_GNSS_REFERENCE_TIME: [u8; 8] = [0x48, 0x30, 0x0C, 0x81, 0x38, 0x87, 0xD1, 0xF8];
+
+    fn golden_reference_time_value() -> GnssReferenceTime {
+        GnssReferenceTime {
+            gnss_system_time: GnssSystemTime {
+                gnss_time_id: GnssId {
+                    gnss_id: GnssIdValue::Galileo,
+                },
+                gnss_day_number: 100,
+                gnss_time_of_day: 5000,
+                gnss_time_of_day_frac_msec: Some(500),
+                notification_of_leap_second: None,
+            },
+            reference_time_unc: Some(63),
+            gnss_reference_time_for_cells: None,
+        }
+    }
+
+    #[test]
+    fn golden_gnss_reference_time_encode() {
+        let mut enc = UperEncoder::new();
+        golden_reference_time_value().encode_uper(&mut enc).unwrap();
+        assert_eq!(enc.bit_length(), 61, "hand derivation A = 61 bits");
+        let bytes = enc.into_bytes();
+        assert_eq!(bytes.as_ref(), &GOLDEN_GNSS_REFERENCE_TIME);
+    }
+
+    #[test]
+    fn golden_gnss_reference_time_decode() {
+        let mut dec = UperDecoder::new(&GOLDEN_GNSS_REFERENCE_TIME);
+        let decoded = GnssReferenceTime::decode_uper(&mut dec).unwrap();
+        assert_eq!(decoded, golden_reference_time_value());
+    }
 }

@@ -1172,4 +1172,88 @@ mod tests {
         let mut dec = UperDecoder::new(&bytes);
         assert!(AGnssRequestAssistanceData::decode_uper(&mut dec).is_err());
     }
+
+    // =====================================================================
+    // GOLDEN VECTOR — A-GNSS-ProvideAssistanceData spine/envelope
+    // (H7, TS 37.355 §6.5.2, UPER)
+    //
+    // Method: `.context/GOLDEN-VECTOR-METHOD.md` (H5 dual derivation).
+    //   Derivation A: the hand X.691-UNALIGNED bit table below.
+    //   Derivation B: `tests/lpp_agnss_golden_derivation_b.py` (`vector1()`),
+    //     an independent from-scratch recompute agreeing byte-for-byte.
+    //   This vector exercises the SHARED SPINE machinery every GNSS IE reuses:
+    //   the ProvideAssistanceData SEQUENCE preamble, the GNSS-GenericAssistData
+    //   SIZE(1..16) SEQUENCE-OF length determinant, the 10-bit element OPTIONAL
+    //   bitmap, and two nested extensible SEQUENCE + ENUMERATED types
+    //   (GNSS-ID, SBAS-ID). Tier-1 encoder golden + tier-2 decode below.
+    //
+    // Value: gnss-CommonAssistData absent; gnss-GenericAssistData present with
+    //   one element{ gnss-ID=sbas, sbas-ID=egnos, all leaves absent }.
+    //
+    //   bits   value          X.691 clause / ASN.1 production
+    //   -----  -------------  ------------------------------------------------
+    //   0      0              §19 ext-marker of A-GNSS-ProvideAssistanceData
+    //   1      0              §19.2 gnss-CommonAssistData ABSENT
+    //   2      1              §19.2 gnss-GenericAssistData PRESENT
+    //   3      0              §19.2 gnss-Error ABSENT
+    //   4-7    0000           §20 GNSS-GenericAssistData SIZE(1..16) len, 4 bits, off 0 (=1 elem)
+    //   -- GNSS-GenericAssistDataElement (extensible SEQ, gnss-ID + 10 OPTIONAL) --
+    //   8      0              §19 ext-marker (none)
+    //   9      1              §19.2 sbas-ID PRESENT
+    //   10-18  000000000      §19.2 nine remaining OPTIONALs ABSENT
+    //   -- gnss-ID = GNSS-ID (extensible SEQ, ENUMERATED) --
+    //   19     0              §19 ext-marker (none)
+    //   20     0              §14 ENUMERATED ext-marker (root)
+    //   21-23  001            §11.5 enum idx 1 (sbas), range 6 -> 3 bits
+    //   -- sbas-ID = SBAS-ID (extensible SEQ, ENUMERATED) --
+    //   24     0              §19 ext-marker (none)
+    //   25     0              §14 ENUMERATED ext-marker (root)
+    //   26-27  01             §11.5 enum idx 1 (egnos), range 4 -> 2 bits
+    //   pad    0000           §11.1 final octet alignment (28 -> 32 bits)
+    //   regroup: 00100000 01000000 00000001 00010000 = 20 40 01 10
+    // =====================================================================
+    const GOLDEN_PROVIDE_ASSISTANCE_DATA_SPINE: [u8; 4] = [0x20, 0x40, 0x01, 0x10];
+
+    fn golden_provide_assistance_data_value() -> AGnssProvideAssistanceData {
+        AGnssProvideAssistanceData {
+            gnss_common_assist_data: None,
+            gnss_generic_assist_data: Some(GnssGenericAssistData {
+                elements: vec![GnssGenericAssistDataElement {
+                    gnss_id: GnssId {
+                        gnss_id: GnssIdValue::Sbas,
+                    },
+                    sbas_id: Some(SbasId {
+                        sbas_id: SbasIdValue::Egnos,
+                    }),
+                    gnss_time_models: None,
+                    gnss_differential_corrections: None,
+                    gnss_navigation_model: None,
+                    gnss_real_time_integrity: None,
+                    gnss_data_bit_assistance: None,
+                    gnss_acquisition_assistance: None,
+                    gnss_almanac: None,
+                    gnss_utc_model: None,
+                    gnss_auxiliary_information: None,
+                }],
+            }),
+        }
+    }
+
+    #[test]
+    fn golden_provide_assistance_data_spine_encode() {
+        let mut enc = UperEncoder::new();
+        golden_provide_assistance_data_value()
+            .encode_uper(&mut enc)
+            .unwrap();
+        assert_eq!(enc.bit_length(), 28, "hand derivation A = 28 bits");
+        let bytes = enc.into_bytes();
+        assert_eq!(bytes.as_ref(), &GOLDEN_PROVIDE_ASSISTANCE_DATA_SPINE);
+    }
+
+    #[test]
+    fn golden_provide_assistance_data_spine_decode() {
+        let mut dec = UperDecoder::new(&GOLDEN_PROVIDE_ASSISTANCE_DATA_SPINE);
+        let decoded = AGnssProvideAssistanceData::decode_uper(&mut dec).unwrap();
+        assert_eq!(decoded, golden_provide_assistance_data_value());
+    }
 }

@@ -6,10 +6,32 @@
 //! the 13 per-GNSS assistance-data IEs, each in its own sibling module.
 //!
 //! Like the rest of `lpp`, this is hand-derived bit-by-bit from X.691 + the
-//! TS 37.355 ASN.1; there is no golden wire vector in-repo and no reference
-//! encoder, so the round-trip tests attest structural self-consistency (they
-//! cannot catch a symmetric bit-field error). Rarely-used sub-options are
-//! modeled UNSUPPORTED (never emitted, rejected on decode) and documented inline.
+//! TS 37.355 ASN.1. Rarely-used sub-options are modeled UNSUPPORTED (never
+//! emitted, rejected on decode) and documented inline.
+//!
+//! # Golden wire vectors (Wave-6 H7)
+//!
+//! Four productions are now pinned by **hand-derived golden byte vectors**
+//! (H5 TUAK-style dual derivation — see `.context/GOLDEN-VECTOR-METHOD.md`;
+//! derivation B is `tests/lpp_agnss_golden_derivation_b.py`), catching the
+//! symmetric bit-order / length-determinant errors that round-trip tests
+//! cannot. Each has a tier-1 `encode == FROZEN` and a tier-2
+//! `decode(FROZEN) == struct` test (`golden_*`):
+//!
+//!   * [`common::AGnssProvideAssistanceData`] — the spine/envelope: SEQUENCE
+//!     preamble, `GNSS-GenericAssistData` SIZE(1..16) length determinant, the
+//!     10-bit element OPTIONAL bitmap, nested `GNSS-ID`/`SBAS-ID` ENUMERATEDs,
+//!   * [`reference_time::GnssReferenceTime`],
+//!   * [`navigation_model::GnssNavigationModel`] (one satellite, one Keplerian
+//!     set — exercises the CHOICE index + fixed BIT STRING machinery),
+//!   * [`acquisition_assistance::GnssAcquisitionAssistance`] (one satellite).
+//!
+//! These four were chosen because they drive the spine's list / choice /
+//! extension machinery that all 13 IEs share. The remaining 9 leaf IEs
+//! (`almanac`, `auxiliary_information`, `data_bit_assistance`,
+//! `differential_corrections`, `earth_orientation`, `ionospheric_model`,
+//! `real_time_integrity`, `time_model`, `utc_model`) remain **round-trip-only**
+//! (honest deferral) and should be golden-pinned opportunistically.
 
 // The per-IE ASN.1 is quoted verbatim in doc comments (machine-generated from
 // TS 37.355); allow the cosmetic markdown list-continuation lint on it.

@@ -628,4 +628,81 @@ mod tests {
         };
         round_trip(&value);
     }
+
+    // =====================================================================
+    // GOLDEN VECTOR — GNSS-NavigationModel (H7, TS 37.355 §6.5.2, UPER)
+    //
+    // Method: `.context/GOLDEN-VECTOR-METHOD.md` (H5 dual derivation).
+    //   Derivation A: the hand X.691-UNALIGNED bit table below (spine +
+    //     per-field width/offset table for the Keplerian/clock leaves).
+    //   Derivation B: `tests/lpp_agnss_golden_derivation_b.py` (`vector3()`),
+    //     an independent from-scratch recompute agreeing byte-for-byte.
+    //   Tier-1 encoder golden + tier-2 decode-from-frozen asserted below.
+    //
+    // Value: nonBroadcastIndFlag=1; one satellite = sample_element()
+    //   { svID=42, svHealth=0b10100110, iod=0b11001010011,
+    //     clock=NAV{toc=37799,af2=-128,af1=12345,af0=-2097152,tgd=127},
+    //     orbit=keplerianSet(sample_keplerian()) }.
+    //
+    //   Spine bit layout (X.691 UNALIGNED):
+    //     bit 0      0        §19 ext-marker of GNSS-NavigationModel (none)
+    //     bit 1      1        §11.5 nonBroadcastIndFlag(0..1), 1 bit, off 1
+    //     bits 2-7   000000   §20 satelliteList SIZE(1..64) length, 6 bits, off 0
+    //     bit 8      0        §19 ext-marker of NavModelSatelliteElement (none)
+    //     bits 9-15  0101010  §19+§11.5 svID (ext-marker 0 + INTEGER(0..63) off 42)
+    //     bits 16-23 10100110 §16 svHealth BIT STRING(SIZE(8)) content
+    //     bits 24-34 11001010011 §16 iod BIT STRING(SIZE(11)) content
+    //     bits 35-38 0001     §23 GNSS-ClockModel CHOICE: ext 0 + idx 1/5 (3 bits) = nav
+    //     bit 39     0        §19 ext-marker of NAV-ClockModel (none)
+    //     bits 40..  (NAV-ClockModel leaves, then §23 GNSS-OrbitModel CHOICE
+    //                 ext 0 + idx 0/5 = keplerianSet, then NavModelKeplerianSet)
+    //   -> bytes 0..9 hand-check: 40 2A A6 CA 62 93 A7 00 B0 39 (verified).
+    //
+    //   Leaf field widths/offsets (§11.5 constrained whole numbers, UNALIGNED;
+    //   signed values use offset = value - min):
+    //     NAV-ClockModel: toc 16b/37799 · af2 8b/0 · af1 16b/45113 · af0 22b/0 · tgd 8b/255
+    //     NavModelKeplerianSet (preamble ext 0, then):
+    //       toe 14b/12345 · w 32b/1147483648 · deltaN 16b/20423 · m0 32b/4147483648
+    //       omegaDot 24b/0 · e 32b/4000000000 · iDot 14b/16383 · aPowerHalf 32b/4294967295
+    //       i0 32b/0 · omega0 32b/4294967295 · crs 16b/0 · cis 16b/65535 · cus 16b/32767
+    //       crc 16b/32868 · cic 16b/32668 · cuc 16b/32768
+    //   Total 471 bits -> 59 octets (final zero pad §11.1). Full assembly: see
+    //   derivation B; frozen bytes below.
+    // =====================================================================
+    #[rustfmt::skip]
+    const GOLDEN_GNSS_NAVIGATION_MODEL: [u8; 59] = [
+        0x40, 0x2A, 0xA6, 0xCA, 0x62, 0x93, 0xA7, 0x00, 0xB0, 0x39,
+        0x00, 0x00, 0x03, 0xFC, 0x18, 0x1C, 0xA2, 0x32, 0x9B, 0x00,
+        0x27, 0xE3, 0xFB, 0x9A, 0xCA, 0x00, 0x00, 0x00, 0x00, 0x77,
+        0x35, 0x94, 0x00, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0x00,
+        0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFE, 0x00, 0x01, 0xFF,
+        0xFE, 0xFF, 0xFF, 0x00, 0xC8, 0xFF, 0x39, 0x00, 0x00,
+    ];
+
+    fn golden_navigation_model_value() -> GnssNavigationModel {
+        GnssNavigationModel {
+            non_broadcast_ind_flag: 1,
+            gnss_satellite_list: GnssNavModelSatelliteList {
+                elements: vec![sample_element()],
+            },
+        }
+    }
+
+    #[test]
+    fn golden_gnss_navigation_model_encode() {
+        let mut enc = UperEncoder::new();
+        golden_navigation_model_value()
+            .encode_uper(&mut enc)
+            .unwrap();
+        assert_eq!(enc.bit_length(), 471, "hand derivation A = 471 bits");
+        let bytes = enc.into_bytes();
+        assert_eq!(bytes.as_ref(), &GOLDEN_GNSS_NAVIGATION_MODEL);
+    }
+
+    #[test]
+    fn golden_gnss_navigation_model_decode() {
+        let mut dec = UperDecoder::new(&GOLDEN_GNSS_NAVIGATION_MODEL);
+        let decoded = GnssNavigationModel::decode_uper(&mut dec).unwrap();
+        assert_eq!(decoded, golden_navigation_model_value());
+    }
 }

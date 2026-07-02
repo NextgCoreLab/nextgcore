@@ -342,4 +342,83 @@ mod tests {
         let mut dec = UperDecoder::new(&bytes);
         assert!(GnssAcquisitionAssistElement::decode_uper(&mut dec).is_err());
     }
+
+    // =====================================================================
+    // GOLDEN VECTOR — GNSS-AcquisitionAssistance (H7, TS 37.355 §6.5.2, UPER)
+    //
+    // Method: `.context/GOLDEN-VECTOR-METHOD.md` (H5 dual derivation).
+    //   Derivation A: the hand X.691-UNALIGNED bit table below.
+    //   Derivation B: `tests/lpp_agnss_golden_derivation_b.py` (`vector4()`),
+    //     an independent from-scratch recompute agreeing byte-for-byte.
+    //   Tier-1 encoder golden + tier-2 decode-from-frozen asserted below.
+    //
+    // Value: gnss-SignalID=5; one element{ svID=17, doppler0=-1500, doppler1=42,
+    //        dopplerUncertainty=3, codePhase=900, intCodePhase=100,
+    //        codePhaseSearchWindow=20, azimuth=400, elevation=90 }.
+    //
+    //   bits   value          X.691 clause / ASN.1 production
+    //   -----  -------------  ------------------------------------------------
+    //   0      0              §19 ext-marker of GNSS-AcquisitionAssistance (none)
+    //   -- gnss-SignalID = SEQUENCE{ INTEGER(0..7) } (extensible SEQ) --
+    //   1      0              §19 ext-marker (none)
+    //   2-4    101            §11.5 gnss-SignalID, range 8 -> 3 bits, off 5
+    //   5-10   000000         §20 SEQUENCE(SIZE(1..64)) OF length, range 64 -> 6 bits, off 0
+    //   -- element (extensible SEQ, no root OPTIONAL) --
+    //   11     0              §19 ext-marker (none)
+    //   -- svID = SV-ID SEQUENCE{ INTEGER(0..63) } (extensible SEQ) --
+    //   12     0              §19 ext-marker (none)
+    //   13-18  010001         §11.5 satellite-id, range 64 -> 6 bits, off 17
+    //   19-30  001000100100   §11.5 doppler0, range 4096 -> 12 bits, off 548 (=-1500+2048)
+    //   31-36  101010         §11.5 doppler1, range 64 -> 6 bits, off 42
+    //   37-39  011            §11.5 dopplerUncertainty, range 5 -> 3 bits, off 3
+    //   40-49  1110000100     §11.5 codePhase, range 1023 -> 10 bits, off 900
+    //   50-56  1100100        §11.5 intCodePhase, range 128 -> 7 bits, off 100
+    //   57-61  10100          §11.5 codePhaseSearchWindow, range 32 -> 5 bits, off 20
+    //   62-70  110010000      §11.5 azimuth, range 512 -> 9 bits, off 400
+    //   71-77  1011010        §11.5 elevation, range 128 -> 7 bits, off 90
+    //   pad    00             §11.1 final octet alignment (78 -> 80 bits)
+    //   regroup: 00101000 00000010 00100100 01001001 01010011 11100001
+    //            00110010 01010011 00100001 01101000
+    //          = 28 02 24 49 53 E1 32 53 21 68
+    // =====================================================================
+    const GOLDEN_GNSS_ACQUISITION_ASSISTANCE: [u8; 10] = [
+        0x28, 0x02, 0x24, 0x49, 0x53, 0xE1, 0x32, 0x53, 0x21, 0x68,
+    ];
+
+    fn golden_acquisition_assistance_value() -> GnssAcquisitionAssistance {
+        GnssAcquisitionAssistance {
+            gnss_signal_id: GnssSignalId { gnss_signal_id: 5 },
+            gnss_acquisition_assist_list: GnssAcquisitionAssistList {
+                elements: vec![GnssAcquisitionAssistElement {
+                    sv_id: SvId { satellite_id: 17 },
+                    doppler0: -1500,
+                    doppler1: 42,
+                    doppler_uncertainty: 3,
+                    code_phase: 900,
+                    int_code_phase: 100,
+                    code_phase_search_window: 20,
+                    azimuth: 400,
+                    elevation: 90,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn golden_gnss_acquisition_assistance_encode() {
+        let mut enc = UperEncoder::new();
+        golden_acquisition_assistance_value()
+            .encode_uper(&mut enc)
+            .unwrap();
+        assert_eq!(enc.bit_length(), 78, "hand derivation A = 78 bits");
+        let bytes = enc.into_bytes();
+        assert_eq!(bytes.as_ref(), &GOLDEN_GNSS_ACQUISITION_ASSISTANCE);
+    }
+
+    #[test]
+    fn golden_gnss_acquisition_assistance_decode() {
+        let mut dec = UperDecoder::new(&GOLDEN_GNSS_ACQUISITION_ASSISTANCE);
+        let decoded = GnssAcquisitionAssistance::decode_uper(&mut dec).unwrap();
+        assert_eq!(decoded, golden_acquisition_assistance_value());
+    }
 }
