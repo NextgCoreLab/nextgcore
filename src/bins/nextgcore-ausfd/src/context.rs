@@ -741,6 +741,26 @@ mod tests {
     }
 
     #[test]
+    fn test_ausf_get_ue_load_monotonic_and_capped() {
+        let mut ctx = AusfContext::new();
+        ctx.init(4); // capacity of 4 UEs
+        assert_eq!(ctx.get_ue_load(), 0, "no UEs -> 0%");
+        ctx.ue_add("suci-1");
+        assert_eq!(ctx.get_ue_load(), 25, "1/4 -> 25%");
+        ctx.ue_add("suci-2");
+        assert_eq!(ctx.get_ue_load(), 50, "2/4 -> 50%");
+        ctx.ue_add("suci-3");
+        ctx.ue_add("suci-4");
+        assert_eq!(ctx.get_ue_load(), 100, "4/4 -> 100%");
+    }
+
+    #[test]
+    fn test_ausf_get_ue_load_zero_capacity() {
+        let ctx = AusfContext::new();
+        assert_eq!(ctx.get_ue_load(), 0, "uninitialized capacity -> 0");
+    }
+
+    #[test]
     fn test_ausf_context_init_fini() {
         let mut ctx = AusfContext::new();
         ctx.init(100);

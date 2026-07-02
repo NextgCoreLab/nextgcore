@@ -35,6 +35,8 @@ ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+base64.workspace = true
 
 [lints]
 workspace = true
