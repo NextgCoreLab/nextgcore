@@ -455,6 +455,10 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
                 "PCF" => nextgcore_sbi::types::NfType::Pcf,
                 "NSSF" => nextgcore_sbi::types::NfType::Nssf,
                 "NRF" => nextgcore_sbi::types::NfType::Nrf,
+                // NSAC (TS 23.501 §5.15.11): without this arm a discovered
+                // NSACF profile was silently DROPPED here, so UE admission
+                // always fell back to degrade-open.
+                "NSACF" => nextgcore_sbi::types::NfType::Nsacf,
                 _ => continue,
             };
 
@@ -1331,20 +1335,49 @@ pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResul
     };
 
     let sbi_ctx = global_context();
+    let endpoint_from_cache = |instances: Vec<NfInstance>| {
+        let inst = instances.first()?;
+        let svc = inst.find_service(nextgcore_service_type)?;
+        let host = svc
+            .ip_addresses
+            .first()
+            .or(inst.ipv4_addresses.first())
+            .or(svc.fqdn.as_ref())
+            .or(inst.fqdn.as_ref())?;
+        Some((host.clone(), svc.port))
+    };
+
     let instances = sbi_ctx
         .find_nf_instances_by_service(nextgcore_service_type)
         .await;
-    if let Some(inst) = instances.first() {
-        if let Some(svc) = inst.find_service(nextgcore_service_type) {
-            let host = svc
-                .ip_addresses
-                .first()
-                .or(inst.ipv4_addresses.first())
-                .or(svc.fqdn.as_ref())
-                .or(inst.fqdn.as_ref());
-            if let Some(h) = host {
-                return Ok((h.clone(), svc.port));
-            }
+    if let Some(ep) = endpoint_from_cache(instances) {
+        return Ok(ep);
+    }
+
+    // Cache miss: perform on-demand NRF discovery (TS 29.510 §5.3.2) for this
+    // exact service and re-check. Without this, an NF that registered with the
+    // NRF after this AMF populated its cache (e.g. the NSACF) was never found
+    // and the resolver silently fell back to env/localhost — which is how
+    // slice admission control ended up permanently degrade-open in the E2E.
+    let target_nf_type = match service_type {
+        SbiServiceType::NausfAuth => "AUSF",
+        SbiServiceType::NudmUecm | SbiServiceType::NudmSdm => "UDM",
+        SbiServiceType::NsmfPdusession => "SMF",
+        SbiServiceType::NnssfNsselection => "NSSF",
+        SbiServiceType::NpcfAmPolicyControl => "PCF",
+        SbiServiceType::NnsacfNsac => "NSACF",
+        _ => "",
+    };
+    if !target_nf_type.is_empty()
+        && amf_nrf_discover(target_nf_type, service_type.service_name())
+            .await
+            .is_ok()
+    {
+        let instances = sbi_ctx
+            .find_nf_instances_by_service(nextgcore_service_type)
+            .await;
+        if let Some(ep) = endpoint_from_cache(instances) {
+            return Ok(ep);
         }
     }
 
