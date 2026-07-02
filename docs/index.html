@@ -42,8 +42,8 @@
       </div>
       <div class="stats-row">
         <div class="stat"><div class="stat-value">24</div><div class="stat-label">Network Functions</div></div>
-        <div class="stat"><div class="stat-value">18</div><div class="stat-label">Libraries</div></div>
-        <div class="stat"><div class="stat-value">~100k</div><div class="stat-label">Lines of Rust</div></div>
+        <div class="stat"><div class="stat-value">17</div><div class="stat-label">Libraries</div></div>
+        <div class="stat"><div class="stat-value">~400k</div><div class="stat-label">Lines of Rust</div></div>
         <div class="stat"><div class="stat-value">8</div><div class="stat-label">AI/6G NFs</div></div>
       </div>
     </div>
@@ -74,7 +74,7 @@
       <div class="feature-card">
         <div class="feature-icon">&#9729;</div>
         <h3>Cloud Native</h3>
-        <p>Kubernetes with Helm charts, Prometheus metrics on every NF, Jaeger distributed tracing, horizontal scaling. Docker Compose for dev (21 NF services), Kubernetes for production.</p>
+        <p>Kubernetes with Helm charts, Prometheus metrics on every NF, Jaeger distributed tracing, horizontal scaling. Docker Compose for dev (24 NF services), Kubernetes for production.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">&#128640;</div>
@@ -258,7 +258,7 @@
 <section id="architecture">
   <div class="container">
     <h2 class="section-title">Architecture</h2>
-    <p class="section-subtitle">Service-Based Architecture (SBA) with AI/analytics overlay. AMF uses ogs-ngap exclusively with tokio::select! event loop. NRF issues real HMAC-SHA256 JWT tokens. SEPP enforces AES-128-GCM PRINS. All 7 Rel-17 NFs register with NRF. ogs-app provides nf_common_init(); ogs-dbi and ogs-sbi carry cfg(feature = "6g-extensions") gates.</p>
+    <p class="section-subtitle">Service-Based Architecture (SBA) with AI/analytics overlay. AMF uses nextgcore-ngap with tokio::select! event loop. NRF issues real ES256/RS256 JWS access tokens. SEPP enforces AES-128-GCM PRINS. All 7 Rel-17 NFs register with NRF. nextgcore-app provides nf_common_init(); nextgcore-dbi and nextgcore-sbi carry cfg(feature = "6g-extensions") gates.</p>
     <div class="arch-diagram">
       <div class="arch-layer">
         <div class="arch-label">AI &amp; Analytics</div>
@@ -466,7 +466,7 @@
     <div class="components-grid">
       <div class="component-card">
         <div class="component-header"><span class="component-name">AMF</span><span class="component-badge badge-core">Core</span></div>
-        <div class="component-desc">Access and Mobility Management — UE registration, authentication orchestration, connection management, NGAP handover dispatch (procedures 0,1,3,25,27). Uses ogs-ngap exclusively; async event loop via tokio::select!.</div>
+        <div class="component-desc">Access and Mobility Management — UE registration, authentication orchestration, connection management, NGAP handover dispatch (procedures 0,1,3,25,27). Uses nextgcore-ngap exclusively; async event loop via tokio::select!.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">SMF</span><span class="component-badge badge-core">Core</span></div>
@@ -478,7 +478,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">NRF</span><span class="component-badge badge-core">Core</span></div>
-        <div class="component-desc">NF Repository — Service discovery, profiles, OAuth2 JWT with real HMAC-SHA256 signing (RS256/ES256), health monitoring. All 7 Rel-17 NFs (NWDAF, EES, LMF, MBSMF, NSACF, PIN, DCCF) register with NRF.</div>
+        <div class="component-desc">NF Repository — Service discovery, profiles, OAuth2 JWT with RS256/ES256 JWS signing, health monitoring. All 7 Rel-17 NFs (NWDAF, EES, LMF, MBSMF, NSACF, PIN, DCCF) register with NRF.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">AUSF</span><span class="component-badge badge-core">Core</span></div>
@@ -585,51 +585,51 @@
     <h3 class="group-heading">Shared Libraries (18)</h3>
     <div class="components-grid">
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-sbi</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-sbi</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">HTTP/2 SBI client/server with TLS, OpenTelemetry tracing. cfg(feature = "6g-extensions") gates for Rel-18+ SBI extensions.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-nas</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-nas</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">5G NAS codec — registration, auth, session messages.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-ngap</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-ngap</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">NGAP ASN.1 PER codec for AMF-gNB signaling.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-pfcp</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-pfcp</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">PFCP for SMF-UPF session management.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-gtp</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-gtp</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">GTP-C v2 and GTP-U tunneling protocol.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-diameter</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-diameter</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">Diameter S6a, Gx, Rx, Cx for EPC/IMS.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-metrics</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-metrics</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">Prometheus counters, histograms, gauges.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-dbi</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-dbi</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">MongoDB interface for subscriber data. Async init wrapper for non-blocking startup across all NFs.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-core</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-core</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">Logging, config, timers, shared types.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-app</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-app</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">CLI, YAML config, signal handling, NF lifecycle. Provides nf_common_init() helper used by all NFs. cfg(feature = "6g-extensions") gates for optional 6G capabilities.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-crypt</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-crypt</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">MILENAGE, TUAK, KDF, Snow3G, ZUC.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-sctp</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-header"><span class="component-name">nextgcore-sctp</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">SCTP transport for NGAP/S1AP signaling.</div>
       </div>
     </div>
@@ -659,7 +659,7 @@
     <h3 class="group-heading">Docker Compose</h3>
     <div class="code-block">
       <button class="copy-btn">Copy</button>
-      <code><span class="comment"># Start all 21 NF services (5GC + RAN) + observability</span>
+      <code><span class="comment"># Start all 24 NF services (5GC + RAN) + observability</span>
 <span class="comment"># Includes Rel-17 NFs: NWDAF, NWDAF-D, DCCF, EES, LMF, MBSMF, NSACF, PIN</span>
 <span class="cmd">cd docker/rust</span>
 <span class="cmd">docker compose up -d</span>
