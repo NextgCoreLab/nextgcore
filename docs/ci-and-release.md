@@ -29,6 +29,9 @@ The richer matched-sim data-plane E2E (registration + PDU session + GTP-U ping) 
 ### `pages.yml` — documentation site
 
 Deploys `docs/` to GitHub Pages (runs `docs/scripts/update-api-docs.sh`, uploads `docs/`).
+Triggered **only when a GitHub release is published** (`on: release: [published]`) so the site
+tracks the last release, plus `workflow_dispatch` for a manual re-deploy — it does **not** redeploy
+on every `docs/**` push.
 
 ## Branch triggers
 
@@ -41,7 +44,8 @@ on:
   pull_request: { branches: [initial_commit, main] }
 ```
 
-(`ci.yml` on push + PR to either branch; `pages.yml` on push to either branch when `docs/**` changes.)
+(`ci.yml` on push + PR to either branch. `pages.yml` is **not** branch-triggered — it deploys the
+docs site when a release is published; see below.)
 
 ## Local pre-push gate (mirror of CI)
 
@@ -64,6 +68,7 @@ Optionally the full data-plane E2E: `cd docker/rust && ./e2e.sh`.
 4. Commit (`Signed-off-by: Murat Parlakisik <parlakisik@gmail.com>`), tag `vX.Y.Z`, push the tag.
 5. Create the GitHub release from the tag, pasting the CHANGELOG section as the release notes:
    `gh release create vX.Y.Z --repo NextgCoreLab/nextgcore --title "NextGCore vX.Y.Z" --notes-file <(...)`.
+   Publishing the release fires `pages.yml`, which deploys the docs site for this version.
 
 > **Honesty in release notes:** keep the validation caveat — spec-text + golden-vector + strict-peer
 > + matched-sim E2E, **not** TTCN-certified or third-party-interop tested. 6G/Rel-20 items are
