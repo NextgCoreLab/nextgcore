@@ -2243,7 +2243,12 @@ mod tests {
     /// A SUCI deconcealment, 5G-AKA + EAP-AKA' AV generation, AMF separation
     /// bit enforcement, and AUTS resynchronization.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_http_generate_auth_data_flows() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         let _ = env_logger::try_init();
         tokio::time::timeout(Duration::from_secs(60), async {
             udm_context_init(64, 64);
@@ -2649,7 +2654,12 @@ mod tests {
     // ========================================================================
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_sdm_subscribe_persists_and_unsubscribe_is_idempotent() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         let _ = env_logger::try_init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
@@ -2742,7 +2752,12 @@ mod tests {
     // ========================================================================
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_auth_event_returns_201_with_location_header() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         let _ = env_logger::try_init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
@@ -2793,7 +2808,12 @@ mod tests {
     // ========================================================================
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_ee_subscribe_persists_and_unsubscribe_404_then_204() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         let _ = env_logger::try_init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
         udm_context_init(64, 64);
@@ -2858,7 +2878,12 @@ mod tests {
     // ========================================================================
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_sor_upu_ack_requires_provisioning_time_then_204() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
         let supi = "imsi-udmdsor-0001";
         // Missing provisioningTime -> 400.

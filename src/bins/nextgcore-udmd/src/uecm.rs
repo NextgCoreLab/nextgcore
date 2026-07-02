@@ -795,7 +795,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_amf_registration_complete_returns_201() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         crate::context::udm_context_init(1024, 4096);
         let mock = Arc::new(MockUdr::new());
         let client = UdrClient::Mock(mock.clone());
@@ -807,7 +812,12 @@ mod tests {
     // ----- udmd-01 ---------------------------------------------------------
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_amf_registration_persists_put_to_udr() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         crate::context::udm_context_init(1024, 4096);
         let supi = "imsi-001010000000310";
         let body = valid_amf_body();
@@ -847,7 +857,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_amf_registration_udr_5xx_maps_to_503() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         crate::context::udm_context_init(1024, 4096);
         let mut mock = MockUdr::new();
         mock.put_status = 500;
@@ -859,7 +874,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_amf_deregistration_deletes_udr_context() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         crate::context::udm_context_init(1024, 4096);
         let supi = "imsi-001010000000313";
         let mock = Arc::new(MockUdr::new());
@@ -948,7 +968,12 @@ mod tests {
     // ----- udmd-06 ---------------------------------------------------------
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_amf_registration_first_put_201_second_put_200() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         crate::context::udm_context_init(1024, 4096);
         let supi = "imsi-udmd06-0001";
         let mock = Arc::new(MockUdr::new());
@@ -992,7 +1017,12 @@ mod tests {
     // ----- udmd-02 ---------------------------------------------------------
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_reregistration_notifies_old_amf_then_suppresses_same_id() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         crate::context::udm_context_init(1024, 4096);
         let supi = "imsi-001010000000320";
         let amf_a_uri =
@@ -1427,7 +1457,12 @@ mod tests {
     /// return 500; udmd's re-registration must still complete (200) and the
     /// notification must have been attempted exactly once.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_reregistration_continues_when_dereg_notify_fails() {
+        // Serialize on udmd's global-context/UDR-env guard: this test re-inits
+        // the process-global UDM context and/or sets UDR_SBI_* env vars, which
+        // races any other udmd test doing the same (the CI-flaky AUTS-resync).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         crate::context::udm_context_init(1024, 4096);
         let supi = "imsi-001010000000393";
         let amf_a_uri =
