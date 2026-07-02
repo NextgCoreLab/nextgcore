@@ -127,10 +127,35 @@ static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth
     std::sync::OnceLock::new();
 
 /// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
-/// Phase A). Outbound SBI clients attach a token via `client.with_oauth2`.
-#[allow(dead_code)]
+/// Phase A). Outbound SBI clients attach a token via [`peer_client`].
 fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Build an outbound peer SBI client for `host:port` (Wave-6 H8 Phase A).
+///
+/// When OAuth2 enforcement is ON, returns a fresh client carrying an NRF-issued
+/// Bearer token scoped to `target` (TS 33.501 §13.4.1, TS 29.510 §5.4.2). When
+/// OFF (the default), returns the process-wide pooled client unchanged, so the
+/// matched-sim default path is byte-identical.
+async fn peer_client(
+    host: &str,
+    port: u16,
+    target: nextgcore_sbi::types::NfType,
+) -> Arc<nextgcore_sbi::client::SbiClient> {
+    match oauth2_client() {
+        Some(oauth2) => Arc::new(
+            nextgcore_sbi::client::SbiClient::new(nextgcore_sbi::client::SbiClientConfig::new(
+                host, port,
+            ))
+            .with_oauth2(oauth2, target),
+        ),
+        None => {
+            nextgcore_sbi::context::global_context()
+                .get_client(host, port)
+                .await
+        }
+    }
 }
 
 /// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the
@@ -1386,7 +1411,9 @@ async fn send_udm_generate_auth_data(
         log::info!("Using UDM env var fallback: {host_owned}:{port}");
     }
 
-    let client = sbi_ctx.get_client(&host_owned, port).await;
+    // Attach an NRF-issued Bearer token to the Nudm_UEAuthentication call when
+    // OAuth2 enforcement is on (Wave-6 H8 Phase A); pooled/no-op otherwise.
+    let client = peer_client(&host_owned, port, nextgcore_sbi::types::NfType::Udm).await;
 
     // ausfd-09: populate ausfInstanceId from the real registered NF instance id.
     let ausf_instance_id = resolve_ausf_instance_id().await;
@@ -1539,7 +1566,10 @@ async fn send_udm_auth_result(
         .ok_or("No UDM endpoint address available")?;
     let port = udm_service.port;
 
-    let client = sbi_ctx.get_client(host, port).await;
+    // Attach an NRF-issued Bearer token to the Nudm_UEAuthentication result
+    // notification when OAuth2 enforcement is on (Wave-6 H8 Phase A); pooled
+    // client / no-op otherwise so the matched-sim default path is unchanged.
+    let client = peer_client(host, port, nextgcore_sbi::types::NfType::Udm).await;
 
     let body = serde_json::json!({
         "nfInstanceId": nextgcore_sbi::context::global_context()
