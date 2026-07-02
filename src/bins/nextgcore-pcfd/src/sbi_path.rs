@@ -629,14 +629,20 @@ pub async fn pcf_discover_endpoint(
     Ok(parse_first_endpoint(&json, service_name))
 }
 
-/// Build a bounded-timeout SBI client for a discovered endpoint.
-fn client_for(ep: &DiscoveredEndpoint) -> nextgcore_sbi::client::SbiClient {
+/// Build a bounded-timeout SBI client for a discovered endpoint. Attaches an
+/// NRF-issued Bearer token scoped to `target` when OAuth2 enforcement is on
+/// (Wave-6 H8 Phase A, TS 33.501 §13.4.1); a no-op otherwise so the matched-sim
+/// default path is byte-unchanged.
+fn client_for(ep: &DiscoveredEndpoint, target: NfType) -> nextgcore_sbi::client::SbiClient {
     use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
     use std::time::Duration;
-    SbiClient::new(
-        SbiClientConfig::new(ep.host.clone(), ep.port)
-            .with_connect_timeout(Duration::from_secs(2))
-            .with_request_timeout(Duration::from_secs(3)),
+    crate::app::attach_oauth2(
+        SbiClient::new(
+            SbiClientConfig::new(ep.host.clone(), ep.port)
+                .with_connect_timeout(Duration::from_secs(2))
+                .with_request_timeout(Duration::from_secs(3)),
+        ),
+        target,
     )
 }
 
@@ -653,7 +659,7 @@ pub async fn pcf_udr_get_sm_policy_data(
     let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
         return Ok(None);
     };
-    let client = client_for(&ep);
+    let client = client_for(&ep, NfType::Udr);
     let snssai = match snssai_sd {
         Some(sd) => format!("{{\"sst\":{snssai_sst},\"sd\":\"{sd:06x}\"}}"),
         None => format!("{{\"sst\":{snssai_sst}}}"),
@@ -728,7 +734,7 @@ pub async fn pcf_udr_get_ue_policy_set(
     let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
         return Ok(None);
     };
-    let client = client_for(&ep);
+    let client = client_for(&ep, NfType::Udr);
     let path = format!(
         "/nudr-dr/v1/policy-data/ues/{}/ue-policy-set",
         percent_encode(supi),
@@ -774,7 +780,7 @@ pub async fn pcf_register_bsf_binding(
     let Some(ep) = pcf_discover_endpoint("BSF", "nbsf-management").await? else {
         return Ok(None);
     };
-    let client = client_for(&ep);
+    let client = client_for(&ep, NfType::Bsf);
     let resp = client
         .post_json("/nbsf-management/v1/pcfBindings", binding)
         .await
@@ -809,7 +815,7 @@ pub async fn pcf_deregister_bsf_binding(binding_id: &str) -> Result<bool, String
     let Some(ep) = pcf_discover_endpoint("BSF", "nbsf-management").await? else {
         return Ok(false);
     };
-    let client = client_for(&ep);
+    let client = client_for(&ep, NfType::Bsf);
     let path = format!("/nbsf-management/v1/pcfBindings/{binding_id}");
     let resp = client
         .delete(&path)
@@ -869,7 +875,7 @@ pub async fn pcf_deliver_ue_policy(supi: &str, updp_pdu: &[u8]) -> Result<(), St
     let Some(ep) = pcf_discover_endpoint("AMF", "namf-comm").await? else {
         return Err("no AMF reachable (NRF discovery found no namf-comm endpoint)".into());
     };
-    let client = client_for(&ep);
+    let client = client_for(&ep, NfType::Amf);
     let req = build_ue_policy_n1n2_request(supi, updp_pdu);
     let resp = client
         .send_request(req)
@@ -900,7 +906,7 @@ pub async fn pcf_subscribe_ue_policy_notify(
     let Some(ep) = pcf_discover_endpoint("AMF", "namf-comm").await? else {
         return Ok(None);
     };
-    let client = client_for(&ep);
+    let client = client_for(&ep, NfType::Amf);
     // UeN1N2InfoSubscriptionCreateData (TS29518_Namf_Communication.yaml): the
     // (n1MessageClass, n1NotifyCallbackUri) pair — the AMF fail-closed-rejects a
     // half-pair (Wave-6 A3).
@@ -947,7 +953,7 @@ pub async fn pcf_unsubscribe_ue_policy_notify(
     let Some(ep) = pcf_discover_endpoint("AMF", "namf-comm").await? else {
         return Ok(false);
     };
-    let client = client_for(&ep);
+    let client = client_for(&ep, NfType::Amf);
     let path = format!(
         "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{subscription_id}"
     );
