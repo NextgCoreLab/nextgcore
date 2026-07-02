@@ -281,6 +281,8 @@ async fn ausf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     // - /nausf-auth/v1/ue-authentications
     // - /nausf-auth/v1/ue-authentications/{authCtxId}/5g-aka-confirmation
     // - /nausf-auth/v1/ue-authentications/{authCtxId}/eap-session
+    // - /nausf-sorprotection/v1/{supi}/ue-sor      (TS 29.509, F-03)
+    // - /nausf-upuprotection/v1/{supi}/ue-upu      (TS 29.509, F-03)
 
     if parts.len() < 3 {
         return send_not_found("Invalid path", None);
@@ -315,6 +317,18 @@ async fn ausf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             // Delete Authentication Context
             let auth_ctx_id = parts[3];
             handle_auth_context_delete(auth_ctx_id).await
+        }
+
+        // Nausf_SoRProtection / Nausf_UPUProtection custom operations
+        // (TS 29.509; Wave-6 F-03). NOTE the path shape differs from
+        // nausf-auth: the SUPI sits at parts[2] (where "ue-authentications"
+        // sits for nausf-auth), so these arms match on the service prefix
+        // with the custom-op name at parts[3].
+        ("nausf-sorprotection", supi, "POST") if parts.len() == 4 && parts[3] == "ue-sor" => {
+            nextgcore_ausfd::sor_protection::handle_sor_protect(supi, &request)
+        }
+        ("nausf-upuprotection", supi, "POST") if parts.len() == 4 && parts[3] == "ue-upu" => {
+            nextgcore_ausfd::upu_protection::handle_upu_protect(supi, &request)
         }
 
         _ => {
@@ -1476,6 +1490,42 @@ async fn send_udm_auth_result(
     Ok(())
 }
 
+/// Build the TS 29.510 NFProfile the AUSF registers with the NRF.
+///
+/// Advertises nausf-auth plus the Wave-6 F-03 producer services
+/// nausf-sorprotection / nausf-upuprotection (TS 29.509), so udmd
+/// discovery-by-service works (TS 33.501 §6.14.2.1 step 8: the UDM selects
+/// the AUSF holding the latest KAUSF). UDM — the consumer of both new
+/// services — is included in allowedNfTypes.
+fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+    let service = |name: &str| {
+        serde_json::json!({
+            "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+            "serviceName": name,
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{
+                "ipv4Address": sbi_addr,
+                "port": sbi_port
+            }]
+        })
+    };
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "AUSF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": [
+            service("nausf-auth"),
+            service("nausf-sorprotection"),
+            service("nausf-upuprotection")
+        ],
+        "allowedNfTypes": ["AMF", "UDM", "SCP"],
+        "heartBeatTimer": 10
+    })
+}
+
 /// Register AUSF with NRF (B23.4)
 ///
 /// Returns the NF instance ID that was registered, so callers can start a
@@ -1502,25 +1552,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
     let nf_instance_id = uuid::Uuid::new_v4().to_string();
 
     // Build NF Profile for registration
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "AUSF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [{
-            "serviceInstanceId": format!("{}-nausf-auth", nf_instance_id),
-            "serviceName": "nausf-auth",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{
-                "ipv4Address": sbi_addr,
-                "port": sbi_port
-            }]
-        }],
-        "allowedNfTypes": ["AMF", "SCP"],
-        "heartBeatTimer": 10
-    });
+    let nf_profile = build_nf_profile(&nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1540,13 +1572,22 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
                 nextgcore_sbi::types::NfType::Ausf,
             );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = nextgcore_sbi::context::NfService::new(
-                "nausf-auth",
-                nextgcore_sbi::types::SbiServiceType::NausfAuth,
-            );
-            svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
-            self_instance.add_service(svc);
+            for (name, service_type) in [
+                ("nausf-auth", nextgcore_sbi::types::SbiServiceType::NausfAuth),
+                (
+                    "nausf-sorprotection",
+                    nextgcore_sbi::types::SbiServiceType::NausfSorprotection,
+                ),
+                (
+                    "nausf-upuprotection",
+                    nextgcore_sbi::types::SbiServiceType::NausfUpuprotection,
+                ),
+            ] {
+                let mut svc = nextgcore_sbi::context::NfService::new(name, service_type);
+                svc.port = sbi_port;
+                svc.ip_addresses = vec![sbi_addr.to_string()];
+                self_instance.add_service(svc);
+            }
             sbi_ctx.set_self_instance(self_instance).await;
 
             // Extract heartbeat interval from response
@@ -2823,5 +2864,242 @@ mod tests {
         })
         .await
         .expect("test_snn_entitlement_against_consumer_token timed out");
+    }
+
+    // ====================================================================
+    // F-03: Nausf_SoRProtection / Nausf_UPUProtection producers
+    // ====================================================================
+
+    /// The NRF registration profile must advertise both TS 29.509 protection
+    /// services (falsifiable acceptance: grep for 'nausf-sorprotection') and
+    /// allow UDM, their consumer (TS 33.501 §6.14.2.1 step 8).
+    #[test]
+    fn test_nf_profile_advertises_sor_and_upu_protection_services() {
+        let profile = build_nf_profile("test-instance", "127.0.0.1", 7777);
+
+        let service_names: Vec<&str> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices array")
+            .iter()
+            .filter_map(|s| s.get("serviceName").and_then(|v| v.as_str()))
+            .collect();
+        assert!(service_names.contains(&"nausf-auth"));
+        assert!(
+            service_names.contains(&"nausf-sorprotection"),
+            "NF profile must advertise nausf-sorprotection: {service_names:?}"
+        );
+        assert!(
+            service_names.contains(&"nausf-upuprotection"),
+            "NF profile must advertise nausf-upuprotection: {service_names:?}"
+        );
+
+        let allowed: Vec<&str> = profile["allowedNfTypes"]
+            .as_array()
+            .expect("allowedNfTypes array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            allowed.contains(&"UDM"),
+            "UDM (SoR/UPU consumer) must be in allowedNfTypes: {allowed:?}"
+        );
+
+        // Every advertised service carries a versioned endpoint.
+        for svc in profile["nfServices"].as_array().unwrap() {
+            assert_eq!(svc["versions"][0]["apiVersionInUri"], "v1");
+            assert_eq!(svc["ipEndPoints"][0]["port"], 7777);
+        }
+    }
+
+    /// curl-shaped acceptance test for F-03: a real 5G-AKA authentication
+    /// seeds the anchor through the production path, then the SoR and UPU
+    /// custom operations are exercised over HTTP against the REAL dispatcher
+    /// (`ausf_sbi_request_handler`) — no handler shortcuts.
+    ///
+    /// The MAC assertions recompute the expected values from the anchor's
+    /// KAUSF and HAND-DERIVED wire bytes (TS 24.501 §9.11.3.51 /
+    /// §9.11.3.53A), so a corrupted steering-list encoder fails this test.
+    #[tokio::test]
+    async fn test_sor_upu_protection_http_end_to_end() {
+        let _ = env_logger::try_init();
+        let _lock = TEST_MUTEX.lock().await;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            ausf_context_init(128);
+
+            // Mock UDM (real Milenage + 5G KDFs) + real AUSF dispatcher.
+            let udm_port = free_port();
+            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                udm_port,
+            ))));
+            udm_server.start(mock_udm_handler).await.expect("udm start");
+            std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+            std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
+
+            let ausf_port = free_port();
+            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                ausf_port,
+            ))));
+            ausf_server
+                .start(ausf_sbi_request_handler)
+                .await
+                .expect("ausf start");
+            let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
+
+            // ---- Seed the anchor via a REAL 5G-AKA flow (fresh SUPI). ----
+            let supi = "imsi-001010000000888";
+            let (href, rand) = initiate_5g_aka(&client, supi, TEST_SNN).await;
+            let (res, ck, ik, _ak, _akstar) =
+                nextgcore_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
+            let res_star =
+                nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+            let resp = client
+                .put_json(
+                    &href,
+                    &serde_json::json!({
+                        "resStar": nextgcore_ausfd::nudm_handler::bytes_to_hex(&res_star)
+                    }),
+                )
+                .await
+                .expect("confirmation");
+            assert_eq!(resp.status, 200);
+            let kausf = ausf_self()
+                .read()
+                .unwrap()
+                .anchor_lookup_kausf(supi)
+                .expect("anchor after successful primary auth");
+
+            // ---- SoR: POST /nausf-sorprotection/v1/{supi}/ue-sor ----
+            // Hand-derived P2 (TS 24.501 fig. 9.11.3.51.3 + TS 31.102
+            // §4.2.5): mcc=001 mnc=01 → 00 F1 10, NR → 08 00;
+            // mcc=310 mnc=410 → 13 00 14, NR|E-UTRAN → 48 00.
+            const GOLDEN_P2: [u8; 10] =
+                [0x00, 0xF1, 0x10, 0x08, 0x00, 0x13, 0x00, 0x14, 0x48, 0x00];
+            let sor_body = serde_json::json!({
+                "ackInd": true,
+                "steeringContainer": [
+                    {"plmnId": {"mcc": "001", "mnc": "01"}, "accessTechList": ["NR"]},
+                    {"plmnId": {"mcc": "310", "mnc": "410"},
+                     "accessTechList": ["NR", "EUTRAN_IN_WBS1_MODE_AND_NBS1_MODE"]}
+                ]
+            });
+            let sor_path = format!("/nausf-sorprotection/v1/{supi}/ue-sor");
+            let resp = client.post_json(&sor_path, &sor_body).await.expect("sor");
+            assert_eq!(resp.status, 200, "SoR body: {:?}", resp.http.content);
+            let sor: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+
+            // First MAC after the fresh KAUSF uses Counter_SoR 0x0001
+            // (TS 33.501 §6.14.2.3); header 0x0E = ack + list ind + PLMN
+            // list type (TS 24.501 fig. 9.11.3.51.5).
+            assert_eq!(sor["counterSor"], "0001");
+            let expected_mac = nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iausf(
+                &kausf,
+                &[0x0E],
+                0x0001,
+                Some(&GOLDEN_P2),
+            );
+            assert_eq!(
+                nextgcore_ausfd::nudm_handler::hex_to_bytes(sor["sorMacIausf"].as_str().unwrap()),
+                expected_mac.to_vec(),
+                "sorMacIausf must be reproducible from KAUSF + documented S-string"
+            );
+            let expected_xmac =
+                nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iue(&kausf, 0x0001);
+            assert_eq!(
+                nextgcore_ausfd::nudm_handler::hex_to_bytes(sor["sorXmacIue"].as_str().unwrap()),
+                expected_xmac.to_vec()
+            );
+
+            // Freshness: second call → counter 0x0002 and a different MAC
+            // over identical input.
+            let resp = client.post_json(&sor_path, &sor_body).await.expect("sor2");
+            assert_eq!(resp.status, 200);
+            let sor2: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(sor2["counterSor"], "0002");
+            assert_ne!(sor2["sorMacIausf"], sor["sorMacIausf"]);
+
+            // ---- UPU: POST /nausf-upuprotection/v1/{supi}/ue-upu ----
+            // Hand-derived P0 (TS 24.501 fig. 9.11.3.53A.2): ME routing
+            // indicator "1234" → 04 0002 21 43; default configured NSSAI
+            // [{sst:1},{sst:2,sd:00007B}] → 02 0007 01 01 04 02 00 00 7B.
+            const GOLDEN_UPU: [u8; 15] = [
+                0x04, 0x00, 0x02, 0x21, 0x43, 0x02, 0x00, 0x07, 0x01, 0x01, 0x04, 0x02, 0x00,
+                0x00, 0x7B,
+            ];
+            let upu_body = serde_json::json!({
+                "upuAckInd": true,
+                "upuDataList": [
+                    {"routingId": "1234"},
+                    {"defaultConfNssai": [{"sst": 1}, {"sst": 2, "sd": "00007B"}]}
+                ]
+            });
+            let upu_path = format!("/nausf-upuprotection/v1/{supi}/ue-upu");
+            let resp = client.post_json(&upu_path, &upu_body).await.expect("upu");
+            assert_eq!(resp.status, 200, "UPU body: {:?}", resp.http.content);
+            let upu: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(upu["counterUpu"], "0001");
+            let expected_mac = nextgcore_crypt::kdf::nextgcore_kdf_upu_mac_iausf(
+                &kausf,
+                &GOLDEN_UPU,
+                0x0001,
+            );
+            assert_eq!(
+                nextgcore_ausfd::nudm_handler::hex_to_bytes(upu["upuMacIausf"].as_str().unwrap()),
+                expected_mac.to_vec(),
+                "upuMacIausf must be reproducible from KAUSF + documented S-string"
+            );
+            let expected_xmac =
+                nextgcore_crypt::kdf::nextgcore_kdf_upu_mac_iue(&kausf, 0x0001);
+            assert_eq!(
+                nextgcore_ausfd::nudm_handler::hex_to_bytes(upu["upuXmacIue"].as_str().unwrap()),
+                expected_xmac.to_vec()
+            );
+
+            // ---- Fail-closed over the wire ----
+            // Unknown SUPI → 404 CONTEXT_NOT_FOUND, never a MAC.
+            let resp = client
+                .post_json("/nausf-sorprotection/v1/imsi-001019999999999/ue-sor", &sor_body)
+                .await
+                .expect("sor 404");
+            assert_eq!(resp.status, 404);
+            let pd: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+            assert_eq!(pd["cause"], "CONTEXT_NOT_FOUND");
+            assert!(pd.get("sorMacIausf").is_none());
+            let resp = client
+                .post_json("/nausf-upuprotection/v1/imsi-001019999999999/ue-upu", &upu_body)
+                .await
+                .expect("upu 404");
+            assert_eq!(resp.status, 404);
+
+            // Missing mandatory IE → 400 MANDATORY_IE_MISSING.
+            let resp = client
+                .post_json(&sor_path, &serde_json::json!({"steeringContainer": []}))
+                .await
+                .expect("sor 400");
+            assert_eq!(resp.status, 400);
+            let pd: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+            assert_eq!(pd["cause"], "MANDATORY_IE_MISSING");
+            let resp = client
+                .post_json(&upu_path, &serde_json::json!({"upuAckInd": true}))
+                .await
+                .expect("upu 400");
+            assert_eq!(resp.status, 400);
+
+            // Wrong method on the custom op → 405 catch-all.
+            let resp = client.get(&sor_path).await.expect("sor GET");
+            assert_eq!(resp.status, 405);
+
+            ausf_server.stop().await.expect("stop ausf");
+            udm_server.stop().await.expect("stop udm");
+        })
+        .await
+        .expect("test_sor_upu_protection_http_end_to_end timed out");
     }
 }

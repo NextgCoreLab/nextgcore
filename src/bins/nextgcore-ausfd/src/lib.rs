@@ -16,8 +16,10 @@ pub mod nudm_build;
 pub mod nudm_handler;
 pub mod sbi_path;
 pub mod sbi_response;
+pub mod sor_protection;
 pub mod timer;
 pub mod ue_sm;
+pub mod upu_protection;
 
 // Re-export commonly used types
 pub use ausf_sm::{ausf_sm_debug, AusfSmContext, AusfState};
@@ -37,6 +39,10 @@ pub use nausf_handler::{
     ausf_nausf_auth_handle_authenticate, ausf_nausf_auth_handle_authenticate_confirmation,
     ausf_nausf_auth_handle_authenticate_delete,
 };
+
+// Re-export SoR/UPU protection producers (Wave-6 F-03, TS 29.509)
+pub use sor_protection::handle_sor_protect;
+pub use upu_protection::handle_upu_protect;
 
 // Re-export NUDM handler types
 pub use nudm_handler::{
