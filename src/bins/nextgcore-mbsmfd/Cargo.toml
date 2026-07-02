@@ -14,6 +14,8 @@ path = "src/main.rs"
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }
 nextgcore-pfcp = { workspace = true }
+nextgcore-ngap = { workspace = true }
+nextgcore-asn1c = { workspace = true }
 nextgcore-metrics = { workspace = true }
 nextgcore-app = { workspace = true }
 log.workspace = true

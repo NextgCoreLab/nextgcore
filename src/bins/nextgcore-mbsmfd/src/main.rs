@@ -9,8 +9,20 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nextgcore_asn1c::ngap::cause::{Cause, CauseTransport};
+use nextgcore_ngap::mbs_transfer::{
+    MbsDistributionReleaseRequestTransfer, MbsDistributionSetupRequestTransfer,
+    MbsDistributionSetupResponseTransfer, MbsDistributionSetupUnsuccessfulTransfer,
+    MbsQosFlowsToBeSetupItem, MbsSessionId as NgapMbsSessionId,
+    MbsSessionStatus as NgapMbsSessionStatus, SharedNguMulticastTnlInformation,
+};
+use nextgcore_ngap::transfer::{
+    AllocationAndRetentionPriority, NonDynamic5qiDescriptor, PreEmptionCapability,
+    PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters, TransportLayerAddress,
+};
+use nextgcore_sbi::constants::content_type::APPLICATION_NGAP;
 use nextgcore_sbi::context::global_context;
-use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::message::{SbiPart, SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as NextgcoreSbiServerConfig,
@@ -802,31 +814,11 @@ async fn handle_mbs_session_context_update(request: &SbiRequest) -> SbiResponse 
         return SbiResponse::with_status(204);
     }
 
-    // --- AMF path: produce an N2 MBS SM container for distribution setup.
+    // --- AMF path: shared-delivery establishment / release driven by a real
+    // N2 MBS SM container (TS 29.532 §5.3.2.5 steps 1/2a/2b, TS 38.413
+    // §9.3.5.7-§9.3.5.10). [G1-2]
     if is_amf {
-        let exists = ctx
-            .read()
-            .map(|c| c.session_find_by_tmgi(&tmgi).is_some())
-            .unwrap_or(false);
-        if !exists {
-            return send_not_found(
-                "MBS session not found for ContextUpdate",
-                Some("CONTEXT_NOT_FOUND"),
-            );
-        }
-        let rsp = types::ContextUpdateRspData {
-            ll_ssm: None,
-            c_teid: None,
-            n2_mbs_sm_info: Some(types::N2MbsSmInfo {
-                ngap_ie_type: "MBS_DIS_SETUP_REQ".to_string(),
-                ngap_data: types::RefToBinaryData {
-                    content_id: "n2MbsSmInfo".to_string(),
-                },
-            }),
-        };
-        return SbiResponse::with_status(200)
-            .with_json_body(&rsp)
-            .unwrap_or_else(|_| SbiResponse::with_status(200));
+        return handle_context_update_amf(request, &req, &tmgi).await;
     }
 
     // --- SMF multicast Start: allocate cTeid + llSsm, drive N4mb establishment.
@@ -877,6 +869,316 @@ async fn handle_mbs_session_context_update(request: &SbiRequest) -> SbiResponse 
     SbiResponse::with_status(200)
         .with_json_body(&rsp)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+// ---------------------------------------------------------------------------
+// G1-2: ContextUpdate AMF path — real multipart/related N2 container handling
+// (TS 29.532 §5.3.2.5, §6.2.6.2.5/6/9, §6.2.6.5.2; TS 38.413 §9.3.5.7-10;
+//  TS 23.247 §7.2.1.4/§7.2.2.4)
+// ---------------------------------------------------------------------------
+
+/// Content-Id used for the N2 MBS SM container part in ContextUpdate
+/// responses (`ContextUpdateRspData.n2MbsSmInfo.ngapData.contentId`).
+const N2_RSP_CONTENT_ID: &str = "n2MbsSmInfo";
+
+/// BCD-encode an MCC/MNC digit-string pair into the 3-octet PLMN identity of
+/// TS 24.008 §10.5.1.3 (as carried in the NGAP TMGI, TS 38.413 §9.3.1.206):
+/// octet1 = MCC2|MCC1, octet2 = MNC3|MCC3 (MNC3=0xF for 2-digit MNC),
+/// octet3 = MNC2|MNC1. Non-digit / missing positions encode as 0xF.
+fn plmn_bcd(mcc: &str, mnc: &str) -> [u8; 3] {
+    fn digit(s: &str, i: usize) -> u8 {
+        s.as_bytes()
+            .get(i)
+            .map(|b| b.wrapping_sub(b'0'))
+            .filter(|d| *d <= 9)
+            .unwrap_or(0xF)
+    }
+    let (m1, m2, m3) = (digit(mcc, 0), digit(mcc, 1), digit(mcc, 2));
+    let (n1, n2) = (digit(mnc, 0), digit(mnc, 1));
+    let n3 = if mnc.len() >= 3 { digit(mnc, 2) } else { 0xF };
+    [(m2 << 4) | m1, (n3 << 4) | m3, (n2 << 4) | n1]
+}
+
+/// The NGAP-side TMGI ([`NgapMbsSessionId`]) for an internal [`Tmgi`].
+fn ngap_session_id_from(tmgi: &Tmgi) -> NgapMbsSessionId {
+    NgapMbsSessionId::new(
+        plmn_bcd(&tmgi.plmn_id.mcc, &tmgi.plmn_id.mnc),
+        tmgi.mbs_service_id,
+    )
+}
+
+/// TMGI-match validation (G1-2 step 3): the TMGI inside the decoded NGAP
+/// transfer container must equal `req.mbsSessionId.tmgi`.
+fn transfer_tmgi_matches(container: &NgapMbsSessionId, tmgi: &Tmgi) -> bool {
+    container.mbs_service_id == tmgi.mbs_service_id
+        && container.plmn_identity == plmn_bcd(&tmgi.plmn_id.mcc, &tmgi.plmn_id.mnc)
+}
+
+/// Resolve `n2MbsSmInfo.ngapData.contentId` against the inbound multipart
+/// parts (`request.http.parts`, populated by the SBI server per TS 29.500
+/// §6.1.2.3). Fail-closed: a dangling contentId or a part that is not
+/// `application/vnd.3gpp.ngap` is a 400 MANDATORY_IE_INCORRECT — never a
+/// silent JSON-only fallback.
+fn resolve_n2_part<'a>(
+    request: &'a SbiRequest,
+    content_id: &str,
+) -> Result<&'a SbiPart, Box<SbiResponse>> {
+    let part = request
+        .http
+        .parts
+        .iter()
+        .find(|p| p.content_id.as_deref() == Some(content_id))
+        .ok_or_else(|| {
+            Box::new(send_bad_request(
+                &format!("n2MbsSmInfo references missing binary part '{content_id}'"),
+                Some("MANDATORY_IE_INCORRECT"),
+            ))
+        })?;
+    let ct_ok = part
+        .content_type
+        .as_deref()
+        .and_then(|ct| ct.split(';').next())
+        .map(|ct| ct.trim().eq_ignore_ascii_case(APPLICATION_NGAP))
+        .unwrap_or(false);
+    if !ct_ok {
+        return Err(Box::new(send_bad_request(
+            &format!("binary part '{content_id}' must be {APPLICATION_NGAP}"),
+            Some("MANDATORY_IE_INCORRECT"),
+        )));
+    }
+    Ok(part)
+}
+
+/// Build the 200 multipart ContextUpdate response: `ContextUpdateRspData`
+/// JSON root referencing an `application/vnd.3gpp.ngap` binary part carrying
+/// `ngap_bytes` (the SBI server auto-encodes `multipart/related` when parts
+/// are attached).
+fn context_update_n2_response(ie_type: types::NgapIeType, ngap_bytes: Vec<u8>) -> SbiResponse {
+    let rsp = types::ContextUpdateRspData {
+        ll_ssm: None,
+        c_teid: None,
+        n2_mbs_sm_info: Some(types::N2MbsSmInfo {
+            ngap_ie_type: ie_type,
+            ngap_data: types::RefToBinaryData {
+                content_id: N2_RSP_CONTENT_ID.to_string(),
+            },
+        }),
+    };
+    match SbiResponse::with_status(200).with_json_body(&rsp) {
+        Ok(r) => r.with_part(SbiPart::with_content(
+            N2_RSP_CONTENT_ID,
+            APPLICATION_NGAP,
+            bytes::Bytes::from(ngap_bytes),
+        )),
+        Err(e) => {
+            log::error!("Failed to serialize ContextUpdateRspData: {e}");
+            SbiResponse::with_status(500)
+        }
+    }
+}
+
+/// AMF shared-delivery establishment (TS 23.247 §7.2.1.4, single shared
+/// NG-U tunnel per session): drive the session_context_start/N4mb path and
+/// answer with an `MBS_DIS_SETUP_RSP` (TS 38.413 §9.3.5.8) built from the
+/// session's real N4mb transport (llSsm + cTeid), or an `MBS_DIS_SETUP_FAIL`
+/// (§9.3.5.9) with a real Cause when establishment cannot be started.
+fn amf_shared_delivery_setup(tmgi: &Tmgi) -> SbiResponse {
+    let ctx = mbsmf_self();
+    let upf_addr = configured_mb_upf_ip();
+    let started = ctx
+        .read()
+        .ok()
+        .and_then(|c| c.session_context_start(tmgi, upf_addr));
+    let ngap_tmgi = ngap_session_id_from(tmgi);
+
+    let (session, n4mb) = match started
+        .as_ref()
+        .and_then(|s| s.n4mb_session.as_ref().map(|n| (s, n)))
+    {
+        Some(pair) => pair,
+        None => {
+            // N4mb/establishment failure: a real Unsuccessful Transfer with a
+            // real Cause instead of the old silent JSON 200. [G1-2 step 5]
+            let fail = MbsDistributionSetupUnsuccessfulTransfer {
+                mbs_session_id: ngap_tmgi,
+                mbs_area_session_id: None,
+                cause: Cause::Transport(CauseTransport::TransportResourceUnavailable),
+                criticality_diagnostics: None,
+            };
+            return match fail.encode() {
+                Ok(bytes) => {
+                    log::warn!(
+                        "ContextUpdate AMF setup failed for TMGI {:02x?}: N4mb start unavailable",
+                        tmgi.mbs_service_id
+                    );
+                    context_update_n2_response(types::NgapIeType::MbsDisSetupFail, bytes)
+                }
+                Err(e) => {
+                    log::error!("Failed to encode MbsDistributionSetupUnsuccessfulTransfer: {e}");
+                    SbiResponse::with_status(500)
+                }
+            };
+        }
+    };
+
+    // Shared NG-U Multicast TNL Information (TS 38.413 §9.3.2.16) from the
+    // session's real N4mb transport: llSsm dst/src + the common GTP TEID.
+    let tnl = SharedNguMulticastTnlInformation {
+        ip_multicast_address: TransportLayerAddress::from_ipv4(
+            n4mb.ll_ssm_dst.unwrap_or(upf_addr).octets(),
+        ),
+        ip_source_address: TransportLayerAddress::from_ipv4(
+            n4mb.ll_ssm_src.unwrap_or(upf_addr).octets(),
+        ),
+        gtp_teid: n4mb.dl_teid.to_be_bytes(),
+    };
+    // Single QoS flow derived from the session model (default QFI 1 / 5QI 9
+    // when the create carried no mbsServiceInfo) — documented minimal scope.
+    let qos_flow = MbsQosFlowsToBeSetupItem {
+        mbs_qos_flow_identifier: session.qfi.min(63),
+        mbs_qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
+            qos_characteristics: QosCharacteristics::NonDynamic5qi(NonDynamic5qiDescriptor::new(
+                session.fiveqi as u16,
+            )),
+            allocation_and_retention_priority: AllocationAndRetentionPriority {
+                priority_level_arp: 8,
+                pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
+                pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
+            },
+            gbr_qos_information: None,
+            reflective_qos_attribute: false,
+            additional_qos_flow_information: false,
+        },
+    };
+    let rsp_transfer = MbsDistributionSetupResponseTransfer {
+        mbs_session_id: ngap_tmgi,
+        mbs_area_session_id: None,
+        shared_ngu_multicast_tnl_information: Some(tnl),
+        mbs_qos_flows_to_be_setup_list: vec![qos_flow],
+        mbs_session_status: NgapMbsSessionStatus::Activated,
+    };
+    match rsp_transfer.encode() {
+        Ok(bytes) => {
+            log::info!(
+                "ContextUpdate AMF setup (TMGI {:02x?}): cTeid={:#010x}, llSsm dst={:?}",
+                tmgi.mbs_service_id,
+                n4mb.dl_teid,
+                n4mb.ll_ssm_dst
+            );
+            // Drive the real N4mb establishment in the background, exactly
+            // like the SMF Start path. [mbsmfd-02]
+            tokio::spawn(drive_n4mb_establishment(session.id, session.clone()));
+            context_update_n2_response(types::NgapIeType::MbsDisSetupRsp, bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode MbsDistributionSetupResponseTransfer: {e}");
+            SbiResponse::with_status(500)
+        }
+    }
+}
+
+/// ContextUpdate AMF path (TS 29.532 §5.3.2.5): decode the inbound N2 MBS SM
+/// container (when present) from the multipart body, drive shared-delivery
+/// establishment or release, and answer with a *response-direction* container
+/// (`MBS_DIS_SETUP_RSP`/`MBS_DIS_SETUP_FAIL`) or 204 (release, spec 2b).
+async fn handle_context_update_amf(
+    request: &SbiRequest,
+    req: &types::ContextUpdateReqData,
+    tmgi: &Tmgi,
+) -> SbiResponse {
+    let ctx = mbsmf_self();
+    let exists = ctx
+        .read()
+        .map(|c| c.session_find_by_tmgi(tmgi).is_some())
+        .unwrap_or(false);
+    if !exists {
+        return send_not_found(
+            "MBS session not found for ContextUpdate",
+            Some("CONTEXT_NOT_FOUND"),
+        );
+    }
+
+    let Some(n2) = req.n2_mbs_sm_info.as_ref() else {
+        // Legacy JSON-only AMF request (ranNodeId only, no inbound container):
+        // still a shared-delivery setup — the response now carries a REAL
+        // container part (no dangling contentId). [G1-2 step 8]
+        return amf_shared_delivery_setup(tmgi);
+    };
+
+    let part = match resolve_n2_part(request, &n2.ngap_data.content_id) {
+        Ok(p) => p,
+        Err(rsp) => return *rsp,
+    };
+
+    match n2.ngap_ie_type {
+        // Establishment of shared delivery toward the RAN node
+        // (TS 23.247 §7.2.1.4): decode the Setup Request Transfer (§9.3.5.7).
+        types::NgapIeType::MbsDisSetupReq => {
+            let transfer = match MbsDistributionSetupRequestTransfer::decode(&part.data) {
+                Ok(t) => t,
+                Err(e) => {
+                    return send_bad_request(
+                        &format!("Invalid MBS Distribution Setup Request Transfer: {e}"),
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+            };
+            if !transfer_tmgi_matches(&transfer.mbs_session_id, tmgi) {
+                return send_bad_request(
+                    "TMGI in N2 container does not match mbsSessionId.tmgi",
+                    Some("INVALID_MSG_FORMAT"),
+                );
+            }
+            amf_shared_delivery_setup(tmgi)
+        }
+        // Release of shared delivery toward the RAN node (TS 23.247
+        // §7.2.2.4): decode the Release Request Transfer (§9.3.5.10),
+        // release the shared transport, 204 (spec 2b: nothing to return).
+        types::NgapIeType::MbsDisRelReq => {
+            let transfer = match MbsDistributionReleaseRequestTransfer::decode(&part.data) {
+                Ok(t) => t,
+                Err(e) => {
+                    return send_bad_request(
+                        &format!("Invalid MBS Distribution Release Request Transfer: {e}"),
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+            };
+            if !transfer_tmgi_matches(&transfer.mbs_session_id, tmgi) {
+                return send_bad_request(
+                    "TMGI in N2 container does not match mbsSessionId.tmgi",
+                    Some("INVALID_MSG_FORMAT"),
+                );
+            }
+            let released = ctx
+                .read()
+                .map(|c| c.session_context_terminate(tmgi))
+                .unwrap_or(false);
+            if !released {
+                return send_not_found(
+                    "MBS session not found for ContextUpdate",
+                    Some("CONTEXT_NOT_FOUND"),
+                );
+            }
+            log::info!(
+                "ContextUpdate AMF release (TMGI {:02x?})",
+                tmgi.mbs_service_id
+            );
+            SbiResponse::with_status(204)
+        }
+        // Response-direction IE types are invalid in a request (TS 29.532
+        // §5.3.2.5 step 1) — fail-closed.
+        types::NgapIeType::MbsDisSetupRsp | types::NgapIeType::MbsDisSetupFail => {
+            send_bad_request(
+                "response-direction ngapIeType in ContextUpdate request",
+                Some("INVALID_MSG_FORMAT"),
+            )
+        }
+        types::NgapIeType::Unknown => send_bad_request(
+            "unknown ngapIeType in ContextUpdate request",
+            Some("INVALID_MSG_FORMAT"),
+        ),
+    }
 }
 
 /// Handle TMGI Allocate (TS 29.532 §5.2.2.2, POST /nmbsmf-tmgi/v1/tmgi).
@@ -1659,15 +1961,15 @@ mod tests {
 
     // ---- mbsmfd-03/04/10: SBI router behaviour (against the global context) ----
 
-    /// Seed a session in the *global* context keyed by `tmgi`, returning its
-    /// `mbsServiceId` hex string for building an `MbsSessionId`.
-    fn seed_global_session(svc_id: [u8; 3]) -> String {
+    /// Seed a session in the *global* context keyed by `tmgi` (in the given
+    /// PLMN), returning its `mbsServiceId` hex string.
+    fn seed_global_session_plmn(svc_id: [u8; 3], mcc: &str, mnc: &str) -> String {
         mbsmf_context_init(256);
         let tmgi = Tmgi {
             mbs_service_id: svc_id,
             plmn_id: PlmnId {
-                mcc: "001".to_string(),
-                mnc: "01".to_string(),
+                mcc: mcc.to_string(),
+                mnc: mnc.to_string(),
             },
         };
         let ctx = mbsmf_self();
@@ -1676,6 +1978,12 @@ mod tests {
             .session_add(tmgi, MbsSessionType::Multicast)
             .expect("session added");
         hex::encode(svc_id)
+    }
+
+    /// Seed a session in the *global* context keyed by `tmgi` (PLMN 001/01),
+    /// returning its `mbsServiceId` hex string for building an `MbsSessionId`.
+    fn seed_global_session(svc_id: [u8; 3]) -> String {
+        seed_global_session_plmn(svc_id, "001", "01")
     }
 
     // mbsmfd-03: ContextUpdate SMF Start → 200 with cTeid + llSsm.
@@ -1689,11 +1997,22 @@ mod tests {
             .with_body(body, "application/json");
         let rsp = mbsmf_sbi_request_handler(req).await;
         assert_eq!(rsp.status, 200);
-        let parsed: types::ContextUpdateRspData =
-            serde_json::from_str(rsp.http.content.as_deref().unwrap()).unwrap();
+        let body = rsp.http.content.as_deref().unwrap();
+        let parsed: types::ContextUpdateRspData = serde_json::from_str(body).unwrap();
         assert!(parsed.c_teid.is_some(), "cTeid allocated");
-        let ssm = parsed.ll_ssm.expect("llSsm present");
+        let ssm = parsed.ll_ssm.as_ref().expect("llSsm present");
         assert!(ssm.dest_ip_addr.ipv4_addr.is_some(), "llSsm dest allocated");
+        // G1-2 regression: the SMF JSON path is unchanged — no N2 container,
+        // no multipart parts, and the body is exactly the serde shape of
+        // ContextUpdateRspData (no extra fields).
+        assert!(parsed.n2_mbs_sm_info.is_none(), "SMF path carries no N2");
+        assert!(!body.contains("n2MbsSmInfo"), "no n2MbsSmInfo key emitted");
+        assert!(rsp.http.parts.is_empty(), "SMF path stays JSON-only");
+        assert_eq!(
+            body,
+            serde_json::to_string(&parsed).unwrap(),
+            "byte-identical to the ContextUpdateRspData serde shape"
+        );
     }
 
     // mbsmfd-03: ContextUpdate Terminate → 204; unknown session → 404.
@@ -1730,14 +2049,95 @@ mod tests {
         assert_eq!(rsp.status, 404);
     }
 
-    // mbsmfd-03: ContextUpdate AMF path → 200 with an N2 MBS SM container.
+    // ---- G1-2: ContextUpdate AMF path — real multipart N2 containers ----
+
+    /// The G1-1 golden `MBS-DistributionSetupRequestTransfer` APER vector
+    /// (TS 38.413 §9.3.5.7), hand-derived independently in
+    /// `libs/nextgcore-ngap/src/mbs_transfer.rs` (GOLDEN_SETUP_REQ):
+    /// TMGI = PLMN 208/93 (BCD `02 F8 39`) + service id `00 00 01`,
+    /// areaSessionId=1, sharedNGU-UnicastTNLInformation = GTP tunnel
+    /// 10.1.2.3 / TEID 0x00003039, no iE-Extensions.
+    const GOLDEN_MBS_SETUP_REQ: [u8; 20] = [
+        0x60, 0x02, 0xF8, 0x39, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x01, 0xF0, 0x0A, 0x01, 0x02,
+        0x03, 0x00, 0x00, 0x30, 0x39,
+    ];
+
+    /// Hand-derived `MBS-DistributionReleaseRequestTransfer` (§9.3.5.10) for
+    /// TMGI 208/93 / `C1 02 02`, cause = nas:normal-release(0). Same
+    /// derivation as the G1-1 GOLDEN_REL_REQ vector — every field is
+    /// byte-aligned, so only the TMGI octets differ:
+    ///   byte0 = ext(0) area(0) tnl(0) iE-Ext(0) | MBS-SessionID
+    ///           preamble 000 | TMGI align pad 0            = 0x00
+    ///   bytes1-6 = TMGI 02 F8 39 C1 02 02
+    ///   byte7 = Cause CHOICE nas (idx 2 of 6, 3 bits) 010 |
+    ///           ENUM ext 0 | normal-release 00 | pad 00    = 0x40
+    const GOLDEN_MBS_REL_REQ: [u8; 8] = [0x00, 0x02, 0xF8, 0x39, 0xC1, 0x02, 0x02, 0x40];
+
+    /// Build an AMF ContextUpdate JSON body carrying an `n2MbsSmInfo`
+    /// (field names typed from TS29532_Nmbsmf_MBSSession.yaml).
+    fn amf_ctx_update_body(
+        svc_hex: &str,
+        mcc: &str,
+        mnc: &str,
+        ie_type: &str,
+        content_id: &str,
+    ) -> String {
+        format!(
+            r#"{{"nfcInstanceId":"amf-x","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc_hex}","plmnId":{{"mcc":"{mcc}","mnc":"{mnc}"}}}}}},"ranNodeId":{{"gNbId":{{"bitLength":24,"gNBValue":"000001"}}}},"n2MbsSmInfo":{{"ngapIeType":"{ie_type}","ngapData":{{"contentId":"{content_id}"}}}}}}"#
+        )
+    }
+
+    /// POST a ContextUpdate request through the real router.
+    async fn post_ctx_update(req: SbiRequest) -> SbiResponse {
+        mbsmf_sbi_request_handler(req).await
+    }
+
+    /// Contract check vs TS29532_Nmbsmf_MBSSession.yaml:236-283: every
+    /// `RefToBinaryData.contentId` in the response JSON must resolve to a
+    /// body part with Content-Id equal to it and Content-Type
+    /// `application/vnd.3gpp.ngap`. A JSON-only body whose `n2MbsSmInfo`
+    /// references a missing part (the old stub shape) is schema-invalid.
+    fn check_ctx_update_rsp_contract(
+        json: &str,
+        parts: &[nextgcore_sbi::message::SbiPart],
+    ) -> Result<(), String> {
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+        let mut stack = vec![&value];
+        while let Some(v) = stack.pop() {
+            match v {
+                serde_json::Value::Object(map) => {
+                    if let Some(cid) = map.get("contentId").and_then(|c| c.as_str()) {
+                        let part = parts
+                            .iter()
+                            .find(|p| p.content_id.as_deref() == Some(cid))
+                            .ok_or_else(|| format!("dangling contentId '{cid}': no body part"))?;
+                        let ct = part.content_type.as_deref().unwrap_or("");
+                        if !ct.eq_ignore_ascii_case(APPLICATION_NGAP) {
+                            return Err(format!(
+                                "part '{cid}' Content-Type '{ct}' != {APPLICATION_NGAP}"
+                            ));
+                        }
+                    }
+                    stack.extend(map.values());
+                }
+                serde_json::Value::Array(arr) => stack.extend(arr.iter()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    // G1-2 (legacy shape): a JSON-only AMF request (ranNodeId only, no
+    // n2MbsSmInfo) now returns a REAL response-direction container part —
+    // ngapIeType MBS_DIS_SETUP_RSP with no dangling contentId.
     #[tokio::test]
     async fn test_router_context_update_amf_n2() {
         let svc = seed_global_session([0xC0, 0x03, 0x03]);
         let body = format!(
             r#"{{"nfcInstanceId":"amf-x","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc}","plmnId":{{"mcc":"001","mnc":"01"}}}}}},"ranNodeId":{{"gNbId":{{"bitLength":24,"gNBValue":"000001"}}}}}}"#
         );
-        let rsp = mbsmf_sbi_request_handler(
+        let rsp = post_ctx_update(
             SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
                 .with_body(body, "application/json"),
         )
@@ -1745,7 +2145,328 @@ mod tests {
         assert_eq!(rsp.status, 200);
         let parsed: types::ContextUpdateRspData =
             serde_json::from_str(rsp.http.content.as_deref().unwrap()).unwrap();
-        assert!(parsed.n2_mbs_sm_info.is_some(), "N2 container produced");
+        let n2 = parsed.n2_mbs_sm_info.expect("N2 container produced");
+        assert_eq!(
+            n2.ngap_ie_type,
+            types::NgapIeType::MbsDisSetupRsp,
+            "response direction is MBS_DIS_SETUP_RSP (never *_REQ)"
+        );
+        // The referenced part is really attached (multipart/related is
+        // auto-encoded by the SBI server when parts are present).
+        check_ctx_update_rsp_contract(rsp.http.content.as_deref().unwrap(), &rsp.http.parts)
+            .expect("contract: contentId resolves to an application/vnd.3gpp.ngap part");
+        // The part decodes as a Setup Response Transfer (§9.3.5.8).
+        let part = &rsp.http.parts[0];
+        MbsDistributionSetupResponseTransfer::decode(&part.data)
+            .expect("part decodes as MBS Distribution Setup Response Transfer");
+    }
+
+    // G1-2 round-trip: inbound multipart MBS_DIS_SETUP_REQ (G1-1 golden
+    // bytes) → 200 multipart whose part decodes as MBS_DIS_SETUP_RSP with
+    // the session's real N4mb transport, equal to the SMF-path cTeid.
+    #[tokio::test]
+    async fn test_router_context_update_amf_multipart_setup_roundtrip() {
+        // Session TMGI must equal the golden container's TMGI:
+        // PLMN 208/93, service id 000001.
+        let svc = seed_global_session_plmn([0x00, 0x00, 0x01], "208", "93");
+        let body = amf_ctx_update_body(&svc, "208", "93", "MBS_DIS_SETUP_REQ", "n2SmInfo");
+        let req = SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+            .with_body(body, "application/json")
+            .with_part(SbiPart::with_content(
+                "n2SmInfo",
+                APPLICATION_NGAP,
+                bytes::Bytes::copy_from_slice(&GOLDEN_MBS_SETUP_REQ),
+            ));
+        let rsp = post_ctx_update(req).await;
+        assert_eq!(rsp.status, 200);
+
+        // JSON root: ngapIeType is the response direction, contentId resolves.
+        let json = rsp.http.content.as_deref().unwrap();
+        let parsed: types::ContextUpdateRspData = serde_json::from_str(json).unwrap();
+        let n2 = parsed.n2_mbs_sm_info.expect("n2MbsSmInfo present");
+        assert_eq!(n2.ngap_ie_type, types::NgapIeType::MbsDisSetupRsp);
+        assert_eq!(n2.ngap_data.content_id, "n2MbsSmInfo");
+        check_ctx_update_rsp_contract(json, &rsp.http.parts).expect("contract");
+
+        // Binary part: decodes as §9.3.5.8 with the session's real N4mb TNL.
+        let part = rsp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2MbsSmInfo"))
+            .expect("response part n2MbsSmInfo");
+        let decoded = MbsDistributionSetupResponseTransfer::decode(&part.data)
+            .expect("decodes as Setup Response Transfer");
+        assert_eq!(decoded.mbs_session_id.plmn_identity, [0x02, 0xF8, 0x39]);
+        assert_eq!(decoded.mbs_session_id.mbs_service_id, [0x00, 0x00, 0x01]);
+        assert_eq!(decoded.mbs_session_status, NgapMbsSessionStatus::Activated);
+        let tnl = decoded
+            .shared_ngu_multicast_tnl_information
+            .as_ref()
+            .expect("shared NG-U multicast TNL present");
+
+        // The decoded TNL matches the stored session's N4mb transport.
+        let ctx = mbsmf_self();
+        let tmgi = Tmgi {
+            mbs_service_id: [0x00, 0x00, 0x01],
+            plmn_id: PlmnId {
+                mcc: "208".to_string(),
+                mnc: "93".to_string(),
+            },
+        };
+        let session = ctx
+            .read()
+            .unwrap()
+            .session_find_by_tmgi(&tmgi)
+            .expect("session");
+        let n4mb = session.n4mb_session.as_ref().expect("n4mb allocated");
+        assert_eq!(u32::from_be_bytes(tnl.gtp_teid), n4mb.dl_teid);
+        assert_eq!(
+            tnl.ip_multicast_address.octets,
+            n4mb.ll_ssm_dst.unwrap().octets().to_vec()
+        );
+        assert_eq!(
+            tnl.ip_source_address.octets,
+            n4mb.ll_ssm_src.unwrap().octets().to_vec()
+        );
+        // One QoS flow derived from the session model (QFI 1 / 5QI 9 default).
+        assert_eq!(decoded.mbs_qos_flows_to_be_setup_list.len(), 1);
+        assert_eq!(
+            decoded.mbs_qos_flows_to_be_setup_list[0].mbs_qos_flow_identifier,
+            session.qfi
+        );
+
+        // Acceptance cross-check: the SMF Start path of the SAME session
+        // reports the same cTeid in JSON as the decoded NGAP TNL TEID.
+        let smf_body = format!(
+            r#"{{"nfcInstanceId":"smf-x","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc}","plmnId":{{"mcc":"208","mnc":"93"}}}}}},"requestedAction":"START"}}"#
+        );
+        let smf_rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(smf_body, "application/json"),
+        )
+        .await;
+        assert_eq!(smf_rsp.status, 200);
+        let smf_parsed: types::ContextUpdateRspData =
+            serde_json::from_str(smf_rsp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            smf_parsed.c_teid.expect("cTeid"),
+            u32::from_be_bytes(tnl.gtp_teid),
+            "SMF-path JSON cTeid == decoded NGAP SharedNguMulticastTnl gtp_teid"
+        );
+    }
+
+    // G1-2 fail-closed: a dangling contentId (no matching body part) → 400,
+    // never a silent JSON-only 200.
+    #[tokio::test]
+    async fn test_router_context_update_amf_dangling_content_id_400() {
+        let svc = seed_global_session([0xC1, 0x04, 0x04]);
+        let body = amf_ctx_update_body(&svc, "001", "01", "MBS_DIS_SETUP_REQ", "missingPart");
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(body, "application/json"),
+        )
+        .await;
+        assert_eq!(rsp.status, 400, "dangling contentId is fail-closed");
+        assert!(rsp
+            .http
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("MANDATORY_IE_INCORRECT"));
+    }
+
+    // G1-2 fail-closed: unknown ngapIeType (yaml anyOf open string) → 400.
+    #[tokio::test]
+    async fn test_router_context_update_amf_unknown_ie_type_400() {
+        let svc = seed_global_session([0xC1, 0x05, 0x05]);
+        let body = amf_ctx_update_body(&svc, "001", "01", "FUTURE_IE_TYPE", "n2SmInfo");
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(body, "application/json")
+                .with_part(SbiPart::with_content(
+                    "n2SmInfo",
+                    APPLICATION_NGAP,
+                    bytes::Bytes::copy_from_slice(&GOLDEN_MBS_SETUP_REQ),
+                )),
+        )
+        .await;
+        assert_eq!(rsp.status, 400, "unknown ngapIeType is fail-closed");
+    }
+
+    // G1-2 fail-closed: a response-direction ngapIeType in a request → 400
+    // (TS 29.532 §5.3.2.5 step 1 only allows SETUP_REQ / REL_REQ inbound).
+    #[tokio::test]
+    async fn test_router_context_update_amf_response_direction_ie_type_400() {
+        let svc = seed_global_session([0xC1, 0x06, 0x06]);
+        let body = amf_ctx_update_body(&svc, "001", "01", "MBS_DIS_SETUP_RSP", "n2SmInfo");
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(body, "application/json")
+                .with_part(SbiPart::with_content(
+                    "n2SmInfo",
+                    APPLICATION_NGAP,
+                    bytes::Bytes::copy_from_slice(&GOLDEN_MBS_SETUP_REQ),
+                )),
+        )
+        .await;
+        assert_eq!(rsp.status, 400, "SETUP_RSP in a request is fail-closed");
+    }
+
+    // G1-2 fail-closed: the referenced part must be application/vnd.3gpp.ngap.
+    #[tokio::test]
+    async fn test_router_context_update_amf_wrong_part_content_type_400() {
+        let svc = seed_global_session([0xC1, 0x07, 0x07]);
+        let body = amf_ctx_update_body(&svc, "001", "01", "MBS_DIS_SETUP_REQ", "n2SmInfo");
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(body, "application/json")
+                .with_part(SbiPart::with_content(
+                    "n2SmInfo",
+                    "application/json",
+                    bytes::Bytes::copy_from_slice(&GOLDEN_MBS_SETUP_REQ),
+                )),
+        )
+        .await;
+        assert_eq!(rsp.status, 400, "non-NGAP part content-type is fail-closed");
+    }
+
+    // G1-2 fail-closed: TMGI inside the NGAP container must match
+    // req.mbsSessionId.tmgi (golden bytes carry 208/93/000001; the JSON and
+    // session use 001/01/C10303).
+    #[tokio::test]
+    async fn test_router_context_update_amf_tmgi_mismatch_400() {
+        let svc = seed_global_session([0xC1, 0x03, 0x03]);
+        let body = amf_ctx_update_body(&svc, "001", "01", "MBS_DIS_SETUP_REQ", "n2SmInfo");
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(body, "application/json")
+                .with_part(SbiPart::with_content(
+                    "n2SmInfo",
+                    APPLICATION_NGAP,
+                    bytes::Bytes::copy_from_slice(&GOLDEN_MBS_SETUP_REQ),
+                )),
+        )
+        .await;
+        assert_eq!(rsp.status, 400, "container/JSON TMGI mismatch is 400");
+    }
+
+    // G1-2 fail-closed: corrupt NGAP bytes → 400 with ProblemDetails
+    // (assert NOT 200 — real decoding, not pass-through).
+    #[tokio::test]
+    async fn test_router_context_update_amf_corrupt_ngap_400() {
+        let svc = seed_global_session([0xC1, 0x08, 0x08]);
+        let body = amf_ctx_update_body(&svc, "001", "01", "MBS_DIS_SETUP_REQ", "n2SmInfo");
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(body, "application/json")
+                .with_part(SbiPart::with_content(
+                    "n2SmInfo",
+                    APPLICATION_NGAP,
+                    bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF]),
+                )),
+        )
+        .await;
+        assert_ne!(rsp.status, 200, "corrupt NGAP bytes must not yield 200");
+        assert_eq!(rsp.status, 400);
+        assert!(rsp
+            .http
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("INVALID_MSG_FORMAT"));
+    }
+
+    // G1-2 release leg: MBS_DIS_REL_REQ golden bytes → 204 (spec 2b) and the
+    // shared transport is released.
+    #[tokio::test]
+    async fn test_router_context_update_amf_release_golden_204() {
+        let svc = seed_global_session_plmn([0xC1, 0x02, 0x02], "208", "93");
+        // Establish first (AMF setup path) so there is a transport to release.
+        let setup = amf_ctx_update_body(&svc, "208", "93", "MBS_DIS_SETUP_REQ", "n2SmInfo");
+        // Minimal §9.3.5.7 container for this TMGI (no optionals):
+        // byte0 = presence 0000 | preamble 000 | pad 0 = 0x00, then TMGI.
+        let setup_bytes = [0x00, 0x02, 0xF8, 0x39, 0xC1, 0x02, 0x02];
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(setup, "application/json")
+                .with_part(SbiPart::with_content(
+                    "n2SmInfo",
+                    APPLICATION_NGAP,
+                    bytes::Bytes::copy_from_slice(&setup_bytes),
+                )),
+        )
+        .await;
+        assert_eq!(rsp.status, 200, "setup leg established");
+
+        // Release with the hand-derived §9.3.5.10 container.
+        let rel = amf_ctx_update_body(&svc, "208", "93", "MBS_DIS_REL_REQ", "n2SmInfo");
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(rel, "application/json")
+                .with_part(SbiPart::with_content(
+                    "n2SmInfo",
+                    APPLICATION_NGAP,
+                    bytes::Bytes::copy_from_slice(&GOLDEN_MBS_REL_REQ),
+                )),
+        )
+        .await;
+        assert_eq!(rsp.status, 204, "release → 204 (nothing to return)");
+
+        // The stored session's shared transport is gone.
+        let ctx = mbsmf_self();
+        let tmgi = Tmgi {
+            mbs_service_id: [0xC1, 0x02, 0x02],
+            plmn_id: PlmnId {
+                mcc: "208".to_string(),
+                mnc: "93".to_string(),
+            },
+        };
+        let session = ctx
+            .read()
+            .unwrap()
+            .session_find_by_tmgi(&tmgi)
+            .expect("session still exists");
+        assert!(
+            session.n4mb_session.is_none(),
+            "shared transport released by MBS_DIS_REL_REQ"
+        );
+    }
+
+    // G1-2 contract: the OLD stub-style response body (JSON referencing
+    // contentId 'n2MbsSmInfo' with NO body part, request-direction ie type)
+    // FAILS the yaml contract check; the new response construction passes.
+    #[test]
+    fn test_context_update_rsp_contract_rejects_old_stub_shape() {
+        // Old stub shape (pre-G1-2): dangling RefToBinaryData.
+        let old_stub =
+            r#"{"n2MbsSmInfo":{"ngapIeType":"MBS_DIS_SETUP_REQ","ngapData":{"contentId":"n2MbsSmInfo"}}}"#;
+        let err = check_ctx_update_rsp_contract(old_stub, &[]).unwrap_err();
+        assert!(err.contains("dangling contentId"), "got: {err}");
+
+        // New shape: real part attached via context_update_n2_response.
+        let rsp = context_update_n2_response(
+            types::NgapIeType::MbsDisSetupRsp,
+            GOLDEN_MBS_SETUP_REQ.to_vec(),
+        );
+        assert_eq!(rsp.status, 200);
+        check_ctx_update_rsp_contract(rsp.http.content.as_deref().unwrap(), &rsp.http.parts)
+            .expect("new response construction satisfies the yaml contract");
+        // Serialized field names match TS29532_Nmbsmf_MBSSession.yaml.
+        let json = rsp.http.content.as_deref().unwrap();
+        assert!(json.contains("\"ngapIeType\":\"MBS_DIS_SETUP_RSP\""));
+        assert!(json.contains("\"ngapData\":{\"contentId\":\"n2MbsSmInfo\"}"));
+        let part = &rsp.http.parts[0];
+        assert_eq!(part.content_id.as_deref(), Some("n2MbsSmInfo"));
+        assert_eq!(part.content_type.as_deref(), Some(APPLICATION_NGAP));
+    }
+
+    // G1-2: PLMN BCD encoding per TS 24.008 §10.5.1.3 (2- and 3-digit MNC).
+    #[test]
+    fn test_plmn_bcd_encoding() {
+        assert_eq!(plmn_bcd("208", "93"), [0x02, 0xF8, 0x39]);
+        assert_eq!(plmn_bcd("001", "01"), [0x00, 0xF1, 0x10]);
+        assert_eq!(plmn_bcd("310", "410"), [0x13, 0x00, 0x14]);
     }
 
     // mbsmfd-04: TMGI Allocate → 200 + TmgiAllocated; Deallocate → 204.

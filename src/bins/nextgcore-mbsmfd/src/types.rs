@@ -200,13 +200,39 @@ pub struct RefToBinaryData {
     pub content_id: String,
 }
 
-/// N2MbsSmInfo (TS 29.532 §6.2.6.4) — the N2 (NGAP) MBS session-management
+/// NgapIeType (TS29532_Nmbsmf_MBSSession.yaml:1172-1181) — the type of NGAP
+/// IE carried in an [`N2MbsSmInfo`] binary part.
+///
+/// Direction matters (TS 29.532 §5.3.2.5): the AMF *request* carries
+/// `MBS_DIS_SETUP_REQ` / `MBS_DIS_REL_REQ` (TS 38.413 §9.3.5.7/§9.3.5.10);
+/// the MB-SMF *response* carries `MBS_DIS_SETUP_RSP` or `MBS_DIS_SETUP_FAIL`
+/// (§9.3.5.8/§9.3.5.9). Modelled `anyOf` per the yaml: unknown strings decode
+/// to [`NgapIeType::Unknown`] (tolerant deserialize) and are rejected
+/// fail-closed with 400 on the AMF handling path. [G1-2]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NgapIeType {
+    #[serde(rename = "MBS_DIS_SETUP_REQ")]
+    MbsDisSetupReq,
+    #[serde(rename = "MBS_DIS_SETUP_RSP")]
+    MbsDisSetupRsp,
+    #[serde(rename = "MBS_DIS_SETUP_FAIL")]
+    MbsDisSetupFail,
+    #[serde(rename = "MBS_DIS_REL_REQ")]
+    MbsDisRelReq,
+    /// Any other string (the yaml `anyOf` open extension): tolerated on
+    /// decode, never emitted, rejected when handled.
+    #[serde(other, rename = "UNKNOWN")]
+    Unknown,
+}
+
+/// N2MbsSmInfo (TS 29.532 §6.2.6.2.9) — the N2 (NGAP) MBS session-management
 /// container exchanged with the AMF for shared MBS distribution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct N2MbsSmInfo {
-    /// `NgapIeType` (e.g. `MBS_DIS_SETUP_REQ`).
-    pub ngap_ie_type: String,
+    /// Typed [`NgapIeType`]; request vs response direction is enforced by the
+    /// ContextUpdate handler. [G1-2]
+    pub ngap_ie_type: NgapIeType,
     pub ngap_data: RefToBinaryData,
 }
 
@@ -462,8 +488,33 @@ mod tests {
         let req: ContextUpdateReqData = serde_json::from_str(json).unwrap();
         assert!(req.ran_node_id.is_some());
         let n2 = req.n2_mbs_sm_info.unwrap();
-        assert_eq!(n2.ngap_ie_type, "MBS_DIS_SETUP_REQ");
+        assert_eq!(n2.ngap_ie_type, NgapIeType::MbsDisSetupReq);
         assert_eq!(n2.ngap_data.content_id, "n2");
+    }
+
+    // ---- G1-2: NgapIeType serde matches TS29532_Nmbsmf_MBSSession.yaml:1177-1180 ----
+
+    #[test]
+    fn test_ngap_ie_type_serde_matches_yaml() {
+        // Serialized tokens are exactly the yaml enum values.
+        for (variant, token) in [
+            (NgapIeType::MbsDisSetupReq, "\"MBS_DIS_SETUP_REQ\""),
+            (NgapIeType::MbsDisSetupRsp, "\"MBS_DIS_SETUP_RSP\""),
+            (NgapIeType::MbsDisSetupFail, "\"MBS_DIS_SETUP_FAIL\""),
+            (NgapIeType::MbsDisRelReq, "\"MBS_DIS_REL_REQ\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), token);
+            let back: NgapIeType = serde_json::from_str(token).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn test_ngap_ie_type_unknown_tolerated_on_decode() {
+        // yaml models NgapIeType as anyOf { enum, string }: an unrecognized
+        // string must decode (to Unknown), not fail the whole request parse.
+        let back: NgapIeType = serde_json::from_str("\"FUTURE_IE_TYPE\"").unwrap();
+        assert_eq!(back, NgapIeType::Unknown);
     }
 
     #[test]
