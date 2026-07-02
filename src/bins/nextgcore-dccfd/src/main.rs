@@ -360,7 +360,13 @@ async fn main() -> Result<()> {
     if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
+        // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+        // (active data-collection subscriptions, saturated at 100;
+        // TS 29.510 §5.2.2.3.2). Honest subscription-count proxy — no
+        // fabricated CPU numbers.
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id.clone(), 5, || {
+            dccf_context_subscription_count().min(100) as u8
+        });
     }
 
     log::info!("NextGCore DCCF ready (instance: {nf_instance_id})");
