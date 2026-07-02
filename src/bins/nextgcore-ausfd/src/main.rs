@@ -740,6 +740,17 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
     // Update UE in context
     if let Ok(context) = ctx.read() {
         context.ue_update(&ausf_ue);
+        // F-02 / TS 33.501 §6.14.1 (and §6.15 for UPU): a SoR/UPU-capable AUSF
+        // "shall store the latest K_AUSF after the completion of the latest
+        // primary authentication". The anchor store is separate from the auth
+        // context and survives its deletion; counters reset to 0x0001 only
+        // when this KAUSF is genuinely new (§6.14.2.3/§6.15.2.2 — a
+        // retransmitted confirmation must not reset them).
+        if auth_success {
+            if let Some(supi) = ausf_ue.supi.as_deref() {
+                context.anchor_refresh(supi, &ausf_ue.kausf);
+            }
+        }
     }
 
     // Notify UDM of authentication result (fire-and-forget)
@@ -948,6 +959,16 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
 
             if let Ok(context) = ctx.read() {
                 context.ue_update(&ausf_ue);
+                // F-02 / TS 33.501 §6.14.1: store the latest KAUSF after the
+                // completion of the latest primary authentication (EAP-AKA'
+                // success path; kausf comes from the RFC 5448/9048 key
+                // schedule via session.kausf above). Same-KAUSF refreshes do
+                // not reset the SoR/UPU counters (§6.14.2.3/§6.15.2.2).
+                if auth_success {
+                    if let Some(supi) = ausf_ue.supi.as_deref() {
+                        context.anchor_refresh(supi, &ausf_ue.kausf);
+                    }
+                }
             }
 
             // Notify UDM of the authentication result (fire-and-forget)
@@ -1105,6 +1126,13 @@ async fn handle_auth_context_delete(auth_ctx_id: &str) -> SbiResponse {
     // ausfd-08: TS 29.509 DELETE ue-authentications/{authCtxId} and TS 33.501
     // §6.1.4.1a context teardown — look up the UE, return 404 if absent, else
     // remove it and zeroize its key material (KAUSF/KSEAF/XRES*).
+    //
+    // F-02 / TS 33.501 §6.14.1: the per-SUPI SoR/UPU anchor store is
+    // deliberately NOT purged here — "the AUSF shall store the latest K_AUSF
+    // after the completion of the latest primary authentication" so that
+    // Nausf_SoRProtection/Nausf_UPUProtection keep working after the AMF
+    // deletes the authentication context. §6.1.4.1a's zeroization is scoped
+    // to the authentication context (AusfUe) only.
     let ctx = ausf_self();
 
     let ue_id = {
@@ -2583,6 +2611,127 @@ mod tests {
         // Second DELETE -> 404.
         let resp = handle_auth_context_delete(&ctx_id).await;
         assert_eq!(resp.status, 404, "second DELETE must return 404");
+    }
+
+    // ====================================================================
+    // F-02: SoR/UPU anchor (TS 33.501 §6.14.1) — populated by a REAL 5G-AKA
+    // confirmation through the production handler, and SURVIVES the real
+    // handle_auth_context_delete (auth → delete ctx → anchor still there).
+    // ====================================================================
+    #[tokio::test]
+    async fn test_sor_upu_anchor_survives_auth_context_delete() {
+        let _ = env_logger::try_init();
+        let _lock = TEST_MUTEX.lock().await;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            ausf_context_init(128);
+
+            // Mock UDM (real Milenage + 5G KDFs) + real AUSF handler.
+            let udm_port = free_port();
+            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                udm_port,
+            ))));
+            udm_server.start(mock_udm_handler).await.expect("udm start");
+            std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+            std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
+
+            let ausf_port = free_port();
+            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                ausf_port,
+            ))));
+            ausf_server
+                .start(ausf_sbi_request_handler)
+                .await
+                .expect("ausf start");
+            let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
+
+            // Fresh SUPI so earlier tests cannot have seeded an anchor.
+            let supi = "imsi-001010000000777";
+            assert!(
+                ausf_self()
+                    .read()
+                    .unwrap()
+                    .anchor_lookup_kausf(supi)
+                    .is_none(),
+                "no anchor before authentication"
+            );
+
+            // Real 5G-AKA flow: initiate, compute RES* UE-side, confirm.
+            let (href, rand) = initiate_5g_aka(&client, supi, TEST_SNN).await;
+            let (res, ck, ik, _ak, _akstar) =
+                nextgcore_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
+            let res_star =
+                nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+            let resp = client
+                .put_json(
+                    &href,
+                    &serde_json::json!({
+                        "resStar": nextgcore_ausfd::nudm_handler::bytes_to_hex(&res_star)
+                    }),
+                )
+                .await
+                .expect("confirmation");
+            assert_eq!(resp.status, 200);
+            let conf: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                conf.get("authResult").and_then(|v| v.as_str()),
+                Some("AUTHENTICATION_SUCCESS")
+            );
+
+            // The production success hook stored the anchor with the UE's
+            // KAUSF (TS 33.501 §6.14.1 "store the latest K_AUSF").
+            let ue = ausf_self()
+                .read()
+                .unwrap()
+                .ue_find_by_supi(supi)
+                .expect("UE context after confirm");
+            let anchor_kausf = ausf_self()
+                .read()
+                .unwrap()
+                .anchor_lookup_kausf(supi)
+                .expect("anchor after successful primary auth");
+            assert_eq!(anchor_kausf, ue.kausf, "anchor must hold the UE's KAUSF");
+            assert_ne!(anchor_kausf, [0u8; 32], "anchor KAUSF must not be zero");
+
+            // AMF-style teardown: DELETE the auth context via the REAL handler.
+            // href = /nausf-auth/v1/ue-authentications/{authCtxId}/5g-aka
+            let ctx_id = href
+                .split('/')
+                .nth(4)
+                .expect("authCtxId in href")
+                .to_string();
+            let resp = handle_auth_context_delete(&ctx_id).await;
+            assert_eq!(resp.status, 204, "DELETE must succeed");
+            assert!(
+                ausf_self()
+                    .read()
+                    .unwrap()
+                    .ue_find_by_supi(supi)
+                    .is_none(),
+                "auth context must be gone (zeroized) after DELETE"
+            );
+
+            // §6.14.1: the anchor SURVIVES the auth-context deletion...
+            let survived = ausf_self()
+                .read()
+                .unwrap()
+                .anchor_lookup_kausf(supi)
+                .expect("anchor must survive handle_auth_context_delete");
+            assert_eq!(survived, anchor_kausf, "retained KAUSF unchanged");
+
+            // ...and the counter lifecycle still works (first MAC would use
+            // 0x0001, next 0x0002 — §6.14.2.3).
+            let guard = ausf_self();
+            let guard = guard.read().unwrap();
+            assert_eq!(guard.anchor_next_sor_counter(supi), Ok(0x0001));
+            assert_eq!(guard.anchor_next_sor_counter(supi), Ok(0x0002));
+            assert_eq!(guard.anchor_next_upu_counter(supi), Ok(0x0001));
+        })
+        .await
+        .expect("test timed out");
     }
 
     // ====================================================================

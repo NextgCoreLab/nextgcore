@@ -22,8 +22,8 @@ pub mod ue_sm;
 // Re-export commonly used types
 pub use ausf_sm::{ausf_sm_debug, AusfSmContext, AusfState};
 pub use context::{
-    ausf_context_final, ausf_context_init, ausf_self, AusfContext, AusfUe, AuthEvent, AuthResult,
-    AuthType,
+    ausf_context_final, ausf_context_init, ausf_self, AnchorCounterError, AusfContext, AusfUe,
+    AuthEvent, AuthResult, AuthType, SorUpuAnchor,
 };
 pub use event::{AusfEvent, AusfEventId, AusfTimerId};
 pub use timer::{ausf_timer_get_name, timer_manager, AusfTimerManager};

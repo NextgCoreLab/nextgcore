@@ -32,6 +32,10 @@ const FC_FOR_KSEAF_DERIVATION: u8 = 0x6C;
 const FC_FOR_KAMF_DERIVATION: u8 = 0x6D;
 const FC_FOR_KGNB_KN3IWF_DERIVATION: u8 = 0x6E;
 const FC_FOR_NH_GNB_DERIVATION: u8 = 0x6F;
+const FC_FOR_SOR_MAC_IAUSF_DERIVATION: u8 = 0x77;
+const FC_FOR_SOR_MAC_IUE_DERIVATION: u8 = 0x78;
+const FC_FOR_UPU_MAC_IAUSF_DERIVATION: u8 = 0x7B;
+const FC_FOR_UPU_MAC_IUE_DERIVATION: u8 = 0x7C;
 
 const FC_FOR_KASME: u8 = 0x10;
 const FC_FOR_KENB_DERIVATION: u8 = 0x11;
@@ -294,6 +298,142 @@ pub fn nextgcore_kdf_nh_gnb(
     params[0].len = SHA256_DIGEST_SIZE as u16;
 
     nextgcore_kdf_common(kamf, FC_FOR_NH_GNB_DERIVATION, &params)
+}
+
+/// TS 33.501 Annex A.17: SoR-MAC-I_AUSF generation function
+///
+/// `S = FC(0x77) || P0(SoR header) || L0 || P1(Counter_SoR, 2 bytes BE) || L1(0x0002)
+///      [ || P2(steering-list octets) || L2 ]`
+///
+/// * `sor_header` — the SOR header received from the requester NF (e.g. UDM) or
+///   constructed by the AUSF per TS 24.501 §9.11.3.51.
+/// * `steering_list` — the octets included in the SOR transparent container
+///   beyond (and not including) octet 22 (TS 24.501 §9.11.3.51). When `None`
+///   (no list / no secured packet in the Nausf_SoRProtection invocation),
+///   **P2 and L2 are not included at all** (A.17: "P2 and L2 are not included
+///   for SoR-MAC-I_AUSF generation") — omission, not an empty P2 with L2=0.
+///   An empty `Some(&[])` is normalised to the same omission.
+///
+/// Returns the 128 **least** significant bits (the LAST 16 bytes) of the
+/// TS 33.220 B.2.0 HMAC-SHA-256 output.
+///
+/// Counter policy (TS 33.501 §6.14.2.3): `counter_sor` 0x0000 shall never be
+/// used; callers must obtain counters from the per-SUPI anchor store.
+pub fn nextgcore_kdf_sor_mac_iausf(
+    kausf: &[u8; SHA256_DIGEST_SIZE],
+    sor_header: &[u8],
+    counter_sor: u16,
+    steering_list: Option<&[u8]>,
+) -> [u8; NEXTGCORE_KEY_LEN] {
+    debug_assert!(counter_sor != 0, "Counter_SoR 0x0000 is forbidden (TS 33.501 §6.14.2.3)");
+
+    let mut params = [
+        KdfParam::default(),
+        KdfParam::default(),
+        KdfParam::default(),
+    ];
+    params[0].buf = Some(sor_header.to_vec());
+    params[0].len = sor_header.len() as u16;
+    params[1].buf = Some(counter_sor.to_be_bytes().to_vec());
+    params[1].len = 2;
+    if let Some(list) = steering_list {
+        // Zero-length P2 is skipped by nextgcore_kdf_common (len == 0), which
+        // realises the A.17 omission rule for an absent steering list.
+        params[2].buf = Some(list.to_vec());
+        params[2].len = list.len() as u16;
+    }
+
+    let output = nextgcore_kdf_common(kausf, FC_FOR_SOR_MAC_IAUSF_DERIVATION, &params);
+
+    // 128 least significant bits = last 16 bytes of the 32-byte output.
+    let mut mac = [0u8; NEXTGCORE_KEY_LEN];
+    mac.copy_from_slice(&output[NEXTGCORE_KEY_LEN..]);
+    mac
+}
+
+/// TS 33.501 Annex A.18: SoR-MAC-I_UE / SoR-XMAC-I_UE generation function
+///
+/// `S = FC(0x78) || P0(0x01 SoR acknowledgement) || L0(0x0001)
+///      || P1(Counter_SoR, 2 bytes BE) || L1(0x0002)`
+///
+/// P0 is the fixed SoR Acknowledgement value 0x01 ("Verified the Steering of
+/// Roaming Information successfully"). Returns the 128 least significant bits
+/// (last 16 bytes) of the HMAC-SHA-256 output.
+pub fn nextgcore_kdf_sor_mac_iue(
+    kausf: &[u8; SHA256_DIGEST_SIZE],
+    counter_sor: u16,
+) -> [u8; NEXTGCORE_KEY_LEN] {
+    debug_assert!(counter_sor != 0, "Counter_SoR 0x0000 is forbidden (TS 33.501 §6.14.2.3)");
+
+    let mut params = [KdfParam::default(), KdfParam::default()];
+    params[0].buf = Some(vec![0x01]);
+    params[0].len = 1;
+    params[1].buf = Some(counter_sor.to_be_bytes().to_vec());
+    params[1].len = 2;
+
+    let output = nextgcore_kdf_common(kausf, FC_FOR_SOR_MAC_IUE_DERIVATION, &params);
+
+    let mut mac = [0u8; NEXTGCORE_KEY_LEN];
+    mac.copy_from_slice(&output[NEXTGCORE_KEY_LEN..]);
+    mac
+}
+
+/// TS 33.501 Annex A.19: UPU-MAC-I_AUSF generation function
+///
+/// `S = FC(0x7B) || P0(UE Parameters Update Data) || L0
+///      || P1(Counter_UPU, 2 bytes BE) || L1(0x0002)`
+///
+/// `upu_data` — the UE parameters update list per TS 24.501 §9.11.3.53A
+/// starting from octet 23. Returns the 128 least significant bits (last 16
+/// bytes) of the HMAC-SHA-256 output.
+///
+/// Counter policy (TS 33.501 §6.15.2.2): `counter_upu` 0x0000 shall never be
+/// used; callers must obtain counters from the per-SUPI anchor store.
+pub fn nextgcore_kdf_upu_mac_iausf(
+    kausf: &[u8; SHA256_DIGEST_SIZE],
+    upu_data: &[u8],
+    counter_upu: u16,
+) -> [u8; NEXTGCORE_KEY_LEN] {
+    debug_assert!(counter_upu != 0, "Counter_UPU 0x0000 is forbidden (TS 33.501 §6.15.2.2)");
+
+    let mut params = [KdfParam::default(), KdfParam::default()];
+    params[0].buf = Some(upu_data.to_vec());
+    params[0].len = upu_data.len() as u16;
+    params[1].buf = Some(counter_upu.to_be_bytes().to_vec());
+    params[1].len = 2;
+
+    let output = nextgcore_kdf_common(kausf, FC_FOR_UPU_MAC_IAUSF_DERIVATION, &params);
+
+    let mut mac = [0u8; NEXTGCORE_KEY_LEN];
+    mac.copy_from_slice(&output[NEXTGCORE_KEY_LEN..]);
+    mac
+}
+
+/// TS 33.501 Annex A.20: UPU-MAC-I_UE / UPU-XMAC-I_UE generation function
+///
+/// `S = FC(0x7C) || P0(0x01 UPU acknowledgement) || L0(0x0001)
+///      || P1(Counter_UPU, 2 bytes BE) || L1(0x0002)`
+///
+/// P0 is the fixed UPU Acknowledgement value 0x01 ("Verified the UE Parameters
+/// Update Data successfully"). Returns the 128 least significant bits (last 16
+/// bytes) of the HMAC-SHA-256 output.
+pub fn nextgcore_kdf_upu_mac_iue(
+    kausf: &[u8; SHA256_DIGEST_SIZE],
+    counter_upu: u16,
+) -> [u8; NEXTGCORE_KEY_LEN] {
+    debug_assert!(counter_upu != 0, "Counter_UPU 0x0000 is forbidden (TS 33.501 §6.15.2.2)");
+
+    let mut params = [KdfParam::default(), KdfParam::default()];
+    params[0].buf = Some(vec![0x01]);
+    params[0].len = 1;
+    params[1].buf = Some(counter_upu.to_be_bytes().to_vec());
+    params[1].len = 2;
+
+    let output = nextgcore_kdf_common(kausf, FC_FOR_UPU_MAC_IUE_DERIVATION, &params);
+
+    let mut mac = [0u8; NEXTGCORE_KEY_LEN];
+    mac.copy_from_slice(&output[NEXTGCORE_KEY_LEN..]);
+    mac
 }
 
 /// TS33.501 Annex C.3.4.1 Profile A / C.3.4.2 Profile B: ANSI-X9.63-KDF
@@ -602,6 +742,287 @@ mod tests {
         assert_eq!(
             &ik_prime[..],
             &unhex("ccfc230ca74fcc96c0a5d61164f5a76c")[..]
+        );
+    }
+
+    // ========================================================================
+    // TS 33.501 Annex A.17–A.20 SoR/UPU MAC KATs (F-01).
+    //
+    // TS 33.501 contains NO official test vectors for these MACs (A.17–A.20
+    // define construction only), so the expected MACs below are SELF-DERIVED
+    // golden vectors: each test hand-assembles the S byte string per the annex
+    // and computes HMAC-SHA-256 with the raw `Hmac<Sha256>` primitive —
+    // deliberately NOT via `nextgcore_kdf_common`, to avoid self-confirmation —
+    // then locks the resulting hex constants. The same constants were
+    // cross-derived with an independent Python `hmac`/`hashlib` recompute.
+    //
+    // Shared inputs (documented so a reviewer can reproduce every MAC):
+    //   KAUSF_1  = 000102...1e1f                     (bytes 0x00..=0x1f)
+    //   KAUSF_2  = ffeeddccbbaa99887766554433221100 x2
+    //   SOR_HDR_ACK    = 0x0a (example SOR header octet, ack requested)
+    //   SOR_HDR_NO_ACK = 0x02 (example SOR header octet, no ack)
+    //   STEERING = 00f110800032f4024000  (two PLMN+access-tech entries,
+    //              container octets beyond octet 22, TS 24.501 §9.11.3.51)
+    //   UPU_DATA_1 = a0a1a2a3a4a5, UPU_DATA_2 = b0b1b2b3
+    //              (UPU list octets from octet 23, TS 24.501 §9.11.3.53A)
+    //   MAC = 128 LEAST significant bits (LAST 16 bytes) of the HMAC output.
+    // ========================================================================
+
+    const KAUSF_1_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const KAUSF_2_HEX: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+    const STEERING_HEX: &str = "00f110800032f4024000";
+    const UPU_DATA_1_HEX: &str = "a0a1a2a3a4a5";
+    const UPU_DATA_2_HEX: &str = "b0b1b2b3";
+
+    fn kausf_1() -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&unhex(KAUSF_1_HEX));
+        k
+    }
+
+    fn kausf_2() -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&unhex(KAUSF_2_HEX));
+        k
+    }
+
+    /// Independent reference: raw HMAC-SHA-256 over a hand-assembled S string,
+    /// returning the 128 least significant bits (last 16 bytes). This is the
+    /// oracle for the golden vectors — it never calls `nextgcore_kdf_common`.
+    fn raw_hmac_last16(key: &[u8], s: &[u8]) -> [u8; 16] {
+        let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
+        mac.update(s);
+        let out = mac.finalize().into_bytes();
+        let mut last16 = [0u8; 16];
+        last16.copy_from_slice(&out[16..]);
+        last16
+    }
+
+    /// A.17 golden vectors: SoR-MAC-I_AUSF with P2 present, counter freshness
+    /// and key sensitivity.
+    #[test]
+    fn sor_mac_iausf_golden() {
+        let steering = unhex(STEERING_HEX);
+
+        // Vector 1: KAUSF_1, header 0x0a (ack), counter 0x0001, P2 = STEERING.
+        // S = 77 || 0a || 0001 || 0001 || 0002 || STEERING || 000a
+        let mut s1 = vec![0x77u8, 0x0a, 0x00, 0x01, 0x00, 0x01, 0x00, 0x02];
+        s1.extend_from_slice(&steering);
+        s1.extend_from_slice(&[0x00, 0x0a]);
+        assert_eq!(s1, unhex("770a00010001000200f110800032f4024000000a"));
+        let expected1 = unhex("ce848061a1d075a400526c79a601089e"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_1(), &s1)[..], &expected1[..]);
+        assert_eq!(
+            &nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x0a], 0x0001, Some(&steering))[..],
+            &expected1[..]
+        );
+
+        // Vector 2: same inputs, counter 0x0002 → different MAC (freshness).
+        let mut s2 = vec![0x77u8, 0x0a, 0x00, 0x01, 0x00, 0x02, 0x00, 0x02];
+        s2.extend_from_slice(&steering);
+        s2.extend_from_slice(&[0x00, 0x0a]);
+        let expected2 = unhex("a804047820d952431cd93cd8fb388623"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_1(), &s2)[..], &expected2[..]);
+        assert_eq!(
+            &nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x0a], 0x0002, Some(&steering))[..],
+            &expected2[..]
+        );
+        assert_ne!(expected1, expected2, "counter must be freshness input");
+
+        // Vector 3: KAUSF_2, header 0x0a, counter 0x0001, P2 = STEERING.
+        let expected3 = unhex("675bbf06b48e9b3d5ca97ad83939dd3d"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_2(), &s1)[..], &expected3[..]);
+        assert_eq!(
+            &nextgcore_kdf_sor_mac_iausf(&kausf_2(), &[0x0a], 0x0001, Some(&steering))[..],
+            &expected3[..]
+        );
+    }
+
+    /// A.17: when no steering list is supplied, P2 AND L2 are omitted entirely
+    /// (S is exactly 8 bytes: FC ‖ P0(1) ‖ L0(2) ‖ P1(2) ‖ L1(2)) — NOT encoded
+    /// as an empty P2 with L2 = 0x0000 (which would make S 10 bytes).
+    #[test]
+    fn sor_mac_no_p2_omits_l2() {
+        // Hand-assembled S for KAUSF_1, header 0x02 (no ack), counter 0x0001.
+        let s = unhex("7702000100010002");
+        assert_eq!(
+            s.len(),
+            1 + 1 + 2 + 2 + 2,
+            "S with P2 omitted must carry no L2 length field"
+        );
+        let expected = unhex("f2dac4d1463c5cac640430a1f447db93"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_1(), &s)[..], &expected[..]);
+        assert_eq!(
+            &nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x02], 0x0001, None)[..],
+            &expected[..]
+        );
+
+        // Some(&[]) normalises to the same omission (A.17 "not included").
+        assert_eq!(
+            nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x02], 0x0001, Some(&[])),
+            nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x02], 0x0001, None),
+        );
+
+        // And an L2=0x0000 encoding would NOT verify against the locked MAC.
+        let s_wrong = unhex("77020001000100020000");
+        assert_ne!(&raw_hmac_last16(&kausf_1(), &s_wrong)[..], &expected[..]);
+    }
+
+    /// A.18 golden vectors: SoR-MAC-I_UE (P0 fixed 0x01, L0 0x0001).
+    #[test]
+    fn sor_mac_iue_golden() {
+        // S = 78 || 01 || 0001 || counter || 0002
+        let s1 = unhex("7801000100010002");
+        let expected1 = unhex("4a67dd7f904e7c8f668238aa702c4a9f"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_1(), &s1)[..], &expected1[..]);
+        assert_eq!(
+            &nextgcore_kdf_sor_mac_iue(&kausf_1(), 0x0001)[..],
+            &expected1[..]
+        );
+
+        let s2 = unhex("7801000100020002");
+        let expected2 = unhex("49f6998ef6bbb0c8e0b02f758c4f61bf"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_1(), &s2)[..], &expected2[..]);
+        assert_eq!(
+            &nextgcore_kdf_sor_mac_iue(&kausf_1(), 0x0002)[..],
+            &expected2[..]
+        );
+
+        let expected3 = unhex("076862e7dbfb2a598d13613ab6ad97ea"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_2(), &s1)[..], &expected3[..]);
+        assert_eq!(
+            &nextgcore_kdf_sor_mac_iue(&kausf_2(), 0x0001)[..],
+            &expected3[..]
+        );
+    }
+
+    /// A.19 golden vectors: UPU-MAC-I_AUSF over UPU data + counter.
+    #[test]
+    fn upu_mac_iausf_golden() {
+        let upu1 = unhex(UPU_DATA_1_HEX);
+        let upu2 = unhex(UPU_DATA_2_HEX);
+
+        // S = 7b || UPU_DATA_1 || 0006 || 0001 || 0002
+        let s1 = unhex("7ba0a1a2a3a4a5000600010002");
+        let expected1 = unhex("80c0b44903002328f3c307ae2b1e5ac6"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_1(), &s1)[..], &expected1[..]);
+        assert_eq!(
+            &nextgcore_kdf_upu_mac_iausf(&kausf_1(), &upu1, 0x0001)[..],
+            &expected1[..]
+        );
+
+        let s2 = unhex("7ba0a1a2a3a4a5000600020002");
+        let expected2 = unhex("8161f20f89478cd3a8f2abd1a54baef8"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_1(), &s2)[..], &expected2[..]);
+        assert_eq!(
+            &nextgcore_kdf_upu_mac_iausf(&kausf_1(), &upu1, 0x0002)[..],
+            &expected2[..]
+        );
+
+        // Different UPU data (4 bytes) → different S length and MAC.
+        let s3 = unhex("7bb0b1b2b3000400010002");
+        let expected3 = unhex("d53be64e793db605c2867983a98cee82"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_1(), &s3)[..], &expected3[..]);
+        assert_eq!(
+            &nextgcore_kdf_upu_mac_iausf(&kausf_1(), &upu2, 0x0001)[..],
+            &expected3[..]
+        );
+
+        let expected4 = unhex("78146881485e45dc3d042f4790b5b1cb"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_2(), &s1)[..], &expected4[..]);
+        assert_eq!(
+            &nextgcore_kdf_upu_mac_iausf(&kausf_2(), &upu1, 0x0001)[..],
+            &expected4[..]
+        );
+    }
+
+    /// A.20 golden vectors: UPU-MAC-I_UE (P0 fixed 0x01, L0 0x0001).
+    #[test]
+    fn upu_mac_iue_golden() {
+        // S = 7c || 01 || 0001 || counter || 0002
+        let s1 = unhex("7c01000100010002");
+        let expected1 = unhex("c954bbe60cbf81b3be14051c2b21116c"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_1(), &s1)[..], &expected1[..]);
+        assert_eq!(
+            &nextgcore_kdf_upu_mac_iue(&kausf_1(), 0x0001)[..],
+            &expected1[..]
+        );
+
+        let s2 = unhex("7c01000100020002");
+        let expected2 = unhex("f20f43b13f188d1a588f43d0a4f32636"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_1(), &s2)[..], &expected2[..]);
+        assert_eq!(
+            &nextgcore_kdf_upu_mac_iue(&kausf_1(), 0x0002)[..],
+            &expected2[..]
+        );
+
+        let expected3 = unhex("34a3861428e32627b9511e9cbe796b78"); // locked golden
+        assert_eq!(&raw_hmac_last16(&kausf_2(), &s1)[..], &expected3[..]);
+        assert_eq!(
+            &nextgcore_kdf_upu_mac_iue(&kausf_2(), 0x0001)[..],
+            &expected3[..]
+        );
+    }
+
+    /// Adversarial non-malleability sanity: flipping one steering-list byte,
+    /// one header bit, one counter bit, one UPU-data byte or one key bit must
+    /// change the MAC.
+    #[test]
+    fn sor_upu_mac_bitflip_sensitivity() {
+        let steering = unhex(STEERING_HEX);
+        let base =
+            nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x0a], 0x0001, Some(&steering));
+
+        // Flip one steering-list byte.
+        let mut steering_flipped = steering.clone();
+        steering_flipped[3] ^= 0x01;
+        assert_ne!(
+            base,
+            nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x0a], 0x0001, Some(&steering_flipped))
+        );
+
+        // Flip one header bit.
+        assert_ne!(
+            base,
+            nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x0b], 0x0001, Some(&steering))
+        );
+
+        // Flip one counter bit.
+        assert_ne!(
+            base,
+            nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x0a], 0x0001 ^ 0x0100, Some(&steering))
+        );
+
+        // Flip one key bit.
+        let mut k = kausf_1();
+        k[0] ^= 0x80;
+        assert_ne!(
+            base,
+            nextgcore_kdf_sor_mac_iausf(&k, &[0x0a], 0x0001, Some(&steering))
+        );
+
+        // UPU: one data byte flip and one counter bit flip.
+        let upu = unhex(UPU_DATA_1_HEX);
+        let upu_base = nextgcore_kdf_upu_mac_iausf(&kausf_1(), &upu, 0x0001);
+        let mut upu_flipped = upu.clone();
+        upu_flipped[0] ^= 0x01;
+        assert_ne!(
+            upu_base,
+            nextgcore_kdf_upu_mac_iausf(&kausf_1(), &upu_flipped, 0x0001)
+        );
+        assert_ne!(
+            upu_base,
+            nextgcore_kdf_upu_mac_iausf(&kausf_1(), &upu, 0x8001)
+        );
+
+        // IUE variants: counter sensitivity.
+        assert_ne!(
+            nextgcore_kdf_sor_mac_iue(&kausf_1(), 0x0001),
+            nextgcore_kdf_sor_mac_iue(&kausf_1(), 0x0002)
+        );
+        assert_ne!(
+            nextgcore_kdf_upu_mac_iue(&kausf_1(), 0x0001),
+            nextgcore_kdf_upu_mac_iue(&kausf_1(), 0x0002)
         );
     }
 
