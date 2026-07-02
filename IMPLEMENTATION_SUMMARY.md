@@ -2,6 +2,8 @@
 
 This document summarizes the 6G features implemented across the nextgcore workspace.
 
+> **⚠️ STALE (Phase-1 snapshot, ~2026-02-08).** This lists only the first 6 infrastructure features (timer coordination, OTel logging, intent config, config versioning, graph/TS/distributed-DB helpers). The "Remaining Features (To Be Implemented)" section below is largely superseded — many NF-level items have since landed (e.g. NSACF slice-quota provisioning in `nextgcore-nsacfd`, NWDAF as `nextgcore-nwdafd`, PCF URSP work, SBI `/oauth2/token`). Treat as historical; all 6G items remain prototype-level, not Rel-20-conformant.
+
 ## Completed Implementations
 
 ### 1. nextgcore-core (Infrastructure)
@@ -95,6 +97,8 @@ This document summarizes the 6G features implemented across the nextgcore worksp
 - **Key Types**: `DistributedDbCoordinator`, `DbNode`, `ReplicationMode`, `ReadPreference`, `WriteConcern`
 
 ## Remaining Features (To Be Implemented)
+
+> **NOTE (2026-07): this list is no longer authoritative.** Several items below have since landed — e.g. B24.5 (NSSF↔NSACF interaction) is now backed by `nextgcore-nsacfd` with config-provisioned slice quotas (`nsacf.slice_quotas`), and NWDAF exists as `nextgcore-nwdafd`. Verify each entry against current code before treating it as "not implemented."
 
 Due to response length constraints, the following features require additional implementation files to be created:
 

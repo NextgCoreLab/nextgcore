@@ -2,6 +2,8 @@
 
 > Generated: 2026-02-07 | Scope: 9 infrastructure libraries under nextgcore/src/libs/
 
+> **Partial staleness (2026-07):** Most entries here remain accurate, with corrections: `nextgcore-dbi` is now consumed by `nextgcore-udrd` (in-memory Nudr `data_store` via the `test-helpers` feature), so it is no longer unused. Note: SBI TLS/mTLS + OAuth2 and the NGAP/S1AP/PFCP protocol codecs are covered in gap-libs-proto.md, which is now substantially out of date - see its notice. Post-quantum crypto is still absent (`nextgcore-crypt` remains 0% PQC).
+
 ---
 
 ## Overview

@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **nextgcore** (38852 symbols, 87245 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **nextgcore** (38852 symbols, 87245 relationships, 300 execution flows). ⚠️ STALE: these counts predate the H1 lib+bin split — nextgcore-amfd/-ausfd/-bsfd/-pcfd/-udmd now expose `src/lib.rs` (pcfd/udmd/ausfd also `src/app.rs`) beside a thin `src/main.rs` — and the added `nextgcore-dccfd`/`nextgcore-webui` crates plus Wave-6 handlers; the index has not been re-run (read-only DB), so run `npx gitnexus analyze` before trusting impact/context results. Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

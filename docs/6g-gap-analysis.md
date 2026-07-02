@@ -1,22 +1,24 @@
 # NextGCore 6G Gap Analysis Report
 
 **Date:** 2026-02-07
-**Scope:** Comprehensive source code analysis of all 17 network functions and 18 shared libraries
+**Scope:** Comprehensive source code analysis of the network functions and shared libraries *(as of 2026-02-07: 17 NFs / 18 libs; the workspace now ships **24 NF binaries** and **17 libraries** — see stale-snapshot banner)*
 **Standards Reference:** 3GPP Rel-18/19, ITU-R IMT-2030 Framework
+
+> **⚠️ STALE SNAPSHOT (2026-02-07).** This report predates the Wave-1..6 remediation and the peripheral-NF build-out; it is retained for historical context only and several "does not exist" / "0%" statements below are now FALSE. As of 2026-07 the workspace ships **24 NF binaries (19 5GC + 5 EPC)** and **17 shared libraries** — including NWDAF (`nextgcore-nwdafd`: NRF-driven NF_LOAD collection, analytics, ML-service and federation scaffolding), NSACF (`nextgcore-nsacfd`: config-provisioned slice quotas per TS 29.536), plus DCCF, EES, LMF, MBSMF and PIN NFs; SBI OAuth2 (`/oauth2/token`); and wired NAS security (`bins/nextgcore-amfd/src/nas_security.rs`). A matched-sim Docker E2E (`docker/rust/e2e-test.sh`) exercises full registration + PDU session + data plane. These 6G-oriented items remain **research-/prototype-level and are NOT Rel-20 conformant — no frozen 6G stage-3 spec exists.**
 
 ---
 
 ## Executive Summary
 
-NextGCore is a pure Rust port of the Open5GS C codebase implementing 12 5G Core (5GC) network functions and 5 EPC network functions, supported by 18 shared libraries. The project has established strong foundational infrastructure -- FSM frameworks, SBI HTTP/2 server/client, PFCP protocol library, NAS message encoding/decoding, and a working UPF data plane -- but the majority of service-specific handlers remain stubbed. There are **316 documented TODOs** across 8 phases required to reach basic 5G operational parity, and **zero 6G-specific features** exist in the codebase.
+NextGCore is a pure Rust port of the Open5GS C codebase implementing **19 5G Core (5GC) network functions and 5 EPC network functions, supported by 17 shared libraries** *(counts as of 2026-07; this report was written against an earlier 12+5 / 18-lib layout)*. The project has established strong foundational infrastructure -- FSM frameworks, SBI HTTP/2 server/client, PFCP protocol library, NAS message encoding/decoding, and a working UPF data plane -- but the majority of service-specific handlers remain stubbed. There are **316 documented TODOs** across 8 phases required to reach basic 5G operational parity, and (at the time of writing) no 6G-specific features existed in the codebase. *(Historical: as of 2026-07 several 6G-oriented research NFs/features have since landed — NWDAF `nextgcore-nwdafd`, NSACF `nextgcore-nsacfd`, DCCF `nextgcore-dccfd`, plus ISAC/FL prototypes in nextgsim — all prototype-level, not Rel-20-conformant. See banner.)*
 
 The gap to a 6G-ready core network is therefore two-layered:
 
 1. **Layer 1 (5G Completion):** ~17 weeks of work to implement timer management, SBI infrastructure, error responses, NRF integration, and service-specific handlers across all NFs.
 2. **Layer 2 (6G Evolution):** Entirely new capabilities required for AI-native networking, SBA 2.0, compute-aware networking, digital twins, intent-driven management, enhanced slicing, zero-trust security, green networking, NTN support, and TSN integration.
 
-**Overall 5G Implementation Completeness: ~25%**
-**6G Readiness: 0%**
+**Overall 5G Implementation Completeness: ~25%** *(as of 2026-02-07; substantially higher after Wave-1..6 remediation — see banner)*
+**6G Readiness: 0%** *(STALE — 6G-oriented research NFs/features have since landed; still prototype-level, not Rel-20-conformant)*
 
 ---
 
@@ -124,7 +126,7 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 
 ### 3.1 AI/ML-Native Network Automation (NWDAF)
 
-**Current State:** No NWDAF NF exists. No AI/ML infrastructure. No data collection pipelines. No analytics framework.
+**Current State (2026-02-07 — now STALE):** No NWDAF NF existed at the time of writing. *Update: NWDAF now exists as `nextgcore-nwdafd` with an NRF-driven NF_LOAD collector (`nrf_collector.rs`), analytics (`analytics.rs`), ML service (`ml_service.rs`) and federation scaffolding (`federation.rs`) — research/prototype-level, not Rel-18/Rel-20 conformant.*
 
 **Gaps:**
 - No NWDAF binary or scaffolding in `src/bins/`

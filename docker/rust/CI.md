@@ -37,7 +37,11 @@ Exit codes (CI gates on them directly):
 - Linux or macOS host. On macOS note the APFS df gotcha: local snapshots
   pin space `df` reports as used; the preflight error text explains the
   `tmutil` remedy.
-- ~8 GB RAM for the 13-container baseline stack.
+- ~8 GB RAM for the 13 health-gated containers (mongodb + 5GC NFs + gNB + UE).
+  Note `docker-compose.yml` has no profiles, so `docker compose up -d` also
+  starts the advanced NFs (nwdaf/ees/lmf/mbsmf/nsacf/pin/dccf/scp/sepp) and
+  observability (prometheus/grafana/jaeger) — ~25 containers total; budget
+  12-16 GB to keep those running.
 - No network egress needed beyond pulling base images
   (`rust`, `debian:trixie-slim`, `mongo`, `alpine:3`).
 

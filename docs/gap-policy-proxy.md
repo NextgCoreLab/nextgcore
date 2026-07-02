@@ -2,6 +2,8 @@
 
 > Generated: 2026-02-07 | Scope: PCF, BSF, SEPP, UPF | Target: 6G readiness assessment
 
+> **STALENESS NOTICE (updated 2026-07):** This 2026-02-07 snapshot is superseded. SEPP now implements N32f forwarding (`sbi_path.rs`: `N32fPeerClient` registry, `register_n32f_client`) and the N32-c cert/JOSE path (`jose.rs` X.509 subjectPublicKeyInfo extraction, TS 29.573 6.1.5). UPF's PDR/FAR matching is wired into the forwarding path (`data_plane.rs`: `match_pdr_with_packet` -> `apply_far`, uplink+downlink) and async event loops dispatch PFCP-session/report events; the matched-sim E2E carries real user-plane data (ping through GTP-U, 0% loss). PCF delivers URSP/UPDP UE-policies over Namf N1N2 (`build_ue_policy_n1n2_request`, `ue_policy` module). PCF/BSF are now lib+bin crates. Treat the "completeness %" claims below as a historical baseline.
+
 ---
 
 ## 1. Summary
@@ -37,7 +39,7 @@
 
 ### 2.3 Completeness: 70%
 
-12 SBI handler endpoints with real CRUD logic. However, no real NRF registration, no UDR connectivity, and mock policy data.
+12 SBI handler endpoints with real CRUD logic. Since this snapshot PCF added URSP/UPDP UE-policy delivery over Namf_Communication N1N2 (`sbi_path.rs`: `build_ue_policy_n1n2_request`, `ue_policy` module, TS 24.501 Annex D UPDP). NRF-registration / UDR-connectivity depth still partial.
 
 ### 2.4 6G Gaps
 
@@ -59,7 +61,7 @@
 
 ### 4.1 Completeness: 55%
 
-N32c handshake protocol fully modeled. N32f forwarding (core SEPP function) not implemented. PRINS explicitly unsupported (returns 501).
+N32-c handshake fully modeled. N32f forwarding is now implemented (`sbi_path.rs`: `N32fPeerClient` registry, `register_n32f_client`, forwarding client) and the N32-c JOSE/cert path landed (`jose.rs`: X.509 `subjectPublicKeyInfo` extraction, TS 29.573 6.1.5 / TS 33.501 13.2.4).
 
 ### 4.2 6G Gaps
 
@@ -92,7 +94,7 @@ All session message types implemented (Establishment, Modification, Deletion). F
 
 ### 5.4 Completeness: 60%
 
-Main event loop dispatchers are empty stubs, PDR/FAR rule matching not wired to forwarding path, QoS not enforced, URR threshold reporting missing.
+PDR/FAR rule matching is wired into the forwarding path (`data_plane.rs`: `match_pdr_with_packet` selects a PDR by precedence + SDF, `apply_far` applies the FAR action for uplink and downlink); the async event loops dispatch PFCP-session and session-report events (`main.rs`). QoS/URR enforcement depth remains partial.
 
 ### 5.5 6G Gaps
 

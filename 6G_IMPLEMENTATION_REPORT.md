@@ -5,6 +5,8 @@
 **Workspace**: `/Users/parlakisik/projects/github/nextg/nextgcore/src/`
 **Implementation Status**: Phase 1 Complete
 
+> **⚠️ STALE (2026-02-08 Phase-1 snapshot).** Covers only 6 infrastructure features (6/30). Superseded by later Wave-1..6 work: the workspace now ships **24 NF binaries (19 5GC + 5 EPC)** and **17 libraries**, incl. NWDAF/NSACF/DCCF/EES/LMF/MBSMF/PIN. All 6G-oriented items remain research-/prototype-level and are **NOT Rel-20-conformant** (no frozen 6G stage-3 spec). Retained for historical context.
+
 ---
 
 ## Executive Summary
