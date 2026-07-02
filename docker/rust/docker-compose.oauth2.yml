@@ -1,25 +1,74 @@
-# OAuth2 enforcement overlay (NRF auth stage 4b validation)
+# OAuth2 enforcement overlay (NRF auth — SBA authorization, TS 33.501 §13.4.1).
 #
-# Swaps each NF's config for an OAuth2 variant. The UDR/NSSF/NSACF/BSF servers
-# then reject SBI requests without a valid NRF-issued bearer token (401), and
-# answer 503 while the NRF's JWKS is unreachable; their outbound SBI calls also
-# acquire and attach a token. The NRF variant enables the CLIENT side only
-# (the NRF is the Authorization Server, so its own token/jwks endpoints stay
-# open — see nrf-oauth2.yaml).
+# Turns on SBI OAuth2 bearer-token enforcement on every 5GC SBI NF: each server
+# rejects requests without a valid NRF-issued bearer token (401), answers 503
+# while the NRF JWKS is unreachable, and every consumer NF attaches an
+# NRF-issued token to its outbound SBI calls (Wave-6 H8 Phase A/B/C).
 #
 #   docker compose -f docker-compose.yml -f docker-compose.oauth2.yml up -d
 #
-# Keep this an overlay: enabling enforcement in the default deployment can
-# break consumers that do not yet attach OAuth2 tokens, so it is opt-in.
+# ---------------------------------------------------------------------------
+# FAIL-OPEN DEFAULT IS TEMPORARY. The plain docker-compose.yml runs with
+# enforcement OFF (require_oauth2 defaults false in nextgcore-sbi server.rs and
+# every per-NF knob) so the matched-sim E2E path is byte-unchanged. Enforcement
+# lives ONLY in this opt-in overlay until the flip criterion below is met.
+#
+# FLIP CRITERION (H8 Phase D — separate later commit, NOT this wave): change the
+# per-NF defaults to require=true only AFTER this oauth2 overlay has run green
+# in CI across the FULL NF set (full reg + PDU + ping) via the H10 one-command
+# E2E. Until then keep enforcement out of the default compose.
+# ---------------------------------------------------------------------------
+#
+# STAGED MIGRATION ORDER (TS 33.501 §13.4.1; bring producers up before their
+# consumers so no live call is left tokenless). Gate each step on the overlay
+# E2E (H10) staying green before enabling the next:
+#   1. nrf                         (Authorization Server — client side only)
+#   2. udr                         (data repository; UDM/PCF depend on it)
+#   3. udm, ausf                   (subscriber data + auth; AMF depends on them)
+#   4. pcf, bsf, nssf, nsacf       (policy / binding / slice-selection)
+#   5. amf, smf                    (control-plane consumers of the above)
+#   6. rest: lmf, mbsmf, nwdaf, dccf, ees, pin
+#
+# Enablement mechanism per NF:
+#   * nrf/udr/nssf/nsacf/bsf  — config-file swap (`<nf>-oauth2.yaml`, mounts certs).
+#   * udm/ausf/pcf/amf/smf/lmf/mbsmf/nwdaf/dccf — env `NEXTGCORE_SBI_OAUTH2_REQUIRE=1`
+#     (honored by their oauth2_required() knob; sets server enforcement + installs
+#     the outbound OAUTH2_CLIENT).
+#   * ees, pin — enable via their own per-NF knob (ees config `require_oauth2` /
+#     pin `--oauth2-require`); they do not read the env knob.
+# Out of the SBA token-audience model (intentionally NOT enforced here):
+#   scp (proxy: forwards Authorization unmodified, enforces only its admin
+#   surface), sepp (N32 PRINS/TLS trust model, TS 33.501 §13.2), upf (N4/PFCP,
+#   not an SBI surface).
 
 services:
+  # -- step 1: NRF (Authorization Server; client side only, token/jwks stay open)
   nrf:
     volumes:
       - ./configs/5gc/nrf-oauth2.yaml:/etc/nextgcore/nrf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro
+
+  # -- step 2: UDR
   udr:
     volumes:
       - ./configs/5gc/udr-oauth2.yaml:/etc/nextgcore/udr.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro
+
+  # -- step 3: UDM + AUSF
+  udm:
+    environment:
+      - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+  ausf:
+    environment:
+      - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+
+  # -- step 4: PCF, BSF, NSSF, NSACF
+  pcf:
+    environment:
+      - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+  bsf:
+    volumes:
+      - ./configs/5gc/bsf-oauth2.yaml:/etc/nextgcore/bsf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro
   nssf:
     volumes:
@@ -29,7 +78,25 @@ services:
     volumes:
       - ./configs/5gc/nsacf-oauth2.yaml:/etc/nextgcore/nsacf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro
-  bsf:
-    volumes:
-      - ./configs/5gc/bsf-oauth2.yaml:/etc/nextgcore/bsf.yaml:ro
-      - ./certs:/etc/nextgcore/certs:ro
+
+  # -- step 5: AMF + SMF (consumers of UDM/AUSF/PCF/NSACF)
+  amf:
+    environment:
+      - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+  smf:
+    environment:
+      - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+
+  # -- step 6: rest (lmf, mbsmf, nwdaf, dccf). ees/pin use their own knob.
+  lmf:
+    environment:
+      - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+  mbsmf:
+    environment:
+      - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+  nwdaf:
+    environment:
+      - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+  dccf:
+    environment:
+      - NEXTGCORE_SBI_OAUTH2_REQUIRE=1

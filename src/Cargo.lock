@@ -2879,9 +2879,11 @@ dependencies = [
  "clap",
  "ctrlc",
  "env_logger",
+ "hmac",
  "log",
  "nextgcore-amfd",
  "nextgcore-app",
+ "nextgcore-ausfd",
  "nextgcore-core",
  "nextgcore-crypt",
  "nextgcore-dbi",
@@ -2892,6 +2894,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tokio",
  "uuid",
 ]
@@ -2935,9 +2938,12 @@ dependencies = [
  "nextgcore-ipfw",
  "nextgcore-metrics",
  "nextgcore-pfcp",
+ "nextgcore-sbi",
  "nextgcore-tun",
  "proptest",
+ "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -55,6 +55,19 @@ amf:
     full: NextGCore
     short: Next
   amf_name: nextgcore-amf0
+  # NAS-security canary (Wave-6 H9 / nas-06 Phase-6) — RUNTIME ENABLE KNOB.
+  # Default OFF: the AMF uses the legacy byte-for-byte NAS protect/unprotect
+  # path. Set to true (or export AMF_NAS_SECURITY=nextgcore on the container,
+  # which overrides this yaml) to make new UEs use the conformant nextgcore-nas
+  # strict path (MAC verify + replay rejection, TS 24.501 §4.4).
+  #
+  # MANUAL DOCKER A/B GATE (do NOT flip the shipped default here — HOST-ONLY):
+  #   run 1 (baseline, canary OFF): ./docker/rust/e2e.sh          # expect full reg+PDU+ping green
+  #   run 2 (canary ON):  AMF_NAS_SECURITY=nextgcore ./docker/rust/e2e.sh
+  # Compare the DL NAS security-protected bytes + confirm run 2 stays green.
+  # Only after run 2 signs off is the default-flip commit landed separately.
+  nas:
+    use_nextgcore_security: false
   time:
     t3512:
       value: 540
