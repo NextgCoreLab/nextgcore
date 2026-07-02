@@ -235,7 +235,17 @@ async fn main() -> Result<()> {
     {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
+        // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+        // (active analytics subscriptions, saturated at 100;
+        // TS 29.510 §5.2.2.3.2). Honest subscription-count proxy — no
+        // fabricated CPU numbers.
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id.clone(), 5, || {
+            let load = nwdaf_self()
+                .read()
+                .map(|c| c.subscription_count())
+                .unwrap_or(0);
+            load.min(100) as u8
+        });
     }
 
     // G2-1: arm the NRF NF_LOAD collector and attempt the initial
