@@ -44,6 +44,18 @@
 //!   (`eees-acr-param`, TS 29.558 §5.13). SessionWithQoS and TIE DEFERRED
 //!   (NEF/PCF-AF exposure path missing in this repo).
 //!
+//! Implemented (Wave 6, D1+D2):
+//! - D1: `eees-appclientinformation` bodies are spec-exact
+//!   `ACInfoSubscription` (TS29558_Eees_AppClientInformation.yaml; sole
+//!   mandatory IE `easId`); PUT is a validated full replace while PATCH is an
+//!   RFC 7396 merge restricted to the `ACInfoSubscriptionPatch` members; the
+//!   non-spec collection GET now answers 405.
+//! - D2: `eees-eeccontextreloc` push takes the spec `EECContextPush`
+//!   envelope ({eesId, eecCntx{eecId, cntxId}}) answering 204 (or 200
+//!   `EECContextPushRes` when `acrScenariosSelReq` selects scenarios), and
+//!   pull is `GET /eec-contexts?ees-id=..&eec-cntx-id=..` (both REQUIRED);
+//!   the bespoke path-param pull and list are gone (404/405).
+//!
 //! DEFERRED (flagged): eesd-09/10 (UE location/identifier exposure —
 //! NEF-path-blocked), eesd-14 (standalone conformance suite; tests colocated).
 
@@ -74,8 +86,8 @@ use acr::{
 use context::{ees_context_final, ees_context_init, ees_self, UpdateError};
 use eec::EecRegistration;
 use services::{
-    AcrMgntEventSubsc, AcrParamInfoReq, AcrParamInfoResp, AppClientInfo, CeaAnnouncement,
-    EecContext,
+    ACInfoSubscription, AcrMgntEventSubsc, AcrParamInfoReq, AcrParamInfoResp, CeaAnnouncement,
+    EECContextPush, EECContextPushRes, SessionContexts,
 };
 use types::{cause, EasDiscoveryReq, EasDiscoveryResp, EasDiscoverySubscription, EasRegistration};
 
@@ -452,15 +464,15 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 _ => send_method_not_allowed(method, "announcements/{announcementId}"),
             }
         }
-        // eesd-13: eees-appclientinformation (TS 29.558 §8.4.2) — AC Information
-        // reporting subscriptions, hosted at /subscriptions per the spec.
+        // D1: eees-appclientinformation (TS 29.558 §8.4) — AC Information
+        // subscriptions hosted at /subscriptions. The yaml defines POST on the
+        // collection only (no collection GET → 405).
         ["eees-appclientinformation", "v1", "subscriptions"] => {
             if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCLIENTINFORMATION) {
                 return resp;
             }
             match method {
                 "POST" => handle_acinfo_create(&request).await,
-                "GET" => handle_acinfo_list().await,
                 _ => send_method_not_allowed(method, "subscriptions"),
             }
         }
@@ -470,9 +482,11 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
             match method {
                 "GET" => handle_acinfo_get(subscription_id).await,
-                // TS 29.558 §8.4.2 table 8.4.2.1-1: both full update (PUT) and
-                // partial update (PATCH) are defined on the individual resource.
-                "PUT" | "PATCH" => handle_acinfo_update(subscription_id, &request).await,
+                // Spec ops on the individual resource: PUT full replace
+                // (ACInfoSubscription) vs PATCH application/merge-patch+json
+                // (ACInfoSubscriptionPatch) — distinct semantics.
+                "PUT" => handle_acinfo_update(subscription_id, &request).await,
+                "PATCH" => handle_acinfo_modify(subscription_id, &request).await,
                 "DELETE" => handle_acinfo_delete(subscription_id).await,
                 _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
@@ -499,25 +513,20 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
         }
-        // eesd-13: eees-eeccontextreloc (TS 29.558 §8.7.2) — EEC Contexts.
-        // Spec resource is /eec-contexts: POST pushes an EEC context, GET pulls.
+        // D2: eees-eeccontextreloc (TS 29.558 §8.7.2) — EEC Contexts. The yaml
+        // defines exactly two ops on /eec-contexts: POST (PushEecContexts,
+        // EECContextPush → 200 EECContextPushRes | 204) and GET
+        // (PullEecContexts with REQUIRED `ees-id` + `eec-cntx-id` query
+        // params). There is NO individual /eec-contexts/{id} resource — a
+        // path-param GET falls through to 404 below.
         ["eees-eeccontextreloc", "v1", "eec-contexts"] => {
             if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EECCONTEXTRELOC) {
                 return resp;
             }
             match method {
                 "POST" => handle_eec_context_push(&request).await,
-                "GET" => handle_eec_context_list().await,
+                "GET" => handle_eec_context_pull(&request).await,
                 _ => send_method_not_allowed(method, "eec-contexts"),
-            }
-        }
-        ["eees-eeccontextreloc", "v1", "eec-contexts", eec_id] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EECCONTEXTRELOC) {
-                return resp;
-            }
-            match method {
-                "GET" => handle_eec_context_pull(eec_id).await,
-                _ => send_method_not_allowed(method, "eec-contexts/{eecId}"),
             }
         }
         // eesd-13: eees-acr-param (TS 29.558 §5.13) — ACR Parameter Information.
@@ -1430,120 +1439,127 @@ async fn handle_cea_delete(announcement_id: &str) -> SbiResponse {
     }
 }
 
-// ---- eesd-13: eees-appclientinformation handlers ----------------------------
+// ---- D1: eees-appclientinformation handlers ----------------------------------
 
-/// `ProvideAppClientInfo` (`POST .../eees-appclientinformation/v1/subscriptions`).
+/// Parse + mandatory-IE-validate an `ACInfoSubscription` body
+/// (TS29558_Eees_AppClientInformation.yaml:317-353; sole REQUIRED field
+/// `easId`). Fail-closed 400 `MANDATORY_IE_MISSING` on a missing/empty
+/// `easId`. The error response is boxed (clippy `result_large_err`).
+fn parse_acinfo_subscription(request: &SbiRequest) -> Result<ACInfoSubscription, Box<SbiResponse>> {
+    let value = parse_json_body(request)?;
+    let mut sub: ACInfoSubscription = serde_json::from_value(value).map_err(|e| {
+        Box::new(send_bad_request(
+            &format!("Missing or invalid mandatory IE (easId): {e}"),
+            Some(cause::MANDATORY_IE_MISSING),
+        ))
+    })?;
+    if sub.eas_id.trim().is_empty() {
+        return Err(Box::new(send_bad_request(
+            "Mandatory IE easId is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        )));
+    }
+    // eesd-11: negotiate suppFeat (echoed in the response body).
+    sub.supp_feat = types::negotiate_supp_feat(sub.supp_feat.as_deref());
+    Ok(sub)
+}
+
+/// `CreateAppClientInfoSubscription`
+/// (`POST .../eees-appclientinformation/v1/subscriptions`, yaml:26-73).
 ///
-/// Parses `AppClientInfo` (mandatory: `acId`), mints an `subscriptionId`,
-/// and returns 201 + `Location` + echoed body.
+/// Parses the spec `ACInfoSubscription` (mandatory: `easId` ONLY) and returns
+/// 201 + `Location` (keyed on the server-minted `subscriptionId`) + the echoed
+/// `ACInfoSubscription` body. The wire body never carries the id.
 async fn handle_acinfo_create(request: &SbiRequest) -> SbiResponse {
-    log::info!("AppClientInfo create");
-    let value = match parse_json_body(request) {
-        Ok(v) => v,
+    log::info!("ACInfoSubscription create");
+    let sub = match parse_acinfo_subscription(request) {
+        Ok(s) => s,
         Err(resp) => return *resp,
     };
-    let info: AppClientInfo = match serde_json::from_value(value) {
-        Ok(i) => i,
-        Err(e) => {
-            return send_bad_request(
-                &format!("Missing or invalid mandatory IE (acId): {e}"),
-                Some(cause::MANDATORY_IE_MISSING),
-            );
-        }
-    };
-    if info.ac_id.trim().is_empty() {
-        return send_bad_request(
-            "Mandatory IE acId is empty",
-            Some(cause::MANDATORY_IE_MISSING),
-        );
-    }
     let ctx = ees_self();
-    match ctx.read().ok().and_then(|c| c.acinfo_create(info)) {
-        Some(created) => {
-            let id = created.subscription_id.clone().unwrap_or_default();
-            SbiResponse::with_status(201)
-                .with_header("Location", format!("{APPCLIENTINFO_RESOURCES_PATH}/{id}"))
-                .with_json_body(&created)
-                .unwrap_or_else(|_| SbiResponse::with_status(201))
-        }
+    match ctx.read().ok().and_then(|c| c.acinfo_create(sub.clone())) {
+        Some(id) => SbiResponse::with_status(201)
+            .with_header("Location", format!("{APPCLIENTINFO_RESOURCES_PATH}/{id}"))
+            .with_json_body(&sub)
+            .unwrap_or_else(|_| SbiResponse::with_status(201)),
         None => send_error(
             507,
             "Insufficient Storage",
-            "Failed to create AppClientInfo (capacity exhausted)",
+            "Failed to create AC information subscription (capacity exhausted)",
             Some(cause::INSUFFICIENT_RESOURCES),
         ),
     }
 }
 
-async fn handle_acinfo_list() -> SbiResponse {
-    let infos = ees_self()
-        .read()
-        .map(|c| c.acinfo_list())
-        .unwrap_or_default();
-    SbiResponse::with_status(200)
-        .with_json_body(&infos)
-        .unwrap_or_else(|_| SbiResponse::with_status(200))
-}
-
+/// `ReadIndAppClientInfoSubscription` (GET, yaml:115-156).
 async fn handle_acinfo_get(subscription_id: &str) -> SbiResponse {
-    let info = ees_self()
+    let sub = ees_self()
         .read()
         .ok()
         .and_then(|c| c.acinfo_find(subscription_id));
-    match info {
-        Some(info) => SbiResponse::with_status(200)
-            .with_json_body(&info)
+    match sub {
+        Some(sub) => SbiResponse::with_status(200)
+            .with_json_body(&sub)
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(
-            &format!("AppClientInfo {subscription_id} not found"),
+            &format!("AC information subscription {subscription_id} not found"),
             Some(cause::SUBSCRIPTION_NOT_FOUND),
         ),
     }
 }
 
-/// TS 29.558 §8.4.2: PUT (full replace) / PATCH (partial update) of an existing
-/// AC-information subscription. The server-minted `subscriptionId` is preserved
-/// regardless of the body, and the updated resource is returned (200).
+/// `UpdateIndAppClientInfoSubscription` (PUT full replace, yaml:158-207).
+/// Validates a complete `ACInfoSubscription` and returns the replaced
+/// representation (200).
 async fn handle_acinfo_update(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("AppClientInfo update: {subscription_id}");
-    let value = match parse_json_body(request) {
+    log::info!("ACInfoSubscription replace: {subscription_id}");
+    let sub = match parse_acinfo_subscription(request) {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    let result = ees_self()
+        .read()
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.acinfo_update(subscription_id, sub));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(e) => update_error_response(
+            e,
+            &format!("AC information subscription {subscription_id}"),
+        ),
+    }
+}
+
+/// `ModifyIndAppClientInfoSubscription` (PATCH `application/merge-patch+json`,
+/// yaml:209-266). Applies an RFC 7396 merge restricted to the
+/// `ACInfoSubscriptionPatch` members (yaml:355-377) and returns the merged
+/// representation (200); `easId` is not patchable and is preserved.
+async fn handle_acinfo_modify(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("ACInfoSubscription merge-patch: {subscription_id}");
+    let patch = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let mut info: AppClientInfo = match serde_json::from_value(value) {
-        Ok(i) => i,
-        Err(e) => {
-            return send_bad_request(
-                &format!("Missing or invalid mandatory IE (acId): {e}"),
-                Some(cause::MANDATORY_IE_MISSING),
-            );
-        }
-    };
-    if info.ac_id.trim().is_empty() {
-        return send_bad_request(
-            "Mandatory IE acId is empty",
-            Some(cause::MANDATORY_IE_MISSING),
-        );
-    }
-    // The resource id is immutable and taken from the URI, never the body.
-    info.subscription_id = Some(subscription_id.to_string());
-    match ees_self()
+    let result = ees_self()
         .read()
-        .ok()
-        .and_then(|c| c.acinfo_update(subscription_id, info))
-    {
-        Some(updated) => SbiResponse::with_status(200)
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.acinfo_modify(subscription_id, &patch));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
             .with_json_body(&updated)
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        None => send_not_found(
-            &format!("AppClientInfo {subscription_id} not found"),
-            Some(cause::SUBSCRIPTION_NOT_FOUND),
+        Err(e) => update_error_response(
+            e,
+            &format!("AC information subscription {subscription_id}"),
         ),
     }
 }
 
+/// `DeleteIndAppClientInfoSubscription` (DELETE, yaml:268-303) → 204.
 async fn handle_acinfo_delete(subscription_id: &str) -> SbiResponse {
-    log::info!("AppClientInfo delete: {subscription_id}");
+    log::info!("ACInfoSubscription delete: {subscription_id}");
     let removed = ees_self()
         .read()
         .ok()
@@ -1551,7 +1567,7 @@ async fn handle_acinfo_delete(subscription_id: &str) -> SbiResponse {
     match removed {
         Some(_) => SbiResponse::with_status(204),
         None => send_not_found(
-            &format!("AppClientInfo {subscription_id} not found"),
+            &format!("AC information subscription {subscription_id} not found"),
             Some(cause::SUBSCRIPTION_NOT_FOUND),
         ),
     }
@@ -1681,78 +1697,206 @@ async fn handle_acrmgnt_sub_delete(subscription_id: &str) -> SbiResponse {
     }
 }
 
-// ---- eesd-13: eees-eeccontextreloc handler ----------------------------------
+// ---- D2: eees-eeccontextreloc handlers ---------------------------------------
 
-/// Push an EEC context (`POST .../eees-eeccontextreloc/v1/eec-contexts`,
-/// TS 29.558 §8.7.2). Parses `EecContext` (mandatory: `eecId`), stores it, and
-/// returns 201 Created with a `Location` to the individual resource.
+/// Percent-decode an RFC 3986 URI component (`%XX` triplets). A malformed
+/// escape sequence is kept verbatim rather than dropped.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let (Some(h), Some(l)) = (
+                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+            ) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse the raw query string of `uri` (the part after `?`) into
+/// percent-decoded `(key, value)` pairs. Returns an empty list when the URI
+/// carries no query.
+fn parse_query_params(uri: &str) -> Vec<(String, String)> {
+    let raw = match uri.split_once('?') {
+        Some((_, q)) => q,
+        None => return Vec::new(),
+    };
+    raw.split('&')
+        .filter(|p| !p.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (percent_decode(k), percent_decode(v)),
+            None => (percent_decode(pair), String::new()),
+        })
+        .collect()
+}
+
+/// Find a query parameter value by (exact) key.
+fn query_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    params
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// `PushEecContexts` (`POST .../eees-eeccontextreloc/v1/eec-contexts`,
+/// TS29558_Eees_EECContextRelocation.yaml:30-73).
+///
+/// Parses the spec `EECContextPush` envelope (required: `eesId`, `eecCntx`
+/// with `eecId` AND `cntxId`), stores every carried context keyed by its
+/// `cntxId`, and answers **204 No Content** — or **200** with an
+/// `EECContextPushRes` ONLY when `acrScenariosSelReq=true` yields a real
+/// `selAcrScenariosList` (selected from the EEC-declared
+/// `eecSrvContSupp.acrScenarios`). No `Location` header and no minted
+/// sub-resource; an implicit registration is never fabricated.
 async fn handle_eec_context_push(request: &SbiRequest) -> SbiResponse {
     log::info!("EEC context push");
     let value = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let ctx: EecContext = match serde_json::from_value(value) {
-        Ok(c) => c,
+    let push: EECContextPush = match serde_json::from_value(value) {
+        Ok(p) => p,
         Err(e) => {
             return send_bad_request(
-                &format!("Missing or invalid mandatory IE (eecId): {e}"),
+                &format!("Missing or invalid mandatory IE (eesId/eecCntx.eecId/eecCntx.cntxId): {e}"),
                 Some(cause::MANDATORY_IE_MISSING),
             );
         }
     };
-    if ctx.eec_id.trim().is_empty() {
+    if push.ees_id.trim().is_empty() {
         return send_bad_request(
-            "Mandatory IE eecId is empty",
+            "Mandatory IE eesId is empty",
             Some(cause::MANDATORY_IE_MISSING),
         );
     }
-    let eec_id = ctx.eec_id.clone();
-    match ees_self().read().ok().and_then(|c| c.eec_context_push(ctx)) {
-        Some(stored) => SbiResponse::with_status(201)
-            .with_header(
-                "Location",
-                format!("/eees-eeccontextreloc/v1/eec-contexts/{eec_id}"),
-            )
-            .with_json_body(&stored)
-            .unwrap_or_else(|_| SbiResponse::with_status(201)),
-        None => send_error(
+    let extras = push.eec_cntxs.as_deref().unwrap_or(&[]);
+    for cntx in std::iter::once(&push.eec_cntx).chain(extras.iter()) {
+        if cntx.eec_id.trim().is_empty() || cntx.cntx_id.trim().is_empty() {
+            return send_bad_request(
+                "Mandatory IE eecId/cntxId is empty in an EECContext",
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    }
+
+    // The 200-vs-204 rule: 200 only when scenario selection was requested AND
+    // the primary context declares supported ACR scenarios to select from;
+    // otherwise 204. An empty EECContextPushRes is never emitted.
+    let sel_acr_scenarios = if push.acr_scenarios_sel_req == Some(true) {
+        push.eec_cntx
+            .eec_srv_cont_supp
+            .as_ref()
+            .and_then(|c| c.acr_scenarios.clone())
+            .filter(|scenarios| !scenarios.is_empty())
+    } else {
+        None
+    };
+
+    let stored = ees_self().read().ok().and_then(|c| {
+        let mut all = vec![push.eec_cntx.clone()];
+        all.extend(extras.iter().cloned());
+        for cntx in all {
+            c.eec_context_push(cntx)?;
+        }
+        Some(())
+    });
+    if stored.is_none() {
+        return send_error(
             507,
             "Insufficient Storage",
             "Failed to store EEC context (capacity exhausted)",
             Some(cause::INSUFFICIENT_RESOURCES),
-        ),
+        );
+    }
+
+    match sel_acr_scenarios {
+        Some(scenarios) => {
+            let res = EECContextPushRes {
+                impl_reg: None,
+                sel_acr_scenarios_list: Some(scenarios),
+            };
+            SbiResponse::with_status(200)
+                .with_json_body(&res)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => SbiResponse::with_status(204),
     }
 }
 
-/// Pull one EEC context by `eecId`
-/// (`GET .../eees-eeccontextreloc/v1/eec-contexts/{eecId}`, TS 29.558 §8.7.2).
-async fn handle_eec_context_pull(eec_id: &str) -> SbiResponse {
-    match ees_self()
+/// `PullEecContexts` (`GET .../eees-eeccontextreloc/v1/eec-contexts`,
+/// TS29558_Eees_EECContextRelocation.yaml:75-127).
+///
+/// The pull is query-form: `ees-id` AND `eec-cntx-id` are REQUIRED
+/// (yaml:81-92) → 400 `MANDATORY_IE_MISSING` when absent/empty. The optional
+/// `sess-cntxs` parameter (a URL-encoded `SessionContexts` JSON document,
+/// yaml:93-100) narrows the `sessCntxs` of the returned `EECContext` to the
+/// requested `easId`s. Success is 200 with the `EECContext`, else 404.
+async fn handle_eec_context_pull(request: &SbiRequest) -> SbiResponse {
+    let params = parse_query_params(&request.header.uri);
+    let ees_id = query_param(&params, "ees-id").unwrap_or("");
+    let cntx_id = query_param(&params, "eec-cntx-id").unwrap_or("");
+    if ees_id.trim().is_empty() || cntx_id.trim().is_empty() {
+        return send_bad_request(
+            "Mandatory query parameters ees-id and eec-cntx-id are required",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    // Optional sess-cntxs filter: a SessionContexts JSON document.
+    let requested_sess: Option<SessionContexts> = match query_param(&params, "sess-cntxs") {
+        Some(raw) => match serde_json::from_str(raw) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                return send_bad_request(
+                    &format!("Invalid sess-cntxs query parameter: {e}"),
+                    Some(cause::INVALID_MSG_FORMAT),
+                );
+            }
+        },
+        None => None,
+    };
+
+    let found = ees_self()
         .read()
         .ok()
-        .and_then(|c| c.eec_context_pull(eec_id))
-    {
-        Some(ctx) => SbiResponse::with_status(200)
-            .with_json_body(&ctx)
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        .and_then(|c| c.eec_context_pull(cntx_id));
+    match found {
+        Some(mut ctx) => {
+            if let Some(requested) = requested_sess {
+                // Narrow the response sessCntxs to the requested easIds;
+                // SessionContexts.sessCntxs has minItems 1, so an empty
+                // narrowing omits the member entirely.
+                ctx.sess_cntxs = ctx.sess_cntxs.take().and_then(|stored| {
+                    let kept: Vec<_> = stored
+                        .sess_cntxs
+                        .into_iter()
+                        .filter(|s| requested.sess_cntxs.iter().any(|r| r.eas_id == s.eas_id))
+                        .collect();
+                    if kept.is_empty() {
+                        None
+                    } else {
+                        Some(SessionContexts { sess_cntxs: kept })
+                    }
+                });
+            }
+            log::debug!("EEC context pulled: cntxId={cntx_id} by eesId={ees_id}");
+            SbiResponse::with_status(200)
+                .with_json_body(&ctx)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
         None => send_not_found(
-            &format!("EEC context {eec_id} not found"),
+            &format!("EEC context {cntx_id} not found"),
             Some(cause::SUBSCRIPTION_NOT_FOUND),
         ),
     }
-}
-
-/// List all stored EEC contexts
-/// (`GET .../eees-eeccontextreloc/v1/eec-contexts`, TS 29.558 §8.7.2).
-async fn handle_eec_context_list() -> SbiResponse {
-    let ctxs = ees_self()
-        .read()
-        .map(|c| c.eec_context_list())
-        .unwrap_or_default();
-    SbiResponse::with_status(200)
-        .with_json_body(&ctxs)
-        .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
 // ---- eesd-13: eees-acr-param handler ----------------------------------------
@@ -2626,7 +2770,10 @@ mod tests {
         auth::clear_auth_jwks();
     }
 
-    /// eesd-13 eees-appclientinformation: POST → 201 + Location; GET; DELETE.
+    /// D1 eees-appclientinformation: spec `ACInfoSubscription` lifecycle —
+    /// POST {"easId":..} → 201 + Location; GET → 200 same body; PUT full
+    /// replace → 200; PATCH merge-patch changing only `expTime` → 200 with
+    /// `easId` preserved; DELETE → 204; GET → 404.
     #[test]
     fn test_acinfo_lifecycle() {
         let _g = auth::GLOBAL_STATE_TEST_LOCK
@@ -2636,7 +2783,8 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        let body = r#"{"acId":"ac-uniq-1","easIds":["eas1"],"acType":"V2X"}"#;
+        // POST the minimal spec body (sole mandatory IE easId) → 201.
+        let body = r#"{"easId":"eas1.example.com"}"#;
         let req = SbiRequest::post("/eees-appclientinformation/v1/subscriptions")
             .with_header(
                 "Authorization",
@@ -2648,21 +2796,26 @@ mod tests {
         let loc = resp.http.get_header("location").cloned().unwrap();
         assert!(loc.starts_with(APPCLIENTINFO_RESOURCES_PATH));
         let id = loc.rsplit('/').next().unwrap().to_string();
-        let created: AppClientInfo =
+        assert!(!id.is_empty());
+        let created: ACInfoSubscription =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(created.ac_id, "ac-uniq-1");
-        assert_eq!(created.subscription_id.as_deref(), Some(id.as_str()));
+        assert_eq!(created.eas_id, "eas1.example.com");
 
-        // GET → 200.
+        // GET → 200 with the same body.
         let req = SbiRequest::get(format!("/eees-appclientinformation/v1/subscriptions/{id}"))
             .with_header(
                 "Authorization",
                 bearer(&sk, "k1", "eees-appclientinformation"),
             );
-        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let fetched: ACInfoSubscription =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(fetched, created);
 
-        // PUT (full update) → 200, id preserved (TS 29.558 §8.4.2).
-        let put_body = r#"{"acId":"ac-uniq-1","acType":"IoT"}"#;
+        // PUT full replace → 200 (new acFltrs; easId unchanged).
+        let put_body =
+            r#"{"easId":"eas1.example.com","acFltrs":[{"acTypesList":["V2X"]}],"suppFeat":"1"}"#;
         let req = SbiRequest::put(format!("/eees-appclientinformation/v1/subscriptions/{id}"))
             .with_header(
                 "Authorization",
@@ -2671,10 +2824,41 @@ mod tests {
             .with_body(put_body, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 200);
-        let updated: AppClientInfo =
+        let replaced: ACInfoSubscription =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(updated.subscription_id.as_deref(), Some(id.as_str()));
-        assert_eq!(updated.ac_type.as_deref(), Some("IoT"));
+        assert!(replaced.ac_fltrs.is_some());
+
+        // PATCH merge-patch changing ONLY expTime → 200; easId + acFltrs
+        // preserved (ACInfoSubscriptionPatch semantics).
+        let patch = r#"{"expTime":"2030-01-01T00:00:00Z"}"#;
+        let req = SbiRequest::patch(format!("/eees-appclientinformation/v1/subscriptions/{id}"))
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", "eees-appclientinformation"),
+            )
+            .with_body(patch, "application/merge-patch+json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let patched: ACInfoSubscription =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(patched.eas_id, "eas1.example.com");
+        assert_eq!(patched.exp_time.as_deref(), Some("2030-01-01T00:00:00Z"));
+        assert!(patched.ac_fltrs.is_some(), "merge keeps unpatched members");
+
+        // A patch attempting to change the immutable easId is ignored (only
+        // ACInfoSubscriptionPatch members are merged).
+        let bad_patch = r#"{"easId":"evil.example.com"}"#;
+        let req = SbiRequest::patch(format!("/eees-appclientinformation/v1/subscriptions/{id}"))
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", "eees-appclientinformation"),
+            )
+            .with_body(bad_patch, "application/merge-patch+json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let unchanged: ACInfoSubscription =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(unchanged.eas_id, "eas1.example.com");
 
         // DELETE → 204; GET → 404.
         let req = SbiRequest::delete(format!("/eees-appclientinformation/v1/subscriptions/{id}"))
@@ -2689,6 +2873,112 @@ mod tests {
                 bearer(&sk, "k1", "eees-appclientinformation"),
             );
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// D1 fail-closed: the OLD bespoke shape {"acId":"ac1"} (no easId) → 400
+    /// with cause MANDATORY_IE_MISSING; a body with acFltrs but no easId →
+    /// 400; the non-spec collection GET → 405.
+    #[test]
+    fn test_acinfo_fail_closed_and_no_collection_get() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        for bad in [
+            r#"{"acId":"ac1"}"#,
+            r#"{"acFltrs":[{"acIdsList":["ac1"]}]}"#,
+            r#"{"easId":""}"#,
+        ] {
+            let req = SbiRequest::post("/eees-appclientinformation/v1/subscriptions")
+                .with_header(
+                    "Authorization",
+                    bearer(&sk, "k1", "eees-appclientinformation"),
+                )
+                .with_body(bad, "application/json");
+            let resp = block_on(ees_sbi_request_handler(req));
+            assert_eq!(resp.status, 400, "expected 400 for body {bad}");
+            assert!(
+                resp.http
+                    .content
+                    .as_deref()
+                    .unwrap()
+                    .contains("MANDATORY_IE_MISSING"),
+                "400 ProblemDetails must carry cause MANDATORY_IE_MISSING"
+            );
+        }
+
+        // The spec defines no collection GET → 405.
+        let req = SbiRequest::get("/eees-appclientinformation/v1/subscriptions").with_header(
+            "Authorization",
+            bearer(&sk, "k1", "eees-appclientinformation"),
+        );
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 405);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// D1 strict-peer: a raw spec JSON document (hand-derived from
+    /// TS29558_Eees_AppClientInformation.yaml, NOT via our structs) is
+    /// accepted, and the echoed 201 wire body contains ONLY spec schema keys
+    /// (no `subscriptionId`/`acId` leakage).
+    #[test]
+    fn test_acinfo_strict_peer_body_whitelist() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // Raw strict-peer body: every ACInfoSubscription member (yaml:317-353).
+        let body = r#"{
+            "easId":"eas-strict.example.com",
+            "acFltrs":[{"acTypesList":["V2X"],"ueIds":["msisdn-14155550001"]}],
+            "expTime":"2030-01-01T00:00:00Z",
+            "eventReq":{"notifMethod":"ON_EVENT_DETECTION"},
+            "notificationDestination":"http://eas-strict.example.com/cb",
+            "requestTestNotification":false,
+            "websockNotifConfig":{"requestWebsocketUri":true},
+            "suppFeat":"1",
+            "trigCondParams":["EAS_DISCOVERY"]
+        }"#;
+        let req = SbiRequest::post("/eees-appclientinformation/v1/subscriptions")
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", "eees-appclientinformation"),
+            )
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 201);
+
+        // Field-whitelist assert on the raw wire body.
+        let wire: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let allowed = [
+            "easId",
+            "acFltrs",
+            "expTime",
+            "eventReq",
+            "notificationDestination",
+            "requestTestNotification",
+            "websockNotifConfig",
+            "suppFeat",
+            "trigCondParams",
+        ];
+        for key in wire.as_object().unwrap().keys() {
+            assert!(
+                allowed.contains(&key.as_str()),
+                "non-spec field {key} leaked into the wire body"
+            );
+        }
+        assert!(wire.get("subscriptionId").is_none());
+        assert!(wire.get("acId").is_none());
+        assert_eq!(wire["easId"], "eas-strict.example.com");
 
         auth::clear_auth_jwks();
     }
@@ -2745,9 +3035,10 @@ mod tests {
         auth::clear_auth_jwks();
     }
 
-    /// eesd-13 eees-eeccontextreloc (TS 29.558 §8.7.2): POST /eec-contexts pushes
-    /// a context (201 + Location), GET pulls it back (200); missing `eecId` → 400;
-    /// no token → 401.
+    /// D2 eees-eeccontextreloc (TS 29.558 §8.7.2): spec push
+    /// (EECContextPush{eesId,eecCntx{eecId,cntxId}}) → 204 with NO Location;
+    /// old flat push → 400; query-form pull → 200; pull without the required
+    /// params → 400; the old path-param pull form → 404; no token → 401.
     #[test]
     fn test_eec_context_push_pull() {
         let _g = auth::GLOBAL_STATE_TEST_LOCK
@@ -2757,39 +3048,84 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        // POST push → 201 + Location to /eec-contexts/{eecId}.
-        let body = r#"{"eecId":"eec1","ueId":"ue-1"}"#;
+        // Spec push (S-EES side of the strict-peer round trip) → 204.
+        let body = r#"{
+            "eesId":"ees-src",
+            "eecCntx":{
+                "eecId":"eec1","cntxId":"c-1","ueId":"msisdn-14155550001",
+                "sessCntxs":{"sessCntxs":[
+                    {"easId":"eas1.example.com","endPt":{"fqdn":"eas1.example.com"}},
+                    {"easId":"eas2.example.com","endPt":{"fqdn":"eas2.example.com"}}
+                ]}
+            }
+        }"#;
         let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
             .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"))
             .with_body(body, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
-        assert_eq!(resp.status, 201);
-        let loc = resp.http.get_header("location").cloned().unwrap();
-        assert_eq!(loc, "/eees-eeccontextreloc/v1/eec-contexts/eec1");
-        let stored: EecContext =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(stored.eec_id, "eec1");
+        assert_eq!(resp.status, 204, "spec push success is 204 No Content");
+        assert!(
+            resp.http.get_header("location").is_none(),
+            "push mints no sub-resource: Location header must be absent"
+        );
+        assert!(resp.http.content.as_deref().unwrap_or("").is_empty());
 
-        // GET pull → 200 with the stored context.
-        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts/eec1")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
-        let resp = block_on(ees_sbi_request_handler(req));
-        assert_eq!(resp.status, 200);
-        let pulled: EecContext =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(pulled.ue_id.as_deref(), Some("ue-1"));
-
-        // Unknown eecId → 404.
-        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts/nope")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
-        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
-
-        // Missing eecId → 400.
-        let bad = r#"{"ueId":"ue-1"}"#;
+        // OLD flat bespoke push shape → 400 MANDATORY_IE_MISSING.
+        let bad = r#"{"eecId":"eec1","ueId":"ue-1"}"#;
         let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
             .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"))
             .with_body(bad, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 400);
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("MANDATORY_IE_MISSING"));
+
+        // Query-form pull (T-EES side of the round trip) → 200 EECContext.
+        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t&eec-cntx-id=c-1")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let pulled: services::EECContext =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pulled.eec_id, "eec1");
+        assert_eq!(pulled.cntx_id, "c-1");
+        assert_eq!(pulled.ue_id.as_deref(), Some("msisdn-14155550001"));
+
+        // Optional sess-cntxs filter narrows the returned sessCntxs.
+        let filter = "%7B%22sessCntxs%22%3A%5B%7B%22easId%22%3A%22eas1.example.com%22%2C%22endPt%22%3A%7B%22fqdn%22%3A%22eas1.example.com%22%7D%7D%5D%7D";
+        let req = SbiRequest::get(format!(
+            "/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t&eec-cntx-id=c-1&sess-cntxs={filter}"
+        ))
+        .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let narrowed: services::EECContext =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let sess = narrowed.sess_cntxs.unwrap();
+        assert_eq!(sess.sess_cntxs.len(), 1);
+        assert_eq!(sess.sess_cntxs[0].eas_id, "eas1.example.com");
+
+        // Pull without the REQUIRED query params → 400.
+        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+
+        // Unknown eec-cntx-id → 404.
+        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t&eec-cntx-id=nope")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        // The OLD path-param pull form → 404 (no individual resource in the yaml).
+        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts/c-1")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
 
         // No token → 401.
         auth::clear_auth_jwks();
@@ -2798,6 +3134,74 @@ mod tests {
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 401);
 
         auth::clear_auth_jwks();
+    }
+
+    /// D2: acrScenariosSelReq=true with EEC-declared acrScenarios → 200 with
+    /// a non-empty EECContextPushRes.selAcrScenariosList and NO fabricated
+    /// implReg; without scenarios → 204.
+    #[test]
+    fn test_eec_context_push_acr_scenario_selection() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // Selection requested + scenarios declared → 200.
+        let body = r#"{
+            "eesId":"ees-src",
+            "eecCntx":{
+                "eecId":"eec-sel","cntxId":"c-sel",
+                "eecSrvContSupp":{"srvContSupp":true,"acrScenarios":["EEC_INITIATED","EEC_EXECUTED_VIA_SOURCE_EES"]}
+            },
+            "acrScenariosSelReq":true
+        }"#;
+        let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let res: EECContextPushRes =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let sel = res.sel_acr_scenarios_list.expect("selection returned");
+        assert!(!sel.is_empty());
+        assert!(sel.contains(&"EEC_INITIATED".to_string()));
+        assert!(res.impl_reg.is_none(), "implReg is never fabricated");
+
+        // Selection requested but the EEC declared no scenarios → 204.
+        let body = r#"{
+            "eesId":"ees-src",
+            "eecCntx":{"eecId":"eec-nosel","cntxId":"c-nosel"},
+            "acrScenariosSelReq":true
+        }"#;
+        let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"))
+            .with_body(body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// D2: the percent-decoding query helper handles plain, encoded, empty and
+    /// valueless parameters.
+    #[test]
+    fn test_parse_query_params_percent_decoding() {
+        assert!(parse_query_params("/eec-contexts").is_empty());
+        let p = parse_query_params("/eec-contexts?ees-id=ees-t&eec-cntx-id=c-1");
+        assert_eq!(query_param(&p, "ees-id"), Some("ees-t"));
+        assert_eq!(query_param(&p, "eec-cntx-id"), Some("c-1"));
+        assert_eq!(query_param(&p, "missing"), None);
+
+        // Percent-encoded value round-trips ({"a":"b c"}).
+        let p = parse_query_params("/x?doc=%7B%22a%22%3A%22b%20c%22%7D");
+        assert_eq!(query_param(&p, "doc"), Some(r#"{"a":"b c"}"#));
+
+        // Valueless + empty pairs are tolerated; malformed escapes are kept
+        // verbatim rather than dropped.
+        let p = parse_query_params("/x?flag&&k=v%2");
+        assert_eq!(query_param(&p, "flag"), Some(""));
+        assert_eq!(query_param(&p, "k"), Some("v%2"));
     }
 
     /// eesd-13 eees-acr-param: after an ACR Determine, the param request

@@ -9,7 +9,9 @@ use crate::acr::{
     acr_ue_key, AcrContextError, AcrDecReq, AcrDetermReq, AcrInitReq, AcrState, AcrStatus,
 };
 use crate::eec::EecRegistration;
-use crate::services::{AcrMgntEventSubsc, AppClientInfo, CeaAnnouncement, EecContext};
+use crate::services::{
+    ACInfoSubscription, AcrMgntEventSubsc, CeaAnnouncement, EECContext, ACINFO_PATCHABLE_FIELDS,
+};
 use crate::types::{
     apply_merge_patch, is_expired, EasDiscoveryFilter, EasDiscoverySubscription, EasProfile,
     EasRegistration,
@@ -48,12 +50,16 @@ pub struct EesContext {
     acr_states: RwLock<HashMap<String, AcrState>>,
     /// CEA announcements (eesd-13 `eees-cea`), keyed by server-minted `announcementId`.
     cea_announcements: RwLock<HashMap<String, CeaAnnouncement>>,
-    /// App-client information records (eesd-13 `eees-appclientinformation`), keyed by `subscriptionId`.
-    app_client_infos: RwLock<HashMap<String, AppClientInfo>>,
+    /// AC Information subscriptions (`eees-appclientinformation`, TS 29.558
+    /// §8.4). The spec `ACInfoSubscription` body carries NO id field: the
+    /// server-minted `subscriptionId` lives only as this map's key (returned
+    /// via the `Location` header).
+    app_client_infos: RwLock<HashMap<String, ACInfoSubscription>>,
     /// ACR management event subscriptions (eesd-13 `eees-acrmgntevent`), keyed by `subscriptionId`.
     acr_mgnt_subscriptions: RwLock<HashMap<String, AcrMgntEventSubsc>>,
-    /// EEC contexts (eesd-13 `eees-eeccontextreloc`, TS 29.558 §8.7.2), keyed by `eecId`.
-    eec_contexts: RwLock<HashMap<String, EecContext>>,
+    /// EEC contexts (`eees-eeccontextreloc`, TS 29.558 §8.7.2), keyed by the
+    /// spec pull key `cntxId` (the `eec-cntx-id` query parameter).
+    eec_contexts: RwLock<HashMap<String, EECContext>>,
     /// Maximum registrations (applied per resource family).
     max_eas: usize,
     /// Context initialized flag.
@@ -687,25 +693,25 @@ impl EesContext {
         removed
     }
 
-    // ---- eesd-13: eees-appclientinformation — App Client Information ---------
+    // ---- eees-appclientinformation — AC Information subscriptions (§8.4) -----
 
-    /// Store an `AppClientInfo`; mints an `subscriptionId`.
-    pub fn acinfo_create(&self, mut info: AppClientInfo) -> Option<AppClientInfo> {
-        let mut infos = self.app_client_infos.write().ok()?;
-        if infos.len() >= self.max_eas {
+    /// Store an `ACInfoSubscription`; mints and returns the server
+    /// `subscriptionId` (the map key — the spec wire body carries no id).
+    pub fn acinfo_create(&self, sub: ACInfoSubscription) -> Option<String> {
+        let mut subs = self.app_client_infos.write().ok()?;
+        if subs.len() >= self.max_eas {
             return None;
         }
         let id = Uuid::new_v4().to_string();
-        info.subscription_id = Some(id.clone());
-        infos.insert(id.clone(), info.clone());
+        subs.insert(id.clone(), sub.clone());
         log::info!(
-            "AppClientInfo created: subscriptionId={id} acId={}",
-            info.ac_id
+            "ACInfoSubscription created: subscriptionId={id} easId={}",
+            sub.eas_id
         );
-        Some(info)
+        Some(id)
     }
 
-    pub fn acinfo_find(&self, subscription_id: &str) -> Option<AppClientInfo> {
+    pub fn acinfo_find(&self, subscription_id: &str) -> Option<ACInfoSubscription> {
         self.app_client_infos
             .read()
             .ok()?
@@ -713,62 +719,95 @@ impl EesContext {
             .cloned()
     }
 
-    pub fn acinfo_list(&self) -> Vec<AppClientInfo> {
-        self.app_client_infos
-            .read()
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    pub fn acinfo_delete(&self, subscription_id: &str) -> Option<AppClientInfo> {
+    pub fn acinfo_delete(&self, subscription_id: &str) -> Option<ACInfoSubscription> {
         let removed = self.app_client_infos.write().ok()?.remove(subscription_id);
         if removed.is_some() {
-            log::info!("AppClientInfo deleted: subscriptionId={subscription_id}");
+            log::info!("ACInfoSubscription deleted: subscriptionId={subscription_id}");
         }
         removed
     }
 
-    /// Replace an existing subscription (PUT/PATCH). Returns `None` when the
-    /// `subscriptionId` is unknown; the stored id is always preserved.
+    /// PUT full-replace an existing AC Information subscription
+    /// (`UpdateIndAppClientInfoSubscription`, yaml:158-207). `sub` is assumed
+    /// already mandatory-IE-validated by the handler.
     pub fn acinfo_update(
         &self,
         subscription_id: &str,
-        mut info: AppClientInfo,
-    ) -> Option<AppClientInfo> {
-        let mut infos = self.app_client_infos.write().ok()?;
-        if !infos.contains_key(subscription_id) {
-            return None;
+        sub: ACInfoSubscription,
+    ) -> Result<ACInfoSubscription, UpdateError> {
+        let mut subs = self
+            .app_client_infos
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
+        if !subs.contains_key(subscription_id) {
+            return Err(UpdateError::NotFound);
         }
-        info.subscription_id = Some(subscription_id.to_string());
-        infos.insert(subscription_id.to_string(), info.clone());
-        log::info!("AppClientInfo updated: subscriptionId={subscription_id}");
-        Some(info)
+        subs.insert(subscription_id.to_string(), sub.clone());
+        log::info!("ACInfoSubscription replaced: subscriptionId={subscription_id}");
+        Ok(sub)
     }
 
-    // ---- eesd-13: eees-eeccontextreloc — EEC contexts (TS 29.558 §8.7.2) -----
+    /// PATCH merge an AC Information subscription
+    /// (`ModifyIndAppClientInfoSubscription`, `application/merge-patch+json`,
+    /// yaml:209-266). The RFC 7396 merge is restricted to the
+    /// `ACInfoSubscriptionPatch` members (yaml:355-377); any other key in the
+    /// patch document — including the immutable `easId` — is ignored.
+    pub fn acinfo_modify(
+        &self,
+        subscription_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<ACInfoSubscription, UpdateError> {
+        let mut subs = self
+            .app_client_infos
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
+        let stored = subs.get(subscription_id).ok_or(UpdateError::NotFound)?;
 
-    /// Push (store/replace) an EEC context, keyed by its `eecId`.
-    pub fn eec_context_push(&self, ctx: EecContext) -> Option<EecContext> {
+        // Restrict the merge document to the spec ACInfoSubscriptionPatch keys.
+        let filtered = match patch.as_object() {
+            Some(map) => serde_json::Value::Object(
+                map.iter()
+                    .filter(|(k, _)| ACINFO_PATCHABLE_FIELDS.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            None => return Err(UpdateError::Invalid),
+        };
+
+        let mut value = serde_json::to_value(stored).map_err(|_| UpdateError::Internal)?;
+        apply_merge_patch(&mut value, &filtered);
+        let updated: ACInfoSubscription =
+            serde_json::from_value(value).map_err(|_| UpdateError::Invalid)?;
+        if updated.eas_id.trim().is_empty() {
+            return Err(UpdateError::Invalid);
+        }
+        subs.insert(subscription_id.to_string(), updated.clone());
+        log::info!("ACInfoSubscription merge-patched: subscriptionId={subscription_id}");
+        Ok(updated)
+    }
+
+    // ---- eees-eeccontextreloc — EEC contexts (TS 29.558 §8.7.2) --------------
+
+    /// Push (store/replace) an EEC context, keyed by the spec pull key
+    /// `cntxId` (TS29558_Eees_EECContextRelocation.yaml:236-238).
+    pub fn eec_context_push(&self, ctx: EECContext) -> Option<()> {
         let mut ctxs = self.eec_contexts.write().ok()?;
-        if !ctxs.contains_key(&ctx.eec_id) && ctxs.len() >= self.max_eas {
+        if !ctxs.contains_key(&ctx.cntx_id) && ctxs.len() >= self.max_eas {
             return None;
         }
-        log::info!("EEC context pushed: eecId={}", ctx.eec_id);
-        ctxs.insert(ctx.eec_id.clone(), ctx.clone());
-        Some(ctx)
+        log::info!(
+            "EEC context pushed: cntxId={} eecId={}",
+            ctx.cntx_id,
+            ctx.eec_id
+        );
+        ctxs.insert(ctx.cntx_id.clone(), ctx);
+        Some(())
     }
 
-    /// Pull a stored EEC context by `eecId`.
-    pub fn eec_context_pull(&self, eec_id: &str) -> Option<EecContext> {
-        self.eec_contexts.read().ok()?.get(eec_id).cloned()
-    }
-
-    /// List all stored EEC contexts.
-    pub fn eec_context_list(&self) -> Vec<EecContext> {
-        self.eec_contexts
-            .read()
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
+    /// Pull a stored EEC context by its `cntxId` (the `eec-cntx-id` query
+    /// parameter of `PullEecContexts`, yaml:87-92).
+    pub fn eec_context_pull(&self, cntx_id: &str) -> Option<EECContext> {
+        self.eec_contexts.read().ok()?.get(cntx_id).cloned()
     }
 
     // ---- eesd-13: eees-acrmgntevent — ACR Management Event subscriptions -----
