@@ -40,9 +40,10 @@
 //! edge-triggered rather than re-firing every cycle. `PERIODIC` events are
 //! unaffected and always reported on their period.
 
-use crate::analytics::{AnalyticsEngine, NfLoadSample};
+use crate::analytics::AnalyticsEngine;
 use crate::context::{
-    AnalyticsId, AnalyticsSubscription, MatchingDirection, NotificationMethod, NwdafContext,
+    AnalyticsId, AnalyticsSubscription, EventSubscription, MatchingDirection, NotificationMethod,
+    NwdafContext,
 };
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use serde_json::{json, Map, Value};
@@ -156,6 +157,48 @@ fn extract_level(event: AnalyticsId, infos: &Value) -> Option<f64> {
 // Analytics runner
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Per-event analytics filter (TS 29.520 `EventFilter` /
+/// `EventSubscription.nfInstanceIds`/`nfTypes`). Empty vectors = no filter.
+#[derive(Debug, Clone, Default)]
+pub struct EventInfoFilter {
+    /// Restrict to these NF instance IDs (`nfInstanceIds`), when non-empty.
+    pub nf_instance_ids: Vec<String>,
+    /// Restrict to these NF types (`nfTypes`), when non-empty.
+    pub nf_types: Vec<String>,
+}
+
+impl EventInfoFilter {
+    /// No filtering: report every instance with data.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Build the filter from a subscription's per-event
+    /// `nfInstanceIds`/`nfTypes` (TS 29.520 `EventSubscription`).
+    pub fn from_event_subscription(e: &EventSubscription) -> Self {
+        Self {
+            nf_instance_ids: e.nf_instance_ids.clone(),
+            nf_types: e.nf_types.clone(),
+        }
+    }
+
+    fn matches(&self, nf_instance_id: &str, nf_type: &str) -> bool {
+        (self.nf_instance_ids.is_empty()
+            || self.nf_instance_ids.iter().any(|i| i == nf_instance_id))
+            && (self.nf_types.is_empty() || self.nf_types.iter().any(|t| t == nf_type))
+    }
+}
+
+/// Serialize the cached NRF `nfStatus` token into the TS 29.520 `NfStatus`
+/// object (percentage of time per state, `SamplingRatio` 1..=100). We track
+/// only the latest NRF-reported state, so it is reported as 100 %.
+fn nf_status_json(status: &str) -> Value {
+    match status {
+        "REGISTERED" => json!({ "statusRegistered": 100 }),
+        _ => json!({ "statusUnregistered": 100 }),
+    }
+}
+
 /// Compute the per-event `*Infos` **array** (the value stored under
 /// `event.infos_key()`) for a single analytics event.
 ///
@@ -165,35 +208,62 @@ fn extract_level(event: AnalyticsId, infos: &Value) -> Option<f64> {
 /// other events return an empty array of the correct key until their
 /// collectors exist.
 ///
+/// G2-1: NF_LOAD is computed from **NRF-sourced samples only** (TS 23.288
+/// §6.5 Table 6.5.2-1: the NF load data source is the NRF). One
+/// `NfLoadLevelInformation` is emitted per NF instance with samples, honoring
+/// `filter`. No samples → empty array — never fabricated data. The former
+/// hard-coded synthetic self-sample placeholder is gone.
+///
+/// Emission shape per TS 29.520 `NfLoadLevelInformation`
+/// (`TS29520_Nnwdaf_EventsSubscription.yaml` `NfLoadLevelInformation`):
+/// `nfType`+`nfInstanceId` mandatory; `nfStatus` is the **object** form
+/// (`statusRegistered`/`statusUnregistered` SamplingRatio), emitted only when
+/// the NRF profile status is cached; `confidence` is a `Uinteger` 0..=100
+/// (`round(R² × 100)`). The former non-spec vendor keys `predictedLoad` and
+/// float `confidence` are dropped (documented per the G2-1 spec item).
+///
 /// T5.4 HONESTY NOTE: `compute_nf_load` is linear regression on the last N
-/// samples, not a trained ML model; `confidence` reflects sample count, not
+/// samples, not a trained ML model; `confidence` is the regression R², not
 /// model accuracy (TS 23.288 §6.14).
-pub fn compute_event_infos(engine: &mut AnalyticsEngine, event: AnalyticsId) -> Value {
+pub fn compute_event_infos(
+    engine: &AnalyticsEngine,
+    event: AnalyticsId,
+    filter: &EventInfoFilter,
+) -> Value {
     match event {
         AnalyticsId::NfLoad => {
-            // Ingest a placeholder sample representing the NWDAF's own NF load.
-            // A real implementation would collect these from data sources.
-            let sample = NfLoadSample::now("NWDAF", "nwdaf-self", 0.3, 0.4, 0);
-            engine.ingest_nf_load(sample);
-
-            let infos = engine
-                .compute_nf_load("nwdaf-self")
-                .map(|r| {
-                    vec![json!({
-                        // TS 29.520 NfLoadLevelInformation (subset).
-                        "nfType":             r.nf_type,
-                        "nfInstanceId":       r.nf_instance_id,
-                        "nfStatus":           "REGISTERED",
-                        "nfCpuUsage":         (r.mean_cpu * 100.0).round() as u64,
-                        "nfLoadLevelAverage": (r.mean_cpu * 100.0).round() as u64,
-                        "nfLoadLevelpeak":    (r.peak_cpu * 100.0).round() as u64,
-                        // Vendor extensions: the linear-regression projection and
-                        // its sample-count confidence (not a trained-model score).
-                        "predictedLoad":      r.predicted_load,
-                        "confidence":         r.confidence,
-                    })]
-                })
-                .unwrap_or_default();
+            let mut infos: Vec<Value> = Vec::new();
+            for instance_id in engine.nf_instance_ids() {
+                let Some(r) = engine.compute_nf_load(&instance_id) else {
+                    continue;
+                };
+                if !filter.matches(&instance_id, &r.nf_type) {
+                    continue;
+                }
+                let mut obj = Map::new();
+                obj.insert("nfType".to_string(), json!(r.nf_type));
+                obj.insert("nfInstanceId".to_string(), json!(r.nf_instance_id));
+                if let Some(meta) = engine.nf_meta(&instance_id) {
+                    obj.insert("nfStatus".to_string(), nf_status_json(&meta.nf_status));
+                }
+                obj.insert(
+                    "nfCpuUsage".to_string(),
+                    json!((r.mean_cpu * 100.0).round() as u64),
+                );
+                obj.insert(
+                    "nfLoadLevelAverage".to_string(),
+                    json!((r.mean_cpu * 100.0).round() as u64),
+                );
+                obj.insert(
+                    "nfLoadLevelpeak".to_string(),
+                    json!((r.peak_cpu * 100.0).round() as u64),
+                );
+                obj.insert(
+                    "confidence".to_string(),
+                    json!((r.confidence * 100.0).round().clamp(0.0, 100.0) as u64),
+                );
+                infos.push(Value::Object(obj));
+            }
             Value::Array(infos)
         }
         // No live collector yet for other events: emit an empty (but correctly
@@ -210,10 +280,12 @@ pub fn compute_event_infos(engine: &mut AnalyticsEngine, event: AnalyticsId) -> 
 /// when their computed analytic crosses the configured threshold in the
 /// configured `matchingDir`; the previous level is read from / written back to
 /// `ctx` so the crossing is edge-triggered. `PERIODIC` (and unspecified) events
-/// are always emitted.
+/// are always emitted **when they have data**: G2-1 suppresses an event whose
+/// computed `*Infos` array is empty — nothing observed means nothing is
+/// reported, never an empty/fabricated entry.
 fn build_event_notifications(
     ctx: &NwdafContext,
-    engine: &mut AnalyticsEngine,
+    engine: &AnalyticsEngine,
     sub: &AnalyticsSubscription,
 ) -> Vec<Value> {
     let now = chrono::Utc::now();
@@ -223,7 +295,13 @@ fn build_event_notifications(
     sub.events
         .iter()
         .filter_map(|e| {
-            let infos = compute_event_infos(engine, e.event);
+            let filter = EventInfoFilter::from_event_subscription(e);
+            let infos = compute_event_infos(engine, e.event, &filter);
+
+            // G2-1: no data for this event → do not report it at all.
+            if infos.as_array().is_none_or(|a| a.is_empty()) {
+                return None;
+            }
 
             // THRESHOLD gate (nwafd-07).
             if e.notification_method == Some(NotificationMethod::Threshold) {
@@ -288,6 +366,10 @@ pub fn build_notify_body(sub: &AnalyticsSubscription, event_notifications: Vec<V
 /// Network errors are logged as warnings and do **not** abort the cycle for
 /// other subscriptions.  No `unwrap()` on any runtime-reachable path.
 pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
+    // G2-1: keep the NRF NFStatusSubscribe channel alive (initial retry +
+    // validityTime renewal) on the existing dispatcher tick — no extra loop.
+    crate::nrf_collector::maybe_renew_nrf_subscription(&ctx).await;
+
     let subscriptions: Vec<AnalyticsSubscription> = {
         match ctx.read() {
             Ok(guard) => guard.get_all_active_subscriptions(),
@@ -298,15 +380,17 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
         }
     };
 
-    let mut engine = AnalyticsEngine::new();
-
     for sub in &subscriptions {
         if !sub.is_due_for_notification() {
             continue;
         }
 
+        // Lock order (nf-context-lock-deadlocks): context read → engine mutex.
         let event_notifications = match ctx.read() {
-            Ok(guard) => build_event_notifications(&guard, &mut engine, sub),
+            Ok(guard) => {
+                let engine = guard.lock_engine();
+                build_event_notifications(&guard, &engine, sub)
+            }
             Err(e) => {
                 log::error!("dispatch_notifications: failed to read context: {e}");
                 continue;
@@ -485,19 +569,39 @@ mod tests {
 
     // ── T5.3: notify body shape ──────────────────────────────────────────────
 
+    /// Ingest `n` NRF-style load samples (0..=100) for an instance into the
+    /// context's shared engine (G2-1: samples only ever come from NRF data).
+    fn ingest_loads(ctx: &NwdafContext, nf_type: &str, instance: &str, loads: &[u8]) {
+        let mut engine = ctx.lock_engine();
+        for &load in loads {
+            engine.ingest_nf_load(crate::analytics::NfLoadSample::now(
+                nf_type,
+                instance,
+                f64::from(load) / 100.0,
+                0.0,
+                0,
+            ));
+        }
+    }
+
     /// nwafd-04: the Notify body is an `NnwdafEventsSubscriptionNotification`:
     /// it MUST carry `subscriptionId`, `notifCorrId`, and `eventNotifications[]`
     /// where each entry has `event` and the event-specific `*Infos` **array**
     /// (`nfLoadLevelInfos` for NF_LOAD). The legacy `reportList` /
     /// `notificationCorrelationId` keys MUST be gone.
+    ///
+    /// G2-1: the reported data comes from ingested NRF-sourced samples — the
+    /// old synthetic self-sample is gone, so the test seeds real samples.
     #[test]
     fn test_notify_body_shape() {
         let (ctx_arc, sub_id) = make_ctx_with_sub("http://amf.local:8080/notify", Some(60));
         let ctx = ctx_arc.read().unwrap();
+        ingest_loads(&ctx, "AMF", "amf-notify-shape", &[30, 32]);
         let sub = ctx.get_subscription(&sub_id).unwrap();
 
-        let mut engine = AnalyticsEngine::new();
-        let event_notifications = build_event_notifications(&ctx, &mut engine, &sub);
+        let engine = ctx.lock_engine();
+        let event_notifications = build_event_notifications(&ctx, &engine, &sub);
+        drop(engine);
         let body = build_notify_body(&sub, event_notifications);
 
         assert_eq!(
@@ -749,25 +853,23 @@ mod tests {
     }
 
     /// A THRESHOLD event is suppressed below its threshold and emitted at/above
-    /// it; a PERIODIC event is unaffected. The synthetic NF load is ≈30
-    /// (cpu 0.3 × 100).
+    /// it; a PERIODIC event is unaffected. G2-1: the load level under test is
+    /// **ingested** (NRF-sourced samples at load 30), not the former synthetic
+    /// self-sample constant.
     #[test]
     fn test_threshold_event_gating_vs_periodic() {
-        use crate::context::EventSubscription;
-
         let ctx = NwdafContext::new("nwdaf-test".to_string());
-        let mut engine = AnalyticsEngine::new();
+        ingest_loads(&ctx, "AMF", "amf-thr-01", &[30, 30]);
 
-        let thr_event = |threshold: u64| EventSubscription {
-            event: AnalyticsId::NfLoad,
-            notification_method: Some(NotificationMethod::Threshold),
-            rep_period_secs: None,
-            load_level_threshold: Some(threshold),
-            matching_dir: Some("ASCENDING".to_string()),
-            snssais: Vec::new(),
+        let thr_event = |threshold: u64| {
+            let mut e = EventSubscription::periodic(AnalyticsId::NfLoad);
+            e.notification_method = Some(NotificationMethod::Threshold);
+            e.load_level_threshold = Some(threshold);
+            e.matching_dir = Some("ASCENDING".to_string());
+            e
         };
 
-        // Threshold 80 > load ≈30 → suppressed (no event reported).
+        // Threshold 80 > ingested load 30 → suppressed (no event reported).
         let mut sub_high = AnalyticsSubscription::new(
             "sub-high".into(),
             AnalyticsId::NfLoad,
@@ -775,12 +877,13 @@ mod tests {
             u64::MAX,
         );
         sub_high.events = vec![thr_event(80)];
+        let engine = ctx.lock_engine();
         assert!(
-            build_event_notifications(&ctx, &mut engine, &sub_high).is_empty(),
-            "THRESHOLD must not fire when load (≈30) is below threshold 80"
+            build_event_notifications(&ctx, &engine, &sub_high).is_empty(),
+            "THRESHOLD must not fire when ingested load (30) is below threshold 80"
         );
 
-        // Threshold 20 ≤ load ≈30 → fires (one EventNotification).
+        // Threshold 20 ≤ ingested load 30 → fires (one EventNotification).
         let mut sub_low = AnalyticsSubscription::new(
             "sub-low".into(),
             AnalyticsId::NfLoad,
@@ -789,9 +892,9 @@ mod tests {
         );
         sub_low.events = vec![thr_event(20)];
         assert_eq!(
-            build_event_notifications(&ctx, &mut engine, &sub_low).len(),
+            build_event_notifications(&ctx, &engine, &sub_low).len(),
             1,
-            "THRESHOLD must fire when load (≈30) is at/above threshold 20"
+            "THRESHOLD must fire when ingested load (30) is at/above threshold 20"
         );
 
         // PERIODIC (the default from `new`) is unaffected by thresholds.
@@ -802,9 +905,187 @@ mod tests {
             u64::MAX,
         );
         assert_eq!(
-            build_event_notifications(&ctx, &mut engine, &sub_periodic).len(),
+            build_event_notifications(&ctx, &engine, &sub_periodic).len(),
             1,
-            "PERIODIC subscription must always report"
+            "PERIODIC subscription must always report when data exists"
+        );
+    }
+
+    // ── G2-1: NRF-sourced NF_LOAD computation ────────────────────────────────
+
+    /// The hard-coded self-sample is gone: with an empty engine, NF_LOAD
+    /// computes NO infos, and a PERIODIC subscription reports NOTHING (no
+    /// fabricated data, no empty-array entry).
+    #[test]
+    fn test_no_ingested_data_reports_nothing() {
+        let ctx = NwdafContext::new("nwdaf-test".to_string());
+        let engine = ctx.lock_engine();
+
+        let infos = compute_event_infos(&engine, AnalyticsId::NfLoad, &EventInfoFilter::none());
+        assert_eq!(
+            infos.as_array().map(Vec::len),
+            Some(0),
+            "no samples → empty infos, never a fabricated self-sample"
+        );
+
+        let sub = AnalyticsSubscription::new(
+            "sub-empty".into(),
+            AnalyticsId::NfLoad,
+            "http://x/y".into(),
+            u64::MAX,
+        );
+        assert!(
+            build_event_notifications(&ctx, &engine, &sub).is_empty(),
+            "an event with no data must be suppressed entirely"
+        );
+    }
+
+    /// One NfLoadLevelInformation per NF instance with samples; the
+    /// per-event `nfTypes`/`nfInstanceIds` filters are honored.
+    #[test]
+    fn test_per_instance_infos_and_filters() {
+        let ctx = NwdafContext::new("nwdaf-test".to_string());
+        ingest_loads(&ctx, "AMF", "amf-multi-01", &[10, 20]);
+        ingest_loads(&ctx, "SMF", "smf-multi-01", &[40, 50]);
+        ingest_loads(&ctx, "UPF", "upf-multi-01", &[70, 80]);
+        let engine = ctx.lock_engine();
+
+        // Unfiltered: 3 instances → 3 infos (sorted by instance id).
+        let infos = compute_event_infos(&engine, AnalyticsId::NfLoad, &EventInfoFilter::none());
+        let arr = infos.as_array().expect("array");
+        assert_eq!(arr.len(), 3, "one info per instance with samples");
+        assert_eq!(arr[0]["nfInstanceId"].as_str(), Some("amf-multi-01"));
+        assert_eq!(arr[0]["nfLoadLevelAverage"].as_u64(), Some(15));
+        assert_eq!(arr[0]["nfLoadLevelpeak"].as_u64(), Some(20));
+
+        // nfTypes filter.
+        let by_type = compute_event_infos(
+            &engine,
+            AnalyticsId::NfLoad,
+            &EventInfoFilter {
+                nf_instance_ids: Vec::new(),
+                nf_types: vec!["SMF".to_string()],
+            },
+        );
+        let arr = by_type.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["nfType"].as_str(), Some("SMF"));
+
+        // nfInstanceIds filter.
+        let by_id = compute_event_infos(
+            &engine,
+            AnalyticsId::NfLoad,
+            &EventInfoFilter {
+                nf_instance_ids: vec!["upf-multi-01".to_string()],
+                nf_types: Vec::new(),
+            },
+        );
+        let arr = by_id.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["nfInstanceId"].as_str(), Some("upf-multi-01"));
+
+        // Non-matching filter → empty.
+        let none = compute_event_infos(
+            &engine,
+            AnalyticsId::NfLoad,
+            &EventInfoFilter {
+                nf_instance_ids: vec!["nope".to_string()],
+                nf_types: Vec::new(),
+            },
+        );
+        assert_eq!(none.as_array().map(Vec::len), Some(0));
+    }
+
+    /// G2-1 spec-shaping regression: `confidence` is a TS 29.571 `Uinteger`
+    /// 0..=100 (never the old float R²), the non-spec `predictedLoad` vendor
+    /// key is gone, and `nfStatus` is the TS 29.520 object form sourced from
+    /// the cached NRF profile (never a bare string literal).
+    #[test]
+    fn test_nf_load_info_spec_shape() {
+        use crate::analytics::NfProfileMeta;
+
+        let ctx = NwdafContext::new("nwdaf-test".to_string());
+        ingest_loads(&ctx, "AMF", "amf-shape-01", &[10, 20, 30]);
+        {
+            let mut engine = ctx.lock_engine();
+            engine.upsert_nf_meta(
+                "amf-shape-01",
+                NfProfileMeta {
+                    nf_type: "AMF".to_string(),
+                    nf_status: "REGISTERED".to_string(),
+                    last_load: Some(30),
+                },
+            );
+        }
+        let engine = ctx.lock_engine();
+        let infos = compute_event_infos(&engine, AnalyticsId::NfLoad, &EventInfoFilter::none());
+        let info = &infos.as_array().expect("array")[0];
+
+        // confidence: integer 0..=100 (rejects the old float emission).
+        let confidence = &info["confidence"];
+        assert!(
+            confidence.is_u64(),
+            "confidence must be an integer Uinteger, got {confidence:?}"
+        );
+        assert!(confidence.as_u64().expect("u64") <= 100);
+
+        // predictedLoad (non-spec vendor key) must be gone.
+        assert!(
+            info.get("predictedLoad").is_none(),
+            "non-spec predictedLoad must not be emitted"
+        );
+
+        // nfStatus: TS 29.520 object form from the cached NRF profile.
+        assert_eq!(
+            info["nfStatus"]["statusRegistered"].as_u64(),
+            Some(100),
+            "nfStatus must be the object form sourced from the NRF profile"
+        );
+        assert!(
+            !info["nfStatus"].is_string(),
+            "nfStatus must never be a bare string literal"
+        );
+
+        // Mandatory IEs per the yaml allOf.
+        assert!(info["nfType"].is_string());
+        assert!(info["nfInstanceId"].is_string());
+    }
+
+    /// An instance whose cached NRF status is SUSPENDED reports
+    /// `statusUnregistered`, and NF_DEREGISTERED removal drops its data.
+    #[test]
+    fn test_nf_status_object_and_removal() {
+        use crate::analytics::NfProfileMeta;
+
+        let ctx = NwdafContext::new("nwdaf-test".to_string());
+        ingest_loads(&ctx, "SMF", "smf-status-01", &[42]);
+        {
+            let mut engine = ctx.lock_engine();
+            engine.upsert_nf_meta(
+                "smf-status-01",
+                NfProfileMeta {
+                    nf_type: "SMF".to_string(),
+                    nf_status: "SUSPENDED".to_string(),
+                    last_load: Some(42),
+                },
+            );
+        }
+        {
+            let engine = ctx.lock_engine();
+            let infos =
+                compute_event_infos(&engine, AnalyticsId::NfLoad, &EventInfoFilter::none());
+            let info = &infos.as_array().expect("array")[0];
+            assert_eq!(info["nfStatus"]["statusUnregistered"].as_u64(), Some(100));
+        }
+
+        // NF_DEREGISTERED → all data for the instance is dropped.
+        ctx.lock_engine().remove_nf_instance("smf-status-01");
+        let engine = ctx.lock_engine();
+        let infos = compute_event_infos(&engine, AnalyticsId::NfLoad, &EventInfoFilter::none());
+        assert_eq!(
+            infos.as_array().map(Vec::len),
+            Some(0),
+            "a deregistered instance must not be reported"
         );
     }
 }

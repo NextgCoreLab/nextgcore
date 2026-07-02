@@ -23,6 +23,7 @@ mod context;
 pub mod federation;
 pub mod ml_service;
 pub mod notification_dispatcher;
+pub mod nrf_collector;
 mod sbi_handler;
 
 pub use context::*;
@@ -161,6 +162,23 @@ async fn main() -> Result<()> {
         nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
     }
 
+    // G2-1: arm the NRF NF_LOAD collector and attempt the initial
+    // NFStatusSubscribe (TS 29.510 §5.2.2.5). Non-fatal on every failure —
+    // the dispatcher tick retries/renews; analytics degrade to no-data.
+    {
+        let ctx = nwdaf_self();
+        if let Ok(guard) = ctx.read() {
+            guard.set_nrf_collector_config(NrfCollectorConfig {
+                nrf_uri: args.nrf_uri.clone(),
+                callback_uri: format!(
+                    "http://{}:{}/nnwdaf-nfstatus-notify/v1/notify",
+                    args.sbi_addr, args.sbi_port
+                ),
+            });
+        }
+        nrf_collector::subscribe_nf_status(&ctx).await;
+    }
+
     // Spawn the notification dispatcher background task (T5.3).
     // It wakes every DEFAULT_DISPATCH_INTERVAL_SECS (30 s), computes analytics,
     // and POSTs Nnwdaf_EventsSubscription_Notify to all due subscribers.
@@ -234,6 +252,14 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "PUT" => handle_ml_prov_subscription_update(subscription_id, &request).await,
             "DELETE" => handle_ml_prov_subscription_delete(subscription_id).await,
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
+        },
+
+        // G2-1: Nnrf_NFManagement NFStatusNotify callback (TS 29.510
+        // §5.2.2.6) — the NRF POSTs NotificationData here; NFProfile.load
+        // becomes the NF_LOAD analytics data.
+        ["nnwdaf-nfstatus-notify", "v1", "notify"] => match method {
+            "POST" => nrf_collector::handle_nf_status_notify(&request).await,
+            _ => send_method_not_allowed(method, "notify"),
         },
 
         _ => send_not_found(&format!("Resource not found: {path}"), None),
@@ -397,13 +423,60 @@ mod tests {
 
     #[tokio::test]
     async fn test_routing_analytics_get_is_routed() {
-        // A GET with a valid event-id reaches the handler and yields 200.
-        let req = SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD");
+        // A GET with a valid event-id reaches the handler. G2-1: the handler
+        // computes from ingested NRF data only, so seed the global engine with
+        // a sample for a test-unique instance and filter the query to it —
+        // proving the route reaches the real handler AND real data flows back.
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        {
+            let ctx = nwdaf_self();
+            let guard = ctx.read().unwrap();
+            guard
+                .lock_engine()
+                .ingest_nf_load(crate::analytics::NfLoadSample::now(
+                    "AMF",
+                    "amf-route-test",
+                    0.5,
+                    0.0,
+                    0,
+                ));
+        }
+        let req = SbiRequest::get(
+            "/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD&event-filter=%7B%22nfInstanceIds%22%3A%5B%22amf-route-test%22%5D%7D",
+        );
         let resp = nwdaf_sbi_request_handler(req).await;
         assert_eq!(
             resp.status, 200,
-            "GET /analytics?event-id=NF_LOAD must be 200"
+            "GET /analytics?event-id=NF_LOAD with data must be 200"
         );
+    }
+
+    // --- G2-1: NFStatusNotify callback route ---
+
+    #[tokio::test]
+    async fn test_routing_nfstatus_notify_post_routed() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let req = SbiRequest::post("/nnwdaf-nfstatus-notify/v1/notify")
+            .with_json_body(&serde_json::json!({
+                "event": "NF_REGISTERED",
+                "nfInstanceUri": "http://n/nnrf-nfm/v1/nf-instances/amf-route-notify",
+                "nfProfile": {
+                    "nfInstanceId": "amf-route-notify",
+                    "nfType": "AMF",
+                    "nfStatus": "REGISTERED",
+                    "load": 10
+                }
+            }))
+            .expect("valid JSON body");
+        let resp = nwdaf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 204, "NFStatusNotify must route and return 204");
+    }
+
+    #[tokio::test]
+    async fn test_routing_nfstatus_notify_get_is_405() {
+        let req = SbiRequest::get("/nnwdaf-nfstatus-notify/v1/notify");
+        let resp = nwdaf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 405, "GET on the notify callback must be 405");
     }
 
     // --- nwafd-05: Nnwdaf_MLModelProvision is Subscribe/Notify, not /models ---
@@ -462,5 +535,218 @@ mod tests {
             None,
             "context b must not observe context a's NRF URI"
         );
+    }
+}
+
+/// G2-1 STRICT-PEER test (the pcfd lesson: no lenient mocks).
+///
+/// The conformant peer is our REAL nrfd: its NF-instance registry
+/// (`nf_manager`), its real `apply_json_patch`, its real
+/// `NotificationData`/`profileChanges` serializer and its real HTTP notify
+/// sender (`nrf_nnrf_nfm_send_*_notify_all_async`) deliver TS 29.510
+/// NFStatusNotify bodies over a real socket to nwdafd's REAL SBI server and
+/// router. Analytics are then queried back over the wire via
+/// Nnwdaf_AnalyticsInfo.
+#[cfg(test)]
+mod g21_strict_peer_tests {
+    use super::*;
+    use nextgcore_nrfd::{
+        apply_json_patch, nf_manager, nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async,
+        nrf_nnrf_nfm_send_nf_status_notify_all_async, ChangeItem, NfProfile,
+        NotificationEventType, SubscriptionData,
+    };
+    use nextgcore_sbi::client::SbiClient;
+    use serde_json::{json, Value};
+
+    const INSTANCE: &str = "g21-strict-amf";
+    /// Percent-encoded `{"nfInstanceIds":["g21-strict-amf"]}`.
+    const FILTER_QS: &str = "%7B%22nfInstanceIds%22%3A%5B%22g21-strict-amf%22%5D%7D";
+    const NRF_SELF_URI: &str = "http://nrf.test:7777";
+
+    async fn get_nf_load(client: &SbiClient) -> (u16, Option<Value>) {
+        let uri = format!(
+            "/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD&event-filter={FILTER_QS}"
+        );
+        let resp = client
+            .send_request(SbiRequest::get(&uri))
+            .await
+            .expect("GET analytics over the wire");
+        let body = resp
+            .http
+            .content
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<Value>(b).ok());
+        (resp.status, body)
+    }
+
+    fn avg_of(body: &Option<Value>) -> u64 {
+        body.as_ref()
+            .and_then(|b| b.get("nfLoadLevelInfos"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|i| i.get("nfLoadLevelAverage"))
+            .and_then(|v| v.as_u64())
+            .expect("nfLoadLevelAverage present")
+    }
+
+    /// Full chain: NRF NF_REGISTERED → PATCH /load (two different values) →
+    /// NF_DEREGISTERED, all delivered by nrfd's real notify pipeline, with the
+    /// reported nfLoadLevelAverage tracking every PATCHed value and analytics
+    /// going dark (204) after deregistration.
+    #[tokio::test]
+    async fn test_g21_strict_peer_nrf_load_ingestion() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+
+        // Real nwdafd SBI server on a free localhost port.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
+        server
+            .start(nwdaf_sbi_request_handler)
+            .await
+            .expect("nwdafd server starts");
+
+        // Conformant peer state: our real nrfd registry with a fake AMF whose
+        // profile carries load=40, plus a subscription pointing at nwdafd's
+        // real NFStatusNotify callback.
+        let profile = NfProfile::from_json(&json!({
+            "nfInstanceId": INSTANCE,
+            "nfType": "AMF",
+            "nfStatus": "REGISTERED",
+            "load": 40,
+        }))
+        .expect("valid NFProfile");
+        nf_manager()
+            .register(profile.clone())
+            .expect("register at nrfd");
+        nf_manager().add_subscription(SubscriptionData {
+            id: "g21-strict-sub".to_string(),
+            req_nf_type: Some("NWDAF".to_string()),
+            req_nf_instance_id: None,
+            notification_uri: format!(
+                "http://127.0.0.1:{port}/nnwdaf-nfstatus-notify/v1/notify"
+            ),
+            subscr_cond: None, // all NFs
+            validity_duration: 3600,
+        });
+
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // ── Leg A: NF_REGISTERED (full profile, load 40) ────────────────────
+        let sent = nrf_nnrf_nfm_send_nf_status_notify_all_async(
+            NotificationEventType::NfRegistered,
+            &profile,
+            NRF_SELF_URI,
+        )
+        .await
+        .expect("nrfd delivers NF_REGISTERED");
+        assert_eq!(sent, 1, "exactly our subscription must be notified");
+
+        let (status, body) = get_nf_load(&client).await;
+        assert_eq!(status, 200, "data exists after NF_REGISTERED");
+        assert_eq!(avg_of(&body), 40, "average must equal the registered load");
+        let info = body.as_ref().expect("body")["nfLoadLevelInfos"][0].clone();
+        assert_eq!(info["nfInstanceId"].as_str(), Some(INSTANCE));
+        assert_eq!(
+            info["nfStatus"]["statusRegistered"].as_u64(),
+            Some(100),
+            "nfStatus must come from the NRF profile, in the TS 29.520 object form"
+        );
+        assert!(info["confidence"].is_u64(), "confidence is a Uinteger");
+        assert!(
+            info.get("predictedLoad").is_none(),
+            "non-spec predictedLoad must not appear on the wire"
+        );
+
+        // ── Leg B: PATCH /load → 80, via nrfd's real patch + notify path ────
+        let pre = profile.to_json();
+        let patch = json!([{"op": "replace", "path": "/load", "value": 80}]);
+        let mut post = pre.clone();
+        apply_json_patch(&mut post, &patch).expect("nrfd applies the PATCH");
+        let updated80 = NfProfile::from_json(&post).expect("patched profile");
+        let sent = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
+            &updated80,
+            NRF_SELF_URI,
+            vec![ChangeItem {
+                op: "replace".to_string(),
+                path: "/load".to_string(),
+                value: Some(json!(80)),
+                orig_value: Some(json!(40)),
+            }],
+        )
+        .await
+        .expect("nrfd delivers NF_PROFILE_CHANGED");
+        assert_eq!(sent, 1);
+
+        let (status, body) = get_nf_load(&client).await;
+        assert_eq!(status, 200);
+        // Samples [40, 80] → average 60.
+        assert_eq!(
+            avg_of(&body),
+            60,
+            "the reported average must move with the PATCHed load (40→80)"
+        );
+
+        // ── Leg B': a DIFFERENT PATCH value moves the average differently ───
+        let patch = json!([{"op": "replace", "path": "/load", "value": 90}]);
+        let mut post90 = post.clone();
+        apply_json_patch(&mut post90, &patch).expect("nrfd applies the PATCH");
+        let updated90 = NfProfile::from_json(&post90).expect("patched profile");
+        let sent = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
+            &updated90,
+            NRF_SELF_URI,
+            vec![ChangeItem {
+                op: "replace".to_string(),
+                path: "/load".to_string(),
+                value: Some(json!(90)),
+                orig_value: Some(json!(80)),
+            }],
+        )
+        .await
+        .expect("nrfd delivers NF_PROFILE_CHANGED");
+        assert_eq!(sent, 1);
+
+        let (status, body) = get_nf_load(&client).await;
+        assert_eq!(status, 200);
+        // Samples [40, 80, 90] → average 70 — a constant/fabricated value
+        // could not produce 40 → 60 → 70 tracking the PATCH sequence.
+        assert_eq!(
+            avg_of(&body),
+            70,
+            "a second, different PATCH value must move the average again"
+        );
+
+        // ── Fail-closed over the wire: mandatory-IE violation → 400 ─────────
+        let bad = client
+            .post_json(
+                "/nnwdaf-nfstatus-notify/v1/notify",
+                &json!({ "nfInstanceUri": "http://n/nnrf-nfm/v1/nf-instances/x" }),
+            )
+            .await
+            .expect("POST over the wire");
+        assert_eq!(bad.status, 400, "missing event must fail closed with 400");
+
+        // ── Leg C: NF_DEREGISTERED → analytics go dark (204, no fabrication) ─
+        let sent = nrf_nnrf_nfm_send_nf_status_notify_all_async(
+            NotificationEventType::NfDeregistered,
+            &updated90,
+            NRF_SELF_URI,
+        )
+        .await
+        .expect("nrfd delivers NF_DEREGISTERED");
+        assert_eq!(sent, 1);
+
+        let (status, body) = get_nf_load(&client).await;
+        assert_eq!(
+            status, 204,
+            "after the data source is gone, NF_LOAD must be 204 — numbers here would mean fabricated analytics"
+        );
+        assert!(body.is_none(), "204 carries no body");
+
+        server.stop().await.expect("server stops");
     }
 }

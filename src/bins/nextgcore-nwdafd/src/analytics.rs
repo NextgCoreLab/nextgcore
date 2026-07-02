@@ -53,6 +53,21 @@ impl NfLoadSample {
     }
 }
 
+/// Cached per-NF-instance profile metadata sourced from NRF
+/// NFStatusSubscribe/Notify (TS 29.510 §5.2.2.5/§5.2.2.6). This is the
+/// authoritative record of what the NRF last told us about an instance —
+/// `nf_status` feeds the emitted `NfLoadLevelInformation.nfStatus` and
+/// `last_load` is the base value `profileChanges` `/load` deltas apply to.
+#[derive(Debug, Clone)]
+pub struct NfProfileMeta {
+    /// NF type from the NRF profile (e.g., "AMF")
+    pub nf_type: String,
+    /// NF status token from the NRF profile ("REGISTERED" / "SUSPENDED" / ...)
+    pub nf_status: String,
+    /// Last known NFProfile.load (0..=100), when the profile carried one
+    pub last_load: Option<u8>,
+}
+
 /// NF load analytics report
 #[derive(Debug, Clone)]
 pub struct NfLoadAnalytics {
@@ -112,6 +127,9 @@ pub struct AbnormalBehaviourRecord {
 pub struct AnalyticsEngine {
     /// NF load samples, keyed by NF instance ID, bounded circular buffer (last 100)
     nf_samples: HashMap<String, Vec<NfLoadSample>>,
+    /// Cached NRF profile metadata per NF instance (G2-1: fed by the
+    /// Nnrf_NFManagement NFStatusNotify ingestion path)
+    nf_meta: HashMap<String, NfProfileMeta>,
     /// UE mobility history: last observed cell per SUPI
     ue_cells: HashMap<String, Vec<(u64, u64)>>, // (cell_id, timestamp)
     /// Anomaly scores per SUPI
@@ -133,6 +151,37 @@ impl AnalyticsEngine {
             buf.remove(0);
         }
         buf.push(sample);
+    }
+
+    /// Upsert the cached NRF profile metadata for an NF instance (G2-1).
+    pub fn upsert_nf_meta(&mut self, nf_instance_id: &str, meta: NfProfileMeta) {
+        self.nf_meta.insert(nf_instance_id.to_string(), meta);
+    }
+
+    /// Cached NRF profile metadata for an NF instance, if any.
+    pub fn nf_meta(&self, nf_instance_id: &str) -> Option<&NfProfileMeta> {
+        self.nf_meta.get(nf_instance_id)
+    }
+
+    /// Drop everything known about an NF instance (samples + cached profile
+    /// metadata). Called on NF_DEREGISTERED so analytics never report data
+    /// for an instance the NRF says is gone (G2-1 fail-closed).
+    pub fn remove_nf_instance(&mut self, nf_instance_id: &str) {
+        self.nf_samples.remove(nf_instance_id);
+        self.nf_meta.remove(nf_instance_id);
+    }
+
+    /// All NF instance IDs that currently have at least one load sample,
+    /// sorted for deterministic emission order.
+    pub fn nf_instance_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .nf_samples
+            .iter()
+            .filter(|(_, samples)| !samples.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// Compute NF load analytics for a given instance.

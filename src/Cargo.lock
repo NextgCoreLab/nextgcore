@@ -2580,6 +2580,7 @@ dependencies = [
  "nextgcore-app",
  "nextgcore-core",
  "nextgcore-metrics",
+ "nextgcore-nrfd",
  "nextgcore-sbi",
  "proptest",
  "serde",

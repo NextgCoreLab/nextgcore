@@ -28,6 +28,9 @@ chrono = "0.4"
 
 [dev-dependencies]
 proptest.workspace = true
+# G2-1 strict-peer test: our REAL nrfd (registry + NF_PROFILE_CHANGED notify
+# builder + HTTP sender) is the conformant peer — no mocks.
+nextgcore-nrfd = { path = "../nextgcore-nrfd" }
 
 [lints]
 workspace = true

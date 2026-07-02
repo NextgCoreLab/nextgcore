@@ -3,9 +3,10 @@
 //! Network Data Analytics Function context (TS 23.288)
 //! Manages analytics subscriptions, ML models, and data collection
 
+use crate::analytics::AnalyticsEngine;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 /// Analytics event types defined in TS 29.520 `NwdafEvent` (Rel-16/17/18).
 ///
@@ -223,6 +224,12 @@ pub struct EventSubscription {
     pub matching_dir: Option<String>,
     /// Per-event slice filters (`snssais`).
     pub snssais: Vec<SNssai>,
+    /// Per-event NF-instance filter (`nfInstanceIds`, TS 29.520
+    /// `EventSubscription`); empty = no filter (G2-1).
+    pub nf_instance_ids: Vec<String>,
+    /// Per-event NF-type filter (`nfTypes`, TS 29.520 `EventSubscription`);
+    /// empty = no filter (G2-1).
+    pub nf_types: Vec<String>,
 }
 
 impl EventSubscription {
@@ -236,6 +243,8 @@ impl EventSubscription {
             load_level_threshold: None,
             matching_dir: None,
             snssais: Vec::new(),
+            nf_instance_ids: Vec::new(),
+            nf_types: Vec::new(),
         }
     }
 
@@ -417,6 +426,28 @@ impl MlProvSubscription {
     }
 }
 
+/// State of the NWDAF's own Nnrf_NFManagement NFStatusSubscribe subscription
+/// at the NRF (TS 29.510 §5.2.2.5) — the G2-1 NF_LOAD data-collection channel.
+#[derive(Debug, Clone)]
+pub struct NrfStatusSubscription {
+    /// NRF-assigned `subscriptionId`.
+    pub subscription_id: String,
+    /// Absolute expiry (Unix seconds) parsed from the NRF's `validityTime`,
+    /// when the NRF returned one. `None` = no expiry communicated.
+    pub validity_unix: Option<u64>,
+}
+
+/// Where the G2-1 NRF collector subscribes and where the NRF must deliver
+/// NFStatusNotify callbacks. Set once at startup by `main()`; read by the
+/// dispatcher tick for (re-)subscription.
+#[derive(Debug, Clone)]
+pub struct NrfCollectorConfig {
+    /// NRF base URI (e.g., `http://127.0.0.1:7777`).
+    pub nrf_uri: String,
+    /// Our absolute `nfStatusNotificationUri` callback.
+    pub callback_uri: String,
+}
+
 /// Data source configuration for analytics collection
 #[derive(Debug, Clone)]
 pub struct DataSource {
@@ -445,6 +476,17 @@ pub struct NwdafContext {
     event_levels: RwLock<HashMap<String, f64>>,
     /// Data sources (nf_instance_id -> source)
     data_sources: RwLock<HashMap<String, DataSource>>,
+    /// The analytics engine (G2-1): sample store + computation, shared by the
+    /// Nnwdaf_AnalyticsInfo handler, the notification dispatcher and the NRF
+    /// NFStatusNotify ingestion path so samples actually accumulate.
+    ///
+    /// LOCK ORDER (nf-context-lock-deadlocks): always take the outer context
+    /// `RwLock` (read) FIRST, then this `Mutex` — never the reverse.
+    engine: Mutex<AnalyticsEngine>,
+    /// Our own NFStatusSubscribe subscription at the NRF (G2-1), if active.
+    nrf_status_subscription: RwLock<Option<NrfStatusSubscription>>,
+    /// NRF collector configuration (G2-1), set by `main()` at startup.
+    nrf_collector_config: RwLock<Option<NrfCollectorConfig>>,
     /// Next internal ID generator
     next_id: AtomicUsize,
     /// Maximum subscriptions
@@ -461,6 +503,9 @@ impl NwdafContext {
             ml_prov_subscriptions: RwLock::new(HashMap::new()),
             event_levels: RwLock::new(HashMap::new()),
             data_sources: RwLock::new(HashMap::new()),
+            engine: Mutex::new(AnalyticsEngine::new()),
+            nrf_status_subscription: RwLock::new(None),
+            nrf_collector_config: RwLock::new(None),
             next_id: AtomicUsize::new(1),
             max_subscriptions: 0,
             initialized: AtomicBool::new(false),
@@ -496,8 +541,57 @@ impl NwdafContext {
         if let Ok(mut sources) = self.data_sources.write() {
             sources.clear();
         }
+        if let Ok(engine) = self.engine.get_mut() {
+            *engine = AnalyticsEngine::new();
+        }
+        if let Ok(mut sub) = self.nrf_status_subscription.write() {
+            *sub = None;
+        }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("NWDAF context finalized");
+    }
+
+    /// Lock the shared analytics engine (G2-1).
+    ///
+    /// LOCK ORDER: callers must already hold (or not need) the outer context
+    /// `RwLock`; never acquire the outer lock while holding this guard.
+    /// A poisoned mutex is recovered (`into_inner`) rather than panicking on a
+    /// runtime-reachable path.
+    pub fn lock_engine(&self) -> MutexGuard<'_, AnalyticsEngine> {
+        self.engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The active NFStatusSubscribe subscription at the NRF, if any (G2-1).
+    pub fn nrf_status_subscription(&self) -> Option<NrfStatusSubscription> {
+        self.nrf_status_subscription
+            .read()
+            .ok()
+            .and_then(|s| s.clone())
+    }
+
+    /// Record (or clear) the NFStatusSubscribe subscription state (G2-1).
+    pub fn set_nrf_status_subscription(&self, sub: Option<NrfStatusSubscription>) {
+        if let Ok(mut slot) = self.nrf_status_subscription.write() {
+            *slot = sub;
+        }
+    }
+
+    /// The NRF collector configuration, if `main()` armed it (G2-1).
+    pub fn nrf_collector_config(&self) -> Option<NrfCollectorConfig> {
+        self.nrf_collector_config
+            .read()
+            .ok()
+            .and_then(|c| c.clone())
+    }
+
+    /// Arm the NRF collector (G2-1): stores where to subscribe and the
+    /// callback URI the NRF must POST NFStatusNotify to.
+    pub fn set_nrf_collector_config(&self, config: NrfCollectorConfig) {
+        if let Ok(mut slot) = self.nrf_collector_config.write() {
+            *slot = Some(config);
+        }
     }
 
     pub fn is_initialized(&self) -> bool {
