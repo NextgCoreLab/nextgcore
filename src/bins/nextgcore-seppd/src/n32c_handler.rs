@@ -905,13 +905,15 @@ pub fn local_ipx_provider_sec_info(fqdn: &str) -> Option<Vec<IpxProviderSecInfo>
 }
 
 /// Register the ES256 modifications-signing public keys a peer advertises in its
-/// `ipxProviderSecInfoList` (TS 29.573 §6.1.5.2.15). Each RI's raw public keys
-/// (RFC 7468 PEM) are stored under its `ipxProviderId` so the modificationsBlock
-/// JWS entries that RI signs can be verified (TS 33.501 §13.2.4.6). The list is
-/// OPTIONAL per spec (only `n32fContextId` is mandatory in SecParamExchReqData),
+/// `ipxProviderSecInfoList` (TS 29.573 §6.1.5.2.15/§6.1.5.2.18). An RI may carry
+/// its signing key either as a raw `rawPublicKeyList` (RFC 7468 SubjectPublicKeyInfo
+/// PEM) or inside an X.509 `certificateList`; both are OPTIONAL and both are
+/// honoured here, stored under the RI's `ipxProviderId` so the modificationsBlock
+/// JWS entries that RI signs can be verified (TS 33.501 §13.2.4.6). The list
+/// itself is OPTIONAL (only `n32fContextId` is mandatory in SecParamExchReqData),
 /// so a missing/empty list is accepted; any later modificationsBlock from an
-/// unregistered signer is still rejected at unprotect time. A malformed raw
-/// public key fails the handshake.
+/// unregistered signer is still rejected at unprotect time. Fail-closed: a
+/// malformed raw key OR a malformed/non-ES256 certificate fails the handshake.
 fn register_peer_ipx_sec_info(
     peer: &str,
     list: Option<&[IpxProviderSecInfo]>,
@@ -930,14 +932,20 @@ fn register_peer_ipx_sec_info(
                 })?;
                 crate::prins::register_verifying_key(info.ipx_provider_id.clone(), vk);
             }
-        } else if info.certificate_list.is_some() {
-            // certificateList (RFC 7468 X.509) key extraction is not yet
-            // supported; such RIs are left unregistered and any modificationsBlock
-            // they sign will fail verification at unprotect time.
-            log::warn!(
-                "[{peer}] RI [{}] advertised only certificateList; X.509 key extraction unsupported, ignoring",
-                info.ipx_provider_id
-            );
+        }
+        if let Some(certs) = info.certificate_list.as_ref() {
+            // certificateList (X.509) signing-key profile: recover each cert's
+            // ES256 SubjectPublicKeyInfo and register it, so a cert-profile RI's
+            // modificationsBlock can be verified (TS 29.573 §6.1.5.2.18).
+            for cert in certs {
+                let vk = crate::jose::parse_es256_public_key_from_cert(cert).map_err(|e| {
+                    format!(
+                        "peer [{peer}] RI [{}] sent bad X.509 signing certificate: {e}",
+                        info.ipx_provider_id
+                    )
+                })?;
+                crate::prins::register_verifying_key(info.ipx_provider_id.clone(), vk);
+            }
         }
     }
     Ok(())
@@ -1408,6 +1416,52 @@ mod tests {
             ipx_provider_id: "ri-bad.example.com".to_string(),
             raw_public_key_list: Some(vec!["not-a-pem".to_string()]),
             certificate_list: None,
+        }];
+        assert!(register_peer_ipx_sec_info("p", Some(&bad)).is_err());
+    }
+
+    /// Strict-peer (I3): a peer/RI that advertises its ES256 signing key via an
+    /// X.509 `certificateList` (instead of a raw public key) gets that key
+    /// extracted and registered, and a modificationsBlock JWS it signs then
+    /// verifies against the registered key — i.e. our SEPP (verifier) accepts a
+    /// cert-profile SEPP's (signer's) signature. Fail-closed on a bad cert.
+    #[test]
+    fn test_register_peer_ipx_sec_info_registers_certificate_key() {
+        use p256::ecdsa::SigningKey;
+        // Signer's real ES256 identity, advertised as an X.509 certificate.
+        let sk = SigningKey::from_slice(&[0x33u8; 32]).unwrap();
+        let vk = *sk.verifying_key();
+        let cert_pem = crate::jose::build_test_x509_cert_pem(&vk);
+        let list = vec![IpxProviderSecInfo {
+            ipx_provider_id: "ri-cert.example.com".to_string(),
+            raw_public_key_list: None,
+            certificate_list: Some(vec![cert_pem]),
+        }];
+        register_peer_ipx_sec_info("sepp-peer.example.com", Some(&list)).unwrap();
+
+        // The extracted key is registered and IS the signer's real key.
+        let registered = crate::prins::all_verifying_keys();
+        let got = registered
+            .get("ri-cert.example.com")
+            .expect("certificate signing key registered");
+        assert_eq!(got, &vk);
+
+        // Strict-peer proof: signer signs, our SEPP verifies with the cert key.
+        let jws =
+            crate::jose::jws_sign_es256(&sk, b"modificationsBlock-entry", Some("ri-cert.example.com"))
+                .unwrap();
+        assert_eq!(
+            crate::jose::jws_verify_es256(got, &jws).unwrap(),
+            b"modificationsBlock-entry"
+        );
+
+        // Fail-closed: a malformed certificate fails the handshake.
+        let bad = vec![IpxProviderSecInfo {
+            ipx_provider_id: "ri-badcert.example.com".to_string(),
+            raw_public_key_list: None,
+            certificate_list: Some(vec![
+                "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n".to_string(),
+            ]),
         }];
         assert!(register_peer_ipx_sec_info("p", Some(&bad)).is_err());
     }

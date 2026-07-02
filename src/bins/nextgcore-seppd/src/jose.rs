@@ -520,6 +520,165 @@ pub fn parse_es256_public_key_pem(pem: &str) -> Result<VerifyingKey, JoseError> 
         .map_err(|e| JoseError::Crypto(format!("bad ES256 public key PEM: {e}")))
 }
 
+// ============================================================================
+// X.509 certificate signing-key extraction (TS 29.573 §6.1.5.2.18
+// IpxProviderSecInfo.certificateList; TS 33.501 §13.2.4.6 modificationsBlock).
+//
+// N32-c peers may advertise their ES256 modifications-signing key either as a
+// raw SubjectPublicKeyInfo (the `rawPublicKeyList` PEM handled above) OR inside
+// an X.509 certificate (`certificateList`). To verify a modificationsBlock a
+// cert-profile peer signs, we must recover the SPKI from the certificate.
+//
+// x509-cert is not vendored offline, so the certificate is walked with a
+// strict, fail-closed DER TLV reader that descends Certificate -> tbsCertificate
+// and returns the raw `subjectPublicKeyInfo` element. That SPKI is then handed
+// to p256/`spki` (`VerifyingKey::from_public_key_der`), which performs the
+// security-critical validation: only a well-formed secp256r1 point on the
+// ecPublicKey/prime256v1 algorithm is accepted. A location bug in the walker
+// therefore still fails closed at the key decode; a non-ES256 (e.g. RSA or
+// P-384) certificate is rejected, matching the raw-key path.
+// ============================================================================
+
+/// DER `SEQUENCE` (constructed) tag.
+const DER_SEQUENCE: u8 = 0x30;
+/// DER `[0]` EXPLICIT context-specific constructed tag (`tbsCertificate.version`).
+const DER_CONTEXT_EXPLICIT_0: u8 = 0xA0;
+
+/// One parsed DER TLV: its tag byte, the length of the tag+length header, and
+/// the content length. The element occupies `header_len + content_len` bytes
+/// starting at the read offset.
+struct DerTlv {
+    tag: u8,
+    header_len: usize,
+    content_len: usize,
+}
+
+/// Read a single DER TLV at `data[pos..]`. Strict / fail-closed: definite
+/// lengths only (indefinite form is not valid DER), high-tag-number form is
+/// rejected (never used on the Certificate spine we walk), and the element is
+/// bounds-checked against the buffer.
+fn der_read_tlv(data: &[u8], pos: usize) -> Result<DerTlv, JoseError> {
+    let e = |m: &str| JoseError::Format(format!("X.509 DER: {m}"));
+    let tag = *data.get(pos).ok_or_else(|| e("truncated at tag"))?;
+    if tag & 0x1f == 0x1f {
+        return Err(e("high-tag-number form unsupported"));
+    }
+    let len_byte = *data.get(pos + 1).ok_or_else(|| e("truncated at length"))?;
+    let (content_len, len_size) = if len_byte & 0x80 == 0 {
+        (len_byte as usize, 1usize)
+    } else {
+        let n = (len_byte & 0x7f) as usize;
+        if n == 0 {
+            return Err(e("indefinite length is not valid DER"));
+        }
+        if n > 4 {
+            return Err(e("length field too large"));
+        }
+        let mut len = 0usize;
+        for k in 0..n {
+            let b = *data
+                .get(pos + 2 + k)
+                .ok_or_else(|| e("truncated in long-form length"))?;
+            len = (len << 8) | b as usize;
+        }
+        (len, 1 + n)
+    };
+    let header_len = 1 + len_size;
+    let end = pos
+        .checked_add(header_len)
+        .and_then(|h| h.checked_add(content_len))
+        .ok_or_else(|| e("length overflow"))?;
+    if end > data.len() {
+        return Err(e("element exceeds buffer"));
+    }
+    Ok(DerTlv {
+        tag,
+        header_len,
+        content_len,
+    })
+}
+
+/// Extract the raw `subjectPublicKeyInfo` DER element from an X.509 certificate
+/// DER. Walks `Certificate ::= SEQUENCE { tbsCertificate, .. }` then the
+/// `tbsCertificate` fields, skipping the optional `[0] version` and the fixed
+/// prefix `serialNumber, signature, issuer, validity, subject` to reach the
+/// SPKI (RFC 5280 §4.1). Returns the SPKI as its own DER SEQUENCE for
+/// `VerifyingKey::from_public_key_der`.
+fn spki_der_from_x509_der(cert: &[u8]) -> Result<Vec<u8>, JoseError> {
+    let e = |m: &str| JoseError::Format(format!("X.509: {m}"));
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    let outer = der_read_tlv(cert, 0)?;
+    if outer.tag != DER_SEQUENCE {
+        return Err(e("Certificate is not a SEQUENCE"));
+    }
+    if outer.header_len + outer.content_len != cert.len() {
+        return Err(e("trailing bytes after Certificate"));
+    }
+    let tbs_container = &cert[outer.header_len..outer.header_len + outer.content_len];
+    // tbsCertificate ::= SEQUENCE { .. } (first element of Certificate)
+    let tbs_hdr = der_read_tlv(tbs_container, 0)?;
+    if tbs_hdr.tag != DER_SEQUENCE {
+        return Err(e("tbsCertificate is not a SEQUENCE"));
+    }
+    let tbs = &tbs_container[tbs_hdr.header_len..tbs_hdr.header_len + tbs_hdr.content_len];
+
+    let mut pos = 0usize;
+    // Optional [0] EXPLICIT version (DEFAULT v1 -> absent in v1 certs).
+    let first = der_read_tlv(tbs, pos)?;
+    if first.tag == DER_CONTEXT_EXPLICIT_0 {
+        pos += first.header_len + first.content_len;
+    }
+    // Skip the five fixed fields before the SPKI: serialNumber, signature,
+    // issuer, validity, subject.
+    for _ in 0..5 {
+        let f = der_read_tlv(tbs, pos)?;
+        pos += f.header_len + f.content_len;
+    }
+    // subjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey }
+    let spki = der_read_tlv(tbs, pos)?;
+    if spki.tag != DER_SEQUENCE {
+        return Err(e("subjectPublicKeyInfo is not a SEQUENCE"));
+    }
+    let spki_end = pos + spki.header_len + spki.content_len;
+    Ok(tbs[pos..spki_end].to_vec())
+}
+
+/// Decode an X.509 certificate supplied as RFC 7468 PEM (`-----BEGIN
+/// CERTIFICATE-----`) or bare base64 DER into raw DER bytes. Fail-closed on any
+/// base64 error or a missing PEM footer.
+fn decode_certificate(input: &str) -> Result<Vec<u8>, JoseError> {
+    use base64::engine::general_purpose::STANDARD;
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let trimmed = input.trim();
+    let body: String = if let Some(begin) = trimmed.find(BEGIN) {
+        let after = &trimmed[begin + BEGIN.len()..];
+        let end = after
+            .find(END)
+            .ok_or_else(|| JoseError::Format("X.509 PEM: missing END CERTIFICATE".into()))?;
+        after[..end].split_whitespace().collect()
+    } else {
+        trimmed.split_whitespace().collect()
+    };
+    STANDARD
+        .decode(body.as_bytes())
+        .map_err(|err| JoseError::Format(format!("X.509: bad base64 certificate: {err}")))
+}
+
+/// Extract and validate the ES256 (ECDSA P-256) signing key from an X.509
+/// certificate supplied as RFC 7468 PEM or bare base64 DER, for the N32-c
+/// `IpxProviderSecInfo.certificateList` profile (TS 29.573 §6.1.5.2.18,
+/// TS 33.501 §13.2.4.6). Fail-closed: any structural DER error, or an SPKI that
+/// is not a valid secp256r1 public key, is rejected. The final key validation
+/// is delegated to p256/`spki`, so only genuine ES256 keys are accepted.
+pub fn parse_es256_public_key_from_cert(cert: &str) -> Result<VerifyingKey, JoseError> {
+    let der = decode_certificate(cert)?;
+    let spki = spki_der_from_x509_der(&der)?;
+    VerifyingKey::from_public_key_der(&spki).map_err(|err| {
+        JoseError::Crypto(format!("certificate SPKI is not a valid ES256 key: {err}"))
+    })
+}
+
 /// Read the `kid` and `alg` header of a flattened JWS without verifying it.
 /// Used to locate the registered public key for the entity that signed it.
 pub fn jws_peek_header(jws: &FlatJws) -> Result<(String, Option<String>), JoseError> {
@@ -527,6 +686,71 @@ pub fn jws_peek_header(jws: &FlatJws) -> Result<(String, Option<String>), JoseEr
     let header: JwsHeader = serde_json::from_slice(&header_bytes)
         .map_err(|e| JoseError::Format(format!("JWS header: {e}")))?;
     Ok((header.alg, header.kid))
+}
+
+/// Test-only: build a minimal but structurally-valid X.509 v3 certificate DER
+/// (RFC 5280 §4.1 spine) wrapping the given `subjectPublicKeyInfo` bytes, then
+/// PEM-armor it. The signature is a placeholder — extraction never validates
+/// it. Shared with the n32c_handler cert-registration tests.
+#[cfg(test)]
+pub(crate) fn build_test_x509_cert_pem_from_spki(spki: &[u8]) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else if len < 0x100 {
+            out.push(0x81);
+            out.push(len as u8);
+        } else {
+            out.push(0x82);
+            out.push((len >> 8) as u8);
+            out.push((len & 0xff) as u8);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+    // AlgorithmIdentifier { ecdsa-with-SHA256 } (OID 1.2.840.10045.4.3.2).
+    let sig_algid = tlv(0x30, &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]);
+    let version = tlv(DER_CONTEXT_EXPLICIT_0, &tlv(0x02, &[0x02])); // [0] INTEGER 2 (v3)
+    let serial = tlv(0x02, &[0x01]); // serialNumber
+    let issuer = tlv(0x30, &[]); // empty RDNSequence
+    let mut validity_content = tlv(0x17, b"260101000000Z"); // UTCTime notBefore
+    validity_content.extend_from_slice(&tlv(0x17, b"270101000000Z")); // UTCTime notAfter
+    let validity = tlv(0x30, &validity_content);
+    let subject = tlv(0x30, &[]); // empty RDNSequence
+
+    let mut tbs_content = Vec::new();
+    for part in [&version, &serial, &sig_algid, &issuer, &validity, &subject] {
+        tbs_content.extend_from_slice(part);
+    }
+    tbs_content.extend_from_slice(spki);
+    let tbs = tlv(0x30, &tbs_content);
+    let sig_value = tlv(0x03, &[0x00, 0xde, 0xad, 0xbe, 0xef]); // placeholder BIT STRING
+
+    let mut cert_content = Vec::new();
+    cert_content.extend_from_slice(&tbs);
+    cert_content.extend_from_slice(&sig_algid);
+    cert_content.extend_from_slice(&sig_value);
+    let cert = tlv(0x30, &cert_content);
+
+    let b64 = STANDARD.encode(&cert);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    pem
+}
+
+/// Test-only: build a certificate PEM carrying `vk`'s SubjectPublicKeyInfo.
+#[cfg(test)]
+pub(crate) fn build_test_x509_cert_pem(vk: &VerifyingKey) -> String {
+    use p256::pkcs8::EncodePublicKey;
+    let spki = vk.to_public_key_der().unwrap().as_bytes().to_vec();
+    build_test_x509_cert_pem_from_spki(&spki)
 }
 
 #[cfg(test)]
@@ -819,5 +1043,121 @@ mod tests {
 
         let jws = jws_sign_es256(&sk2, b"payload", None).unwrap();
         assert_eq!(jws_verify_es256(&vk2, &jws).unwrap(), b"payload");
+    }
+
+    /// Golden byte-vector: the SPKI recovered from an X.509 certificate by the
+    /// hand-rolled DER walk is byte-identical to the SPKI encoded independently
+    /// by p256/`spki` (dual-derivation, per the wave's golden-vector method),
+    /// AND matches the hand-derived RFC 5480 P-256 SPKI constant.
+    #[test]
+    fn es256_cert_spki_extraction_golden() {
+        // Fixed private scalar -> deterministic public key -> deterministic SPKI.
+        let sk = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
+        let vk = *sk.verifying_key();
+        let expected_spki = {
+            use p256::pkcs8::EncodePublicKey;
+            vk.to_public_key_der().unwrap().as_bytes().to_vec()
+        };
+
+        let cert_pem = build_test_x509_cert_pem(&vk);
+        let der = decode_certificate(&cert_pem).unwrap();
+        let spki = spki_der_from_x509_der(&der).unwrap();
+
+        // Derivation 1 (hand DER walk) == derivation 2 (p256/spki encoder).
+        assert_eq!(spki, expected_spki);
+        // Hand-derived spec constant: a P-256 SubjectPublicKeyInfo is 91 bytes
+        // and begins with SEQUENCE{ SEQUENCE{ ecPublicKey OID, prime256v1 OID },
+        // BIT STRING 00 04 } (RFC 5480 §2.1.1).
+        assert_eq!(spki.len(), 91);
+        let p256_spki_prefix: [u8; 27] = [
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+        ];
+        assert_eq!(&spki[..27], &p256_spki_prefix);
+
+        // The recovered VerifyingKey is A's actual key, and verifies A's JWS.
+        let recovered = parse_es256_public_key_from_cert(&cert_pem).unwrap();
+        assert_eq!(recovered, vk);
+        let jws = jws_sign_es256(&sk, b"modificationsBlock", None).unwrap();
+        assert_eq!(jws_verify_es256(&recovered, &jws).unwrap(), b"modificationsBlock");
+    }
+
+    /// The cert path is fail-closed: junk, truncated DER, and a structurally
+    /// valid certificate whose SPKI is not a secp256r1 key are all rejected.
+    #[test]
+    fn es256_cert_extraction_fail_closed() {
+        // Not PEM and not base64.
+        assert!(parse_es256_public_key_from_cert("this is not a certificate!").is_err());
+
+        // Empty / no key material.
+        assert!(parse_es256_public_key_from_cert("").is_err());
+
+        // Truncated DER (outer SEQUENCE header intact, body cut).
+        let (_sk, vk) = es256_keypair();
+        let cert_pem = build_test_x509_cert_pem(&vk);
+        let mut der = decode_certificate(&cert_pem).unwrap();
+        der.truncate(der.len() / 2);
+        assert!(spki_der_from_x509_der(&der).is_err());
+
+        // Structurally valid cert, but the SPKI is a bogus SEQUENCE (not a
+        // P-256 key): the walker extracts it, p256's decode rejects it.
+        let bogus_spki: Vec<u8> = vec![0x30, 0x03, 0x02, 0x01, 0x00]; // SEQUENCE { INTEGER 0 }
+        let bogus_cert = build_test_x509_cert_pem_from_spki(&bogus_spki);
+        let extracted = {
+            let d = decode_certificate(&bogus_cert).unwrap();
+            spki_der_from_x509_der(&d).unwrap()
+        };
+        assert_eq!(extracted, bogus_spki); // walker located it correctly
+        assert!(parse_es256_public_key_from_cert(&bogus_cert).is_err()); // key decode fails closed
+
+        // Missing PEM footer.
+        assert!(parse_es256_public_key_from_cert("-----BEGIN CERTIFICATE-----\nQUJD").is_err());
+    }
+
+    /// A v1 certificate (no `[0] version` field) is also walked correctly:
+    /// with the optional version absent, the SPKI is still located.
+    #[test]
+    fn es256_cert_spki_extraction_no_version_field() {
+        use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
+        let sk = SigningKey::from_slice(&[0x2au8; 32]).unwrap();
+        let vk = *sk.verifying_key();
+        let spki = vk.to_public_key_der().unwrap().as_bytes().to_vec();
+
+        // Build a v1 TBSCertificate: serialNumber, signature, issuer, validity,
+        // subject, subjectPublicKeyInfo (NO [0] version).
+        fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            let len = content.len();
+            if len < 0x80 {
+                out.push(len as u8);
+            } else {
+                out.push(0x81);
+                out.push(len as u8);
+            }
+            out.extend_from_slice(content);
+            out
+        }
+        let sig_algid = tlv(0x30, &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]);
+        let mut validity_content = tlv(0x17, b"260101000000Z");
+        validity_content.extend_from_slice(&tlv(0x17, b"270101000000Z"));
+        let mut tbs_content = Vec::new();
+        tbs_content.extend_from_slice(&tlv(0x02, &[0x01])); // serialNumber
+        tbs_content.extend_from_slice(&sig_algid); // signature
+        tbs_content.extend_from_slice(&tlv(0x30, &[])); // issuer
+        tbs_content.extend_from_slice(&tlv(0x30, &validity_content)); // validity
+        tbs_content.extend_from_slice(&tlv(0x30, &[])); // subject
+        tbs_content.extend_from_slice(&spki); // subjectPublicKeyInfo
+        let tbs = tlv(0x30, &tbs_content);
+        let mut cert_content = tbs;
+        cert_content.extend_from_slice(&sig_algid);
+        cert_content.extend_from_slice(&tlv(0x03, &[0x00, 0x01]));
+        let cert = tlv(0x30, &cert_content);
+
+        let got = spki_der_from_x509_der(&cert).unwrap();
+        assert_eq!(got, spki);
+        assert_eq!(
+            VerifyingKey::from_public_key_der(&got).unwrap(),
+            vk
+        );
     }
 }
