@@ -429,12 +429,8 @@ mod tests {
     #[test]
     fn golden_n1n2_transfer_multipart_body() {
         let lpp: Vec<u8> = vec![0x92, 0x00, 0x1C, 0x00, 0x07];
-        let request = build_n1n2_transfer_request(
-            "imsi-001010000000001",
-            "corr-0001",
-            "lmf-1",
-            lpp.clone(),
-        );
+        let request =
+            build_n1n2_transfer_request("imsi-001010000000001", "corr-0001", "lmf-1", lpp.clone());
         assert_eq!(
             request.header.uri,
             "/namf-comm/v1/ue-contexts/imsi-001010000000001/n1-n2-messages"
@@ -480,7 +476,11 @@ mod tests {
 
         let boundary = multipart::generate_boundary();
         let content_type = multipart::content_type_with_boundary(&boundary);
-        let wire = multipart::encode(request.http.content.as_deref(), &request.http.parts, &boundary);
+        let wire = multipart::encode(
+            request.http.content.as_deref(),
+            &request.http.parts,
+            &boundary,
+        );
 
         let decoded = multipart::decode(&content_type, &wire).expect("multipart decode");
         let root = decoded.json.expect("jsonData root part");

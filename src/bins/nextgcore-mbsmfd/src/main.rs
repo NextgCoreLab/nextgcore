@@ -166,8 +166,11 @@ fn apply_oauth2_enforcement(
 ) -> NextgcoreSbiServerConfig {
     cfg.require_oauth2 = true;
     let uri = (!nrf_uri.is_empty()).then_some(nrf_uri);
-    cfg.oauth2_jwks_uri =
-        uri.map(|u| nextgcore_sbi::oauth::JwksCache::for_nrf(u).jwks_uri().to_string());
+    cfg.oauth2_jwks_uri = uri.map(|u| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(u)
+            .jwks_uri()
+            .to_string()
+    });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Mbsmf);
     if let Some(u) = uri {
         let nf_instance_id = format!("mbsmf-{}", uuid::Uuid::new_v4());
@@ -253,13 +256,14 @@ async fn main() -> Result<()> {
         // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
         // (active MBS sessions, saturated at 100; TS 29.510 §5.2.2.3.2).
         // Honest session-count proxy — no fabricated CPU numbers.
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id.clone(), 5, || {
-            let load = mbsmf_self()
-                .read()
-                .map(|c| c.session_count())
-                .unwrap_or(0);
-            load.min(100) as u8
-        });
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+            nf_instance_id.clone(),
+            5,
+            || {
+                let load = mbsmf_self().read().map(|c| c.session_count()).unwrap_or(0);
+                load.min(100) as u8
+            },
+        );
     }
 
     log::info!("NextGCore MB-SMF ready (instance: {nf_instance_id})");
@@ -1259,12 +1263,10 @@ async fn handle_context_update_amf(
         }
         // Response-direction IE types are invalid in a request (TS 29.532
         // §5.3.2.5 step 1) — fail-closed.
-        types::NgapIeType::MbsDisSetupRsp | types::NgapIeType::MbsDisSetupFail => {
-            send_bad_request(
-                "response-direction ngapIeType in ContextUpdate request",
-                Some("INVALID_MSG_FORMAT"),
-            )
-        }
+        types::NgapIeType::MbsDisSetupRsp | types::NgapIeType::MbsDisSetupFail => send_bad_request(
+            "response-direction ngapIeType in ContextUpdate request",
+            Some("INVALID_MSG_FORMAT"),
+        ),
         types::NgapIeType::Unknown => send_bad_request(
             "unknown ngapIeType in ContextUpdate request",
             Some("INVALID_MSG_FORMAT"),
@@ -2530,8 +2532,7 @@ mod tests {
     #[test]
     fn test_context_update_rsp_contract_rejects_old_stub_shape() {
         // Old stub shape (pre-G1-2): dangling RefToBinaryData.
-        let old_stub =
-            r#"{"n2MbsSmInfo":{"ngapIeType":"MBS_DIS_SETUP_REQ","ngapData":{"contentId":"n2MbsSmInfo"}}}"#;
+        let old_stub = r#"{"n2MbsSmInfo":{"ngapIeType":"MBS_DIS_SETUP_REQ","ngapData":{"contentId":"n2MbsSmInfo"}}}"#;
         let err = check_ctx_update_rsp_contract(old_stub, &[]).unwrap_err();
         assert!(err.contains("dangling contentId"), "got: {err}");
 
@@ -2793,7 +2794,12 @@ mod oauth2_h8_tests {
             .port()
     }
 
-    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str, scope: &str) -> String {
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -2845,7 +2851,11 @@ mod oauth2_h8_tests {
     fn test_oauth2_require_knob_parses_and_defaults_off() {
         let dir = std::env::temp_dir();
         let off = dir.join(format!("mbsmf-h8-off-{}.yaml", std::process::id()));
-        std::fs::write(&off, "mbsmf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n").unwrap();
+        std::fs::write(
+            &off,
+            "mbsmf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n",
+        )
+        .unwrap();
         assert!(!super::oauth2_required(off.to_str().unwrap()));
         let on = dir.join(format!("mbsmf-h8-on-{}.yaml", std::process::id()));
         std::fs::write(&on, "mbsmf:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();

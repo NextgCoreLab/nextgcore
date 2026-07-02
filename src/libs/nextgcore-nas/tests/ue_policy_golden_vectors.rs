@@ -209,8 +209,8 @@ fn vec_c_os_app_id_rule_recomputes() {
     let s = walk_ursp_rule(VEC_C_URSP_RULE_OS_APP_ID);
     assert_eq!(s.precedence, 100);
     assert_eq!(s.td_ids, vec![0x08]); // OS Id + OS App Id
-    // TD value: 16-octet OS Id + 1-octet App Id length + "app1"
-    // (24526-i50.txt:2504-2506).
+                                      // TD value: 16-octet OS Id + 1-octet App Id length + "app1"
+                                      // (24526-i50.txt:2504-2506).
     let td_len = be16(VEC_C_URSP_RULE_OS_APP_ID, 3);
     assert_eq!(td_len, 1 + 16 + 1 + 4);
     let td = &VEC_C_URSP_RULE_OS_APP_ID[5..5 + td_len];
@@ -267,8 +267,16 @@ fn vec_e_section_list_recomputes_and_embeds_vec_a() {
     let part_len = be16(v, 11);
     assert_eq!(part_len, v.len() - 13);
     let part_type_octet = v[13];
-    assert_eq!(part_type_octet & 0xF0, 0, "bits 8..5 of octet q+2 are spare");
-    assert_eq!(part_type_octet & 0x0F, 0x01, "part type must be URSP (0001)");
+    assert_eq!(
+        part_type_octet & 0xF0,
+        0,
+        "bits 8..5 of octet q+2 are spare"
+    );
+    assert_eq!(
+        part_type_octet & 0x0F,
+        0x01,
+        "part type must be URSP (0001)"
+    );
 
     // Part contents == exactly the catch-all rule vector (a).
     assert_eq!(&v[14..], VEC_A_URSP_RULE_CATCH_ALL);

@@ -552,7 +552,8 @@ mod tests {
     #[test]
     fn a4_lpp_ecid_provide_golden_vector_to_measurements() {
         use nextgcore_asn1c::lpp::ecid::{
-            EcidProvideLocationInformation, EcidSignalMeasurementInformation, MeasuredResultsElement,
+            EcidProvideLocationInformation, EcidSignalMeasurementInformation,
+            MeasuredResultsElement,
         };
         let primary = MeasuredResultsElement {
             phys_cell_id: 42,
@@ -603,17 +604,28 @@ mod tests {
         // vectors in nextgcore-asn1c/src/lpp/ecid.rs). This guards the wire
         // encode without hand-transcribing the deeply-nested octets here.
         let redecoded = LppMessage::decode(&bytes).expect("re-decode E-CID provide");
-        assert_eq!(redecoded, msg, "E-CID ProvideLocationInformation must round-trip byte-exact");
+        assert_eq!(
+            redecoded, msg,
+            "E-CID ProvideLocationInformation must round-trip byte-exact"
+        );
 
         // Decode through the A4 adapter and assert the anchored values.
         let (txn, cells) = decode_lpp_ecid_report(&bytes).expect("decode E-CID report");
         assert_eq!(txn, 9, "LPP transactionNumber survives");
-        assert_eq!(cells.len(), 2, "primary (serving) cell first, then the list");
+        assert_eq!(
+            cells.len(),
+            2,
+            "primary (serving) cell first, then the list"
+        );
 
         assert_eq!(cells[0].nr_cgi, "pci-42");
         assert_eq!(cells[0].rsrp, Some(-80), "rsrp-Result 60 -> 60-140 dBm");
         assert_eq!(cells[0].rsrq, Some(20), "rsrq-Result raw index");
-        assert_eq!(cells[0].timing_advance, Some(700), "ue-RxTxTimeDiff -> TA term");
+        assert_eq!(
+            cells[0].timing_advance,
+            Some(700),
+            "ue-RxTxTimeDiff -> TA term"
+        );
         assert_eq!(cells[0].rtt_ns, None);
         assert_eq!(cells[0].rstd_ns, None);
 

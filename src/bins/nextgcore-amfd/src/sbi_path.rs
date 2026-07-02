@@ -1380,7 +1380,10 @@ pub fn advertised_sbi_base() -> String {
 /// (WSB-4, TS 29.503 §5.3.2.3.2). Routed by `namf_server` at
 /// `POST /namf-callback/v1/{supi}/dereg-notify`.
 pub fn dereg_callback_uri(supi: &str) -> String {
-    format!("{}/namf-callback/v1/{supi}/dereg-notify", advertised_sbi_base())
+    format!(
+        "{}/namf-callback/v1/{supi}/dereg-notify",
+        advertised_sbi_base()
+    )
 }
 
 /// Nudm_UECM_Registration (amf3gpp-access):
@@ -1692,7 +1695,9 @@ pub async fn call_pcf_ue_policy_delete(
     );
 
     let response = client
-        .delete(&format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}"))
+        .delete(&format!(
+            "/npcf-ue-policy-control/v1/policies/{pol_asso_id}"
+        ))
         .await
         .map_err(|e| SbiError::RequestFailed(format!("UE policy delete failed: {e}")))?;
 

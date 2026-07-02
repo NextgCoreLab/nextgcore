@@ -189,7 +189,9 @@ fn encode_plmn_bcd(plmn: &PlmnId) -> NasResult<[u8; 3]> {
         )));
     }
     let digits_ok = plmn.mcc.iter().all(|d| *d <= 9)
-        && plmn.mnc[..usize::from(plmn.mnc_len)].iter().all(|d| *d <= 9);
+        && plmn.mnc[..usize::from(plmn.mnc_len)]
+            .iter()
+            .all(|d| *d <= 9);
     if !digits_ok {
         return Err(NasError::EncodingError(
             "PLMN MCC/MNC digits must be BCD (0..=9)".into(),
@@ -1194,7 +1196,11 @@ impl UePolicySectionManagementList {
     pub fn encode_lv_e(&self) -> NasResult<Vec<u8>> {
         let contents = self.encode_contents()?;
         let mut out = Vec::with_capacity(2 + contents.len());
-        push_u16_len(&mut out, contents.len(), "UE policy section management list")?;
+        push_u16_len(
+            &mut out,
+            contents.len(),
+            "UE policy section management list",
+        )?;
         out.extend_from_slice(&contents);
         Ok(out)
     }
@@ -1590,7 +1596,11 @@ impl ManageUePolicyCommandReject {
         let mut out = Vec::with_capacity(4 + contents.len());
         out.push(self.pti);
         out.push(UPDP_MSG_MANAGE_UE_POLICY_COMMAND_REJECT);
-        push_u16_len(&mut out, contents.len(), "UE policy section management result")?;
+        push_u16_len(
+            &mut out,
+            contents.len(),
+            "UE policy section management result",
+        )?;
         out.extend_from_slice(&contents);
         Ok(out)
     }
@@ -1818,9 +1828,9 @@ mod tests {
     #[test]
     fn duplicate_singleton_rsd_components_rejected() {
         let mut rule = catch_all_rule();
-        rule.route_selection_descriptors[0]
-            .components
-            .push(RouteSelectionDescriptorComponent::SscMode(SscMode::SscMode2));
+        rule.route_selection_descriptors[0].components.push(
+            RouteSelectionDescriptorComponent::SscMode(SscMode::SscMode2),
+        );
         assert!(encode_ursp_rules(&[rule]).is_err());
     }
 
@@ -1874,7 +1884,10 @@ mod tests {
             }],
         };
         let lv_e = list.encode_lv_e().unwrap();
-        assert_eq!(UePolicySectionManagementList::decode_lv_e(&lv_e).unwrap(), list);
+        assert_eq!(
+            UePolicySectionManagementList::decode_lv_e(&lv_e).unwrap(),
+            list
+        );
     }
 
     #[test]

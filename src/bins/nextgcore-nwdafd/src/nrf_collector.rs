@@ -781,8 +781,9 @@ mod tests {
     /// subscrCond is omitted so ALL NF instances match.
     #[test]
     fn test_subscription_body_shape() {
-        let body =
-            build_nf_status_subscription_body("http://10.0.0.5:7815/nnwdaf-nfstatus-notify/v1/notify");
+        let body = build_nf_status_subscription_body(
+            "http://10.0.0.5:7815/nnwdaf-nfstatus-notify/v1/notify",
+        );
         assert_eq!(
             body["nfStatusNotificationUri"].as_str(),
             Some("http://10.0.0.5:7815/nnwdaf-nfstatus-notify/v1/notify")
@@ -823,11 +824,9 @@ mod tests {
         assert_eq!(sub.validity_unix, Some(1_782_907_200));
 
         // Location-header fallback.
-        let sub = parse_subscription_create_response(
-            None,
-            Some("/nnrf-nfm/v1/subscriptions/sub-456"),
-        )
-        .expect("parsed");
+        let sub =
+            parse_subscription_create_response(None, Some("/nnrf-nfm/v1/subscriptions/sub-456"))
+                .expect("parsed");
         assert_eq!(sub.subscription_id, "sub-456");
         assert_eq!(sub.validity_unix, None);
 

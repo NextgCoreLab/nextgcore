@@ -25,7 +25,10 @@ async fn known_bad_pcf_binding_gets_real_400() {
         .expect("serialize");
     let resp = nextgcore_bsfd::bsf_sbi_request_handler(req).await;
 
-    assert_eq!(resp.status, 400, "real validation must reject, not mock-2xx");
+    assert_eq!(
+        resp.status, 400,
+        "real validation must reject, not mock-2xx"
+    );
     let problem: serde_json::Value =
         serde_json::from_str(resp.http.content.as_deref().expect("problem body")).expect("json");
     assert_eq!(problem["cause"], "MANDATORY_IE_MISSING");

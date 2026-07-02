@@ -244,7 +244,10 @@ mod tests {
         assert_eq!(sub.eec_id, "eec1.example.com");
         assert_eq!(sub.eas_ids.len(), 2);
         assert_eq!(sub.event_ids, "TARGET_INFORMATION");
-        assert_eq!(sub.notification_destination, "http://eec.example.com/acr-cb");
+        assert_eq!(
+            sub.notification_destination,
+            "http://eec.example.com/acr-cb"
+        );
         assert_eq!(sub.request_test_notification, Some(true));
 
         let wire = serde_json::to_value(&sub).unwrap();
@@ -370,7 +373,10 @@ mod tests {
             r#"{"notificationDestination":"http://cb2","eventIds":"ACR_COMPLETE"}"#,
         )
         .unwrap();
-        assert_eq!(patch.notification_destination.as_deref(), Some("http://cb2"));
+        assert_eq!(
+            patch.notification_destination.as_deref(),
+            Some("http://cb2")
+        );
         assert_eq!(patch.event_ids.as_deref(), Some("ACR_COMPLETE"));
         assert!(patch.exp_time.is_none());
         // Empty merge document is valid (all-optional).
@@ -387,16 +393,21 @@ mod tests {
             r#"{"easId":"e","eventId":"ACR_COMPLETE"}"#
         )
         .is_err());
-        assert!(
-            serde_json::from_str::<ACRInfoNotification>(r#"{"subId":"s","eventId":"ACR_COMPLETE"}"#)
-                .is_err()
-        );
+        assert!(serde_json::from_str::<ACRInfoNotification>(
+            r#"{"subId":"s","eventId":"ACR_COMPLETE"}"#
+        )
+        .is_err());
         assert!(
             serde_json::from_str::<ACRInfoNotification>(r#"{"subId":"s","easId":"e"}"#).is_err()
         );
     }
 
-    fn sub_for(event: &str, eec: &str, eas_ids: &[&str], ue: Option<&str>) -> ACREventsSubscription {
+    fn sub_for(
+        event: &str,
+        eec: &str,
+        eas_ids: &[&str],
+        ue: Option<&str>,
+    ) -> ACREventsSubscription {
         ACREventsSubscription {
             eec_id: eec.into(),
             eas_ids: eas_ids.iter().map(|s| s.to_string()).collect(),
@@ -414,7 +425,12 @@ mod tests {
     /// Matching: event + easId-membership + identity, all conservative.
     #[test]
     fn test_matches_conservative_filter() {
-        let s = sub_for(EVENT_TARGET_INFORMATION, "eec-1", &["eas-s.example.com"], None);
+        let s = sub_for(
+            EVENT_TARGET_INFORMATION,
+            "eec-1",
+            &["eas-s.example.com"],
+            None,
+        );
         // Happy path: event + easId + eecId all match.
         assert!(s.matches(
             EVENT_TARGET_INFORMATION,
@@ -423,7 +439,12 @@ mod tests {
             Some("eas-s.example.com")
         ));
         // Wrong event → no fire.
-        assert!(!s.matches(EVENT_ACR_COMPLETE, Some("eec-1"), None, Some("eas-s.example.com")));
+        assert!(!s.matches(
+            EVENT_ACR_COMPLETE,
+            Some("eec-1"),
+            None,
+            Some("eas-s.example.com")
+        ));
         // easId not in the subscribed set → no fire.
         assert!(!s.matches(EVENT_TARGET_INFORMATION, Some("eec-1"), None, Some("eas-x")));
         // Wrong eecId (and no ueId match) → no fire.

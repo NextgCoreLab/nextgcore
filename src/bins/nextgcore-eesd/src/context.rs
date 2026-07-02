@@ -718,7 +718,9 @@ impl EesContext {
         let key = acr_ue_key(None, Some(&info.eec_id));
         if let Ok(mut states) = self.acr_states.write() {
             let state = states.entry(key).or_default();
-            state.requestor_id.get_or_insert_with(|| info.eec_id.clone());
+            state
+                .requestor_id
+                .get_or_insert_with(|| info.eec_id.clone());
             state.s_eas_endpoint = Some(info.s_as_end_point.clone());
             state.t_eas_endpoint = Some(info.t_as_end_point.clone());
             state.acr_params = Some(info.acr_params.clone());
@@ -1119,20 +1121,22 @@ impl EesContext {
         if updated.eas_id.trim().is_empty()
             || updated.notification_destination.trim().is_empty()
             || updated.event_subscs.is_empty()
-            || updated.event_subscs.iter().any(|e| e.event.trim().is_empty())
+            || updated
+                .event_subscs
+                .iter()
+                .any(|e| e.event.trim().is_empty())
         {
             return Err(UpdateError::Invalid);
         }
         updated.self_ = Some(format!("{ACRMGNT_SUB_COLLECTION}/{subscription_id}"));
         subs.insert(subscription_id.to_string(), updated.clone());
-        log::info!("ACR management event subscription merge-patched: subscriptionId={subscription_id}");
+        log::info!(
+            "ACR management event subscription merge-patched: subscriptionId={subscription_id}"
+        );
         Ok(updated)
     }
 
-    pub fn acrmgnt_sub_delete(
-        &self,
-        subscription_id: &str,
-    ) -> Option<AcrMgntEventsSubscription> {
+    pub fn acrmgnt_sub_delete(&self, subscription_id: &str) -> Option<AcrMgntEventsSubscription> {
         let removed = self
             .acr_mgnt_subscriptions
             .write()
@@ -1564,8 +1568,14 @@ mod tests {
         .unwrap();
 
         // UP_PATH_CHG for grp-1 → only A; grp-2 → A's filter excludes it → 0.
-        assert_eq!(ctx.notify_acrmgnt_subscribers("UP_PATH_CHG", Some("grp-1")), 1);
-        assert_eq!(ctx.notify_acrmgnt_subscribers("UP_PATH_CHG", Some("grp-2")), 0);
+        assert_eq!(
+            ctx.notify_acrmgnt_subscribers("UP_PATH_CHG", Some("grp-1")),
+            1
+        );
+        assert_eq!(
+            ctx.notify_acrmgnt_subscribers("UP_PATH_CHG", Some("grp-2")),
+            0
+        );
         // ACR_MONITORING (any group) → only B (unfiltered).
         assert_eq!(
             ctx.notify_acrmgnt_subscribers("ACR_MONITORING", Some("grp-9")),

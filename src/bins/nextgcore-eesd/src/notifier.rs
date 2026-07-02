@@ -397,16 +397,31 @@ mod tests {
     fn test_parse_callback_uri() {
         assert_eq!(
             parse_callback_uri("http://127.0.0.1:8080/acr-cb"),
-            Some((UriScheme::Http, "127.0.0.1".to_string(), 8080, "/acr-cb".to_string()))
+            Some((
+                UriScheme::Http,
+                "127.0.0.1".to_string(),
+                8080,
+                "/acr-cb".to_string()
+            ))
         );
         // Default ports per scheme when the authority omits a port.
         assert_eq!(
             parse_callback_uri("http://eec.example.com/cb"),
-            Some((UriScheme::Http, "eec.example.com".to_string(), 80, "/cb".to_string()))
+            Some((
+                UriScheme::Http,
+                "eec.example.com".to_string(),
+                80,
+                "/cb".to_string()
+            ))
         );
         assert_eq!(
             parse_callback_uri("https://eec.example.com/cb?x=1"),
-            Some((UriScheme::Https, "eec.example.com".to_string(), 443, "/cb?x=1".to_string()))
+            Some((
+                UriScheme::Https,
+                "eec.example.com".to_string(),
+                443,
+                "/cb?x=1".to_string()
+            ))
         );
         // No path → "/".
         assert_eq!(
@@ -432,14 +447,27 @@ mod tests {
         assert_eq!(retry_delay(&cfg, Some(&resp)), Some(Duration::from_secs(2)));
         // No Retry-After → base_backoff.
         let plain = SbiResponse::with_status(500);
-        assert_eq!(retry_delay(&cfg, Some(&plain)), Some(Duration::from_millis(50)));
+        assert_eq!(
+            retry_delay(&cfg, Some(&plain)),
+            Some(Duration::from_millis(50))
+        );
         // Transport error (no response) → base_backoff.
         assert_eq!(retry_delay(&cfg, None), Some(Duration::from_millis(50)));
         // honor_retry_after=false ignores the header.
-        let cfg_off = SbiNotifierConfig { honor_retry_after: false, ..cfg.clone() };
-        assert_eq!(retry_delay(&cfg_off, Some(&resp)), Some(Duration::from_millis(50)));
+        let cfg_off = SbiNotifierConfig {
+            honor_retry_after: false,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            retry_delay(&cfg_off, Some(&resp)),
+            Some(Duration::from_millis(50))
+        );
         // Zero base backoff → no wait.
-        let cfg_zero = SbiNotifierConfig { base_backoff: Duration::ZERO, honor_retry_after: false, ..cfg };
+        let cfg_zero = SbiNotifierConfig {
+            base_backoff: Duration::ZERO,
+            honor_retry_after: false,
+            ..cfg
+        };
         assert_eq!(retry_delay(&cfg_zero, None), None);
     }
 
@@ -531,7 +559,11 @@ mod tests {
         });
 
         assert!(
-            wait_until(|| counter.load(Ordering::SeqCst) >= 1, Duration::from_secs(5)).await,
+            wait_until(
+                || counter.load(Ordering::SeqCst) >= 1,
+                Duration::from_secs(5)
+            )
+            .await,
             "the notification should be POSTed to the subscriber"
         );
         // Settle: assert exactly one POST (no spurious retry on success).
@@ -569,7 +601,11 @@ mod tests {
         });
 
         assert!(
-            wait_until(|| counter.load(Ordering::SeqCst) >= 3, Duration::from_secs(5)).await,
+            wait_until(
+                || counter.load(Ordering::SeqCst) >= 3,
+                Duration::from_secs(5)
+            )
+            .await,
             "three attempts (two 500s then a 204)"
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -604,7 +640,11 @@ mod tests {
             "delivery should be abandoned after the attempt budget is spent"
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(counter.load(Ordering::SeqCst), 3, "exactly max_attempts POSTs");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "exactly max_attempts POSTs"
+        );
         assert_eq!(n.dropped_count(), 1);
         let _ = server.stop().await;
     }
@@ -616,8 +656,13 @@ mod tests {
         let port = free_port();
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let responder: Responder =
-            Arc::new(|n| if n == 0 { (503, Some("1".to_string())) } else { (204, None) });
+        let responder: Responder = Arc::new(|n| {
+            if n == 0 {
+                (503, Some("1".to_string()))
+            } else {
+                (204, None)
+            }
+        });
         let server = start_receiver(port, counter.clone(), bodies.clone(), responder).await;
 
         let n = SbiNotifier::spawn(SbiNotifierConfig {
@@ -634,7 +679,11 @@ mod tests {
         });
 
         assert!(
-            wait_until(|| counter.load(Ordering::SeqCst) >= 2, Duration::from_secs(6)).await,
+            wait_until(
+                || counter.load(Ordering::SeqCst) >= 2,
+                Duration::from_secs(6)
+            )
+            .await,
             "second attempt (after the Retry-After wait) succeeds"
         );
         let elapsed = start.elapsed();
@@ -715,7 +764,11 @@ mod tests {
         assert_eq!(matched, 1, "the filter-less subscription matches");
 
         assert!(
-            wait_until(|| counter.load(Ordering::SeqCst) >= 1, Duration::from_secs(5)).await,
+            wait_until(
+                || counter.load(Ordering::SeqCst) >= 1,
+                Duration::from_secs(5)
+            )
+            .await,
             "the discovery notification is delivered by the real sender"
         );
         let delivered = bodies.lock().unwrap()[0].clone();

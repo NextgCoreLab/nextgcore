@@ -583,7 +583,10 @@ pub fn apply_ue_policy_ul_container(pol_asso_id: &str, container: &[u8]) -> UePo
                 };
             }
             let cause = summarize_reject_result(&reject.result);
-            log::warn!("[{pol_asso_id}] UE policy REJECTED (PTI={:#04x}): {cause}", reject.pti);
+            log::warn!(
+                "[{pol_asso_id}] UE policy REJECTED (PTI={:#04x}): {cause}",
+                reject.pti
+            );
             ue_policy_update_delivery_state(
                 pol_asso_id,
                 DeliveryState::Failed(format!("MANAGE UE POLICY COMMAND REJECT: {cause}")),
@@ -751,7 +754,8 @@ pub fn map_pcfd_rule_to_wire(rule: &UrspRule) -> Result<nas_updp::UrspRule, Stri
         out
     };
 
-    let mut route_selection_descriptors = Vec::with_capacity(rule.route_selection_descriptors.len());
+    let mut route_selection_descriptors =
+        Vec::with_capacity(rule.route_selection_descriptors.len());
     for rsd in &rule.route_selection_descriptors {
         route_selection_descriptors.push(map_rsd(rsd)?);
     }
@@ -964,7 +968,9 @@ fn parse_one_rule(v: &serde_json::Value) -> Result<UrspRule, String> {
         .and_then(|r| r.as_array())
         .ok_or("missing 'routeSelectionDescriptors' array")?;
     if rsds_json.is_empty() {
-        return Err("'routeSelectionDescriptors' must be non-empty (TS 24.526 Figure 5.2.3)".into());
+        return Err(
+            "'routeSelectionDescriptors' must be non-empty (TS 24.526 Figure 5.2.3)".into(),
+        );
     }
     let mut route_selection_descriptors = Vec::with_capacity(rsds_json.len());
     for rsd in rsds_json {
@@ -1359,7 +1365,10 @@ mod tests {
         });
         // map errors and names the offending component (grep-able WARN source).
         let err = map_ue_policy_set_to_rules(&doc).expect_err("malformed urspRules must err");
-        assert!(err.contains("carrier-pigeon"), "error must name the component: {err}");
+        assert!(
+            err.contains("carrier-pigeon"),
+            "error must name the component: {err}"
+        );
         // resolve falls back to the static default (E1(f)).
         let rules = resolve_ursp_rules(Some(&doc));
         let bytes = build_manage_ue_policy_command(0x80, 1, "001", "01", &rules).expect("encode");
@@ -1385,7 +1394,10 @@ mod tests {
             ]
         });
         let err = map_ue_policy_set_to_rules(&dup).expect_err("duplicate precedence must err");
-        assert!(err.contains("precedence"), "error must mention precedence: {err}");
+        assert!(
+            err.contains("precedence"),
+            "error must mention precedence: {err}"
+        );
     }
 
     /// E3 step: resolved rules are provisioned into the process-global
@@ -1395,13 +1407,19 @@ mod tests {
     fn context_provision_round_trips_by_supi() {
         std::env::remove_var("PCF_URSP_RULES");
         let supi = "imsi-001019900000e3a";
-        assert!(context_ursp_for(supi).is_empty(), "unprovisioned SUPI is empty");
+        assert!(
+            context_ursp_for(supi).is_empty(),
+            "unprovisioned SUPI is empty"
+        );
         let doc = serde_json::json!({ "urspRules": provisioned_ims_ursp_rules_json() });
         let rules = resolve_ursp_rules(Some(&doc));
         provision_context_ursp(supi, rules);
         let back = context_ursp_for(supi);
         assert_eq!(back.len(), 1, "provisioned rule readable by SUPI");
-        assert_eq!(back[0].precedence, 10, "the provisioned ims rule (precedence 10)");
+        assert_eq!(
+            back[0].precedence, 10,
+            "the provisioned ims rule (precedence 10)"
+        );
     }
 
     // --- Wave-6 E6: T3501 + delivery-result correlation ----------------------
@@ -1462,7 +1480,10 @@ mod tests {
             "exactly one retransmission before abort"
         );
         assert!(
-            matches!(ue_policy_delivery_state(&id), Some(DeliveryState::Failed(_))),
+            matches!(
+                ue_policy_delivery_state(&id),
+                Some(DeliveryState::Failed(_))
+            ),
             "association aborts to Failed at 2 x T3501"
         );
     }
@@ -1552,7 +1573,10 @@ mod tests {
         let outcome = apply_ue_policy_ul_container(&id, &reject);
         match outcome {
             UePolicyResultOutcome::Rejected(cause) => {
-                assert!(cause.contains("UPSC"), "cause names the failed UPSC: {cause}");
+                assert!(
+                    cause.contains("UPSC"),
+                    "cause names the failed UPSC: {cause}"
+                );
             }
             other => panic!("expected Rejected, got {other:?}"),
         }

@@ -325,7 +325,10 @@ pub fn nextgcore_kdf_sor_mac_iausf(
     counter_sor: u16,
     steering_list: Option<&[u8]>,
 ) -> [u8; NEXTGCORE_KEY_LEN] {
-    debug_assert!(counter_sor != 0, "Counter_SoR 0x0000 is forbidden (TS 33.501 §6.14.2.3)");
+    debug_assert!(
+        counter_sor != 0,
+        "Counter_SoR 0x0000 is forbidden (TS 33.501 §6.14.2.3)"
+    );
 
     let mut params = [
         KdfParam::default(),
@@ -363,7 +366,10 @@ pub fn nextgcore_kdf_sor_mac_iue(
     kausf: &[u8; SHA256_DIGEST_SIZE],
     counter_sor: u16,
 ) -> [u8; NEXTGCORE_KEY_LEN] {
-    debug_assert!(counter_sor != 0, "Counter_SoR 0x0000 is forbidden (TS 33.501 §6.14.2.3)");
+    debug_assert!(
+        counter_sor != 0,
+        "Counter_SoR 0x0000 is forbidden (TS 33.501 §6.14.2.3)"
+    );
 
     let mut params = [KdfParam::default(), KdfParam::default()];
     params[0].buf = Some(vec![0x01]);
@@ -394,7 +400,10 @@ pub fn nextgcore_kdf_upu_mac_iausf(
     upu_data: &[u8],
     counter_upu: u16,
 ) -> [u8; NEXTGCORE_KEY_LEN] {
-    debug_assert!(counter_upu != 0, "Counter_UPU 0x0000 is forbidden (TS 33.501 §6.15.2.2)");
+    debug_assert!(
+        counter_upu != 0,
+        "Counter_UPU 0x0000 is forbidden (TS 33.501 §6.15.2.2)"
+    );
 
     let mut params = [KdfParam::default(), KdfParam::default()];
     params[0].buf = Some(upu_data.to_vec());
@@ -421,7 +430,10 @@ pub fn nextgcore_kdf_upu_mac_iue(
     kausf: &[u8; SHA256_DIGEST_SIZE],
     counter_upu: u16,
 ) -> [u8; NEXTGCORE_KEY_LEN] {
-    debug_assert!(counter_upu != 0, "Counter_UPU 0x0000 is forbidden (TS 33.501 §6.15.2.2)");
+    debug_assert!(
+        counter_upu != 0,
+        "Counter_UPU 0x0000 is forbidden (TS 33.501 §6.15.2.2)"
+    );
 
     let mut params = [KdfParam::default(), KdfParam::default()];
     params[0].buf = Some(vec![0x01]);
@@ -970,8 +982,7 @@ mod tests {
     #[test]
     fn sor_upu_mac_bitflip_sensitivity() {
         let steering = unhex(STEERING_HEX);
-        let base =
-            nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x0a], 0x0001, Some(&steering));
+        let base = nextgcore_kdf_sor_mac_iausf(&kausf_1(), &[0x0a], 0x0001, Some(&steering));
 
         // Flip one steering-list byte.
         let mut steering_flipped = steering.clone();

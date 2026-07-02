@@ -265,10 +265,16 @@ async fn sor_upu_strict_peer_end_to_end() {
 
         // TS 29.503 SorInfo shape (note the lowercase-`countersor` spec quirk).
         assert_eq!(sor["ackInd"], serde_json::Value::Bool(true));
-        assert!(sor["provisioningTime"].as_str().is_some(), "SorInfo.provisioningTime is mandatory");
+        assert!(
+            sor["provisioningTime"].as_str().is_some(),
+            "SorInfo.provisioningTime is mandatory"
+        );
         assert!(sor.get("steeringContainer").is_some());
         let counter = u16::from_str_radix(sor["countersor"].as_str().unwrap(), 16).unwrap();
-        assert_eq!(counter, 0x0001, "first MAC after a fresh KAUSF uses Counter_SoR 0x0001");
+        assert_eq!(
+            counter, 0x0001,
+            "first MAC after a fresh KAUSF uses Counter_SoR 0x0001"
+        );
 
         // INDEPENDENT Annex A.17 recompute (header 0x0E, counter, P2 = the
         // hand-derived steering wire bytes). Equality proves the ausfd producer
@@ -276,7 +282,11 @@ async fn sor_upu_strict_peer_end_to_end() {
         let expected = independent_mac(
             &kausf_sor,
             FC_SOR_MAC_IAUSF,
-            &[&[SOR_HEADER_ACK_PLMN_LIST], &counter.to_be_bytes(), &GOLDEN_LIST],
+            &[
+                &[SOR_HEADER_ACK_PLMN_LIST],
+                &counter.to_be_bytes(),
+                &GOLDEN_LIST,
+            ],
         );
         assert_eq!(
             sor["sorMacIausf"].as_str().unwrap(),
@@ -289,9 +299,16 @@ async fn sor_upu_strict_peer_end_to_end() {
         let mac_tampered = independent_mac(
             &kausf_sor,
             FC_SOR_MAC_IAUSF,
-            &[&[SOR_HEADER_ACK_PLMN_LIST], &counter.to_be_bytes(), &tampered],
+            &[
+                &[SOR_HEADER_ACK_PLMN_LIST],
+                &counter.to_be_bytes(),
+                &tampered,
+            ],
         );
-        assert_ne!(expected, mac_tampered, "MAC must depend on the steering-list bytes");
+        assert_ne!(
+            expected, mac_tampered,
+            "MAC must depend on the steering-list bytes"
+        );
 
         // =================================================================
         // Scenario 2 — SoR ack (F-06): verified SoR-MAC-I_UE ⇒ 204; wrong MAC
@@ -304,7 +321,10 @@ async fn sor_upu_strict_peer_end_to_end() {
         let mut bad = mac_iue;
         bad[0] ^= 0x01;
         let resp = handle_sor_ack(supi_sor, &sor_ack_req("sorMacIue", &to_hex(&bad))).await;
-        assert_eq!(resp.status, 400, "Scenario 2: mismatched SoR-MAC-I_UE ⇒ 400");
+        assert_eq!(
+            resp.status, 400,
+            "Scenario 2: mismatched SoR-MAC-I_UE ⇒ 400"
+        );
 
         // Correct MAC — verifies constant-time against the pinned XMAC ⇒ 204,
         // and clears the pin (single-use).
@@ -313,7 +333,10 @@ async fn sor_upu_strict_peer_end_to_end() {
 
         // Replay the same valid ack — pin already consumed ⇒ unexpected ack.
         let resp = handle_sor_ack(supi_sor, &sor_ack_req("sorMacIue", &to_hex(&mac_iue))).await;
-        assert_eq!(resp.status, 400, "Scenario 2: replayed ack ⇒ 400 (single-use)");
+        assert_eq!(
+            resp.status, 400,
+            "Scenario 2: replayed ack ⇒ 400 (single-use)"
+        );
 
         // =================================================================
         // Scenario 3 — freshness: two GETs ⇒ Counter_SoR 0x0001 then 0x0002,
@@ -324,15 +347,28 @@ async fn sor_upu_strict_peer_end_to_end() {
 
         let first = parse(&maybe_inject_sor_info(supi_fresh, RAW_AM_DATA.to_string()).await);
         let second = parse(&maybe_inject_sor_info(supi_fresh, RAW_AM_DATA.to_string()).await);
-        let (m1, c1) = (&first["sorInfo"]["sorMacIausf"], &first["sorInfo"]["countersor"]);
-        let (m2, c2) = (&second["sorInfo"]["sorMacIausf"], &second["sorInfo"]["countersor"]);
+        let (m1, c1) = (
+            &first["sorInfo"]["sorMacIausf"],
+            &first["sorInfo"]["countersor"],
+        );
+        let (m2, c2) = (
+            &second["sorInfo"]["sorMacIausf"],
+            &second["sorInfo"]["countersor"],
+        );
         assert_eq!(c1, "0001");
         assert_eq!(c2, "0002");
-        assert_ne!(m1, m2, "Scenario 3: identical input, fresh counter ⇒ different MAC");
+        assert_ne!(
+            m1, m2,
+            "Scenario 3: identical input, fresh counter ⇒ different MAC"
+        );
         let expected_2 = independent_mac(
             &kausf_fresh,
             FC_SOR_MAC_IAUSF,
-            &[&[SOR_HEADER_ACK_PLMN_LIST], &0x0002u16.to_be_bytes(), &GOLDEN_LIST],
+            &[
+                &[SOR_HEADER_ACK_PLMN_LIST],
+                &0x0002u16.to_be_bytes(),
+                &GOLDEN_LIST,
+            ],
         );
         assert_eq!(m2.as_str().unwrap(), to_hex(&expected_2));
 
@@ -349,12 +385,19 @@ async fn sor_upu_strict_peer_end_to_end() {
             .anchor_force_counters(supi_wrap, 0xFFFF, 0xFFFF));
 
         let out = maybe_inject_sor_info(supi_wrap, RAW_AM_DATA.to_string()).await;
-        assert!(!out.contains("sorInfo"), "Scenario 4: counter_wrap ⇒ withhold sorInfo: {out}");
+        assert!(
+            !out.contains("sorInfo"),
+            "Scenario 4: counter_wrap ⇒ withhold sorInfo: {out}"
+        );
         assert!(
             !out.contains("steeringContainer"),
             "Scenario 4: no unprotected steering list may leak"
         );
-        assert_eq!(parse(&out)["gpsis"][0], "msisdn-777", "rest of am-data survives");
+        assert_eq!(
+            parse(&out)["gpsis"][0],
+            "msisdn-777",
+            "rest of am-data survives"
+        );
 
         // =================================================================
         // Scenario 5 — no anchor (UE never primary-authenticated through this
@@ -362,7 +405,10 @@ async fn sor_upu_strict_peer_end_to_end() {
         // a zero key), the real udmd fail-closes ⇒ no sorInfo.
         // =================================================================
         let out = maybe_inject_sor_info(supi_noanchor, RAW_AM_DATA.to_string()).await;
-        assert!(!out.contains("sorInfo"), "Scenario 5: no anchor ⇒ withhold sorInfo: {out}");
+        assert!(
+            !out.contains("sorInfo"),
+            "Scenario 5: no anchor ⇒ withhold sorInfo: {out}"
+        );
         assert!(!out.contains("steeringContainer"));
         assert_eq!(parse(&out)["gpsis"][0], "msisdn-777");
 
@@ -395,9 +441,15 @@ async fn sor_upu_strict_peer_end_to_end() {
         // Wire-byte sensitivity for the UPU list too.
         let mut tampered_upu = GOLDEN_UPU_LIST;
         tampered_upu[3] ^= 0x01;
-        let mac_upu_tampered =
-            independent_mac(&kausf_upu, FC_UPU_MAC_IAUSF, &[&tampered_upu, &counter_upu.to_be_bytes()]);
-        assert_ne!(expected_upu, mac_upu_tampered, "UPU MAC must depend on the UpuData bytes");
+        let mac_upu_tampered = independent_mac(
+            &kausf_upu,
+            FC_UPU_MAC_IAUSF,
+            &[&tampered_upu, &counter_upu.to_be_bytes()],
+        );
+        assert_ne!(
+            expected_upu, mac_upu_tampered,
+            "UPU MAC must depend on the UpuData bytes"
+        );
 
         // UPU ack (A.20): wrong ⇒ 400, correct ⇒ 204, replay ⇒ 400.
         let upu_mac_iue =
@@ -405,11 +457,17 @@ async fn sor_upu_strict_peer_end_to_end() {
         let mut bad_upu = upu_mac_iue;
         bad_upu[0] ^= 0x01;
         let resp = handle_upu_ack(supi_upu, &upu_ack_req("upuMacIue", &to_hex(&bad_upu))).await;
-        assert_eq!(resp.status, 400, "Scenario 6: mismatched UPU-MAC-I_UE ⇒ 400");
+        assert_eq!(
+            resp.status, 400,
+            "Scenario 6: mismatched UPU-MAC-I_UE ⇒ 400"
+        );
         let resp = handle_upu_ack(supi_upu, &upu_ack_req("upuMacIue", &to_hex(&upu_mac_iue))).await;
         assert_eq!(resp.status, 204, "Scenario 6: verified UPU-MAC-I_UE ⇒ 204");
         let resp = handle_upu_ack(supi_upu, &upu_ack_req("upuMacIue", &to_hex(&upu_mac_iue))).await;
-        assert_eq!(resp.status, 400, "Scenario 6: replayed UPU ack ⇒ 400 (single-use)");
+        assert_eq!(
+            resp.status, 400,
+            "Scenario 6: replayed UPU ack ⇒ 400 (single-use)"
+        );
 
         let _ = ausf_server.stop().await;
     })
@@ -419,12 +477,20 @@ async fn sor_upu_strict_peer_end_to_end() {
 
 /// Build a TS 29.503 `AcknowledgeInfo` SoR-ack PUT carrying `mac_field=hex`.
 fn sor_ack_req(mac_field: &str, mac_hex: &str) -> SbiRequest {
-    ack_req("/nudm-sdm/v2/imsi-001010000000701/am-data/sor-ack", mac_field, mac_hex)
+    ack_req(
+        "/nudm-sdm/v2/imsi-001010000000701/am-data/sor-ack",
+        mac_field,
+        mac_hex,
+    )
 }
 
 /// Build a TS 29.503 `AcknowledgeInfo` UPU-ack PUT carrying `mac_field=hex`.
 fn upu_ack_req(mac_field: &str, mac_hex: &str) -> SbiRequest {
-    ack_req("/nudm-sdm/v2/imsi-001010000000705/am-data/upu-ack", mac_field, mac_hex)
+    ack_req(
+        "/nudm-sdm/v2/imsi-001010000000705/am-data/upu-ack",
+        mac_field,
+        mac_hex,
+    )
 }
 
 fn ack_req(path: &str, mac_field: &str, mac_hex: &str) -> SbiRequest {

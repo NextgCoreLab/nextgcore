@@ -101,9 +101,7 @@ use acr::{
     ACRUpdateData, AcrContextError, AcrDecReq, AcrDetermReq, AcrInitReq, AcrState, AcrStatus,
     EELACRReq, EELACRResp,
 };
-use acrevents::{
-    ACRCompleteEventInfo, ACREventsSubscription, ACRInfoNotification, TargetInfo,
-};
+use acrevents::{ACRCompleteEventInfo, ACREventsSubscription, ACRInfoNotification, TargetInfo};
 use context::{ees_context_final, ees_context_init, ees_self, UpdateError};
 use eec::EecRegistration;
 use services::{
@@ -1587,10 +1585,9 @@ async fn handle_acinfo_update(subscription_id: &str, request: &SbiRequest) -> Sb
         Ok(updated) => SbiResponse::with_status(200)
             .with_json_body(&updated)
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        Err(e) => update_error_response(
-            e,
-            &format!("AC information subscription {subscription_id}"),
-        ),
+        Err(e) => {
+            update_error_response(e, &format!("AC information subscription {subscription_id}"))
+        }
     }
 }
 
@@ -1612,10 +1609,9 @@ async fn handle_acinfo_modify(subscription_id: &str, request: &SbiRequest) -> Sb
         Ok(updated) => SbiResponse::with_status(200)
             .with_json_body(&updated)
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        Err(e) => update_error_response(
-            e,
-            &format!("AC information subscription {subscription_id}"),
-        ),
+        Err(e) => {
+            update_error_response(e, &format!("AC information subscription {subscription_id}"))
+        }
     }
 }
 
@@ -2072,7 +2068,9 @@ async fn handle_eec_context_push(request: &SbiRequest) -> SbiResponse {
         Ok(p) => p,
         Err(e) => {
             return send_bad_request(
-                &format!("Missing or invalid mandatory IE (eesId/eecCntx.eecId/eecCntx.cntxId): {e}"),
+                &format!(
+                    "Missing or invalid mandatory IE (eesId/eecCntx.eecId/eecCntx.cntxId): {e}"
+                ),
                 Some(cause::MANDATORY_IE_MISSING),
             );
         }
@@ -3399,7 +3397,10 @@ mod tests {
         assert_eq!(resp.status, 200);
         let patched: AcrMgntEventsSubscription =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(patched.notification_destination, "http://eec/acr-mgnt/cb-patched");
+        assert_eq!(
+            patched.notification_destination,
+            "http://eec/acr-mgnt/cb-patched"
+        );
         assert_eq!(patched.eas_id, "eas1.example.com");
         assert_eq!(patched.event_subscs[0].event, "UP_PATH_CHG");
 
@@ -3481,8 +3482,9 @@ mod tests {
             .contains("MANDATORY_IE_MISSING"));
 
         // Query-form pull (T-EES side of the round trip) → 200 EECContext.
-        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t&eec-cntx-id=c-1")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        let req =
+            SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t&eec-cntx-id=c-1")
+                .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 200);
         let pulled: services::EECContext =
@@ -3514,8 +3516,9 @@ mod tests {
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
 
         // Unknown eec-cntx-id → 404.
-        let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t&eec-cntx-id=nope")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        let req =
+            SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t&eec-cntx-id=nope")
+                .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
 
         // The OLD path-param pull form → 404 (no individual resource in the yaml).
@@ -3646,10 +3649,7 @@ mod tests {
                 Some("s-as.edge.example.com")
             );
             assert_eq!(
-                state
-                    .acr_params
-                    .and_then(|p| p.predict_exp_time)
-                    .as_deref(),
+                state.acr_params.and_then(|p| p.predict_exp_time).as_deref(),
                 Some("2030-01-01T00:00:00Z")
             );
         }
@@ -4057,7 +4057,10 @@ mod tests {
         assert_eq!(notif.eas_id, "d5c-t.example.com");
         let status = notif.acr_status.expect("acrStatus present");
         assert!(status.acr_res);
-        assert_eq!(status.t_eas_endpoint.fqdn.as_deref(), Some("d5c-t.edge.example.com"));
+        assert_eq!(
+            status.t_eas_endpoint.fqdn.as_deref(),
+            Some("d5c-t.edge.example.com")
+        );
 
         delete_acrevents(&sk, &id);
         auth::clear_auth_jwks();
@@ -4093,7 +4096,9 @@ mod tests {
         let fired: Vec<notifier::QueuedNotification> = notifier::notifier()
             .drain()
             .into_iter()
-            .filter(|q| q.uri == "http://eec-d5neg/acr-cb" || q.body["easId"] == "d5neg-s.example.com")
+            .filter(|q| {
+                q.uri == "http://eec-d5neg/acr-cb" || q.body["easId"] == "d5neg-s.example.com"
+            })
             .collect();
         assert!(fired.is_empty(), "no subscription ⇒ no notification");
 
@@ -4126,7 +4131,11 @@ mod tests {
             .into_iter()
             .filter(|q| q.body["subId"] == id)
             .collect();
-        assert_eq!(mine.len(), 1, "requestTestNotification ⇒ one test notification");
+        assert_eq!(
+            mine.len(),
+            1,
+            "requestTestNotification ⇒ one test notification"
+        );
         assert_eq!(mine[0].uri, "http://eec-d5t/acr-cb");
         let notif: ACRInfoNotification = serde_json::from_value(mine[0].body.clone()).unwrap();
         assert_eq!(notif.sub_id, id);

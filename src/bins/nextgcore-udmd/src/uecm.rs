@@ -1107,7 +1107,9 @@ mod tests {
     fn seed_amf_ue(supi: &str, ran_ue_ngap_id: u64) -> u64 {
         let ctx = nextgcore_amfd::context::amf_self();
         let guard = ctx.read().expect("amf ctx lock");
-        let ran = guard.ran_ue_add(900_400, ran_ue_ngap_id).expect("ran_ue_add");
+        let ran = guard
+            .ran_ue_add(900_400, ran_ue_ngap_id)
+            .expect("ran_ue_add");
         let ue = guard.amf_ue_add(ran.id).expect("amf_ue_add");
         guard.amf_ue_set_supi(ue.id, supi);
         let mut ue = ue;
@@ -1181,7 +1183,11 @@ mod tests {
 
         // The real handler enqueued exactly one network-initiated dereg.
         let queued = drain_network_deregs_for(ue_id);
-        assert_eq!(queued.len(), 1, "exactly one network-initiated dereg enqueued");
+        assert_eq!(
+            queued.len(),
+            1,
+            "exactly one network-initiated dereg enqueued"
+        );
         assert_eq!(queued[0].amf_ue_ngap_id, ue_id);
         assert!(
             queued[0].reregistration_required,
@@ -1201,7 +1207,8 @@ mod tests {
             nextgcore_amfd::test_support::init_context();
             seed_amf_ue(supi, 60_101)
         };
-        let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "NON_3GPP_ACCESS" });
+        let body =
+            json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "NON_3GPP_ACCESS" });
         let path = format!("/namf-callback/v1/{supi}/dereg-notify");
         let req = SbiRequest::post(path).with_json_body(&body).expect("json");
         let resp = nextgcore_amfd::namf_request_handler(req).await;
@@ -1227,19 +1234,29 @@ mod tests {
         // 400: mandatory accessType absent (WSB-4 fail-closed).
         let missing = json!({ "deregReason": "UE_INITIAL_REGISTRATION" });
         let path = format!("/namf-callback/v1/{supi}/dereg-notify");
-        let resp =
-            nextgcore_amfd::namf_request_handler(SbiRequest::post(path).with_json_body(&missing).expect("json"))
-                .await;
-        assert_eq!(resp.status, 400, "missing accessType must fail closed (400)");
+        let resp = nextgcore_amfd::namf_request_handler(
+            SbiRequest::post(path)
+                .with_json_body(&missing)
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "missing accessType must fail closed (400)"
+        );
 
         // 404: unknown SUPI (never seeded).
         let unknown = "imsi-001019999999999";
         let full = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" });
         let path2 = format!("/namf-callback/v1/{unknown}/dereg-notify");
-        let resp2 =
-            nextgcore_amfd::namf_request_handler(SbiRequest::post(path2).with_json_body(&full).expect("json"))
-                .await;
-        assert_eq!(resp2.status, 404, "unknown SUPI must be 404 CONTEXT_NOT_FOUND");
+        let resp2 = nextgcore_amfd::namf_request_handler(
+            SbiRequest::post(path2).with_json_body(&full).expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp2.status, 404,
+            "unknown SUPI must be 404 CONTEXT_NOT_FOUND"
+        );
     }
 
     // ----- H3 finish: reverse-shape cross-decode pin + step-3 negatives ------
@@ -1358,7 +1375,10 @@ mod tests {
             SbiRequest::post(path).with_json_body(&body).expect("json"),
         )
         .await;
-        assert_eq!(resp.status, 204, "a recognised non-initial reason is accepted");
+        assert_eq!(
+            resp.status, 204,
+            "a recognised non-initial reason is accepted"
+        );
         let queued = drain_network_deregs_for(ue_id);
         assert_eq!(queued.len(), 1, "3GPP-access dereg is still enqueued");
         assert!(
@@ -1386,7 +1406,10 @@ mod tests {
             SbiRequest::post(path).with_json_body(&body).expect("json"),
         )
         .await;
-        assert_eq!(resp.status, 400, "an unknown deregReason must fail closed (400)");
+        assert_eq!(
+            resp.status, 400,
+            "an unknown deregReason must fail closed (400)"
+        );
         assert_eq!(
             problem_cause(&resp).as_deref(),
             Some("MANDATORY_IE_INCORRECT"),

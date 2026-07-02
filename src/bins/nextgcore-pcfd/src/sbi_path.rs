@@ -728,9 +728,7 @@ pub async fn pcf_udr_sm_policy_dnn_data(
 /// / udrd `handle_policy_data`). Returns the decoded UePolicySet body on 200,
 /// `Ok(None)` on 404 or when no UDR is reachable — the caller (E3 rule source)
 /// then falls back to the static default rule set, fail-closed.
-pub async fn pcf_udr_get_ue_policy_set(
-    supi: &str,
-) -> Result<Option<serde_json::Value>, String> {
+pub async fn pcf_udr_get_ue_policy_set(supi: &str) -> Result<Option<serde_json::Value>, String> {
     let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
         return Ok(None);
     };
@@ -848,17 +846,15 @@ pub fn build_ue_policy_n1n2_request(
             "n1MessageContent": { "contentId": UPDP_CONTENT_ID }
         }
     });
-    SbiRequest::post(format!(
-        "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
-    ))
-    .with_json_body(&body)
-    .expect("n1n2 UPDP root JSON serializes")
-    .with_part(SbiPart::with_content(
-        UPDP_CONTENT_ID,
-        // 5GS NAS message media type (TS 29.500 Table 6.1.2.3-1).
-        "application/vnd.3gpp.5gnas",
-        bytes::Bytes::copy_from_slice(updp_pdu),
-    ))
+    SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+        .with_json_body(&body)
+        .expect("n1n2 UPDP root JSON serializes")
+        .with_part(SbiPart::with_content(
+            UPDP_CONTENT_ID,
+            // 5GS NAS message media type (TS 29.500 Table 6.1.2.3-1).
+            "application/vnd.3gpp.5gnas",
+            bytes::Bytes::copy_from_slice(updp_pdu),
+        ))
 }
 
 /// Discover an AMF and POST the UE policy container over
@@ -954,9 +950,8 @@ pub async fn pcf_unsubscribe_ue_policy_notify(
         return Ok(false);
     };
     let client = client_for(&ep, NfType::Amf);
-    let path = format!(
-        "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{subscription_id}"
-    );
+    let path =
+        format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{subscription_id}");
     let resp = client
         .delete(&path)
         .await
@@ -1457,7 +1452,9 @@ mod tests {
         assert_eq!(b["snssai"]["sst"], 1);
         assert_eq!(b["ipv4Addr"], "10.45.0.88");
         // pcfIpEndPoints: non-empty, TS 29.510 IpEndPoint field names
-        let eps = b["pcfIpEndPoints"].as_array().expect("pcfIpEndPoints array");
+        let eps = b["pcfIpEndPoints"]
+            .as_array()
+            .expect("pcfIpEndPoints array");
         assert!(!eps.is_empty());
         assert_eq!(eps[0]["ipv4Address"], "10.45.0.10");
         assert_eq!(eps[0]["port"], 7777);
@@ -1482,19 +1479,15 @@ mod tests {
             None,
         );
         assert_eq!(bf["pcfFqdn"], "pcf.5gc.mnc001.mcc001.3gppnetwork.org");
-        assert!(bf["pcfIpEndPoints"].as_array().is_some_and(|a| !a.is_empty()));
+        assert!(bf["pcfIpEndPoints"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()));
 
         // Without self info (pre-WSB-1 legacy shape): no PCF address members —
         // this is exactly the body our bsfd 400-rejects (negative-control
         // shape pinned strict-peer in tests/strict_peer_bsfd.rs).
-        let legacy = build_pcf_binding_body_with(
-            None,
-            "imsi-001010000000088",
-            "internet",
-            1,
-            None,
-            None,
-        );
+        let legacy =
+            build_pcf_binding_body_with(None, "imsi-001010000000088", "internet", 1, None, None);
         assert!(legacy.get("pcfIpEndPoints").is_none());
         assert!(legacy.get("pcfFqdn").is_none());
         assert!(legacy.get("pcfId").is_none());

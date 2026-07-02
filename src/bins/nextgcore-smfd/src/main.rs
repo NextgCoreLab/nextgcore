@@ -130,14 +130,14 @@ fn oauth2_required(config_path: &str) -> bool {
 /// client (Wave-6 H8). The server verifies incoming Bearer tokens against the
 /// NRF JWKS and requires `aud` to include NfType::Smf; with no NRF URI
 /// configured it fails closed (503, per nextgcore-sbi server.rs).
-async fn apply_oauth2_enforcement(
-    mut cfg: NextgcoreSbiServerConfig,
-) -> NextgcoreSbiServerConfig {
+async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
     let nrf_uri = global_context().get_nrf_uri().await;
     cfg.require_oauth2 = true;
-    cfg.oauth2_jwks_uri = nrf_uri
-        .as_deref()
-        .map(|uri| nextgcore_sbi::oauth::JwksCache::for_nrf(uri).jwks_uri().to_string());
+    cfg.oauth2_jwks_uri = nrf_uri.as_deref().map(|uri| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(uri)
+            .jwks_uri()
+            .to_string()
+    });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Smf);
     if let Some(uri) = nrf_uri.as_deref() {
         let nf_instance_id = format!("smf-{}", uuid::Uuid::new_v4());
@@ -3660,7 +3660,12 @@ mod oauth2_h8_tests {
     }
 
     /// Mint an ES256 access token in the NRF's shape, signed by `sk`.
-    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str, scope: &str) -> String {
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -3713,7 +3718,11 @@ mod oauth2_h8_tests {
     fn test_oauth2_require_knob_parses_and_defaults_off() {
         let dir = std::env::temp_dir();
         let off = dir.join(format!("smf-h8-off-{}.yaml", std::process::id()));
-        std::fs::write(&off, "smf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n").unwrap();
+        std::fs::write(
+            &off,
+            "smf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n",
+        )
+        .unwrap();
         assert!(
             !oauth2_required(off.to_str().unwrap()),
             "absent oauth2 block must default off"

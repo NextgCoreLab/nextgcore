@@ -1360,7 +1360,11 @@ mod tests {
         let t3512 = nextgcore_types::GprsTimer3::new(nextgcore_types::GprsTimer3::UNIT_1_MINUTE, 9);
         let mut buf = BytesMut::new();
         t3512.encode(&mut buf);
-        assert_eq!(buf.as_ref(), &[0x01, 0xA9], "L=1, unit 101 | value 9 = 0xA9");
+        assert_eq!(
+            buf.as_ref(),
+            &[0x01, 0xA9],
+            "L=1, unit 101 | value 9 = 0xA9"
+        );
 
         // Decode side (mirrors the nextgsim UE decode_gprs_timer3 semantics):
         // 0xA9 → unit 5 (1 minute), value 9 → the UE re-arms T3512 at 540 s.
@@ -1370,7 +1374,11 @@ mod tests {
         assert_eq!(decoded.unit, nextgcore_types::GprsTimer3::UNIT_1_MINUTE);
         assert_eq!(decoded.unit, 5);
         assert_eq!(decoded.value, 9);
-        assert_eq!(u32::from(decoded.value) * 60, 540, "T3512 = 540 s, not 90 h");
+        assert_eq!(
+            u32::from(decoded.value) * 60,
+            540,
+            "T3512 = 540 s, not 90 h"
+        );
         assert!(!wire.has_remaining());
 
         // The full Registration Accept must carry the 0xA9 octet (and never
@@ -1560,7 +1568,10 @@ mod tests {
         //   0x05  payload container type = UE policy       (Table 9.11.3.40.1)
         //   0x00 0x03  payload container length (LV-E, big-endian)
         //   0x80 0x01 0x00  verbatim UPDP payload
-        assert_eq!(nas, vec![0x7E, 0x00, 0x68, 0x05, 0x00, 0x03, 0x80, 0x01, 0x00]);
+        assert_eq!(
+            nas,
+            vec![0x7E, 0x00, 0x68, 0x05, 0x00, 0x03, 0x80, 0x01, 0x00]
+        );
         // And no optional IE (PSI 0x12 / cause 0x58 / back-off 0x37) trails.
         assert_eq!(nas.len(), 6 + updp.len());
     }

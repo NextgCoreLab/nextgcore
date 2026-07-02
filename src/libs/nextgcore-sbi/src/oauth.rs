@@ -1689,8 +1689,8 @@ mod tests {
     #[test]
     fn test_token_path_defaults_to_bespoke() {
         let _g = lock_path_mode(); // pin the I4 baseline (shipped: bespoke)
-        // The default keeps the bespoke path so the wire request is unchanged
-        // until the NRF is migrated to the TS 29.510 route.
+                                   // The default keeps the bespoke path so the wire request is unchanged
+                                   // until the NRF is migrated to the TS 29.510 route.
         let c = OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf);
         assert_eq!(c.token_path(), "/nnrf-oauth2/v1/access-token");
         assert_eq!(c.token_path(), OAuth2Client::TOKEN_PATH_BESPOKE);
@@ -1703,7 +1703,7 @@ mod tests {
     #[test]
     fn test_jwks_path_default_and_standard() {
         let _g = lock_path_mode(); // pin the I4 baseline (shipped: bespoke)
-        // Default `for_nrf` uses the bespoke path.
+                                   // Default `for_nrf` uses the bespoke path.
         assert_eq!(
             JwksCache::for_nrf("http://nrf:7777").jwks_uri(),
             "http://nrf:7777/nnrf-oauth2/v1/jwks"
@@ -1833,7 +1833,10 @@ mod tests {
             OAuth2Client::default_token_path(),
             OAuth2Client::TOKEN_PATH_STANDARD
         );
-        assert_eq!(JwksCache::default_key_path(), JwksCache::NRF_KEY_PATH_STANDARD);
+        assert_eq!(
+            JwksCache::default_key_path(),
+            JwksCache::NRF_KEY_PATH_STANDARD
+        );
         // Constructors now default to the TS 29.510 standard paths.
         assert_eq!(
             OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf).token_path(),

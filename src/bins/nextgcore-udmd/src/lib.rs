@@ -15,19 +15,19 @@ pub mod nudm_handler;
 pub mod nudr_handler;
 pub mod sbi_path;
 pub mod sbi_response;
+pub mod sess_sm;
 /// Wave-6 F-04: Steering-of-Roaming injection into Nudm_SDM am-data via the
 /// real Nausf_SoRProtection producer (TS 33.501 §6.14.2.1, TS 29.503/29.509).
 pub mod sor;
+pub mod timer;
+pub mod udm_sm;
+pub mod ue_sm;
+pub mod uecm;
 /// Wave-6 F-05: UE-Parameters-Update injection into Nudm_SDM am-data via the
 /// real Nausf_UPUProtection producer (TS 33.501 §6.15.2.1, TS 29.503/29.509).
 /// Notification-driven UPU (Nudm_SDM_Notification) is deferred — see the module
 /// doc-comment.
 pub mod upu;
-pub mod sess_sm;
-pub mod timer;
-pub mod udm_sm;
-pub mod ue_sm;
-pub mod uecm;
 
 // Re-export commonly used types
 pub use context::{
@@ -64,11 +64,11 @@ pub mod test_support {
 
 // Re-export SBI path functions
 pub use sbi_path::{
-    udm_nrf_deregister, udm_nrf_discover, udm_nrf_heartbeat, udm_nrf_register,
-    udm_nudr_dr_send_amf_context_get, udm_nudr_dr_send_amf_context_patch,
-    udm_nudr_dr_send_amf_context_put, udm_nudr_dr_send_auth_status_put,
-    udm_nudr_dr_send_auth_subscription_get, udm_nudr_dr_send_auth_subscription_patch,
-    udm_ausf_send_sor_protect, udm_ausf_send_upu_protect, udm_nudr_dr_send_context_delete,
+    udm_ausf_send_sor_protect, udm_ausf_send_upu_protect, udm_nrf_deregister, udm_nrf_discover,
+    udm_nrf_heartbeat, udm_nrf_register, udm_nudr_dr_send_amf_context_get,
+    udm_nudr_dr_send_amf_context_patch, udm_nudr_dr_send_amf_context_put,
+    udm_nudr_dr_send_auth_status_put, udm_nudr_dr_send_auth_subscription_get,
+    udm_nudr_dr_send_auth_subscription_patch, udm_nudr_dr_send_context_delete,
     udm_nudr_dr_send_provisioned_data_get, udm_nudr_dr_send_provisioned_data_get_with_params,
     udm_nudr_dr_send_smf_context_get, udm_nudr_dr_send_smf_context_put, udm_sbi_close,
     udm_sbi_discover_and_send_nudr_dr, udm_sbi_is_running, udm_sbi_open,

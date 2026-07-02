@@ -508,7 +508,8 @@ async fn register_upf_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_upf_nf_profile(nf_instance_id, pfcp_addr, gtpu_addr, upf_self().get_load());
+    let nf_profile =
+        build_upf_nf_profile(nf_instance_id, pfcp_addr, gtpu_addr, upf_self().get_load());
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");

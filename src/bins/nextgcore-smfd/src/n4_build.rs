@@ -1906,7 +1906,11 @@ mod tests {
         // IPv4 + Destination -> V4 | S/D -> 0x06
         let mut b = PfcpMessageBuilder::new();
         b.add_ue_ip_address(Some([10, 45, 0, 2]), None, false, true);
-        assert_eq!(b.build()[4], 0x06, "IPv4 Destination UE IP octet-5 must be 0x06");
+        assert_eq!(
+            b.build()[4],
+            0x06,
+            "IPv4 Destination UE IP octet-5 must be 0x06"
+        );
 
         // IPv6 + Source -> V6 only -> 0x01
         let mut b = PfcpMessageBuilder::new();
@@ -1916,12 +1920,20 @@ mod tests {
         // IPv6 + Destination -> V6 | S/D -> 0x05
         let mut b = PfcpMessageBuilder::new();
         b.add_ue_ip_address(None, Some([0u8; 16]), false, true);
-        assert_eq!(b.build()[4], 0x05, "IPv6 Destination UE IP octet-5 must be 0x05");
+        assert_eq!(
+            b.build()[4],
+            0x05,
+            "IPv6 Destination UE IP octet-5 must be 0x05"
+        );
 
         // Dual-stack + Source -> V4 | V6 -> 0x03
         let mut b = PfcpMessageBuilder::new();
         b.add_ue_ip_address(Some([10, 45, 0, 2]), Some([0u8; 16]), true, false);
-        assert_eq!(b.build()[4], 0x03, "dual-stack Source UE IP octet-5 must be 0x03");
+        assert_eq!(
+            b.build()[4],
+            0x03,
+            "dual-stack Source UE IP octet-5 must be 0x03"
+        );
     }
 
     /// Golden byte-vector for the LIVE UL PDR shape (main.rs `ul_pdr`,
@@ -1978,7 +1990,10 @@ mod tests {
             // QER ID (type 109, len 4): 1
             0x00, 0x6D, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
         ];
-        assert_eq!(data, expected, "UL Create PDR bytes must match the hand-derived golden vector");
+        assert_eq!(
+            data, expected,
+            "UL Create PDR bytes must match the hand-derived golden vector"
+        );
 
         // Explicit anchor on the full UE IP Address IE TLV and its flags byte:
         assert_eq!(
@@ -1986,7 +2001,10 @@ mod tests {
             &[0x00, 0x5D, 0x00, 0x05, 0x02, 0x0A, 0x2D, 0x00, 0x02],
             "UL UE IP Address IE TLV must advertise S/D=0 (Source)"
         );
-        assert_eq!(data[36], 0x02, "UL UE IP Address value[0] must be 0x02 (V4, S/D=0)");
+        assert_eq!(
+            data[36], 0x02,
+            "UL UE IP Address value[0] must be 0x02 (V4, S/D=0)"
+        );
     }
 
     /// Golden byte-vector for the LIVE DL PDR shape (main.rs `dl_pdr`):
@@ -2028,7 +2046,10 @@ mod tests {
             // QER ID (type 109, len 4): 1
             0x00, 0x6D, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
         ];
-        assert_eq!(data, expected, "DL Create PDR bytes must match the hand-derived golden vector");
+        assert_eq!(
+            data, expected,
+            "DL Create PDR bytes must match the hand-derived golden vector"
+        );
 
         // Explicit anchor on the full UE IP Address IE TLV and its flags byte:
         assert_eq!(
@@ -2036,7 +2057,10 @@ mod tests {
             &[0x00, 0x5D, 0x00, 0x05, 0x06, 0x0A, 0x2D, 0x00, 0x02],
             "DL UE IP Address IE TLV must advertise S/D=1 (Destination)"
         );
-        assert_eq!(data[27], 0x06, "DL UE IP Address value[0] must be 0x06 (V4, S/D=1)");
+        assert_eq!(
+            data[27], 0x06,
+            "DL UE IP Address value[0] must be 0x06 (V4, S/D=1)"
+        );
     }
 
     #[test]

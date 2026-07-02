@@ -6,17 +6,17 @@
 //! - Subscription management
 //! - UE context management (AMF/SMF registration)
 
+use crate::{
+    timer_manager, timer_type_to_timer_id, udm_context_final, udm_context_init, udm_sbi_close,
+    udm_sbi_open, udm_self, SbiServerConfig, UdmEeSubscription, UdmEvent, UdmSdmSubscription,
+    UdmSmContext,
+};
 use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as NextgcoreSbiServerConfig,
-};
-use crate::{
-    timer_manager, timer_type_to_timer_id, udm_context_final, udm_context_init, udm_sbi_close,
-    udm_sbi_open, udm_self, SbiServerConfig, UdmEeSubscription, UdmEvent, UdmSdmSubscription,
-    UdmSmContext,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -234,9 +234,11 @@ fn oauth2_required(config_path: &str) -> bool {
 async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
     let nrf_uri = nextgcore_sbi::context::global_context().get_nrf_uri().await;
     cfg.require_oauth2 = true;
-    cfg.oauth2_jwks_uri = nrf_uri
-        .as_deref()
-        .map(|uri| nextgcore_sbi::oauth::JwksCache::for_nrf(uri).jwks_uri().to_string());
+    cfg.oauth2_jwks_uri = nrf_uri.as_deref().map(|uri| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(uri)
+            .jwks_uri()
+            .to_string()
+    });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udm);
     if let Some(uri) = nrf_uri.as_deref() {
         let nf_instance_id = format!("udm-{}", uuid::Uuid::new_v4());
@@ -341,21 +343,15 @@ pub async fn run() -> Result<()> {
                         // (TS 33.501 §6.14.2.1). Absent/empty → am-data
                         // passthrough is byte-identical (default-safe).
                         if let Some(sor) = udm.sor {
-                            if let Some(steering) =
-                                sor.steering.filter(|s| !s.is_empty())
-                            {
+                            if let Some(steering) = sor.steering.filter(|s| !s.is_empty()) {
                                 let entries = steering.len();
                                 let ack_ind = sor.ack_ind.unwrap_or(true);
                                 let ctx = udm_self();
                                 if let Ok(context) = ctx.read() {
-                                    context.set_sor_steering(
-                                        crate::context::SorSteeringConfig {
-                                            steering_container: serde_json::Value::Array(
-                                                steering,
-                                            ),
-                                            ack_ind,
-                                        },
-                                    );
+                                    context.set_sor_steering(crate::context::SorSteeringConfig {
+                                        steering_container: serde_json::Value::Array(steering),
+                                        ack_ind,
+                                    });
                                     log::info!(
                                         "SoR steering provisioned ({entries} PLMN \
                                          entries, ackInd={ack_ind})"
@@ -655,12 +651,7 @@ pub async fn handle_amf_registration(supi: &str, request: &SbiRequest) -> SbiRes
     };
 
     // udmd-03 (validate) -> udmd-01 (persist to UDR) -> udmd-02 (notify old AMF).
-    crate::uecm::process_amf_registration(
-        supi,
-        &reg_data,
-        &crate::uecm::UdrClient::Live,
-    )
-    .await
+    crate::uecm::process_amf_registration(supi, &reg_data, &crate::uecm::UdrClient::Live).await
 }
 
 pub async fn handle_amf_registration_update(supi: &str, request: &SbiRequest) -> SbiResponse {
@@ -677,20 +668,15 @@ pub async fn handle_amf_registration_update(supi: &str, request: &SbiRequest) ->
     };
 
     // udmd-05: GUAMI ownership check + UDR PATCH.
-    crate::uecm::process_amf_registration_update(
-        supi,
-        &update_data,
-        &crate::uecm::UdrClient::Live,
-    )
-    .await
+    crate::uecm::process_amf_registration_update(supi, &update_data, &crate::uecm::UdrClient::Live)
+        .await
 }
 
 pub async fn handle_amf_deregistration(supi: &str) -> SbiResponse {
     log::info!("AMF Deregistration: SUPI={supi}");
 
     // udmd-01: DELETE the UDR context-data before returning 204.
-    crate::uecm::process_amf_deregistration(supi, &crate::uecm::UdrClient::Live)
-        .await
+    crate::uecm::process_amf_deregistration(supi, &crate::uecm::UdrClient::Live).await
 }
 
 /// udmd-12: AMF non-3GPP-access registration (PUT).
@@ -713,12 +699,7 @@ pub async fn handle_amf_non3gpp_registration(supi: &str, request: &SbiRequest) -
 
     // Reuse the same UECM registration path — UDR resource key is different
     // (/amf-non-3gpp-access) but the validation and persistence logic is the same.
-    crate::uecm::process_amf_registration(
-        supi,
-        &reg_data,
-        &crate::uecm::UdrClient::Live,
-    )
-    .await
+    crate::uecm::process_amf_registration(supi, &reg_data, &crate::uecm::UdrClient::Live).await
 }
 
 pub async fn handle_smf_registration(
@@ -752,12 +733,8 @@ pub async fn handle_smf_deregistration(supi: &str, pdu_session_id: &str) -> SbiR
     log::info!("SMF Deregistration: SUPI={supi}, PDU Session={pdu_session_id}");
 
     // udmd-01: DELETE the per-PDU-session UDR context-data before returning 204.
-    crate::uecm::process_smf_deregistration(
-        supi,
-        pdu_session_id,
-        &crate::uecm::UdrClient::Live,
-    )
-    .await
+    crate::uecm::process_smf_deregistration(supi, pdu_session_id, &crate::uecm::UdrClient::Live)
+        .await
 }
 
 // Subscriber Data Management handlers
@@ -811,8 +788,7 @@ pub async fn handle_get_am_data(supi: &str, request: &SbiRequest) -> SbiResponse
     let udr_result = if params.is_empty() {
         crate::udm_nudr_dr_send_provisioned_data_get(supi, "am-data", 0, 0).await
     } else {
-        crate::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "am-data", &params)
-            .await
+        crate::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "am-data", &params).await
     };
 
     match udr_result {
@@ -859,13 +835,8 @@ pub async fn handle_get_smf_select_data(supi: &str, request: &SbiRequest) -> Sbi
     // udmd-08: forward query params to UDR.
     let params = sdm_query_params(request);
     let udr_result = if params.is_empty() {
-        crate::udm_nudr_dr_send_provisioned_data_get(
-            supi,
-            "smf-selection-subscription-data",
-            0,
-            0,
-        )
-        .await
+        crate::udm_nudr_dr_send_provisioned_data_get(supi, "smf-selection-subscription-data", 0, 0)
+            .await
     } else {
         crate::udm_nudr_dr_send_provisioned_data_get_with_params(
             supi,
@@ -913,8 +884,7 @@ pub async fn handle_get_sm_data(supi: &str, request: &SbiRequest) -> SbiResponse
     let udr_result = if params.is_empty() {
         crate::udm_nudr_dr_send_provisioned_data_get(supi, "sm-data", 0, 0).await
     } else {
-        crate::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "sm-data", &params)
-            .await
+        crate::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "sm-data", &params).await
     };
 
     match udr_result {
@@ -1280,7 +1250,10 @@ pub fn handle_ack_info(supi: &str, request: &SbiRequest, kind: &str) -> SbiRespo
     let provisioning_time = match ack.get("provisioningTime").and_then(|v| v.as_str()) {
         Some(t) => t.to_string(),
         None => {
-            return send_bad_request("provisioningTime is mandatory", Some("MANDATORY_IE_MISSING"))
+            return send_bad_request(
+                "provisioningTime is mandatory",
+                Some("MANDATORY_IE_MISSING"),
+            )
         }
     };
 
@@ -1301,7 +1274,11 @@ pub fn handle_ack_info(supi: &str, request: &SbiRequest, kind: &str) -> SbiRespo
         peeked
     };
 
-    let mac_field = if kind == "SoR" { "sorMacIue" } else { "upuMacIue" };
+    let mac_field = if kind == "SoR" {
+        "sorMacIue"
+    } else {
+        "upuMacIue"
+    };
     let mac_fail_cause = if kind == "SoR" {
         "SOR_MAC_FAILURE"
     } else {
@@ -1343,9 +1320,7 @@ pub fn handle_ack_info(supi: &str, request: &SbiRequest, kind: &str) -> SbiRespo
         }
         // Outstanding XMAC but the UE sent no MAC → REQUIRE it.
         (Some(_), None) => {
-            log::warn!(
-                "[{supi}] {kind} ack missing {mac_field} for a protected update — rejected"
-            );
+            log::warn!("[{supi}] {kind} ack missing {mac_field} for a protected update — rejected");
             send_bad_request(
                 &format!("{mac_field} is required to acknowledge a protected {kind} update"),
                 Some("MANDATORY_IE_MISSING"),
@@ -1353,9 +1328,7 @@ pub fn handle_ack_info(supi: &str, request: &SbiRequest, kind: &str) -> SbiRespo
         }
         // No outstanding XMAC but a MAC was supplied → unexpected ack.
         (None, Some(_)) => {
-            log::warn!(
-                "[{supi}] unexpected {kind} ack MAC with no outstanding update — rejected"
-            );
+            log::warn!("[{supi}] unexpected {kind} ack MAC with no outstanding update — rejected");
             send_problem(
                 400,
                 "UNEXPECTED_MESSAGE",
@@ -1524,25 +1497,24 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
     };
 
     // Step 1: Query UDR for authentication subscription data (by SUPI)
-    let udr_response =
-        match crate::udm_nudr_dr_send_auth_subscription_get(&supi, 0, 0).await {
-            Ok(resp) if resp.is_success() => resp,
-            Ok(resp) if resp.status == 404 => {
-                return send_problem(404, "USER_NOT_FOUND", "No authentication subscription");
-            }
-            Ok(resp) => {
-                log::error!(
-                    "[{}] UDR auth subscription query failed: status={}",
-                    supi,
-                    resp.status
-                );
-                return nextgcore_sbi::server::send_service_unavailable("UDR query failed");
-            }
-            Err(e) => {
-                log::error!("[{supi}] UDR auth subscription query failed: {e}");
-                return nextgcore_sbi::server::send_service_unavailable("UDR unavailable");
-            }
-        };
+    let udr_response = match crate::udm_nudr_dr_send_auth_subscription_get(&supi, 0, 0).await {
+        Ok(resp) if resp.is_success() => resp,
+        Ok(resp) if resp.status == 404 => {
+            return send_problem(404, "USER_NOT_FOUND", "No authentication subscription");
+        }
+        Ok(resp) => {
+            log::error!(
+                "[{}] UDR auth subscription query failed: status={}",
+                supi,
+                resp.status
+            );
+            return nextgcore_sbi::server::send_service_unavailable("UDR query failed");
+        }
+        Err(e) => {
+            log::error!("[{supi}] UDR auth subscription query failed: {e}");
+            return nextgcore_sbi::server::send_service_unavailable("UDR unavailable");
+        }
+    };
 
     // Step 2: Parse authentication subscription from UDR response
     let auth_sub_json: serde_json::Value = match udr_response
@@ -1732,8 +1704,7 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
     let sqn_arr: [u8; 6] = ue.sqn.as_slice().try_into().expect("sqn is 6 bytes");
     let new_sqn_arr = advance_sqn_ind(sqn_arr);
     let new_sqn_hex: String = new_sqn_arr.iter().map(|b| format!("{b:02x}")).collect();
-    match crate::udm_nudr_dr_send_auth_subscription_patch(&supi, &new_sqn_hex, 0, 0).await
-    {
+    match crate::udm_nudr_dr_send_auth_subscription_patch(&supi, &new_sqn_hex, 0, 0).await {
         Ok(r) if r.is_success() || r.status == 204 => {
             log::debug!("[{supi}] SQN advanced to 0x{new_sqn_hex}");
         }
@@ -2982,7 +2953,10 @@ mod tests {
     #[test]
     fn f06_handler_uses_ct_compare_and_single_use_clear() {
         let src = include_str!("app.rs");
-        assert!(src.contains("fn ct_compare("), "ct_compare helper must exist");
+        assert!(
+            src.contains("fn ct_compare("),
+            "ct_compare helper must exist"
+        );
         assert!(
             src.contains("ct_compare(&mac, &xmac)"),
             "handle_ack_info must compare via ct_compare, not =="
@@ -3018,14 +2992,21 @@ mod tests {
                 "sorMacIue": mac_hex,
             }),
         );
-        assert_eq!(handle_sor_ack(supi, &ok).await.status, 204, "valid MAC → 204");
+        assert_eq!(
+            handle_sor_ack(supi, &ok).await.status,
+            204,
+            "valid MAC → 204"
+        );
 
         // Ack state recorded + expected XMAC consumed (single-use).
         let ue = udm_self().read().unwrap().ue_find_by_supi(supi).unwrap();
         assert!(ue.sor_ack.is_some(), "ack state must be persisted");
         assert_eq!(ue.sor_ack.as_ref().unwrap().counter, Some(counter));
         assert!(!ue.sor_ack.as_ref().unwrap().ue_not_reachable);
-        assert!(ue.expected_sor_xmac_iue.is_none(), "expected XMAC must be cleared");
+        assert!(
+            ue.expected_sor_xmac_iue.is_none(),
+            "expected XMAC must be cleared"
+        );
 
         // Replayed identical ack → 400 (nothing outstanding to compare).
         assert_eq!(
@@ -3060,7 +3041,11 @@ mod tests {
                 "sorMacIue": crate::nudm_handler::bytes_to_hex(&wrong),
             }),
         );
-        assert_eq!(handle_sor_ack(supi, &bad).await.status, 400, "wrong MAC → 400");
+        assert_eq!(
+            handle_sor_ack(supi, &bad).await.status,
+            400,
+            "wrong MAC → 400"
+        );
 
         let ue = udm_self().read().unwrap().ue_find_by_supi(supi).unwrap();
         assert!(ue.sor_ack.is_none(), "mismatch must NOT record ack state");
@@ -3261,7 +3246,12 @@ mod oauth2_h8_tests {
             .port()
     }
 
-    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str, scope: &str) -> String {
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -3313,7 +3303,11 @@ mod oauth2_h8_tests {
     fn test_oauth2_require_knob_parses_and_defaults_off() {
         let dir = std::env::temp_dir();
         let off = dir.join(format!("udm-h8-off-{}.yaml", std::process::id()));
-        std::fs::write(&off, "udm:\n  sbi:\n    server:\n      - address: 127.0.0.1\n").unwrap();
+        std::fs::write(
+            &off,
+            "udm:\n  sbi:\n    server:\n      - address: 127.0.0.1\n",
+        )
+        .unwrap();
         assert!(!super::oauth2_required(off.to_str().unwrap()));
         let on = dir.join(format!("udm-h8-on-{}.yaml", std::process::id()));
         std::fs::write(&on, "udm:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();

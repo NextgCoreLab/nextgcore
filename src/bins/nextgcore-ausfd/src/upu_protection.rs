@@ -171,7 +171,11 @@ pub fn encode_upu_data_list(upu_data_list: &[serde_json::Value]) -> Result<Vec<u
             if item.get("aol").and_then(|v| v.as_bool()).unwrap_or(false) {
                 flags |= 0x02;
             }
-            if item.get("dreiEps").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if item
+                .get("dreiEps")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 flags |= 0x04;
             }
             push_data_set(&mut out, UPU_SET_DISASTER_ROAMING_INFO, &[flags])?;
@@ -182,7 +186,11 @@ pub fn encode_upu_data_list(upu_data_list: &[serde_json::Value]) -> Result<Vec<u
             let ri = routing_id
                 .as_str()
                 .ok_or("UpuData.routingId must be a string (TS 29.544 RoutingId)")?;
-            push_data_set(&mut out, UPU_SET_ME_ROUTING_ID, &encode_routing_indicator(ri)?)?;
+            push_data_set(
+                &mut out,
+                UPU_SET_ME_ROUTING_ID,
+                &encode_routing_indicator(ri)?,
+            )?;
             encoded_any = true;
         }
 
@@ -208,7 +216,11 @@ pub fn handle_upu_protect(supi: &str, request: &SbiRequest) -> SbiResponse {
     let upu_info: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => {
-            return problem(400, "INVALID_MSG_FORMAT", &format!("Invalid UpuInfo JSON: {e}"))
+            return problem(
+                400,
+                "INVALID_MSG_FORMAT",
+                &format!("Invalid UpuInfo JSON: {e}"),
+            )
         }
     };
 
@@ -414,12 +426,15 @@ mod tests {
         // Empty list violates minItems 1.
         assert!(encode_upu_data_list(&[]).is_err());
         // Bad SD.
-        assert!(encode_default_conf_nssai(&[serde_json::json!({"sst": 1, "sd": "12345"})])
-            .is_err());
+        assert!(
+            encode_default_conf_nssai(&[serde_json::json!({"sst": 1, "sd": "12345"})]).is_err()
+        );
         // Missing SST (mandatory).
-        assert!(encode_default_conf_nssai(&[serde_json::json!({"sd": "00007B"})])
-            .unwrap_err()
-            .contains("mandatory"));
+        assert!(
+            encode_default_conf_nssai(&[serde_json::json!({"sd": "00007B"})])
+                .unwrap_err()
+                .contains("mandatory")
+        );
     }
 
     // ------------------------------------------------------------------
@@ -433,10 +448,13 @@ mod tests {
         let kausf = test_kausf(0xB1);
         ausf_self().read().unwrap().anchor_refresh(supi, &kausf);
 
-        let response = post_upu(supi, &serde_json::json!({
-            "upuAckInd": true,
-            "upuDataList": golden_upu_data_list(),
-        }));
+        let response = post_upu(
+            supi,
+            &serde_json::json!({
+                "upuAckInd": true,
+                "upuDataList": golden_upu_data_list(),
+            }),
+        );
         assert_eq!(response.status, 200, "body: {:?}", response.http.content);
         let json = body_json(&response);
 
@@ -461,16 +479,25 @@ mod tests {
     fn upu_without_ack_omits_xmac() {
         ausf_context_init(64);
         let supi = "imsi-999700000000202";
-        ausf_self().read().unwrap().anchor_refresh(supi, &test_kausf(0xB2));
+        ausf_self()
+            .read()
+            .unwrap()
+            .anchor_refresh(supi, &test_kausf(0xB2));
 
-        let response = post_upu(supi, &serde_json::json!({
-            "upuAckInd": false,
-            "upuDataList": golden_upu_data_list(),
-        }));
+        let response = post_upu(
+            supi,
+            &serde_json::json!({
+                "upuAckInd": false,
+                "upuDataList": golden_upu_data_list(),
+            }),
+        );
         assert_eq!(response.status, 200);
         let json = body_json(&response);
         assert!(json.get("upuMacIausf").is_some());
-        assert!(json.get("upuXmacIue").is_none(), "no XMAC when ack not requested");
+        assert!(
+            json.get("upuXmacIue").is_none(),
+            "no XMAC when ack not requested"
+        );
     }
 
     #[test]
@@ -481,13 +508,16 @@ mod tests {
         ausf_self().read().unwrap().anchor_refresh(supi, &kausf);
 
         let opaque = [0x04u8, 0x00, 0x02, 0x21, 0x43];
-        let response = post_upu(supi, &serde_json::json!({
-            "upuAckInd": false,
-            // upuDataList still mandatory per the yaml even when the
-            // transparent form carries the octets.
-            "upuDataList": [{"routingId": "9999"}],
-            "upuTransparentInfo": nextgcore_crypt::base64::encode(&opaque),
-        }));
+        let response = post_upu(
+            supi,
+            &serde_json::json!({
+                "upuAckInd": false,
+                // upuDataList still mandatory per the yaml even when the
+                // transparent form carries the octets.
+                "upuDataList": [{"routingId": "9999"}],
+                "upuTransparentInfo": nextgcore_crypt::base64::encode(&opaque),
+            }),
+        );
         assert_eq!(response.status, 200);
         let json = body_json(&response);
         let expected_mac = nextgcore_kdf_upu_mac_iausf(&kausf, &opaque, 0x0001);
@@ -502,12 +532,18 @@ mod tests {
     fn upu_missing_mandatory_ies_are_400() {
         ausf_context_init(64);
         let supi = "imsi-999700000000204";
-        ausf_self().read().unwrap().anchor_refresh(supi, &test_kausf(0xB4));
+        ausf_self()
+            .read()
+            .unwrap()
+            .anchor_refresh(supi, &test_kausf(0xB4));
 
         // Missing upuAckInd.
-        let response = post_upu(supi, &serde_json::json!({
-            "upuDataList": golden_upu_data_list(),
-        }));
+        let response = post_upu(
+            supi,
+            &serde_json::json!({
+                "upuDataList": golden_upu_data_list(),
+            }),
+        );
         assert_eq!(response.status, 400);
         assert_eq!(body_json(&response)["cause"], "MANDATORY_IE_MISSING");
 
@@ -517,31 +553,43 @@ mod tests {
         assert_eq!(body_json(&response)["cause"], "MANDATORY_IE_MISSING");
 
         // Empty upuDataList (minItems 1).
-        let response = post_upu(supi, &serde_json::json!({
-            "upuAckInd": true,
-            "upuDataList": [],
-        }));
+        let response = post_upu(
+            supi,
+            &serde_json::json!({
+                "upuAckInd": true,
+                "upuDataList": [],
+            }),
+        );
         assert_eq!(response.status, 400);
 
         // disasterCondPlmnIds → fail-closed 400.
-        let response = post_upu(supi, &serde_json::json!({
-            "upuAckInd": true,
-            "upuDataList": [{"disasterCondPlmnIds": [{"mcc": "001", "mnc": "01"}]}],
-        }));
+        let response = post_upu(
+            supi,
+            &serde_json::json!({
+                "upuAckInd": true,
+                "upuDataList": [{"disasterCondPlmnIds": [{"mcc": "001", "mnc": "01"}]}],
+            }),
+        );
         assert_eq!(response.status, 400);
     }
 
     #[test]
     fn upu_unknown_supi_is_404_never_a_mac() {
         ausf_context_init(64);
-        let response = post_upu("imsi-999700000000299", &serde_json::json!({
-            "upuAckInd": true,
-            "upuDataList": golden_upu_data_list(),
-        }));
+        let response = post_upu(
+            "imsi-999700000000299",
+            &serde_json::json!({
+                "upuAckInd": true,
+                "upuDataList": golden_upu_data_list(),
+            }),
+        );
         assert_eq!(response.status, 404);
         let json = body_json(&response);
         assert_eq!(json["cause"], "CONTEXT_NOT_FOUND");
-        assert!(json.get("upuMacIausf").is_none(), "404 must never carry a MAC");
+        assert!(
+            json.get("upuMacIausf").is_none(),
+            "404 must never carry a MAC"
+        );
     }
 
     #[test]
@@ -567,7 +615,10 @@ mod tests {
 
         // Counter_SoR is a separate counter (§6.14.2.3 vs §6.15.2.2): the
         // two UPU allocations above must not have advanced it.
-        assert_eq!(ctx.read().unwrap().anchor_next_sor_counter(supi), Ok(0x0001));
+        assert_eq!(
+            ctx.read().unwrap().anchor_next_sor_counter(supi),
+            Ok(0x0001)
+        );
     }
 
     #[test]
@@ -576,7 +627,10 @@ mod tests {
         let supi = "imsi-999700000000206";
         let ctx = ausf_self();
         ctx.read().unwrap().anchor_refresh(supi, &test_kausf(0xB6));
-        assert!(ctx.read().unwrap().anchor_force_counters(supi, 0xFFFF, 0xFFFF));
+        assert!(ctx
+            .read()
+            .unwrap()
+            .anchor_force_counters(supi, 0xFFFF, 0xFFFF));
 
         let body = serde_json::json!({
             "upuAckInd": true,

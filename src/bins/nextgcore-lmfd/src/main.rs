@@ -182,8 +182,11 @@ fn apply_oauth2_enforcement(
 ) -> NextgcoreSbiServerConfig {
     cfg.require_oauth2 = true;
     let uri = (!nrf_uri.is_empty()).then_some(nrf_uri);
-    cfg.oauth2_jwks_uri =
-        uri.map(|u| nextgcore_sbi::oauth::JwksCache::for_nrf(u).jwks_uri().to_string());
+    cfg.oauth2_jwks_uri = uri.map(|u| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(u)
+            .jwks_uri()
+            .to_string()
+    });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Lmf);
     if let Some(u) = uri {
         let nf_instance_id = format!("lmf-{}", uuid::Uuid::new_v4());
@@ -286,13 +289,17 @@ async fn main() -> Result<()> {
         // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
         // (active positioning sessions, saturated at 100; TS 29.510 §5.2.2.3.2).
         // Honest session-count proxy — no fabricated CPU numbers.
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id.clone(), 5, || {
-            let load = lmf_self()
-                .read()
-                .map(|c| c.positioning_session_count())
-                .unwrap_or(0);
-            load.min(100) as u8
-        });
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+            nf_instance_id.clone(),
+            5,
+            || {
+                let load = lmf_self()
+                    .read()
+                    .map(|c| c.positioning_session_count())
+                    .unwrap_or(0);
+                load.min(100) as u8
+            },
+        );
     }
 
     log::info!("NextGCore LMF ready (instance: {nf_instance_id})");
@@ -345,12 +352,11 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "POST" => handle_measurement_request(&request).await,
             _ => send_method_not_allowed(method, "measurements"),
         },
-        ["nlmf-loc", "v1", "measurements", request_id] if debug_endpoints_enabled() => {
-            match method {
-                "GET" => handle_measurement_get(request_id).await,
-                _ => send_method_not_allowed(method, "measurements/{id}"),
-            }
-        }
+        ["nlmf-loc", "v1", "measurements", request_id] if debug_endpoints_enabled() => match method
+        {
+            "GET" => handle_measurement_get(request_id).await,
+            _ => send_method_not_allowed(method, "measurements/{id}"),
+        },
         // NRPPa measurement reports (from gNB via AMF)
         ["nlmf-loc", "v1", "nrppa-reports"] if debug_endpoints_enabled() => match method {
             "POST" => handle_nrppa_report(&request).await,
@@ -474,13 +480,7 @@ static LPP_TRANSACTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU
 /// discipline): channel handles are cloned/moved out of the lock scopes.
 async fn initiate_positioning(
     input: &nlmf::InputData,
-) -> Result<
-    (
-        String,
-        tokio::sync::oneshot::Receiver<PositioningOutcome>,
-    ),
-    Box<SbiResponse>,
-> {
+) -> Result<(String, tokio::sync::oneshot::Receiver<PositioningOutcome>), Box<SbiResponse>> {
     let Some(target) = input
         .supi
         .as_deref()
@@ -980,11 +980,14 @@ async fn handle_mo_lr_lpp(request: &SbiRequest, input: &nlmf::InputData) -> SbiR
 /// context [`PeriodicReporting`] mirror. `reportingAmount` is clamped to ≥ 1
 /// (yaml minimum) so a scheduler always makes forward progress.
 fn periodic_reporting_from_input(input: &nlmf::InputData) -> Option<PeriodicReporting> {
-    input.periodic_event_info.as_ref().map(|p| PeriodicReporting {
-        reporting_amount: p.reporting_amount.max(1),
-        reporting_interval_secs: p.reporting_interval,
-        reporting_interval_ms: p.reporting_interval_ms,
-    })
+    input
+        .periodic_event_info
+        .as_ref()
+        .map(|p| PeriodicReporting {
+            reporting_amount: p.reporting_amount.max(1),
+            reporting_interval_secs: p.reporting_interval,
+            reporting_interval_ms: p.reporting_interval_ms,
+        })
 }
 
 /// A8: the interval between periodic reports. Prefers `reportingIntervalMs`
@@ -1173,7 +1176,10 @@ async fn deliver_event_notify(hgmlc_uri: &str, body: &nlmf::EventNotifyDataExt) 
 /// A8: single outbound EventNotify POST. Parses the `hgmlcCallBackURI` into
 /// host/port/path, POSTs `application/json` with a bounded-timeout client
 /// (connect 2 s / request 3 s), and returns the HTTP status.
-async fn post_event_notify(hgmlc_uri: &str, body: &nlmf::EventNotifyDataExt) -> Result<u16, String> {
+async fn post_event_notify(
+    hgmlc_uri: &str,
+    body: &nlmf::EventNotifyDataExt,
+) -> Result<u16, String> {
     let (host, port, path) = split_callback_uri(hgmlc_uri)
         .ok_or_else(|| format!("invalid hgmlcCallBackURI: {hgmlc_uri}"))?;
     let json = serde_json::to_string(body).map_err(|e| e.to_string())?;
@@ -3062,7 +3068,9 @@ mod tests {
     /// Encode a UE LPP `ProvideLocationInformation` (nr-Multi-RTT) carrying the
     /// given `(nr-PhysCellID, K0 code)` measurements.
     fn build_multi_rtt_lpp(cells: &[(u16, u32)], txn: u8) -> Vec<u8> {
-        use nextgcore_asn1c::lpp::ecid::{ProvideLocationInformation, ProvideLocationInformationR9};
+        use nextgcore_asn1c::lpp::ecid::{
+            ProvideLocationInformation, ProvideLocationInformationR9,
+        };
         use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
         use nextgcore_asn1c::lpp::nr_dl_tdoa::{NrRstd, NrSlot, NrTimeStamp, NrTimingQuality};
         use nextgcore_asn1c::lpp::nr_multi_rtt::{
@@ -3176,7 +3184,10 @@ mod tests {
         // A real-solver fix (NOT the (0,0) placeholder): near the seeded scene.
         let lat = v["locationEstimate"]["point"]["lat"].as_f64().unwrap();
         let lon = v["locationEstimate"]["point"]["lon"].as_f64().unwrap();
-        assert!((37.0..38.0).contains(&lat), "lat={lat} (placeholder leaked?)");
+        assert!(
+            (37.0..38.0).contains(&lat),
+            "lat={lat} (placeholder leaked?)"
+        );
         assert!((-123.0..-122.0).contains(&lon), "lon={lon}");
         assert_eq!(v["positioningDataList"][0]["method"], "MULTI-RTT");
     }
@@ -3279,8 +3290,11 @@ mod tests {
         lmf_context_init(1024);
         let lpp = seed_scene_and_build_multi_rtt_lpp(57);
         let input = r#"{"supi":"imsi-001010000000506","lppMessage":{"contentId":"lpp-mo-lr"}}"#;
-        let part =
-            SbiPart::with_content("lpp-mo-lr", "application/vnd.3gpp.lpp", Bytes::from(lpp.clone()));
+        let part = SbiPart::with_content(
+            "lpp-mo-lr",
+            "application/vnd.3gpp.lpp",
+            Bytes::from(lpp.clone()),
+        );
         let boundary = multipart::generate_boundary();
         let body = multipart::encode(Some(input), std::slice::from_ref(&part), &boundary);
         let ct = multipart::content_type_with_boundary(&boundary);
@@ -3296,7 +3310,10 @@ mod tests {
             req.http.add_part(p);
         }
         let resp = handle_determine_location(&req).await;
-        assert_eq!(resp.status, 200, "client-encoded multipart accepted round-trip");
+        assert_eq!(
+            resp.status, 200,
+            "client-encoded multipart accepted round-trip"
+        );
     }
 
     // =======================================================================
@@ -3391,13 +3408,22 @@ mod tests {
     }
 
     /// Build an inbound notify `SbiRequest` (jsonData root + one binary part).
-    fn notify_request(path: &str, json: &str, content_id: &str, content_type: &str, part: Vec<u8>) -> SbiRequest {
+    fn notify_request(
+        path: &str,
+        json: &str,
+        content_id: &str,
+        content_type: &str,
+        part: Vec<u8>,
+    ) -> SbiRequest {
         use bytes::Bytes;
         use nextgcore_sbi::message::SbiPart;
         let mut req = SbiRequest::post(path);
         req.http.set_content(json.to_string());
-        req.http
-            .add_part(SbiPart::with_content(content_id, content_type, Bytes::from(part)));
+        req.http.add_part(SbiPart::with_content(
+            content_id,
+            content_type,
+            Bytes::from(part),
+        ));
         req
     }
 
@@ -3417,7 +3443,13 @@ mod tests {
                 crate::positioning::TrpCoord::new(37.5, -122.3, 0.0),
             );
             let req = guard
-                .measurement_request(0, PositioningMethod::Ecid, None, None, PositioningQos::BestEffort)
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
                 .expect("measurement request");
             guard.positioning_session_register(Some(supi.to_string()), 177, req.request_id)
         };
@@ -3438,7 +3470,11 @@ mod tests {
 
         // Through the shared multipart codec (client encode → server-side decode).
         let boundary = multipart::generate_boundary();
-        let wire = multipart::encode(amf_req.http.content.as_deref(), &amf_req.http.parts, &boundary);
+        let wire = multipart::encode(
+            amf_req.http.content.as_deref(),
+            &amf_req.http.parts,
+            &boundary,
+        );
         let ct = multipart::content_type_with_boundary(&boundary);
         let decoded = multipart::decode(&ct, &wire).expect("multipart decode");
         assert_eq!(
@@ -3455,7 +3491,10 @@ mod tests {
 
         // lmfd's REAL callback handler consumes it.
         let resp = handle_n1_message_notify(&req).await;
-        assert_eq!(resp.status, 204, "successful N1MessageNotify callback → 204");
+        assert_eq!(
+            resp.status, 204,
+            "successful N1MessageNotify callback → 204"
+        );
 
         // The pending DetermineLocation session completed with a REAL fix.
         let outcome = tokio::time::timeout(Duration::from_secs(2), rx)
@@ -3465,7 +3504,11 @@ mod tests {
         match outcome {
             PositioningOutcome::Fix(est) => {
                 assert!((37.0..38.0).contains(&est.latitude), "lat={}", est.latitude);
-                assert!((-123.0..-122.0).contains(&est.longitude), "lon={}", est.longitude);
+                assert!(
+                    (-123.0..-122.0).contains(&est.longitude),
+                    "lon={}",
+                    est.longitude
+                );
             }
             other => panic!("expected a measurement-derived fix, got {other:?}"),
         }
@@ -3526,7 +3569,13 @@ mod tests {
         let (corr, rx, request_id) = {
             let guard = ctx.read().unwrap();
             let req = guard
-                .measurement_request(0, PositioningMethod::Ecid, None, None, PositioningQos::BestEffort)
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
                 .expect("measurement request");
             let (corr, rx) =
                 guard.positioning_session_register(Some(supi.to_string()), 188, req.request_id);
@@ -3610,7 +3659,12 @@ mod oauth2_h8_tests {
             .port()
     }
 
-    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str, scope: &str) -> String {
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -3662,7 +3716,11 @@ mod oauth2_h8_tests {
     fn test_oauth2_require_knob_parses_and_defaults_off() {
         let dir = std::env::temp_dir();
         let off = dir.join(format!("lmf-h8-off-{}.yaml", std::process::id()));
-        std::fs::write(&off, "lmf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n").unwrap();
+        std::fs::write(
+            &off,
+            "lmf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n",
+        )
+        .unwrap();
         assert!(!super::oauth2_required(off.to_str().unwrap()));
         let on = dir.join(format!("lmf-h8-on-{}.yaml", std::process::id()));
         std::fs::write(&on, "lmf:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();
@@ -3789,16 +3847,38 @@ mod a8_event_notify_tests {
     }
 
     fn sink_count(path: &str) -> u32 {
-        sink().lock().unwrap().counts.get(path).copied().unwrap_or(0)
+        sink()
+            .lock()
+            .unwrap()
+            .counts
+            .get(path)
+            .copied()
+            .unwrap_or(0)
     }
     fn sink_bodies(path: &str) -> Vec<serde_json::Value> {
-        sink().lock().unwrap().bodies.get(path).cloned().unwrap_or_default()
+        sink()
+            .lock()
+            .unwrap()
+            .bodies
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
     }
     fn sink_content_types(path: &str) -> Vec<String> {
-        sink().lock().unwrap().content_types.get(path).cloned().unwrap_or_default()
+        sink()
+            .lock()
+            .unwrap()
+            .content_types
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
     }
     fn sink_set_status(path: &str, status: u16) {
-        sink().lock().unwrap().statuses.insert(path.to_string(), status);
+        sink()
+            .lock()
+            .unwrap()
+            .statuses
+            .insert(path.to_string(), status);
     }
 
     fn free_port() -> u16 {
@@ -3851,13 +3931,8 @@ mod a8_event_notify_tests {
         let (server, port) = start_sink().await;
         let path = "/sink/a8-exact/cb";
         let hgmlc = format!("http://127.0.0.1:{port}{path}");
-        let body = periodic_determine_location_body(
-            "imsi-001010000000801",
-            "a8-exact",
-            &hgmlc,
-            2,
-            150,
-        );
+        let body =
+            periodic_determine_location_body("imsi-001010000000801", "a8-exact", &hgmlc, 2, 150);
         let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
             .with_body(&body, "application/json");
         // Activation spawns the scheduler (its response is independent of it).
@@ -3867,7 +3942,11 @@ mod a8_event_notify_tests {
         assert_eq!(c, 2, "exactly reportingAmount EventNotify callbacks");
         // A further two intervals: still exactly 2 (the task finished).
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(sink_count(path), 2, "no callbacks after reportingAmount reached");
+        assert_eq!(
+            sink_count(path),
+            2,
+            "no callbacks after reportingAmount reached"
+        );
 
         // Normal completion cleaned up the LDR session and its trigger task.
         assert!(
@@ -3909,13 +3988,8 @@ mod a8_event_notify_tests {
         let (server, port) = start_sink().await;
         let path = "/sink/a8-cancel/cb";
         let hgmlc = format!("http://127.0.0.1:{port}{path}");
-        let body = periodic_determine_location_body(
-            "imsi-001010000000802",
-            "a8-cancel",
-            &hgmlc,
-            20,
-            150,
-        );
+        let body =
+            periodic_determine_location_body("imsi-001010000000802", "a8-cancel", &hgmlc, 20, 150);
         let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
             .with_body(&body, "application/json");
         let _ = handle_determine_location(&req).await;
@@ -3953,13 +4027,8 @@ mod a8_event_notify_tests {
         let path = "/sink/a8-fail/cb";
         sink_set_status(path, 500); // the GMLC rejects every notification
         let hgmlc = format!("http://127.0.0.1:{port}{path}");
-        let body = periodic_determine_location_body(
-            "imsi-001010000000803",
-            "a8-fail",
-            &hgmlc,
-            20,
-            150,
-        );
+        let body =
+            periodic_determine_location_body("imsi-001010000000803", "a8-fail", &hgmlc, 20, 150);
         let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
             .with_body(&body, "application/json");
         let _ = handle_determine_location(&req).await;
@@ -4053,8 +4122,7 @@ mod a8_event_notify_tests {
         assert_eq!(periodic_report_interval(&p_ms), Duration::from_millis(200));
 
         // No periodicEventInfo → None (no scheduler).
-        let none_input: nlmf::InputData =
-            serde_json::from_str(r#"{"supi":"imsi-1"}"#).unwrap();
+        let none_input: nlmf::InputData = serde_json::from_str(r#"{"supi":"imsi-1"}"#).unwrap();
         assert!(periodic_reporting_from_input(&none_input).is_none());
 
         // reportingAmount clamped to ≥ 1 so the scheduler makes progress.
@@ -4063,7 +4131,9 @@ mod a8_event_notify_tests {
         )
         .unwrap();
         assert_eq!(
-            periodic_reporting_from_input(&zero_input).unwrap().reporting_amount,
+            periodic_reporting_from_input(&zero_input)
+                .unwrap()
+                .reporting_amount,
             1
         );
     }
@@ -4191,8 +4261,8 @@ mod positioning_chain_strict_peer {
     /// `pci-<pci>` (TS 37.355 §6.5 ECID-SignalMeasurementInformation).
     fn build_ecid_lpp(pci: u16, rsrp_result: u8, ue_rx_tx: u16, txn: u8) -> Vec<u8> {
         use nextgcore_asn1c::lpp::ecid::{
-            EcidProvideLocationInformation, EcidSignalMeasurementInformation, MeasuredResultsElement,
-            ProvideLocationInformation, ProvideLocationInformationR9,
+            EcidProvideLocationInformation, EcidSignalMeasurementInformation,
+            MeasuredResultsElement, ProvideLocationInformation, ProvideLocationInformationR9,
         };
         use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
         use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
@@ -4216,10 +4286,12 @@ mod positioning_chain_strict_peer {
                 MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
                     ies: ProvideLocationInformationR9 {
                         ecid: Some(EcidProvideLocationInformation {
-                            signal_measurement_information: Some(EcidSignalMeasurementInformation {
-                                primary_cell_measured_results: None,
-                                measured_results_list: vec![element],
-                            }),
+                            signal_measurement_information: Some(
+                                EcidSignalMeasurementInformation {
+                                    primary_cell_measured_results: None,
+                                    measured_results_list: vec![element],
+                                },
+                            ),
                             ecid_error: None,
                         }),
                         nr_multi_rtt: None,
@@ -4247,7 +4319,11 @@ mod positioning_chain_strict_peer {
         )
         .expect("amfd builds N1MessageNotify");
         let boundary = multipart::generate_boundary();
-        let wire = multipart::encode(amf_req.http.content.as_deref(), &amf_req.http.parts, &boundary);
+        let wire = multipart::encode(
+            amf_req.http.content.as_deref(),
+            &amf_req.http.parts,
+            &boundary,
+        );
         let ct = multipart::content_type_with_boundary(&boundary);
         let decoded = multipart::decode(&ct, &wire).expect("multipart decode");
         assert_eq!(
@@ -4273,7 +4349,11 @@ mod positioning_chain_strict_peer {
     /// gNB/UE fixture" capture point for the NGAP egress.
     async fn start_positioning_harness(
         supi: String,
-    ) -> (SbiServer, SbiServer, tokio::sync::mpsc::Receiver<(String, Vec<u8>)>) {
+    ) -> (
+        SbiServer,
+        SbiServer,
+        tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
+    ) {
         let (tap_tx, tap_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(4);
 
         let amf_port = free_port();
@@ -4300,13 +4380,15 @@ mod positioning_chain_strict_peer {
                             let ctx = amf_self();
                             let out = match ctx.read() {
                                 Ok(g) => {
-                                    let corr = g.lcs_correlation_find(&supi).map(|r| r.lcs_correlation_id);
-                                    let lpp = g.positioning_dl_drain().into_iter().find_map(|d| {
-                                        match d.kind {
+                                    let corr =
+                                        g.lcs_correlation_find(&supi).map(|r| r.lcs_correlation_id);
+                                    let lpp =
+                                        g.positioning_dl_drain().into_iter().find_map(|d| match d
+                                            .kind
+                                        {
                                             PositioningDlKind::LppToUe { lpp_pdu } => Some(lpp_pdu),
                                             _ => None,
-                                        }
-                                    });
+                                        });
                                     corr.zip(lpp)
                                 }
                                 Err(_) => None,
@@ -4383,8 +4465,8 @@ mod positioning_chain_strict_peer {
         // session completion the notify leg will deliver.
         let body =
             format!(r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"]}}"#);
-        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
-            .with_body(body, "application/json");
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let det = tokio::spawn(async move { handle_determine_location(&req).await });
 
         // The fixture receives the DL LPP the instant amfd accepts lmfd's POST.
@@ -4462,11 +4544,9 @@ mod positioning_chain_strict_peer {
         seed_amf_connected_ue(&supi);
         let (amf_server, nrf_server, _tap_rx) = start_positioning_harness(supi.clone()).await;
 
-        let body = format!(
-            r#"{{"supi":"{supi}","locationQoS":{{"responseTime":"NO_DELAY"}}}}"#
-        );
-        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
-            .with_body(body, "application/json");
+        let body = format!(r#"{{"supi":"{supi}","locationQoS":{{"responseTime":"NO_DELAY"}}}}"#);
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let resp = handle_determine_location(&req).await;
         assert_eq!(resp.status, 504);
         assert_eq!(body_json(&resp)["cause"], "UNREACHABLE_USER");
@@ -4490,8 +4570,8 @@ mod positioning_chain_strict_peer {
 
         let body =
             format!(r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"]}}"#);
-        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
-            .with_body(body, "application/json");
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let det = tokio::spawn(async move { handle_determine_location(&req).await });
 
         let (corr, _dl_lpp) = tokio::time::timeout(Duration::from_secs(5), tap_rx.recv())
@@ -4551,7 +4631,13 @@ mod positioning_chain_strict_peer {
             let ctx = lmf_self();
             let g = ctx.read().unwrap();
             let req = g
-                .measurement_request(0, PositioningMethod::Ecid, None, None, PositioningQos::BestEffort)
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
                 .expect("measurement A");
             g.positioning_session_register(Some(supi_a.to_string()), 111, req.request_id)
         };
@@ -4559,7 +4645,13 @@ mod positioning_chain_strict_peer {
             let ctx = lmf_self();
             let g = ctx.read().unwrap();
             let req = g
-                .measurement_request(0, PositioningMethod::Ecid, None, None, PositioningQos::BestEffort)
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
                 .expect("measurement B");
             g.positioning_session_register(Some(supi_b.to_string()), 112, req.request_id)
         };
@@ -4598,7 +4690,11 @@ mod positioning_chain_strict_peer {
             "session B must not be satisfied by another UE's report"
         );
         assert!(
-            lmf_self().read().unwrap().positioning_session_find(&corr_b).is_some(),
+            lmf_self()
+                .read()
+                .unwrap()
+                .positioning_session_find(&corr_b)
+                .is_some(),
             "session B must remain registered (isolated)"
         );
     }
@@ -4631,10 +4727,12 @@ mod positioning_chain_strict_peer {
         let extracted = {
             let ctx = amf_self();
             let g = ctx.read().unwrap();
-            g.positioning_dl_drain().into_iter().find_map(|d| match d.kind {
-                PositioningDlKind::LppToUe { lpp_pdu } => Some(lpp_pdu),
-                _ => None,
-            })
+            g.positioning_dl_drain()
+                .into_iter()
+                .find_map(|d| match d.kind {
+                    PositioningDlKind::LppToUe { lpp_pdu } => Some(lpp_pdu),
+                    _ => None,
+                })
         }
         .expect("amfd enqueued an LPP downlink");
         assert_eq!(extracted, lpp, "amfd must relay lmfd's LPP byte-exact");

@@ -1144,8 +1144,7 @@ mod tests {
         }
         {
             let engine = ctx.lock_engine();
-            let infos =
-                compute_event_infos(&engine, AnalyticsId::NfLoad, &EventInfoFilter::none());
+            let infos = compute_event_infos(&engine, AnalyticsId::NfLoad, &EventInfoFilter::none());
             let info = &infos.as_array().expect("array")[0];
             assert_eq!(info["nfStatus"]["statusUnregistered"].as_u64(), Some(100));
         }

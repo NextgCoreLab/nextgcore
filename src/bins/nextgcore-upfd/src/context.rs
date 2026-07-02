@@ -1671,7 +1671,10 @@ impl UpfContext {
         let sessions = self.sess_count();
         // `checked_div` yields `None` iff `max_num_of_sess == 0` (no ceiling
         // configured), in which case we report the raw session count.
-        let load = match sessions.saturating_mul(100).checked_div(self.max_num_of_sess) {
+        let load = match sessions
+            .saturating_mul(100)
+            .checked_div(self.max_num_of_sess)
+        {
             Some(pct) => pct.min(100),
             None => sessions.min(100),
         };

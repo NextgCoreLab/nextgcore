@@ -26,7 +26,11 @@ use nextgcore_pcfd::ue_policy::{
 
 /// Seed a Pending pcfd UE-policy association carrying `pti`, return its id.
 fn seed_pending_association(pti: u8) -> String {
-    let assoc = ue_policy_add("imsi-001010000006e60", "http://127.0.0.1:9/ue-policy-notify", "");
+    let assoc = ue_policy_add(
+        "imsi-001010000006e60",
+        "http://127.0.0.1:9/ue-policy-notify",
+        "",
+    );
     ue_policy_set_delivery(
         &assoc.pol_asso_id,
         pti,
@@ -40,12 +44,8 @@ fn seed_pending_association(pti: u8) -> String {
 /// The N1MessageNotify amfd would POST to the PCF's registered callback for a
 /// UE-policy uplink message: amfd's REAL multipart builder (class "UPDP"),
 /// targeting pcfd's callback path for `pol_asso_id`.
-fn amfd_notify_request(
-    pol_asso_id: &str,
-    n1_payload: &[u8],
-) -> nextgcore_sbi::message::SbiRequest {
-    let path =
-        format!("/npcf-ue-policy-control/v1/notify/{pol_asso_id}/n1-message-notify");
+fn amfd_notify_request(pol_asso_id: &str, n1_payload: &[u8]) -> nextgcore_sbi::message::SbiRequest {
+    let path = format!("/npcf-ue-policy-control/v1/notify/{pol_asso_id}/n1-message-notify");
     build_n1_message_notify_request(
         &path,
         Some("n1n2sub-test"),
@@ -105,7 +105,10 @@ async fn reject_via_real_amfd_notify_fails_with_cause() {
     match ue_policy_find(&id).expect("association").delivery_state {
         DeliveryState::Failed(cause) => {
             assert!(cause.contains("REJECT"), "cause names the REJECT: {cause}");
-            assert!(cause.contains("UPSC"), "cause names the failed UPSC: {cause}");
+            assert!(
+                cause.contains("UPSC"),
+                "cause names the failed UPSC: {cause}"
+            );
         }
         other => panic!("expected Failed, got {other:?}"),
     }
@@ -122,7 +125,10 @@ async fn wrong_pti_complete_is_dropped() {
         .expect("COMPLETE encodes");
 
     let resp = pcf_sbi_request_handler(amfd_notify_request(&id, &stale)).await;
-    assert_eq!(resp.status, 204, "stale answer is still consumed (no crash)");
+    assert_eq!(
+        resp.status, 204,
+        "stale answer is still consumed (no crash)"
+    );
     assert_eq!(
         ue_policy_find(&id).expect("association").delivery_state,
         DeliveryState::Pending,

@@ -234,7 +234,6 @@ pub fn arp_json(priority_level: u8, preempt_cap: bool, preempt_vuln: bool) -> se
     })
 }
 
-
 /// Format bitrate as a human-readable string per 3GPP TS 29.571
 pub fn format_bitrate(bps: u64) -> String {
     if bps >= 1_000_000_000 && bps.is_multiple_of(1_000_000_000) {

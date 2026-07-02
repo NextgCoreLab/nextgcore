@@ -93,10 +93,7 @@ pub(crate) fn inc_sqn(supi: &str) -> DbiResult<()> {
 
 /// Mirror of `nextgcore_dbi_provision_auth_info`: upsert the security
 /// sub-document. Returns `Ok(true)` when the subscriber was created.
-pub(crate) fn provision_auth_info(
-    supi: &str,
-    p: &NextgcoreDbiAuthProvision,
-) -> DbiResult<bool> {
+pub(crate) fn provision_auth_info(supi: &str, p: &NextgcoreDbiAuthProvision) -> DbiResult<bool> {
     let mut guard = STORE.lock().unwrap();
     let map = guard.as_mut().expect("test store enabled");
     let created = !map.contains_key(supi);
@@ -157,7 +154,10 @@ mod tests {
         // update_sqn: exactly the written value, no side effects.
         nextgcore_dbi_update_sqn(supi, 0xA0C5).expect("update");
         assert_eq!(super::stored_sqn(supi), Some(0xA0C5));
-        assert_eq!(nextgcore_dbi_auth_info(supi).expect("auth_info").sqn, 0xA0C5);
+        assert_eq!(
+            nextgcore_dbi_auth_info(supi).expect("auth_info").sqn,
+            0xA0C5
+        );
 
         // increment_sqn: +32 (one IND-aware SEQ step), mirroring Mongo's
         // `$inc: 32` + `$bit and MAX_SQN`.

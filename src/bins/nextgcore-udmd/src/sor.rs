@@ -234,7 +234,9 @@ pub async fn maybe_inject_sor_info(supi: &str, raw: String) -> String {
         };
         (
             guard.sor_steering(),
-            guard.ue_find_by_supi(supi).and_then(|ue| ue.ausf_instance_id),
+            guard
+                .ue_find_by_supi(supi)
+                .and_then(|ue| ue.ausf_instance_id),
         )
     };
     inject_sor_info(supi, raw, config, ausf_instance_id).await
@@ -291,8 +293,8 @@ mod tests {
 
         // (b) no UDR sorInfo → config source.
         let am_data = serde_json::json!({"gpsis": ["msisdn-1"]});
-        let (container, ack) = resolve_steering_source(&am_data, Some(config(true)))
-            .expect("config source");
+        let (container, ack) =
+            resolve_steering_source(&am_data, Some(config(true))).expect("config source");
         assert_eq!(container, golden_container());
         assert!(ack);
 
@@ -319,7 +321,10 @@ mod tests {
         assert_eq!(sor["sorMacIausf"], "0123456789abcdef0123456789abcdef");
         // spec quirk: lowercase `countersor` in TS29503, not `counterSor`.
         assert_eq!(sor["countersor"], "0001");
-        assert!(obj.get("counterSor").is_none(), "TS29503 uses lowercase countersor");
+        assert!(
+            obj.get("counterSor").is_none(),
+            "TS29503 uses lowercase countersor"
+        );
         assert_eq!(sor["provisioningTime"], "2026-07-01T00:00:00Z");
     }
 
@@ -349,8 +354,12 @@ mod tests {
         // Independent Annex A.17 recompute (header 0x0E = ack + list ind + PLMN
         // list type, counter 0x0001, P2 = the golden wire bytes) — this stands
         // in for the SorSecurityInfo the AUSF returns.
-        let mac =
-            nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iausf(&kausf, &[0x0E], 0x0001, Some(&GOLDEN_LIST));
+        let mac = nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iausf(
+            &kausf,
+            &[0x0E],
+            0x0001,
+            Some(&GOLDEN_LIST),
+        );
         let xmac = nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iue(&kausf, 0x0001);
         let security = serde_json::json!({
             "sorMacIausf": crate::nudm_handler::bytes_to_hex(&mac),
@@ -370,8 +379,12 @@ mod tests {
         // Flip one wire byte → a different MAC (non-malleability sanity).
         let mut tampered = GOLDEN_LIST;
         tampered[0] ^= 0x01;
-        let mac2 =
-            nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iausf(&kausf, &[0x0E], 0x0001, Some(&tampered));
+        let mac2 = nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iausf(
+            &kausf,
+            &[0x0E],
+            0x0001,
+            Some(&tampered),
+        );
         assert_ne!(mac, mac2, "the MAC must depend on the steering-list bytes");
     }
 
@@ -400,9 +413,17 @@ mod tests {
     #[tokio::test]
     async fn ausf_unreachable_withholds_sor_info() {
         let raw = r#"{"gpsis":["msisdn-9"]}"#;
-        let out = inject_sor_info("imsi-001010000000009", raw.to_string(), Some(config(true)), None)
-            .await;
-        assert!(!out.contains("sorInfo"), "fail-closed: no sorInfo when AUSF down: {out}");
+        let out = inject_sor_info(
+            "imsi-001010000000009",
+            raw.to_string(),
+            Some(config(true)),
+            None,
+        )
+        .await;
+        assert!(
+            !out.contains("sorInfo"),
+            "fail-closed: no sorInfo when AUSF down: {out}"
+        );
         assert!(
             !out.contains("steeringContainer"),
             "fail-closed: an unprotected steering list must never leak: {out}"
@@ -419,8 +440,14 @@ mod tests {
     async fn udr_provisioned_unprotected_sor_is_stripped_when_ausf_down() {
         let raw = r#"{"gpsis":["msisdn-3"],"sorInfo":{"steeringContainer":[{"plmnId":{"mcc":"262","mnc":"02"}}],"ackInd":true}}"#;
         let out = inject_sor_info("imsi-001010000000003", raw.to_string(), None, None).await;
-        assert!(!out.contains("sorInfo"), "unprotected UDR sorInfo must be stripped: {out}");
-        assert!(!out.contains("steeringContainer"), "no steering list may leak: {out}");
+        assert!(
+            !out.contains("sorInfo"),
+            "unprotected UDR sorInfo must be stripped: {out}"
+        );
+        assert!(
+            !out.contains("steeringContainer"),
+            "no steering list may leak: {out}"
+        );
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["gpsis"][0], "msisdn-3");
     }

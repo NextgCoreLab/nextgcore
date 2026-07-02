@@ -292,8 +292,11 @@ fn oauth2_required(config_path: &str) -> bool {
 fn apply_oauth2_enforcement(mut cfg: SbiServerConfig, nrf_uri: &str) -> SbiServerConfig {
     cfg.require_oauth2 = true;
     let uri = (!nrf_uri.is_empty()).then_some(nrf_uri);
-    cfg.oauth2_jwks_uri =
-        uri.map(|u| nextgcore_sbi::oauth::JwksCache::for_nrf(u).jwks_uri().to_string());
+    cfg.oauth2_jwks_uri = uri.map(|u| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(u)
+            .jwks_uri()
+            .to_string()
+    });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Dccf);
     if let Some(u) = uri {
         let nf_instance_id = format!("dccf-{}", uuid::Uuid::new_v4());
@@ -364,9 +367,11 @@ async fn main() -> Result<()> {
         // (active data-collection subscriptions, saturated at 100;
         // TS 29.510 §5.2.2.3.2). Honest subscription-count proxy — no
         // fabricated CPU numbers.
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id.clone(), 5, || {
-            dccf_context_subscription_count().min(100) as u8
-        });
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+            nf_instance_id.clone(),
+            5,
+            || dccf_context_subscription_count().min(100) as u8,
+        );
     }
 
     log::info!("NextGCore DCCF ready (instance: {nf_instance_id})");
@@ -501,7 +506,12 @@ mod oauth2_h8_tests {
             .port()
     }
 
-    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str, scope: &str) -> String {
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -542,7 +552,10 @@ mod oauth2_h8_tests {
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Dccf);
         let server = SbiServer::new(cfg);
-        server.start(dccf_request_handler).await.expect("server start");
+        server
+            .start(dccf_request_handler)
+            .await
+            .expect("server start");
         (server, port)
     }
 
@@ -550,7 +563,11 @@ mod oauth2_h8_tests {
     fn test_oauth2_require_knob_parses_and_defaults_off() {
         let dir = std::env::temp_dir();
         let off = dir.join(format!("dccf-h8-off-{}.yaml", std::process::id()));
-        std::fs::write(&off, "dccf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n").unwrap();
+        std::fs::write(
+            &off,
+            "dccf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n",
+        )
+        .unwrap();
         assert!(!super::oauth2_required(off.to_str().unwrap()));
         let on = dir.join(format!("dccf-h8-on-{}.yaml", std::process::id()));
         std::fs::write(&on, "dccf:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();

@@ -712,7 +712,10 @@ pub(crate) fn build_test_x509_cert_pem_from_spki(spki: &[u8]) -> String {
         out
     }
     // AlgorithmIdentifier { ecdsa-with-SHA256 } (OID 1.2.840.10045.4.3.2).
-    let sig_algid = tlv(0x30, &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]);
+    let sig_algid = tlv(
+        0x30,
+        &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02],
+    );
     let version = tlv(DER_CONTEXT_EXPLICIT_0, &tlv(0x02, &[0x02])); // [0] INTEGER 2 (v3)
     let serial = tlv(0x02, &[0x01]); // serialNumber
     let issuer = tlv(0x30, &[]); // empty RDNSequence
@@ -1079,7 +1082,10 @@ mod tests {
         let recovered = parse_es256_public_key_from_cert(&cert_pem).unwrap();
         assert_eq!(recovered, vk);
         let jws = jws_sign_es256(&sk, b"modificationsBlock", None).unwrap();
-        assert_eq!(jws_verify_es256(&recovered, &jws).unwrap(), b"modificationsBlock");
+        assert_eq!(
+            jws_verify_es256(&recovered, &jws).unwrap(),
+            b"modificationsBlock"
+        );
     }
 
     /// The cert path is fail-closed: junk, truncated DER, and a structurally
@@ -1137,7 +1143,10 @@ mod tests {
             out.extend_from_slice(content);
             out
         }
-        let sig_algid = tlv(0x30, &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]);
+        let sig_algid = tlv(
+            0x30,
+            &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02],
+        );
         let mut validity_content = tlv(0x17, b"260101000000Z");
         validity_content.extend_from_slice(&tlv(0x17, b"270101000000Z"));
         let mut tbs_content = Vec::new();
@@ -1155,9 +1164,6 @@ mod tests {
 
         let got = spki_der_from_x509_der(&cert).unwrap();
         assert_eq!(got, spki);
-        assert_eq!(
-            VerifyingKey::from_public_key_der(&got).unwrap(),
-            vk
-        );
+        assert_eq!(VerifyingKey::from_public_key_der(&got).unwrap(), vk);
     }
 }

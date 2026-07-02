@@ -226,9 +226,11 @@ async fn apply_oauth2_enforcement(
 ) -> nextgcore_sbi::server::SbiServerConfig {
     let nrf_uri = nextgcore_sbi::context::global_context().get_nrf_uri().await;
     cfg.require_oauth2 = true;
-    cfg.oauth2_jwks_uri = nrf_uri
-        .as_deref()
-        .map(|uri| nextgcore_sbi::oauth::JwksCache::for_nrf(uri).jwks_uri().to_string());
+    cfg.oauth2_jwks_uri = nrf_uri.as_deref().map(|uri| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(uri)
+            .jwks_uri()
+            .to_string()
+    });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Amf);
     if let Some(uri) = nrf_uri.as_deref() {
         let nf_instance_id = format!("amf-{}", uuid::Uuid::new_v4());
@@ -928,7 +930,12 @@ mod oauth2_h8_tests {
             .port()
     }
 
-    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str, scope: &str) -> String {
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -980,8 +987,11 @@ mod oauth2_h8_tests {
     fn test_oauth2_require_knob_parses_and_defaults_off() {
         let dir = std::env::temp_dir();
         let off = dir.join(format!("amf-h8-off-{}.yaml", std::process::id()));
-        std::fs::write(&off, "amf:\n  sbi:\n    client:\n      nrf:\n        - uri: http://x\n")
-            .unwrap();
+        std::fs::write(
+            &off,
+            "amf:\n  sbi:\n    client:\n      nrf:\n        - uri: http://x\n",
+        )
+        .unwrap();
         assert!(!crate::oauth2_required(off.to_str().unwrap()));
         let on = dir.join(format!("amf-h8-on-{}.yaml", std::process::id()));
         std::fs::write(&on, "amf:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();

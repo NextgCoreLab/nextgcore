@@ -41,7 +41,10 @@ pub(crate) fn resolve_upu_source(
 ) -> Option<(serde_json::Value, bool)> {
     if let Some(upu) = am_data.get("upuInfo") {
         if let Some(list) = upu.get("upuDataList") {
-            let ack_ind = upu.get("upuAckInd").and_then(|v| v.as_bool()).unwrap_or(true);
+            let ack_ind = upu
+                .get("upuAckInd")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             return Some((list.clone(), ack_ind));
         }
     }
@@ -187,8 +190,7 @@ pub(crate) async fn inject_upu_info(
         }
     };
 
-    let Some(upu_info) =
-        build_upu_info(&upu_data_list, ack_ind, &security_info, &now_rfc3339())
+    let Some(upu_info) = build_upu_info(&upu_data_list, ack_ind, &security_info, &now_rfc3339())
     else {
         log::warn!("[{supi}] UpuSecurityInfo missing upuMacIausf/counterUpu — withholding");
         return withhold(am_data);
@@ -222,7 +224,9 @@ pub async fn maybe_inject_upu_info(supi: &str, raw: String) -> String {
         };
         (
             guard.upu_config(),
-            guard.ue_find_by_supi(supi).and_then(|ue| ue.ausf_instance_id),
+            guard
+                .ue_find_by_supi(supi)
+                .and_then(|ue| ue.ausf_instance_id),
         )
     };
     inject_upu_info(supi, raw, config, ausf_instance_id).await
@@ -277,8 +281,7 @@ mod tests {
 
         // (b) no UDR upuInfo → config source.
         let am_data = serde_json::json!({"gpsis": ["msisdn-1"]});
-        let (list, ack) =
-            resolve_upu_source(&am_data, Some(config(true))).expect("config source");
+        let (list, ack) = resolve_upu_source(&am_data, Some(config(true))).expect("config source");
         assert_eq!(list, golden_upu_data_list());
         assert!(ack);
 
@@ -294,8 +297,13 @@ mod tests {
             "counterUpu": "0001",
             "upuXmacIue": "fedcba9876543210fedcba9876543210",
         });
-        let upu = build_upu_info(&golden_upu_data_list(), true, &security, "2026-07-01T00:00:00Z")
-            .expect("all mandatory fields present");
+        let upu = build_upu_info(
+            &golden_upu_data_list(),
+            true,
+            &security,
+            "2026-07-01T00:00:00Z",
+        )
+        .expect("all mandatory fields present");
         let obj = upu.as_object().unwrap();
 
         // Exactly the 5 TS29503 UpuInfo fields, correct names/types.
@@ -339,7 +347,8 @@ mod tests {
         // Independent Annex A.19 recompute (P0 = the golden wire bytes,
         // counter 0x0001 — the UPU header is NOT part of the MAC input) —
         // this stands in for the UpuSecurityInfo the AUSF returns.
-        let mac = nextgcore_crypt::kdf::nextgcore_kdf_upu_mac_iausf(&kausf, &GOLDEN_UPU_LIST, 0x0001);
+        let mac =
+            nextgcore_crypt::kdf::nextgcore_kdf_upu_mac_iausf(&kausf, &GOLDEN_UPU_LIST, 0x0001);
         let xmac = nextgcore_crypt::kdf::nextgcore_kdf_upu_mac_iue(&kausf, 0x0001);
         let security = serde_json::json!({
             "upuMacIausf": crate::nudm_handler::bytes_to_hex(&mac),
@@ -389,10 +398,17 @@ mod tests {
     #[tokio::test]
     async fn ausf_unreachable_withholds_upu_info() {
         let raw = r#"{"gpsis":["msisdn-9"]}"#;
-        let out =
-            inject_upu_info("imsi-001010000000009", raw.to_string(), Some(config(true)), None)
-                .await;
-        assert!(!out.contains("upuInfo"), "fail-closed: no upuInfo when AUSF down: {out}");
+        let out = inject_upu_info(
+            "imsi-001010000000009",
+            raw.to_string(),
+            Some(config(true)),
+            None,
+        )
+        .await;
+        assert!(
+            !out.contains("upuInfo"),
+            "fail-closed: no upuInfo when AUSF down: {out}"
+        );
         assert!(
             !out.contains("upuDataList"),
             "fail-closed: an unprotected UPU list must never leak: {out}"
@@ -409,7 +425,10 @@ mod tests {
     async fn udr_provisioned_unprotected_upu_is_stripped_when_ausf_down() {
         let raw = r#"{"gpsis":["msisdn-3"],"upuInfo":{"upuDataList":[{"routingId":"9999"}],"upuAckInd":true}}"#;
         let out = inject_upu_info("imsi-001010000000003", raw.to_string(), None, None).await;
-        assert!(!out.contains("upuInfo"), "unprotected UDR upuInfo must be stripped: {out}");
+        assert!(
+            !out.contains("upuInfo"),
+            "unprotected UDR upuInfo must be stripped: {out}"
+        );
         assert!(!out.contains("upuDataList"), "no UPU list may leak: {out}");
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["gpsis"][0], "msisdn-3");

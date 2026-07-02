@@ -620,10 +620,7 @@ impl LmfContext {
         supi: Option<String>,
         lpp_transaction: u8,
         request_id: u64,
-    ) -> (
-        String,
-        tokio::sync::oneshot::Receiver<PositioningOutcome>,
-    ) {
+    ) -> (String, tokio::sync::oneshot::Receiver<PositioningOutcome>) {
         let corr = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let session = PositioningSession {
@@ -666,11 +663,7 @@ impl LmfContext {
     /// later request can honour `ageOfLocationEstimate`. Returns `false` when
     /// no such session exists (fail-closed: unknown correlations are never
     /// ingested globally).
-    pub fn positioning_session_complete(
-        &self,
-        corr: &str,
-        outcome: PositioningOutcome,
-    ) -> bool {
+    pub fn positioning_session_complete(&self, corr: &str, outcome: PositioningOutcome) -> bool {
         let Some(mut session) = self.positioning_session_take(corr) else {
             return false;
         };

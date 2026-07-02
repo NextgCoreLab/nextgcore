@@ -7,12 +7,12 @@
 //!   real builders (e.g. [`sbi_path::build_pcf_binding_body`]) in-process
 //!   for strict-peer tests instead of hand-rolled lenient mocks.
 
+pub mod am_sm;
 /// Daemon entrypoint + SBI request handlers, moved verbatim from the former
 /// `main.rs` for Wave-6 H1 lib-targetization; the binary is now a thin wrapper
 /// around [`app::run`]. Peer NF crates drive `pcf_sbi_request_handler` (and the
 /// AM/SM/UE-policy sub-handlers below) in-process for strict-peer tests.
 pub mod app;
-pub mod am_sm;
 pub mod context;
 pub mod event;
 /// Future-use intent-policy translation (Rel-20 research scaffolding): not

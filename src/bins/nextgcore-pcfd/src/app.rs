@@ -201,9 +201,11 @@ fn oauth2_required(config_path: &str) -> bool {
 async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
     let nrf_uri = nextgcore_sbi::context::global_context().get_nrf_uri().await;
     cfg.require_oauth2 = true;
-    cfg.oauth2_jwks_uri = nrf_uri
-        .as_deref()
-        .map(|uri| nextgcore_sbi::oauth::JwksCache::for_nrf(uri).jwks_uri().to_string());
+    cfg.oauth2_jwks_uri = nrf_uri.as_deref().map(|uri| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(uri)
+            .jwks_uri()
+            .to_string()
+    });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Pcf);
     if let Some(uri) = nrf_uri.as_deref() {
         let nf_instance_id = format!("pcf-{}", uuid::Uuid::new_v4());
@@ -912,9 +914,7 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
             match sbi_path::pcf_subscribe_ue_policy_notify(&supi, &callback_uri).await {
                 Ok(Some(sub_id)) => {
                     ue_policy::ue_policy_set_subscription_id(&id, &sub_id);
-                    log::info!(
-                        "[{supi}] UE policy: N1N2MessageSubscribe (UPDP) ok (sub={sub_id})"
-                    );
+                    log::info!("[{supi}] UE policy: N1N2MessageSubscribe (UPDP) ok (sub={sub_id})");
                 }
                 Ok(None) => log::warn!(
                     "[{supi}] UE policy: no AMF reachable to subscribe UPDP notifications"
@@ -957,7 +957,10 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
             }
             Err(e) => {
                 log::warn!("[{supi}] UE policy: delivery failed ({e})");
-                ue_policy::ue_policy_update_delivery_state(&id, ue_policy::DeliveryState::Failed(e));
+                ue_policy::ue_policy_update_delivery_state(
+                    &id,
+                    ue_policy::DeliveryState::Failed(e),
+                );
             }
         }
     });
@@ -1484,7 +1487,10 @@ pub async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
     }
 }
 
-pub async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest) -> SbiResponse {
+pub async fn handle_sm_policy_update_notify(
+    sm_policy_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     log::info!("SM Policy Update Notify: {sm_policy_id}");
 
     let body = match &request.http.content {
@@ -2990,7 +2996,10 @@ mod tests {
             "PTI {:#04x} must be in the PCF range 80H-FEH (TS 24.501 D.1.2)",
             assoc.pti
         );
-        assert!(!assoc.rules.is_empty(), "default URSP rule set is non-empty");
+        assert!(
+            !assoc.rules.is_empty(),
+            "default URSP rule set is non-empty"
+        );
         let mut waited = 0;
         loop {
             match ue_policy::ue_policy_find(&pol_id).map(|a| a.delivery_state) {
@@ -3099,7 +3108,12 @@ mod oauth2_h8_tests {
             .port()
     }
 
-    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str, scope: &str) -> String {
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -3151,7 +3165,11 @@ mod oauth2_h8_tests {
     fn test_oauth2_require_knob_parses_and_defaults_off() {
         let dir = std::env::temp_dir();
         let off = dir.join(format!("pcf-h8-off-{}.yaml", std::process::id()));
-        std::fs::write(&off, "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n").unwrap();
+        std::fs::write(
+            &off,
+            "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n",
+        )
+        .unwrap();
         assert!(!super::oauth2_required(off.to_str().unwrap()));
         let on = dir.join(format!("pcf-h8-on-{}.yaml", std::process::id()));
         std::fs::write(&on, "pcf:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();

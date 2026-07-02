@@ -492,8 +492,7 @@ pub fn handle_dereg_notify(amf_ue: &AmfUe, data: &DeregistrationData) -> NamfHan
         return Ok(());
     }
 
-    let reregistration_required =
-        data.dereg_reason == DeregistrationReason::UeInitialRegistration;
+    let reregistration_required = data.dereg_reason == DeregistrationReason::UeInitialRegistration;
 
     if let Ok(context) = crate::context::amf_self().read() {
         context.network_dereg_add(crate::context::PendingNetworkDereg {

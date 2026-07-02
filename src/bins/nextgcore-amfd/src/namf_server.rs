@@ -18,9 +18,9 @@ use nextgcore_sbi::server::{send_error, send_method_not_allowed, send_not_found}
 use serde_json::{json, Value};
 
 use crate::context::{
-    amf_self, AmfSess, AmfUe, EventSubscription, LcsCorrelationRecord, NrCgi,
-    PendingPositioningDl, PlmnId, PositioningDlKind, RanUe, Tai5gs, UeContextTransferState,
-    UeN1N2InfoSubscription, NEXTGCORE_INVALID_POOL_ID,
+    amf_self, AmfSess, AmfUe, EventSubscription, LcsCorrelationRecord, NrCgi, PendingPositioningDl,
+    PlmnId, PositioningDlKind, RanUe, Tai5gs, UeContextTransferState, UeN1N2InfoSubscription,
+    NEXTGCORE_INVALID_POOL_ID,
 };
 use crate::namf_handler::{
     self, AccessType, DeregistrationData, DeregistrationReason, N1N2MessageTransferCause,
@@ -133,9 +133,7 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         // (sbi_path::call_udm_uecm_registration) when the serving AMF changed.
         //   POST /namf-callback/v1/{supi}/dereg-notify
         // --------------------------------------------------------------
-        "namf-callback"
-            if parts.len() == 4 && parts[3] == "dereg-notify" && method == "POST" =>
-        {
+        "namf-callback" if parts.len() == 4 && parts[3] == "dereg-notify" && method == "POST" => {
             handle_dereg_notify_callback(parts[2], &request)
         }
 
@@ -276,10 +274,7 @@ fn handle_dereg_notify_callback(supi: &str, request: &SbiRequest) -> SbiResponse
         "3GPP_ACCESS" => AccessType::ThreeGppAccess,
         "NON_3GPP_ACCESS" => AccessType::NonThreeGppAccess,
         other => {
-            return mandatory_ie_incorrect(
-                "accessType",
-                &format!("unknown access type '{other}'"),
-            )
+            return mandatory_ie_incorrect("accessType", &format!("unknown access type '{other}'"))
         }
     };
 
@@ -1798,9 +1793,7 @@ fn handle_n1n2_subscription_delete(ue_context_id: &str, subscription_id: &str) -
         None => send_error(
             404,
             "Not Found",
-            &format!(
-                "N1N2 subscription '{subscription_id}' not found for UE '{ue_context_id}'"
-            ),
+            &format!("N1N2 subscription '{subscription_id}' not found for UE '{ue_context_id}'"),
             Some("CONTEXT_NOT_FOUND"),
         ),
     }
@@ -2923,7 +2916,10 @@ mod tests {
         );
         expected.extend_from_slice(&nrppa);
         expected.extend_from_slice(b"\r\n--gold--\r\n");
-        assert_eq!(body, expected, "multipart body must match the hand-derived vector");
+        assert_eq!(
+            body, expected,
+            "multipart body must match the hand-derived vector"
+        );
 
         // Cross-decode with our own multipart decoder (strict-peer property:
         // this is exactly what lmfd's SbiServer layer runs on receipt) — the
@@ -3001,7 +2997,10 @@ mod tests {
         );
         expected.extend_from_slice(&lpp);
         expected.extend_from_slice(b"\r\n--gold--\r\n");
-        assert_eq!(body, expected, "multipart body must match the hand-derived vector");
+        assert_eq!(
+            body, expected,
+            "multipart body must match the hand-derived vector"
+        );
 
         // Cross-decode with our own multipart decoder (this is exactly what
         // lmfd's SbiServer layer runs on receipt) — the binary N1 part must be
@@ -3117,9 +3116,7 @@ mod tests {
             .to_string();
         assert_eq!(
             location,
-            format!(
-                "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{sub_id}"
-            )
+            format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{sub_id}")
         );
 
         // The registry serves class-keyed lookups with the stored URIs
@@ -3867,7 +3864,8 @@ mod tests {
         let _serial = dereg_queue_test_lock().lock().await;
         let supi = "imsi-001010000070404";
         let ue = setup_ue(supi, true, true);
-        let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "NON_3GPP_ACCESS" });
+        let body =
+            json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "NON_3GPP_ACCESS" });
         let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
             .with_json_body(&body)
             .expect("json");

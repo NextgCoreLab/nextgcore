@@ -328,13 +328,17 @@ async fn main() -> Result<()> {
         // (active admission-control subscriptions, saturated at 100;
         // TS 29.510 §5.2.2.3.2). Honest subscription-count proxy — no
         // fabricated CPU numbers.
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id.clone(), 5, || {
-            let load = nsacf_self()
-                .read()
-                .map(|c| c.subscription_count())
-                .unwrap_or(0);
-            load.min(100) as u8
-        });
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+            nf_instance_id.clone(),
+            5,
+            || {
+                let load = nsacf_self()
+                    .read()
+                    .map(|c| c.subscription_count())
+                    .unwrap_or(0);
+                load.min(100) as u8
+            },
+        );
     }
 
     log::info!("NextGCore NSACF ready (instance: {nf_instance_id})");

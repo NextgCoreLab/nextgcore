@@ -6,12 +6,12 @@
 //! - Key derivation (KAUSF, KSEAF)
 //! - Authentication result confirmation
 
-use anyhow::{Context, Result};
-use clap::Parser;
 use crate::{
     ausf_context_final, ausf_context_init, ausf_sbi_close, ausf_sbi_open, ausf_self, timer_manager,
     AusfEvent, AusfSmContext, SbiServerConfig,
 };
+use anyhow::{Context, Result};
+use clap::Parser;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
@@ -191,9 +191,11 @@ fn oauth2_required(config_path: &str) -> bool {
 async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
     let nrf_uri = nextgcore_sbi::context::global_context().get_nrf_uri().await;
     cfg.require_oauth2 = true;
-    cfg.oauth2_jwks_uri = nrf_uri
-        .as_deref()
-        .map(|uri| nextgcore_sbi::oauth::JwksCache::for_nrf(uri).jwks_uri().to_string());
+    cfg.oauth2_jwks_uri = nrf_uri.as_deref().map(|uri| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(uri)
+            .jwks_uri()
+            .to_string()
+    });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Ausf);
     if let Some(uri) = nrf_uri.as_deref() {
         let nf_instance_id = format!("ausf-{}", uuid::Uuid::new_v4());
@@ -466,10 +468,9 @@ pub async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
     let serving_network_name = auth_info.get("servingNetworkName").and_then(|v| v.as_str());
 
     // Validate required fields
-    if let Err(msg) = crate::nausf_handler::validate_authentication_info(
-        Some(supi_or_suci),
-        serving_network_name,
-    ) {
+    if let Err(msg) =
+        crate::nausf_handler::validate_authentication_info(Some(supi_or_suci), serving_network_name)
+    {
         return send_bad_request(msg, Some("INVALID_REQUEST"));
     }
 
@@ -497,10 +498,7 @@ pub async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
         .get_header("Authorization")
         .map(|h| extract_consumer_plmns(h))
         .unwrap_or_default();
-    if !crate::nausf_handler::snn_authorized_for_consumer(
-        serving_network_name,
-        &consumer_plmns,
-    ) {
+    if !crate::nausf_handler::snn_authorized_for_consumer(serving_network_name, &consumer_plmns) {
         log::warn!(
             "SNN '{serving_network_name}' not authorized for consumer PLMNs {consumer_plmns:?}"
         );
@@ -621,8 +619,7 @@ pub async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
                 .clone()
                 .unwrap_or_else(|| supi_or_suci.to_string());
 
-            let mut session =
-                crate::eap_aka_prime::EapAkaSession::new(serving_network_name);
+            let mut session = crate::eap_aka_prime::EapAkaSession::new(serving_network_name);
             session.init_from_transformed_av(&rand, &autn, &xres, &ck_prime, &ik_prime, &identity);
 
             // KAUSF = MSB256(EMSK) is fixed by the key schedule; store it now
@@ -1684,7 +1681,10 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
             );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             for (name, service_type) in [
-                ("nausf-auth", nextgcore_sbi::types::SbiServiceType::NausfAuth),
+                (
+                    "nausf-auth",
+                    nextgcore_sbi::types::SbiServiceType::NausfAuth,
+                ),
                 (
                     "nausf-sorprotection",
                     nextgcore_sbi::types::SbiServiceType::NausfSorprotection,
@@ -2858,11 +2858,7 @@ mod tests {
             let resp = handle_auth_context_delete(&ctx_id).await;
             assert_eq!(resp.status, 204, "DELETE must succeed");
             assert!(
-                ausf_self()
-                    .read()
-                    .unwrap()
-                    .ue_find_by_supi(supi)
-                    .is_none(),
+                ausf_self().read().unwrap().ue_find_by_supi(supi).is_none(),
                 "auth context must be gone (zeroized) after DELETE"
             );
 
@@ -3117,8 +3113,7 @@ mod tests {
                 expected_mac.to_vec(),
                 "sorMacIausf must be reproducible from KAUSF + documented S-string"
             );
-            let expected_xmac =
-                nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iue(&kausf, 0x0001);
+            let expected_xmac = nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iue(&kausf, 0x0001);
             assert_eq!(
                 crate::nudm_handler::hex_to_bytes(sor["sorXmacIue"].as_str().unwrap()),
                 expected_xmac.to_vec()
@@ -3138,8 +3133,8 @@ mod tests {
             // indicator "1234" → 04 0002 21 43; default configured NSSAI
             // [{sst:1},{sst:2,sd:00007B}] → 02 0007 01 01 04 02 00 00 7B.
             const GOLDEN_UPU: [u8; 15] = [
-                0x04, 0x00, 0x02, 0x21, 0x43, 0x02, 0x00, 0x07, 0x01, 0x01, 0x04, 0x02, 0x00,
-                0x00, 0x7B,
+                0x04, 0x00, 0x02, 0x21, 0x43, 0x02, 0x00, 0x07, 0x01, 0x01, 0x04, 0x02, 0x00, 0x00,
+                0x7B,
             ];
             let upu_body = serde_json::json!({
                 "upuAckInd": true,
@@ -3154,18 +3149,14 @@ mod tests {
             let upu: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
             assert_eq!(upu["counterUpu"], "0001");
-            let expected_mac = nextgcore_crypt::kdf::nextgcore_kdf_upu_mac_iausf(
-                &kausf,
-                &GOLDEN_UPU,
-                0x0001,
-            );
+            let expected_mac =
+                nextgcore_crypt::kdf::nextgcore_kdf_upu_mac_iausf(&kausf, &GOLDEN_UPU, 0x0001);
             assert_eq!(
                 crate::nudm_handler::hex_to_bytes(upu["upuMacIausf"].as_str().unwrap()),
                 expected_mac.to_vec(),
                 "upuMacIausf must be reproducible from KAUSF + documented S-string"
             );
-            let expected_xmac =
-                nextgcore_crypt::kdf::nextgcore_kdf_upu_mac_iue(&kausf, 0x0001);
+            let expected_xmac = nextgcore_crypt::kdf::nextgcore_kdf_upu_mac_iue(&kausf, 0x0001);
             assert_eq!(
                 crate::nudm_handler::hex_to_bytes(upu["upuXmacIue"].as_str().unwrap()),
                 expected_xmac.to_vec()
@@ -3174,7 +3165,10 @@ mod tests {
             // ---- Fail-closed over the wire ----
             // Unknown SUPI → 404 CONTEXT_NOT_FOUND, never a MAC.
             let resp = client
-                .post_json("/nausf-sorprotection/v1/imsi-001019999999999/ue-sor", &sor_body)
+                .post_json(
+                    "/nausf-sorprotection/v1/imsi-001019999999999/ue-sor",
+                    &sor_body,
+                )
                 .await
                 .expect("sor 404");
             assert_eq!(resp.status, 404);
@@ -3183,7 +3177,10 @@ mod tests {
             assert_eq!(pd["cause"], "CONTEXT_NOT_FOUND");
             assert!(pd.get("sorMacIausf").is_none());
             let resp = client
-                .post_json("/nausf-upuprotection/v1/imsi-001019999999999/ue-upu", &upu_body)
+                .post_json(
+                    "/nausf-upuprotection/v1/imsi-001019999999999/ue-upu",
+                    &upu_body,
+                )
                 .await
                 .expect("upu 404");
             assert_eq!(resp.status, 404);
@@ -3237,7 +3234,12 @@ mod oauth2_h8_tests {
             .port()
     }
 
-    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str, scope: &str) -> String {
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -3289,7 +3291,11 @@ mod oauth2_h8_tests {
     fn test_oauth2_require_knob_parses_and_defaults_off() {
         let dir = std::env::temp_dir();
         let off = dir.join(format!("ausf-h8-off-{}.yaml", std::process::id()));
-        std::fs::write(&off, "ausf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n").unwrap();
+        std::fs::write(
+            &off,
+            "ausf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n",
+        )
+        .unwrap();
         assert!(!super::oauth2_required(off.to_str().unwrap()));
         let on = dir.join(format!("ausf-h8-on-{}.yaml", std::process::id()));
         std::fs::write(&on, "ausf:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();

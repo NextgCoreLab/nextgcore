@@ -179,7 +179,9 @@ pub fn encode_steering_list(entries: &[serde_json::Value]) -> Result<Vec<u8>, St
                 .as_array()
                 .ok_or("SteeringInfo.accessTechList must be an array")?;
             if arr.is_empty() {
-                return Err("SteeringInfo.accessTechList needs at least 1 entry (minItems 1)".into());
+                return Err(
+                    "SteeringInfo.accessTechList needs at least 1 entry (minItems 1)".into(),
+                );
             }
             for tech in arr {
                 let name = tech
@@ -231,7 +233,9 @@ fn resolve_sor_mac_inputs(
             let octets = nextgcore_crypt::base64::decode(encoded)
                 .filter(|o| !o.is_empty())
                 .ok_or_else(|| {
-                    Box::new(encoding_error("sorTransparentInfo is not valid non-empty base64"))
+                    Box::new(encoding_error(
+                        "sorTransparentInfo is not valid non-empty base64",
+                    ))
                 })?;
             if sor_info.get("sorHeader").is_none() {
                 // Fail-closed: guessing the header bits over opaque octets
@@ -249,8 +253,8 @@ fn resolve_sor_mac_inputs(
             match sor_info.get("steeringContainer") {
                 None => (None, false, false),
                 Some(serde_json::Value::Array(entries)) => {
-                    let list = encode_steering_list(entries)
-                        .map_err(|e| Box::new(encoding_error(&e)))?;
+                    let list =
+                        encode_steering_list(entries).map_err(|e| Box::new(encoding_error(&e)))?;
                     (Some(list), true, true)
                 }
                 Some(serde_json::Value::String(secured)) => {
@@ -275,7 +279,9 @@ fn resolve_sor_mac_inputs(
     let header = match sor_info.get("sorHeader") {
         Some(h) => {
             let encoded = h.as_str().ok_or_else(|| {
-                Box::new(encoding_error("sorHeader must be a base64 string (TS 29.571 Bytes)"))
+                Box::new(encoding_error(
+                    "sorHeader must be a base64 string (TS 29.571 Bytes)",
+                ))
             })?;
             let octets = nextgcore_crypt::base64::decode(encoded)
                 .ok_or_else(|| Box::new(encoding_error("sorHeader is not valid base64")))?;
@@ -303,7 +309,11 @@ pub fn handle_sor_protect(supi: &str, request: &SbiRequest) -> SbiResponse {
     let sor_info: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => {
-            return problem(400, "INVALID_MSG_FORMAT", &format!("Invalid SorInfo JSON: {e}"))
+            return problem(
+                400,
+                "INVALID_MSG_FORMAT",
+                &format!("Invalid SorInfo JSON: {e}"),
+            )
         }
     };
 
@@ -460,9 +470,21 @@ mod tests {
         // TS 24.501 fig. 9.11.3.51.5: b1 data type, b2 list ind, b3 list
         // type, b4 ACK.
         assert_eq!(build_sor_header(true, true, true), 0x0E, "ack + PLMN list");
-        assert_eq!(build_sor_header(false, true, false), 0x02, "secured packet, no ack");
-        assert_eq!(build_sor_header(true, false, false), 0x08, "HPLMN no-change + ack");
-        assert_eq!(build_sor_header(false, false, false), 0x00, "no-change, no ack");
+        assert_eq!(
+            build_sor_header(false, true, false),
+            0x02,
+            "secured packet, no ack"
+        );
+        assert_eq!(
+            build_sor_header(true, false, false),
+            0x08,
+            "HPLMN no-change + ack"
+        );
+        assert_eq!(
+            build_sor_header(false, false, false),
+            0x00,
+            "no-change, no ack"
+        );
     }
 
     #[test]
@@ -473,9 +495,11 @@ mod tests {
             .collect();
         assert!(encode_steering_list(&big).is_err());
         // missing plmnId (mandatory).
-        assert!(encode_steering_list(&[serde_json::json!({"accessTechList": ["NR"]})])
-            .unwrap_err()
-            .contains("mandatory"));
+        assert!(
+            encode_steering_list(&[serde_json::json!({"accessTechList": ["NR"]})])
+                .unwrap_err()
+                .contains("mandatory")
+        );
         // unknown access technology (fail-closed).
         let bad = serde_json::json!([
             {"plmnId": {"mcc": "001", "mnc": "01"}, "accessTechList": ["6G_RAN"]}
@@ -502,10 +526,13 @@ mod tests {
         let kausf = test_kausf(0xA1);
         ausf_self().read().unwrap().anchor_refresh(supi, &kausf);
 
-        let response = post_sor(supi, &serde_json::json!({
-            "ackInd": true,
-            "steeringContainer": golden_container(),
-        }));
+        let response = post_sor(
+            supi,
+            &serde_json::json!({
+                "ackInd": true,
+                "steeringContainer": golden_container(),
+            }),
+        );
         assert_eq!(response.status, 200, "body: {:?}", response.http.content);
         let json = body_json(&response);
 
@@ -516,8 +543,7 @@ mod tests {
         // (ack + list ind + PLMN list type), counter 0x0001, P2 = the
         // hand-derived golden list bytes. The handler's MAC must match a
         // recompute that does NOT reuse any handler intermediates.
-        let expected_mac =
-            nextgcore_kdf_sor_mac_iausf(&kausf, &[0x0E], 0x0001, Some(&GOLDEN_LIST));
+        let expected_mac = nextgcore_kdf_sor_mac_iausf(&kausf, &[0x0E], 0x0001, Some(&GOLDEN_LIST));
         assert_eq!(
             hex_to_bytes(json["sorMacIausf"].as_str().unwrap()),
             expected_mac.to_vec()
@@ -535,16 +561,25 @@ mod tests {
     fn sor_without_ack_omits_xmac() {
         ausf_context_init(64);
         let supi = "imsi-999700000000102";
-        ausf_self().read().unwrap().anchor_refresh(supi, &test_kausf(0xA2));
+        ausf_self()
+            .read()
+            .unwrap()
+            .anchor_refresh(supi, &test_kausf(0xA2));
 
-        let response = post_sor(supi, &serde_json::json!({
-            "ackInd": false,
-            "steeringContainer": golden_container(),
-        }));
+        let response = post_sor(
+            supi,
+            &serde_json::json!({
+                "ackInd": false,
+                "steeringContainer": golden_container(),
+            }),
+        );
         assert_eq!(response.status, 200);
         let json = body_json(&response);
         assert!(json.get("sorMacIausf").is_some());
-        assert!(json.get("sorXmacIue").is_none(), "no XMAC when ack not requested");
+        assert!(
+            json.get("sorXmacIue").is_none(),
+            "no XMAC when ack not requested"
+        );
     }
 
     #[test]
@@ -574,10 +609,13 @@ mod tests {
         ausf_self().read().unwrap().anchor_refresh(supi, &kausf);
 
         let packet = [0xDEu8, 0xAD, 0xBE, 0xEF];
-        let response = post_sor(supi, &serde_json::json!({
-            "ackInd": false,
-            "steeringContainer": nextgcore_crypt::base64::encode(&packet),
-        }));
+        let response = post_sor(
+            supi,
+            &serde_json::json!({
+                "ackInd": false,
+                "steeringContainer": nextgcore_crypt::base64::encode(&packet),
+            }),
+        );
         assert_eq!(response.status, 200);
         let json = body_json(&response);
 
@@ -598,19 +636,25 @@ mod tests {
 
         // sorTransparentInfo without sorHeader → 400 (fail-closed).
         let opaque = [0x11u8, 0x22, 0x33];
-        let response = post_sor(supi, &serde_json::json!({
-            "ackInd": true,
-            "sorTransparentInfo": nextgcore_crypt::base64::encode(&opaque),
-        }));
+        let response = post_sor(
+            supi,
+            &serde_json::json!({
+                "ackInd": true,
+                "sorTransparentInfo": nextgcore_crypt::base64::encode(&opaque),
+            }),
+        );
         assert_eq!(response.status, 400);
         assert_eq!(body_json(&response)["cause"], "MANDATORY_IE_MISSING");
 
         // With sorHeader: the provided header + verbatim octets are MACed.
-        let response = post_sor(supi, &serde_json::json!({
-            "ackInd": true,
-            "sorHeader": nextgcore_crypt::base64::encode(&[0x0A]),
-            "sorTransparentInfo": nextgcore_crypt::base64::encode(&opaque),
-        }));
+        let response = post_sor(
+            supi,
+            &serde_json::json!({
+                "ackInd": true,
+                "sorHeader": nextgcore_crypt::base64::encode(&[0x0A]),
+                "sorTransparentInfo": nextgcore_crypt::base64::encode(&opaque),
+            }),
+        );
         assert_eq!(response.status, 200);
         let json = body_json(&response);
         let expected_mac = nextgcore_kdf_sor_mac_iausf(&kausf, &[0x0A], 0x0001, Some(&opaque));
@@ -620,10 +664,13 @@ mod tests {
         );
 
         // Multi-octet sorHeader → 400 (octet 4 is exactly one octet).
-        let response = post_sor(supi, &serde_json::json!({
-            "ackInd": true,
-            "sorHeader": nextgcore_crypt::base64::encode(&[0x0A, 0x0B]),
-        }));
+        let response = post_sor(
+            supi,
+            &serde_json::json!({
+                "ackInd": true,
+                "sorHeader": nextgcore_crypt::base64::encode(&[0x0A, 0x0B]),
+            }),
+        );
         assert_eq!(response.status, 400);
     }
 
@@ -631,11 +678,17 @@ mod tests {
     fn sor_missing_ack_ind_is_400_mandatory_ie_missing() {
         ausf_context_init(64);
         let supi = "imsi-999700000000106";
-        ausf_self().read().unwrap().anchor_refresh(supi, &test_kausf(0xA6));
+        ausf_self()
+            .read()
+            .unwrap()
+            .anchor_refresh(supi, &test_kausf(0xA6));
 
-        let response = post_sor(supi, &serde_json::json!({
-            "steeringContainer": golden_container(),
-        }));
+        let response = post_sor(
+            supi,
+            &serde_json::json!({
+                "steeringContainer": golden_container(),
+            }),
+        );
         assert_eq!(response.status, 400);
         assert_eq!(body_json(&response)["cause"], "MANDATORY_IE_MISSING");
 
@@ -649,21 +702,30 @@ mod tests {
     #[test]
     fn sor_unknown_supi_is_404_context_not_found_never_a_mac() {
         ausf_context_init(64);
-        let response = post_sor("imsi-999700000000199", &serde_json::json!({
-            "ackInd": true,
-            "steeringContainer": golden_container(),
-        }));
+        let response = post_sor(
+            "imsi-999700000000199",
+            &serde_json::json!({
+                "ackInd": true,
+                "steeringContainer": golden_container(),
+            }),
+        );
         assert_eq!(response.status, 404);
         let json = body_json(&response);
         assert_eq!(json["cause"], "CONTEXT_NOT_FOUND");
-        assert!(json.get("sorMacIausf").is_none(), "404 must never carry a MAC");
+        assert!(
+            json.get("sorMacIausf").is_none(),
+            "404 must never carry a MAC"
+        );
     }
 
     #[test]
     fn sor_counter_freshness_two_calls_two_counters_two_macs() {
         ausf_context_init(64);
         let supi = "imsi-999700000000107";
-        ausf_self().read().unwrap().anchor_refresh(supi, &test_kausf(0xA7));
+        ausf_self()
+            .read()
+            .unwrap()
+            .anchor_refresh(supi, &test_kausf(0xA7));
 
         let body = serde_json::json!({"ackInd": true, "steeringContainer": golden_container()});
         let first = body_json(&post_sor(supi, &body));
@@ -683,7 +745,10 @@ mod tests {
         let supi = "imsi-999700000000108";
         let ctx = ausf_self();
         ctx.read().unwrap().anchor_refresh(supi, &test_kausf(0xA8));
-        assert!(ctx.read().unwrap().anchor_force_counters(supi, 0xFFFF, 0xFFFF));
+        assert!(ctx
+            .read()
+            .unwrap()
+            .anchor_force_counters(supi, 0xFFFF, 0xFFFF));
 
         let body = serde_json::json!({"ackInd": true, "steeringContainer": golden_container()});
         let response = post_sor(supi, &body);

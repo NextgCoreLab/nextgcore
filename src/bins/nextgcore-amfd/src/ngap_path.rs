@@ -3739,10 +3739,7 @@ impl NgapServer {
                 None => (None, None),
             }
         };
-        let Some(callback_uri) = sub
-            .as_ref()
-            .and_then(|s| s.n2_notify_callback_uri.clone())
-        else {
+        let Some(callback_uri) = sub.as_ref().and_then(|s| s.n2_notify_callback_uri.clone()) else {
             UL_NRPPA_DROPPED_NO_CONSUMER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::warn!(
                 "Uplink UE-associated NRPPa (association {association_id}, \
@@ -3821,10 +3818,7 @@ impl NgapServer {
             };
             guard.n1n2_subscription_find_any_n2("NRPPa")
         };
-        let Some(callback_uri) = sub
-            .as_ref()
-            .and_then(|s| s.n2_notify_callback_uri.clone())
-        else {
+        let Some(callback_uri) = sub.as_ref().and_then(|s| s.n2_notify_callback_uri.clone()) else {
             UL_NRPPA_DROPPED_NO_CONSUMER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::warn!(
                 "Uplink non-UE-associated NRPPa (association {association_id}) \
@@ -7140,11 +7134,10 @@ mod tests {
             .expect("proc-50 dispatch must not emit anything toward the gNB");
 
         // Exactly one multipart N2InfoNotify POST at the LMF callback.
-        let (uri, json_root, parts) =
-            tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .expect("N2InfoNotify within 5s")
-                .expect("sink channel open");
+        let (uri, json_root, parts) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("N2InfoNotify within 5s")
+            .expect("sink channel open");
         assert!(
             uri.starts_with("/nlmf-loc/v1/notify/n2"),
             "posted to the registered n2NotifyCallbackUri, got {uri}"
@@ -7163,8 +7156,7 @@ mod tests {
             "nrppa"
         );
         assert_eq!(
-            body["n2InfoContainer"]["nrppaInfo"]["nfId"],
-            "lmf-nf-instance-1",
+            body["n2InfoContainer"]["nrppaInfo"]["nfId"], "lmf-nf-instance-1",
             "nfId recovered from the RoutingID echo"
         );
         assert_eq!(body["lcsCorrelationId"], "corr-a1-ue");
@@ -7229,8 +7221,7 @@ mod tests {
         ngap.process_ngap_message(1, &bytes)
             .await
             .expect("no-consumer uplink NRPPa must NOT attempt an ErrorIndication");
-        let dropped_after =
-            UL_NRPPA_DROPPED_NO_CONSUMER.load(std::sync::atomic::Ordering::Relaxed);
+        let dropped_after = UL_NRPPA_DROPPED_NO_CONSUMER.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             dropped_after - dropped_before,
             1,
@@ -7285,11 +7276,10 @@ mod tests {
             .await
             .expect("proc-47 dispatch must not emit anything toward the gNB");
 
-        let (uri, json_root, parts) =
-            tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .expect("N2InfoNotify within 5s")
-                .expect("sink channel open");
+        let (uri, json_root, parts) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("N2InfoNotify within 5s")
+            .expect("sink channel open");
         assert!(uri.starts_with("/nlmf-loc/v1/notify/n2"));
         let body: serde_json::Value = serde_json::from_str(&json_root).expect("jsonData");
         assert_eq!(body["n2NotifySubscriptionId"], sub_id);

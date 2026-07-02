@@ -90,7 +90,10 @@ fn provisioned_via_real_udrd_store_matches_golden() {
         "provisioned MANAGE UE POLICY COMMAND must be byte-exact E3 golden vector"
     );
     // Proves the provisioned source changed the wire artifact vs the default.
-    assert_ne!(bytes, VEC_F, "provisioned command must differ from the catch-all default");
+    assert_ne!(
+        bytes, VEC_F,
+        "provisioned command must differ from the catch-all default"
+    );
 }
 
 /// No provisioning for a SUPI → pcfd delivers the static default (E1(f)).
@@ -104,7 +107,10 @@ fn no_provisioning_delivers_static_default() {
     let stored = ds.policy_ue_get(supi);
     let rules = resolve_ursp_rules(stored.as_ref());
     let bytes = build_manage_ue_policy_command(0x80, 1, "001", "01", &rules).expect("encode");
-    assert_eq!(bytes, VEC_F, "no provisioning → static catch-all default (E1(f))");
+    assert_eq!(
+        bytes, VEC_F,
+        "no provisioning → static catch-all default (E1(f))"
+    );
 }
 
 /// A malformed provisioning doc round-tripped through udrd's REAL store → pcfd
@@ -127,8 +133,14 @@ fn malformed_provisioning_falls_back_via_real_store() {
     );
     let stored = ds.policy_ue_get(supi).expect("stored");
     let err = map_ue_policy_set_to_rules(&stored).expect_err("malformed urspRules must err");
-    assert!(err.contains("carrier-pigeon"), "error must name the component: {err}");
+    assert!(
+        err.contains("carrier-pigeon"),
+        "error must name the component: {err}"
+    );
     let rules = resolve_ursp_rules(Some(&stored));
     let bytes = build_manage_ue_policy_command(0x80, 1, "001", "01", &rules).expect("encode");
-    assert_eq!(bytes, VEC_F, "malformed provisioning → static default fallback (E1(f))");
+    assert_eq!(
+        bytes, VEC_F,
+        "malformed provisioning → static default fallback (E1(f))"
+    );
 }

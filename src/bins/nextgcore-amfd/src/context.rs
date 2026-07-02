@@ -3503,9 +3503,7 @@ mod tests {
                 n1_message_class: None,
                 n1_notify_callback_uri: None,
                 n2_information_class: Some("NRPPa".to_string()),
-                n2_notify_callback_uri: Some(
-                    "http://lmf:7777/nlmf-loc/v1/notify/n2".to_string()
-                ),
+                n2_notify_callback_uri: Some("http://lmf:7777/nlmf-loc/v1/notify/n2".to_string()),
                 lcs_correlation_id: None,
             }
         ));
@@ -3540,7 +3538,9 @@ mod tests {
         // Fail-closed: classes never stored are never returned
         assert!(ctx.n1n2_subscription_find_n1(supi, "SMS").is_none());
         assert!(ctx.n1n2_subscription_find_n2(supi, "PWS").is_none());
-        assert!(ctx.n1n2_subscription_find_n1("imsi-unknown", "LPP").is_none());
+        assert!(ctx
+            .n1n2_subscription_find_n1("imsi-unknown", "LPP")
+            .is_none());
 
         // Remove one — the other coexists
         assert!(ctx.n1n2_subscription_remove(supi, "sub-lpp").is_some());

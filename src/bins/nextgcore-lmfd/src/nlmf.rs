@@ -553,7 +553,10 @@ pub struct EventNotifyData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub positioning_data_list: Option<Vec<PositioningMethodAndUsage>>,
     /// `servingLMFidentification` (yaml:1625 — note the lower-case `i`).
-    #[serde(rename = "servingLMFidentification", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "servingLMFidentification",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub serving_lmf_identification: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub termination_cause: Option<String>,
@@ -566,7 +569,10 @@ pub struct EventNotifyData {
 pub struct EventNotifyDataExt {
     #[serde(flatten)]
     pub event_notify_data: EventNotifyData,
-    #[serde(rename = "addEventNotifyDatas", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "addEventNotifyDatas",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub add_event_notify_datas: Option<Vec<EventNotifyData>>,
 }
 
@@ -1088,6 +1094,9 @@ mod tests {
         };
         let v = serde_json::to_value(&ext).unwrap();
         assert_eq!(v["reportedEventType"], "PERIODIC_EVENT");
-        assert_eq!(v["addEventNotifyDatas"][0]["reportedEventType"], "INTERMEDIATE_EVENT");
+        assert_eq!(
+            v["addEventNotifyDatas"][0]["reportedEventType"],
+            "INTERMEDIATE_EVENT"
+        );
     }
 }

@@ -757,7 +757,10 @@ mod tests {
         let sub: ACInfoSubscription = serde_json::from_str(body).expect("deserializes");
         assert_eq!(sub.eas_id, "eas1.example.com");
         let fltr = &sub.ac_fltrs.as_ref().unwrap()[0];
-        assert_eq!(fltr.ac_types_list.as_deref(), Some(&["V2X".to_string()][..]));
+        assert_eq!(
+            fltr.ac_types_list.as_deref(),
+            Some(&["V2X".to_string()][..])
+        );
         assert_eq!(fltr.ue_ids.as_deref().unwrap().len(), 1);
         assert_eq!(sub.exp_time.as_deref(), Some("2030-01-01T00:00:00Z"));
         assert!(sub.event_req.is_some());
@@ -1129,8 +1132,9 @@ mod tests {
     /// fails to deserialize; missing nested `cntxId` also fails.
     #[test]
     fn test_eec_context_push_old_flat_shape_fails() {
-        assert!(serde_json::from_str::<EECContextPush>(r#"{"eecId":"eec1","ueId":"ue-1"}"#)
-            .is_err());
+        assert!(
+            serde_json::from_str::<EECContextPush>(r#"{"eecId":"eec1","ueId":"ue-1"}"#).is_err()
+        );
         // Envelope present but nested EECContext missing cntxId (yaml:265-267).
         assert!(serde_json::from_str::<EECContextPush>(
             r#"{"eesId":"ees-src","eecCntx":{"eecId":"eec1"}}"#

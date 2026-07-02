@@ -3799,7 +3799,10 @@ udr:
             "auth-status PUT must not advance the stored SQN"
         );
 
-        let resp = client.delete(&status_path).await.expect("DELETE auth-status");
+        let resp = client
+            .delete(&status_path)
+            .await
+            .expect("DELETE auth-status");
         assert_eq!(resp.status, 204);
         assert_eq!(
             nextgcore_dbi::test_store::stored_sqn(supi),
@@ -3850,11 +3853,9 @@ udr:
             assert_eq!(resp.status, 200);
             let doc: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-            let served = u64::from_str_radix(
-                doc["sequenceNumber"]["sqn"].as_str().expect("sqn hex"),
-                16,
-            )
-            .expect("sqn parses");
+            let served =
+                u64::from_str_radix(doc["sequenceNumber"]["sqn"].as_str().expect("sqn hex"), 16)
+                    .expect("sqn parses");
             let advanced = udm_advance_sqn_ind(served);
             let resp = client
                 .patch_json(

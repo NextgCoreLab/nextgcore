@@ -125,7 +125,11 @@ fn amf_ctx_update_json(svc_hex: &str, ngap_ie_type: &str, content_id: &str) -> S
 /// decode it via `multipart::decode` (what mbsmfd's SBI server does inbound,
 /// server.rs:570-592), then drive the real handler.
 async fn amf_post_multipart(json: &str, content_id: &str, ngap_bytes: &[u8]) -> SbiResponse {
-    let part = SbiPart::with_content(content_id, APPLICATION_NGAP, Bytes::copy_from_slice(ngap_bytes));
+    let part = SbiPart::with_content(
+        content_id,
+        APPLICATION_NGAP,
+        Bytes::copy_from_slice(ngap_bytes),
+    );
     let boundary = multipart::generate_boundary();
     // AMF client emits multipart/related on the wire.
     let wire = multipart::encode(Some(json), std::slice::from_ref(&part), &boundary);
@@ -245,7 +249,10 @@ async fn mbs_context_update_strict_peer_corrupt_container_4xx() {
     let json = amf_ctx_update_json("0000b4", "MBS_DIS_SETUP_REQ", "binaryDataN2Information");
     let rsp = amf_post_multipart(&json, "binaryDataN2Information", &container).await;
 
-    assert_ne!(rsp.status, 200, "corrupt container must NOT pass through as 200");
+    assert_ne!(
+        rsp.status, 200,
+        "corrupt container must NOT pass through as 200"
+    );
     assert!(
         (400..600).contains(&rsp.status),
         "corrupt container is fail-closed (4xx/5xx), got {}",
@@ -296,8 +303,12 @@ async fn mbs_context_update_strict_peer_release_204() {
     // Establish shared delivery first (setup leg) so there is a transport to
     // release.
     let setup_json = amf_ctx_update_json("0000c5", "MBS_DIS_SETUP_REQ", "binaryDataN2Information");
-    let setup_rsp =
-        amf_post_multipart(&setup_json, "binaryDataN2Information", &golden_setup_req(SVC)).await;
+    let setup_rsp = amf_post_multipart(
+        &setup_json,
+        "binaryDataN2Information",
+        &golden_setup_req(SVC),
+    )
+    .await;
     assert_eq!(setup_rsp.status, 200, "setup leg established");
     assert!(
         session_transport_present(SVC),

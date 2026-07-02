@@ -1965,12 +1965,13 @@ fn verify_cca_signature(
     // Verify over the exact base64url header.payload as received (do NOT
     // re-encode the decoded parts — canonicalisation would change the bytes).
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    key.verify(signing_input.as_bytes(), &signature).map_err(|_| {
-        (
-            "invalid_client",
-            "Client Credentials Assertion signature verification failed".to_string(),
-        )
-    })?;
+    key.verify(signing_input.as_bytes(), &signature)
+        .map_err(|_| {
+            (
+                "invalid_client",
+                "Client Credentials Assertion signature verification failed".to_string(),
+            )
+        })?;
     Ok(())
 }
 
@@ -3657,8 +3658,8 @@ mod tests {
 
         // Tampered payload (forged claims, original signature) -> rejected: this
         // is exactly the forged-CCA the audit flagged as accepted.
-        let forged_payload =
-            URL_SAFE_NO_PAD.encode(br#"{"sub":"attacker","iss":"attacker","aud":"NRF","iat":1000000}"#);
+        let forged_payload = URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"attacker","iss":"attacker","aud":"NRF","iat":1000000}"#);
         let forged = format!("{}.{}.{}", parts[0], forged_payload, parts[2]);
         assert_eq!(
             verify_cca_signature(&forged, &vk).unwrap_err().0,
@@ -3775,7 +3776,10 @@ mod tests {
             Some("urn:uuid:leaf")
         );
         // No URI element at all.
-        assert_eq!(parse_xfcc_first_entry_uri("Hash=abcd;Subject=\"CN=x\""), None);
+        assert_eq!(
+            parse_xfcc_first_entry_uri("Hash=abcd;Subject=\"CN=x\""),
+            None
+        );
 
         // Full extraction: urn:uuid: prefix (case-insensitive) is stripped.
         let mut req = SbiRequest::post("/nnrf-oauth2/v1/access-token");
@@ -3787,8 +3791,10 @@ mod tests {
         );
         // A non-URN URI SAN binds on the exact value.
         let mut req2 = SbiRequest::post("/x");
-        req2.http
-            .set_header("x-forwarded-client-cert", "URI=https://amf.example/nf/amf-9");
+        req2.http.set_header(
+            "x-forwarded-client-cert",
+            "URI=https://amf.example/nf/amf-9",
+        );
         assert_eq!(
             extract_transport_client_nf_instance_id(&req2).as_deref(),
             Some("https://amf.example/nf/amf-9")
@@ -3927,10 +3933,9 @@ mod tests {
 
         // (a) A forged/mismatched mTLS identity is rejected with invalid_client
         // even though require_client_auth defaults OFF.
-        let resp = handle_access_token_request(&token_req(Some(
-            "Hash=ab;URI=urn:uuid:some-other-nf",
-        )))
-        .await;
+        let resp =
+            handle_access_token_request(&token_req(Some("Hash=ab;URI=urn:uuid:some-other-nf")))
+                .await;
         assert_eq!(resp.status, 400, "mismatched cert must be rejected");
         let err: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();

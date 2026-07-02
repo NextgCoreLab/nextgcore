@@ -381,9 +381,8 @@ mod tests {
     //            00110010 01010011 00100001 01101000
     //          = 28 02 24 49 53 E1 32 53 21 68
     // =====================================================================
-    const GOLDEN_GNSS_ACQUISITION_ASSISTANCE: [u8; 10] = [
-        0x28, 0x02, 0x24, 0x49, 0x53, 0xE1, 0x32, 0x53, 0x21, 0x68,
-    ];
+    const GOLDEN_GNSS_ACQUISITION_ASSISTANCE: [u8; 10] =
+        [0x28, 0x02, 0x24, 0x49, 0x53, 0xE1, 0x32, 0x53, 0x21, 0x68];
 
     fn golden_acquisition_assistance_value() -> GnssAcquisitionAssistance {
         GnssAcquisitionAssistance {

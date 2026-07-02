@@ -926,8 +926,10 @@ mod tests {
             if event.is_supported() {
                 continue;
             }
-            let uri =
-                format!("/nnwdaf-analyticsinfo/v1/analytics?event-id={}", event.as_str());
+            let uri = format!(
+                "/nnwdaf-analyticsinfo/v1/analytics?event-id={}",
+                event.as_str()
+            );
             let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
             assert_eq!(
                 resp.status,

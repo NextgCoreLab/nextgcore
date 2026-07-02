@@ -1447,9 +1447,12 @@ mod tests {
         assert_eq!(got, &vk);
 
         // Strict-peer proof: signer signs, our SEPP verifies with the cert key.
-        let jws =
-            crate::jose::jws_sign_es256(&sk, b"modificationsBlock-entry", Some("ri-cert.example.com"))
-                .unwrap();
+        let jws = crate::jose::jws_sign_es256(
+            &sk,
+            b"modificationsBlock-entry",
+            Some("ri-cert.example.com"),
+        )
+        .unwrap();
         assert_eq!(
             crate::jose::jws_verify_es256(got, &jws).unwrap(),
             b"modificationsBlock-entry"
