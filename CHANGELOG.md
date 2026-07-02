@@ -10,7 +10,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 > real handler), and the matched-simulator end-to-end suite. It has **not** been run
 > against a TTCN certification suite or an independent third-party gNB/UE/core.
 
-## [Unreleased] — proposed v0.1.0
+## [Unreleased]
+
+_Nothing yet._
+
+## [0.1.0] — 2026-07-02
 
 First release aligning the core with the 3GPP Rel-15/16/17/18 procedures and adding a
 full matched-simulator data-plane validation path. 25 NF binaries + 17 shared libraries,

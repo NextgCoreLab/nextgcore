@@ -65,9 +65,9 @@ Optionally the full data-plane E2E: `cd docker/rust && ./e2e.sh`.
 1. Ensure `main` (or the release branch) is green in CI and the matched-sim E2E passes (`docker/rust/e2e.sh` → 84/84).
 2. Bump the workspace version in `src/Cargo.toml` (`[workspace.package] version`) if used, and per-crate versions as needed. Current: `0.1.0`.
 3. Move the `## [Unreleased]` section of `CHANGELOG.md` under a dated `## [X.Y.Z]` heading; add a fresh empty `Unreleased`.
-4. Commit (`Signed-off-by: Murat Parlakisik <parlakisik@gmail.com>`), tag `vX.Y.Z`, push the tag.
+4. Commit (`Signed-off-by: Murat Parlakisik <parlakisik@gmail.com>`), tag `X.Y.Z`, push the tag.
 5. Create the GitHub release from the tag, pasting the CHANGELOG section as the release notes:
-   `gh release create vX.Y.Z --repo NextgCoreLab/nextgcore --title "NextGCore vX.Y.Z" --notes-file <(...)`.
+   `gh release create X.Y.Z --repo NextgCoreLab/nextgcore --title "NextGCore X.Y.Z" --notes-file <(...)`.
    Publishing the release fires `pages.yml`, which deploys the docs site for this version.
 
 > **Honesty in release notes:** keep the validation caveat — spec-text + golden-vector + strict-peer
