@@ -542,6 +542,15 @@ pub enum UlTransportAction {
     /// the serving LMF over Nlmf. Until an LMF association exists (lmfd-07) the
     /// caller falls back to the #90 abnormal action, so the wire is unchanged.
     ForwardLppToLmf { lpp: Vec<u8> },
+    /// UE policy container (TS 24.501 Annex D, e.g. MANAGE UE POLICY COMPLETE /
+    /// COMMAND REJECT): forward the uplink UE-policy message to the PCF over
+    /// Namf `N1MessageNotify` (Wave-6 E6, TS 29.525 §4.2.2.2 delivery-result
+    /// loop). The payload is opaque to the AMF and forwarded verbatim. Exactly
+    /// mirrors `ForwardLppToLmf`: unless a PCF registered an `n1MessageClass ==
+    /// "UPDP"` notify callback for this UE (Wave-6 A3 `N1N2MessageSubscribe`),
+    /// the caller falls back to the #90 abnormal action, so the default wire
+    /// (no subscription) is byte-identical to today.
+    ForwardUpdpToPcf { container: Vec<u8> },
 }
 
 /// Handle UL NAS transport (TS 24.501 Section 8.2.10)
@@ -605,9 +614,25 @@ pub fn handle_ul_nas_transport(
                 lpp: transport.payload_container.clone(),
             })
         }
+        payload_container_type::UE_POLICY_CONTAINER => {
+            // UE policy container (TS 24.501 Annex D): the uplink UE-policy
+            // message (MANAGE UE POLICY COMPLETE / COMMAND REJECT / UE STATE
+            // INDICATION) is destined for the PCF (Wave-6 E6). Recognised
+            // distinctly from the unsupported containers below; the caller
+            // forwards it to the PCF's registered notify callback (or, with no
+            // "UPDP" subscription, falls back to the #90 abnormal action —
+            // byte-identical to the pre-E6 default).
+            log::info!(
+                "[{}] UL NAS Transport - UE policy container ({} bytes) for the PCF",
+                amf_ue.supi.as_deref().unwrap_or("Unknown"),
+                transport.payload_container.len()
+            );
+            Ok(UlTransportAction::ForwardUpdpToPcf {
+                container: transport.payload_container.clone(),
+            })
+        }
         payload_container_type::SMS
         | payload_container_type::SOR_TRANSPARENT_CONTAINER
-        | payload_container_type::UE_POLICY_CONTAINER
         | payload_container_type::UE_PARAMETERS_UPDATE
         | payload_container_type::MULTIPLE_PAYLOADS => {
             log::info!(
@@ -992,6 +1017,30 @@ mod tests {
 
         let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
         assert_eq!(result, Ok(UlTransportAction::ForwardLppToLmf { lpp }));
+    }
+
+    #[test]
+    fn test_handle_ul_nas_transport_ue_policy_forwards_to_pcf() {
+        let mut amf_ue = create_test_amf_ue();
+        let ran_ue = create_test_ran_ue();
+
+        // UE policy container (TS 24.501 Annex D, e.g. MANAGE UE POLICY COMPLETE
+        // = [PTI, 0x02]): recognised distinctly from the unsupported containers
+        // and routed toward the PCF (Wave-6 E6), NOT lumped into #90. The caller
+        // still falls back to #90 when no "UPDP" subscription exists.
+        let container = vec![0x80u8, 0x02];
+        let transport = UlNasTransport {
+            payload_container_type: payload_container_type::UE_POLICY_CONTAINER,
+            payload_container: container.clone(),
+            pdu_session_id: None,
+            ..Default::default()
+        };
+
+        let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
+        assert_eq!(
+            result,
+            Ok(UlTransportAction::ForwardUpdpToPcf { container })
+        );
     }
 
     #[test]

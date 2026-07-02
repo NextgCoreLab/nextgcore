@@ -10,6 +10,13 @@ description = "NextGCore AMF (Access and Mobility Management Function)"
 name = "nextgcore-amfd"
 path = "src/main.rs"
 
+# Wave-6 H1 (strict-peer harness foundation): the AMF is also a library so peer
+# NF crates can drive the real `namf_request_handler` in-process from
+# integration tests instead of hand-rolled lenient mocks.
+[lib]
+name = "nextgcore_amfd"
+path = "src/lib.rs"
+
 [features]
 # Native Linux kernel-SCTP NGAP backend (production remediation T0.2b).
 # Enables `--sctp-backend kernel` so an independent RAN can connect over
@@ -45,6 +52,8 @@ hex.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+base64.workspace = true
 
 [lints]
 workspace = true

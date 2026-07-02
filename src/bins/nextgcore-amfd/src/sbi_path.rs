@@ -1338,6 +1338,33 @@ pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResul
     Ok((host, port))
 }
 
+/// Base URL (`http://{advertised_sbi_addr}:{port}`) the AMF advertises for its
+/// own SBI server — the same address/port `run()` binds the Namf HTTP/2 server
+/// to and the NRF NFProfile advertises (env `AMF_SBI_ADDR`/`AMF_SBI_PORT`,
+/// defaults `127.0.0.1:7777`, matching [`amf_sbi_open`]).
+///
+/// WSB-4: callback URIs the AMF registers with peers (e.g. the Nudm_UECM
+/// `deregCallbackUri`, TS 29.503 §5.3.2.2.2) MUST be absolute so the peer can
+/// POST to them — a relative URI is rejected by udmd's `parse_callback_uri`,
+/// which is exactly what broke the network-initiated deregistration round trip.
+/// Shared helper for every amfd inbound SBI callback (dereg-notify, and the
+/// still-unserved am-policy-notify / sdmsubscription-notify — WS-A reuses this).
+pub fn advertised_sbi_base() -> String {
+    let addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("AMF_SBI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    format!("http://{addr}:{port}")
+}
+
+/// The absolute Nudm_UECM `deregCallbackUri` the AMF registers for `supi`
+/// (WSB-4, TS 29.503 §5.3.2.3.2). Routed by `namf_server` at
+/// `POST /namf-callback/v1/{supi}/dereg-notify`.
+pub fn dereg_callback_uri(supi: &str) -> String {
+    format!("{}/namf-callback/v1/{supi}/dereg-notify", advertised_sbi_base())
+}
+
 /// Nudm_UECM_Registration (amf3gpp-access):
 /// PUT /nudm-uecm/v1/{supi}/registrations/amf-3gpp-access (TS 29.503 5.3.2.2.2)
 pub async fn call_udm_uecm_registration(
@@ -1353,7 +1380,9 @@ pub async fn call_udm_uecm_registration(
 
     let body = serde_json::json!({
         "amfInstanceId": amf_instance_id,
-        "deregCallbackUri": format!("/namf-callback/v1/{supi}/dereg-notify"),
+        // WSB-4: absolute URI (was relative) so udmd can POST the
+        // DeregistrationNotification back (TS 29.503 §5.3.2.3.2).
+        "deregCallbackUri": dereg_callback_uri(supi),
         "guami": {
             "plmnId": { "mcc": guami_plmn_mcc, "mnc": guami_plmn_mnc },
             "amfId": amf_id_hex,

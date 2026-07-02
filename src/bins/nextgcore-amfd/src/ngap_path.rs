@@ -442,6 +442,12 @@ impl NgapServer {
         // (TS 23.273): NRPPa→gNB (N2) / LPP→UE (N1). Dormant when none pending.
         self.process_positioning_downlinks().await;
 
+        // Execute any network-initiated deregistrations the Namf_Callback
+        // dereg-notify handler enqueued (WSB-4, TS 23.502 §4.2.2.3.3 /
+        // TS 24.501 §5.5.2.3): protected DEREGISTRATION REQUEST + T3522.
+        // Dormant when none pending.
+        self.process_network_deregs().await;
+
         // Process any pending server events
         while let Ok(event) = self.server_event_rx.try_recv() {
             self.handle_server_event(event).await?;
@@ -2999,28 +3005,24 @@ impl NgapServer {
                 }
             }
             Ok(crate::gmm_handler::UlTransportAction::ForwardLppToLmf { lpp }) => {
-                // TS 23.273: forward the uplink LPP message to the serving LMF
-                // over Nlmf. No LMF association exists yet (lmfd-07), so fall
-                // back to the spec abnormal action (DL NAS Transport, 5GMM cause
-                // #90) — wire-identical to the legacy behaviour. Recognising LPP
-                // distinctly is what readies the real forward.
-                log::info!(
-                    "UL LPP positioning container ({} B) pending LMF forward; no LMF \
-                     associated — replying 5GMM #90",
-                    lpp.len()
-                );
-                let plain = gmm_build::build_dl_nas_transport(
-                    None,
+                self.forward_ul_lpp_to_lmf(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
                     container_type,
-                    &lpp,
-                    Some(GmmCause::PayloadWasNotForwarded),
-                    None,
+                    lpp,
                 )
-                .unwrap_or_default();
-                if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
-                    self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
-                        .await?;
-                }
+                .await?;
+            }
+            Ok(crate::gmm_handler::UlTransportAction::ForwardUpdpToPcf { container }) => {
+                self.forward_ul_updp_to_pcf(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    container_type,
+                    container,
+                )
+                .await?;
             }
             Err(cause) => {
                 // Protocol error: 5GMM STATUS (TS 24.501 Section 5.4.7)
@@ -3030,6 +3032,189 @@ impl NgapServer {
                         .await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Wave-6 A4 (TS 23.273 §6.11.2 uplink LPP leg): relay an uplink LPP N1
+    /// message to the serving LMF via a Namf `N1MessageNotify` (TS 29.518
+    /// §5.2.2.4) when the LMF registered an `n1MessageClass == "LPP"` notify
+    /// callback for this UE via `N1N2MessageSubscribe` (Wave-6 A3). The LPP PDU
+    /// is opaque to the AMF and forwarded **verbatim** (transparent relay).
+    ///
+    /// Fail-OPEN toward the UE: with NO registered LPP subscription the legacy
+    /// abnormal action is preserved byte-for-byte — a Downlink NAS TRANSPORT
+    /// echoing the payload with 5GMM cause #90 (TS 24.501 §5.4.5.3.1) — so the
+    /// default matched-sim reg/PDU/ping path (UEs never send LPP) is unchanged.
+    async fn forward_ul_lpp_to_lmf(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        container_type: u8,
+        lpp: Vec<u8>,
+    ) -> Result<()> {
+        // Resolve the UE's ueContextId (SUPI) — the N1N2 subscription registry
+        // key (the NGAP server's own per-UE state first, the shared AMF context
+        // as fallback), mirroring the uplink NRPPa relay.
+        let supi = self
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .and_then(|s| s.amf_ue.supi.clone())
+            .or_else(|| {
+                crate::context::amf_self()
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.amf_ue_find_by_id(amf_ue_ngap_id))
+                    .and_then(|ue| ue.supi)
+            });
+
+        // A3 registry lookup (exact-class "LPP", fail-closed) + fallback LCS
+        // correlation captured from the originating N1N2MessageTransfer.
+        let (sub, fallback_corr) = {
+            let ctx = crate::context::amf_self();
+            let Ok(guard) = ctx.read() else {
+                return Ok(());
+            };
+            match supi.as_deref() {
+                Some(s) => (
+                    guard.n1n2_subscription_find_n1(s, "LPP"),
+                    guard.lcs_correlation_find(s),
+                ),
+                None => (None, None),
+            }
+        };
+
+        if let Some(callback_uri) = sub.as_ref().and_then(|s| s.n1_notify_callback_uri.clone()) {
+            let sub = sub.expect("callback_uri implies subscription");
+            let lcs_correlation_id = sub
+                .lcs_correlation_id
+                .clone()
+                .or_else(|| fallback_corr.map(|r| r.lcs_correlation_id));
+            log::info!(
+                "LCS: relaying uplink LPP N1 ({} B, amf_ue_ngap_id {amf_ue_ngap_id}) to LMF \
+                 callback {callback_uri} (sub={})",
+                lpp.len(),
+                sub.subscription_id
+            );
+            crate::namf_server::send_n1_message_notify(
+                callback_uri,
+                Some(sub.subscription_id),
+                "LPP".to_string(),
+                lcs_correlation_id,
+                supi,
+                lpp,
+            );
+            return Ok(());
+        }
+
+        // No LMF registered → legacy abnormal action, byte-identical to pre-A4:
+        // DL NAS TRANSPORT echoing the payload with 5GMM cause #90.
+        log::info!(
+            "UL LPP positioning container ({} B, amf_ue_ngap_id {amf_ue_ngap_id}) — no LMF N1 \
+             'LPP' subscription registered; replying 5GMM #90 (payload not forwarded)",
+            lpp.len()
+        );
+        let plain = gmm_build::build_dl_nas_transport(
+            None,
+            container_type,
+            &lpp,
+            Some(GmmCause::PayloadWasNotForwarded),
+            None,
+        )
+        .unwrap_or_default();
+        if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Wave-6 E6 (TS 29.525 §4.2.2.2 delivery-result loop): relay an uplink
+    /// UE-policy N1 message (MANAGE UE POLICY COMPLETE / COMMAND REJECT, TS
+    /// 24.501 D.2.1.3/D.2.1.4) to the PCF via a Namf `N1MessageNotify` (TS
+    /// 29.518 §5.2.2.4) when the PCF registered an `n1MessageClass == "UPDP"`
+    /// notify callback for this UE via `N1N2MessageSubscribe` (Wave-6 A3). The
+    /// UE-policy container is opaque to the AMF and forwarded **verbatim**
+    /// (transparent relay) — the PCF decodes the COMPLETE/REJECT.
+    ///
+    /// Fail-safe toward the UE and DEFAULT-SAFE: with NO registered "UPDP"
+    /// subscription the legacy abnormal action is preserved byte-for-byte — a
+    /// Downlink NAS TRANSPORT echoing the payload with 5GMM cause #90 (TS 24.501
+    /// §5.4.5.3.1) — so on the default matched-sim path (no PCF subscription)
+    /// the UL behaviour is unchanged. Exactly mirrors [`forward_ul_lpp_to_lmf`].
+    async fn forward_ul_updp_to_pcf(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        container_type: u8,
+        container: Vec<u8>,
+    ) -> Result<()> {
+        // Resolve the UE's ueContextId (SUPI) — the N1N2 subscription registry
+        // key, mirroring the uplink LPP relay.
+        let supi = self
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .and_then(|s| s.amf_ue.supi.clone())
+            .or_else(|| {
+                crate::context::amf_self()
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.amf_ue_find_by_id(amf_ue_ngap_id))
+                    .and_then(|ue| ue.supi)
+            });
+
+        // A3 registry lookup (exact-class "UPDP", fail-closed): only a PCF that
+        // registered a "UPDP" notify callback for this UE receives the uplink.
+        let sub = {
+            let ctx = crate::context::amf_self();
+            let Ok(guard) = ctx.read() else {
+                return Ok(());
+            };
+            match supi.as_deref() {
+                Some(s) => guard.n1n2_subscription_find_n1(s, "UPDP"),
+                None => None,
+            }
+        };
+
+        if let Some(callback_uri) = sub.as_ref().and_then(|s| s.n1_notify_callback_uri.clone()) {
+            let sub = sub.expect("callback_uri implies subscription");
+            log::info!(
+                "UE policy: relaying uplink UE-policy N1 ({} B, amf_ue_ngap_id {amf_ue_ngap_id}) \
+                 to PCF callback {callback_uri} (sub={})",
+                container.len(),
+                sub.subscription_id
+            );
+            crate::namf_server::send_n1_message_notify(
+                callback_uri,
+                Some(sub.subscription_id),
+                "UPDP".to_string(),
+                None, // no LCS correlation for UE-policy
+                supi,
+                container,
+            );
+            return Ok(());
+        }
+
+        // No PCF subscribed → legacy abnormal action, byte-identical to pre-E6:
+        // DL NAS TRANSPORT echoing the payload with 5GMM cause #90.
+        log::info!(
+            "UL UE-policy container ({} B, amf_ue_ngap_id {amf_ue_ngap_id}) — no PCF N1 'UPDP' \
+             subscription registered; replying 5GMM #90 (payload not forwarded)",
+            container.len()
+        );
+        let plain = gmm_build::build_dl_nas_transport(
+            None,
+            container_type,
+            &container,
+            Some(GmmCause::PayloadWasNotForwarded),
+            None,
+        )
+        .unwrap_or_default();
+        if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                .await?;
         }
         Ok(())
     }
@@ -3336,6 +3521,37 @@ impl NgapServer {
     /// security-protected N1 DL NAS Transport. Best effort: a UE that has since
     /// gone CM-IDLE, or a build/send failure, is logged and skipped — never
     /// propagated, so a positioning hiccup cannot break the NGAP pump.
+    /// Drain the network-initiated deregistration queue (WSB-4) the
+    /// Namf_Callback dereg-notify handler populated and send a protected
+    /// DEREGISTRATION REQUEST + arm T3522 for each (TS 23.502 §4.2.2.3.3 /
+    /// TS 24.501 §5.5.2.3). This is the (non-test) caller of
+    /// [`Self::send_network_initiated_deregistration`].
+    async fn process_network_deregs(&mut self) {
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let Ok(guard) = ctx.read() else {
+                return;
+            };
+            guard.network_dereg_drain()
+        };
+        for item in pending {
+            let gmm_cause = item.gmm_cause.map(GmmCause::from);
+            if let Err(e) = self
+                .send_network_initiated_deregistration(
+                    item.amf_ue_ngap_id,
+                    item.reregistration_required,
+                    gmm_cause,
+                )
+                .await
+            {
+                log::warn!(
+                    "Network-initiated deregistration for UE {} failed: {e}",
+                    item.amf_ue_ngap_id
+                );
+            }
+        }
+    }
+
     async fn process_positioning_downlinks(&mut self) {
         let ctx = crate::context::amf_self();
         let pending = {
@@ -6780,6 +6996,55 @@ mod tests {
         )
         .await
         .expect("NGAP test server")
+    }
+
+    /// WSB-4: the NGAP `process_network_deregs` pump is the (non-test) caller
+    /// of `send_network_initiated_deregistration`. Enqueuing a
+    /// `PendingNetworkDereg` on the AMF context and running the pump drains it
+    /// and invokes the sender, which builds the protected DEREGISTRATION
+    /// REQUEST (0x47) and would arm T3522 after a successful N2 send. This test
+    /// has no live gNB association, so the send fails and the item is consumed
+    /// with a logged warning — the queue-consumption is the observable proof of
+    /// the SBI->NGAP wiring; the successful-send + T3522 arming is exercised by
+    /// the docker matched-sim E2E sign-off (TS 24.501 §5.5.2.3). Serialized on
+    /// the shared dereg-queue lock so it never steals a router-arm test's item.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_process_network_deregs_drains_and_invokes_sender() {
+        let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        let amf_ue_ngap_id = 7_400_001u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 41, 1);
+        ue_ctx.amf_ue.supi = Some("imsi-001010000074001".to_string());
+        ue_ctx.amf_ue.security_context_available = true;
+        ue_ctx.amf_ue.selected_int_algorithm = 2;
+        ue_ctx.amf_ue.selected_enc_algorithm = 2;
+        ue_ctx.amf_ue.knas_int = [0x11; 16];
+        ue_ctx.amf_ue.knas_enc = [0x22; 16];
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // Enqueue a network-initiated dereg exactly as handle_dereg_notify does.
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.network_dereg_add(crate::context::PendingNetworkDereg {
+                amf_ue_ngap_id,
+                reregistration_required: true,
+                gmm_cause: None,
+            });
+        }
+
+        ngap.process_network_deregs().await;
+
+        // The pump consumed our queued dereg (proves it invoked the sender).
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        let remaining = guard.network_dereg_drain();
+        assert!(
+            !remaining.iter().any(|d| d.amf_ue_ngap_id == amf_ue_ngap_id),
+            "pump must consume the queued network-initiated dereg"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

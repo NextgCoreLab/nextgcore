@@ -459,9 +459,23 @@ pub fn handle_sm_context_status(
     Ok(())
 }
 
-/// Handle deregistration notification
+/// Handle a Nudm_UECM DeregistrationNotification (TS 29.503 §5.3.2.3.2).
 ///
-/// This is called when UDM notifies about deregistration
+/// WSB-4: this now has a real effect. When the notification targets 3GPP
+/// access it enqueues a network-initiated deregistration onto the AMF context
+/// queue; the NGAP server task drains it and sends the protected
+/// DEREGISTRATION REQUEST (TS 24.501 §5.5.2.3) + arms T3522
+/// (`ngap_path::send_network_initiated_deregistration`). PDU-session release,
+/// UDM unsubscribe, AM-policy termination and the NG UE-context release follow
+/// on the Deregistration Accept / T3522 exhaustion inside the GMM state
+/// machine, exactly like the UE-initiated path.
+///
+/// `reregistration_required` (TS 23.502 §4.2.2.3.3): the UDM sends
+/// `deregReason == UE_INITIAL_REGISTRATION` when the UE performed an initial
+/// registration in a *new* AMF, so the old AMF must ask the UE to re-register.
+///
+/// A non-3GPP-access notification is accepted (the SBI callback answers 204)
+/// but not actioned here — this AMF models only the 3GPP-access context.
 pub fn handle_dereg_notify(amf_ue: &AmfUe, data: &DeregistrationData) -> NamfHandlerResult<()> {
     log::info!(
         "[{}] Deregistration notify: reason={:?}, access={:?}",
@@ -471,16 +485,28 @@ pub fn handle_dereg_notify(amf_ue: &AmfUe, data: &DeregistrationData) -> NamfHan
     );
 
     if data.access_type != AccessType::ThreeGppAccess {
-        return Err(NamfHandlerError::InvalidState);
+        log::info!(
+            "[{}] Non-3GPP-access dereg-notify accepted without 3GPP action",
+            amf_ue.supi.as_deref().unwrap_or("unknown")
+        );
+        return Ok(());
     }
 
-    // Note: Initiate network-initiated deregistration
-    // Network-initiated deregistration flow handled by GMM state machine:
-    // 1. Send deregistration request to UE via nas_security module
-    // 2. Unsubscribe from UDM via nudm_sdm service
-    // 3. Release PDU sessions via nsmf_pdusession service
-    // 4. Terminate AM policy association via npcf_am_policy service
-    // 5. Release signalling connection via NGAP UE context release
+    let reregistration_required =
+        data.dereg_reason == DeregistrationReason::UeInitialRegistration;
+
+    if let Ok(context) = crate::context::amf_self().read() {
+        context.network_dereg_add(crate::context::PendingNetworkDereg {
+            amf_ue_ngap_id: amf_ue.id,
+            reregistration_required,
+            gmm_cause: None,
+        });
+    }
+    log::info!(
+        "[{}] Network-initiated deregistration enqueued (reregistration_required={})",
+        amf_ue.supi.as_deref().unwrap_or("unknown"),
+        reregistration_required
+    );
 
     Ok(())
 }
@@ -777,6 +803,12 @@ mod tests {
         assert_eq!(sess.resource_status, ResourceStatus::Released);
     }
 
+    // WSB-4: `handle_dereg_notify`'s enqueue side effect and the
+    // reregistration_required distinction are verified over the wire in the
+    // `namf_server` router-arm tests (they serialize the destructive
+    // process-global-queue drain). These two only assert the accept/skip
+    // contract, so they never touch the shared queue.
+
     #[test]
     fn test_handle_dereg_notify() {
         let ue = create_test_ue();
@@ -785,8 +817,9 @@ mod tests {
             access_type: AccessType::ThreeGppAccess,
         };
 
-        let result = handle_dereg_notify(&ue, &data);
-        assert!(result.is_ok());
+        // WSB-4: a 3GPP-access notify is accepted (and enqueues a
+        // network-initiated deregistration — asserted in the namf_server tests).
+        assert!(handle_dereg_notify(&ue, &data).is_ok());
     }
 
     #[test]
@@ -797,8 +830,9 @@ mod tests {
             access_type: AccessType::NonThreeGppAccess,
         };
 
-        let result = handle_dereg_notify(&ue, &data);
-        assert!(result.is_err());
+        // WSB-4: a non-3GPP-access notify is accepted (the SBI layer answers
+        // 204) but triggers no 3GPP network-initiated deregistration.
+        assert!(handle_dereg_notify(&ue, &data).is_ok());
     }
 
     #[test]

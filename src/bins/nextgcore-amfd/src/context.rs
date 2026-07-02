@@ -495,6 +495,15 @@ pub struct AmfContext {
     /// N1N2MessageTransfer, so the uplink leg can route back to the
     /// originating LMF even without an explicit subscription.
     lcs_correlations: RwLock<HashMap<String, LcsCorrelationRecord>>,
+
+    /// Network-initiated deregistration queue (WSB-4, TS 23.502 §4.2.2.3.3 /
+    /// TS 24.501 §5.5.2.3): deregistrations the Namf_Callback dereg-notify
+    /// handler (Nudm_UECM DeregistrationNotification, TS 29.503 §5.3.2.3.2)
+    /// asked the NGAP server task to execute. Enqueued by the Namf SBI handler
+    /// task and drained + sent (protected DEREGISTRATION REQUEST 0x47 + T3522)
+    /// by the NGAP server task, mirroring `positioning_dl_queue`. Empty on the
+    /// reg/PDU/ping path — only populated when the serving AMF changes.
+    network_dereg_queue: RwLock<Vec<PendingNetworkDereg>>,
 }
 
 /// A positioning payload the LMF asked the AMF to relay downlink (TS 23.273),
@@ -527,6 +536,26 @@ pub enum PositioningDlKind {
     /// (TS 29.518, TS29518_Namf_Communication.yaml:4453); the payload is
     /// opaque to the AMF and relayed verbatim.
     UePolicyToUe { updp_pdu: Vec<u8> },
+}
+
+/// A network-initiated deregistration the Nudm_UECM DeregistrationNotification
+/// callback (TS 29.503 §5.3.2.3.2) asked the AMF to execute (WSB-4), enqueued
+/// by the Namf SBI handler task and carried out by the NGAP server task
+/// (TS 23.502 §4.2.2.3.3 → DEREGISTRATION REQUEST, TS 24.501 §5.5.2.3).
+#[derive(Debug, Clone)]
+pub struct PendingNetworkDereg {
+    /// Target UE (AMF-UE-NGAP-ID). The NGAP task resolves the serving SCTP
+    /// association + RAN-UE-NGAP-ID from its per-UE state at send time.
+    pub amf_ue_ngap_id: u64,
+    /// Re-registration-required flag for the DEREGISTRATION REQUEST
+    /// de-registration type (TS 24.501 §9.11.3.20). Set when the UDM's
+    /// `deregReason` is `UE_INITIAL_REGISTRATION` (the UE registered in a new
+    /// AMF), so the old AMF tells the UE to re-register (TS 23.502 §4.2.2.3.3).
+    pub reregistration_required: bool,
+    /// Optional 5GMM cause (TS 24.501 §9.11.3.2), carried as the raw cause
+    /// value to keep this container decoupled from `gmm_build::GmmCause`. The
+    /// UDM-triggered path passes `None` per TS 23.502 §4.2.2.3.3.
+    pub gmm_cause: Option<u8>,
 }
 
 /// Namf_Communication N1N2 message subscription stored per ueContextId
@@ -638,6 +667,7 @@ impl AmfContext {
             positioning_dl_queue: RwLock::new(Vec::new()),
             n1n2_subscriptions: RwLock::new(HashMap::new()),
             lcs_correlations: RwLock::new(HashMap::new()),
+            network_dereg_queue: RwLock::new(Vec::new()),
         }
     }
 
@@ -1317,6 +1347,23 @@ impl AmfContext {
     /// Drain all pending positioning downlinks (called by the NGAP server pump).
     pub fn positioning_dl_drain(&self) -> Vec<PendingPositioningDl> {
         match self.positioning_dl_queue.write() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Enqueue a network-initiated deregistration for NGAP-task egress (WSB-4,
+    /// TS 23.502 §4.2.2.3.3 / TS 24.501 §5.5.2.3).
+    pub fn network_dereg_add(&self, item: PendingNetworkDereg) {
+        if let Ok(mut q) = self.network_dereg_queue.write() {
+            q.push(item);
+        }
+    }
+
+    /// Drain all pending network-initiated deregistrations (called by the NGAP
+    /// server pump).
+    pub fn network_dereg_drain(&self) -> Vec<PendingNetworkDereg> {
+        match self.network_dereg_queue.write() {
             Ok(mut q) => std::mem::take(&mut *q),
             Err(_) => Vec::new(),
         }

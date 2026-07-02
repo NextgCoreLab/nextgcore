@@ -23,7 +23,8 @@ use crate::context::{
     UeN1N2InfoSubscription, NEXTGCORE_INVALID_POOL_ID,
 };
 use crate::namf_handler::{
-    self, N1N2MessageTransferCause, N1N2MessageTransferReqData, N2InfoContainer, NgapIeType,
+    self, AccessType, DeregistrationData, DeregistrationReason, N1N2MessageTransferCause,
+    N1N2MessageTransferReqData, N2InfoContainer, NgapIeType,
 };
 
 /// Notification client connect timeout (bounded so notification tasks can
@@ -125,6 +126,19 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
             handle_provide_positioning_info(parts[2], &request)
         }
 
+        // --------------------------------------------------------------
+        // Namf_Callback: Nudm_UECM DeregistrationNotification (WSB-4,
+        // TS 29.503 §5.3.2.3.2). UDM POSTs a DeregistrationData to the
+        // absolute deregCallbackUri the AMF registered at UECM registration
+        // (sbi_path::call_udm_uecm_registration) when the serving AMF changed.
+        //   POST /namf-callback/v1/{supi}/dereg-notify
+        // --------------------------------------------------------------
+        "namf-callback"
+            if parts.len() == 4 && parts[3] == "dereg-notify" && method == "POST" =>
+        {
+            handle_dereg_notify_callback(parts[2], &request)
+        }
+
         _ => {
             log::warn!("Unknown AMF SBI request: {method} {uri}");
             send_not_found(
@@ -208,6 +222,88 @@ fn ue_ran_context(ue: &AmfUe) -> Option<RanUe> {
     let ctx = amf_self();
     let guard = ctx.read().ok()?;
     guard.ran_ue_find_by_id(ue.ran_ue_id)
+}
+
+/// Map a TS 29.503 `DeregistrationReason` enum string to the internal reason.
+/// Returns `None` for an unrecognised value (the callback fails closed).
+fn parse_dereg_reason(s: &str) -> Option<DeregistrationReason> {
+    Some(match s {
+        "UE_INITIAL_REGISTRATION" => DeregistrationReason::UeInitialRegistration,
+        "UE_REGISTRATION_AREA_CHANGE" => DeregistrationReason::UeRegistrationAreaChange,
+        "SUBSCRIPTION_WITHDRAWN" => DeregistrationReason::SubscriptionWithdrawn,
+        "5GS_TO_EPS_MOBILITY" => DeregistrationReason::FiveGsToEpsMobility,
+        "5GS_TO_EPS_MOBILITY_UE_INITIAL_REGISTRATION" => {
+            DeregistrationReason::FiveGsToEpsMobilityUeInitialRegistration
+        }
+        "REREGISTRATION_REQUIRED" => DeregistrationReason::ReregistrationRequired,
+        "SMF_CONTEXT_TRANSFERRED" => DeregistrationReason::SmfContextTransferred,
+        _ => return None,
+    })
+}
+
+/// Nudm_UECM DeregistrationNotification callback (WSB-4, TS 29.503 §5.3.2.3.2).
+///
+/// The UDM POSTs a `DeregistrationData` (deregReason + accessType) to the
+/// absolute `deregCallbackUri` the AMF registered at UECM registration, when
+/// the serving AMF for the SUPI changed. The AMF triggers a network-initiated
+/// deregistration toward the UE (TS 23.502 §4.2.2.3.3 → DEREGISTRATION REQUEST,
+/// TS 24.501 §5.5.2.3), enqueued for the NGAP server task by
+/// [`namf_handler::handle_dereg_notify`].
+///
+/// Fail-closed (TS 29.500 §5.2.7): an unparseable body is 400
+/// INVALID_MSG_FORMAT; a missing/unknown mandatory member is 400
+/// MANDATORY_IE_MISSING / MANDATORY_IE_INCORRECT; an unknown SUPI is 404
+/// CONTEXT_NOT_FOUND. On success the AMF answers 204 No Content.
+fn handle_dereg_notify_callback(supi: &str, request: &SbiRequest) -> SbiResponse {
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+
+    // deregReason (mandatory — TS 29.503 DeregistrationData).
+    let Some(reason_str) = body.get("deregReason").and_then(Value::as_str) else {
+        return mandatory_ie_missing("deregReason");
+    };
+    let Some(dereg_reason) = parse_dereg_reason(reason_str) else {
+        return mandatory_ie_incorrect("deregReason", &format!("unknown reason '{reason_str}'"));
+    };
+
+    // accessType (mandatory — the AMF keys its network-initiated
+    // deregistration on it; fail-closed if absent, WSB-4).
+    let Some(access_str) = body.get("accessType").and_then(Value::as_str) else {
+        return mandatory_ie_missing("accessType");
+    };
+    let access_type = match access_str {
+        "3GPP_ACCESS" => AccessType::ThreeGppAccess,
+        "NON_3GPP_ACCESS" => AccessType::NonThreeGppAccess,
+        other => {
+            return mandatory_ie_incorrect(
+                "accessType",
+                &format!("unknown access type '{other}'"),
+            )
+        }
+    };
+
+    // Resolve the UE by SUPI (ueContextId form, TS 29.518 §6.1.3.2.2).
+    let Some(ue) = find_ue_by_context_id(supi) else {
+        return context_not_found(supi);
+    };
+
+    let data = DeregistrationData {
+        dereg_reason,
+        access_type,
+    };
+    match namf_handler::handle_dereg_notify(&ue, &data) {
+        Ok(()) => SbiResponse::no_content(),
+        Err(e) => {
+            log::warn!("[{supi}] dereg-notify handling error: {e:?}");
+            send_error(
+                500,
+                "Internal Server Error",
+                "deregistration notify handling failed",
+                None,
+            )
+        }
+    }
 }
 
 /// Encode a PlmnId as TS 29.571 JSON ({"mcc": "...", "mnc": "..."})
@@ -1051,6 +1147,107 @@ pub fn send_n2_info_notify(
     });
 }
 
+/// Content-Id of the binary N1 (LPP) part inside an N1MessageNotify multipart
+/// body (referenced from `n1MessageContainer.n1MessageContent.contentId`).
+pub(crate) const N1_MESSAGE_NOTIFY_CONTENT_ID: &str = "n1-lpp";
+
+/// Build the multipart Namf_Communication N1MessageNotify callback POST
+/// (Wave-6 A4; TS 29.518 §5.2.2.4, callback `{$request.body#/n1NotifyCallbackUri}`
+/// — TS29518_Namf_Communication.yaml:1540-1596): jsonData is an
+/// `N1MessageNotification` (yaml:2708-2725, `n1MessageContainer` mandatory)
+/// with `n1MessageClass` (e.g. "LPP") and the uplink N1 payload as a
+/// `binaryDataN1Message` part, Content-Id "n1-lpp", Content-Type
+/// `application/vnd.3gpp.5gnas`, carried **verbatim** (the AMF is a transparent
+/// relay for the uplink LPP leg per TS 23.273 §6.11.2).
+///
+/// `lcs_correlation_id` (TS 29.572 CorrelationID) is the LCS correlation the
+/// consuming LMF keys its pending positioning session on (specs/29518-j60.txt:
+/// 12361 — "If the N1 message notified is for LCS procedures ... may include an
+/// LCS correlation identifier"). `supi` is included when known.
+///
+/// `pub` (not `pub(crate)`) so peer NF crates can drive the real producer body
+/// in-process for strict-peer tests (Wave-6 H1 lib-targetization).
+pub fn build_n1_message_notify_request(
+    path: &str,
+    n1_notify_subscription_id: Option<&str>,
+    n1_message_class: &str,
+    lcs_correlation_id: Option<&str>,
+    supi: Option<&str>,
+    n1_payload: &[u8],
+) -> Result<SbiRequest, serde_json::Error> {
+    let mut notification = json!({
+        "n1MessageContainer": {
+            "n1MessageClass": n1_message_class,
+            "n1MessageContent": { "contentId": N1_MESSAGE_NOTIFY_CONTENT_ID },
+        },
+    });
+    if let Some(id) = n1_notify_subscription_id {
+        notification["n1NotifySubscriptionId"] = json!(id);
+    }
+    if let Some(corr) = lcs_correlation_id {
+        notification["lcsCorrelationId"] = json!(corr);
+    }
+    if let Some(supi) = supi {
+        notification["supi"] = json!(supi);
+    }
+    Ok(SbiRequest::post(path)
+        .with_json_body(&notification)?
+        .with_part(SbiPart::with_content(
+            N1_MESSAGE_NOTIFY_CONTENT_ID,
+            nextgcore_sbi::constants::content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(n1_payload),
+        )))
+}
+
+/// POST an N1MessageNotify to the LMF's registered `n1NotifyCallbackUri`
+/// (Wave-6 A4; TS 29.518 §5.2.2.4) relaying an uplink N1 (LPP) payload verbatim
+/// (TS 23.273 §6.11.2). Fire-and-forget on a background task with bounded
+/// timeouts, mirroring [`send_n2_info_notify`] — a notify failure is logged,
+/// never surfaced toward the UE.
+pub fn send_n1_message_notify(
+    callback_uri: String,
+    n1_notify_subscription_id: Option<String>,
+    n1_message_class: String,
+    lcs_correlation_id: Option<String>,
+    supi: Option<String>,
+    n1_payload: Vec<u8>,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("N1MessageNotify skipped (no tokio runtime)");
+        return;
+    };
+    handle.spawn(async move {
+        let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
+            log::warn!("Invalid n1NotifyCallbackUri: {callback_uri}");
+            return;
+        };
+        let request = match build_n1_message_notify_request(
+            &path,
+            n1_notify_subscription_id.as_deref(),
+            &n1_message_class,
+            lcs_correlation_id.as_deref(),
+            supi.as_deref(),
+            &n1_payload,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                log::warn!("N1MessageNotify body build failed: {e}");
+                return;
+            }
+        };
+        let client = notify_client(&host, port);
+        match client.send_request(request).await {
+            Ok(resp) if resp.is_success() => {
+                log::info!("N1MessageNotify delivered to {callback_uri}");
+            }
+            Ok(resp) => {
+                log::warn!("N1MessageNotify to {callback_uri} returned {}", resp.status)
+            }
+            Err(e) => log::warn!("N1MessageNotify to {callback_uri} failed: {e}"),
+        }
+    });
+}
+
 /// LCS positioning relay (TS 23.273 §7): build the downlink wire messages for
 /// an LMF-originated `Namf_Communication_N1N2MessageTransfer` carrying NRPPa
 /// (→ serving gNB over N2) and/or LPP (→ UE over N1). Returns `Some(response)`
@@ -1248,7 +1445,10 @@ fn try_ue_policy_relay(
 
 /// POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages —
 /// Namf_Communication_N1N2MessageTransfer (TS 29.518 §5.2.2.3.1).
-fn handle_n1_n2_message_transfer_request(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+pub fn handle_n1_n2_message_transfer_request(
+    ue_context_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     let Some(ue) = find_ue_by_context_id(ue_context_id) else {
         return context_not_found(ue_context_id);
     };
@@ -1977,6 +2177,17 @@ fn handle_provide_positioning_info(ue_context_id: &str, request: &SbiRequest) ->
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// WSB-4: shared serialize lock for tests that DESTRUCTIVELY drain the
+/// process-global `network_dereg_queue` — the router-arm tests in this module
+/// AND the NGAP `process_network_deregs` pump test in `ngap_path`. Same
+/// rationale as the positioning queue's `UPDP_QUEUE_TEST_LOCK`; module-level +
+/// `pub(crate)` so both test modules serialize against one lock.
+#[cfg(test)]
+pub(crate) fn dereg_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 #[cfg(test)]
 mod tests {
@@ -2748,6 +2959,116 @@ mod tests {
         );
     }
 
+    /// Wave-6 A4 — hand-derived golden byte-vector for the multipart
+    /// N1MessageNotify body (TS 29.500 §6.1.2.3 framing; TS 29.518
+    /// N1MessageNotification, TS29518_Namf_Communication.yaml:2708 —
+    /// n1MessageContainer mandatory). The expected bytes are written out by hand
+    /// from the multipart/related grammar, NOT round-tripped through the encoder.
+    #[test]
+    fn golden_n1_message_notify_multipart_body() {
+        // A synthetic UPER LPP payload (opaque to the AMF — forwarded verbatim).
+        let lpp = [0x08u8, 0x00, 0x11, 0x22];
+        let req = build_n1_message_notify_request(
+            "/nlmf-loc/v1/notify/n1",
+            Some("sub-7"),
+            "LPP",
+            Some("corr-42"),
+            Some("imsi-001010000000001"),
+            &lpp,
+        )
+        .expect("build N1MessageNotify");
+
+        // JSON root: parsed-Value equality (RFC 8259 object members unordered).
+        let json = req.http.content.clone().expect("json root part");
+        let actual: serde_json::Value = serde_json::from_str(&json).expect("valid JSON root");
+        let expected_json: serde_json::Value = serde_json::from_str(
+            "{\"n1MessageContainer\":{\"n1MessageClass\":\"LPP\",\
+             \"n1MessageContent\":{\"contentId\":\"n1-lpp\"}},\
+             \"n1NotifySubscriptionId\":\"sub-7\",\
+             \"lcsCorrelationId\":\"corr-42\",\
+             \"supi\":\"imsi-001010000000001\"}",
+        )
+        .expect("valid expected JSON");
+        assert_eq!(actual, expected_json);
+
+        // Full multipart body with a pinned boundary — hand-written layout.
+        let body = nextgcore_sbi::multipart::encode(Some(json.as_str()), &req.http.parts, "gold");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"--gold\r\nContent-Type: application/json\r\n\r\n");
+        expected.extend_from_slice(json.as_bytes());
+        expected.extend_from_slice(
+            b"\r\n--gold\r\nContent-Id: n1-lpp\r\nContent-Type: application/vnd.3gpp.5gnas\r\n\r\n",
+        );
+        expected.extend_from_slice(&lpp);
+        expected.extend_from_slice(b"\r\n--gold--\r\n");
+        assert_eq!(body, expected, "multipart body must match the hand-derived vector");
+
+        // Cross-decode with our own multipart decoder (this is exactly what
+        // lmfd's SbiServer layer runs on receipt) — the binary N1 part must be
+        // the LPP PDU verbatim (transparent relay, TS 23.273 §6.11.2).
+        let decoded = nextgcore_sbi::multipart::decode(
+            &nextgcore_sbi::multipart::content_type_with_boundary("gold"),
+            &body,
+        )
+        .expect("multipart decode");
+        assert_eq!(decoded.json.as_deref(), Some(json.as_str()));
+        assert_eq!(decoded.parts.len(), 1);
+        assert_eq!(decoded.parts[0].content_id.as_deref(), Some("n1-lpp"));
+        assert_eq!(
+            decoded.parts[0].content_type.as_deref(),
+            Some("application/vnd.3gpp.5gnas")
+        );
+        assert_eq!(decoded.parts[0].data.as_ref(), &lpp[..]);
+    }
+
+    #[test]
+    fn n1_message_notify_optional_fields_omitted() {
+        // Absent n1NotifySubscriptionId / lcsCorrelationId / supi must be
+        // OMITTED (never null, never fabricated) — fail-closed producer.
+        let req = build_n1_message_notify_request("/cb", None, "LPP", None, None, &[0x01])
+            .expect("build N1MessageNotify");
+        let v: Value = serde_json::from_str(req.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["n1MessageContainer"]["n1MessageClass"], "LPP");
+        assert_eq!(
+            v["n1MessageContainer"]["n1MessageContent"]["contentId"],
+            "n1-lpp"
+        );
+        assert!(v.get("n1NotifySubscriptionId").is_none());
+        assert!(v.get("lcsCorrelationId").is_none());
+        assert!(v.get("supi").is_none());
+    }
+
+    /// Wave-6 A4 canary: the no-LMF-subscription fallback of `forward_ul_lpp_to_lmf`
+    /// builds the DL NAS TRANSPORT with 5GMM cause #90 exactly as the pre-A4
+    /// code did. Pins the `gmm_build::build_dl_nas_transport` output (the whole
+    /// content of that fallback branch) to a hand-derived byte vector so a
+    /// regression in the legacy abnormal action is caught (the branch itself is
+    /// verbatim-preserved — see `forward_ul_lpp_to_lmf`).
+    #[test]
+    fn a4_no_subscription_dl_nas_90_is_byte_identical() {
+        use crate::gmm_build::GmmCause;
+        // container_type 5 = LPP (TS 24.501 §9.11.3.40 payload container type);
+        // the LPP payload is echoed back verbatim in the DL NAS TRANSPORT.
+        let lpp = [0xAAu8, 0xBB, 0xCC];
+        let dl = crate::gmm_build::build_dl_nas_transport(
+            None,
+            0x05,
+            &lpp,
+            Some(GmmCause::PayloadWasNotForwarded),
+            None,
+        )
+        .expect("build DL NAS transport");
+        // 5GMM header: EPD 0x7E, security-header 0x00, msg-type 0x68 (DL NAS
+        // TRANSPORT); spare-half-octet + payload-container-type 0x05; container
+        // length 0x0003 + the 3 payload bytes; then the 5GMM-cause IEI 0x58 +
+        // value 0x5A (#90, payload not forwarded).
+        assert_eq!(
+            dl,
+            vec![0x7E, 0x00, 0x68, 0x05, 0x00, 0x03, 0xAA, 0xBB, 0xCC, 0x58, 0x5A],
+            "the #90 fallback DL NAS bytes must be byte-identical to the pre-A4 legacy action"
+        );
+    }
+
     fn n1n2_subscription_body(port_tag: &str) -> Value {
         json!({
             "n1MessageClass": "LPP",
@@ -3433,5 +3754,124 @@ mod tests {
         assert_eq!(resp.status, 204);
 
         server.stop().await.expect("server stop");
+    }
+
+    // ======================================================================
+    // WSB-4: Namf_Callback dereg-notify router arm (TS 29.503 §5.3.2.3.2)
+    // ======================================================================
+
+    use super::dereg_queue_test_lock;
+
+    /// Drain the process-global network-dereg queue, keep only this UE's items
+    /// and re-add the rest (queue is process-global; parallel tests must not
+    /// steal each other's enqueues).
+    fn drain_network_deregs_for(ue_id: u64) -> Vec<crate::context::PendingNetworkDereg> {
+        let ctx = amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        let (mine, others): (Vec<_>, Vec<_>) = guard
+            .network_dereg_drain()
+            .into_iter()
+            .partition(|d| d.amf_ue_ngap_id == ue_id);
+        for item in others {
+            guard.network_dereg_add(item);
+        }
+        mine
+    }
+
+    /// A known SUPI + a full DeregistrationData (UE_INITIAL_REGISTRATION,
+    /// 3GPP_ACCESS) POSTed through the real router -> 204 and exactly one
+    /// network-initiated dereg enqueued with reregistration_required=true.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dereg_notify_callback_204_enqueues_event() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000070401";
+        let ue = setup_ue(supi, true, true);
+
+        let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" });
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+            .with_json_body(&body)
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 204, "known SUPI + full body -> 204");
+
+        let queued = drain_network_deregs_for(ue.id);
+        assert_eq!(queued.len(), 1, "exactly one dereg event enqueued");
+        assert_eq!(queued[0].amf_ue_ngap_id, ue.id);
+        assert!(queued[0].reregistration_required);
+        assert_eq!(queued[0].gmm_cause, None);
+    }
+
+    /// SUBSCRIPTION_WITHDRAWN -> reregistration_required=false.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dereg_notify_callback_subscription_withdrawn_no_rereg() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000070405";
+        let ue = setup_ue(supi, true, true);
+
+        let body = json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN", "accessType": "3GPP_ACCESS" });
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+            .with_json_body(&body)
+            .expect("json");
+        assert_eq!(namf_request_handler(req).await.status, 204);
+
+        let queued = drain_network_deregs_for(ue.id);
+        assert_eq!(queued.len(), 1);
+        assert!(!queued[0].reregistration_required);
+    }
+
+    /// Unknown SUPI -> 404 CONTEXT_NOT_FOUND.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dereg_notify_callback_404_unknown_supi() {
+        amf_context_init(64, 1024, 4096);
+        let supi = "imsi-001010000079999"; // never added
+        let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" });
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+            .with_json_body(&body)
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 404);
+        assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND");
+    }
+
+    /// Missing mandatory accessType -> 400 (fail-closed), no event enqueued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dereg_notify_callback_400_missing_access_type() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000070402";
+        let ue = setup_ue(supi, true, true);
+
+        let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION" });
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+            .with_json_body(&body)
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 400, "missing accessType must fail closed");
+        assert!(drain_network_deregs_for(ue.id).is_empty());
+    }
+
+    /// Missing mandatory deregReason -> 400 (fail-closed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dereg_notify_callback_400_missing_reason() {
+        let supi = "imsi-001010000070403";
+        setup_ue(supi, true, true);
+        let body = json!({ "accessType": "3GPP_ACCESS" });
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+            .with_json_body(&body)
+            .expect("json");
+        assert_eq!(namf_request_handler(req).await.status, 400);
+    }
+
+    /// Non-3GPP access -> 204 accepted but no 3GPP dereg enqueued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dereg_notify_callback_non_3gpp_no_enqueue() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000070404";
+        let ue = setup_ue(supi, true, true);
+        let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "NON_3GPP_ACCESS" });
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+            .with_json_body(&body)
+            .expect("json");
+        assert_eq!(namf_request_handler(req).await.status, 204);
+        assert!(drain_network_deregs_for(ue.id).is_empty());
     }
 }
