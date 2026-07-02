@@ -102,6 +102,15 @@ struct Args {
     /// Disable data plane (TUN device) - useful for control plane testing
     #[arg(long, default_value = "false")]
     no_dataplane: bool,
+
+    /// NRF base URI (e.g. http://127.0.0.10:7777). G2-2: when set, the UPF
+    /// registers a UPF NFProfile with the NRF and reports a real PFCP-session
+    /// `/load` gauge on every heartbeat (TS 29.510 §5.2.2.3.2). Empty (the
+    /// default) disables the SBI/NRF plane entirely — the UPF then behaves
+    /// exactly as before (data-plane-only), so the matched-sim E2E default
+    /// path is unchanged.
+    #[arg(long, default_value = "")]
+    nrf_uri: String,
 }
 
 /// Global shutdown flag
@@ -140,6 +149,36 @@ async fn main() -> Result<()> {
         "UPF context initialized (max_sessions={})",
         args.max_sessions
     );
+
+    // G2-2: opt-in NRF registration + heartbeat `/load` PATCH
+    // (TS 29.510 §5.2.2.3.2). This is OFF by default: when `--nrf-uri` is
+    // empty the UPF never touches the SBI/NRF plane, so the default
+    // data-plane path (and the matched-sim E2E) is byte-identical to before.
+    // When an NRF is configured the UPF registers a UPF NFProfile and reports
+    // a real PFCP-session occupancy gauge on every heartbeat. All failures
+    // are log-only and never affect UPF packet forwarding.
+    if !args.nrf_uri.trim().is_empty() {
+        let nf_instance_id = format!("upf-{}", uuid::Uuid::new_v4());
+        let sbi_ctx = nextgcore_sbi::context::global_context();
+        sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
+        match register_upf_with_nrf(&nf_instance_id, &args.pfcp_addr, &args.gtpu_addr).await {
+            Ok(()) => {
+                // G2-2: PATCH a real NFProfile "/load" gauge to NRF each
+                // heartbeat — PFCP-session occupancy, recomputed each tick.
+                nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+                    nf_instance_id.clone(),
+                    5,
+                    || upf_self().get_load(),
+                );
+                log::info!("UPF NRF heartbeat started (instance: {nf_instance_id})");
+            }
+            Err(e) => {
+                log::warn!("NRF registration failed (UPF will operate without NRF): {e}");
+            }
+        }
+    } else {
+        log::debug!("No NRF URI configured (--nrf-uri empty); UPF runs data-plane-only");
+    }
 
     // Initialize GTP-U path
     upf_gtp_init().map_err(|e| anyhow::anyhow!("Failed to initialize GTP path: {e}"))?;
@@ -408,6 +447,102 @@ async fn main() -> Result<()> {
 
     log::info!("NextGCore UPF stopped");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// G2-2: NRF registration + heartbeat /load PATCH (opt-in)
+// ---------------------------------------------------------------------------
+
+/// Build the UPF `NFProfile` sent to the NRF on registration
+/// (TS 29.510 §6.1.6.2.2). The UPF exposes no SBI service, so `nfServices` is
+/// omitted — consumers (SMF) reach it over N4/PFCP. `upfInfo`
+/// (TS 29.510 §6.1.6.2.10) advertises the N3 (GTP-U) interface endpoint. The
+/// `load` field carries the initial PFCP-session occupancy gauge; it is
+/// refreshed by the heartbeat PATCH (`build_load_patch`, `/load` 0..=100).
+fn build_upf_nf_profile(
+    nf_instance_id: &str,
+    pfcp_addr: &str,
+    gtpu_addr: &str,
+    load: u8,
+) -> serde_json::Value {
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "UPF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [pfcp_addr],
+        "load": load,
+        "upfInfo": {
+            "sNssaiUpfInfoList": [{
+                "sNssai": { "sst": 1 },
+                "dnnUpfInfoList": [{ "dnn": "internet" }]
+            }],
+            "interfaceUpfInfoList": [{
+                "interfaceType": "N3",
+                "ipv4EndpointAddresses": [gtpu_addr]
+            }]
+        },
+        "heartBeatTimer": 10
+    })
+}
+
+/// Register the UPF with the NRF via `PUT /nnrf-nfm/v1/nf-instances/{id}`
+/// (TS 29.510 §5.2.2.2). Fail-closed only in the sense that a non-2xx status
+/// is reported as an error to the caller, which logs it and continues — UPF
+/// packet forwarding is never blocked by NRF availability.
+async fn register_upf_with_nrf(
+    nf_instance_id: &str,
+    pfcp_addr: &str,
+    gtpu_addr: &str,
+) -> Result<(), String> {
+    let sbi_ctx = nextgcore_sbi::context::global_context();
+
+    let nrf_uri = match sbi_ctx.get_nrf_uri().await {
+        Some(uri) => uri,
+        None => {
+            log::debug!("No NRF URI configured, skipping NRF registration");
+            return Ok(());
+        }
+    };
+
+    log::info!("Registering UPF with NRF at {nrf_uri}");
+    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+
+    let nf_profile = build_upf_nf_profile(nf_instance_id, pfcp_addr, gtpu_addr, upf_self().get_load());
+
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    log::debug!("NRF registration: PUT {path}");
+
+    let response = client
+        .put_json(&path, &nf_profile)
+        .await
+        .map_err(|e| format!("NRF registration request failed: {e}"))?;
+
+    match response.status {
+        200 | 201 => {
+            log::info!("UPF registered with NRF successfully (id={nf_instance_id})");
+            Ok(())
+        }
+        s => Err(format!("NRF registration returned status {s}")),
+    }
+}
+
+/// Parse host and port from a URI string (e.g., "http://127.0.0.10:7777").
+fn parse_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
+        Some((host_port.to_string(), default_port))
+    }
 }
 
 /// Initialize logging based on command line arguments
@@ -932,5 +1067,56 @@ mod tests {
     fn test_args_log_file() {
         let args = Args::parse_from(["nextgcore-upfd", "-l", "/var/log/upf.log"]);
         assert_eq!(args.log_file, Some("/var/log/upf.log".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // G2-2: NRF /load heartbeat wiring
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_nrf_uri_defaults_empty_and_is_settable() {
+        // Default: SBI/NRF plane OFF (data-plane-only) — no behavior change.
+        let args = Args::parse_from(["nextgcore-upfd"]);
+        assert_eq!(args.nrf_uri, "");
+        assert!(args.nrf_uri.trim().is_empty(), "default must disable NRF");
+
+        // Opt-in: explicit --nrf-uri enables registration + heartbeat.
+        let args = Args::parse_from(["nextgcore-upfd", "--nrf-uri", "http://127.0.0.10:7777"]);
+        assert_eq!(args.nrf_uri, "http://127.0.0.10:7777");
+        assert!(!args.nrf_uri.trim().is_empty());
+    }
+
+    #[test]
+    fn test_build_upf_nf_profile_shape() {
+        // TS 29.510 §6.1.6.2.2/§6.1.6.2.10: UPF NFProfile with upfInfo N3 endpoint.
+        let p = build_upf_nf_profile("upf-abc", "127.0.0.4", "127.0.0.4", 42);
+        assert_eq!(p["nfInstanceId"], "upf-abc");
+        assert_eq!(p["nfType"], "UPF");
+        assert_eq!(p["nfStatus"], "REGISTERED");
+        // Honest load gauge carried in the initial profile (0..=100).
+        assert_eq!(p["load"], serde_json::json!(42));
+        // UPF has NO SBI service — nfServices must be absent.
+        assert!(p.get("nfServices").is_none(), "UPF exposes no SBI service");
+        // upfInfo advertises the N3 (GTP-U) interface endpoint.
+        let iface = &p["upfInfo"]["interfaceUpfInfoList"][0];
+        assert_eq!(iface["interfaceType"], "N3");
+        assert_eq!(iface["ipv4EndpointAddresses"][0], "127.0.0.4");
+    }
+
+    #[test]
+    fn test_parse_host_port() {
+        assert_eq!(
+            parse_host_port("http://127.0.0.10:7777"),
+            Some(("127.0.0.10".to_string(), 7777))
+        );
+        assert_eq!(
+            parse_host_port("https://nrf.example:443/nnrf-nfm/v1"),
+            Some(("nrf.example".to_string(), 443))
+        );
+        // No explicit port → scheme default.
+        assert_eq!(
+            parse_host_port("http://nrf.local"),
+            Some(("nrf.local".to_string(), 80))
+        );
     }
 }

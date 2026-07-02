@@ -1658,6 +1658,26 @@ impl UpfContext {
         self.sess_list.read().map(|l| l.len()).unwrap_or(0)
     }
 
+    /// NFProfile `load` gauge (`0..=100`) reported to the NRF on each
+    /// heartbeat PATCH (TS 29.510 §5.2.2.3.2; `NFProfile.load` is a
+    /// percentage `0..=100`).
+    ///
+    /// Reports active PFCP/N4 session occupancy as a percentage of the
+    /// configured `max_num_of_sess`. When no session ceiling is configured
+    /// (`max_num_of_sess == 0`) the raw session count is reported, saturated
+    /// at 100. This is an honest occupancy metric derived from real session
+    /// state — the UPF never fabricates a CPU-based load figure (G2-2).
+    pub fn get_load(&self) -> u8 {
+        let sessions = self.sess_count();
+        // `checked_div` yields `None` iff `max_num_of_sess == 0` (no ceiling
+        // configured), in which case we report the raw session count.
+        let load = match sessions.saturating_mul(100).checked_div(self.max_num_of_sess) {
+            Some(pct) => pct.min(100),
+            None => sessions.min(100),
+        };
+        load as u8
+    }
+
     /// Get all sessions (for iteration)
     pub fn get_all_sessions(&self) -> Vec<UpfSess> {
         self.sess_list
@@ -1932,5 +1952,38 @@ mod tests {
 
         assert_eq!(f_seid1, f_seid2);
         assert_ne!(f_seid1, f_seid3);
+    }
+
+    // G2-2: PFCP-session occupancy load gauge (TS 29.510 §5.2.2.3.2, 0..=100).
+    #[test]
+    fn test_get_load_gauge() {
+        // No sessions → 0 regardless of ceiling.
+        let ctx = UpfContext::new();
+        assert_eq!(ctx.get_load(), 0);
+
+        // With a ceiling, load is percentage occupancy (monotonic in count).
+        let mut ctx = UpfContext::new();
+        ctx.init(10);
+        for i in 0..2u64 {
+            ctx.sess_add(&FSeid::with_ipv4(1000 + i, Ipv4Addr::new(10, 0, 0, 1)))
+                .expect("session added under ceiling");
+        }
+        assert_eq!(ctx.sess_count(), 2);
+        assert_eq!(ctx.get_load(), 20, "2/10 sessions = 20%");
+
+        // At the ceiling → saturates at 100%.
+        let mut ctx = UpfContext::new();
+        ctx.init(2);
+        for i in 0..2u64 {
+            ctx.sess_add(&FSeid::with_ipv4(2000 + i, Ipv4Addr::new(10, 0, 0, 2)));
+        }
+        assert_eq!(ctx.get_load(), 100, "full occupancy = 100%");
+
+        // No ceiling configured (max == 0) → raw count reported, capped at 100.
+        let ctx = UpfContext::new();
+        for i in 0..3u64 {
+            ctx.sess_add(&FSeid::with_ipv4(3000 + i, Ipv4Addr::new(10, 0, 0, 3)));
+        }
+        assert_eq!(ctx.get_load(), 3, "no ceiling → raw session count");
     }
 }
