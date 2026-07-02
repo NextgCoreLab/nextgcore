@@ -333,8 +333,9 @@ async fn emit_positioning_request(input: &nlmf::InputData) {
 /// LPP RequestLocationInformation over Namf N1N2); the returned position comes
 /// from REAL collected measurements via `context::compute_location`
 /// ([`crate::context::LmfContext::latest_location`]). When no measurement-
-/// derived fix is available a 504 positioning-method-failure is returned — the
-/// handler never fabricates coordinates.
+/// derived fix is available a 500 `POSITIONING_FAILED` is returned (a zero
+/// response-time budget yields 504 `UNREACHABLE_USER`), per TS 29.572
+/// Table 6.1.7.3-1 — the handler never fabricates coordinates.
 async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
     log::info!("Determine Location");
 
@@ -372,11 +373,13 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         );
     }
 
-    // A zero response-time budget cannot complete positioning -> 504.
+    // A zero response-time budget cannot complete positioning: the user cannot
+    // be reached in time to perform the positioning procedure -> 504
+    // UNREACHABLE_USER (TS 29.572 Table 6.1.7.3-1).
     if input.max_resp_time == Some(0) {
         return problem(
             504,
-            nlmf::cause::POSITIONING_METHOD_FAILURE,
+            nlmf::cause::UNREACHABLE_USER,
             "Positioning did not complete within the response-time budget",
         );
     }
@@ -417,8 +420,9 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
 
     // Compute the location from REAL collected measurements
     // (context::compute_location via the stored NRPPa/LPP reports). NO
-    // fabrication: when no measurement-derived fix is available, report a
-    // positioning-method failure rather than inventing coordinates.
+    // fabrication: when no measurement-derived fix can be produced the
+    // positioning procedure failed -> 500 POSITIONING_FAILED
+    // (TS 29.572 Table 6.1.7.3-1) rather than inventing coordinates.
     let est = match lmf_self()
         .read()
         .ok()
@@ -427,8 +431,8 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         Some(loc) => loc,
         None => {
             return problem(
-                504,
-                nlmf::cause::POSITIONING_METHOD_FAILURE,
+                500,
+                nlmf::cause::POSITIONING_FAILED,
                 "No measurement-derived location available for the target UE",
             )
         }
@@ -1473,7 +1477,10 @@ mod tests {
         assert_eq!(v["cause"], "INVALID_MSG_FORMAT");
     }
 
-    // -- lmfd-02 + lmfd-10: zero response budget -> 504 ProblemDetails -------
+    // -- lmfd-02 + lmfd-10 + A6/WSB-5: zero response budget -> 504 -----------
+    // TS 29.572 Table 6.1.7.3-1 (specs/29572-j60.txt:7651): the ONLY valid
+    // 504 cause is UNREACHABLE_USER ("The user could not be reached in order
+    // to perform positioning procedure").
     #[tokio::test]
     async fn test_determine_location_timeout_504() {
         let body = r#"{ "supi": "imsi-001010000000003", "maxRespTime": 0 }"#;
@@ -1486,7 +1493,34 @@ mod tests {
             Some("application/problem+json")
         );
         let v = body_json(&resp);
-        assert_eq!(v["cause"], "POSITIONING_METHOD_FAILURE");
+        // Status/cause PAIRING is the falsifiable check: 504 must carry
+        // UNREACHABLE_USER (byte-equal to the spec table value), never
+        // POSITIONING_FAILED or the retired invented cause.
+        assert_eq!(v["cause"], "UNREACHABLE_USER");
+        assert_eq!(v["status"], 504);
+    }
+
+    // -- A6/WSB-5: no measurement-derived fix -> 500 POSITIONING_FAILED ------
+    // TS 29.572 Table 6.1.7.3-1 (specs/29572-j60.txt:7643): POSITIONING_FAILED
+    // maps to 500 Internal Server Error ("The positioning procedure failed").
+    #[tokio::test]
+    async fn test_determine_location_no_fix_500_positioning_failed() {
+        // A SUPI never seeded by any test: latest_location has no per-SUPI fix
+        // and no completed global report -> the solver cannot produce a fix.
+        let body = r#"{ "supi": "imsi-001010000000404" }"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 500);
+        assert_eq!(
+            content_type(&resp).as_deref(),
+            Some("application/problem+json")
+        );
+        let v = body_json(&resp);
+        // Pairing check: 500 must carry POSITIONING_FAILED (byte-equal to the
+        // spec table value), never UNREACHABLE_USER.
+        assert_eq!(v["cause"], "POSITIONING_FAILED");
+        assert_eq!(v["status"], 500);
     }
 
     // -- lmfd-12: unknown positioning method on the debug route -> 400 -------

@@ -23,9 +23,14 @@ pub mod cause {
     pub const MANDATORY_IE_INCORRECT: &str = "MANDATORY_IE_INCORRECT";
     pub const MANDATORY_IE_MISSING: &str = "MANDATORY_IE_MISSING";
     pub const UNSPECIFIED: &str = "UNSPECIFIED";
+    /// TS 29.572 Table 6.1.7.3-1 (specs/29572-j60.txt:7651): 504 Gateway
+    /// Timeout — "The user could not be reached in order to perform
+    /// positioning procedure."
     pub const UNREACHABLE_USER: &str = "UNREACHABLE_USER";
     pub const POSITIONING_DENIED: &str = "POSITIONING_DENIED";
-    pub const POSITIONING_METHOD_FAILURE: &str = "POSITIONING_METHOD_FAILURE";
+    /// TS 29.572 Table 6.1.7.3-1 (specs/29572-j60.txt:7643): 500 Internal
+    /// Server Error — "The positioning procedure failed."
+    pub const POSITIONING_FAILED: &str = "POSITIONING_FAILED";
     // lmfd#0: per-operation application errors (TS 29.572 §6.1.7.3-1).
     pub const LOCATION_SESSION_UNKNOWN: &str = "LOCATION_SESSION_UNKNOWN";
     pub const LOCATION_TRANSFER_NOT_SUPPORTED: &str = "LOCATION_TRANSFER_NOT_SUPPORTED";
