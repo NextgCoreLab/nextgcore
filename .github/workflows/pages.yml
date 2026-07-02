@@ -1,10 +1,10 @@
 name: Deploy to GitHub Pages
 
 on:
-  push:
-    branches: [initial_commit]
-    paths:
-      - 'docs/**'
+  # Deploy the docs site only when a release is published (versioned docs),
+  # not on every docs push. workflow_dispatch allows a manual re-deploy.
+  release:
+    types: [published]
 
   workflow_dispatch:
 
