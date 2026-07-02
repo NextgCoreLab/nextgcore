@@ -1495,6 +1495,9 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
             );
         }
     };
+    if supi != supi_or_suci {
+        log::info!("SIDF de-concealed SUCI {supi_or_suci} -> SUPI {supi}");
+    }
 
     // Step 1: Query UDR for authentication subscription data (by SUPI)
     let udr_response = match crate::udm_nudr_dr_send_auth_subscription_get(&supi, 0, 0).await {
