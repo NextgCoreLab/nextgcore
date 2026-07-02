@@ -130,8 +130,26 @@ pub struct InputData {
     pub ncgi: Option<Ncgi>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_resp_time: Option<u32>,
+    // A5: MO-LR / assistance flows carry the UE's LPP PDU in a multipart
+    // binary body part referenced by these IEs (TS 29.572 §6.1.6.2.2 InputData
+    // `lppMessage`/`lppMessageExt`; specs/TS29572_Nlmf_Location.yaml:629-635).
+    // `camelCase` maps these to `lppMessage` / `lppMessageExt` on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lpp_message: Option<RefToBinaryData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lpp_message_ext: Option<Vec<RefToBinaryData>>,
     #[serde(rename = "supportedFeatures", skip_serializing_if = "Option::is_none")]
     pub supported_features: Option<String>,
+}
+
+/// `RefToBinaryData` (TS 29.571 §5.2.4.6) — references a multipart/related
+/// binary body part by the value of its `Content-Id` header (TS 29.500 §6.2).
+/// A5: used by [`InputData::lpp_message`] to reference the
+/// `binaryDataLppMessage` part carrying the UE's UPER-encoded LPP PDU.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RefToBinaryData {
+    #[serde(rename = "contentId")]
+    pub content_id: String,
 }
 
 /// `LocationQoS` (TS 29.572 §6.1.6.2.7).
@@ -768,6 +786,46 @@ mod tests {
         let pei = d.periodic_event_info.unwrap();
         assert_eq!(pei.reporting_amount, 5);
         assert_eq!(pei.reporting_interval, 60);
+    }
+
+    // -- A5: InputData lppMessage / lppMessageExt (RefToBinaryData) ----------
+
+    #[test]
+    fn test_input_data_lpp_message_parse() {
+        let json = r#"{
+            "supi": "imsi-001010000000123",
+            "ueLocationServiceInd": "LOCATION_ESTIMATE",
+            "lppMessage": { "contentId": "lpp-1" },
+            "lppMessageExt": [ { "contentId": "lpp-ext-1" }, { "contentId": "lpp-ext-2" } ]
+        }"#;
+        let d: InputData = serde_json::from_str(json).unwrap();
+        assert_eq!(d.lpp_message.as_ref().unwrap().content_id, "lpp-1");
+        let exts = d.lpp_message_ext.as_ref().unwrap();
+        assert_eq!(exts.len(), 2);
+        assert_eq!(exts[0].content_id, "lpp-ext-1");
+        assert_eq!(exts[1].content_id, "lpp-ext-2");
+    }
+
+    #[test]
+    fn test_input_data_without_lpp_message() {
+        // Absent lppMessage stays None and is skipped on re-serialization.
+        let d: InputData = serde_json::from_str(r#"{"supi":"imsi-1"}"#).unwrap();
+        assert!(d.lpp_message.is_none());
+        assert!(d.lpp_message_ext.is_none());
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(v.get("lppMessage").is_none());
+        assert!(v.get("lppMessageExt").is_none());
+    }
+
+    #[test]
+    fn test_ref_to_binary_data_camel_case_wire() {
+        let r = RefToBinaryData {
+            content_id: "lpp-9".to_string(),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["contentId"], "lpp-9");
+        let back: RefToBinaryData = serde_json::from_value(v).unwrap();
+        assert_eq!(back, r);
     }
 
     // -- InputData parse + ecgi/ncgi exclusion (lmfd-03 acceptance) ---------

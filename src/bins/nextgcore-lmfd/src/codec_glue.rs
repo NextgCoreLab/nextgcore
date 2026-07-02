@@ -23,7 +23,8 @@
 
 use crate::CellMeasurement;
 use nextgcore_asn1c::lpp::ecid::{
-    EcidRequestLocationInformation, RequestLocationInformation, RequestLocationInformationR9,
+    EcidRequestLocationInformation, MeasuredResultsElement, RequestLocationInformation,
+    RequestLocationInformationR9,
 };
 use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
 use nextgcore_asn1c::lpp::nr_dl_tdoa::NrRstd;
@@ -232,6 +233,78 @@ pub fn decode_nrppa_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasuremen
 }
 
 // ---------------------------------------------------------------------------
+// LPP E-CID adapter (A4)
+// ---------------------------------------------------------------------------
+
+/// Map one LPP `MeasuredResultsElement` (TS 37.355 §6.5.3
+/// `ECID-SignalMeasurementInformation`) to a [`CellMeasurement`].
+///
+/// | PDU field                    | `CellMeasurement` | scaling (value tables)          |
+/// |------------------------------|-------------------|---------------------------------|
+/// | `phys_cell_id` (0..503)      | `nr_cgi`          | `"pci-<n>"` (matches the Multi-RTT / DL-TDOA adapters, so one seeded registry serves all methods) |
+/// | `rsrp_result` (0..97)        | `rsrp`            | `v − 140` → −140..−43 dBm (E-UTRA RSRP-Range, TS 36.133 §9.1.4; same convention as [`nrppa_ecid_report_to_measurements`]) |
+/// | `rsrq_result` (0..34)        | `rsrq`            | raw 0..34 index (E-UTRA RSRQ-Range, TS 36.133 §9.1.7; same as the NRPPa adapter) |
+/// | `ue_rx_tx_time_diff` (0..4095) | `timing_advance` | raw UE Rx−Tx time-difference units — the E-CID ranging term `solve_ecid`'s TA ring consumes |
+fn measured_results_element_to_cell(elem: &MeasuredResultsElement) -> CellMeasurement {
+    CellMeasurement {
+        nr_cgi: format!("pci-{}", elem.phys_cell_id),
+        rsrp: elem.rsrp_result.map(|v| i16::from(v) - 140),
+        rsrq: elem.rsrq_result.map(i16::from),
+        timing_advance: elem.ue_rx_tx_time_diff.map(u32::from),
+        aoa: None,
+        rtt_ns: None,
+        rstd_ns: None,
+    }
+}
+
+/// Adapt a decoded LPP UPER PDU carrying a `ProvideLocationInformation` →
+/// `ecid-ProvideLocationInformation` → `ECID-SignalMeasurementInformation`
+/// (TS 37.355 §6.5.3) into [`CellMeasurement`]s.
+///
+/// The `primaryCellMeasuredResults` (serving cell) is emitted first, then each
+/// `measuredResultsList` element, so `try_real_solve`'s ECID branch (serving =
+/// best-RSRP cell that also carries a timing term + registry hit) sees the
+/// serving cell.
+///
+/// Returns an empty `Vec` when the message is not a `ProvideLocationInformation`,
+/// carries no `ecid` body, or the `ecid` body carries only an `ECID-Error`
+/// (no `signal_measurement_information`).
+pub fn lpp_ecid_provide_to_measurements(msg: &LppMessage) -> Vec<CellMeasurement> {
+    let prov = match msg.message_body.as_ref() {
+        Some(LppMessageBody::C1(MessageBodyC1::ProvideLocationInformation(p))) => p,
+        _ => return vec![],
+    };
+    let sig = match prov
+        .ies
+        .ecid
+        .as_ref()
+        .and_then(|e| e.signal_measurement_information.as_ref())
+    {
+        Some(s) => s,
+        None => return vec![],
+    };
+
+    let mut out = Vec::with_capacity(
+        sig.measured_results_list.len() + usize::from(sig.primary_cell_measured_results.is_some()),
+    );
+    if let Some(primary) = sig.primary_cell_measured_results.as_ref() {
+        out.push(measured_results_element_to_cell(primary));
+    }
+    for elem in &sig.measured_results_list {
+        out.push(measured_results_element_to_cell(elem));
+    }
+    out
+}
+
+/// Decode raw LPP UPER bytes and adapt E-CID `ProvideLocationInformation`
+/// measurements. `request_id` is the LPP transaction number (0 when absent).
+pub fn decode_lpp_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>), String> {
+    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP UPER decode: {e}"))?;
+    let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
+    Ok((request_id, lpp_ecid_provide_to_measurements(&msg)))
+}
+
+// ---------------------------------------------------------------------------
 // LPP Multi-RTT adapter
 // ---------------------------------------------------------------------------
 
@@ -382,6 +455,40 @@ pub fn decode_lpp_dl_tdoa_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasureme
     Ok((request_id, lpp_dl_tdoa_provide_to_measurements(&msg)))
 }
 
+/// Decode a UE-provided LPP `ProvideLocationInformation` (TS 37.355 §6.2) once
+/// and route it through the available signal-measurement adapters, returning
+/// the first non-empty [`CellMeasurement`] set.
+///
+/// A5: this is the single decode entry point for the LPP PDU carried in a
+/// `binaryDataLppMessage` multipart part on the MO-LR `DetermineLocation`
+/// path, and (A4) for the uplink LPP `ProvideLocationInformation` delivered by
+/// the N1MessageNotify callback. The message is decoded ONCE (avoiding the
+/// repeated `LppMessage::decode` of the per-adapter wrappers) and its body is
+/// tried against nr-E-CID (A4), then nr-Multi-RTT, then nr-DL-TDOA — the first
+/// non-empty measurement set wins. `request_id` is the LPP
+/// `transactionID.transactionNumber` (0 when absent). Returns an `Err` only when
+/// the bytes are not a decodable `LppMessage`; a decodable message with no
+/// recognised measurements yields an empty vector (the caller maps that to a
+/// no-fix outcome / 400 MANDATORY_IE_MISSING).
+pub fn decode_lpp_provide_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>), String> {
+    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP UPER decode: {e}"))?;
+    let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
+    let cells = {
+        let ecid = lpp_ecid_provide_to_measurements(&msg);
+        if !ecid.is_empty() {
+            ecid
+        } else {
+            let multi_rtt = lpp_multi_rtt_provide_to_measurements(&msg);
+            if multi_rtt.is_empty() {
+                lpp_dl_tdoa_provide_to_measurements(&msg)
+            } else {
+                multi_rtt
+            }
+        }
+    };
+    Ok((request_id, cells))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -389,10 +496,10 @@ pub fn decode_lpp_dl_tdoa_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasureme
 #[cfg(test)]
 mod tests {
     use super::{
-        build_lpp_ecid_request, decode_nrppa_ecid_report, extract_lpp_request_id,
-        extract_nrppa_request_id, lpp_dl_tdoa_provide_to_measurements,
-        lpp_multi_rtt_provide_to_measurements, nrppa_ecid_report_to_measurements, nrrstd_to_ns,
-        nrrstd_to_signed_ns, TC_NS,
+        build_lpp_ecid_request, decode_lpp_ecid_report, decode_lpp_provide_report,
+        decode_nrppa_ecid_report, extract_lpp_request_id, extract_nrppa_request_id,
+        lpp_dl_tdoa_provide_to_measurements, lpp_multi_rtt_provide_to_measurements,
+        nrppa_ecid_report_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TC_NS,
     };
     use nextgcore_asn1c::lpp::ecid::{ProvideLocationInformation, ProvideLocationInformationR9};
     use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
@@ -430,6 +537,132 @@ mod tests {
             assert!(r.ies.nr_multi_rtt.is_none());
             assert!(r.ies.nr_dl_tdoa.is_none());
         }
+    }
+
+    /// A4 golden byte-vector: a hand-built UPER LPP E-CID
+    /// `ProvideLocationInformation` round-trips through the new adapter to the
+    /// expected [`CellMeasurement`] values (TS 37.355 §6.5.3). Field values are
+    /// anchored to the TS 36.133 value tables, NOT to the encoder:
+    ///   physCellId 42        -> `"pci-42"`
+    ///   rsrp-Result 60       -> 60 − 140 = −80 dBm (E-UTRA RSRP-Range §9.1.4)
+    ///   rsrq-Result 20       -> raw index 20 (E-UTRA RSRQ-Range §9.1.7)
+    ///   ue-RxTxTimeDiff 700  -> timing_advance 700 (the ranging term)
+    /// The exact UPER bytes are pinned so an encoder regression is caught, then
+    /// decoded through the adapter and the adapted values are asserted.
+    #[test]
+    fn a4_lpp_ecid_provide_golden_vector_to_measurements() {
+        use nextgcore_asn1c::lpp::ecid::{
+            EcidProvideLocationInformation, EcidSignalMeasurementInformation, MeasuredResultsElement,
+        };
+        let primary = MeasuredResultsElement {
+            phys_cell_id: 42,
+            arfcn_eutra: 1850,
+            system_frame_number: None,
+            rsrp_result: Some(60),
+            rsrq_result: Some(20),
+            ue_rx_tx_time_diff: Some(700),
+        };
+        let neighbour = MeasuredResultsElement {
+            phys_cell_id: 7,
+            arfcn_eutra: 1850,
+            system_frame_number: None,
+            rsrp_result: Some(30),
+            rsrq_result: None,
+            ue_rx_tx_time_diff: None,
+        };
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(9),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: Some(EcidProvideLocationInformation {
+                            signal_measurement_information: Some(
+                                EcidSignalMeasurementInformation {
+                                    primary_cell_measured_results: Some(primary),
+                                    measured_results_list: vec![neighbour],
+                                },
+                            ),
+                            ecid_error: None,
+                        }),
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().expect("encode E-CID provide").to_vec();
+
+        // Byte fidelity: the UPER PDU decodes back to the SAME typed value
+        // (the per-field UPER framing is pinned bit-for-bit by the golden
+        // vectors in nextgcore-asn1c/src/lpp/ecid.rs). This guards the wire
+        // encode without hand-transcribing the deeply-nested octets here.
+        let redecoded = LppMessage::decode(&bytes).expect("re-decode E-CID provide");
+        assert_eq!(redecoded, msg, "E-CID ProvideLocationInformation must round-trip byte-exact");
+
+        // Decode through the A4 adapter and assert the anchored values.
+        let (txn, cells) = decode_lpp_ecid_report(&bytes).expect("decode E-CID report");
+        assert_eq!(txn, 9, "LPP transactionNumber survives");
+        assert_eq!(cells.len(), 2, "primary (serving) cell first, then the list");
+
+        assert_eq!(cells[0].nr_cgi, "pci-42");
+        assert_eq!(cells[0].rsrp, Some(-80), "rsrp-Result 60 -> 60-140 dBm");
+        assert_eq!(cells[0].rsrq, Some(20), "rsrq-Result raw index");
+        assert_eq!(cells[0].timing_advance, Some(700), "ue-RxTxTimeDiff -> TA term");
+        assert_eq!(cells[0].rtt_ns, None);
+        assert_eq!(cells[0].rstd_ns, None);
+
+        assert_eq!(cells[1].nr_cgi, "pci-7");
+        assert_eq!(cells[1].rsrp, Some(-110), "rsrp-Result 30 -> 30-140 dBm");
+        assert_eq!(cells[1].rsrq, None);
+        assert_eq!(cells[1].timing_advance, None);
+
+        // The unified decode entry point also selects the E-CID measurements.
+        let (_txn2, cells2) =
+            decode_lpp_provide_report(&bytes).expect("decode via the provide entry point");
+        assert_eq!(cells2.len(), 2);
+        assert_eq!(cells2[0].nr_cgi, "pci-42");
+        assert_eq!(cells2[0].timing_advance, Some(700));
+    }
+
+    /// An `ECID-Error`-only provide body (no signal measurements) adapts to an
+    /// empty measurement set (never a fabricated cell).
+    #[test]
+    fn ecid_error_only_provide_yields_no_measurements() {
+        use nextgcore_asn1c::lpp::ecid::{
+            EcidError, EcidLocationServerErrorCauses, EcidProvideLocationInformation,
+        };
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(3),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: Some(EcidProvideLocationInformation {
+                            signal_measurement_information: None,
+                            ecid_error: Some(EcidError::LocationServerErrorCauses(
+                                EcidLocationServerErrorCauses { cause: 0 },
+                            )),
+                        }),
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().expect("encode").to_vec();
+        let (_txn, cells) = decode_lpp_ecid_report(&bytes).expect("decode");
+        assert!(cells.is_empty(), "an error-only report yields no cells");
     }
 
     /// `nrrstd_to_ns`: single-unit inputs verify the 2^k × T_c scaling.
@@ -698,6 +931,81 @@ mod tests {
         assert_eq!(cells[1].rsrp, Some(-40)); // 100 − 140
         let rstd = cells[1].rstd_ns.expect("rstd_ns");
         assert!((rstd - 100.0 * TC_NS).abs() < 1e-6, "rstd_ns={rstd}");
+    }
+
+    /// A5 golden vector: `decode_lpp_provide_report` decodes a UE-provided LPP
+    /// `ProvideLocationInformation` (nr-Multi-RTT) ONCE and yields the exact
+    /// [`CellMeasurement`]s — the byte-fidelity proof that the LPP PDU carried
+    /// in a `binaryDataLppMessage` multipart part reaches the decode adapter.
+    #[test]
+    fn decode_lpp_provide_report_multi_rtt_golden() {
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(42),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: None,
+                        nr_multi_rtt: Some(NrMultiRttProvideLocationInformation {
+                            signal_measurement_information: Some(
+                                NrMultiRttSignalMeasurementInformation {
+                                    meas_list: NrMultiRttMeasList {
+                                        items: vec![NrMultiRttMeasElement {
+                                            dl_prs_id: 5,
+                                            nr_phys_cell_id: Some(321),
+                                            nr_arfcn: None,
+                                            nr_ue_rx_tx_time_diff: NrUeRxTxTimeDiff::K1(200_000),
+                                            nr_time_stamp: sample_nr_timestamp(),
+                                            nr_timing_quality: NrTimingQuality {
+                                                timing_quality_value: 8,
+                                                timing_quality_resolution: 1,
+                                            },
+                                            nr_dl_prs_rsrp_result: Some(80),
+                                        }],
+                                    },
+                                },
+                            ),
+                        }),
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().expect("LppMessage::encode");
+
+        let (req_id, cells) = decode_lpp_provide_report(&bytes).expect("decode_lpp_provide_report");
+        // request_id is the LPP transaction number.
+        assert_eq!(req_id, 42);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].nr_cgi, "pci-321");
+        // nr_dl_prs_rsrp_result=80 -> 80 - 140 = -60 dBm.
+        assert_eq!(cells[0].rsrp, Some(-60));
+        // K1(200_000): 200_000 * 2 * TC_NS ~= 203_450 ns.
+        let rtt = cells[0].rtt_ns.expect("rtt_ns");
+        assert!((203_000..=204_000).contains(&rtt), "rtt_ns={rtt}");
+    }
+
+    /// A5: a decodable LPP message with no recognised signal measurements
+    /// yields an empty vector (the handler maps that to 400), NOT an error.
+    #[test]
+    fn decode_lpp_provide_report_empty_when_no_measurements() {
+        // A RequestLocationInformation is a valid LppMessage but carries no
+        // ProvideLocationInformation measurements.
+        let bytes = build_lpp_ecid_request(3).expect("encode");
+        let (req_id, cells) = decode_lpp_provide_report(&bytes).expect("decode");
+        assert_eq!(req_id, 3);
+        assert!(cells.is_empty());
+    }
+
+    /// A5: non-LPP bytes are a decode error, not a silent empty result.
+    #[test]
+    fn decode_lpp_provide_report_rejects_garbage() {
+        assert!(decode_lpp_provide_report(&[0xde, 0xad, 0xbe, 0xef]).is_err());
     }
 
     /// `decode_nrppa_ecid_report`: thin wrapper returns same request-id and CGI

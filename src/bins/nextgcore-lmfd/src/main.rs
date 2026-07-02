@@ -90,6 +90,80 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
     .expect("value expected");
 }
 
+// ---------------------------------------------------------------------------
+// OAuth2 rollout (Wave-6 H8): opt-in producer verification + outbound consumer
+// token install. Default OFF so the matched-sim E2E path is byte-unchanged;
+// enabled per-NF via `NEXTGCORE_SBI_OAUTH2_REQUIRE=1` (overlay-friendly) or the
+// `lmf.sbi.oauth2.require: true` yaml knob. TS 33.501 §13.4.1, TS 29.510 §5.4.2.
+// ---------------------------------------------------------------------------
+
+/// Process-wide OAuth2 client for automatic Bearer-token acquisition on
+/// outbound SBI calls (installed only when OAuth2 enforcement is enabled).
+static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>> =
+    std::sync::OnceLock::new();
+
+/// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
+/// Phase A). Outbound SBI clients attach a token via `client.with_oauth2`.
+#[allow(dead_code)]
+fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the
+/// matched-sim path is untouched. Honors `NEXTGCORE_SBI_OAUTH2_REQUIRE` first
+/// (overlay-friendly), then the yaml `<nf>.sbi.oauth2.require` (root-key
+/// agnostic: true iff any top-level section sets it).
+fn oauth2_required(config_path: &str) -> bool {
+    if let Ok(v) = std::env::var("NEXTGCORE_SBI_OAUTH2_REQUIRE") {
+        return matches!(v.trim(), "1" | "true" | "TRUE" | "yes");
+    }
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
+        return false;
+    };
+    value.as_mapping().is_some_and(|map| {
+        map.values().any(|section| {
+            section
+                .get("sbi")
+                .and_then(|s| s.get("oauth2"))
+                .and_then(|o| o.get("require"))
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// Apply OAuth2 producer enforcement to `cfg` and install the outbound OAuth2
+/// client (Wave-6 H8). The server verifies incoming Bearer tokens against the
+/// NRF JWKS and requires `aud` to include NfType::Lmf; with no NRF URI it fails
+/// closed (503, per nextgcore-sbi server.rs). `nrf_uri` is the configured NRF
+/// (empty ⇒ unconfigured ⇒ fail-closed).
+fn apply_oauth2_enforcement(
+    mut cfg: NextgcoreSbiServerConfig,
+    nrf_uri: &str,
+) -> NextgcoreSbiServerConfig {
+    cfg.require_oauth2 = true;
+    let uri = (!nrf_uri.is_empty()).then_some(nrf_uri);
+    cfg.oauth2_jwks_uri =
+        uri.map(|u| nextgcore_sbi::oauth::JwksCache::for_nrf(u).jwks_uri().to_string());
+    cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Lmf);
+    if let Some(u) = uri {
+        let nf_instance_id = format!("lmf-{}", uuid::Uuid::new_v4());
+        let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
+            u,
+            nf_instance_id,
+            nextgcore_sbi::types::NfType::Lmf,
+        ))));
+    }
+    log::info!(
+        "OAuth2 enforcement enabled (JWKS: {})",
+        cfg.oauth2_jwks_uri.as_deref().unwrap_or("UNCONFIGURED")
+    );
+    cfg
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -143,6 +217,9 @@ async fn main() -> Result<()> {
             .as_deref()
             .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_server_config = sbi_server_config.with_tls(key, cert);
+    }
+    if oauth2_required(&args.config) {
+        sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
 
     let sbi_server = SbiServer::new(sbi_server_config);
@@ -268,6 +345,21 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "DELETE" => handle_up_unsubscribe(subscription_id).await,
             _ => send_method_not_allowed(method, "up-subscriptions/{subscriptionId}"),
         },
+        // A4: Namf_Communication notify callbacks (TS 29.518 §5.2.2.4
+        // N1MessageNotify / §5.2.2.3.3 N2InfoNotify). These are consumer-chosen
+        // callback URIs — NOT TS 29.572 resources — registered by the A2
+        // N1N2MessageSubscribe (see namf_client::{N1_NOTIFY_PATH, N2_NOTIFY_PATH}).
+        // They correlate an uplink LPP (N1) / NRPPa (N2) report to a pending
+        // DetermineLocation session (A2) and complete it (fail-closed: an unknown
+        // correlation is never ingested).
+        ["nlmf-loc", "v1", "notify", "n1"] => match method {
+            "POST" => handle_n1_message_notify(&request).await,
+            _ => send_method_not_allowed(method, "notify/n1"),
+        },
+        ["nlmf-loc", "v1", "notify", "n2"] => match method {
+            "POST" => handle_n2_info_notify(&request).await,
+            _ => send_method_not_allowed(method, "notify/n2"),
+        },
         _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
 }
@@ -279,6 +371,7 @@ fn problem(status: u16, cause: &str, detail: &str) -> SbiResponse {
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        415 => "Unsupported Media Type",
         500 => "Internal Server Error",
         504 => "Gateway Timeout",
         _ => "Error",
@@ -525,6 +618,17 @@ fn age_of_fix_minutes(timestamp: u64) -> Option<u16> {
 async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
     log::info!("Determine Location");
 
+    // A5: content-type gate (TS 29.572 yaml:42-47 lists application/json AND
+    // multipart/related; yaml:102 lists 415). Any other media type is rejected
+    // 415 Unsupported Media Type — never silently parsed.
+    if !determine_location_media_type_supported(request) {
+        return problem(
+            415,
+            nlmf::cause::UNSPECIFIED,
+            "DetermineLocation accepts application/json or multipart/related request bodies only",
+        );
+    }
+
     let body = match &request.http.content {
         Some(c) => c,
         None => {
@@ -580,6 +684,18 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         return SbiResponse::no_content();
     }
 
+    // A5: MO-LR flow — the UE's own LPP PDU is carried in a
+    // `binaryDataLppMessage` multipart part referenced by InputData.lppMessage
+    // (TS 29.572 §6.1.6.2.2; TS 23.273 §6.11 uplink MO-LR leg). When present,
+    // the positioning measurements are ALREADY in the request, so the LMF
+    // decodes and solves them directly INSTEAD of issuing the network-initiated
+    // 5GC-MT-LR LPP RequestLocationInformation. A dangling reference is a hard
+    // error (400 MANDATORY_IE_INCORRECT) — a multipart body must never be
+    // accepted while silently ignoring its referenced parts.
+    if input.lpp_message.is_some() || input.lpp_message_ext.is_some() {
+        return handle_mo_lr_lpp(request, &input).await;
+    }
+
     // lmfd#1: deferred/periodic/triggered LDR (ldrType present) -> register a
     // reporting context keyed by ldrReference so it can be cancelled
     // (cancel-location, §6.1.4.3) and later reported (EventNotify, §6.1.5).
@@ -622,6 +738,132 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         Err(resp) => return *resp,
     };
     await_positioning_outcome(&input, corr, rx).await
+}
+
+/// A5: whether the `DetermineLocation` request body media type is supported.
+///
+/// TS 29.572 (specs/TS29572_Nlmf_Location.yaml:42-47) accepts `application/json`
+/// (the bare `InputData`) or `multipart/related` (`InputData` jsonData +
+/// `binaryDataLppMessage` binary parts, TS 29.500 §6.2). Any other media type
+/// is rejected 415 (yaml:102). A JSON content type carrying parameters (e.g.
+/// `application/json; charset=utf-8`) is matched on its prefix. A missing
+/// Content-Type is tolerated and parsed as JSON so byte-identical legacy
+/// callers (and the in-crate handler tests) are unaffected.
+fn determine_location_media_type_supported(request: &SbiRequest) -> bool {
+    use nextgcore_sbi::constants::content_type::APPLICATION_JSON;
+    match request.http.get_header("Content-Type") {
+        None => true,
+        Some(ct) => {
+            let ct = ct.trim();
+            ct.get(..APPLICATION_JSON.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(APPLICATION_JSON))
+                || nextgcore_sbi::multipart::is_multipart_related(ct)
+        }
+    }
+}
+
+/// A5: resolve a `RefToBinaryData` `contentId` against the decoded
+/// multipart/related binary parts, returning the part bytes verbatim
+/// (transparent-relay: no re-encoding). Copy of amfd's `find_binary_part`
+/// idiom (namf_server.rs:872). `None` when no part carries that `Content-Id`.
+fn find_binary_part(request: &SbiRequest, content_id: &str) -> Option<Vec<u8>> {
+    request
+        .http
+        .parts
+        .iter()
+        .find(|p| p.content_id.as_deref() == Some(content_id))
+        .map(|p| p.data.to_vec())
+}
+
+/// A5: MO-LR `DetermineLocation` — the UE's LPP `ProvideLocationInformation`
+/// is carried in `binaryDataLppMessage` multipart part(s) referenced by
+/// `InputData.lppMessage` / `lppMessageExt` (TS 29.572 §6.1.6.2.2; TS 23.273
+/// §6.11). Every referenced part is resolved (a dangling `contentId` →
+/// 400 `MANDATORY_IE_INCORRECT`, mirroring amfd namf_server.rs:983-986),
+/// decoded through the LPP Provide adapters (Multi-RTT / DL-TDOA — A4 folds in
+/// E-CID), and the measurements are attached to a fresh positioning session
+/// which is completed via the standard strict solver path: a real-solver fix →
+/// 200 `LocationDataExt`; no solvable fix → 500 `POSITIONING_FAILED`
+/// (never a fabricated coordinate). No `LmfContext` lock is held across the
+/// await (the completion receiver is moved out of the lock scope).
+async fn handle_mo_lr_lpp(request: &SbiRequest, input: &nlmf::InputData) -> SbiResponse {
+    // Collect every referenced LPP part (primary + extensions), in order.
+    let mut refs: Vec<&nlmf::RefToBinaryData> = Vec::new();
+    if let Some(r) = input.lpp_message.as_ref() {
+        refs.push(r);
+    }
+    if let Some(exts) = input.lpp_message_ext.as_ref() {
+        refs.extend(exts.iter());
+    }
+
+    let mut cells: Vec<CellMeasurement> = Vec::new();
+    let mut txn: u8 = 0;
+    for reference in &refs {
+        // A dangling reference must fail closed — never silently drop the part.
+        let Some(bytes) = find_binary_part(request, &reference.content_id) else {
+            return problem(
+                400,
+                nlmf::cause::MANDATORY_IE_INCORRECT,
+                &format!(
+                    "InputData.lppMessage references contentId '{}' but no matching \
+                     binaryDataLppMessage part is present",
+                    reference.content_id
+                ),
+            );
+        };
+        match codec_glue::decode_lpp_provide_report(&bytes) {
+            Ok((rid, mut decoded)) => {
+                if txn == 0 {
+                    txn = rid as u8;
+                }
+                cells.append(&mut decoded);
+            }
+            Err(e) => {
+                return problem(
+                    400,
+                    nlmf::cause::INVALID_MSG_FORMAT,
+                    &format!("binaryDataLppMessage LPP decode failed: {e}"),
+                )
+            }
+        }
+    }
+
+    if cells.is_empty() {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "binaryDataLppMessage carries no decodable LPP measurements",
+        );
+    }
+
+    // Register a session for the UE-provided measurements, then feed them
+    // through the standard solver path. The completion receiver is cloned out
+    // of the lock scope; measurement_report fires it (strict outcome).
+    let qos = positioning_qos_from_input(input);
+    let registered = match lmf_self().read() {
+        Ok(context) => context
+            .measurement_request(0, PositioningMethod::NrBased, None, None, qos)
+            .map(|req| {
+                let (corr, rx) =
+                    context.positioning_session_register(input.supi.clone(), txn, req.request_id);
+                (corr, rx, req.request_id)
+            }),
+        Err(_) => None,
+    };
+    let Some((corr, rx, request_id)) = registered else {
+        return problem(
+            500,
+            nlmf::cause::POSITIONING_FAILED,
+            "Positioning session could not be registered (measurement store exhausted)",
+        );
+    };
+
+    // Attach the decoded measurements: completes the session with a strict
+    // outcome (real-solver Fix, else SolverFailed → 500 POSITIONING_FAILED).
+    if let Ok(context) = lmf_self().read() {
+        context.measurement_report(request_id, cells);
+    }
+    await_positioning_outcome(input, corr, rx).await
 }
 
 /// Encode the 200 `LocationDataExt` response (TS 29.572 Table 6.1.4.2.2-2)
@@ -1244,6 +1486,208 @@ async fn handle_lpp_binary_report(request: &SbiRequest) -> SbiResponse {
             Some("MEASUREMENT_NOT_FOUND"),
         ),
     }
+}
+
+// ===========================================================================
+// A4: Namf_Communication uplink notify callbacks (TS 29.518 §5.2.2.4 /
+// §5.2.2.3.3). The AMF (Wave-6 A4 producer for LPP N1, Wave-6 A1 producer for
+// NRPPa N2) POSTs an uplink positioning report to the callback URIs the LMF
+// registered via N1N2MessageSubscribe (A2). These handlers correlate the
+// report to a pending DetermineLocation session and complete it.
+// ===========================================================================
+
+/// A4: resolve the pending DetermineLocation session for an inbound notify.
+///
+/// Correlates on `lcsCorrelationId` (TS 29.572 CorrelationID) first, then — for
+/// the N1/LPP leg — falls back to the LPP `transactionID.transactionNumber`
+/// (TS 37.355 §6.1). Returns the session's measurement-store `request_id` on a
+/// hit; `None` fails closed (the caller answers 404 — an uplink report is never
+/// ingested against an unknown or global session).
+fn resolve_notify_session(lcs_correlation_id: Option<&str>, lpp_txn: Option<u8>) -> Option<u64> {
+    let ctx = lmf_self();
+    let context = ctx.read().ok()?;
+    if let Some(corr) = lcs_correlation_id {
+        if let Some(info) = context.positioning_session_find(corr) {
+            return Some(info.request_id);
+        }
+    }
+    if let Some(txn) = lpp_txn {
+        if let Some(corr) = context.positioning_session_find_by_transaction(txn) {
+            if let Some(info) = context.positioning_session_find(&corr) {
+                return Some(info.request_id);
+            }
+        }
+    }
+    None
+}
+
+/// Callback: `POST /nlmf-loc/v1/notify/n1` — Namf_Communication N1MessageNotify
+/// (A4; TS 29.518 §5.2.2.4, TS29518_Namf_Communication.yaml:1540-1596). The AMF
+/// relays an uplink LPP N1 message (TS 23.273 §6.11.2) as `multipart/related`:
+/// jsonData `N1MessageNotification` + a `binaryDataN1Message` part
+/// (`application/vnd.3gpp.5gnas`) carrying the UPER LPP PDU verbatim.
+///
+/// Correlates to a pending DetermineLocation session (A2) via `lcsCorrelationId`
+/// (fallback: the LPP transactionID), decodes the LPP `ProvideLocationInformation`
+/// through the codec adapters (E-CID / Multi-RTT / DL-TDOA) and feeds the
+/// measurements to [`LmfContext::measurement_report`], which fires the session's
+/// completion channel. Returns **204** (yaml: "204 Expected response to a
+/// successful callback processing").
+///
+/// Fail-closed: an unknown correlation → **404** `LOCATION_SESSION_UNKNOWN` (no
+/// global ingest, no session mutation); a missing/dangling binary part → **400**
+/// `MANDATORY_IE_MISSING`. An undecodable or empty LPP body for a KNOWN session
+/// completes it as SolverFailed so the DetermineLocation leg returns 500
+/// `POSITIONING_FAILED` (never a fabricated fix).
+async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
+    let Some(json) = request.http.content.as_deref() else {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "Missing N1MessageNotification jsonData",
+        );
+    };
+    let notification: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("Malformed N1MessageNotification: {e}"),
+            )
+        }
+    };
+    // n1MessageContainer.n1MessageContent.contentId references the binary part.
+    let Some(content_id) = notification
+        .pointer("/n1MessageContainer/n1MessageContent/contentId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "N1MessageNotification n1MessageContainer.n1MessageContent.contentId missing",
+        );
+    };
+    let Some(lpp_bytes) = find_binary_part(request, content_id) else {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "binaryDataN1Message part referenced by contentId is absent",
+        );
+    };
+    let lcs_correlation_id = notification
+        .get("lcsCorrelationId")
+        .and_then(serde_json::Value::as_str);
+
+    // Decode the uplink LPP; keep the result so its transactionID can seed the
+    // correlation fallback.
+    let decoded = codec_glue::decode_lpp_provide_report(&lpp_bytes);
+    let lpp_txn = decoded.as_ref().ok().map(|(rid, _)| *rid as u8);
+
+    let Some(request_id) = resolve_notify_session(lcs_correlation_id, lpp_txn) else {
+        log::warn!(
+            "N1MessageNotify with no matching positioning session \
+             (lcsCorrelationId={lcs_correlation_id:?}, lppTxn={lpp_txn:?}); dropped"
+        );
+        return problem(
+            404,
+            nlmf::cause::LOCATION_SESSION_UNKNOWN,
+            "No pending positioning session matches the notification (lcsCorrelationId / LPP transaction)",
+        );
+    };
+
+    let cells = match decoded {
+        Ok((_txn, cells)) => cells,
+        Err(e) => {
+            log::warn!(
+                "N1MessageNotify LPP decode failed for session (request_id {request_id}): {e}"
+            );
+            Vec::new()
+        }
+    };
+    if let Ok(context) = lmf_self().read() {
+        context.measurement_report(request_id, cells);
+    }
+    SbiResponse::no_content()
+}
+
+/// Callback: `POST /nlmf-loc/v1/notify/n2` — Namf_Communication N2InfoNotify
+/// (A1/A4; TS 29.518 §5.2.2.3.3, TS29518_Namf_Communication.yaml:1597-1661). The
+/// AMF relays an uplink NRPPa PDU (TS 38.413 §8.15.3/§8.15.5, TS 23.273 §6.11) as
+/// `multipart/related`: jsonData `N2InformationNotification` + a
+/// `binaryDataN2Information` part (`application/vnd.3gpp.ngap`) carrying the NRPPa
+/// PDU verbatim. Shared with the A1 uplink-NRPPa producer.
+///
+/// Correlates to a pending session via `lcsCorrelationId` (NRPPa carries no LPP
+/// transaction), decodes the NRPPa E-CID report and feeds the measurements to
+/// the session. **204** on success; **404** unknown correlation; **400** missing
+/// binary part.
+async fn handle_n2_info_notify(request: &SbiRequest) -> SbiResponse {
+    let Some(json) = request.http.content.as_deref() else {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "Missing N2InformationNotification jsonData",
+        );
+    };
+    let notification: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("Malformed N2InformationNotification: {e}"),
+            )
+        }
+    };
+    let Some(content_id) = notification
+        .pointer("/n2InfoContainer/nrppaInfo/nrppaPdu/ngapData/contentId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "N2InformationNotification n2InfoContainer.nrppaInfo.nrppaPdu.ngapData.contentId missing",
+        );
+    };
+    let Some(nrppa_bytes) = find_binary_part(request, content_id) else {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "binaryDataN2Information part referenced by contentId is absent",
+        );
+    };
+    let lcs_correlation_id = notification
+        .get("lcsCorrelationId")
+        .and_then(serde_json::Value::as_str);
+
+    let Some(request_id) = resolve_notify_session(lcs_correlation_id, None) else {
+        log::warn!(
+            "N2InfoNotify with no matching positioning session \
+             (lcsCorrelationId={lcs_correlation_id:?}); dropped"
+        );
+        return problem(
+            404,
+            nlmf::cause::LOCATION_SESSION_UNKNOWN,
+            "No pending positioning session matches the notification's lcsCorrelationId",
+        );
+    };
+
+    // Correlation is by lcsCorrelationId, so the embedded lmf-UE-Measurement-ID
+    // is not consulted for routing (only the measurements are used).
+    let cells = match codec_glue::decode_nrppa_ecid_report(&nrppa_bytes) {
+        Ok((_embedded_id, cells)) => cells,
+        Err(e) => {
+            log::warn!(
+                "N2InfoNotify NRPPa decode failed for session (request_id {request_id}): {e}"
+            );
+            Vec::new()
+        }
+    };
+    if let Ok(context) = lmf_self().read() {
+        context.measurement_report(request_id, cells);
+    }
+    SbiResponse::no_content()
 }
 
 /// Handle UE location get
@@ -2143,5 +2587,693 @@ mod tests {
             .expect("LDR context not registered after deferred determine-location");
         assert_eq!(found.ldr_type, "PERIODIC");
         assert_eq!(found.hgmlc_callback_uri.as_deref(), Some("http://gmlc/cb"));
+    }
+
+    // -----------------------------------------------------------------------
+    // A5: multipart/related DetermineLocation + InputData.lppMessage
+    // (TS 29.572 §6.1.4.2.2, specs/TS29572_Nlmf_Location.yaml:42-76).
+    // -----------------------------------------------------------------------
+
+    /// Build a determine-location `SbiRequest` exactly as the SBI server hands
+    /// a decoded `multipart/related` body to the handler: jsonData in
+    /// `http.content`, binary LPP part(s) in `http.parts`.
+    fn multipart_lpp_request(input_json: &str, parts: &[(&str, Vec<u8>)]) -> SbiRequest {
+        use bytes::Bytes;
+        use nextgcore_sbi::message::SbiPart;
+        let mut req = SbiRequest::post("/nlmf-loc/v1/determine-location");
+        req.http.set_content(input_json.to_string());
+        req.http.set_header(
+            "Content-Type",
+            "multipart/related; boundary=\"b1\"; type=\"application/json\"",
+        );
+        for (cid, data) in parts {
+            req.http.add_part(SbiPart::with_content(
+                *cid,
+                "application/vnd.3gpp.lpp",
+                Bytes::from(data.clone()),
+            ));
+        }
+        req
+    }
+
+    /// Encode a UE LPP `ProvideLocationInformation` (nr-Multi-RTT) carrying the
+    /// given `(nr-PhysCellID, K0 code)` measurements.
+    fn build_multi_rtt_lpp(cells: &[(u16, u32)], txn: u8) -> Vec<u8> {
+        use nextgcore_asn1c::lpp::ecid::{ProvideLocationInformation, ProvideLocationInformationR9};
+        use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
+        use nextgcore_asn1c::lpp::nr_dl_tdoa::{NrRstd, NrSlot, NrTimeStamp, NrTimingQuality};
+        use nextgcore_asn1c::lpp::nr_multi_rtt::{
+            NrMultiRttMeasElement, NrMultiRttMeasList, NrMultiRttProvideLocationInformation,
+            NrMultiRttSignalMeasurementInformation,
+        };
+        use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
+
+        let items: Vec<NrMultiRttMeasElement> = cells
+            .iter()
+            .map(|(pci, val)| NrMultiRttMeasElement {
+                dl_prs_id: 5,
+                nr_phys_cell_id: Some(*pci),
+                nr_arfcn: None,
+                nr_ue_rx_tx_time_diff: NrRstd::K0(*val),
+                nr_time_stamp: NrTimeStamp {
+                    dl_prs_id: 5,
+                    nr_phys_cell_id: None,
+                    nr_arfcn: None,
+                    nr_sfn: 700,
+                    nr_slot: NrSlot::Scs30(11),
+                },
+                nr_timing_quality: NrTimingQuality {
+                    timing_quality_value: 8,
+                    timing_quality_resolution: 1,
+                },
+                nr_dl_prs_rsrp_result: Some(90),
+            })
+            .collect();
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(txn),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: None,
+                        nr_multi_rtt: Some(NrMultiRttProvideLocationInformation {
+                            signal_measurement_information: Some(
+                                NrMultiRttSignalMeasurementInformation {
+                                    meas_list: NrMultiRttMeasList { items },
+                                },
+                            ),
+                        }),
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        msg.encode().expect("encode multi-rtt lpp").to_vec()
+    }
+
+    /// Seed the global TRP registry with a solvable 4-cell Multi-RTT scene and
+    /// build a matching UE LPP ProvideLocationInformation (K0 codes derived
+    /// from the true UE position via the codec's T_c scaling).
+    fn seed_scene_and_build_multi_rtt_lpp(txn: u8) -> Vec<u8> {
+        use crate::positioning::{enu_to_geodetic, EnuPoint, TrpCoord, SPEED_OF_LIGHT_M_S};
+        // T_c ns, matching codec_glue::TC_NS (TS 38.211 §4.1).
+        const TC_NS: f64 = 1_000_000_000.0 / (480_000.0 * 4_096.0);
+        let origin = TrpCoord::new(37.7749, -122.4194, 0.0);
+        let trps = [
+            (201u16, 0.0f64, 0.0f64),
+            (202, 1000.0, 0.0),
+            (203, 0.0, 1000.0),
+            (204, 1000.0, 1000.0),
+        ];
+        let (ue_e, ue_n) = (350.0f64, 600.0f64);
+
+        let ctx = lmf_self();
+        let mut cells: Vec<(u16, u32)> = Vec::new();
+        {
+            let guard = ctx.read().unwrap();
+            for (pci, e, n) in trps.iter() {
+                let coord = enu_to_geodetic(
+                    EnuPoint {
+                        e: *e,
+                        n: *n,
+                        u: 0.0,
+                    },
+                    origin,
+                );
+                guard.set_cell_coord(format!("pci-{pci}"), coord);
+                let range_m = (ue_e - e).hypot(ue_n - n);
+                let target_rtt_ns = range_m * 2.0 / SPEED_OF_LIGHT_M_S * 1e9;
+                let val = (target_rtt_ns / TC_NS).round() as u32;
+                cells.push((*pci, val));
+            }
+        }
+        build_multi_rtt_lpp(&cells, txn)
+    }
+
+    // -- A5 acceptance: LPP bytes reach the decode adapter -> a real fix ------
+    #[tokio::test]
+    async fn test_determine_location_multipart_lpp_produces_fix_200() {
+        lmf_context_init(1024);
+        let lpp = seed_scene_and_build_multi_rtt_lpp(55);
+        let input = r#"{"supi":"imsi-001010000000501",
+            "ueLocationServiceInd":"LOCATION_ESTIMATE",
+            "lppMessage":{"contentId":"lpp-mo-lr"}}"#;
+        let req = multipart_lpp_request(input, &[("lpp-mo-lr", lpp)]);
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(
+            resp.status, 200,
+            "the UE-provided LPP measurements must be decoded and solved"
+        );
+        let v = body_json(&resp);
+        // A real-solver fix (NOT the (0,0) placeholder): near the seeded scene.
+        let lat = v["locationEstimate"]["point"]["lat"].as_f64().unwrap();
+        let lon = v["locationEstimate"]["point"]["lon"].as_f64().unwrap();
+        assert!((37.0..38.0).contains(&lat), "lat={lat} (placeholder leaked?)");
+        assert!((-123.0..-122.0).contains(&lon), "lon={lon}");
+        assert_eq!(v["positioningDataList"][0]["method"], "MULTI-RTT");
+    }
+
+    // -- A5: decode happens but no solvable fix -> 500 (not the network 504) --
+    // A single Multi-RTT cell for a UN-seeded PCI: the bytes ARE decoded (a
+    // non-empty measurement set), fed to the solver, which fails -> 500
+    // POSITIONING_FAILED. If the parts had been ignored, the handler would have
+    // fallen through to the network path (504). 500-vs-504 is the discriminator.
+    #[tokio::test]
+    async fn test_determine_location_multipart_lpp_no_fix_500() {
+        lmf_context_init(1024);
+        let lpp = build_multi_rtt_lpp(&[(301, 5000)], 60);
+        let input = r#"{"supi":"imsi-001010000000502","lppMessage":{"contentId":"lpp-1"}}"#;
+        let req = multipart_lpp_request(input, &[("lpp-1", lpp)]);
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 500);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "POSITIONING_FAILED");
+    }
+
+    // -- A5 acceptance: a dangling contentId fails 400 (never silently ignored) -
+    #[tokio::test]
+    async fn test_determine_location_lpp_dangling_content_id_400() {
+        lmf_context_init(1024);
+        let lpp = build_multi_rtt_lpp(&[(301, 5000)], 61);
+        // lppMessage references "lpp-missing"; the part carries a DIFFERENT id.
+        let input = r#"{"supi":"imsi-001010000000503","lppMessage":{"contentId":"lpp-missing"}}"#;
+        let req = multipart_lpp_request(input, &[("some-other-id", lpp)]);
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            content_type(&resp).as_deref(),
+            Some("application/problem+json")
+        );
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "MANDATORY_IE_INCORRECT");
+    }
+
+    // -- A5: a lppMessage IE with NO multipart parts at all -> 400 ------------
+    #[tokio::test]
+    async fn test_determine_location_lpp_ref_without_parts_400() {
+        lmf_context_init(1024);
+        // application/json body (no binary parts) carrying a lppMessage ref.
+        let body = r#"{"supi":"imsi-001010000000504","lppMessage":{"contentId":"lpp-x"}}"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 400);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "MANDATORY_IE_INCORRECT");
+    }
+
+    // -- A5: content-type gate rejects unsupported media types with 415 -------
+    #[tokio::test]
+    async fn test_determine_location_unsupported_media_type_415() {
+        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
+            .with_body("not json or multipart", "text/plain");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 415);
+        assert_eq!(
+            content_type(&resp).as_deref(),
+            Some("application/problem+json")
+        );
+        let v = body_json(&resp);
+        assert_eq!(v["status"], 415);
+    }
+
+    // -- A5 acceptance: plain-JSON DetermineLocation is byte-identical to today.
+    // A JSON request with no lppMessage takes the exact pre-A5 path (stored-fix
+    // short-circuit -> 200 LocationDataExt), untouched by the new content-type
+    // gate (application/json) or the multipart branch (no parts).
+    #[tokio::test]
+    async fn test_determine_location_plain_json_unaffected() {
+        seed_fix("imsi-001010000000505", 50.0);
+        let body = r#"{
+            "supi": "imsi-001010000000505",
+            "locationQoS": { "hAccuracy": 100.0 },
+            "supportedGADShapes": ["POINT_UNCERTAINTY_CIRCLE"]
+        }"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        assert_eq!(v["locationEstimate"]["shape"], "POINT_UNCERTAINTY_CIRCLE");
+        assert_eq!(
+            v["accuracyFulfilmentIndicator"],
+            "REQUESTED_ACCURACY_FULFILLED"
+        );
+    }
+
+    // -- A5 strict self-consistency: our own multipart writer -> our reader ->
+    // handler round-trip (TS 29.500 boundary handling), yielding the same fix.
+    #[tokio::test]
+    async fn test_determine_location_multipart_roundtrip_via_sbi_codec() {
+        use bytes::Bytes;
+        use nextgcore_sbi::message::SbiPart;
+        use nextgcore_sbi::multipart;
+        lmf_context_init(1024);
+        let lpp = seed_scene_and_build_multi_rtt_lpp(57);
+        let input = r#"{"supi":"imsi-001010000000506","lppMessage":{"contentId":"lpp-mo-lr"}}"#;
+        let part =
+            SbiPart::with_content("lpp-mo-lr", "application/vnd.3gpp.lpp", Bytes::from(lpp.clone()));
+        let boundary = multipart::generate_boundary();
+        let body = multipart::encode(Some(input), std::slice::from_ref(&part), &boundary);
+        let ct = multipart::content_type_with_boundary(&boundary);
+        // Decode with our own reader (what the SBI server does on ingress).
+        let decoded = multipart::decode(&ct, &body).expect("multipart decode");
+        // The binary LPP part survived the writer->reader round-trip byte-exact.
+        assert_eq!(decoded.parts.len(), 1);
+        assert_eq!(decoded.parts[0].data.as_ref(), lpp.as_slice());
+        let mut req = SbiRequest::post("/nlmf-loc/v1/determine-location");
+        req.http.set_content(decoded.json.expect("jsonData root"));
+        req.http.set_header("Content-Type", ct);
+        for p in decoded.parts {
+            req.http.add_part(p);
+        }
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 200, "client-encoded multipart accepted round-trip");
+    }
+
+    // =======================================================================
+    // A4: uplink notify callbacks (handle_n1_message_notify / handle_n2_info_notify)
+    // =======================================================================
+
+    /// Encode a UE LPP `ProvideLocationInformation` (E-CID) carrying one
+    /// measured-results element (physCellId `pci`, rsrp-Result, ue-RxTxTimeDiff).
+    fn build_ecid_lpp(pci: u16, rsrp_result: u8, ue_rx_tx: u16, txn: u8) -> Vec<u8> {
+        use nextgcore_asn1c::lpp::ecid::{
+            EcidProvideLocationInformation, EcidSignalMeasurementInformation,
+            MeasuredResultsElement, ProvideLocationInformation, ProvideLocationInformationR9,
+        };
+        use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
+        use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
+        let element = MeasuredResultsElement {
+            phys_cell_id: pci,
+            arfcn_eutra: 1850,
+            system_frame_number: None,
+            rsrp_result: Some(rsrp_result),
+            rsrq_result: Some(20),
+            ue_rx_tx_time_diff: Some(ue_rx_tx),
+        };
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(txn),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: Some(EcidProvideLocationInformation {
+                            // MeasuredResultsList SIZE(1..32): the serving cell
+                            // rides in the list (an empty list fails encode).
+                            signal_measurement_information: Some(
+                                EcidSignalMeasurementInformation {
+                                    primary_cell_measured_results: None,
+                                    measured_results_list: vec![element],
+                                },
+                            ),
+                            ecid_error: None,
+                        }),
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        msg.encode().expect("encode E-CID lpp").to_vec()
+    }
+
+    /// Encode an NRPPa E-CID Measurement Report (serving cell + TA + RSRP).
+    fn build_nrppa_ecid_report() -> Vec<u8> {
+        use nextgcore_asn1c::nrppa::ies::{
+            ECidMeasurementResult, MeasuredResults, MeasuredResultsValue, NgRanCell, NgRanCgi,
+            PlmnIdentity, ResultRsrpEutraItem, Tac, UeMeasurementId,
+        };
+        use nextgcore_asn1c::nrppa::pdu::build_ecid_measurement_report;
+        use nextgcore_asn1c::nrppa::types::NrppaTransactionId;
+        let e_cid = ECidMeasurementResult {
+            serving_cell_id: NgRanCgi {
+                plmn_identity: PlmnIdentity([0x02, 0xF8, 0x39]),
+                ng_ran_cell: NgRanCell::NrCellId(0x000000001),
+            },
+            serving_cell_tac: Tac([0x00, 0x12, 0x34]),
+            ng_ran_access_point_position: None,
+            measured_results: Some(MeasuredResults {
+                values: vec![
+                    MeasuredResultsValue::ValueTimingAdvanceType1(500),
+                    MeasuredResultsValue::ResultRsrp(vec![ResultRsrpEutraItem {
+                        pci_eutra: 42,
+                        earfcn: 1850,
+                        value_rsrp_eutra: 60,
+                    }]),
+                ],
+            }),
+        };
+        build_ecid_measurement_report(
+            NrppaTransactionId(1),
+            UeMeasurementId(42),
+            UeMeasurementId(7),
+            &e_cid,
+            None,
+        )
+        .expect("build NRPPa E-CID report")
+        .encode()
+        .expect("NrppaPdu::encode")
+        .to_vec()
+    }
+
+    /// Build an inbound notify `SbiRequest` (jsonData root + one binary part).
+    fn notify_request(path: &str, json: &str, content_id: &str, content_type: &str, part: Vec<u8>) -> SbiRequest {
+        use bytes::Bytes;
+        use nextgcore_sbi::message::SbiPart;
+        let mut req = SbiRequest::post(path);
+        req.http.set_content(json.to_string());
+        req.http
+            .add_part(SbiPart::with_content(content_id, content_type, Bytes::from(part)));
+        req
+    }
+
+    // -- A4 STRICT-PEER: amfd's REAL N1MessageNotify producer body → lmfd's REAL
+    // callback handler completes a pending session with a measurement-derived fix.
+    #[tokio::test]
+    async fn test_n1_message_notify_strict_peer_completes_session_with_fix() {
+        use nextgcore_sbi::multipart;
+        lmf_context_init(1024);
+        let supi = "imsi-001010000000601";
+        let ctx = lmf_self();
+        let (corr, rx) = {
+            let guard = ctx.read().unwrap();
+            // Seed the serving cell so the E-CID solver returns a real fix.
+            guard.set_cell_coord(
+                "pci-42".to_string(),
+                crate::positioning::TrpCoord::new(37.5, -122.3, 0.0),
+            );
+            let req = guard
+                .measurement_request(0, PositioningMethod::Ecid, None, None, PositioningQos::BestEffort)
+                .expect("measurement request");
+            guard.positioning_session_register(Some(supi.to_string()), 177, req.request_id)
+        };
+
+        // The UE's uplink LPP E-CID ProvideLocationInformation (txn 177).
+        let lpp = build_ecid_lpp(42, 60, 800, 177);
+
+        // amfd's REAL producer body-builder (H1 lib import — not a mock).
+        let amf_req = nextgcore_amfd::namf_server::build_n1_message_notify_request(
+            "/nlmf-loc/v1/notify/n1",
+            Some("sub-1"),
+            "LPP",
+            Some(&corr),
+            Some(supi),
+            &lpp,
+        )
+        .expect("amfd builds N1MessageNotify");
+
+        // Through the shared multipart codec (client encode → server-side decode).
+        let boundary = multipart::generate_boundary();
+        let wire = multipart::encode(amf_req.http.content.as_deref(), &amf_req.http.parts, &boundary);
+        let ct = multipart::content_type_with_boundary(&boundary);
+        let decoded = multipart::decode(&ct, &wire).expect("multipart decode");
+        assert_eq!(
+            decoded.parts[0].data.as_ref(),
+            lpp.as_slice(),
+            "the LPP PDU must survive the amfd→lmfd relay byte-exact"
+        );
+        let mut req = SbiRequest::post("/nlmf-loc/v1/notify/n1");
+        req.http.set_content(decoded.json.expect("jsonData root"));
+        req.http.set_header("Content-Type", ct);
+        for p in decoded.parts {
+            req.http.add_part(p);
+        }
+
+        // lmfd's REAL callback handler consumes it.
+        let resp = handle_n1_message_notify(&req).await;
+        assert_eq!(resp.status, 204, "successful N1MessageNotify callback → 204");
+
+        // The pending DetermineLocation session completed with a REAL fix.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("session completed within budget")
+            .expect("completion sender was not dropped");
+        match outcome {
+            PositioningOutcome::Fix(est) => {
+                assert!((37.0..38.0).contains(&est.latitude), "lat={}", est.latitude);
+                assert!((-123.0..-122.0).contains(&est.longitude), "lon={}", est.longitude);
+            }
+            other => panic!("expected a measurement-derived fix, got {other:?}"),
+        }
+    }
+
+    // -- A4: an unknown lcsCorrelationId / LPP transaction → 404, no ingestion.
+    #[tokio::test]
+    async fn test_n1_message_notify_unknown_correlation_404() {
+        lmf_context_init(1024);
+        // txn 249 + a fresh UUID correlation: neither matches any session.
+        let lpp = build_ecid_lpp(42, 60, 800, 249);
+        let json = format!(
+            "{{\"n1MessageContainer\":{{\"n1MessageClass\":\"LPP\",\
+             \"n1MessageContent\":{{\"contentId\":\"n1-lpp\"}}}},\
+             \"lcsCorrelationId\":\"{}\"}}",
+            uuid::Uuid::new_v4()
+        );
+        let req = notify_request(
+            "/nlmf-loc/v1/notify/n1",
+            &json,
+            "n1-lpp",
+            "application/vnd.3gpp.5gnas",
+            lpp,
+        );
+        let resp = handle_n1_message_notify(&req).await;
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            content_type(&resp).as_deref(),
+            Some("application/problem+json")
+        );
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "LOCATION_SESSION_UNKNOWN");
+    }
+
+    // -- A4: jsonData references a contentId with no matching part → 400.
+    #[tokio::test]
+    async fn test_n1_message_notify_missing_binary_part_400() {
+        lmf_context_init(1024);
+        let json = "{\"n1MessageContainer\":{\"n1MessageClass\":\"LPP\",\
+             \"n1MessageContent\":{\"contentId\":\"n1-lpp\"}},\
+             \"lcsCorrelationId\":\"corr-whatever\"}";
+        // No binary part attached at all.
+        let mut req = SbiRequest::post("/nlmf-loc/v1/notify/n1");
+        req.http.set_content(json.to_string());
+        let resp = handle_n1_message_notify(&req).await;
+        assert_eq!(resp.status, 400);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "MANDATORY_IE_MISSING");
+    }
+
+    // -- A4: N2InfoNotify (NRPPa) correlates on lcsCorrelationId and completes
+    // the session; the report is attached to the session's request_id.
+    #[tokio::test]
+    async fn test_n2_info_notify_completes_session() {
+        lmf_context_init(1024);
+        let supi = "imsi-001010000000602";
+        let ctx = lmf_self();
+        let (corr, rx, request_id) = {
+            let guard = ctx.read().unwrap();
+            let req = guard
+                .measurement_request(0, PositioningMethod::Ecid, None, None, PositioningQos::BestEffort)
+                .expect("measurement request");
+            let (corr, rx) =
+                guard.positioning_session_register(Some(supi.to_string()), 188, req.request_id);
+            (corr, rx, req.request_id)
+        };
+        let nrppa = build_nrppa_ecid_report();
+        let json = format!(
+            "{{\"n2NotifySubscriptionId\":\"sub-9\",\
+             \"n2InfoContainer\":{{\"n2InformationClass\":\"NRPPa\",\
+             \"nrppaInfo\":{{\"nrppaPdu\":{{\"ngapIeType\":\"NRPPA_PDU\",\
+             \"ngapData\":{{\"contentId\":\"nrppa\"}}}}}}}},\
+             \"lcsCorrelationId\":\"{corr}\"}}"
+        );
+        let req = notify_request(
+            "/nlmf-loc/v1/notify/n2",
+            &json,
+            "nrppa",
+            "application/vnd.3gpp.ngap",
+            nrppa,
+        );
+        let resp = handle_n2_info_notify(&req).await;
+        assert_eq!(resp.status, 204, "successful N2InfoNotify callback → 204");
+
+        // The session completed (outcome delivered) and the report was stored.
+        let _outcome = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("session completed within budget")
+            .expect("completion sender was not dropped");
+        assert!(
+            lmf_self().read().unwrap().report_find(request_id).is_some(),
+            "the uplink NRPPa report must be attached to the session's request_id"
+        );
+    }
+
+    // -- A4: N2InfoNotify with an unknown lcsCorrelationId → 404.
+    #[tokio::test]
+    async fn test_n2_info_notify_unknown_correlation_404() {
+        lmf_context_init(1024);
+        let nrppa = build_nrppa_ecid_report();
+        let json = format!(
+            "{{\"n2NotifySubscriptionId\":\"sub-9\",\
+             \"n2InfoContainer\":{{\"n2InformationClass\":\"NRPPa\",\
+             \"nrppaInfo\":{{\"nrppaPdu\":{{\"ngapIeType\":\"NRPPA_PDU\",\
+             \"ngapData\":{{\"contentId\":\"nrppa\"}}}}}}}},\
+             \"lcsCorrelationId\":\"{}\"}}",
+            uuid::Uuid::new_v4()
+        );
+        let req = notify_request(
+            "/nlmf-loc/v1/notify/n2",
+            &json,
+            "nrppa",
+            "application/vnd.3gpp.ngap",
+            nrppa,
+        );
+        let resp = handle_n2_info_notify(&req).await;
+        assert_eq!(resp.status, 404);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "LOCATION_SESSION_UNKNOWN");
+    }
+}
+
+#[cfg(test)]
+mod oauth2_h8_tests {
+    //! Wave-6 H8 (Phase B) strict-peer OAuth2 enforcement triplet: the real
+    //! `lmf_sbi_request_handler` is mounted behind nextgcore-sbi's server-side
+    //! OAuth2 verification (TS 33.501 §13.4.1). A missing or wrong-audience
+    //! Bearer is rejected (401) before the handler runs; a valid NRF-audience
+    //! token (aud=LMF, ES256-signed against the served JWKS) passes through.
+    use nextgcore_sbi::client::SbiClient;
+    use nextgcore_sbi::message::SbiRequest;
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    use nextgcore_sbi::types::NfType;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str, scope: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature};
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
+        let claims = serde_json::json!({
+            "iss": "NRF", "sub": "lmf-1", "aud": aud,
+            "scope": scope, "exp": exp, "iat": 0
+        })
+        .to_string();
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("{h}.{p}.{s}")
+    }
+
+    fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let point = sk.verifying_key().to_encoded_point(false);
+        serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":kid,
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }]})
+    }
+
+    async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
+        super::lmf_context_init(256);
+        let port = free_port();
+        let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(jwks);
+        cfg = cfg.with_expected_audience_nf_type(NfType::Lmf);
+        let server = SbiServer::new(cfg);
+        server
+            .start(super::lmf_sbi_request_handler)
+            .await
+            .expect("server start");
+        (server, port)
+    }
+
+    #[test]
+    fn test_oauth2_require_knob_parses_and_defaults_off() {
+        let dir = std::env::temp_dir();
+        let off = dir.join(format!("lmf-h8-off-{}.yaml", std::process::id()));
+        std::fs::write(&off, "lmf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n").unwrap();
+        assert!(!super::oauth2_required(off.to_str().unwrap()));
+        let on = dir.join(format!("lmf-h8-on-{}.yaml", std::process::id()));
+        std::fs::write(&on, "lmf:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();
+        assert!(super::oauth2_required(on.to_str().unwrap()));
+        let _ = std::fs::remove_file(off);
+        let _ = std::fs::remove_file(on);
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_missing_token_rejected_401() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get("/nlmf-loc/v1/determine-location"),
+        )
+        .await
+        .expect("bounded")
+        .expect("response");
+        assert_eq!(resp.status, 401, "unauthenticated request must be 401");
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_wrong_audience_rejected_401() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let token = build_es256_token(&sk, "nrf-es256", "AMF", "nlmf-loc");
+        let req = SbiRequest::get("/nlmf-loc/v1/determine-location")
+            .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_valid_token_reaches_handler() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let token = build_es256_token(&sk, "nrf-es256", "LMF", "nlmf-loc");
+        let req = SbiRequest::get("/nlmf-loc/v1/determine-location/does-not-exist")
+            .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_ne!(resp.status, 401, "valid token must not be 401");
+        assert_ne!(resp.status, 403, "valid token must not be 403");
+        server.stop().await.expect("stop");
     }
 }

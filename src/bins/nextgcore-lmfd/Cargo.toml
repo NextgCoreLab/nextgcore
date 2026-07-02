@@ -23,12 +23,18 @@ anyhow.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+base64.workspace = true
+# Wave-6 A4/H1 strict-peer test: drive amfd's REAL N1MessageNotify producer
+# body-builder in-process (no lenient mock) against lmfd's real callback handler.
+nextgcore-amfd = { path = "../nextgcore-amfd" }
 
 [lints]
 workspace = true
