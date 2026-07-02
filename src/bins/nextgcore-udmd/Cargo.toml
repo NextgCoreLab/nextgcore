@@ -45,6 +45,19 @@ base64.workspace = true
 # amfd lib target, instead of a lenient mock. Dev-only edge; the binary
 # graph is unchanged.
 nextgcore-amfd = { path = "../nextgcore-amfd" }
+# Wave-6 F-07 (TRUE strict-peer): drive ausfd's REAL Nausf_SoRProtection /
+# Nausf_UPUProtection producers (`ausf_sbi_request_handler` +
+# `handle_sor_protect`/`handle_upu_protect`) in-process from udmd's tests
+# via the H1 ausfd lib target — real udmd am-data injection ↔ real ausfd
+# MAC producers over a loopback SBI HTTP/2 server, not a lenient mock.
+# Dev-only edge; the binary graph is unchanged.
+nextgcore-ausfd = { path = "../nextgcore-ausfd" }
+# F-07 independent MAC oracle: recompute the Annex A.17-A.20 MACs from a
+# raw HMAC-SHA-256 S-string assembly, NOT via nextgcore-crypt's KDF (which
+# the ausfd producer uses) — so the strict-peer equality is a genuine
+# cross-implementation check, not self-confirmation.
+hmac.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

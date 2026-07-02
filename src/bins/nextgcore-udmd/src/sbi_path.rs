@@ -383,7 +383,9 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
         log::info!("Using UDR env var fallback: {host_str}:{port}");
     }
 
-    let client = sbi_ctx.get_client(&host_str, port).await;
+    // Attach an NRF-issued Bearer token to the Nudr_DataRepository call when
+    // OAuth2 enforcement is on (Wave-6 H8 Phase A); pooled/no-op otherwise.
+    let client = crate::app::peer_client(&host_str, port, NfType::Udr).await;
 
     log::debug!(
         "Sending NUDR-DR request for UE [{udm_ue_id}] stream [{stream_id}] to UDR at {host_str}:{port}"

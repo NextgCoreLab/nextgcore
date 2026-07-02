@@ -170,10 +170,35 @@ static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth
     std::sync::OnceLock::new();
 
 /// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
-/// Phase A). Outbound SBI clients attach a token via `client.with_oauth2`.
-#[allow(dead_code)]
-fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+/// Phase A). Outbound SBI clients attach a token via [`peer_client`].
+pub(crate) fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Build an outbound peer SBI client for `host:port` (Wave-6 H8 Phase A).
+///
+/// When OAuth2 enforcement is ON, returns a fresh client carrying an NRF-issued
+/// Bearer token scoped to `target` (TS 33.501 §13.4.1, TS 29.510 §5.4.2). When
+/// OFF (the default), returns the process-wide pooled client unchanged, so the
+/// matched-sim default path is byte-identical.
+pub(crate) async fn peer_client(
+    host: &str,
+    port: u16,
+    target: nextgcore_sbi::types::NfType,
+) -> Arc<nextgcore_sbi::client::SbiClient> {
+    match oauth2_client() {
+        Some(oauth2) => Arc::new(
+            nextgcore_sbi::client::SbiClient::new(nextgcore_sbi::client::SbiClientConfig::new(
+                host, port,
+            ))
+            .with_oauth2(oauth2, target),
+        ),
+        None => {
+            nextgcore_sbi::context::global_context()
+                .get_client(host, port)
+                .await
+        }
+    }
 }
 
 /// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the

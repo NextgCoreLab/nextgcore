@@ -582,6 +582,7 @@ pub struct MockUdr {
     stored_smf: std::sync::Mutex<std::collections::HashMap<String, Value>>,
     put_status: u16,
     patch_status: u16,
+    dereg_status: u16,
     calls: std::sync::Mutex<Vec<UdrCall>>,
 }
 
@@ -593,6 +594,7 @@ impl MockUdr {
             stored_smf: std::sync::Mutex::new(std::collections::HashMap::new()),
             put_status: 201,
             patch_status: 204,
+            dereg_status: 204,
             calls: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -601,6 +603,15 @@ impl MockUdr {
         let m = Self::new();
         *m.stored_amf.lock().unwrap() = Some(prior);
         m
+    }
+
+    /// Override the status the mocked old-AMF dereg-notify callback returns
+    /// (default 204). Used by the H3 step-3 "logs-and-continues" test to prove
+    /// a FAILING notification does not wedge udmd's re-registration
+    /// (TS 29.503 §5.3.2.2.2 best-effort semantics).
+    fn with_dereg_status(mut self, status: u16) -> Self {
+        self.dereg_status = status;
+        self
     }
 
     fn amf_context_get(&self, supi: &str) -> SbiResponse {
@@ -670,7 +681,7 @@ impl MockUdr {
             callback_uri: callback_uri.to_string(),
             body: body.clone(),
         });
-        SbiResponse::with_status(204)
+        SbiResponse::with_status(self.dereg_status)
     }
 
     fn calls(&self) -> Vec<UdrCall> {
@@ -1229,5 +1240,198 @@ mod tests {
             nextgcore_amfd::namf_request_handler(SbiRequest::post(path2).with_json_body(&full).expect("json"))
                 .await;
         assert_eq!(resp2.status, 404, "unknown SUPI must be 404 CONTEXT_NOT_FOUND");
+    }
+
+    // ----- H3 finish: reverse-shape cross-decode pin + step-3 negatives ------
+    //
+    // Wave-6 H3 (TS 29.503 §5.3.2.3.2) implementation steps 2 & 3. Step 1
+    // (strict-peer accept + resulting AmfUe/enqueue state) is proven above; the
+    // tests below close:
+    //   step 2 — the reverse-shape cross-decode pin: amfd's OWN
+    //            `DeregistrationData` struct (namf_handler.rs:143) <-> udmd's
+    //            serializer, BOTH directions, so a `deregReason`/`accessType`
+    //            field-name or enum-string drift on EITHER side fails a test;
+    //   step 3 — the negatives: a deregReason amfd's REAL handler rejects
+    //            (-> 400 MANDATORY_IE_INCORRECT), and udmd logs-and-continues
+    //            (a FAILING notification must not wedge re-registration).
+
+    /// Canonical TS 29.503 §5.3.2.3.2 `DeregistrationReason` wire strings for
+    /// amfd's OWN enum. The match is exhaustive so a renamed/added amfd variant
+    /// forces this pin to be revisited — the compile-time half of the
+    /// field-drift guard the H3 cross-decode step exists to provide.
+    fn amfd_dereg_reason_wire(
+        r: nextgcore_amfd::namf_handler::DeregistrationReason,
+    ) -> &'static str {
+        use nextgcore_amfd::namf_handler::DeregistrationReason as R;
+        match r {
+            R::UeInitialRegistration => "UE_INITIAL_REGISTRATION",
+            R::UeRegistrationAreaChange => "UE_REGISTRATION_AREA_CHANGE",
+            R::SubscriptionWithdrawn => "SUBSCRIPTION_WITHDRAWN",
+            R::FiveGsToEpsMobility => "5GS_TO_EPS_MOBILITY",
+            R::FiveGsToEpsMobilityUeInitialRegistration => {
+                "5GS_TO_EPS_MOBILITY_UE_INITIAL_REGISTRATION"
+            }
+            R::ReregistrationRequired => "REREGISTRATION_REQUIRED",
+            R::SmfContextTransferred => "SMF_CONTEXT_TRANSFERRED",
+        }
+    }
+
+    /// Canonical TS 29.503 `AccessType` wire strings for amfd's OWN enum
+    /// (exhaustive — same compile-time drift-guard rationale as above).
+    fn amfd_access_type_wire(a: nextgcore_amfd::namf_handler::AccessType) -> &'static str {
+        use nextgcore_amfd::namf_handler::AccessType as A;
+        match a {
+            A::ThreeGppAccess => "3GPP_ACCESS",
+            A::NonThreeGppAccess => "NON_3GPP_ACCESS",
+        }
+    }
+
+    /// H3 step 2 — reverse-shape cross-decode pin, BOTH directions:
+    ///  (1) ENCODE: construct amfd's OWN `DeregistrationData` struct for a UE
+    ///      that re-registered in a new AMF over 3GPP access, render it to its
+    ///      canonical TS 29.503 wire strings, and assert it is field/value-
+    ///      identical to udmd's production `build_dereg_notification_body()`;
+    ///  (2) DECODE: feed udmd's production body through amfd's REAL handler and
+    ///      assert it decodes to the semantics of that same struct
+    ///      (reregistration required for UE_INITIAL_REGISTRATION).
+    /// A field-name or enum-string drift on either side breaks one direction.
+    #[tokio::test]
+    async fn test_dereg_notify_cross_decode_amfd_struct_and_udmd_body() {
+        use nextgcore_amfd::namf_handler::{AccessType, DeregistrationData, DeregistrationReason};
+        use nextgcore_sbi::message::SbiRequest;
+
+        // Direction 1 (encode pin) — amfd's OWN struct rendered to the wire.
+        let amfd_struct = DeregistrationData {
+            dereg_reason: DeregistrationReason::UeInitialRegistration,
+            access_type: AccessType::ThreeGppAccess,
+        };
+        let from_amfd_struct = json!({
+            "deregReason": amfd_dereg_reason_wire(amfd_struct.dereg_reason),
+            "accessType": amfd_access_type_wire(amfd_struct.access_type),
+        });
+        assert_eq!(
+            from_amfd_struct,
+            build_dereg_notification_body(),
+            "amfd's DeregistrationData wire form must be field/value-identical to \
+             udmd's emitted body (TS 29.503 §5.3.2.3.2 cross-decode pin)"
+        );
+
+        // Direction 2 (decode pin) — udmd's body through amfd's REAL handler.
+        let supi = "imsi-001010000000396";
+        let ue_id = {
+            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+            nextgcore_amfd::test_support::init_context();
+            seed_amf_ue(supi, 60_103)
+        };
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let req = SbiRequest::post(path)
+            .with_json_body(&build_dereg_notification_body())
+            .expect("json");
+        let resp = nextgcore_amfd::namf_request_handler(req).await;
+        assert_eq!(resp.status, 204, "amfd decodes udmd's body -> 204");
+        let queued = drain_network_deregs_for(ue_id);
+        assert_eq!(queued.len(), 1, "one network-initiated dereg enqueued");
+        assert!(
+            queued[0].reregistration_required,
+            "UE_INITIAL_REGISTRATION decodes to reregistration_required=true"
+        );
+    }
+
+    /// Decoder-discrimination pin: a non-initial reason amfd recognises
+    /// (SUBSCRIPTION_WITHDRAWN) is accepted (204) and still enqueues a
+    /// network-initiated dereg, but with `reregistration_required=false` —
+    /// proving amfd's REAL decoder keys on the EXACT deregReason string, not a
+    /// blanket accept (TS 23.502 §4.2.2.3.3: only UE_INITIAL_REGISTRATION asks
+    /// the UE to re-register).
+    #[tokio::test]
+    async fn test_dereg_notify_strict_peer_non_initial_reason_no_rereg() {
+        use nextgcore_sbi::message::SbiRequest;
+        let supi = "imsi-001010000000395";
+        let ue_id = {
+            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+            nextgcore_amfd::test_support::init_context();
+            seed_amf_ue(supi, 60_104)
+        };
+        let body = json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN", "accessType": "3GPP_ACCESS" });
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let resp = nextgcore_amfd::namf_request_handler(
+            SbiRequest::post(path).with_json_body(&body).expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 204, "a recognised non-initial reason is accepted");
+        let queued = drain_network_deregs_for(ue_id);
+        assert_eq!(queued.len(), 1, "3GPP-access dereg is still enqueued");
+        assert!(
+            !queued[0].reregistration_required,
+            "SUBSCRIPTION_WITHDRAWN must NOT set reregistration_required"
+        );
+    }
+
+    /// H3 step 3 (first half) — a deregReason amfd's REAL handler does not
+    /// recognise fails closed: 400 MANDATORY_IE_INCORRECT and NO dereg enqueued
+    /// (TS 29.500 §5.2.7). Proves the accept above is discriminating, not a
+    /// blanket 2xx.
+    #[tokio::test]
+    async fn test_dereg_notify_strict_peer_rejects_unknown_reason() {
+        use nextgcore_sbi::message::SbiRequest;
+        let supi = "imsi-001010000000394";
+        let ue_id = {
+            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+            nextgcore_amfd::test_support::init_context();
+            seed_amf_ue(supi, 60_105)
+        };
+        let body = json!({ "deregReason": "NOT_A_REAL_REASON", "accessType": "3GPP_ACCESS" });
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let resp = nextgcore_amfd::namf_request_handler(
+            SbiRequest::post(path).with_json_body(&body).expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 400, "an unknown deregReason must fail closed (400)");
+        assert_eq!(
+            problem_cause(&resp).as_deref(),
+            Some("MANDATORY_IE_INCORRECT"),
+            "unknown deregReason -> MANDATORY_IE_INCORRECT"
+        );
+        assert!(
+            drain_network_deregs_for(ue_id).is_empty(),
+            "a rejected notify must not enqueue a network-initiated dereg"
+        );
+    }
+
+    /// H3 step 3 (second half) — udmd logs-and-continues: a FAILING dereg
+    /// notification to the old AMF must not wedge the new registration
+    /// (TS 29.503 §5.3.2.2.2 best-effort). The old-AMF callback is mocked to
+    /// return 500; udmd's re-registration must still complete (200) and the
+    /// notification must have been attempted exactly once.
+    #[tokio::test]
+    async fn test_reregistration_continues_when_dereg_notify_fails() {
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-001010000000393";
+        let amf_a_uri =
+            "http://amf-a.example.org:7777/namf-callback/v1/imsi-x/dereg-notify".to_string();
+        let prior = json!({
+            "amfInstanceId": "amf-a-0001",
+            "deregCallbackUri": amf_a_uri,
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
+            "ratType": "NR"
+        });
+        // The old-AMF dereg-notify callback FAILS (500).
+        let mock = Arc::new(MockUdr::with_prior(prior).with_dereg_status(500));
+        let client = UdrClient::Mock(mock.clone());
+
+        let mut body_b = valid_amf_body();
+        body_b["amfInstanceId"] = json!("amf-b-0002");
+        body_b["deregCallbackUri"] =
+            json!("http://amf-b.example.org:7777/namf-callback/v1/imsi-x/dereg-notify");
+        let resp = process_amf_registration(supi, &body_b, &client).await;
+        assert_eq!(
+            resp.status, 200,
+            "a failing dereg notification must NOT wedge re-registration"
+        );
+        assert_eq!(
+            deregister_count(&mock.calls()),
+            1,
+            "the (failed) dereg notification was attempted exactly once"
+        );
     }
 }
