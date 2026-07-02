@@ -1805,7 +1805,17 @@ mod tests {
         port
     }
 
-    async fn start_nsacf_server() -> (SbiServer, u16) {
+    /// Serializes every test that touches the PROCESS-GLOBAL NSACF context.
+    /// `start_nsacf_server*` re-inits (wipes) the shared store, so two such
+    /// tests running on parallel test threads corrupt each other's quota/UE
+    /// counts mid-flight — the CI-flaky EAC-notification failure (and the
+    /// occasional HTTP/2 connection error) were exactly this race. The guard
+    /// is returned and must be held for the whole test (bind it, even as
+    /// `_ctx_guard` — a bare `_` would drop it immediately).
+    static GLOBAL_CTX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn start_nsacf_server() -> (SbiServer, u16, tokio::sync::MutexGuard<'static, ()>) {
+        let guard = GLOBAL_CTX_TEST_LOCK.lock().await;
         nsacf_context_init(64);
         let port = free_port();
         let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
@@ -1816,7 +1826,7 @@ mod tests {
             .start(nsacf_sbi_request_handler)
             .await
             .expect("server start");
-        (server, port)
+        (server, port, guard)
     }
 
     // -----------------------------------------------------------------
@@ -1862,7 +1872,10 @@ mod tests {
 
     /// Start an NSACF SBI server with OAuth2 enforcement keyed to a static
     /// JWKS and the NSACF audience.
-    async fn start_nsacf_server_oauth2(jwks: serde_json::Value) -> (SbiServer, u16) {
+    async fn start_nsacf_server_oauth2(
+        jwks: serde_json::Value,
+    ) -> (SbiServer, u16, tokio::sync::MutexGuard<'static, ()>) {
+        let guard = GLOBAL_CTX_TEST_LOCK.lock().await;
         nsacf_context_init(64);
         let port = free_port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
@@ -1874,7 +1887,7 @@ mod tests {
             .start(nsacf_sbi_request_handler)
             .await
             .expect("server start");
-        (server, port)
+        (server, port, guard)
     }
 
     #[test]
@@ -1932,7 +1945,8 @@ mod tests {
     #[tokio::test]
     async fn test_oauth2_missing_token_rejected() {
         let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
-        let (server, port) = start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
+        let (server, port, _ctx_guard) =
+            start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         let resp = tokio::time::timeout(
@@ -1950,7 +1964,8 @@ mod tests {
     #[tokio::test]
     async fn test_oauth2_valid_token_accepted() {
         let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
-        let (server, port) = start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
+        let (server, port, _ctx_guard) =
+            start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Valid token whose aud includes "NSACF" reaches the handler: the
@@ -1970,7 +1985,8 @@ mod tests {
     #[tokio::test]
     async fn test_oauth2_wrong_audience_rejected() {
         let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
-        let (server, port) = start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
+        let (server, port, _ctx_guard) =
+            start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Token addressed to a different NF (aud="UDM") is rejected (401).
@@ -2011,7 +2027,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_ue_admission_lifecycle() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         create_quota(&client, 71, 2, 100).await;
@@ -2084,7 +2100,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_ue_ac_missing_mandatory() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Missing snssai inside an acuOperationList op -> 400 MANDATORY_IE_MISSING.
@@ -2200,7 +2216,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_pdu_session_admission() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         create_quota(&client, 73, 100, 1).await;
@@ -2270,7 +2286,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_slice_ee_subscription_and_eac_notification() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Notification receiver
@@ -2517,7 +2533,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_ue_nested_two_supis_two_ops() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Two NSAC-subject slices, each with room for exactly 2 UEs.
@@ -2568,7 +2584,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_ue_partial_failure_200_acu_failure_list() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
         create_quota(&client, 83, 1, 100).await; // room for exactly 1 UE
 
@@ -2608,7 +2624,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_ue_partial_failure_slice_not_found() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
         create_quota(&client, 84, 10, 100).await;
 
@@ -2639,7 +2655,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_pdu_partial_failure_exceed_max_pdu_num() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
         create_quota(&client, 85, 100, 1).await; // room for exactly 1 PDU session
 
@@ -2676,7 +2692,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_pdu_uri_is_slices_pdus() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
         create_quota(&client, 86, 100, 100).await;
 
@@ -2709,7 +2725,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_per_access_ue_counting_and_reason() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Provision per-access ceilings via the local-configs custom op: 1 UE
@@ -2777,7 +2793,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_ue_update_moves_access_bucket() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
         create_quota(&client, 91, 10, 100).await;
 
@@ -2851,7 +2867,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_custom_ops_local_configs_and_roaming_quotas() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // local-configs/update is routed (not 404) and returns a spec-shaped body.
@@ -2913,7 +2929,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_ac_missing_nf_id() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // UE AC body WITHOUT nfId -> 400 MANDATORY_IE_MISSING.
@@ -2963,7 +2979,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_ue_decrease_membership_and_cause() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
         create_quota(&client, 94, 10, 100).await;
 
@@ -3042,7 +3058,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_ac_response_features_no_ue_admission_list() {
-        let (server, port) = start_nsacf_server().await;
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
         create_quota(&client, 96, 1, 100).await; // room for exactly 1 UE
 
