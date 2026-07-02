@@ -156,6 +156,21 @@ pub struct UeLocationContext {
     pub active_measurement: Option<u64>,
 }
 
+/// Periodic-reporting parameters for a deferred LDR (A8, TS 29.572
+/// `PeriodicEventInfo` — `reportingAmount`, `reportingInterval` seconds, optional
+/// `reportingIntervalMs`). A `Copy` mirror kept in `context` so `LdrContext`
+/// stays independent of the `nlmf` serde models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodicReporting {
+    /// `ReportingAmount` (TS 29.572, yaml:2083) — number of periodic reports.
+    pub reporting_amount: u32,
+    /// `ReportingInterval` (TS 29.572, yaml:2089) — interval in **seconds**.
+    pub reporting_interval_secs: u32,
+    /// `ReportingIntervalMs` (TS 29.572, yaml:2095) — interval in
+    /// **milliseconds** (1..999) when a sub-second cadence is requested.
+    pub reporting_interval_ms: Option<u32>,
+}
+
 /// Registered deferred/periodic/triggered LDR session context (lmfd#1).
 /// Keyed by `ldrReference` in `ldr_sessions`; created on `determine-location`
 /// or `location-context-transfer`; removed by `cancel-location`.
@@ -169,6 +184,9 @@ pub struct LdrContext {
     pub hgmlc_callback_uri: Option<String>,
     /// Target SUPI when known.
     pub supi: Option<String>,
+    /// A8: periodic-reporting parameters, present only for `ldrType == PERIODIC`
+    /// with a `periodicEventInfo` IE. Drives the EventNotify trigger scheduler.
+    pub periodic_event_info: Option<PeriodicReporting>,
 }
 
 /// Outcome of a pending network-induced positioning procedure (Wave-6 A2,
@@ -239,6 +257,11 @@ pub struct LmfContext {
     cell_registry: RwLock<HashMap<String, TrpCoord>>,
     /// Registered deferred/periodic/triggered LDR sessions (ldrReference -> ctx). lmfd#1.
     ldr_sessions: RwLock<HashMap<String, LdrContext>>,
+    /// A8: running EventNotify trigger tasks (ldrReference -> abort handle). A
+    /// PERIODIC LDR spawns a tokio interval task whose [`AbortHandle`] is stored
+    /// here so `cancel-location` and `fini` can stop it (no task leaks on
+    /// cancel or shutdown). Only ever taken alone (no lock-order inversion).
+    ldr_tasks: RwLock<HashMap<String, tokio::task::AbortHandle>>,
     /// Pending DetermineLocation sessions keyed by lcsCorrelationId (A2).
     /// Lock discipline: the session maps below are only ever taken ONE at a
     /// time (acquire → mutate → drop before the next) so no lock ordering
@@ -275,6 +298,7 @@ impl LmfContext {
             initialized: AtomicBool::new(false),
             cell_registry: RwLock::new(HashMap::new()),
             ldr_sessions: RwLock::new(HashMap::new()),
+            ldr_tasks: RwLock::new(HashMap::new()),
             positioning_sessions: RwLock::new(HashMap::new()),
             positioning_txn_index: RwLock::new(HashMap::new()),
             positioning_request_index: RwLock::new(HashMap::new()),
@@ -308,6 +332,13 @@ impl LmfContext {
         }
         if let Ok(mut ldrs) = self.ldr_sessions.write() {
             ldrs.clear();
+        }
+        // A8: abort every running EventNotify trigger task so no periodic
+        // producer outlives the LMF (shutdown-token discipline).
+        if let Ok(mut tasks) = self.ldr_tasks.write() {
+            for (_ref, handle) in tasks.drain() {
+                handle.abort();
+            }
         }
         // Dropping the sessions drops their completion senders, so any
         // still-awaiting DetermineLocation handler unblocks with a recv error.
@@ -377,11 +408,16 @@ impl LmfContext {
     /// A2: when the report belongs to a pending DetermineLocation session
     /// (request_id indexed by [`Self::positioning_session_register`]), the
     /// session is completed with a **strict** outcome: only a real-solver fix
-    /// yields [`PositioningOutcome::Fix`]; the heuristic placeholder maps to
-    /// [`PositioningOutcome::SolverFailed`] (→ 500 `POSITIONING_FAILED`), so
-    /// no fabricated coordinates can escape on the conformant MT-LR path.
-    /// The returned estimate is byte-identical to the pre-A2 behaviour for
-    /// the legacy report routes.
+    /// yields [`PositioningOutcome::Fix`]; anything else maps to
+    /// [`PositioningOutcome::SolverFailed`] (→ 500 `POSITIONING_FAILED`).
+    ///
+    /// A7 (lmfd-11): the runtime path NEVER fabricates coordinates. The return
+    /// value and the stored [`NrppaMeasurementReport::location`] are exactly the
+    /// real-solver fix ([`try_real_solve`]) or `None` — the old heuristic
+    /// `compute_location_placeholder` lat/lon 0.0 fallback has been removed from
+    /// the runtime path entirely (it now lives under `#[cfg(test)]`). `None`
+    /// means "no location fix could be solved" and every caller treats it as
+    /// no-fix (debug routes → 404; the MT-LR session → `SolverFailed` → 500).
     pub fn measurement_report(
         &self,
         request_id: u64,
@@ -392,7 +428,7 @@ impl LmfContext {
         let registry = self.build_trp_registry();
 
         // Scope the store locks so the session completion below runs lock-free.
-        let (location, strict_fix) = {
+        let strict_fix = {
             let mut measurements = self.measurements.write().ok()?;
             let mut reports = self.reports.write().ok()?;
 
@@ -400,48 +436,46 @@ impl LmfContext {
             measurement.state = MeasurementState::Completed;
 
             // Real geometric solve (None on empty registry / no solvable set).
+            // A7: no placeholder fallback — an unsolvable report yields no fix.
             let strict_fix = if cell_measurements.is_empty() || registry.is_empty() {
                 None
             } else {
                 try_real_solve(&cell_measurements, &registry)
             };
-            // Legacy estimate: identical to the old compute_location result
-            // (real solve, else heuristic placeholder / default).
-            let location = strict_fix.clone().unwrap_or_else(|| {
-                if cell_measurements.is_empty() {
-                    LocationEstimate::default()
-                } else {
-                    compute_location_placeholder(&measurement.method, &cell_measurements)
-                }
-            });
 
             let report = NrppaMeasurementReport {
                 request_id,
                 cell_measurements,
-                location: Some(location.clone()),
+                location: strict_fix.clone(),
             };
 
             reports.insert(request_id, report);
-            (location, strict_fix)
+            strict_fix
         };
 
-        log::info!(
-            "Measurement report processed: id={} lat={:.6} lon={:.6} accuracy={:.1}m",
-            request_id,
-            location.latitude,
-            location.longitude,
-            location.horizontal_accuracy
-        );
+        match &strict_fix {
+            Some(location) => log::info!(
+                "Measurement report processed: id={} lat={:.6} lon={:.6} accuracy={:.1}m",
+                request_id,
+                location.latitude,
+                location.longitude,
+                location.horizontal_accuracy
+            ),
+            None => log::info!(
+                "Measurement report processed: id={request_id} — no location fix solvable \
+                 (empty TRP registry or no solvable measurement set); reporting no fix"
+            ),
+        }
 
         // A2: complete a pending DetermineLocation session (if any) with the
-        // strict outcome — never the placeholder.
-        let outcome = match strict_fix {
+        // strict outcome — a real fix, else SolverFailed (never a placeholder).
+        let outcome = match strict_fix.clone() {
             Some(fix) => PositioningOutcome::Fix(fix),
             None => PositioningOutcome::SolverFailed,
         };
         self.positioning_session_complete_by_request(request_id, outcome);
 
-        Some(location)
+        strict_fix
     }
 
     /// Get measurement by request ID
@@ -517,16 +551,57 @@ impl LmfContext {
     /// Returns `true` if the session existed (it was cancelled), `false` if not
     /// found (→ caller should return 403 LOCATION_SESSION_UNKNOWN).
     /// Used by `cancel-location` (TS 29.572 §6.1.4.3.2).
+    ///
+    /// A8: also aborts any running EventNotify trigger task for the session so a
+    /// PERIODIC producer stops immediately on cancel (wire `cancel` to abort).
     pub fn cancel_ldr(&self, ldr_reference: &str) -> bool {
-        if let Ok(mut l) = self.ldr_sessions.write() {
-            return l.remove(ldr_reference).is_some();
+        let existed = if let Ok(mut l) = self.ldr_sessions.write() {
+            l.remove(ldr_reference).is_some()
+        } else {
+            false
+        };
+        // Abort the trigger task regardless of `existed` (idempotent).
+        if let Ok(mut tasks) = self.ldr_tasks.write() {
+            if let Some(handle) = tasks.remove(ldr_reference) {
+                handle.abort();
+            }
         }
-        false
+        existed
     }
 
     /// Look up an LDR session by `ldrReference`. Returns a clone, or `None`.
     pub fn ldr_find(&self, ldr_reference: &str) -> Option<LdrContext> {
         self.ldr_sessions.read().ok()?.get(ldr_reference).cloned()
+    }
+
+    /// A8: register the [`AbortHandle`] of a PERIODIC LDR's trigger task,
+    /// keyed by `ldrReference`. Aborts and replaces any prior task for the same
+    /// reference (last-writer-wins; a re-registration supersedes the old task).
+    pub fn ldr_task_register(&self, ldr_reference: &str, handle: tokio::task::AbortHandle) {
+        if let Ok(mut tasks) = self.ldr_tasks.write() {
+            if let Some(prev) = tasks.insert(ldr_reference.to_string(), handle) {
+                prev.abort();
+            }
+        }
+    }
+
+    /// A8: mark a trigger task finished — removes the LDR session and its task
+    /// handle WITHOUT aborting (the task itself is completing: normal
+    /// reporting-amount exhaustion or an auto-cancel after repeated GMLC POST
+    /// failure). Distinct from [`Self::cancel_ldr`], which aborts a still-running
+    /// task from the outside.
+    pub fn ldr_finish(&self, ldr_reference: &str) {
+        if let Ok(mut l) = self.ldr_sessions.write() {
+            l.remove(ldr_reference);
+        }
+        if let Ok(mut tasks) = self.ldr_tasks.write() {
+            tasks.remove(ldr_reference);
+        }
+    }
+
+    /// A8: number of running EventNotify trigger tasks (test/observability).
+    pub fn ldr_task_count(&self) -> usize {
+        self.ldr_tasks.read().map(|t| t.len()).unwrap_or(0)
     }
 
     // -----------------------------------------------------------------------
@@ -738,7 +813,14 @@ impl LmfContext {
 ///
 /// On any solver failure or when the registry is empty / has no matching
 /// cells, falls back to the heuristic placeholder (lat/lon 0.0, method-based
-/// accuracy estimate) so no existing behaviour regresses.
+/// accuracy estimate).
+///
+/// A7 (lmfd-11): this helper is now **test-only** (`#[cfg(test)]`). The runtime
+/// path uses [`try_real_solve`] directly (via
+/// [`LmfContext::measurement_report`]) and NEVER falls back to the placeholder —
+/// an unsolvable report yields `None`, not a fabricated (0,0) fix. This helper
+/// is retained only so the solver-selection tests can assert placeholder shapes.
+#[cfg(test)]
 fn compute_location(
     method: &PositioningMethod,
     measurements: &[CellMeasurement],
@@ -876,9 +958,15 @@ fn try_real_solve(
     }
 }
 
-/// Heuristic placeholder used when no registry coordinates are available.
-/// Returns lat/lon 0.0 with a method-derived accuracy estimate; kept so
-/// unconfigured deployments still produce a well-formed (if fake) response.
+/// Heuristic placeholder that returns a lat/lon 0.0 fix with a method-derived
+/// accuracy estimate.
+///
+/// A7 (lmfd-11): this is a **fabrication** (fake 0.0/0.0 coordinates) and is now
+/// **test-only** (`#[cfg(test)]`). It is NOT reachable from any served path —
+/// the runtime positioning path returns `None` (no fix → 500 POSITIONING_FAILED
+/// / 404) rather than a made-up location. Retained only so the solver-selection
+/// unit tests can assert the placeholder's shape.
+#[cfg(test)]
 fn compute_location_placeholder(
     method: &PositioningMethod,
     measurements: &[CellMeasurement],
@@ -1006,11 +1094,16 @@ mod tests {
             rstd_ns: None,
         }];
 
-        let location = ctx.measurement_report(req.request_id, cells).unwrap();
-        assert!(location.horizontal_accuracy > 0.0);
+        // A7 (lmfd-11): with no TRP registry configured the report cannot be
+        // solved to a real fix, so NO (fabricated) location is returned — the
+        // runtime path no longer falls back to the (0,0) placeholder. The report
+        // is still recorded and the request marked Completed.
+        let location = ctx.measurement_report(req.request_id, cells);
+        assert!(location.is_none());
 
         let report = ctx.report_find(req.request_id).unwrap();
         assert_eq!(report.cell_measurements.len(), 1);
+        assert!(report.location.is_none());
 
         let completed = ctx.measurement_find(req.request_id).unwrap();
         assert_eq!(completed.state, MeasurementState::Completed);
@@ -1052,9 +1145,13 @@ mod tests {
             },
         ];
 
-        let location = ctx.measurement_report(req.request_id, cells).unwrap();
-        // Multi-RTT should give ~5m accuracy
-        assert!(location.horizontal_accuracy <= 10.0);
+        // A7 (lmfd-11): no TRP registry ⇒ no real solve ⇒ no fix returned (the
+        // runtime path never fabricates a placeholder estimate). The real
+        // solver path with a populated registry is covered by
+        // `test_compute_location_multi_rtt_real_solve` and
+        // `test_measurement_report_completes_session_with_real_fix`.
+        let location = ctx.measurement_report(req.request_id, cells);
+        assert!(location.is_none());
     }
 
     #[test]
@@ -1073,6 +1170,81 @@ mod tests {
         let found = ctx.ue_location_get("imsi-001010000000001").unwrap();
         let loc = found.last_location.unwrap();
         assert!((loc.latitude - 37.7749).abs() < 0.001);
+    }
+
+    // -- A8: LDR trigger-task lifecycle -------------------------------------
+
+    #[test]
+    fn test_register_ldr_carries_periodic_event_info() {
+        let ctx = LmfContext::new();
+        assert!(ctx.register_ldr(LdrContext {
+            ldr_reference: "aa10".to_string(),
+            ldr_type: "PERIODIC".to_string(),
+            hgmlc_callback_uri: Some("http://gmlc/cb".to_string()),
+            supi: Some("imsi-1".to_string()),
+            periodic_event_info: Some(PeriodicReporting {
+                reporting_amount: 3,
+                reporting_interval_secs: 60,
+                reporting_interval_ms: None,
+            }),
+        }));
+        let found = ctx.ldr_find("aa10").unwrap();
+        let pei = found.periodic_event_info.unwrap();
+        assert_eq!(pei.reporting_amount, 3);
+        assert_eq!(pei.reporting_interval_secs, 60);
+    }
+
+    // A8 risk: task leakage on shutdown. `fini` must abort every running
+    // trigger task (shutdown-token discipline). Uses a LOCAL context (never the
+    // process-global one) so it is safe under parallel test execution.
+    #[tokio::test]
+    async fn test_fini_aborts_trigger_tasks() {
+        let mut ctx = LmfContext::new();
+        ctx.init(16);
+        // A never-completing task stands in for a long-interval periodic producer.
+        let jh = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+        ctx.ldr_task_register("ref-shutdown", jh.abort_handle());
+        assert_eq!(ctx.ldr_task_count(), 1);
+
+        ctx.fini();
+        assert_eq!(ctx.ldr_task_count(), 0, "fini must drop all task handles");
+
+        // The task was aborted (awaiting it yields a cancellation JoinError).
+        let joined = jh.await;
+        assert!(
+            joined.is_err() && joined.unwrap_err().is_cancelled(),
+            "fini must abort the running trigger task"
+        );
+    }
+
+    // A8: `cancel_ldr` aborts a running trigger task from the outside;
+    // `ldr_task_register` replacing an existing handle aborts the superseded one.
+    #[tokio::test]
+    async fn test_cancel_ldr_aborts_trigger_task() {
+        let mut ctx = LmfContext::new();
+        ctx.init(16);
+        ctx.register_ldr(LdrContext {
+            ldr_reference: "ref-cancel".to_string(),
+            ldr_type: "PERIODIC".to_string(),
+            hgmlc_callback_uri: Some("http://gmlc/cb".to_string()),
+            supi: Some("imsi-2".to_string()),
+            periodic_event_info: None,
+        });
+        let jh = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+        ctx.ldr_task_register("ref-cancel", jh.abort_handle());
+
+        assert!(ctx.cancel_ldr("ref-cancel"), "the LDR session existed");
+        assert_eq!(ctx.ldr_task_count(), 0);
+        let joined = jh.await;
+        assert!(joined.is_err() && joined.unwrap_err().is_cancelled());
     }
 
     #[test]
@@ -1468,6 +1640,7 @@ mod tests_real_solve {
             ldr_type: "PERIODIC".to_string(),
             hgmlc_callback_uri: Some("http://gmlc/cb".to_string()),
             supi: Some("imsi-001010000000099".to_string()),
+            periodic_event_info: None,
         };
         // Register: find should return Some
         assert!(ctx.register_ldr(ldr));
@@ -1585,12 +1758,12 @@ mod tests_real_solve {
         assert!(ctx.positioning_session_find_by_transaction(5).is_none());
     }
 
-    /// measurement_report on a session-linked request with an EMPTY registry:
-    /// the legacy return keeps the placeholder (debug routes unchanged) but
-    /// the session completes SolverFailed — no fabricated fix escapes the
-    /// conformant MT-LR path.
+    /// A7 (lmfd-11): measurement_report on a session-linked request with an
+    /// EMPTY registry returns NO fix (the placeholder fabrication was removed
+    /// from the runtime path) AND completes the session `SolverFailed` — no
+    /// fabricated (0,0) coordinate escapes on any path.
     #[test]
-    fn test_measurement_report_completes_session_solver_failed_on_placeholder() {
+    fn test_measurement_report_completes_session_solver_failed_on_empty_registry() {
         let mut ctx = LmfContext::new();
         ctx.init(256);
         let req = ctx
@@ -1612,9 +1785,9 @@ mod tests_real_solve {
             rtt_ns: None,
             rstd_ns: None,
         }];
-        // Legacy behaviour preserved for the report routes (placeholder).
-        let legacy = ctx.measurement_report(req.request_id, cells).unwrap();
-        assert_eq!(legacy.latitude, 0.0);
+        // A7: no fabricated placeholder — an unsolvable report yields None.
+        let no_fix = ctx.measurement_report(req.request_id, cells);
+        assert!(no_fix.is_none());
         // Strict session outcome: SolverFailed, session removed.
         assert!(matches!(
             rx.try_recv(),

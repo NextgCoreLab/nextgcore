@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
@@ -74,6 +75,28 @@ struct Args {
 
     #[arg(long, default_value = "http://127.0.0.1:7777")]
     nrf_uri: String,
+
+    /// A7 (lmfd-11): enable the bespoke/debug ingest routes (measurements,
+    /// nrppa-reports, nrppa-binary-reports, lpp-binary-reports, ue-locations).
+    /// These are NOT TS 29.572 resources. Default OFF (fail-closed): when
+    /// disabled they 404 exactly like any unknown path (no route disclosure).
+    /// The conformant DetermineLocation → Namf N1N2 → notify chain (A1-A5) is
+    /// the production positioning path. Opt-in only for local testing.
+    #[arg(long, default_value = "false")]
+    debug_endpoints: bool,
+}
+
+/// A7 (lmfd-11): process-wide gate for the bespoke/debug ingest routes.
+/// Default `false` (fail-closed); set once from `--debug-endpoints` in `main`.
+/// When `false`, the six non-spec route arms below do not match and requests
+/// fall through to the 404 handler — no fabricated fixes can be injected and
+/// no debug route is disclosed.
+static DEBUG_ENDPOINTS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the bespoke/debug ingest routes are enabled (A7). Read on every
+/// request; cheap relaxed load.
+fn debug_endpoints_enabled() -> bool {
+    DEBUG_ENDPOINTS.load(Ordering::Relaxed)
 }
 
 fn init_logging(level: &str) {
@@ -103,10 +126,23 @@ static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth
     std::sync::OnceLock::new();
 
 /// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
-/// Phase A). Outbound SBI clients attach a token via `client.with_oauth2`.
-#[allow(dead_code)]
+/// Phase A). Outbound SBI clients attach a token via [`attach_oauth2`].
 fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Attach the process-wide OAuth2 client (when enforcement is on) so the
+/// outbound SBI request carries an NRF-issued Bearer token scoped to `target`
+/// (TS 33.501 §13.4.1, TS 29.510 §5.4.2). A no-op when enforcement is off, so
+/// the matched-sim default path is byte-unchanged (Wave-6 H8 Phase A).
+pub(crate) fn attach_oauth2(
+    client: nextgcore_sbi::client::SbiClient,
+    target: nextgcore_sbi::types::NfType,
+) -> nextgcore_sbi::client::SbiClient {
+    match oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, target),
+        None => client,
+    }
 }
 
 /// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the
@@ -182,6 +218,18 @@ async fn main() -> Result<()> {
 
     lmf_context_init(args.max_measurements);
 
+    // A7 (lmfd-11): the bespoke/debug ingest routes are OFF unless explicitly
+    // enabled. Default-off is the fail-closed direction; positioning is not on
+    // the matched-sim reg+PDU+ping path so no E2E flow depends on them.
+    DEBUG_ENDPOINTS.store(args.debug_endpoints, Ordering::Relaxed);
+    if args.debug_endpoints {
+        log::warn!(
+            "Bespoke/debug ingest routes ENABLED (--debug-endpoints): measurements, \
+             nrppa-reports, nrppa-binary-reports, lpp-binary-reports, ue-locations. \
+             These are NOT TS 29.572 resources and must not be enabled in production."
+        );
+    }
+
     let nf_instance_id = format!("lmf-{}", uuid::Uuid::new_v4());
 
     // A2: advertise our identity + notify-callback base for the outbound
@@ -235,7 +283,16 @@ async fn main() -> Result<()> {
     if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
+        // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+        // (active positioning sessions, saturated at 100; TS 29.510 §5.2.2.3.2).
+        // Honest session-count proxy — no fabricated CPU numbers.
+        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id.clone(), 5, || {
+            let load = lmf_self()
+                .read()
+                .map(|c| c.positioning_session_count())
+                .unwrap_or(0);
+            load.min(100) as u8
+        });
     }
 
     log::info!("NextGCore LMF ready (instance: {nf_instance_id})");
@@ -274,39 +331,47 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "POST" => handle_determine_location(&request).await,
             _ => send_method_not_allowed(method, "determine-location"),
         },
-        // NOTE (lmfd-11, DEFERRED): the resources below are bespoke/debug routes
-        // that are NOT in TS 29.572. They are retained (now under the correct
-        // `nlmf-loc` apiName) until the NRPPa/LPP/Namf flow (lmfd-05/06/07)
-        // replaces their function; lmfd-11 then removes them.
-        ["nlmf-loc", "v1", "measurements"] => match method {
+        // A7 (lmfd-11): the six resources below are bespoke/debug ingest routes
+        // that are NOT in TS 29.572. The conformant positioning path is now the
+        // DetermineLocation → Namf N1N2MessageTransfer → uplink N1/N2 notify
+        // chain (A1-A5), so these are gated behind the opt-in `--debug-endpoints`
+        // flag (`debug_endpoints_enabled()`), default OFF. When disabled the
+        // match guard fails and the request falls through to the 404 handler,
+        // exactly like any unknown path (no route disclosure). In particular
+        // `PUT ue-locations/{supi}` — which injected an arbitrary client-supplied
+        // fix that `stored_fix` would then serve — is unreachable by default, so
+        // no fabricated location can be injected.
+        ["nlmf-loc", "v1", "measurements"] if debug_endpoints_enabled() => match method {
             "POST" => handle_measurement_request(&request).await,
             _ => send_method_not_allowed(method, "measurements"),
         },
-        ["nlmf-loc", "v1", "measurements", request_id] => match method {
-            "GET" => handle_measurement_get(request_id).await,
-            _ => send_method_not_allowed(method, "measurements/{id}"),
-        },
+        ["nlmf-loc", "v1", "measurements", request_id] if debug_endpoints_enabled() => {
+            match method {
+                "GET" => handle_measurement_get(request_id).await,
+                _ => send_method_not_allowed(method, "measurements/{id}"),
+            }
+        }
         // NRPPa measurement reports (from gNB via AMF)
-        ["nlmf-loc", "v1", "nrppa-reports"] => match method {
+        ["nlmf-loc", "v1", "nrppa-reports"] if debug_endpoints_enabled() => match method {
             "POST" => handle_nrppa_report(&request).await,
             _ => send_method_not_allowed(method, "nrppa-reports"),
         },
         // lmfd-05: raw NRPPa APER binary report (Content-Type: application/octet-stream).
         // The body is a complete APER-encoded NrppaPdu; the LMF request-id is
         // extracted from the embedded lmf-UE-Measurement-ID IE (TS 38.455 §9.2.13).
-        ["nlmf-loc", "v1", "nrppa-binary-reports"] => match method {
+        ["nlmf-loc", "v1", "nrppa-binary-reports"] if debug_endpoints_enabled() => match method {
             "POST" => handle_nrppa_binary_report(&request).await,
             _ => send_method_not_allowed(method, "nrppa-binary-reports"),
         },
         // lmfd-06: raw LPP UPER binary report (Content-Type: application/octet-stream).
         // The body is a complete UPER-encoded LppMessage carrying
         // ProvideLocationInformation → nr-Multi-RTT.
-        ["nlmf-loc", "v1", "lpp-binary-reports"] => match method {
+        ["nlmf-loc", "v1", "lpp-binary-reports"] if debug_endpoints_enabled() => match method {
             "POST" => handle_lpp_binary_report(&request).await,
             _ => send_method_not_allowed(method, "lpp-binary-reports"),
         },
         // UE location queries
-        ["nlmf-loc", "v1", "ue-locations", supi] => match method {
+        ["nlmf-loc", "v1", "ue-locations", supi] if debug_endpoints_enabled() => match method {
             "GET" => handle_ue_location_get(supi).await,
             "PUT" => handle_ue_location_update(supi, &request).await,
             _ => send_method_not_allowed(method, "ue-locations/{supi}"),
@@ -317,10 +382,11 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "capabilities"),
         },
         // lmfd#0: Nlmf_Location custom operations (TS 29.572 §6.1.4).
-        // EventNotify/UPNotify (§6.1.5) are LMF-initiated outbound POSTs —
-        // deferred (E2E-gated: need a live GMLC/AF endpoint + trigger scheduler).
-        // TODO lmfd: implement EventNotify producer (TS 29.572 §6.1.5.1) once
-        // a trigger scheduler and outbound SBI client are available.
+        // EventNotify (§6.1.5.1) is now an LMF-initiated OUTBOUND producer, not
+        // a served resource: a PERIODIC deferred LDR (registered via
+        // determine-location) drives [`spawn_periodic_ldr`], which POSTs
+        // `EventNotifyDataExt` to the request's `hgmlcCallBackURI` each interval
+        // (A8). UPNotify (§6.1.5.2) remains deferred (needs the LCS-UP data path).
         ["nlmf-loc", "v1", "cancel-location"] => match method {
             "POST" => handle_cancel_location(&request).await,
             _ => send_method_not_allowed(method, "cancel-location"),
@@ -699,19 +765,51 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
     // lmfd#1: deferred/periodic/triggered LDR (ldrType present) -> register a
     // reporting context keyed by ldrReference so it can be cancelled
     // (cancel-location, §6.1.4.3) and later reported (EventNotify, §6.1.5).
-    // Activation still returns the 200 LocationDataExt below. EventNotify
-    // emission on trigger is E2E-gated (TODO lmfd: needs outbound GMLC callback,
-    // TS 29.572 §6.1.5.1).
+    // Activation still returns the 200 LocationDataExt below.
+    //
+    // A8 (TS 29.572 §6.1.5.1 EventNotify, TS 23.273 §6.3 deferred 5GC-MT-LR):
+    // an `ldrType == PERIODIC` LDR carrying a `periodicEventInfo` and an
+    // `hgmlcCallBackURI` additionally starts the EventNotify trigger scheduler
+    // ([`spawn_periodic_ldr`]) — a bounded tokio interval task that runs the
+    // live positioning procedure each tick and POSTs an `EventNotifyDataExt`
+    // to the H-GMLC callback. Opt-in by request content; the reg+PDU+ping path
+    // never sets ldrType so the default flow is untouched.
     if let (Some(ldr_type), Some(ldr_ref)) =
         (input.ldr_type.as_deref(), input.ldr_reference.as_deref())
     {
+        let periodic = periodic_reporting_from_input(&input);
         if let Ok(c) = lmf_self().read() {
             c.register_ldr(LdrContext {
                 ldr_reference: ldr_ref.to_string(),
                 ldr_type: ldr_type.to_string(),
                 hgmlc_callback_uri: input.hgmlc_call_back_uri.clone(),
                 supi: input.supi.clone(),
+                periodic_event_info: periodic,
             });
+        }
+        // A8: only PERIODIC + periodicEventInfo + a reachable H-GMLC callback +
+        // a target SUPI drives the trigger scheduler. Anything else registers
+        // the context only (areaEventInfo/motionEventInfo triggers are SCOPED
+        // OUT — they need UE-side event detection).
+        if ldr_type == nlmf::ldr_type::PERIODIC {
+            match (
+                periodic,
+                input.hgmlc_call_back_uri.as_deref(),
+                input.supi.as_deref(),
+            ) {
+                (Some(params), Some(hgmlc), Some(supi)) => {
+                    spawn_periodic_ldr(
+                        ldr_ref.to_string(),
+                        supi.to_string(),
+                        hgmlc.to_string(),
+                        params,
+                    );
+                }
+                _ => log::info!(
+                    "A8: PERIODIC LDR [{ldr_ref}] not scheduled \
+                     (needs periodicEventInfo + hgmlcCallBackURI + supi)"
+                ),
+            }
         }
     }
 
@@ -864,6 +962,261 @@ async fn handle_mo_lr_lpp(request: &SbiRequest, input: &nlmf::InputData) -> SbiR
         context.measurement_report(request_id, cells);
     }
     await_positioning_outcome(input, corr, rx).await
+}
+
+// ===========================================================================
+// A8: EventNotify producer for deferred/periodic LDR (TS 29.572 §6.1.5.1
+// EventNotify; TS 23.273 §6.3 deferred 5GC-MT-LR periodic reporting).
+//
+// A PERIODIC LDR (registered at determine-location time) starts a bounded
+// tokio interval task. Each tick runs the live A2 positioning procedure for
+// the target SUPI and POSTs an `EventNotifyDataExt` to the request's
+// `hgmlcCallBackURI`. The task stops after `reportingAmount` reports, on
+// `cancel-location`, on repeated GMLC POST failure (fail-closed), or on LMF
+// shutdown (its `AbortHandle` lives in `LmfContext::ldr_tasks`).
+// ===========================================================================
+
+/// Map `InputData.periodicEventInfo` (TS 29.572 `PeriodicEventInfo`) to the
+/// context [`PeriodicReporting`] mirror. `reportingAmount` is clamped to ≥ 1
+/// (yaml minimum) so a scheduler always makes forward progress.
+fn periodic_reporting_from_input(input: &nlmf::InputData) -> Option<PeriodicReporting> {
+    input.periodic_event_info.as_ref().map(|p| PeriodicReporting {
+        reporting_amount: p.reporting_amount.max(1),
+        reporting_interval_secs: p.reporting_interval,
+        reporting_interval_ms: p.reporting_interval_ms,
+    })
+}
+
+/// A8: the interval between periodic reports. Prefers `reportingIntervalMs`
+/// (TS 29.572 `ReportingIntervalMs`, 1..999 ms) when present, else
+/// `reportingInterval` seconds (`ReportingInterval`, ≥ 1). Never zero.
+fn periodic_report_interval(params: &PeriodicReporting) -> Duration {
+    match params.reporting_interval_ms {
+        Some(ms) if (1..=999).contains(&ms) => Duration::from_millis(u64::from(ms)),
+        _ => Duration::from_secs(u64::from(params.reporting_interval_secs.max(1))),
+    }
+}
+
+/// A8: spawn the EventNotify trigger scheduler for a PERIODIC LDR and register
+/// its [`AbortHandle`] on the context (keyed by `ldrReference`) so
+/// `cancel-location` / shutdown can stop it. Must be called from within the
+/// tokio runtime (the SBI handler is async).
+fn spawn_periodic_ldr(
+    ldr_reference: String,
+    supi: String,
+    hgmlc_uri: String,
+    params: PeriodicReporting,
+) {
+    let key = ldr_reference.clone();
+    let handle = tokio::spawn(run_periodic_ldr(ldr_reference, supi, hgmlc_uri, params));
+    if let Ok(c) = lmf_self().read() {
+        c.ldr_task_register(&key, handle.abort_handle());
+    }
+    log::info!(
+        "A8: periodic EventNotify scheduler started for LDR [{key}] \
+         (amount={}, interval={:?})",
+        params.reporting_amount,
+        periodic_report_interval(&params)
+    );
+}
+
+/// A8: the periodic EventNotify trigger loop (TS 29.572 §6.1.5.1). Emits exactly
+/// `reportingAmount` reports spaced by the reporting interval (a report is sent
+/// AFTER each interval elapses — the immediate first interval tick is skipped),
+/// then finishes. Each tick runs the live positioning procedure; a fix yields a
+/// report with a `locationEstimate`, a per-tick positioning failure yields a
+/// report WITHOUT a fabricated location (honest event-report semantics). The
+/// final report carries `terminationCause = NORMAL_TERMINATION`. On repeated
+/// GMLC POST failure the LDR is auto-cancelled (no infinite retry).
+async fn run_periodic_ldr(
+    ldr_reference: String,
+    supi: String,
+    hgmlc_uri: String,
+    params: PeriodicReporting,
+) {
+    use tokio::time::MissedTickBehavior;
+
+    let period = periodic_report_interval(&params);
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Consume the immediate first tick so reports are spaced by `period`.
+    interval.tick().await;
+
+    let mut sent: u32 = 0;
+    while sent < params.reporting_amount {
+        interval.tick().await;
+        sent += 1;
+        let is_final = sent >= params.reporting_amount;
+
+        // Each report runs a fresh positioning procedure (no latest_location
+        // shortcut). The per-tick wait never outlasts the reporting period.
+        let fix = run_periodic_positioning(&supi, period).await;
+        let body = build_periodic_event_notify(&ldr_reference, &supi, fix.as_ref(), is_final);
+
+        if !deliver_event_notify(&hgmlc_uri, &body).await {
+            log::warn!(
+                "A8: EventNotify delivery to the H-GMLC failed twice for LDR \
+                 [{ldr_reference}]; auto-cancelling the deferred session"
+            );
+            break;
+        }
+        log::debug!(
+            "A8: EventNotify {sent}/{} delivered for LDR [{ldr_reference}] (fix={})",
+            params.reporting_amount,
+            fix.is_some()
+        );
+    }
+
+    // Normal completion or auto-cancel: drop the session + task handle WITHOUT
+    // self-abort (we are finishing).
+    if let Ok(c) = lmf_self().read() {
+        c.ldr_finish(&ldr_reference);
+    }
+}
+
+/// A8: run the live A2 positioning procedure once for `supi`, returning the
+/// measurement-derived fix or `None` (unreachable AMF / timeout / solver
+/// failure). Never fabricates a location. The wait is bounded by `budget` so a
+/// tick cannot outlast its reporting interval; on timeout the session is
+/// expired (nf-context-lock discipline: no lock held across the await).
+async fn run_periodic_positioning(supi: &str, budget: Duration) -> Option<LocationEstimate> {
+    let input = nlmf::InputData {
+        supi: Some(supi.to_string()),
+        ..Default::default()
+    };
+    let (corr, rx) = initiate_positioning(&input).await.ok()?;
+    match tokio::time::timeout(budget, rx).await {
+        Ok(Ok(PositioningOutcome::Fix(est))) => Some(est),
+        Ok(Ok(PositioningOutcome::SolverFailed)) | Ok(Err(_)) => None,
+        Err(_elapsed) => {
+            if let Ok(c) = lmf_self().read() {
+                c.positioning_session_expire(&corr);
+            }
+            None
+        }
+    }
+}
+
+/// A8: build the `EventNotifyDataExt` for one periodic report (TS 29.572
+/// EventNotifyData, yaml:1586-1657). M IEs `reportedEventType` (`PERIODIC_EVENT`)
+/// and `ldrReference` are always present. On a real fix the `locationEstimate`
+/// (GAD, reusing [`nlmf::to_gad`]), `ageOfLocationEstimate` (0 = freshly
+/// computed) and `positioningDataList` are included; on a per-tick failure the
+/// report carries NO `locationEstimate` (never fabricated). The final report
+/// carries `terminationCause = NORMAL_TERMINATION`.
+fn build_periodic_event_notify(
+    ldr_reference: &str,
+    supi: &str,
+    fix: Option<&LocationEstimate>,
+    is_final: bool,
+) -> nlmf::EventNotifyDataExt {
+    let serving_lmf_identification = lmf_self().read().ok().and_then(|c| c.nf_instance_id());
+    let location_estimate = fix.map(|est| {
+        nlmf::to_gad(
+            est.latitude,
+            est.longitude,
+            est.horizontal_accuracy,
+            95,
+            nlmf::gad_shape::POINT_UNCERTAINTY_CIRCLE,
+        )
+    });
+    let positioning_data_list = fix.map(|est| {
+        vec![nlmf::PositioningMethodAndUsage {
+            method: est
+                .method_used
+                .clone()
+                .unwrap_or_else(|| nlmf::positioning_method::ECID.to_string()),
+            mode: "CONVENTIONAL".to_string(),
+            usage: "SUCCESS_RESULTS_USED_TO_GENERATE_LOCATION".to_string(),
+        }]
+    });
+    nlmf::EventNotifyDataExt {
+        event_notify_data: nlmf::EventNotifyData {
+            reported_event_type: nlmf::reported_event_type::PERIODIC_EVENT.to_string(),
+            ldr_reference: ldr_reference.to_string(),
+            supi: Some(supi.to_string()),
+            gpsi: None,
+            hgmlc_call_back_uri: None,
+            location_estimate,
+            // Freshly computed each tick: honest age 0 (omitted when no fix).
+            age_of_location_estimate: fix.map(|_| 0),
+            timestamp_of_location_estimate: None,
+            positioning_data_list,
+            serving_lmf_identification,
+            termination_cause: is_final
+                .then(|| nlmf::termination_cause::NORMAL_TERMINATION.to_string()),
+        },
+        add_event_notify_datas: None,
+    }
+}
+
+/// A8: POST an `EventNotifyDataExt` to the H-GMLC callback, retrying exactly
+/// once on any non-2xx / transport error (TS 29.572 §6.1.5.1: "204 Expected
+/// response to a valid notification"). Returns `true` iff a 2xx was received
+/// within the two attempts. `false` → the caller auto-cancels the LDR.
+async fn deliver_event_notify(hgmlc_uri: &str, body: &nlmf::EventNotifyDataExt) -> bool {
+    for attempt in 0..2u8 {
+        match post_event_notify(hgmlc_uri, body).await {
+            Ok(status) if (200..=299).contains(&status) => return true,
+            Ok(status) => {
+                log::warn!("A8: EventNotify POST returned HTTP {status} (attempt {attempt})")
+            }
+            Err(e) => log::warn!("A8: EventNotify POST failed (attempt {attempt}): {e}"),
+        }
+        if attempt == 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    false
+}
+
+/// A8: single outbound EventNotify POST. Parses the `hgmlcCallBackURI` into
+/// host/port/path, POSTs `application/json` with a bounded-timeout client
+/// (connect 2 s / request 3 s), and returns the HTTP status.
+async fn post_event_notify(hgmlc_uri: &str, body: &nlmf::EventNotifyDataExt) -> Result<u16, String> {
+    let (host, port, path) = split_callback_uri(hgmlc_uri)
+        .ok_or_else(|| format!("invalid hgmlcCallBackURI: {hgmlc_uri}"))?;
+    let json = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    let client = SbiClient::new(
+        SbiClientConfig::new(host, port)
+            .with_connect_timeout(Duration::from_secs(2))
+            .with_request_timeout(Duration::from_secs(3)),
+    );
+    let request = SbiRequest::post(path).with_body(json, "application/json");
+    client
+        .send_request(request)
+        .await
+        .map(|resp| resp.status)
+        .map_err(|e| e.to_string())
+}
+
+/// A8: split an absolute callback URI (`http[s]://host[:port]/path`) into
+/// (host, port, path). Defaults the port from the scheme (80/443) and the path
+/// to `/` when absent. `None` on an unparseable authority.
+fn split_callback_uri(uri: &str) -> Option<(String, u16, String)> {
+    let (is_https, rest) = if let Some(r) = uri.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = uri.strip_prefix("http://") {
+        (false, r)
+    } else {
+        (false, uri)
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some((h, p)) = authority.rsplit_once(':') {
+        (h.to_string(), p.parse().ok()?)
+    } else {
+        (authority.to_string(), if is_https { 443u16 } else { 80 })
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, path))
 }
 
 /// Encode the 200 `LocationDataExt` response (TS 29.572 Table 6.1.4.2.2-2)
@@ -1021,6 +1374,9 @@ async fn handle_location_context_transfer(request: &SbiRequest) -> SbiResponse {
             ldr_type: data.ldr_type.clone(),
             hgmlc_callback_uri: Some(data.hgmlc_call_back_uri.clone()),
             supi: data.supi.clone(),
+            // A8: context-transfer restores the LDR record; re-driving the
+            // periodic trigger after AMF relocation is out of A8 scope.
+            periodic_event_info: None,
         });
     }
     SbiResponse::no_content()
@@ -1945,6 +2301,8 @@ mod tests {
         assert_eq!(args.config, "/etc/nextgcore/lmf.yaml");
         assert_eq!(args.sbi_port, 7816);
         assert_eq!(args.max_measurements, 1024);
+        // A7 (lmfd-11): the bespoke/debug ingest routes are OFF by default.
+        assert!(!args.debug_endpoints);
     }
 
     // lmfd-12: spec-enumerated PositioningMethod values; unknown -> None.
@@ -2043,6 +2401,90 @@ mod tests {
             .with_body("{}", "application/json");
         let resp = lmf_sbi_request_handler(req).await;
         assert_eq!(resp.status, 404);
+    }
+
+    // -- A7 (lmfd-11): the six bespoke/debug ingest routes are gated behind the
+    // opt-in `--debug-endpoints` flag (default OFF). This is the one test that
+    // toggles the process-global DEBUG_ENDPOINTS gate; it runs OFF→ON→OFF in a
+    // single test so no other test observes a partially-toggled state.
+    #[tokio::test]
+    async fn test_debug_endpoints_flag_gates_bespoke_routes() {
+        lmf_context_init(1024);
+
+        // The six bespoke/debug routes, each with the method it normally handles.
+        let normal: [(&str, &str); 7] = [
+            ("POST", "/nlmf-loc/v1/measurements"),
+            ("GET", "/nlmf-loc/v1/measurements/abc"),
+            ("POST", "/nlmf-loc/v1/nrppa-reports"),
+            ("POST", "/nlmf-loc/v1/nrppa-binary-reports"),
+            ("POST", "/nlmf-loc/v1/lpp-binary-reports"),
+            ("GET", "/nlmf-loc/v1/ue-locations/imsi-001010000000777"),
+            ("PUT", "/nlmf-loc/v1/ue-locations/imsi-001010000000777"),
+        ];
+        let build = |method: &str, uri: &str| -> SbiRequest {
+            match method {
+                "GET" => SbiRequest::get(uri),
+                "PUT" => SbiRequest::put(uri).with_body("{}", "application/json"),
+                _ => SbiRequest::post(uri).with_body("{}", "application/json"),
+            }
+        };
+
+        // Default OFF: every bespoke path 404s exactly like an unknown path
+        // (no route disclosure), even with the route's normal method.
+        DEBUG_ENDPOINTS.store(false, Ordering::Relaxed);
+        assert!(!debug_endpoints_enabled());
+        for (method, uri) in normal {
+            let resp = lmf_sbi_request_handler(build(method, uri)).await;
+            assert_eq!(
+                resp.status, 404,
+                "{method} {uri} must 404 when --debug-endpoints is OFF"
+            );
+        }
+
+        // Enabled: the arms now match and dispatch. A DELETE (a method none of
+        // the arms handle) proves the arm is reachable by returning 405 — the
+        // outer 404 would fire only if the arm did not match. This discriminator
+        // is independent of each handler's body/state handling.
+        DEBUG_ENDPOINTS.store(true, Ordering::Relaxed);
+        let reachable: [&str; 6] = [
+            "/nlmf-loc/v1/measurements",
+            "/nlmf-loc/v1/measurements/abc",
+            "/nlmf-loc/v1/nrppa-reports",
+            "/nlmf-loc/v1/nrppa-binary-reports",
+            "/nlmf-loc/v1/lpp-binary-reports",
+            "/nlmf-loc/v1/ue-locations/imsi-001010000000777",
+        ];
+        for uri in reachable {
+            let resp = lmf_sbi_request_handler(SbiRequest::delete(uri)).await;
+            assert_eq!(
+                resp.status, 405,
+                "DELETE {uri} must dispatch (405 Method Not Allowed) when --debug-endpoints is ON"
+            );
+        }
+
+        // Reset so the shared process-global default does not leak to other tests.
+        DEBUG_ENDPOINTS.store(false, Ordering::Relaxed);
+    }
+
+    // -- A7 (lmfd-11): an empty TRP registry NEVER yields a fabricated (0,0) fix.
+    // A DetermineLocation whose measurements decode but cannot be solved (no
+    // registry match) returns 500 POSITIONING_FAILED — never 200 with lat 0.0.
+    #[tokio::test]
+    async fn test_determine_location_empty_registry_no_fabricated_zero_fix() {
+        lmf_context_init(1024);
+        // A decodable Multi-RTT measurement for an UN-seeded PCI: no registry hit.
+        let lpp = build_multi_rtt_lpp(&[(303, 5000)], 62);
+        let input = r#"{"supi":"imsi-001010000000606","lppMessage":{"contentId":"lpp-x"}}"#;
+        let req = multipart_lpp_request(input, &[("lpp-x", lpp)]);
+        let resp = handle_determine_location(&req).await;
+        assert_ne!(resp.status, 200, "no fix must never be reported as a 200");
+        assert_eq!(resp.status, 500);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "POSITIONING_FAILED");
+        assert!(
+            v.get("locationEstimate").is_none(),
+            "no fabricated location may be present on a no-fix response"
+        );
     }
 
     // -- lmfd-02 + lmfd-04: 200 OK with a GAD LocationDataExt ----------------
@@ -2510,6 +2952,7 @@ mod tests {
             ldr_type: "UE_AVAILABLE".to_string(),
             hgmlc_callback_uri: Some("http://gmlc/cb".to_string()),
             supi: None,
+            periodic_event_info: None,
         });
 
         // First cancel -> 204.
@@ -3275,5 +3718,963 @@ mod oauth2_h8_tests {
         assert_ne!(resp.status, 401, "valid token must not be 401");
         assert_ne!(resp.status, 403, "valid token must not be 403");
         server.stop().await.expect("stop");
+    }
+}
+
+#[cfg(test)]
+mod a8_event_notify_tests {
+    //! Wave-6 A8: EventNotify producer for deferred/periodic LDR
+    //! (TS 29.572 §6.1.5.1; TS 23.273 §6.3). A real in-process H-GMLC sink (an
+    //! `SbiServer` bound to a free port whose handler validates each
+    //! `EventNotifyDataExt` and returns 204 per the yaml) receives the callbacks.
+    //! No lenient mock: the producer's exact bytes are decoded by the real SBI
+    //! server stack and asserted field-by-field.
+    //!
+    //! In these tests no NRF is configured, so each per-tick positioning
+    //! procedure fail-closes fast (no serving AMF) → the reports carry NO
+    //! fabricated location, exercising the honest "no-fix" event-report path.
+    use super::*;
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Default)]
+    struct SinkState {
+        counts: HashMap<String, u32>,
+        statuses: HashMap<String, u16>,
+        bodies: HashMap<String, Vec<serde_json::Value>>,
+        content_types: HashMap<String, Vec<String>>,
+    }
+
+    /// Process-global sink registry, keyed by callback PATH (each test uses a
+    /// unique path so parallel tests never collide on the shared server handler).
+    fn sink() -> &'static Mutex<SinkState> {
+        static SINK: OnceLock<Mutex<SinkState>> = OnceLock::new();
+        SINK.get_or_init(|| Mutex::new(SinkState::default()))
+    }
+
+    /// The H-GMLC sink handler: records every callback (count, parsed body,
+    /// Content-Type) and returns the per-path configured status (default 204).
+    async fn sink_handler(req: SbiRequest) -> SbiResponse {
+        let path = req
+            .header
+            .uri
+            .split('?')
+            .next()
+            .unwrap_or(&req.header.uri)
+            .to_string();
+        let ct = req.http.get_header("Content-Type").cloned();
+        let body = req
+            .http
+            .content
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok());
+        let status = {
+            let mut s = sink().lock().unwrap();
+            *s.counts.entry(path.clone()).or_insert(0) += 1;
+            if let Some(c) = ct {
+                s.content_types.entry(path.clone()).or_default().push(c);
+            }
+            if let Some(v) = body {
+                s.bodies.entry(path.clone()).or_default().push(v);
+            }
+            s.statuses.get(&path).copied().unwrap_or(204)
+        };
+        if status == 204 {
+            SbiResponse::no_content()
+        } else {
+            SbiResponse::with_status(status)
+        }
+    }
+
+    fn sink_count(path: &str) -> u32 {
+        sink().lock().unwrap().counts.get(path).copied().unwrap_or(0)
+    }
+    fn sink_bodies(path: &str) -> Vec<serde_json::Value> {
+        sink().lock().unwrap().bodies.get(path).cloned().unwrap_or_default()
+    }
+    fn sink_content_types(path: &str) -> Vec<String> {
+        sink().lock().unwrap().content_types.get(path).cloned().unwrap_or_default()
+    }
+    fn sink_set_status(path: &str, status: u16) {
+        sink().lock().unwrap().statuses.insert(path.to_string(), status);
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    async fn start_sink() -> (SbiServer, u16) {
+        let port = free_port();
+        let cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        let server = SbiServer::new(cfg);
+        server.start(sink_handler).await.expect("sink server start");
+        (server, port)
+    }
+
+    /// Poll the sink until `path` has received `target` callbacks or `timeout`
+    /// elapses (no fixed sleeps that race the scheduler).
+    async fn wait_for_count(path: &str, target: u32, timeout: Duration) -> u32 {
+        let start = std::time::Instant::now();
+        loop {
+            let c = sink_count(path);
+            if c >= target || start.elapsed() >= timeout {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn periodic_determine_location_body(
+        supi: &str,
+        ldr_ref: &str,
+        hgmlc: &str,
+        amount: u32,
+        interval_ms: u32,
+    ) -> String {
+        format!(
+            r#"{{"supi":"{supi}","ldrType":"PERIODIC","ldrReference":"{ldr_ref}",
+                "hgmlcCallBackURI":"{hgmlc}",
+                "periodicEventInfo":{{"reportingAmount":{amount},"reportingInterval":60,"reportingIntervalMs":{interval_ms}}}}}"#
+        )
+    }
+
+    // -- A8 acceptance: exactly reportingAmount callbacks, then the task stops.
+    #[tokio::test]
+    async fn test_periodic_ldr_emits_exact_amount_then_stops() {
+        lmf_context_init(1024);
+        let (server, port) = start_sink().await;
+        let path = "/sink/a8-exact/cb";
+        let hgmlc = format!("http://127.0.0.1:{port}{path}");
+        let body = periodic_determine_location_body(
+            "imsi-001010000000801",
+            "a8-exact",
+            &hgmlc,
+            2,
+            150,
+        );
+        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
+            .with_body(&body, "application/json");
+        // Activation spawns the scheduler (its response is independent of it).
+        let _ = handle_determine_location(&req).await;
+
+        let c = wait_for_count(path, 2, Duration::from_secs(4)).await;
+        assert_eq!(c, 2, "exactly reportingAmount EventNotify callbacks");
+        // A further two intervals: still exactly 2 (the task finished).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(sink_count(path), 2, "no callbacks after reportingAmount reached");
+
+        // Normal completion cleaned up the LDR session and its trigger task.
+        assert!(
+            lmf_self().read().unwrap().ldr_find("a8-exact").is_none(),
+            "LDR session removed on normal completion"
+        );
+
+        // Each callback is a valid EventNotifyDataExt; final carries termination.
+        let bodies = sink_bodies(path);
+        assert_eq!(bodies.len(), 2);
+        for b in &bodies {
+            assert_eq!(b["reportedEventType"], "PERIODIC_EVENT");
+            assert_eq!(b["ldrReference"], "a8-exact");
+            assert_eq!(b["supi"], "imsi-001010000000801");
+            // No NRF ⇒ no fix ⇒ honest report WITHOUT a fabricated location.
+            assert!(
+                b.get("locationEstimate").is_none(),
+                "no fabricated location on a no-fix periodic report"
+            );
+            let _typed: nlmf::EventNotifyDataExt = serde_json::from_value(b.clone()).unwrap();
+        }
+        assert_eq!(
+            bodies[1]["terminationCause"], "NORMAL_TERMINATION",
+            "final report carries NORMAL_TERMINATION"
+        );
+        assert!(
+            sink_content_types(path)
+                .iter()
+                .all(|c| c.to_ascii_lowercase().starts_with("application/json")),
+            "EventNotify is POSTed as application/json"
+        );
+        server.stop().await.expect("stop");
+    }
+
+    // -- A8 acceptance: cancel-location mid-stream stops emission.
+    #[tokio::test]
+    async fn test_periodic_ldr_cancel_stops_emission() {
+        lmf_context_init(1024);
+        let (server, port) = start_sink().await;
+        let path = "/sink/a8-cancel/cb";
+        let hgmlc = format!("http://127.0.0.1:{port}{path}");
+        let body = periodic_determine_location_body(
+            "imsi-001010000000802",
+            "a8-cancel",
+            &hgmlc,
+            20,
+            150,
+        );
+        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
+            .with_body(&body, "application/json");
+        let _ = handle_determine_location(&req).await;
+
+        // At least one report, then cancel while the session is still running.
+        assert!(
+            wait_for_count(path, 1, Duration::from_secs(4)).await >= 1,
+            "at least one report before cancel"
+        );
+        let cancel_body = r#"{"hgmlcCallBackURI":"http://gmlc/cb","ldrReference":"a8-cancel"}"#;
+        let creq = SbiRequest::post("/nlmf-loc/v1/cancel-location")
+            .with_body(cancel_body, "application/json");
+        assert_eq!(handle_cancel_location(&creq).await.status, 204);
+
+        // Emission is stable across two further intervals (task aborted).
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let a = sink_count(path);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let b = sink_count(path);
+        assert_eq!(a, b, "no EventNotify emitted after cancel");
+        assert!(b < 20, "cancel stopped the session before reportingAmount");
+        assert!(
+            lmf_self().read().unwrap().ldr_find("a8-cancel").is_none(),
+            "cancel removed the LDR session"
+        );
+        server.stop().await.expect("stop");
+    }
+
+    // -- A8 acceptance: an unreachable/failing H-GMLC is auto-cancelled, not
+    // retried forever (one report + one retry, then the session is dropped).
+    #[tokio::test]
+    async fn test_periodic_ldr_failing_gmlc_auto_cancels() {
+        lmf_context_init(1024);
+        let (server, port) = start_sink().await;
+        let path = "/sink/a8-fail/cb";
+        sink_set_status(path, 500); // the GMLC rejects every notification
+        let hgmlc = format!("http://127.0.0.1:{port}{path}");
+        let body = periodic_determine_location_body(
+            "imsi-001010000000803",
+            "a8-fail",
+            &hgmlc,
+            20,
+            150,
+        );
+        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
+            .with_body(&body, "application/json");
+        let _ = handle_determine_location(&req).await;
+
+        // First report POSTs (500) + one retry (500) → deliver fails → break.
+        let c = wait_for_count(path, 2, Duration::from_secs(4)).await;
+        assert_eq!(c, 2, "one report + exactly one retry");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            sink_count(path),
+            2,
+            "no infinite retry after repeated GMLC failure"
+        );
+        assert!(
+            lmf_self().read().unwrap().ldr_find("a8-fail").is_none(),
+            "repeated failure auto-cancelled the LDR"
+        );
+        server.stop().await.expect("stop");
+    }
+
+    // -- A8 STRICT-PEER: post_event_notify → the real SBI sink returns 204 and
+    // receives a byte-valid EventNotifyDataExt as application/json.
+    #[tokio::test]
+    async fn test_post_event_notify_strict_peer_204() {
+        let (server, port) = start_sink().await;
+        let path = "/sink/a8-post/cb";
+        let hgmlc = format!("http://127.0.0.1:{port}{path}");
+        let notify = build_periodic_event_notify("ref-post", "imsi-001010000000804", None, true);
+        let status = post_event_notify(&hgmlc, &notify).await.expect("POST ok");
+        assert_eq!(status, 204, "the H-GMLC callback returns 204 (yaml)");
+        let bodies = sink_bodies(path);
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["reportedEventType"], "PERIODIC_EVENT");
+        assert_eq!(bodies[0]["terminationCause"], "NORMAL_TERMINATION");
+        let _typed: nlmf::EventNotifyDataExt =
+            serde_json::from_value(bodies[0].clone()).expect("valid EventNotifyDataExt");
+        server.stop().await.expect("stop");
+    }
+
+    // -- A8 unit: the report body (fix vs no-fix, final vs interim). ----------
+    #[test]
+    fn test_build_periodic_event_notify_fix_vs_nofix() {
+        // No fix, not final: only the M IEs + supi; no fabricated location.
+        let nf = build_periodic_event_notify("ref-x", "imsi-1", None, false);
+        assert_eq!(nf.event_notify_data.reported_event_type, "PERIODIC_EVENT");
+        assert_eq!(nf.event_notify_data.ldr_reference, "ref-x");
+        assert!(nf.event_notify_data.location_estimate.is_none());
+        assert!(nf.event_notify_data.age_of_location_estimate.is_none());
+        assert!(nf.event_notify_data.termination_cause.is_none());
+
+        // Fix + final: locationEstimate + honest age 0 + method + termination.
+        let fix = LocationEstimate {
+            latitude: 37.5,
+            longitude: -122.3,
+            horizontal_accuracy: 25.0,
+            method_used: Some(nlmf::positioning_method::NR_ECID.to_string()),
+            ..Default::default()
+        };
+        let f = build_periodic_event_notify("ref-x", "imsi-1", Some(&fix), true);
+        assert!(f.event_notify_data.location_estimate.is_some());
+        assert_eq!(f.event_notify_data.age_of_location_estimate, Some(0));
+        assert_eq!(
+            f.event_notify_data.termination_cause.as_deref(),
+            Some("NORMAL_TERMINATION")
+        );
+        assert_eq!(
+            f.event_notify_data.positioning_data_list.as_ref().unwrap()[0].method,
+            "NR_ECID"
+        );
+    }
+
+    // -- A8 unit: InputData.periodicEventInfo → PeriodicReporting + interval. --
+    #[test]
+    fn test_periodic_reporting_from_input_and_interval() {
+        let input: nlmf::InputData = serde_json::from_str(
+            r#"{"supi":"imsi-1","periodicEventInfo":{"reportingAmount":5,"reportingInterval":60}}"#,
+        )
+        .unwrap();
+        let p = periodic_reporting_from_input(&input).unwrap();
+        assert_eq!(p.reporting_amount, 5);
+        assert_eq!(p.reporting_interval_secs, 60);
+        // Seconds resolution when no reportingIntervalMs.
+        assert_eq!(periodic_report_interval(&p), Duration::from_secs(60));
+
+        // reportingIntervalMs (1..999) takes precedence for a sub-second cadence.
+        let p_ms = PeriodicReporting {
+            reporting_amount: 1,
+            reporting_interval_secs: 60,
+            reporting_interval_ms: Some(200),
+        };
+        assert_eq!(periodic_report_interval(&p_ms), Duration::from_millis(200));
+
+        // No periodicEventInfo → None (no scheduler).
+        let none_input: nlmf::InputData =
+            serde_json::from_str(r#"{"supi":"imsi-1"}"#).unwrap();
+        assert!(periodic_reporting_from_input(&none_input).is_none());
+
+        // reportingAmount clamped to ≥ 1 so the scheduler makes progress.
+        let zero_input: nlmf::InputData = serde_json::from_str(
+            r#"{"supi":"imsi-1","periodicEventInfo":{"reportingAmount":0,"reportingInterval":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            periodic_reporting_from_input(&zero_input).unwrap().reporting_amount,
+            1
+        );
+    }
+
+    // -- A8 unit: callback-URI splitter (host/port/path + scheme defaults). ---
+    #[test]
+    fn test_split_callback_uri() {
+        assert_eq!(
+            split_callback_uri("http://10.0.0.5:8080/gmlc/cb"),
+            Some(("10.0.0.5".to_string(), 8080, "/gmlc/cb".to_string()))
+        );
+        assert_eq!(
+            split_callback_uri("https://gmlc.example/cb"),
+            Some(("gmlc.example".to_string(), 443, "/cb".to_string()))
+        );
+        assert_eq!(
+            split_callback_uri("http://host:9/"),
+            Some(("host".to_string(), 9, "/".to_string()))
+        );
+        assert_eq!(
+            split_callback_uri("http://host"),
+            Some(("host".to_string(), 80, "/".to_string()))
+        );
+        // Unparseable authority / port → None (never a silent misroute).
+        assert_eq!(split_callback_uri("http://:80/x"), None);
+        assert_eq!(split_callback_uri("http://host:notaport/x"), None);
+    }
+}
+
+// ===========================================================================
+// Wave-6 A9 + H4 — strict-peer full-chain positioning integration.
+//
+// A9 (WS-A §A9, TS 23.273 §6.11.2 5GC-MT-LR): drive lmfd's REAL DetermineLocation
+// handler → its REAL outbound Namf N1N2MessageTransfer POST (A2) → amfd's REAL
+// `namf_request_handler` (H1 lib target, in-process over loopback HTTP) → a
+// scripted UE/gNB fixture replies with a UPER LPP ProvideLocationInformation via
+// amfd's REAL `build_n1_message_notify_request` producer → lmfd's REAL notify
+// callback (A4) completes the session → 200 LocationDataExt with a
+// measurement-derived fix. No lenient mocks on any leg (only the NRF discovery
+// bootstrap is a sink, per the H1 policy: it targets a different peer).
+//
+// H4 (WS-H §H4, superseded-in-part: A2 owns the POST impl): the lmfd→amfd
+// N1N2MessageTransfer strict-peer conversion — lmfd's PRODUCTION request builder
+// fed to amfd's REAL consumer, asserting amfd extracts the EXACT LPP PDU bytes
+// (transparent relay, TS 29.518 §5.2.2.3 / §6.1.6.2.2).
+//
+// The peer on every leg is the real other-NF handler/producer; "mechanically
+// closed" is impossible (the pcfd/bsfd lenient-mock lesson). The mutation check
+// (WS-A §A9 acceptance) holds: revert A2's POST → amfd never receives the
+// transfer → the tap never fires → the full-chain test fails.
+// ===========================================================================
+#[cfg(test)]
+mod positioning_chain_strict_peer {
+    use super::*;
+    use nextgcore_amfd::context::{amf_self, PositioningDlKind, NEXTGCORE_INVALID_POOL_ID};
+    use nextgcore_sbi::multipart;
+    use nextgcore_sbi::server::SbiServerConfig;
+    use std::net::SocketAddr;
+
+    /// Serialize the strict-peer tests among themselves: they share the
+    /// process-global AMF context (`amf_self`), the shared SBI NRF URI, and the
+    /// global positioning downlink queue (cf. the amfd flaky-test hazard, and
+    /// the nf-context-lock discipline). A `tokio::sync::Mutex` so the guard is
+    /// held across awaits (real HTTP round-trips).
+    fn chain_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// Unique RAN-UE-NGAP-ID source so seeded UEs never collide in the shared
+    /// (never-reset) global AMF context.
+    static NEXT_NGAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(88_000);
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind probe")
+            .local_addr()
+            .expect("local_addr")
+            .port()
+    }
+
+    fn body_json(resp: &SbiResponse) -> serde_json::Value {
+        serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("json body")
+    }
+
+    /// Seed a CM-CONNECTED UE (keyed by SUPI) in the real global AMF context via
+    /// amfd's PUBLIC context API — so amfd's `try_positioning_relay` accepts the
+    /// LPP downlink (needs a live RAN-UE association). Clears any leftover
+    /// downlinks first (the queue is process-global and never auto-reset).
+    fn seed_amf_connected_ue(supi: &str) {
+        nextgcore_amfd::test_support::init_context();
+        let ctx = amf_self();
+        let g = ctx.read().expect("amf ctx");
+        let _ = g.positioning_dl_drain();
+        let ngap_id = NEXT_NGAP_ID.fetch_add(1, Ordering::SeqCst);
+        let ran_ue = g.ran_ue_add(900_100, ngap_id).expect("ran_ue_add");
+        let ue = g.amf_ue_add(ran_ue.id).expect("amf_ue_add");
+        g.amf_ue_set_supi(ue.id, supi);
+        g.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
+    }
+
+    /// Seed a CM-IDLE UE (SUPI known, no RAN association) so the relay
+    /// fail-closes with 504 UE_NOT_REACHABLE.
+    fn seed_amf_idle_ue(supi: &str) {
+        nextgcore_amfd::test_support::init_context();
+        let ctx = amf_self();
+        let g = ctx.read().expect("amf ctx");
+        let _ = g.positioning_dl_drain();
+        let ue = g.amf_ue_add(NEXTGCORE_INVALID_POOL_ID).expect("amf_ue_add");
+        g.amf_ue_set_supi(ue.id, supi);
+    }
+
+    /// Prime lmfd's own identity + notify-callback base so `initiate_positioning`
+    /// registers an A3 subscription and stamps `servingLMFIdentification`.
+    fn prime_lmf_self() {
+        let ctx = lmf_self();
+        let g = ctx.read().expect("lmf ctx");
+        g.set_callback_base("http://127.0.0.1:7816");
+        g.set_nf_instance_id("lmf-strict-peer");
+    }
+
+    /// Encode a UE uplink LPP `ProvideLocationInformation` (E-CID) carrying one
+    /// measured-results element (physCellId `pci`, rsrp, ue-RxTxTimeDiff). This
+    /// is what the scripted UE returns; it decodes to a `CellMeasurement` keyed
+    /// `pci-<pci>` (TS 37.355 §6.5 ECID-SignalMeasurementInformation).
+    fn build_ecid_lpp(pci: u16, rsrp_result: u8, ue_rx_tx: u16, txn: u8) -> Vec<u8> {
+        use nextgcore_asn1c::lpp::ecid::{
+            EcidProvideLocationInformation, EcidSignalMeasurementInformation, MeasuredResultsElement,
+            ProvideLocationInformation, ProvideLocationInformationR9,
+        };
+        use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
+        use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
+        let element = MeasuredResultsElement {
+            phys_cell_id: pci,
+            arfcn_eutra: 1850,
+            system_frame_number: None,
+            rsrp_result: Some(rsrp_result),
+            rsrq_result: Some(20),
+            ue_rx_tx_time_diff: Some(ue_rx_tx),
+        };
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(txn),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: Some(EcidProvideLocationInformation {
+                            signal_measurement_information: Some(EcidSignalMeasurementInformation {
+                                primary_cell_measured_results: None,
+                                measured_results_list: vec![element],
+                            }),
+                            ecid_error: None,
+                        }),
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        msg.encode().expect("encode E-CID lpp").to_vec()
+    }
+
+    /// Build the scripted UE's N1MessageNotify request the way amfd's REAL
+    /// producer builds it (H1 import), routed through the SAME nextgcore-sbi
+    /// multipart codec the wire uses, and re-materialised as the inbound
+    /// `SbiRequest` lmfd's server hands its callback handler. Asserts the LPP
+    /// PDU survives the amfd→lmfd relay byte-exact (transparent relay).
+    fn amfd_notify_request(corr: &str, supi: &str, lpp: &[u8]) -> SbiRequest {
+        let amf_req = nextgcore_amfd::namf_server::build_n1_message_notify_request(
+            namf_client::N1_NOTIFY_PATH,
+            Some("sub-strict-peer"),
+            "LPP",
+            Some(corr),
+            Some(supi),
+            lpp,
+        )
+        .expect("amfd builds N1MessageNotify");
+        let boundary = multipart::generate_boundary();
+        let wire = multipart::encode(amf_req.http.content.as_deref(), &amf_req.http.parts, &boundary);
+        let ct = multipart::content_type_with_boundary(&boundary);
+        let decoded = multipart::decode(&ct, &wire).expect("multipart decode");
+        assert_eq!(
+            decoded.parts[0].data.as_ref(),
+            lpp,
+            "UL LPP must survive the amfd→lmfd notify relay byte-exact"
+        );
+        let mut req = SbiRequest::post(namf_client::N1_NOTIFY_PATH);
+        req.http.set_content(decoded.json.expect("jsonData root"));
+        req.http.set_header("Content-Type", ct);
+        for p in decoded.parts {
+            req.http.add_part(p);
+        }
+        req
+    }
+
+    /// Start amfd's REAL `namf_request_handler` behind a loopback SbiServer, plus
+    /// a minimal NRF discovery sink pointing at it, and set the global NRF URI.
+    /// Returns both servers (keep alive) and a receiver that fires with
+    /// `(lcsCorrelationId, downlink-LPP-bytes)` the instant amfd accepts the
+    /// N1N2MessageTransfer — captured from amfd's OWN recorded state (the
+    /// handler runs verbatim; the tap only observes). This is the "scripted
+    /// gNB/UE fixture" capture point for the NGAP egress.
+    async fn start_positioning_harness(
+        supi: String,
+    ) -> (SbiServer, SbiServer, tokio::sync::mpsc::Receiver<(String, Vec<u8>)>) {
+        let (tap_tx, tap_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(4);
+
+        let amf_port = free_port();
+        let amf_addr: SocketAddr = format!("127.0.0.1:{amf_port}").parse().expect("amf addr");
+        let amf_server = SbiServer::new(SbiServerConfig::new(amf_addr));
+        amf_server
+            .start(move |req: SbiRequest| {
+                let tap_tx = tap_tx.clone();
+                let supi = supi.clone();
+                async move {
+                    let is_transfer = req.header.method == "POST"
+                        && req
+                            .header
+                            .uri
+                            .split('?')
+                            .next()
+                            .unwrap_or("")
+                            .ends_with("/n1-n2-messages");
+                    // amfd's REAL Namf consumer (H1) — verbatim, no mock.
+                    let resp = nextgcore_amfd::namf_request_handler(req).await;
+                    if is_transfer && resp.status == 200 {
+                        // Observe amfd's real recorded relay state for the fixture.
+                        let captured = {
+                            let ctx = amf_self();
+                            let out = match ctx.read() {
+                                Ok(g) => {
+                                    let corr = g.lcs_correlation_find(&supi).map(|r| r.lcs_correlation_id);
+                                    let lpp = g.positioning_dl_drain().into_iter().find_map(|d| {
+                                        match d.kind {
+                                            PositioningDlKind::LppToUe { lpp_pdu } => Some(lpp_pdu),
+                                            _ => None,
+                                        }
+                                    });
+                                    corr.zip(lpp)
+                                }
+                                Err(_) => None,
+                            };
+                            out
+                        };
+                        if let Some(pair) = captured {
+                            let _ = tap_tx.try_send(pair);
+                        }
+                    }
+                    resp
+                }
+            })
+            .await
+            .expect("amf server start");
+
+        let nrf_port = free_port();
+        let nrf_addr: SocketAddr = format!("127.0.0.1:{nrf_port}").parse().expect("nrf addr");
+        let nrf_server = SbiServer::new(SbiServerConfig::new(nrf_addr));
+        let search = serde_json::json!({
+            "nfInstances": [{
+                "nfInstanceId": "amf-strict-peer",
+                "nfServices": [{
+                    "serviceName": "namf-comm",
+                    "scheme": "http",
+                    "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": amf_port }]
+                }]
+            }]
+        })
+        .to_string();
+        nrf_server
+            .start(move |_req: SbiRequest| {
+                let search = search.clone();
+                async move { SbiResponse::ok().with_body(search, "application/json") }
+            })
+            .await
+            .expect("nrf sink start");
+
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
+            .await;
+
+        (amf_server, nrf_server, tap_rx)
+    }
+
+    // =======================================================================
+    // A9 — full chain: DetermineLocation → N1N2 → (fixture) → notify → 200.
+    // =======================================================================
+
+    /// The wave's CRITICAL falsifier: a conformant MT-LR DetermineLocation
+    /// returns a measurement-derived fix, driven end-to-end across BOTH real NFs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_positioning_chain_returns_200_computed_fix_via_real_amfd() {
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000000701".to_string();
+
+        lmf_context_init(1024);
+        prime_lmf_self();
+        // Seed the serving cell so the E-CID solver returns a KNOWN analytic fix.
+        {
+            let ctx = lmf_self();
+            let g = ctx.read().unwrap();
+            g.set_cell_coord(
+                "pci-77".to_string(),
+                crate::positioning::TrpCoord::new(40.1, -74.5, 0.0),
+            );
+        }
+        seed_amf_connected_ue(&supi);
+
+        let (amf_server, nrf_server, mut tap_rx) = start_positioning_harness(supi.clone()).await;
+
+        // Drive lmfd's REAL DetermineLocation handler (no stored fix for this
+        // SUPI → the live 5GC-MT-LR procedure). Spawned: it blocks awaiting the
+        // session completion the notify leg will deliver.
+        let body =
+            format!(r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"]}}"#);
+        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
+            .with_body(body, "application/json");
+        let det = tokio::spawn(async move { handle_determine_location(&req).await });
+
+        // The fixture receives the DL LPP the instant amfd accepts lmfd's POST.
+        let (corr, dl_lpp) = tokio::time::timeout(Duration::from_secs(5), tap_rx.recv())
+            .await
+            .expect("amfd accepted the N1N2MessageTransfer within budget")
+            .expect("harness captured the correlation + downlink LPP");
+
+        // Transparent-relay proof (DL leg): amfd extracted EXACTLY lmfd's encoder
+        // output. Decode the relayed PDU for its LPP transactionID, then re-encode
+        // lmfd's own builder for that txn and compare byte-for-byte.
+        let dl_msg =
+            nextgcore_asn1c::lpp::message::LppMessage::decode(&dl_lpp).expect("DL LPP decodes");
+        let txn = dl_msg
+            .transaction_id
+            .as_ref()
+            .expect("DL LPP carries a transactionID")
+            .transaction_number
+            .0;
+        assert_eq!(
+            dl_lpp,
+            codec_glue::build_lpp_ecid_request(txn).expect("re-encode DL LPP"),
+            "amfd must relay lmfd's LPP RequestLocationInformation byte-exact"
+        );
+
+        // Scripted UE: reply with a valid UPER LPP E-CID ProvideLocationInformation
+        // for the seeded serving cell (pci 77), via amfd's REAL notify producer.
+        let ul_lpp = build_ecid_lpp(77, 60, 800, txn);
+        let notify = amfd_notify_request(&corr, &supi, &ul_lpp);
+        let notify_resp = handle_n1_message_notify(&notify).await;
+        assert_eq!(notify_resp.status, 204, "N1MessageNotify callback → 204");
+
+        // DetermineLocation now completes with the computed fix — NOT 504.
+        let resp = tokio::time::timeout(Duration::from_secs(10), det)
+            .await
+            .expect("DetermineLocation did not hang")
+            .expect("DetermineLocation task did not panic");
+        assert_eq!(resp.status, 200, "full chain must yield 200, not 504");
+
+        let v = body_json(&resp);
+        let lat = v["locationEstimate"]["point"]["lat"]
+            .as_f64()
+            .expect("locationEstimate latitude");
+        let lon = v["locationEstimate"]["point"]["lon"]
+            .as_f64()
+            .expect("locationEstimate longitude");
+        assert!(
+            (40.0..41.0).contains(&lat),
+            "fix latitude {lat} must be near the seeded serving cell (40.1)"
+        );
+        assert!(
+            (-75.0..-74.0).contains(&lon),
+            "fix longitude {lon} must be near the seeded serving cell (-74.5)"
+        );
+        // E-CID method + honest freshly-computed age.
+        assert_eq!(v["positioningDataList"][0]["method"], "NR_ECID");
+        assert_eq!(v["ageOfLocationEstimate"], 0);
+
+        let _ = amf_server.stop().await;
+        let _ = nrf_server.stop().await;
+    }
+
+    /// Negative leg (WS-A §A9 step 3): amfd accepts the transfer but the UE stays
+    /// silent within the response-time budget → 504 UNREACHABLE_USER (fail-closed,
+    /// never a fabricated fix). `NO_DELAY` gives a zero budget so the timeout is
+    /// deterministic (no real sleep). The lmfd→amfd transfer still executes over
+    /// the real harness (proving the A2 leg), then fail-closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_positioning_chain_silent_ue_times_out_504() {
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000000702".to_string();
+
+        lmf_context_init(1024);
+        prime_lmf_self();
+        seed_amf_connected_ue(&supi);
+        let (amf_server, nrf_server, _tap_rx) = start_positioning_harness(supi.clone()).await;
+
+        let body = format!(
+            r#"{{"supi":"{supi}","locationQoS":{{"responseTime":"NO_DELAY"}}}}"#
+        );
+        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
+            .with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 504);
+        assert_eq!(body_json(&resp)["cause"], "UNREACHABLE_USER");
+
+        let _ = amf_server.stop().await;
+        let _ = nrf_server.stop().await;
+    }
+
+    /// Negative leg (WS-A §A9 step 3): the UE replies, but with an undecodable
+    /// LPP payload → a report is received yet no fix is solvable → 500
+    /// POSITIONING_FAILED (TS 29.572 Table 6.1.7.3-1), never a fabricated fix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_positioning_chain_corrupt_lpp_reply_maps_to_500() {
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000000703".to_string();
+
+        lmf_context_init(1024);
+        prime_lmf_self();
+        seed_amf_connected_ue(&supi);
+        let (amf_server, nrf_server, mut tap_rx) = start_positioning_harness(supi.clone()).await;
+
+        let body =
+            format!(r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"]}}"#);
+        let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
+            .with_body(body, "application/json");
+        let det = tokio::spawn(async move { handle_determine_location(&req).await });
+
+        let (corr, _dl_lpp) = tokio::time::timeout(Duration::from_secs(5), tap_rx.recv())
+            .await
+            .expect("amfd accepted the transfer")
+            .expect("captured correlation");
+
+        // Scripted UE returns garbage where a UPER LPP ProvideLocationInformation
+        // is expected — a KNOWN session, but no decodable measurement.
+        let corrupt: Vec<u8> = vec![0xFF, 0x13, 0x37, 0xAB, 0xCD];
+        let notify = nextgcore_amfd::namf_server::build_n1_message_notify_request(
+            namf_client::N1_NOTIFY_PATH,
+            Some("sub-corrupt"),
+            "LPP",
+            Some(&corr),
+            Some(&supi),
+            &corrupt,
+        )
+        .expect("amfd builds N1MessageNotify");
+        // Delivered to a matched session (204), but yields no fix.
+        assert_eq!(handle_n1_message_notify(&notify).await.status, 204);
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), det)
+            .await
+            .expect("DetermineLocation did not hang")
+            .expect("no panic");
+        assert_eq!(resp.status, 500);
+        assert_eq!(body_json(&resp)["cause"], "POSITIONING_FAILED");
+        assert!(
+            body_json(&resp).get("locationEstimate").is_none(),
+            "a no-fix response must never carry a fabricated location"
+        );
+
+        let _ = amf_server.stop().await;
+        let _ = nrf_server.stop().await;
+    }
+
+    /// Correlation isolation (WS-A §A9 step 3): a second UE's report must never
+    /// satisfy the first UE's pending session. Two sessions with distinct
+    /// `lcsCorrelationId`s; a notify correlated to A completes ONLY A — B stays
+    /// pending. Driven through lmfd's REAL notify handler + amfd's REAL producer.
+    #[tokio::test]
+    async fn test_positioning_chain_correlation_isolation() {
+        let _serial = chain_lock().lock().await;
+        lmf_context_init(1024);
+        let supi_a = "imsi-001010000000704";
+        let supi_b = "imsi-001010000000705";
+        {
+            let ctx = lmf_self();
+            let g = ctx.read().unwrap();
+            g.set_cell_coord(
+                "pci-88".to_string(),
+                crate::positioning::TrpCoord::new(51.5, -0.12, 0.0),
+            );
+        }
+        let (corr_a, rx_a) = {
+            let ctx = lmf_self();
+            let g = ctx.read().unwrap();
+            let req = g
+                .measurement_request(0, PositioningMethod::Ecid, None, None, PositioningQos::BestEffort)
+                .expect("measurement A");
+            g.positioning_session_register(Some(supi_a.to_string()), 111, req.request_id)
+        };
+        let (corr_b, rx_b) = {
+            let ctx = lmf_self();
+            let g = ctx.read().unwrap();
+            let req = g
+                .measurement_request(0, PositioningMethod::Ecid, None, None, PositioningQos::BestEffort)
+                .expect("measurement B");
+            g.positioning_session_register(Some(supi_b.to_string()), 112, req.request_id)
+        };
+        assert_ne!(corr_a, corr_b);
+
+        // A notify correlated to A only.
+        let ul = build_ecid_lpp(88, 60, 800, 111);
+        let notify = nextgcore_amfd::namf_server::build_n1_message_notify_request(
+            namf_client::N1_NOTIFY_PATH,
+            Some("sub-iso"),
+            "LPP",
+            Some(&corr_a),
+            Some(supi_a),
+            &ul,
+        )
+        .expect("amfd builds N1MessageNotify");
+        assert_eq!(handle_n1_message_notify(&notify).await.status, 204);
+
+        // A completed with a real fix.
+        let out_a = tokio::time::timeout(Duration::from_secs(2), rx_a)
+            .await
+            .expect("session A completes")
+            .expect("A sender alive");
+        assert!(
+            matches!(out_a, PositioningOutcome::Fix(_)),
+            "session A must complete with a measurement-derived fix"
+        );
+
+        // B is untouched: no value on its channel, session still pending.
+        let mut rx_b = rx_b;
+        assert!(
+            matches!(
+                rx_b.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "session B must not be satisfied by another UE's report"
+        );
+        assert!(
+            lmf_self().read().unwrap().positioning_session_find(&corr_b).is_some(),
+            "session B must remain registered (isolated)"
+        );
+    }
+
+    // =======================================================================
+    // H4 — lmfd→amfd N1N2MessageTransfer strict-peer conversion (A2 owns impl).
+    // =======================================================================
+
+    /// lmfd's PRODUCTION request builder fed to amfd's REAL consumer in-process
+    /// (H1): amfd accepts the multipart transfer, resolves the contentId, and
+    /// extracts the LPP PDU byte-exact — proving the transparent relay and
+    /// killing the "prepared and logged" (log-only) non-delivery.
+    #[tokio::test]
+    async fn test_h4_lmfd_transfer_strict_peer_amfd_extracts_exact_lpp() {
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000000731";
+        seed_amf_connected_ue(supi);
+
+        let lpp = codec_glue::build_lpp_ecid_request(41).expect("LPP encode");
+        let corr = uuid::Uuid::new_v4().to_string();
+        // The exact SbiRequest lmfd's A2 leg POSTs on the wire.
+        let req = namf_client::build_n1n2_transfer_request(supi, &corr, "lmf-h4", lpp.clone());
+
+        // amfd's REAL consumer (crate-root re-export, H1) — no lenient mock.
+        let resp = nextgcore_amfd::handle_n1_n2_message_transfer_request(supi, &req);
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_json(&resp)["cause"], "N1_N2_TRANSFER_INITIATED");
+
+        // Transparent-relay: amfd enqueued the EXACT LPP bytes lmfd encoded.
+        let extracted = {
+            let ctx = amf_self();
+            let g = ctx.read().unwrap();
+            g.positioning_dl_drain().into_iter().find_map(|d| match d.kind {
+                PositioningDlKind::LppToUe { lpp_pdu } => Some(lpp_pdu),
+                _ => None,
+            })
+        }
+        .expect("amfd enqueued an LPP downlink");
+        assert_eq!(extracted, lpp, "amfd must relay lmfd's LPP byte-exact");
+
+        // amfd recorded the LCS correlation lmfd minted (uplink route back).
+        let rec = amf_self()
+            .read()
+            .unwrap()
+            .lcs_correlation_find(supi)
+            .expect("lcsCorrelation recorded on the UE context");
+        assert_eq!(rec.lcs_correlation_id, corr);
+    }
+
+    /// Negative (WS-H §H4): a CM-IDLE UE gets 504 UE_NOT_REACHABLE from amfd's
+    /// real handler (TS 29.518 Table 6.1.7.3-1) — not a fake 200.
+    #[tokio::test]
+    async fn test_h4_lmfd_transfer_idle_ue_504_ue_not_reachable() {
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000000732";
+        seed_amf_idle_ue(supi);
+
+        let lpp = codec_glue::build_lpp_ecid_request(42).expect("LPP encode");
+        let req = namf_client::build_n1n2_transfer_request(supi, "corr-idle", "lmf-h4", lpp);
+        let resp = nextgcore_amfd::handle_n1_n2_message_transfer_request(supi, &req);
+        assert_eq!(resp.status, 504);
+        // N1N2MessageTransferError envelope: {"error": {ProblemDetails}}.
+        assert_eq!(body_json(&resp)["error"]["cause"], "UE_NOT_REACHABLE");
+    }
+
+    /// Negative (WS-H §H4): an unknown ueContextId → 404 CONTEXT_NOT_FOUND from
+    /// amfd's real handler (the transfer can never land for an absent UE).
+    #[tokio::test]
+    async fn test_h4_lmfd_transfer_unknown_ue_404() {
+        let _serial = chain_lock().lock().await;
+        nextgcore_amfd::test_support::init_context();
+        let supi = "imsi-001019999999999"; // never seeded
+        let lpp = codec_glue::build_lpp_ecid_request(43).expect("LPP encode");
+        let req = namf_client::build_n1n2_transfer_request(supi, "corr-unknown", "lmf-h4", lpp);
+        let resp = nextgcore_amfd::handle_n1_n2_message_transfer_request(supi, &req);
+        assert_eq!(resp.status, 404);
+        assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND");
     }
 }

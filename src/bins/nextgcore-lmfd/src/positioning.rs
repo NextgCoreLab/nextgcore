@@ -10,14 +10,16 @@
 //! ## Status (lmfd-08, Wave-3)
 //!
 //! This file is STANDALONE (no dependency on the NRPPa / LPP ASN.1 codecs
-//! lmfd-LIB-01/02) and is **wired into [`crate::context::compute_location`]**
-//! as of lmfd-08. The solver selection order is: Multi-RTT (≥3 cells with
-//! `rtt_ns`) → AoA (≥2 cells with `aoa`) → ECID (serving cell with
-//! `timing_advance`); fallback to the heuristic placeholder when the cell
-//! coordinate registry is empty or no matching cells are found.
+//! lmfd-LIB-01/02) and is **wired into
+//! [`crate::context::LmfContext::measurement_report`]** (via the runtime
+//! `try_real_solve` helper) as of lmfd-08. The solver selection order is:
+//! Multi-RTT (≥3 cells with `rtt_ns`) → AoA (≥2 cells with `aoa`) → ECID
+//! (serving cell with `timing_advance`). A7 (lmfd-11): when the cell coordinate
+//! registry is empty or no matching cells are found the runtime path returns
+//! `None` (no fabricated fix) — the heuristic placeholder is now test-only.
 //!
 //! `solve_tdoa` and `TdoaObservation` remain available for lmfd-05/06 (NRPPa
-//! TDOA measurements) but are not yet called by `compute_location`; the
+//! TDOA measurements) but are not yet called on the runtime path; the
 //! workspace `dead_code = "allow"` suppresses the lint. The solver math is
 //! exercised against closed-form synthetic geometries (known TRP coordinates +
 //! a known UE position) below.

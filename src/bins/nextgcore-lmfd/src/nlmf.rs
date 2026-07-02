@@ -234,6 +234,41 @@ pub mod ue_location_service_ind {
     pub const LOCATION_ASSISTANCE_DATA: &str = "LOCATION_ASSISTANCE_DATA";
 }
 
+/// `LdrType` string values (TS 29.572 LdrType, yaml:2356-2367) — the class of
+/// deferred location request. A8 drives the EventNotify scheduler for
+/// `PERIODIC` only; the area/motion triggers need UE-side event detection.
+pub mod ldr_type {
+    pub const UE_AVAILABLE: &str = "UE_AVAILABLE";
+    pub const PERIODIC: &str = "PERIODIC";
+    pub const ENTERING_INTO_AREA: &str = "ENTERING_INTO_AREA";
+    pub const LEAVING_FROM_AREA: &str = "LEAVING_FROM_AREA";
+    pub const BEING_INSIDE_AREA: &str = "BEING_INSIDE_AREA";
+    pub const MOTION: &str = "MOTION";
+}
+
+/// `ReportedEventType` string values (TS 29.572 ReportedEventType,
+/// yaml:2413-2428) — the type of event carried by an EventNotify (A8).
+pub mod reported_event_type {
+    pub const PERIODIC_EVENT: &str = "PERIODIC_EVENT";
+    pub const ENTERING_AREA_EVENT: &str = "ENTERING_AREA_EVENT";
+    pub const LEAVING_AREA_EVENT: &str = "LEAVING_AREA_EVENT";
+    pub const BEING_INSIDE_AREA_EVENT: &str = "BEING_INSIDE_AREA_EVENT";
+    pub const MOTION_EVENT: &str = "MOTION_EVENT";
+    pub const MAXIMUM_INTERVAL_EXPIRATION_EVENT: &str = "MAXIMUM_INTERVAL_EXPIRATION_EVENT";
+    pub const LOCATION_CANCELLATION_EVENT: &str = "LOCATION_CANCELLATION_EVENT";
+    pub const INTERMEDIATE_EVENT: &str = "INTERMEDIATE_EVENT";
+    pub const DIRECT_REPORT_EVENT: &str = "DIRECT_REPORT_EVENT";
+    pub const CUMULATIVE_EVENT_REPORT: &str = "CUMULATIVE_EVENT_REPORT";
+}
+
+/// `TerminationCause` string values (TS 29.572 TerminationCause,
+/// yaml:2430-2438) — why an event-reporting (LDR) session ended (A8).
+pub mod termination_cause {
+    pub const TERMINATION_BY_UE: &str = "TERMINATION_BY_UE";
+    pub const TERMINATION_BY_NETWORK: &str = "TERMINATION_BY_NETWORK";
+    pub const NORMAL_TERMINATION: &str = "NORMAL_TERMINATION";
+}
+
 // ---------------------------------------------------------------------------
 // lmfd#0: custom Nlmf_Location operation data types (TS 29.572 §6.1.4.x).
 // ---------------------------------------------------------------------------
@@ -482,6 +517,57 @@ pub struct LocationDataExt {
     pub location_data: LocationData,
     #[serde(rename = "addLocationData", skip_serializing_if = "Option::is_none")]
     pub add_location_data: Option<Vec<serde_json::Value>>,
+}
+
+// ---------------------------------------------------------------------------
+// A8: EventNotify body (TS 29.572 §6.1.5.1, EventNotifyDataExt/EventNotifyData
+// yaml:1580-1657) — the LMF-initiated deferred/periodic-LDR report POSTed to
+// the HGMLC callback URI.
+// ---------------------------------------------------------------------------
+
+/// `EventNotifyData` — one deferred/periodic-LDR event report (TS 29.572
+/// EventNotifyData, yaml:1586-1657). M IEs: `reportedEventType`, `ldrReference`.
+/// `locationEstimate` is OMITTED (not fabricated) when a tick produced no fix;
+/// `terminationCause` marks the final/aborted report. Only the IEs lmfd
+/// actually emits are modelled; the rest of the (large) schema is out of scope.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventNotifyData {
+    /// M — `ReportedEventType` (yaml:2413), e.g. `PERIODIC_EVENT`.
+    pub reported_event_type: String,
+    /// M — `LdrReference` (yaml:2073) identifying the LDR session.
+    pub ldr_reference: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supi: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpsi: Option<String>,
+    #[serde(rename = "hgmlcCallBackURI", skip_serializing_if = "Option::is_none")]
+    pub hgmlc_call_back_uri: Option<String>,
+    /// The GAD `GeographicArea` fix for this report (present only on success).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location_estimate: Option<GeographicArea>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_of_location_estimate: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_of_location_estimate: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub positioning_data_list: Option<Vec<PositioningMethodAndUsage>>,
+    /// `servingLMFidentification` (yaml:1625 — note the lower-case `i`).
+    #[serde(rename = "servingLMFidentification", skip_serializing_if = "Option::is_none")]
+    pub serving_lmf_identification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub termination_cause: Option<String>,
+}
+
+/// `EventNotifyDataExt` = `EventNotifyData` + `AddEventNotifyDatas` (TS 29.572
+/// yaml:1580-1584/1877-1884). The `addEventNotifyDatas` array (related/SL-UE
+/// reports) is modelled but left `None` by the periodic producer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EventNotifyDataExt {
+    #[serde(flatten)]
+    pub event_notify_data: EventNotifyData,
+    #[serde(rename = "addEventNotifyDatas", skip_serializing_if = "Option::is_none")]
+    pub add_event_notify_datas: Option<Vec<EventNotifyData>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -909,5 +995,99 @@ mod tests {
         );
         let back: LocationDataExt = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, back);
+    }
+
+    // -- A8: EventNotifyDataExt schema (TS 29.572 yaml:1580-1657) -------------
+
+    // Field-by-field vs the yaml: the two M IEs (reportedEventType, ldrReference)
+    // are always present; a per-tick failure report carries NO fabricated
+    // locationEstimate; the flattened AddEventNotifyDatas array stays absent.
+    #[test]
+    fn test_event_notify_data_ext_no_fix_required_ies_only() {
+        let no_fix = EventNotifyDataExt {
+            event_notify_data: EventNotifyData {
+                reported_event_type: reported_event_type::PERIODIC_EVENT.to_string(),
+                ldr_reference: "aa01".to_string(),
+                supi: Some("imsi-001010000000042".to_string()),
+                ..Default::default()
+            },
+            add_event_notify_datas: None,
+        };
+        let v = serde_json::to_value(&no_fix).unwrap();
+        // M IEs present (TS 29.572 EventNotifyData required list).
+        assert_eq!(v["reportedEventType"], "PERIODIC_EVENT");
+        assert_eq!(v["ldrReference"], "aa01");
+        assert_eq!(v["supi"], "imsi-001010000000042");
+        // No fabricated location on a no-fix report.
+        assert!(v.get("locationEstimate").is_none());
+        assert!(v.get("ageOfLocationEstimate").is_none());
+        assert!(v.get("terminationCause").is_none());
+        // AddEventNotifyDatas is flattened and omitted when None.
+        assert!(v.get("addEventNotifyDatas").is_none());
+        let back: EventNotifyDataExt = serde_json::from_value(v).unwrap();
+        assert_eq!(back, no_fix);
+    }
+
+    // A successful (final) report: GAD locationEstimate + honest age 0 +
+    // positioningDataList + servingLMFidentification (note lower-case i) +
+    // terminationCause NORMAL_TERMINATION, all round-tripping byte-stable.
+    #[test]
+    fn test_event_notify_data_ext_fix_and_final_termination() {
+        let fix = EventNotifyDataExt {
+            event_notify_data: EventNotifyData {
+                reported_event_type: reported_event_type::PERIODIC_EVENT.to_string(),
+                ldr_reference: "bb02".to_string(),
+                supi: Some("imsi-001010000000043".to_string()),
+                location_estimate: Some(to_gad(
+                    37.5,
+                    -122.3,
+                    30.0,
+                    95,
+                    gad_shape::POINT_UNCERTAINTY_CIRCLE,
+                )),
+                age_of_location_estimate: Some(0),
+                positioning_data_list: Some(vec![PositioningMethodAndUsage {
+                    method: positioning_method::NR_ECID.to_string(),
+                    mode: "CONVENTIONAL".to_string(),
+                    usage: "SUCCESS_RESULTS_USED_TO_GENERATE_LOCATION".to_string(),
+                }]),
+                serving_lmf_identification: Some("lmf-1".to_string()),
+                termination_cause: Some(termination_cause::NORMAL_TERMINATION.to_string()),
+                ..Default::default()
+            },
+            add_event_notify_datas: None,
+        };
+        let v = serde_json::to_value(&fix).unwrap();
+        assert_eq!(v["reportedEventType"], "PERIODIC_EVENT");
+        assert_eq!(v["ldrReference"], "bb02");
+        assert_eq!(v["locationEstimate"]["shape"], "POINT_UNCERTAINTY_CIRCLE");
+        assert_eq!(v["locationEstimate"]["point"]["lat"], 37.5);
+        assert_eq!(v["ageOfLocationEstimate"], 0);
+        assert_eq!(v["positioningDataList"][0]["method"], "NR_ECID");
+        // yaml:1625 spells this `servingLMFidentification` (lower-case i).
+        assert_eq!(v["servingLMFidentification"], "lmf-1");
+        assert_eq!(v["terminationCause"], "NORMAL_TERMINATION");
+        let back: EventNotifyDataExt = serde_json::from_value(v).unwrap();
+        assert_eq!(back, fix);
+    }
+
+    // AddEventNotifyDatas flattens into the same object (TS 29.572 yaml:1580).
+    #[test]
+    fn test_event_notify_data_ext_add_datas_flattened() {
+        let ext = EventNotifyDataExt {
+            event_notify_data: EventNotifyData {
+                reported_event_type: reported_event_type::PERIODIC_EVENT.to_string(),
+                ldr_reference: "cc03".to_string(),
+                ..Default::default()
+            },
+            add_event_notify_datas: Some(vec![EventNotifyData {
+                reported_event_type: reported_event_type::INTERMEDIATE_EVENT.to_string(),
+                ldr_reference: "cc03".to_string(),
+                ..Default::default()
+            }]),
+        };
+        let v = serde_json::to_value(&ext).unwrap();
+        assert_eq!(v["reportedEventType"], "PERIODIC_EVENT");
+        assert_eq!(v["addEventNotifyDatas"][0]["reportedEventType"], "INTERMEDIATE_EVENT");
     }
 }

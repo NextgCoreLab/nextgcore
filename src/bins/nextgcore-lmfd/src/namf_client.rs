@@ -292,10 +292,15 @@ pub async fn discover_amf(preferred_amf_id: Option<&str>) -> Option<DiscoveredAm
 /// Bounded-timeout SBI client for a discovered AMF (connect 2s, request 3s —
 /// strictly inside the DetermineLocation wait budget).
 fn client_for(amf: &DiscoveredAmf) -> SbiClient {
-    SbiClient::new(
-        SbiClientConfig::new(amf.host.clone(), amf.port)
-            .with_connect_timeout(Duration::from_secs(2))
-            .with_request_timeout(Duration::from_secs(3)),
+    // Attach an NRF-issued Bearer token when OAuth2 enforcement is on (Wave-6
+    // H8 Phase A); no-op otherwise so the matched-sim default path is unchanged.
+    crate::attach_oauth2(
+        SbiClient::new(
+            SbiClientConfig::new(amf.host.clone(), amf.port)
+                .with_connect_timeout(Duration::from_secs(2))
+                .with_request_timeout(Duration::from_secs(3)),
+        ),
+        nextgcore_sbi::types::NfType::Amf,
     )
 }
 
