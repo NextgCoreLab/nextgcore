@@ -54,7 +54,45 @@ struct SbiOauth2Yaml {
     /// nrfd-05: require the token endpoint to authenticate the requesting NF
     /// via a Client-Credentials-Assertion (CCA) bound to the body
     /// nfInstanceId. Default OFF (non-TLS dev / matched sim still function).
+    ///
+    /// I2 semantics extension: when this is ON, client authentication is
+    /// satisfied by EITHER a bound CCA (existing path) OR a transport-
+    /// authenticated mTLS client identity bound to the body `nfInstanceId`
+    /// (see `require_client_cert_binding`). A request carrying NEITHER is
+    /// rejected (`invalid_client`).
     require_client_auth: Option<bool>,
+    /// I2 (TS 33.501 §13.3.1 / §13.4.1): mandate transport-layer (mTLS)
+    /// authentication of the token requester. When ON, the token request MUST
+    /// carry a mutually-authenticated TLS client identity whose NF Instance ID
+    /// — carried in the certificate URI SubjectAltName (TS 33.310) and conveyed
+    /// by the trusted TLS-terminating SBI ingress/SCP in the
+    /// `x-forwarded-client-cert` header (Envoy XFCC; RFC 9440 trust model) —
+    /// matches the request `nfInstanceId`. Default OFF so non-TLS dev, the
+    /// matched simulator, and deployments where the NRF terminates TLS directly
+    /// but does not yet surface the verified peer certificate all still
+    /// function. The mismatch check itself always runs when an identity is
+    /// present, independent of this flag (fail-closed on a forged binding).
+    require_client_cert_binding: Option<bool>,
+    /// I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA's ES256 JWS
+    /// signature (not just the claim binding). Default OFF so the matched
+    /// simulator — which today signs CCAs with a placeholder — is not locked
+    /// out; the flip to `true` is a manual host gate, taken only once every NF
+    /// signs its CCA with a real key registered under `cca_trusted_keys`.
+    cca_verify_signature: Option<bool>,
+    /// I1: the trusted per-NF ES256 public keys the NRF verifies CCA signatures
+    /// against, keyed by the signing NF's `nfInstanceId`. Each entry carries an
+    /// RFC 7517 EC/P-256 JWK. When signature verification is ON and an issuer
+    /// has no trusted key here, its CCA is rejected (fail-closed).
+    cca_trusted_keys: Option<Vec<CcaTrustedKeyYaml>>,
+}
+
+/// I1: one entry of the CCA trusted-key store. `jwk` is an RFC 7517 EC JWK
+/// (`kty=EC, crv=P-256, x, y`) parsed by [`nextgcore_sbi::oauth::parse_es256_jwk`].
+#[derive(Debug, Default, Deserialize)]
+struct CcaTrustedKeyYaml {
+    #[serde(rename = "nfInstanceId")]
+    nf_instance_id: String,
+    jwk: serde_json::Value,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -124,8 +162,18 @@ struct NrfPolicy {
     disc_max_page_size: usize,
     /// nrfd-06: enforce OAuth2 on own nnrf-nfm/nnrf-disc endpoints.
     require_oauth2_server: bool,
-    /// nrfd-05: enforce CCA client authentication at the token endpoint.
+    /// nrfd-05: enforce CCA (or, per I2, mTLS) client authentication at the
+    /// token endpoint.
     require_client_auth: bool,
+    /// I2 (TS 33.501 §13.3.1/§13.4.1): mandate a transport-authenticated (mTLS)
+    /// client identity bound to the request `nfInstanceId`.
+    require_client_cert_binding: bool,
+    /// I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA ES256 JWS
+    /// signature (not just the claim binding). Default OFF.
+    cca_verify_signature: bool,
+    /// I1: `nfInstanceId` -> trusted ES256 verifying key used to check the CCA
+    /// signature. Populated from `nrf.sbi.oauth2.cca_trusted_keys`.
+    cca_trusted_keys: std::collections::HashMap<String, p256::ecdsa::VerifyingKey>,
 }
 
 impl Default for NrfPolicy {
@@ -139,6 +187,9 @@ impl Default for NrfPolicy {
             disc_max_page_size: NRF_DISC_MAX_PAGE_SIZE,
             require_oauth2_server: false,
             require_client_auth: false,
+            require_client_cert_binding: false,
+            cca_verify_signature: false,
+            cca_trusted_keys: std::collections::HashMap::new(),
         }
     }
 }
@@ -173,8 +224,51 @@ impl NrfPolicy {
         if let Some(o) = nrf.sbi.as_ref().and_then(|s| s.oauth2.as_ref()) {
             p.require_oauth2_server = o.require_server.unwrap_or(false);
             p.require_client_auth = o.require_client_auth.unwrap_or(false);
+            // I2 (TS 33.501 §13.3.1/§13.4.1): mTLS client-cert binding.
+            p.require_client_cert_binding = o.require_client_cert_binding.unwrap_or(false);
+            // I1 (TS 33.501 §13.3.8.3): CCA ES256 JWS signature verification.
+            p.cca_verify_signature = o.cca_verify_signature.unwrap_or(false);
+            if let Some(keys) = o.cca_trusted_keys.as_ref() {
+                for entry in keys {
+                    match nextgcore_sbi::oauth::parse_es256_jwk(&entry.jwk) {
+                        Ok(key) => {
+                            p.cca_trusted_keys.insert(entry.nf_instance_id.clone(), key);
+                        }
+                        // A malformed key is dropped (not fatal): the issuer
+                        // then has no trusted key and its CCA is rejected at
+                        // runtime when verification is ON — i.e. fail-closed.
+                        Err(e) => log::warn!(
+                            "nrfd-I1: ignoring malformed CCA trusted key for nfInstanceId {:?}: {e}",
+                            entry.nf_instance_id
+                        ),
+                    }
+                }
+            }
         }
         p
+    }
+
+    /// I2: runtime overrides for the client-authentication knobs so the manual
+    /// host-gate flip can be A/B-tested in docker WITHOUT a code edit (mirrors
+    /// the H9 NAS-security canary runtime-knob pattern). Each env var forces the
+    /// corresponding knob ON only; a knob already `true` (from yaml) is never
+    /// turned back off here, and an absent/other env value leaves it unchanged —
+    /// so the default-safe (OFF) matched-sim path is untouched unless a host
+    /// operator explicitly opts in. `NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH` and
+    /// `NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING` accept `1`/`true`.
+    fn apply_env_overrides(&mut self) {
+        let forced_on = |key: &str| {
+            matches!(
+                std::env::var(key).ok().as_deref().map(str::trim),
+                Some("1") | Some("true") | Some("TRUE")
+            )
+        };
+        if forced_on("NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH") {
+            self.require_client_auth = true;
+        }
+        if forced_on("NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING") {
+            self.require_client_cert_binding = true;
+        }
     }
 }
 
@@ -469,6 +563,9 @@ async fn main() -> Result<()> {
     } else {
         log::debug!("Configuration file not found: {}", args.config);
     }
+    // I2: apply the env-var runtime overrides (default-safe: forces ON only) so
+    // the manual host-gate flip is A/B-testable in docker without a code edit.
+    policy.apply_env_overrides();
     if policy.require_oauth2_server {
         log::warn!(
             "nrfd-06: server-side OAuth2 enforcement ENABLED on nnrf-nfm/nnrf-disc \
@@ -476,7 +573,19 @@ async fn main() -> Result<()> {
         );
     }
     if policy.require_client_auth {
-        log::warn!("nrfd-05: token-endpoint CCA client authentication ENABLED");
+        log::warn!("nrfd-05: token-endpoint client authentication ENABLED (CCA or mTLS)");
+    }
+    if policy.require_client_cert_binding {
+        log::warn!(
+            "nrfd-I2: token-endpoint mTLS client-certificate binding REQUIRED \
+             (x-forwarded-client-cert URI SAN must match nfInstanceId)"
+        );
+    }
+    if policy.cca_verify_signature {
+        log::warn!(
+            "nrfd-I1: CCA ES256 JWS signature verification ENABLED ({} trusted key(s))",
+            policy.cca_trusted_keys.len()
+        );
     }
     NRF_POLICY.set(policy).ok();
 
@@ -1704,15 +1813,15 @@ fn authorize_access_token(
 /// expired, that the `iat` timestamp is present and not in the future, and that
 /// the `aud` claim matches the NRF's own NF type ("NRF").
 ///
-/// FLAGGED — the CCA's ES256 SIGNATURE is still not cryptographically verified
-/// here: the NRF does not hold the requesting NF's public key/cert in this crate,
-/// and the mutual-TLS client-certificate subject is not surfaced on `SbiRequest`
-/// by the shared `nextgcore-sbi` transport. Full binding additionally requires
-/// (a) a `SbiRequest::client_identity()` accessor exposing the TLS client-cert
-/// subject and (b) NF public-key distribution — both additive `nextgcore-sbi`
-/// work outside this crate. This function performs the claim-binding plus the
-/// iat/aud validation mandated of the NRF by §13.3.8.3; signature verification
-/// remains deferred.
+/// This function performs the claim-binding plus the iat/aud validation mandated
+/// of the NRF by §13.3.8.3. The CCA's ES256 JWS SIGNATURE is verified by the
+/// companion [`verify_cca_signature`] (I1): the token handler calls it, when the
+/// `cca_verify_signature` policy knob is ON, against the requesting NF's trusted
+/// public key from the `cca_trusted_keys` store. Signature verification is
+/// default-OFF and fail-closed (an issuer with no trusted key, or a bad
+/// signature, is rejected). NF trusted-key distribution beyond this config-store
+/// (e.g. an x5c cert chain or an mTLS client-cert subject surfaced on
+/// `SbiRequest`) remains an additive `nextgcore-sbi` extension.
 fn verify_cca_binding(
     cca_jwt: &str,
     expected_nf_instance_id: &str,
@@ -1797,6 +1906,221 @@ fn verify_cca_binding(
         return Err((
             "invalid_client",
             "Client Credentials Assertion audience does not match the NRF's NF type".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// I1 (TS 33.501 §13.3.8.3): cryptographically verify a CCA's ES256 JWS
+/// signature against the requesting NF's trusted public `key`.
+///
+/// The JWS signing input is the ASCII `base64url(header) "." base64url(payload)`
+/// (RFC 7515 §5.2); the JOSE header `alg` MUST be `ES256` — `none` and every
+/// other algorithm are rejected so a forged unsigned/downgraded assertion cannot
+/// pass (the classic JWS algorithm-substitution hole). ES256 signatures are the
+/// fixed 64-byte `r||s` form (RFC 7518 §3.4). Returns `invalid_client` on any
+/// failure so the caller emits a fail-closed AccessTokenErr.
+fn verify_cca_signature(
+    cca_jwt: &str,
+    key: &p256::ecdsa::VerifyingKey,
+) -> Result<(), (&'static str, String)> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use p256::ecdsa::signature::Verifier;
+
+    let parts: Vec<&str> = cca_jwt.split('.').collect();
+    if parts.len() != 3 {
+        return Err((
+            "invalid_client",
+            "Client Credentials Assertion is not a well-formed JWT".to_string(),
+        ));
+    }
+    // JOSE header: the algorithm MUST be ES256 (TS 33.501 §13.3.8.2).
+    let header = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .ok_or((
+            "invalid_client",
+            "Client Credentials Assertion header is not valid base64url JSON".to_string(),
+        ))?;
+    if header.get("alg").and_then(|v| v.as_str()) != Some("ES256") {
+        return Err((
+            "invalid_client",
+            "Client Credentials Assertion alg is not ES256".to_string(),
+        ));
+    }
+    let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).map_err(|_| {
+        (
+            "invalid_client",
+            "Client Credentials Assertion signature is not valid base64url".to_string(),
+        )
+    })?;
+    let signature = p256::ecdsa::Signature::from_slice(&sig_bytes).map_err(|_| {
+        (
+            "invalid_client",
+            "Client Credentials Assertion has a malformed ES256 signature".to_string(),
+        )
+    })?;
+    // Verify over the exact base64url header.payload as received (do NOT
+    // re-encode the decoded parts — canonicalisation would change the bytes).
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    key.verify(signing_input.as_bytes(), &signature).map_err(|_| {
+        (
+            "invalid_client",
+            "Client Credentials Assertion signature verification failed".to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+/// The HTTP header a trusted TLS-terminating SBI ingress / SCP uses to convey
+/// the verified client certificate to the upstream NF (Envoy `x-forwarded-
+/// client-cert`, the de-facto SBA service-mesh standard; same trust model as
+/// RFC 9440 `Client-Cert`). It MUST be set only by the trusted terminator and
+/// stripped from any client-supplied copy at the trust boundary.
+const XFCC_HEADER: &str = "x-forwarded-client-cert";
+
+/// Parse the URI SubjectAltName from the FIRST cert entry of an Envoy XFCC
+/// header value. The header is a comma-separated list of cert entries (the leaf
+/// / immediate peer first); each entry is a `;`-separated list of `Key=Value`
+/// pairs whose value may be double-quoted (and a quoted value may itself
+/// contain `,` or `;`). Splitting is quote-aware on purpose: a naive split
+/// would let an attacker smuggle a fake `URI=` inside a quoted `Subject` DN.
+/// Returns the (unquoted) `URI=` value of the leaf entry, or None when absent.
+fn parse_xfcc_first_entry_uri(header: &str) -> Option<String> {
+    // 1) Take the first cert entry (up to the first UNQUOTED comma).
+    let mut in_quotes = false;
+    let mut entry_end = header.len();
+    for (i, c) in header.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                entry_end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let entry = &header[..entry_end];
+
+    // 2) Split the entry into `Key=Value` pairs on UNQUOTED semicolons.
+    let mut pairs: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    in_quotes = false;
+    for (i, c) in entry.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => {
+                pairs.push(&entry[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    pairs.push(&entry[start..]);
+
+    // 3) Find the URI element (case-insensitive key) and unquote its value.
+    for pair in pairs {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("uri") {
+                let v = v.trim();
+                let v = v
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(v);
+                if v.is_empty() {
+                    return None;
+                }
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// I2 (TS 33.501 §13.3.1/§13.4.1, TS 33.310, TS 29.510 §6.1.6.2): extract the
+/// transport-authenticated client NF Instance ID from the request. A 3GPP NF
+/// certificate carries the NF Instance ID as a URI SubjectAltName (commonly the
+/// URN `urn:uuid:<nfInstanceId>`); a trusted TLS-terminating SBI ingress/SCP
+/// conveys that verified SAN to the NRF in the XFCC header. Returns the bare NF
+/// Instance ID, or None when no transport identity is present.
+///
+/// NOTE: this consumes an identity a TRUSTED terminator already verified at the
+/// TLS layer; it does not itself validate the certificate chain. When the NRF
+/// terminates TLS directly (no SCP), surfacing the rustls-verified peer
+/// certificate's SAN into this header (or onto `SbiRequest`) is an additive
+/// `nextgcore-sbi` server-glue extension outside this component's boundary.
+fn extract_transport_client_nf_instance_id(request: &SbiRequest) -> Option<String> {
+    let xfcc = request.http.get_header(XFCC_HEADER)?;
+    let uri = parse_xfcc_first_entry_uri(xfcc)?;
+    // Strip the `urn:uuid:` scheme+NID (case-insensitive) when present; other
+    // URI SAN forms bind on the exact value. `get(..9)` keeps the slice on a
+    // char boundary (the value is attacker-influenced).
+    let id = match uri.get(..9) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("urn:uuid:") => &uri[9..],
+        _ => uri.as_str(),
+    };
+    let id = id.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+/// I2: verify the transport-authenticated (mTLS) client NF Instance ID is bound
+/// to the token request's `nfInstanceId`. A mismatch is `invalid_client`
+/// (TS 33.501 §13.4.1: the authenticated consumer identity must equal the NF
+/// Instance ID asserted in the request). Combined with [`verify_cca_binding`]
+/// (which binds `cca.sub == nfInstanceId`), this transitively binds the mTLS
+/// certificate identity to the CCA — closing the "no mTLS/CCA binding" gap.
+fn verify_transport_binding(
+    cert_nf_instance_id: &str,
+    expected_nf_instance_id: &str,
+) -> Result<(), (&'static str, String)> {
+    if cert_nf_instance_id != expected_nf_instance_id {
+        return Err((
+            "invalid_client",
+            format!(
+                "mTLS client-certificate NF Instance ID {cert_nf_instance_id:?} does not match \
+                 request nfInstanceId {expected_nf_instance_id:?}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// I2: decide whether the token request satisfies the configured client-
+/// authentication policy, given whether a (already-binding-validated) CCA and a
+/// (already-binding-validated) mTLS transport identity are present.
+///
+/// - `require_client_auth` (nrfd-05 + I2): authentication is satisfied by a
+///   bound CCA OR a bound mTLS identity; a request with NEITHER is rejected.
+/// - `require_client_cert_binding` (I2): the request MUST additionally carry a
+///   bound mTLS transport identity (mandate transport-layer authentication).
+///
+/// Both knobs default OFF (`NrfPolicy::default`), so with no config/env the
+/// function always returns `Ok(())` and the matched-sim path is unchanged.
+fn enforce_client_authentication(
+    policy: &NrfPolicy,
+    has_cca: bool,
+    has_transport_identity: bool,
+) -> Result<(), (&'static str, String)> {
+    if policy.require_client_cert_binding && !has_transport_identity {
+        return Err((
+            "invalid_client",
+            "mTLS client-certificate authentication required \
+             (nrf.sbi.oauth2.require_client_cert_binding)"
+                .to_string(),
+        ));
+    }
+    if policy.require_client_auth && !has_cca && !has_transport_identity {
+        return Err((
+            "invalid_client",
+            "client authentication required: present a Client Credentials Assertion or an \
+             mTLS client certificate (nrf.sbi.oauth2.require_client_auth)"
+                .to_string(),
         ));
     }
     Ok(())
@@ -1985,19 +2309,58 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
         .expect("value expected")
         .as_secs();
 
-    // nrfd-05: when CCA client authentication is enforced, the request must
-    // carry a Client Credentials Assertion bound to the body nfInstanceId
-    // (the cryptographic signature / mTLS cert-subject binding is FLAGGED —
-    // see verify_cca_binding). A present CCA is always validated for binding.
-    if nrf_policy().require_client_auth && req.cca.is_empty() {
-        return token_error(
-            "invalid_client",
-            "Client Credentials Assertion required (nrf.sbi.oauth2.require_client_auth)",
-        );
+    let policy = nrf_policy();
+
+    // I2 (TS 33.501 §13.3.1/§13.4.1): extract the transport-authenticated (mTLS)
+    // client NF Instance ID conveyed by the trusted TLS terminator, and — when
+    // one is present — ALWAYS verify it is bound to the request nfInstanceId.
+    // The mismatch rejection is unconditional (like the CCA binding below): a
+    // forged transport identity is refused regardless of the policy flags.
+    let transport_nf_id = extract_transport_client_nf_instance_id(request);
+    if let Some(ref cert_id) = transport_nf_id {
+        if let Err((code, desc)) = verify_transport_binding(cert_id, &nf_instance_id) {
+            return token_error(code, &desc);
+        }
     }
+
+    // nrfd-05 + I2: enforce the client-authentication policy. Authentication is
+    // satisfied by a bound CCA OR a bound mTLS transport identity; the
+    // require_client_cert_binding knob additionally mandates the mTLS identity.
+    // Both knobs default OFF so the matched-sim path is unchanged.
+    if let Err((code, desc)) =
+        enforce_client_authentication(policy, !req.cca.is_empty(), transport_nf_id.is_some())
+    {
+        return token_error(code, &desc);
+    }
+
+    // A present CCA is always validated for binding (TS 29.510 §6.7.5).
     if !req.cca.is_empty() {
         if let Err((code, desc)) = verify_cca_binding(&req.cca, &nf_instance_id, now) {
             return token_error(code, &desc);
+        }
+        // I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA's ES256
+        // JWS signature against the requesting NF's trusted public key. This is
+        // fail-closed and default-OFF (cca_verify_signature): when enabled, an
+        // issuer with no configured trusted key is rejected, so a forged CCA —
+        // which today passes the claim-binding checks with any placeholder
+        // signature — can no longer be accepted.
+        if policy.cca_verify_signature {
+            match policy.cca_trusted_keys.get(&nf_instance_id) {
+                Some(key) => {
+                    if let Err((code, desc)) = verify_cca_signature(&req.cca, key) {
+                        return token_error(code, &desc);
+                    }
+                }
+                None => {
+                    return token_error(
+                        "invalid_client",
+                        &format!(
+                            "no trusted ES256 key configured to verify the CCA signature of \
+                             nfInstanceId {nf_instance_id:?}"
+                        ),
+                    );
+                }
+            }
         }
     }
 
@@ -3259,6 +3622,337 @@ mod tests {
             now
         )
         .is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // I1: CCA ES256 JWS signature verification (TS 33.501 §13.3.8.3)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_nrfd_i1_verify_cca_signature() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        // Deterministic P-256 signer (fixed scalar, well below the group order).
+        let sk = SigningKey::from_slice(&[0x11u8; 32]).expect("valid P-256 scalar");
+        let vk = sk.verifying_key().to_owned();
+
+        // Produce a real ES256 JWS over base64url(header).base64url(payload).
+        let sign = |header_json: &[u8], payload_json: &[u8]| -> String {
+            let h = URL_SAFE_NO_PAD.encode(header_json);
+            let p = URL_SAFE_NO_PAD.encode(payload_json);
+            let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+            format!("{h}.{p}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+        };
+
+        let header = br#"{"alg":"ES256","typ":"JWT"}"#;
+        let payload = br#"{"sub":"nf-1","iss":"nf-1","aud":"NRF","iat":1000000}"#;
+
+        // A correctly-signed CCA verifies against the matching public key.
+        let cca = sign(header, payload);
+        assert!(verify_cca_signature(&cca, &vk).is_ok());
+
+        let parts: Vec<&str> = cca.split('.').collect();
+
+        // Tampered payload (forged claims, original signature) -> rejected: this
+        // is exactly the forged-CCA the audit flagged as accepted.
+        let forged_payload =
+            URL_SAFE_NO_PAD.encode(br#"{"sub":"attacker","iss":"attacker","aud":"NRF","iat":1000000}"#);
+        let forged = format!("{}.{}.{}", parts[0], forged_payload, parts[2]);
+        assert_eq!(
+            verify_cca_signature(&forged, &vk).unwrap_err().0,
+            "invalid_client"
+        );
+
+        // Valid signature but WRONG (untrusted) key -> rejected.
+        let other = SigningKey::from_slice(&[0x22u8; 32]).unwrap();
+        assert_eq!(
+            verify_cca_signature(&cca, other.verifying_key())
+                .unwrap_err()
+                .0,
+            "invalid_client"
+        );
+
+        // alg=none downgrade -> rejected before any crypto (algorithm-substitution).
+        let none_header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let none_jwt = format!("{}.{}.{}", none_header, parts[1], parts[2]);
+        assert_eq!(
+            verify_cca_signature(&none_jwt, &vk).unwrap_err().0,
+            "invalid_client"
+        );
+
+        // Malformed signature bytes (wrong length) -> rejected.
+        let bad_sig = format!(
+            "{}.{}.{}",
+            parts[0],
+            parts[1],
+            URL_SAFE_NO_PAD.encode(b"short")
+        );
+        assert_eq!(
+            verify_cca_signature(&bad_sig, &vk).unwrap_err().0,
+            "invalid_client"
+        );
+
+        // Not a well-formed 3-part JWT -> rejected.
+        assert_eq!(
+            verify_cca_signature("a.b", &vk).unwrap_err().0,
+            "invalid_client"
+        );
+    }
+
+    #[test]
+    fn test_nrfd_i1_from_yaml_cca_signature_config() {
+        // RFC 7515 Appendix A.3.1 P-256 public key — a valid EC/P-256 JWK.
+        let yaml_str = "nrf:\n  sbi:\n    oauth2:\n      cca_verify_signature: true\n      \
+             cca_trusted_keys:\n        - nfInstanceId: nf-1\n          jwk:\n            \
+             kty: EC\n            crv: P-256\n            \
+             x: f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\n            \
+             y: x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\n";
+        let yaml: NrfYaml = serde_yaml::from_str(yaml_str).expect("parse yaml");
+        let policy = NrfPolicy::from_yaml(&yaml);
+        assert!(policy.cca_verify_signature);
+        assert!(policy.cca_trusted_keys.contains_key("nf-1"));
+
+        // A malformed JWK entry is dropped, not fatal — the issuer then has no
+        // trusted key and its CCA is rejected at runtime (fail-closed).
+        let bad = "nrf:\n  sbi:\n    oauth2:\n      cca_verify_signature: true\n      \
+             cca_trusted_keys:\n        - nfInstanceId: nf-2\n          jwk:\n            \
+             kty: EC\n            crv: P-256\n            x: not-valid\n            y: not-valid\n";
+        let yaml2: NrfYaml = serde_yaml::from_str(bad).expect("parse yaml");
+        let policy2 = NrfPolicy::from_yaml(&yaml2);
+        assert!(policy2.cca_verify_signature);
+        assert!(!policy2.cca_trusted_keys.contains_key("nf-2"));
+
+        // Defaults: signature verification OFF, empty trust store.
+        let def = NrfPolicy::default();
+        assert!(!def.cca_verify_signature);
+        assert!(def.cca_trusted_keys.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // I2: token-requester transport auth (mTLS/CCA binding) — TS 33.501
+    // §13.3.1/§13.4.1, TS 33.310 (NF Instance ID in cert URI SAN),
+    // Envoy XFCC / RFC 9440 conveyance trust model.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_nrfd_i2_xfcc_uri_extraction() {
+        // Leaf entry URI SAN, urn:uuid stripped to the bare NF Instance ID.
+        assert_eq!(
+            parse_xfcc_first_entry_uri(
+                r#"By=spiffe://c/ns/5gc/sa/nrf;Hash=abcd;Subject="CN=SMF,O=Op";URI=urn:uuid:smf-1"#
+            )
+            .as_deref(),
+            Some("urn:uuid:smf-1")
+        );
+
+        // Quote-awareness (security): a fake `;URI=` smuggled INSIDE a quoted
+        // Subject DN must NOT be treated as a separate URI element — the only
+        // real URI element wins.
+        assert_eq!(
+            parse_xfcc_first_entry_uri(
+                r#"Subject="CN=evil;URI=urn:uuid:victim";URI=urn:uuid:real"#
+            )
+            .as_deref(),
+            Some("urn:uuid:real")
+        );
+        // A quoted Subject carrying only a fake URI (no genuine URI element)
+        // yields nothing — the smuggled value is never surfaced.
+        assert_eq!(
+            parse_xfcc_first_entry_uri(r#"Subject="CN=evil;URI=urn:uuid:victim""#),
+            None
+        );
+        // A quoted value containing a comma does not prematurely end the entry.
+        assert_eq!(
+            parse_xfcc_first_entry_uri(r#"Subject="O=Foo, Inc";URI=urn:uuid:abc"#).as_deref(),
+            Some("urn:uuid:abc")
+        );
+        // Multiple cert entries: the FIRST (leaf) entry's URI is chosen.
+        assert_eq!(
+            parse_xfcc_first_entry_uri("URI=urn:uuid:leaf,By=x;URI=urn:uuid:intermediate")
+                .as_deref(),
+            Some("urn:uuid:leaf")
+        );
+        // No URI element at all.
+        assert_eq!(parse_xfcc_first_entry_uri("Hash=abcd;Subject=\"CN=x\""), None);
+
+        // Full extraction: urn:uuid: prefix (case-insensitive) is stripped.
+        let mut req = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+        req.http
+            .set_header("x-forwarded-client-cert", "Hash=ab;URI=URN:UUID:amf-9");
+        assert_eq!(
+            extract_transport_client_nf_instance_id(&req).as_deref(),
+            Some("amf-9")
+        );
+        // A non-URN URI SAN binds on the exact value.
+        let mut req2 = SbiRequest::post("/x");
+        req2.http
+            .set_header("x-forwarded-client-cert", "URI=https://amf.example/nf/amf-9");
+        assert_eq!(
+            extract_transport_client_nf_instance_id(&req2).as_deref(),
+            Some("https://amf.example/nf/amf-9")
+        );
+        // No XFCC header -> no transport identity.
+        let bare = SbiRequest::post("/x");
+        assert!(extract_transport_client_nf_instance_id(&bare).is_none());
+    }
+
+    #[test]
+    fn test_nrfd_i2_verify_transport_binding() {
+        // Matching cert identity and request nfInstanceId -> Ok.
+        assert!(verify_transport_binding("nf-1", "nf-1").is_ok());
+        // Mismatch -> invalid_client (a cert for nf-A cannot mint tokens for nf-B).
+        assert_eq!(
+            verify_transport_binding("nf-A", "nf-B").unwrap_err().0,
+            "invalid_client"
+        );
+    }
+
+    #[test]
+    fn test_nrfd_i2_enforce_client_authentication() {
+        // Defaults OFF: no authentication required regardless of what's present.
+        let def = NrfPolicy::default();
+        assert!(enforce_client_authentication(&def, false, false).is_ok());
+        assert!(enforce_client_authentication(&def, true, false).is_ok());
+
+        // require_client_auth ON: satisfied by a CCA OR an mTLS identity;
+        // neither present -> invalid_client.
+        let auth = NrfPolicy {
+            require_client_auth: true,
+            ..NrfPolicy::default()
+        };
+        assert!(enforce_client_authentication(&auth, true, false).is_ok());
+        assert!(enforce_client_authentication(&auth, false, true).is_ok());
+        assert_eq!(
+            enforce_client_authentication(&auth, false, false)
+                .unwrap_err()
+                .0,
+            "invalid_client"
+        );
+
+        // require_client_cert_binding ON: an mTLS identity is MANDATORY — a CCA
+        // alone does not satisfy it.
+        let mtls = NrfPolicy {
+            require_client_cert_binding: true,
+            ..NrfPolicy::default()
+        };
+        assert!(enforce_client_authentication(&mtls, false, true).is_ok());
+        assert_eq!(
+            enforce_client_authentication(&mtls, true, false)
+                .unwrap_err()
+                .0,
+            "invalid_client"
+        );
+    }
+
+    #[test]
+    fn test_nrfd_i2_from_yaml_and_env_overrides() {
+        // yaml knobs fold into the policy.
+        let yaml: NrfYaml = serde_yaml::from_str(
+            "nrf:\n  sbi:\n    oauth2:\n      require_client_auth: true\n      \
+             require_client_cert_binding: true\n",
+        )
+        .expect("parse yaml");
+        let policy = NrfPolicy::from_yaml(&yaml);
+        assert!(policy.require_client_auth);
+        assert!(policy.require_client_cert_binding);
+
+        // Defaults are OFF (default-safe / matched-sim untouched).
+        let def = NrfPolicy::default();
+        assert!(!def.require_client_auth);
+        assert!(!def.require_client_cert_binding);
+
+        // Env override forces a default-OFF knob ON without a code edit; an
+        // absent/other value leaves it unchanged. Serialized because it mutates
+        // process env.
+        let mut p = NrfPolicy::default();
+        std::env::set_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING", "1");
+        p.apply_env_overrides();
+        assert!(p.require_client_cert_binding);
+        assert!(!p.require_client_auth, "unset knob stays OFF");
+        std::env::remove_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING");
+
+        // An env override never turns a yaml-ON knob back off.
+        let mut on = NrfPolicy {
+            require_client_auth: true,
+            ..NrfPolicy::default()
+        };
+        std::env::set_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH", "0");
+        on.apply_env_overrides();
+        assert!(on.require_client_auth);
+        std::env::remove_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH");
+    }
+
+    /// Strict-peer (real handler) test of the mTLS/CCA binding at the live token
+    /// endpoint. The transport-binding mismatch check runs unconditionally (no
+    /// flag needed): a forged XFCC identity is rejected even under the default
+    /// (OFF) policy — the falsifiable core of I2.
+    #[tokio::test]
+    async fn test_nrfd_i2_token_endpoint_mtls_binding() {
+        use serde_json::json;
+        let mgr = nf_manager();
+        let consumer_id = "nrfdi2-consumer";
+        let producer_id = "nrfdi2-producer";
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": consumer_id, "nfType": "NRFDI2C", "nfStatus": "REGISTERED",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": producer_id, "nfType": "NRFDI2P", "nfStatus": "REGISTERED",
+                "nfServices": [{"serviceInstanceId": "s0", "serviceName": "nrfdi2-svc"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let token_req = |xfcc: Option<&str>| {
+            let mut r = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+            r.http.set_content(
+                json!({
+                    "grant_type": "client_credentials", "nfInstanceId": consumer_id,
+                    "nfType": "NRFDI2C", "targetNfType": "NRFDI2P", "scope": "nrfdi2-svc"
+                })
+                .to_string(),
+            );
+            if let Some(x) = xfcc {
+                r.http.set_header("x-forwarded-client-cert", x);
+            }
+            r
+        };
+
+        // (a) A forged/mismatched mTLS identity is rejected with invalid_client
+        // even though require_client_auth defaults OFF.
+        let resp = handle_access_token_request(&token_req(Some(
+            "Hash=ab;URI=urn:uuid:some-other-nf",
+        )))
+        .await;
+        assert_eq!(resp.status, 400, "mismatched cert must be rejected");
+        let err: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(err["error"], "invalid_client");
+
+        // (b) A matching mTLS identity binds cleanly -> token issued (200).
+        let resp = handle_access_token_request(&token_req(Some(&format!(
+            "Hash=ab;URI=urn:uuid:{consumer_id}"
+        ))))
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "bound cert must pass: {:?}",
+            resp.http.content
+        );
+
+        // (c) No mTLS identity, default policy -> unchanged behaviour (200).
+        let resp = handle_access_token_request(&token_req(None)).await;
+        assert_eq!(resp.status, 200, "default path unchanged");
+
+        mgr.deregister(consumer_id).ok();
+        mgr.deregister(producer_id).ok();
     }
 
     // -----------------------------------------------------------------
