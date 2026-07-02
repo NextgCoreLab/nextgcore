@@ -2128,7 +2128,12 @@ mod tests {
     /// Single test function: it owns the process-wide UDM_SBI_ADDR/PORT env
     /// fallback and the global AUSF context.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_http_auth_flows_5g_aka_and_eap_aka_prime() {
+        // Serialize on ausfd's global-context/env guard: re-inits the process-
+        // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
+        // other ausfd test doing the same under parallel `cargo test`.
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
         tokio::time::timeout(Duration::from_secs(60), async {
@@ -2488,7 +2493,12 @@ mod tests {
     /// - {"resStar": null}               → 200 AUTHENTICATION_FAILURE  (ausfd-03 null path)
     /// - {"resStar": "zz"}               → 400                         (ausfd-03 bad-hex path)
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_confirmation_response_shaping() {
+        // Serialize on ausfd's global-context/env guard: re-inits the process-
+        // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
+        // other ausfd test doing the same under parallel `cargo test`.
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
 
@@ -2728,7 +2738,12 @@ mod tests {
     // ausfd-08: DELETE cleans up the context (204), second DELETE -> 404
     // ====================================================================
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_auth_context_delete_lifecycle() {
+        // Serialize on ausfd's global-context/env guard: re-inits the process-
+        // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
+        // other ausfd test doing the same under parallel `cargo test`.
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         let _lock = TEST_MUTEX.lock().await;
         ausf_context_init(128);
 
@@ -2771,7 +2786,12 @@ mod tests {
     // handle_auth_context_delete (auth → delete ctx → anchor still there).
     // ====================================================================
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_sor_upu_anchor_survives_auth_context_delete() {
+        // Serialize on ausfd's global-context/env guard: re-inits the process-
+        // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
+        // other ausfd test doing the same under parallel `cargo test`.
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
 
@@ -2886,7 +2906,12 @@ mod tests {
     // ausfd-05: serving-network-name entitlement vs consumer token PLMN
     // ====================================================================
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_snn_entitlement_against_consumer_token() {
+        // Serialize on ausfd's global-context/env guard: re-inits the process-
+        // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
+        // other ausfd test doing the same under parallel `cargo test`.
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
 
@@ -3027,7 +3052,12 @@ mod tests {
     /// KAUSF and HAND-DERIVED wire bytes (TS 24.501 §9.11.3.51 /
     /// §9.11.3.53A), so a corrupted steering-list encoder fails this test.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_sor_upu_protection_http_end_to_end() {
+        // Serialize on ausfd's global-context/env guard: re-inits the process-
+        // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
+        // other ausfd test doing the same under parallel `cargo test`.
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
 
