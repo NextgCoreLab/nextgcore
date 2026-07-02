@@ -306,7 +306,12 @@ pub async fn run() -> Result<()> {
     // Register with NRF and start heartbeat worker
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+            // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+            // (BSF bindings vs configured capacity; TS 29.510 §5.2.2.3.2).
+            nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
+                let load = crate::context::get_sess_load();
+                load.clamp(0, 100) as u8
+            });
         }
         Ok(_) => {}
         Err(e) => {
