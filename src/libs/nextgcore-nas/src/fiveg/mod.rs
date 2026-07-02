@@ -7,6 +7,7 @@ pub mod header;
 pub mod ie;
 pub mod message;
 pub mod types;
+pub mod ue_policy;
 
 pub use header::*;
 pub use ie::*;
