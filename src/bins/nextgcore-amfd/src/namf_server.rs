@@ -1,8 +1,9 @@
 //! Namf HTTP/2 SBI server resources (TS 29.518)
 //!
 //! Server-side implementation of the AMF's own SBI services:
-//! - Namf_Communication (§6.1): N1N2MessageTransfer, UEContextTransfer,
-//!   RegistrationStatusUpdate
+//! - Namf_Communication (§6.1): N1N2MessageTransfer,
+//!   N1N2MessageSubscribe/UnSubscribe (§5.2.2.6/§5.2.2.7 — the per-UE uplink
+//!   notify-callback registry), UEContextTransfer, RegistrationStatusUpdate
 //! - Namf_EventExposure (§6.2): Subscribe / Unsubscribe / Modify with real
 //!   HTTP POST notification delivery to the subscribed notify URI
 //! - Namf_MT (§6.3): EnableUeReachability, ProvideDomainSelectionInfo
@@ -17,8 +18,9 @@ use nextgcore_sbi::server::{send_error, send_method_not_allowed, send_not_found}
 use serde_json::{json, Value};
 
 use crate::context::{
-    amf_self, AmfSess, AmfUe, EventSubscription, NrCgi, PendingPositioningDl, PlmnId,
-    PositioningDlKind, RanUe, Tai5gs, UeContextTransferState, NEXTGCORE_INVALID_POOL_ID,
+    amf_self, AmfSess, AmfUe, EventSubscription, LcsCorrelationRecord, NrCgi,
+    PendingPositioningDl, PlmnId, PositioningDlKind, RanUe, Tai5gs, UeContextTransferState,
+    UeN1N2InfoSubscription, NEXTGCORE_INVALID_POOL_ID,
 };
 use crate::namf_handler::{
     self, N1N2MessageTransferCause, N1N2MessageTransferReqData, N2InfoContainer, NgapIeType,
@@ -74,18 +76,28 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
 
         // --------------------------------------------------------------
         // Namf_Communication (TS 29.518 §6.1)
-        //   POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages
-        //   POST /namf-comm/v1/ue-contexts/{ueContextId}/transfer
-        //   POST /namf-comm/v1/ue-contexts/{ueContextId}/transfer-update
+        //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages
+        //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions
+        //   DELETE /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions/{subscriptionId}
+        //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/transfer
+        //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/transfer-update
         // --------------------------------------------------------------
         "namf-comm" if parts[2] == "ue-contexts" && parts.len() >= 5 => {
             let ue_context_id = parts[3];
-            match (method, parts[4]) {
-                ("POST", "n1-n2-messages") => {
+            match (method, parts[4], parts.len()) {
+                ("POST", "n1-n2-messages", 5) => {
                     handle_n1_n2_message_transfer_request(ue_context_id, &request)
                 }
-                ("POST", "transfer") => handle_ue_context_transfer(ue_context_id, &request),
-                ("POST", "transfer-update") => {
+                // N1N2MessageSubscribe (TS 29.518 §5.2.2.6)
+                ("POST", "n1-n2-messages", 6) if parts[5] == "subscriptions" => {
+                    handle_n1n2_subscription_create(ue_context_id, &request)
+                }
+                // N1N2MessageUnSubscribe (TS 29.518 §5.2.2.7)
+                ("DELETE", "n1-n2-messages", 7) if parts[5] == "subscriptions" => {
+                    handle_n1n2_subscription_delete(ue_context_id, parts[6])
+                }
+                ("POST", "transfer", 5) => handle_ue_context_transfer(ue_context_id, &request),
+                ("POST", "transfer-update", 5) => {
                     handle_registration_status_update(ue_context_id, &request)
                 }
                 _ => send_method_not_allowed(method, path),
@@ -971,6 +983,24 @@ fn try_positioning_relay(
         return Some(ue_not_reachable_error(ue_context_id, None));
     }
 
+    // Fallback correlation record (TS 29.518 N1N2MessageTransferReqData
+    // lcsCorrelationId / servingLMFIdentification, yaml:2771-2774): capture
+    // the originating LMF onto the UE context so the uplink leg can route a
+    // UE/gNB reply back even without an explicit N1N2 subscription
+    // (last-writer-wins).
+    if let Some(corr) = body.get("lcsCorrelationId").and_then(Value::as_str) {
+        let record = LcsCorrelationRecord {
+            lcs_correlation_id: corr.to_string(),
+            serving_lmf_identification: body
+                .get("servingLMFIdentification")
+                .and_then(Value::as_str)
+                .map(String::from),
+        };
+        if let Ok(context) = amf_self().read() {
+            context.lcs_correlation_set(ue_context_id, record);
+        }
+    }
+
     let mut downlinks: Vec<PendingPositioningDl> = Vec::new();
 
     // LPP → UE (N1, DL NAS Transport, payload container type LPP).
@@ -1244,6 +1274,145 @@ fn handle_n1_n2_message_transfer_request(ue_context_id: &str, request: &SbiReque
             "Internal Server Error",
             &format!("N1N2 transfer failed: {e:?}"),
             None,
+        ),
+    }
+}
+
+// ============================================================================
+// Namf_Communication — N1N2MessageSubscribe / UnSubscribe
+// (TS 29.518 §5.2.2.6/§5.2.2.7; TS 23.273 §6.11 — the LMF registers here for
+// uplink LPP/NRPPa delivery)
+// ============================================================================
+
+/// POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions —
+/// Namf_Communication_N1N2MessageSubscribe (TS 29.518 §5.2.2.6,
+/// UeN1N2InfoSubscriptionCreateData). Stores the consumer's per-UE uplink
+/// notify callbacks and returns 201 with a Location header of the form
+/// {apiRoot}/namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions/{subscriptionId}
+/// and a UeN1N2InfoSubscriptionCreatedData body ({n1n2NotifySubscriptionId}).
+///
+/// Fail-closed validation: at least one complete (class, callback URI) pair —
+/// (n1MessageClass AND n1NotifyCallbackUri) or (n2InformationClass AND
+/// n2NotifyCallbackUri) — must be present; a class without its callback URI
+/// (or vice versa) is rejected 400 MANDATORY_IE_MISSING, never silently
+/// accepted. Classes LPP/NRPPa are the consumers wired today; other classes
+/// are stored opaquely (producers do exact-class lookups, so a class that was
+/// never stored is never notified).
+fn handle_n1n2_subscription_create(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+    // The subscription targets an individual UE context (TS 29.518 §6.1.3.5)
+    if find_ue_by_context_id(ue_context_id).is_none() {
+        return context_not_found(ue_context_id);
+    }
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+
+    let n1_message_class = body.get("n1MessageClass").and_then(Value::as_str);
+    let n1_notify_callback_uri = body.get("n1NotifyCallbackUri").and_then(Value::as_str);
+    let n2_information_class = body.get("n2InformationClass").and_then(Value::as_str);
+    let n2_notify_callback_uri = body.get("n2NotifyCallbackUri").and_then(Value::as_str);
+
+    // Reject half-pairs: a class with no callback URI is unusable and a
+    // callback URI with no class would notify a class we never stored.
+    if n1_message_class.is_some() && n1_notify_callback_uri.is_none() {
+        return mandatory_ie_missing("n1NotifyCallbackUri");
+    }
+    if n1_notify_callback_uri.is_some() && n1_message_class.is_none() {
+        return mandatory_ie_missing("n1MessageClass");
+    }
+    if n2_information_class.is_some() && n2_notify_callback_uri.is_none() {
+        return mandatory_ie_missing("n2NotifyCallbackUri");
+    }
+    if n2_notify_callback_uri.is_some() && n2_information_class.is_none() {
+        return mandatory_ie_missing("n2InformationClass");
+    }
+    // At least one complete pair must be present
+    if n1_message_class.is_none() && n2_information_class.is_none() {
+        return mandatory_ie_missing(
+            "(n1MessageClass, n1NotifyCallbackUri) or (n2InformationClass, n2NotifyCallbackUri)",
+        );
+    }
+    // Callback URIs must be resolvable HTTP URIs (we must be able to POST
+    // N1MessageNotify / N2InfoNotify to them)
+    if let Some(uri) = n1_notify_callback_uri {
+        if parse_http_uri(uri).is_none() {
+            return mandatory_ie_incorrect("n1NotifyCallbackUri", "not a valid HTTP URI");
+        }
+    }
+    if let Some(uri) = n2_notify_callback_uri {
+        if parse_http_uri(uri).is_none() {
+            return mandatory_ie_incorrect("n2NotifyCallbackUri", "not a valid HTTP URI");
+        }
+    }
+
+    let subscription_id = format!("n1n2sub-{}", uuid::Uuid::new_v4());
+    let sub = UeN1N2InfoSubscription {
+        subscription_id: subscription_id.clone(),
+        n1_message_class: n1_message_class.map(String::from),
+        n1_notify_callback_uri: n1_notify_callback_uri.map(String::from),
+        n2_information_class: n2_information_class.map(String::from),
+        n2_notify_callback_uri: n2_notify_callback_uri.map(String::from),
+        lcs_correlation_id: body
+            .get("lcsCorrelationId")
+            .and_then(Value::as_str)
+            .map(String::from),
+    };
+
+    let added = {
+        let ctx = amf_self();
+        let Ok(guard) = ctx.read() else {
+            return send_error(500, "Internal Server Error", "context lock poisoned", None);
+        };
+        guard.n1n2_subscription_add(ue_context_id, sub)
+    };
+    if !added {
+        return send_error(
+            500,
+            "Internal Server Error",
+            "subscription ID collision",
+            None,
+        );
+    }
+
+    log::info!(
+        "[{ue_context_id}] N1N2 subscription created: id={subscription_id}, \
+         n1Class={n1_message_class:?}, n2Class={n2_information_class:?}"
+    );
+
+    // UeN1N2InfoSubscriptionCreatedData (n1n2NotifySubscriptionId mandatory)
+    let response_body = json!({ "n1n2NotifySubscriptionId": subscription_id });
+    let location = format!(
+        "/namf-comm/v1/ue-contexts/{ue_context_id}/n1-n2-messages/subscriptions/{subscription_id}"
+    );
+    match SbiResponse::with_status(201).with_json_body(&response_body) {
+        Ok(resp) => resp.with_header("location", location),
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
+/// DELETE /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions/{subscriptionId}
+/// — Namf_Communication_N1N2MessageUnSubscribe (TS 29.518 §5.2.2.7).
+/// 204 on success, 404 CONTEXT_NOT_FOUND when the subscription does not exist.
+fn handle_n1n2_subscription_delete(ue_context_id: &str, subscription_id: &str) -> SbiResponse {
+    let ctx = amf_self();
+    let removed = {
+        let Ok(guard) = ctx.read() else {
+            return send_error(500, "Internal Server Error", "context lock poisoned", None);
+        };
+        guard.n1n2_subscription_remove(ue_context_id, subscription_id)
+    };
+    match removed {
+        Some(_) => {
+            log::info!("[{ue_context_id}] N1N2 subscription removed: {subscription_id}");
+            SbiResponse::no_content()
+        }
+        None => send_error(
+            404,
+            "Not Found",
+            &format!(
+                "N1N2 subscription '{subscription_id}' not found for UE '{ue_context_id}'"
+            ),
+            Some("CONTEXT_NOT_FOUND"),
         ),
     }
 }
@@ -2145,6 +2314,267 @@ mod tests {
         assert_eq!(
             body_json(&resp)["cause"].as_str(),
             Some("N1_N2_TRANSFER_INITIATED")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Namf_Communication — N1N2MessageSubscribe / UnSubscribe
+    // (TS 29.518 §5.2.2.6/§5.2.2.7)
+    // ------------------------------------------------------------------
+
+    /// UeN1N2InfoSubscriptionCreateData shaped per
+    /// TS29518_Namf_Communication.yaml:2609-2626 (all fields)
+    fn n1n2_subscription_body(port_tag: &str) -> Value {
+        json!({
+            "n1MessageClass": "LPP",
+            "n1NotifyCallbackUri": format!("http://127.0.0.1:7777/nlmf-loc/v1/notify/n1/{port_tag}"),
+            "n2InformationClass": "NRPPa",
+            "n2NotifyCallbackUri": format!("http://127.0.0.1:7777/nlmf-loc/v1/notify/n2/{port_tag}"),
+            "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            "supportedFeatures": "0",
+        })
+    }
+
+    fn n1n2_subscription_request(ue_context_id: &str, body: &Value) -> SbiRequest {
+        SbiRequest::post(format!(
+            "/namf-comm/v1/ue-contexts/{ue_context_id}/n1-n2-messages/subscriptions"
+        ))
+        .with_json_body(body)
+        .expect("json")
+    }
+
+    /// Create -> 201 with the yaml:1503 Location structure +
+    /// UeN1N2InfoSubscriptionCreatedData; the store serves class-keyed
+    /// lookups; DELETE -> 204; second DELETE -> 404.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_subscription_create_201_location_delete_204() {
+        let supi = "imsi-001010000060070";
+        setup_ue(supi, true, true);
+
+        let body = n1n2_subscription_body("a");
+        let resp = namf_request_handler(n1n2_subscription_request(supi, &body)).await;
+        assert_eq!(resp.status, 201);
+
+        // UeN1N2InfoSubscriptionCreatedData: n1n2NotifySubscriptionId required
+        let created = body_json(&resp);
+        let sub_id = created["n1n2NotifySubscriptionId"]
+            .as_str()
+            .expect("n1n2NotifySubscriptionId missing")
+            .to_string();
+        assert!(!sub_id.is_empty());
+
+        // Location header structure per yaml:1503:
+        // {apiRoot}/namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions/{subscriptionId}
+        let location = resp
+            .http
+            .get_header("location")
+            .expect("Location header missing")
+            .to_string();
+        assert_eq!(
+            location,
+            format!(
+                "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{sub_id}"
+            )
+        );
+
+        // The registry serves class-keyed lookups with the stored URIs
+        let ctx = amf_self();
+        {
+            let guard = ctx.read().expect("ctx lock");
+            let n1 = guard
+                .n1n2_subscription_find_n1(supi, "LPP")
+                .expect("LPP subscription not stored");
+            assert_eq!(
+                n1.n1_notify_callback_uri.as_deref(),
+                body["n1NotifyCallbackUri"].as_str()
+            );
+            let n2 = guard
+                .n1n2_subscription_find_n2(supi, "NRPPa")
+                .expect("NRPPa subscription not stored");
+            assert_eq!(
+                n2.n2_notify_callback_uri.as_deref(),
+                body["n2NotifyCallbackUri"].as_str()
+            );
+            // Fail-closed: a class we never stored is never returned
+            assert!(guard.n1n2_subscription_find_n1(supi, "SMS").is_none());
+        }
+
+        // UnSubscribe: 204, then 404 CONTEXT_NOT_FOUND
+        let del = SbiRequest::delete(format!(
+            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{sub_id}"
+        ));
+        let resp = namf_request_handler(del).await;
+        assert_eq!(resp.status, 204);
+
+        let del = SbiRequest::delete(format!(
+            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{sub_id}"
+        ));
+        let resp = namf_request_handler(del).await;
+        assert_eq!(resp.status, 404);
+        assert_eq!(problem_cause(&resp), "CONTEXT_NOT_FOUND");
+    }
+
+    /// Fail-closed mandatory-IE validation: a body without at least one
+    /// complete (class, callback URI) pair is rejected 400
+    /// MANDATORY_IE_MISSING — never silently accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_subscription_missing_pair_400() {
+        let supi = "imsi-001010000060071";
+        setup_ue(supi, true, true);
+
+        // Only n1MessageClass (no callback URI) — the acceptance case
+        let resp = namf_request_handler(n1n2_subscription_request(
+            supi,
+            &json!({ "n1MessageClass": "LPP" }),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+
+        // Only n1NotifyCallbackUri (no class)
+        let resp = namf_request_handler(n1n2_subscription_request(
+            supi,
+            &json!({ "n1NotifyCallbackUri": "http://127.0.0.1:7777/cb" }),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+
+        // Empty body: no pair at all
+        let resp = namf_request_handler(n1n2_subscription_request(supi, &json!({}))).await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+
+        // Complete N1 pair but a dangling n2InformationClass half-pair
+        let resp = namf_request_handler(n1n2_subscription_request(
+            supi,
+            &json!({
+                "n1MessageClass": "LPP",
+                "n1NotifyCallbackUri": "http://127.0.0.1:7777/cb",
+                "n2InformationClass": "NRPPa",
+            }),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+
+        // Malformed callback URI
+        let resp = namf_request_handler(n1n2_subscription_request(
+            supi,
+            &json!({
+                "n1MessageClass": "LPP",
+                "n1NotifyCallbackUri": "not-a-uri",
+            }),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_INCORRECT");
+
+        // Malformed body never panics
+        let mut req = SbiRequest::post(format!(
+            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions"
+        ));
+        req.http.set_content("{{{{");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 400);
+
+        // Nothing was stored by any of the rejected requests
+        let ctx = amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        assert_eq!(guard.n1n2_subscription_count(supi), 0);
+    }
+
+    /// Unknown ueContextId -> 404 CONTEXT_NOT_FOUND
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_subscription_unknown_ue_404() {
+        amf_context_init(64, 1024, 4096);
+        let resp = namf_request_handler(n1n2_subscription_request(
+            "imsi-999999999999999",
+            &n1n2_subscription_body("b"),
+        ))
+        .await;
+        assert_eq!(resp.status, 404);
+        assert_eq!(problem_cause(&resp), "CONTEXT_NOT_FOUND");
+    }
+
+    /// Two subscriptions on one UE coexist and are independently addressable
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_subscription_two_coexist() {
+        let supi = "imsi-001010000060042";
+        setup_ue(supi, true, true);
+
+        let resp1 = namf_request_handler(n1n2_subscription_request(
+            supi,
+            &json!({
+                "n1MessageClass": "LPP",
+                "n1NotifyCallbackUri": "http://127.0.0.1:7777/notify/n1",
+            }),
+        ))
+        .await;
+        assert_eq!(resp1.status, 201);
+        let resp2 = namf_request_handler(n1n2_subscription_request(
+            supi,
+            &json!({
+                "n2InformationClass": "NRPPa",
+                "n2NotifyCallbackUri": "http://127.0.0.1:7777/notify/n2",
+            }),
+        ))
+        .await;
+        assert_eq!(resp2.status, 201);
+
+        let ctx = amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        assert_eq!(guard.n1n2_subscription_count(supi), 2);
+        assert_eq!(
+            guard
+                .n1n2_subscription_find_n1(supi, "LPP")
+                .and_then(|s| s.n1_notify_callback_uri),
+            Some("http://127.0.0.1:7777/notify/n1".to_string())
+        );
+        assert_eq!(
+            guard
+                .n1n2_subscription_find_n2(supi, "NRPPa")
+                .and_then(|s| s.n2_notify_callback_uri),
+            Some("http://127.0.0.1:7777/notify/n2".to_string())
+        );
+    }
+
+    /// A positioning N1N2MessageTransfer carrying lcsCorrelationId /
+    /// servingLMFIdentification records the fallback correlation on the UE
+    /// context (TS 29.518 N1N2MessageTransferReqData, yaml:2771-2774).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_lpp_transfer_captures_lcs_correlation() {
+        let supi = "imsi-001010000060043";
+        setup_ue(supi, true, true);
+
+        let body = json!({
+            "n1MessageContainer": {
+                "n1MessageClass": "LPP",
+                "n1MessageContent": { "contentId": "lpp-pdu" }
+            },
+            "lcsCorrelationId": "lcs-corr-0001",
+            "servingLMFIdentification": "LMF-0001",
+        });
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "lpp-pdu",
+                "application/vnd.3gpp.lpp",
+                bytes::Bytes::from_static(&[0x90, 0x01, 0x20, 0x09, 0x30]),
+            ));
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+
+        let ctx = amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        let record = guard
+            .lcs_correlation_find(supi)
+            .expect("fallback LCS correlation not captured");
+        assert_eq!(record.lcs_correlation_id, "lcs-corr-0001");
+        assert_eq!(
+            record.serving_lmf_identification.as_deref(),
+            Some("LMF-0001")
         );
     }
 

@@ -478,6 +478,20 @@ pub struct AmfContext {
     /// handler and drained + delivered by the NGAP server task. Empty on the
     /// reg/PDU/ping path — only populated by positioning N1N2 transfers.
     positioning_dl_queue: RwLock<Vec<PendingPositioningDl>>,
+
+    /// Namf_Communication N1N2 message subscriptions (TS 29.518 §5.2.2.6):
+    /// ueContextId -> the consumer-registered uplink notify callbacks
+    /// (n1NotifyCallbackUri / n2NotifyCallbackUri per message class). This is
+    /// the registry the uplink NRPPa/LPP notify producers key off. Empty on
+    /// the reg/PDU/ping path — only populated by N1N2MessageSubscribe.
+    n1n2_subscriptions: RwLock<HashMap<String, Vec<UeN1N2InfoSubscription>>>,
+
+    /// Fallback LCS correlation records (TS 29.518 N1N2MessageTransferReqData
+    /// lcsCorrelationId / servingLMFIdentification): ueContextId -> the most
+    /// recent correlation captured from an incoming positioning
+    /// N1N2MessageTransfer, so the uplink leg can route back to the
+    /// originating LMF even without an explicit subscription.
+    lcs_correlations: RwLock<HashMap<String, LcsCorrelationRecord>>,
 }
 
 /// A positioning payload the LMF asked the AMF to relay downlink (TS 23.273),
@@ -503,6 +517,44 @@ pub enum PositioningDlKind {
     },
     /// LPP message → UE (N1, DL NAS Transport with payload container type LPP).
     LppToUe { lpp_pdu: Vec<u8> },
+}
+
+/// Namf_Communication N1N2 message subscription stored per ueContextId
+/// (TS 29.518 §5.2.2.6 N1N2MessageSubscribe,
+/// UeN1N2InfoSubscriptionCreateData — TS29518_Namf_Communication.yaml:2609).
+/// Registers where the AMF must deliver uplink N1 (e.g. LPP) / N2 (e.g.
+/// NRPPa) payloads for this UE. Classes are stored verbatim; producers do
+/// exact-class lookups so a class that was never stored is never notified
+/// (fail-closed).
+#[derive(Debug, Clone)]
+pub struct UeN1N2InfoSubscription {
+    /// Subscription ID minted by the AMF (returned as
+    /// `n1n2NotifySubscriptionId` and in the Location header)
+    pub subscription_id: String,
+    /// N1 message class filter (`n1MessageClass`, e.g. "LPP")
+    pub n1_message_class: Option<String>,
+    /// Callback URI for N1MessageNotify (`n1NotifyCallbackUri`)
+    pub n1_notify_callback_uri: Option<String>,
+    /// N2 information class filter (`n2InformationClass`, e.g. "NRPPa")
+    pub n2_information_class: Option<String>,
+    /// Callback URI for N2InfoNotify (`n2NotifyCallbackUri`)
+    pub n2_notify_callback_uri: Option<String>,
+    /// LCS correlation identifier supplied by the consumer, echoed back in
+    /// notifications (TS 29.572 CorrelationID)
+    pub lcs_correlation_id: Option<String>,
+}
+
+/// Fallback LCS correlation captured from an incoming
+/// N1N2MessageTransferReqData (`lcsCorrelationId` /
+/// `servingLMFIdentification`, TS29518_Namf_Communication.yaml:2771-2774):
+/// identifies the LMF that originated the latest positioning downlink for a
+/// UE when no explicit N1N2 subscription exists (last-writer-wins).
+#[derive(Debug, Clone)]
+pub struct LcsCorrelationRecord {
+    /// LCS correlation identifier (TS 29.572 CorrelationID, 1..255 chars)
+    pub lcs_correlation_id: String,
+    /// Serving LMF identification (TS 29.572 LMFIdentification)
+    pub serving_lmf_identification: Option<String>,
 }
 
 /// Namf_EventExposure subscription stored in the AMF context
@@ -574,6 +626,8 @@ impl AmfContext {
             paging_map: RwLock::new(HashMap::new()),
             event_subscriptions: RwLock::new(HashMap::new()),
             positioning_dl_queue: RwLock::new(Vec::new()),
+            n1n2_subscriptions: RwLock::new(HashMap::new()),
+            lcs_correlations: RwLock::new(HashMap::new()),
         }
     }
 
@@ -899,12 +953,13 @@ impl AmfContext {
 
     /// Remove an AMF UE by ID
     pub fn amf_ue_remove(&self, id: u64) -> Option<AmfUe> {
-        let mut amf_ue_list = self.amf_ue_list.write().ok()?;
-        let mut suci_hash = self.suci_hash.write().ok()?;
-        let mut supi_hash = self.supi_hash.write().ok()?;
-        let mut guti_ue_hash = self.guti_ue_hash.write().ok()?;
+        let removed = {
+            let mut amf_ue_list = self.amf_ue_list.write().ok()?;
+            let mut suci_hash = self.suci_hash.write().ok()?;
+            let mut supi_hash = self.supi_hash.write().ok()?;
+            let mut guti_ue_hash = self.guti_ue_hash.write().ok()?;
 
-        if let Some(amf_ue) = amf_ue_list.remove(&id) {
+            let amf_ue = amf_ue_list.remove(&id)?;
             if let Some(ref suci) = amf_ue.suci {
                 suci_hash.remove(suci);
             }
@@ -912,14 +967,24 @@ impl AmfContext {
                 supi_hash.remove(supi);
             }
             guti_ue_hash.remove(&amf_ue.current_guti);
+            amf_ue
+        };
 
-            // Remove all sessions for this UE
-            self.sess_remove_all_for_ue(id);
+        // Remove all sessions for this UE (locks taken after the UE guards
+        // above are dropped — never nested)
+        self.sess_remove_all_for_ue(id);
 
-            log::debug!("AMF UE removed (id={id})");
-            return Some(amf_ue);
+        // Drop N1N2 message subscriptions + the fallback LCS correlation for
+        // this UE so the uplink notify registry cannot leak across UE-context
+        // lifetimes (TS 29.518 §5.2.2.6 — subscription lifetime is bound to
+        // the UE context)
+        if let Some(ref supi) = removed.supi {
+            self.n1n2_subscriptions_remove_for_ue(supi);
+            self.lcs_correlation_remove(supi);
         }
-        None
+
+        log::debug!("AMF UE removed (id={id})");
+        Some(removed)
     }
 
     /// Remove all AMF UEs
@@ -939,6 +1004,14 @@ impl AmfContext {
         // Clear sessions
         if let Ok(mut sess_list) = self.sess_list.write() {
             sess_list.clear();
+        }
+
+        // Clear the N1N2 uplink notify registry + LCS correlation fallbacks
+        if let Ok(mut subs) = self.n1n2_subscriptions.write() {
+            subs.clear();
+        }
+        if let Ok(mut corr) = self.lcs_correlations.write() {
+            corr.clear();
         }
     }
 
@@ -1390,6 +1463,146 @@ impl AmfContext {
             .read()
             .map(|m| m.len())
             .unwrap_or(0)
+    }
+
+    // ========================================================================
+    // Namf_Communication N1N2 Message Subscription Management
+    // (TS 29.518 §5.2.2.6/§5.2.2.7 — the uplink notify-callback registry)
+    //
+    // Lock-order rule (nf-context-lock-deadlock sweep): these methods only
+    // ever take the single `n1n2_subscriptions` / `lcs_correlations` lock and
+    // never call into other lock-taking methods while holding it. Finders
+    // clone results out so callers never hold the lock.
+    // ========================================================================
+
+    /// Store an N1N2 message subscription for a UE. Returns false when a
+    /// subscription with the same ID already exists for that UE.
+    pub fn n1n2_subscription_add(&self, ue_context_id: &str, sub: UeN1N2InfoSubscription) -> bool {
+        if let Ok(mut subs) = self.n1n2_subscriptions.write() {
+            let list = subs.entry(ue_context_id.to_string()).or_default();
+            if list
+                .iter()
+                .any(|s| s.subscription_id == sub.subscription_id)
+            {
+                return false;
+            }
+            list.push(sub);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove an N1N2 message subscription by (ueContextId, subscriptionId).
+    /// Returns the removed subscription, or None when it does not exist.
+    pub fn n1n2_subscription_remove(
+        &self,
+        ue_context_id: &str,
+        subscription_id: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        let mut subs = self.n1n2_subscriptions.write().ok()?;
+        let list = subs.get_mut(ue_context_id)?;
+        let idx = list
+            .iter()
+            .position(|s| s.subscription_id == subscription_id)?;
+        let removed = list.remove(idx);
+        if list.is_empty() {
+            subs.remove(ue_context_id);
+        }
+        Some(removed)
+    }
+
+    /// Find an N1N2 message subscription by (ueContextId, subscriptionId)
+    /// (clone-out, lock dropped)
+    pub fn n1n2_subscription_find(
+        &self,
+        ue_context_id: &str,
+        subscription_id: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        self.n1n2_subscriptions.read().ok().and_then(|subs| {
+            subs.get(ue_context_id)?
+                .iter()
+                .find(|s| s.subscription_id == subscription_id)
+                .cloned()
+        })
+    }
+
+    /// Find the subscription registered for an N1 message class on a UE
+    /// (exact-class match, fail-closed: a class that was never stored is
+    /// never returned). When several match, the most recent wins.
+    pub fn n1n2_subscription_find_n1(
+        &self,
+        ue_context_id: &str,
+        n1_message_class: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        self.n1n2_subscriptions.read().ok().and_then(|subs| {
+            subs.get(ue_context_id)?
+                .iter()
+                .rev()
+                .find(|s| {
+                    s.n1_message_class.as_deref() == Some(n1_message_class)
+                        && s.n1_notify_callback_uri.is_some()
+                })
+                .cloned()
+        })
+    }
+
+    /// Find the subscription registered for an N2 information class on a UE
+    /// (exact-class match, fail-closed). When several match, the most recent
+    /// wins.
+    pub fn n1n2_subscription_find_n2(
+        &self,
+        ue_context_id: &str,
+        n2_information_class: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        self.n1n2_subscriptions.read().ok().and_then(|subs| {
+            subs.get(ue_context_id)?
+                .iter()
+                .rev()
+                .find(|s| {
+                    s.n2_information_class.as_deref() == Some(n2_information_class)
+                        && s.n2_notify_callback_uri.is_some()
+                })
+                .cloned()
+        })
+    }
+
+    /// Drop all N1N2 message subscriptions for a UE (UE-context release path)
+    pub fn n1n2_subscriptions_remove_for_ue(&self, ue_context_id: &str) {
+        if let Ok(mut subs) = self.n1n2_subscriptions.write() {
+            subs.remove(ue_context_id);
+        }
+    }
+
+    /// Number of N1N2 message subscriptions stored for a UE
+    pub fn n1n2_subscription_count(&self, ue_context_id: &str) -> usize {
+        self.n1n2_subscriptions
+            .read()
+            .map(|subs| subs.get(ue_context_id).map(Vec::len).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// Record the fallback LCS correlation for a UE (last-writer-wins),
+    /// captured from an incoming positioning N1N2MessageTransferReqData
+    pub fn lcs_correlation_set(&self, ue_context_id: &str, record: LcsCorrelationRecord) {
+        if let Ok(mut corr) = self.lcs_correlations.write() {
+            corr.insert(ue_context_id.to_string(), record);
+        }
+    }
+
+    /// Look up the fallback LCS correlation for a UE (clone-out)
+    pub fn lcs_correlation_find(&self, ue_context_id: &str) -> Option<LcsCorrelationRecord> {
+        self.lcs_correlations
+            .read()
+            .ok()
+            .and_then(|corr| corr.get(ue_context_id).cloned())
+    }
+
+    /// Drop the fallback LCS correlation for a UE (UE-context release path)
+    pub fn lcs_correlation_remove(&self, ue_context_id: &str) {
+        if let Ok(mut corr) = self.lcs_correlations.write() {
+            corr.remove(ue_context_id);
+        }
     }
 
     // ========================================================================
@@ -3067,6 +3280,117 @@ mod tests {
         assert_eq!(drained[1].amf_ue_ngap_id, 9);
         assert!(matches!(drained[1].kind, PositioningDlKind::LppToUe { .. }));
         assert!(ctx.positioning_dl_drain().is_empty());
+    }
+
+    /// Two N1N2 subscriptions on one UE coexist; lookup by (ueContextId,
+    /// class) returns the right callback URI; unknown classes are never
+    /// returned (fail-closed).
+    #[test]
+    fn test_n1n2_subscription_add_find_by_class_remove() {
+        let ctx = AmfContext::new();
+        let supi = "imsi-001010000070001";
+
+        assert!(ctx.n1n2_subscription_add(
+            supi,
+            UeN1N2InfoSubscription {
+                subscription_id: "sub-lpp".to_string(),
+                n1_message_class: Some("LPP".to_string()),
+                n1_notify_callback_uri: Some("http://lmf:7777/nlmf-loc/v1/notify/n1".to_string()),
+                n2_information_class: None,
+                n2_notify_callback_uri: None,
+                lcs_correlation_id: Some("corr-1".to_string()),
+            }
+        ));
+        assert!(ctx.n1n2_subscription_add(
+            supi,
+            UeN1N2InfoSubscription {
+                subscription_id: "sub-nrppa".to_string(),
+                n1_message_class: None,
+                n1_notify_callback_uri: None,
+                n2_information_class: Some("NRPPa".to_string()),
+                n2_notify_callback_uri: Some(
+                    "http://lmf:7777/nlmf-loc/v1/notify/n2".to_string()
+                ),
+                lcs_correlation_id: None,
+            }
+        ));
+        // Duplicate subscription ID on the same UE is rejected
+        assert!(!ctx.n1n2_subscription_add(
+            supi,
+            UeN1N2InfoSubscription {
+                subscription_id: "sub-lpp".to_string(),
+                n1_message_class: Some("LPP".to_string()),
+                n1_notify_callback_uri: Some("http://other/cb".to_string()),
+                n2_information_class: None,
+                n2_notify_callback_uri: None,
+                lcs_correlation_id: None,
+            }
+        ));
+        assert_eq!(ctx.n1n2_subscription_count(supi), 2);
+
+        // Class-keyed lookups return the right callback URI
+        let n1 = ctx.n1n2_subscription_find_n1(supi, "LPP").expect("LPP sub");
+        assert_eq!(
+            n1.n1_notify_callback_uri.as_deref(),
+            Some("http://lmf:7777/nlmf-loc/v1/notify/n1")
+        );
+        assert_eq!(n1.lcs_correlation_id.as_deref(), Some("corr-1"));
+        let n2 = ctx
+            .n1n2_subscription_find_n2(supi, "NRPPa")
+            .expect("NRPPa sub");
+        assert_eq!(
+            n2.n2_notify_callback_uri.as_deref(),
+            Some("http://lmf:7777/nlmf-loc/v1/notify/n2")
+        );
+        // Fail-closed: classes never stored are never returned
+        assert!(ctx.n1n2_subscription_find_n1(supi, "SMS").is_none());
+        assert!(ctx.n1n2_subscription_find_n2(supi, "PWS").is_none());
+        assert!(ctx.n1n2_subscription_find_n1("imsi-unknown", "LPP").is_none());
+
+        // Remove one — the other coexists
+        assert!(ctx.n1n2_subscription_remove(supi, "sub-lpp").is_some());
+        assert!(ctx.n1n2_subscription_remove(supi, "sub-lpp").is_none());
+        assert_eq!(ctx.n1n2_subscription_count(supi), 1);
+        assert!(ctx.n1n2_subscription_find(supi, "sub-nrppa").is_some());
+    }
+
+    /// Subscriptions + the fallback LCS correlation are dropped when the UE
+    /// context is released (no registry leak across UE lifetimes).
+    #[test]
+    fn test_n1n2_subscription_dropped_on_ue_release() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+
+        let supi = "imsi-001010000070002";
+        let gnb = ctx.gnb_add("192.168.0.9:38412").unwrap();
+        let ran_ue = ctx.ran_ue_add(gnb.id, 2001).unwrap();
+        let amf_ue = ctx.amf_ue_add(ran_ue.id).unwrap();
+        ctx.amf_ue_set_supi(amf_ue.id, supi);
+
+        assert!(ctx.n1n2_subscription_add(
+            supi,
+            UeN1N2InfoSubscription {
+                subscription_id: "sub-1".to_string(),
+                n1_message_class: Some("LPP".to_string()),
+                n1_notify_callback_uri: Some("http://lmf:7777/cb".to_string()),
+                n2_information_class: None,
+                n2_notify_callback_uri: None,
+                lcs_correlation_id: None,
+            }
+        ));
+        ctx.lcs_correlation_set(
+            supi,
+            LcsCorrelationRecord {
+                lcs_correlation_id: "corr-42".to_string(),
+                serving_lmf_identification: Some("LMF-1".to_string()),
+            },
+        );
+        assert_eq!(ctx.n1n2_subscription_count(supi), 1);
+        assert!(ctx.lcs_correlation_find(supi).is_some());
+
+        ctx.amf_ue_remove(amf_ue.id);
+        assert_eq!(ctx.n1n2_subscription_count(supi), 0);
+        assert!(ctx.lcs_correlation_find(supi).is_none());
     }
 
     #[test]
