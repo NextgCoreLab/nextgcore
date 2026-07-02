@@ -63,6 +63,14 @@
 //!   taking `ACRParamsInfo` (the consumer PUSHES ACR parameters TO the EES →
 //!   204, merged into the eecId-keyed ACR state); the reversed bespoke lookup
 //!   query is gone (404).
+//! - D5: `eees-acrevents` (TS 24.558 §6.4, `acrevents.rs`) — the ACR events
+//!   subscribe/notify API and conformant T-EAS delivery path. POST
+//!   /subscriptions (201 + Location, spec `ACREventsSubscription`), PUT/PATCH
+//!   (merge-patch)/DELETE on the individual resource (no GET — the yaml defines
+//!   none). Determine → `TARGET_INFORMATION` (trgtInfo.trgetEASInfo = selected
+//!   T-EAS) and Declare/status-update → `ACR_COMPLETE` (acrStatus.tEasEndpoint)
+//!   build spec `ACRInfoNotification`s and hand them to the [`notifier`] seam
+//!   (D5 stub queues; D6 delivers the outbound POST).
 //!
 //! DEFERRED (flagged): eesd-09/10 (UE location/identifier exposure —
 //! NEF-path-blocked), eesd-14 (standalone conformance suite; tests colocated).
@@ -80,21 +88,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod acr;
+mod acrevents;
 mod auth;
 mod context;
 mod ecs_registration;
 mod eec;
+mod notifier;
 mod services;
 mod types;
 
 use acr::{
-    ACRUpdateData, AcrContextError, AcrDecReq, AcrDetermReq, AcrInitReq, AcrStatus, EELACRReq,
-    EELACRResp,
+    ACRUpdateData, AcrContextError, AcrDecReq, AcrDetermReq, AcrInitReq, AcrState, AcrStatus,
+    EELACRReq, EELACRResp,
+};
+use acrevents::{
+    ACRCompleteEventInfo, ACREventsSubscription, ACRInfoNotification, TargetInfo,
 };
 use context::{ees_context_final, ees_context_init, ees_self, UpdateError};
 use eec::EecRegistration;
 use services::{
-    ACInfoSubscription, ACRParamsInfo, AcrMgntEventSubsc, CommonEASInfo, EECContextPush,
+    ACInfoSubscription, ACRParamsInfo, AcrMgntEventsSubscription, CommonEASInfo, EECContextPush,
     EECContextPushRes, SessionContexts,
 };
 use types::{cause, EasDiscoveryReq, EasDiscoveryResp, EasDiscoverySubscription, EasRegistration};
@@ -119,6 +132,10 @@ const APPCLIENTINFO_RESOURCES_PATH: &str = "/eees-appclientinformation/v1/subscr
 
 /// Resource path prefix for ACR Management Event subscription resources (eesd-13).
 const ACRMGNTEVENT_SUBSCRIPTIONS_PATH: &str = "/eees-acrmgntevent/v1/subscriptions";
+
+/// Resource path prefix for ACR events subscription resources
+/// (`eees-acrevents`, TS 24.558 §6.4, D5).
+const ACREVENTS_SUBSCRIPTIONS_PATH: &str = "/eees-acrevents/v1/subscriptions";
 
 /// NextGCore EES - Edge Enabler Server
 #[derive(Parser, Debug)]
@@ -182,6 +199,21 @@ struct Args {
     /// (authorization is mandatory, TS 29.558 §6).
     #[arg(long)]
     oauth2_jwks_file: Option<String>,
+
+    /// Notification callback delivery (D6): maximum attempts per notification
+    /// before the delivery is dropped (bounded retry, TS 29.558 §6).
+    #[arg(long, default_value = "3")]
+    callback_max_attempts: u32,
+
+    /// Notification callback delivery (D6): base backoff between retries, in
+    /// milliseconds. A present `Retry-After` response header takes precedence.
+    #[arg(long, default_value = "1000")]
+    callback_backoff_ms: u64,
+
+    /// Notification callback delivery (D6): per-attempt request timeout, in
+    /// seconds.
+    #[arg(long, default_value = "5")]
+    callback_timeout_secs: u64,
 }
 
 fn init_logging(level: &str) {
@@ -230,6 +262,19 @@ async fn main() -> Result<()> {
     log::info!("Edge Enabler Server (3GPP TS 23.558)");
 
     ees_context_init(args.max_eas);
+
+    // D6: install the real notification callback sender (nextgcore-sbi
+    // SbiClient + bounded retry/backoff honouring Retry-After). Replaces the
+    // D5 queue stub; runs its delivery worker on this tokio runtime. Every
+    // EES callback (ACR events, AC information, EAS-discovery change, ACR
+    // management events) is now POSTed to the subscriber's
+    // notificationDestination instead of logged (TS 29.558 §6 / TS 29.122).
+    notifier::install_sbi_notifier(notifier::SbiNotifierConfig {
+        max_attempts: args.callback_max_attempts,
+        base_backoff: Duration::from_millis(args.callback_backoff_ms),
+        request_timeout: Duration::from_secs(args.callback_timeout_secs),
+        ..Default::default()
+    });
 
     let ees_id = args
         .ees_id
@@ -506,7 +551,11 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
             match method {
                 "GET" => handle_acrmgnt_sub_get(subscription_id).await,
+                // Spec ops on the individual resource: PUT full replace
+                // (AcrMgntEventsSubscription) vs PATCH application/merge-patch+json
+                // (AcrMgntEventsSubscriptionPatch) — distinct semantics.
                 "PUT" => handle_acrmgnt_sub_update(subscription_id, &request).await,
+                "PATCH" => handle_acrmgnt_sub_modify(subscription_id, &request).await,
                 "DELETE" => handle_acrmgnt_sub_delete(subscription_id).await,
                 _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
@@ -539,6 +588,30 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             match method {
                 "POST" => handle_acr_param_send(&request).await,
                 _ => send_method_not_allowed(method, "send-acrparamsinfo"),
+            }
+        }
+        // D5: eees-acrevents (TS 24.558 §6.4) — ACR events subscribe/notify.
+        // The yaml defines POST on the collection (201 + Location + callback
+        // ACRInfoNotification) and PUT/PATCH/DELETE on the individual
+        // subscription. There is NO GET on either resource — do not invent one.
+        ["eees-acrevents", "v1", "subscriptions"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACREVENTS) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_acrevents_create(&request).await,
+                _ => send_method_not_allowed(method, "subscriptions"),
+            }
+        }
+        ["eees-acrevents", "v1", "subscriptions", subscription_id] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACREVENTS) {
+                return resp;
+            }
+            match method {
+                "PUT" => handle_acrevents_update(subscription_id, &request).await,
+                "PATCH" => handle_acrevents_modify(subscription_id, &request).await,
+                "DELETE" => handle_acrevents_delete(subscription_id).await,
+                _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
         }
         _ => send_not_found(&format!("Resource not found: {path}"), None),
@@ -1149,7 +1222,13 @@ async fn handle_acr_determine(request: &SbiRequest) -> SbiResponse {
         .map_err(|_| AcrContextError::Internal)
         .and_then(|c| c.acr_determine(&req))
     {
-        Ok(_state) => SbiResponse::with_status(204),
+        Ok(state) => {
+            // D5: fire TARGET_INFORMATION callbacks to matching acrevents
+            // subscribers (build + enqueue; the 204 below is unchanged — the
+            // T-EAS is delivered ONLY via the notification).
+            emit_acrevents_target_info(&req, &state);
+            SbiResponse::with_status(204)
+        }
         Err(e) => acr_context_error_response(
             e,
             &format!(
@@ -1235,6 +1314,8 @@ async fn handle_acr_declare(request: &SbiRequest) -> SbiResponse {
     let ctx = ees_self();
     let done = ctx.read().map(|c| c.acr_declare(&req)).is_ok();
     if done {
+        // D5: fire ACR_COMPLETE callbacks to matching acrevents subscribers.
+        emit_acrevents_acr_complete(&req);
         SbiResponse::with_status(204)
     } else {
         send_error(
@@ -1353,7 +1434,20 @@ async fn handle_acr_status_update(request: &SbiRequest) -> SbiResponse {
         .unwrap_or(AcrStatus::Initiated);
     let ctx = ees_self();
     if let Ok(c) = ctx.read() {
-        c.acr_status_update(&req.eas_id, status);
+        c.acr_status_update(&req.eas_id, status.clone());
+    }
+    // D5: a status-update reaching COMPLETED fires ACR_COMPLETE to matching
+    // acrevents subscribers. This path carries no eecId/ueId, so easId
+    // membership alone selects (conservative — see `ACREventsSubscription`).
+    if status == AcrStatus::Completed {
+        emit_acrevents(
+            acrevents::EVENT_ACR_COMPLETE,
+            None,
+            None,
+            Some(req.eas_id.as_str()),
+            None,
+            None,
+        );
     }
     SbiResponse::with_status(204)
 }
@@ -1541,42 +1635,274 @@ async fn handle_acinfo_delete(subscription_id: &str) -> SbiResponse {
     }
 }
 
-// ---- eesd-13: eees-acrmgntevent handlers ------------------------------------
+// ---- D5: eees-acrevents handlers (TS 24.558 §6.4) ---------------------------
 
-/// `CreateAcrMgntEventSubsc` (`POST .../eees-acrmgntevent/v1/subscriptions`).
+/// Parse + mandatory-IE-validate an `ACREventsSubscription` body
+/// (TS24558_Eees_ACREvents.yaml:281-320; REQUIRED: `eecId`, `easIds` minItems 1,
+/// `eventIds`, `notificationDestination`). Fail-closed 400
+/// `MANDATORY_IE_MISSING` on any missing/empty required IE. The error response
+/// is boxed (clippy `result_large_err`).
+fn parse_acrevents_subscription(
+    request: &SbiRequest,
+) -> Result<ACREventsSubscription, Box<SbiResponse>> {
+    let value = parse_json_body(request)?;
+    let mut sub: ACREventsSubscription = serde_json::from_value(value).map_err(|e| {
+        Box::new(send_bad_request(
+            &format!(
+                "Missing or invalid mandatory IE (eecId/easIds/eventIds/notificationDestination): {e}"
+            ),
+            Some(cause::MANDATORY_IE_MISSING),
+        ))
+    })?;
+    if sub.eec_id.trim().is_empty()
+        || sub.event_ids.trim().is_empty()
+        || sub.notification_destination.trim().is_empty()
+        || sub.eas_ids.is_empty()
+        || sub.eas_ids.iter().any(|e| e.trim().is_empty())
+    {
+        return Err(Box::new(send_bad_request(
+            "Mandatory IE eecId/easIds/eventIds/notificationDestination missing or empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        )));
+    }
+    // eesd-11: negotiate suppFeat (echoed in the response body).
+    sub.supp_feat = types::negotiate_supp_feat(sub.supp_feat.as_deref());
+    Ok(sub)
+}
+
+/// `CreateACREventsSubscripton` (POST /subscriptions, yaml:29-114).
 ///
-/// Parses `AcrMgntEventSubsc` (mandatory: `notificationUri`), mints a
-/// `subscriptionId`, and returns 201 + `Location` + echoed body.
-async fn handle_acrmgnt_sub_create(request: &SbiRequest) -> SbiResponse {
-    log::info!("ACR management event subscription create");
-    let value = match parse_json_body(request) {
+/// Returns 201 + `Location` (keyed on the server-minted `subscriptionId`) + the
+/// echoed `ACREventsSubscription` body. When `requestTestNotification=true`, an
+/// immediate test `ACRInfoNotification` is enqueued to the subscriber.
+async fn handle_acrevents_create(request: &SbiRequest) -> SbiResponse {
+    log::info!("ACREventsSubscription create");
+    let sub = match parse_acrevents_subscription(request) {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    let ctx = ees_self();
+    let created = ctx
+        .read()
+        .ok()
+        .and_then(|c| c.acrevents_create(sub.clone()));
+    match created {
+        Some(id) => {
+            if sub.request_test_notification == Some(true) {
+                let notif = ACRInfoNotification {
+                    sub_id: id.clone(),
+                    eas_id: sub.eas_ids.first().cloned().unwrap_or_default(),
+                    event_id: sub.event_ids.clone(),
+                    ac_id: None,
+                    trgt_info: None,
+                    acr_status: None,
+                    eec_ctxt_reloc: None,
+                    acr_scenario_list: None,
+                    eas_bundle_info: None,
+                    t_eas_end_point_bundle_list: None,
+                };
+                let value = serde_json::to_value(&notif).unwrap_or_default();
+                notifier::enqueue(
+                    sub.notification_destination.clone(),
+                    value,
+                    "ACRInfoNotification",
+                );
+            }
+            SbiResponse::with_status(201)
+                .with_header("Location", format!("{ACREVENTS_SUBSCRIPTIONS_PATH}/{id}"))
+                .with_json_body(&sub)
+                .unwrap_or_else(|_| SbiResponse::with_status(201))
+        }
+        None => send_error(
+            507,
+            "Insufficient Storage",
+            "Failed to create ACR events subscription (capacity exhausted)",
+            Some(cause::INSUFFICIENT_RESOURCES),
+        ),
+    }
+}
+
+/// `UpdateACREventsSubscription` (PUT full replace, yaml:117-172) → 200.
+async fn handle_acrevents_update(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("ACREventsSubscription replace: {subscription_id}");
+    let sub = match parse_acrevents_subscription(request) {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    let result = ees_self()
+        .read()
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.acrevents_update(subscription_id, sub));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(e) => update_error_response(e, &format!("ACR events subscription {subscription_id}")),
+    }
+}
+
+/// `ModifyACREventsSubscription` (PATCH `application/merge-patch+json`,
+/// yaml:211-267) → 200. RFC 7396 merge restricted to the
+/// `ACREventsSubscriptionPatch` members; `eecId` is preserved.
+async fn handle_acrevents_modify(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("ACREventsSubscription merge-patch: {subscription_id}");
+    let patch = match parse_json_body(request) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let sub: AcrMgntEventSubsc = match serde_json::from_value(value) {
-        Ok(s) => s,
-        Err(e) => {
-            return send_bad_request(
-                &format!("Missing or invalid mandatory IE (notificationUri): {e}"),
-                Some(cause::MANDATORY_IE_MISSING),
-            );
-        }
-    };
-    if sub.notification_uri.trim().is_empty() {
-        return send_bad_request(
-            "Mandatory IE notificationUri is empty",
-            Some(cause::MANDATORY_IE_MISSING),
-        );
+    let result = ees_self()
+        .read()
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.acrevents_modify(subscription_id, &patch));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(e) => update_error_response(e, &format!("ACR events subscription {subscription_id}")),
     }
+}
+
+/// `DeleteACREventsSubscription` (DELETE, yaml:174-209) → 204.
+async fn handle_acrevents_delete(subscription_id: &str) -> SbiResponse {
+    log::info!("ACREventsSubscription delete: {subscription_id}");
+    let removed = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.acrevents_delete(subscription_id));
+    match removed {
+        Some(_) => SbiResponse::with_status(204),
+        None => send_not_found(
+            &format!("ACR events subscription {subscription_id} not found"),
+            Some(cause::SUBSCRIPTION_NOT_FOUND),
+        ),
+    }
+}
+
+// ---- D5: eees-acrevents emission hooks --------------------------------------
+
+/// Core emission: collect the `ACRInfoNotification` callbacks that fire for an
+/// ACR transition, then enqueue each for delivery. The `EesContext` read guard
+/// is released before enqueue (collect-then-enqueue; never hold a lock across
+/// delivery — the NF-context AB-BA rule).
+fn emit_acrevents(
+    event_id: &'static str,
+    eec_id: Option<&str>,
+    ue_id: Option<&str>,
+    eas_id: Option<&str>,
+    trgt_info: Option<TargetInfo>,
+    acr_status: Option<ACRCompleteEventInfo>,
+) {
+    let ctx = ees_self();
+    let notifs = match ctx.read() {
+        Ok(c) => c.acrevents_collect(event_id, eec_id, ue_id, eas_id, trgt_info, acr_status),
+        Err(_) => return,
+    };
+    for (uri, body) in notifs {
+        let value = serde_json::to_value(&body).unwrap_or_default();
+        notifier::enqueue(uri, value, "ACRInfoNotification");
+    }
+}
+
+/// After `Determine` selects a T-EAS: fire `TARGET_INFORMATION` to matching
+/// subscribers, carrying the selected T-EAS as `trgtInfo.trgetEASInfo`.
+fn emit_acrevents_target_info(req: &AcrDetermReq, state: &AcrState) {
+    // Build the T-EAS DiscoveredEas from a short read of the registered pool.
+    let trgt_info = state.t_eas_id.as_deref().and_then(|tid| {
+        let ctx = ees_self();
+        let profile = ctx
+            .read()
+            .ok()
+            .and_then(|c| c.eas_discover(Some(tid), None).into_iter().next());
+        profile.map(|eas| TargetInfo {
+            trget_eas_info: Some(types::DiscoveredEas { eas }),
+            trget_ees_info: None,
+        })
+    });
+    emit_acrevents(
+        acrevents::EVENT_TARGET_INFORMATION,
+        Some(req.requestor_id.as_str()),
+        req.ue_id.as_deref(),
+        req.eas_id.as_deref(),
+        trgt_info,
+        None,
+    );
+}
+
+/// After `Declare` completes: fire `ACR_COMPLETE` to matching subscribers,
+/// carrying `acrStatus{acrRes:true, tEasEndpoint}`.
+fn emit_acrevents_acr_complete(req: &AcrDecReq) {
+    let acr_status = ACRCompleteEventInfo {
+        acr_res: true,
+        t_eas_endpoint: req.t_eas_endpoint.clone(),
+        fail_reason: None,
+    };
+    emit_acrevents(
+        acrevents::EVENT_ACR_COMPLETE,
+        req.requestor_id.as_deref(),
+        Some(req.ue_id.as_str()),
+        Some(req.t_eas_id.as_str()),
+        None,
+        Some(acr_status),
+    );
+}
+
+// ---- D7: eees-acrmgntevent handlers (TS 29.558) -----------------------------
+
+/// Parse + mandatory-IE-validate an `AcrMgntEventsSubscription` body
+/// (TS29558_Eees_ACRManagementEvent.yaml:424-469; REQUIRED: `easId`,
+/// `eventSubscs` minItems 1 each carrying `event`, `notificationDestination`).
+/// Fail-closed 400 `MANDATORY_IE_MISSING` on any missing/empty required IE. The
+/// server-set `self` link is ignored on input. The error response is boxed
+/// (clippy `result_large_err`).
+fn parse_acrmgnt_subscription(
+    request: &SbiRequest,
+) -> Result<AcrMgntEventsSubscription, Box<SbiResponse>> {
+    let value = parse_json_body(request)?;
+    let mut sub: AcrMgntEventsSubscription = serde_json::from_value(value).map_err(|e| {
+        Box::new(send_bad_request(
+            &format!(
+                "Missing or invalid mandatory IE (easId/eventSubscs/notificationDestination): {e}"
+            ),
+            Some(cause::MANDATORY_IE_MISSING),
+        ))
+    })?;
+    if sub.eas_id.trim().is_empty()
+        || sub.notification_destination.trim().is_empty()
+        || sub.event_subscs.is_empty()
+        || sub.event_subscs.iter().any(|e| e.event.trim().is_empty())
+    {
+        return Err(Box::new(send_bad_request(
+            "Mandatory IE easId/eventSubscs(>=1, each with event)/notificationDestination missing or empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        )));
+    }
+    // `self` is server-set; ignore any client-provided value.
+    sub.self_ = None;
+    // eesd-11: negotiate suppFeat (echoed in the response body).
+    sub.supp_feat = types::negotiate_supp_feat(sub.supp_feat.as_deref());
+    Ok(sub)
+}
+
+/// `CreateACRMngEventSubscr` (POST /subscriptions, yaml:29-163).
+///
+/// Parses + validates the spec `AcrMgntEventsSubscription` (REQUIRED: `easId`,
+/// `eventSubscs`, `notificationDestination`), mints a `subscriptionId`, and
+/// returns 201 + `Location` (the resource `self` link) + echoed body.
+async fn handle_acrmgnt_sub_create(request: &SbiRequest) -> SbiResponse {
+    log::info!("ACR management event subscription create");
+    let sub = match parse_acrmgnt_subscription(request) {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
     let ctx = ees_self();
     match ctx.read().ok().and_then(|c| c.acrmgnt_sub_create(sub)) {
         Some(created) => {
-            let id = created.subscription_id.clone().unwrap_or_default();
+            let location = created
+                .self_
+                .clone()
+                .unwrap_or_else(|| ACRMGNTEVENT_SUBSCRIPTIONS_PATH.to_string());
             SbiResponse::with_status(201)
-                .with_header(
-                    "Location",
-                    format!("{ACRMGNTEVENT_SUBSCRIPTIONS_PATH}/{id}"),
-                )
+                .with_header("Location", location)
                 .with_json_body(&created)
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
@@ -1615,31 +1941,42 @@ async fn handle_acrmgnt_sub_get(subscription_id: &str) -> SbiResponse {
     }
 }
 
+/// `UpdateIndACRMngEventSubscr` (PUT full replace, yaml:262-315) → 200.
 async fn handle_acrmgnt_sub_update(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
-    let value = match parse_json_body(request) {
-        Ok(v) => v,
+    let sub = match parse_acrmgnt_subscription(request) {
+        Ok(s) => s,
         Err(resp) => return *resp,
     };
-    let sub: AcrMgntEventSubsc = match serde_json::from_value(value) {
-        Ok(s) => s,
-        Err(e) => {
-            return send_bad_request(
-                &format!("Missing or invalid mandatory IE (notificationUri): {e}"),
-                Some(cause::MANDATORY_IE_MISSING),
-            );
-        }
-    };
-    if sub.notification_uri.trim().is_empty() {
-        return send_bad_request(
-            "Mandatory IE notificationUri is empty",
-            Some(cause::MANDATORY_IE_MISSING),
-        );
-    }
     let ctx = ees_self();
     let result = ctx
         .read()
         .map_err(|_| UpdateError::Internal)
         .and_then(|c| c.acrmgnt_sub_update(subscription_id, sub));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(e) => update_error_response(
+            e,
+            &format!("ACR management event subscription {subscription_id}"),
+        ),
+    }
+}
+
+/// `ModifyIndACRMngEventSubscr` (PATCH `application/merge-patch+json`,
+/// yaml:317-372). Applies an RFC 7396 merge restricted to the
+/// `AcrMgntEventsSubscriptionPatch` members (yaml:521-535) and returns the
+/// merged representation (200); the immutable `easId`/`self` are preserved.
+async fn handle_acrmgnt_sub_modify(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("ACR management event subscription merge-patch: {subscription_id}");
+    let patch = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let result = ees_self()
+        .read()
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.acrmgnt_sub_modify(subscription_id, &patch));
     match result {
         Ok(updated) => SbiResponse::with_status(200)
             .with_json_body(&updated)
@@ -2997,7 +3334,11 @@ mod tests {
         auth::clear_auth_jwks();
     }
 
-    /// eesd-13 eees-acrmgntevent: POST → 201; GET; PUT full-replace; DELETE.
+    /// D7 eees-acrmgntevent (TS 29.558): spec `AcrMgntEventsSubscription`
+    /// POST → 201 + Location; GET collection → 200 array; GET individual → 200;
+    /// PATCH merge-patch swapping `notificationDestination` → 200 (easId
+    /// preserved); PUT full-replace → 200; DELETE → 204/404. The OLD bespoke
+    /// body (`notificationUri` + `acrEvents`) → 400 MANDATORY_IE_MISSING.
     #[test]
     fn test_acrmgnt_subscription_lifecycle() {
         let _g = auth::GLOBAL_STATE_TEST_LOCK
@@ -3007,7 +3348,19 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        let body = r#"{"notificationUri":"http://eec/acr-mgnt/cb","acrEvents":["ACR_COMPLETED"]}"#;
+        // Old bespoke body (notificationUri + acrEvents) is rejected fail-closed.
+        let old = r#"{"notificationUri":"http://eec/cb","acrEvents":["ACR_COMPLETED"]}"#;
+        let req = SbiRequest::post("/eees-acrmgntevent/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrmgntevent"))
+            .with_body(old, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+
+        // Spec body → 201 + Location (the resource self link).
+        let body = concat!(
+            r#"{"easId":"eas1.example.com","#,
+            r#""eventSubscs":[{"event":"UP_PATH_CHG","appGrpId":"grp-1"}],"#,
+            r#""notificationDestination":"http://eec/acr-mgnt/cb"}"#
+        );
         let req = SbiRequest::post("/eees-acrmgntevent/v1/subscriptions")
             .with_header("Authorization", bearer(&sk, "k1", "eees-acrmgntevent"))
             .with_body(body, "application/json");
@@ -3016,27 +3369,56 @@ mod tests {
         let loc = resp.http.get_header("location").cloned().unwrap();
         assert!(loc.starts_with(ACRMGNTEVENT_SUBSCRIPTIONS_PATH));
         let id = loc.rsplit('/').next().unwrap().to_string();
-        let created: AcrMgntEventSubsc =
+        let created: AcrMgntEventsSubscription =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(created.notification_uri, "http://eec/acr-mgnt/cb");
-        assert_eq!(created.subscription_id.as_deref(), Some(id.as_str()));
+        assert_eq!(created.eas_id, "eas1.example.com");
+        assert_eq!(created.event_subscs[0].event, "UP_PATH_CHG");
+        assert_eq!(created.self_.as_deref(), Some(loc.as_str()));
+
+        // GET collection → 200 array (spec HAS GetACRMngEventSubscrs).
+        let req = SbiRequest::get("/eees-acrmgntevent/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrmgntevent"));
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let list: Vec<AcrMgntEventsSubscription> =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(list.len(), 1);
 
         // GET individual → 200.
         let req = SbiRequest::get(format!("/eees-acrmgntevent/v1/subscriptions/{id}"))
             .with_header("Authorization", bearer(&sk, "k1", "eees-acrmgntevent"));
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
 
-        // PUT full-replace → 200 with new notificationUri.
-        let update = r#"{"notificationUri":"http://eec/acr-mgnt/cb2"}"#;
+        // PATCH merge-patch swapping only notificationDestination → 200; easId
+        // preserved, eventSubscs preserved.
+        let patch = r#"{"notificationDestination":"http://eec/acr-mgnt/cb-patched"}"#;
+        let req = SbiRequest::patch(format!("/eees-acrmgntevent/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrmgntevent"))
+            .with_body(patch, "application/merge-patch+json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let patched: AcrMgntEventsSubscription =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(patched.notification_destination, "http://eec/acr-mgnt/cb-patched");
+        assert_eq!(patched.eas_id, "eas1.example.com");
+        assert_eq!(patched.event_subscs[0].event, "UP_PATH_CHG");
+
+        // PUT full-replace → 200 with new eventSubscs.
+        let update = concat!(
+            r#"{"easId":"eas1.example.com","#,
+            r#""eventSubscs":[{"event":"ACR_MONITORING"}],"#,
+            r#""notificationDestination":"http://eec/acr-mgnt/cb2"}"#
+        );
         let req = SbiRequest::put(format!("/eees-acrmgntevent/v1/subscriptions/{id}"))
             .with_header("Authorization", bearer(&sk, "k1", "eees-acrmgntevent"))
             .with_body(update, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 200);
-        let updated: AcrMgntEventSubsc =
+        let updated: AcrMgntEventsSubscription =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(updated.notification_uri, "http://eec/acr-mgnt/cb2");
-        assert_eq!(updated.subscription_id.as_deref(), Some(id.as_str()));
+        assert_eq!(updated.notification_destination, "http://eec/acr-mgnt/cb2");
+        assert_eq!(updated.event_subscs[0].event, "ACR_MONITORING");
+        assert_eq!(updated.self_.as_deref(), Some(loc.as_str()));
 
         // DELETE → 204; second DELETE → 404.
         let req = SbiRequest::delete(format!("/eees-acrmgntevent/v1/subscriptions/{id}"))
@@ -3399,6 +3781,358 @@ mod tests {
             assert_eq!(state.unwrap().status, Some(acr::AcrStatus::Completed));
         }
 
+        auth::clear_auth_jwks();
+    }
+
+    // ---- D5: eees-acrevents (TS 24.558 §6.4) --------------------------------
+
+    /// POST an acrevents subscription; assert 201 + `Location` and return the
+    /// server-minted subscriptionId.
+    fn create_acrevents_ok(sk: &SigningKey, body: &str) -> String {
+        let req = SbiRequest::post("/eees-acrevents/v1/subscriptions")
+            .with_header("Authorization", bearer(sk, "k1", "eees-acrevents"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 201, "acrevents create should be 201");
+        let loc = resp.http.get_header("location").cloned().unwrap();
+        assert!(loc.starts_with(ACREVENTS_SUBSCRIPTIONS_PATH));
+        loc.rsplit('/').next().unwrap().to_string()
+    }
+
+    fn delete_acrevents(sk: &SigningKey, id: &str) {
+        let req = SbiRequest::delete(format!("/eees-acrevents/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(sk, "k1", "eees-acrevents"));
+        let _ = block_on(ees_sbi_request_handler(req));
+    }
+
+    /// D5: POST → 201 + Location; GET (undefined) → 405; PUT full-replace →
+    /// 200; PATCH merge (notificationDestination) → 200 with eecId preserved;
+    /// DELETE → 204; second DELETE → 404.
+    #[test]
+    fn test_acrevents_subscription_crud() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let body = r#"{
+            "eecId":"eec-crud",
+            "easIds":["eas-a.example.com"],
+            "eventIds":"TARGET_INFORMATION",
+            "notificationDestination":"http://eec/acr-cb"
+        }"#;
+        let id = create_acrevents_ok(&sk, body);
+
+        // GET is not defined on the individual resource → 405.
+        let req = SbiRequest::get(format!("/eees-acrevents/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrevents"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 405);
+        // GET is not defined on the collection either → 405.
+        let req = SbiRequest::get("/eees-acrevents/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrevents"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 405);
+
+        // PUT full-replace → 200 (new eventIds + notificationDestination).
+        let replace = r#"{
+            "eecId":"eec-crud",
+            "easIds":["eas-a.example.com","eas-b.example.com"],
+            "eventIds":"ACR_COMPLETE",
+            "notificationDestination":"http://eec/acr-cb2"
+        }"#;
+        let req = SbiRequest::put(format!("/eees-acrevents/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrevents"))
+            .with_body(replace, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let updated: ACREventsSubscription =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(updated.event_ids, "ACR_COMPLETE");
+        assert_eq!(updated.notification_destination, "http://eec/acr-cb2");
+        // The wire body never carries a server id.
+        let wire: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(wire.get("subscriptionId").is_none());
+
+        // PATCH merge changing only notificationDestination → 200; eecId preserved.
+        let patch = r#"{"notificationDestination":"http://eec/acr-cb3"}"#;
+        let req = SbiRequest::patch(format!("/eees-acrevents/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrevents"))
+            .with_body(patch, "application/merge-patch+json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let merged: ACREventsSubscription =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(merged.notification_destination, "http://eec/acr-cb3");
+        assert_eq!(merged.eec_id, "eec-crud");
+        assert_eq!(merged.event_ids, "ACR_COMPLETE");
+
+        // An immutable eecId in a PATCH document is ignored (not patchable).
+        let patch = r#"{"eecId":"attacker","notificationDestination":"http://eec/acr-cb4"}"#;
+        let req = SbiRequest::patch(format!("/eees-acrevents/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrevents"))
+            .with_body(patch, "application/merge-patch+json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let merged: ACREventsSubscription =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(merged.eec_id, "eec-crud", "eecId change ignored by merge");
+
+        // DELETE → 204; second DELETE → 404.
+        let req = SbiRequest::delete(format!("/eees-acrevents/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrevents"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
+        let req = SbiRequest::delete(format!("/eees-acrevents/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrevents"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// D5 fail-closed: each of the 4 required IEs missing → 400
+    /// MANDATORY_IE_MISSING; empty easIds → 400.
+    #[test]
+    fn test_acrevents_create_missing_ie_400() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let bad_bodies = [
+            // missing eecId
+            r#"{"easIds":["e"],"eventIds":"ACR_COMPLETE","notificationDestination":"http://cb"}"#,
+            // missing easIds
+            r#"{"eecId":"eec","eventIds":"ACR_COMPLETE","notificationDestination":"http://cb"}"#,
+            // missing eventIds
+            r#"{"eecId":"eec","easIds":["e"],"notificationDestination":"http://cb"}"#,
+            // missing notificationDestination
+            r#"{"eecId":"eec","easIds":["e"],"eventIds":"ACR_COMPLETE"}"#,
+            // empty easIds array (minItems 1)
+            r#"{"eecId":"eec","easIds":[],"eventIds":"ACR_COMPLETE","notificationDestination":"http://cb"}"#,
+        ];
+        for body in bad_bodies {
+            let req = SbiRequest::post("/eees-acrevents/v1/subscriptions")
+                .with_header("Authorization", bearer(&sk, "k1", "eees-acrevents"))
+                .with_body(body, "application/json");
+            let resp = block_on(ees_sbi_request_handler(req));
+            assert_eq!(resp.status, 400, "must reject: {body}");
+            let pd: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(pd["cause"], "MANDATORY_IE_MISSING");
+        }
+
+        auth::clear_auth_jwks();
+    }
+
+    /// D5: a valid token whose scope is not `eees-acrevents` → 403.
+    #[test]
+    fn test_acrevents_wrong_scope_403() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        let body = r#"{"eecId":"e","easIds":["a"],"eventIds":"ACR_COMPLETE","notificationDestination":"http://cb"}"#;
+        let req = SbiRequest::post("/eees-acrevents/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
+            .with_body(body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 403);
+        auth::clear_auth_jwks();
+    }
+
+    /// D5 strict-peer (in-process, notifier stubbed to the queue per D6-defer):
+    /// after `Determine` selects a T-EAS, EXACTLY ONE `ACRInfoNotification` is
+    /// delivered — eventId TARGET_INFORMATION with a populated
+    /// trgtInfo.trgetEASInfo — while the Determine handler itself still returns
+    /// a bodyless 204 (the T-EAS is delivered ONLY via the notification).
+    #[test]
+    fn test_acrevents_target_information_emission() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        // Isolate the queue from any prior test.
+        let _ = notifier::notifier().drain();
+
+        register_eas(&sk, "d5-s.example.com", "VIDEO");
+        register_eas(&sk, "d5-t.example.com", "VIDEO");
+
+        let sub_body = r#"{
+            "eecId":"eec-d5",
+            "easIds":["d5-s.example.com"],
+            "eventIds":"TARGET_INFORMATION",
+            "notificationDestination":"http://eec-d5/acr-cb",
+            "ueId":"imsi-d5-1"
+        }"#;
+        let id = create_acrevents_ok(&sk, sub_body);
+
+        let det_body = r#"{
+            "requestorId":"eec-d5",
+            "sEasEndpoint":{"fqdn":"d5-s.example.com"},
+            "ueId":"imsi-d5-1",
+            "easId":"d5-s.example.com"
+        }"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(det_body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        // Determine still returns a bodyless 204.
+        assert_eq!(resp.status, 204);
+        assert!(resp.http.content.is_none());
+
+        // Exactly one notification for THIS subscription was delivered.
+        let mine: Vec<notifier::QueuedNotification> = notifier::notifier()
+            .drain()
+            .into_iter()
+            .filter(|q| q.body["subId"] == id)
+            .collect();
+        assert_eq!(mine.len(), 1, "exactly one TARGET_INFORMATION notification");
+        let q = &mine[0];
+        assert_eq!(q.uri, "http://eec-d5/acr-cb");
+        assert_eq!(q.kind, "ACRInfoNotification");
+        // The body deserializes as a spec ACRInfoNotification.
+        let notif: ACRInfoNotification = serde_json::from_value(q.body.clone()).unwrap();
+        assert_eq!(notif.sub_id, id);
+        assert_eq!(notif.eas_id, "d5-s.example.com");
+        assert_eq!(notif.event_id, "TARGET_INFORMATION");
+        // The T-EAS is delivered in trgtInfo.trgetEASInfo (populated, not S-EAS).
+        let t_eas = notif
+            .trgt_info
+            .as_ref()
+            .and_then(|t| t.trget_eas_info.as_ref())
+            .expect("trgtInfo.trgetEASInfo populated");
+        assert!(!t_eas.eas.eas_id.is_empty());
+        assert_ne!(t_eas.eas.eas_id, "d5-s.example.com");
+
+        delete_acrevents(&sk, &id);
+        auth::clear_auth_jwks();
+    }
+
+    /// D5: after `Declare` completes, an `ACR_COMPLETE` notification with
+    /// acrStatus.tEasEndpoint is delivered to a matching subscriber.
+    #[test]
+    fn test_acrevents_acr_complete_emission() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        let _ = notifier::notifier().drain();
+
+        let sub_body = r#"{
+            "eecId":"eec-d5c",
+            "easIds":["d5c-t.example.com"],
+            "eventIds":"ACR_COMPLETE",
+            "notificationDestination":"http://eec-d5c/acr-cb"
+        }"#;
+        let id = create_acrevents_ok(&sk, sub_body);
+
+        // Declare with requestorId == the subscribed eecId so it matches.
+        let decl_body = r#"{
+            "ueId":"imsi-d5c-1",
+            "tEasId":"d5c-t.example.com",
+            "tEasEndpoint":{"fqdn":"d5c-t.edge.example.com"},
+            "requestorId":"eec-d5c"
+        }"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/declare")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(decl_body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
+
+        let mine: Vec<notifier::QueuedNotification> = notifier::notifier()
+            .drain()
+            .into_iter()
+            .filter(|q| q.body["subId"] == id)
+            .collect();
+        assert_eq!(mine.len(), 1, "exactly one ACR_COMPLETE notification");
+        let notif: ACRInfoNotification = serde_json::from_value(mine[0].body.clone()).unwrap();
+        assert_eq!(notif.event_id, "ACR_COMPLETE");
+        assert_eq!(notif.eas_id, "d5c-t.example.com");
+        let status = notif.acr_status.expect("acrStatus present");
+        assert!(status.acr_res);
+        assert_eq!(status.t_eas_endpoint.fqdn.as_deref(), Some("d5c-t.edge.example.com"));
+
+        delete_acrevents(&sk, &id);
+        auth::clear_auth_jwks();
+    }
+
+    /// D5 falsifiable negative: with NO matching subscription, Determine still
+    /// returns 204 and ZERO notifications are delivered.
+    #[test]
+    fn test_acrevents_no_subscription_no_notification() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        let _ = notifier::notifier().drain();
+
+        // Unique easIds not referenced by any subscription.
+        register_eas(&sk, "d5neg-s.example.com", "VIDEO");
+        register_eas(&sk, "d5neg-t.example.com", "VIDEO");
+
+        let det_body = r#"{
+            "requestorId":"eec-d5neg",
+            "sEasEndpoint":{"fqdn":"d5neg-s.example.com"},
+            "ueId":"imsi-d5neg-1",
+            "easId":"d5neg-s.example.com"
+        }"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(det_body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
+
+        let fired: Vec<notifier::QueuedNotification> = notifier::notifier()
+            .drain()
+            .into_iter()
+            .filter(|q| q.uri == "http://eec-d5neg/acr-cb" || q.body["easId"] == "d5neg-s.example.com")
+            .collect();
+        assert!(fired.is_empty(), "no subscription ⇒ no notification");
+
+        auth::clear_auth_jwks();
+    }
+
+    /// D5: `requestTestNotification=true` at create → an immediate test
+    /// `ACRInfoNotification` is enqueued to the subscriber.
+    #[test]
+    fn test_acrevents_request_test_notification() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        let _ = notifier::notifier().drain();
+
+        let sub_body = r#"{
+            "eecId":"eec-d5t",
+            "easIds":["d5t.example.com"],
+            "eventIds":"TARGET_INFORMATION",
+            "notificationDestination":"http://eec-d5t/acr-cb",
+            "requestTestNotification":true
+        }"#;
+        let id = create_acrevents_ok(&sk, sub_body);
+
+        let mine: Vec<notifier::QueuedNotification> = notifier::notifier()
+            .drain()
+            .into_iter()
+            .filter(|q| q.body["subId"] == id)
+            .collect();
+        assert_eq!(mine.len(), 1, "requestTestNotification ⇒ one test notification");
+        assert_eq!(mine[0].uri, "http://eec-d5t/acr-cb");
+        let notif: ACRInfoNotification = serde_json::from_value(mine[0].body.clone()).unwrap();
+        assert_eq!(notif.sub_id, id);
+        assert_eq!(notif.event_id, "TARGET_INFORMATION");
+
+        delete_acrevents(&sk, &id);
         auth::clear_auth_jwks();
     }
 }

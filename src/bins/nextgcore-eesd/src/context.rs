@@ -8,19 +8,28 @@
 use crate::acr::{
     acr_ue_key, AcrContextError, AcrDecReq, AcrDetermReq, AcrInitReq, AcrState, AcrStatus,
 };
+use crate::acrevents::{
+    ACRCompleteEventInfo, ACREventsSubscription, ACRInfoNotification, TargetInfo,
+    ACREVENTS_PATCHABLE_FIELDS,
+};
 use crate::eec::EecRegistration;
 use crate::services::{
-    ACInfoSubscription, ACRParamsInfo, AcrMgntEventSubsc, CommonEASInfo, EECContext,
-    ACINFO_PATCHABLE_FIELDS,
+    ACInfoSubscription, ACRParamsInfo, AcrMgntEventReport, AcrMgntEventsNotification,
+    AcrMgntEventsSubscription, CommonEASInfo, EECContext, ACINFO_PATCHABLE_FIELDS,
+    ACRMGNT_PATCHABLE_FIELDS,
 };
 use crate::types::{
-    apply_merge_patch, is_expired, EasDiscoveryFilter, EasDiscoverySubscription, EasProfile,
-    EasRegistration,
+    apply_merge_patch, is_expired, DiscoveredEas, EasDiscoveryFilter, EasDiscoveryNotification,
+    EasDiscoverySubscription, EasProfile, EasRegistration, EAS_AVAILABILITY_CHANGE,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
+
+/// Resource collection path for `eees-acrmgntevent` subscriptions (D7); used to
+/// build the read-only `self` link stored in each `AcrMgntEventsSubscription`.
+const ACRMGNT_SUB_COLLECTION: &str = "/eees-acrmgntevent/v1/subscriptions";
 
 /// Outcome of a merge-patch / replace update that can fail for several
 /// spec-distinct reasons mapped to different HTTP status codes by the handler.
@@ -57,8 +66,14 @@ pub struct EesContext {
     /// server-minted `subscriptionId` lives only as this map's key (returned
     /// via the `Location` header).
     app_client_infos: RwLock<HashMap<String, ACInfoSubscription>>,
-    /// ACR management event subscriptions (eesd-13 `eees-acrmgntevent`), keyed by `subscriptionId`.
-    acr_mgnt_subscriptions: RwLock<HashMap<String, AcrMgntEventSubsc>>,
+    /// ACR management event subscriptions (`eees-acrmgntevent`, TS 29.558,
+    /// D7), keyed by the server-minted `subscriptionId` (the last path segment
+    /// of the resource `self` link). Body is the spec-exact
+    /// [`AcrMgntEventsSubscription`].
+    acr_mgnt_subscriptions: RwLock<HashMap<String, AcrMgntEventsSubscription>>,
+    /// ACR events subscriptions (`eees-acrevents`, TS 24.558 §6.4, D5), keyed by
+    /// the server-minted `subscriptionId` (the spec body carries no id).
+    acrevents_subscriptions: RwLock<HashMap<String, ACREventsSubscription>>,
     /// EEC contexts (`eees-eeccontextreloc`, TS 29.558 §8.7.2), keyed by the
     /// spec pull key `cntxId` (the `eec-cntx-id` query parameter).
     eec_contexts: RwLock<HashMap<String, EECContext>>,
@@ -79,6 +94,7 @@ impl EesContext {
             declared_common_eas: RwLock::new(HashMap::new()),
             app_client_infos: RwLock::new(HashMap::new()),
             acr_mgnt_subscriptions: RwLock::new(HashMap::new()),
+            acrevents_subscriptions: RwLock::new(HashMap::new()),
             eec_contexts: RwLock::new(HashMap::new()),
             max_eas: 0,
             initialized: AtomicBool::new(false),
@@ -120,6 +136,9 @@ impl EesContext {
             infos.clear();
         }
         if let Ok(mut subs) = self.acr_mgnt_subscriptions.write() {
+            subs.clear();
+        }
+        if let Ok(mut subs) = self.acrevents_subscriptions.write() {
             subs.clear();
         }
         if let Ok(mut ctxs) = self.eec_contexts.write() {
@@ -429,25 +448,45 @@ impl EesContext {
         Ok(sub)
     }
 
-    /// eesd-05 notify stub: count the subscriptions whose filter selects
-    /// `changed`. No live notification peer exists in this stack, so delivery is
-    /// logged rather than POSTed (wire delivery DEFERRED). Returns the number of
-    /// matching subscriptions for testability.
+    /// eesd-05 (D6): build an `EasDiscoveryNotification`
+    /// (`TS24558_Eees_EASDiscovery.yaml:475-513`) for every discovery
+    /// subscription whose filter selects `changed`, and enqueue each for real
+    /// delivery via the shared notifier (D6) to the subscriber's
+    /// `notificationUri`. Returns the number of matched subscriptions (kept for
+    /// testability).
+    ///
+    /// Collect-then-enqueue: the `(uri, body)` pairs are built UNDER the
+    /// `disc_subscriptions` read lock and enqueued only AFTER it is released —
+    /// the documented NF-context AB-BA rule (the notifier is never invoked while
+    /// holding an `EesContext` lock). The reported `eventType` is
+    /// `EAS_AVAILABILITY_CHANGE` (a fresh EAS matching the filter became
+    /// available); the notifier POST expects a 204 from the subscriber.
     pub fn notify_discovery_subscribers(&self, changed: &EasProfile) -> usize {
-        let subs = match self.disc_subscriptions.read() {
-            Ok(s) => s,
-            Err(_) => return 0,
-        };
-        let mut matched = 0;
-        for sub in subs.values() {
-            if sub.filter_matches(changed) {
-                matched += 1;
-                log::debug!(
-                    "EAS discovery notify (stub): would POST to {} for easId={}",
-                    sub.notification_uri,
-                    changed.eas_id
-                );
+        let mut pending: Vec<(String, serde_json::Value)> = Vec::new();
+        {
+            let subs = match self.disc_subscriptions.read() {
+                Ok(s) => s,
+                Err(_) => return 0,
+            };
+            for (id, sub) in subs.iter() {
+                if !sub.filter_matches(changed) {
+                    continue;
+                }
+                let notif = EasDiscoveryNotification {
+                    sub_id: id.clone(),
+                    event_type: EAS_AVAILABILITY_CHANGE.to_string(),
+                    discovered_eas: vec![DiscoveredEas {
+                        eas: changed.clone(),
+                    }],
+                };
+                if let Ok(body) = serde_json::to_value(&notif) {
+                    pending.push((sub.notification_uri.clone(), body));
+                }
             }
+        }
+        let matched = pending.len();
+        for (uri, body) in pending {
+            crate::notifier::enqueue(uri, body, "EasDiscoveryNotification");
         }
         matched
     }
@@ -488,6 +527,19 @@ impl EesContext {
                 .collect();
             for id in expired {
                 eecs.remove(&id);
+                removed += 1;
+            }
+        }
+
+        // D5: sweep expired ACR-events subscriptions (`eees-acrevents`).
+        if let Ok(mut subs) = self.acrevents_subscriptions.write() {
+            let expired: Vec<String> = subs
+                .iter()
+                .filter(|(_, s)| is_expired(s.exp_time.as_deref(), now_epoch))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for id in expired {
+                subs.remove(&id);
                 removed += 1;
             }
         }
@@ -798,6 +850,153 @@ impl EesContext {
         Ok(updated)
     }
 
+    // ---- eees-acrevents — ACR events subscriptions (TS 24.558 §6.4, D5) ------
+
+    /// Store an `ACREventsSubscription`; mints and returns the server
+    /// `subscriptionId` (the map key — the spec wire body carries no id).
+    pub fn acrevents_create(&self, sub: ACREventsSubscription) -> Option<String> {
+        let mut subs = self.acrevents_subscriptions.write().ok()?;
+        if subs.len() >= self.max_eas {
+            return None;
+        }
+        let id = Uuid::new_v4().to_string();
+        subs.insert(id.clone(), sub.clone());
+        log::info!(
+            "ACREventsSubscription created: subscriptionId={id} eecId={} eventIds={}",
+            sub.eec_id,
+            sub.event_ids
+        );
+        Some(id)
+    }
+
+    /// Look up an ACR-events subscription by its `subscriptionId`.
+    pub fn acrevents_find(&self, subscription_id: &str) -> Option<ACREventsSubscription> {
+        self.acrevents_subscriptions
+            .read()
+            .ok()?
+            .get(subscription_id)
+            .cloned()
+    }
+
+    /// Delete an ACR-events subscription by its `subscriptionId`.
+    pub fn acrevents_delete(&self, subscription_id: &str) -> Option<ACREventsSubscription> {
+        let removed = self
+            .acrevents_subscriptions
+            .write()
+            .ok()?
+            .remove(subscription_id);
+        if removed.is_some() {
+            log::info!("ACREventsSubscription deleted: subscriptionId={subscription_id}");
+        }
+        removed
+    }
+
+    /// PUT full-replace an existing ACR-events subscription
+    /// (`UpdateACREventsSubscription`, yaml:117-172). `sub` is assumed already
+    /// mandatory-IE-validated by the handler.
+    pub fn acrevents_update(
+        &self,
+        subscription_id: &str,
+        sub: ACREventsSubscription,
+    ) -> Result<ACREventsSubscription, UpdateError> {
+        let mut subs = self
+            .acrevents_subscriptions
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
+        if !subs.contains_key(subscription_id) {
+            return Err(UpdateError::NotFound);
+        }
+        subs.insert(subscription_id.to_string(), sub.clone());
+        log::info!("ACREventsSubscription replaced: subscriptionId={subscription_id}");
+        Ok(sub)
+    }
+
+    /// PATCH merge an ACR-events subscription (`ModifyACREventsSubscription`,
+    /// `application/merge-patch+json`, yaml:211-267). The RFC 7396 merge is
+    /// restricted to the `ACREventsSubscriptionPatch` members
+    /// ([`ACREVENTS_PATCHABLE_FIELDS`]); any other key — including the immutable
+    /// `eecId` — is ignored. The merged result is re-validated fail-closed.
+    pub fn acrevents_modify(
+        &self,
+        subscription_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<ACREventsSubscription, UpdateError> {
+        let mut subs = self
+            .acrevents_subscriptions
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
+        let stored = subs.get(subscription_id).ok_or(UpdateError::NotFound)?;
+
+        let filtered = match patch.as_object() {
+            Some(map) => serde_json::Value::Object(
+                map.iter()
+                    .filter(|(k, _)| ACREVENTS_PATCHABLE_FIELDS.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            None => return Err(UpdateError::Invalid),
+        };
+
+        let mut value = serde_json::to_value(stored).map_err(|_| UpdateError::Internal)?;
+        apply_merge_patch(&mut value, &filtered);
+        let updated: ACREventsSubscription =
+            serde_json::from_value(value).map_err(|_| UpdateError::Invalid)?;
+        // Re-validate the required IEs after the merge (fail-closed).
+        if updated.eec_id.trim().is_empty()
+            || updated.event_ids.trim().is_empty()
+            || updated.notification_destination.trim().is_empty()
+            || updated.eas_ids.is_empty()
+            || updated.eas_ids.iter().any(|e| e.trim().is_empty())
+        {
+            return Err(UpdateError::Invalid);
+        }
+        subs.insert(subscription_id.to_string(), updated.clone());
+        log::info!("ACREventsSubscription merge-patched: subscriptionId={subscription_id}");
+        Ok(updated)
+    }
+
+    /// Collect the `ACRInfoNotification` callbacks that fire for an ACR
+    /// transition. Returns `(notificationDestination, body)` pairs for every
+    /// subscription selected by [`ACREventsSubscription::matches`].
+    ///
+    /// Only `acrevents_subscriptions` is read here; the caller pre-builds the
+    /// (registration-derived) `trgt_info`/`acr_status` and enqueues delivery
+    /// AFTER this returns and its guard drops — collect-then-enqueue avoids the
+    /// NF-context AB-BA deadlock class and never holds a lock across delivery.
+    #[allow(clippy::too_many_arguments)]
+    pub fn acrevents_collect(
+        &self,
+        event_id: &str,
+        eec_id: Option<&str>,
+        ue_id: Option<&str>,
+        eas_id: Option<&str>,
+        trgt_info: Option<TargetInfo>,
+        acr_status: Option<ACRCompleteEventInfo>,
+    ) -> Vec<(String, ACRInfoNotification)> {
+        let subs = match self.acrevents_subscriptions.read() {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        subs.iter()
+            .filter(|(_, sub)| sub.matches(event_id, eec_id, ue_id, eas_id))
+            .map(|(id, sub)| {
+                let notif = ACRInfoNotification {
+                    sub_id: id.clone(),
+                    eas_id: eas_id.unwrap_or_default().to_string(),
+                    event_id: event_id.to_string(),
+                    ac_id: None,
+                    trgt_info: trgt_info.clone(),
+                    acr_status: acr_status.clone(),
+                    eec_ctxt_reloc: None,
+                    acr_scenario_list: None,
+                    eas_bundle_info: None,
+                    t_eas_end_point_bundle_list: None,
+                };
+                (sub.notification_destination.clone(), notif)
+            })
+            .collect()
+    }
+
     // ---- eees-eeccontextreloc — EEC contexts (TS 29.558 §8.7.2) --------------
 
     /// Push (store/replace) an EEC context, keyed by the spec pull key
@@ -824,23 +1023,30 @@ impl EesContext {
 
     // ---- eesd-13: eees-acrmgntevent — ACR Management Event subscriptions -----
 
-    /// Create an ACR management event subscription; mints a `subscriptionId`.
-    pub fn acrmgnt_sub_create(&self, mut sub: AcrMgntEventSubsc) -> Option<AcrMgntEventSubsc> {
+    /// Create an ACR management event subscription (`CreateACRMngEventSubscr`,
+    /// yaml:29-163); mints a `subscriptionId` (the map key) and sets the
+    /// read-only `self` link. `sub` is assumed already mandatory-IE-validated by
+    /// the handler.
+    pub fn acrmgnt_sub_create(
+        &self,
+        mut sub: AcrMgntEventsSubscription,
+    ) -> Option<AcrMgntEventsSubscription> {
         let mut subs = self.acr_mgnt_subscriptions.write().ok()?;
         if subs.len() >= self.max_eas {
             return None;
         }
         let id = Uuid::new_v4().to_string();
-        sub.subscription_id = Some(id.clone());
+        sub.self_ = Some(format!("{ACRMGNT_SUB_COLLECTION}/{id}"));
         subs.insert(id.clone(), sub.clone());
         log::info!(
-            "ACR management event subscription created: subscriptionId={id} notificationUri={}",
-            sub.notification_uri
+            "ACR management event subscription created: subscriptionId={id} easId={} notificationDestination={}",
+            sub.eas_id,
+            sub.notification_destination
         );
         Some(sub)
     }
 
-    pub fn acrmgnt_sub_find(&self, subscription_id: &str) -> Option<AcrMgntEventSubsc> {
+    pub fn acrmgnt_sub_find(&self, subscription_id: &str) -> Option<AcrMgntEventsSubscription> {
         self.acr_mgnt_subscriptions
             .read()
             .ok()?
@@ -848,19 +1054,22 @@ impl EesContext {
             .cloned()
     }
 
-    pub fn acrmgnt_sub_list(&self) -> Vec<AcrMgntEventSubsc> {
+    pub fn acrmgnt_sub_list(&self) -> Vec<AcrMgntEventsSubscription> {
         self.acr_mgnt_subscriptions
             .read()
             .map(|m| m.values().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// PUT full-replace an ACR management event subscription.
+    /// PUT full-replace an ACR management event subscription
+    /// (`UpdateIndACRMngEventSubscr`, yaml:262-315). `sub` is assumed already
+    /// mandatory-IE-validated by the handler; the immutable `self` link is
+    /// re-derived from the resource id.
     pub fn acrmgnt_sub_update(
         &self,
         subscription_id: &str,
-        mut sub: AcrMgntEventSubsc,
-    ) -> Result<AcrMgntEventSubsc, UpdateError> {
+        mut sub: AcrMgntEventsSubscription,
+    ) -> Result<AcrMgntEventsSubscription, UpdateError> {
         let mut subs = self
             .acr_mgnt_subscriptions
             .write()
@@ -868,12 +1077,62 @@ impl EesContext {
         if !subs.contains_key(subscription_id) {
             return Err(UpdateError::NotFound);
         }
-        sub.subscription_id = Some(subscription_id.to_string());
+        sub.self_ = Some(format!("{ACRMGNT_SUB_COLLECTION}/{subscription_id}"));
         subs.insert(subscription_id.to_string(), sub.clone());
         Ok(sub)
     }
 
-    pub fn acrmgnt_sub_delete(&self, subscription_id: &str) -> Option<AcrMgntEventSubsc> {
+    /// PATCH merge an ACR management event subscription
+    /// (`ModifyIndACRMngEventSubscr`, `application/merge-patch+json`,
+    /// yaml:317-372). The RFC 7396 merge is restricted to the
+    /// `AcrMgntEventsSubscriptionPatch` members (yaml:521-535); any other key —
+    /// including the immutable `easId`/`self` — is ignored. The merged result is
+    /// re-validated fail-closed against the required IEs.
+    pub fn acrmgnt_sub_modify(
+        &self,
+        subscription_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<AcrMgntEventsSubscription, UpdateError> {
+        let mut subs = self
+            .acr_mgnt_subscriptions
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
+        let stored = subs.get(subscription_id).ok_or(UpdateError::NotFound)?;
+
+        // Restrict the merge document to the spec AcrMgntEventsSubscriptionPatch keys.
+        let filtered = match patch.as_object() {
+            Some(map) => serde_json::Value::Object(
+                map.iter()
+                    .filter(|(k, _)| ACRMGNT_PATCHABLE_FIELDS.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            None => return Err(UpdateError::Invalid),
+        };
+
+        let mut value = serde_json::to_value(stored).map_err(|_| UpdateError::Internal)?;
+        apply_merge_patch(&mut value, &filtered);
+        let mut updated: AcrMgntEventsSubscription =
+            serde_json::from_value(value).map_err(|_| UpdateError::Invalid)?;
+        // Re-validate required IEs after merge (a patch may clear eventSubscs or
+        // notificationDestination).
+        if updated.eas_id.trim().is_empty()
+            || updated.notification_destination.trim().is_empty()
+            || updated.event_subscs.is_empty()
+            || updated.event_subscs.iter().any(|e| e.event.trim().is_empty())
+        {
+            return Err(UpdateError::Invalid);
+        }
+        updated.self_ = Some(format!("{ACRMGNT_SUB_COLLECTION}/{subscription_id}"));
+        subs.insert(subscription_id.to_string(), updated.clone());
+        log::info!("ACR management event subscription merge-patched: subscriptionId={subscription_id}");
+        Ok(updated)
+    }
+
+    pub fn acrmgnt_sub_delete(
+        &self,
+        subscription_id: &str,
+    ) -> Option<AcrMgntEventsSubscription> {
         let removed = self
             .acr_mgnt_subscriptions
             .write()
@@ -887,34 +1146,48 @@ impl EesContext {
         removed
     }
 
-    /// Notify stub: count subscriptions whose `eecId`/`easId` filter matches the
-    /// event. Delivery is logged only (no live callback peer).
-    pub fn notify_acrmgnt_subscribers(
-        &self,
-        event_eec_id: Option<&str>,
-        event_eas_id: Option<&str>,
-    ) -> usize {
-        let subs = match self.acr_mgnt_subscriptions.read() {
-            Ok(s) => s,
-            Err(_) => return 0,
-        };
-        let mut matched = 0;
-        for sub in subs.values() {
-            let eec_match = sub
-                .eec_id
-                .as_deref()
-                .is_none_or(|id| Some(id) == event_eec_id);
-            let eas_match = sub
-                .eas_id
-                .as_deref()
-                .is_none_or(|id| Some(id) == event_eas_id);
-            if eec_match && eas_match {
-                matched += 1;
-                log::debug!(
-                    "ACR management event notify (stub): would POST to {}",
-                    sub.notification_uri
-                );
+    /// Build + enqueue an `AcrMgntEventsNotification` (yaml:537-554) for every
+    /// subscription whose `eventSubscs` include the fired `event` (and, when a
+    /// per-event `appGrpId` filter is present, only when it matches). Returns
+    /// the number of matched subscriptions (kept for testability).
+    ///
+    /// Delivery is fire-and-forget via the shared notifier (D6): the callback
+    /// `(uri, body)` pairs are collected UNDER the read lock and enqueued only
+    /// AFTER it is released — the documented NF-context AB-BA rule (the notifier
+    /// must never be invoked while holding the `EesContext` lock).
+    pub fn notify_acrmgnt_subscribers(&self, event: &str, app_grp_id: Option<&str>) -> usize {
+        let mut pending: Vec<(String, serde_json::Value)> = Vec::new();
+        {
+            let subs = match self.acr_mgnt_subscriptions.read() {
+                Ok(s) => s,
+                Err(_) => return 0,
+            };
+            for (id, sub) in subs.iter() {
+                let matches = sub.event_subscs.iter().any(|es| {
+                    es.event == event
+                        && es
+                            .app_grp_id
+                            .as_deref()
+                            .is_none_or(|g| Some(g) == app_grp_id)
+                });
+                if !matches {
+                    continue;
+                }
+                let notif = AcrMgntEventsNotification {
+                    subp_id: id.clone(),
+                    event_reports: vec![AcrMgntEventReport {
+                        event: event.to_string(),
+                        ..Default::default()
+                    }],
+                };
+                if let Ok(body) = serde_json::to_value(&notif) {
+                    pending.push((sub.notification_destination.clone(), body));
+                }
             }
+        }
+        let matched = pending.len();
+        for (uri, body) in pending {
+            crate::notifier::enqueue(uri, body, "AcrMgntEventsNotification");
         }
         matched
     }
@@ -1156,9 +1429,23 @@ mod tests {
         assert!(ctx.eec_deregister(&reg_id).is_none());
     }
 
-    /// eesd-05: discovery subscription create/find/delete + notify-stub matching.
+    /// eesd-05 (D6): discovery subscription create/find/delete + notify builds a
+    /// spec `EasDiscoveryNotification` and enqueues it via the shared notifier
+    /// (collect-then-enqueue; asserted through a fresh `QueueNotifier`).
     #[test]
     fn test_disc_subscription_and_notify() {
+        use crate::notifier::Notifier;
+        use crate::types::EasDiscoveryNotification;
+
+        // Serialize with the other tests that swap the process-global notifier
+        // and install a fresh queue to inspect.
+        let _g = crate::auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = Arc::new(crate::notifier::QueueNotifier::default());
+        crate::notifier::set_notifier(n.clone());
+        let _ = n.drain();
+
         let mut ctx = EesContext::new();
         ctx.init(8);
         ctx.eas_register(make_reg("eas1.example.com", "V2X"));
@@ -1180,11 +1467,124 @@ mod tests {
         // The V2X EAS matches the V2X-filtered subscription.
         let v2x = make_reg("eas1.example.com", "V2X");
         assert_eq!(ctx.notify_discovery_subscribers(&v2x.eas_prof), 1);
+
+        // Exactly one spec-shaped EasDiscoveryNotification was enqueued.
+        let queued = n.drain();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].uri, "http://eec/callback");
+        assert_eq!(queued[0].kind, "EasDiscoveryNotification");
+        let notif: EasDiscoveryNotification =
+            serde_json::from_value(queued[0].body.clone()).unwrap();
+        assert_eq!(notif.sub_id, sub_id);
+        assert_eq!(notif.event_type, "EAS_AVAILABILITY_CHANGE");
+        assert_eq!(notif.discovered_eas.len(), 1);
+        assert_eq!(notif.discovered_eas[0].eas.eas_id, "eas1.example.com");
+
+        // A non-matching EAS fires nothing.
         let ar = make_reg("eas9.example.com", "AR");
         assert_eq!(ctx.notify_discovery_subscribers(&ar.eas_prof), 0);
+        assert!(n.drain().is_empty());
 
         assert!(ctx.disc_sub_delete(&sub_id).is_some());
         assert!(ctx.disc_sub_find(&sub_id).is_none());
+
+        // Restore the default notifier for the rest of the suite.
+        crate::notifier::set_notifier(Arc::new(crate::notifier::QueueNotifier::default()));
+    }
+
+    /// D7: `notify_acrmgnt_subscribers` fires only for subscriptions whose
+    /// `eventSubscs` include the event (respecting a per-event `appGrpId`
+    /// filter), builds a spec `AcrMgntEventsNotification`, and enqueues it via
+    /// the shared notifier (collect-then-enqueue; no ctx lock held across the
+    /// enqueue).
+    #[test]
+    fn test_acrmgnt_notify_builds_and_enqueues() {
+        use crate::notifier::Notifier;
+        use crate::services::{AcrMgntEventSubsc, AcrMgntEventsSubscription};
+
+        fn subsc(event: &str, app_grp_id: Option<&str>) -> AcrMgntEventSubsc {
+            AcrMgntEventSubsc {
+                event: event.into(),
+                app_grp_id: app_grp_id.map(str::to_string),
+                event_filter: None,
+                evt_req: None,
+                tgt_ue_id: None,
+                dnai_chg_type: None,
+                eas_ack_ind: None,
+                eas_chars: None,
+                traf_filter_info: None,
+                serv_cont_plan_ind: None,
+                eas_ack_svc_cont: None,
+            }
+        }
+        fn subscription(
+            eas: &str,
+            dest: &str,
+            subs: Vec<AcrMgntEventSubsc>,
+        ) -> AcrMgntEventsSubscription {
+            AcrMgntEventsSubscription {
+                self_: None,
+                eas_id: eas.into(),
+                event_subscs: subs,
+                evt_req: None,
+                notification_destination: dest.into(),
+                event_reports: None,
+                availability_info: None,
+                fail_event_reports: None,
+                request_test_notification: None,
+                websock_notif_config: None,
+                supp_feat: None,
+            }
+        }
+
+        // Serialize with the other tests that touch the process-global notifier
+        // (e.g. acrevents requestTestNotification), then install a fresh queue.
+        let _g = crate::auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = Arc::new(crate::notifier::QueueNotifier::default());
+        crate::notifier::set_notifier(n.clone());
+        let _ = n.drain();
+
+        let mut ctx = EesContext::new();
+        ctx.init(8);
+        // A: UP_PATH_CHG filtered to appGrpId "grp-1".
+        ctx.acrmgnt_sub_create(subscription(
+            "eas-a.example.com",
+            "http://eec-a/cb",
+            vec![subsc("UP_PATH_CHG", Some("grp-1"))],
+        ))
+        .unwrap();
+        // B: ACR_MONITORING, no appGrpId filter (matches any group).
+        ctx.acrmgnt_sub_create(subscription(
+            "eas-b.example.com",
+            "http://eec-b/cb",
+            vec![subsc("ACR_MONITORING", None)],
+        ))
+        .unwrap();
+
+        // UP_PATH_CHG for grp-1 → only A; grp-2 → A's filter excludes it → 0.
+        assert_eq!(ctx.notify_acrmgnt_subscribers("UP_PATH_CHG", Some("grp-1")), 1);
+        assert_eq!(ctx.notify_acrmgnt_subscribers("UP_PATH_CHG", Some("grp-2")), 0);
+        // ACR_MONITORING (any group) → only B (unfiltered).
+        assert_eq!(
+            ctx.notify_acrmgnt_subscribers("ACR_MONITORING", Some("grp-9")),
+            1
+        );
+
+        // Exactly the two matched notifications were enqueued as spec-shaped
+        // AcrMgntEventsNotification bodies.
+        let queued = n.drain();
+        assert_eq!(queued.len(), 2);
+        assert!(queued.iter().all(|q| q.kind == "AcrMgntEventsNotification"));
+        let a = queued.iter().find(|q| q.uri == "http://eec-a/cb").unwrap();
+        let notif: AcrMgntEventsNotification = serde_json::from_value(a.body.clone()).unwrap();
+        assert!(!notif.subp_id.is_empty());
+        assert_eq!(notif.event_reports.len(), 1);
+        assert_eq!(notif.event_reports[0].event, "UP_PATH_CHG");
+
+        // Restore the default notifier for the other tests.
+        crate::notifier::set_notifier(Arc::new(crate::notifier::QueueNotifier::default()));
     }
 
     /// eesd-12: the sweep drops a lapsed EAS registration but keeps an

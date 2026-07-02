@@ -277,6 +277,36 @@ pub struct DiscoveredEas {
     pub eas: EasProfile,
 }
 
+/// TS 24.558 `EASDiscEventIDs` value: an EAS became available (a fresh
+/// registration matching the subscription filter). The only discovery event
+/// this EES emits today (`TS24558_Eees_EASDiscovery.yaml:664-679`).
+pub const EAS_AVAILABILITY_CHANGE: &str = "EAS_AVAILABILITY_CHANGE";
+/// TS 24.558 `EASDiscEventIDs` value: an EAS's dynamic information changed
+/// (`TS24558_Eees_EASDiscovery.yaml:664-679`; modelled for completeness).
+pub const EAS_DYNAMIC_INFO_CHANGE: &str = "EAS_DYNAMIC_INFO_CHANGE";
+
+/// TS 24.558 `EasDiscoveryNotification`
+/// (`TS24558_Eees_EASDiscovery.yaml:475-513`) — the callback body the EES POSTs
+/// to a discovery subscription's `notificationUri` when a matching EAS changes.
+///
+/// Required IEs (yaml:510-513): `subId`, `eventType`, `discoveredEas`
+/// (minItems 1). Cross-spec optional maps (`easInstInfos`, `edgeLoadAnalytics`)
+/// are not emitted by this EES and are therefore omitted rather than
+/// fabricated (the yaml marks them optional).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EasDiscoveryNotification {
+    /// Identifier of the individual discovery subscription — the server-minted
+    /// `subscriptionId` (yaml:479-483; REQUIRED).
+    pub sub_id: String,
+    /// The discovery event being reported (`EASDiscEventIDs`, yaml:484-485;
+    /// REQUIRED, open-enum string).
+    pub event_type: String,
+    /// The discovered EAS entries (`DiscoveredEas`, yaml:486-491, minItems 1;
+    /// REQUIRED).
+    pub discovered_eas: Vec<DiscoveredEas>,
+}
+
 /// TS 24.558 `EASDiscoverySubscription` (subset) — discovery-change
 /// subscription resource. `notificationUri` is mandatory; `subscriptionId`
 /// and `expTime` are server-managed.

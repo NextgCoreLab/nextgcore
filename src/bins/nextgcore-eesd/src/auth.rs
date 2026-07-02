@@ -44,6 +44,8 @@ pub const SCOPE_ACRMGNTEVENT: &str = "eees-acrmgntevent";
 pub const SCOPE_EECCONTEXTRELOC: &str = "eees-eeccontextreloc";
 /// OAuth2 scope required for the `eees-acr-param` service operations (eesd-13).
 pub const SCOPE_ACR_PARAM: &str = "eees-acr-param";
+/// OAuth2 scope required for the `eees-acrevents` service operations (D5).
+pub const SCOPE_ACREVENTS: &str = "eees-acrevents";
 
 /// Process-wide JWKS used to verify access tokens. `None` ⇒ unconfigured
 /// (fail-closed). Seeded from `--oauth2-jwks-file` or by tests.

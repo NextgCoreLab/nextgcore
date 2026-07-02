@@ -232,50 +232,204 @@ pub struct ACInformation {
 }
 
 // ============================================================================
-// eees-acrmgntevent — ACR Management Event subscriptions (TS 29.558 §5.8)
+// eees-acrmgntevent — ACR Management Event subscriptions (TS 29.558,
+// TS29558_Eees_ACRManagementEvent.yaml)
 // ============================================================================
 
-/// ACR management event types (TS 29.558 §5.8).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum AcrMgntEvent {
-    /// ACR procedure completed successfully.
-    AcrCompleted,
-    /// ACR procedure failed.
-    AcrFailed,
-    /// ACR procedure initiated.
-    AcrInitiated,
-    /// EAS relocated to a new serving area.
-    EasRelocated,
+/// The six `AcrMgntEvent` enumeration values defined by TS 29.558
+/// (TS29558_Eees_ACRManagementEvent.yaml:778-800). The schema is
+/// `anyOf: [enum, string]` (forward-compatible), so the wire type is an open
+/// `String`; these constants pin the spec values for matching/tests. The old
+/// fabricated four-value enum — whose values did not exist anywhere in the spec
+/// — was deleted (D7).
+pub const ACR_MGNT_EVENTS: [&str; 6] = [
+    "UP_PATH_CHG",
+    "ACR_MONITORING",
+    "ACR_FACILITATION",
+    "ACT_START_STOP",
+    "ACR_SELECTION",
+    "OUT_OF_SERVICE_AREA",
+];
+
+/// `AcrMgntEventsSubscription` (TS29558_Eees_ACRManagementEvent.yaml:424-469) —
+/// body of `CreateACRMngEventSubscr`
+/// (`POST .../eees-acrmgntevent/v1/subscriptions`), of the PUT full-replace, and
+/// of every 200/201 response.
+///
+/// Required IEs (yaml:466-469): `easId`, `eventSubscs` (minItems 1),
+/// `notificationDestination`. The read-only `self` link is the resource URI set
+/// by the server on create (the store key is the last path segment).
+///
+/// Cross-spec leaves (`ReportingInformation` from TS 29.523, `AvailabilityNotif`
+/// / `FailureAcrMgntEventInfo` sub-trees, `WebsockNotifConfig` from TS 29.122)
+/// are carried as passthrough JSON values, per the established `acr.rs`
+/// convention (preserve wire bytes without fabricating a local model).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AcrMgntEventsSubscription {
+    /// Resource self-link (`Uri`, yaml:428-429; server-set, read-only).
+    #[serde(rename = "self", skip_serializing_if = "Option::is_none")]
+    pub self_: Option<String>,
+    /// Identifier of the service consumer (yaml:430-432; REQUIRED).
+    pub eas_id: String,
+    /// The subscribed ACR management events (yaml:433-438, minItems 1;
+    /// REQUIRED).
+    pub event_subscs: Vec<AcrMgntEventSubsc>,
+    /// TS 29.523 `ReportingInformation` (yaml:439-440; passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evt_req: Option<serde_json::Value>,
+    /// Callback URI for ACR management event notifications (`Uri`,
+    /// yaml:441-442; REQUIRED).
+    pub notification_destination: String,
+    /// The ACR management event report(s) (yaml:443-448, minItems 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_reports: Option<Vec<AcrMgntEventReport>>,
+    /// UP path-change monitoring availability (`AvailabilityNotif`,
+    /// yaml:449-450; passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability_info: Option<serde_json::Value>,
+    /// Failure event reports (`FailureAcrMgntEventInfo`, yaml:451-456,
+    /// minItems 1; passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_event_reports: Option<Vec<serde_json::Value>>,
+    /// Set to true to request a test notification (yaml:457-461).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_test_notification: Option<bool>,
+    /// TS 29.122 `WebsockNotifConfig` (yaml:462-463; passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websock_notif_config: Option<serde_json::Value>,
+    /// Supported features (yaml:464-465).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supp_feat: Option<String>,
 }
 
-/// `AcrMgntEventSubsc` — body of `CreateAcrMgntEventSubsc`
-/// (`POST .../eees-acrmgntevent/v1/subscriptions`) and stored resource.
+/// `AcrMgntEventSubsc` (TS29558_Eees_ACRManagementEvent.yaml:471-519) — one
+/// subscribed ACR management event with its optional filters. The sole REQUIRED
+/// member is `event` (yaml:518-519), an [`ACR_MGNT_EVENTS`] open-enum string.
 ///
-/// Mandatory IE: `notificationUri`. The server mints a `subscriptionId`.
+/// Cross-spec leaves (`AcrMgntEventFilter`, `ReportingInformation`,
+/// `TargetUeIdentification`, `DnaiChangeType`, `EasCharacteristics`,
+/// `TrafficFilterInfo`) are carried as passthrough JSON values.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AcrMgntEventSubsc {
-    /// Callback URI for ACR management event notifications (mandatory).
-    pub notification_uri: String,
-    /// Server-minted subscription resource identifier (read-only).
+    /// The subscribed ACR management event (`AcrMgntEvent` open-enum string,
+    /// yaml:475-476/778-800; REQUIRED).
+    pub event: String,
+    /// Event filter (`AcrMgntEventFilter`, yaml:477-478; passthrough).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub subscription_id: Option<String>,
-    /// EEC identifier filter (optional; absent ⇒ all EECs).
+    pub event_filter: Option<serde_json::Value>,
+    /// TS 29.523 `ReportingInformation` (yaml:479-480; passthrough).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub eec_id: Option<String>,
-    /// EAS identifier filter (optional; absent ⇒ all EASes).
+    pub evt_req: Option<serde_json::Value>,
+    /// Target UE identification (`TargetUeIdentification`, yaml:481-482;
+    /// passthrough).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub eas_id: Option<String>,
-    /// Event types to subscribe to (optional; absent ⇒ all events).
+    pub tgt_ue_id: Option<serde_json::Value>,
+    /// Application group identifier (yaml:483-484).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub acr_events: Option<Vec<AcrMgntEvent>>,
-    /// Subscription expiration time (optional).
+    pub app_grp_id: Option<String>,
+    /// DNAI change type (`DnaiChangeType`, yaml:485-486; passthrough).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub exp_time: Option<String>,
-    /// Supported features (optional).
+    pub dnai_chg_type: Option<serde_json::Value>,
+    /// Whether EAS acknowledgement of UP path change is expected (yaml:487-493).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub supp_feat: Option<String>,
+    pub eas_ack_ind: Option<bool>,
+    /// A list of EAS characteristics (`EasCharacteristics`, yaml:494-499,
+    /// minItems 1; passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_chars: Option<Vec<serde_json::Value>>,
+    /// Traffic filter information (`TrafficFilterInfo`, yaml:500-501;
+    /// passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traf_filter_info: Option<serde_json::Value>,
+    /// Service continuity planning indication (yaml:502-509).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serv_cont_plan_ind: Option<bool>,
+    /// Whether the EAS will acknowledge service-continuity notifications
+    /// (yaml:510-517).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_ack_svc_cont: Option<bool>,
+}
+
+/// Top-level members of `AcrMgntEventsSubscriptionPatch`
+/// (TS29558_Eees_ACRManagementEvent.yaml:521-535) — the ONLY fields a `PATCH`
+/// (`application/merge-patch+json`) may modify. The RFC 7396 merge is restricted
+/// to these keys; anything else in the patch document (including the immutable
+/// `easId`) is ignored.
+pub const ACRMGNT_PATCHABLE_FIELDS: [&str; 3] =
+    ["eventSubscs", "evtReq", "notificationDestination"];
+
+/// `AcrMgntEventsNotification` (TS29558_Eees_ACRManagementEvent.yaml:537-554) —
+/// the callback body POSTed to `notificationDestination`. Required
+/// (yaml:552-554): `subpId`, `eventReports` (minItems 1). Consumed by the shared
+/// notification sender (D6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AcrMgntEventsNotification {
+    /// Identifier of the Individual ACR Management Events Subscription for which
+    /// the notification is delivered (yaml:541-545; REQUIRED).
+    pub subp_id: String,
+    /// A list of ACR management event reports (yaml:546-551, minItems 1;
+    /// REQUIRED).
+    pub event_reports: Vec<AcrMgntEventReport>,
+}
+
+/// `AcrMgntEventReport` (TS29558_Eees_ACRManagementEvent.yaml:556-603) — one ACR
+/// management event report. The sole REQUIRED member is `event` (yaml:602-603).
+/// Cross-spec leaf sub-trees (`UpPathChangeInfo`, `ActStatus`,
+/// `TargetUeIdentification`, `SelectedACRScenarios`, `EasInBundleInfo`,
+/// `InOutArea`) are passthrough JSON values; `easEndPoint` reuses
+/// [`crate::types::EndPoint`] and `acrParams` reuses the spec-exact
+/// [`crate::acr::AcrParameters`] (`ACRParameters`, yaml:605-610).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AcrMgntEventReport {
+    /// The ACR management event (`AcrMgntEvent` open-enum string,
+    /// yaml:560-561; REQUIRED).
+    pub event: String,
+    /// Event time stamp (`DateTime`, yaml:562-563).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_stamp: Option<String>,
+    /// UP path-change information (`UpPathChangeInfo`, yaml:564-565;
+    /// passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_path_chg_info: Option<serde_json::Value>,
+    /// EAS endpoint (`EndPoint`, yaml:566-567).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_end_point: Option<crate::types::EndPoint>,
+    /// ACT status (`ActStatus`, yaml:568-569; passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act_status: Option<serde_json::Value>,
+    /// ACR parameters (`ACRParameters`, yaml:570-571) — reuses the spec-exact
+    /// [`crate::acr::AcrParameters`] (`predictExpTime`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acr_params: Option<crate::acr::AcrParameters>,
+    /// AC identifier (yaml:572-573).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ac_id: Option<String>,
+    /// Target UE identification (`TargetUeIdentification`, yaml:574-575;
+    /// passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ue_id: Option<serde_json::Value>,
+    /// Selected ACR scenarios (`SelectedACRScenarios`, yaml:576-580, minItems 1;
+    /// passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sel_acr_scen: Option<Vec<serde_json::Value>>,
+    /// EAS-in-bundle information (`EasInBundleInfo`, yaml:581-586, minItems 1;
+    /// passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_in_bdl_info_list: Option<Vec<serde_json::Value>>,
+    /// Service continuity planning indication (yaml:587-594).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serv_cont_plan_ind: Option<bool>,
+    /// In/out of service area (`InOutArea`, yaml:595-596; passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_out_of_serv_area: Option<serde_json::Value>,
+    /// A list of target UE identifications (`TargetUeIdentification`,
+    /// yaml:597-601, minItems 1; passthrough).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ue_ids: Option<Vec<serde_json::Value>>,
 }
 
 // ============================================================================
@@ -693,45 +847,200 @@ mod tests {
         assert!(serde_json::from_str::<ACInformation>(r#"{"ueIds":["u1"]}"#).is_err());
     }
 
-    // ---- AcrMgntEventSubsc --------------------------------------------------
+    // ---- AcrMgntEventsSubscription (TS29558_Eees_ACRManagementEvent.yaml) ----
 
-    /// Mandatory `notificationUri` round-trips; missing it fails.
+    /// Spec-exact hand-built JSON literal carrying every top-level field
+    /// (yaml:424-469) + a fully-populated `AcrMgntEventSubsc` (yaml:471-519)
+    /// deserializes; camelCase names are exact (`notificationDestination`,
+    /// `eventSubscs`, `requestTestNotification`, `easAckSvcCont`).
     #[test]
-    fn test_acr_mgnt_event_subsc_roundtrip() {
-        let body =
-            r#"{"notificationUri":"http://eec/cb","acrEvents":["ACR_COMPLETED","EAS_RELOCATED"]}"#;
-        let sub: AcrMgntEventSubsc = serde_json::from_str(body).expect("deserializes");
-        assert_eq!(sub.notification_uri, "http://eec/cb");
-        let events = sub.acr_events.unwrap();
-        assert!(events.contains(&AcrMgntEvent::AcrCompleted));
-        assert!(events.contains(&AcrMgntEvent::EasRelocated));
-        assert!(sub.subscription_id.is_none());
+    fn test_acrmgnt_subscription_spec_literal_all_fields() {
+        // Hand-derived from AcrMgntEventsSubscription (yaml:424-469) +
+        // AcrMgntEventSubsc (yaml:471-519); NOT built via our own structs.
+        let body = r#"{
+            "self":"https://ees.example.com/eees-acrmgntevent/v1/subscriptions/sub-1",
+            "easId":"eas1.example.com",
+            "eventSubscs":[{
+                "event":"UP_PATH_CHG",
+                "eventFilter":"INTRA_EDN_MOBILITY",
+                "evtReq":{"immRep":true},
+                "tgtUeId":{"gpsi":"msisdn-14155550001"},
+                "appGrpId":"grp-1",
+                "dnaiChgType":"EARLY",
+                "easAckInd":true,
+                "easChars":[{"easId":"eas1.example.com"}],
+                "trafFilterInfo":{"uris":["https://eas1.example.com/"]},
+                "servContPlanInd":true,
+                "easAckSvcCont":false
+            }],
+            "evtReq":{"notifMethod":"ON_EVENT_DETECTION"},
+            "notificationDestination":"http://eas1.example.com/acrmgnt-cb",
+            "eventReports":[{"event":"ACR_MONITORING"}],
+            "availabilityInfo":{"availabilityStatus":"AVAILABLE"},
+            "failEventReports":[{"event":"UP_PATH_CHG","failureCode":"OTHER_REASONS"}],
+            "requestTestNotification":true,
+            "websockNotifConfig":{"requestWebsocketUri":true},
+            "suppFeat":"1"
+        }"#;
+        let sub: AcrMgntEventsSubscription = serde_json::from_str(body).expect("deserializes");
+        assert_eq!(
+            sub.self_.as_deref(),
+            Some("https://ees.example.com/eees-acrmgntevent/v1/subscriptions/sub-1")
+        );
+        assert_eq!(sub.eas_id, "eas1.example.com");
+        assert_eq!(sub.event_subscs.len(), 1);
+        let es = &sub.event_subscs[0];
+        assert_eq!(es.event, "UP_PATH_CHG");
+        assert_eq!(es.app_grp_id.as_deref(), Some("grp-1"));
+        assert_eq!(es.eas_ack_ind, Some(true));
+        assert_eq!(es.serv_cont_plan_ind, Some(true));
+        assert_eq!(es.eas_ack_svc_cont, Some(false));
+        assert!(es.tgt_ue_id.is_some());
+        assert!(es.event_filter.is_some());
+        assert_eq!(
+            sub.notification_destination,
+            "http://eas1.example.com/acrmgnt-cb"
+        );
+        assert!(sub.event_reports.is_some());
+        assert!(sub.availability_info.is_some());
+        assert!(sub.fail_event_reports.is_some());
+        assert_eq!(sub.request_test_notification, Some(true));
+        assert!(sub.websock_notif_config.is_some());
+        assert_eq!(sub.supp_feat.as_deref(), Some("1"));
     }
 
+    /// Golden byte-vector: the minimal spec subscription (3 required IEs only)
+    /// serializes to EXACTLY the hand-derived camelCase wire form — pinning the
+    /// `self`→"self" rename and the `eventSubscs`/`notificationDestination`
+    /// casing at the byte level.
     #[test]
-    fn test_acr_mgnt_event_subsc_missing_uri_fails() {
-        assert!(serde_json::from_str::<AcrMgntEventSubsc>(r#"{"eecId":"eec1"}"#).is_err());
+    fn test_acrmgnt_subscription_golden_serialization() {
+        let sub = AcrMgntEventsSubscription {
+            self_: Some("/eees-acrmgntevent/v1/subscriptions/s-1".into()),
+            eas_id: "eas1.example.com".into(),
+            event_subscs: vec![AcrMgntEventSubsc {
+                event: "ACR_MONITORING".into(),
+                event_filter: None,
+                evt_req: None,
+                tgt_ue_id: None,
+                app_grp_id: None,
+                dnai_chg_type: None,
+                eas_ack_ind: None,
+                eas_chars: None,
+                traf_filter_info: None,
+                serv_cont_plan_ind: None,
+                eas_ack_svc_cont: None,
+            }],
+            evt_req: None,
+            notification_destination: "http://eas1.example.com/cb".into(),
+            event_reports: None,
+            availability_info: None,
+            fail_event_reports: None,
+            request_test_notification: None,
+            websock_notif_config: None,
+            supp_feat: None,
+        };
+        // Hand-derived from AcrMgntEventsSubscription yaml:424-469 field names.
+        let expected = concat!(
+            r#"{"self":"/eees-acrmgntevent/v1/subscriptions/s-1","#,
+            r#""easId":"eas1.example.com","#,
+            r#""eventSubscs":[{"event":"ACR_MONITORING"}],"#,
+            r#""notificationDestination":"http://eas1.example.com/cb"}"#
+        );
+        assert_eq!(serde_json::to_string(&sub).unwrap(), expected);
     }
 
-    /// `AcrMgntEvent` enum serializes as SCREAMING_SNAKE_CASE.
+    /// Each of the 3 required IEs (yaml:466-469) individually missing fails to
+    /// deserialize → handler maps to 400 MANDATORY_IE_MISSING. The OLD bespoke
+    /// body (`notificationUri` + `acrEvents`) is exactly such a body: it lacks
+    /// `easId`, `eventSubscs`, and `notificationDestination`.
     #[test]
-    fn test_acr_mgnt_event_serialization() {
-        assert_eq!(
-            serde_json::to_string(&AcrMgntEvent::AcrCompleted).unwrap(),
-            r#""ACR_COMPLETED""#
+    fn test_acrmgnt_subscription_missing_required_fails() {
+        // Missing easId.
+        assert!(serde_json::from_str::<AcrMgntEventsSubscription>(
+            r#"{"eventSubscs":[{"event":"UP_PATH_CHG"}],"notificationDestination":"http://cb"}"#
+        )
+        .is_err());
+        // Missing eventSubscs.
+        assert!(serde_json::from_str::<AcrMgntEventsSubscription>(
+            r#"{"easId":"eas1","notificationDestination":"http://cb"}"#
+        )
+        .is_err());
+        // Missing notificationDestination.
+        assert!(serde_json::from_str::<AcrMgntEventsSubscription>(
+            r#"{"easId":"eas1","eventSubscs":[{"event":"UP_PATH_CHG"}]}"#
+        )
+        .is_err());
+        // Nested AcrMgntEventSubsc missing its required `event` (yaml:518-519).
+        assert!(serde_json::from_str::<AcrMgntEventsSubscription>(
+            r#"{"easId":"eas1","eventSubscs":[{"appGrpId":"g"}],"notificationDestination":"http://cb"}"#
+        )
+        .is_err());
+        // Old bespoke shape (notificationUri + acrEvents, none of the spec
+        // required IEs) → rejected.
+        assert!(serde_json::from_str::<AcrMgntEventsSubscription>(
+            r#"{"notificationUri":"http://eec/cb","acrEvents":["LEGACY_VALUE"]}"#
+        )
+        .is_err());
+    }
+
+    /// The `AcrMgntEvent` open-enum accepts all 6 spec values (yaml:778-800) as
+    /// plain strings AND tolerates a forward-compat unknown string.
+    #[test]
+    fn test_acrmgnt_event_open_enum_values() {
+        for ev in ACR_MGNT_EVENTS {
+            let body = format!(r#"{{"event":"{ev}"}}"#);
+            let es: AcrMgntEventSubsc = serde_json::from_str(&body).expect("deserializes");
+            assert_eq!(es.event, ev);
+        }
+        // Forward-compatible unknown value (open enum) is tolerated.
+        let es: AcrMgntEventSubsc =
+            serde_json::from_str(r#"{"event":"REL21_FUTURE_EVENT"}"#).expect("deserializes");
+        assert_eq!(es.event, "REL21_FUTURE_EVENT");
+    }
+
+    /// `AcrMgntEventsNotification` requires `subpId` + `eventReports`, and
+    /// `AcrMgntEventReport` requires `event` (yaml:537-603); golden
+    /// serialization asserted (incl. reused `acrParams`/`easEndPoint`).
+    #[test]
+    fn test_acrmgnt_notification_model() {
+        let notif = AcrMgntEventsNotification {
+            subp_id: "sub-1".into(),
+            event_reports: vec![AcrMgntEventReport {
+                event: "ACR_MONITORING".into(),
+                eas_end_point: Some(crate::types::EndPoint {
+                    fqdn: Some("t-eas.example.com".into()),
+                    ..Default::default()
+                }),
+                acr_params: Some(crate::acr::AcrParameters {
+                    predict_exp_time: Some("2030-01-01T00:00:00Z".into()),
+                }),
+                ..Default::default()
+            }],
+        };
+        // Hand-derived from AcrMgntEventsNotification yaml:537-554 +
+        // AcrMgntEventReport yaml:556-603 field names.
+        let expected = concat!(
+            r#"{"subpId":"sub-1","eventReports":[{"event":"ACR_MONITORING","#,
+            r#""easEndPoint":{"fqdn":"t-eas.example.com"},"#,
+            r#""acrParams":{"predictExpTime":"2030-01-01T00:00:00Z"}}]}"#
         );
-        assert_eq!(
-            serde_json::to_string(&AcrMgntEvent::AcrFailed).unwrap(),
-            r#""ACR_FAILED""#
+        assert_eq!(serde_json::to_string(&notif).unwrap(), expected);
+        // Missing required members fail to deserialize.
+        assert!(
+            serde_json::from_str::<AcrMgntEventsNotification>(r#"{"subpId":"sub-1"}"#).is_err()
         );
-        assert_eq!(
-            serde_json::to_string(&AcrMgntEvent::AcrInitiated).unwrap(),
-            r#""ACR_INITIATED""#
-        );
-        assert_eq!(
-            serde_json::to_string(&AcrMgntEvent::EasRelocated).unwrap(),
-            r#""EAS_RELOCATED""#
-        );
+        assert!(serde_json::from_str::<AcrMgntEventReport>(r#"{"acId":"ac1"}"#).is_err());
+    }
+
+    /// `AcrMgntEventsSubscriptionPatch` patchable-field allow-list (yaml:521-535)
+    /// excludes the immutable `easId`.
+    #[test]
+    fn test_acrmgnt_patchable_fields() {
+        assert!(ACRMGNT_PATCHABLE_FIELDS.contains(&"eventSubscs"));
+        assert!(ACRMGNT_PATCHABLE_FIELDS.contains(&"notificationDestination"));
+        assert!(ACRMGNT_PATCHABLE_FIELDS.contains(&"evtReq"));
+        assert!(!ACRMGNT_PATCHABLE_FIELDS.contains(&"easId"));
     }
 
     // ---- EECContextPush / EECContext (TS29558_Eees_EECContextRelocation) ----
