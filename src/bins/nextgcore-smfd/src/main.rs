@@ -81,10 +81,23 @@ static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth
     std::sync::OnceLock::new();
 
 /// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
-/// Phase A). Outbound SBI clients attach a token via `client.with_oauth2`.
-#[allow(dead_code)]
+/// Phase A). Outbound SBI clients attach a token via [`attach_oauth2`].
 fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Attach the process-wide OAuth2 client (when enforcement is on) so the
+/// outbound SBI request carries an NRF-issued Bearer token scoped to `target`
+/// (TS 33.501 §13.4.1, TS 29.510 §5.4.2). A no-op when enforcement is off, so
+/// the matched-sim default path is byte-unchanged (Wave-6 H8 Phase A).
+pub(crate) fn attach_oauth2(
+    client: nextgcore_sbi::client::SbiClient,
+    target: nextgcore_sbi::types::NfType,
+) -> nextgcore_sbi::client::SbiClient {
+    match oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, target),
+        None => client,
+    }
 }
 
 /// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the

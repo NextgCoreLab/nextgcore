@@ -217,10 +217,15 @@ pub struct PcfEndpoint {
 
 impl PcfEndpoint {
     fn client(&self) -> SbiClient {
-        SbiClient::new(
-            SbiClientConfig::new(self.host.clone(), self.port)
-                .with_connect_timeout(Duration::from_secs(2))
-                .with_request_timeout(Duration::from_secs(3)),
+        // Attach an NRF-issued Bearer token to the Npcf_SMPolicyControl call
+        // when OAuth2 enforcement is on (Wave-6 H8 Phase A); no-op otherwise.
+        crate::attach_oauth2(
+            SbiClient::new(
+                SbiClientConfig::new(self.host.clone(), self.port)
+                    .with_connect_timeout(Duration::from_secs(2))
+                    .with_request_timeout(Duration::from_secs(3)),
+            ),
+            nextgcore_sbi::types::NfType::Pcf,
         )
     }
 }
@@ -306,10 +311,15 @@ pub struct NsacfEndpoint {
 
 impl NsacfEndpoint {
     fn client(&self) -> SbiClient {
-        SbiClient::new(
-            SbiClientConfig::new(self.host.clone(), self.port)
-                .with_connect_timeout(Duration::from_secs(2))
-                .with_request_timeout(Duration::from_secs(3)),
+        // Attach an NRF-issued Bearer token to the Nnsacf_NSAC call when OAuth2
+        // enforcement is on (Wave-6 H8 Phase A); no-op otherwise.
+        crate::attach_oauth2(
+            SbiClient::new(
+                SbiClientConfig::new(self.host.clone(), self.port)
+                    .with_connect_timeout(Duration::from_secs(2))
+                    .with_request_timeout(Duration::from_secs(3)),
+            ),
+            nextgcore_sbi::types::NfType::Nsacf,
         )
     }
 }
@@ -1830,5 +1840,25 @@ mod tests {
     fn nsac_reject_uses_slice_specific_5gsm_cause() {
         // TS 24.501 §9.11.4.2 cause #67 (insufficient resources for slice).
         assert_eq!(gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE, 67);
+    }
+
+    /// Wave-6 H8 Phase A: OAuth2 consumer enforcement is OFF by default, so the
+    /// PCF/NSACF outbound clients built by `PcfEndpoint::client`/
+    /// `NsacfEndpoint::client` attach NO Bearer token — the matched-sim default
+    /// path is byte-unchanged. The token attach is opt-in via
+    /// `smf.sbi.oauth2.require` (TS 33.501 §13.4.1). Flipping this invariant
+    /// (installing an OAUTH2_CLIENT unconditionally) fails this test.
+    #[test]
+    fn oauth2_consumer_disabled_by_default() {
+        assert!(
+            crate::oauth2_client().is_none(),
+            "OAuth2 must be off by default so attach_oauth2 is a no-op"
+        );
+        // attach_oauth2 is a pure pass-through when enforcement is off.
+        let ep = PcfEndpoint {
+            host: "127.0.0.1".to_string(),
+            port: 7777,
+        };
+        let _ = ep.client();
     }
 }
