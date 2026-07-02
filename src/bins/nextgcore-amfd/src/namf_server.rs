@@ -13,7 +13,7 @@
 //! Malformed input returns 400 — handlers never panic on bad bodies.
 
 use nextgcore_sbi::client::SbiClient;
-use nextgcore_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
+use nextgcore_sbi::message::{ProblemDetails, SbiPart, SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{send_error, send_method_not_allowed, send_not_found};
 use serde_json::{json, Value};
 
@@ -946,6 +946,111 @@ pub fn send_n1n2_failure_notification(notify_uri: String, cause: &str, n1n2_msg_
     });
 }
 
+/// Content-Id of the binary NRPPa part inside an N2InfoNotify multipart body
+/// (referenced from `n2InfoContainer.nrppaInfo.nrppaPdu.ngapData.contentId`).
+pub(crate) const N2_INFO_NOTIFY_NRPPA_CONTENT_ID: &str = "nrppa";
+
+/// Build the multipart Namf_Communication N2InfoNotify callback POST
+/// (TS 29.518 §5.2.2.3.3, callback `{$request.body#/n2NotifyCallbackUri}` —
+/// TS29518_Namf_Communication.yaml:1597-1661): jsonData is an
+/// `N2InformationNotification` (yaml:2637-2670, `n2NotifySubscriptionId`
+/// mandatory) with `n2InformationClass` "NRPPa" and the NRPPa payload as a
+/// `binaryDataN2Information` part, Content-Id "nrppa", Content-Type
+/// `application/vnd.3gpp.ngap`, carried **verbatim** (the AMF is a
+/// transparent relay per TS 23.273 §6.11).
+///
+/// `nf_id` is the originating LMF NF-instance id echoed back from the NGAP
+/// RoutingID (our downlink relay seeds the RoutingID from the transfer's
+/// `nrppaInfo.nfId`, so a conformant gNB echo round-trips it); included as
+/// `nrppaInfo.nfId` when it survives the echo as a UTF-8 string.
+pub(crate) fn build_n2_info_notify_request(
+    path: &str,
+    n2_notify_subscription_id: &str,
+    lcs_correlation_id: Option<&str>,
+    nf_id: Option<&str>,
+    nrppa_pdu: &[u8],
+) -> Result<SbiRequest, serde_json::Error> {
+    let mut notification = json!({
+        "n2NotifySubscriptionId": n2_notify_subscription_id,
+        "n2InfoContainer": {
+            "n2InformationClass": "NRPPa",
+            "nrppaInfo": {
+                "nrppaPdu": {
+                    "ngapIeType": "NRPPA_PDU",
+                    "ngapData": { "contentId": N2_INFO_NOTIFY_NRPPA_CONTENT_ID },
+                },
+            },
+        },
+    });
+    if let Some(nf_id) = nf_id {
+        notification["n2InfoContainer"]["nrppaInfo"]["nfId"] = json!(nf_id);
+    }
+    if let Some(corr) = lcs_correlation_id {
+        notification["lcsCorrelationId"] = json!(corr);
+    }
+    Ok(SbiRequest::post(path)
+        .with_json_body(&notification)?
+        .with_part(SbiPart::with_content(
+            N2_INFO_NOTIFY_NRPPA_CONTENT_ID,
+            nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(nrppa_pdu),
+        )))
+}
+
+/// POST an N2InfoNotify to the LMF's registered `n2NotifyCallbackUri`
+/// (TS 29.518 §5.2.2.3.3) relaying an uplink NRPPa PDU (TS 38.413 §8.15.3 /
+/// §8.15.5). Fire-and-forget on a background task with bounded timeouts,
+/// mirroring [`send_n1n2_failure_notification`] — a notify failure is logged,
+/// never surfaced toward the gNB.
+pub fn send_n2_info_notify(
+    callback_uri: String,
+    n2_notify_subscription_id: String,
+    lcs_correlation_id: Option<String>,
+    nf_id: Option<String>,
+    nrppa_pdu: Vec<u8>,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("N2InfoNotify skipped (no tokio runtime)");
+        return;
+    };
+    handle.spawn(async move {
+        let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
+            log::warn!("Invalid n2NotifyCallbackUri: {callback_uri}");
+            return;
+        };
+        let request = match build_n2_info_notify_request(
+            &path,
+            &n2_notify_subscription_id,
+            lcs_correlation_id.as_deref(),
+            nf_id.as_deref(),
+            &nrppa_pdu,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                log::warn!("N2InfoNotify body build failed: {e}");
+                return;
+            }
+        };
+        let client = notify_client(&host, port);
+        match client.send_request(request).await {
+            Ok(resp) if resp.is_success() => {
+                log::info!(
+                    "N2InfoNotify delivered to {callback_uri} \
+                     (sub={n2_notify_subscription_id})"
+                );
+            }
+            Ok(resp) => {
+                log::warn!(
+                    "N2InfoNotify to {callback_uri} returned {} \
+                     (sub={n2_notify_subscription_id})",
+                    resp.status
+                );
+            }
+            Err(e) => log::warn!("N2InfoNotify to {callback_uri} failed: {e}"),
+        }
+    });
+}
+
 /// LCS positioning relay (TS 23.273 §7): build the downlink wire messages for
 /// an LMF-originated `Namf_Communication_N1N2MessageTransfer` carrying NRPPa
 /// (→ serving gNB over N2) and/or LPP (→ UE over N1). Returns `Some(response)`
@@ -1077,6 +1182,70 @@ fn try_positioning_relay(
     })
 }
 
+/// UPDP (UE policy) downlink relay — Wave-6 E5 (TS 29.525 §4.2.2.2: the PCF
+/// delivers UE policies via `Namf_Communication_N1N2MessageTransfer`;
+/// TS 29.518 N1MessageClass `UPDP`, TS29518_Namf_Communication.yaml:4453).
+/// Returns `Some(response)` when `body` is a UPDP transfer (so the caller
+/// skips SM handling), or `None` otherwise.
+///
+/// A UPDP transfer is identified structurally, same guard style as
+/// [`try_positioning_relay`]: `n1MessageClass == "UPDP"`. The UPDP payload
+/// (e.g. MANAGE UE POLICY COMMAND, TS 24.501 Annex D) is opaque to the AMF
+/// and relayed verbatim as a DL NAS TRANSPORT with payload container type
+/// "UE policy container" (0x05, TS 24.501 §9.11.3.40 / §5.4.5).
+///
+/// Fail-closed: a UE that is not CM-CONNECTED gets 504 UE_NOT_REACHABLE
+/// (honoring `n1n2FailureTxfNotifURI`), and a missing binary part gets 400 —
+/// never the pre-E5 fake-success 200-and-drop. Egress is performed by the
+/// NGAP server task via `positioning_dl_queue` /
+/// `process_positioning_downlinks`, exactly like the LPP leg.
+fn try_ue_policy_relay(
+    ue_context_id: &str,
+    ue: &AmfUe,
+    request: &SbiRequest,
+    body: &Value,
+) -> Option<SbiResponse> {
+    let is_updp = body
+        .pointer("/n1MessageContainer/n1MessageClass")
+        .and_then(Value::as_str)
+        == Some("UPDP");
+    if !is_updp {
+        return None; // not a UE-policy transfer — fall through
+    }
+
+    let failure_uri = body.get("n1n2FailureTxfNotifURI").and_then(Value::as_str);
+
+    // The N1 downlink needs a live NAS signalling connection (CM-CONNECTED).
+    if ue_ran_context(ue).is_none() {
+        return Some(ue_not_reachable_error(ue_context_id, failure_uri));
+    }
+
+    let Some(updp_pdu) = body
+        .pointer("/n1MessageContainer/n1MessageContent/contentId")
+        .and_then(Value::as_str)
+        .and_then(|cid| find_binary_part(request, cid))
+    else {
+        return Some(mandatory_ie_incorrect(
+            "n1MessageContainer.n1MessageContent.contentId",
+            "no binary part for the UPDP payload",
+        ));
+    };
+
+    if let Ok(context) = amf_self().read() {
+        context.positioning_dl_add(PendingPositioningDl {
+            amf_ue_ngap_id: ue.id,
+            kind: PositioningDlKind::UePolicyToUe { updp_pdu },
+        });
+        log::info!("[{ue_context_id}] UE policy: enqueued UPDP downlink for N1 egress");
+    }
+
+    let rsp = json!({ "cause": "N1_N2_TRANSFER_INITIATED" });
+    Some(match SbiResponse::ok().with_json_body(&rsp) {
+        Ok(resp) => resp,
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    })
+}
+
 /// POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages —
 /// Namf_Communication_N1N2MessageTransfer (TS 29.518 §5.2.2.3.1).
 fn handle_n1_n2_message_transfer_request(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
@@ -1098,6 +1267,14 @@ fn handle_n1_n2_message_transfer_request(ue_context_id: &str, request: &SbiReque
     // LPP (→UE, N1) carries no PDU session and no smInfo. Detect and handle it
     // up front so the SM-centric path below is completely untouched.
     if let Some(resp) = try_positioning_relay(ue_context_id, &ue, request, &body) {
+        return resp;
+    }
+
+    // UPDP (UE policy) relay — Wave-6 E5 (TS 29.525 §4.2.2.2): a PCF push of
+    // a UE-policy container (n1MessageClass "UPDP", no PDU session). Handled
+    // up front, same pattern as the positioning relay, so the SM-centric path
+    // below stays untouched.
+    if let Some(resp) = try_ue_policy_relay(ue_context_id, &ue, request, &body) {
         return resp;
     }
 
@@ -1178,10 +1355,22 @@ fn handle_n1_n2_message_transfer_request(ue_context_id: &str, request: &SbiReque
 
     let ran_ue = ue_ran_context(&ue);
 
-    // Pure N1 transfer without an SM context (e.g. SMS/LPP payloads): the
-    // internal handler requires a PDU session, so handle reachability here.
+    // Pure N1 transfer without an SM context: LPP and UPDP are relayed by the
+    // classful handlers above; any class remaining here has NO downlink
+    // forwarding path yet. Wave-6 E5: name the dropped class in a WARN
+    // instead of silently faking success (the 200 is kept this wave for
+    // backward compatibility — the full fail-closed fix is WS-A scope).
     let Some(psi) = pdu_session_id else {
         return if ran_ue.is_some() {
+            let class = body
+                .pointer("/n1MessageContainer/n1MessageClass")
+                .and_then(Value::as_str)
+                .unwrap_or("<none>");
+            log::warn!(
+                "[{ue_context_id}] N1N2MessageTransfer with unhandled pure-N1 \
+                 class '{class}' acknowledged (200) but NOT forwarded to the \
+                 UE — no relay for this n1MessageClass"
+            );
             let rsp = json!({ "cause": "N1_N2_TRANSFER_INITIATED" });
             match SbiResponse::ok().with_json_body(&rsp) {
                 Ok(resp) => resp,
@@ -2317,6 +2506,160 @@ mod tests {
         );
     }
 
+    /// Serializes the two UPDP tests that DRAIN the shared global
+    /// positioning_dl_queue (drains are destructive; other relay tests only
+    /// enqueue and never read the queue, so they are unaffected).
+    static UPDP_QUEUE_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn updp_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
+        UPDP_QUEUE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// Drain the global downlink queue, keep the items for `ue_id`, re-add
+    /// everything else (leave other tests' enqueues untouched).
+    fn drain_downlinks_for(ue_id: u64) -> Vec<crate::context::PendingPositioningDl> {
+        let ctx = amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        let (mine, others): (Vec<_>, Vec<_>) = guard
+            .positioning_dl_drain()
+            .into_iter()
+            .partition(|d| d.amf_ue_ngap_id == ue_id);
+        for item in others {
+            guard.positioning_dl_add(item);
+        }
+        mine
+    }
+
+    /// Wave-6 E5: a PCF push of UPDP (n1MessageClass "UPDP", TS 29.518
+    /// yaml:4453, no PDU session) to a CM-CONNECTED UE returns 200 and
+    /// enqueues the VERBATIM UPDP bytes as a UePolicyToUe downlink for the
+    /// NGAP egress pump — no silent drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_updp_to_connected_ue_relays_verbatim() {
+        let _serial = updp_queue_test_lock().lock().await;
+        let supi = "imsi-001010000060032";
+        let ue = setup_ue(supi, true, true);
+
+        // Opaque MANAGE UE POLICY COMMAND-ish bytes (payload is opaque to the
+        // AMF; content does not matter, byte-for-byte relay does).
+        let updp: &[u8] = &[0x80, 0x01, 0x00, 0x05, 0xAB];
+        let body = json!({
+            "n1MessageContainer": {
+                "n1MessageClass": "UPDP",
+                "n1MessageContent": { "contentId": "updp-pdu" }
+            }
+        });
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "updp-pdu",
+                "application/vnd.3gpp.5gnas",
+                bytes::Bytes::copy_from_slice(updp),
+            ));
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            body_json(&resp)["cause"].as_str(),
+            Some("N1_N2_TRANSFER_INITIATED")
+        );
+
+        // The queue now holds the verbatim payload for this UE (filter by
+        // AMF-UE-NGAP-ID: the queue is global and shared across tests).
+        let drained = drain_downlinks_for(ue.id);
+        assert_eq!(drained.len(), 1, "exactly one UPDP downlink enqueued");
+        match &drained[0].kind {
+            crate::context::PositioningDlKind::UePolicyToUe { updp_pdu } => {
+                assert_eq!(updp_pdu.as_slice(), updp, "UPDP payload relayed verbatim");
+            }
+            other => panic!("expected UePolicyToUe, got {other:?}"),
+        }
+    }
+
+    /// Wave-6 E5 fail-closed assert: the same UPDP transfer against a CM-IDLE
+    /// UE gets 504 UE_NOT_REACHABLE (and the n1n2FailureTxfNotifURI callback),
+    /// NOT the pre-E5 fake-success 200-and-drop.
+    ///
+    /// Drives `try_ue_policy_relay` directly with a locally-constructed
+    /// CM-IDLE `AmfUe` (its CM check reads the passed UE, not the global
+    /// store) so the assert is deterministic: the shared global UE store is
+    /// mutated concurrently by other tests (pool-id reuse can flip a stored
+    /// idle UE to connected mid-test — the known
+    /// `test_ue_context_transfer_error_paths` flake class). The HTTP routing
+    /// into the relay is covered by the connected-UE test above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_updp_to_idle_ue_504_not_fake_200() {
+        let _serial = updp_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+        let supi = "imsi-001010000060033";
+        // CM-IDLE by construction: no live RAN UE context.
+        let mut ue = AmfUe::new(987_654, NEXTGCORE_INVALID_POOL_ID);
+        ue.supi = Some(supi.to_string());
+        ue.ran_ue_id = NEXTGCORE_INVALID_POOL_ID;
+
+        let (server, port, mut rx) = start_capture_server().await;
+        let failure_uri = format!("http://127.0.0.1:{port}/pcf-n1n2-failure");
+
+        let body = json!({
+            "n1MessageContainer": {
+                "n1MessageClass": "UPDP",
+                "n1MessageContent": { "contentId": "updp-pdu" }
+            },
+            "n1n2FailureTxfNotifURI": failure_uri,
+        });
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "updp-pdu",
+                "application/vnd.3gpp.5gnas",
+                bytes::Bytes::from_static(&[0x80, 0x01, 0x00]),
+            ));
+        let resp = try_ue_policy_relay(supi, &ue, &req, &body)
+            .expect("UPDP transfer must be classified as a UE-policy relay");
+        assert_eq!(resp.status, 504, "CM-IDLE UPDP must be 504, never 200");
+        let err = body_json(&resp);
+        assert_eq!(err["error"]["cause"].as_str(), Some("UE_NOT_REACHABLE"));
+
+        // n1n2FailureTxfNotifURI is honored (TS 29.518 §6.1.6.2.8).
+        let (uri, posted) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("failure notification not delivered within 3s")
+            .expect("capture channel closed");
+        assert_eq!(uri, "/pcf-n1n2-failure");
+        let posted: Value = serde_json::from_str(&posted).expect("failure body JSON");
+        assert_eq!(posted["cause"].as_str(), Some("UE_NOT_REACHABLE"));
+
+        // Nothing was enqueued for this UE (fail-closed).
+        let leaked = drain_downlinks_for(ue.id).len();
+        assert_eq!(leaked, 0, "no downlink may be enqueued for an idle UE");
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// Wave-6 E5: a UPDP transfer whose contentId has no matching binary part
+    /// is rejected 400 MANDATORY_IE_INCORRECT (never accepted-and-dropped).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_updp_missing_binary_part_400() {
+        let supi = "imsi-001010000060034";
+        setup_ue(supi, true, true);
+
+        let body = json!({
+            "n1MessageContainer": {
+                "n1MessageClass": "UPDP",
+                "n1MessageContent": { "contentId": "updp-pdu" }
+            }
+        });
+        // No multipart binary part attached at all.
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_INCORRECT");
+    }
+
     // ------------------------------------------------------------------
     // Namf_Communication — N1N2MessageSubscribe / UnSubscribe
     // (TS 29.518 §5.2.2.6/§5.2.2.7)
@@ -2324,6 +2667,87 @@ mod tests {
 
     /// UeN1N2InfoSubscriptionCreateData shaped per
     /// TS29518_Namf_Communication.yaml:2609-2626 (all fields)
+    #[test]
+    fn golden_n2_info_notify_multipart_body() {
+        // Wave-6 WS-A A1 — hand-derived golden byte-vector for the multipart
+        // N2InfoNotify body (TS 29.500 §6.1.2.3 framing; TS 29.518
+        // N2InformationNotification, TS29518_Namf_Communication.yaml:2637 —
+        // n2NotifySubscriptionId mandatory). The expected bytes below are
+        // written out by hand from the multipart/related grammar, NOT
+        // round-tripped through the encoder.
+        let nrppa = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let req = build_n2_info_notify_request(
+            "/nlmf-loc/v1/notify/n2",
+            "sub-1",
+            Some("corr-9"),
+            Some("lmf-1"),
+            &nrppa,
+        )
+        .expect("build N2InfoNotify");
+
+        // JSON root: compared order-insensitively (parsed Value equality) —
+        // RFC 8259 object members are unordered and the emitted key order is
+        // serializer-dependent (this workspace unifies serde_json with
+        // `preserve_order`, so `json!` maps keep insertion order).
+        let json = req.http.content.clone().expect("json root part");
+        let actual: serde_json::Value = serde_json::from_str(&json).expect("valid JSON root");
+        let expected_json: serde_json::Value = serde_json::from_str(
+            "{\"lcsCorrelationId\":\"corr-9\",\
+             \"n2InfoContainer\":{\"n2InformationClass\":\"NRPPa\",\
+             \"nrppaInfo\":{\"nfId\":\"lmf-1\",\
+             \"nrppaPdu\":{\"ngapData\":{\"contentId\":\"nrppa\"},\
+             \"ngapIeType\":\"NRPPA_PDU\"}}},\
+             \"n2NotifySubscriptionId\":\"sub-1\"}",
+        )
+        .expect("valid expected JSON");
+        assert_eq!(actual, expected_json);
+
+        // Full multipart body with a pinned boundary.
+        let body = nextgcore_sbi::multipart::encode(Some(json.as_str()), &req.http.parts, "gold");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"--gold\r\nContent-Type: application/json\r\n\r\n");
+        expected.extend_from_slice(json.as_bytes());
+        expected.extend_from_slice(
+            b"\r\n--gold\r\nContent-Id: nrppa\r\nContent-Type: application/vnd.3gpp.ngap\r\n\r\n",
+        );
+        expected.extend_from_slice(&nrppa);
+        expected.extend_from_slice(b"\r\n--gold--\r\n");
+        assert_eq!(body, expected, "multipart body must match the hand-derived vector");
+
+        // Cross-decode with our own multipart decoder (strict-peer property:
+        // this is exactly what lmfd's SbiServer layer runs on receipt) — the
+        // binary part must be the NRPPa PDU verbatim (transparent relay).
+        let decoded = nextgcore_sbi::multipart::decode(
+            &nextgcore_sbi::multipart::content_type_with_boundary("gold"),
+            &body,
+        )
+        .expect("multipart decode");
+        assert_eq!(decoded.json.as_deref(), Some(json.as_str()));
+        assert_eq!(decoded.parts.len(), 1);
+        assert_eq!(decoded.parts[0].content_id.as_deref(), Some("nrppa"));
+        assert_eq!(
+            decoded.parts[0].content_type.as_deref(),
+            Some("application/vnd.3gpp.ngap")
+        );
+        assert_eq!(decoded.parts[0].data.as_ref(), &nrppa[..]);
+    }
+
+    #[test]
+    fn n2_info_notify_optional_fields_omitted() {
+        // Absent lcsCorrelationId / nfId must be OMITTED (never null / never
+        // fabricated) — fail-closed producer per WS-A A1 step 2.
+        let req = build_n2_info_notify_request("/cb", "sub-2", None, None, &[0x01])
+            .expect("build N2InfoNotify");
+        let v: Value = serde_json::from_str(req.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["n2NotifySubscriptionId"], "sub-2");
+        assert!(v.get("lcsCorrelationId").is_none());
+        assert!(v["n2InfoContainer"]["nrppaInfo"].get("nfId").is_none());
+        assert_eq!(
+            v["n2InfoContainer"]["nrppaInfo"]["nrppaPdu"]["ngapIeType"],
+            "NRPPA_PDU"
+        );
+    }
+
     fn n1n2_subscription_body(port_tag: &str) -> Value {
         json!({
             "n1MessageClass": "LPP",

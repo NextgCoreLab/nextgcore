@@ -23,14 +23,19 @@
 //! PDU-session / user-plane data path, so this code is dormant in the
 //! reg+PDU+ping flow and cannot perturb it.
 //!
-//! ## Cross-task egress (deferred)
-//! The actual SCTP egress to the gNB and the `Nlmf` uplink callback to the LMF
-//! are owned by the NGAP server task / a future LMF consumer, not by the SBI
-//! handler task that invokes these builders. The same SBI→NGAP hand-off gap
-//! affects the existing paging N1/N2 path (its `pending_n1`/`pending_n2` are
-//! likewise not yet drained to SCTP). Wiring that shared egress + the `Nlmf`
-//! consumer is tracked as `lmfd-07`; conformance of the bytes built here is
-//! proven by the round-trip / framing unit tests below, independent of egress.
+//! ## Cross-task egress (wired)
+//! Downlink egress is live: the Namf SBI handler enqueues the payloads built
+//! here on `positioning_dl_queue` (`context.rs`) and the NGAP server task
+//! drains it every pump loop in `process_positioning_downlinks`
+//! (`ngap_path.rs`), delivering NRPPa to the serving gNB over the live SCTP
+//! association and LPP to the UE as a security-protected DL NAS Transport.
+//! The **uplink** leg is wired too (Wave-6 WS-A item A1): NGAP procedures 50
+//! (`UplinkUEAssociatedNRPPaTransport`) and 47 (`UplinkNonUEAssociatedNRPPa-
+//! Transport`) are dispatched in `ngap_path.rs` and relayed verbatim to the
+//! LMF's registered `n2NotifyCallbackUri` as a multipart Namf N2InfoNotify
+//! (`namf_server::send_n2_info_notify`, TS 29.518 §5.2.2.3.3), keyed off the
+//! N1N2MessageSubscribe registry (fail-closed: no subscription → WARN + drop,
+//! never an ErrorIndication toward the gNB).
 
 use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
 use nextgcore_asn1c::ngap::pdu::{

@@ -475,8 +475,11 @@ pub struct AmfContext {
 
     /// LCS positioning downlink queue (TS 23.273): positioning payloads the LMF
     /// asked the AMF to relay (NRPPa→gNB / LPP→UE), enqueued by the Namf SBI
-    /// handler and drained + delivered by the NGAP server task. Empty on the
-    /// reg/PDU/ping path — only populated by positioning N1N2 transfers.
+    /// handler and drained + delivered by the NGAP server task. Wave-6 E5 also
+    /// carries UPDP UE-policy downlinks (TS 29.518 n1MessageClass "UPDP" →
+    /// DL NAS Transport, payload container type 0x05) on this queue. Empty on
+    /// the reg/PDU/ping path — only populated by positioning/UPDP N1N2
+    /// transfers.
     positioning_dl_queue: RwLock<Vec<PendingPositioningDl>>,
 
     /// Namf_Communication N1N2 message subscriptions (TS 29.518 §5.2.2.6):
@@ -517,6 +520,13 @@ pub enum PositioningDlKind {
     },
     /// LPP message → UE (N1, DL NAS Transport with payload container type LPP).
     LppToUe { lpp_pdu: Vec<u8> },
+    /// UPDP message (e.g. MANAGE UE POLICY COMMAND, TS 24.501 Annex D) → UE
+    /// (N1, DL NAS Transport with payload container type "UE policy
+    /// container" 0x05, TS 24.501 §9.11.3.40). Wave-6 E5: the PCF pushes it
+    /// via Namf_Communication N1N2MessageTransfer with n1MessageClass "UPDP"
+    /// (TS 29.518, TS29518_Namf_Communication.yaml:4453); the payload is
+    /// opaque to the AMF and relayed verbatim.
+    UePolicyToUe { updp_pdu: Vec<u8> },
 }
 
 /// Namf_Communication N1N2 message subscription stored per ueContextId
@@ -1567,6 +1577,43 @@ impl AmfContext {
         })
     }
 
+    /// Find a subscription registered for an N2 information class across ALL
+    /// UEs (exact-class match, fail-closed). Used by the uplink
+    /// non-UE-associated NRPPa relay (TS 38.413 §8.15.5 / TS 23.273 §6.11):
+    /// that procedure carries no UE identity, only an opaque RoutingID, so
+    /// the consumer is resolved from the registry alone. When several
+    /// subscriptions with distinct callback URIs coexist the choice is
+    /// ambiguous: the lexicographically greatest subscriptionId wins
+    /// (deterministic tie-break) and a WARN is logged.
+    pub fn n1n2_subscription_find_any_n2(
+        &self,
+        n2_information_class: &str,
+    ) -> Option<UeN1N2InfoSubscription> {
+        let subs = self.n1n2_subscriptions.read().ok()?;
+        let mut matches: Vec<&UeN1N2InfoSubscription> = subs
+            .values()
+            .flatten()
+            .filter(|s| {
+                s.n2_information_class.as_deref() == Some(n2_information_class)
+                    && s.n2_notify_callback_uri.is_some()
+            })
+            .collect();
+        matches.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+        let distinct_uris = matches
+            .iter()
+            .filter_map(|s| s.n2_notify_callback_uri.as_deref())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if distinct_uris > 1 {
+            log::warn!(
+                "n1n2_subscription_find_any_n2({n2_information_class}): {distinct_uris} \
+                 distinct callback URIs registered; picking max-subscriptionId \
+                 (ambiguous non-UE-associated uplink routing)"
+            );
+        }
+        matches.last().map(|s| (*s).clone())
+    }
+
     /// Drop all N1N2 message subscriptions for a UE (UE-context release path)
     pub fn n1n2_subscriptions_remove_for_ue(&self, ue_context_id: &str) {
         if let Ok(mut subs) = self.n1n2_subscriptions.write() {
@@ -2000,6 +2047,10 @@ pub struct AmfUe {
     pub rejected_nssai: Vec<SNssai>,
     /// Policy association
     pub policy_association: PolicyAssociation,
+    /// UE Policy Association (Npcf_UEPolicyControl, TS 29.525 §4.2.2 —
+    /// Wave-6 E7): created at registration alongside the AM policy
+    /// association, deleted at deregistration.
+    pub ue_policy_association: PolicyAssociation,
     /// GMM capability
     pub gmm_capability: GmmCapability,
     /// Security context available flag
@@ -2494,6 +2545,7 @@ impl AmfUe {
             allowed_nssai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SLICE),
             rejected_nssai: Vec::with_capacity(NEXTGCORE_MAX_NUM_OF_SLICE),
             policy_association: PolicyAssociation::default(),
+            ue_policy_association: PolicyAssociation::default(),
             gmm_capability: GmmCapability::default(),
             security_context_available: false,
             mac_failed: false,
@@ -2594,6 +2646,18 @@ impl AmfUe {
     pub fn pcf_am_policy_clear(&mut self) {
         self.policy_association.resource_uri = None;
         self.policy_association.id = None;
+    }
+
+    /// Check if a PCF UE Policy Association exists (Npcf_UEPolicyControl,
+    /// TS 29.525 — Wave-6 E7)
+    pub fn pcf_ue_policy_associated(&self) -> bool {
+        self.ue_policy_association.id.is_some()
+    }
+
+    /// Clear the PCF UE Policy Association (Wave-6 E7)
+    pub fn pcf_ue_policy_clear(&mut self) {
+        self.ue_policy_association.resource_uri = None;
+        self.ue_policy_association.id = None;
     }
 
     /// Check if 5G AKA confirmation exists
@@ -3268,10 +3332,17 @@ mod tests {
                 lpp_pdu: vec![0x90, 0x01],
             },
         });
+        // Wave-6 E5: the UPDP UE-policy downlink rides the same queue.
+        ctx.positioning_dl_add(PendingPositioningDl {
+            amf_ue_ngap_id: 11,
+            kind: PositioningDlKind::UePolicyToUe {
+                updp_pdu: vec![0x80, 0x01, 0x00],
+            },
+        });
 
         // Drain returns all items in FIFO order and leaves the queue empty.
         let drained = ctx.positioning_dl_drain();
-        assert_eq!(drained.len(), 2);
+        assert_eq!(drained.len(), 3);
         assert_eq!(drained[0].amf_ue_ngap_id, 7);
         assert!(matches!(
             drained[0].kind,
@@ -3279,6 +3350,13 @@ mod tests {
         ));
         assert_eq!(drained[1].amf_ue_ngap_id, 9);
         assert!(matches!(drained[1].kind, PositioningDlKind::LppToUe { .. }));
+        assert_eq!(drained[2].amf_ue_ngap_id, 11);
+        match &drained[2].kind {
+            PositioningDlKind::UePolicyToUe { updp_pdu } => {
+                assert_eq!(updp_pdu, &vec![0x80, 0x01, 0x00]);
+            }
+            other => panic!("expected UePolicyToUe, got {other:?}"),
+        }
         assert!(ctx.positioning_dl_drain().is_empty());
     }
 

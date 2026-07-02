@@ -340,7 +340,8 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     // identical to the prior hand-rolled output — 5GS registration result LV
     // [01, access&7]; 5G-GUTI (0x77 TLV-E) when a next-GUTI is assigned; single-TAI
     // partial list type-00 (0x54 TLV); Allowed NSSAI (0x15 TLV, omitted when empty);
-    // T3512 = 9 minutes (GPRS timer 3, 0x49). Locked by
+    // T3512 = 9 minutes (GPRS timer 3: unit 101 = multiples of 1 minute,
+    // value 9 → wire octet 0xA9, TS 24.008 Table 10.5.163b). Locked by
     // `drift_registration_accept_minimal_through_nextgcore_nas` (reg-result+TAI+T3512) and
     // `golden_registration_accept_full` (GUTI + multi-S-NSSAI branches, derived from
     // the still-present encode_guti/encode_tai_list/encode_nssai_value helpers).
@@ -408,8 +409,13 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
         })
     };
 
-    // T3512 value (IEI 0x5E): 9 minutes — unit 010 (multiples of 1 minute), value 9.
-    let t3512_value = Some(nextgcore_types::GprsTimer3::new(2, 9));
+    // T3512 value (IEI 0x5E, GPRS timer 3 — TS 24.501 §9.11.3.44 / TS 24.008
+    // §10.5.7.4a Table 10.5.163b): 9 minutes — unit 101 (multiples of
+    // 1 minute), value 9 → 9 min, wire octet 0xA9.
+    let t3512_value = Some(nextgcore_types::GprsTimer3::new(
+        nextgcore_types::GprsTimer3::UNIT_1_MINUTE,
+        9,
+    ));
 
     let msg =
         nextgcore_msg::FiveGmmMessage::RegistrationAccept(nextgcore_msg::RegistrationAccept {
@@ -812,6 +818,24 @@ pub fn build_dl_nas_transport(
     }
 
     Some(builder.build())
+}
+
+/// Build a DL NAS Transport (TS 24.501 §8.2.10) carrying a PCF-provided UPDP
+/// message (e.g. MANAGE UE POLICY COMMAND, TS 24.501 Annex D) toward the UE
+/// — Wave-6 E5. Thin wrapper over the generic 5GMM DL NAS Transport builder
+/// with payload container type "UE policy container" (0x05, TS 24.501
+/// Table 9.11.3.40.1); no PDU session ID and no 5GMM cause (the container is
+/// being *forwarded*, not rejected). Mirrors
+/// `positioning::build_lpp_dl_nas`. The returned NAS PDU still needs NAS
+/// security protection by the caller before it goes on the wire.
+pub fn build_ue_policy_dl_nas(updp_pdu: &[u8]) -> Option<Vec<u8>> {
+    build_dl_nas_transport(
+        None,
+        crate::gmm_handler::payload_container_type::UE_POLICY_CONTAINER,
+        updp_pdu,
+        None,
+        None,
+    )
 }
 
 /// Build 5GMM Status message (plain inner; wrap with nas_5gs_security_encode).
@@ -1254,7 +1278,9 @@ mod tests {
         let n = encode_nssai_value(&ue.allowed_nssai); // 0x15 TLV
         expected.extend_from_slice(&[0x15, n.len() as u8]);
         expected.extend_from_slice(&n);
-        expected.extend_from_slice(&[0x5e, 0x01, 0x49]); // T3512
+        // T3512: unit 101 (1-minute multiples), value 9 → 0xA9 = 9 min
+        // (TS 24.501 §9.11.3.44 / TS 24.008 Table 10.5.163b)
+        expected.extend_from_slice(&[0x5e, 0x01, 0xA9]);
 
         assert_eq!(build_registration_accept(&ue), Some(expected));
     }
@@ -1275,7 +1301,8 @@ mod tests {
         let t = encode_tai_list(&ue.nr_tai);
         expected.extend_from_slice(&[0x54, t.len() as u8]);
         expected.extend_from_slice(&t);
-        expected.extend_from_slice(&[0x5e, 0x01, 0x49]);
+        // T3512 = 0xA9: 9 min (TS 24.008 Table 10.5.163b, unit 101/value 9)
+        expected.extend_from_slice(&[0x5e, 0x01, 0xA9]);
 
         let out = build_registration_accept(&ue).unwrap();
         assert_eq!(out, expected);
@@ -1308,7 +1335,8 @@ mod tests {
         let t = encode_tai_list(&ue.nr_tai);
         expected.extend_from_slice(&[0x54, t.len() as u8]);
         expected.extend_from_slice(&t);
-        expected.extend_from_slice(&[0x5e, 0x01, 0x49]);
+        // T3512 = 0xA9: 9 min (TS 24.008 Table 10.5.163b, unit 101/value 9)
+        expected.extend_from_slice(&[0x5e, 0x01, 0xA9]);
 
         let out = build_registration_accept(&ue).unwrap();
         assert_eq!(out, expected);
@@ -1319,6 +1347,38 @@ mod tests {
             out.windows(3).any(|w| w == [0x13, 0x00, 0x62]),
             "3-digit MNC PLMN must encode 13 00 62 (mnc3 nibble is the real 0, not 0xf)"
         );
+    }
+
+    #[test]
+    fn golden_t3512_nine_minutes_unit_and_decode() {
+        // WSB-3 (Wave 6): the intended 9-minute T3512 default must encode as
+        // GPRS timer 3 unit 101 (multiples of 1 minute) + value 9 → 0xA9, per
+        // TS 24.501 §9.11.3.44 / TS 24.008 §10.5.7.4a Table 10.5.163b. The
+        // old encoding passed unit octet 2 (unit bits 010 = multiples of
+        // 10 hours) × 9 = 90 hours — spec-legal but not the intended default.
+        use bytes::{Buf, BytesMut};
+        let t3512 = nextgcore_types::GprsTimer3::new(nextgcore_types::GprsTimer3::UNIT_1_MINUTE, 9);
+        let mut buf = BytesMut::new();
+        t3512.encode(&mut buf);
+        assert_eq!(buf.as_ref(), &[0x01, 0xA9], "L=1, unit 101 | value 9 = 0xA9");
+
+        // Decode side (mirrors the nextgsim UE decode_gprs_timer3 semantics):
+        // 0xA9 → unit 5 (1 minute), value 9 → the UE re-arms T3512 at 540 s.
+        let mut wire = buf.freeze();
+        let decoded =
+            nextgcore_types::GprsTimer3::decode(&mut wire).expect("GprsTimer3 decode 0xA9");
+        assert_eq!(decoded.unit, nextgcore_types::GprsTimer3::UNIT_1_MINUTE);
+        assert_eq!(decoded.unit, 5);
+        assert_eq!(decoded.value, 9);
+        assert_eq!(u32::from(decoded.value) * 60, 540, "T3512 = 540 s, not 90 h");
+        assert!(!wire.has_remaining());
+
+        // The full Registration Accept must carry the 0xA9 octet (and never
+        // the old 90-hour encoding) in its trailing T3512 IE.
+        let mut ue = create_test_amf_ue();
+        ue.next_guti.tmsi = 0;
+        let out = build_registration_accept(&ue).unwrap();
+        assert_eq!(&out[out.len() - 3..], &[0x5e, 0x01, 0xA9], "T3512 IE tail");
     }
 
     #[test]
@@ -1479,6 +1539,30 @@ mod tests {
         // 0x58 cause IEI must be present, no 0x12 PSI IEI
         assert!(msg2.windows(2).any(|w| w == [0x58, 90]));
         assert!(!msg2[6..].starts_with(&[0x12]));
+    }
+
+    /// Wave-6 E5 golden byte-vector (hand-derived from TS 24.501 §8.2.10
+    /// Table 8.2.10.1.1 + Table 9.11.3.40.1, mirroring
+    /// `positioning.rs::lpp_dl_nas_frames_lpp_container`): a DL NAS TRANSPORT
+    /// carrying a UPDP payload frames it under payload container type
+    /// "UE policy container" (0b0101 = 0x05) with an LV-E length and the
+    /// verbatim payload; no PSI, no 5GMM cause, no back-off IEs follow.
+    #[test]
+    fn golden_ue_policy_dl_nas_transport() {
+        // Opaque UPDP body (envelope bytes are irrelevant to the framing):
+        // PTI 0x80 (TS 24.501 D.1.2 PCF range) + msg type 0x01 + one byte.
+        let updp = [0x80u8, 0x01, 0x00];
+        let nas = build_ue_policy_dl_nas(&updp).expect("build UE policy DL NAS Transport");
+        // Hand-derived expected bytes:
+        //   0x7E  extended protocol discriminator = 5GMM   (TS 24.501 §9.2)
+        //   0x00  security header type = plain             (§9.3)
+        //   0x68  message type = DL NAS TRANSPORT          (Table 8.2.10.1.1)
+        //   0x05  payload container type = UE policy       (Table 9.11.3.40.1)
+        //   0x00 0x03  payload container length (LV-E, big-endian)
+        //   0x80 0x01 0x00  verbatim UPDP payload
+        assert_eq!(nas, vec![0x7E, 0x00, 0x68, 0x05, 0x00, 0x03, 0x80, 0x01, 0x00]);
+        // And no optional IE (PSI 0x12 / cause 0x58 / back-off 0x37) trails.
+        assert_eq!(nas.len(), 6 + updp.len());
     }
 
     #[test]

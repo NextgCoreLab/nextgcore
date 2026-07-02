@@ -1533,6 +1533,115 @@ pub async fn call_pcf_am_policy_create(
     Ok(assoc_id)
 }
 
+/// Wave-6 E7 kill-switch for the UE Policy Association at registration:
+/// `AMF_UE_POLICY_ASSOC=off` (also `0`/`false`, case-insensitive) restores
+/// the pre-E7 registration byte-flow (no Npcf_UEPolicyControl create/delete).
+/// Default (unset or any other value) is enabled.
+pub fn ue_policy_assoc_enabled() -> bool {
+    ue_policy_assoc_enabled_value(std::env::var("AMF_UE_POLICY_ASSOC").ok().as_deref())
+}
+
+/// Pure classifier behind [`ue_policy_assoc_enabled`] (env-free for tests).
+fn ue_policy_assoc_enabled_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("off") | Some("0") | Some("false")
+    )
+}
+
+/// Npcf_UEPolicyControl_Create: POST /npcf-ue-policy-control/v1/policies
+/// (TS 29.525 §4.2.2 — the AMF is the NF service consumer creating the UE
+/// Policy Association at registration; Wave-6 E7). The body is a
+/// PolicyAssociationRequest (TS29525_Npcf_UEPolicyControl.yaml:381-461):
+/// `notificationUri`/`supi`/`suppFeat` (the members pcfd validates as
+/// mandatory) plus the `servingPlmn` and `guami` optionals so the PCF can
+/// address the serving AMF for the Namf N1N2 delivery leg (E4). Returns the
+/// policy association ID parsed from the Location header (fallback:
+/// `polAssoId` in the body).
+#[allow(clippy::too_many_arguments)]
+pub async fn call_pcf_ue_policy_create(
+    pcf_host: &str,
+    pcf_port: u16,
+    supi: &str,
+    serving_plmn_mcc: &str,
+    serving_plmn_mnc: &str,
+    guami_mcc: &str,
+    guami_mnc: &str,
+    guami_amf_id_hex: &str,
+) -> SbiResult<String> {
+    let client = SbiClient::with_host_port(pcf_host, pcf_port);
+
+    let body = serde_json::json!({
+        "notificationUri": format!("/namf-callback/v1/{supi}/ue-policy-notify"),
+        "supi": supi,
+        "suppFeat": "",
+        "servingPlmn": { "mcc": serving_plmn_mcc, "mnc": serving_plmn_mnc },
+        "guami": {
+            "plmnId": { "mcc": guami_mcc, "mnc": guami_mnc },
+            "amfId": guami_amf_id_hex,
+        },
+    });
+
+    let response = client
+        .post_json("/npcf-ue-policy-control/v1/policies", &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("UE policy create failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "UE policy create returned status {}",
+            response.status
+        )));
+    }
+
+    let assoc_id = response
+        .http
+        .headers
+        .get("location")
+        .and_then(|loc| loc.rsplit('/').next().map(String::from))
+        .or_else(|| {
+            response.http.content.as_ref().and_then(|c| {
+                serde_json::from_str::<serde_json::Value>(c)
+                    .ok()
+                    .and_then(|j| j["polAssoId"].as_str().map(String::from))
+            })
+        })
+        .ok_or_else(|| {
+            SbiError::RequestFailed(
+                "UE policy create: no Location header and no polAssoId in body".to_string(),
+            )
+        })?;
+
+    log::info!("[{supi}] Npcf_UEPolicyControl_Create OK (polAssoId={assoc_id})");
+    Ok(assoc_id)
+}
+
+/// Npcf_UEPolicyControl_Delete: DELETE
+/// /npcf-ue-policy-control/v1/policies/{polAssoId} (TS 29.525 §4.2.4 —
+/// Wave-6 E7, the deregistration leg of the UE Policy Association).
+pub async fn call_pcf_ue_policy_delete(
+    pcf_host: &str,
+    pcf_port: u16,
+    pol_asso_id: &str,
+) -> SbiResult<()> {
+    let client = SbiClient::with_host_port(pcf_host, pcf_port);
+
+    let response = client
+        .delete(&format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}"))
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("UE policy delete failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "UE policy delete returned status {}",
+            response.status
+        )));
+    }
+
+    log::info!("Npcf_UEPolicyControl_Delete OK (polAssoId={pol_asso_id})");
+    Ok(())
+}
+
 /// Result of an Nnsacf UE-admission query (TS 29.536).
 #[derive(Debug, Clone)]
 pub struct NsacfUeAdmissionResult {
@@ -1989,5 +2098,244 @@ mod tests {
             extract_binary_ref(&response, &response_body, "n2SmInfo").unwrap(),
             n2
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Wave-6 E7 — Npcf_UEPolicyControl consumer (TS 29.525 §4.2.2/§4.2.4)
+    // ------------------------------------------------------------------
+
+    /// Kill-switch classifier: AMF_UE_POLICY_ASSOC=off/0/false disables the
+    /// UE Policy Association leg; unset or anything else keeps it enabled
+    /// (env-free pure-function test to avoid process-global env races).
+    #[test]
+    fn ue_policy_assoc_kill_switch_classifier() {
+        assert!(ue_policy_assoc_enabled_value(None), "default (unset) = on");
+        assert!(!ue_policy_assoc_enabled_value(Some("off")));
+        assert!(!ue_policy_assoc_enabled_value(Some("OFF")));
+        assert!(!ue_policy_assoc_enabled_value(Some(" off ")));
+        assert!(!ue_policy_assoc_enabled_value(Some("0")));
+        assert!(!ue_policy_assoc_enabled_value(Some("false")));
+        assert!(ue_policy_assoc_enabled_value(Some("on")));
+        assert!(ue_policy_assoc_enabled_value(Some("1")));
+        assert!(ue_policy_assoc_enabled_value(Some("")));
+    }
+
+    /// Paired-emit stub of pcfd's REAL `handle_ue_policy_create`
+    /// (bins/nextgcore-pcfd/src/main.rs:677-713). It re-asserts, with line
+    /// citations, exactly what the real handler validates and answers:
+    ///
+    /// * mandatory PolicyAssociationRequest members `notificationUri`,
+    ///   `supi`, `suppFeat` → 400 MANDATORY_IE_MISSING when absent
+    ///   (main.rs:686-695, TS 29.525);
+    /// * 201 + `Location: /npcf-ue-policy-control/v1/policies/{polAssoId}`
+    ///   (main.rs:706-710) with the PolicyAssociation body shape
+    ///   (main.rs:701-705).
+    ///
+    /// NOTE: this is a cross-check of the emitted request against the peer's
+    /// contract, not the in-process strict-peer test — pcfd's handler lives
+    /// only in its binary target (not its lib), so it cannot be mounted here.
+    async fn stub_pcf_ue_policy(
+        req: nextgcore_sbi::message::SbiRequest,
+    ) -> nextgcore_sbi::message::SbiResponse {
+        let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+
+        // DELETE /npcf-ue-policy-control/v1/policies/{id} → 204 (pcfd
+        // main.rs:731-740 via ue_policy_remove).
+        if req.header.method == "DELETE" {
+            return if path.ends_with("/npcf-ue-policy-control/v1/policies/pol-ue-42") {
+                nextgcore_sbi::message::SbiResponse::with_status(204)
+            } else {
+                nextgcore_sbi::message::SbiResponse::with_status(404)
+            };
+        }
+
+        if !path.ends_with("/npcf-ue-policy-control/v1/policies") {
+            return nextgcore_sbi::message::SbiResponse::with_status(404);
+        }
+        let body: serde_json::Value = req
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or(serde_json::Value::Null);
+
+        // The three members pcfd's real handler requires (main.rs:686-695).
+        for mandatory in ["notificationUri", "supi", "suppFeat"] {
+            if !body[mandatory].is_string() {
+                return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
+                    serde_json::json!({
+                        "status": 400,
+                        "cause": "MANDATORY_IE_MISSING",
+                        "detail": format!("{mandatory} is required"),
+                    })
+                    .to_string(),
+                    "application/problem+json",
+                );
+            }
+        }
+        // SUPI-keyed behavior so the error path is drivable per test case.
+        if body["supi"].as_str() == Some("imsi-pcf-unavailable") {
+            return nextgcore_sbi::message::SbiResponse::with_status(503);
+        }
+
+        // amfd's notification URI convention (mirrors the AM-policy one):
+        // /namf-callback/v1/{supi}/ue-policy-notify.
+        let supi = body["supi"].as_str().unwrap_or_default();
+        if body["notificationUri"].as_str()
+            != Some(format!("/namf-callback/v1/{supi}/ue-policy-notify").as_str())
+        {
+            return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
+                serde_json::json!({
+                    "status": 400,
+                    "cause": "INVALID_NOTIFICATION_URI",
+                })
+                .to_string(),
+                "application/problem+json",
+            );
+        }
+
+        // The optionals amfd promises so the PCF can address the serving AMF
+        // for the E4 Namf delivery leg: servingPlmn (PlmnIdNid) and guami
+        // (Guami — TS29525 yaml:427-428/452-453). Reject drift so the test
+        // fails if amfd stops sending them well-formed.
+        if !(body["servingPlmn"]["mcc"].is_string() && body["servingPlmn"]["mnc"].is_string()) {
+            return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
+                serde_json::json!({
+                    "status": 400,
+                    "cause": "INVALID_SERVING_PLMN",
+                })
+                .to_string(),
+                "application/problem+json",
+            );
+        }
+        if !(body["guami"]["plmnId"]["mcc"].is_string()
+            && body["guami"]["plmnId"]["mnc"].is_string()
+            && body["guami"]["amfId"].is_string())
+        {
+            return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
+                serde_json::json!({
+                    "status": 400,
+                    "cause": "INVALID_GUAMI",
+                })
+                .to_string(),
+                "application/problem+json",
+            );
+        }
+
+        // pcfd's real 201 (main.rs:701-712): PolicyAssociation body + Location.
+        let resp = serde_json::json!({
+            "suppFeat": "0",
+            "triggers": ["UE_POLICY"],
+            "request": {
+                "notificationUri": body["notificationUri"],
+                "supi": body["supi"],
+                "suppFeat": body["suppFeat"],
+            },
+        });
+        nextgcore_sbi::message::SbiResponse::with_status(201)
+            .with_header(
+                "Location",
+                "/npcf-ue-policy-control/v1/policies/pol-ue-42".to_string(),
+            )
+            .with_json_body(&resp)
+            .unwrap_or_else(|_| nextgcore_sbi::message::SbiResponse::with_status(201))
+    }
+
+    async fn start_pcf_ue_policy_stub() -> (nextgcore_sbi::server::SbiServer, u16) {
+        let port = nsacf_free_port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+        );
+        server
+            .start(stub_pcf_ue_policy)
+            .await
+            .expect("start stub PCF");
+        (server, port)
+    }
+
+    /// call_pcf_ue_policy_create sends a schema-exact PolicyAssociationRequest
+    /// (TS29525_Npcf_UEPolicyControl.yaml:381-461) — the pcfd-mandatory
+    /// members plus servingPlmn (PlmnIdNid) and guami (Guami) — and parses
+    /// the polAssoId out of the Location header.
+    #[tokio::test]
+    async fn ue_policy_create_posts_spec_body_and_parses_location() {
+        let (server, port) = start_pcf_ue_policy_stub().await;
+
+        let assoc = call_pcf_ue_policy_create(
+            "127.0.0.1",
+            port,
+            "imsi-001010000060040",
+            "001",
+            "01",
+            "001",
+            "01",
+            "020040",
+        )
+        .await
+        .expect("UE policy create against paired stub");
+        assert_eq!(assoc, "pol-ue-42", "polAssoId parsed from Location");
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// A PCF 5xx yields Err — the registration call site logs a WARN and
+    /// continues, so registration outcome is unchanged by construction
+    /// (fire-and-forget, ngap_path.rs complete_registration step 3b).
+    #[tokio::test]
+    async fn ue_policy_create_5xx_is_err_not_panic() {
+        let (server, port) = start_pcf_ue_policy_stub().await;
+
+        let result = call_pcf_ue_policy_create(
+            "127.0.0.1",
+            port,
+            "imsi-pcf-unavailable",
+            "001",
+            "01",
+            "001",
+            "01",
+            "020040",
+        )
+        .await;
+        assert!(result.is_err(), "5xx from PCF must surface as Err");
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// An unreachable PCF (connection refused) also yields Err, not a panic.
+    #[tokio::test]
+    async fn ue_policy_create_unreachable_is_err() {
+        let port = nsacf_free_port(); // nothing listening
+        let result = call_pcf_ue_policy_create(
+            "127.0.0.1",
+            port,
+            "imsi-001010000060041",
+            "001",
+            "01",
+            "001",
+            "01",
+            "020040",
+        )
+        .await;
+        assert!(result.is_err(), "unreachable PCF must surface as Err");
+    }
+
+    /// The deregistration leg DELETEs the association resource (TS 29.525
+    /// §4.2.4) and maps 204 → Ok, 404 → Err.
+    #[tokio::test]
+    async fn ue_policy_delete_deletes_resource() {
+        let (server, port) = start_pcf_ue_policy_stub().await;
+
+        call_pcf_ue_policy_delete("127.0.0.1", port, "pol-ue-42")
+            .await
+            .expect("delete existing association");
+        assert!(
+            call_pcf_ue_policy_delete("127.0.0.1", port, "pol-ue-does-not-exist")
+                .await
+                .is_err(),
+            "404 must surface as Err"
+        );
+
+        server.stop().await.expect("server stop");
     }
 }

@@ -191,6 +191,10 @@ const ACCESS_TYPE_3GPP: u8 = 0x01;
 mod proc_code {
     use nextgcore_asn1c::ngap::types::ProcedureCode;
     pub const ERROR_INDICATION: u16 = ProcedureCode::ERROR_INDICATION.0 as u16;
+    pub const UPLINK_UE_ASSOCIATED_NRPPA_TRANSPORT: u16 =
+        ProcedureCode::UPLINK_UE_ASSOCIATED_NRPPA_TRANSPORT.0 as u16;
+    pub const UPLINK_NON_UE_ASSOCIATED_NRPPA_TRANSPORT: u16 =
+        ProcedureCode::UPLINK_NON_UE_ASSOCIATED_NRPPA_TRANSPORT.0 as u16;
     pub const HANDOVER_CANCEL: u16 = ProcedureCode::HANDOVER_CANCEL.0 as u16;
     pub const HANDOVER_NOTIFICATION: u16 = ProcedureCode::HANDOVER_NOTIFICATION.0 as u16;
     pub const HANDOVER_PREPARATION: u16 = ProcedureCode::HANDOVER_PREPARATION.0 as u16;
@@ -200,6 +204,14 @@ mod proc_code {
     pub const OVERLOAD_STOP: u16 = ProcedureCode::OVERLOAD_STOP.0 as u16;
     pub const PATH_SWITCH_REQUEST: u16 = ProcedureCode::PATH_SWITCH_REQUEST.0 as u16;
 }
+
+/// Uplink NRPPa transports (NGAP procedures 50/47, TS 38.413 Sections
+/// 8.15.3/8.15.5) dropped because no LMF consumer was registered (no
+/// Namf N1N2 subscription with `n2InformationClass == "NRPPa"`). Fail-closed
+/// observability for WS-A item A1: the relay never invents NGAP errors toward
+/// the gNB — it WARNs and counts here instead of sending an ErrorIndication.
+pub(crate) static UL_NRPPA_DROPPED_NO_CONSUMER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 // ============================================================================
 // NGAP Server State
@@ -308,6 +320,9 @@ struct UeNasContext {
     sdm_subscription_id: Option<String>,
     /// PCF AM policy association ID (from Npcf_AMPolicyControl_Create)
     policy_association_id: Option<String>,
+    /// PCF UE Policy Association ID (from Npcf_UEPolicyControl_Create,
+    /// TS 29.525 — Wave-6 E7); deleted at deregistration
+    ue_policy_association_id: Option<String>,
     /// Per-UE GMM state machine (TS 24.501): tracks the registration phase,
     /// including the InitialContextSetup wait after the ICS Request is sent.
     gmm_fsm: GmmFsm,
@@ -333,6 +348,7 @@ impl UeNasContext {
             retx: None,
             sdm_subscription_id: None,
             policy_association_id: None,
+            ue_policy_association_id: None,
             gmm_fsm: GmmFsm::new(amf_ue_ngap_id),
             initial_context_setup_request_sent: false,
             initial_context_setup_response_received: false,
@@ -722,6 +738,27 @@ impl NgapServer {
                 // HandoverNotification: HandoverNotify from the target gNB
                 // confirms the UE arrived (TS 38.413 Section 8.4.3).
                 self.handle_handover_notify(association_id, data).await?;
+            }
+            Some(50) => {
+                // UplinkUEAssociatedNRPPaTransport (TS 38.413 Section 8.15.3,
+                // procedure 50 = proc_code::UPLINK_UE_ASSOCIATED_NRPPA_TRANSPORT):
+                // the gNB's uplink leg of the LCS NRPPa relay (TS 23.273
+                // Section 6.11). Relayed verbatim to the LMF registered via
+                // N1N2MessageSubscribe as an Namf N2InfoNotify (TS 29.518);
+                // never answered on N2 — before this arm existed the `_`
+                // fallthrough actively broke the procedure by replying with
+                // ErrorIndication(AbstractSyntaxErrorReject).
+                self.handle_uplink_ue_associated_nrppa_transport(association_id, data)
+                    .await?;
+            }
+            Some(47) => {
+                // UplinkNonUEAssociatedNRPPaTransport (TS 38.413 Section
+                // 8.15.5, procedure 47 =
+                // proc_code::UPLINK_NON_UE_ASSOCIATED_NRPPA_TRANSPORT): same
+                // relay without a UE association (TRP/assistance information),
+                // keyed off the RoutingID echo + the subscription registry.
+                self.handle_uplink_non_ue_associated_nrppa_transport(association_id, data)
+                    .await?;
             }
             _ => {
                 // Unknown / unsupported procedure: the PDU is either undecodable
@@ -2380,6 +2417,41 @@ impl NgapServer {
             }
         }
 
+        // 3b) Npcf_UEPolicyControl_Create (TS 29.525 §4.2.2 / TS 23.503
+        // §6.6.2: URSP provision trigger at registration) — Wave-6 E7. The
+        // AMF is the NF service consumer; the same PCF endpoint the AM-policy
+        // create resolved is reused (no second NRF round-trip). Fire-and-
+        // forget for the control plane: any failure logs a WARN and NEVER
+        // fails the registration (the policy feature itself fails closed —
+        // no association, no URSP delivery). Kill-switch
+        // AMF_UE_POLICY_ASSOC=off restores the pre-E7 byte-flow.
+        if crate::sbi_path::ue_policy_assoc_enabled() {
+            match crate::sbi_path::call_pcf_ue_policy_create(
+                &pcf_host,
+                pcf_port,
+                &supi,
+                &serving_mcc,
+                &serving_mnc,
+                &guami_mcc,
+                &guami_mnc,
+                &amf_id_hex,
+            )
+            .await
+            {
+                Ok(assoc) => {
+                    log::info!("[{supi}] UE policy association created (polAssoId={assoc})");
+                    state.ue_policy_association_id = Some(assoc.clone());
+                    state.amf_ue.ue_policy_association.id = Some(assoc);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[{supi}] Npcf_UEPolicyControl_Create failed \
+                         (registration continues unaffected): {e}"
+                    );
+                }
+            }
+        }
+
         // amfd-06 — Allowed NSSAI (TS 23.502 §4.2.2.2.3 / TS 24.501 §9.11.3.37):
         // the authorized set comes ONLY from network-authoritative sources — the
         // UDM subscription, else the AMF's configured PLMN slice support. The
@@ -2746,14 +2818,49 @@ impl NgapServer {
             .await
     }
 
-    /// Common tail of both deregistration directions: drop the NAS state and
-    /// release the NG UE context (Cause NAS deregister)
+    /// Common tail of both deregistration directions: terminate the PCF UE
+    /// Policy Association (Wave-6 E7), drop the NAS state and release the NG
+    /// UE context (Cause NAS deregister)
     async fn finish_deregistration(
         &mut self,
         association_id: u64,
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
     ) -> Result<()> {
+        // Npcf_UEPolicyControl_Delete (TS 29.525 §4.2.4) — Wave-6 E7: delete
+        // the UE Policy Association created at registration. Fire-and-forget
+        // on a background task: a PCF hiccup must never delay or fail the NG
+        // release. Only fires when an association was actually created (so
+        // with AMF_UE_POLICY_ASSOC=off the deregistration flow is unchanged).
+        if let Some(pol_asso_id) = self
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .and_then(|s| s.ue_policy_association_id.clone())
+        {
+            tokio::spawn(async move {
+                let (pcf_host, pcf_port) = match crate::sbi_path::resolve_nf_endpoint_async(
+                    crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
+                )
+                .await
+                {
+                    Ok(ep) => ep,
+                    Err(e) => {
+                        log::warn!(
+                            "UE policy association {pol_asso_id} not deleted \
+                             (PCF endpoint resolution failed): {e}"
+                        );
+                        return;
+                    }
+                };
+                if let Err(e) =
+                    crate::sbi_path::call_pcf_ue_policy_delete(&pcf_host, pcf_port, &pol_asso_id)
+                        .await
+                {
+                    log::warn!("Npcf_UEPolicyControl_Delete({pol_asso_id}) failed: {e}");
+                }
+            });
+        }
+
         self.ue_auth_state.remove(&amf_ue_ngap_id);
         // Cause: NAS deregister (TS 38.413 Section 9.3.1.2, CauseNas value 2)
         self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
@@ -3301,8 +3408,220 @@ impl NgapServer {
                         Err(e) => log::warn!("LCS positioning DL LPP send failed: {e}"),
                     }
                 }
+                // Wave-6 E5: UPDP (UE policy) downlink — DL NAS Transport with
+                // payload container type "UE policy container" (0x05), same
+                // protect + send flow as the LPP leg (TS 24.501 §5.4.5).
+                crate::context::PositioningDlKind::UePolicyToUe { updp_pdu } => {
+                    let Some(plain) = crate::gmm_build::build_ue_policy_dl_nas(&updp_pdu) else {
+                        log::warn!(
+                            "UE policy DL NAS build failed for UE {}",
+                            item.amf_ue_ngap_id
+                        );
+                        continue;
+                    };
+                    let nas = self
+                        .protect_nas(item.amf_ue_ngap_id, &plain)
+                        .unwrap_or(plain);
+                    match self
+                        .send_nas_pdu(association_id, item.amf_ue_ngap_id, ran_ue_ngap_id, &nas)
+                        .await
+                    {
+                        Ok(_) => log::info!(
+                            "UE policy: delivered UE policy DL NAS Transport to UE {}",
+                            item.amf_ue_ngap_id
+                        ),
+                        Err(e) => log::warn!("UE policy DL NAS send failed: {e}"),
+                    }
+                }
             }
         }
+    }
+
+    /// Handle an UplinkUEAssociatedNRPPaTransport (TS 38.413 Section 8.15.3,
+    /// NGAP procedure 50): the gNB→AMF uplink leg of the LCS NRPPa relay
+    /// (TS 23.273 Section 6.11).
+    ///
+    /// The NRPPa PDU is opaque to the AMF (transparent relay): it is forwarded
+    /// **verbatim** to the LMF that registered an `n2InformationClass ==
+    /// "NRPPa"` callback for this UE via Namf N1N2MessageSubscribe, as a
+    /// multipart Namf N2InfoNotify POST (TS 29.518 Section 5.2.2.3.3). The
+    /// notification's `lcsCorrelationId` comes from the subscription, falling
+    /// back to the correlation captured from the originating
+    /// N1N2MessageTransfer; the `nrppaInfo.nfId` is recovered from the NGAP
+    /// RoutingID echo (our downlink seeds the RoutingID from the LMF's nfId).
+    ///
+    /// Fail-closed: with no registered consumer the PDU is dropped with a
+    /// WARN and counted in [`UL_NRPPA_DROPPED_NO_CONSUMER`] — a relay with no
+    /// consumer must not invent NGAP errors toward the gNB, so this path
+    /// never sends an ErrorIndication (the pre-A1 `_` dispatch arm actively
+    /// broke the procedure by replying AbstractSyntaxErrorReject).
+    async fn handle_uplink_ue_associated_nrppa_transport(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        use nextgcore_asn1c::ngap::pdu::{parse_ue_associated_nrppa_transport, NgapPdu};
+        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
+
+        let mut decoder = AperDecoder::new(data);
+        let ul = match NgapPdu::decode_aper(&mut decoder)
+            .and_then(|pdu| parse_ue_associated_nrppa_transport(&pdu))
+        {
+            Ok(ul) => ul,
+            Err(e) => {
+                log::warn!(
+                    "Uplink UE-associated NRPPa transport from association \
+                     {association_id} undecodable, dropped: {e}"
+                );
+                return Ok(());
+            }
+        };
+        let amf_ue_ngap_id = ul.amf_ue_ngap_id.0;
+
+        // Resolve the UE's ueContextId (SUPI) — the key of the N1N2
+        // subscription registry (TS 29.518 Section 6.1.3.2.2): the NGAP
+        // server's own per-UE state first, the shared AMF context as fallback.
+        let supi = self
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .and_then(|s| s.amf_ue.supi.clone())
+            .or_else(|| {
+                crate::context::amf_self()
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.amf_ue_find_by_id(amf_ue_ngap_id))
+                    .and_then(|ue| ue.supi)
+            });
+
+        // A3 registry lookup (exact-class, fail-closed) + fallback LCS
+        // correlation captured from the originating N1N2MessageTransfer.
+        let (sub, fallback_corr) = {
+            let ctx = crate::context::amf_self();
+            let Ok(guard) = ctx.read() else {
+                return Ok(());
+            };
+            match supi.as_deref() {
+                Some(s) => (
+                    guard.n1n2_subscription_find_n2(s, "NRPPa"),
+                    guard.lcs_correlation_find(s),
+                ),
+                None => (None, None),
+            }
+        };
+        let Some(callback_uri) = sub
+            .as_ref()
+            .and_then(|s| s.n2_notify_callback_uri.clone())
+        else {
+            UL_NRPPA_DROPPED_NO_CONSUMER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::warn!(
+                "Uplink UE-associated NRPPa (association {association_id}, \
+                 amf_ue_ngap_id {amf_ue_ngap_id}, supi {supi:?}) dropped: no \
+                 LMF N2 'NRPPa' subscription registered (no ErrorIndication \
+                 sent — transparent relay, TS 23.273 Section 6.11)"
+            );
+            return Ok(());
+        };
+        let sub = sub.expect("callback_uri implies subscription");
+
+        let lcs_correlation_id = sub
+            .lcs_correlation_id
+            .clone()
+            .or_else(|| fallback_corr.map(|r| r.lcs_correlation_id));
+        // The RoutingID is the opaque LMF identity echo (seeded from
+        // nrppaInfo.nfId on the downlink leg); recover it as nfId when it is
+        // printable, never fabricate one.
+        let nf_id = String::from_utf8(ul.routing_id.0.clone())
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        log::info!(
+            "LCS: relaying uplink UE-associated NRPPa ({} B, amf_ue_ngap_id \
+             {amf_ue_ngap_id}) to LMF callback {callback_uri} (sub={})",
+            ul.nrppa_pdu.0.len(),
+            sub.subscription_id
+        );
+        crate::namf_server::send_n2_info_notify(
+            callback_uri,
+            sub.subscription_id,
+            lcs_correlation_id,
+            nf_id,
+            ul.nrppa_pdu.0,
+        );
+        Ok(())
+    }
+
+    /// Handle an UplinkNonUEAssociatedNRPPaTransport (TS 38.413 Section
+    /// 8.15.5, NGAP procedure 47): the non-UE-associated uplink NRPPa leg
+    /// (TRP information / assistance data, TS 23.273 Section 6.11).
+    ///
+    /// Same transparent-relay producer as the UE-associated arm but with no
+    /// UE resolution — the procedure carries no UE identity, only the opaque
+    /// RoutingID echo, so the consumer is resolved from the N1N2 subscription
+    /// registry alone (any UE's `n2InformationClass == "NRPPa"` subscription;
+    /// deterministic tie-break + WARN on ambiguity). Fail-closed drop with a
+    /// WARN + [`UL_NRPPA_DROPPED_NO_CONSUMER`] when no LMF is registered;
+    /// never an ErrorIndication.
+    async fn handle_uplink_non_ue_associated_nrppa_transport(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        use nextgcore_asn1c::ngap::pdu::{parse_non_ue_associated_nrppa_transport, NgapPdu};
+        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
+
+        let mut decoder = AperDecoder::new(data);
+        let ul = match NgapPdu::decode_aper(&mut decoder)
+            .and_then(|pdu| parse_non_ue_associated_nrppa_transport(&pdu))
+        {
+            Ok(ul) => ul,
+            Err(e) => {
+                log::warn!(
+                    "Uplink non-UE-associated NRPPa transport from association \
+                     {association_id} undecodable, dropped: {e}"
+                );
+                return Ok(());
+            }
+        };
+
+        let sub = {
+            let ctx = crate::context::amf_self();
+            let Ok(guard) = ctx.read() else {
+                return Ok(());
+            };
+            guard.n1n2_subscription_find_any_n2("NRPPa")
+        };
+        let Some(callback_uri) = sub
+            .as_ref()
+            .and_then(|s| s.n2_notify_callback_uri.clone())
+        else {
+            UL_NRPPA_DROPPED_NO_CONSUMER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::warn!(
+                "Uplink non-UE-associated NRPPa (association {association_id}) \
+                 dropped: no LMF N2 'NRPPa' subscription registered (no \
+                 ErrorIndication sent — transparent relay)"
+            );
+            return Ok(());
+        };
+        let sub = sub.expect("callback_uri implies subscription");
+
+        let nf_id = String::from_utf8(ul.routing_id.0.clone())
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        log::info!(
+            "LCS: relaying uplink non-UE-associated NRPPa ({} B) to LMF \
+             callback {callback_uri} (sub={})",
+            ul.nrppa_pdu.0.len(),
+            sub.subscription_id
+        );
+        crate::namf_server::send_n2_info_notify(
+            callback_uri,
+            sub.subscription_id,
+            sub.lcs_correlation_id,
+            nf_id,
+            ul.nrppa_pdu.0,
+        );
+        Ok(())
     }
 
     /// Protect a plain inner NAS message with the UE's security context
@@ -6100,6 +6419,10 @@ mod tests {
         assert_eq!(proc_code::OVERLOAD_START, 22);
         assert_eq!(proc_code::OVERLOAD_STOP, 23);
         assert_eq!(proc_code::PATH_SWITCH_REQUEST, 25);
+        // Uplink NRPPa transports (TS 38.413 §8.15.3/§8.15.5) — locks the
+        // literal `Some(50)` / `Some(47)` dispatch arms to the spec constants.
+        assert_eq!(proc_code::UPLINK_NON_UE_ASSOCIATED_NRPPA_TRANSPORT, 47);
+        assert_eq!(proc_code::UPLINK_UE_ASSOCIATED_NRPPA_TRANSPORT, 50);
     }
 
     #[test]
@@ -6389,5 +6712,305 @@ mod tests {
         state.gmm_fsm.transition_to_registered();
         assert_eq!(state.gmm_fsm.state, GmmState::Registered);
         assert!(state.gmm_fsm.is_registered());
+    }
+
+    // ======================================================================
+    // Wave-6 WS-A A1 — amfd uplink NRPPa ingest (NGAP procedures 50/47,
+    // TS 38.413 §8.15.3/§8.15.5) → Namf N2InfoNotify producer (TS 29.518
+    // §5.2.2.3.3) toward the LMF callback registered via N1N2MessageSubscribe.
+    // ======================================================================
+
+    /// APER-encode an NGAP PDU exactly like the wire path does.
+    fn encode_ngap_pdu(pdu: &nextgcore_asn1c::ngap::pdu::NgapPdu) -> Vec<u8> {
+        use nextgcore_asn1c::per::{AperEncode, AperEncoder};
+        let mut encoder = AperEncoder::new();
+        pdu.encode_aper(&mut encoder).expect("APER encode");
+        encoder.align();
+        encoder.into_bytes().to_vec()
+    }
+
+    /// Capture SbiServer standing in for the LMF's notify-callback endpoint:
+    /// records (uri, json root, binary parts) for each POST and returns 204.
+    /// Runs the same SbiServer multipart decode layer lmfd's real callback
+    /// handler will run on receipt (server.rs multipart/related splitting).
+    async fn start_lmf_callback_sink() -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        mpsc::Receiver<(String, String, Vec<nextgcore_sbi::message::SbiPart>)>,
+    ) {
+        use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().expect("local_addr").port();
+        drop(probe);
+        let (tx, rx) = mpsc::channel(8);
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let server = SbiServer::new(SbiServerConfig::new(addr));
+        server
+            .start(move |req: SbiRequest| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx
+                        .send((
+                            req.header.uri.clone(),
+                            req.http.content.clone().unwrap_or_default(),
+                            req.http.parts.clone(),
+                        ))
+                        .await;
+                    SbiResponse::no_content()
+                }
+            })
+            .await
+            .expect("LMF callback sink start");
+        (server, port, rx)
+    }
+
+    /// NgapServer test instance (userspace SCTP on an ephemeral port) with no
+    /// live gNB associations — any attempted SCTP send fails, which is the
+    /// canary proving "returned Ok" == "never tried to send an ErrorIndication".
+    async fn test_ngap_server() -> NgapServer {
+        let (etx, _erx) = mpsc::channel(64);
+        // Leak the receiver so spawned event sends never error the test.
+        std::mem::forget(_erx);
+        NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            Arc::new(RwLock::new(AmfContext::new())),
+            etx,
+        )
+        .await
+        .expect("NGAP test server")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_uplink_ue_associated_nrppa_relays_to_lmf_callback() {
+        use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
+        use nextgcore_asn1c::ngap::pdu::build_uplink_ue_associated_nrppa_transport;
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        let (_sink, port, mut rx) = start_lmf_callback_sink().await;
+
+        // A3 registry: LMF subscribed for this UE's uplink NRPPa (class
+        // "NRPPa" per TS 29.518 N2InformationClass) at our sink URI.
+        let supi = "imsi-999700000424250";
+        let sub_id = "n1n2sub-a1-ue-assoc-test";
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            assert!(guard.n1n2_subscription_add(
+                supi,
+                crate::context::UeN1N2InfoSubscription {
+                    subscription_id: sub_id.to_string(),
+                    n1_message_class: None,
+                    n1_notify_callback_uri: None,
+                    n2_information_class: Some("NRPPa".to_string()),
+                    n2_notify_callback_uri: Some(format!(
+                        "http://127.0.0.1:{port}/nlmf-loc/v1/notify/n2"
+                    )),
+                    lcs_correlation_id: Some("corr-a1-ue".to_string()),
+                },
+            ));
+        }
+
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 424_250u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 7, 1);
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // The gNB's uplink reply: opaque NRPPa PDU + RoutingID echo (our DL
+        // leg seeds the RoutingID from the LMF's nfId — TS 38.413 §9.3.3.23).
+        let nrppa = vec![0x20u8, 0x0B, 0x00, 0x07, 0xAA, 0xBB, 0xCC];
+        let routing = b"lmf-nf-instance-1".to_vec();
+        let pdu = build_uplink_ue_associated_nrppa_transport(
+            AmfUeNgapId(amf_ue_ngap_id),
+            RanUeNgapId(7),
+            RoutingId::new(routing),
+            NrppaPdu::new(nrppa.clone()),
+        )
+        .expect("build UplinkUEAssociatedNRPPaTransport");
+        let bytes = encode_ngap_pdu(&pdu);
+        // Hand-derived header check: InitiatingMessage (0x00), procedure 50.
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 50);
+
+        // Feed the REAL dispatch. Pre-A1 this hit the `_` arm and answered
+        // ErrorIndication(AbstractSyntaxErrorReject); now it must not touch
+        // N2 at all (an attempted send on this association would Err).
+        ngap.process_ngap_message(1, &bytes)
+            .await
+            .expect("proc-50 dispatch must not emit anything toward the gNB");
+
+        // Exactly one multipart N2InfoNotify POST at the LMF callback.
+        let (uri, json_root, parts) =
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("N2InfoNotify within 5s")
+                .expect("sink channel open");
+        assert!(
+            uri.starts_with("/nlmf-loc/v1/notify/n2"),
+            "posted to the registered n2NotifyCallbackUri, got {uri}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&json_root).expect("jsonData is N2InformationNotification");
+        // Byte-check the N2InformationNotification fields (yaml:2637-2670).
+        assert_eq!(body["n2NotifySubscriptionId"], sub_id);
+        assert_eq!(body["n2InfoContainer"]["n2InformationClass"], "NRPPa");
+        assert_eq!(
+            body["n2InfoContainer"]["nrppaInfo"]["nrppaPdu"]["ngapIeType"],
+            "NRPPA_PDU"
+        );
+        assert_eq!(
+            body["n2InfoContainer"]["nrppaInfo"]["nrppaPdu"]["ngapData"]["contentId"],
+            "nrppa"
+        );
+        assert_eq!(
+            body["n2InfoContainer"]["nrppaInfo"]["nfId"],
+            "lmf-nf-instance-1",
+            "nfId recovered from the RoutingID echo"
+        );
+        assert_eq!(body["lcsCorrelationId"], "corr-a1-ue");
+        // Transparent-relay property: the binary part IS the NRPPa PDU.
+        assert_eq!(parts.len(), 1, "exactly one binaryDataN2Information part");
+        assert_eq!(parts[0].content_id.as_deref(), Some("nrppa"));
+        assert_eq!(
+            parts[0].content_type.as_deref(),
+            Some("application/vnd.3gpp.ngap")
+        );
+        assert_eq!(
+            parts[0].data.as_ref(),
+            &nrppa[..],
+            "NRPPa bytes must reach the callback unmodified"
+        );
+        // ... and only one POST.
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one N2InfoNotify expected per uplink transport"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_uplink_nrppa_no_subscription_drops_without_error_indication() {
+        use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
+        use nextgcore_asn1c::ngap::pdu::build_uplink_ue_associated_nrppa_transport;
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 424_251u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 8, 1);
+        // Unique SUPI with NO N1N2 subscription registered.
+        ue_ctx.amf_ue.supi = Some("imsi-999700000424251".to_string());
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // Falsifier / control leg: the `_` arm DOES attempt an ErrorIndication.
+        // With no live association that SCTP send fails and the error
+        // propagates, so an unknown procedure returns Err here. This proves
+        // the Ok() below means "no ErrorIndication was attempted", not
+        // "sending happened to succeed".
+        let unknown_pdu = [0x00u8, 99, 0x00];
+        assert!(
+            ngap.process_ngap_message(1, &unknown_pdu).await.is_err(),
+            "control: `_` arm must still attempt an ErrorIndication (Err on \
+             this association-less server)"
+        );
+
+        let pdu = build_uplink_ue_associated_nrppa_transport(
+            AmfUeNgapId(amf_ue_ngap_id),
+            RanUeNgapId(8),
+            RoutingId::new(b"lmf-nf-instance-9".to_vec()),
+            NrppaPdu::new(vec![0x01, 0x02, 0x03]),
+        )
+        .expect("build UplinkUEAssociatedNRPPaTransport");
+        let bytes = encode_ngap_pdu(&pdu);
+        assert_eq!(bytes[1], 50);
+
+        let dropped_before =
+            UL_NRPPA_DROPPED_NO_CONSUMER.load(std::sync::atomic::Ordering::Relaxed);
+        // Same server, same (dead) association: proc-50 with no registered LMF
+        // must fail-closed drop — Ok, no NGAP egress, WARN + counter.
+        ngap.process_ngap_message(1, &bytes)
+            .await
+            .expect("no-consumer uplink NRPPa must NOT attempt an ErrorIndication");
+        let dropped_after =
+            UL_NRPPA_DROPPED_NO_CONSUMER.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            dropped_after - dropped_before,
+            1,
+            "the fail-closed drop is counted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_uplink_non_ue_associated_nrppa_relays_to_registered_lmf() {
+        use nextgcore_asn1c::ngap::ies::{NrppaPdu, RoutingId};
+        use nextgcore_asn1c::ngap::pdu::build_uplink_non_ue_associated_nrppa_transport;
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        let (_sink, port, mut rx) = start_lmf_callback_sink().await;
+
+        // Non-UE-associated uplink (procedure 47) has no UE identity: the
+        // consumer is resolved from the registry alone. The
+        // max-subscriptionId tie-break makes this deterministic — "zzzz-…"
+        // outranks any transient "n1n2sub-…" another test may hold.
+        let supi = "imsi-999700000424252";
+        let sub_id = "zzzz-a1-non-ue-assoc-test";
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            assert!(guard.n1n2_subscription_add(
+                supi,
+                crate::context::UeN1N2InfoSubscription {
+                    subscription_id: sub_id.to_string(),
+                    n1_message_class: None,
+                    n1_notify_callback_uri: None,
+                    n2_information_class: Some("NRPPa".to_string()),
+                    n2_notify_callback_uri: Some(format!(
+                        "http://127.0.0.1:{port}/nlmf-loc/v1/notify/n2"
+                    )),
+                    lcs_correlation_id: Some("corr-a1-non-ue".to_string()),
+                },
+            ));
+        }
+
+        let mut ngap = test_ngap_server().await;
+        let nrppa = vec![0x00u8, 0x11, 0x22, 0x33, 0x44];
+        let pdu = build_uplink_non_ue_associated_nrppa_transport(
+            RoutingId::new(b"lmf-nf-instance-2".to_vec()),
+            NrppaPdu::new(nrppa.clone()),
+        )
+        .expect("build UplinkNonUEAssociatedNRPPaTransport");
+        let bytes = encode_ngap_pdu(&pdu);
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 47);
+
+        ngap.process_ngap_message(1, &bytes)
+            .await
+            .expect("proc-47 dispatch must not emit anything toward the gNB");
+
+        let (uri, json_root, parts) =
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("N2InfoNotify within 5s")
+                .expect("sink channel open");
+        assert!(uri.starts_with("/nlmf-loc/v1/notify/n2"));
+        let body: serde_json::Value = serde_json::from_str(&json_root).expect("jsonData");
+        assert_eq!(body["n2NotifySubscriptionId"], sub_id);
+        assert_eq!(body["lcsCorrelationId"], "corr-a1-non-ue");
+        assert_eq!(
+            body["n2InfoContainer"]["nrppaInfo"]["nfId"],
+            "lmf-nf-instance-2"
+        );
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].data.as_ref(),
+            &nrppa[..],
+            "transparent relay both for non-UE-associated NRPPa"
+        );
+
+        // Cleanup: drop this cross-UE-visible subscription so it cannot leak
+        // into other tests' find_any resolution.
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        guard.n1n2_subscription_remove(supi, sub_id);
     }
 }
