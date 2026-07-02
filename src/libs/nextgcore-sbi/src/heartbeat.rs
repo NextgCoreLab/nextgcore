@@ -6,6 +6,7 @@
 
 use crate::client::SbiClient;
 use crate::error::SbiResult;
+use crate::message::SbiRequest;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -412,6 +413,25 @@ fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
     }
 }
 
+/// Build the RFC 6902 JSON Patch body for an NRF heartbeat that also reports a
+/// real `NFProfile.load` gauge (TS 29.510 §5.2.2.3.2; `load` is `0..=100`).
+///
+/// - `nfStatus` is refreshed via `replace` (always present after registration).
+/// - `/load` uses `add` so it is created-or-replaced regardless of whether the
+///   initial registration carried a `load` value (RFC 6902 `replace` requires
+///   the target to already exist; `add` does not — nrfd's `apply_json_patch`
+///   enforces that distinction). `load` is saturated to 100.
+///
+/// nrfd auto-detects an array body as JSON Patch (`main.rs` dispatch on shape)
+/// and applies both the merge-object and json-patch load PATCH forms.
+pub fn build_load_patch(load: u8) -> serde_json::Value {
+    let load = load.min(100);
+    serde_json::json!([
+        {"op": "replace", "path": "/nfStatus", "value": "REGISTERED"},
+        {"op": "add",     "path": "/load",     "value": load}
+    ])
+}
+
 /// Spawn a background tokio task that periodically sends a heartbeat
 /// `PATCH /nnrf-nfm/v1/nf-instances/{nf_instance_id}` to the NRF.
 ///
@@ -421,7 +441,26 @@ fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
 /// `interval_secs` is the fire interval (use `heartBeatTimer / 2`, e.g. 5).
 /// The task runs until the process exits; it logs warnings on failure but
 /// never panics, so a temporary NRF outage does not crash the NF.
+///
+/// NFs that do not (yet) expose a load gauge report a constant `0` load,
+/// keeping the `/load` hook wired for later (see
+/// [`spawn_heartbeat_worker_with_load`] for the real-gauge variant).
 pub fn spawn_heartbeat_worker(nf_instance_id: String, interval_secs: u64) {
+    spawn_heartbeat_worker_with_load(nf_instance_id, interval_secs, || 0);
+}
+
+/// Like [`spawn_heartbeat_worker`], but PATCHes a real `NFProfile.load` gauge
+/// each tick, computed fresh by `load_fn` (TS 29.510 §5.2.2.3.2).
+///
+/// `load_fn` is polled on every tick so the reported load tracks live NF state
+/// (e.g. registered-UE or session count as a percentage of configured
+/// capacity). Values are saturated to 100 by [`build_load_patch`]. As with the
+/// plain worker, a PATCH failure only logs a warning and never affects NF
+/// operation, so a temporary NRF outage cannot crash the NF.
+pub fn spawn_heartbeat_worker_with_load<F>(nf_instance_id: String, interval_secs: u64, load_fn: F)
+where
+    F: Fn() -> u8 + Send + 'static,
+{
     tokio::spawn(async move {
         log::info!(
             "Heartbeat worker started for NF instance {nf_instance_id} (interval={interval_secs}s)"
@@ -457,14 +496,26 @@ pub fn spawn_heartbeat_worker(nf_instance_id: String, interval_secs: u64) {
 
             let client = SbiClient::with_host_port(&nrf_host, nrf_port);
             let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
-            let body = serde_json::json!({"nfStatus": "REGISTERED"});
+            let load = load_fn();
+            let body = build_load_patch(load);
 
-            match client.patch_json(&path, &body).await {
+            // TS 29.510 §5.2.2.3 mandates application/json-patch+json for
+            // NFUpdate; set it explicitly (nrfd also shape-detects the array).
+            let request = match SbiRequest::patch(&path).with_json_body(&body) {
+                Ok(req) => req.with_header("Content-Type", "application/json-patch+json"),
+                Err(e) => {
+                    log::warn!("Heartbeat: failed to serialize body for {nf_instance_id}: {e}");
+                    continue;
+                }
+            };
+
+            match client.send_request(request).await {
                 Ok(resp) if resp.status == 200 || resp.status == 204 => {
                     log::debug!(
-                        "Heartbeat OK for {} (status={})",
+                        "Heartbeat OK for {} (status={}, load={})",
                         nf_instance_id,
-                        resp.status
+                        resp.status,
+                        load
                     );
                 }
                 Ok(resp) => {
@@ -590,5 +641,34 @@ mod tests {
 
         assert_eq!(config.default_interval, 30);
         assert_eq!(config.poll_interval_ms, 500);
+    }
+
+    #[test]
+    fn test_build_load_patch_shape() {
+        use serde_json::json;
+        let patch = build_load_patch(42);
+        let items = patch.as_array().expect("json-patch array");
+        assert_eq!(items.len(), 2, "nfStatus + load");
+
+        // nfStatus refresh via replace (target always present).
+        assert_eq!(items[0]["op"], "replace");
+        assert_eq!(items[0]["path"], "/nfStatus");
+        assert_eq!(items[0]["value"], "REGISTERED");
+
+        // /load via add so it is created-or-replaced.
+        assert_eq!(items[1]["op"], "add");
+        assert_eq!(items[1]["path"], "/load");
+        assert_eq!(items[1]["value"], json!(42));
+    }
+
+    #[test]
+    fn test_build_load_patch_saturates_at_100() {
+        use serde_json::json;
+        // u8 max is 255; anything over 100 saturates to 100 (NFProfile.load 0..=100).
+        let patch = build_load_patch(200);
+        assert_eq!(patch.as_array().unwrap()[1]["value"], json!(100));
+
+        let patch = build_load_patch(0);
+        assert_eq!(patch.as_array().unwrap()[1]["value"], json!(0));
     }
 }
