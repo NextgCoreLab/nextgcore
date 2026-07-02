@@ -34,6 +34,9 @@ tokio.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# WSB-6: enable the nextgcore-dbi in-memory test store so the real Nudr
+# handlers can be exercised hermetically (no MongoDB) in unit tests.
+nextgcore-dbi = { path = "../../libs/nextgcore-dbi", features = ["test-helpers"] }
 
 [lints]
 workspace = true

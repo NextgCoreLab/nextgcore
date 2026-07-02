@@ -39,6 +39,11 @@ pub fn nextgcore_dbi_auth_info(supi: &str) -> DbiResult<NextgcoreDbiAuthInfo> {
     let supi_id =
         nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
+    #[cfg(any(test, feature = "test-helpers"))]
+    if crate::test_store::active() {
+        return crate::test_store::auth_info(supi);
+    }
+
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };
 
@@ -103,6 +108,11 @@ pub fn nextgcore_dbi_update_sqn(supi: &str, sqn: u64) -> DbiResult<()> {
     let supi_id =
         nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
+    #[cfg(any(test, feature = "test-helpers"))]
+    if crate::test_store::active() {
+        return crate::test_store::update_sqn(supi, sqn);
+    }
+
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };
     let update = doc! {
@@ -124,6 +134,11 @@ pub fn nextgcore_dbi_increment_sqn(supi: &str) -> DbiResult<()> {
         nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
     let supi_id =
         nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    if crate::test_store::active() {
+        return crate::test_store::inc_sqn(supi);
+    }
 
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };
@@ -209,6 +224,11 @@ pub fn nextgcore_dbi_provision_auth_info(
         nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
     let supi_id =
         nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    if crate::test_store::active() {
+        return crate::test_store::provision_auth_info(supi, p);
+    }
 
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };

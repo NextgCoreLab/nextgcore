@@ -625,7 +625,14 @@ async fn handle_auth_data(
         ("authentication-subscription", "PATCH") => {
             log::info!("[{supi}] PATCH authentication-subscription");
 
-            // Parse PatchItemList from request body to extract new SQN
+            // TS 29.505 (Nudr subscription-data): PATCH applies the
+            // PatchItemList and nothing else — the UDR must store exactly
+            // what is written.  SQN generation/advancement is the
+            // authentication-centre (UDM/ARPF) function per TS 33.102
+            // Annex C.3; udmd already advances the SQN itself before
+            // PATCHing the new value (advance_sqn_ind).  The previous
+            // unconditional SQN-increment side effect here corrupted every
+            // stored SQN by an extra +32 SEQ step (WSB-6).
             if let Some(content) = &request.http.content {
                 if let Ok(patches) = serde_json::from_str::<serde_json::Value>(content) {
                     if let Some(arr) = patches.as_array() {
@@ -650,26 +657,18 @@ async fn handle_auth_data(
                 }
             }
 
-            // Increment SQN for next use
-            if let Err(e) =
-                nextgcore_dbi::subscription::nextgcore_dbi_increment_sqn_async(supi.to_string())
-                    .await
-            {
-                log::error!("[{supi}] DB increment_sqn failed: {e:?}");
-            }
-
             SbiResponse::with_status(204)
         }
         ("authentication-status", "PUT") | ("authentication-status", "DELETE") => {
             log::info!("[{supi}] {method} authentication-status");
 
-            if let Err(e) =
-                nextgcore_dbi::subscription::nextgcore_dbi_increment_sqn_async(supi.to_string())
-                    .await
-            {
-                log::error!("[{supi}] DB increment_sqn failed: {e:?}");
-            }
-
+            // TS 29.505 §6.3.3 / TS 29.503 §5.4.2: the authentication-status
+            // resource carries the AuthEvent from the UDM on auth
+            // confirmation.  It has NO SQN semantics — the previous
+            // unconditional SQN-increment side effect here advanced the
+            // stored SQN by another +32 SEQ step on every confirmation
+            // (WSB-6).  Follow-up (noted, out of WSB-6 scope): persist the
+            // AuthEvent body, which is currently acknowledged but discarded.
             SbiResponse::with_status(204)
         }
         _ => {
@@ -2527,6 +2526,34 @@ udr:
         addr
     }
 
+    /// Serializes tests that depend on the global nextgcore-dbi backend
+    /// state: the WSB-6 tests enable the in-memory dbi test store while
+    /// `test_http_auth_provisioning_and_plmn_validation` asserts the
+    /// fail-closed no-DB 503 path — the two must not overlap in time.
+    static DBI_BACKEND_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// RAII guard (WSB-6): holds `DBI_BACKEND_LOCK` with the nextgcore-dbi
+    /// in-memory test store enabled, and disables the store again on drop —
+    /// including on panic/unwind, so a failing test cannot leak the store
+    /// into the fail-closed 503 test.
+    struct DbiTestStore {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DbiTestStore {
+        async fn enable() -> Self {
+            let lock = DBI_BACKEND_LOCK.lock().await;
+            nextgcore_dbi::test_store::enable();
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for DbiTestStore {
+        fn drop(&mut self) {
+            nextgcore_dbi::test_store::disable();
+        }
+    }
+
     /// Start the UDR SBI server plus a local notification listener that
     /// forwards (path, body) of every received POST into a channel.
     async fn start_udr_and_listener() -> (
@@ -3041,6 +3068,10 @@ udr:
     /// success path requires MongoDB and is covered by E2E).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_auth_provisioning_and_plmn_validation() {
+        // WSB-6: this test asserts the fail-closed no-DB 503 path; take the
+        // backend lock so it cannot overlap with the WSB-6 tests that enable
+        // the in-memory dbi test store.
+        let _backend = DBI_BACKEND_LOCK.lock().await;
         let udr_addr = ephemeral_addr();
         let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
         udr.start(udr_sbi_request_handler)
@@ -3596,5 +3627,260 @@ udr:
 
         udr.stop().await.expect("udr stops");
         listener.stop().await.expect("listener stops");
+    }
+
+    // ------------------------------------------------------------------
+    // WSB-6: UDR must store exactly the SQN that is written — no
+    // side-effect increments (TS 29.505 PATCH = apply PatchItemList only;
+    // TS 33.102 Annex C.3: SQN advancement is the UDM/ARPF function).
+    // ------------------------------------------------------------------
+
+    /// Local copy of udmd's SQN advance (nextgcore-udmd main.rs
+    /// `advance_sqn_ind`, TS 33.102 Annex C.3.2): SQN = SEQ[47:5] || IND[4:0],
+    /// SEQ increments by 1 (one +32 step on the packed value), IND kept,
+    /// masked to 48 bits. udmd is a bin-only crate so the function cannot be
+    /// linked from here; the arithmetic is replicated verbatim.
+    fn udm_advance_sqn_ind(sqn: u64) -> u64 {
+        let seq = sqn >> 5;
+        let ind = sqn & 0x1F;
+        (((seq + 1) << 5) | ind) & 0x0000_FFFF_FFFF_FFFF
+    }
+
+    /// Provision an authentication subscription through the REAL PUT handler
+    /// (TS 29.505 AuthenticationSubscription shape) and return the auth path.
+    async fn wsb6_provision(client: &SbiClient, supi: &str, sqn: u64) -> String {
+        let auth_path = format!(
+            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+        );
+        let resp = client
+            .put_json(
+                &auth_path,
+                &json!({
+                    "authenticationMethod": "5G_AKA",
+                    "encPermanentKey": "465b5ce8b199b49faa5f0a2ee238a6bc",
+                    "encOpcKey": "e8ed289deba952e4283b54e88e6183ca",
+                    "authenticationManagementField": "8000",
+                    "sequenceNumber": {
+                        "sqnScheme": "NON_TIME_BASED",
+                        "sqn": format!("{sqn:012x}"),
+                        "indLength": 5
+                    }
+                }),
+            )
+            .await
+            .expect("PUT provision");
+        assert_eq!(resp.status, 201, "provisioning PUT must create (201)");
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(sqn),
+            "provisioned SQN must be stored exactly"
+        );
+        auth_path
+    }
+
+    /// WSB-6 acceptance test: PATCH /sequenceNumber/sqn = X through the real
+    /// SBI server + router + handler → the stored SQN is EXACTLY X (the old
+    /// PATCH arm corrupted it to X+32 via an unconditional SQN increment).
+    /// Reintroducing the increment makes this test fail.
+    #[tokio::test]
+    async fn wsb6_patch_stores_exact_sqn_no_side_effect() {
+        let _store = DbiTestStore::enable().await;
+        let udr_addr = ephemeral_addr();
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let supi = "imsi-999990000000601";
+        let auth_path = wsb6_provision(&client, supi, 0x20).await;
+
+        // udmd-shaped PATCH body — byte-identical PatchItemList to
+        // udm_nudr_dr_send_auth_subscription_patch (nextgcore-udmd
+        // sbi_path.rs): [{"op":"replace","path":"/sequenceNumber/sqn",...}].
+        let x: u64 = 0x2020; // IND bits zero, so the served form is exact too
+        let resp = client
+            .patch_json(
+                &auth_path,
+                &json!([{
+                    "op": "replace",
+                    "path": "/sequenceNumber/sqn",
+                    "value": format!("{x:012x}")
+                }]),
+            )
+            .await
+            .expect("PATCH sqn");
+        assert_eq!(resp.status, 204);
+
+        // Stored value must be exactly X — not X+32.
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(x),
+            "UDR must store exactly the PATCHed SQN (TS 29.505); +32 means the \
+             WSB-6 side-effect increment was reintroduced"
+        );
+
+        // And the real GET handler serves it back exactly.
+        let resp = client.get(&auth_path).await.expect("GET auth-subscription");
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(doc["sequenceNumber"]["sqn"], format!("{x:012x}"));
+
+        udr.stop().await.expect("udr stops");
+    }
+
+    /// WSB-6: the authentication-status PUT/DELETE arm must have NO SQN side
+    /// effect (it previously incremented by +32 on every UDM confirmation).
+    #[tokio::test]
+    async fn wsb6_auth_status_put_delete_no_sqn_side_effect() {
+        let _store = DbiTestStore::enable().await;
+        let udr_addr = ephemeral_addr();
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let supi = "imsi-999990000000602";
+        let s0: u64 = 0x40;
+        wsb6_provision(&client, supi, s0).await;
+        let status_path = format!(
+            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status"
+        );
+
+        // TS 29.503 AuthEvent body, as udmd PUTs it on auth confirmation
+        // (udm_nudr_dr_send_auth_status_put passes the AUSF body verbatim).
+        let resp = client
+            .put_json(
+                &status_path,
+                &json!({
+                    "nfInstanceId": "6874ed4b-262c-4a53-a8a4-e846a41ad0e8",
+                    "success": true,
+                    "timeStamp": "2026-07-01T00:00:00Z",
+                    "authType": "5G_AKA",
+                    "servingNetworkName": "5G:mnc001.mcc001.3gppnetwork.org"
+                }),
+            )
+            .await
+            .expect("PUT auth-status");
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(s0),
+            "auth-status PUT must not advance the stored SQN"
+        );
+
+        let resp = client.delete(&status_path).await.expect("DELETE auth-status");
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(s0),
+            "auth-status DELETE must not advance the stored SQN"
+        );
+
+        udr.stop().await.expect("udr stops");
+    }
+
+    /// WSB-6 strict-peer sequence: emulate udmd's generate-AV flow (GET →
+    /// client-side advance_sqn_ind → PATCH exact value → auth-status PUT on
+    /// confirmation) N times against the REAL udrd handler stack. The stored
+    /// SQN must advance EXACTLY one SEQ step per AV (previously 3: udmd's
+    /// intended advance + PATCH-side +32 + auth-status +32). Includes one
+    /// AUTS-resync iteration (TS 33.102 §6.3.5: resume from SQN_MS+1, then
+    /// one advance) whose exact value — including nonzero IND bits — must be
+    /// stored verbatim.
+    #[tokio::test]
+    async fn wsb6_udm_av_flow_advances_sqn_one_step_per_av() {
+        let _store = DbiTestStore::enable().await;
+        let udr_addr = ephemeral_addr();
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let supi = "imsi-999990000000603";
+        let s0: u64 = 0x20;
+        let auth_path = wsb6_provision(&client, supi, s0).await;
+        let status_path = format!(
+            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status"
+        );
+        let auth_event = json!({
+            "nfInstanceId": "6874ed4b-262c-4a53-a8a4-e846a41ad0e8",
+            "success": true,
+            "timeStamp": "2026-07-01T00:00:00Z",
+            "authType": "5G_AKA",
+            "servingNetworkName": "5G:mnc001.mcc001.3gppnetwork.org"
+        });
+
+        const N: u32 = 3;
+        for _ in 0..N {
+            // udmd reads the served SQN (GET), advances it client-side per
+            // TS 33.102 C.3.2 and PATCHes the advanced value (udmd main.rs
+            // step 6), then PUTs the AuthEvent on confirmation.
+            let resp = client.get(&auth_path).await.expect("GET auth-subscription");
+            assert_eq!(resp.status, 200);
+            let doc: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let served = u64::from_str_radix(
+                doc["sequenceNumber"]["sqn"].as_str().expect("sqn hex"),
+                16,
+            )
+            .expect("sqn parses");
+            let advanced = udm_advance_sqn_ind(served);
+            let resp = client
+                .patch_json(
+                    &auth_path,
+                    &json!([{
+                        "op": "replace",
+                        "path": "/sequenceNumber/sqn",
+                        "value": format!("{advanced:012x}")
+                    }]),
+                )
+                .await
+                .expect("PATCH sqn");
+            assert_eq!(resp.status, 204);
+            let resp = client
+                .put_json(&status_path, &auth_event)
+                .await
+                .expect("PUT auth-status");
+            assert_eq!(resp.status, 204);
+        }
+
+        // Exactly one SEQ step (+32) per AV — nothing more.
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(s0 + u64::from(N) * 32),
+            "stored SQN must advance exactly one advance_sqn_ind step per AV"
+        );
+
+        // AUTS resync iteration: udmd resumes from SQN_MS+1 (main.rs resync
+        // branch), then step 6 advances once and PATCHes; the exact value —
+        // IND bits included — must be stored verbatim.
+        let sqn_ms: u64 = 0xA0C5; // nonzero IND (5)
+        let resync_next = udm_advance_sqn_ind((sqn_ms + 1) & 0x0000_FFFF_FFFF_FFFF);
+        let resp = client
+            .patch_json(
+                &auth_path,
+                &json!([{
+                    "op": "replace",
+                    "path": "/sequenceNumber/sqn",
+                    "value": format!("{resync_next:012x}")
+                }]),
+            )
+            .await
+            .expect("PATCH resync sqn");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .put_json(&status_path, &auth_event)
+            .await
+            .expect("PUT auth-status after resync");
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(resync_next),
+            "resynchronized SQN must be stored exactly (IND bits preserved, \
+             no +32 corruption)"
+        );
+
+        udr.stop().await.expect("udr stops");
     }
 }

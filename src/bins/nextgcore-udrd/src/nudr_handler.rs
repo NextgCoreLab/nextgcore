@@ -166,10 +166,10 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                         }
                     }
 
-                    // Increment SQN by 32 for next use
-                    if let Err(e) = nextgcore_dbi::subscription::nextgcore_dbi_increment_sqn(supi) {
-                        log::error!("[{supi}] DB increment_sqn failed: {e:?}");
-                    }
+                    // WSB-6: no SQN side effect — TS 29.505 PATCH applies the
+                    // PatchItemList only; SQN advancement is the UDM/ARPF
+                    // function (TS 33.102 Annex C.3), mirrored from the live
+                    // handler fix in main.rs.
 
                     send_success_response(stream_id, 204, None);
                 }
@@ -189,10 +189,9 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                 "PUT" | "DELETE" => {
                     log::debug!("[{supi}] {method} authentication-status (stream={stream_id})");
 
-                    // Increment SQN on auth status update
-                    if let Err(e) = nextgcore_dbi::subscription::nextgcore_dbi_increment_sqn(supi) {
-                        log::error!("[{supi}] DB increment_sqn failed: {e:?}");
-                    }
+                    // WSB-6: no SQN side effect — authentication-status
+                    // carries the AuthEvent (TS 29.505 §6.3.3) and has no SQN
+                    // semantics, mirrored from the live handler fix in main.rs.
 
                     send_success_response(stream_id, 204, None);
                 }

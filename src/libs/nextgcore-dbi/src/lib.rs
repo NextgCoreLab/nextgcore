@@ -9,6 +9,10 @@ pub mod ims;
 pub mod mongoc;
 pub mod session;
 pub mod subscription;
+/// In-memory subscriber backend for hermetic unit tests (WSB-6); never
+/// compiled into production builds.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_store;
 pub mod tsdb; // B4.5: Time-series database support
 pub mod types; // B4.7: Data federation (cross-operator sharing)
 
