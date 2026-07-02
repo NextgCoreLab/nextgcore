@@ -368,7 +368,7 @@ fn build_sm_policy_notification(sess: &crate::context::PcfSess) -> serde_json::V
     let dnn = sess.dnn.clone().unwrap_or_else(|| "internet".to_string());
     let decision = crate::nudr_handler::pcf_get_session_data("", None, &sess.s_nssai, &dnn)
         .map(|sd| {
-            let parts = crate::build_sm_policy_decision(&sess.sm_policy_id, &sd);
+            let parts = crate::sm_policy_build::build_sm_policy_decision(&sess.sm_policy_id, &sd);
             serde_json::json!({
                 "sessRules": parts.sess_rules,
                 "pccRules": parts.pcc_rules,
@@ -770,9 +770,61 @@ pub async fn pcf_deregister_bsf_binding(binding_id: &str) -> Result<bool, String
     Ok(resp.status == 204 || resp.status == 200)
 }
 
+/// This PCF's advertised identity for Nbsf_Management PcfBinding bodies
+/// (WSB-1/H2): SBI address information (TS 29.521 `pcfIpEndPoints`, shaped as
+/// TS 29.510 IpEndPoint), the optional configured FQDN (`pcfFqdn` — never
+/// invented when absent), and the NRF NF instance id (`pcfId`).
+#[derive(Debug, Clone)]
+pub struct PcfSelfInfo {
+    /// Advertised (routable) SBI IPv4 address, same value the NRF NFProfile
+    /// advertises in `ipv4Addresses`.
+    pub sbi_addr: String,
+    /// Advertised SBI port.
+    pub sbi_port: u16,
+    /// Optional configured FQDN (`pcf.sbi.server[0].fqdn` in pcf.yaml).
+    pub fqdn: Option<String>,
+    /// NF instance id (UUID) registered with the NRF; emitted as `pcfId`.
+    pub nf_instance_id: String,
+}
+
+/// Process-global PCF self identity, set once in `main` after config parse
+/// (before any PDU session can register a binding).
+static PCF_SELF_INFO: std::sync::OnceLock<PcfSelfInfo> = std::sync::OnceLock::new();
+
+/// Publish the PCF's advertised identity (set-once; later calls are ignored
+/// and return `false`).
+pub fn pcf_self_info_set(info: PcfSelfInfo) -> bool {
+    PCF_SELF_INFO.set(info).is_ok()
+}
+
+/// The published PCF identity, if `main` (or a test) has set it.
+pub fn pcf_self_info() -> Option<&'static PcfSelfInfo> {
+    PCF_SELF_INFO.get()
+}
+
 /// Build the TS 29.521 PcfBinding body for a PDU session. `dnn` and `snssai`
 /// are the mandatory members; supi and ipv4Addr are included when known.
+///
+/// WSB-1/H2: also emits the PCF address information the spec requires the
+/// binding to carry — `pcfIpEndPoints` (TS 29.510 IpEndPoint array) always,
+/// `pcfFqdn` only when configured, and `pcfId` — from the process-global
+/// [`PcfSelfInfo`]. Our own bsfd (the conformant strict peer) rejects a
+/// binding without pcfFqdn|pcfIpEndPoints with 400 MANDATORY_IE_MISSING
+/// (TS 29.521 §5.3.2 / PcfBinding NOTE).
 pub fn build_pcf_binding_body(
+    supi: &str,
+    dnn: &str,
+    sst: u8,
+    sd: Option<u32>,
+    ipv4: Option<&str>,
+) -> serde_json::Value {
+    build_pcf_binding_body_with(pcf_self_info(), supi, dnn, sst, sd, ipv4)
+}
+
+/// Pure variant of [`build_pcf_binding_body`] taking the self identity
+/// explicitly (unit-testable without touching the process-global OnceLock).
+pub fn build_pcf_binding_body_with(
+    self_info: Option<&PcfSelfInfo>,
     supi: &str,
     dnn: &str,
     sst: u8,
@@ -789,6 +841,26 @@ pub fn build_pcf_binding_body(
     });
     if let Some(ip) = ipv4 {
         b["ipv4Addr"] = serde_json::json!(ip);
+    }
+    match self_info {
+        Some(info) => {
+            // TS 29.510 IpEndPoint: ipv4Address + transport + port.
+            b["pcfIpEndPoints"] = serde_json::json!([{
+                "ipv4Address": info.sbi_addr,
+                "transport": "TCP",
+                "port": info.sbi_port,
+            }]);
+            if let Some(fqdn) = &info.fqdn {
+                b["pcfFqdn"] = serde_json::json!(fqdn);
+            }
+            b["pcfId"] = serde_json::json!(info.nf_instance_id);
+        }
+        None => {
+            log::warn!(
+                "PCF self info not set; PcfBinding omits pcfIpEndPoints/pcfId \
+                 (a conformant BSF rejects it, TS 29.521)"
+            );
+        }
     }
     b
 }
@@ -1008,12 +1080,18 @@ mod tests {
         server.stop().await.ok();
     }
 
-    /// pcfd-09: real NRF NF-discovery + nudr-dr GET + nbsf-management binding
-    /// against a single mock server that plays NRF, UDR and BSF (routed by
-    /// path). Proves the discover-and-send wiring end to end without a live
-    /// peer; live-interop invocation from the SM-policy path remains E2E-gated.
+    /// pcfd-09: real NRF NF-discovery + nudr-dr GET against a mock server
+    /// that plays NRF and UDR (routed by path). Proves the discover-and-send
+    /// wiring without a live peer; live-interop invocation from the SM-policy
+    /// path remains E2E-gated.
+    ///
+    /// Wave-6 H2: the former BSF leg of this test (a lenient mock that
+    /// 201-accepted a PcfBinding our real bsfd 400-rejects) was converted to
+    /// a strict-peer test against bsfd's REAL `bsf_sbi_request_handler` —
+    /// see `tests/strict_peer_bsfd.rs`. Only the NRF-discovery bootstrap may
+    /// stay mocked (H1 policy).
     #[tokio::test]
-    async fn discover_and_send_udr_and_bsf_mock() {
+    async fn discover_and_send_udr_mock() {
         use nextgcore_sbi::message::SbiRequest as Req;
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::time::Duration;
@@ -1025,13 +1103,13 @@ mod tests {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let server = SbiServer::new(SbiServerConfig::new(addr));
 
-        // Mock NRF/UDR/BSF: the closure captures its own port so the NRF
-        // SearchResult advertises UDR/BSF endpoints that point back at itself.
+        // Mock NRF/UDR: the closure captures its own port so the NRF
+        // SearchResult advertises a UDR endpoint that points back at itself.
         let handler = move |req: Req| {
             let resp = build_mock_response(&req, port);
             async move { resp }
         };
-        server.start(handler).await.expect("start mock NRF/UDR/BSF");
+        server.start(handler).await.expect("start mock NRF/UDR");
 
         // Point the PCF's SBI context at the mock NRF.
         global_context()
@@ -1054,24 +1132,6 @@ mod tests {
                     .expect("udr GET ok")
                     .expect("policy data present");
             assert!(data.get("smPolicySnssaiData").is_some());
-
-            // nbsf-management register → binding id from the Location header.
-            let binding = serde_json::json!({
-                "supi": "imsi-001010000000777",
-                "ipv4Addr": "10.45.0.77",
-                "dnn": "internet",
-                "snssai": { "sst": 1 },
-            });
-            let binding_id = pcf_register_bsf_binding(&binding)
-                .await
-                .expect("bsf register ok")
-                .expect("binding id present");
-            assert_eq!(binding_id, "bind-777");
-
-            // nbsf-management deregister → 204.
-            assert!(pcf_deregister_bsf_binding(&binding_id)
-                .await
-                .expect("bsf delete ok"));
         };
         tokio::time::timeout(Duration::from_secs(15), run)
             .await
@@ -1080,12 +1140,17 @@ mod tests {
         server.stop().await.ok();
     }
 
-    /// Mock NRF/UDR/BSF response router used by the pcfd-09 test.
+    /// Mock NRF/UDR response router used by the pcfd-09 test.
+    ///
+    /// Wave-6 H2: this mock deliberately serves ONLY the NRF-discovery
+    /// bootstrap and the UDR leg. It must NOT grow BSF (nbsf-management)
+    /// arms again — the lenient 201-accepting BSF mock masked the missing
+    /// pcfIpEndPoints defect for months; the BSF leg is strict-peer tested
+    /// against the real bsfd handler in `tests/strict_peer_bsfd.rs`.
     fn build_mock_response(
         req: &nextgcore_sbi::message::SbiRequest,
         port: u16,
     ) -> nextgcore_sbi::message::SbiResponse {
-        let method = req.header.method.clone();
         let path = req.header.uri.split('?').next().unwrap_or("").to_string();
         if path == "/nnrf-disc/v1/nf-instances" {
             let body = serde_json::json!({
@@ -1096,16 +1161,6 @@ mod tests {
                         "ipv4Addresses": ["127.0.0.1"],
                         "nfServices": [{
                             "serviceName": "nudr-dr",
-                            "scheme": "http",
-                            "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
-                        }]
-                    },
-                    {
-                        "nfInstanceId": "bsf-mock",
-                        "nfType": "BSF",
-                        "ipv4Addresses": ["127.0.0.1"],
-                        "nfServices": [{
-                            "serviceName": "nbsf-management",
                             "scheme": "http",
                             "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
                         }]
@@ -1128,15 +1183,6 @@ mod tests {
             return nextgcore_sbi::message::SbiResponse::with_status(200)
                 .with_json_body(&body)
                 .unwrap_or_else(|_| nextgcore_sbi::message::SbiResponse::with_status(500));
-        }
-        if method == "POST" && path == "/nbsf-management/v1/pcfBindings" {
-            return nextgcore_sbi::message::SbiResponse::with_status(201)
-                .with_header("Location", "/nbsf-management/v1/pcfBindings/bind-777")
-                .with_json_body(&serde_json::json!({ "bindingId": "bind-777" }))
-                .unwrap_or_else(|_| nextgcore_sbi::message::SbiResponse::with_status(500));
-        }
-        if method == "DELETE" && path.starts_with("/nbsf-management/v1/pcfBindings/") {
-            return nextgcore_sbi::message::SbiResponse::with_status(204);
         }
         nextgcore_sbi::message::SbiResponse::with_status(404)
     }
@@ -1162,6 +1208,75 @@ mod tests {
         let b2 = build_pcf_binding_body("imsi-1", "ims", 2, None, None);
         assert!(b2["snssai"].get("sd").is_none());
         assert!(b2.get("ipv4Addr").is_none());
+    }
+
+    /// WSB-1: with the PCF self identity available, the PcfBinding carries
+    /// the mandatory PCF address information — a non-empty pcfIpEndPoints
+    /// array shaped per TS 29.510 IpEndPoint (ipv4Address/transport/port)
+    /// — plus pcfId as a UUID; pcfFqdn is emitted ONLY when configured
+    /// (TS 29.521 §5.3.2, TS29521_Nbsf_Management.yaml PcfBinding).
+    #[test]
+    fn pcf_binding_body_carries_pcf_address_info() {
+        let info = PcfSelfInfo {
+            sbi_addr: "10.45.0.10".to_string(),
+            sbi_port: 7777,
+            fqdn: None,
+            nf_instance_id: "5f4dc3a2-1c8f-4e0b-9d5a-0e2b7f6a1c33".to_string(),
+        };
+        let b = build_pcf_binding_body_with(
+            Some(&info),
+            "imsi-001010000000088",
+            "internet",
+            1,
+            Some(0x010203),
+            Some("10.45.0.88"),
+        );
+        // Existing members unchanged
+        assert_eq!(b["dnn"], "internet");
+        assert_eq!(b["snssai"]["sst"], 1);
+        assert_eq!(b["ipv4Addr"], "10.45.0.88");
+        // pcfIpEndPoints: non-empty, TS 29.510 IpEndPoint field names
+        let eps = b["pcfIpEndPoints"].as_array().expect("pcfIpEndPoints array");
+        assert!(!eps.is_empty());
+        assert_eq!(eps[0]["ipv4Address"], "10.45.0.10");
+        assert_eq!(eps[0]["port"], 7777);
+        assert_eq!(eps[0]["transport"], "TCP");
+        // pcfId is a UUID
+        let pcf_id = b["pcfId"].as_str().expect("pcfId string");
+        assert!(uuid::Uuid::parse_str(pcf_id).is_ok(), "pcfId not a UUID");
+        // No FQDN configured -> pcfFqdn must NOT be invented
+        assert!(b.get("pcfFqdn").is_none());
+
+        // With a configured FQDN it is emitted alongside the endpoints.
+        let info_fqdn = PcfSelfInfo {
+            fqdn: Some("pcf.5gc.mnc001.mcc001.3gppnetwork.org".to_string()),
+            ..info
+        };
+        let bf = build_pcf_binding_body_with(
+            Some(&info_fqdn),
+            "imsi-001010000000088",
+            "internet",
+            1,
+            None,
+            None,
+        );
+        assert_eq!(bf["pcfFqdn"], "pcf.5gc.mnc001.mcc001.3gppnetwork.org");
+        assert!(bf["pcfIpEndPoints"].as_array().is_some_and(|a| !a.is_empty()));
+
+        // Without self info (pre-WSB-1 legacy shape): no PCF address members —
+        // this is exactly the body our bsfd 400-rejects (negative-control
+        // shape pinned strict-peer in tests/strict_peer_bsfd.rs).
+        let legacy = build_pcf_binding_body_with(
+            None,
+            "imsi-001010000000088",
+            "internet",
+            1,
+            None,
+            None,
+        );
+        assert!(legacy.get("pcfIpEndPoints").is_none());
+        assert!(legacy.get("pcfFqdn").is_none());
+        assert!(legacy.get("pcfId").is_none());
     }
 
     /// pcfd#2: TS 29.519 SmPolicyData navigation extracts the DNN data object.

@@ -10,6 +10,13 @@ description = "NextGCore PCF (Policy Control Function)"
 name = "nextgcore-pcfd"
 path = "src/main.rs"
 
+# Wave-6 H1 lib-targetization: the PCF module tree is a library (mirroring
+# nextgcore-udrd/udmd) so strict-peer integration tests can use the real
+# PcfBinding body builder / client functions in-process.
+[lib]
+name = "nextgcore_pcfd"
+path = "src/lib.rs"
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }
@@ -29,6 +36,9 @@ ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# WSB-1/H2 strict-peer tests: drive the REAL bsfd SBI request handler
+# in-process (and over a real HTTP/2 socket) instead of a lenient mock.
+nextgcore-bsfd = { path = "../nextgcore-bsfd" }
 
 [lints]
 workspace = true
