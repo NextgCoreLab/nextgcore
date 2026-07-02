@@ -155,6 +155,30 @@ pub struct UdmUe {
     pub amf_3gpp_access_registration: Option<Amf3GppAccessRegistration>,
     /// Associated stream ID
     pub stream_id: Option<u64>,
+    /// Wave-6 F-04: temporarily-stored expected SoR-XMAC-I_UE (TS 33.501
+    /// §6.14.2.1 step 10). Populated when the UDM injects a SoR container with
+    /// `ackInd == true`; consumed by the SoR ack verify (F-06) then cleared
+    /// (single-use). 16 bytes = the 128 LSBs of the Annex A.18 HMAC.
+    pub expected_sor_xmac_iue: Option<[u8; 16]>,
+    /// Wave-6 F-04: the Counter_SoR value used to protect the outstanding SoR
+    /// container, pinned alongside `expected_sor_xmac_iue` for replay defence.
+    pub last_sor_counter: Option<u16>,
+    /// Wave-6 F-05: temporarily-stored expected UPU-XMAC-I_UE (TS 33.501
+    /// §6.15.2.1 step 6). Populated when the UDM injects a UPU payload with
+    /// `upuAckInd == true`; consumed by the UPU ack verify (F-06) then cleared
+    /// (single-use). 16 bytes = the 128 LSBs of the Annex A.20 HMAC.
+    pub expected_upu_xmac_iue: Option<[u8; 16]>,
+    /// Wave-6 F-05: the Counter_UPU value used to protect the outstanding UPU
+    /// payload, pinned alongside `expected_upu_xmac_iue` for replay defence.
+    pub last_upu_counter: Option<u16>,
+    /// Wave-6 F-06: recorded SoR acknowledgement state (TS 33.501 §6.14.2.1
+    /// steps 13-15). Set once the UE's SoR-MAC-I_UE verifies against
+    /// `expected_sor_xmac_iue` (or on `ueNotReachable`); the expected XMAC is
+    /// cleared at the same time (single-use).
+    pub sor_ack: Option<SorUpuAckState>,
+    /// Wave-6 F-06: recorded UPU acknowledgement state (TS 33.501 §6.15.2.1
+    /// step 9) — the UPU mirror of `sor_ack`.
+    pub upu_ack: Option<SorUpuAckState>,
 }
 
 impl UdmUe {
@@ -183,6 +207,12 @@ impl UdmUe {
             auth_event: None,
             amf_3gpp_access_registration: None,
             stream_id: None,
+            expected_sor_xmac_iue: None,
+            last_sor_counter: None,
+            expected_upu_xmac_iue: None,
+            last_upu_counter: None,
+            sor_ack: None,
+            upu_ack: None,
         }
     }
 
@@ -329,6 +359,62 @@ impl UdmEeSubscription {
     }
 }
 
+/// Wave-6 F-04: operator-provisioned Steering-of-Roaming source (TS 33.501
+/// §6.14.2.1). When present the UDM invokes Nausf_SoRProtection on an am-data
+/// GET and injects the protected `sorInfo`; absence keeps the byte-identical
+/// UDR passthrough (the default-safety mechanism — matched-sim configs carry
+/// no `sor` section, so nothing changes).
+#[derive(Debug, Clone)]
+pub struct SorSteeringConfig {
+    /// TS 29.509 `SteeringContainer` — a `SteeringInfo[]` array
+    /// (`{plmnId, accessTechList}` entries) forwarded verbatim to the AUSF,
+    /// which performs the TS 24.501 §9.11.3.51 wire encoding and validation.
+    pub steering_container: serde_json::Value,
+    /// Whether to request the UE acknowledgement (`SorInfo.ackInd`).
+    pub ack_ind: bool,
+}
+
+/// Wave-6 F-05: operator-provisioned UE-Parameters-Update source (TS 33.501
+/// §6.15.2.1). When present the UDM invokes Nausf_UPUProtection on an am-data
+/// GET and injects the protected `upuInfo`; absence keeps the byte-identical
+/// UDR passthrough (the default-safety mechanism — matched-sim configs carry
+/// no `upu` section, so nothing changes).
+///
+/// HONESTY MARKER: this makes the protected-payload PRODUCTION real. The
+/// spec-primary UPU delivery vehicle — Nudm_SDM_Notification after registration
+/// (TS 33.501 §6.15.2.1 step 5) — is DEFERRED until udmd grows SDM
+/// data-change-notification machinery (it has none today). This item does not
+/// implement the async post-registration delivery.
+#[derive(Debug, Clone)]
+pub struct UpuConfig {
+    /// TS 29.509 `UpuData[]` — an array of `UpuData` objects
+    /// (`{routingId, defaultConfNssai, secPacket, ...}` entries) forwarded
+    /// verbatim to the AUSF, which performs the TS 24.501 §9.11.3.53A wire
+    /// encoding, validation and MAC.
+    pub upu_data_list: serde_json::Value,
+    /// Whether to request the UE acknowledgement (`UpuInfo.upuAckInd`).
+    pub ack_ind: bool,
+}
+
+/// Wave-6 F-06: recorded SoR/UPU acknowledgement state on a `UdmUe`.
+///
+/// Set after a successful SoR-MAC-I_UE / UPU-MAC-I_UE verification (TS 33.501
+/// §6.14.2.1 steps 13-15 / §6.15.2.1 step 9) — or after an AMF-reported
+/// `ueNotReachable` — at which point the matching expected-XMAC is cleared
+/// (single-use, replay defence). Persistence is in-memory this wave; a UDR
+/// PATCH of ack state is deferred (P2), noted rather than faked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SorUpuAckState {
+    /// `AcknowledgeInfo.provisioningTime` echoed by the UE (TS 29.503 §5.2.2.6).
+    pub provisioning_time: String,
+    /// The Counter_SoR / Counter_UPU that was verified (pinned at injection
+    /// time); `None` for an ack recorded via `ueNotReachable` with no pin.
+    pub counter: Option<u16>,
+    /// `true` when the ack was recorded on an AMF-reported `ueNotReachable`
+    /// (TS 29.503 AcknowledgeInfo.ueNotReachable) rather than a verified MAC.
+    pub ue_not_reachable: bool,
+}
+
 /// SUCI protection scheme identifiers (TS 23.003 Annex C / TS 33.501 Annex C)
 pub const PROTECTION_SCHEME_NULL: u8 = 0;
 /// ECIES Profile A (Curve25519)
@@ -466,6 +552,12 @@ pub struct UdmContext {
     /// udmd-11: whether the null-scheme SUCI is accepted.
     /// Default true preserves matched-sim behaviour; operator can disable via config.
     allow_null_scheme: AtomicBool,
+    /// Wave-6 F-04: operator-provisioned Steering-of-Roaming list. `None`
+    /// (the default) keeps the byte-identical am-data passthrough.
+    sor_steering: RwLock<Option<SorSteeringConfig>>,
+    /// Wave-6 F-05: operator-provisioned UE-Parameters-Update list. `None`
+    /// (the default) keeps the byte-identical am-data passthrough.
+    upu_config: RwLock<Option<UpuConfig>>,
 }
 
 impl UdmContext {
@@ -487,6 +579,10 @@ impl UdmContext {
             initialized: AtomicBool::new(false),
             // Default true: accept null-scheme SUCIs (matched-sim uses them).
             allow_null_scheme: AtomicBool::new(true),
+            // Default None: no SoR steering → byte-identical am-data passthrough.
+            sor_steering: RwLock::new(None),
+            // Default None: no UPU config → byte-identical am-data passthrough.
+            upu_config: RwLock::new(None),
         }
     }
 
@@ -538,6 +634,152 @@ impl UdmContext {
     /// Returns `true` when the null-scheme SUCI is accepted.
     pub fn get_allow_null_scheme(&self) -> bool {
         self.allow_null_scheme.load(Ordering::SeqCst)
+    }
+
+    // Wave-6 F-04: SoR steering configuration + expected-XMAC store -----------
+
+    /// Provision the operator Steering-of-Roaming list (TS 33.501 §6.14.2.1).
+    pub fn set_sor_steering(&self, config: SorSteeringConfig) {
+        if let Ok(mut guard) = self.sor_steering.write() {
+            *guard = Some(config);
+        }
+    }
+
+    /// Return the provisioned Steering-of-Roaming list, if any. `None` keeps
+    /// the byte-identical am-data passthrough (default-safe).
+    pub fn sor_steering(&self) -> Option<SorSteeringConfig> {
+        self.sor_steering.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Temporarily store the expected SoR-XMAC-I_UE for `supi` (TS 33.501
+    /// §6.14.2.1 step 10), creating the UE context if the am-data GET arrives
+    /// for a UE not authenticated through this UDM instance (F-04 risk note).
+    ///
+    /// Lock discipline: `ue_find_by_supi`, `ue_add` and `ue_update` are each
+    /// self-contained lock acquisitions — this method never holds one map
+    /// guard while taking another (nf-context-lock-deadlocks learning).
+    pub fn sor_store_expected_xmac(&self, supi: &str, xmac: [u8; 16], counter: u16) -> bool {
+        if let Some(mut ue) = self.ue_find_by_supi(supi) {
+            ue.expected_sor_xmac_iue = Some(xmac);
+            ue.last_sor_counter = Some(counter);
+            return self.ue_update(&ue);
+        }
+        // Create-or-find: `ue_add` accepts the `imsi-...` SUPI via the
+        // `supi_from_suci` passthrough, then we pin the expected XMAC.
+        if let Some(mut ue) = self.ue_add(supi) {
+            ue.expected_sor_xmac_iue = Some(xmac);
+            ue.last_sor_counter = Some(counter);
+            return self.ue_update(&ue);
+        }
+        false
+    }
+
+    /// F-06: peek the outstanding expected SoR-XMAC-I_UE + pinned Counter_SoR
+    /// for `supi` (TS 33.501 §6.14.2.1 step 13). `None` when no SoR container is
+    /// outstanding for this UE — the ack verify then treats a supplied MAC as an
+    /// unexpected ack. Read-only: the single-use clear happens in
+    /// [`Self::sor_record_ack`].
+    pub fn sor_expected_xmac(&self, supi: &str) -> Option<([u8; 16], u16)> {
+        let ue = self.ue_find_by_supi(supi)?;
+        let xmac = ue.expected_sor_xmac_iue?;
+        Some((xmac, ue.last_sor_counter.unwrap_or(0)))
+    }
+
+    /// F-06: record a verified (or `ueNotReachable`) SoR acknowledgement for
+    /// `supi` AND clear the expected SoR-XMAC-I_UE (single-use — a replayed ack
+    /// then finds nothing to compare and is rejected). Returns `false` when the
+    /// UE context is absent (nothing to record). Self-contained lock
+    /// acquisitions only (nf-context-lock-deadlocks learning).
+    pub fn sor_record_ack(
+        &self,
+        supi: &str,
+        provisioning_time: &str,
+        counter: Option<u16>,
+        ue_not_reachable: bool,
+    ) -> bool {
+        if let Some(mut ue) = self.ue_find_by_supi(supi) {
+            ue.sor_ack = Some(SorUpuAckState {
+                provisioning_time: provisioning_time.to_string(),
+                counter,
+                ue_not_reachable,
+            });
+            // Single-use: consume the expected XMAC so a replayed ack fails.
+            ue.expected_sor_xmac_iue = None;
+            ue.last_sor_counter = None;
+            return self.ue_update(&ue);
+        }
+        false
+    }
+
+    // Wave-6 F-05: UPU configuration + expected-XMAC store --------------------
+
+    /// Provision the operator UE-Parameters-Update list (TS 33.501 §6.15.2.1).
+    pub fn set_upu_config(&self, config: UpuConfig) {
+        if let Ok(mut guard) = self.upu_config.write() {
+            *guard = Some(config);
+        }
+    }
+
+    /// Return the provisioned UE-Parameters-Update list, if any. `None` keeps
+    /// the byte-identical am-data passthrough (default-safe).
+    pub fn upu_config(&self) -> Option<UpuConfig> {
+        self.upu_config.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Temporarily store the expected UPU-XMAC-I_UE for `supi` (TS 33.501
+    /// §6.15.2.1 step 6), creating the UE context if the am-data GET arrives
+    /// for a UE not authenticated through this UDM instance (F-04 risk note).
+    ///
+    /// Lock discipline: `ue_find_by_supi`, `ue_add` and `ue_update` are each
+    /// self-contained lock acquisitions — this method never holds one map
+    /// guard while taking another (nf-context-lock-deadlocks learning).
+    pub fn upu_store_expected_xmac(&self, supi: &str, xmac: [u8; 16], counter: u16) -> bool {
+        if let Some(mut ue) = self.ue_find_by_supi(supi) {
+            ue.expected_upu_xmac_iue = Some(xmac);
+            ue.last_upu_counter = Some(counter);
+            return self.ue_update(&ue);
+        }
+        // Create-or-find: `ue_add` accepts the `imsi-...` SUPI via the
+        // `supi_from_suci` passthrough, then we pin the expected XMAC.
+        if let Some(mut ue) = self.ue_add(supi) {
+            ue.expected_upu_xmac_iue = Some(xmac);
+            ue.last_upu_counter = Some(counter);
+            return self.ue_update(&ue);
+        }
+        false
+    }
+
+    /// F-06: peek the outstanding expected UPU-XMAC-I_UE + pinned Counter_UPU
+    /// for `supi` (TS 33.501 §6.15.2.1 step 9) — the UPU mirror of
+    /// [`Self::sor_expected_xmac`].
+    pub fn upu_expected_xmac(&self, supi: &str) -> Option<([u8; 16], u16)> {
+        let ue = self.ue_find_by_supi(supi)?;
+        let xmac = ue.expected_upu_xmac_iue?;
+        Some((xmac, ue.last_upu_counter.unwrap_or(0)))
+    }
+
+    /// F-06: record a verified (or `ueNotReachable`) UPU acknowledgement for
+    /// `supi` AND clear the expected UPU-XMAC-I_UE (single-use) — the UPU mirror
+    /// of [`Self::sor_record_ack`].
+    pub fn upu_record_ack(
+        &self,
+        supi: &str,
+        provisioning_time: &str,
+        counter: Option<u16>,
+        ue_not_reachable: bool,
+    ) -> bool {
+        if let Some(mut ue) = self.ue_find_by_supi(supi) {
+            ue.upu_ack = Some(SorUpuAckState {
+                provisioning_time: provisioning_time.to_string(),
+                counter,
+                ue_not_reachable,
+            });
+            // Single-use: consume the expected XMAC so a replayed ack fails.
+            ue.expected_upu_xmac_iue = None;
+            ue.last_upu_counter = None;
+            return self.ue_update(&ue);
+        }
+        false
     }
 
     // udmd-07: SDM subscription direct insert ----------------------------------
@@ -1186,6 +1428,47 @@ mod tests {
             ctx.ue_add(&format!("suci-0-001-01-0000-0-0-{i:010}"));
         }
         assert_eq!(ctx.get_ue_load(), 50);
+    }
+
+    // Wave-6 F-05: UPU config + expected-XMAC store ---------------------------
+
+    #[test]
+    fn test_upu_config_accessors() {
+        let ctx = UdmContext::new();
+        // Default: no UPU config → passthrough (None).
+        assert!(ctx.upu_config().is_none());
+
+        ctx.set_upu_config(UpuConfig {
+            upu_data_list: serde_json::json!([{"routingId": "1234"}]),
+            ack_ind: true,
+        });
+        let cfg = ctx.upu_config().expect("config provisioned");
+        assert!(cfg.ack_ind);
+        assert_eq!(cfg.upu_data_list[0]["routingId"], "1234");
+    }
+
+    #[test]
+    fn test_upu_store_expected_xmac_creates_then_updates() {
+        let mut ctx = UdmContext::new();
+        ctx.init(100, 200);
+        let supi = "imsi-001010000000042";
+        let xmac = [0xABu8; 16];
+
+        // No UE yet → create-or-find must create the context and pin the XMAC.
+        assert!(ctx.upu_store_expected_xmac(supi, xmac, 0x0001));
+        let ue = ctx.ue_find_by_supi(supi).expect("UE created");
+        assert_eq!(ue.expected_upu_xmac_iue, Some(xmac));
+        assert_eq!(ue.last_upu_counter, Some(0x0001));
+        // The SoR expected-XMAC is a SEPARATE slot (independent counters).
+        assert_eq!(ue.expected_sor_xmac_iue, None);
+
+        // Second call updates the existing UE in place (no duplicate).
+        let xmac2 = [0xCDu8; 16];
+        assert!(ctx.upu_store_expected_xmac(supi, xmac2, 0x0002));
+        let ue = ctx.ue_find_by_supi(supi).unwrap();
+        assert_eq!(ue.expected_upu_xmac_iue, Some(xmac2));
+        assert_eq!(ue.last_upu_counter, Some(0x0002));
+        assert_eq!(ctx.ue_count(), 1, "no duplicate UE created");
     }
 
     // ========================================================================

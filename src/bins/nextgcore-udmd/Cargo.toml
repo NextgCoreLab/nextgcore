@@ -10,6 +10,13 @@ description = "NextGCore UDM (Unified Data Management)"
 name = "nextgcore-udmd"
 path = "src/main.rs"
 
+# Wave-6 H1 (strict-peer harness foundation): the UDM is also a library so
+# peer NF crates can drive the real `udm_sbi_request_handler` in-process from
+# integration tests instead of hand-rolled lenient mocks.
+[lib]
+name = "nextgcore_udmd"
+path = "src/lib.rs"
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-crypt = { workspace = true }
@@ -30,6 +37,14 @@ ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+base64.workspace = true
+# Wave-6 H3 (strict-peer conversion): drive amfd's REAL Nudm_UECM
+# deregistration-notify consumer (`handle_dereg_notify` + the real
+# DeregistrationData wire enums) in-process from udmd's tests via the H1
+# amfd lib target, instead of a lenient mock. Dev-only edge; the binary
+# graph is unchanged.
+nextgcore-amfd = { path = "../nextgcore-amfd" }
 
 [lints]
 workspace = true

@@ -263,6 +263,17 @@ fn cache_amf_registration(supi: &str, body: &Value) {
     }
 }
 
+/// Build the Nudm_UECM `DeregistrationData` notification body (TS 29.503
+/// §5.3.2.3.2): `deregReason` + `accessType`. Both members are mandatory — the
+/// old AMF's dereg-notify handler keys its network-initiated deregistration on
+/// `accessType` (WSB-4), so it must be present on the wire. The old AMF's
+/// registration was superseded by a fresh UE initial registration in the new
+/// AMF over 3GPP access. Exposed so peer NF crates (amfd) can drive the exact
+/// wire body through their real handler in strict-peer tests.
+pub fn build_dereg_notification_body() -> Value {
+    json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" })
+}
+
 /// udmd-02: notify the old AMF if the serving AMF changed; suppress when the new
 /// amfInstanceId equals the old one.
 async fn notify_old_amf_if_changed(supi: &str, prior: &Value, new: &Value, client: &UdrClient) {
@@ -277,7 +288,7 @@ async fn notify_old_amf_if_changed(supi: &str, prior: &Value, new: &Value, clien
         // Suppression rule (TS 29.503 §5.3.2.2.2): same serving AMF, no notify.
         return;
     }
-    let dereg = json!({ "deregReason": "UE_INITIAL_REGISTRATION" });
+    let dereg = build_dereg_notification_body();
     match client.send_dereg_notification(old_uri, &dereg).await {
         Ok(resp) => log::info!(
             "[{supi}] Deregistration notification to old AMF {old_uri} -> {}",
@@ -1029,5 +1040,194 @@ mod tests {
             1,
             "no notification when amfInstanceId is unchanged"
         );
+    }
+
+    // ----- H3 / WSB-4: udmd -> amfd deregistration-notify STRICT-PEER -------
+    //
+    // Wave-6 WSB-4 (upgraded from the H3 hand-off). The emission-decision test
+    // above proves udmd *decides* to notify; these tests prove udmd's
+    // PRODUCTION `DeregistrationData` body is one amfd's REAL Namf_Callback
+    // consumer accepts over the WIRE — POSTing the raw JSON through amfd's real
+    // `nextgcore_amfd::namf_request_handler` at the `/namf-callback/v1/{supi}/
+    // dereg-notify` route amfd itself registers, NOT a lenient mock and no
+    // longer just the pre-WSB-4 in-memory `handle_dereg_notify` call.
+    //
+    // Spec: TS 29.503 §5.3.2.3.2 (Nudm_UECM DeregistrationNotification;
+    // DeregistrationData = deregReason + accessType); DeregistrationReason
+    // enum values verified against specs/29503-j60.txt:27268-27298. The full
+    // WSB-4 round trip (absolute deregCallbackUri, router arm, serde decode,
+    // fail-closed 400, network-initiated-dereg enqueue) is exercised here.
+
+    /// Drive udmd's REAL re-registration emission and return the exact
+    /// `(callbackUri, DeregistrationData)` JSON body udmd POSTs to the old AMF.
+    async fn capture_udmd_dereg_body() -> (String, Value) {
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-001010000000399";
+        let amf_a_uri =
+            "http://amf-a.example.org:7777/namf-callback/v1/imsi-x/dereg-notify".to_string();
+        let prior = json!({
+            "amfInstanceId": "amf-a-0001",
+            "deregCallbackUri": amf_a_uri,
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
+            "ratType": "NR"
+        });
+        let mock = Arc::new(MockUdr::with_prior(prior));
+        let client = UdrClient::Mock(mock.clone());
+
+        // AMF-B registers over the stored AMF-A -> udmd emits a dereg notify.
+        let mut body_b = valid_amf_body();
+        body_b["amfInstanceId"] = json!("amf-b-0002");
+        body_b["deregCallbackUri"] =
+            json!("http://amf-b.example.org:7777/namf-callback/v1/imsi-x/dereg-notify");
+        let _ = process_amf_registration(supi, &body_b, &client).await;
+
+        mock.calls()
+            .into_iter()
+            .find_map(|c| match c {
+                UdrCall::DeregNotify { callback_uri, body } => Some((callback_uri, body)),
+                _ => None,
+            })
+            .expect("udmd emitted a DeregistrationData notification")
+    }
+
+    /// Seed a real `AmfUe` (resolvable by SUPI) in amfd's process-global
+    /// context so `namf_request_handler`'s SUPI lookup succeeds. Returns the
+    /// AMF-UE-NGAP-ID (== the enqueued dereg's `amf_ue_ngap_id`).
+    fn seed_amf_ue(supi: &str, ran_ue_ngap_id: u64) -> u64 {
+        let ctx = nextgcore_amfd::context::amf_self();
+        let guard = ctx.read().expect("amf ctx lock");
+        let ran = guard.ran_ue_add(900_400, ran_ue_ngap_id).expect("ran_ue_add");
+        let ue = guard.amf_ue_add(ran.id).expect("amf_ue_add");
+        guard.amf_ue_set_supi(ue.id, supi);
+        let mut ue = ue;
+        ue.supi = Some(supi.to_string());
+        guard.amf_ue_update(&ue);
+        ue.id
+    }
+
+    /// Drain amfd's process-global network-dereg queue, keep only this UE's
+    /// items and re-add the rest (queue is process-global; parallel tests must
+    /// not steal each other's enqueues).
+    fn drain_network_deregs_for(ue_id: u64) -> Vec<nextgcore_amfd::context::PendingNetworkDereg> {
+        let ctx = nextgcore_amfd::context::amf_self();
+        let guard = ctx.read().expect("amf ctx lock");
+        let (mine, others): (Vec<_>, Vec<_>) = guard
+            .network_dereg_drain()
+            .into_iter()
+            .partition(|d| d.amf_ue_ngap_id == ue_id);
+        for item in others {
+            guard.network_dereg_add(item);
+        }
+        mine
+    }
+
+    /// WSB-4 acceptance: udmd's REAL production DeregistrationData body ->
+    /// amfd's REAL Namf_Callback handler over the wire -> 204 + exactly one
+    /// network-initiated deregistration enqueued (reregistration_required=true
+    /// for UE_INITIAL_REGISTRATION). A relative URI or a missing router arm
+    /// would fail this (the whole point of the WSB-4 round trip).
+    #[tokio::test]
+    async fn test_dereg_notify_strict_peer_amfd_accepts_udmd_body() {
+        use nextgcore_sbi::message::SbiRequest;
+
+        // Capture udmd's production notify body BEFORE any std lock (no lock
+        // held across an await point).
+        let (uri, body) = capture_udmd_dereg_body().await;
+
+        // Reverse-shape pins on udmd's production body: absolute URI + both
+        // mandatory members present (WSB-4 added accessType).
+        assert!(
+            uri.starts_with("http://") || uri.starts_with("https://"),
+            "dereg callback URI must be absolute so amfd can be reached: {uri}"
+        );
+        assert_eq!(
+            body.get("deregReason").and_then(|v| v.as_str()),
+            Some("UE_INITIAL_REGISTRATION")
+        );
+        assert_eq!(
+            body.get("accessType").and_then(|v| v.as_str()),
+            Some("3GPP_ACCESS"),
+            "WSB-4: udmd's DeregistrationData must carry accessType (amfd keys on it)"
+        );
+
+        let supi = "imsi-001010000000399";
+        let ue_id = {
+            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+            nextgcore_amfd::test_support::init_context();
+            seed_amf_ue(supi, 60_100)
+        };
+
+        // Drive udmd's REAL body through amfd's REAL Namf SBI handler at the
+        // path amfd itself registers as its absolute deregCallbackUri.
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let req = SbiRequest::post(path).with_json_body(&body).expect("json");
+        let resp = nextgcore_amfd::namf_request_handler(req).await;
+        assert_eq!(
+            resp.status, 204,
+            "amfd must 204-accept udmd's dereg body, got {} ({:?})",
+            resp.status, resp.http.content
+        );
+
+        // The real handler enqueued exactly one network-initiated dereg.
+        let queued = drain_network_deregs_for(ue_id);
+        assert_eq!(queued.len(), 1, "exactly one network-initiated dereg enqueued");
+        assert_eq!(queued[0].amf_ue_ngap_id, ue_id);
+        assert!(
+            queued[0].reregistration_required,
+            "UE_INITIAL_REGISTRATION => reregistration_required (TS 23.502 §4.2.2.3.3)"
+        );
+    }
+
+    /// Negative twin: a non-3GPP-access dereg is accepted (204) but triggers no
+    /// 3GPP network-initiated deregistration — proves the accept above is
+    /// discriminating, not a blanket 2xx-and-enqueue.
+    #[tokio::test]
+    async fn test_dereg_notify_strict_peer_non_3gpp_no_enqueue() {
+        use nextgcore_sbi::message::SbiRequest;
+        let supi = "imsi-001010000000398";
+        let ue_id = {
+            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+            nextgcore_amfd::test_support::init_context();
+            seed_amf_ue(supi, 60_101)
+        };
+        let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "NON_3GPP_ACCESS" });
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let req = SbiRequest::post(path).with_json_body(&body).expect("json");
+        let resp = nextgcore_amfd::namf_request_handler(req).await;
+        assert_eq!(resp.status, 204, "non-3GPP dereg is accepted");
+        assert!(
+            drain_network_deregs_for(ue_id).is_empty(),
+            "no 3GPP network-initiated dereg for a non-3GPP-access notify"
+        );
+    }
+
+    /// Fail-closed twins: a missing mandatory accessType -> 400; an unknown
+    /// SUPI -> 404 CONTEXT_NOT_FOUND (TS 29.500 §5.2.7 / TS 29.518 §6.1.7.3).
+    #[tokio::test]
+    async fn test_dereg_notify_fail_closed_400_and_404() {
+        use nextgcore_sbi::message::SbiRequest;
+        let supi = "imsi-001010000000397";
+        let _ue_id = {
+            let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+            nextgcore_amfd::test_support::init_context();
+            seed_amf_ue(supi, 60_102)
+        };
+
+        // 400: mandatory accessType absent (WSB-4 fail-closed).
+        let missing = json!({ "deregReason": "UE_INITIAL_REGISTRATION" });
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let resp =
+            nextgcore_amfd::namf_request_handler(SbiRequest::post(path).with_json_body(&missing).expect("json"))
+                .await;
+        assert_eq!(resp.status, 400, "missing accessType must fail closed (400)");
+
+        // 404: unknown SUPI (never seeded).
+        let unknown = "imsi-001019999999999";
+        let full = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" });
+        let path2 = format!("/namf-callback/v1/{unknown}/dereg-notify");
+        let resp2 =
+            nextgcore_amfd::namf_request_handler(SbiRequest::post(path2).with_json_body(&full).expect("json"))
+                .await;
+        assert_eq!(resp2.status, 404, "unknown SUPI must be 404 CONTEXT_NOT_FOUND");
     }
 }

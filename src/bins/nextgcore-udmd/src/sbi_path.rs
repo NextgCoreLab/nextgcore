@@ -602,6 +602,130 @@ pub async fn udm_sbi_send_dereg_notification(
         .map_err(|e| format!("Dereg notification POST to {callback_uri} failed: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// Nausf_SoRProtection client (Wave-6 F-04, TS 29.509 / TS 33.501 §6.14.2.1)
+// ---------------------------------------------------------------------------
+
+/// POST a `SorInfo` to the AUSF's Nausf_SoRProtection Protect custom operation
+/// (`POST /nausf-sorprotection/v1/{supi}/ue-sor`, specs/TS29509_Nausf_SoRProtection.yaml:27).
+///
+/// AUSF selection (TS 33.501 §6.14.2.1 step 8 — "the AUSF that holds the latest
+/// K_AUSF"): prefer the `ausf_instance_id` captured at authentication time;
+/// fall back to a cached AUSF instance, then to the `AUSF_SBI_ADDR`/
+/// `AUSF_SBI_PORT` env vars (mirrors the UDR fallback). When none resolves the
+/// call errors and the caller withholds `sorInfo` (fail-closed).
+pub async fn udm_ausf_send_sor_protect(
+    supi: &str,
+    ausf_instance_id: Option<&str>,
+    sor_info: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nausf-sorprotection/v1/{supi}/ue-sor");
+    let build_request = || {
+        SbiRequest::post(&path)
+            .with_json_body(sor_info)
+            .map_err(|e| format!("Failed to serialize SorInfo: {e}"))
+    };
+
+    // 1. Prefer the AUSF that authenticated this UE (holds the latest KAUSF).
+    if let Some(id) = ausf_instance_id {
+        if global_context().get_nf_instance(id).await.is_some() {
+            return udm_sbi_send_request(id, build_request()?).await;
+        }
+    }
+
+    let sbi_ctx = global_context();
+
+    // 2. Any cached AUSF instance discovered via NRF.
+    let ausf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Ausf).await;
+    if let Some(ausf) = ausf_instances.first() {
+        let host = ausf
+            .ipv4_addresses
+            .first()
+            .ok_or("AUSF instance has no IPv4 address")?;
+        let port = ausf.services.first().map(|s| s.port).unwrap_or(80);
+        let client = sbi_ctx.get_client(host, port).await;
+        return client
+            .send_request(build_request()?)
+            .await
+            .map_err(|e| format!("Nausf_SoRProtection request to AUSF failed: {e}"));
+    }
+
+    // 3. Env-var fallback (matches the UDR env fallback pattern).
+    let host = std::env::var("AUSF_SBI_ADDR")
+        .map_err(|_| "No AUSF instance discovered and AUSF_SBI_ADDR not set".to_string())?;
+    let port: u16 = std::env::var("AUSF_SBI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    let client = sbi_ctx.get_client(&host, port).await;
+    client
+        .send_request(build_request()?)
+        .await
+        .map_err(|e| format!("Nausf_SoRProtection request to AUSF failed: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Nausf_UPUProtection client (Wave-6 F-05, TS 29.509 / TS 33.501 §6.15.2.1)
+// ---------------------------------------------------------------------------
+
+/// POST a `UpuInfo` to the AUSF's Nausf_UPUProtection Protect custom operation
+/// (`POST /nausf-upuprotection/v1/{supi}/ue-upu`, specs/TS29509_Nausf_UPUProtection.yaml:27).
+///
+/// AUSF selection (TS 33.501 §6.15.2.1 — "the AUSF that holds the latest
+/// K_AUSF"): prefer the `ausf_instance_id` captured at authentication time;
+/// fall back to a cached AUSF instance, then to the `AUSF_SBI_ADDR`/
+/// `AUSF_SBI_PORT` env vars (mirrors the SoR helper). When none resolves the
+/// call errors and the caller withholds `upuInfo` (fail-closed).
+pub async fn udm_ausf_send_upu_protect(
+    supi: &str,
+    ausf_instance_id: Option<&str>,
+    upu_info: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nausf-upuprotection/v1/{supi}/ue-upu");
+    let build_request = || {
+        SbiRequest::post(&path)
+            .with_json_body(upu_info)
+            .map_err(|e| format!("Failed to serialize UpuInfo: {e}"))
+    };
+
+    // 1. Prefer the AUSF that authenticated this UE (holds the latest KAUSF).
+    if let Some(id) = ausf_instance_id {
+        if global_context().get_nf_instance(id).await.is_some() {
+            return udm_sbi_send_request(id, build_request()?).await;
+        }
+    }
+
+    let sbi_ctx = global_context();
+
+    // 2. Any cached AUSF instance discovered via NRF.
+    let ausf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Ausf).await;
+    if let Some(ausf) = ausf_instances.first() {
+        let host = ausf
+            .ipv4_addresses
+            .first()
+            .ok_or("AUSF instance has no IPv4 address")?;
+        let port = ausf.services.first().map(|s| s.port).unwrap_or(80);
+        let client = sbi_ctx.get_client(host, port).await;
+        return client
+            .send_request(build_request()?)
+            .await
+            .map_err(|e| format!("Nausf_UPUProtection request to AUSF failed: {e}"));
+    }
+
+    // 3. Env-var fallback (matches the SoR env fallback pattern).
+    let host = std::env::var("AUSF_SBI_ADDR")
+        .map_err(|_| "No AUSF instance discovered and AUSF_SBI_ADDR not set".to_string())?;
+    let port: u16 = std::env::var("AUSF_SBI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    let client = sbi_ctx.get_client(&host, port).await;
+    client
+        .send_request(build_request()?)
+        .await
+        .map_err(|e| format!("Nausf_UPUProtection request to AUSF failed: {e}"))
+}
+
 /// SBI transaction for tracking requests
 #[derive(Debug, Clone)]
 pub struct SbiXact {
@@ -732,5 +856,27 @@ mod tests {
         assert_eq!(xact.sbi_object_id, 100);
         assert_eq!(xact.service_type, "nudm-ueau");
         assert_eq!(xact.state, 0);
+    }
+
+    /// WSB-4: amfd now registers an ABSOLUTE deregCallbackUri (it was relative,
+    /// which `parse_callback_uri` rejected -> the DeregistrationNotification
+    /// round trip was broken). The absolute URI must parse; the old relative
+    /// form must still be rejected (fail-closed, TS 29.503 §5.3.2.3.2 Uri).
+    #[test]
+    fn parse_callback_uri_accepts_absolute_amf_dereg_uri() {
+        let uri = "http://127.0.0.1:7777/namf-callback/v1/imsi-001010000000001/dereg-notify";
+        assert_eq!(
+            parse_callback_uri(uri),
+            Some((
+                "127.0.0.1".to_string(),
+                7777,
+                "/namf-callback/v1/imsi-001010000000001/dereg-notify".to_string(),
+            ))
+        );
+        // The pre-WSB-4 relative amfd URI is still rejected (no host to POST).
+        assert_eq!(
+            parse_callback_uri("/namf-callback/v1/imsi-001010000000001/dereg-notify"),
+            None
+        );
     }
 }
