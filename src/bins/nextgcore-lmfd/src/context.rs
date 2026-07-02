@@ -12,6 +12,14 @@ use crate::positioning::{
     RttObservation, TdoaObservation, TrpCoord, TrpRegistry,
 };
 
+/// Current Unix time in whole seconds (0 when the clock is before the epoch).
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Positioning method (TS 23.273 6.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositioningMethod {
@@ -163,6 +171,52 @@ pub struct LdrContext {
     pub supi: Option<String>,
 }
 
+/// Outcome of a pending network-induced positioning procedure (Wave-6 A2,
+/// TS 23.273 §6.11.2 5GC-MT-LR). Delivered on the session's completion
+/// channel by [`LmfContext::measurement_report`] (fed by the A4 N1/N2 notify
+/// callbacks or the A1-relayed NRPPa uplink).
+#[derive(Debug, Clone)]
+pub enum PositioningOutcome {
+    /// A REAL measurement-derived fix (from the geometric solvers only —
+    /// never the heuristic placeholder).
+    Fix(LocationEstimate),
+    /// A report arrived but the solver could not produce a fix
+    /// (→ 500 `POSITIONING_FAILED`, TS 29.572 Table 6.1.7.3-1).
+    SolverFailed,
+}
+
+/// A pending DetermineLocation correlation session (Wave-6 A2).
+///
+/// Registered BEFORE the outbound Namf `N1N2MessageTransfer` POST so an
+/// uplink report can never race the registration. Indexed by
+/// `lcsCorrelationId` (TS 29.572 CorrelationID, 1..255 chars) AND by the LPP
+/// `transactionNumber` (TS 37.355 §6.1; wrap-around means the transaction
+/// index is last-writer-wins — `lcsCorrelationId` stays unique).
+pub struct PositioningSession {
+    /// Minted LCS correlation identifier (UUID, TS 29.572 CorrelationID).
+    pub lcs_correlation_id: String,
+    /// LPP transaction number of the RequestLocationInformation we sent.
+    pub lpp_transaction: u8,
+    /// Target SUPI when known.
+    pub supi: Option<String>,
+    /// The measurement-store request id measurements are reported against.
+    pub request_id: u64,
+    /// Session creation instant (timeout bookkeeping).
+    pub created_at: std::time::Instant,
+    /// One-shot completion channel to the awaiting DetermineLocation handler.
+    sender: Option<tokio::sync::oneshot::Sender<PositioningOutcome>>,
+}
+
+/// Cloneable lookup view of a [`PositioningSession`] (the completion channel
+/// is not cloneable and stays in the store).
+#[derive(Debug, Clone)]
+pub struct PositioningSessionInfo {
+    pub lcs_correlation_id: String,
+    pub lpp_transaction: u8,
+    pub supi: Option<String>,
+    pub request_id: u64,
+}
+
 /// LMF Context
 pub struct LmfContext {
     /// UE location contexts (SUPI -> context)
@@ -185,6 +239,23 @@ pub struct LmfContext {
     cell_registry: RwLock<HashMap<String, TrpCoord>>,
     /// Registered deferred/periodic/triggered LDR sessions (ldrReference -> ctx). lmfd#1.
     ldr_sessions: RwLock<HashMap<String, LdrContext>>,
+    /// Pending DetermineLocation sessions keyed by lcsCorrelationId (A2).
+    /// Lock discipline: the session maps below are only ever taken ONE at a
+    /// time (acquire → mutate → drop before the next) so no lock ordering
+    /// exists to invert (nf-context-lock-deadlocks sweep convention).
+    positioning_sessions: RwLock<HashMap<String, PositioningSession>>,
+    /// LPP transactionNumber -> lcsCorrelationId (last-writer-wins on wrap).
+    positioning_txn_index: RwLock<HashMap<u8, String>>,
+    /// Measurement-store request_id -> lcsCorrelationId.
+    positioning_request_index: RwLock<HashMap<u64, String>>,
+    /// Cached AMF N1N2 subscription ids: "host:port|ueContextId" -> subscriptionId
+    /// (TS 29.518 §5.2.2.6; reused across DetermineLocation requests).
+    amf_subscriptions: RwLock<HashMap<String, String>>,
+    /// Advertised base URI for our A4 notify callback routes
+    /// (e.g. `http://10.0.0.5:7816`), set at startup from the SBI bind args.
+    callback_base: RwLock<Option<String>>,
+    /// Our NF instance id (servingLMFIdentification, TS 29.518).
+    nf_instance_id: RwLock<Option<String>>,
 }
 
 impl LmfContext {
@@ -204,6 +275,12 @@ impl LmfContext {
             initialized: AtomicBool::new(false),
             cell_registry: RwLock::new(HashMap::new()),
             ldr_sessions: RwLock::new(HashMap::new()),
+            positioning_sessions: RwLock::new(HashMap::new()),
+            positioning_txn_index: RwLock::new(HashMap::new()),
+            positioning_request_index: RwLock::new(HashMap::new()),
+            amf_subscriptions: RwLock::new(HashMap::new()),
+            callback_base: RwLock::new(None),
+            nf_instance_id: RwLock::new(None),
         }
     }
 
@@ -231,6 +308,20 @@ impl LmfContext {
         }
         if let Ok(mut ldrs) = self.ldr_sessions.write() {
             ldrs.clear();
+        }
+        // Dropping the sessions drops their completion senders, so any
+        // still-awaiting DetermineLocation handler unblocks with a recv error.
+        if let Ok(mut s) = self.positioning_sessions.write() {
+            s.clear();
+        }
+        if let Ok(mut t) = self.positioning_txn_index.write() {
+            t.clear();
+        }
+        if let Ok(mut r) = self.positioning_request_index.write() {
+            r.clear();
+        }
+        if let Ok(mut a) = self.amf_subscriptions.write() {
+            a.clear();
         }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("LMF context finalized");
@@ -281,7 +372,16 @@ impl LmfContext {
         Some(request)
     }
 
-    /// Process a measurement report (NRPPa: gNB -> LMF via AMF)
+    /// Process a measurement report (NRPPa: gNB -> LMF via AMF).
+    ///
+    /// A2: when the report belongs to a pending DetermineLocation session
+    /// (request_id indexed by [`Self::positioning_session_register`]), the
+    /// session is completed with a **strict** outcome: only a real-solver fix
+    /// yields [`PositioningOutcome::Fix`]; the heuristic placeholder maps to
+    /// [`PositioningOutcome::SolverFailed`] (→ 500 `POSITIONING_FAILED`), so
+    /// no fabricated coordinates can escape on the conformant MT-LR path.
+    /// The returned estimate is byte-identical to the pre-A2 behaviour for
+    /// the legacy report routes.
     pub fn measurement_report(
         &self,
         request_id: u64,
@@ -291,22 +391,39 @@ impl LmfContext {
         // lock; drop it before acquiring the write locks below to avoid deadlock.
         let registry = self.build_trp_registry();
 
-        let mut measurements = self.measurements.write().ok()?;
-        let mut reports = self.reports.write().ok()?;
+        // Scope the store locks so the session completion below runs lock-free.
+        let (location, strict_fix) = {
+            let mut measurements = self.measurements.write().ok()?;
+            let mut reports = self.reports.write().ok()?;
 
-        let measurement = measurements.get_mut(&request_id)?;
-        measurement.state = MeasurementState::Completed;
+            let measurement = measurements.get_mut(&request_id)?;
+            measurement.state = MeasurementState::Completed;
 
-        // Compute location estimate based on method and measurements
-        let location = compute_location(&measurement.method, &cell_measurements, &registry);
+            // Real geometric solve (None on empty registry / no solvable set).
+            let strict_fix = if cell_measurements.is_empty() || registry.is_empty() {
+                None
+            } else {
+                try_real_solve(&cell_measurements, &registry)
+            };
+            // Legacy estimate: identical to the old compute_location result
+            // (real solve, else heuristic placeholder / default).
+            let location = strict_fix.clone().unwrap_or_else(|| {
+                if cell_measurements.is_empty() {
+                    LocationEstimate::default()
+                } else {
+                    compute_location_placeholder(&measurement.method, &cell_measurements)
+                }
+            });
 
-        let report = NrppaMeasurementReport {
-            request_id,
-            cell_measurements,
-            location: Some(location.clone()),
+            let report = NrppaMeasurementReport {
+                request_id,
+                cell_measurements,
+                location: Some(location.clone()),
+            };
+
+            reports.insert(request_id, report);
+            (location, strict_fix)
         };
-
-        reports.insert(request_id, report);
 
         log::info!(
             "Measurement report processed: id={} lat={:.6} lon={:.6} accuracy={:.1}m",
@@ -315,6 +432,14 @@ impl LmfContext {
             location.longitude,
             location.horizontal_accuracy
         );
+
+        // A2: complete a pending DetermineLocation session (if any) with the
+        // strict outcome — never the placeholder.
+        let outcome = match strict_fix {
+            Some(fix) => PositioningOutcome::Fix(fix),
+            None => PositioningOutcome::SolverFailed,
+        };
+        self.positioning_session_complete_by_request(request_id, outcome);
 
         Some(location)
     }
@@ -356,33 +481,17 @@ impl LmfContext {
         self.ue_locations.read().ok()?.get(supi).cloned()
     }
 
-    /// Return the most recently computed **real** location fix for the target,
-    /// preferring the UE's stored fix (by SUPI), else the newest completed
-    /// measurement report. Returns `None` when no measurement-derived fix
-    /// exists — the caller MUST NOT fabricate one (a genuine positioning
-    /// failure). A fix is "real" only when its horizontal accuracy is > 0
-    /// (a defaulted, all-zero estimate means the solver had no measurements).
-    pub fn latest_location(&self, supi: Option<&str>) -> Option<LocationEstimate> {
-        if let Some(supi) = supi {
-            if let Some(loc) = self
-                .ue_location_get(supi)
-                .and_then(|c| c.last_location)
-                .filter(|l| l.horizontal_accuracy > 0.0)
-            {
-                return Some(loc);
-            }
-        }
-        // Newest completed report (highest request_id) carrying a real fix.
-        let reports = self.reports.read().ok()?;
-        reports
-            .iter()
-            .filter(|(_, r)| {
-                r.location
-                    .as_ref()
-                    .is_some_and(|l| l.horizontal_accuracy > 0.0)
-            })
-            .max_by_key(|(id, _)| **id)
-            .and_then(|(_, r)| r.location.clone())
+    /// Return the target UE's stored **per-SUPI** location fix, or `None`.
+    ///
+    /// A2: this replaces the retired `latest_location` global newest-report
+    /// fallback, which could serve a fix computed for a DIFFERENT UE on the
+    /// DetermineLocation MT-LR path. Only the UE's own stored fix (with a
+    /// real horizontal accuracy > 0) is ever returned; the caller MUST NOT
+    /// fabricate a location when this is `None`.
+    pub fn stored_fix(&self, supi: &str) -> Option<LocationEstimate> {
+        self.ue_location_get(supi)
+            .and_then(|c| c.last_location)
+            .filter(|l| l.horizontal_accuracy > 0.0)
     }
 
     pub fn measurement_count(&self) -> usize {
@@ -418,6 +527,181 @@ impl LmfContext {
     /// Look up an LDR session by `ldrReference`. Returns a clone, or `None`.
     pub fn ldr_find(&self, ldr_reference: &str) -> Option<LdrContext> {
         self.ldr_sessions.read().ok()?.get(ldr_reference).cloned()
+    }
+
+    // -----------------------------------------------------------------------
+    // A2: pending DetermineLocation positioning-session store (TS 23.273
+    // §6.11.2 correlation; TS 29.572 CorrelationID; TS 37.355 transactionID).
+    // -----------------------------------------------------------------------
+
+    /// Register a pending positioning session BEFORE the outbound Namf
+    /// N1N2MessageTransfer POST. Mints the `lcsCorrelationId` (UUID — 36
+    /// chars, inside the TS 29.572 CorrelationID 1..255 bound) and returns it
+    /// with the completion receiver the DetermineLocation handler awaits.
+    /// The transaction index is last-writer-wins on `u8` wrap; uniqueness is
+    /// carried by the correlation id.
+    pub fn positioning_session_register(
+        &self,
+        supi: Option<String>,
+        lpp_transaction: u8,
+        request_id: u64,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<PositioningOutcome>,
+    ) {
+        let corr = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let session = PositioningSession {
+            lcs_correlation_id: corr.clone(),
+            lpp_transaction,
+            supi,
+            request_id,
+            created_at: std::time::Instant::now(),
+            sender: Some(tx),
+        };
+        if let Ok(mut s) = self.positioning_sessions.write() {
+            s.insert(corr.clone(), session);
+        }
+        if let Ok(mut t) = self.positioning_txn_index.write() {
+            t.insert(lpp_transaction, corr.clone());
+        }
+        if let Ok(mut r) = self.positioning_request_index.write() {
+            r.insert(request_id, corr.clone());
+        }
+        (corr, rx)
+    }
+
+    /// Remove a session from all three maps. Returns the removed session.
+    fn positioning_session_take(&self, corr: &str) -> Option<PositioningSession> {
+        let session = self.positioning_sessions.write().ok()?.remove(corr)?;
+        if let Ok(mut t) = self.positioning_txn_index.write() {
+            if t.get(&session.lpp_transaction).map(String::as_str) == Some(corr) {
+                t.remove(&session.lpp_transaction);
+            }
+        }
+        if let Ok(mut r) = self.positioning_request_index.write() {
+            r.remove(&session.request_id);
+        }
+        Some(session)
+    }
+
+    /// Complete (and remove) a pending session by `lcsCorrelationId`, firing
+    /// its completion channel with `outcome`. On a real fix the estimate is
+    /// also cached as the UE's stored fix with a REAL capture timestamp so a
+    /// later request can honour `ageOfLocationEstimate`. Returns `false` when
+    /// no such session exists (fail-closed: unknown correlations are never
+    /// ingested globally).
+    pub fn positioning_session_complete(
+        &self,
+        corr: &str,
+        outcome: PositioningOutcome,
+    ) -> bool {
+        let Some(mut session) = self.positioning_session_take(corr) else {
+            return false;
+        };
+        if let (PositioningOutcome::Fix(fix), Some(supi)) = (&outcome, session.supi.as_ref()) {
+            let mut cached = fix.clone();
+            cached.timestamp = unix_now();
+            self.ue_location_update(supi, cached);
+        }
+        if let Some(tx) = session.sender.take() {
+            // A dropped receiver just means the waiter timed out first.
+            let _ = tx.send(outcome);
+        }
+        true
+    }
+
+    /// Complete a pending session by measurement-store `request_id`
+    /// (the [`Self::measurement_report`] ingest path).
+    pub fn positioning_session_complete_by_request(
+        &self,
+        request_id: u64,
+        outcome: PositioningOutcome,
+    ) -> bool {
+        let corr = self
+            .positioning_request_index
+            .read()
+            .ok()
+            .and_then(|r| r.get(&request_id).cloned());
+        match corr {
+            Some(corr) => self.positioning_session_complete(&corr, outcome),
+            None => false,
+        }
+    }
+
+    /// Expire (remove) a pending session without firing its channel — the
+    /// waiter already timed out (→ 504 `UNREACHABLE_USER`). Returns `true`
+    /// when a session was removed.
+    pub fn positioning_session_expire(&self, corr: &str) -> bool {
+        self.positioning_session_take(corr).is_some()
+    }
+
+    /// Look up a pending session by `lcsCorrelationId` (A4 correlation).
+    pub fn positioning_session_find(&self, corr: &str) -> Option<PositioningSessionInfo> {
+        self.positioning_sessions
+            .read()
+            .ok()?
+            .get(corr)
+            .map(|s| PositioningSessionInfo {
+                lcs_correlation_id: s.lcs_correlation_id.clone(),
+                lpp_transaction: s.lpp_transaction,
+                supi: s.supi.clone(),
+                request_id: s.request_id,
+            })
+    }
+
+    /// Look up the `lcsCorrelationId` of the newest session that used LPP
+    /// `transactionNumber` `txn` (A4 fallback correlation; last-writer-wins).
+    pub fn positioning_session_find_by_transaction(&self, txn: u8) -> Option<String> {
+        self.positioning_txn_index.read().ok()?.get(&txn).cloned()
+    }
+
+    /// Number of pending positioning sessions.
+    pub fn positioning_session_count(&self) -> usize {
+        self.positioning_sessions
+            .read()
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // A2: outbound-leg bookkeeping (AMF subscription cache + self identity).
+    // -----------------------------------------------------------------------
+
+    /// Cached N1N2 subscription id for `key` = "host:port|ueContextId".
+    pub fn amf_subscription_get(&self, key: &str) -> Option<String> {
+        self.amf_subscriptions.read().ok()?.get(key).cloned()
+    }
+
+    /// Cache an N1N2 subscription id (TS 29.518 §5.2.2.6) for reuse.
+    pub fn amf_subscription_set(&self, key: impl Into<String>, subscription_id: impl Into<String>) {
+        if let Ok(mut a) = self.amf_subscriptions.write() {
+            a.insert(key.into(), subscription_id.into());
+        }
+    }
+
+    /// Advertised base URI for the lmfd notify-callback routes.
+    pub fn callback_base(&self) -> Option<String> {
+        self.callback_base.read().ok()?.clone()
+    }
+
+    /// Set the advertised callback base URI (from the SBI bind address).
+    pub fn set_callback_base(&self, base: impl Into<String>) {
+        if let Ok(mut b) = self.callback_base.write() {
+            *b = Some(base.into());
+        }
+    }
+
+    /// Our NF instance id (used as servingLMFIdentification).
+    pub fn nf_instance_id(&self) -> Option<String> {
+        self.nf_instance_id.read().ok()?.clone()
+    }
+
+    /// Set our NF instance id at startup.
+    pub fn set_nf_instance_id(&self, id: impl Into<String>) {
+        if let Ok(mut n) = self.nf_instance_id.write() {
+            *n = Some(id.into());
+        }
     }
 
     /// Register (or update) a cell geodetic coordinate for use by the real
@@ -1130,6 +1414,52 @@ mod tests_real_solve {
     // -- Registry API ---------------------------------------------------------
     // -- LDR session store (lmfd#1) -------------------------------------------
 
+    /// A2: measurement_report against a REGISTERED registry completes the
+    /// linked session with `PositioningOutcome::Fix` from the real solver
+    /// (ECID pins the estimate to the serving cell) and caches the per-SUPI
+    /// stored fix with a real capture timestamp.
+    #[test]
+    fn test_measurement_report_completes_session_with_real_fix() {
+        let (ctx, entries, _true_geo, _true_enu, _origin) = scene();
+        let cell_a_coord = entries.iter().find(|(id, _)| id == "cell-a").unwrap().1;
+        let req = ctx
+            .measurement_request(
+                77,
+                PositioningMethod::Ecid,
+                None,
+                None,
+                PositioningQos::BestEffort,
+            )
+            .unwrap();
+        let (corr, mut rx) = ctx.positioning_session_register(
+            Some("imsi-001010000000777".into()),
+            21,
+            req.request_id,
+        );
+        let cells = vec![CellMeasurement {
+            nr_cgi: "cell-a".to_string(),
+            rsrp: Some(-75),
+            rsrq: Some(-8),
+            timing_advance: Some(50),
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+        }];
+        ctx.measurement_report(req.request_id, cells).unwrap();
+        match rx.try_recv() {
+            Ok(PositioningOutcome::Fix(fix)) => {
+                assert!((fix.latitude - cell_a_coord.lat_deg).abs() < 1e-9);
+                assert!((fix.longitude - cell_a_coord.lon_deg).abs() < 1e-9);
+                assert!(fix.horizontal_accuracy > 0.0);
+            }
+            other => panic!("expected a real-solver Fix, got {other:?}"),
+        }
+        assert!(ctx.positioning_session_find(&corr).is_none());
+        // Cached per-SUPI with a real timestamp (honest age on later reads).
+        let cached = ctx.stored_fix("imsi-001010000000777").expect("cached");
+        assert!(cached.timestamp > 0);
+    }
+
     #[test]
     fn test_ldr_register_cancel() {
         let ctx = LmfContext::new();
@@ -1162,5 +1492,153 @@ mod tests_real_solve {
         assert_eq!(reg.len(), 2);
         assert!(reg.lookup("cell-1").is_some());
         assert!(reg.lookup("no-such-cell").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // A2: positioning-session store (insert / complete / expire / indexes)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_positioning_session_register_and_complete() {
+        let ctx = LmfContext::new();
+        let (corr, mut rx) =
+            ctx.positioning_session_register(Some("imsi-001010000000001".into()), 7, 42);
+        // TS 29.572 CorrelationID bounds: 1..255 chars (UUID = 36).
+        assert!((1..=255).contains(&corr.len()));
+        assert_eq!(ctx.positioning_session_count(), 1);
+
+        // Both indexes resolve.
+        let info = ctx.positioning_session_find(&corr).expect("session");
+        assert_eq!(info.lpp_transaction, 7);
+        assert_eq!(info.request_id, 42);
+        assert_eq!(info.supi.as_deref(), Some("imsi-001010000000001"));
+        assert_eq!(
+            ctx.positioning_session_find_by_transaction(7).as_deref(),
+            Some(corr.as_str())
+        );
+
+        // Complete fires the channel and removes the session + indexes.
+        let fix = LocationEstimate {
+            latitude: 1.0,
+            longitude: 2.0,
+            horizontal_accuracy: 30.0,
+            ..Default::default()
+        };
+        assert!(ctx.positioning_session_complete(&corr, PositioningOutcome::Fix(fix)));
+        match rx.try_recv() {
+            Ok(PositioningOutcome::Fix(f)) => assert_eq!(f.latitude, 1.0),
+            other => panic!("expected Fix outcome, got {other:?}"),
+        }
+        assert_eq!(ctx.positioning_session_count(), 0);
+        assert!(ctx.positioning_session_find(&corr).is_none());
+        assert!(ctx.positioning_session_find_by_transaction(7).is_none());
+        // Double-complete: fail-closed false (no orphan ingestion).
+        assert!(!ctx.positioning_session_complete(&corr, PositioningOutcome::SolverFailed));
+        // The fix was cached per-SUPI with a REAL capture timestamp.
+        let cached = ctx.stored_fix("imsi-001010000000001").expect("cached fix");
+        assert!(cached.timestamp > 0);
+    }
+
+    #[test]
+    fn test_positioning_session_expire_drops_without_firing() {
+        let ctx = LmfContext::new();
+        let (corr, mut rx) = ctx.positioning_session_register(None, 9, 43);
+        assert!(ctx.positioning_session_expire(&corr));
+        // The sender was dropped, not fired.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        // Second expire: nothing left.
+        assert!(!ctx.positioning_session_expire(&corr));
+        assert_eq!(ctx.positioning_session_count(), 0);
+    }
+
+    /// LPP transactionNumber wraps at 256 requests: uniqueness is carried by
+    /// the lcsCorrelationId; the txn index is last-writer-wins and never
+    /// mis-routes a completion addressed by correlation id.
+    #[test]
+    fn test_positioning_session_transaction_wrap_uniqueness() {
+        let ctx = LmfContext::new();
+        let (corr_a, mut rx_a) = ctx.positioning_session_register(None, 5, 100);
+        let (corr_b, mut rx_b) = ctx.positioning_session_register(None, 5, 101); // wrapped txn
+        assert_ne!(corr_a, corr_b, "correlation ids stay unique across wrap");
+        assert_eq!(ctx.positioning_session_count(), 2);
+        // Transaction index points at the NEWEST session (last-writer-wins).
+        assert_eq!(
+            ctx.positioning_session_find_by_transaction(5).as_deref(),
+            Some(corr_b.as_str())
+        );
+        // Completing the OLD session by correlation id still works and does
+        // NOT disturb the newer session's txn index entry.
+        assert!(ctx.positioning_session_complete(&corr_a, PositioningOutcome::SolverFailed));
+        assert!(matches!(
+            rx_a.try_recv(),
+            Ok(PositioningOutcome::SolverFailed)
+        ));
+        assert_eq!(
+            ctx.positioning_session_find_by_transaction(5).as_deref(),
+            Some(corr_b.as_str())
+        );
+        assert!(ctx.positioning_session_complete(&corr_b, PositioningOutcome::SolverFailed));
+        assert!(rx_b.try_recv().is_ok());
+        assert!(ctx.positioning_session_find_by_transaction(5).is_none());
+    }
+
+    /// measurement_report on a session-linked request with an EMPTY registry:
+    /// the legacy return keeps the placeholder (debug routes unchanged) but
+    /// the session completes SolverFailed — no fabricated fix escapes the
+    /// conformant MT-LR path.
+    #[test]
+    fn test_measurement_report_completes_session_solver_failed_on_placeholder() {
+        let mut ctx = LmfContext::new();
+        ctx.init(256);
+        let req = ctx
+            .measurement_request(
+                1,
+                PositioningMethod::Ecid,
+                None,
+                None,
+                PositioningQos::BestEffort,
+            )
+            .unwrap();
+        let (corr, mut rx) = ctx.positioning_session_register(None, 11, req.request_id);
+        let cells = vec![CellMeasurement {
+            nr_cgi: "unregistered-cell".to_string(),
+            rsrp: Some(-80),
+            rsrq: None,
+            timing_advance: Some(100),
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+        }];
+        // Legacy behaviour preserved for the report routes (placeholder).
+        let legacy = ctx.measurement_report(req.request_id, cells).unwrap();
+        assert_eq!(legacy.latitude, 0.0);
+        // Strict session outcome: SolverFailed, session removed.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PositioningOutcome::SolverFailed)
+        ));
+        assert!(ctx.positioning_session_find(&corr).is_none());
+    }
+
+    #[test]
+    fn test_amf_subscription_cache_and_identity() {
+        let ctx = LmfContext::new();
+        assert!(ctx.amf_subscription_get("10.0.0.1:80|imsi-1").is_none());
+        ctx.amf_subscription_set("10.0.0.1:80|imsi-1", "n1n2sub-abc");
+        assert_eq!(
+            ctx.amf_subscription_get("10.0.0.1:80|imsi-1").as_deref(),
+            Some("n1n2sub-abc")
+        );
+        assert!(ctx.callback_base().is_none());
+        ctx.set_callback_base("http://127.0.0.1:7816");
+        assert_eq!(
+            ctx.callback_base().as_deref(),
+            Some("http://127.0.0.1:7816")
+        );
+        ctx.set_nf_instance_id("lmf-test");
+        assert_eq!(ctx.nf_instance_id().as_deref(), Some("lmf-test"));
     }
 }

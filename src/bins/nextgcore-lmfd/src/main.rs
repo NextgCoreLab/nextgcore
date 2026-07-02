@@ -24,6 +24,9 @@ use std::time::Duration;
 // by `handle_nrppa_binary_report` and `handle_lpp_binary_report` below.
 mod codec_glue;
 mod context;
+// A2: lmfd → AMF Namf_Communication client leg (NRF discovery of the serving
+// AMF, N1N2MessageSubscribe registration, multipart N1N2MessageTransfer POST).
+mod namf_client;
 mod nlmf;
 // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
 // Wired into `context::compute_location`; solve_tdoa remains available for
@@ -106,6 +109,21 @@ async fn main() -> Result<()> {
     lmf_context_init(args.max_measurements);
 
     let nf_instance_id = format!("lmf-{}", uuid::Uuid::new_v4());
+
+    // A2: advertise our identity + notify-callback base for the outbound
+    // Namf_Communication leg (subscription callback URIs must be reachable
+    // by the AMF, so an unspecified bind address falls back to loopback).
+    {
+        let advertised_host = if args.sbi_addr == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            args.sbi_addr.as_str()
+        };
+        if let Ok(context) = lmf_self().read() {
+            context.set_nf_instance_id(nf_instance_id.clone());
+            context.set_callback_base(format!("http://{advertised_host}:{}", args.sbi_port));
+        }
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
@@ -275,51 +293,214 @@ fn problem(status: u16, cause: &str, detail: &str) -> SbiResponse {
 /// LMF-initiated LPP transaction numbering (TS 37.355 §6.1), wrapping 0..255.
 static LPP_TRANSACTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// lmfd-05/06/07: initiate the LMF positioning procedure for a
-/// Determine-Location request (TS 23.273 §6, 5GC-MT-LR). Encodes an
-/// LMF-initiated LPP `RequestLocationInformation` (TS 37.355) and packages it
-/// in a Namf_Communication N1N2MessageTransfer (TS 29.518) toward the target
-/// UE's serving AMF; the eventual `ProvideLocationInformation` / NRPPa report
-/// is consumed by the inbound handlers to produce a real fix via
-/// `context::compute_location`.
+/// A2: initiate the LMF positioning procedure for a Determine-Location
+/// request (TS 23.273 §6.11.1/§6.11.2, 5GC-MT-LR):
 ///
-/// This ALWAYS encodes and logs the LPP PDU and the N1N2MessageTransferReqData,
-/// and would POST it once a serving-AMF endpoint is resolvable. Live delivery +
-/// report correlation are E2E-gated (need a serving AMF + a real UE) — see
-/// TASKS lmfd-07. It NEVER fabricates a position.
-async fn emit_positioning_request(input: &nlmf::InputData) {
-    let tx = LPP_TRANSACTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let lpp = match crate::codec_glue::build_lpp_ecid_request(tx) {
-        Ok(pdu) => pdu,
-        Err(e) => {
-            log::warn!("LMF-initiated LPP request encode failed: {e}");
-            return;
-        }
-    };
-    let target = input
+/// 1. resolve the target `ueContextId` (supi, else gpsi/pei — matches amfd's
+///    `find_ue_by_context_id`), else 400 `MANDATORY_IE_MISSING`;
+/// 2. discover the serving AMF's `namf-comm` endpoint via the NRF, preferring
+///    `InputData.amfId`; no AMF → 504 `UNREACHABLE_USER` (fail-closed, never
+///    a fabricated fix);
+/// 3. encode the LMF-initiated LPP `RequestLocationInformation` (TS 37.355,
+///    E-CID) with a fresh transaction number;
+/// 4. register the [`PositioningSession`] (mints the `lcsCorrelationId`)
+///    BEFORE the POST so the uplink report cannot race the registration;
+/// 5. ensure an N1N2 subscription (TS 29.518 §5.2.2.6) registering our A4
+///    callback routes (best-effort, cached per (AMF, UE));
+/// 6. POST the multipart `N1N2MessageTransfer` (TS 29.518 §5.2.2.3.1);
+///    200 `N1_N2_TRANSFER_INITIATED` hands the completion receiver back to
+///    the caller; 504 `UE_NOT_REACHABLE` / failure → 504 `UNREACHABLE_USER`.
+///
+/// No `LmfContext` lock is ever held across an await (nf-context-lock
+/// discipline): channel handles are cloned/moved out of the lock scopes.
+async fn initiate_positioning(
+    input: &nlmf::InputData,
+) -> Result<
+    (
+        String,
+        tokio::sync::oneshot::Receiver<PositioningOutcome>,
+    ),
+    Box<SbiResponse>,
+> {
+    let Some(target) = input
         .supi
         .as_deref()
         .or(input.gpsi.as_deref())
         .or(input.pei.as_deref())
-        .unwrap_or("<unknown>");
+    else {
+        return Err(Box::new(problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "InputData carries no target UE identity (supi, gpsi or pei)",
+        )));
+    };
 
-    // Namf_Communication N1N2MessageTransfer (TS 29.518 §6.1.6.2.2): the LPP
-    // PDU is carried as the n1MessageContainer (n1MessageClass = LPP) referenced
-    // by a binary body part.
-    let n1n2_req_data = serde_json::json!({
-        "n1MessageContainer": {
-            "n1MessageClass": "LPP",
-            "n1MessageContent": { "contentId": "lpp-request" }
-        },
-        "ppi": 0
-    });
-    log::info!(
-        "LMF-initiated LPP RequestLocationInformation (E-CID, txn={tx}, {} bytes) prepared for \
-         Namf N1N2MessageTransfer to serving AMF for target [{target}]: {n1n2_req_data}",
-        lpp.len()
-    );
-    // Delivery to the serving AMF is E2E-gated (serving-AMF endpoint resolution
-    // + report correlation need a live AMF/UE); see TASKS lmfd-07.
+    // Serving-AMF discovery (TS 29.510). Fail-closed: unreachable NRF or no
+    // AMF instance means the user cannot be reached for positioning.
+    let Some(amf) = namf_client::discover_amf(input.amf_id.as_deref()).await else {
+        return Err(Box::new(problem(
+            504,
+            nlmf::cause::UNREACHABLE_USER,
+            "No serving AMF with namf-comm discoverable via the NRF",
+        )));
+    };
+
+    let txn = LPP_TRANSACTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let lpp_pdu = match crate::codec_glue::build_lpp_ecid_request(txn) {
+        Ok(pdu) => pdu,
+        Err(e) => {
+            return Err(Box::new(problem(
+                500,
+                nlmf::cause::POSITIONING_FAILED,
+                &format!("LPP RequestLocationInformation encode failed: {e}"),
+            )))
+        }
+    };
+
+    // Measurement-store entry + correlation session, registered BEFORE the
+    // POST (TS 29.572 CorrelationID minted inside; TS 37.355 txn indexed).
+    let qos = positioning_qos_from_input(input);
+    let registered = match lmf_self().read() {
+        Ok(context) => context
+            .measurement_request(0, PositioningMethod::Ecid, None, None, qos)
+            .map(|req| {
+                context.positioning_session_register(input.supi.clone(), txn, req.request_id)
+            }),
+        Err(_) => None,
+    };
+    let Some((corr, rx)) = registered else {
+        return Err(Box::new(problem(
+            500,
+            nlmf::cause::POSITIONING_FAILED,
+            "Positioning session could not be registered (measurement store exhausted)",
+        )));
+    };
+
+    // A3 subscription first (uplink notify registration), then the transfer.
+    namf_client::ensure_n1n2_subscription(&amf, target).await;
+
+    let lmf_id = lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.nf_instance_id())
+        .unwrap_or_else(|| "nextgcore-lmf".to_string());
+
+    match namf_client::send_n1n2_transfer(&amf, target, &corr, &lmf_id, lpp_pdu).await {
+        namf_client::TransferOutcome::Initiated => Ok((corr, rx)),
+        namf_client::TransferOutcome::UeNotReachable => {
+            if let Ok(context) = lmf_self().read() {
+                context.positioning_session_expire(&corr);
+            }
+            Err(Box::new(problem(
+                504,
+                nlmf::cause::UNREACHABLE_USER,
+                "The serving AMF reports the target UE is not reachable (UE_NOT_REACHABLE)",
+            )))
+        }
+        namf_client::TransferOutcome::Failed(e) => {
+            if let Ok(context) = lmf_self().read() {
+                context.positioning_session_expire(&corr);
+            }
+            Err(Box::new(problem(
+                504,
+                nlmf::cause::UNREACHABLE_USER,
+                &format!("N1N2MessageTransfer to the serving AMF failed: {e}"),
+            )))
+        }
+    }
+}
+
+/// Map `InputData` QoS hints onto the internal [`PositioningQos`].
+fn positioning_qos_from_input(input: &nlmf::InputData) -> PositioningQos {
+    if input.external_client_type.as_deref() == Some("EMERGENCY_SERVICES") {
+        return PositioningQos::Emergency;
+    }
+    match input.location_qos.as_ref() {
+        Some(q) if q.response_time.as_deref() == Some("LOW_DELAY") => PositioningQos::LowLatency,
+        Some(q) if q.h_accuracy.is_some_and(|a| a <= 10.0) => PositioningQos::HighAccuracy,
+        _ => PositioningQos::BestEffort,
+    }
+}
+
+/// A2: bounded wait budget for the positioning procedure —
+/// `min(maxRespTime, locationQoS-derived bound, hard cap 20 s)`.
+/// `maxRespTime` is TS 29.571 DurationSec (seconds). `responseTime`
+/// (TS 29.572 ResponseTime): `NO_DELAY` waits not at all (only an already-
+/// stored fix could have answered), `LOW_DELAY` is bounded to 5 s.
+/// The SBI client timeouts (2 s connect / 3 s request) nest inside this cap.
+fn wait_budget(input: &nlmf::InputData) -> Duration {
+    const HARD_CAP: Duration = Duration::from_secs(20);
+    const LOW_DELAY_CAP: Duration = Duration::from_secs(5);
+    let mut budget = HARD_CAP;
+    if let Some(max_s) = input.max_resp_time {
+        budget = budget.min(Duration::from_secs(u64::from(max_s)));
+    }
+    match input
+        .location_qos
+        .as_ref()
+        .and_then(|q| q.response_time.as_deref())
+    {
+        Some("NO_DELAY") => budget = Duration::ZERO,
+        Some("LOW_DELAY") => budget = budget.min(LOW_DELAY_CAP),
+        _ => {}
+    }
+    budget
+}
+
+/// A2: await the session outcome within the budget and map it per the A6
+/// cause table (TS 29.572 Table 6.1.7.3-1): a real fix → 200 LocationDataExt
+/// (age 0 — freshly computed); solver failure (report arrived, no fix) → 500
+/// `POSITIONING_FAILED`; timeout (UE never reported in budget) → 504
+/// `UNREACHABLE_USER` + session expiry.
+async fn await_positioning_outcome(
+    input: &nlmf::InputData,
+    corr: String,
+    rx: tokio::sync::oneshot::Receiver<PositioningOutcome>,
+) -> SbiResponse {
+    match tokio::time::timeout(wait_budget(input), rx).await {
+        Ok(Ok(PositioningOutcome::Fix(est))) => encode_location_response(input, &est, 0),
+        Ok(Ok(PositioningOutcome::SolverFailed)) => problem(
+            500,
+            nlmf::cause::POSITIONING_FAILED,
+            "A measurement report was received but no location fix could be solved",
+        ),
+        // Sender dropped (context finalized) — the procedure cannot complete.
+        Ok(Err(_)) => problem(
+            500,
+            nlmf::cause::POSITIONING_FAILED,
+            "The positioning session was aborted",
+        ),
+        Err(_elapsed) => {
+            if let Ok(context) = lmf_self().read() {
+                context.positioning_session_expire(&corr);
+            }
+            problem(
+                504,
+                nlmf::cause::UNREACHABLE_USER,
+                "Positioning did not complete within the response-time budget",
+            )
+        }
+    }
+}
+
+/// Number of seconds between the Unix and NTP epochs (1900→1970).
+const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
+
+/// A2: honest `ageOfLocationEstimate` (minutes, TS 29.572/TS 29.002 §17.7.6)
+/// for a stored fix. `None` when the capture instant is unknown (timestamp 0)
+/// — such a fix must NOT be served with a made-up age. Timestamps at or above
+/// the NTP-epoch offset are treated as NTP seconds and converted.
+fn age_of_fix_minutes(timestamp: u64) -> Option<u16> {
+    if timestamp == 0 {
+        return None;
+    }
+    let unix_ts = if timestamp >= NTP_UNIX_OFFSET {
+        timestamp - NTP_UNIX_OFFSET
+    } else {
+        timestamp
+    };
+    let age_min = unix_now().saturating_sub(unix_ts) / 60;
+    Some(age_min.min(32_767) as u16)
 }
 
 /// Handle Determine Location (Nlmf_Location, AMF -> LMF; TS 29.572 §6.1.4.2).
@@ -329,13 +510,18 @@ async fn emit_positioning_request(input: &nlmf::InputData) {
 /// per Table 6.1.4.2.2-2 — NOT the old non-conformant `201 PENDING` (lmfd-02).
 /// 4xx/5xx ProblemDetails on failure (lmfd-10).
 ///
-/// The procedure is initiated via [`emit_positioning_request`] (LMF-initiated
-/// LPP RequestLocationInformation over Namf N1N2); the returned position comes
-/// from REAL collected measurements via `context::compute_location`
-/// ([`crate::context::LmfContext::latest_location`]). When no measurement-
-/// derived fix is available a 500 `POSITIONING_FAILED` is returned (a zero
-/// response-time budget yields 504 `UNREACHABLE_USER`), per TS 29.572
-/// Table 6.1.7.3-1 — the handler never fabricates coordinates.
+/// A2 (TS 23.273 §6.11.2 5GC-MT-LR): the procedure is initiated via
+/// [`initiate_positioning`] — a REAL Namf `N1N2MessageTransfer` POST toward
+/// the NRF-discovered serving AMF carrying the LMF-initiated LPP
+/// `RequestLocationInformation` — then the handler awaits THAT session's
+/// completion channel within [`wait_budget`]. The fix comes exclusively from
+/// the session's own measurement report (fed by the uplink notify legs);
+/// the retired global newest-report fallback is unreachable from this path.
+/// A stored per-SUPI fix short-circuits the procedure ONLY when its age can
+/// be reported honestly ([`age_of_fix_minutes`]). Failures map per TS 29.572
+/// Table 6.1.7.3-1: timeout/unreachable → 504 `UNREACHABLE_USER`, solver
+/// failure → 500 `POSITIONING_FAILED` — the handler never fabricates
+/// coordinates.
 async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
     log::info!("Determine Location");
 
@@ -413,31 +599,40 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         }
     }
 
-    // lmfd-05/06/07: initiate the real positioning procedure — encode an
-    // LMF-initiated LPP RequestLocationInformation and (best-effort) transfer it
-    // to the serving AMF via Namf_Communication N1N2MessageTransfer.
-    emit_positioning_request(&input).await;
-
-    // Compute the location from REAL collected measurements
-    // (context::compute_location via the stored NRPPa/LPP reports). NO
-    // fabrication: when no measurement-derived fix can be produced the
-    // positioning procedure failed -> 500 POSITIONING_FAILED
-    // (TS 29.572 Table 6.1.7.3-1) rather than inventing coordinates.
-    let est = match lmf_self()
-        .read()
-        .ok()
-        .and_then(|c| c.latest_location(input.supi.as_deref()))
-    {
-        Some(loc) => loc,
-        None => {
-            return problem(
-                500,
-                nlmf::cause::POSITIONING_FAILED,
-                "No measurement-derived location available for the target UE",
-            )
+    // A2: per-SUPI stored-fix short-circuit — ONLY when the age of the fix
+    // can be reported honestly (a real capture timestamp exists). The global
+    // newest-report fallback is retired from this path: another UE's fix can
+    // never be served for this target.
+    if let Some(supi) = input.supi.as_deref() {
+        if let Some(fix) = lmf_self().read().ok().and_then(|c| c.stored_fix(supi)) {
+            if let Some(age_min) = age_of_fix_minutes(fix.timestamp) {
+                return encode_location_response(&input, &fix, age_min);
+            }
+            log::debug!(
+                "stored fix for [{supi}] has no capture timestamp; \
+                 running the live positioning procedure instead"
+            );
         }
-    };
+    }
 
+    // A2: the live 5GC-MT-LR procedure — LPP request → Namf N1N2 POST to the
+    // serving AMF → bounded wait on THIS session's completion channel.
+    let (corr, rx) = match initiate_positioning(&input).await {
+        Ok(pair) => pair,
+        Err(resp) => return *resp,
+    };
+    await_positioning_outcome(&input, corr, rx).await
+}
+
+/// Encode the 200 `LocationDataExt` response (TS 29.572 Table 6.1.4.2.2-2)
+/// for a REAL measurement-derived fix: GAD shape negotiation (lmfd-04),
+/// accuracy fulfilment vs the requested QoS and an HONEST
+/// `ageOfLocationEstimate` (minutes; 0 = freshly computed).
+fn encode_location_response(
+    input: &nlmf::InputData,
+    est: &LocationEstimate,
+    age_minutes: u16,
+) -> SbiResponse {
     // lmfd-04: negotiate a GAD shape against supportedGADShapes and GAD-encode
     // the real fix into a GeographicArea.
     let want_ellipse = input
@@ -467,7 +662,7 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         location_data: nlmf::LocationData {
             location_estimate,
             accuracy_fulfilment_indicator: Some(accuracy_fulfilment_indicator.to_string()),
-            age_of_location_estimate: Some(0),
+            age_of_location_estimate: Some(age_minutes),
             // Real positioning method from the measurement report (else E-CID).
             positioning_data_list: Some(vec![nlmf::PositioningMethodAndUsage {
                 method: est
@@ -1366,13 +1561,21 @@ mod tests {
 
     /// Seed a real (measurement-derived) location fix for a target SUPI so the
     /// non-fabricating determine-location handler returns 200. Mirrors what the
-    /// inbound NRPPa/LPP report flow (`context::compute_location`) would store.
+    /// A2 session-completion path stores (fix + REAL capture timestamp — a
+    /// fix with an unknown capture instant is never short-circuit-served).
     fn seed_fix(supi: &str, h_accuracy: f64) {
+        seed_fix_at(supi, h_accuracy, unix_now());
+    }
+
+    /// Seed a fix with an explicit capture timestamp (Unix seconds; 0 =
+    /// unknown capture instant).
+    fn seed_fix_at(supi: &str, h_accuracy: f64, timestamp: u64) {
         let loc = LocationEstimate {
             latitude: 37.5,
             longitude: -122.3,
             horizontal_accuracy: h_accuracy,
             method_used: Some(nlmf::positioning_method::ECID.to_string()),
+            timestamp,
             ..Default::default()
         };
         assert!(lmf_self().read().unwrap().ue_location_update(supi, loc));
@@ -1500,27 +1703,267 @@ mod tests {
         assert_eq!(v["status"], 504);
     }
 
-    // -- A6/WSB-5: no measurement-derived fix -> 500 POSITIONING_FAILED ------
-    // TS 29.572 Table 6.1.7.3-1 (specs/29572-j60.txt:7643): POSITIONING_FAILED
-    // maps to 500 Internal Server Error ("The positioning procedure failed").
+    // -- A2 + A6: no stored fix + unreachable AMF -> 504 UNREACHABLE_USER ----
+    // TS 29.572 Table 6.1.7.3-1 (specs/29572-j60.txt:7651): the user could not
+    // be reached to perform the positioning procedure. With no NRF configured
+    // the serving AMF is undiscoverable — the fail-closed live path 504s
+    // (never the retired invented cause, never a fabricated 200).
     #[tokio::test]
-    async fn test_determine_location_no_fix_500_positioning_failed() {
-        // A SUPI never seeded by any test: latest_location has no per-SUPI fix
-        // and no completed global report -> the solver cannot produce a fix.
+    async fn test_determine_location_unreachable_amf_504_unreachable_user() {
+        // A SUPI never seeded by any test: no per-SUPI stored fix exists, so
+        // the handler runs the live procedure and fails at AMF discovery.
         let body = r#"{ "supi": "imsi-001010000000404" }"#;
         let req =
             SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let resp = handle_determine_location(&req).await;
-        assert_eq!(resp.status, 500);
+        assert_eq!(resp.status, 504);
         assert_eq!(
             content_type(&resp).as_deref(),
             Some("application/problem+json")
         );
         let v = body_json(&resp);
-        // Pairing check: 500 must carry POSITIONING_FAILED (byte-equal to the
-        // spec table value), never UNREACHABLE_USER.
+        // Pairing check: 504 must carry UNREACHABLE_USER (byte-equal to the
+        // spec table value), never POSITIONING_FAILED.
+        assert_eq!(v["cause"], "UNREACHABLE_USER");
+        assert_eq!(v["status"], 504);
+    }
+
+    // -- A2: solver failure on the session channel -> 500 POSITIONING_FAILED -
+    // TS 29.572 Table 6.1.7.3-1 (specs/29572-j60.txt:7643): a report was
+    // received but the solver produced no fix.
+    #[tokio::test]
+    async fn test_positioning_outcome_solver_failed_maps_to_500() {
+        lmf_context_init(1024);
+        let input: nlmf::InputData =
+            serde_json::from_str(r#"{ "supi": "imsi-001010000000405" }"#).unwrap();
+        let (corr, rx) = lmf_self().read().unwrap().positioning_session_register(
+            input.supi.clone(),
+            201,
+            990_001,
+        );
+        assert!(lmf_self()
+            .read()
+            .unwrap()
+            .positioning_session_complete(&corr, PositioningOutcome::SolverFailed));
+        let resp = await_positioning_outcome(&input, corr, rx).await;
+        assert_eq!(resp.status, 500);
+        let v = body_json(&resp);
         assert_eq!(v["cause"], "POSITIONING_FAILED");
-        assert_eq!(v["status"], 500);
+    }
+
+    // -- A2: a real fix on the session channel -> 200 LocationDataExt --------
+    #[tokio::test]
+    async fn test_positioning_outcome_fix_maps_to_200() {
+        lmf_context_init(1024);
+        let input: nlmf::InputData = serde_json::from_str(
+            r#"{ "supi": "imsi-001010000000406",
+                 "supportedGADShapes": ["POINT_UNCERTAINTY_CIRCLE"] }"#,
+        )
+        .unwrap();
+        let (corr, rx) = lmf_self().read().unwrap().positioning_session_register(
+            input.supi.clone(),
+            202,
+            990_002,
+        );
+        let fix = LocationEstimate {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            horizontal_accuracy: 25.0,
+            method_used: Some(nlmf::positioning_method::NR_ECID.to_string()),
+            ..Default::default()
+        };
+        assert!(lmf_self()
+            .read()
+            .unwrap()
+            .positioning_session_complete(&corr, PositioningOutcome::Fix(fix)));
+        let resp = await_positioning_outcome(&input, corr, rx).await;
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        assert_eq!(v["locationEstimate"]["shape"], "POINT_UNCERTAINTY_CIRCLE");
+        assert_eq!(v["locationEstimate"]["point"]["lat"], 37.7749);
+        // Freshly computed fix: honest age 0.
+        assert_eq!(v["ageOfLocationEstimate"], 0);
+        assert_eq!(v["positioningDataList"][0]["method"], "NR_ECID");
+        // The completed session also cached the fix per-SUPI with a REAL
+        // capture timestamp (age semantics honoured on later requests).
+        let cached = lmf_self()
+            .read()
+            .unwrap()
+            .stored_fix("imsi-001010000000406")
+            .expect("fix cached for the target SUPI");
+        assert!(cached.timestamp > 0, "cached fix must carry a timestamp");
+    }
+
+    // -- A2: timeout on the session channel -> 504 + session expired ---------
+    #[tokio::test]
+    async fn test_positioning_outcome_timeout_504_and_session_expired() {
+        lmf_context_init(1024);
+        // NO_DELAY -> zero wait budget -> immediate timeout (no real sleeps).
+        let input: nlmf::InputData = serde_json::from_str(
+            r#"{ "supi": "imsi-001010000000407",
+                 "locationQoS": { "responseTime": "NO_DELAY" } }"#,
+        )
+        .unwrap();
+        let (corr, rx) = lmf_self().read().unwrap().positioning_session_register(
+            input.supi.clone(),
+            203,
+            990_003,
+        );
+        let resp = await_positioning_outcome(&input, corr.clone(), rx).await;
+        assert_eq!(resp.status, 504);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "UNREACHABLE_USER");
+        // The pending session was expired (removed) on timeout.
+        assert!(lmf_self()
+            .read()
+            .unwrap()
+            .positioning_session_find(&corr)
+            .is_none());
+    }
+
+    // -- A2: no target UE identity -> 400 MANDATORY_IE_MISSING ---------------
+    #[tokio::test]
+    async fn test_determine_location_no_target_identity_400() {
+        let body = r#"{ "locationQoS": { "hAccuracy": 50.0 } }"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 400);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "MANDATORY_IE_MISSING");
+    }
+
+    // -- A2: stored fix served with an HONEST age (not hardcoded 0) ----------
+    #[tokio::test]
+    async fn test_determine_location_stored_fix_reports_real_age() {
+        // Captured 5 minutes ago.
+        seed_fix_at("imsi-001010000000408", 40.0, unix_now() - 300);
+        let body = r#"{ "supi": "imsi-001010000000408" }"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 200);
+        let v = body_json(&resp);
+        assert_eq!(
+            v["ageOfLocationEstimate"], 5,
+            "ageOfLocationEstimate must be the REAL age in minutes, not 0"
+        );
+    }
+
+    // -- A2: a stored fix with UNKNOWN capture instant is not short-circuited -
+    #[tokio::test]
+    async fn test_determine_location_ageless_stored_fix_not_served() {
+        // timestamp 0 = capture instant unknown -> age cannot be honoured ->
+        // the live procedure runs (and 504s here: no AMF discoverable).
+        seed_fix_at("imsi-001010000000409", 40.0, 0);
+        let body = r#"{ "supi": "imsi-001010000000409" }"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 504);
+        let v = body_json(&resp);
+        assert_eq!(v["cause"], "UNREACHABLE_USER");
+    }
+
+    // -- A2 acceptance: the global newest-report fallback is UNREACHABLE from
+    // the MT-LR path — another UE's completed report is never served. --------
+    #[tokio::test]
+    async fn test_determine_location_never_serves_another_ues_report() {
+        lmf_context_init(1024);
+        // Complete a measurement report (for some unrelated request) so a
+        // "global newest report" exists — the retired latest_location fallback
+        // would have served it to ANY supi.
+        let ctx = lmf_self();
+        let req_id = {
+            let guard = ctx.read().unwrap();
+            let req = guard
+                .measurement_request(
+                    424_242,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
+                .expect("measurement request");
+            guard.measurement_report(
+                req.request_id,
+                vec![CellMeasurement {
+                    nr_cgi: "001-01-424242-01".to_string(),
+                    rsrp: Some(-70),
+                    rsrq: Some(-9),
+                    timing_advance: Some(50),
+                    aoa: None,
+                    rtt_ns: None,
+                    rstd_ns: None,
+                }],
+            );
+            req.request_id
+        };
+        assert!(
+            lmf_self().read().unwrap().report_find(req_id).is_some(),
+            "global report exists"
+        );
+        // A DIFFERENT, never-seeded SUPI must NOT be served that report.
+        let body = r#"{ "supi": "imsi-001010000000410" }"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(
+            resp.status, 504,
+            "another UE's report must never satisfy this target (correlation isolation)"
+        );
+    }
+
+    // -- A2: wait budget derivation ------------------------------------------
+    #[test]
+    fn test_wait_budget_bounds() {
+        let parse = |s: &str| -> nlmf::InputData { serde_json::from_str(s).unwrap() };
+        // Default: the 20 s hard cap.
+        assert_eq!(
+            wait_budget(&parse(r#"{"supi":"imsi-1"}"#)),
+            Duration::from_secs(20)
+        );
+        // maxRespTime (DurationSec) tightens the budget.
+        assert_eq!(
+            wait_budget(&parse(r#"{"supi":"imsi-1","maxRespTime":3}"#)),
+            Duration::from_secs(3)
+        );
+        // ...but never widens past the hard cap.
+        assert_eq!(
+            wait_budget(&parse(r#"{"supi":"imsi-1","maxRespTime":600}"#)),
+            Duration::from_secs(20)
+        );
+        // LOW_DELAY bounds to 5 s; NO_DELAY waits not at all.
+        assert_eq!(
+            wait_budget(&parse(
+                r#"{"supi":"imsi-1","locationQoS":{"responseTime":"LOW_DELAY"}}"#
+            )),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            wait_budget(&parse(
+                r#"{"supi":"imsi-1","locationQoS":{"responseTime":"NO_DELAY"}}"#
+            )),
+            Duration::ZERO
+        );
+    }
+
+    // -- A2: honest age computation ------------------------------------------
+    #[test]
+    fn test_age_of_fix_minutes() {
+        // Unknown capture instant -> None (never a made-up age).
+        assert_eq!(age_of_fix_minutes(0), None);
+        // Fresh fix -> 0 minutes (computed, not hardcoded).
+        assert_eq!(age_of_fix_minutes(unix_now()), Some(0));
+        // 10 minutes ago.
+        assert_eq!(age_of_fix_minutes(unix_now() - 600), Some(10));
+        // NTP-epoch timestamps are converted (offset 2_208_988_800 s).
+        assert_eq!(
+            age_of_fix_minutes(unix_now() - 600 + NTP_UNIX_OFFSET),
+            Some(10)
+        );
+        // Saturates at the TS 29.571 maximum (32767).
+        assert_eq!(age_of_fix_minutes(1), Some(32_767));
     }
 
     // -- lmfd-12: unknown positioning method on the debug route -> 400 -------
