@@ -132,6 +132,15 @@ struct SbiYaml {
     client: Option<SbiClientYaml>,
 }
 
+/// Wave-6 H9 NAS-security canary knob (`amf.nas.use_nextgcore_security`).
+/// Default OFF (absent → legacy byte-for-byte NAS path). The `AMF_NAS_SECURITY`
+/// env override takes precedence over this yaml value; see
+/// `context::resolve_nas_security_canary`.
+#[derive(Debug, Default, Deserialize)]
+struct NasYaml {
+    use_nextgcore_security: Option<bool>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct AmfSection {
     amf_name: Option<String>,
@@ -141,6 +150,7 @@ struct AmfSection {
     plmn_support: Option<Vec<PlmnSupportYaml>>,
     security: Option<SecurityYaml>,
     sbi: Option<SbiYaml>,
+    nas: Option<NasYaml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -162,9 +172,23 @@ static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth
 
 /// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
 /// Phase A). Outbound SBI clients attach a token via `client.with_oauth2`.
-#[allow(dead_code)]
 fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Attach the process-wide OAuth2 client (when enforcement is on) so the
+/// outbound request carries an NRF-issued Bearer token scoped to `target`
+/// (aud = the target NF type, TS 33.501 §13.4.1). A no-op when enforcement is
+/// off — the matched-sim default — because `oauth2_client()` is then `None`,
+/// so the outbound wire is byte-unchanged. Wave-6 H8 Phase A (consumer attach).
+pub(crate) fn attach_oauth2(
+    client: nextgcore_sbi::client::SbiClient,
+    target: nextgcore_sbi::types::NfType,
+) -> nextgcore_sbi::client::SbiClient {
+    match oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, target),
+        None => client,
+    }
 }
 
 /// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the
@@ -329,6 +353,19 @@ impl AmfApp {
                 return Ok(());
             }
         };
+
+        // Wave-6 H9 NAS-security canary (nas-06 Phase-6): seed the process-wide
+        // runtime knob from `AMF_NAS_SECURITY` env (override) or the yaml
+        // `amf.nas.use_nextgcore_security` key. Default OFF keeps the legacy
+        // byte-for-byte NAS path; flip is a manual docker gate (see WS-H H9).
+        let nas_canary = context::resolve_nas_security_canary(
+            std::env::var("AMF_NAS_SECURITY").ok().as_deref(),
+            amf_section
+                .nas
+                .as_ref()
+                .and_then(|n| n.use_nextgcore_security),
+        );
+        context::set_nas_security_canary(nas_canary);
 
         // Seed NRF URI into SBI context for NF registration
         if let Some(sbi) = &amf_section.sbi {

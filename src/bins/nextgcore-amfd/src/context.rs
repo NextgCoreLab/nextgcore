@@ -984,7 +984,10 @@ impl AmfContext {
         }
 
         let id = self.next_amf_ue_id.fetch_add(1, Ordering::SeqCst) as u64;
-        let amf_ue = AmfUe::new(id, ran_ue_id);
+        let mut amf_ue = AmfUe::new(id, ran_ue_id);
+        // Wave-6 H9 runtime canary: newly created UEs adopt the process-wide
+        // NAS-security setting (default OFF → legacy byte-for-byte path).
+        amf_ue.use_nextgcore_nas_security = nas_security_canary();
         amf_ue_list.insert(id, amf_ue.clone());
 
         log::debug!("AMF UE added (id={id})");
@@ -3139,6 +3142,73 @@ pub fn amf_context_final() {
     };
 }
 
+// ============================================================================
+// NAS-security runtime canary (Wave-6 H9, nas-06 Phase-6)
+// ============================================================================
+
+/// Process-wide default applied to `AmfUe::use_nextgcore_nas_security` when a UE
+/// context is created.
+///
+/// Default `false`: every AMF UE keeps the byte-for-byte legacy hand-rolled NAS
+/// protect/unprotect path (see `nas_security.rs`), so the plain matched-sim
+/// docker E2E is untouched. When `true`, newly created UEs use the conformant
+/// nextgcore-nas adapter (strict MAC verify + replay rejection, TS 24.501 §4.4 /
+/// TS 33.501 §6.4.3-6.4.4).
+///
+/// This is the RUNTIME ENABLE KNOB the H9 A/B runbook needs: it is seeded ONCE
+/// at AMF startup from the `amf.nas.use_nextgcore_security` yaml key or the
+/// `AMF_NAS_SECURITY` env override (docker-friendly), so an operator can run the
+/// canary-OFF vs canary-ON A/B in docker WITHOUT a code edit. The DEFAULT-FLIP
+/// (making `true` the shipped default + deleting the legacy encoder) is a
+/// separate, HOST-gated commit that lands only after the docker A/B signs off —
+/// see `.context/remediation/wave6/WS-H-oracle-e2e.md` H9.
+static NAS_SECURITY_CANARY: AtomicBool = AtomicBool::new(false);
+
+/// Set the process-wide NAS-security canary default (Wave-6 H9 runtime knob).
+///
+/// Called once at AMF startup after config load. Newly created `AmfUe`s adopt
+/// this value; the AMF holds no UE contexts at startup so there is nothing to
+/// migrate. Does NOT change the shipped default — an operator must opt in.
+pub fn set_nas_security_canary(enabled: bool) {
+    NAS_SECURITY_CANARY.store(enabled, Ordering::SeqCst);
+    if enabled {
+        log::warn!(
+            "[nas-06 H9] NAS-security canary ENABLED (amf.nas.use_nextgcore_security / \
+             AMF_NAS_SECURITY): new UEs use the conformant nextgcore-nas strict path"
+        );
+    } else {
+        log::debug!(
+            "[nas-06 H9] NAS-security canary disabled (default): new UEs use the legacy path"
+        );
+    }
+}
+
+/// Read the process-wide NAS-security canary default (Wave-6 H9). Consulted by
+/// the production `AmfUe` creation sites (`amf_ue_add`, `UeNasContext::new`).
+pub fn nas_security_canary() -> bool {
+    NAS_SECURITY_CANARY.load(Ordering::SeqCst)
+}
+
+/// Resolve the NAS-security canary from configuration (Wave-6 H9), env-first.
+///
+/// Precedence (fail-safe — default OFF): the `AMF_NAS_SECURITY` env override
+/// wins when it is a recognized token, else the yaml
+/// `amf.nas.use_nextgcore_security` bool, else `false`. Env tokens
+/// (case-insensitive, trimmed): `nextgcore` / `1` / `true` / `yes` / `on`
+/// enable; `legacy` / `0` / `false` / `no` / `off` disable; any other value is
+/// ignored (falls through to the yaml value). Pure function (no globals) so it
+/// is unit-testable in isolation.
+pub fn resolve_nas_security_canary(env_val: Option<&str>, yaml_val: Option<bool>) -> bool {
+    if let Some(raw) = env_val {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "nextgcore" | "1" | "true" | "yes" | "on" => return true,
+            "legacy" | "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    yaml_val.unwrap_or(false)
+}
+
 /// Get UE load (for NF instance load reporting)
 pub fn amf_instance_get_load() -> i32 {
     let ctx = amf_self();
@@ -3534,5 +3604,76 @@ mod tests {
         assert!(ctx.paging_retransmit(10)); // 1/2
         assert!(ctx.paging_retransmit(10)); // 2/2
         assert!(!ctx.paging_retransmit(10)); // exceeded
+    }
+
+    // ========================================================================
+    // Wave-6 H9 NAS-security runtime canary
+    // ========================================================================
+
+    /// The pure config resolver: `AMF_NAS_SECURITY` env override wins over the
+    /// yaml value; absent everywhere is the fail-safe default OFF.
+    #[test]
+    fn test_resolve_nas_security_canary_precedence() {
+        // Absent everywhere / yaml-false -> OFF (fail-safe default).
+        assert!(!resolve_nas_security_canary(None, None));
+        assert!(!resolve_nas_security_canary(None, Some(false)));
+        // yaml true, no env -> ON.
+        assert!(resolve_nas_security_canary(None, Some(true)));
+        // env enable tokens -> ON regardless of yaml.
+        for v in ["nextgcore", "NextGCore", " 1 ", "true", "YES", "on"] {
+            assert!(
+                resolve_nas_security_canary(Some(v), Some(false)),
+                "env {v:?} must enable"
+            );
+        }
+        // env disable tokens -> OFF even when yaml says true.
+        for v in ["legacy", "0", "false", "no", "OFF"] {
+            assert!(
+                !resolve_nas_security_canary(Some(v), Some(true)),
+                "env {v:?} must disable"
+            );
+        }
+        // Unrecognized env falls through to the yaml value.
+        assert!(resolve_nas_security_canary(Some("maybe"), Some(true)));
+        assert!(!resolve_nas_security_canary(Some("maybe"), Some(false)));
+    }
+
+    /// Knob plumbing (yaml/env -> AmfUe flag): `set_nas_security_canary(true)`
+    /// makes the next `amf_ue_add()` stamp `use_nextgcore_nas_security=true`;
+    /// OFF (the default) yields the legacy UE. Serialized on the shared context
+    /// guard (the canary is process-wide) and restored to OFF so no other test
+    /// bleeds.
+    #[test]
+    fn test_nas_security_canary_knob_seeds_new_ue() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Default: OFF -> legacy UE.
+        set_nas_security_canary(false);
+        assert!(!nas_security_canary());
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+        let gnb = ctx.gnb_add("10.0.0.1:38412").unwrap();
+        let ran_ue = ctx.ran_ue_add(gnb.id, 5001).unwrap();
+        let ue_off = ctx.amf_ue_add(ran_ue.id).unwrap();
+        assert!(
+            !ue_off.use_nextgcore_nas_security,
+            "OFF canary must create a legacy UE"
+        );
+
+        // Flip ON at runtime: the NEXT UE picks it up.
+        set_nas_security_canary(true);
+        assert!(nas_security_canary());
+        let ran_ue2 = ctx.ran_ue_add(gnb.id, 5002).unwrap();
+        let ue_on = ctx.amf_ue_add(ran_ue2.id).unwrap();
+        assert!(
+            ue_on.use_nextgcore_nas_security,
+            "ON canary must create a nextgcore-security UE"
+        );
+
+        // Restore the process-wide default (never leave the canary ON).
+        set_nas_security_canary(false);
+        assert!(!nas_security_canary());
     }
 }

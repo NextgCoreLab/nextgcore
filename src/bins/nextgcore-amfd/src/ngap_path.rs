@@ -334,9 +334,20 @@ struct UeNasContext {
 }
 
 impl UeNasContext {
-    fn new(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32, association_id: u64) -> Self {
+    /// Create a per-UE NAS context. `use_nextgcore_nas_security` is the Wave-6
+    /// H9 runtime canary applied to the fresh `AmfUe`: the production caller
+    /// passes `crate::context::nas_security_canary()` (the process-wide setting,
+    /// default OFF); tests pass an explicit `false` to keep the legacy path.
+    fn new(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        association_id: u64,
+        use_nextgcore_nas_security: bool,
+    ) -> Self {
+        let mut amf_ue = AmfUe::new(amf_ue_ngap_id, ran_ue_ngap_id as u64);
+        amf_ue.use_nextgcore_nas_security = use_nextgcore_nas_security;
         Self {
-            amf_ue: AmfUe::new(amf_ue_ngap_id, ran_ue_ngap_id as u64),
+            amf_ue,
             auth_ctx_id: String::new(),
             ran_ue_ngap_id,
             association_id,
@@ -1076,8 +1087,12 @@ impl NgapServer {
 
         match msg_type {
             message_type::REGISTRATION_REQUEST => {
-                let mut state =
-                    UeNasContext::new(amf_ue_ngap_id, initial_ue.ran_ue_ngap_id, association_id);
+                let mut state = UeNasContext::new(
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                    association_id,
+                    crate::context::nas_security_canary(),
+                );
                 state.amf_ue.nr_tai = crate::context::Tai5gs {
                     plmn_id: initial_ue.plmn_id.clone(),
                     tac: initial_ue.tac,
@@ -6574,7 +6589,7 @@ mod tests {
         // T0.1: a fresh UE context starts with the ICS Response not yet
         // received, so the PDU-session-setup gate (and the "context
         // established" decision) must be false until the gNB confirms.
-        let mut state = UeNasContext::new(1, 2, 100);
+        let mut state = UeNasContext::new(1, 2, 100, false);
         assert!(!state.initial_context_setup_response_received);
         assert!(!state.initial_context_setup_request_sent);
         assert_eq!(state.gmm_fsm.state, crate::gmm_sm::GmmState::Initial);
@@ -6849,6 +6864,24 @@ mod tests {
         assert_eq!(GmmCause::NoNetworkSlicesAvailable as u8, 62);
     }
 
+    /// Wave-6 H9: the reg-flow per-UE context stamps the NAS-security canary onto
+    /// its `AmfUe` from the `use_nextgcore_nas_security` constructor argument
+    /// (the production caller passes `context::nas_security_canary()`; tests pass
+    /// an explicit bool). Off -> legacy path; on -> nextgcore strict path.
+    #[test]
+    fn h9_ue_nas_context_seeds_canary() {
+        let off = UeNasContext::new(1, 2, 100, false);
+        assert!(
+            !off.amf_ue.use_nextgcore_nas_security,
+            "canary OFF must yield a legacy-path AmfUe"
+        );
+        let on = UeNasContext::new(1, 2, 100, true);
+        assert!(
+            on.amf_ue.use_nextgcore_nas_security,
+            "canary ON must yield a nextgcore-security AmfUe"
+        );
+    }
+
     // amfd-05 — EAP-AKA' transparent passthrough: AUSF eapPayload -> NAS
     // Authentication Request EAP message IE (0x78) + ABBA, and the reverse.
     #[test]
@@ -6907,7 +6940,7 @@ mod tests {
     #[test]
     fn amfd07_gmm_state_reporting_tracks_live_procedure_stages() {
         use crate::gmm_sm::GmmState;
-        let mut state = UeNasContext::new(1, 2, 100);
+        let mut state = UeNasContext::new(1, 2, 100, false);
 
         // Fresh context (pre-registration).
         assert_eq!(state.gmm_fsm.state, GmmState::Initial);
@@ -7015,7 +7048,7 @@ mod tests {
         let mut ngap = test_ngap_server().await;
 
         let amf_ue_ngap_id = 7_400_001u64;
-        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 41, 1);
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 41, 1, false);
         ue_ctx.amf_ue.supi = Some("imsi-001010000074001".to_string());
         ue_ctx.amf_ue.security_context_available = true;
         ue_ctx.amf_ue.selected_int_algorithm = 2;
@@ -7079,7 +7112,7 @@ mod tests {
 
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 424_250u64;
-        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 7, 1);
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 7, 1, false);
         ue_ctx.amf_ue.supi = Some(supi.to_string());
         ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
 
@@ -7162,7 +7195,7 @@ mod tests {
 
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 424_251u64;
-        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 8, 1);
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 8, 1, false);
         // Unique SUPI with NO N1N2 subscription registered.
         ue_ctx.amf_ue.supi = Some("imsi-999700000424251".to_string());
         ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);

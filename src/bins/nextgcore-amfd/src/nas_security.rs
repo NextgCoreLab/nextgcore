@@ -1602,6 +1602,59 @@ mod tests {
         assert_eq!(ue.ul_count, 1, "UL COUNT advanced to the verified value");
     }
 
+    /// Wave-6 H9 A/B byte-compare scaffold — the in-process analog of the
+    /// docker A/B runbook (`.context/remediation/wave6/WS-H-oracle-e2e.md` H9).
+    ///
+    /// For each representative DL 5GMM payload, encode it through the gated
+    /// dispatcher on BOTH canary settings (A = OFF/legacy, B = ON/nextgcore
+    /// adapter) and byte-compare the protected wire image + DL COUNT; then
+    /// confirm the canary-ON strict UL decode accepts a conformant frame and
+    /// establishes the replay baseline. This pins the invariant the docker A/B
+    /// must reproduce before the (HOST-ONLY) default-flip: the runtime knob
+    /// selects the path, and the nextgcore adapter is byte-identical to the
+    /// legacy encoder for 3GPP-access frames (TS 24.501 §4.4).
+    #[test]
+    fn h9_ab_byte_compare_scaffold() {
+        let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
+        // Representative DL 5GMM bodies exercised on the registration flow.
+        let messages: &[&[u8]] = &[
+            &[0x7e, 0x00, 0x5d, 0x02, 0x00, 0x02, 0xe0, 0xe1],
+            &[0x7e, 0x00, 0x42, 0x01, 0x77, 0x00, 0x0b, 0xf2, 0x00],
+        ];
+
+        for msg in messages {
+            // Path A: canary OFF (legacy production encoder).
+            let mut ue_a = create_test_ue();
+            assert!(
+                !ue_a.use_nextgcore_nas_security,
+                "path A must run with the canary OFF"
+            );
+            let a = nas_5gs_security_encode(&mut ue_a, msg, sht).expect("A encode");
+
+            // Path B: canary ON (conformant nextgcore adapter).
+            let mut ue_b = create_test_ue();
+            ue_b.use_nextgcore_nas_security = true;
+            let b = nas_5gs_security_encode(&mut ue_b, msg, sht).expect("B encode");
+
+            // A/B invariant: byte-identical DL image + COUNT parity.
+            assert_eq!(a, b, "H9 A/B: DL protected bytes differ for msg {msg:02x?}");
+            assert_eq!(ue_a.dl_count, ue_b.dl_count, "H9 A/B: DL COUNT desync");
+        }
+
+        // UL leg under canary ON: a conformant uplink frame is accepted and the
+        // strict path establishes the anti-replay baseline.
+        let mut ue_on = create_test_ue();
+        ue_on.use_nextgcore_nas_security = true;
+        let body = [0x7e, 0x00, 0x57, 0x00];
+        let frame = make_uplink_frame(&ue_on, &body, sht, 0);
+        let out = nas_5gs_security_decode(&mut ue_on, sht, &frame).expect("UL accept under ON");
+        assert_eq!(out, body, "H9 A/B: UL plaintext recovered under canary ON");
+        assert!(
+            ue_on.ul_count_established,
+            "H9 A/B: replay baseline established under canary ON"
+        );
+    }
+
     #[test]
     fn test_nas_mac_calculate_nia2() {
         let key = [0x11u8; 16];

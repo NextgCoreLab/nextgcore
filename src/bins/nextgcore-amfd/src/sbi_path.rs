@@ -837,7 +837,10 @@ pub async fn call_smf_create_sm_context(
          DNN={dnn}, redcap={redcap_indication}"
     );
 
-    let client = SbiClient::with_host_port(smf_host, smf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
 
     // redcapIndication propagates the UE's Reduced-Capability status to the SMF
     // (TS 29.502 SmContextCreateData) so the SMF can apply a reduced
@@ -926,7 +929,10 @@ pub async fn call_smf_update_sm_context(
         n2_sm_info.len()
     );
 
-    let client = SbiClient::with_host_port(smf_host, smf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
 
     // N2 SM transfer (gNB DL F-TEID) carried as a multipart/related ngap binary
     // part referenced by RefToBinaryData (smfd-02).
@@ -983,7 +989,10 @@ pub async fn call_smf_update_sm_context_with_n1(
         n1_sm_msg.len()
     );
 
-    let client = SbiClient::with_host_port(smf_host, smf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
 
     // UE-initiated modification: the UE's N1 container is carried as a
     // multipart/related 5gnas binary part referenced by RefToBinaryData
@@ -1046,7 +1055,10 @@ pub async fn call_smf_release_sm_context(
 ) -> SbiResult<()> {
     log::info!("Calling SMF SM Context Release: ref={sm_context_ref}");
 
-    let client = SbiClient::with_host_port(smf_host, smf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
 
     let body = serde_json::json!({
         "cause": "REL_DUE_TO_UE_REQUEST"
@@ -1113,7 +1125,10 @@ pub async fn call_ausf_authenticate_with_resync(
         resync.is_some()
     );
 
-    let client = SbiClient::with_host_port(ausf_host, ausf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(ausf_host, ausf_port),
+        nextgcore_sbi::types::NfType::Ausf,
+    );
 
     let mut body = serde_json::json!({
         "supiOrSuci": suci,
@@ -1204,7 +1219,10 @@ pub async fn call_ausf_5g_aka_confirm(
         hex::encode(&res_star[..4])
     );
 
-    let client = SbiClient::with_host_port(ausf_host, ausf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(ausf_host, ausf_port),
+        nextgcore_sbi::types::NfType::Ausf,
+    );
 
     let body = serde_json::json!({
         "resStar": hex::encode(res_star)
@@ -1376,7 +1394,10 @@ pub async fn call_udm_uecm_registration(
     guami_plmn_mnc: &str,
     amf_id_hex: &str,
 ) -> SbiResult<()> {
-    let client = SbiClient::with_host_port(udm_host, udm_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(udm_host, udm_port),
+        nextgcore_sbi::types::NfType::Udm,
+    );
 
     let body = serde_json::json!({
         "amfInstanceId": amf_instance_id,
@@ -1423,7 +1444,10 @@ pub async fn call_udm_sdm_get_am_data(
     udm_port: u16,
     supi: &str,
 ) -> SbiResult<AmDataResponse> {
-    let client = SbiClient::with_host_port(udm_host, udm_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(udm_host, udm_port),
+        nextgcore_sbi::types::NfType::Udm,
+    );
     let path = format!("/nudm-sdm/v1/{supi}/am-data");
     let response = client
         .get(&path)
@@ -1474,7 +1498,10 @@ pub async fn call_udm_sdm_subscribe(
     supi: &str,
     amf_instance_id: &str,
 ) -> SbiResult<String> {
-    let client = SbiClient::with_host_port(udm_host, udm_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(udm_host, udm_port),
+        nextgcore_sbi::types::NfType::Udm,
+    );
 
     let body = serde_json::json!({
         "nfInstanceId": amf_instance_id,
@@ -1523,7 +1550,10 @@ pub async fn call_pcf_am_policy_create(
     serving_plmn_mcc: &str,
     serving_plmn_mnc: &str,
 ) -> SbiResult<String> {
-    let client = SbiClient::with_host_port(pcf_host, pcf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
 
     let body = serde_json::json!({
         "notificationUri": format!("/namf-callback/v1/{supi}/am-policy-notify"),
@@ -1598,7 +1628,10 @@ pub async fn call_pcf_ue_policy_create(
     guami_mnc: &str,
     guami_amf_id_hex: &str,
 ) -> SbiResult<String> {
-    let client = SbiClient::with_host_port(pcf_host, pcf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
 
     let body = serde_json::json!({
         "notificationUri": format!("/namf-callback/v1/{supi}/ue-policy-notify"),
@@ -1653,7 +1686,10 @@ pub async fn call_pcf_ue_policy_delete(
     pcf_port: u16,
     pol_asso_id: &str,
 ) -> SbiResult<()> {
-    let client = SbiClient::with_host_port(pcf_host, pcf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
 
     let response = client
         .delete(&format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}"))
@@ -1700,7 +1736,10 @@ pub async fn call_nsacf_ue_admission(
     access_type: &str,
     update_flag: bool,
 ) -> SbiResult<NsacfUeAdmissionResult> {
-    let client = SbiClient::with_host_port(nsacf_host, nsacf_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(nsacf_host, nsacf_port),
+        nextgcore_sbi::types::NfType::Nsacf,
+    );
 
     let mut snssai = serde_json::json!({ "sst": snssai_sst });
     if let Some(sd) = snssai_sd {
@@ -1770,7 +1809,10 @@ pub async fn call_udm_uecm_deregistration(
     udm_port: u16,
     supi: &str,
 ) -> SbiResult<()> {
-    let client = SbiClient::with_host_port(udm_host, udm_port);
+    let client = crate::attach_oauth2(
+        SbiClient::with_host_port(udm_host, udm_port),
+        nextgcore_sbi::types::NfType::Udm,
+    );
 
     let body = serde_json::json!({ "purgeFlag": true });
     let path = format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access");
