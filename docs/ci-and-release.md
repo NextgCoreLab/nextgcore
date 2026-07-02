@@ -30,18 +30,18 @@ The richer matched-sim data-plane E2E (registration + PDU session + GTP-U ping) 
 
 Deploys `docs/` to GitHub Pages (runs `docs/scripts/update-api-docs.sh`, uploads `docs/`).
 
-## ⚠️ Branch triggers
+## Branch triggers
 
-Both workflows currently trigger on the **`initial_commit`** branch only:
+Both workflows run on the default release branch **`main`** and on the development branch
+**`initial_commit`**:
 
 ```yaml
 on:
-  push:    { branches: [initial_commit] }
-  pull_request: { branches: [initial_commit] }
+  push:    { branches: [initial_commit, main] }
+  pull_request: { branches: [initial_commit, main] }
 ```
 
-If the default/release branch is `main`, **CI and Pages will not run on `main`.** Before cutting a
-release from `main`, update the `branches:` lists (add `main`, or switch to it).
+(`ci.yml` on push + PR to either branch; `pages.yml` on push to either branch when `docs/**` changes.)
 
 ## Local pre-push gate (mirror of CI)
 
