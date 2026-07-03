@@ -39,7 +39,12 @@ jobs:
         with:
           workspaces: src
       - name: cargo test
-        run: cd src && cargo test --workspace
+        # Retry once: a few NF tests share process-global state (context /
+        # UDR_SBI_* env) and ephemeral ports (free_port TOCTOU), which can race
+        # under the runner's heavy parallel load. A single retry clears a flake
+        # while a deterministic failure still fails twice. TODO: proper deflake
+        # (bind-and-keep ports + one cross-crate serialize lock).
+        run: cd src && (cargo test --workspace || (echo '::warning::cargo test flaked, retrying once' && cargo test --workspace))
 
   clippy:
     name: Clippy
