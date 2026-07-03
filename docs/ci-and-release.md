@@ -16,6 +16,8 @@ Two workflows live in `.github/workflows/`.
 | **Docker E2E** | brings up the 5GC stack (mongodb, nrf, ausf/udm/udr/pcf/nssf/bsf, amf/smf/upf) and health-checks NRF/AMF | startup / health failures |
 | **Docker E2E (EPC)** | brings up the 4G EPC stack from `docker-compose-epc.yml` and inspects hss/pcrf/sgwc/sgwu/mme | startup / health failures |
 
+> **Docker jobs are opt-in.** `docker-build` (and the dependent `docker-e2e`/`docker-e2e-epc`) run **only on manual `workflow_dispatch`** (Actions tab → Run workflow), not on push/PR — they recompile both workspaces in a container and need a cross-repo checkout, so they are too heavy/fragile for every commit. The fast gate (Check/Format/Clippy/Test) protects every push/PR.
+
 `Test`/`Clippy` depend on `Check`; the two Docker E2E jobs depend on `Docker Build`.
 
 **The `Test` job runs `cargo test --workspace` at the runner's default parallelism.** Tests
