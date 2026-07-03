@@ -1200,7 +1200,7 @@ mod tests {
         // Hold the guard across seed + real handler + drain so a parallel test
         // cannot re-init (wipe) the global amf context in between — that race
         // was the intermittent "0 vs 1 enqueued" failure.
-        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_100);
 
@@ -1238,7 +1238,7 @@ mod tests {
         use nextgcore_sbi::message::SbiRequest;
         let supi = "imsi-001010000000398";
         // Held across the async handler + drain (see the twin test above).
-        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_101);
         let body =
@@ -1260,7 +1260,7 @@ mod tests {
     async fn test_dereg_notify_fail_closed_400_and_404() {
         use nextgcore_sbi::message::SbiRequest;
         let supi = "imsi-001010000000397";
-        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         nextgcore_amfd::test_support::init_context();
         let _ue_id = seed_amf_ue(supi, 60_102);
 
@@ -1369,7 +1369,7 @@ mod tests {
 
         // Direction 2 (decode pin) — udmd's body through amfd's REAL handler.
         let supi = "imsi-001010000000396";
-        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_103);
         let path = format!("/namf-callback/v1/{supi}/dereg-notify");
@@ -1397,7 +1397,7 @@ mod tests {
     async fn test_dereg_notify_strict_peer_non_initial_reason_no_rereg() {
         use nextgcore_sbi::message::SbiRequest;
         let supi = "imsi-001010000000395";
-        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_104);
         let body = json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN", "accessType": "3GPP_ACCESS" });
@@ -1427,7 +1427,7 @@ mod tests {
     async fn test_dereg_notify_strict_peer_rejects_unknown_reason() {
         use nextgcore_sbi::message::SbiRequest;
         let supi = "imsi-001010000000394";
-        let _guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_105);
         let body = json!({ "deregReason": "NOT_A_REAL_REASON", "accessType": "3GPP_ACCESS" });
