@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b04bf570.js";
+            window.path_to_searchindex_js = "../searchindex-d1172b21.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-1b88980e.js"></script>
@@ -184,16 +184,6 @@
 <blockquote>
 <p><strong>⚠️ STALE SNAPSHOT (2026-02-07).</strong> This report predates the Wave-1..6 remediation and the peripheral-NF build-out; it is retained for historical context only and several “does not exist” / “0%” statements below are now FALSE. As of 2026-07 the workspace ships <strong>24 NF binaries (19 5GC + 5 EPC)</strong> and <strong>17 shared libraries</strong> — including NWDAF (<code>nextgcore-nwdafd</code>: NRF-driven NF_LOAD collection, analytics, ML-service and federation scaffolding), NSACF (<code>nextgcore-nsacfd</code>: config-provisioned slice quotas per TS 29.536), plus DCCF, EES, LMF, MBSMF and PIN NFs; SBI OAuth2 (<code>/oauth2/token</code>); and wired NAS security (<code>bins/nextgcore-amfd/src/nas_security.rs</code>). A matched-sim Docker E2E (<code>docker/rust/e2e-test.sh</code>) exercises full registration + PDU session + data plane. These 6G-oriented items remain <strong>research-/prototype-level and are NOT Rel-20 conformant — no frozen 6G stage-3 spec exists.</strong></p>
 </blockquote>
-<hr>
-<h2 id="executive-summary"><a class="header" href="#executive-summary">Executive Summary</a></h2>
-<p>NextGCore is a pure Rust port of the Open5GS C codebase implementing <strong>19 5G Core (5GC) network functions and 5 EPC network functions, supported by 17 shared libraries</strong> <em>(counts as of 2026-07; this report was written against an earlier 12+5 / 18-lib layout)</em>. The project has established strong foundational infrastructure – FSM frameworks, SBI HTTP/2 server/client, PFCP protocol library, NAS message encoding/decoding, and a working UPF data plane – but the majority of service-specific handlers remain stubbed. There are <strong>316 documented TODOs</strong> across 8 phases required to reach basic 5G operational parity, and (at the time of writing) no 6G-specific features existed in the codebase. <em>(Historical: as of 2026-07 several 6G-oriented research NFs/features have since landed — NWDAF <code>nextgcore-nwdafd</code>, NSACF <code>nextgcore-nsacfd</code>, DCCF <code>nextgcore-dccfd</code>, plus ISAC/FL prototypes in nextgsim — all prototype-level, not Rel-20-conformant. See banner.)</em></p>
-<p>The gap to a 6G-ready core network is therefore two-layered:</p>
-<ol>
-<li><strong>Layer 1 (5G Completion):</strong> ~17 weeks of work to implement timer management, SBI infrastructure, error responses, NRF integration, and service-specific handlers across all NFs.</li>
-<li><strong>Layer 2 (6G Evolution):</strong> Entirely new capabilities required for AI-native networking, SBA 2.0, compute-aware networking, digital twins, intent-driven management, enhanced slicing, zero-trust security, green networking, NTN support, and TSN integration.</li>
-</ol>
-<p><strong>Overall 5G Implementation Completeness: ~25%</strong> <em>(as of 2026-02-07; substantially higher after Wave-1..6 remediation — see banner)</em>
-<strong>6G Readiness: 0%</strong> <em>(STALE — 6G-oriented research NFs/features have since landed; still prototype-level, not Rel-20-conformant)</em></p>
 <hr>
 <h2 id="1-network-function-by-nf-analysis"><a class="header" href="#1-network-function-by-nf-analysis">1. Network Function-by-NF Analysis</a></h2>
 <h3 id="11-5g-core-network-functions"><a class="header" href="#11-5g-core-network-functions">1.1 5G Core Network Functions</a></h3>
@@ -599,35 +589,14 @@
 </table>
 </div>
 <hr>
-<h2 id="7-recommendations"><a class="header" href="#7-recommendations">7. Recommendations</a></h2>
-<h3 id="71-immediate-0-3-months"><a class="header" href="#71-immediate-0-3-months">7.1 Immediate (0-3 months)</a></h3>
-<ol>
-<li><strong>Complete Phase A1-A3</strong> (timer management, SBI event loop, error responses, NRF integration). This unblocks all other work.</li>
-<li><strong>Implement nextgcore-ngap</strong> ASN.1 encoding to enable AMF-gNB communication.</li>
-<li><strong>Wire nextgcore-metrics</strong> to all NFs for basic observability.</li>
-<li><strong>Add mTLS</strong> between NFs as a security baseline.</li>
-</ol>
-<h3 id="72-short-term-3-6-months"><a class="header" href="#72-short-term-3-6-months">7.2 Short-term (3-6 months)</a></h3>
-<ol start="5">
-<li><strong>Complete Phase A5-A8</strong> (AMF, SMF, AUSF/UDM/UDR, PCF handlers) for basic mobile connectivity.</li>
-<li><strong>Implement NWDAF</strong> with data collection from AMF/SMF/UPF as the foundational 6G capability.</li>
-<li><strong>Deploy observability stack</strong> (OpenTelemetry, structured logging, Prometheus dashboards).</li>
-<li><strong>Begin containerization</strong> (Dockerfiles, CI/CD pipeline).</li>
-</ol>
-<h3 id="73-medium-term-6-12-months"><a class="header" href="#73-medium-term-6-12-months">7.3 Medium-term (6-12 months)</a></h3>
-<ol start="9">
-<li><strong>Complete SBA 2.0 planning</strong>: Evaluate gRPC/HTTP3 as SBI transport alongside HTTP/2.</li>
-<li><strong>Implement enhanced slicing</strong> with NSACF and slice SLA monitoring.</li>
-<li><strong>Build edge computing</strong> support with EASDF and latency-aware UPF selection.</li>
-<li><strong>Prototype digital twin</strong> framework using network state exports and metrics.</li>
-</ol>
-<h3 id="74-long-term-12-24-months"><a class="header" href="#74-long-term-12-24-months">7.4 Long-term (12-24 months)</a></h3>
-<ol start="13">
-<li><strong>AI-native NWDAF</strong> with ML model serving, federated learning, autonomous operations.</li>
-<li><strong>Zero-trust evolution</strong> with post-quantum cryptography, continuous authentication.</li>
-<li><strong>Intent-driven management</strong> engine with natural language policy translation.</li>
-<li><strong>ISAC support</strong> pending 3GPP standardization progress.</li>
-</ol>
+<h2 id="7-open-work"><a class="header" href="#7-open-work">7. Open work</a></h2>
+<p>Forward-looking work items from this analysis are tracked as
+<a href="https://github.com/NextgCoreLab/nextgcore/issues">GitHub issues</a> rather than as a
+roadmap here, so the code and the tracker stay the source of truth. Each issue
+records the verified current state, a bounded scope, and acceptance criteria.
+Many items from earlier revisions of this report (NWDAF, NSACF, DCCF/EES, SBI
+OAuth2, the metrics/OTel stack, containerization, the matched-sim E2E) are
+already implemented — see the stale-snapshot banner at the top.</p>
 <hr>
 <h2 id="8-architecture-strengths-for-6g-evolution"><a class="header" href="#8-architecture-strengths-for-6g-evolution">8. Architecture Strengths for 6G Evolution</a></h2>
 <p>Despite the gaps, the project has several architectural strengths that position it well for 6G:</p>

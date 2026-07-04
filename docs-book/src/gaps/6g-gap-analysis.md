@@ -8,20 +8,6 @@
 
 ---
 
-## Executive Summary
-
-NextGCore is a pure Rust port of the Open5GS C codebase implementing **19 5G Core (5GC) network functions and 5 EPC network functions, supported by 17 shared libraries** *(counts as of 2026-07; this report was written against an earlier 12+5 / 18-lib layout)*. The project has established strong foundational infrastructure -- FSM frameworks, SBI HTTP/2 server/client, PFCP protocol library, NAS message encoding/decoding, and a working UPF data plane -- but the majority of service-specific handlers remain stubbed. There are **316 documented TODOs** across 8 phases required to reach basic 5G operational parity, and (at the time of writing) no 6G-specific features existed in the codebase. *(Historical: as of 2026-07 several 6G-oriented research NFs/features have since landed — NWDAF `nextgcore-nwdafd`, NSACF `nextgcore-nsacfd`, DCCF `nextgcore-dccfd`, plus ISAC/FL prototypes in nextgsim — all prototype-level, not Rel-20-conformant. See banner.)*
-
-The gap to a 6G-ready core network is therefore two-layered:
-
-1. **Layer 1 (5G Completion):** ~17 weeks of work to implement timer management, SBI infrastructure, error responses, NRF integration, and service-specific handlers across all NFs.
-2. **Layer 2 (6G Evolution):** Entirely new capabilities required for AI-native networking, SBA 2.0, compute-aware networking, digital twins, intent-driven management, enhanced slicing, zero-trust security, green networking, NTN support, and TSN integration.
-
-**Overall 5G Implementation Completeness: ~25%** *(as of 2026-02-07; substantially higher after Wave-1..6 remediation — see banner)*
-**6G Readiness: 0%** *(STALE — 6G-oriented research NFs/features have since landed; still prototype-level, not Rel-20-conformant)*
-
----
-
 ## 1. Network Function-by-NF Analysis
 
 ### 1.1 5G Core Network Functions
@@ -415,31 +401,15 @@ The following NFs do not exist in the codebase and must be created for 6G:
 
 ---
 
-## 7. Recommendations
+## 7. Open work
 
-### 7.1 Immediate (0-3 months)
-1. **Complete Phase A1-A3** (timer management, SBI event loop, error responses, NRF integration). This unblocks all other work.
-2. **Implement nextgcore-ngap** ASN.1 encoding to enable AMF-gNB communication.
-3. **Wire nextgcore-metrics** to all NFs for basic observability.
-4. **Add mTLS** between NFs as a security baseline.
-
-### 7.2 Short-term (3-6 months)
-5. **Complete Phase A5-A8** (AMF, SMF, AUSF/UDM/UDR, PCF handlers) for basic mobile connectivity.
-6. **Implement NWDAF** with data collection from AMF/SMF/UPF as the foundational 6G capability.
-7. **Deploy observability stack** (OpenTelemetry, structured logging, Prometheus dashboards).
-8. **Begin containerization** (Dockerfiles, CI/CD pipeline).
-
-### 7.3 Medium-term (6-12 months)
-9. **Complete SBA 2.0 planning**: Evaluate gRPC/HTTP3 as SBI transport alongside HTTP/2.
-10. **Implement enhanced slicing** with NSACF and slice SLA monitoring.
-11. **Build edge computing** support with EASDF and latency-aware UPF selection.
-12. **Prototype digital twin** framework using network state exports and metrics.
-
-### 7.4 Long-term (12-24 months)
-13. **AI-native NWDAF** with ML model serving, federated learning, autonomous operations.
-14. **Zero-trust evolution** with post-quantum cryptography, continuous authentication.
-15. **Intent-driven management** engine with natural language policy translation.
-16. **ISAC support** pending 3GPP standardization progress.
+Forward-looking work items from this analysis are tracked as
+[GitHub issues](https://github.com/NextgCoreLab/nextgcore/issues) rather than as a
+roadmap here, so the code and the tracker stay the source of truth. Each issue
+records the verified current state, a bounded scope, and acceptance criteria.
+Many items from earlier revisions of this report (NWDAF, NSACF, DCCF/EES, SBI
+OAuth2, the metrics/OTel stack, containerization, the matched-sim E2E) are
+already implemented — see the stale-snapshot banner at the top.
 
 ---
 
