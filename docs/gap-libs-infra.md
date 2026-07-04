@@ -207,7 +207,7 @@ Testing utility for C comparison. Provides stub bindings by default, optional ge
 | Gap | Details |
 |-----|---------|
 | No 6G-specific types | Missing: ISAC config, semantic comm parameters, SHE compute descriptors |
-| No NTN types | No satellite orbit parameters, timing advance types |
+| NTN types unwired | Satellite orbit parameters and timing-advance types now exist in `nextgcore-proto` (`ntn_constellation.rs`) but are not consumed by any NF |
 | No AI/ML types | No model metadata, inference request/response types |
 
 ### Completeness: **90%** for 5G

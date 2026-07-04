@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NextGCore — Agentic 6G Core Network</title>
-  <meta name="description" content="5G Core Network in Rust. 22 Network Functions with AI-native analytics, intent-based automation, and zero-trust security. Targets 3GPP Rel-15 with selected Rel-17/18 features; 6G/Rel-20 capabilities are non-normative research prototypes (no frozen Rel-20 specs exist).">
+  <meta name="description" content="5G Core Network in Rust. 24 Network Functions with AI-native analytics, intent-based automation, zero-trust security, and full 4G/EPC interworking. Targets 3GPP Rel-15 with selected Rel-17/18 features; 6G/Rel-20 capabilities are non-normative research prototypes (no frozen Rel-20 specs exist).">
   <link rel="stylesheet" href="css/style.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔷</text></svg>">
 </head>
@@ -34,17 +34,17 @@
         <span>v0.1.0</span> &middot; 3GPP Rel-15 / Rel-17/18 features &middot; 6G prototypes (non-normative, no frozen Rel-20 specs)
       </div>
       <h1>Agentic <span class="accent">6G Core</span> Network</h1>
-      <p>The first AI-native 5G/6G Core Network — 24 Network Functions with ML-driven analytics, intent-based autonomous operations, zero-trust security, and edge intelligence. Built entirely in Rust.</p>
+      <p>The first AI-native 5G/6G Core Network — 24 Network Functions with ML-driven analytics, intent-based autonomous operations, zero-trust security, and edge intelligence — plus full 4G/EPC interworking (MME, HSS, SGW, PCRF). Built entirely in Rust.</p>
       <div class="hero-buttons">
         <a href="#quickstart" class="btn btn-primary">Get Started</a>
         <a href="#ai-native" class="btn btn-secondary">Explore AI Features</a>
-        <a href="api.html" class="btn btn-secondary">27 OpenAPI Specs</a>
+        <a href="api.html" class="btn btn-secondary">31 OpenAPI Specs</a>
       </div>
       <div class="stats-row">
         <div class="stat"><div class="stat-value">24</div><div class="stat-label">Network Functions</div></div>
         <div class="stat"><div class="stat-value">17</div><div class="stat-label">Libraries</div></div>
         <div class="stat"><div class="stat-value">~400k</div><div class="stat-label">Lines of Rust</div></div>
-        <div class="stat"><div class="stat-value">8</div><div class="stat-label">AI/6G NFs</div></div>
+        <div class="stat"><div class="stat-value">7</div><div class="stat-label">AI/6G NFs</div></div>
       </div>
     </div>
   </div>
@@ -84,7 +84,7 @@
       <div class="feature-card">
         <div class="feature-icon">&#9878;</div>
         <h3>3GPP Rel-15, Rel-17/18 features</h3>
-        <p>Full 5G SA and selected 5G-Advanced (Rel-17/18) features: MBS multicast, PIN IoT networks, NSACF slice admission, LMF positioning with 10+ methods, and beyond. 6G/Rel-20 items (ISAC, FL, PQC, semantic comms) are research prototypes informed by TR 22.870 use cases only — no frozen Rel-20 3GPP stage-3 specs exist.</p>
+        <p>Full 5G SA and selected 5G-Advanced (Rel-17/18) features: MBS multicast, PIN IoT networks, NSACF slice admission, LMF positioning with 10+ methods, RedCap admission with AMBR capping, XR QoS (5QI 82&ndash;85, PDU Set GTP-U container), SNPN (44-bit NID, allowed-NID gating, onboarding), MINT disaster roaming, and UAV Service-level-AA (TS 23.256, IEI 0x72). 6G/Rel-20 items (ISAC, FL, PQC, semantic comms) are research prototypes informed by TR 22.870 use cases only — no frozen Rel-20 3GPP stage-3 specs exist.</p>
       </div>
     </div>
   </div>
@@ -94,7 +94,7 @@
 <section id="ai-native">
   <div class="container">
     <h2 class="section-title">AI-Native Network Functions</h2>
-    <p class="section-subtitle">Six specialized NFs that bring intelligence, analytics, and autonomy to the core network.</p>
+    <p class="section-subtitle">Seven specialized NFs that bring intelligence, analytics, and autonomy to the core network.</p>
 
     <!-- NWDAF Deep Dive -->
     <div class="ai-feature-block">
@@ -239,7 +239,7 @@
         </div>
         <div class="component-card">
           <div class="component-header"><span class="component-name">MBSMF</span><span class="component-badge badge-6g">Multicast</span></div>
-          <div class="component-desc">TMGI-based group sessions. Multicast and broadcast modes. N4mb PFCP protocol with UPF for DL forwarding. Group membership tracking with dynamic join/leave. Session states: Created → Active → Suspended.</div>
+          <div class="component-desc">TMGI-based group sessions. Multicast and broadcast modes. N4mb PFCP protocol with UPF for DL forwarding. Group membership tracking with dynamic join/leave. Session states: Created → Active → Suspended. TS 29.532 ContextUpdate with multipart/related N2 (NGAP) containers.</div>
         </div>
         <div class="component-card">
           <div class="component-header"><span class="component-name">NSACF</span><span class="component-badge badge-6g">Slicing</span></div>
@@ -432,13 +432,14 @@
 
     <!-- Location Service Flow -->
     <h3 class="group-heading">8. UE Positioning via LMF (TS 23.273)</h3>
-    <p class="wf-desc">Multi-method positioning with NRPPa measurement collection, coordinate calculation, and QoS-based accuracy.</p>
+    <p class="wf-desc">Multi-method positioning: LMF drives LPP (UE) and NRPPa (gNB) sessions through the AMF over N1N2 (TS 29.518), then computes the position from returned measurements with QoS-based accuracy.</p>
     <div class="workflow-diagram">
       <div class="workflow-step"><span class="wf-actor">App / AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /nlmf-location/v1/determine-location (SUPI, QoS=HIGH_ACCURACY, methods=[DL-TDOA, Multi-RTT])</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">LMF</span></div>
-      <div class="workflow-step"><span class="wf-actor">LMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /nlmf-location/v1/measurements (methods, cells=[0x10, 0x11, 0x12], measurement_period=500ms)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNBs</span></div>
-      <div class="workflow-step"><span class="wf-actor">gNBs</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NRPPa reports: RSRP=-85dBm, timing_advance=12.3μs, AoA=45.2°, RTT=234ns per cell</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">LMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">LMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Namf_Communication_N1N2MessageTransfer (LPP RequestLocationInformation in n1MessageContainer, NRPPa MeasurementRequest in n2InfoContainer)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP: DownlinkUEAssociatedNRPPaTransport to gNB + DL NAS Transport (LPP) to UE</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB / UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB / UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Uplink NRPPa MeasurementResponse + LPP ProvideLocationInformation (RSRP, timing advance, AoA, RTT) returned via AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">LMF</span></div>
       <div class="workflow-step"><span class="wf-actor">LMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Multi-RTT trilateration from 3 cells → lat: 41.0082, lon: 28.9784, alt: 35m, accuracy: ±2.5m</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Position</span></div>
-      <div class="workflow-step"><span class="wf-actor">LMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PUT /nlmf-location/v1/ue-locations/{supi} → store result + return to requesting entity</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">App / AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">LMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Store result + return location estimate to the requesting entity</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">App / AMF</span></div>
     </div>
 
     <!-- MBS Flow -->
@@ -453,6 +454,30 @@
       <div class="workflow-step"><span class="wf-actor">MBSMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">N4mb: PFCP Session Establish (multicast PDR, FAR with DL-TEID for each gNB, mcast group IP)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UPF</span></div>
       <div class="workflow-step"><span class="wf-actor">UPF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Multicast forwarding active: DL data → replicated to all member gNBs via GTP-U tunnels</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNBs → UEs</span></div>
     </div>
+
+    <!-- URSP Delivery Flow -->
+    <h3 class="group-heading">10. UE Policy (URSP) Delivery (TS 29.525 / TS 24.501 Annex D)</h3>
+    <p class="wf-desc">PCF provisions URSP rules to the UE through a UE Policy Association, delivered as UPDP MANAGE UE POLICY messages carried over N1N2.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Npcf_UEPolicyControl: UE Policy Association Create (SUPI, PEI, access type, PC5 capability)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">PCF</span></div>
+      <div class="workflow-step"><span class="wf-actor">PCF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Build URSP rules: traffic descriptors (DNN, FQDN, app ID) → route selection descriptors (S-NSSAI, DNN, SSC mode, precedence)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE Policy Sections</span></div>
+      <div class="workflow-step"><span class="wf-actor">PCF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Namf_Communication_N1N2MessageTransfer (multipart: UPDP MANAGE UE POLICY COMMAND in N1 container)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS DL Transport (payload container type: UE policy) → UE stores URSP rules</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">UPDP MANAGE UE POLICY COMPLETE (uplink NAS transport) → AMF notifies PCF</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF → PCF</span></div>
+      <div class="workflow-step"><span class="wf-actor">PCF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Delivery state updated on the policy association; per-section failures recorded for retry</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Association</span></div>
+    </div>
+
+    <!-- SoR/UPU Flow -->
+    <h3 class="group-heading">11. Steering of Roaming &amp; UE Parameter Update (TS 33.501 §6.14/6.15)</h3>
+    <p class="wf-desc">UDM delivers SoR steering lists and UE parameter updates integrity-protected by AUSF; delivery is fail-closed — no MAC, no delivery.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UDM</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Resolve SoR steering list (preferred PLMN/access-tech combinations) or UPU payload for the UE</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Payload</span></div>
+      <div class="workflow-step"><span class="wf-actor">UDM</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /nausf-sorprotection/v1/{supi}/ue-sor (or /nausf-upuprotection/v1/{supi}/ue-upu)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AUSF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AUSF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Compute SoR-MAC-I_AUSF / UPU-MAC-I_AUSF from K_AUSF + counter (fail-closed: protection failure aborts delivery)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UDM</span></div>
+      <div class="workflow-step"><span class="wf-actor">UDM</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">SoR/UPU transparent container (payload + MAC + counter) via Nudm_SDM / registration path</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF → UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Verifies MAC, applies steering/parameters, returns acknowledgement (SoR-MAC-I_UE / UPU-MAC-I_UE)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UDM</span></div>
+      <div class="workflow-step"><span class="wf-actor">UDM</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Verifies SoR-XMAC-I_UE / UPU-XMAC-I_UE — steering or parameter update confirmed</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Done</span></div>
+    </div>
   </div>
 </section>
 
@@ -460,7 +485,7 @@
 <section id="components">
   <div class="container">
     <h2 class="section-title">Components</h2>
-    <p class="section-subtitle">24 Network Functions and 18 shared libraries.</p>
+    <p class="section-subtitle">24 Network Functions and 17 shared libraries.</p>
 
     <h3 class="group-heading">Core 5G Network Functions</h3>
     <div class="components-grid">
@@ -478,15 +503,15 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">NRF</span><span class="component-badge badge-core">Core</span></div>
-        <div class="component-desc">NF Repository — Service discovery, profiles, OAuth2 JWT with RS256/ES256 JWS signing, health monitoring. All 7 Rel-17 NFs (NWDAF, EES, LMF, MBSMF, NSACF, PIN, DCCF) register with NRF.</div>
+        <div class="component-desc">NF Repository — Service discovery, profiles, OAuth2 JWT with RS256/ES256 JWS signing, health monitoring. All 7 Rel-17 NFs (NWDAF, EES, LMF, MBSMF, NSACF, PIN, DCCF) register with NRF. Verifies Client Credentials Assertions (CCA-JWS, ES256) per TS 33.501 §13.3.8.3.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">AUSF</span><span class="component-badge badge-core">Core</span></div>
-        <div class="component-desc">Authentication — 5G-AKA, EAP-AKA', SUPI/SUCI resolution, key derivation.</div>
+        <div class="component-desc">Authentication — 5G-AKA, EAP-AKA', SUPI/SUCI resolution, key derivation. SoR/UPU protection services (Nausf_SoRProtection / Nausf_UPUProtection, TS 33.501 §6.14/6.15).</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">UDM</span><span class="component-badge badge-core">Core</span></div>
-        <div class="component-desc">Data Management — Subscriber data, auth credentials, subscription management.</div>
+        <div class="component-desc">Data Management — Subscriber data, auth credentials, subscription management. Steering of Roaming (SoR) and UE Parameter Update (UPU) delivery, fail-closed via the AUSF protection services.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">UDR</span><span class="component-badge badge-core">Core</span></div>
@@ -494,7 +519,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">PCF</span><span class="component-badge badge-core">Core</span></div>
-        <div class="component-desc">Policy Control — SM/AM policy decisions, QoS/charging rules, slice policies.</div>
+        <div class="component-desc">Policy Control — SM/AM policy decisions, QoS/charging rules, slice policies. UE Policy (URSP) provisioning via Npcf_UEPolicyControl (TS 29.525), delivered as UPDP MANAGE UE POLICY over N1N2.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">NSSF</span><span class="component-badge badge-core">Core</span></div>
@@ -522,7 +547,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">MBSMF</span><span class="component-badge badge-6g">Multicast</span></div>
-        <div class="component-desc">TMGI group sessions, multicast/broadcast modes, N4mb PFCP with UPF, dynamic member join/leave.</div>
+        <div class="component-desc">TMGI group sessions, multicast/broadcast modes, N4mb PFCP with UPF, dynamic member join/leave. TS 29.532 ContextUpdate with multipart/related N2 (NGAP) containers.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">NSACF</span><span class="component-badge badge-6g">Slicing</span></div>
@@ -533,8 +558,8 @@
         <div class="component-desc">Personal IoT Networks: device group management, PEGC gateways, capability discovery, relay path management.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">NWDAF-D</span><span class="component-badge badge-6g">AI</span></div>
-        <div class="component-desc">NWDAF Data Collector — NRF-registered Rel-17 analytics data ingestion plane. Collects UE measurements, NF load metrics, and cell telemetry; feeds the NWDAF analytics engine via internal event bus.</div>
+        <div class="component-header"><span class="component-name">NWDAF-D (module)</span><span class="component-badge badge-6g">AI</span></div>
+        <div class="component-desc">NWDAF Data Collector — the data-collection module inside the nextgcore-nwdafd binary (not a separate NF). Collects UE measurements, NF load metrics, and cell telemetry; feeds the NWDAF analytics engine via internal event bus.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">DCCF</span><span class="component-badge badge-6g">Analytics</span></div>
@@ -582,7 +607,7 @@
       </div>
     </div>
 
-    <h3 class="group-heading">Shared Libraries (18)</h3>
+    <h3 class="group-heading">Shared Libraries (17)</h3>
     <div class="components-grid">
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-sbi</span><span class="component-badge badge-lib">Lib</span></div>
@@ -631,6 +656,26 @@
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-sctp</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">SCTP transport for NGAP/S1AP signaling.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-asn1c</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">ASN.1 PER codecs — NGAP (TS 38.413), S1AP (TS 36.413), XnAP, F1AP, E1AP (APER), plus NRPPa (TS 38.455) and LPP (TS 37.355, UPER) including A-GNSS assistance data.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-ipfw</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">IP firewall rule parsing and encoding for 3GPP flow descriptions — SDF filter matching used by GTP and PFCP.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-proto</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">Shared 3GPP protocol types, events, and timers — plus non-normative 6G research prototypes (NTN constellation planning, ambient IoT, ISAC, sub-THz types; not wired into live NF paths).</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-s1ap</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">S1AP message building/parsing for eNodeB–MME (TS 36.413), APER-encoded via nextgcore-asn1c.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-tun</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">TUN/TAP device management (Linux, macOS utun) for the UPF/SGW-U user plane.</div>
       </div>
     </div>
   </div>

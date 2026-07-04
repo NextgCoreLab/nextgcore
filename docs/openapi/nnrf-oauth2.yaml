@@ -1,0 +1,100 @@
+# NextGCore NRF OAuth2 Access Token Service OpenAPI Specification
+# Honest stub reflecting the implemented surface (bins/nextgcore-nrfd)
+# Based on 3GPP TS 29.510 v18 §5.4.2 / RFC 6749
+
+openapi: 3.0.3
+info:
+  title: NRF OAuth2 Access Token Service
+  version: 1.0.0
+  description: NRF OAuth2 token endpoint (POST /oauth2/token) per 3GPP TS 29.510 — client_credentials grant issuing ES256/RS256-signed JWS Bearer tokens; supports Client Credentials Assertion (CCA-JWS, ES256) verification per TS 33.501 §13.3.8.3
+
+servers:
+  - url: "{nrfApiRoot}"
+    variables:
+      nrfApiRoot:
+        default: http://localhost:7777
+
+paths:
+  /oauth2/token:
+    post:
+      summary: Request an SBI access token (client_credentials grant)
+      operationId: AccessTokenRequest
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: "#/components/schemas/AccessTokenReq"
+      responses:
+        "200":
+          description: Access token issued (JWS-signed claims per TS 29.510 AccessTokenClaims)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessTokenRsp"
+        "400":
+          description: Token error (invalid_request, unsupported_grant_type, invalid_client, invalid_scope)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessTokenErr"
+
+components:
+  schemas:
+    AccessTokenReq:
+      type: object
+      required:
+        - grant_type
+        - nfInstanceId
+        - scope
+      properties:
+        grant_type:
+          type: string
+          enum:
+            - client_credentials
+        nfInstanceId:
+          type: string
+          format: uuid
+        nfType:
+          type: string
+        targetNfType:
+          type: string
+        scope:
+          type: string
+          description: Space-separated requested service names (e.g. "nudm-sdm")
+        targetNfInstanceId:
+          type: string
+          format: uuid
+
+    AccessTokenRsp:
+      type: object
+      required:
+        - access_token
+        - token_type
+      properties:
+        access_token:
+          type: string
+          description: JWS-signed access token (ES256 or RS256)
+        token_type:
+          type: string
+          enum:
+            - Bearer
+        expires_in:
+          type: integer
+        scope:
+          type: string
+
+    AccessTokenErr:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - invalid_client
+            - invalid_scope
+            - unsupported_grant_type
+        error_description:
+          type: string

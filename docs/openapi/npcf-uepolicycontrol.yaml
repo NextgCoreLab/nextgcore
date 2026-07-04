@@ -1,0 +1,173 @@
+# NextGCore PCF UE Policy Control Service OpenAPI Specification
+# Honest stub reflecting the implemented surface (bins/nextgcore-pcfd)
+# Based on 3GPP TS 29.525 v18
+
+openapi: 3.0.3
+info:
+  title: PCF UE Policy Control Service
+  version: 1.0.0
+  description: PCF UE Policy Association service (npcf-ue-policy-control) per 3GPP TS 29.525 — URSP rules are delivered to the UE as UPDP MANAGE UE POLICY over Namf_Communication N1N2MessageTransfer
+
+servers:
+  - url: "{apiRoot}/npcf-ue-policy-control/v1"
+    variables:
+      apiRoot:
+        default: http://localhost:7777
+
+paths:
+  /policies:
+    post:
+      summary: Create a UE Policy Association
+      operationId: CreateUEPolicyAssociation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PolicyAssociationRequest"
+      responses:
+        "201":
+          description: UE Policy Association created; URSP delivery is triggered via N1N2
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyAssociation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /policies/{polAssoId}:
+    get:
+      summary: Read a UE Policy Association
+      operationId: ReadUEPolicyAssociation
+      parameters:
+        - $ref: "#/components/parameters/PolAssoId"
+      responses:
+        "200":
+          description: UE Policy Association
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyAssociation"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    delete:
+      summary: Delete a UE Policy Association
+      operationId: DeleteUEPolicyAssociation
+      parameters:
+        - $ref: "#/components/parameters/PolAssoId"
+      responses:
+        "204":
+          description: Association deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /notify/{polAssoId}/n1-message-notify:
+    post:
+      summary: N1 message notification (UPDP MANAGE UE POLICY COMPLETE/COMMAND REJECT from the UE via AMF)
+      operationId: N1MessageNotify
+      parameters:
+        - $ref: "#/components/parameters/PolAssoId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/N1MessageNotification"
+      responses:
+        "204":
+          description: Notification accepted; URSP delivery state updated
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  parameters:
+    PolAssoId:
+      name: polAssoId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    PolicyAssociationRequest:
+      type: object
+      required:
+        - supi
+        - notificationUri
+      properties:
+        supi:
+          type: string
+        gpsi:
+          type: string
+        pei:
+          type: string
+        accessType:
+          type: string
+          enum:
+            - 3GPP_ACCESS
+            - NON_3GPP_ACCESS
+        notificationUri:
+          type: string
+        suppFeat:
+          type: string
+
+    PolicyAssociation:
+      type: object
+      properties:
+        polAssoId:
+          type: string
+        supi:
+          type: string
+        uePolicy:
+          type: string
+          description: Base64 UE policy sections (URSP rules per TS 24.501 Annex D)
+        n1MessageDeliveryStatus:
+          type: string
+          enum:
+            - PENDING
+            - DELIVERED
+            - FAILED
+
+    N1MessageNotification:
+      type: object
+      properties:
+        n1MessageContainer:
+          type: object
+          description: UPDP payload (MANAGE UE POLICY COMPLETE or COMMAND REJECT)
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"

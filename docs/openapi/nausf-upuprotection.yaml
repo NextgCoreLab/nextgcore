@@ -1,0 +1,134 @@
+# NextGCore AUSF UE Parameter Update Protection Service OpenAPI Specification
+# Honest stub reflecting the implemented surface (bins/nextgcore-ausfd)
+# Based on 3GPP TS 29.509 v18 / TS 33.501 §6.15
+
+openapi: 3.0.3
+info:
+  title: AUSF UPU Protection Service
+  version: 1.0.0
+  description: AUSF UE Parameter Update protection (nausf-upuprotection) per 3GPP TS 29.509 — computes UPU-MAC-I_AUSF from K_AUSF so the UDM can deliver integrity-protected parameter updates (TS 33.501 §6.15, fail-closed)
+
+servers:
+  - url: "{apiRoot}/nausf-upuprotection/v1"
+    variables:
+      apiRoot:
+        default: http://localhost:7777
+
+paths:
+  /{supi}/ue-upu:
+    post:
+      summary: Compute UPU protection material for a UE parameter update
+      operationId: UpuProtection
+      parameters:
+        - $ref: "#/components/parameters/Supi"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpuInfo"
+      responses:
+        "200":
+          description: UPU security material (UPU-MAC-I_AUSF, CounterUPU, optional UPU-XMAC-I_UE)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpuSecurityInfo"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  parameters:
+    Supi:
+      name: supi
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    UpuInfo:
+      type: object
+      required:
+        - upuDataList
+        - upuAckInd
+      properties:
+        upuDataList:
+          type: array
+          items:
+            $ref: "#/components/schemas/UpuData"
+        upuAckInd:
+          type: boolean
+          description: Whether UE acknowledgement (UPU-MAC-I_UE) is requested
+
+    UpuData:
+      type: object
+      properties:
+        secPacket:
+          type: string
+          description: Base64 secured packet (e.g. SIM OTA)
+        defaultConfNssai:
+          type: array
+          items:
+            $ref: "#/components/schemas/Snssai"
+        routingId:
+          type: string
+
+    UpuSecurityInfo:
+      type: object
+      required:
+        - upuMacIausf
+        - counterUpu
+      properties:
+        upuMacIausf:
+          type: string
+          pattern: '^[A-Fa-f0-9]{32}$'
+        counterUpu:
+          type: string
+          pattern: '^[A-Fa-f0-9]{4}$'
+        upuXmacIue:
+          type: string
+          pattern: '^[A-Fa-f0-9]{32}$'
+          description: Expected UE acknowledgement MAC, returned when upuAckInd is true
+
+    Snssai:
+      type: object
+      required:
+        - sst
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: '^[0-9A-F]{6}$'
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    NotFound:
+      description: Not found (no K_AUSF for this SUPI)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
