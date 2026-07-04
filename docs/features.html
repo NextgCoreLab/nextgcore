@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NextGCore — Supported-Features Matrix</title>
+  <meta name="description" content="Per-component supported-features matrix generated from the live code: served services, procedures, 3GPP spec references, and implementation status.">
+  <link rel="stylesheet" href="css/style.css">
+
+<style>
+.fm-table{width:100%;border-collapse:collapse;margin:0.75rem 0 2rem;font-size:0.85rem;}
+.fm-table th,.fm-table td{border:1px solid var(--border,#2a2f3a);padding:0.45rem 0.6rem;text-align:left;vertical-align:top;}
+.fm-table th{background:rgba(127,127,127,0.12);white-space:nowrap;}
+.fm-table td:nth-child(3){white-space:nowrap;}
+.fm-status{display:inline-block;padding:0.1rem 0.5rem;border-radius:999px;font-size:0.75rem;font-weight:600;white-space:nowrap;}
+.fm-implemented{background:rgba(46,160,67,0.18);color:#3fb950;}
+.fm-partial{background:rgba(210,153,34,0.18);color:#d29922;}
+.fm-prototype{background:rgba(163,113,247,0.18);color:#a371f7;}
+.fm-notes{color:var(--text-secondary,#8b949e);font-size:0.8rem;margin:-1.5rem 0 2rem;}
+.fm-wrap{overflow-x:auto;}
+</style>
+
+</head>
+<body>
+<nav class="nav">
+  <a href="index.html" class="nav-logo">Next<span>GCore</span></a>
+  <ul class="nav-links">
+    <li><a href="index.html#features">Features</a></li>
+    <li><a href="features.html">Feature Matrix</a></li>
+    <li><a href="index.html#components">Components</a></li>
+    <li><a href="api.html">API Docs</a></li>
+    <li><a href="https://github.com/NextgCoreLab/nextgcore" class="btn btn-secondary" style="padding:0.4rem 1rem;font-size:0.8rem;">GitHub</a></li>
+  </ul>
+  <button class="mobile-menu-btn">&#9776;</button>
+</nav>
+<section>
+  <div class="container">
+    <h2 class="section-title">Supported-Features Matrix</h2>
+    <p class="section-subtitle">What each Network Function actually serves — extracted from the live router/handler code (services, procedures, 3GPP references).</p>
+    <p class="section-subtitle"><strong>Status legend:</strong> <span class="fm-status fm-implemented">implemented</span> wired &amp; handled &middot; <span class="fm-status fm-partial">partial</span> some operations stubbed or gated &middot; <span class="fm-status fm-prototype">prototype</span> non-normative / off-wire research code. Validated against the matched NextGCore/NextGSim pair, not third-party certified. See the <a href="https://github.com/NextgCoreLab/nextgcore/blob/main/CHANGELOG.md">CHANGELOG</a> for version history.</p>
+<h2 class="section-title" style="font-size:1.4rem;margin-top:2.5rem;">Core 5G Network Functions</h2>
+<h3 class="group-heading">AMF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Namf_Communication (namf-comm)</td><td>N1N2MessageTransfer, N1N2 subscriptions, UEContextTransfer, RegistrationStatusUpdate</td><td>TS 29.518</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Namf_EventExposure (namf-evts)</td><td>Event subscription create/modify/delete</td><td>TS 29.518</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Namf_MT (namf-mt)</td><td>EnableUeReachability, MT UE-context info GET</td><td>TS 29.518</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Namf_Location (namf-loc)</td><td>ProvidePositioningInfo (LMF relay)</td><td>TS 29.518 / TS 23.273</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>UDM dereg callback (namf-callback)</td><td>DeregistrationNotification from UDM</td><td>TS 29.503 §5.3.2.3.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NGAP / N2 server</td><td>NGSetup, InitialUEMessage, UL NAS, UEContextRelease, InitialContextSetup, NGReset, ErrorIndication</td><td>TS 38.413</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N2/Xn handover</td><td>HandoverRequired/Ack/Notify/Cancel, PathSwitchRequest</td><td>TS 23.502 §4.9 / TS 38.413</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>5GMM NAS handling</td><td>Registration, ServiceRequest, Deregistration, Auth/Identity/SecurityModeComplete, UL NAS transport</td><td>TS 24.501</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRPPa/LPP positioning relay</td><td>DL UE-/non-UE-associated NRPPa transport, LPP DL NAS transport</td><td>TS 38.455 / TS 37.355 / TS 23.273</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NGAP MBS multicast sessions</td><td>Multicast session create/manage (custom PER builders, unwired to dispatch)</td><td>TS 38.413 §9.2.9 / TS 23.247</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>UAV tracking (Rel-18)</td><td>UAV tracking report handling</td><td>TS 23.256</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>SBI consumer side</td><td>NRF register/discover, AUSF auth, UDM UECM/SDM, SMF PDU session, PCF AM/UE policy, NSACF admission</td><td>TS 29.510/29.509/29.503/29.502/29.507/29.525/29.536</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">SCTP transports: userspace sctp-proto/UDP default plus kernel-SCTP feature (port 38412); mcast MBS module has no call sites outside its own file.</p>
+<h3 class="group-heading">SMF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nsmf_PDUSession sm-contexts (N11)</td><td>SM context create/update/release/retrieve; N1/N2 multipart, PCF policy, PFCP orchestration</td><td>TS 29.502</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nsmf_PDUSession pdu-sessions (HO/roaming)</td><td>pdu-sessions create/modify/release; create returns hardcoded ref, minimal logic</td><td>TS 29.502</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Nsmf_EventExposure</td><td>Subscribe/unsubscribe; issues subscription IDs only, no event delivery</td><td>TS 29.508 (nsmf-event-exposure)</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>SBI callbacks (nsmf-callback)</td><td>PCF SM-policy update/terminate notify, N1N2 transfer failure, AMF status change</td><td>TS 29.512 / TS 29.518</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N4 PFCP toward UPF</td><td>Association setup/release, heartbeat, session est/mod/del, session report (usage reports); UDP 8805 server</td><td>TS 29.244</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF registration + OAuth2 enforcement</td><td>NF register w/ load reporting, token validation on inbound SBI</td><td>TS 29.510, TS 33.501 s13.4.1</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NSACF slice admission (Nnsacf_NSAC)</td><td>Per-S-NSSAI PDU session admission at SM context create</td><td>TS 29.536</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Gn/Gp GTPv1-C GGSN interworking</td><td>Create/Update/Delete PDP Context, echo; handler module present, no bound GTP-C socket</td><td>TS 29.060, TS 23.401 Annex E</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>GTPv2-C (S5/S8/N26 interworking)</td><td>gtp_handler/gtp_build message parse+build via state machine, no wire listener</td><td>TS 29.274</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>MBS session management</td><td>Multicast session context, UE join/leave; MBSF/MBSTF/N4mb interface stubs</td><td>TS 23.247 (Rel-17)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>Rel-17/18 QoS features</td><td>RedCap AMBR reduction, XR 5QI upgrade and QoS-flow binding in session create</td><td>TS 23.501 s5.7</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">GTPv1/v2 handlers exist but main.rs binds only SBI HTTP/2 + PFCP UDP sockets; no GTP-C listener wired</p>
+<h3 class="group-heading">UPF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>N4 PFCP node procedures</td><td>Association setup/release, heartbeat req/rsp, recovery/restoration state machine</td><td>TS 29.244 / TS 23.527</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N4 PFCP session procedures</td><td>Session establishment/modification/deletion, session report response; PDR/FAR/QER/URR/BAR handling</td><td>TS 29.244</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N4 usage reporting</td><td>URR accounting snapshots, UR-SEQN, usage reports, error-indication reports (session report req)</td><td>TS 29.244 7.5.8 / TS 23.527</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N3/N9 GTP-U data plane</td><td>G-PDU encap/decap, echo req/rsp, error indication, end marker (SNDEM), PDU session container QFI</td><td>TS 29.281 / TS 38.415</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>QoS enforcement &amp; DL buffering</td><td>QER rate gating, QFI-&gt;DSCP marking incl XR 5QIs 82-85, BAR buffering, anti-spoofing</td><td>TS 29.244 5.4.1 / TS 23.501 5.7.4</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF registration (opt-in SBI client)</td><td>NFRegister PUT nf-instances, heartbeat PATCH /load; off by default, no SBI server</td><td>TS 29.510</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>ARP/ND proxy</td><td>ARP reply, IPv6 neighbor advertisement for TAP devices (module unwired to data path)</td><td>(no spec cited; Open5GS port)</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>TSN bridge (Rel-17/18)</td><td>QFI-&gt;PCP mapping, bridge port mgmt; CNC/PSFP are stubs</td><td>TS 23.501 5.28</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>MBS multicast forwarding (N4mb)</td><td>Mcast session activate/deactivate, 1-to-many GTP-U fan-out; not wired into dispatch</td><td>TS 23.247</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>Programmable plane / energy-aware 6G</td><td>P4/eBPF-style match-action tables, energy-aware forwarding, ISAC mirror; unwired</td><td>non-normative (item #193)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+</table></div>
+<p class="fm-notes">UPF serves no SBI server; only surfaces are PFCP (N4), GTP-U (N3/N9), and an opt-in NRF client. All files under nextgcore/src/bins/nextgcore-upfd/src.</p>
+<h3 class="group-heading">NRF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>nnrf-nfm (NF Management)</td><td>NFRegister/NFUpdate (PUT/PATCH), NFProfileRetrieve, NFListRetrieve, NFDeregister</td><td>TS 29.510</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>nnrf-nfm subscriptions</td><td>Subscribe (POST), Unsubscribe (DELETE), subscription update (PATCH)</td><td>TS 29.510</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>nnrf-nfm status notifications</td><td>NF_STATUS notify + NF_PROFILE_CHANGED (RFC 6902 profileChanges) to matching subscribers</td><td>TS 29.510 §5.2.2.6</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>nnrf-disc (NF Discovery)</td><td>SearchNFInstances GET with target/requester-nf-type, S-NSSAI/PLMN/service filtering, paging</td><td>TS 29.510 §6.2.3.2.3.1</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>nnrf-oauth2 (Access Token)</td><td>AccessTokenRequest POST, JWKS GET (ES256 key publish), server-side scope enforcement on nfm/disc</td><td>TS 29.510 / TS 33.501 §13.4.1</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NF heartbeat / liveness</td><td>Heartbeat negotiation, no-heartbeat timer, SUSPEND/reactivate of NF instances</td><td>TS 29.510 Table 6.1.6.2.2-1</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NFUpdate patch engine</td><td>RFC 6902 JSON Patch (incl. test/move) + RFC 7396 merge-patch on NFProfile</td><td>TS 29.510 §5.2.2.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">HTTP SBI only — no NGAP/PFCP/GTP/Diameter servers in nrfd; dispatch at nextgcore/src/bins/nextgcore-nrfd/src/main.rs ~754-824</p>
+<h3 class="group-heading">AUSF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nausf_UEAuthentication (5G-AKA)</td><td>POST ue-authentications (authenticate, SNN validation, UDM auth-vector fetch), 403 on unauthorized SNN</td><td>TS 29.509 / TS 33.501</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nausf_UEAuthentication 5G-AKA confirmation</td><td>PUT 5g-aka-confirmation: constant-time RES* vs XRES* compare, KSEAF, result confirmation to UDM</td><td>TS 29.509 §6.1.6.2 / TS 33.501 §6.1.3.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nausf_UEAuthentication EAP-AKA&#x27;</td><td>POST eap-session: EAP-Request/AKA&#x27;-Challenge, CK&#x27;/IK&#x27; + KAUSF derivation</td><td>TS 33.501 §6.1.3.1 / Annex F</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nausf_UEAuthentication context delete</td><td>DELETE ue-authentications/{ctxId} (authenticate_delete, UDM auth-removal indication)</td><td>TS 29.509</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nausf_SoRProtection</td><td>POST /nausf-sorprotection/v1/{supi}/ue-sor: SoR-MAC-I_AUSF, counterSoR, KAUSF anchor checks</td><td>TS 29.509 / TS 33.501 §6.14.1</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nausf_UPUProtection</td><td>POST /nausf-upuprotection/v1/{supi}/ue-upu: UPU-MAC-I_AUSF (Annex A.19), UPU data-set encoding, counter wrap error</td><td>TS 29.509 / TS 33.501 §14.1.4 / TS 24.501 §9.11.3.53A</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nudm_UEAuthentication client (consumer)</td><td>nudm-ueau GET auth data, result-confirmation-inform, auth-removal-ind</td><td>TS 29.503 (nudm-ueau)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF registration + OAuth2</td><td>NF register with NRF; optional Bearer token attach/require (default off)</td><td>TS 29.510 §5.4.2 / TS 33.501 §13.4.1</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+</table></div>
+<p class="fm-notes">Route dispatch in app.rs match(service,resource,method); ausfd serves only SBI (no NGAP/PFCP/GTP/Diameter servers).</p>
+<h3 class="group-heading">UDM</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nudm_UECM (nudm-uecm)</td><td>AMF 3GPP/non-3GPP registration PUT/PATCH/DELETE; SMF registration/deregistration</td><td>TS 29.503 §5.3</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Nudm_SDM (nudm-sdm)</td><td>GET am-data/sm-data/smf-select-data/nssai; sdm-subscriptions POST/DELETE; sor-ack/upu-ack PUT</td><td>TS 29.503</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Nudm_UEAU (nudm-ueau)</td><td>generate-auth-data (auth vector), auth-events confirmation POST</td><td>TS 29.503</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nudm_EE (nudm-ee)</td><td>ee-subscriptions POST/PATCH/DELETE event exposure</td><td>TS 29.503 §5.5/6.4</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Steering of Roaming (SoR)</td><td>SorInfo build via Nausf_SoRProtection, XMAC-I verify on sor-ack, fail-closed</td><td>TS 33.501 §6.14.2.1; TS 29.509</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>UE Parameters Update (UPU)</td><td>UpuInfo via Nausf_UPUProtection at registration; post-registration notification UPU not built</td><td>TS 33.501 §6.15.2.1; TS 29.509</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Nudr client (outbound)</td><td>Subscription/auth data fetch from UDR (nudr_handler)</td><td>TS 29.504/29.505 (per code, Nudr DR)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF registration (outbound)</td><td>NF profile with nudm-sdm/uecm/ueau service entries; OAuth2 scope checks on inbound</td><td>TS 29.510 (implied)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">Explicit 501 stubs: ue-context-in-smf-data GET, id-translation-result GET, sdm-subscriptions PATCH (udmd-12); dispatch in app.rs:524-635</p>
+<h3 class="group-heading">UDR</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nudr_DR subscription-data auth</td><td>GET/PATCH authentication-subscription, PUT/DELETE authentication-status (AuthEvent)</td><td>TS 29.505</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nudr_DR subscription-data context</td><td>PUT/PATCH amf-3gpp-access registration, PUT/DELETE smf-registrations</td><td>TS 29.505</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nudr_DR provisioned-data</td><td>GET am-data / smf-selection / sm-data provisioned subscription data</td><td>TS 29.505</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nudr_DR subs-to-notify</td><td>CRUD data-change subscriptions, sends DataChangeNotify callbacks</td><td>TS 29.505</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nudr_DR policy-data</td><td>GET/PUT am-data, sm-data, ue-policy-set per SUPI</td><td>TS 29.519</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nudr_DR exposure-data</td><td>access-and-mobility-data, session-management-data, subs-to-notify + change notifications</td><td>TS 29.519</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nudr_DR application-data</td><td>pfds CRUD, influenceData PUT/PATCH/GET + subs-to-notify notifications</td><td>TS 29.519</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF NF management (client)</td><td>NF register/heartbeat, nf-status-notify handling, OAuth2 bearer/JWKS enforcement knob</td><td>TS 29.510</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Legacy C-port SM dispatch</td><td>udr_sm/nudr_handler mirror of routes; some error paths only log &#x27;Would send 4xx&#x27;</td><td>TS 29.504</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+</table></div>
+<p class="fm-notes">Live routing is the async dispatcher in main.rs (~3.9k lines), not sbi_path.rs; nudr-dr is the only served SBI service.</p>
+<h3 class="group-heading">PCF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Npcf_AMPolicyControl</td><td>policy create/get/update/delete (PolicyAssociation, suppFeat negotiation)</td><td>TS 29.507</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Npcf_SMPolicyControl</td><td>sm-policy create/get/update-notify/delete; PCC/QoS rule decisions from UDR data</td><td>TS 29.512</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Npcf_UEPolicyControl</td><td>policy create/get/update/delete + N1MessageNotify callback (MANAGE UE POLICY via AMF)</td><td>TS 29.525</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Npcf_PolicyAuthorization</td><td>app-session create/get/modify/delete; AF media-component to PCC rule mapping</td><td>TS 29.514</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF registration/discovery (client)</td><td>NF register, heartbeat, discovery of UDR/BSF/AMF; OAuth2 token attach</td><td>TS 29.510</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nudr_DataRepository (client)</td><td>GET SM PolicyData and UePolicySet from UDR (bounded, fallback to config)</td><td>TS 29.519</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nbsf_Management (client)</td><td>PcfBinding register/deregister at BSF</td><td>TS 29.521</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Namf_Communication (client)</td><td>N1N2MessageTransfer + N1N2MessageSubscribe for UE policy delivery</td><td>TS 29.518</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>UAV flight-policy gating</td><td>aerial-DNN SM-policy authorization gate (Rel-18)</td><td>TS 23.256</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Intent-based policy translation</td><td>high-level intent to QoS/energy policy; not wired into any route</td><td>none cited</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+</table></div>
+<h3 class="group-heading">NSSF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nnssf_NSSelection (v2)</td><td>GET network-slice-information: registration, PDU-session, UE-config-update slice selection; AMF/vNSSF and hNSSF variants; restricted-SNSSAI checks</td><td>TS 29.531</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nnssf_NSSAIAvailability (v1)</td><td>PUT/PATCH/DELETE per-AMF availability doc, OPTIONS discovery, subscription create/PATCH/DELETE + change notify</td><td>TS 29.531</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF client (registration/discovery)</td><td>NF register/heartbeat with NSI-load, NF discover, slice-availability query, OAuth2 bearer verify</td><td>TS 29.510 / TS 33.501</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NSACF interaction client</td><td>Slice admission check, quota cache, admit/release counters (6G Item #195, not route-wired)</td><td>TS 29.536</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+</table></div>
+<p class="fm-notes">All external routes in main.rs nssf_sbi_request_handler; sbi_path.rs is client plumbing only; no NGAP/PFCP/GTP/Diameter surfaces.</p>
+<h3 class="group-heading">BSF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nbsf_Management pcfBindings</td><td>Register/Get/Discover(query)/Update(JSON merge-patch)/Deregister PDU-session PCF bindings</td><td>TS 29.521</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nbsf_Management pcf-ue-bindings</td><td>Create/Get/Discover/Update/Delete PCF-for-UE bindings</td><td>TS 29.521 §4.2.2.3/4.2.4.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nbsf_Management pcf-mbs-bindings</td><td>Create/Get/Discover(mbs-session-id)/Update/Delete PCF-for-MBS bindings</td><td>TS 29.521 §4.2.2.4/4.2.4.4</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF registration client (Nnrf_NFManagement)</td><td>NF register (PUT nf-instances), deregister on close, load reporting</td><td>TS 29.510</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF discovery handling</td><td>NF-discover SearchResult processing, NFStatusNotify handling</td><td>TS 29.510</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+</table></div>
+<h3 class="group-heading">SCP</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>SBI proxy Model C (indirect, no delegated discovery)</td><td>3gpp-Sbi-Target-apiRoot routing, header stripping, Via/loop guard, error annotation</td><td>TS 29.500 §6.10</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>SBI proxy Model D (delegated discovery)</td><td>3gpp-Sbi-Discovery-* to nnrf-disc query, producer selection, Producer-Id return</td><td>TS 29.500 §6.10.3 / TS 29.510 §5.3.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Binding stickiness</td><td>3gpp-Sbi-Binding capture, Routing-Binding lookup, binding-set fallback</td><td>TS 29.500 §6.12, §5.2.3.2.5/6</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Hop/loop control</td><td>Max-Forward-Hops decrement, Via SCP-FQDN loop detection, 502 on exhaustion</td><td>TS 29.500 §5.2.3.2.14 / §6.10.10</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Delegated OAuth2 token attach</td><td>NRF client-credentials token fetch, Bearer retry on producer challenge</td><td>TS 33.501 §13 / TS 29.510 §6.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NF discovery cache + producer selection</td><td>SearchResult parse, priority/capacity/round-robin selection, per-factor cache TTL</td><td>TS 29.510 §6.2.3.2.3 / TS 29.500 §6.10.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nnrf_NFManagement consumer (ingress notify)</td><td>POST nf-status-notify accepted but handler is log-only stub</td><td>TS 29.510 (nnrf-nfm)</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Service-mesh router / circuit breaker</td><td>endpoint health, failure-threshold breaker, routing modes; module not wired into proxy path</td><td>none cited (non-normative)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+</table></div>
+<p class="fm-notes">SCP serves no resource-owning SBI API of its own; its surface is the TS 29.500 §6.10 forwarding data path (proxy.rs, ~3k lines) plus NRF client-side interactions.</p>
+<h3 class="group-heading">SEPP</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>N32-c handshake</td><td>exchange-capability, exchange-params (PRINS key material), negotiation-failure handling</td><td>TS 29.573 §6.1.5</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N32-f forwarding</td><td>POST /n32f-forward/v1/n32f-process: protected inter-PLMN SBI message relay</td><td>TS 29.573 §6.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N32-f error reporting</td><td>POST /n32c-handshake/v1/n32f-error: decode/verify failure reports</td><td>TS 29.573 §6.1.5.4</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>PRINS message protection</td><td>JWE/JWS protect-unprotect, N32-f key hierarchy, IPX modificationsBlock chain</td><td>TS 29.573 §6.3, TS 33.501 §13.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Consumer-facing SBI proxy</td><td>home-PLMN NF outbound roaming: target-apiroot peer selection, forward via N32-f, relay response</td><td>TS 29.573 (3gpp-sbi-target-apiroot)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N32 TLS/mTLS transport</td><td>mandatory mTLS N32-c listener, TLS security-scheme pass-through, exporter-secret keying</td><td>TS 33.501 §13.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>JOSE crypto (JWE/JWS)</td><td>A128/A256GCM dir-encryption, flattened JWS; RFC 7516 known-answer tested</td><td>RFC 7516/7515 (per TS 29.573)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Zero-trust policy engine</td><td>PLMN allowlist authz, anomaly counters, adaptive trust scoring; not wired into request path</td><td>TS 33.501 §13 (SA3 zero-trust study)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>PQC security negotiation</td><td>PQC KEM/sig negotiation, AI threat detection; not wired into handshake</td><td>TR 33.831, TR 33.875, NIST FIPS 203/204</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+</table></div>
+<p class="fm-notes">zero_trust.rs and pqc_security.rs are compiled but referenced only by their own tests (unwired)</p>
+<h2 class="section-title" style="font-size:1.4rem;margin-top:2.5rem;">AI, Analytics &amp; Advanced (Rel-17/18)</h2>
+<h3 class="group-heading">NWDAF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nnwdaf_AnalyticsInfo</td><td>GET /analytics with event-id + event-filter; 204 on unavailable data</td><td>TS 29.520 §4.3.2.2.2 / TS 23.288</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nnwdaf_EventsSubscription</td><td>Subscribe/Update/Get/Unsubscribe (POST/GET/PUT/DELETE subscriptions), partial-grant failEventReports</td><td>TS 29.520 §5.1.3.3 / TS 23.288</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>EventsSubscription Notify dispatcher</td><td>Periodic/threshold POST NnwdafEventsSubscriptionNotification to notificationURI with periodicity guard</td><td>TS 29.520 (TS29520_Nnwdaf_EventsSubscription.yaml)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nnwdaf_MLModelProvision</td><td>Subscribe/Update/Delete + NwdafMLModelProvNotif callbacks; mLFileAddr is placeholder (no real trained model)</td><td>TS 29.520 / TS 23.288 §6.12</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>NRF NFStatusNotify callback + data collection</td><td>POST /nnwdaf-nfstatus-notify/v1/notify; NF discovery/subscription-count load sampling via NRF</td><td>TS 29.510 §5.2.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF registration with NwdafInfo</td><td>NFProfile registration advertising 3 Nnwdaf services + nwdafInfo.eventIds; OAuth2 optional</td><td>TS 29.510 / TS 33.501 §13.4.1</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Analytics engine (internal)</td><td>NF load, UE mobility, QoS sustainability, slice load, abnormal behaviour via OLS linear regression (no ML)</td><td>TS 23.288 §6</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Federation / DCCF-MFAF integration</td><td>Cross-PLMN federated analytics + federated-learning aggregation stubs; not wired into route dispatch</td><td>TS 23.288 §6.1A (Rel-17)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+</table></div>
+<p class="fm-notes">Dispatch in main.rs ~L319-356; federation.rs FederationManager has no caller in main.rs (off-wire)</p>
+<h3 class="group-heading">DCCF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Ndccf_DataManagement</td><td>subscription create/get/delete; producer notify with fan-out to subscriber notifyUri</td><td>TS 29.574 §5.2</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Ndccf_ContextDocument</td><td>analytics context create/get/delete (ID-only, no context payload)</td><td>TS 29.574 §5.3</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>NRF registration (client)</td><td>NFRegister PUT nf-instances, load reporting via subscription count</td><td>TS 29.510 §5.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>SBI OAuth2 producer auth</td><td>opt-in Bearer token verification (401 reject), env/yaml gated, default off</td><td>TS 33.501 §13.4.1 / TS 29.510 §5.4.2</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Health check</td><td>GET /healthz liveness</td><td>n/a (non-3GPP)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">DCCF is Rel-17 optional NF per TS 23.288 §6.7; handlers store IDs/URIs only (no DataSpec/formatting logic), hence partial.</p>
+<h3 class="group-heading">EES</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Eees_EASRegistration</td><td>EAS register/list/get/update/modify/deregister (EDGE-3)</td><td>TS 29.558 §5.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_EASDiscovery</td><td>request-discovery + discovery subscriptions CRUD</td><td>TS 29.558</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_EECRegistration</td><td>EEC register/get/update/modify/deregister, expTime sweep (EDGE-1)</td><td>TS 24.558 §5.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_AppCtxtReloc</td><td>ACR determine/initiate/declare</td><td>TS 24.558 §6.5.5</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_EELManagedACR</td><td>request-eelacr (EEL-managed ACR)</td><td>TS 29.558 §8.8</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_ACRStatusUpdate</td><td>request-acrupdate</td><td>TS 29.558 §8.9</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_CommonEASAnnouncement</td><td>POST /declare CommonEASInfo</td><td>TS 29.558</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_AppClientInformation</td><td>AC info subscriptions create/get/update/modify/delete</td><td>TS 29.558 §8.4</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_ACRManagementEvent</td><td>ACR mgmt event subscriptions CRUD</td><td>TS 29.558 §5.8</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_EECContextReloc</td><td>eec-contexts push/pull</td><td>TS 29.558 §8.7.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_ACRParameterInformation</td><td>POST send-acrparamsinfo</td><td>TS 29.558</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eees_ACREvents</td><td>ACR event subscriptions create/update/modify/delete + callback notify</td><td>TS 24.558 §6.4</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Eecs_EESRegistration (client, EDGE-6)</td><td>EES self-registration to ECS + periodic refresh; skipped w/o --ecs-uri</td><td>TS 29.558 §9</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Notification delivery (SbiNotifier)</td><td>outbound callback POSTs, retry/backoff, Retry-After</td><td>TS 29.558 §6 / TS 29.122</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">All inbound ops OAuth2-gated per-scope; eees-session-with-qos (§5.6) and eees-tie (§5.15) intentionally NOT served (need NEF/PCF-AF plumbing); unknown paths 404.</p>
+<h3 class="group-heading">LMF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nlmf_Location DetermineLocation</td><td>POST determine-location; MT-LR via real Namf N1N2 transfer, LPP request/response</td><td>TS 29.572, TS 23.273</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nlmf_Location CancelLocation</td><td>POST cancel-location; cancels deferred periodic LDR sessions</td><td>TS 29.572 §6.1.4.3.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nlmf_Location LocationContextTransfer</td><td>POST location-context-transfer between LMFs</td><td>TS 29.572 §6.1.4.5.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nlmf_Location MeasureLocation</td><td>POST measure-location; always 403 LOCATION_MEASUREMENT_UNKNOWN (no standalone PRU data)</td><td>TS 29.572 §6.1.4.6</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Nlmf_Location UP positioning config</td><td>POST configure-up; create/delete up-subscriptions</td><td>TS 29.572 §6.1.4.7-6.1.4.9</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Namf N1/N2 notify callbacks</td><td>POST notify/n1 (LPP) and notify/n2 (NRPPa) uplink report correlation</td><td>TS 29.518 §5.2.2.4/§5.2.2.3.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Namf client (outbound)</td><td>NRF discovery, N1N2MessageSubscribe, multipart N1N2MessageTransfer</td><td>TS 29.518, 29.510, 29.500</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Deferred periodic LDR (5GC-MT-LR)</td><td>Periodic positioning ticks, EventNotifyDataExt POST to H-GMLC, auto-cancel on failure</td><td>TS 29.572, TS 23.273 §6.11.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Positioning solvers</td><td>ECID/TA, Multi-RTT, AoA, TDOA (TDOA not on runtime path); GAD encoding</td><td>TS 23.032, 38.213, 37.355</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Capabilities query</td><td>GET capabilities; lists supported positioning methods (non-spec resource)</td><td>TS 29.572 (bespoke resource)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Debug ingest routes</td><td>measurements, nrppa-/lpp-binary-reports, ue-locations; gated off by default (--debug-endpoints)</td><td>bespoke, non-spec</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>OAuth2 SBI protection</td><td>Token verification on inbound SBI (opt-in yaml knob)</td><td>TS 33.501 §13.4.1, 29.510 §5.4.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">All routes under apiName nlmf-loc in main.rs (~line 337-435); no NGAP/PFCP/GTP/Diameter servers in lmfd.</p>
+<h3 class="group-heading">MBSMF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nmbsmf_MBSSession (CRUD)</td><td>Create, List, Get, Update (PATCH redMbsServArea), Release of MBS sessions</td><td>TS 29.532 §5.3.2.2-3, TS 23.247</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nmbsmf_MBSSession ContextUpdate</td><td>Start/terminate MBS data reception; SMF path + AMF multipart N2 MBS SM container</td><td>TS 29.532 §5.3.2.5, TS 38.413</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>MBSSession StatusSubscribe</td><td>Subscribe/Update/Unsubscribe + StatusNotify POST callbacks (NEF/MBSF/AF-facing)</td><td>TS 29.532 §5.3.2.6-8</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>MBSSession ContextStatusSubscribe</td><td>Context status Subscribe/Unsubscribe + ContextStatusNotify (SMF-facing)</td><td>TS 29.532 §5.3.2.9-11</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nmbsmf_TMGI</td><td>TMGI Allocate (POST) and Deallocate (DELETE)</td><td>TS 29.532 §5.2.2.2-3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N4mb PFCP toward MB-UPF</td><td>PFCP association, session establishment/release, T1/N1 retransmission</td><td>TS 29.244, TS 23.247 §7.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF registration</td><td>NF register with load metric (active MBS sessions); optional OAuth2 token verify</td><td>TS 29.510, TS 33.501 §13.4.1</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Debug routes (non-spec)</td><td>Session activate + group members add/remove; gated on MBSMF_DEBUG_ROUTES env</td><td>TS 23.247 7.3 (off-spec alias)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+</table></div>
+<h3 class="group-heading">NSACF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nnsacf_NSAC UE admission</td><td>NumOfUEsUpdate POST /slices/ues; per-access ceilings; EAC subscription via eacNotificationUri</td><td>TS 29.536 §6.1.3.2 / TS 23.502 4.2.9</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nnsacf_NSAC PDU admission</td><td>NumOfPDUsUpdate POST /slices/pdus</td><td>TS 29.536 §6.1.3.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nnsacf_NSAC local configs</td><td>POST /slices/local-configs/update (SliceACConfigData provisioning)</td><td>TS 29.536 §6.1.3.4</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nnsacf_NSAC roaming quotas</td><td>POST /slices/roaming-quotas/query with S-NSSAI filter</td><td>TS 29.536 Table 6.1.3.1-1</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nnsacf_SliceEventExposure</td><td>POST/DELETE /subscriptions; async event notifications to eventNotifyUri</td><td>TS 29.536</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>EAC mode notifications</td><td>EacNotification eacModeList callbacks on threshold-driven EAC activate/deactivate</td><td>TS 29.536 §6.1.6.2.4 / TS 23.502 §4.2.9.5</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Slice quota admin API</td><td>POST/GET/DELETE /slice-quotas, GET /utilization (NextGCore extension, non-3GPP)</td><td>non-normative (NextGCore admin extension)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NRF registration/heartbeat</td><td>NFProfile register + heartbeat load-gauge PATCH; OAuth2 client option</td><td>TS 29.510 §5.2.2.3.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">SupportedFeatures advertises none of HNSAC/VHNSAC feature bits (TS 29.536 §6.1.8); all served routes have real handlers, no stubs found.</p>
+<h3 class="group-heading">PIN</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>PIN management (pinapp/v1/pins)</td><td>PIN create, list, get, delete; PEMC/heartbeat-timer params at create</td><td>TS 23.542</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>PIN element management</td><td>PINE register, discover, get, deregister (mandatory-IE checks per Table 8.4.2.3.2-1)</td><td>TS 23.542</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>PIN element heartbeat</td><td>Per-element keep-alive PUT .../heartbeat (liveness, §8.8)</td><td>TS 23.542</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>PEGC relay path (PIN-7)</td><td>PUT elements/{id}/relay sets relayPath; relay-authorization-failed errors</td><td>TS 23.542</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>SBI security/auth layer</td><td>OAuth2/consumer-header (3gpp-Sbi-Consumer-Info) caller verification, SUPI-vs-ueId check</td><td>TS 29.500 / TS 33.501</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">pind is deliberately application-layer only (no NRF registration; no PIN NfType in TS 29.510) — all routes use bespoke /pinapp/v1 binding for PIN-6/7/8, hence &quot;prototype&quot; (non-normative wire) though handlers are fully implemented. Files: nextgcore/src/bins/nextgcore-pind/src/main.rs (routes ~line 406), context.rs.</p>
+<h2 class="section-title" style="font-size:1.4rem;margin-top:2.5rem;">EPC (4G Interworking)</h2>
+<h3 class="group-heading">EPC (MME / HSS / SGW-C / SGW-U / PCRF)</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>mmed (MME)</td><td>S1AP+NAS-EPS attach/detach/TAU, EMM/ESM handlers, S11 GTP-C, S6a client, SGsAP, SBC</td><td>TS 36.413 / 24.301 / 29.274</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>hssd (HSS)</td><td>Diameter S6a AIR/ULR subscriber data, plus Cx and SWx paths</td><td>TS 29.272</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>sgwcd (SGW-C)</td><td>S11 GTP-C session create/modify/delete, S5-C relay, Sxa PFCP to SGW-U</td><td>TS 29.274 / 29.244</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>sgwud (SGW-U)</td><td>Sxa PFCP session control, GTP-U user-plane forwarding</td><td>TS 29.244 / 29.281</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>pcrfd (PCRF)</td><td>Diameter Gx CCR/CCA policy rules, Rx AF session binding</td><td>TS 29.212 / 29.214</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">All 5 are restored Open5GS-port scaffolding (~42k lines total, near-zero TODOs); &quot;implemented&quot; = code-complete port, not conformance-validated.</p>
+  </div>
+</section>
+<footer class="footer">
+  <div class="container">
+    <p><a href="index.html">Home</a> &middot; <a href="https://github.com/NextgCoreLab/nextgcore">GitHub</a> &middot; GPL-3.0 License</p>
+  </div>
+</footer>
+<script src="js/main.js"></script>
+</body>
+</html>

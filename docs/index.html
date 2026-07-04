@@ -20,6 +20,7 @@
     <li><a href="#workflows">Workflows</a></li>
     <li><a href="#components">Components</a></li>
     <li><a href="#quickstart">Quick Start</a></li>
+    <li><a href="features.html">Feature Matrix</a></li>
     <li><a href="api.html">API Docs</a></li>
     <li><a href="https://github.com/NextgCoreLab/nextgcore" class="btn btn-secondary" style="padding:0.4rem 1rem;font-size:0.8rem;">GitHub</a></li>
   </ul>
@@ -714,6 +715,19 @@
 
 <span class="comment"># Run E2E tests</span>
 <span class="cmd">bash e2e-test.sh</span></code>
+    </div>
+
+    <h3 class="group-heading">Configuration Layout &amp; One-Command E2E</h3>
+    <div class="code-block">
+      <button class="copy-btn">Copy</button>
+      <code><span class="comment"># Per-NF YAML configs live in configs/ (amf.yaml, smf.yaml, upf.yaml, ...)</span>
+<span class="cmd">ls configs/</span>
+
+<span class="comment"># One-command Docker E2E: build + start 5GC + matched RAN simulator + run suite</span>
+<span class="cmd">cd docker/rust &amp;&amp; bash e2e.sh</span>
+
+<span class="comment"># Iterate without rebuilding images; keep containers up for debugging</span>
+<span class="cmd">bash e2e-test.sh --no-build --keep</span></code>
     </div>
 
     <h3 class="group-heading">Kubernetes (Production)</h3>
