@@ -1,0 +1,661 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>UE Registration Call Flow - NextGCore Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-b04bf570.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-1b88980e.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGCore Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgcore" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="ue-registration-call-flow"><a class="header" href="#ue-registration-call-flow">UE Registration Call Flow</a></h1>
+<p>This chapter traces the 5G initial-registration procedure as it is <em>actually</em>
+implemented across the NextGCore network functions — not as TS 23.502 draws it,
+but as the Rust code runs it. It follows a single UE from the gNB’s NGAP
+<code>InitialUEMessage</code> (carrying a NAS Registration Request), through 5G-AKA
+authentication and NAS security-mode control, the three mandatory registration
+SBI calls, the piggybacked Registration Accept, and finally the post-
+registration UE-policy (URSP) push. Every step below names the file and the
+function or struct that performs it, so you can open the source and read along.</p>
+<p>The whole 3GPP-facing flow is driven by the AMF daemon
+(<code>nextgcore-amfd</code>); the authentication maths lives in the AUSF
+(<code>nextgcore-ausfd</code>) and UDM (<code>nextgcore-udmd</code>); post-registration policy comes
+from the PCF (<code>nextgcore-pcfd</code>). The matched UE/gNB simulator that exercises
+this path end-to-end is a <strong>separate repository</strong> — here it appears only as the
+peer on the far side of the N2 (NGAP) association.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> This registration flow is validated by NextGCore’s own unit
+tests and matched-simulator docker E2E (84/84 green as of 2026-07-02), <strong>not</strong>
+by third-party conformance certification. The implementation drives <strong>5G-AKA
+only</strong> on the live path (the AMF’s EAP-AKA′ Authentication-Request builder is
+compiled but unreferenced — see <em>Simplifications and known gaps</em>), takes a
+number of documented wire-format and control-plane shortcuts, and matches a
+cooperative simulator peer rather than an arbitrary commercial UE/RAN. TS
+numbers are quoted only where they appear in this repo’s source comments,
+phrased “per code comments”.</p>
+</blockquote>
+<h2 id="components-involved"><a class="header" href="#components-involved">Components involved</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>NF</th><th>Crate</th><th>Role in registration</th><th>Config page</th></tr>
+</thead>
+<tbody>
+<tr><td>AMF</td><td><code>nextgcore-amfd</code></td><td>N2/NGAP termination, GMM state machine, NAS security, SBI orchestration</td><td><a href="../configuration/amf.html">AMF</a></td></tr>
+<tr><td>AUSF</td><td><code>nextgcore-ausfd</code></td><td><code>Nausf_UEAuthentication</code> (5G-AKA / EAP-AKA′), KSEAF disclosure</td><td><a href="../configuration/ausf.html">AUSF</a></td></tr>
+<tr><td>UDM</td><td><code>nextgcore-udmd</code></td><td><code>generate-auth-data</code> (SIDF + Milenage), UECM registration, SDM am-data</td><td><a href="../configuration/udm.html">UDM</a></td></tr>
+<tr><td>UDR</td><td><code>nextgcore-udrd</code></td><td>System of record for auth-subscription + am-data (queried by UDM)</td><td><a href="../configuration/udr.html">UDR</a></td></tr>
+<tr><td>PCF</td><td><code>nextgcore-pcfd</code></td><td><code>Npcf_AMPolicyControl</code>, <code>Npcf_UEPolicyControl</code> + URSP N1N2 push</td><td><a href="../configuration/pcf.html">PCF</a></td></tr>
+<tr><td>NSACF</td><td><code>nextgcore-nsacfd</code></td><td>Per-slice UE admission control (<code>Nnsacf_NSAC</code>)</td><td><a href="../configuration/nsacf.html">NSACF</a></td></tr>
+<tr><td>NRF</td><td><code>nextgcore-nrfd</code></td><td>On-demand NF discovery for every peer above</td><td><a href="../configuration/nrf.html">NRF</a></td></tr>
+</tbody>
+</table>
+</div>
+<p>Supporting libraries: <code>nextgcore-nas</code> (5GMM message codec, SUCI, NAS security),
+<code>nextgcore-ngap</code> + <code>nextgcore-asn1c</code> (NGAP/APER), and <code>nextgcore-sctp</code> (the N2
+transport). The NSSF (<code>nextgcore-nssfd</code>) is listed here only to say what does
+<strong>not</strong> happen: it is <strong>not</strong> consulted during registration (see step 12).</p>
+<h2 id="the-n2-transport-underneath"><a class="header" href="#the-n2-transport-underneath">The N2 transport underneath</a></h2>
+<p>The AMF terminates NGAP over SCTP through the <code>NgapTransport</code> enum and
+<code>SctpBackend</code> selector in <code>src/bins/nextgcore-amfd/src/ngap_path.rs</code>
+(<code>SctpBackend::parse</code>). Two backends exist:</p>
+<ul>
+<li><strong><code>userspace</code></strong> (default, <code>Args.sctp_backend</code> in
+<code>src/bins/nextgcore-amfd/src/lib.rs</code>) — <code>sctp-proto</code> over UDP, matched to the
+nextgsim gNB. This is what the docker E2E uses.</li>
+<li><strong><code>kernel</code></strong> — native Linux kernel SCTP for a standard external RAN, compiled
+only when amfd is built with the <code>kernel-sctp</code> feature (the <code>#[cfg(feature = "kernel-sctp")]</code> arms in <code>NgapTransport</code>). Requesting <code>kernel</code> without that
+feature is a hard startup error.</li>
+</ul>
+<p>The registration handlers are backend-agnostic: everything below runs
+identically over either transport once bytes arrive at <code>handle_ngap_message</code>.</p>
+<h2 id="the-initial-nas-message"><a class="header" href="#the-initial-nas-message">The initial NAS message</a></h2>
+<ol>
+<li>
+<p><strong>gNB → AMF: <code>InitialUEMessage</code>.</strong> The dispatcher in <code>ngap_path.rs</code>
+(procedure code 15) routes to <code>handle_initial_ue_message</code>, which parses the
+PDU with <code>crate::ngap_asn1::parse_initial_ue_message_asn1</code> into an
+<code>InitialUeMessageData</code> (RAN-UE-NGAP-ID, NAS-PDU, PLMN, TAC, NR-CGI). It
+allocates an AMF-UE-NGAP-ID, creates a <code>UeNasContext</code> (seeded with
+<code>crate::context::nas_security_canary()</code>), records the TAI and 3GPP access
+type, and switches on the inner NAS message type. A <code>REGISTRATION_REQUEST</code>
+(<code>0x7E … 0x41</code>) is dispatched to <code>handle_registration_request_nas</code> with
+<code>integrity_protected = false</code> — this is an unprotected initial NAS message.
+Logs <code>Initial UE Message from association …</code>.</p>
+<p>A <code>SERVICE_REQUEST</code> arriving in an <code>InitialUEMessage</code> with no stored context
+is rejected with 5GMM cause #9 (<code>build_service_reject</code>) — the code comment
+cites TS 24.501 §5.6.1.5.</p>
+</li>
+<li>
+<p><strong>Registration Request parsing + cleartext gate.</strong>
+<code>handle_registration_request_nas</code> (<code>ngap_path.rs</code>) runs
+<code>parse_registration_request_pdu</code>, then enforces the TS 24.501 §4.4.6 /
+TS 33.501 §6.4.6 cleartext-IE rule via
+<code>validate_initial_registration_cleartext</code> (per code comments): an
+<em>unprotected</em> initial Registration Request that carries a non-cleartext IE
+(e.g. Requested NSSAI) or a NAS message container is rejected with 5GMM #95
+before any IE touches UE state. It logs the E2E anchor line
+<code>Registration Request: type=…, ngKSI=…, identity_type=…, suci=…</code>.</p>
+<p>The UE security capability is stored <strong>exactly as received</strong>
+(<code>state.amf_ue.ue_security_capability</code>); when the IE is absent the code
+assumes null algorithms only (<code>ea/ia = 0x80</code>) rather than fabricating
+capabilities. The <strong>Requested NSSAI is deliberately not read here</strong> — it is a
+non-cleartext IE and is taken only from the integrity-protected replay in
+step 11.</p>
+<p>Identity branch:</p>
+<ul>
+<li><strong>SUCI identity</strong> → proceed to authentication (<code>start_authentication</code>).
+Optional Rel-17/18 handling (SNPN NID allow-list via <code>validate_nid</code>, UAV
+geofence authorization, RedCap AMBR capping) is applied here first.</li>
+<li><strong>GUTI unknown to this AMF</strong> → send an Identity Request for the SUCI
+(<code>gmm_build::build_identity_request</code>) and arm timer T3570. There is <strong>no
+blanket Identity Request</strong> otherwise — identification runs only when the UE
+gave a GUTI this AMF cannot resolve.</li>
+<li><strong>Periodic updating</strong> with a live security context → short-circuit straight
+to <code>send_registration_accept</code> (step 13).</li>
+</ul>
+</li>
+</ol>
+<h2 id="authentication-5g-aka"><a class="header" href="#authentication-5g-aka">Authentication (5G-AKA)</a></h2>
+<pre><code>UE            gNB           AMF(amfd)        AUSF(ausfd)      UDM(udmd)     UDR(udrd)
+ |  Reg Req    |  InitialUE   |                 |               |            |
+ |------------&gt;|-------------&gt;| start_auth      |               |            |
+ |             |              |  POST ue-authentications        |            |
+ |             |              |----------------&gt;| generate-auth-data          |
+ |             |              |                 |--------------&gt;| auth-sub GET |
+ |             |              |                 |               |-----------&gt;|
+ |             |              |                 |  Milenage AV  |&lt;-----------|
+ |             |              |  201 5gAuthData |&lt;--------------|            |
+ |  Auth Req   |              |&lt;----------------|               |            |
+ |&lt;------------|&lt;-------------|                 |               |            |
+ |  Auth Resp (RES*)          | verify HXRES*   |               |            |
+ |------------&gt;|-------------&gt;|  PUT 5g-aka-confirmation         |            |
+ |             |              |----------------&gt;| RES* vs XRES* |            |
+ |             |              |  200 kseaf,supi |&lt;--------------|            |
+ |             |              | derive Kamf/Knas|               |            |
+</code></pre>
+<ol start="3">
+<li>
+<p><strong>AMF → AUSF: <code>Nausf_UEAuthentication</code> create.</strong> <code>start_authentication</code>
+(<code>ngap_path.rs</code>) resolves the AUSF endpoint through
+<code>resolve_nf_endpoint_async(NausfAuth)</code> — SBI discovery cache first, then an
+<strong>on-demand NRF discovery</strong> (<code>amf_nrf_discover</code>), then env/localhost fallback
+(<code>sbi_path.rs</code>). It builds the serving-network-name from the serving PLMN
+(<code>serving_network_name_from_plmn</code>) and calls
+<code>call_ausf_authenticate_with_resync</code> (<code>sbi_path.rs</code>), which POSTs
+<code>/nausf-auth/v1/ue-authentications</code> with <code>{ supiOrSuci, servingNetworkName }</code>
+(plus <code>resynchronizationInfo</code> on an SQN-resync retry). Logs the E2E anchor
+<code>Calling AUSF authenticate: …</code>.</p>
+</li>
+<li>
+<p><strong>AUSF validates and asks UDM.</strong> <code>handle_ue_authentication</code>
+(<code>src/bins/nextgcore-ausfd/src/app.rs</code>) validates the SNN shape
+(<code>validate_serving_network_name</code>, requiring the <code>5G:</code> anti-bidding-down
+prefix, per code comments citing TS 33.501 §6.1.2) and checks it is allowed
+for the requesting consumer (<code>snn_authorized_for_consumer</code> in
+<code>nausf_handler.rs</code>, <strong>default-permissive</strong> when no OAuth2 token carries a
+<code>plmnList</code>). It then calls <code>send_udm_generate_auth_data</code>.</p>
+</li>
+<li>
+<p><strong>UDM builds the authentication vector.</strong> <code>handle_generate_auth_data</code>
+(<code>src/bins/nextgcore-udmd/src/app.rs</code>) requires <code>servingNetworkName</code> and
+<code>ausfInstanceId</code>, de-conceals the SUCI via the SIDF
+(<code>context.deconceal_suci</code>, per code comment TS 33.501 §6.12.5), queries UDR
+for the auth subscription (<code>udm_nudr_dr_send_auth_subscription_get</code>), and
+selects 5G-AKA or EAP-AKA′ from the subscription’s <code>authenticationMethod</code>
+(anything else → 501 <code>UNSUPPORTED_AUTHENTICATION_METHOD</code>). For 5G-AKA it runs
+<code>nextgcore_crypt::milenage::milenage_generate(opc, amf, k, sqn, rand)</code> to get
+<code>(autn, ik, ck, ak, res)</code>, then derives <code>kausf = nextgcore_kdf_kausf(ck, ik, snn, autn)</code> and <code>xresStar = nextgcore_kdf_xres_star(...)</code>, returning the AV <code>{ rand, autn, xresStar, kausf }</code>. (An SQN synch failure carrying AUTS is validated against <code>mac_s</code>
+here before a fresh vector is generated.)</p>
+</li>
+<li>
+<p><em><em>AUSF returns <code>5gAuthData</code> (HXRES</em>, not KSEAF).</em>* Back in <code>app.rs</code>, the AUSF
+stores <code>rand/xres_star/autn/kausf</code>, computes HXRES* with
+<code>calculate_hxres_star()</code>, and answers <strong>201</strong> with
+<code>{ authType: "5G_AKA", 5gAuthData: { rand, hxresStar, autn }, _links, servingNetworkName }</code> and a <code>Location</code> header naming the auth context.
+<strong>KSEAF is deliberately withheld</strong> at this stage — it is disclosed only on a
+successful confirmation (step 8), per code comment TS 29.509 §6.1.6.2.8.</p>
+</li>
+<li>
+<p><strong>AMF → UE: Authentication Request; UE → AMF: Authentication Response.</strong> The
+AMF stores the vector, fixes the initial ABBA to <code>[0x00, 0x00]</code> (per code
+comment TS 33.501 Annex A.7.1), builds the NAS Authentication Request
+(<code>gmm_build::build_authentication_request</code>), sends it and arms T3560. When
+the Authentication Response arrives (via <code>handle_uplink_nas_transport</code> →
+<code>handle_authentication_response_nas</code>), the AMF extracts RES* (IEI <code>0x2D</code>) and
+performs the <strong>SEAF-side</strong> check: <code>HRES* = SHA256(RAND ‖ RES*)[16..32]</code>
+compared to the stored HXRES* (per code comment TS 33.501 §6.1.3.2.0). A
+mismatch sends an Authentication Reject and releases the UE.</p>
+</li>
+<li>
+<p><strong>AMF → AUSF: 5G-AKA confirmation.</strong> <code>call_ausf_5g_aka_confirm</code>
+(<code>sbi_path.rs</code>) PUTs
+<code>/nausf-auth/v1/ue-authentications/{ctxId}/5g-aka-confirmation</code> with
+<code>{ resStar }</code>. The AUSF confirmation handler (<code>app.rs</code>) does the
+<strong>authoritative</strong> check — a <strong>constant-time</strong> <code>compare_res_star</code>
+(<code>nausf_handler.rs</code>) of the received RES* against the stored XRES* (per code
+comment TS 33.501 §6.1.3.2 step 11; HXRES* is the SEAF’s job, not the
+AUSF’s). On success it computes KSEAF (<code>calculate_kseaf()</code>), refreshes the
+per-SUPI KAUSF anchor (<code>anchor_refresh</code>, for later SoR/UPU), fires a
+best-effort UDM auth-result notification, and returns <strong>200</strong>
+<code>{ authResult: "AUTHENTICATION_SUCCESS", kseaf, supi }</code> — <code>supi</code> included
+only when the original identity was a SUCI. Logs the E2E anchor
+<code>result=AUTHENTICATION_SUCCESS</code>.</p>
+</li>
+</ol>
+<h2 id="key-hierarchy-and-nas-security-mode-control"><a class="header" href="#key-hierarchy-and-nas-security-mode-control">Key hierarchy and NAS security-mode control</a></h2>
+<ol start="9">
+<li>
+<p><strong>AMF derives the key hierarchy and selects algorithms.</strong> Continuing in
+<code>handle_authentication_response_nas</code>, the AMF takes the SUPI and KSEAF from
+the confirmation and derives:</p>
+<ul>
+<li><code>Kamf = nextgcore_crypt::kdf::nextgcore_kdf_kamf(supi, abba, kseaf)</code>;</li>
+<li>NAS algorithm selection from the intersection of the UE’s replayed
+capabilities and the AMF’s <strong>configured</strong> order
+(<code>algorithm_order_to_mask</code> over <code>integrity_order</code>/<code>ciphering_order</code> from the
+AMF context) via <code>nas_security::select_integrity_algorithm</code> /
+<code>select_encryption_algorithm</code>. Integrity selection is <strong>fail-closed</strong>: an
+empty NIA intersection returns <code>None</code>, and the AMF <strong>rejects the
+registration</strong> rather than fabricating NIA2 the UE never advertised (per
+code comment TS 33.501 §5.5.2). Ciphering is asymmetric — NEA0 (null) is a
+permitted selection, so an empty NEA intersection stays NEA0.</li>
+<li><code>Knas_int / Knas_enc = nextgcore_kdf_nas_5gs(0x02 | 0x01, alg, Kamf)</code>.</li>
+</ul>
+<p>Logs the E2E anchor <code>[{supi}] keys derived; selected NIA{} / NEA{}</code>.</p>
+</li>
+<li>
+<p><strong>AMF → UE: Security Mode Command (protected).</strong> The plain SMC is built by
+<code>gmm_build::build_security_mode_command</code> (replaying the UE’s <em>actual</em>
+capabilities and requesting IMEISV), then wrapped by
+<code>nas_security::nas_5gs_security_encode</code> with security-header type
+<code>INTEGRITY_PROTECTED_WITH_NEW_5G_NAS_SECURITY_CONTEXT</code>. Sent, T3560 armed.
+Logs <code>Security Mode Command sent to UE …</code>.</p>
+</li>
+<li>
+<p><strong>UE → AMF: Security Mode Complete + anti-bidding-down.</strong>
+<code>handle_security_mode_complete_nas</code> (<code>ngap_path.rs</code>) extracts the UE’s
+<strong>replayed</strong> initial Registration Request from the now-integrity-protected
+NAS message container (<code>extract_nas_message_container</code> +
+<code>parse_registration_request_pdu</code>) and compares the replayed UE security
+capabilities against the ones stored from the cleartext initial message. Any
+mismatch is treated as a downgrade attack: Security Mode Reject <strong>#23</strong>
+followed by Registration Reject and UE release (per code comments TS 24.501
+§4.4.2.4 / TS 33.501 §6.7.2). The <strong>Requested NSSAI is populated here</strong>, from
+the protected replay only. IMEISV (IEI <code>0x77</code>) is read from the SMC; if
+absent, the AMF sends a protected Identity Request (IMEISV) and arms T3570
+before completing.</p>
+</li>
+</ol>
+<h2 id="registration-sbi-calls-and-acceptance"><a class="header" href="#registration-sbi-calls-and-acceptance">Registration SBI calls and acceptance</a></h2>
+<ol start="12">
+<li>
+<p><strong>The three mandatory registration calls (all fail-closed).</strong>
+<code>complete_registration</code> (<code>ngap_path.rs</code>) — cited against TS 23.502
+§4.2.2.2.2 steps 14a/b/c/16 per code comments — runs, in order, and rejects
+the registration (Registration Reject + release) on <em>any</em> failure:</p>
+<ol>
+<li><strong><code>Nudm_UECM_Registration</code></strong> — <code>call_udm_uecm_registration</code>
+(<code>sbi_path.rs</code>) PUTs
+<code>/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access</code>, registering an
+absolute <code>deregCallbackUri</code>. UDM <code>process_amf_registration</code> (<code>uecm.rs</code>)
+validates mandatory IEs, reads the prior registration, persists to UDR
+(<code>amf_context_put</code>), notifies the old AMF if the serving AMF changed, and
+answers 201 (create) or 200 (update).</li>
+<li><strong><code>Nudm_SDM_Get</code> (am-data) + <code>Nudm_SDM_Subscribe</code></strong> —
+<code>call_udm_sdm_get_am_data</code> / <code>call_udm_sdm_subscribe</code>. UDM
+<code>handle_get_am_data</code> (<code>app.rs</code>) queries UDR am-data and, when a steering
+source is configured, injects a protected Steering-of-Roaming container
+(<code>sor::maybe_inject_sor_info</code>) via the AUSF’s <code>Nausf_SoRProtection</code>
+service, and a UPU container (<code>upu::maybe_inject_upu_info</code>) via
+<code>Nausf_UPUProtection</code>. Both are <strong>fail-closed</strong>: on any AUSF failure the
+container is withheld and the UDR body is passed through byte-identical
+(per code comments TS 33.501 §6.14.2.1 / §6.15.2.1).</li>
+<li><strong><code>Npcf_AMPolicyControl_Create</code></strong> — <code>call_pcf_am_policy_create</code>; the
+returned association id is stored on the UE context.</li>
+<li><strong><code>Npcf_UEPolicyControl_Create</code></strong> (step 3b, Wave-6) — only when
+<code>ue_policy_assoc_enabled()</code> is true (kill-switch <code>AMF_UE_POLICY_ASSOC</code>).
+This one is <strong>fire-and-forget</strong>: a failure logs a WARN and never fails the
+registration. It is what later triggers the URSP push (step 15).</li>
+</ol>
+<p><strong>Allowed NSSAI is computed locally, not via NSSF.</strong> <code>select_allowed_nssai</code>
+(<code>ngap_path.rs</code>) returns the UDM-subscribed S-NSSAIs if present, else the
+AMF’s configured <code>plmn_support</code> default — the Requested NSSAI is never echoed
+back as authorization (per code comment amfd-06). An empty result is
+Registration Reject <strong>#62</strong>. There is <strong>no <code>Nnssf_NSSelection</code> call anywhere
+in the registration path.</strong></p>
+<p><strong>NSACF admission</strong> then runs per Allowed S-NSSAI via
+<code>call_nsacf_ue_admission</code> (<code>sbi_path.rs</code>), POSTing
+<code>/nnsacf-nsac/v1/slices/ues</code>. A denial (403, or 200 with this SUPI in
+<code>acuFailureList</code>) is Registration Reject <strong>#69</strong>. Note the real net behavior
+is <strong>degrade-open</strong>: <code>call_nsacf_ue_admission</code> catches transport errors and
+unexpected statuses and returns <code>admitted = true</code>, so an unreachable NSACF
+<em>admits</em> rather than blocks (see <em>Simplifications and known gaps</em>).</p>
+<p>Finally the AMF copies the subscribed UE-AMBR from am-data and mints a new
+5G-GUTI (<code>generate_new_guti</code>: this AMF’s GUAMI + a CSPRNG 5G-TMSI).</p>
+</li>
+<li>
+<p><strong>AMF builds and protects the Registration Accept.</strong>
+<code>send_registration_accept</code> (<code>ngap_path.rs</code>) builds the message with
+<code>gmm_build::build_registration_accept</code> (carrying the new 5G-GUTI, Allowed
+NSSAI, etc.) and protects it with <code>nas_5gs_security_encode</code> using header
+<code>INTEGRITY_PROTECTED_AND_CIPHERED</code>. A periodic/mobility update on a UE that
+already has AS security is delivered over <code>DownlinkNASTransport</code>; an
+<strong>initial</strong> registration takes the InitialContextSetup path next.</p>
+</li>
+<li>
+<p><strong>AMF → gNB: <code>InitialContextSetupRequest</code> (Registration Accept piggybacked).</strong>
+The AMF derives <code>KgNB = nextgcore_kdf_kgnb_and_kn3iwf(Kamf, ul_count, access_type_distinguisher)</code> (per code comment TS 33.501 Annex A.9) and calls
+<code>ngap_asn1::build_initial_context_setup_request_asn1</code> to carry the GUAMI, the
+<strong>replayed</strong> UE security capabilities, the UE Security Key (KgNB), the Allowed
+NSSAI, the UE-AMBR, and — as the NAS-PDU — the protected Registration Accept.
+It sends this to the gNB and arms T3550 against the whole ICS PDU (so a
+retransmission re-delivers the Registration Accept). Logs the E2E anchor
+<code>Initial Context Setup Request sent … Registration Accept piggybacked …</code>.</p>
+<p>The gNB’s <code>InitialContextSetupResponse</code> is handled by
+<code>handle_initial_context_setup_response</code>: it stops the T3550 retransmission
+and moves the reporting GMM FSM toward Registered
+(<code>gmm_fsm.transition_to_registered</code>). The UE’s NAS <strong>Registration Complete</strong>
+(handled in <code>handle_uplink_nas_transport</code>, <code>REGISTRATION_COMPLETE</code> arm) sets
+<code>registered = true</code> and promotes <code>next_guti</code> to the current 5G-GUTI, logging
+<code>[{suci}] Registration Complete (5G-TMSI=0x…)</code>.</p>
+</li>
+</ol>
+<h2 id="post-registration-ue-policy--ursp-delivery"><a class="header" href="#post-registration-ue-policy--ursp-delivery">Post-registration: UE policy / URSP delivery</a></h2>
+<p>This is wired end-to-end (Wave-6 E-series) and worth calling out because it is
+what runs <em>after</em> the UE is registered.</p>
+<ol start="15">
+<li>
+<p><strong>PCF pushes URSP over N1N2.</strong> The AMF’s step-3b
+<code>Npcf_UEPolicyControl_Create</code> reaches the PCF’s <code>handle_ue_policy_create</code>
+(<code>src/bins/nextgcore-pcfd/src/app.rs</code>), which returns 201 and — when
+<code>ue_policy::delivery_enabled()</code> is true (kill-switch <code>PCF_UE_POLICY_DELIVERY</code>)
+— spawns <code>spawn_ue_policy_delivery</code>. That task assembles URSP rules
+(<code>src/bins/nextgcore-pcfd/src/ue_policy.rs</code>) and calls
+<code>pcf_deliver_ue_policy</code> (pcfd <code>sbi_path.rs</code>), which discovers the AMF and
+POSTs <code>/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages</code> as an
+<code>Namf_Communication_N1N2MessageTransfer</code> (multipart, <code>n1MessageClass</code> =
+<code>UPDP</code>).</p>
+</li>
+<li>
+<p><strong>AMF relays the UPDP container to the UE.</strong> The AMF’s
+<code>handle_n1_n2_message_transfer_request</code>
+(<code>src/bins/nextgcore-amfd/src/namf_server.rs</code>) recognizes the UPDP class in
+<code>try_ue_policy_relay</code> and enqueues the payload for N1 egress
+(DownlinkNASTransport to the UE), logging
+<code>UE policy: enqueued UPDP downlink for N1 egress</code>. Delivery is only
+<em>confirmed</em> by a MANAGE UE POLICY COMPLETE from the UE (the E6
+delivery-result loop); a bare N1N2 200 is recorded as <em>accepted-for-transfer</em>,
+not <em>delivered</em> — <code>DeliveryState</code> starts <code>Pending</code> and is fail-closed to
+<code>Failed</code> if no COMPLETE arrives.</p>
+</li>
+</ol>
+<h2 id="simplifications-and-known-gaps"><a class="header" href="#simplifications-and-known-gaps">Simplifications and known gaps</a></h2>
+<p>Grounded in the code, these are the honest deviations from a textbook TS 23.502
+registration:</p>
+<ul>
+<li><strong>5G-AKA only on the live path.</strong> The AMF’s EAP-AKA′ Authentication-Request
+builder <code>build_eap_authentication_request</code> (<code>ngap_path.rs</code>) is marked
+<code>#[allow(dead_code)]</code> and carries a source comment that it is <strong>not yet called
+by the live authentication path</strong> — the EAP-AKA′ SBI looping is E2E-deferred.
+The AUSF (<code>app.rs</code>, <code>eap_aka_prime.rs</code>) and UDM both implement the EAP-AKA′
+surface, but a live registration only ever runs 5G-AKA.</li>
+<li><strong>NSACF admission is effectively degrade-open.</strong> The fail-closed
+“unreachable ⇒ not admitted” branch in <code>complete_registration</code> is in practice
+unreachable: <code>call_nsacf_ue_admission</code> (<code>sbi_path.rs</code>) intercepts transport
+errors and unexpected HTTP statuses and returns <code>admitted = true</code>. So a
+down/missing NSACF <strong>admits</strong> the UE. Only an explicit 403 / <code>acuFailureList</code>
+denial blocks registration.</li>
+<li><strong>No NSSF slice selection.</strong> Allowed NSSAI is chosen locally
+(<code>select_allowed_nssai</code>) from UDM subscription or AMF config; the NSSF is never
+queried during registration.</li>
+<li><strong>Identity procedure is normally skipped.</strong> Because the matched UE sends its
+SUCI directly in the initial Registration Request, the AMF never runs an
+Identity Request/Response exchange on the happy path; it only issues one for an
+unknown GUTI (step 2) or a missing PEI (step 11). The E2E script explicitly
+removed the old Identity assertions for this reason.</li>
+<li><strong>NAS-security canary defaults OFF.</strong> New UE contexts inherit
+<code>use_nextgcore_nas_security</code> from the process-wide canary
+(<code>context::nas_security_canary</code>), seeded at startup from
+<code>amf.nas.use_nextgcore_security</code> (default <code>false</code>) — see
+<code>context::resolve_nas_security_canary</code>. The canary lets an operator A/B the
+new NAS-security path without a code change.</li>
+<li><strong>Fire-and-forget policy legs behind kill-switches.</strong> Both the UE-policy
+association (<code>AMF_UE_POLICY_ASSOC</code>) and its delivery (<code>PCF_UE_POLICY_DELIVERY</code>)
+can be disabled, restoring the pre-Wave-6 byte flow. Some inbound AMF SBI
+callbacks (am-policy-notify, sdm-subscription-notify) are noted in
+<code>sbi_path.rs</code> as “still-unserved”.</li>
+<li><strong>Config loading is lenient.</strong> An unreadable/unparsable <code>amf.yaml</code> logs a
+warning and continues with built-in defaults (<code>load_config</code> in
+<code>lib.rs</code>) — a running AMF is not proof your config was applied. See the
+troubleshooting table in <a href="../observability.html">Observability &amp; Troubleshooting</a>.</li>
+<li><strong>Cooperative peer.</strong> All of the above is exercised against the matched
+simulator, not an arbitrary commercial UE/gNB; the SMF-side PDU-session
+establishment that follows registration is covered by the
+<a href="../configuration/smf.html">SMF</a> path, not here.</li>
+</ul>
+<h2 id="how-it-is-validated"><a class="header" href="#how-it-is-validated">How it is validated</a></h2>
+<p><strong>Unit tests (per-crate <code>cargo test</code>).</strong> The wire builders and decision helpers
+are golden- and property-tested independently of any network:</p>
+<ul>
+<li><code>gmm_build.rs</code> — <code>golden_registration_accept_full</code>,
+<code>golden_registration_accept_no_guti_no_nssai</code>,
+<code>golden_registration_accept_3digit_mnc</code>, <code>golden_registration_reject</code>, plus
+<code>drift_registration_accept_*</code> round-trips through <code>nextgcore-nas</code>.</li>
+<li><code>gmm_handler.rs</code> — <code>test_handle_registration_request_initial</code>,
+<code>test_handle_registration_request_with_guti</code>,
+<code>test_handle_registration_request_non_cleartext_rejected</code> (the §4.4.6 gate).</li>
+<li><code>nausf_handler.rs</code> — <code>test_compare_res_star</code> /
+<code>test_compare_res_star_constant_time_xres</code> (constant-time RES*/XRES* compare),
+<code>test_validate_serving_network_name</code>, <code>test_snn_authorized_for_consumer</code>.</li>
+<li><code>context.rs</code> — <code>test_resolve_nas_security_canary_precedence</code> (the canary
+env/yaml precedence). Additional AMF invariants live in
+<code>property_tests.rs</code>.</li>
+</ul>
+<p><strong>Matched-simulator docker E2E.</strong> The single entrypoint is
+<code>nextgcore/docker/rust/e2e.sh</code> (which chains <code>preflight.sh</code> → <code>build.sh</code> →
+<code>e2e-test.sh</code>). <code>e2e-test.sh</code> brings up MongoDB + the 5GC + the nextgsim gNB/UE
+and asserts the registration flow through <strong>source-anchored log lines</strong> — the
+same anchors named in this chapter, e.g. on <code>nextgcore-amf</code>:</p>
+<pre><code>Initial UE Message
+Registration Request: type=
+Calling AUSF authenticate
+Calling AUSF 5G-AKA confirmation
+result=AUTHENTICATION_SUCCESS
+keys derived; selected NIA
+Security Mode Command sent
+Security Mode Complete
+Registration Accept piggybacked
+</code></pre>
+<p>and on the simulator side <code>Sending Registration Request</code> … <code>Registration Accept: UE is now …</code> … <code>Sending Registration Complete</code>. The suite then verifies
+the data plane by pinging <strong>through the UE’s GTP-U tunnel</strong> and finishes at
+<code>UE PDU session 1 ACTIVE with IPv4 address</code>. The full baseline was <strong>84/84 green
+on 2026-07-02</strong>. This is functional validation against a cooperative peer — it
+is not third-party conformance certification.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../observability.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../concepts/pdu-session-pfcp.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../observability.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../concepts/pdu-session-pfcp.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

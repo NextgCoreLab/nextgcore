@@ -1,0 +1,424 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>PDU Sessions &amp; the PFCP Session Model - NextGCore Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-b04bf570.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-1b88980e.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGCore Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgcore" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="pdu-sessions-and-the-pfcp-session-model"><a class="header" href="#pdu-sessions-and-the-pfcp-session-model">PDU Sessions and the PFCP Session Model</a></h1>
+<p>A PDU session is the end-to-end user-plane pipe between a UE and a data network: an IP address for the UE, a GTP-U tunnel across N3, and a set of forwarding/QoS rules programmed into the UPF over N4/PFCP. This chapter traces how NextGCore actually builds one — from the NAS <em>PDU Session Establishment Request</em> that arrives at the SMF, through the PCF policy call, the PFCP session toward the UPF, the N2 resource-setup container handed back to the gNB, and finally the GTP-U packets that the UPF forwards. Every step below names the file and function/struct that implements it, and where the implementation takes a shortcut relative to the 3GPP procedure, that shortcut is called out rather than glossed over.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> The PDU-session and PFCP behavior described here is validated by this project’s own unit tests plus a matched-simulator docker E2E (84/84 green as of 2026-07-02), <strong>not</strong> by third-party conformance certification. The peer on the other side is the in-tree <code>nextgsim</code> gNB/UE, not a commercial RAN or a certified test set. Concrete simplifications (a hand-rolled NAS accept encoder, a bespoke PFCP TLV codec, a userspace UPF fast path, an unwired UDM fetch) are listed under <a href="#simplifications-and-known-gaps">Simplifications and known gaps</a>. TS numbers below are quoted only where they appear in this repo’s source comments, phrased “per code comments”.</p>
+</blockquote>
+<h2 id="components-involved"><a class="header" href="#components-involved">Components involved</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Function</th><th>Daemon / crate</th><th>Role in the PDU session</th></tr>
+</thead>
+<tbody>
+<tr><td>SMF</td><td><a href="../configuration/smf.html"><code>nextgcore-smfd</code></a></td><td>Owns the session: parses N1, calls PCF, drives N4/PFCP, builds the N1 accept + N2 setup transfer.</td></tr>
+<tr><td>UPF</td><td><a href="../configuration/upf.html"><code>nextgcore-upfd</code></a></td><td>The PFCP node: installs PDR/FAR/QER/URR, terminates N3 GTP-U, forwards packets via a TUN device.</td></tr>
+<tr><td>AMF</td><td><a href="../configuration/amf.html"><code>nextgcore-amfd</code></a></td><td>Relays N1 (NAS) to the UE and the opaque N2 transfer to the gNB; not covered in depth here.</td></tr>
+<tr><td>PCF</td><td><a href="../configuration/pcf.html"><code>nextgcore-pcfd</code></a></td><td>Authorizes Session-AMBR / 5QI via Npcf_SMPolicyControl (optional — a config-default is used when absent).</td></tr>
+<tr><td>NSACF</td><td><a href="../configuration/nsacf.html"><code>nextgcore-nsacfd</code></a></td><td>Optional per-slice PDU-session admission (fail-open when not deployed).</td></tr>
+<tr><td>PFCP model</td><td><code>src/libs/nextgcore-pfcp</code></td><td>Header/SEID model, IE-type registry, typed message structs.</td></tr>
+<tr><td>NGAP transfers</td><td><code>src/libs/nextgcore-ngap</code></td><td>Real-APER PDU Session Resource <em>transfer</em> codec used for the N2 container.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="the-two-state-machines-and-how-much-they-actually-drive"><a class="header" href="#the-two-state-machines-and-how-much-they-actually-drive">The two state machines (and how much they actually drive)</a></h2>
+<p>The SMF ships two ported finite-state machines:</p>
+<ul>
+<li><strong>GSM (5G Session Management)</strong> — <code>src/bins/nextgcore-smfd/src/gsm_sm.rs</code>, struct <code>GsmFsm</code>, states <code>Initial → Wait5gcSmPolicyAssociation → WaitPfcpEstablishment → Operational → WaitPfcpDeletion → …</code> (<code>GsmState</code>).</li>
+<li><strong>PFCP node FSM</strong> — <code>src/bins/nextgcore-smfd/src/pfcp_sm.rs</code>, struct <code>PfcpFsm</code>, states <code>Initial → WillAssociate → Associated</code>.</li>
+</ul>
+<p>Be aware of a real structural fact: these FSMs are largely <strong>state-tracking scaffolding</strong>, not the engine that builds messages. Their handlers (<code>GsmFsm::dispatch</code>, <code>PfcpFsm::dispatch</code>) mostly log, flip a state, and return <code>Handled</code>/<code>Ignored</code>; the header comments describe them as a “Port of src/smf/gsm-sm.c / pfcp-sm.c”. The real establishment logic lives in one imperative async function, <code>handle_sm_context_create</code> in <code>src/bins/nextgcore-smfd/src/main.rs</code>, which constructs a fresh <code>GsmFsm</code>, calls <code>fsm.init()</code>, and drives it with several <code>fsm.dispatch(...)</code> calls — the initial <code>ESTABLISHMENT_REQUEST</code> gsm_message dispatch (~line 2006), the PCF policy response via <code>fsm_dispatch_policy_response(&amp;mut fsm, …)</code> (which itself calls <code>fsm.dispatch</code>, ~lines 2052/2059), and an <code>n4_message</code> dispatch after PFCP establishment (~line 2212) — interleaved with explicit <code>fsm.transition_to(...)</code> calls (<code>WaitPfcpEstablishment</code>/<code>Exception</code>) for logging while it does the actual work inline. When you read the flow below, treat the FSM state names as a narration of <code>handle_sm_context_create</code>, not as an independent dispatcher.</p>
+<h2 id="pdu-session-establishment-step-by-step"><a class="header" href="#pdu-session-establishment-step-by-step">PDU session establishment, step by step</a></h2>
+<p>The trigger is an SBI <code>POST</code> to <code>Nsmf_PDUSession</code> CreateSMContext from the AMF. The whole flow is <code>handle_sm_context_create</code> (<code>main.rs</code>).</p>
+<pre><code>UE ──NAS PDU Session Est. Req──▶ AMF ──Nsmf CreateSMContext──▶ SMF
+                                                                │
+                          (1) validate  (2) parse N1  (3) alloc UE IP
+                          (4) NSAC admit (5) PCF policy
+                                                                │
+                                        (6) PFCP Session Est. ──▶ UPF
+                                        ◀── UP F-SEID + UPF N3 F-TEID ──
+                                                                │
+                    (7) build N1 Accept   (8) build N2 setup transfer (APER)
+                                                                │
+SMF ──201 multipart {SmContext, n1SmMsg, n2SmInfo}──▶ AMF ──▶ gNB + UE
+</code></pre>
+<ol>
+<li>
+<p><strong>Parse and validate <code>SmContextCreateData</code>.</strong> <code>handle_sm_context_create</code> deserializes the JSON body and calls <code>validate_sm_context_create_data</code>; genuinely-missing mandatory IEs are rejected with the matching <code>ProblemDetails</code> cause. It then reads <code>pduSessionId</code> (1..15), <code>dnn</code>, <code>sNssai.sst</code>/<code>sd</code>, and (leniently) <code>supi</code>, <code>anType</code>, <code>smContextStatusUri</code>. Per code comments, this maps to TS 29.502 Table 6.1.6.2.2-1. <strong>Lenience worth knowing:</strong> the current matched-sim AMF omits <code>supi</code>/<code>anType</code>, so those are warned-and-defaulted (<code>"imsi-unknown"</code>, <code>3GPP_ACCESS</code>) rather than rejected.</p>
+</li>
+<li>
+<p><strong>Decode the N1 container.</strong> The N1 <code>PDU Session Establishment Request</code> arrives either as a multipart <code>application/vnd.3gpp.5gnas</code> part (resolved from its <code>RefToBinaryData</code> contentId) or as a base64 string — <code>resolve_binary_ref</code> accepts both. It is parsed by <code>policy::parse_establishment_request</code>, yielding PTI, requested PDU-session type, and requested SSC mode. <strong>This SMF serves IPv4 only:</strong> <code>selected_type</code> collapses IPv4/IPv4v6 to IPv4; IPv6-only/Ethernet/Unstructured are rejected with 5GSM cause #50 (“PDU session type IPv4 only allowed”, per code comments).</p>
+</li>
+<li>
+<p><strong>Allocate the UE IP.</strong> <code>context.ipv4_pool.allocate()</code> draws from <code>Ipv4Pool</code> (<code>src/bins/nextgcore-smfd/src/session_extensions.rs</code>), a bitmap allocator over a <code>/16</code>. <code>Ipv4Pool::default_pool()</code> is <code>10.45.0.0/16</code> and reserves <code>.0.0</code> (network) and <code>.0.1</code> (gateway); exhaustion returns 5GSM cause #26 insufficient resources. This is the UE’s IPv4 for the life of the session; a <code>release_ip</code> closure rolls it back on any later failure.</p>
+</li>
+<li>
+<p><strong>Slice admission (optional).</strong> <code>policy::resolve_nsacf_endpoint()</code> + <code>policy::nsac_pdu_session_admit(...)</code> ask the NSACF whether a new PDU session is admissible for this S-NSSAI (per code comments, TS 29.536 §5.3). This is <strong>fail-open</strong>: no NSACF configured, or an unreachable one, proceeds anyway; only an explicit <code>Rejected</code> (quota exhausted) fails the session with 5GSM cause #67.</p>
+</li>
+<li>
+<p><strong>SM policy (PCF, or config-default).</strong> <code>policy::resolve_pcf_endpoint()</code> decides the source:</p>
+<ul>
+<li><strong>PCF present:</strong> <code>policy::sm_policy_create(...)</code> performs Npcf_SMPolicyControl_Create (per code comments, TS 29.512 §4.2.2) and returns a <code>PolicyDecision</code> (default 5QI, Session-AMBR UL/DL, PCC rules). A PCF <em>rejection</em> fails the session (cause #29-family); a PCF that is configured-but-<strong>unreachable</strong> is a hard <code>504</code> failure with cause #38 — no silent fallback.</li>
+<li><strong>No PCF:</strong> <code>PolicyDecision::config_default_for_dnn(&amp;dnn)</code> applies a documented default (DNN-derived 5QI, AMBR 100/100 Mbps). An “xr” DNN yields a delay-critical GBR XR 5QI so the XR QER path below is still exercised.</li>
+</ul>
+<p>The decision is then post-processed: <code>decision.ensure_xr_for_dnn(&amp;dnn)</code> (Rel-18 XR 5QI upgrade for an XR DNN) and, for a <code>redcapIndication</code> UE, a Session-AMBR cap (default 150/50 Mbps DL/UL, env-overridable) applied once so it flows to the N1 accept, the PFCP QER, and the stored binding.</p>
+<blockquote>
+<p><strong>Not wired:</strong> there is <strong>no</strong> UDM <code>Nudm_SDM</code> subscription-data fetch on this path. The GSM FSM has a placeholder <code>nudm-sdm</code> branch, but <code>handle_sm_context_create</code> and <code>policy.rs</code> never call UDM — session type, DNN and S-NSSAI come from <code>SmContextCreateData</code> + the N1 container, and QoS comes from PCF or the config default. (SMF↔UDM N10 exists as an interface line but is not on the establishment path.)</p>
+</blockquote>
+</li>
+<li>
+<p><strong>PFCP Session Establishment toward the UPF.</strong> <code>pfcp_session_establish</code> (<code>main.rs</code>) builds and sends the N4 request. See <a href="#the-pfcp-session-as-built">The PFCP session, as built</a> for the exact PDR/FAR/QER layout. On success it returns the UPF’s <code>UP F-SEID</code>, the UPF N3 GTP-U TEID, and the UPF N3 address, and stores the <code>upf_seid</code> in <code>SmfContext.pfcp_sessions</code> keyed by <code>smContextRef</code>.</p>
+</li>
+<li>
+<p><strong>Build the N1 <code>PDU Session Establishment Accept</code>.</strong> <code>policy::build_establishment_accept</code> (<code>src/bins/nextgcore-smfd/src/policy.rs</code>) hand-encodes the 5GSM message byte-by-byte: octet-5 SSC|type, the authorized QoS-rules LV-E, the Session-AMBR, the IPv4 PDU address, the S-NSSAI IE (<code>0x22</code>), conditional QoS-flow descriptions (<code>0x79</code>), and the DNN. Its doc comment stresses the layout is byte-identical to the legacy encoding and golden-tested. When the UE asked for IPv4v6 but only the IPv4 leg is granted, 5GSM cause #50 is attached (per code comments, TS 24.501 §8.3.2.2).</p>
+</li>
+<li>
+<p><strong>Build the N2 <code>PDUSessionResourceSetupRequestTransfer</code>.</strong> <code>build_setup_request_transfer</code> (<code>main.rs</code>) — this is <strong>real APER</strong>, encoded through <code>nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::encode()</code>, carrying the UPF N3 F-TEID (<code>UpTransportLayerInformation::GtpTunnel</code>) and a <code>QosFlowSetupRequestItem</code> (QFI, <code>NonDynamic5qi</code>, ARP). The code comment is explicit about <em>why</em> it is real APER: “the gNB’s strict APER decoder rejects the legacy hand-rolled byte layout (smfd#2).” This is a place where an earlier bespoke-bytes shortcut was deliberately replaced with a spec codec — the N2 setup, modify, path-switch, and setup-response transfers all go through <code>nextgcore-ngap</code>.</p>
+</li>
+<li>
+<p><strong>Respond.</strong> <code>sbi_response_with_n1_n2</code> (<code>main.rs</code>) returns <code>201</code> as <code>multipart/related</code>: a JSON <code>SmContextCreatedData</code> root (<code>smContextRef</code>, <code>pduSessionId</code>, <code>upCnxState: "ACTIVATING"</code>, <code>n2SmInfoType: "PDU_RES_SETUP_REQ"</code>) plus two binary parts — <code>n1SmMsg</code> (<code>application/vnd.3gpp.5gnas</code>) and <code>n2SmInfo</code> (<code>application/vnd.3gpp.ngap</code>) — referenced by <code>RefToBinaryData</code> (per code comments, TS 29.502 §6.1.2.2.2/§6.1.2.4). <strong>Shortcut:</strong> the N1/N2 are kept <em>inline</em> in the CreateSMContext response; the separate <code>Namf_Communication</code> N1N2MessageTransfer is noted in-code as out of scope (smfd-03).</p>
+</li>
+</ol>
+<h3 id="completing-the-tunnel-sm-context-update"><a class="header" href="#completing-the-tunnel-sm-context-update">Completing the tunnel: SM Context Update</a></h3>
+<p>The gNB accepts the resource and reports its own downlink GTP-U endpoint. The AMF forwards this as an <code>Nsmf_PDUSession</code> update, handled by <code>handle_sm_context_update</code> (<code>main.rs</code>), which dispatches on <code>n2SmInfoType</code>:</p>
+<ul>
+<li><code>PDU_RES_SETUP_RSP</code> → <code>decode_setup_response_dl_endpoint</code> (real-APER <code>PDUSessionResourceSetupResponseTransfer</code>) extracts the gNB DL TEID + address + QFI.</li>
+<li><code>PATH_SWITCH_REQ</code> → <code>decode_path_switch_dl_endpoint</code> (real-APER <code>PathSwitchRequestTransfer</code>) for an Xn handover.</li>
+</ul>
+<p>Either way the SMF then calls <code>pfcp_session_modify</code> (<code>main.rs</code>), which sends a PFCP <strong>Session Modification</strong> that flips the downlink FAR from BUFF to FORW and installs an <code>OuterHeaderCreation</code> (GTP-U/UDP/IPv4, description <code>0x0100</code>) pointing at the gNB TEID, with the SNDEM flag to emit End Markers on any old tunnel. Only after this does downlink traffic actually flow to the UE.</p>
+<h2 id="the-pfcp-session-as-built"><a class="header" href="#the-pfcp-session-as-built">The PFCP session, as built</a></h2>
+<h3 id="request-construction-smf-side"><a class="header" href="#request-construction-smf-side">Request construction (SMF side)</a></h3>
+<p><code>pfcp_session_establish</code> builds the message with the SMF’s bespoke TLV builder <code>n4_build::PfcpMessageBuilder</code> (not the library’s typed structs). It first checks <code>client.is_associated()</code> — no session signalling without an association (per code comments, TS 29.244 6.2.6.2) — then assembles:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>IE</th><th>Value</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>Node ID (IPv4)</td><td>SMF IP</td><td><code>add_node_id_ipv4</code></td></tr>
+<tr><td>F-SEID</td><td><code>smf_n4_seid = (sess_idx | 0x1000)</code></td><td>SMF’s own SEID</td></tr>
+<tr><td>APN/DNN, S-NSSAI</td><td>from the request</td><td></td></tr>
+<tr><td><strong>Create QER 1</strong></td><td>Session-AMBR as MBR UL/DL, gates open, QFI</td><td>enforces authorized AMBR</td></tr>
+<tr><td><strong>Create QER 2</strong> (conditional)</td><td>XR GBR UL/DL</td><td>only when the authorized 5QI is XR (82–85); GBR is the wire-stable XR signal since a 6-bit QFI cannot carry an 82–85 5QI</td></tr>
+<tr><td><strong>Create PDR 1</strong> (uplink)</td><td>source interface <strong>Access(0)</strong>, F-TEID <code>teid=0</code> (UPF allocates), outer-header-removal GTP-U/UDP/IPv4, FAR 1, QER, QFI</td><td></td></tr>
+<tr><td><strong>Create FAR 1</strong> (uplink)</td><td>apply-action <strong>FORW(0x02)</strong>, dest interface <strong>N6/SGi(2)</strong></td><td></td></tr>
+<tr><td><strong>Create PDR 2</strong> (downlink)</td><td>source interface <strong>Core(1)</strong>, UE IP as destination, FAR 2</td><td></td></tr>
+<tr><td><strong>Create FAR 2</strong> (downlink)</td><td>apply-action <strong>BUFF(0x04)</strong>, dest interface <strong>Access(0)</strong></td><td>buffered until the gNB TEID arrives (step above)</td></tr>
+</tbody>
+</table>
+</div>
+<p>It sends <code>SESSION_ESTABLISHMENT_REQUEST</code> with <strong>SEID=0</strong> for a new session (per code comments, TS 29.244 7.2.2.4.2) through the transaction engine (T1/N1 retransmission). A missing/rejected <code>Cause</code> is a hard failure — there is deliberately no fabricated-TEID fallback, since that would create a data-plane black hole.</p>
+<p><strong>Response parsing is hand-rolled here:</strong> rather than decode with the library, <code>pfcp_session_establish</code> walks the response TLVs itself, pulling the <code>UP F-SEID</code> (IE type 57) and the <code>Created PDR</code> (IE 8) → <code>F-TEID</code> (IE 21). The code even documents a subtle gotcha: the F-TEID V4 flag is Bit1 (<code>0x01</code>), the <strong>opposite</strong> of F-SEID’s V4 flag (Bit2), per code comments TS 29.244 §8.2.3 vs §8.2.37. A missing UP F-SEID or a missing Created-PDR F-TEID aborts the session.</p>
+<h3 id="the-object-model-upf-side"><a class="header" href="#the-object-model-upf-side">The object model (UPF side)</a></h3>
+<p>The UPF stores everything in a per-session <code>SessionContext</code> (<code>src/bins/nextgcore-upfd/src/n4_handler.rs</code>), which is just four <code>HashMap</code>s plus a BAR:</p>
+<pre><code>SessionContext { upf_n4_seid, smf_n4_seid,
+                 pdrs: HashMap&lt;u16, Pdr&gt;,
+                 fars: HashMap&lt;u32, Far&gt;,
+                 urrs: HashMap&lt;u32, Urr&gt;,
+                 qers: HashMap&lt;u32, Qer&gt;,
+                 bar:  Option&lt;Bar&gt; }
+</code></pre>
+<ul>
+<li><strong><code>Pdr</code></strong> (<code>context.rs</code>) — <code>pdr_id</code>, <code>precedence</code>, <code>source_interface</code>, optional <code>ue_ip</code>/<code>f_teid</code>/<code>sdf_filter</code>, <code>far_id</code>, <code>qer_id</code>, <code>urr_ids</code>, <code>outer_header_removal</code>. <code>Pdr::pdr_match</code> compares source interface, UE IP, and TEID; SDF filters compile via <code>nextgcore-ipfw</code> but full per-packet SDF matching happens in the data plane.</li>
+<li><strong><code>Far</code></strong> (<code>context.rs</code>) — <code>apply_action</code> bitmask (DROP <code>0x01</code>, FORW <code>0x02</code>, BUFF <code>0x04</code>, NOCP <code>0x08</code>, DUPL <code>0x10</code>), <code>destination_interface</code>, optional <code>OuterHeaderCreation</code>, forwarding/duplicating params, <code>bar_id</code>. Helpers <code>should_forward</code>/<code>should_drop</code>.</li>
+<li><strong><code>Qer</code></strong> (<code>n4_handler.rs</code>) — <code>qer_id</code>, <code>GateStatus{ul_gate,dl_gate}</code> (0=open), <code>Mbr</code>, <code>Gbr</code>, <code>qfi</code>, <code>rqi</code>, <code>ppi</code>.</li>
+<li><strong><code>Urr</code></strong> (<code>n4_handler.rs</code>) — measurement method/reporting-trigger flag structs, volume/time thresholds and quotas; accounting lives in <code>UrrAccounting</code>.</li>
+</ul>
+<p><code>handle_session_establishment_request</code> (<code>n4_handler.rs</code>) inserts the incoming PDRs/FARs/URRs/QERs/BAR into those maps (each guarded by <code>MAX_NUM_OF_*</code> caps → <code>NoResourcesAvailable</code>). <code>handle_session_modification_request</code> applies create/update/remove for each rule class. <code>handle_session_deletion_request</code> snapshots each URR into a final <code>UsageReport</code> before teardown.</p>
+<p>The shared <strong><code>nextgcore-pfcp</code></strong> library underpins the wire format: <code>header.rs</code> models the <code>PfcpHeader</code> (the S-bit <code>seid_presence</code>, the 8-byte no-SEID vs 16-byte with-SEID layouts, and <code>has_seid()</code> per message type); <code>ie.rs</code> is the <code>IeType</code> registry (<code>CreatePdr=1</code>, <code>CreateFar=3</code>, <code>CreateUrr=6</code>, <code>CreateQer=7</code>, <code>CreatedPdr=8</code>, …); <code>message.rs</code> and <code>types.rs</code> carry typed structs (<code>AssociationSetupRequest/Response</code> with a Recovery Time Stamp, <code>SessionEstablishmentRequest</code>/<code>Response</code> that validate a present <code>UP F-SEID</code> on accept, <code>CreatePdr</code>/<code>CreateFar</code>/<code>CreateQer</code>). In practice the daemons build and parse the concrete bytes through their own per-daemon <code>n4_build</code> module, so the library’s typed message structs and the daemons’ TLV codecs coexist.</p>
+<h2 id="pfcp-association-heartbeats-and-failure-handling"><a class="header" href="#pfcp-association-heartbeats-and-failure-handling">PFCP association, heartbeats, and failure handling</a></h2>
+<p>Session signalling requires a live association, and <strong>the SMF is the initiator</strong>:</p>
+<ul>
+<li><code>associate()</code> (<code>src/bins/nextgcore-smfd/src/pfcp_path.rs</code>) sends <code>ASSOCIATION_SETUP_REQUEST</code>; on an accepted cause it sets <code>associated = true</code> and records the peer’s Recovery Time Stamp.</li>
+<li>The UPF answers in <code>handle_association_setup_request</code> (<code>src/bins/nextgcore-upfd/src/pfcp_path.rs</code>): Node ID and Recovery Time Stamp are mandatory (per code comments, TS 29.244 7.4.4.1) — a missing one yields a rejected response naming the offending IE — otherwise it replies <code>ASSOCIATION_SETUP_RESPONSE</code> via <code>build_association_setup_response</code>.</li>
+</ul>
+<p>Heartbeats keep the association alive and detect restarts. Both sides build/handle <code>HEARTBEAT_REQUEST</code>/<code>HEARTBEAT_RESPONSE</code> (<code>build_heartbeat_response</code> carries the sender’s Recovery Time Stamp; heartbeat messages use SEID=0). On the SMF, a lapsed no-heartbeat timer tears down the association and returns the <code>PfcpFsm</code> to <code>WillAssociate</code> (i.e., UPF reselection, <code>PfcpFsm::handle_associated</code> on <code>N4NoHeartbeat</code>). On the UPF, a per-N3-peer <code>path_table</code> compares the Recovery Time Stamp on each heartbeat/echo to spot a restarted peer whose tunnels are now stale (per code comments, TS 29.281 §7.2.2 / TS 23.007).</p>
+<p>Teardown mirrors setup: <code>handle_sm_context_release</code> (<code>main.rs</code>) calls <code>pfcp_session_delete</code>, which sends <code>SESSION_DELETION_REQUEST</code> (no body IEs, per code comments TS 29.244 7.5.6) keyed on the stored <code>upf_seid</code>; the UPF returns the final usage reports and drops the <code>SessionContext</code>.</p>
+<h2 id="the-upf-data-plane-gtp-u--tun"><a class="header" href="#the-upf-data-plane-gtp-u--tun">The UPF data plane (GTP-U ⇄ TUN)</a></h2>
+<p>The forwarder is a <strong>userspace</strong> fast path in <code>src/bins/nextgcore-upfd/src/data_plane.rs</code>. <code>DataPlane::run</code> opens the N3 GTP-U UDP socket (default <code>127.0.0.4:2152</code>, <code>--gtpu-addr</code>) and a TUN device, then spawns two tokio tasks feeding a <code>select!</code> loop:</p>
+<ul>
+<li>a GTP-U receive task (<code>recv_from</code>) → <code>handle_uplink_packet</code>;</li>
+<li>a TUN read task (<code>libc::read</code> on the raw fd) → <code>handle_downlink_packet</code>.</li>
+</ul>
+<p>The TUN device is <strong>its own inline <code>TunDevice</code></strong> (<code>data_plane.rs</code>), which opens <code>/dev/net/tun</code> directly via <code>libc</code> and is Linux-only (the macOS <code>create</code> is a stub returning an error). Default interface <code>ogstun</code>, IP <code>10.45.0.1/16</code> (<code>--tun-ip</code>/<code>--tun-prefix</code>) — the gateway that the E2E ping targets. Note the workspace ships a <code>nextgcore-tun</code> library, but <strong>the UPF does not use it</strong> (a grep for <code>nextgcore_tun</code> in <code>nextgcore-upfd/src</code> is empty).</p>
+<p><strong>Uplink — <code>handle_uplink_packet</code> (gNB → UPF → data network):</strong></p>
+<ol>
+<li><code>parse_gtpu_header</code>; branch on message type — reply to <code>ECHO_REQUEST</code>, raise an Error-Indication Report to the SMF on <code>ERROR_INDICATION</code>, update the path table on <code>ECHO_RESPONSE</code>, ignore <code>END_MARKER</code>; only <code>GPDU</code> continues.</li>
+<li>Locate the session by uplink TEID (<code>find_by_ul_teid</code>), falling back to the inner source IP (<code>find_by_ue_ip</code>). A GPDU for an unknown non-zero TEID triggers a GTP-U Error Indication back to the sender (per code comments, TS 29.281 §7.3.1); TEID=0 is dropped silently.</li>
+<li><strong>Anti-spoofing:</strong> the inner source IP must equal the session’s allocated UE IP, else drop and count (per code comments, TS 23.501 §5.6.1).</li>
+<li><code>match_pdr_with_packet(SRC_INTF_ACCESS, …)</code> → check the QER gate (<code>check_qer_gate</code>, a token bucket built from the MBR) and pull any DSCP → apply the FAR (<code>Forward</code>/<code>Drop</code>/<code>Buffer</code>) → record URR bytes. No PDR match ⇒ drop (per code comments, TS 23.501 §5.8.2).</li>
+<li>MTU guard, optional inner-packet DSCP marking (checksum recomputed), then <code>libc::write</code> the decapsulated IP packet to the TUN.</li>
+</ol>
+<p><strong>Downlink — <code>handle_downlink_packet</code> (data network → UPF → gNB):</strong></p>
+<ol>
+<li>Find the session by destination UE IP (<code>find_by_ue_ip</code>).</li>
+<li><code>match_pdr_with_packet(SRC_INTF_CORE, …)</code> → QER gate + DSCP + QFI → apply the FAR:
+<ul>
+<li><code>Forward</code> → resolve <code>(dl_teid, gnb_addr)</code> from the FAR’s <code>OuterHeaderCreation</code> (or the session default);</li>
+<li><code>Buffer</code> → queue the packet, and on the first buffered packet with NOCP set, emit a <strong>Downlink Data Report</strong> to the SMF (per code comments, TS 29.244 5.2.3);</li>
+<li><code>Drop</code> → drop.</li>
+</ul>
+</li>
+<li>DSCP is applied to the <strong>outer</strong> transport header via a GTP-U socket <code>IP_TOS</code> option, never the inner UE packet (per code comments, TS 23.501 §5.7.4 — the inner packet is carried byte-for-byte on N3).</li>
+<li><code>encapsulate_dl_gpdu</code> prepends the GTP-U header, carrying the QFI in a PDU Session Container extension header (per code comments, TS 38.415 / TS 29.281), and <code>send_to</code> the gNB.</li>
+</ol>
+<p>When the SMF’s modification flips the DL FAR to FORW, <code>main.rs</code>’s <code>handle_pfcp_session_event</code> calls <code>update_session_from_pfcp</code> (record gNB TEID/addr) and then <code>flush_buffered_dl</code>, draining any packets buffered during establishment. Per-session and aggregate packet/byte counters are maintained throughout (the same counters surfaced in <a href="../observability.html">Observability</a>).</p>
+<h2 id="simplifications-and-known-gaps"><a class="header" href="#simplifications-and-known-gaps">Simplifications and known gaps</a></h2>
+<p>Grounded in the code, not aspirational:</p>
+<ul>
+<li><strong>The GSM/PFCP FSMs are scaffolding.</strong> <code>gsm_sm.rs</code>/<code>pfcp_sm.rs</code> mostly log and track state; the establishment logic is imperative in <code>handle_sm_context_create</code>, which advances the FSM with explicit <code>transition_to</code> calls. Do not expect the dispatcher to be authoritative.</li>
+<li><strong>No UDM subscription fetch.</strong> Establishment never calls <code>Nudm_SDM</code>; QoS is PCF-or-config-default and session parameters come from <code>SmContextCreateData</code>/N1. The <code>nudm-sdm</code> FSM branch is unused.</li>
+<li><strong>Bespoke NAS 5GSM encoder.</strong> <code>policy::build_establishment_accept</code> hand-writes bytes (golden-tested, byte-identical to the legacy layout) rather than using a general NAS codec.</li>
+<li><strong>Bespoke PFCP TLV codec with a hand-rolled response parser.</strong> PFCP messages are built/parsed via each daemon’s <code>n4_build</code>; <code>pfcp_session_establish</code> walks response TLVs manually, in parallel with the typed structs in <code>nextgcore-pfcp</code>.</li>
+<li><strong>N1/N2 carried inline in CreateSMContext.</strong> The separate <code>Namf_Communication</code> N1N2MessageTransfer is explicitly out of scope (smfd-03).</li>
+<li><strong>IPv4 only.</strong> IPv6/Ethernet/Unstructured sessions are rejected (cause #50); the IP pool is a single <code>/16</code> bitmap with no per-DNN/per-slice pools.</li>
+<li><strong>Userspace UPF forwarder, Linux-only TUN.</strong> No eBPF/kernel offload; <code>data_plane.rs</code> uses <code>unsafe libc::read</code>/<code>write</code>; the macOS TUN path is a stub. The <code>nextgcore-tun</code> library is unused by the UPF.</li>
+<li><strong>Optional NFs fail open.</strong> A missing/unreachable NSACF (and a missing PCF) do not block the basic data path by design.</li>
+<li><strong>What is genuinely spec-faithful:</strong> the N2 resource transfers use the real-APER <code>nextgcore-ngap</code> codec (a deliberate fix so a strict-APER gNB decoder accepts them), the PFCP F-TEID/F-SEID flag handling and SEID=0-on-new-session semantics follow TS 29.244, and the GTP-U path implements Echo, Error Indication, End Marker, QFI extension headers, uplink anti-spoofing, and DL buffering with Downlink Data Reports.</li>
+</ul>
+<h2 id="how-it-is-validated"><a class="header" href="#how-it-is-validated">How it is validated</a></h2>
+<p><strong>Unit / property tests.</strong> State-machine transitions (<code>gsm_sm.rs</code>, <code>pfcp_sm.rs</code> <code>#[cfg(test)]</code>), the NAS accept builder (<code>gsm_build.rs::test_build_pdu_session_establishment_accept</code>), the multipart N1/N2 response and APER transfer round-trip (<code>main.rs</code> tests such as <code>sm_context_created_response_is_multipart_with_binary_refs</code> and the <code>PduSessionResourceSetupRequestTransfer</code> decode test), the IPv4 pool (<code>session_extensions.rs</code>), and <code>property_tests.rs</code> in both <code>nextgcore-smfd</code> and <code>nextgcore-upfd</code>.</p>
+<p><strong>Matched-simulator docker E2E.</strong> The single entrypoint <code>docker/rust/e2e.sh</code> chains <code>preflight.sh → build.sh → e2e-test.sh</code>. <code>e2e-test.sh</code> brings up the full stack (5GC NFs + <code>nextgsim-gnb</code> + <code>nextgsim-ue</code>) and asserts, against real container logs, the whole establishment and — crucially — the data plane:</p>
+<ul>
+<li>UPF: <code>GTP-U path opened</code>, <code>Configured TUN device …10.45.0.1</code>, <code>Added data plane session</code>, <code>Updated data plane session …DL_TEID</code>;</li>
+<li>gNB: <code>GTP-U socket bound</code>, <code>created GTP-U session</code>;</li>
+<li>UE: <code>Sending PDU Session Establishment Request</code>, <code>PDU Session Establishment Accept</code>, <code>PDU session 1 is now ACTIVE (IPv4: Some…)</code>, <code>Creating TUN interface</code>;</li>
+<li><strong>User-plane proof:</strong> <code>docker exec nextgsim-ue ping -c 3 10.45.0.1</code> — an ICMP round-trip <em>through the UE’s GTP-U tunnel</em> to the UPF gateway.</li>
+</ul>
+<p>The full baseline suite was <strong>84/84 green on 2026-07-02</strong> with 0% loss on the UE→UPF GTP-U path. Overlays extend the same suite: <code>--overlay kernel-sctp</code> (native N2 SCTP), <code>--overlay oauth2</code> (SBI token enforcement), <code>--overlay features</code> (Rel-17/18 harness). When an assertion fails, <code>e2e.sh</code> saves every container’s <code>docker logs</code> under <code>docker/rust/artifacts/</code> before teardown; see <a href="../observability.html">Observability &amp; Troubleshooting</a> for the recipe and the log-grep pitfalls.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../concepts/registration-call-flow.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../concepts/ai-stack.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../concepts/registration-call-flow.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../concepts/ai-stack.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

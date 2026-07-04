@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-51e55ca4.js";
+            window.path_to_searchindex_js = "searchindex-b04bf570.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-06d290c2.js"></script>
+        <script src="toc-1b88980e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -2816,6 +2816,770 @@ pcrf:
 <li>On any failure, <code>e2e.sh</code> saves <code>docker logs</code> of <strong>every</strong> <code>nextgcore-*</code>/<code>nextgsim-*</code> container — before teardown — under <code>docker/rust/artifacts/e2e-YYYYMMDD-HHMMSS/</code> (one <code>&lt;container&gt;.log</code> per container, plus <code>docker-ps.txt</code> and <code>docker-system-df.txt</code>). Override the location with <code>--artifacts DIR</code>.</li>
 <li>To debug interactively, rerun with <code>--keep</code> and inspect the live stack (<code>docker compose logs -f amf gnb ue</code>, <code>docker exec nextgsim-ue ping 10.45.0.1</code>).</li>
 <li>Some historical assertions were removed as stale (e.g. Identity Request/Response — the UE sends its SUCI in the initial Registration Request, so the identity procedure never runs); the comments in <code>e2e-test.sh</code> explain each pattern’s source anchor, which is the right place to start when an assertion and the logs disagree.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="ue-registration-call-flow"><a class="header" href="#ue-registration-call-flow">UE Registration Call Flow</a></h1>
+<p>This chapter traces the 5G initial-registration procedure as it is <em>actually</em>
+implemented across the NextGCore network functions — not as TS 23.502 draws it,
+but as the Rust code runs it. It follows a single UE from the gNB’s NGAP
+<code>InitialUEMessage</code> (carrying a NAS Registration Request), through 5G-AKA
+authentication and NAS security-mode control, the three mandatory registration
+SBI calls, the piggybacked Registration Accept, and finally the post-
+registration UE-policy (URSP) push. Every step below names the file and the
+function or struct that performs it, so you can open the source and read along.</p>
+<p>The whole 3GPP-facing flow is driven by the AMF daemon
+(<code>nextgcore-amfd</code>); the authentication maths lives in the AUSF
+(<code>nextgcore-ausfd</code>) and UDM (<code>nextgcore-udmd</code>); post-registration policy comes
+from the PCF (<code>nextgcore-pcfd</code>). The matched UE/gNB simulator that exercises
+this path end-to-end is a <strong>separate repository</strong> — here it appears only as the
+peer on the far side of the N2 (NGAP) association.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> This registration flow is validated by NextGCore’s own unit
+tests and matched-simulator docker E2E (84/84 green as of 2026-07-02), <strong>not</strong>
+by third-party conformance certification. The implementation drives <strong>5G-AKA
+only</strong> on the live path (the AMF’s EAP-AKA′ Authentication-Request builder is
+compiled but unreferenced — see <em>Simplifications and known gaps</em>), takes a
+number of documented wire-format and control-plane shortcuts, and matches a
+cooperative simulator peer rather than an arbitrary commercial UE/RAN. TS
+numbers are quoted only where they appear in this repo’s source comments,
+phrased “per code comments”.</p>
+</blockquote>
+<h2 id="components-involved"><a class="header" href="#components-involved">Components involved</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>NF</th><th>Crate</th><th>Role in registration</th><th>Config page</th></tr>
+</thead>
+<tbody>
+<tr><td>AMF</td><td><code>nextgcore-amfd</code></td><td>N2/NGAP termination, GMM state machine, NAS security, SBI orchestration</td><td><a href="#amf-configuration">AMF</a></td></tr>
+<tr><td>AUSF</td><td><code>nextgcore-ausfd</code></td><td><code>Nausf_UEAuthentication</code> (5G-AKA / EAP-AKA′), KSEAF disclosure</td><td><a href="#ausf-configuration">AUSF</a></td></tr>
+<tr><td>UDM</td><td><code>nextgcore-udmd</code></td><td><code>generate-auth-data</code> (SIDF + Milenage), UECM registration, SDM am-data</td><td><a href="#udm-configuration">UDM</a></td></tr>
+<tr><td>UDR</td><td><code>nextgcore-udrd</code></td><td>System of record for auth-subscription + am-data (queried by UDM)</td><td><a href="#udr-configuration">UDR</a></td></tr>
+<tr><td>PCF</td><td><code>nextgcore-pcfd</code></td><td><code>Npcf_AMPolicyControl</code>, <code>Npcf_UEPolicyControl</code> + URSP N1N2 push</td><td><a href="#pcf-configuration">PCF</a></td></tr>
+<tr><td>NSACF</td><td><code>nextgcore-nsacfd</code></td><td>Per-slice UE admission control (<code>Nnsacf_NSAC</code>)</td><td><a href="#nsacf-configuration">NSACF</a></td></tr>
+<tr><td>NRF</td><td><code>nextgcore-nrfd</code></td><td>On-demand NF discovery for every peer above</td><td><a href="#nrf-configuration">NRF</a></td></tr>
+</tbody>
+</table>
+</div>
+<p>Supporting libraries: <code>nextgcore-nas</code> (5GMM message codec, SUCI, NAS security),
+<code>nextgcore-ngap</code> + <code>nextgcore-asn1c</code> (NGAP/APER), and <code>nextgcore-sctp</code> (the N2
+transport). The NSSF (<code>nextgcore-nssfd</code>) is listed here only to say what does
+<strong>not</strong> happen: it is <strong>not</strong> consulted during registration (see step 12).</p>
+<h2 id="the-n2-transport-underneath"><a class="header" href="#the-n2-transport-underneath">The N2 transport underneath</a></h2>
+<p>The AMF terminates NGAP over SCTP through the <code>NgapTransport</code> enum and
+<code>SctpBackend</code> selector in <code>src/bins/nextgcore-amfd/src/ngap_path.rs</code>
+(<code>SctpBackend::parse</code>). Two backends exist:</p>
+<ul>
+<li><strong><code>userspace</code></strong> (default, <code>Args.sctp_backend</code> in
+<code>src/bins/nextgcore-amfd/src/lib.rs</code>) — <code>sctp-proto</code> over UDP, matched to the
+nextgsim gNB. This is what the docker E2E uses.</li>
+<li><strong><code>kernel</code></strong> — native Linux kernel SCTP for a standard external RAN, compiled
+only when amfd is built with the <code>kernel-sctp</code> feature (the <code>#[cfg(feature = "kernel-sctp")]</code> arms in <code>NgapTransport</code>). Requesting <code>kernel</code> without that
+feature is a hard startup error.</li>
+</ul>
+<p>The registration handlers are backend-agnostic: everything below runs
+identically over either transport once bytes arrive at <code>handle_ngap_message</code>.</p>
+<h2 id="the-initial-nas-message"><a class="header" href="#the-initial-nas-message">The initial NAS message</a></h2>
+<ol>
+<li>
+<p><strong>gNB → AMF: <code>InitialUEMessage</code>.</strong> The dispatcher in <code>ngap_path.rs</code>
+(procedure code 15) routes to <code>handle_initial_ue_message</code>, which parses the
+PDU with <code>crate::ngap_asn1::parse_initial_ue_message_asn1</code> into an
+<code>InitialUeMessageData</code> (RAN-UE-NGAP-ID, NAS-PDU, PLMN, TAC, NR-CGI). It
+allocates an AMF-UE-NGAP-ID, creates a <code>UeNasContext</code> (seeded with
+<code>crate::context::nas_security_canary()</code>), records the TAI and 3GPP access
+type, and switches on the inner NAS message type. A <code>REGISTRATION_REQUEST</code>
+(<code>0x7E … 0x41</code>) is dispatched to <code>handle_registration_request_nas</code> with
+<code>integrity_protected = false</code> — this is an unprotected initial NAS message.
+Logs <code>Initial UE Message from association …</code>.</p>
+<p>A <code>SERVICE_REQUEST</code> arriving in an <code>InitialUEMessage</code> with no stored context
+is rejected with 5GMM cause #9 (<code>build_service_reject</code>) — the code comment
+cites TS 24.501 §5.6.1.5.</p>
+</li>
+<li>
+<p><strong>Registration Request parsing + cleartext gate.</strong>
+<code>handle_registration_request_nas</code> (<code>ngap_path.rs</code>) runs
+<code>parse_registration_request_pdu</code>, then enforces the TS 24.501 §4.4.6 /
+TS 33.501 §6.4.6 cleartext-IE rule via
+<code>validate_initial_registration_cleartext</code> (per code comments): an
+<em>unprotected</em> initial Registration Request that carries a non-cleartext IE
+(e.g. Requested NSSAI) or a NAS message container is rejected with 5GMM #95
+before any IE touches UE state. It logs the E2E anchor line
+<code>Registration Request: type=…, ngKSI=…, identity_type=…, suci=…</code>.</p>
+<p>The UE security capability is stored <strong>exactly as received</strong>
+(<code>state.amf_ue.ue_security_capability</code>); when the IE is absent the code
+assumes null algorithms only (<code>ea/ia = 0x80</code>) rather than fabricating
+capabilities. The <strong>Requested NSSAI is deliberately not read here</strong> — it is a
+non-cleartext IE and is taken only from the integrity-protected replay in
+step 11.</p>
+<p>Identity branch:</p>
+<ul>
+<li><strong>SUCI identity</strong> → proceed to authentication (<code>start_authentication</code>).
+Optional Rel-17/18 handling (SNPN NID allow-list via <code>validate_nid</code>, UAV
+geofence authorization, RedCap AMBR capping) is applied here first.</li>
+<li><strong>GUTI unknown to this AMF</strong> → send an Identity Request for the SUCI
+(<code>gmm_build::build_identity_request</code>) and arm timer T3570. There is <strong>no
+blanket Identity Request</strong> otherwise — identification runs only when the UE
+gave a GUTI this AMF cannot resolve.</li>
+<li><strong>Periodic updating</strong> with a live security context → short-circuit straight
+to <code>send_registration_accept</code> (step 13).</li>
+</ul>
+</li>
+</ol>
+<h2 id="authentication-5g-aka"><a class="header" href="#authentication-5g-aka">Authentication (5G-AKA)</a></h2>
+<pre><code>UE            gNB           AMF(amfd)        AUSF(ausfd)      UDM(udmd)     UDR(udrd)
+ |  Reg Req    |  InitialUE   |                 |               |            |
+ |------------&gt;|-------------&gt;| start_auth      |               |            |
+ |             |              |  POST ue-authentications        |            |
+ |             |              |----------------&gt;| generate-auth-data          |
+ |             |              |                 |--------------&gt;| auth-sub GET |
+ |             |              |                 |               |-----------&gt;|
+ |             |              |                 |  Milenage AV  |&lt;-----------|
+ |             |              |  201 5gAuthData |&lt;--------------|            |
+ |  Auth Req   |              |&lt;----------------|               |            |
+ |&lt;------------|&lt;-------------|                 |               |            |
+ |  Auth Resp (RES*)          | verify HXRES*   |               |            |
+ |------------&gt;|-------------&gt;|  PUT 5g-aka-confirmation         |            |
+ |             |              |----------------&gt;| RES* vs XRES* |            |
+ |             |              |  200 kseaf,supi |&lt;--------------|            |
+ |             |              | derive Kamf/Knas|               |            |
+</code></pre>
+<ol start="3">
+<li>
+<p><strong>AMF → AUSF: <code>Nausf_UEAuthentication</code> create.</strong> <code>start_authentication</code>
+(<code>ngap_path.rs</code>) resolves the AUSF endpoint through
+<code>resolve_nf_endpoint_async(NausfAuth)</code> — SBI discovery cache first, then an
+<strong>on-demand NRF discovery</strong> (<code>amf_nrf_discover</code>), then env/localhost fallback
+(<code>sbi_path.rs</code>). It builds the serving-network-name from the serving PLMN
+(<code>serving_network_name_from_plmn</code>) and calls
+<code>call_ausf_authenticate_with_resync</code> (<code>sbi_path.rs</code>), which POSTs
+<code>/nausf-auth/v1/ue-authentications</code> with <code>{ supiOrSuci, servingNetworkName }</code>
+(plus <code>resynchronizationInfo</code> on an SQN-resync retry). Logs the E2E anchor
+<code>Calling AUSF authenticate: …</code>.</p>
+</li>
+<li>
+<p><strong>AUSF validates and asks UDM.</strong> <code>handle_ue_authentication</code>
+(<code>src/bins/nextgcore-ausfd/src/app.rs</code>) validates the SNN shape
+(<code>validate_serving_network_name</code>, requiring the <code>5G:</code> anti-bidding-down
+prefix, per code comments citing TS 33.501 §6.1.2) and checks it is allowed
+for the requesting consumer (<code>snn_authorized_for_consumer</code> in
+<code>nausf_handler.rs</code>, <strong>default-permissive</strong> when no OAuth2 token carries a
+<code>plmnList</code>). It then calls <code>send_udm_generate_auth_data</code>.</p>
+</li>
+<li>
+<p><strong>UDM builds the authentication vector.</strong> <code>handle_generate_auth_data</code>
+(<code>src/bins/nextgcore-udmd/src/app.rs</code>) requires <code>servingNetworkName</code> and
+<code>ausfInstanceId</code>, de-conceals the SUCI via the SIDF
+(<code>context.deconceal_suci</code>, per code comment TS 33.501 §6.12.5), queries UDR
+for the auth subscription (<code>udm_nudr_dr_send_auth_subscription_get</code>), and
+selects 5G-AKA or EAP-AKA′ from the subscription’s <code>authenticationMethod</code>
+(anything else → 501 <code>UNSUPPORTED_AUTHENTICATION_METHOD</code>). For 5G-AKA it runs
+<code>nextgcore_crypt::milenage::milenage_generate(opc, amf, k, sqn, rand)</code> to get
+<code>(autn, ik, ck, ak, res)</code>, then derives <code>kausf = nextgcore_kdf_kausf(ck, ik, snn, autn)</code> and <code>xresStar = nextgcore_kdf_xres_star(...)</code>, returning the AV <code>{ rand, autn, xresStar, kausf }</code>. (An SQN synch failure carrying AUTS is validated against <code>mac_s</code>
+here before a fresh vector is generated.)</p>
+</li>
+<li>
+<p><em><em>AUSF returns <code>5gAuthData</code> (HXRES</em>, not KSEAF).</em>* Back in <code>app.rs</code>, the AUSF
+stores <code>rand/xres_star/autn/kausf</code>, computes HXRES* with
+<code>calculate_hxres_star()</code>, and answers <strong>201</strong> with
+<code>{ authType: "5G_AKA", 5gAuthData: { rand, hxresStar, autn }, _links, servingNetworkName }</code> and a <code>Location</code> header naming the auth context.
+<strong>KSEAF is deliberately withheld</strong> at this stage — it is disclosed only on a
+successful confirmation (step 8), per code comment TS 29.509 §6.1.6.2.8.</p>
+</li>
+<li>
+<p><strong>AMF → UE: Authentication Request; UE → AMF: Authentication Response.</strong> The
+AMF stores the vector, fixes the initial ABBA to <code>[0x00, 0x00]</code> (per code
+comment TS 33.501 Annex A.7.1), builds the NAS Authentication Request
+(<code>gmm_build::build_authentication_request</code>), sends it and arms T3560. When
+the Authentication Response arrives (via <code>handle_uplink_nas_transport</code> →
+<code>handle_authentication_response_nas</code>), the AMF extracts RES* (IEI <code>0x2D</code>) and
+performs the <strong>SEAF-side</strong> check: <code>HRES* = SHA256(RAND ‖ RES*)[16..32]</code>
+compared to the stored HXRES* (per code comment TS 33.501 §6.1.3.2.0). A
+mismatch sends an Authentication Reject and releases the UE.</p>
+</li>
+<li>
+<p><strong>AMF → AUSF: 5G-AKA confirmation.</strong> <code>call_ausf_5g_aka_confirm</code>
+(<code>sbi_path.rs</code>) PUTs
+<code>/nausf-auth/v1/ue-authentications/{ctxId}/5g-aka-confirmation</code> with
+<code>{ resStar }</code>. The AUSF confirmation handler (<code>app.rs</code>) does the
+<strong>authoritative</strong> check — a <strong>constant-time</strong> <code>compare_res_star</code>
+(<code>nausf_handler.rs</code>) of the received RES* against the stored XRES* (per code
+comment TS 33.501 §6.1.3.2 step 11; HXRES* is the SEAF’s job, not the
+AUSF’s). On success it computes KSEAF (<code>calculate_kseaf()</code>), refreshes the
+per-SUPI KAUSF anchor (<code>anchor_refresh</code>, for later SoR/UPU), fires a
+best-effort UDM auth-result notification, and returns <strong>200</strong>
+<code>{ authResult: "AUTHENTICATION_SUCCESS", kseaf, supi }</code> — <code>supi</code> included
+only when the original identity was a SUCI. Logs the E2E anchor
+<code>result=AUTHENTICATION_SUCCESS</code>.</p>
+</li>
+</ol>
+<h2 id="key-hierarchy-and-nas-security-mode-control"><a class="header" href="#key-hierarchy-and-nas-security-mode-control">Key hierarchy and NAS security-mode control</a></h2>
+<ol start="9">
+<li>
+<p><strong>AMF derives the key hierarchy and selects algorithms.</strong> Continuing in
+<code>handle_authentication_response_nas</code>, the AMF takes the SUPI and KSEAF from
+the confirmation and derives:</p>
+<ul>
+<li><code>Kamf = nextgcore_crypt::kdf::nextgcore_kdf_kamf(supi, abba, kseaf)</code>;</li>
+<li>NAS algorithm selection from the intersection of the UE’s replayed
+capabilities and the AMF’s <strong>configured</strong> order
+(<code>algorithm_order_to_mask</code> over <code>integrity_order</code>/<code>ciphering_order</code> from the
+AMF context) via <code>nas_security::select_integrity_algorithm</code> /
+<code>select_encryption_algorithm</code>. Integrity selection is <strong>fail-closed</strong>: an
+empty NIA intersection returns <code>None</code>, and the AMF <strong>rejects the
+registration</strong> rather than fabricating NIA2 the UE never advertised (per
+code comment TS 33.501 §5.5.2). Ciphering is asymmetric — NEA0 (null) is a
+permitted selection, so an empty NEA intersection stays NEA0.</li>
+<li><code>Knas_int / Knas_enc = nextgcore_kdf_nas_5gs(0x02 | 0x01, alg, Kamf)</code>.</li>
+</ul>
+<p>Logs the E2E anchor <code>[{supi}] keys derived; selected NIA{} / NEA{}</code>.</p>
+</li>
+<li>
+<p><strong>AMF → UE: Security Mode Command (protected).</strong> The plain SMC is built by
+<code>gmm_build::build_security_mode_command</code> (replaying the UE’s <em>actual</em>
+capabilities and requesting IMEISV), then wrapped by
+<code>nas_security::nas_5gs_security_encode</code> with security-header type
+<code>INTEGRITY_PROTECTED_WITH_NEW_5G_NAS_SECURITY_CONTEXT</code>. Sent, T3560 armed.
+Logs <code>Security Mode Command sent to UE …</code>.</p>
+</li>
+<li>
+<p><strong>UE → AMF: Security Mode Complete + anti-bidding-down.</strong>
+<code>handle_security_mode_complete_nas</code> (<code>ngap_path.rs</code>) extracts the UE’s
+<strong>replayed</strong> initial Registration Request from the now-integrity-protected
+NAS message container (<code>extract_nas_message_container</code> +
+<code>parse_registration_request_pdu</code>) and compares the replayed UE security
+capabilities against the ones stored from the cleartext initial message. Any
+mismatch is treated as a downgrade attack: Security Mode Reject <strong>#23</strong>
+followed by Registration Reject and UE release (per code comments TS 24.501
+§4.4.2.4 / TS 33.501 §6.7.2). The <strong>Requested NSSAI is populated here</strong>, from
+the protected replay only. IMEISV (IEI <code>0x77</code>) is read from the SMC; if
+absent, the AMF sends a protected Identity Request (IMEISV) and arms T3570
+before completing.</p>
+</li>
+</ol>
+<h2 id="registration-sbi-calls-and-acceptance"><a class="header" href="#registration-sbi-calls-and-acceptance">Registration SBI calls and acceptance</a></h2>
+<ol start="12">
+<li>
+<p><strong>The three mandatory registration calls (all fail-closed).</strong>
+<code>complete_registration</code> (<code>ngap_path.rs</code>) — cited against TS 23.502
+§4.2.2.2.2 steps 14a/b/c/16 per code comments — runs, in order, and rejects
+the registration (Registration Reject + release) on <em>any</em> failure:</p>
+<ol>
+<li><strong><code>Nudm_UECM_Registration</code></strong> — <code>call_udm_uecm_registration</code>
+(<code>sbi_path.rs</code>) PUTs
+<code>/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access</code>, registering an
+absolute <code>deregCallbackUri</code>. UDM <code>process_amf_registration</code> (<code>uecm.rs</code>)
+validates mandatory IEs, reads the prior registration, persists to UDR
+(<code>amf_context_put</code>), notifies the old AMF if the serving AMF changed, and
+answers 201 (create) or 200 (update).</li>
+<li><strong><code>Nudm_SDM_Get</code> (am-data) + <code>Nudm_SDM_Subscribe</code></strong> —
+<code>call_udm_sdm_get_am_data</code> / <code>call_udm_sdm_subscribe</code>. UDM
+<code>handle_get_am_data</code> (<code>app.rs</code>) queries UDR am-data and, when a steering
+source is configured, injects a protected Steering-of-Roaming container
+(<code>sor::maybe_inject_sor_info</code>) via the AUSF’s <code>Nausf_SoRProtection</code>
+service, and a UPU container (<code>upu::maybe_inject_upu_info</code>) via
+<code>Nausf_UPUProtection</code>. Both are <strong>fail-closed</strong>: on any AUSF failure the
+container is withheld and the UDR body is passed through byte-identical
+(per code comments TS 33.501 §6.14.2.1 / §6.15.2.1).</li>
+<li><strong><code>Npcf_AMPolicyControl_Create</code></strong> — <code>call_pcf_am_policy_create</code>; the
+returned association id is stored on the UE context.</li>
+<li><strong><code>Npcf_UEPolicyControl_Create</code></strong> (step 3b, Wave-6) — only when
+<code>ue_policy_assoc_enabled()</code> is true (kill-switch <code>AMF_UE_POLICY_ASSOC</code>).
+This one is <strong>fire-and-forget</strong>: a failure logs a WARN and never fails the
+registration. It is what later triggers the URSP push (step 15).</li>
+</ol>
+<p><strong>Allowed NSSAI is computed locally, not via NSSF.</strong> <code>select_allowed_nssai</code>
+(<code>ngap_path.rs</code>) returns the UDM-subscribed S-NSSAIs if present, else the
+AMF’s configured <code>plmn_support</code> default — the Requested NSSAI is never echoed
+back as authorization (per code comment amfd-06). An empty result is
+Registration Reject <strong>#62</strong>. There is <strong>no <code>Nnssf_NSSelection</code> call anywhere
+in the registration path.</strong></p>
+<p><strong>NSACF admission</strong> then runs per Allowed S-NSSAI via
+<code>call_nsacf_ue_admission</code> (<code>sbi_path.rs</code>), POSTing
+<code>/nnsacf-nsac/v1/slices/ues</code>. A denial (403, or 200 with this SUPI in
+<code>acuFailureList</code>) is Registration Reject <strong>#69</strong>. Note the real net behavior
+is <strong>degrade-open</strong>: <code>call_nsacf_ue_admission</code> catches transport errors and
+unexpected statuses and returns <code>admitted = true</code>, so an unreachable NSACF
+<em>admits</em> rather than blocks (see <em>Simplifications and known gaps</em>).</p>
+<p>Finally the AMF copies the subscribed UE-AMBR from am-data and mints a new
+5G-GUTI (<code>generate_new_guti</code>: this AMF’s GUAMI + a CSPRNG 5G-TMSI).</p>
+</li>
+<li>
+<p><strong>AMF builds and protects the Registration Accept.</strong>
+<code>send_registration_accept</code> (<code>ngap_path.rs</code>) builds the message with
+<code>gmm_build::build_registration_accept</code> (carrying the new 5G-GUTI, Allowed
+NSSAI, etc.) and protects it with <code>nas_5gs_security_encode</code> using header
+<code>INTEGRITY_PROTECTED_AND_CIPHERED</code>. A periodic/mobility update on a UE that
+already has AS security is delivered over <code>DownlinkNASTransport</code>; an
+<strong>initial</strong> registration takes the InitialContextSetup path next.</p>
+</li>
+<li>
+<p><strong>AMF → gNB: <code>InitialContextSetupRequest</code> (Registration Accept piggybacked).</strong>
+The AMF derives <code>KgNB = nextgcore_kdf_kgnb_and_kn3iwf(Kamf, ul_count, access_type_distinguisher)</code> (per code comment TS 33.501 Annex A.9) and calls
+<code>ngap_asn1::build_initial_context_setup_request_asn1</code> to carry the GUAMI, the
+<strong>replayed</strong> UE security capabilities, the UE Security Key (KgNB), the Allowed
+NSSAI, the UE-AMBR, and — as the NAS-PDU — the protected Registration Accept.
+It sends this to the gNB and arms T3550 against the whole ICS PDU (so a
+retransmission re-delivers the Registration Accept). Logs the E2E anchor
+<code>Initial Context Setup Request sent … Registration Accept piggybacked …</code>.</p>
+<p>The gNB’s <code>InitialContextSetupResponse</code> is handled by
+<code>handle_initial_context_setup_response</code>: it stops the T3550 retransmission
+and moves the reporting GMM FSM toward Registered
+(<code>gmm_fsm.transition_to_registered</code>). The UE’s NAS <strong>Registration Complete</strong>
+(handled in <code>handle_uplink_nas_transport</code>, <code>REGISTRATION_COMPLETE</code> arm) sets
+<code>registered = true</code> and promotes <code>next_guti</code> to the current 5G-GUTI, logging
+<code>[{suci}] Registration Complete (5G-TMSI=0x…)</code>.</p>
+</li>
+</ol>
+<h2 id="post-registration-ue-policy--ursp-delivery"><a class="header" href="#post-registration-ue-policy--ursp-delivery">Post-registration: UE policy / URSP delivery</a></h2>
+<p>This is wired end-to-end (Wave-6 E-series) and worth calling out because it is
+what runs <em>after</em> the UE is registered.</p>
+<ol start="15">
+<li>
+<p><strong>PCF pushes URSP over N1N2.</strong> The AMF’s step-3b
+<code>Npcf_UEPolicyControl_Create</code> reaches the PCF’s <code>handle_ue_policy_create</code>
+(<code>src/bins/nextgcore-pcfd/src/app.rs</code>), which returns 201 and — when
+<code>ue_policy::delivery_enabled()</code> is true (kill-switch <code>PCF_UE_POLICY_DELIVERY</code>)
+— spawns <code>spawn_ue_policy_delivery</code>. That task assembles URSP rules
+(<code>src/bins/nextgcore-pcfd/src/ue_policy.rs</code>) and calls
+<code>pcf_deliver_ue_policy</code> (pcfd <code>sbi_path.rs</code>), which discovers the AMF and
+POSTs <code>/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages</code> as an
+<code>Namf_Communication_N1N2MessageTransfer</code> (multipart, <code>n1MessageClass</code> =
+<code>UPDP</code>).</p>
+</li>
+<li>
+<p><strong>AMF relays the UPDP container to the UE.</strong> The AMF’s
+<code>handle_n1_n2_message_transfer_request</code>
+(<code>src/bins/nextgcore-amfd/src/namf_server.rs</code>) recognizes the UPDP class in
+<code>try_ue_policy_relay</code> and enqueues the payload for N1 egress
+(DownlinkNASTransport to the UE), logging
+<code>UE policy: enqueued UPDP downlink for N1 egress</code>. Delivery is only
+<em>confirmed</em> by a MANAGE UE POLICY COMPLETE from the UE (the E6
+delivery-result loop); a bare N1N2 200 is recorded as <em>accepted-for-transfer</em>,
+not <em>delivered</em> — <code>DeliveryState</code> starts <code>Pending</code> and is fail-closed to
+<code>Failed</code> if no COMPLETE arrives.</p>
+</li>
+</ol>
+<h2 id="simplifications-and-known-gaps"><a class="header" href="#simplifications-and-known-gaps">Simplifications and known gaps</a></h2>
+<p>Grounded in the code, these are the honest deviations from a textbook TS 23.502
+registration:</p>
+<ul>
+<li><strong>5G-AKA only on the live path.</strong> The AMF’s EAP-AKA′ Authentication-Request
+builder <code>build_eap_authentication_request</code> (<code>ngap_path.rs</code>) is marked
+<code>#[allow(dead_code)]</code> and carries a source comment that it is <strong>not yet called
+by the live authentication path</strong> — the EAP-AKA′ SBI looping is E2E-deferred.
+The AUSF (<code>app.rs</code>, <code>eap_aka_prime.rs</code>) and UDM both implement the EAP-AKA′
+surface, but a live registration only ever runs 5G-AKA.</li>
+<li><strong>NSACF admission is effectively degrade-open.</strong> The fail-closed
+“unreachable ⇒ not admitted” branch in <code>complete_registration</code> is in practice
+unreachable: <code>call_nsacf_ue_admission</code> (<code>sbi_path.rs</code>) intercepts transport
+errors and unexpected HTTP statuses and returns <code>admitted = true</code>. So a
+down/missing NSACF <strong>admits</strong> the UE. Only an explicit 403 / <code>acuFailureList</code>
+denial blocks registration.</li>
+<li><strong>No NSSF slice selection.</strong> Allowed NSSAI is chosen locally
+(<code>select_allowed_nssai</code>) from UDM subscription or AMF config; the NSSF is never
+queried during registration.</li>
+<li><strong>Identity procedure is normally skipped.</strong> Because the matched UE sends its
+SUCI directly in the initial Registration Request, the AMF never runs an
+Identity Request/Response exchange on the happy path; it only issues one for an
+unknown GUTI (step 2) or a missing PEI (step 11). The E2E script explicitly
+removed the old Identity assertions for this reason.</li>
+<li><strong>NAS-security canary defaults OFF.</strong> New UE contexts inherit
+<code>use_nextgcore_nas_security</code> from the process-wide canary
+(<code>context::nas_security_canary</code>), seeded at startup from
+<code>amf.nas.use_nextgcore_security</code> (default <code>false</code>) — see
+<code>context::resolve_nas_security_canary</code>. The canary lets an operator A/B the
+new NAS-security path without a code change.</li>
+<li><strong>Fire-and-forget policy legs behind kill-switches.</strong> Both the UE-policy
+association (<code>AMF_UE_POLICY_ASSOC</code>) and its delivery (<code>PCF_UE_POLICY_DELIVERY</code>)
+can be disabled, restoring the pre-Wave-6 byte flow. Some inbound AMF SBI
+callbacks (am-policy-notify, sdm-subscription-notify) are noted in
+<code>sbi_path.rs</code> as “still-unserved”.</li>
+<li><strong>Config loading is lenient.</strong> An unreadable/unparsable <code>amf.yaml</code> logs a
+warning and continues with built-in defaults (<code>load_config</code> in
+<code>lib.rs</code>) — a running AMF is not proof your config was applied. See the
+troubleshooting table in <a href="#observability--troubleshooting">Observability &amp; Troubleshooting</a>.</li>
+<li><strong>Cooperative peer.</strong> All of the above is exercised against the matched
+simulator, not an arbitrary commercial UE/gNB; the SMF-side PDU-session
+establishment that follows registration is covered by the
+<a href="#smf-configuration">SMF</a> path, not here.</li>
+</ul>
+<h2 id="how-it-is-validated"><a class="header" href="#how-it-is-validated">How it is validated</a></h2>
+<p><strong>Unit tests (per-crate <code>cargo test</code>).</strong> The wire builders and decision helpers
+are golden- and property-tested independently of any network:</p>
+<ul>
+<li><code>gmm_build.rs</code> — <code>golden_registration_accept_full</code>,
+<code>golden_registration_accept_no_guti_no_nssai</code>,
+<code>golden_registration_accept_3digit_mnc</code>, <code>golden_registration_reject</code>, plus
+<code>drift_registration_accept_*</code> round-trips through <code>nextgcore-nas</code>.</li>
+<li><code>gmm_handler.rs</code> — <code>test_handle_registration_request_initial</code>,
+<code>test_handle_registration_request_with_guti</code>,
+<code>test_handle_registration_request_non_cleartext_rejected</code> (the §4.4.6 gate).</li>
+<li><code>nausf_handler.rs</code> — <code>test_compare_res_star</code> /
+<code>test_compare_res_star_constant_time_xres</code> (constant-time RES*/XRES* compare),
+<code>test_validate_serving_network_name</code>, <code>test_snn_authorized_for_consumer</code>.</li>
+<li><code>context.rs</code> — <code>test_resolve_nas_security_canary_precedence</code> (the canary
+env/yaml precedence). Additional AMF invariants live in
+<code>property_tests.rs</code>.</li>
+</ul>
+<p><strong>Matched-simulator docker E2E.</strong> The single entrypoint is
+<code>nextgcore/docker/rust/e2e.sh</code> (which chains <code>preflight.sh</code> → <code>build.sh</code> →
+<code>e2e-test.sh</code>). <code>e2e-test.sh</code> brings up MongoDB + the 5GC + the nextgsim gNB/UE
+and asserts the registration flow through <strong>source-anchored log lines</strong> — the
+same anchors named in this chapter, e.g. on <code>nextgcore-amf</code>:</p>
+<pre><code>Initial UE Message
+Registration Request: type=
+Calling AUSF authenticate
+Calling AUSF 5G-AKA confirmation
+result=AUTHENTICATION_SUCCESS
+keys derived; selected NIA
+Security Mode Command sent
+Security Mode Complete
+Registration Accept piggybacked
+</code></pre>
+<p>and on the simulator side <code>Sending Registration Request</code> … <code>Registration Accept: UE is now …</code> … <code>Sending Registration Complete</code>. The suite then verifies
+the data plane by pinging <strong>through the UE’s GTP-U tunnel</strong> and finishes at
+<code>UE PDU session 1 ACTIVE with IPv4 address</code>. The full baseline was <strong>84/84 green
+on 2026-07-02</strong>. This is functional validation against a cooperative peer — it
+is not third-party conformance certification.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="pdu-sessions-and-the-pfcp-session-model"><a class="header" href="#pdu-sessions-and-the-pfcp-session-model">PDU Sessions and the PFCP Session Model</a></h1>
+<p>A PDU session is the end-to-end user-plane pipe between a UE and a data network: an IP address for the UE, a GTP-U tunnel across N3, and a set of forwarding/QoS rules programmed into the UPF over N4/PFCP. This chapter traces how NextGCore actually builds one — from the NAS <em>PDU Session Establishment Request</em> that arrives at the SMF, through the PCF policy call, the PFCP session toward the UPF, the N2 resource-setup container handed back to the gNB, and finally the GTP-U packets that the UPF forwards. Every step below names the file and function/struct that implements it, and where the implementation takes a shortcut relative to the 3GPP procedure, that shortcut is called out rather than glossed over.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> The PDU-session and PFCP behavior described here is validated by this project’s own unit tests plus a matched-simulator docker E2E (84/84 green as of 2026-07-02), <strong>not</strong> by third-party conformance certification. The peer on the other side is the in-tree <code>nextgsim</code> gNB/UE, not a commercial RAN or a certified test set. Concrete simplifications (a hand-rolled NAS accept encoder, a bespoke PFCP TLV codec, a userspace UPF fast path, an unwired UDM fetch) are listed under <a href="#simplifications-and-known-gaps-1">Simplifications and known gaps</a>. TS numbers below are quoted only where they appear in this repo’s source comments, phrased “per code comments”.</p>
+</blockquote>
+<h2 id="components-involved-1"><a class="header" href="#components-involved-1">Components involved</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Function</th><th>Daemon / crate</th><th>Role in the PDU session</th></tr>
+</thead>
+<tbody>
+<tr><td>SMF</td><td><a href="#smf-configuration"><code>nextgcore-smfd</code></a></td><td>Owns the session: parses N1, calls PCF, drives N4/PFCP, builds the N1 accept + N2 setup transfer.</td></tr>
+<tr><td>UPF</td><td><a href="#upf-configuration"><code>nextgcore-upfd</code></a></td><td>The PFCP node: installs PDR/FAR/QER/URR, terminates N3 GTP-U, forwards packets via a TUN device.</td></tr>
+<tr><td>AMF</td><td><a href="#amf-configuration"><code>nextgcore-amfd</code></a></td><td>Relays N1 (NAS) to the UE and the opaque N2 transfer to the gNB; not covered in depth here.</td></tr>
+<tr><td>PCF</td><td><a href="#pcf-configuration"><code>nextgcore-pcfd</code></a></td><td>Authorizes Session-AMBR / 5QI via Npcf_SMPolicyControl (optional — a config-default is used when absent).</td></tr>
+<tr><td>NSACF</td><td><a href="#nsacf-configuration"><code>nextgcore-nsacfd</code></a></td><td>Optional per-slice PDU-session admission (fail-open when not deployed).</td></tr>
+<tr><td>PFCP model</td><td><code>src/libs/nextgcore-pfcp</code></td><td>Header/SEID model, IE-type registry, typed message structs.</td></tr>
+<tr><td>NGAP transfers</td><td><code>src/libs/nextgcore-ngap</code></td><td>Real-APER PDU Session Resource <em>transfer</em> codec used for the N2 container.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="the-two-state-machines-and-how-much-they-actually-drive"><a class="header" href="#the-two-state-machines-and-how-much-they-actually-drive">The two state machines (and how much they actually drive)</a></h2>
+<p>The SMF ships two ported finite-state machines:</p>
+<ul>
+<li><strong>GSM (5G Session Management)</strong> — <code>src/bins/nextgcore-smfd/src/gsm_sm.rs</code>, struct <code>GsmFsm</code>, states <code>Initial → Wait5gcSmPolicyAssociation → WaitPfcpEstablishment → Operational → WaitPfcpDeletion → …</code> (<code>GsmState</code>).</li>
+<li><strong>PFCP node FSM</strong> — <code>src/bins/nextgcore-smfd/src/pfcp_sm.rs</code>, struct <code>PfcpFsm</code>, states <code>Initial → WillAssociate → Associated</code>.</li>
+</ul>
+<p>Be aware of a real structural fact: these FSMs are largely <strong>state-tracking scaffolding</strong>, not the engine that builds messages. Their handlers (<code>GsmFsm::dispatch</code>, <code>PfcpFsm::dispatch</code>) mostly log, flip a state, and return <code>Handled</code>/<code>Ignored</code>; the header comments describe them as a “Port of src/smf/gsm-sm.c / pfcp-sm.c”. The real establishment logic lives in one imperative async function, <code>handle_sm_context_create</code> in <code>src/bins/nextgcore-smfd/src/main.rs</code>, which constructs a fresh <code>GsmFsm</code>, calls <code>fsm.init()</code>, and drives it with several <code>fsm.dispatch(...)</code> calls — the initial <code>ESTABLISHMENT_REQUEST</code> gsm_message dispatch (~line 2006), the PCF policy response via <code>fsm_dispatch_policy_response(&amp;mut fsm, …)</code> (which itself calls <code>fsm.dispatch</code>, ~lines 2052/2059), and an <code>n4_message</code> dispatch after PFCP establishment (~line 2212) — interleaved with explicit <code>fsm.transition_to(...)</code> calls (<code>WaitPfcpEstablishment</code>/<code>Exception</code>) for logging while it does the actual work inline. When you read the flow below, treat the FSM state names as a narration of <code>handle_sm_context_create</code>, not as an independent dispatcher.</p>
+<h2 id="pdu-session-establishment-step-by-step"><a class="header" href="#pdu-session-establishment-step-by-step">PDU session establishment, step by step</a></h2>
+<p>The trigger is an SBI <code>POST</code> to <code>Nsmf_PDUSession</code> CreateSMContext from the AMF. The whole flow is <code>handle_sm_context_create</code> (<code>main.rs</code>).</p>
+<pre><code>UE ──NAS PDU Session Est. Req──▶ AMF ──Nsmf CreateSMContext──▶ SMF
+                                                                │
+                          (1) validate  (2) parse N1  (3) alloc UE IP
+                          (4) NSAC admit (5) PCF policy
+                                                                │
+                                        (6) PFCP Session Est. ──▶ UPF
+                                        ◀── UP F-SEID + UPF N3 F-TEID ──
+                                                                │
+                    (7) build N1 Accept   (8) build N2 setup transfer (APER)
+                                                                │
+SMF ──201 multipart {SmContext, n1SmMsg, n2SmInfo}──▶ AMF ──▶ gNB + UE
+</code></pre>
+<ol>
+<li>
+<p><strong>Parse and validate <code>SmContextCreateData</code>.</strong> <code>handle_sm_context_create</code> deserializes the JSON body and calls <code>validate_sm_context_create_data</code>; genuinely-missing mandatory IEs are rejected with the matching <code>ProblemDetails</code> cause. It then reads <code>pduSessionId</code> (1..15), <code>dnn</code>, <code>sNssai.sst</code>/<code>sd</code>, and (leniently) <code>supi</code>, <code>anType</code>, <code>smContextStatusUri</code>. Per code comments, this maps to TS 29.502 Table 6.1.6.2.2-1. <strong>Lenience worth knowing:</strong> the current matched-sim AMF omits <code>supi</code>/<code>anType</code>, so those are warned-and-defaulted (<code>"imsi-unknown"</code>, <code>3GPP_ACCESS</code>) rather than rejected.</p>
+</li>
+<li>
+<p><strong>Decode the N1 container.</strong> The N1 <code>PDU Session Establishment Request</code> arrives either as a multipart <code>application/vnd.3gpp.5gnas</code> part (resolved from its <code>RefToBinaryData</code> contentId) or as a base64 string — <code>resolve_binary_ref</code> accepts both. It is parsed by <code>policy::parse_establishment_request</code>, yielding PTI, requested PDU-session type, and requested SSC mode. <strong>This SMF serves IPv4 only:</strong> <code>selected_type</code> collapses IPv4/IPv4v6 to IPv4; IPv6-only/Ethernet/Unstructured are rejected with 5GSM cause #50 (“PDU session type IPv4 only allowed”, per code comments).</p>
+</li>
+<li>
+<p><strong>Allocate the UE IP.</strong> <code>context.ipv4_pool.allocate()</code> draws from <code>Ipv4Pool</code> (<code>src/bins/nextgcore-smfd/src/session_extensions.rs</code>), a bitmap allocator over a <code>/16</code>. <code>Ipv4Pool::default_pool()</code> is <code>10.45.0.0/16</code> and reserves <code>.0.0</code> (network) and <code>.0.1</code> (gateway); exhaustion returns 5GSM cause #26 insufficient resources. This is the UE’s IPv4 for the life of the session; a <code>release_ip</code> closure rolls it back on any later failure.</p>
+</li>
+<li>
+<p><strong>Slice admission (optional).</strong> <code>policy::resolve_nsacf_endpoint()</code> + <code>policy::nsac_pdu_session_admit(...)</code> ask the NSACF whether a new PDU session is admissible for this S-NSSAI (per code comments, TS 29.536 §5.3). This is <strong>fail-open</strong>: no NSACF configured, or an unreachable one, proceeds anyway; only an explicit <code>Rejected</code> (quota exhausted) fails the session with 5GSM cause #67.</p>
+</li>
+<li>
+<p><strong>SM policy (PCF, or config-default).</strong> <code>policy::resolve_pcf_endpoint()</code> decides the source:</p>
+<ul>
+<li><strong>PCF present:</strong> <code>policy::sm_policy_create(...)</code> performs Npcf_SMPolicyControl_Create (per code comments, TS 29.512 §4.2.2) and returns a <code>PolicyDecision</code> (default 5QI, Session-AMBR UL/DL, PCC rules). A PCF <em>rejection</em> fails the session (cause #29-family); a PCF that is configured-but-<strong>unreachable</strong> is a hard <code>504</code> failure with cause #38 — no silent fallback.</li>
+<li><strong>No PCF:</strong> <code>PolicyDecision::config_default_for_dnn(&amp;dnn)</code> applies a documented default (DNN-derived 5QI, AMBR 100/100 Mbps). An “xr” DNN yields a delay-critical GBR XR 5QI so the XR QER path below is still exercised.</li>
+</ul>
+<p>The decision is then post-processed: <code>decision.ensure_xr_for_dnn(&amp;dnn)</code> (Rel-18 XR 5QI upgrade for an XR DNN) and, for a <code>redcapIndication</code> UE, a Session-AMBR cap (default 150/50 Mbps DL/UL, env-overridable) applied once so it flows to the N1 accept, the PFCP QER, and the stored binding.</p>
+<blockquote>
+<p><strong>Not wired:</strong> there is <strong>no</strong> UDM <code>Nudm_SDM</code> subscription-data fetch on this path. The GSM FSM has a placeholder <code>nudm-sdm</code> branch, but <code>handle_sm_context_create</code> and <code>policy.rs</code> never call UDM — session type, DNN and S-NSSAI come from <code>SmContextCreateData</code> + the N1 container, and QoS comes from PCF or the config default. (SMF↔UDM N10 exists as an interface line but is not on the establishment path.)</p>
+</blockquote>
+</li>
+<li>
+<p><strong>PFCP Session Establishment toward the UPF.</strong> <code>pfcp_session_establish</code> (<code>main.rs</code>) builds and sends the N4 request. See <a href="#the-pfcp-session-as-built">The PFCP session, as built</a> for the exact PDR/FAR/QER layout. On success it returns the UPF’s <code>UP F-SEID</code>, the UPF N3 GTP-U TEID, and the UPF N3 address, and stores the <code>upf_seid</code> in <code>SmfContext.pfcp_sessions</code> keyed by <code>smContextRef</code>.</p>
+</li>
+<li>
+<p><strong>Build the N1 <code>PDU Session Establishment Accept</code>.</strong> <code>policy::build_establishment_accept</code> (<code>src/bins/nextgcore-smfd/src/policy.rs</code>) hand-encodes the 5GSM message byte-by-byte: octet-5 SSC|type, the authorized QoS-rules LV-E, the Session-AMBR, the IPv4 PDU address, the S-NSSAI IE (<code>0x22</code>), conditional QoS-flow descriptions (<code>0x79</code>), and the DNN. Its doc comment stresses the layout is byte-identical to the legacy encoding and golden-tested. When the UE asked for IPv4v6 but only the IPv4 leg is granted, 5GSM cause #50 is attached (per code comments, TS 24.501 §8.3.2.2).</p>
+</li>
+<li>
+<p><strong>Build the N2 <code>PDUSessionResourceSetupRequestTransfer</code>.</strong> <code>build_setup_request_transfer</code> (<code>main.rs</code>) — this is <strong>real APER</strong>, encoded through <code>nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::encode()</code>, carrying the UPF N3 F-TEID (<code>UpTransportLayerInformation::GtpTunnel</code>) and a <code>QosFlowSetupRequestItem</code> (QFI, <code>NonDynamic5qi</code>, ARP). The code comment is explicit about <em>why</em> it is real APER: “the gNB’s strict APER decoder rejects the legacy hand-rolled byte layout (smfd#2).” This is a place where an earlier bespoke-bytes shortcut was deliberately replaced with a spec codec — the N2 setup, modify, path-switch, and setup-response transfers all go through <code>nextgcore-ngap</code>.</p>
+</li>
+<li>
+<p><strong>Respond.</strong> <code>sbi_response_with_n1_n2</code> (<code>main.rs</code>) returns <code>201</code> as <code>multipart/related</code>: a JSON <code>SmContextCreatedData</code> root (<code>smContextRef</code>, <code>pduSessionId</code>, <code>upCnxState: "ACTIVATING"</code>, <code>n2SmInfoType: "PDU_RES_SETUP_REQ"</code>) plus two binary parts — <code>n1SmMsg</code> (<code>application/vnd.3gpp.5gnas</code>) and <code>n2SmInfo</code> (<code>application/vnd.3gpp.ngap</code>) — referenced by <code>RefToBinaryData</code> (per code comments, TS 29.502 §6.1.2.2.2/§6.1.2.4). <strong>Shortcut:</strong> the N1/N2 are kept <em>inline</em> in the CreateSMContext response; the separate <code>Namf_Communication</code> N1N2MessageTransfer is noted in-code as out of scope (smfd-03).</p>
+</li>
+</ol>
+<h3 id="completing-the-tunnel-sm-context-update"><a class="header" href="#completing-the-tunnel-sm-context-update">Completing the tunnel: SM Context Update</a></h3>
+<p>The gNB accepts the resource and reports its own downlink GTP-U endpoint. The AMF forwards this as an <code>Nsmf_PDUSession</code> update, handled by <code>handle_sm_context_update</code> (<code>main.rs</code>), which dispatches on <code>n2SmInfoType</code>:</p>
+<ul>
+<li><code>PDU_RES_SETUP_RSP</code> → <code>decode_setup_response_dl_endpoint</code> (real-APER <code>PDUSessionResourceSetupResponseTransfer</code>) extracts the gNB DL TEID + address + QFI.</li>
+<li><code>PATH_SWITCH_REQ</code> → <code>decode_path_switch_dl_endpoint</code> (real-APER <code>PathSwitchRequestTransfer</code>) for an Xn handover.</li>
+</ul>
+<p>Either way the SMF then calls <code>pfcp_session_modify</code> (<code>main.rs</code>), which sends a PFCP <strong>Session Modification</strong> that flips the downlink FAR from BUFF to FORW and installs an <code>OuterHeaderCreation</code> (GTP-U/UDP/IPv4, description <code>0x0100</code>) pointing at the gNB TEID, with the SNDEM flag to emit End Markers on any old tunnel. Only after this does downlink traffic actually flow to the UE.</p>
+<h2 id="the-pfcp-session-as-built"><a class="header" href="#the-pfcp-session-as-built">The PFCP session, as built</a></h2>
+<h3 id="request-construction-smf-side"><a class="header" href="#request-construction-smf-side">Request construction (SMF side)</a></h3>
+<p><code>pfcp_session_establish</code> builds the message with the SMF’s bespoke TLV builder <code>n4_build::PfcpMessageBuilder</code> (not the library’s typed structs). It first checks <code>client.is_associated()</code> — no session signalling without an association (per code comments, TS 29.244 6.2.6.2) — then assembles:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>IE</th><th>Value</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>Node ID (IPv4)</td><td>SMF IP</td><td><code>add_node_id_ipv4</code></td></tr>
+<tr><td>F-SEID</td><td><code>smf_n4_seid = (sess_idx | 0x1000)</code></td><td>SMF’s own SEID</td></tr>
+<tr><td>APN/DNN, S-NSSAI</td><td>from the request</td><td></td></tr>
+<tr><td><strong>Create QER 1</strong></td><td>Session-AMBR as MBR UL/DL, gates open, QFI</td><td>enforces authorized AMBR</td></tr>
+<tr><td><strong>Create QER 2</strong> (conditional)</td><td>XR GBR UL/DL</td><td>only when the authorized 5QI is XR (82–85); GBR is the wire-stable XR signal since a 6-bit QFI cannot carry an 82–85 5QI</td></tr>
+<tr><td><strong>Create PDR 1</strong> (uplink)</td><td>source interface <strong>Access(0)</strong>, F-TEID <code>teid=0</code> (UPF allocates), outer-header-removal GTP-U/UDP/IPv4, FAR 1, QER, QFI</td><td></td></tr>
+<tr><td><strong>Create FAR 1</strong> (uplink)</td><td>apply-action <strong>FORW(0x02)</strong>, dest interface <strong>N6/SGi(2)</strong></td><td></td></tr>
+<tr><td><strong>Create PDR 2</strong> (downlink)</td><td>source interface <strong>Core(1)</strong>, UE IP as destination, FAR 2</td><td></td></tr>
+<tr><td><strong>Create FAR 2</strong> (downlink)</td><td>apply-action <strong>BUFF(0x04)</strong>, dest interface <strong>Access(0)</strong></td><td>buffered until the gNB TEID arrives (step above)</td></tr>
+</tbody>
+</table>
+</div>
+<p>It sends <code>SESSION_ESTABLISHMENT_REQUEST</code> with <strong>SEID=0</strong> for a new session (per code comments, TS 29.244 7.2.2.4.2) through the transaction engine (T1/N1 retransmission). A missing/rejected <code>Cause</code> is a hard failure — there is deliberately no fabricated-TEID fallback, since that would create a data-plane black hole.</p>
+<p><strong>Response parsing is hand-rolled here:</strong> rather than decode with the library, <code>pfcp_session_establish</code> walks the response TLVs itself, pulling the <code>UP F-SEID</code> (IE type 57) and the <code>Created PDR</code> (IE 8) → <code>F-TEID</code> (IE 21). The code even documents a subtle gotcha: the F-TEID V4 flag is Bit1 (<code>0x01</code>), the <strong>opposite</strong> of F-SEID’s V4 flag (Bit2), per code comments TS 29.244 §8.2.3 vs §8.2.37. A missing UP F-SEID or a missing Created-PDR F-TEID aborts the session.</p>
+<h3 id="the-object-model-upf-side"><a class="header" href="#the-object-model-upf-side">The object model (UPF side)</a></h3>
+<p>The UPF stores everything in a per-session <code>SessionContext</code> (<code>src/bins/nextgcore-upfd/src/n4_handler.rs</code>), which is just four <code>HashMap</code>s plus a BAR:</p>
+<pre><code>SessionContext { upf_n4_seid, smf_n4_seid,
+                 pdrs: HashMap&lt;u16, Pdr&gt;,
+                 fars: HashMap&lt;u32, Far&gt;,
+                 urrs: HashMap&lt;u32, Urr&gt;,
+                 qers: HashMap&lt;u32, Qer&gt;,
+                 bar:  Option&lt;Bar&gt; }
+</code></pre>
+<ul>
+<li><strong><code>Pdr</code></strong> (<code>context.rs</code>) — <code>pdr_id</code>, <code>precedence</code>, <code>source_interface</code>, optional <code>ue_ip</code>/<code>f_teid</code>/<code>sdf_filter</code>, <code>far_id</code>, <code>qer_id</code>, <code>urr_ids</code>, <code>outer_header_removal</code>. <code>Pdr::pdr_match</code> compares source interface, UE IP, and TEID; SDF filters compile via <code>nextgcore-ipfw</code> but full per-packet SDF matching happens in the data plane.</li>
+<li><strong><code>Far</code></strong> (<code>context.rs</code>) — <code>apply_action</code> bitmask (DROP <code>0x01</code>, FORW <code>0x02</code>, BUFF <code>0x04</code>, NOCP <code>0x08</code>, DUPL <code>0x10</code>), <code>destination_interface</code>, optional <code>OuterHeaderCreation</code>, forwarding/duplicating params, <code>bar_id</code>. Helpers <code>should_forward</code>/<code>should_drop</code>.</li>
+<li><strong><code>Qer</code></strong> (<code>n4_handler.rs</code>) — <code>qer_id</code>, <code>GateStatus{ul_gate,dl_gate}</code> (0=open), <code>Mbr</code>, <code>Gbr</code>, <code>qfi</code>, <code>rqi</code>, <code>ppi</code>.</li>
+<li><strong><code>Urr</code></strong> (<code>n4_handler.rs</code>) — measurement method/reporting-trigger flag structs, volume/time thresholds and quotas; accounting lives in <code>UrrAccounting</code>.</li>
+</ul>
+<p><code>handle_session_establishment_request</code> (<code>n4_handler.rs</code>) inserts the incoming PDRs/FARs/URRs/QERs/BAR into those maps (each guarded by <code>MAX_NUM_OF_*</code> caps → <code>NoResourcesAvailable</code>). <code>handle_session_modification_request</code> applies create/update/remove for each rule class. <code>handle_session_deletion_request</code> snapshots each URR into a final <code>UsageReport</code> before teardown.</p>
+<p>The shared <strong><code>nextgcore-pfcp</code></strong> library underpins the wire format: <code>header.rs</code> models the <code>PfcpHeader</code> (the S-bit <code>seid_presence</code>, the 8-byte no-SEID vs 16-byte with-SEID layouts, and <code>has_seid()</code> per message type); <code>ie.rs</code> is the <code>IeType</code> registry (<code>CreatePdr=1</code>, <code>CreateFar=3</code>, <code>CreateUrr=6</code>, <code>CreateQer=7</code>, <code>CreatedPdr=8</code>, …); <code>message.rs</code> and <code>types.rs</code> carry typed structs (<code>AssociationSetupRequest/Response</code> with a Recovery Time Stamp, <code>SessionEstablishmentRequest</code>/<code>Response</code> that validate a present <code>UP F-SEID</code> on accept, <code>CreatePdr</code>/<code>CreateFar</code>/<code>CreateQer</code>). In practice the daemons build and parse the concrete bytes through their own per-daemon <code>n4_build</code> module, so the library’s typed message structs and the daemons’ TLV codecs coexist.</p>
+<h2 id="pfcp-association-heartbeats-and-failure-handling"><a class="header" href="#pfcp-association-heartbeats-and-failure-handling">PFCP association, heartbeats, and failure handling</a></h2>
+<p>Session signalling requires a live association, and <strong>the SMF is the initiator</strong>:</p>
+<ul>
+<li><code>associate()</code> (<code>src/bins/nextgcore-smfd/src/pfcp_path.rs</code>) sends <code>ASSOCIATION_SETUP_REQUEST</code>; on an accepted cause it sets <code>associated = true</code> and records the peer’s Recovery Time Stamp.</li>
+<li>The UPF answers in <code>handle_association_setup_request</code> (<code>src/bins/nextgcore-upfd/src/pfcp_path.rs</code>): Node ID and Recovery Time Stamp are mandatory (per code comments, TS 29.244 7.4.4.1) — a missing one yields a rejected response naming the offending IE — otherwise it replies <code>ASSOCIATION_SETUP_RESPONSE</code> via <code>build_association_setup_response</code>.</li>
+</ul>
+<p>Heartbeats keep the association alive and detect restarts. Both sides build/handle <code>HEARTBEAT_REQUEST</code>/<code>HEARTBEAT_RESPONSE</code> (<code>build_heartbeat_response</code> carries the sender’s Recovery Time Stamp; heartbeat messages use SEID=0). On the SMF, a lapsed no-heartbeat timer tears down the association and returns the <code>PfcpFsm</code> to <code>WillAssociate</code> (i.e., UPF reselection, <code>PfcpFsm::handle_associated</code> on <code>N4NoHeartbeat</code>). On the UPF, a per-N3-peer <code>path_table</code> compares the Recovery Time Stamp on each heartbeat/echo to spot a restarted peer whose tunnels are now stale (per code comments, TS 29.281 §7.2.2 / TS 23.007).</p>
+<p>Teardown mirrors setup: <code>handle_sm_context_release</code> (<code>main.rs</code>) calls <code>pfcp_session_delete</code>, which sends <code>SESSION_DELETION_REQUEST</code> (no body IEs, per code comments TS 29.244 7.5.6) keyed on the stored <code>upf_seid</code>; the UPF returns the final usage reports and drops the <code>SessionContext</code>.</p>
+<h2 id="the-upf-data-plane-gtp-u--tun"><a class="header" href="#the-upf-data-plane-gtp-u--tun">The UPF data plane (GTP-U ⇄ TUN)</a></h2>
+<p>The forwarder is a <strong>userspace</strong> fast path in <code>src/bins/nextgcore-upfd/src/data_plane.rs</code>. <code>DataPlane::run</code> opens the N3 GTP-U UDP socket (default <code>127.0.0.4:2152</code>, <code>--gtpu-addr</code>) and a TUN device, then spawns two tokio tasks feeding a <code>select!</code> loop:</p>
+<ul>
+<li>a GTP-U receive task (<code>recv_from</code>) → <code>handle_uplink_packet</code>;</li>
+<li>a TUN read task (<code>libc::read</code> on the raw fd) → <code>handle_downlink_packet</code>.</li>
+</ul>
+<p>The TUN device is <strong>its own inline <code>TunDevice</code></strong> (<code>data_plane.rs</code>), which opens <code>/dev/net/tun</code> directly via <code>libc</code> and is Linux-only (the macOS <code>create</code> is a stub returning an error). Default interface <code>ogstun</code>, IP <code>10.45.0.1/16</code> (<code>--tun-ip</code>/<code>--tun-prefix</code>) — the gateway that the E2E ping targets. Note the workspace ships a <code>nextgcore-tun</code> library, but <strong>the UPF does not use it</strong> (a grep for <code>nextgcore_tun</code> in <code>nextgcore-upfd/src</code> is empty).</p>
+<p><strong>Uplink — <code>handle_uplink_packet</code> (gNB → UPF → data network):</strong></p>
+<ol>
+<li><code>parse_gtpu_header</code>; branch on message type — reply to <code>ECHO_REQUEST</code>, raise an Error-Indication Report to the SMF on <code>ERROR_INDICATION</code>, update the path table on <code>ECHO_RESPONSE</code>, ignore <code>END_MARKER</code>; only <code>GPDU</code> continues.</li>
+<li>Locate the session by uplink TEID (<code>find_by_ul_teid</code>), falling back to the inner source IP (<code>find_by_ue_ip</code>). A GPDU for an unknown non-zero TEID triggers a GTP-U Error Indication back to the sender (per code comments, TS 29.281 §7.3.1); TEID=0 is dropped silently.</li>
+<li><strong>Anti-spoofing:</strong> the inner source IP must equal the session’s allocated UE IP, else drop and count (per code comments, TS 23.501 §5.6.1).</li>
+<li><code>match_pdr_with_packet(SRC_INTF_ACCESS, …)</code> → check the QER gate (<code>check_qer_gate</code>, a token bucket built from the MBR) and pull any DSCP → apply the FAR (<code>Forward</code>/<code>Drop</code>/<code>Buffer</code>) → record URR bytes. No PDR match ⇒ drop (per code comments, TS 23.501 §5.8.2).</li>
+<li>MTU guard, optional inner-packet DSCP marking (checksum recomputed), then <code>libc::write</code> the decapsulated IP packet to the TUN.</li>
+</ol>
+<p><strong>Downlink — <code>handle_downlink_packet</code> (data network → UPF → gNB):</strong></p>
+<ol>
+<li>Find the session by destination UE IP (<code>find_by_ue_ip</code>).</li>
+<li><code>match_pdr_with_packet(SRC_INTF_CORE, …)</code> → QER gate + DSCP + QFI → apply the FAR:
+<ul>
+<li><code>Forward</code> → resolve <code>(dl_teid, gnb_addr)</code> from the FAR’s <code>OuterHeaderCreation</code> (or the session default);</li>
+<li><code>Buffer</code> → queue the packet, and on the first buffered packet with NOCP set, emit a <strong>Downlink Data Report</strong> to the SMF (per code comments, TS 29.244 5.2.3);</li>
+<li><code>Drop</code> → drop.</li>
+</ul>
+</li>
+<li>DSCP is applied to the <strong>outer</strong> transport header via a GTP-U socket <code>IP_TOS</code> option, never the inner UE packet (per code comments, TS 23.501 §5.7.4 — the inner packet is carried byte-for-byte on N3).</li>
+<li><code>encapsulate_dl_gpdu</code> prepends the GTP-U header, carrying the QFI in a PDU Session Container extension header (per code comments, TS 38.415 / TS 29.281), and <code>send_to</code> the gNB.</li>
+</ol>
+<p>When the SMF’s modification flips the DL FAR to FORW, <code>main.rs</code>’s <code>handle_pfcp_session_event</code> calls <code>update_session_from_pfcp</code> (record gNB TEID/addr) and then <code>flush_buffered_dl</code>, draining any packets buffered during establishment. Per-session and aggregate packet/byte counters are maintained throughout (the same counters surfaced in <a href="#observability--troubleshooting">Observability</a>).</p>
+<h2 id="simplifications-and-known-gaps-1"><a class="header" href="#simplifications-and-known-gaps-1">Simplifications and known gaps</a></h2>
+<p>Grounded in the code, not aspirational:</p>
+<ul>
+<li><strong>The GSM/PFCP FSMs are scaffolding.</strong> <code>gsm_sm.rs</code>/<code>pfcp_sm.rs</code> mostly log and track state; the establishment logic is imperative in <code>handle_sm_context_create</code>, which advances the FSM with explicit <code>transition_to</code> calls. Do not expect the dispatcher to be authoritative.</li>
+<li><strong>No UDM subscription fetch.</strong> Establishment never calls <code>Nudm_SDM</code>; QoS is PCF-or-config-default and session parameters come from <code>SmContextCreateData</code>/N1. The <code>nudm-sdm</code> FSM branch is unused.</li>
+<li><strong>Bespoke NAS 5GSM encoder.</strong> <code>policy::build_establishment_accept</code> hand-writes bytes (golden-tested, byte-identical to the legacy layout) rather than using a general NAS codec.</li>
+<li><strong>Bespoke PFCP TLV codec with a hand-rolled response parser.</strong> PFCP messages are built/parsed via each daemon’s <code>n4_build</code>; <code>pfcp_session_establish</code> walks response TLVs manually, in parallel with the typed structs in <code>nextgcore-pfcp</code>.</li>
+<li><strong>N1/N2 carried inline in CreateSMContext.</strong> The separate <code>Namf_Communication</code> N1N2MessageTransfer is explicitly out of scope (smfd-03).</li>
+<li><strong>IPv4 only.</strong> IPv6/Ethernet/Unstructured sessions are rejected (cause #50); the IP pool is a single <code>/16</code> bitmap with no per-DNN/per-slice pools.</li>
+<li><strong>Userspace UPF forwarder, Linux-only TUN.</strong> No eBPF/kernel offload; <code>data_plane.rs</code> uses <code>unsafe libc::read</code>/<code>write</code>; the macOS TUN path is a stub. The <code>nextgcore-tun</code> library is unused by the UPF.</li>
+<li><strong>Optional NFs fail open.</strong> A missing/unreachable NSACF (and a missing PCF) do not block the basic data path by design.</li>
+<li><strong>What is genuinely spec-faithful:</strong> the N2 resource transfers use the real-APER <code>nextgcore-ngap</code> codec (a deliberate fix so a strict-APER gNB decoder accepts them), the PFCP F-TEID/F-SEID flag handling and SEID=0-on-new-session semantics follow TS 29.244, and the GTP-U path implements Echo, Error Indication, End Marker, QFI extension headers, uplink anti-spoofing, and DL buffering with Downlink Data Reports.</li>
+</ul>
+<h2 id="how-it-is-validated-1"><a class="header" href="#how-it-is-validated-1">How it is validated</a></h2>
+<p><strong>Unit / property tests.</strong> State-machine transitions (<code>gsm_sm.rs</code>, <code>pfcp_sm.rs</code> <code>#[cfg(test)]</code>), the NAS accept builder (<code>gsm_build.rs::test_build_pdu_session_establishment_accept</code>), the multipart N1/N2 response and APER transfer round-trip (<code>main.rs</code> tests such as <code>sm_context_created_response_is_multipart_with_binary_refs</code> and the <code>PduSessionResourceSetupRequestTransfer</code> decode test), the IPv4 pool (<code>session_extensions.rs</code>), and <code>property_tests.rs</code> in both <code>nextgcore-smfd</code> and <code>nextgcore-upfd</code>.</p>
+<p><strong>Matched-simulator docker E2E.</strong> The single entrypoint <code>docker/rust/e2e.sh</code> chains <code>preflight.sh → build.sh → e2e-test.sh</code>. <code>e2e-test.sh</code> brings up the full stack (5GC NFs + <code>nextgsim-gnb</code> + <code>nextgsim-ue</code>) and asserts, against real container logs, the whole establishment and — crucially — the data plane:</p>
+<ul>
+<li>UPF: <code>GTP-U path opened</code>, <code>Configured TUN device …10.45.0.1</code>, <code>Added data plane session</code>, <code>Updated data plane session …DL_TEID</code>;</li>
+<li>gNB: <code>GTP-U socket bound</code>, <code>created GTP-U session</code>;</li>
+<li>UE: <code>Sending PDU Session Establishment Request</code>, <code>PDU Session Establishment Accept</code>, <code>PDU session 1 is now ACTIVE (IPv4: Some…)</code>, <code>Creating TUN interface</code>;</li>
+<li><strong>User-plane proof:</strong> <code>docker exec nextgsim-ue ping -c 3 10.45.0.1</code> — an ICMP round-trip <em>through the UE’s GTP-U tunnel</em> to the UPF gateway.</li>
+</ul>
+<p>The full baseline suite was <strong>84/84 green on 2026-07-02</strong> with 0% loss on the UE→UPF GTP-U path. Overlays extend the same suite: <code>--overlay kernel-sctp</code> (native N2 SCTP), <code>--overlay oauth2</code> (SBI token enforcement), <code>--overlay features</code> (Rel-17/18 harness). When an assertion fails, <code>e2e.sh</code> saves every container’s <code>docker logs</code> under <code>docker/rust/artifacts/</code> before teardown; see <a href="#observability--troubleshooting">Observability &amp; Troubleshooting</a> for the recipe and the log-grep pitfalls.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="the-ai-and-analytics-stack"><a class="header" href="#the-ai-and-analytics-stack">The AI and Analytics Stack</a></h1>
+<p>NextGCore’s landing page opens with the phrase “the first AI-native 5G/6G Core Network.” This chapter is the honest, code-grounded account of what that phrase actually maps to in the repository. The short version: there is <strong>one</strong> live analytics computation in the whole codebase — NF-load prediction by ordinary least-squares linear regression inside <code>nextgcore-nwdafd</code> — and a data-collection broker (<code>nextgcore-dccfd</code>) that no in-repo NF talks to. Everything else the marketing calls “AI” (ONNX inference, a four-layer analytics engine, anomaly detection, prescriptive/autonomous actions, intent-based automation, federated learning) is either library-only scaffolding that no runtime path reaches, or aspirational copy with no corresponding Rust code at all. The point of this page is to tell you exactly which is which, with a file-and-function reference for every claim, so you can re-derive it yourself.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> Everything described here is validated only by this project’s own unit tests (including strict-peer tests that run the real <code>nextgcore-nrfd</code> notify pipeline against the real NWDAF router in-process) plus the matched-simulator Docker E2E suite (84/84 green as of 2026-07-02). It is <strong>not</strong> third-party certified, and there is no frozen 3GPP Rel-20 / 6G Stage-3 specification for any of the “6G” items to be conformant to. Note further that <code>nextgcore-nwdafd</code> and <code>nextgcore-dccfd</code> are <strong>not even part of the Docker E2E health gate</strong> (<code>e2e-test.sh</code> waits on <code>mongodb nrf udr udm ausf pcf nssf bsf smf amf upf gnb ue</code> — the analytics NFs are covered by unit/strict-peer tests only). See <a href="#nextgcore-6g-gap-analysis-report">Gap Analysis: 6G</a> for the wider 6G posture; this chapter cross-links it rather than repeating it.</p>
+</blockquote>
+<h2 id="marketing-claims-vs-what-the-code-does"><a class="header" href="#marketing-claims-vs-what-the-code-does">Marketing claims vs. what the code does</a></h2>
+<p>The audited AI/6G surface is <strong>7 NF binaries</strong> (NWDAF, DCCF, EES, LMF, MB-SMF, NSACF, PIN — the set <code>docs/index.html</code> itself enumerates at its NRF component card). Before the component tour, here is the claim-by-claim verification the rest of the chapter substantiates. Every “reality” cell was checked by reading the named source; a repo-wide grep for the marketing keywords (<code>onnx</code>, <code>z-score</code>, <code>4-layer</code>, <code>prescriptive</code>, <code>reinforcement</code>, <code>autonomous action</code>) returns <strong>zero hits in Rust source</strong>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Landing-page claim (<code>docs/index.html</code>)</th><th>Code reality</th><th>Where verified</th></tr>
+</thead>
+<tbody>
+<tr><td>“NWDAF with 4-layer analytics engine (real-time anomaly detection, predictive load forecasting, prescriptive optimization, autonomous actions)”</td><td>Single-layer. One analytic (<code>NF_LOAD</code>) computed by OLS linear regression; no anomaly/prescriptive/autonomous layer exists in any runtime path.</td><td><code>analytics.rs::compute_nf_load</code>; <code>context.rs</code> <code>SUPPORTED_EVENTS</code></td></tr>
+<tr><td>“ML model lifecycle management with ONNX inference”</td><td>No ONNX anywhere. <code>MlModel</code>/<code>MlModelRegistry</code>/<code>FeedbackCollector</code> are in-memory structs with <strong>no runtime caller</strong> (only <code>#[cfg(test)]</code>). Model URLs handed to consumers are synthetic placeholders.</td><td><code>ml_service.rs</code> (<code>MlModelRegistry</code>, <code>synthetic_model_url</code>)</td></tr>
+<tr><td>“Intent-Based Automation … RL-based learning from outcomes”</td><td>An intent→policy translator exists in PCF but is <code>#[allow(dead_code)] mod intent_policy</code> — “not wired to any live handler,” a static match table, no RL.</td><td><code>nextgcore-pcfd/src/lib.rs</code>; <code>nextgcore-pcfd/src/intent_policy.rs::translate</code></td></tr>
+<tr><td>“Federated Analytics … model transfer … privacy-preserving computation”</td><td><code>FederationManager</code> + FedAvg (<code>FlAggregationRound::aggregate</code>) exist but <code>federation</code> is only <code>pub mod federation;</code> — never instantiated by any code path.</td><td><code>federation.rs</code>; <code>main.rs:23</code></td></tr>
+<tr><td>“NWDAF L1 Z-score anomaly detection → anomaly score 78/100” (workflow diagram)</td><td><code>record_anomaly</code>/<code>get_anomalies</code> exist but are called only from tests; <code>ABNORMAL_BEHAVIOUR</code> is not in <code>SUPPORTED_EVENTS</code>, so the query/subscription surface returns 204 / declares it failed.</td><td><code>analytics.rs::record_anomaly</code>; <code>context.rs::SUPPORTED_EVENTS</code></td></tr>
+<tr><td>“ONNX trajectory model → UE moving NE at 30km/h” (workflow diagram)</td><td><code>predict_mobility</code> is a most-visited-next-cell counter (no model), and is test-only; <code>UE_MOBILITY</code> answers 204 on the wire.</td><td><code>analytics.rs::predict_mobility</code>; <code>sbi_handler.rs::handle_analytics_info_query_with_ctx</code></td></tr>
+<tr><td>“DCCF … brokers NWDAF analytics requests at scale”</td><td>DCCF is a standalone subscribe/fan-out broker; <strong>no in-repo NF calls its <code>Ndccf</code> APIs</strong>, and NWDAF collects from the NRF directly, not via DCCF.</td><td><code>nextgcore-dccfd/src/main.rs</code>; <code>nrf_collector.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The remainder of this chapter is the substantiation.</p>
+<h2 id="components-involved-2"><a class="header" href="#components-involved-2">Components involved</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>NF</th><th>Binary</th><th>AI/analytics depth in this repo</th><th>Config page</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>NWDAF</strong></td><td><code>nextgcore-nwdafd</code></td><td>The only NF with a live analytics computation. One event (<code>NF_LOAD</code>) via OLS regression; ML/mobility/anomaly/federation code present but not on any served path.</td><td><a href="#nwdaf-configuration">NWDAF</a></td></tr>
+<tr><td><strong>DCCF</strong></td><td><code>nextgcore-dccfd</code></td><td>Data-collection broker: subscribe + fan-out + context-document CRUD. No analytics; no in-repo producer or consumer.</td><td><a href="#dccf-configuration">DCCF</a></td></tr>
+<tr><td><strong>EES</strong></td><td><code>nextgcore-eesd</code></td><td>Edge Enabler Server (Application Context Relocation, EAS/ECS registration). Not analytics/ML; filed under “AI-Native” on the landing page but it is a Rel-17/18 edge NF.</td><td><a href="#ees-configuration">EES</a></td></tr>
+<tr><td><strong>PIN</strong></td><td><code>nextgcore-pind</code></td><td>Personal IoT Network management. Not analytics/ML; a Rel-18 IoT NF.</td><td><a href="#pin-configuration">PIN</a></td></tr>
+<tr><td><strong>LMF / MB-SMF / NSACF</strong></td><td><code>-lmfd</code> / <code>-mbsmfd</code> / <code>-nsacfd</code></td><td>Positioning, multicast session mgmt, slice admission. Grouped with “AI-Native functions” on the site for marketing, but they are conventional Rel-16/17 control NFs, not intelligence.</td><td><a href="#lmf-configuration">LMF</a>, <a href="#mb-smf-configuration">MB-SMF</a>, <a href="#nsacf-configuration">NSACF</a></td></tr>
+</tbody>
+</table>
+</div>
+<p>The rest of this chapter deep-dives only the two NFs that genuinely belong to an “analytics stack” — NWDAF and DCCF. The others are conventional NFs documented on their own config pages.</p>
+<h2 id="nwdaf-the-one-live-analytics-path-nf_load"><a class="header" href="#nwdaf-the-one-live-analytics-path-nf_load">NWDAF: the one live analytics path (NF_LOAD)</a></h2>
+<p>The single source of truth for what NWDAF can actually produce is one constant:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// src/bins/nextgcore-nwdafd/src/context.rs
+pub const SUPPORTED_EVENTS: &amp;[AnalyticsId] = &amp;[AnalyticsId::NfLoad];
+<span class="boring">}</span></code></pre>
+<p><code>AnalyticsId</code> (<code>context.rs</code>) recognizes 16 TS 29.520 <code>NwdafEvent</code> tokens on the wire (<code>NF_LOAD</code>, <code>UE_MOBILITY</code>, <code>SLICE_LOAD_LEVEL</code>, …), but <code>is_supported()</code> reads <code>SUPPORTED_EVENTS</code>, so only <code>NF_LOAD</code> has a live collector and computation. Three wire surfaces derive from this constant: the NRF profile advertisement, the AnalyticsInfo query, and the events-subscription dispatcher — described below.</p>
+<h3 id="router-and-served-apis"><a class="header" href="#router-and-served-apis">Router and served APIs</a></h3>
+<p><code>nwdaf_sbi_request_handler</code> in <code>main.rs</code> matches the request path against a fixed table (default SBI port <code>7815</code>, <code>Args</code> in <code>main.rs</code>):</p>
+<pre><code class="language-text">GET    /nnwdaf-analyticsinfo/v1/analytics            -&gt; handle_analytics_info_query
+POST   /nnwdaf-eventssubscription/v1/subscriptions   -&gt; handle_subscription_create
+GET|PUT|DELETE  …/subscriptions/{id}                 -&gt; get/update/delete
+POST   /nnwdaf-mlmodelprovision/v1/subscriptions     -&gt; handle_ml_prov_subscription_create
+PUT|DELETE      …/subscriptions/{id}                 -&gt; ml_prov update/delete
+POST   /nnwdaf-nfstatus-notify/v1/notify             -&gt; nrf_collector::handle_nf_status_notify
+</code></pre>
+<p>The <code>/models</code> resource deliberately does not exist — <code>POST /nnwdaf-mlmodelprovision/v1/models</code> returns 404 (<code>ML Model Provision</code> is modeled as a Subscribe/Notify resource only, per code comments citing TS 29.520). The last route, <code>/nnwdaf-nfstatus-notify/v1/notify</code>, is a NextGCore-chosen callback URI (callback URIs are consumer-chosen), not a TS 29.520 resource.</p>
+<h3 id="where-the-data-comes-from-nrf-not-the-ran"><a class="header" href="#where-the-data-comes-from-nrf-not-the-ran">Where the data comes from: NRF, not the RAN</a></h3>
+<p>The marketing workflow shows gNBs streaming “UE measurements (RSRP, RSRQ, SINR)” into NWDAF. In code, the <strong>only</strong> data source is the NRF’s view of NF load. The collector is armed in <code>main()</code> and subscribes to the NRF:</p>
+<ol>
+<li><code>main()</code> sets <code>NrfCollectorConfig</code> (nrf_uri + a callback of <code>http://&lt;sbi-addr&gt;:&lt;sbi-port&gt;/nnwdaf-nfstatus-notify/v1/notify</code>) then calls <code>nrf_collector::subscribe_nf_status</code> — <code>main.rs</code>.</li>
+<li><code>subscribe_nf_status</code> POSTs an <code>Nnrf_NFManagement</code> NFStatusSubscribe <code>SubscriptionData</code> to <code>{nrf}/nnrf-nfm/v1/subscriptions</code>. The body (<code>build_nf_status_subscription_body</code>, <code>nrf_collector.rs</code>) sets <code>reqNfType: "NWDAF"</code> and <code>reqNotifEvents: [NF_REGISTERED, NF_DEREGISTERED, NF_PROFILE_CHANGED]</code> and <strong>omits</strong> <code>subscrCond</code> so every NF matches (per code comments citing TS 29.510 §5.2.2.5). Every failure is non-fatal — logged and retried on the dispatcher tick (<code>maybe_renew_nrf_subscription</code>).</li>
+<li>The NRF then POSTs <code>NotificationData</code> back to the callback. <code>parse_notification_data</code> (<code>nrf_collector.rs</code>) fail-closes on a missing mandatory <code>event</code>/<code>nfInstanceUri</code> (400) but ignores unknown fields, and extracts <code>nfProfile.load</code> (0–100) or a <code>profileChanges</code> <code>/load</code> add/replace/remove.</li>
+<li><code>ingest_notification</code> (<code>nrf_collector.rs</code>) turns each observed load into an <code>NfLoadSample</code> with <code>cpu = load/100</code> via <code>AnalyticsEngine::ingest_nf_load</code>; <code>NF_DEREGISTERED</code> calls <code>remove_nf_instance</code>, so a departed NF’s analytics go dark rather than serving stale numbers.</li>
+</ol>
+<pre><code class="language-text">   NRF ──NFStatusNotify (load=40)──▶ /nnwdaf-nfstatus-notify/v1/notify
+                                         │  parse_notification_data
+                                         ▼
+                                   ingest_notification
+                                         │  cpu = load/100
+                                         ▼
+                        AnalyticsEngine.nf_samples[instance]  (ring buffer, MAX_SAMPLES=100)
+</code></pre>
+<h3 id="the-computation-ols-linear-regression-not-ml"><a class="header" href="#the-computation-ols-linear-regression-not-ml">The computation: OLS linear regression (not ML)</a></h3>
+<p><code>AnalyticsEngine::compute_nf_load</code> (<code>analytics.rs</code>) is the entire “analytics engine.” For an instance’s last ≤5 samples it fits <code>y = a + b·x</code> by ordinary least squares, projects one step ahead for <code>predicted_load</code> (clamped to [0,1]), and computes the coefficient of determination R² as <code>confidence</code>. The module header and the function docstring both state this in the source: <em>“All analytics in this module use ordinary least-squares linear regression … No ML model is used … <code>confidence</code> … reflects how well the predictor fits the observed data, NOT trained-model accuracy.”</em> A single sample yields <code>confidence = 0.0</code>; a flat series yields <code>1.0</code>.</p>
+<p><code>compute_event_infos</code> (<code>notification_dispatcher.rs</code>) shapes the result into the TS 29.520 <code>NfLoadLevelInformation</code> array: <code>nfType</code>, <code>nfInstanceId</code>, <code>nfCpuUsage</code>/<code>nfLoadLevelAverage</code> = <code>round(mean_cpu·100)</code>, <code>nfLoadLevelpeak</code> = <code>round(peak_cpu·100)</code>, <code>confidence</code> = <code>round(R²·100)</code> as an integer 0–100, and <code>nfStatus</code> as the object form (<code>statusRegistered</code>/<code>statusUnregistered</code>) only when an NRF profile is cached. No samples → an empty array, never a fabricated entry.</p>
+<h3 id="query-path-nnwdaf_analyticsinfo"><a class="header" href="#query-path-nnwdaf_analyticsinfo">Query path (Nnwdaf_AnalyticsInfo)</a></h3>
+<p><code>handle_analytics_info_query_with_ctx</code> (<code>sbi_handler.rs</code>) enforces the honesty gate:</p>
+<ol>
+<li>Missing <code>event-id</code> → 400 <code>MANDATORY_QUERY_PARAM_INCORRECT</code>.</li>
+<li>Unrecognized token (outside the 16-value <code>AnalyticsId</code> enum) → 400 <code>INVALID_ANALYTICS_TYPE</code>.</li>
+<li>Recognized-but-unsupported token (anything not in <code>SUPPORTED_EVENTS</code>, i.e. everything except <code>NF_LOAD</code>) → <strong>204 No Content</strong> with an empty body.</li>
+<li><code>NF_LOAD</code> with an optional <code>event-filter</code> (JSON <code>nfInstanceIds</code>/<code>nfTypes</code>) computes from the shared engine; malformed filter JSON → 400; no matching data → 204; otherwise 200 with an <code>AnalyticsData</code> object.</li>
+</ol>
+<h3 id="subscription--dispatcher-path-nnwdaf_eventssubscription"><a class="header" href="#subscription--dispatcher-path-nnwdaf_eventssubscription">Subscription + dispatcher path (Nnwdaf_EventsSubscription)</a></h3>
+<p><code>parse_events_subscription</code> (<code>sbi_handler.rs</code>) requires <code>notificationURI</code> (exact casing) and a non-empty <code>eventSubscriptions[]</code>, else 400. A subscription is always accepted (201), but every subscribed event with no live collector is declared failed in the response body via <code>fail_event_reports</code> → <code>failEventReports[] { event, failureCode: "UNAVAILABLE_DATA" }</code>. A background task (<code>spawn_dispatcher</code>, tick <code>DEFAULT_DISPATCH_INTERVAL_SECS = 30 s</code>) runs <code>dispatch_notifications</code>:</p>
+<ol>
+<li>Renew the NRF collector subscription if needed (<code>maybe_renew_nrf_subscription</code>).</li>
+<li>For each active, non-expired, due subscription (<code>AnalyticsSubscription::is_due_for_notification</code>, honoring <code>repetition_period_secs</code>, default 60 s), build <code>eventNotifications[]</code> via <code>build_event_notifications</code>.</li>
+<li><code>build_event_notifications</code> skips any event not in <code>SUPPORTED_EVENTS</code>, skips any event whose computed <code>*Infos</code> array is empty, and for <code>THRESHOLD</code> events applies edge-triggered gating (<code>threshold_crossed</code> + <code>extract_level</code>, which only exposes a scalar for <code>NF_LOAD</code>). PERIODIC events with data are always emitted.</li>
+<li>POST the <code>NnwdafEventsSubscriptionNotification</code> body to the consumer’s <code>notificationURI</code>; on success update <code>last_notification_time</code>. Network errors are logged and never abort the cycle.</li>
+</ol>
+<p>Note a stale in-code comment: <code>NotificationMethod::Threshold</code>’s docstring in <code>context.rs</code> says threshold evaluation is “deferred … the dispatcher currently fires periodically regardless of method,” but the dispatcher (<code>build_event_notifications</code> + <code>threshold_crossed</code>, nwafd-07) does implement threshold gating. Trust the dispatcher code, not that comment.</p>
+<h2 id="nwdaf-the-parts-that-are-library-only-not-served"><a class="header" href="#nwdaf-the-parts-that-are-library-only-not-served">NWDAF: the parts that are library-only (not served)</a></h2>
+<p>These modules compile and have unit tests, but <strong>no runtime path reaches them</strong> — they are honest scaffolding, and this chapter flags them so nobody mistakes their existence for a served capability.</p>
+<ul>
+<li><strong>ML model registry &amp; feedback loop</strong> (<code>ml_service.rs</code>): <code>MlModel</code>, <code>MlModelRegistry</code> (register/deploy/<code>best_deployed</code>/<code>deprecate_others</code>), and the <code>FeedbackCollector</code>/<code>FeedbackRegistry</code> accuracy-driven retrain loop are all exercised only under <code>#[cfg(test)]</code>. A grep for their constructors outside <code>ml_service.rs</code> returns nothing. What the served <code>Nnwdaf_MLModelProvision</code> path actually does: <code>parse_ml_model_prov_subsc</code> stores a subscription and the dispatcher POSTs <code>build_ml_model_prov_notif_body</code>, whose model URL is <code>synthetic_model_url</code> — explicitly documented as <em>“a stable, well-formed placeholder … no downloadable model artefact exists behind it.”</em></li>
+<li><strong>UE mobility, abnormal behaviour, QoS sustainability</strong> (<code>analytics.rs</code>): <code>predict_mobility</code> (a most-visited-next-cell counter, not a model), <code>record_anomaly</code>/<code>get_anomalies</code>, and the <code>QosSustainabilityPrediction</code> struct (which has no computation function at all) are called only from <code>analytics.rs</code>’s own tests. Because their events are absent from <code>SUPPORTED_EVENTS</code>, the wire surface answers 204 (query) or <code>UNAVAILABLE_DATA</code> (subscription).</li>
+<li><strong>Federation / federated learning / DCCF-MFAF-ADRF integration</strong> (<code>federation.rs</code>): <code>FederationManager</code>, <code>FlAggregationRound::aggregate</code> (element-wise FedAvg mean), and the <code>FederationPeerType</code> enum (including <code>Dccf</code>, <code>Mfaf</code>, <code>Adrf</code>) exist, but <code>main.rs</code> only declares <code>pub mod federation;</code> — nothing constructs a <code>FederationManager</code>. ADRF and MFAF have no binaries in <code>src/bins/</code>, so neither is a real NF. The labels do appear in more than one place: <code>federation.rs</code> (<code>FederationPeerType</code> variants, <code>federation.rs:24-26</code>), the SCP’s <code>NfType</code> table (<code>nextgcore-scpd/src/context.rs:40,46</code> and <code>proxy.rs:248</code>), the core <code>nextgcore-sbi</code> <code>NfType</code> enum (<code>MFAF</code> is a variant at <code>types.rs:264</code>, stringified at <code>:308</code>), and ADRF is named in <code>nextgcore-dccfd</code>’s own module doc-comment (<code>nextgcore-dccfd/src/main.rs:5</code>). But those are enum tokens and comments — not a running ADRF/MFAF NF.</li>
+</ul>
+<h2 id="dccf-a-standalone-data-broker"><a class="header" href="#dccf-a-standalone-data-broker">DCCF: a standalone data broker</a></h2>
+<p><code>nextgcore-dccfd</code> (default SBI port <code>7816</code>, <code>Args</code> in <code>main.rs</code>) is a Data Collection Co-ordination Function that brokers between data producers and analytics consumers — in principle. <code>dccf_request_handler</code> (<code>main.rs</code>) serves:</p>
+<pre><code class="language-text">GET  /healthz                                          -&gt; {"status":"ok"}
+POST /ndccf-datamanagement/v1/subscriptions            -&gt; create subscription (notifyUri)
+GET|DELETE  …/subscriptions/{id}                       -&gt; lookup / delete
+POST /ndccf-datamanagement/v1/notify                   -&gt; ingest + fan-out to subscribers
+POST /ndccf-contextdocument/v1/contexts                -&gt; create analytics context
+GET|DELETE  …/contexts/{id}                            -&gt; lookup / delete
+</code></pre>
+<p>The data flow on the <code>notify</code> route:</p>
+<ol>
+<li>A producer POSTs a body to <code>/ndccf-datamanagement/v1/notify</code>.</li>
+<li><code>dccf_context_fanout_notify</code> (<code>context.rs</code>) returns every registered subscription that has a non-empty <code>notify_uri</code> — with <strong>no filtering by event type, data key, or subscription predicate</strong>. Every subscriber gets every notification.</li>
+<li>The handler wraps the raw body as <code>{"data": &lt;body&gt;}</code> and POSTs it (fire-and-forget <code>tokio::spawn</code>) to each subscriber’s callback URI, then returns 204.</li>
+</ol>
+<p>State lives in a process-wide <code>DccfContext</code> (<code>context.rs</code>): a set of subscription IDs, an ID→callback map, and a set of analytics-context IDs. It is entirely in-memory and lost on restart.</p>
+<p><strong>The load-bearing honesty point:</strong> nothing in this repository consumes DCCF. A grep for the <code>Ndccf</code> service paths finds no client-side caller outside <code>nextgcore-dccfd</code> itself (the only other hits are the SBI type registry and the SCP’s <code>NfType</code> enum). NWDAF’s own load collector subscribes to the <strong>NRF</strong> directly (<code>nrf_collector.rs</code>), not through DCCF. So DCCF is a correct-looking broker with no in-repo producers or consumers — it is validated only by its own unit and OAuth2 strict-peer tests.</p>
+<h2 id="the-6g-research-prototypes"><a class="header" href="#the-6g-research-prototypes">The 6G research prototypes</a></h2>
+<p>The “6G” surface beyond NWDAF/DCCF is deliberately non-normative — there is no frozen Rel-20 Stage-3 wire spec to conform to, and the landing page carries that disclaimer inline. In code it amounts to:</p>
+<ul>
+<li><strong>Intent-based policy</strong> — <code>nextgcore-pcfd/src/intent_policy.rs</code> (<code>IntentPolicyTranslator::translate</code>) maps a <code>PolicyIntent</code> (MaxThroughput, MinLatency, MinEnergy, …) to a <code>GeneratedPolicy</code> via a static match table. <code>nextgcore-pcfd/src/lib.rs</code> gates it as <code>#[allow(dead_code)] mod intent_policy</code> with the comment <em>“Future-use intent-policy translation (Rel-20 research scaffolding): not wired to any live handler.”</em> There is no conflict detection, no RL, and no SBI surface. See the PCF page: <a href="#pcf-configuration">PCF</a>.</li>
+<li><strong><code>6g-extensions</code> cfg gates</strong> — the landing page states <code>cfg(feature = "6g-extensions")</code> gates live in <code>nextgcore-sbi</code> and <code>nextgcore-dbi</code>, but only half of that is code-backed. The feature and its <code>#[cfg(feature = "6g-extensions")]</code> gates exist in <code>nextgcore-sbi</code> (<code>Cargo.toml:12</code>, <code>src/lib.rs:44,51,67,87</code>) and — the actual second crate — <code>nextgcore-app</code> (<code>Cargo.toml:12</code>, <code>src/lib.rs:11,13</code>). A grep of <code>src/libs/nextgcore-dbi</code> returns <strong>nothing</strong>: <code>nextgcore-dbi</code> carries no such feature or gate, so the landing page’s <code>nextgcore-dbi</code> attribution is not code-backed. What does exist is a pair of compile-time feature flags for optional Rel-18+ SBI/app extensions, not a running subsystem.</li>
+</ul>
+<p>For ISAC, PQC, semantic communications, and the other TR 22.870-inspired items, the concrete assessment lives in <a href="#nextgcore-6g-gap-analysis-report">Gap Analysis: 6G</a> — refer there rather than treating any of them as an implemented core-network capability.</p>
+<h2 id="simplifications-and-known-gaps-2"><a class="header" href="#simplifications-and-known-gaps-2">Simplifications and known gaps</a></h2>
+<p>Every item here is grounded in a specific source location.</p>
+<ul>
+<li><strong>One analytic, one algorithm.</strong> Only <code>NF_LOAD</code> is live (<code>SUPPORTED_EVENTS</code>), computed by OLS linear regression (<code>compute_nf_load</code>). “Confidence” is regression R², not model accuracy — stated in the source docstrings.</li>
+<li><strong>No ONNX / no trained models / no four-layer engine.</strong> Grep confirms zero occurrences in Rust source. The ML registry and feedback loop (<code>ml_service.rs</code>) have no runtime callers; provisioned model URLs are <code>synthetic_model_url</code> placeholders.</li>
+<li><strong>Anomaly / mobility / QoS analytics are test-only.</strong> <code>record_anomaly</code>, <code>predict_mobility</code>, <code>QosSustainabilityPrediction</code> (<code>analytics.rs</code>) are unreachable from any served route; the wire answers 204 / <code>UNAVAILABLE_DATA</code>.</li>
+<li><strong>Federation is dead code.</strong> <code>federation.rs</code> is declared but never instantiated; ADRF/MFAF have no binaries.</li>
+<li><strong>NWDAF ingests from the NRF only.</strong> No gNB/AMF/SMF measurement collection exists despite the marketing workflow; the sole source is <code>NFProfile.load</code> via NFStatusNotify (<code>nrf_collector.rs</code>).</li>
+<li><strong>DCCF fan-out is unconditional.</strong> <code>dccf_context_fanout_notify</code> sends every notification to every subscriber with a callback URI — no event/predicate matching.</li>
+<li><strong>DCCF capacity check is advisory.</strong> <code>dccf_context_add_subscription_with_uri</code> returns <code>false</code> at capacity, but the POST handler in <code>main.rs</code> discards that boolean and always answers <code>201 Created</code>; over-capacity subscriptions are silently dropped rather than rejected.</li>
+<li><strong>DCCF advertises fewer services than it serves.</strong> <code>register_with_nrf</code> (<code>main.rs</code>) publishes only the <code>ndccf-datamanagement</code> NF service, even though the router also serves <code>ndccf-contextdocument</code>; and <code>ContextDocument</code> DELETE returns 204 unconditionally (<code>dccf_context_remove_analytics_context</code> never reports absence).</li>
+<li><strong>All analytics state is in-memory.</strong> Both NFs lose every subscription and sample on restart — no state files (NWDAF page confirms this).</li>
+<li><strong>Threshold-method docstring is stale.</strong> <code>NotificationMethod::Threshold</code> in <code>context.rs</code> claims evaluation is deferred; the dispatcher actually implements it (<code>threshold_crossed</code>).</li>
+</ul>
+<h2 id="how-it-is-validated-2"><a class="header" href="#how-it-is-validated-2">How it is validated</a></h2>
+<p>There is no third-party certification. The evidence is unit tests, in-process strict-peer tests, and the Docker E2E suite:</p>
+<ul>
+<li><strong>NWDAF regression + shaping</strong> — <code>analytics.rs</code> <code>#[cfg(test)] mod tests</code> (<code>test_nf_load_analytics</code>, <code>test_confidence_reflects_fit_quality</code>, <code>test_mobility_prediction</code>, <code>test_samples_bounded</code>); <code>notification_dispatcher.rs</code> tests (<code>test_notify_body_shape</code>, <code>test_per_instance_infos_and_filters</code>, <code>test_nf_load_info_spec_shape</code>, <code>test_threshold_predicate_directions</code>).</li>
+<li><strong>Real NRF → real NWDAF over the wire</strong> — <code>main.rs</code> <code>mod g21_strict_peer_tests::test_g21_strict_peer_nrf_load_ingestion</code> drives the actual <code>nextgcore-nrfd</code> notify pipeline (<code>nrf_nnrf_nfm_send_nf_status_notify_all_async</code>, <code>apply_json_patch</code>) into the real NWDAF SBI server and asserts the reported average tracks a 40→60→70 PATCH sequence and goes dark (204) on deregistration.</li>
+<li><strong>NFStatusNotify ingestion</strong> — <code>nrf_collector.rs</code> tests use golden TS 29.510 <code>NotificationData</code> bodies (<code>test_notify_nf_registered_full_profile_ingests_load</code>, <code>..._profile_changed_load_replace_and_add</code>, <code>..._deregistered_drops_instance</code>) plus fail-closed cases (missing <code>event</code>, out-of-range load → 400).</li>
+<li><strong>ML-provision + honesty gates</strong> — <code>sbi_handler.rs</code> tests (<code>test_ml_prov_subscribe_201</code>, <code>test_honesty_unsupported_event_get_204</code>, <code>test_honesty_subscription_fail_event_reports</code>); <code>ml_service.rs</code> codec tests (<code>test_build_ml_prov_notif_body_shape</code>).</li>
+<li><strong>OAuth2 enforcement</strong> — <code>main.rs</code> <code>mod oauth2_h8_tests</code> (NWDAF) and <code>main.rs</code> <code>mod oauth2_h8_tests</code> (DCCF): 401 on missing/wrong-audience Bearer, pass-through on a valid ES256 token.</li>
+<li><strong>DCCF broker</strong> — <code>nextgcore-dccfd/src/context.rs</code> tests (<code>test_subscription_lifecycle</code>, <code>test_fanout_with_callback_uris</code>).</li>
+<li><strong>Docker E2E</strong> — <code>docker/rust/e2e.sh</code> → <code>e2e-test.sh</code> (84/84 on 2026-07-02). As noted above, this suite’s health gate does <strong>not</strong> include NWDAF or DCCF, so their coverage is the unit/strict-peer tests, not the end-to-end registration/data-plane run described in <a href="#observability--troubleshooting">Observability &amp; Troubleshooting</a>.</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="features--apis"><a class="header" href="#features--apis">Features &amp; APIs</a></h1>

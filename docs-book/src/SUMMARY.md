@@ -32,6 +32,12 @@
   - [PCRF (4G/EPC)](configuration/pcrf.md)
 - [Observability & Troubleshooting](observability.md)
 
+# Concepts
+
+- [UE Registration Call Flow](concepts/registration-call-flow.md)
+- [PDU Sessions & the PFCP Session Model](concepts/pdu-session-pfcp.md)
+- [The AI & Analytics Stack](concepts/ai-stack.md)
+
 # Reference
 
 - [Features & APIs](reference.md)
