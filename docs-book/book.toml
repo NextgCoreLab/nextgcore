@@ -1,0 +1,14 @@
+[book]
+title = "NextGCore Documentation"
+authors = ["NextGCore Lab"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../docs/book"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/NextgCoreLab/nextgcore"
+site-url = "/nextgcore/book/"

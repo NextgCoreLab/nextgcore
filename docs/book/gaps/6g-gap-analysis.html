@@ -1,0 +1,703 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Gap Analysis: 6G - NextGCore Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-3ce05853.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-e6ad8d5c.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGCore Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgcore" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="nextgcore-6g-gap-analysis-report"><a class="header" href="#nextgcore-6g-gap-analysis-report">NextGCore 6G Gap Analysis Report</a></h1>
+<p><strong>Date:</strong> 2026-02-07
+<strong>Scope:</strong> Comprehensive source code analysis of the network functions and shared libraries <em>(as of 2026-02-07: 17 NFs / 18 libs; the workspace now ships <strong>24 NF binaries</strong> and <strong>17 libraries</strong> — see stale-snapshot banner)</em>
+<strong>Standards Reference:</strong> 3GPP Rel-18/19, ITU-R IMT-2030 Framework</p>
+<blockquote>
+<p><strong>⚠️ STALE SNAPSHOT (2026-02-07).</strong> This report predates the Wave-1..6 remediation and the peripheral-NF build-out; it is retained for historical context only and several “does not exist” / “0%” statements below are now FALSE. As of 2026-07 the workspace ships <strong>24 NF binaries (19 5GC + 5 EPC)</strong> and <strong>17 shared libraries</strong> — including NWDAF (<code>nextgcore-nwdafd</code>: NRF-driven NF_LOAD collection, analytics, ML-service and federation scaffolding), NSACF (<code>nextgcore-nsacfd</code>: config-provisioned slice quotas per TS 29.536), plus DCCF, EES, LMF, MBSMF and PIN NFs; SBI OAuth2 (<code>/oauth2/token</code>); and wired NAS security (<code>bins/nextgcore-amfd/src/nas_security.rs</code>). A matched-sim Docker E2E (<code>docker/rust/e2e-test.sh</code>) exercises full registration + PDU session + data plane. These 6G-oriented items remain <strong>research-/prototype-level and are NOT Rel-20 conformant — no frozen 6G stage-3 spec exists.</strong></p>
+</blockquote>
+<hr>
+<h2 id="executive-summary"><a class="header" href="#executive-summary">Executive Summary</a></h2>
+<p>NextGCore is a pure Rust port of the Open5GS C codebase implementing <strong>19 5G Core (5GC) network functions and 5 EPC network functions, supported by 17 shared libraries</strong> <em>(counts as of 2026-07; this report was written against an earlier 12+5 / 18-lib layout)</em>. The project has established strong foundational infrastructure – FSM frameworks, SBI HTTP/2 server/client, PFCP protocol library, NAS message encoding/decoding, and a working UPF data plane – but the majority of service-specific handlers remain stubbed. There are <strong>316 documented TODOs</strong> across 8 phases required to reach basic 5G operational parity, and (at the time of writing) no 6G-specific features existed in the codebase. <em>(Historical: as of 2026-07 several 6G-oriented research NFs/features have since landed — NWDAF <code>nextgcore-nwdafd</code>, NSACF <code>nextgcore-nsacfd</code>, DCCF <code>nextgcore-dccfd</code>, plus ISAC/FL prototypes in nextgsim — all prototype-level, not Rel-20-conformant. See banner.)</em></p>
+<p>The gap to a 6G-ready core network is therefore two-layered:</p>
+<ol>
+<li><strong>Layer 1 (5G Completion):</strong> ~17 weeks of work to implement timer management, SBI infrastructure, error responses, NRF integration, and service-specific handlers across all NFs.</li>
+<li><strong>Layer 2 (6G Evolution):</strong> Entirely new capabilities required for AI-native networking, SBA 2.0, compute-aware networking, digital twins, intent-driven management, enhanced slicing, zero-trust security, green networking, NTN support, and TSN integration.</li>
+</ol>
+<p><strong>Overall 5G Implementation Completeness: ~25%</strong> <em>(as of 2026-02-07; substantially higher after Wave-1..6 remediation — see banner)</em>
+<strong>6G Readiness: 0%</strong> <em>(STALE — 6G-oriented research NFs/features have since landed; still prototype-level, not Rel-20-conformant)</em></p>
+<hr>
+<h2 id="1-network-function-by-nf-analysis"><a class="header" href="#1-network-function-by-nf-analysis">1. Network Function-by-NF Analysis</a></h2>
+<h3 id="11-5g-core-network-functions"><a class="header" href="#11-5g-core-network-functions">1.1 5G Core Network Functions</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>NF</th><th>Source Files</th><th>FSM</th><th>SBI Server</th><th>SBI Client</th><th>Service Handlers</th><th>Config</th><th>Tests</th><th>Completeness</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>AMF</strong></td><td>18</td><td>Working (6 event types)</td><td>Scaffolding</td><td>Scaffolding</td><td>Stubbed (NGAP dispatch noted)</td><td>YAML parsing (GUAMI, TAI, PLMN, security)</td><td>Basic</td><td><strong>35%</strong></td></tr>
+<tr><td><strong>AUSF</strong></td><td>~8</td><td>Working + UE sub-FSMs</td><td>Routing (nausf-auth)</td><td>Routing (nudm-ueau)</td><td>Stubbed (UE lookup by SUCI/SUPI)</td><td>Basic</td><td>Comprehensive (845 lines)</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>BSF</strong></td><td>~6</td><td>Working</td><td>Routing (nbsf-management)</td><td>NRF stubs</td><td>Stubbed (PCF binding CRUD)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
+<tr><td><strong>NRF</strong></td><td>~8</td><td>Working</td><td><strong>Functional</strong> (full HTTP/2 routing)</td><td>N/A</td><td><strong>Working</strong> (NF registration, discovery, subscriptions)</td><td>Basic</td><td>Good</td><td><strong>65%</strong></td></tr>
+<tr><td><strong>NSSF</strong></td><td>~6</td><td>Working</td><td>Routing (nnssf-nsselection v2)</td><td>H-NSSF response</td><td>Stubbed</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
+<tr><td><strong>PCF</strong></td><td>~8</td><td>Working + AM/SM sub-FSMs</td><td>Routing (3 services)</td><td>NUDR/BSF response</td><td>Stubbed (AM policy, SM policy, policy auth)</td><td>Basic</td><td>Comprehensive (890 lines)</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>SCP</strong></td><td>~6</td><td>Working</td><td>Minimal (forwards via sbi_path)</td><td>NF discovery</td><td>Stubbed</td><td>Basic</td><td>Basic</td><td><strong>15%</strong></td></tr>
+<tr><td><strong>SEPP</strong></td><td>~8</td><td>Working + Handshake sub-FSMs</td><td>Routing (n32c-handshake)</td><td>N32c response</td><td>Partial (find_or_create returns None)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
+<tr><td><strong>SMF</strong></td><td>~12</td><td>Working (14 event types)</td><td><strong>Functional</strong> (comprehensive HTTP/2 routes)</td><td>Scaffolding</td><td>Stubbed (PDU session CRUD, event exposure)</td><td>YAML parsing</td><td>Basic</td><td><strong>30%</strong></td></tr>
+<tr><td><strong>UDM</strong></td><td>~8</td><td>Working + UE/Session sub-FSMs</td><td>Routing (3 services, v2 SDM)</td><td>NUDR response routing</td><td>Stubbed (SUPI extraction works)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
+<tr><td><strong>UDR</strong></td><td>~6</td><td>Working (stateless)</td><td>Routing (nudr-dr)</td><td>N/A</td><td>Delegated to nudr_handler</td><td>Basic</td><td>Basic</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>UPF</strong></td><td>~10</td><td>Working + Exception state</td><td>N/A (PFCP)</td><td>N/A</td><td><strong>Working</strong> (TUN, GTP-U, session mgmt)</td><td>Basic</td><td>Good</td><td><strong>55%</strong></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="12-epc-network-functions"><a class="header" href="#12-epc-network-functions">1.2 EPC Network Functions</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>NF</th><th>Source Files</th><th>FSM</th><th>Protocol Interfaces</th><th>Service Handlers</th><th>Completeness</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>HSS</strong></td><td>10</td><td>Working + DB poll timer</td><td>S6a/Cx/SWx (Diameter) init/fini scaffolding</td><td>Stubbed (AIR/ULR/PUR/CLR/IDR structures defined)</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>MME</strong></td><td>21</td><td>Working (5 FSMs: MME, EMM, ESM, S1AP, SGsAP)</td><td>S1AP/S11/S6a/SGsAP init scaffolding</td><td>Comprehensive type definitions, handlers stubbed</td><td><strong>30%</strong></td></tr>
+<tr><td><strong>PCRF</strong></td><td>8</td><td>Working + Exception state</td><td>Gx/Rx (Diameter) init/fini scaffolding</td><td>Stubbed</td><td><strong>15%</strong></td></tr>
+<tr><td><strong>SGW-C</strong></td><td>13</td><td>Working + PFCP sub-FSM (5 states)</td><td>S11/S5C/SXA event routing</td><td>Stubbed (GTP message types documented)</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>SGW-U</strong></td><td>10</td><td>Working (returns SgwuSmResult)</td><td>SXA (PFCP) event routing</td><td>Stubbed (dispatch to PFCP node)</td><td><strong>20%</strong></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="13-shared-libraries"><a class="header" href="#13-shared-libraries">1.3 Shared Libraries</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Library</th><th>Purpose</th><th>Status</th><th>Key Types/Features</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>nextgcore-sbi</strong></td><td>SBI HTTP/2</td><td><strong>Functional</strong></td><td>Client, Server (hyper/h2), ProblemDetails, NfInstance, discovery context, TLS config</td></tr>
+<tr><td><strong>nextgcore-pfcp</strong></td><td>PFCP protocol</td><td><strong>Functional</strong></td><td>Header/IE/Message encode/decode, Session/Association/Heartbeat types, TS 29.244</td></tr>
+<tr><td><strong>nextgcore-nas</strong></td><td>NAS protocol</td><td><strong>Functional</strong></td><td>5GMM + EPS message build/parse, security context, Registration/Auth/SMC messages</td></tr>
+<tr><td><strong>nextgcore-core</strong></td><td>Core utilities</td><td><strong>Functional</strong></td><td>26 modules: list, hash, pool, pkbuf, timer, FSM, TLV, socket, poll, TCP/UDP</td></tr>
+<tr><td><strong>nextgcore-metrics</strong></td><td>Prometheus metrics</td><td><strong>Functional</strong></td><td>Counter/Gauge/Histogram, labels, Prometheus HTTP server</td></tr>
+<tr><td><strong>nextgcore-ngap</strong></td><td>NGAP protocol</td><td><strong>Minimal</strong></td><td>Only lib.rs stub (ASN.1 APER note)</td></tr>
+<tr><td><strong>nextgcore-s1ap</strong></td><td>S1AP protocol</td><td>Scaffolding</td><td>ASN.1 encoding via nextgcore-asn1c</td></tr>
+<tr><td><strong>nextgcore-sctp</strong></td><td>SCTP transport</td><td><strong>Working</strong></td><td>sctp-proto 0.6 integration (migration complete per must_be_implemented.txt)</td></tr>
+<tr><td><strong>nextgcore-gtp</strong></td><td>GTPv2-C protocol</td><td>Scaffolding</td><td>GTP-C message building</td></tr>
+<tr><td><strong>nextgcore-diameter</strong></td><td>Diameter protocol</td><td>Scaffolding</td><td>FreeDiameter integration stubs</td></tr>
+<tr><td><strong>nextgcore-crypt</strong></td><td>Crypto functions</td><td>Scaffolding</td><td>Auth vector generation</td></tr>
+<tr><td><strong>nextgcore-dbi</strong></td><td>Database interface</td><td>Scaffolding</td><td>MongoDB integration stubs</td></tr>
+<tr><td><strong>nextgcore-tun</strong></td><td>TUN device</td><td><strong>Working</strong></td><td>Used by UPF for data plane</td></tr>
+<tr><td><strong>nextgcore-ipfw</strong></td><td>IP firewall/NAT</td><td><strong>Working</strong></td><td>Used by UPF for NAT</td></tr>
+<tr><td><strong>nextgcore-ffi</strong></td><td>C FFI bindings</td><td>Scaffolding</td><td>FreeDiameter/ASN.1 C library bridges</td></tr>
+<tr><td><strong>nextgcore-asn1c</strong></td><td>ASN.1 compiler</td><td>Scaffolding</td><td>NGAP/S1AP ASN.1 types</td></tr>
+<tr><td><strong>nextgcore-app</strong></td><td>Application framework</td><td>Scaffolding</td><td>Common app initialization</td></tr>
+<tr><td><strong>nextgcore-proto</strong></td><td>Protocol definitions</td><td>Scaffolding</td><td>Shared protocol types</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="2-critical-5g-gaps-from-todotxt-analysis"><a class="header" href="#2-critical-5g-gaps-from-todotxt-analysis">2. Critical 5G Gaps (from todo.txt Analysis)</a></h2>
+<p>The project documents 316 TODOs across 8 phases. These represent the prerequisite work before any 6G features can be considered.</p>
+<h3 id="phase-1-timer-management--sbi-infrastructure-critical-40-todos"><a class="header" href="#phase-1-timer-management--sbi-infrastructure-critical-40-todos">Phase 1: Timer Management + SBI Infrastructure (CRITICAL, ~40 TODOs)</a></h3>
+<ul>
+<li><strong>Timer Manager:</strong> No centralized async timer system. All NFs use placeholder <code>thread::sleep</code> polling loops.</li>
+<li><strong>SBI Event Loop:</strong> Event queue dispatch from SBI server to state machines is not wired.</li>
+<li><strong>Impact:</strong> Without timers, no NF can perform registration retries, heartbeats, or session timeouts.</li>
+</ul>
+<h3 id="phase-2-error-response-framework-high-50-todos"><a class="header" href="#phase-2-error-response-framework-high-50-todos">Phase 2: Error Response Framework (HIGH, ~50 TODOs)</a></h3>
+<ul>
+<li><strong>ProblemDetails:</strong> Library type exists in nextgcore-sbi but no NF generates proper 3GPP error responses.</li>
+<li><strong>HTTP Status Codes:</strong> Server helper functions exist (<code>send_bad_request</code>, <code>send_not_found</code>, etc.) but are unused.</li>
+<li><strong>Impact:</strong> No interoperability with compliant clients; no error recovery.</li>
+</ul>
+<h3 id="phase-3-nrf-integration-high-35-todos"><a class="header" href="#phase-3-nrf-integration-high-35-todos">Phase 3: NRF Integration (HIGH, ~35 TODOs)</a></h3>
+<ul>
+<li><strong>NRF Server:</strong> Functional (registration, discovery, subscriptions work).</li>
+<li><strong>NRF Clients:</strong> No NF registers itself with NRF on startup, no NF performs NF discovery.</li>
+<li><strong>Impact:</strong> Service-based architecture is non-functional without NRF integration.</li>
+</ul>
+<h3 id="phase-4-service-specific-handlers-medium-80-todos"><a class="header" href="#phase-4-service-specific-handlers-medium-80-todos">Phase 4: Service-Specific Handlers (MEDIUM, ~80 TODOs)</a></h3>
+<ul>
+<li><strong>AMF:</strong> NGAP message dispatch to sub-FSMs, NAS message processing, UE context management.</li>
+<li><strong>SMF:</strong> N4 session establishment with UPF, PDU session lifecycle, QoS rule installation.</li>
+<li><strong>AUSF/UDM/UDR:</strong> Authentication vector generation, subscriber data retrieval, database queries.</li>
+<li><strong>PCF:</strong> Policy decision logic, PCC rule generation, QoS flow binding.</li>
+<li><strong>Impact:</strong> No actual mobile connectivity possible.</li>
+</ul>
+<h3 id="phase-5-scpsepp-routing-medium-40-todos"><a class="header" href="#phase-5-scpsepp-routing-medium-40-todos">Phase 5: SCP/SEPP Routing (MEDIUM, ~40 TODOs)</a></h3>
+<ul>
+<li><strong>SCP:</strong> Request forwarding, load balancing, service mesh capabilities.</li>
+<li><strong>SEPP:</strong> N32 interface, PRINS/TLS security, message filtering.</li>
+<li><strong>Impact:</strong> No inter-PLMN roaming or service mesh support.</li>
+</ul>
+<h3 id="phase-6-protocol-libraries---ngaps1ap-medium-20-todos"><a class="header" href="#phase-6-protocol-libraries---ngaps1ap-medium-20-todos">Phase 6: Protocol Libraries - NGAP/S1AP (MEDIUM, ~20 TODOs)</a></h3>
+<ul>
+<li><strong>nextgcore-ngap:</strong> Only a single-line stub. ASN.1 APER encoding not implemented.</li>
+<li><strong>nextgcore-s1ap:</strong> Scaffolding only.</li>
+<li><strong>Impact:</strong> AMF cannot communicate with gNBs; MME cannot communicate with eNBs.</li>
+</ul>
+<h3 id="phase-7-epcdiameter-low-25-todos"><a class="header" href="#phase-7-epcdiameter-low-25-todos">Phase 7: EPC/Diameter (LOW, ~25 TODOs)</a></h3>
+<ul>
+<li><strong>nextgcore-diameter:</strong> FreeDiameter integration is stub-only.</li>
+<li><strong>HSS/PCRF:</strong> S6a, Cx, SWx, Gx, Rx handlers are all stubbed.</li>
+<li><strong>Impact:</strong> No EPC authentication or policy control.</li>
+</ul>
+<h3 id="phase-8-upf-enhancements-low-5-todos"><a class="header" href="#phase-8-upf-enhancements-low-5-todos">Phase 8: UPF Enhancements (LOW, ~5 TODOs)</a></h3>
+<ul>
+<li><strong>UPF:</strong> Already the most complete NF. Remaining work: URR (usage reporting), QER (QoS enforcement), FAR enhancements.</li>
+</ul>
+<hr>
+<h2 id="3-6g-gap-analysis-per-itu-r-imt-2030-and-3gpp-rel-1819"><a class="header" href="#3-6g-gap-analysis-per-itu-r-imt-2030-and-3gpp-rel-1819">3. 6G Gap Analysis per ITU-R IMT-2030 and 3GPP Rel-18/19</a></h2>
+<h3 id="31-aiml-native-network-automation-nwdaf"><a class="header" href="#31-aiml-native-network-automation-nwdaf">3.1 AI/ML-Native Network Automation (NWDAF)</a></h3>
+<p><strong>Current State (2026-02-07 — now STALE):</strong> No NWDAF NF existed at the time of writing. <em>Update: NWDAF now exists as <code>nextgcore-nwdafd</code> with an NRF-driven NF_LOAD collector (<code>nrf_collector.rs</code>), analytics (<code>analytics.rs</code>), ML service (<code>ml_service.rs</code>) and federation scaffolding (<code>federation.rs</code>) — research/prototype-level, not Rel-18/Rel-20 conformant.</em></p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No NWDAF binary or scaffolding in <code>src/bins/</code></li>
+<li>No ML model serving infrastructure (ONNX runtime, TensorFlow Serving integration)</li>
+<li>No data collection APIs (Nnwdaf_AnalyticsInfo, Nnwdaf_EventsSubscription)</li>
+<li>No analytics exposure to consumers (AMF, SMF, PCF, NSSF)</li>
+<li>No Federated Learning support for distributed model training</li>
+<li>No real-time inference pipeline for anomaly detection, load prediction, or QoE optimization</li>
+<li>No MTLF (Model Training Logical Function) or AnLF (Analytics Logical Function) decomposition</li>
+<li><strong>3GPP Rel-18 NWDAF Phase 3:</strong> Root cause analysis, QoE prediction, network energy saving analytics</li>
+<li><strong>6G Extension:</strong> Autonomous network operations, self-healing, predictive resource management</li>
+</ul>
+<p><strong>Priority:</strong> CRITICAL for 6G – AI-native networking is a cornerstone of IMT-2030.</p>
+<h3 id="32-enhanced-network-slicing"><a class="header" href="#32-enhanced-network-slicing">3.2 Enhanced Network Slicing</a></h3>
+<p><strong>Current State:</strong> NSSF has basic scaffolding for <code>nnssf-nsselection</code> (v2 API). AMF context defines <code>SNssai</code> type. No slice isolation, lifecycle management, or SLA assurance.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No slice admission control or resource reservation</li>
+<li>No Network Slice Instance (NSI) lifecycle management (creation, activation, deactivation, termination)</li>
+<li>No Network Slice Subnet Instance (NSSI) management</li>
+<li>No slice SLA monitoring or assurance framework</li>
+<li>No per-slice QoS enforcement (PCF policies are stubbed)</li>
+<li>No slice-level analytics (requires NWDAF)</li>
+<li>No inter-slice resource sharing or isolation enforcement</li>
+<li>No slice template/blueprint management</li>
+<li><strong>3GPP Rel-18:</strong> Enhanced NSSF for slice-specific authentication, NSACF (Network Slice Admission Control Function)</li>
+<li><strong>6G Extension:</strong> Dynamic micro-slicing with sub-ms granularity, AI-driven slice orchestration, intent-based slice management</li>
+</ul>
+<p><strong>Priority:</strong> HIGH – Network slicing is fundamental to both 5G-Advanced and 6G.</p>
+<h3 id="33-service-based-architecture-sba-20"><a class="header" href="#33-service-based-architecture-sba-20">3.3 Service-Based Architecture (SBA) 2.0</a></h3>
+<p><strong>Current State:</strong> nextgcore-sbi library provides functional HTTP/2 client/server with hyper. NRF has working NF registration and discovery. No other NF uses SBI client for NRF registration or service discovery.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No service mesh capabilities (SCP is minimal stub)</li>
+<li>No event exposure framework (NSEF - Network Service Exposure Function)</li>
+<li>No API gateway / rate limiting / request routing</li>
+<li>No service authorization (OAuth 2.0 tokens not implemented)</li>
+<li>No event subscription/notification framework</li>
+<li>No bulk operations or batch API support</li>
+<li>No HTTP/3 (QUIC) support</li>
+<li><strong>3GPP Rel-18:</strong> Enhanced SBA with indirect communication via SCP, service routing</li>
+<li><strong>6G Extension:</strong> SBA 2.0 with native gRPC/protocol buffers, GraphQL APIs, event-driven architecture, serverless NF execution, WebAssembly NF plugins</li>
+</ul>
+<p><strong>Priority:</strong> HIGH – SBA 2.0 is an architectural pillar of 6G.</p>
+<h3 id="34-multi-access-edge-computing-mec--edge-intelligence"><a class="header" href="#34-multi-access-edge-computing-mec--edge-intelligence">3.4 Multi-Access Edge Computing (MEC) / Edge Intelligence</a></h3>
+<p><strong>Current State:</strong> No edge computing support. No EASDF (Edge Application Server Discovery Function). No edge NF deployment model.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No EASDF NF</li>
+<li>No edge discovery and selection</li>
+<li>No local breakout / local data path management</li>
+<li>No UPF selection based on edge proximity</li>
+<li>No edge application lifecycle management</li>
+<li>No edge-cloud orchestration</li>
+<li>No latency-aware traffic steering</li>
+<li><strong>3GPP Rel-18:</strong> Enhanced EASDF, edge computing phase 2</li>
+<li><strong>6G Extension:</strong> Distributed AI at the edge, compute-aware networking (see 3.8), ultra-low-latency edge processing (&lt;1ms)</li>
+</ul>
+<p><strong>Priority:</strong> HIGH – Edge computing is critical for 6G’s ultra-low-latency and immersive use cases.</p>
+<h3 id="35-zero-trust-security-architecture"><a class="header" href="#35-zero-trust-security-architecture">3.5 Zero-Trust Security Architecture</a></h3>
+<p><strong>Current State:</strong> SBI server has TLS config fields (private_key, cert, verify_client) but no implementation. No authentication, authorization, or integrity protection between NFs.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No mTLS between NFs (SBI server TLS config is unused)</li>
+<li>No OAuth 2.0 client credentials flow for NF authorization</li>
+<li>No NF token validation</li>
+<li>No security context management for UE sessions</li>
+<li>No NAS security (library types exist but not wired to NFs)</li>
+<li>No SUPI/SUCI privacy (AUSF handler stubbed)</li>
+<li>No security event logging or audit trail</li>
+<li>No SEPP N32 security (PRINS or TLS not implemented)</li>
+<li><strong>3GPP Rel-18:</strong> Enhanced network security, AKMA (Authentication and Key Management for Applications)</li>
+<li><strong>6G Extension:</strong> Zero-trust architecture with continuous authentication, AI-driven threat detection, quantum-safe cryptography (post-quantum algorithms), decentralized identity management (DID/SSI)</li>
+</ul>
+<p><strong>Priority:</strong> CRITICAL – Zero-trust is non-negotiable for 6G deployment.</p>
+<h3 id="36-digital-twin-network-functions"><a class="header" href="#36-digital-twin-network-functions">3.6 Digital Twin Network Functions</a></h3>
+<p><strong>Current State:</strong> No digital twin capability. No simulation, modeling, or state replication infrastructure.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No digital twin framework or data model</li>
+<li>No real-time network state mirroring</li>
+<li>No what-if scenario simulation</li>
+<li>No predictive maintenance capabilities</li>
+<li>No network topology modeling</li>
+<li>No protocol behavior simulation</li>
+<li><strong>6G Requirement:</strong> Digital twins of physical network for planning, optimization, and autonomous operations</li>
+<li>Requires integration with AI/ML (3.1), metrics collection (partially exists via nextgcore-metrics), and comprehensive state export</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM-HIGH – Emerging 6G requirement per ITU-R IMT-2030.</p>
+<h3 id="37-intent-driven-network-management"><a class="header" href="#37-intent-driven-network-management">3.7 Intent-Driven Network Management</a></h3>
+<p><strong>Current State:</strong> No intent management. All configuration is imperative (YAML files, CLI arguments).</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No intent translation engine (natural language / policy to configuration)</li>
+<li>No intent lifecycle management (creation, conflict resolution, verification)</li>
+<li>No closed-loop automation (monitor -&gt; analyze -&gt; plan -&gt; execute)</li>
+<li>No declarative network configuration framework</li>
+<li>No policy conflict detection and resolution</li>
+<li><strong>6G Requirement:</strong> Operators express desired outcomes; network autonomously achieves them</li>
+<li>Requires AI/ML (3.1), digital twins (3.6), and comprehensive telemetry</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM – Important for 6G operational efficiency.</p>
+<h3 id="38-compute-aware-networking-can"><a class="header" href="#38-compute-aware-networking-can">3.8 Compute-Aware Networking (CAN)</a></h3>
+<p><strong>Current State:</strong> No compute awareness. UPF selection is not implemented. No resource monitoring.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No compute resource discovery and monitoring</li>
+<li>No compute-aware traffic steering</li>
+<li>No workload placement optimization</li>
+<li>No compute resource abstraction layer</li>
+<li>No joint compute-communication optimization</li>
+<li><strong>3GPP Rel-19:</strong> Compute-aware networking study items</li>
+<li><strong>6G Extension:</strong> Native compute-communication convergence, distributed computing fabric</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM – Growing importance in 6G for edge and AI workloads.</p>
+<h3 id="39-green-networking--energy-efficiency"><a class="header" href="#39-green-networking--energy-efficiency">3.9 Green Networking / Energy Efficiency</a></h3>
+<p><strong>Current State:</strong> No energy management. No NF sleep/wake capabilities. No traffic-adaptive resource scaling.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No energy-aware NF scheduling</li>
+<li>No NF sleep mode or dynamic scaling</li>
+<li>No traffic prediction for energy optimization (requires NWDAF)</li>
+<li>No energy consumption metrics collection</li>
+<li>No carbon-aware workload placement</li>
+<li><strong>3GPP Rel-18:</strong> Network energy saving (NES) features</li>
+<li><strong>6G Extension:</strong> Zero-energy devices support, energy harvesting integration, sustainable networking targets</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM – ITU-R IMT-2030 includes sustainability as a key design principle.</p>
+<h3 id="310-non-terrestrial-networks-ntn-support"><a class="header" href="#310-non-terrestrial-networks-ntn-support">3.10 Non-Terrestrial Networks (NTN) Support</a></h3>
+<p><strong>Current State:</strong> Research prototypes only. <code>nextgcore-proto</code> carries NTN constellation-planning types (<code>ntn_constellation.rs</code>: <code>SatelliteId</code>, orbit parameters, timing advance) and bespoke NAS IEs (NTN timing advance / access barring) exist, but <strong>none of this is wired into live NF procedures or the wire</strong> — no NF consumes the types and there is no NTN signaling path. UAV is separate and IS implemented: UAV Service-level-AA (TS 23.256, IEI 0x72) with geofencing lives in the AMF.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No NTN-specific timing/delay compensation in AMF/SMF (prototype types exist but are unused)</li>
+<li>No discontinuous coverage handling</li>
+<li>No satellite ephemeris data management</li>
+<li>No NTN-specific mobility management</li>
+<li>No store-and-forward mechanism for intermittent connectivity</li>
+<li>No NTN-specific QoS profiles</li>
+<li><strong>3GPP Rel-17/18:</strong> NTN phases 1 &amp; 2 for NR-NTN and IoT-NTN</li>
+<li><strong>6G Extension:</strong> Ubiquitous 3D coverage (terrestrial + NTN + aerial), seamless handover across domains</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM – Critical for 6G’s ubiquitous coverage vision.</p>
+<h3 id="311-time-sensitive-networking-tsn-integration"><a class="header" href="#311-time-sensitive-networking-tsn-integration">3.11 Time-Sensitive Networking (TSN) Integration</a></h3>
+<p><strong>Current State:</strong> No TSN support. No deterministic networking capabilities.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No TSN translator functions (DS-TT, NW-TT)</li>
+<li>No IEEE 802.1Q integration</li>
+<li>No deterministic QoS guarantees</li>
+<li>No time synchronization (gPTP/IEEE 1588)</li>
+<li>No TSN bridge configuration</li>
+<li><strong>3GPP Rel-16/17:</strong> 5G TSN integration</li>
+<li><strong>6G Extension:</strong> Native deterministic networking, ultra-reliable low-latency (&lt;100us), factory automation support</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM – Important for industrial 6G use cases.</p>
+<h3 id="312-integrated-sensing-and-communication-isac"><a class="header" href="#312-integrated-sensing-and-communication-isac">3.12 Integrated Sensing and Communication (ISAC)</a></h3>
+<p><strong>Current State:</strong> No sensing capability. This is a fundamentally new 6G capability.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No sensing NF or sensing data management</li>
+<li>No joint radar-communication waveform support</li>
+<li>No sensing data collection and processing pipeline</li>
+<li>No location/environment sensing service exposure</li>
+<li><strong>6G Requirement:</strong> Radio signals used simultaneously for communication and sensing (radar, positioning, imaging)</li>
+<li>Requires new RAN-core interfaces beyond current NGAP</li>
+</ul>
+<p><strong>Priority:</strong> LOW (near-term) / HIGH (6G target) – A defining 6G feature per ITU-R IMT-2030.</p>
+<hr>
+<h2 id="4-cross-cutting-infrastructure-gaps"><a class="header" href="#4-cross-cutting-infrastructure-gaps">4. Cross-Cutting Infrastructure Gaps</a></h2>
+<h3 id="41-observability-stack"><a class="header" href="#41-observability-stack">4.1 Observability Stack</a></h3>
+<ul>
+<li><strong>Metrics:</strong> nextgcore-metrics provides Prometheus Counter/Gauge/Histogram framework. Not wired to any NF except AMF (has metrics field).</li>
+<li><strong>Logging:</strong> Uses <code>env_logger</code> + <code>log</code> crate. No structured logging (JSON). No distributed tracing.</li>
+<li><strong>Tracing:</strong> No OpenTelemetry integration. No span propagation across NF boundaries.</li>
+<li><strong>Gap:</strong> Need structured logging, distributed tracing (OpenTelemetry), and metrics integration across all NFs.</li>
+</ul>
+<h3 id="42-configuration-management"><a class="header" href="#42-configuration-management">4.2 Configuration Management</a></h3>
+<ul>
+<li><strong>Current:</strong> Each NF has its own YAML parsing (AMF and SMF have manual line-by-line parsers). No unified config framework.</li>
+<li><strong>Gap:</strong> Need centralized configuration management, hot-reload, environment variable override, config validation.</li>
+</ul>
+<h3 id="43-deployment-and-orchestration"><a class="header" href="#43-deployment-and-orchestration">4.3 Deployment and Orchestration</a></h3>
+<ul>
+<li><strong>Current:</strong> Standalone binaries with <code>clap</code> CLI parsing. No containerization files. No Helm charts.</li>
+<li><strong>Gap:</strong> Need Dockerfiles, Kubernetes manifests, Helm charts, operator pattern for lifecycle management.</li>
+</ul>
+<h3 id="44-testing-infrastructure"><a class="header" href="#44-testing-infrastructure">4.4 Testing Infrastructure</a></h3>
+<ul>
+<li><strong>Current:</strong> Unit tests exist for most NFs (FSM state transitions, type creation). No integration tests. No end-to-end tests.</li>
+<li><strong>Gap:</strong> Need integration test framework (multi-NF), protocol conformance tests, performance benchmarks, chaos testing.</li>
+</ul>
+<h3 id="45-database-layer"><a class="header" href="#45-database-layer">4.5 Database Layer</a></h3>
+<ul>
+<li><strong>Current:</strong> nextgcore-dbi has MongoDB stubs. HSS and PCRF reference MongoDB for subscriber data.</li>
+<li><strong>Gap:</strong> No working database integration. Need MongoDB driver implementation, schema management, connection pooling.</li>
+</ul>
+<hr>
+<h2 id="5-prioritized-roadmap"><a class="header" href="#5-prioritized-roadmap">5. Prioritized Roadmap</a></h2>
+<h3 id="phase-a-5g-foundation-estimated-effort-17-weeks-per-todotxt"><a class="header" href="#phase-a-5g-foundation-estimated-effort-17-weeks-per-todotxt">Phase A: 5G Foundation (Estimated effort: 17 weeks per todo.txt)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Step</th><th>Work Items</th><th>Dependencies</th><th>Priority</th></tr>
+</thead>
+<tbody>
+<tr><td>A1</td><td>Timer management system + SBI event loop wiring</td><td>None</td><td>CRITICAL</td></tr>
+<tr><td>A2</td><td>Error response framework (ProblemDetails integration)</td><td>A1</td><td>HIGH</td></tr>
+<tr><td>A3</td><td>NRF client integration for all NFs</td><td>A1, A2</td><td>HIGH</td></tr>
+<tr><td>A4</td><td>NGAP/S1AP ASN.1 encoding library</td><td>A1</td><td>HIGH</td></tr>
+<tr><td>A5</td><td>AMF: NGAP handler, NAS processing, UE context</td><td>A1, A3, A4</td><td>HIGH</td></tr>
+<tr><td>A6</td><td>SMF: N4/PFCP session establishment with UPF</td><td>A1, A3</td><td>HIGH</td></tr>
+<tr><td>A7</td><td>AUSF/UDM/UDR: Authentication and subscriber data</td><td>A1, A3</td><td>HIGH</td></tr>
+<tr><td>A8</td><td>PCF: Policy decision engine, PCC rules</td><td>A1, A3</td><td>MEDIUM</td></tr>
+<tr><td>A9</td><td>SCP: Request forwarding, load balancing</td><td>A1, A3</td><td>MEDIUM</td></tr>
+<tr><td>A10</td><td>SEPP: N32 security, message filtering</td><td>A1, A3</td><td>MEDIUM</td></tr>
+<tr><td>A11</td><td>EPC: Diameter integration, HSS/MME handlers</td><td>A1</td><td>LOW</td></tr>
+<tr><td>A12</td><td>UPF: URR, QER, FAR enhancements</td><td>A6</td><td>LOW</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="phase-b-5g-advanced--pre-6g-new-development"><a class="header" href="#phase-b-5g-advanced--pre-6g-new-development">Phase B: 5G-Advanced / Pre-6G (New development)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Step</th><th>Work Items</th><th>Dependencies</th><th>Priority</th></tr>
+</thead>
+<tbody>
+<tr><td>B1</td><td>mTLS + OAuth 2.0 for NF-to-NF security</td><td>A3</td><td>CRITICAL</td></tr>
+<tr><td>B2</td><td>NWDAF NF (data collection, basic analytics)</td><td>A3, A5, A6</td><td>HIGH</td></tr>
+<tr><td>B3</td><td>Enhanced slicing (NSACF, slice SLA monitoring)</td><td>A3, A5, A8</td><td>HIGH</td></tr>
+<tr><td>B4</td><td>Observability (OpenTelemetry, structured logging)</td><td>A1</td><td>HIGH</td></tr>
+<tr><td>B5</td><td>Database layer (MongoDB driver, schema management)</td><td>A7</td><td>HIGH</td></tr>
+<tr><td>B6</td><td>EASDF + edge computing support</td><td>A3, A6</td><td>MEDIUM</td></tr>
+<tr><td>B7</td><td>NTN timing/mobility extensions (prototype types exist in nextgcore-proto, unwired)</td><td>A5</td><td>MEDIUM</td></tr>
+<tr><td>B8</td><td>TSN integration (DS-TT, NW-TT stubs)</td><td>A6</td><td>MEDIUM</td></tr>
+<tr><td>B9</td><td>Containerization (Docker, K8s, Helm)</td><td>All A-phase</td><td>MEDIUM</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="phase-c-6g-core-evolution"><a class="header" href="#phase-c-6g-core-evolution">Phase C: 6G Core Evolution</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Step</th><th>Work Items</th><th>Dependencies</th><th>Priority</th></tr>
+</thead>
+<tbody>
+<tr><td>C1</td><td>SBA 2.0 (gRPC/protobuf, event-driven, HTTP/3)</td><td>B4</td><td>HIGH</td></tr>
+<tr><td>C2</td><td>AI-native NWDAF (ML model serving, federated learning)</td><td>B2</td><td>HIGH</td></tr>
+<tr><td>C3</td><td>Zero-trust architecture (continuous auth, post-quantum crypto)</td><td>B1</td><td>HIGH</td></tr>
+<tr><td>C4</td><td>Digital twin framework</td><td>B2, B4</td><td>MEDIUM</td></tr>
+<tr><td>C5</td><td>Intent-driven management engine</td><td>B2, C4</td><td>MEDIUM</td></tr>
+<tr><td>C6</td><td>Compute-aware networking</td><td>B6</td><td>MEDIUM</td></tr>
+<tr><td>C7</td><td>Green networking (energy-aware scheduling, NF sleep)</td><td>B2, B4</td><td>MEDIUM</td></tr>
+<tr><td>C8</td><td>ISAC support (sensing NF, data pipeline)</td><td>C1</td><td>LOW</td></tr>
+<tr><td>C9</td><td>Dynamic micro-slicing (&lt;ms granularity)</td><td>B3, C2</td><td>LOW</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="6-new-6g-network-functions-required"><a class="header" href="#6-new-6g-network-functions-required">6. New 6G Network Functions Required</a></h2>
+<p>The following NFs do not exist in the codebase and must be created for 6G:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>New NF</th><th>Purpose</th><th>3GPP Reference</th><th>6G Relevance</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>NWDAF</strong></td><td>Network Data Analytics</td><td>TS 23.288</td><td>AI-native core, predictive automation</td></tr>
+<tr><td><strong>EASDF</strong></td><td>Edge Application Server Discovery</td><td>TS 23.548</td><td>Edge computing, MEC integration</td></tr>
+<tr><td><strong>NSACF</strong></td><td>Network Slice Admission Control</td><td>TS 23.502 Rel-17</td><td>Slice SLA assurance</td></tr>
+<tr><td><strong>TSCTSF</strong></td><td>Time-Sensitive Communication and TSN System</td><td>TS 23.501 Rel-17</td><td>Deterministic networking</td></tr>
+<tr><td><strong>DCCF</strong></td><td>Data Collection Coordination Function</td><td>TS 23.288 Rel-17</td><td>Analytics data pipeline</td></tr>
+<tr><td><strong>MFAF</strong></td><td>Messaging Framework Adaptation Function</td><td>TS 23.288 Rel-17</td><td>Analytics messaging</td></tr>
+<tr><td><strong>AF</strong></td><td>Application Function (generic)</td><td>TS 23.501</td><td>Application-network integration</td></tr>
+<tr><td><strong>NEF</strong></td><td>Network Exposure Function</td><td>TS 23.502</td><td>Capability exposure to 3rd parties</td></tr>
+<tr><td><strong>CHF</strong></td><td>Charging Function</td><td>TS 32.240</td><td>Converged charging</td></tr>
+<tr><td><strong>Digital Twin NF</strong></td><td>Network digital twin management</td><td>ITU-R IMT-2030</td><td>Simulation, planning, optimization</td></tr>
+<tr><td><strong>Intent Engine</strong></td><td>Intent-to-configuration translation</td><td>ITU-R IMT-2030</td><td>Autonomous network operations</td></tr>
+<tr><td><strong>Sensing NF</strong></td><td>ISAC data management</td><td>ITU-R IMT-2030</td><td>Integrated sensing and communication</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="7-recommendations"><a class="header" href="#7-recommendations">7. Recommendations</a></h2>
+<h3 id="71-immediate-0-3-months"><a class="header" href="#71-immediate-0-3-months">7.1 Immediate (0-3 months)</a></h3>
+<ol>
+<li><strong>Complete Phase A1-A3</strong> (timer management, SBI event loop, error responses, NRF integration). This unblocks all other work.</li>
+<li><strong>Implement nextgcore-ngap</strong> ASN.1 encoding to enable AMF-gNB communication.</li>
+<li><strong>Wire nextgcore-metrics</strong> to all NFs for basic observability.</li>
+<li><strong>Add mTLS</strong> between NFs as a security baseline.</li>
+</ol>
+<h3 id="72-short-term-3-6-months"><a class="header" href="#72-short-term-3-6-months">7.2 Short-term (3-6 months)</a></h3>
+<ol start="5">
+<li><strong>Complete Phase A5-A8</strong> (AMF, SMF, AUSF/UDM/UDR, PCF handlers) for basic mobile connectivity.</li>
+<li><strong>Implement NWDAF</strong> with data collection from AMF/SMF/UPF as the foundational 6G capability.</li>
+<li><strong>Deploy observability stack</strong> (OpenTelemetry, structured logging, Prometheus dashboards).</li>
+<li><strong>Begin containerization</strong> (Dockerfiles, CI/CD pipeline).</li>
+</ol>
+<h3 id="73-medium-term-6-12-months"><a class="header" href="#73-medium-term-6-12-months">7.3 Medium-term (6-12 months)</a></h3>
+<ol start="9">
+<li><strong>Complete SBA 2.0 planning</strong>: Evaluate gRPC/HTTP3 as SBI transport alongside HTTP/2.</li>
+<li><strong>Implement enhanced slicing</strong> with NSACF and slice SLA monitoring.</li>
+<li><strong>Build edge computing</strong> support with EASDF and latency-aware UPF selection.</li>
+<li><strong>Prototype digital twin</strong> framework using network state exports and metrics.</li>
+</ol>
+<h3 id="74-long-term-12-24-months"><a class="header" href="#74-long-term-12-24-months">7.4 Long-term (12-24 months)</a></h3>
+<ol start="13">
+<li><strong>AI-native NWDAF</strong> with ML model serving, federated learning, autonomous operations.</li>
+<li><strong>Zero-trust evolution</strong> with post-quantum cryptography, continuous authentication.</li>
+<li><strong>Intent-driven management</strong> engine with natural language policy translation.</li>
+<li><strong>ISAC support</strong> pending 3GPP standardization progress.</li>
+</ol>
+<hr>
+<h2 id="8-architecture-strengths-for-6g-evolution"><a class="header" href="#8-architecture-strengths-for-6g-evolution">8. Architecture Strengths for 6G Evolution</a></h2>
+<p>Despite the gaps, the project has several architectural strengths that position it well for 6G:</p>
+<ol>
+<li><strong>Pure Rust:</strong> Memory safety, concurrency safety, and performance characteristics align with 6G requirements for reliability and efficiency.</li>
+<li><strong>Tokio async runtime:</strong> All NFs use async I/O, which enables high-throughput, low-latency processing required for 6G.</li>
+<li><strong>Clean FSM architecture:</strong> Consistent state machine pattern across all NFs enables systematic feature extension.</li>
+<li><strong>Modular library design:</strong> 17 shared libraries with clear separation of concerns enable independent evolution.</li>
+<li><strong>Working data plane (UPF):</strong> TUN device, GTP-U, PFCP session management provide a solid user plane foundation.</li>
+<li><strong>Working SBI stack:</strong> HTTP/2 server/client with hyper/h2 provides a modern SBA foundation.</li>
+<li><strong>Comprehensive NAS library:</strong> Both 5GS and EPS NAS message support with security context.</li>
+<li><strong>Metrics framework:</strong> Prometheus-compatible metrics collection exists and needs wiring, not creation.</li>
+</ol>
+<hr>
+<p><em>Report generated by deep source code analysis of 17 NFs and 17 shared libraries across ~50,000 lines of Rust code.</em></p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../gaps/gap-libs-infra.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../gaps/gap-libs-infra.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

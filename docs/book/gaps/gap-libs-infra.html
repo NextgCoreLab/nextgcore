@@ -1,0 +1,526 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Gap Analysis: Libraries &amp; Infra - NextGCore Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-3ce05853.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-e6ad8d5c.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGCore Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgcore" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="nextgcore-infrastructure-libraries--6g-gap-analysis"><a class="header" href="#nextgcore-infrastructure-libraries--6g-gap-analysis">NextGCore Infrastructure Libraries – 6G Gap Analysis</a></h1>
+<blockquote>
+<p>Generated: 2026-02-07 | Scope: 9 infrastructure libraries under nextgcore/src/libs/</p>
+</blockquote>
+<blockquote>
+<p><strong>Partial staleness (2026-07):</strong> Most entries here remain accurate, with corrections: <code>nextgcore-dbi</code> is now consumed by <code>nextgcore-udrd</code> (in-memory Nudr <code>data_store</code> via the <code>test-helpers</code> feature), so it is no longer unused. Note: SBI TLS/mTLS + OAuth2 and the NGAP/S1AP/PFCP protocol codecs are covered in gap-libs-proto.md, which is now substantially out of date - see its notice. Post-quantum crypto is still absent (<code>nextgcore-crypt</code> remains 0% PQC).</p>
+</blockquote>
+<hr>
+<h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Library</th><th>Purpose</th><th>Modules</th><th>Completeness</th><th>6G Readiness</th></tr>
+</thead>
+<tbody>
+<tr><td>nextgcore-core</td><td>Core runtime (data structures, networking, timers)</td><td>31</td><td><strong>85%</strong></td><td>Medium</td></tr>
+<tr><td>nextgcore-app</td><td>Application framework (config, init)</td><td>4</td><td><strong>80%</strong></td><td>Low</td></tr>
+<tr><td>nextgcore-crypt</td><td>3GPP cryptographic algorithms</td><td>10</td><td><strong>80%</strong></td><td>Low</td></tr>
+<tr><td>nextgcore-dbi</td><td>MongoDB database interface</td><td>5</td><td><strong>70%</strong></td><td>Low</td></tr>
+<tr><td>nextgcore-ffi</td><td>FFI bindings for C comparison testing</td><td>2</td><td><strong>90%</strong></td><td>N/A</td></tr>
+<tr><td>nextgcore-metrics</td><td>Prometheus metrics collection</td><td>5</td><td><strong>75%</strong></td><td>Medium</td></tr>
+<tr><td>nextgcore-tun</td><td>TUN/TAP device management</td><td>4</td><td><strong>80%</strong></td><td>Low</td></tr>
+<tr><td>nextgcore-ipfw</td><td>IP firewall rule parsing</td><td>3</td><td><strong>85%</strong></td><td>Low</td></tr>
+<tr><td>nextgcore-proto</td><td>Common protocol definitions (PlmnId, AmfId, etc.)</td><td>4</td><td><strong>90%</strong></td><td>Low</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-nextgcore-core--core-runtime"><a class="header" href="#1-nextgcore-core--core-runtime">1. nextgcore-core – Core Runtime</a></h2>
+<p><strong>Port of</strong>: lib/core/ from C implementation</p>
+<h3 id="modules-31"><a class="header" href="#modules-31">Modules (31)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Category</th><th>Modules</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td>Data Structures</td><td><code>list</code> (doubly-linked), <code>hash</code> (hash table), <code>pool</code> (object pool), <code>rbtree</code> (red-black tree), <code>queue</code> (thread-safe)</td><td>Complete</td></tr>
+<tr><td>Networking</td><td><code>sockaddr</code>, <code>socket</code>, <code>sockopt</code>, <code>poll</code> (epoll), <code>tcp</code>, <code>udp</code></td><td>Complete</td></tr>
+<tr><td>Buffers</td><td><code>pkbuf</code> (packet buffer), <code>tlv</code> (TLV encoding)</td><td>Complete</td></tr>
+<tr><td>State Machine</td><td><code>fsm</code> (finite state machine)</td><td>Complete</td></tr>
+<tr><td>Timers</td><td><code>timer</code> (timer wheel), <code>async_timer</code> (async timer for NF event loops)</td><td>Complete</td></tr>
+<tr><td>Utilities</td><td><code>errno</code>, <code>log</code>, <code>memory</code>, <code>strings</code>, <code>time</code>, <code>conv</code>, <code>rand</code>, <code>uuid</code>, <code>signal</code>, <code>thread</code></td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps"><a class="header" href="#6g-gaps">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No async I/O primitives</td><td><code>poll</code> module uses sync epoll; NFs need full async support</td></tr>
+<tr><td>No distributed timer</td><td>Timer wheel is process-local; 6G needs distributed coordination</td></tr>
+<tr><td>No structured logging</td><td>Basic log module; needs OpenTelemetry-compatible structured logging</td></tr>
+<tr><td>No lock-free data structures</td><td>Hash/list use locks; high-performance 6G data paths need lock-free alternatives</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-85--most-comprehensive-library-direct-c-port-with-all-data-structures"><a class="header" href="#completeness-85--most-comprehensive-library-direct-c-port-with-all-data-structures">Completeness: <strong>85%</strong> – Most comprehensive library; direct C port with all data structures</a></h3>
+<hr>
+<h2 id="2-nextgcore-app--application-framework"><a class="header" href="#2-nextgcore-app--application-framework">2. nextgcore-app – Application Framework</a></h2>
+<h3 id="modules-4"><a class="header" href="#modules-4">Modules (4)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Key Types</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>yaml.rs</code></td><td><code>NextgcoreYamlDocument</code>, <code>NextgcoreYamlIter</code></td><td>Complete</td></tr>
+<tr><td><code>config.rs</code></td><td><code>NextgcoreGlobalConf</code>, <code>NextgcoreLocalConf</code>, <code>NextgcorePlmnId</code>, <code>MaxConf</code>, <code>TimeConf</code></td><td>Complete</td></tr>
+<tr><td><code>context.rs</code></td><td><code>NextgcoreApp</code>, <code>NextgcoreAppContext</code>, <code>LoggerConf</code>, <code>PoolConf</code>, <code>MetricsConf</code></td><td>Complete</td></tr>
+<tr><td><code>init.rs</code></td><td><code>NextgcoreAppInitializer</code>, command line options, initialize/terminate</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps-1"><a class="header" href="#6g-gaps-1">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No dynamic reconfiguration</td><td>Config is read once at startup; 6G needs runtime reconfiguration</td></tr>
+<tr><td>No intent-based config</td><td>Imperative YAML only; no declarative intent translation</td></tr>
+<tr><td>No config versioning</td><td>No support for config rollback or A/B deployment</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-80"><a class="header" href="#completeness-80">Completeness: <strong>80%</strong></a></h3>
+<hr>
+<h2 id="3-nextgcore-crypt--cryptographic-library"><a class="header" href="#3-nextgcore-crypt--cryptographic-library">3. nextgcore-crypt – Cryptographic Library</a></h2>
+<h3 id="modules-10"><a class="header" href="#modules-10">Modules (10)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Algorithm</th><th>Spec</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>milenage.rs</code></td><td>Milenage (f1-f5, f1*/f5*)</td><td>TS 35.206</td><td>Complete</td></tr>
+<tr><td><code>kasumi.rs</code></td><td>KASUMI block cipher</td><td>TS 35.202</td><td>Complete</td></tr>
+<tr><td><code>snow3g.rs</code></td><td>SNOW 3G stream cipher</td><td>TS 35.216</td><td>Complete</td></tr>
+<tr><td><code>zuc.rs</code></td><td>ZUC stream cipher</td><td>TS 35.221</td><td>Complete</td></tr>
+<tr><td><code>aes.rs</code></td><td>AES-128 operations</td><td>FIPS 197</td><td>Complete</td></tr>
+<tr><td><code>aes_cmac.rs</code></td><td>AES-CMAC</td><td>RFC 4493</td><td>Complete</td></tr>
+<tr><td><code>sha.rs</code></td><td>SHA-1, SHA-256, SHA-384, SHA-512</td><td>FIPS 180</td><td>Complete</td></tr>
+<tr><td><code>kdf.rs</code></td><td>Key derivation functions</td><td>TS 33.501</td><td>Complete</td></tr>
+<tr><td><code>ecc.rs</code></td><td>Elliptic curve (ECIES Profile A)</td><td>TS 33.501</td><td>Complete</td></tr>
+<tr><td><code>base64.rs</code></td><td>Base64 encoding/decoding</td><td>RFC 4648</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps-2"><a class="header" href="#6g-gaps-2">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Severity</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>No post-quantum cryptography</strong> (ML-KEM, ML-DSA)</td><td>Critical</td></tr>
+<tr><td>No ZUC-256 (256-bit variant)</td><td>High</td></tr>
+<tr><td>No SNOW5G (next-gen stream cipher)</td><td>Medium</td></tr>
+<tr><td>No ECIES Profile B (secp256r1)</td><td>Medium</td></tr>
+<tr><td>No hybrid key exchange (classical + PQC)</td><td>Medium</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-80-for-5g--0-for-post-quantum"><a class="header" href="#completeness-80-for-5g--0-for-post-quantum">Completeness: <strong>80%</strong> for 5G | <strong>0%</strong> for post-quantum</a></h3>
+<hr>
+<h2 id="4-nextgcore-dbi--database-interface"><a class="header" href="#4-nextgcore-dbi--database-interface">4. nextgcore-dbi – Database Interface</a></h2>
+<h3 id="modules-5"><a class="header" href="#modules-5">Modules (5)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Key Functions</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>types.rs</code></td><td>Subscriber data types, auth info</td><td>Complete</td></tr>
+<tr><td><code>mongoc.rs</code></td><td><code>NextgcoreMongoc</code>, <code>NextgcoreDbi</code> MongoDB client</td><td>Partial (connection mgmt)</td></tr>
+<tr><td><code>subscription.rs</code></td><td>Auth info, SQN update, subscription data</td><td>Partial</td></tr>
+<tr><td><code>session.rs</code></td><td>PDU session data queries</td><td>Partial</td></tr>
+<tr><td><code>ims.rs</code></td><td>MSISDN, IMS data queries</td><td>Partial</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps-3"><a class="header" href="#6g-gaps-3">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No graph database support</td><td>6G knowledge graphs need Neo4j/similar</td></tr>
+<tr><td>No time-series database</td><td>Analytics and metrics storage</td></tr>
+<tr><td>No distributed database</td><td>Single MongoDB instance only</td></tr>
+<tr><td>No data federation</td><td>Cross-operator data sharing</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-70"><a class="header" href="#completeness-70">Completeness: <strong>70%</strong></a></h3>
+<hr>
+<h2 id="5-nextgcore-ffi--ffi-bindings"><a class="header" href="#5-nextgcore-ffi--ffi-bindings">5. nextgcore-ffi – FFI Bindings</a></h2>
+<p>Testing utility for C comparison. Provides stub bindings by default, optional generated bindings.</p>
+<h3 id="completeness-90--na-for-6g"><a class="header" href="#completeness-90--na-for-6g">Completeness: <strong>90%</strong> | N/A for 6G</a></h3>
+<hr>
+<h2 id="6-nextgcore-metrics--prometheus-metrics"><a class="header" href="#6-nextgcore-metrics--prometheus-metrics">6. nextgcore-metrics – Prometheus Metrics</a></h2>
+<h3 id="modules-5-1"><a class="header" href="#modules-5-1">Modules (5)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Key Types</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>context.rs</code></td><td>Metrics context, global registry</td><td>Complete</td></tr>
+<tr><td><code>server.rs</code></td><td>HTTP server for <code>/metrics</code> endpoint</td><td>Complete</td></tr>
+<tr><td><code>spec.rs</code></td><td>Metric specification (Counter, Gauge, Histogram)</td><td>Complete</td></tr>
+<tr><td><code>instance.rs</code></td><td>Metric instances with labels</td><td>Complete</td></tr>
+<tr><td><code>types.rs</code></td><td>MetricType enum, label types</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps-4"><a class="header" href="#6g-gaps-4">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No OpenTelemetry support</td><td>Only Prometheus; 6G needs OTel for traces + logs + metrics</td></tr>
+<tr><td>No AI-native observability</td><td>No anomaly detection or predictive alerting</td></tr>
+<tr><td>No distributed tracing</td><td>No span/trace context propagation</td></tr>
+<tr><td>No SLA metric enforcement</td><td>No automated SLA violation detection</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-75--functional-prometheus-metrics-needs-otel-for-6g"><a class="header" href="#completeness-75--functional-prometheus-metrics-needs-otel-for-6g">Completeness: <strong>75%</strong> – Functional Prometheus metrics; needs OTel for 6G</a></h3>
+<hr>
+<h2 id="7-nextgcore-tun--tun-device-management"><a class="header" href="#7-nextgcore-tun--tun-device-management">7. nextgcore-tun – TUN Device Management</a></h2>
+<h3 id="modules-4-1"><a class="header" href="#modules-4-1">Modules (4)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>types.rs</code></td><td>TUN device types</td></tr>
+<tr><td><code>io.rs</code></td><td>Read/write operations</td></tr>
+<tr><td><code>linux.rs</code></td><td>Linux TUN/TAP via ioctl</td></tr>
+<tr><td><code>macos.rs</code></td><td>macOS utun support</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-80-1"><a class="header" href="#completeness-80-1">Completeness: <strong>80%</strong></a></h3>
+<hr>
+<h2 id="8-nextgcore-ipfw--ip-firewall-rules"><a class="header" href="#8-nextgcore-ipfw--ip-firewall-rules">8. nextgcore-ipfw – IP Firewall Rules</a></h2>
+<h3 id="modules-3"><a class="header" href="#modules-3">Modules (3)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Key Functions</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>types.rs</code></td><td><code>IpfwRule</code> struct</td><td>Complete</td></tr>
+<tr><td><code>rule.rs</code></td><td><code>compile_rule()</code> parser</td><td>Complete</td></tr>
+<tr><td><code>packet_filter.rs</code></td><td>SDF filter matching</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-85--functional-for-3gpp-flow-descriptions"><a class="header" href="#completeness-85--functional-for-3gpp-flow-descriptions">Completeness: <strong>85%</strong> – Functional for 3GPP flow descriptions</a></h3>
+<hr>
+<h2 id="9-nextgcore-proto--protocol-definitions"><a class="header" href="#9-nextgcore-proto--protocol-definitions">9. nextgcore-proto – Protocol Definitions</a></h2>
+<h3 id="modules-4-2"><a class="header" href="#modules-4-2">Modules (4)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Key Types</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>types.rs</code></td><td><code>PlmnId</code>, <code>AmfId</code>, <code>Guami</code>, <code>SNssai</code>, <code>Tai</code>, <code>Supi</code>, <code>Gpsi</code>, <code>Dnn</code></td><td>Complete</td></tr>
+<tr><td><code>conv.rs</code></td><td>BCD encoding, hex conversion, IP address conversion</td><td>Complete</td></tr>
+<tr><td><code>event.rs</code></td><td>Event types for NF communication</td><td>Complete</td></tr>
+<tr><td><code>timer.rs</code></td><td>Timer ID types and constants</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps-5"><a class="header" href="#6g-gaps-5">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No 6G-specific types</td><td>Missing: ISAC config, semantic comm parameters, SHE compute descriptors</td></tr>
+<tr><td>NTN types unwired</td><td>Satellite orbit parameters and timing-advance types now exist in <code>nextgcore-proto</code> (<code>ntn_constellation.rs</code>) but are not consumed by any NF</td></tr>
+<tr><td>No AI/ML types</td><td>No model metadata, inference request/response types</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-90-for-5g"><a class="header" href="#completeness-90-for-5g">Completeness: <strong>90%</strong> for 5G</a></h3>
+<hr>
+<h2 id="cross-library-6g-readiness-summary"><a class="header" href="#cross-library-6g-readiness-summary">Cross-Library 6G Readiness Summary</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Capability</th><th>Current Support</th><th>Gap Severity</th></tr>
+</thead>
+<tbody>
+<tr><td>Post-quantum crypto</td><td>None</td><td>Critical</td></tr>
+<tr><td>OpenTelemetry observability</td><td>None (Prometheus only)</td><td>High</td></tr>
+<tr><td>Dynamic reconfiguration</td><td>None</td><td>High</td></tr>
+<tr><td>Async I/O throughout</td><td>Partial (nextgcore-core has sync poll)</td><td>High</td></tr>
+<tr><td>Structured logging</td><td>None</td><td>Medium</td></tr>
+<tr><td>Distributed coordination</td><td>None</td><td>Medium</td></tr>
+<tr><td>Graph/time-series DB</td><td>None (MongoDB only)</td><td>Medium</td></tr>
+<tr><td>6G protocol types</td><td>None</td><td>Medium</td></tr>
+<tr><td>Lock-free data structures</td><td>None</td><td>Low</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="priority-recommendations"><a class="header" href="#priority-recommendations">Priority Recommendations</a></h3>
+<ol>
+<li><strong>Add post-quantum crypto</strong> to nextgcore-crypt (ML-KEM, ML-DSA)</li>
+<li><strong>Add OpenTelemetry</strong> alongside Prometheus in nextgcore-metrics</li>
+<li><strong>Migrate to full async I/O</strong> in nextgcore-core networking modules</li>
+<li><strong>Add dynamic config reload</strong> to nextgcore-app</li>
+<li><strong>Add 6G types</strong> to nextgcore-proto (ISAC, NTN, AI/ML, semantic comm)</li>
+<li><strong>Add ZUC-256</strong> to nextgcore-crypt for 256-bit security</li>
+</ol>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../gaps/6g-gap-analysis.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../contributing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../gaps/6g-gap-analysis.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../contributing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1905 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>NextGCore Documentation</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-0392ca55.css">
+        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-3ce05853.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-e6ad8d5c.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGCore Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgcore" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
+<p><strong>NextGCore</strong> is a research-faithful 5G core network implemented entirely in Rust. It provides <strong>24 network function (NF) binaries</strong> — a full 5G Standalone (SA) control and user plane, an AI/analytics overlay, and a complete <strong>4G/EPC interworking core</strong> (MME, HSS, SGW-C, SGW-U, PCRF) — built on <strong>17 shared libraries</strong> totaling roughly <strong>400k lines of Rust</strong>.</p>
+<p>The project targets <strong>3GPP Release 15</strong> with selected <strong>Release 17/18</strong> features (MBS multicast, NSACF slice admission, LMF positioning, RedCap admission, XR QoS, SNPN, MINT disaster roaming, UAV Service-Level-AA per TS 23.256). Any 6G/Release-20 items (ISAC, federated learning, PQC, semantic communications) are <strong>non-normative research prototypes</strong> — no frozen Rel-20 Stage-3 specifications exist, and those modules are informed by TR 22.870 use cases only.</p>
+<h2 id="at-a-glance"><a class="header" href="#at-a-glance">At a Glance</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Value</th></tr>
+</thead>
+<tbody>
+<tr><td>Network Functions</td><td>24 binaries (5G SA + EPC + AI/analytics)</td></tr>
+<tr><td>Shared libraries</td><td>17</td></tr>
+<tr><td>Language</td><td>100% Rust</td></tr>
+<tr><td>OpenAPI specs</td><td>31</td></tr>
+<tr><td>3GPP target</td><td>Rel-15 core, selected Rel-17/18 features</td></tr>
+<tr><td>6G / Rel-20</td><td>Non-normative research prototypes only</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="architecture"><a class="header" href="#architecture">Architecture</a></h2>
+<p>NextGCore follows the 3GPP Service-Based Architecture (SBA), organized in layers:</p>
+<ul>
+<li><strong>SBI control plane</strong> — AMF, SMF, NRF, AUSF, UDM, UDR, PCF, NSSF, BSF communicating over HTTP/2 + JSON with TLS. NRF issues real ES256/RS256 JWS OAuth2 access tokens and verifies Client Credentials Assertions (CCA-JWS, ES256) per TS 33.501 §13.3.8.3. The AMF drives NGAP via the <code>nextgcore-ngap</code> library with an async <code>tokio::select!</code> event loop.</li>
+<li><strong>Routing and inter-PLMN security</strong> — SCP for indirect communication and load balancing; SEPP for zero-trust N32c/N32f roaming with AES-128-GCM PRINS selective IE protection, per-PLMN trust scoring, and rate limiting (TS 33.501 / TS 29.573); a WebUI for subscriber management (MongoDB backend).</li>
+<li><strong>Data plane</strong> — UPF with 5-tuple SDF filtering, QoS enforcement, GTP-U tunneling, and PFCP-driven usage reporting, connected to the control plane via NGAP / PFCP / GTP-U.</li>
+<li><strong>EPC (4G) layer</strong> — MME, SGW-C, SGW-U, HSS, and PCRF for full LTE attach and 4G/5G interworking. The dual 5G/LTE core is a deliberate, permanent design decision.</li>
+<li><strong>AI &amp; analytics overlay</strong> — NWDAF (4-layer analytics engine per TS 23.288: real-time anomaly detection → ONNX prediction → prescriptive recommendations → autonomous actions), DCCF data-collection coordination, EES edge enabler (TS 23.558), LMF positioning (TS 23.273), MBSMF multicast/broadcast (TS 23.247), NSACF slice admission, and PIN personal-IoT management (TS 23.542). All seven Rel-17 NFs register with the NRF.</li>
+</ul>
+<p>Shared infrastructure includes <code>nextgcore-app</code> (<code>nf_common_init()</code> for common NF bootstrap) and <code>nextgcore-sbi</code> / <code>nextgcore-dbi</code>, which gate experimental 6G behavior behind a <code>6g-extensions</code> Cargo feature.</p>
+<h2 id="key-capabilities"><a class="header" href="#key-capabilities">Key Capabilities</a></h2>
+<ul>
+<li><strong>Full 5G SA procedures</strong> — UE registration with SUCI concealment and 5G-AKA (TS 23.502 §4.2.2), PDU session establishment with PCC-driven QoS and PFCP (TS 23.502 §4.3.2), Xn handover with path switch (§4.9.1), URSP delivery (TS 29.525 / TS 24.501 Annex D), and fail-closed SoR/UPU protection (TS 33.501 §6.14/6.15).</li>
+<li><strong>AI-native operation</strong> — ML model lifecycle management with ONNX inference, intent-based automation, and event subscriptions for consumer NFs.</li>
+<li><strong>Cloud native</strong> — Docker Compose for development (all 24 NF services), Kubernetes with Helm charts for deployment, Prometheus metrics and Jaeger tracing on every NF.</li>
+</ul>
+<h2 id="validation-honesty"><a class="header" href="#validation-honesty">Validation Honesty</a></h2>
+<p>Be clear about what the test results mean:</p>
+<ul>
+<li>NextGCore is validated with <strong>matched simulators and 3GPP/RFC golden vectors</strong>, plus Docker-based end-to-end tests. It has <strong>not</strong> been certified by any third-party conformance body.</li>
+<li>A feature listed as “implemented” means the module exists and passes its tests — it is <strong>not</strong> a claim of full 3GPP conformance. Rel-15/16 NAS, SBI, and N4 are the most spec-faithful; some Rel-17/18 encodings are bespoke and simulator-only.</li>
+<li>All 6G/Rel-20 material is prototype research code and should never be treated as standards-conformant.</li>
+</ul>
+<p>See the <a href="../features.html">Feature Matrix</a> for per-feature status at this level of granularity.</p>
+<h2 id="where-to-go-next"><a class="header" href="#where-to-go-next">Where to Go Next</a></h2>
+<ul>
+<li><a href="../index.html">Project landing page</a> — overview, workflows, and quick start</li>
+<li><a href="../features.html">Feature Matrix</a> — per-NF and per-feature implementation status</li>
+<li><a href="../api.html">API Docs</a> — the 31 OpenAPI specifications</li>
+</ul>
+<p>To build from source, note that the Cargo workspace root is <code>nextgcore/src/</code> (not <code>nextgcore/</code>):</p>
+<pre><code class="language-bash">cd nextgcore/src
+cargo build --workspace
+cargo test --workspace
+</code></pre>
+<p>See the Contributing guide for prerequisites (Rust ≥1.75, protobuf, clang, OpenSSL, cmake) and Docker-based E2E testing.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h1>
+<p>NextGCore is a 5G Core Network implemented in Rust, targeting 3GPP Rel-15 with selected Rel-17/18 features (MBS, NSACF, LMF positioning, RedCap, XR QoS, SNPN, MINT, UAV Service-level-AA per TS 23.256), plus 4G/EPC interworking. 6G/Rel-20 items (ISAC, FL, PQC, semantic comms) are <strong>non-normative research prototypes</strong> — no frozen Rel-20 Stage-3 specs exist. End-to-end validation runs against the project’s own matched RAN simulator (nextgsim gNB/UE); it is <strong>not third-party certified</strong>.</p>
+<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td>Rust</td><td>stable (≥ 1.75)</td><td>Build toolchain</td></tr>
+<tr><td>protobuf-compiler</td><td>≥ 3.21</td><td>Protobuf codegen</td></tr>
+<tr><td>clang / libclang-dev</td><td>any</td><td>LLVM bindings</td></tr>
+<tr><td>libssl-dev</td><td>any</td><td>TLS support</td></tr>
+<tr><td>cmake</td><td>≥ 3.16</td><td>FFI build scripts</td></tr>
+<tr><td>Docker + docker-compose</td><td>≥ 24</td><td>E2E testing</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-bash"># Ubuntu/Debian
+sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler clang
+
+# macOS (Homebrew)
+brew install protobuf cmake openssl
+</code></pre>
+<h2 id="build-from-source"><a class="header" href="#build-from-source">Build from Source</a></h2>
+<p>The Cargo workspace root is <strong><code>nextgcore/src/</code></strong>, not the repository root:</p>
+<pre><code class="language-bash">git clone https://github.com/NextgCoreLab/nextgcore.git
+cd nextgcore/src
+
+cargo build --workspace --release   # all 24 NF binaries + webui
+ls target/release/nextgcore-*
+
+cargo build -p nextgcore-amfd       # or build a single NF
+</code></pre>
+<p>Run the test suite from the same directory:</p>
+<pre><code class="language-bash">cargo test --workspace                 # all tests
+cargo test -p nextgcore-amfd           # single NF
+cargo test --workspace -- --nocapture  # with log output
+</code></pre>
+<h2 id="docker-compose"><a class="header" href="#docker-compose">Docker Compose</a></h2>
+<p>The Docker E2E stack lives in <code>docker/rust/</code>:</p>
+<pre><code class="language-bash">cd nextgcore/docker/rust
+docker compose up -d      # 5GC + matched RAN simulator + observability
+docker compose ps         # expect 25 containers
+bash e2e-test.sh          # run the E2E suite
+</code></pre>
+<p>Overlay compose files extend the baseline stack:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>File</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docker-compose.yml</code></td><td>Baseline 5GC + simulator</td></tr>
+<tr><td><code>docker-compose.oauth2.yml</code></td><td>OAuth2 enforcement on SBI</td></tr>
+<tr><td><code>docker-compose.kernel-sctp.yml</code></td><td>Native kernel-SCTP N2 transport</td></tr>
+<tr><td><code>docker-compose.features.yml</code></td><td>Rel-17/18 feature harness</td></tr>
+<tr><td><code>docker-compose-epc.yml</code></td><td>4G/EPC stack</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="one-command-e2e"><a class="header" href="#one-command-e2e">One-Command E2E</a></h2>
+<p><code>e2e.sh</code> chains disk preflight → image build → matched-sim E2E run (the project’s own gNB/UE against its own 5GC) → artifact capture on failure, with a clean exit code for CI:</p>
+<pre><code class="language-bash">cd nextgcore/docker/rust
+bash e2e.sh                        # preflight + full build + baseline E2E
+bash e2e.sh --quick                # reuse existing binaries
+bash e2e.sh --overlay oauth2       # OAuth2 enforcement overlay
+bash e2e.sh --overlay kernel-sctp  # native kernel SCTP N2
+bash e2e.sh --overlay features     # baseline + Rel-17/18 feature harness
+bash e2e.sh --keep                 # leave the stack running afterwards
+bash e2e.sh --no-build             # images already built
+bash e2e.sh --artifacts DIR        # failure-artifact directory (default: artifacts/)
+</code></pre>
+<p>Exit codes: <code>0</code> all passed, <code>1</code> test assertion failure, <code>2</code> infrastructure failure (preflight refusal, build, startup). On failure, logs of every <code>nextgcore-*</code>/<code>nextgsim-*</code> container are saved to the artifacts directory before teardown.</p>
+<p><code>e2e-test.sh</code> runs the suite directly against an existing stack and accepts <code>--no-build</code>, <code>--keep</code>, <code>--no-preflight</code>, and <code>--overlay NAME</code>. Typical iteration loop:</p>
+<pre><code class="language-bash">bash e2e-test.sh --no-build --keep   # skip rebuild, keep containers for debugging
+</code></pre>
+<p>A multi-UE stress test is also available:</p>
+<pre><code class="language-bash">bash test-multi-ue.sh                # 5 UEs (default)
+bash test-multi-ue.sh --ue-count 10
+</code></pre>
+<h2 id="kubernetes"><a class="header" href="#kubernetes">Kubernetes</a></h2>
+<p>Kubernetes manifests, Helm assets, and a kind config live in <code>k8s/</code>:</p>
+<pre><code class="language-bash">cd nextgcore/k8s
+bash deploy.sh                     # deploy the stack
+kubectl get pods -n nextgcore      # verify pods are running
+bash e2e-test.sh                   # run the E2E suite against the cluster
+
+kubectl port-forward svc/jaeger 16686:16686   # traces
+</code></pre>
+<p>Every NF exposes Prometheus metrics on port 9090 (<code>/metrics</code>); monitoring assets are under <code>k8s/monitoring/</code> and <code>docker/rust/monitoring/</code>. <code>teardown.sh</code> removes the deployment.</p>
+<h2 id="where-configs-live"><a class="header" href="#where-configs-live">Where Configs Live</a></h2>
+<p>Per-NF YAML configs for the Docker stack are under <code>docker/rust/configs/</code>:</p>
+<pre><code>docker/rust/configs/
+├── 5gc/            # per-NF YAML (amf.yaml, smf.yaml, upf.yaml, ...)
+├── epc/            # 4G/EPC NF configs
+├── observability/  # Prometheus / tracing configs
+├── scp.yaml, sepp1.yaml, sepp2.yaml
+└── tls/            # SBI TLS material (see also docker/rust/certs/)
+</code></pre>
+<p>Kubernetes configuration lives in <code>k8s/base/</code> and <code>k8s/manifests/</code>. NFs log at <code>info</code> by default, tunable via <code>RUST_LOG</code>.</p>
+<h2 id="next-steps"><a class="header" href="#next-steps">Next Steps</a></h2>
+<ul>
+<li>Read <code>CONTRIBUTING.md</code> for the style gate (<code>cargo fmt --all</code>, <code>cargo clippy --workspace -- -D warnings</code>, <code>cargo audit</code>) and the PR process.</li>
+<li>Protocol code cites its 3GPP spec in doc comments (e.g. <code>//! TS 23.501 §5.15</code>); key references are TS 23.501/23.502 (architecture/procedures), TS 29.xxx (SBI), TS 38.331 (NR RRC), and TS 38.413 (NGAP).</li>
+<li>Remember the validation caveat: green E2E means the suite passes against the matched simulator — it is not a conformance certification.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="configuration-overview"><a class="header" href="#configuration-overview">Configuration Overview</a></h1>
+<p>NextGCore network functions (NFs) are configured with per-NF YAML files, modelled on the Open5GS configuration layout. This page describes where the config files live, how they are loaded, and the parameters shared across NFs.</p>
+<blockquote>
+<p><strong>Honesty note.</strong> Everything below is grounded in the current source tree. Configuration behaviour is exercised by unit tests and the project’s own matched-simulator Docker E2E runs; it is <strong>not</strong> third-party certified. Any 6G/Rel-20 knobs are non-normative research prototypes.</p>
+</blockquote>
+<h2 id="where-the-config-files-live"><a class="header" href="#where-the-config-files-live">Where the config files live</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Location</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>configs/</code> (repo root)</td><td>Minimal sample; currently only <code>amf.yaml</code> (PLMN 999-70, TAC 1, SST 1)</td></tr>
+<tr><td><code>docker/rust/configs/5gc/</code></td><td>The full working set used by the Docker E2E deployment: <code>amf.yaml</code>, <code>smf.yaml</code>, <code>upf.yaml</code>, <code>nrf.yaml</code>, <code>ausf.yaml</code>, <code>udm.yaml</code>, <code>udr.yaml</code>, <code>pcf.yaml</code>, <code>nssf.yaml</code>, <code>bsf.yaml</code>, <code>nsacf.yaml</code>, <code>nwdaf.yaml</code>, <code>lmf.yaml</code>, <code>ees.yaml</code>, <code>mbsmf.yaml</code>, <code>dccf.yaml</code>, <code>pin.yaml</code> plus <code>*-oauth2.yaml</code> variants (NRF/UDR/BSF/NSSF/NSACF) for OAuth2-enabled runs</td></tr>
+<tr><td><code>docker/rust/configs/</code></td><td><code>scp.yaml</code>, <code>sepp1.yaml</code>, <code>sepp2.yaml</code>; <code>epc/</code> holds the 4G/EPS set (<code>mme.yaml</code>, <code>hss.yaml</code>, <code>sgwc.yaml</code>, <code>sgwu.yaml</code>, <code>pcrf.yaml</code>)</td></tr>
+<tr><td><code>k8s/manifests/</code>, <code>deploy/helm/</code></td><td>Kubernetes/Helm packaging of the same configs</td></tr>
+</tbody>
+</table>
+</div>
+<p>Each file has the same shape: optional <code>logger:</code> and <code>global:</code> sections, plus one NF-specific root section named after the NF (<code>amf:</code>, <code>smf:</code>, <code>upf:</code>, …).</p>
+<h2 id="how-an-nf-loads-its-yaml"><a class="header" href="#how-an-nf-loads-its-yaml">How an NF loads its YAML</a></h2>
+<p>There are two cooperating layers.</p>
+<p><strong>1. Per-NF binary (clap).</strong> Each NF binary (e.g. <code>nextgcore-amfd</code>) parses CLI args and loads its YAML with <code>serde_yaml</code>. From <code>src/bins/nextgcore-amfd/src/lib.rs</code>:</p>
+<ul>
+<li><code>-c / --config &lt;path&gt;</code> — config file, default <code>/etc/nextgcore/amf.yaml</code></li>
+<li><code>-l / --log_level &lt;level&gt;</code> — <code>trace|debug|info|warn|error</code>, default <code>info</code></li>
+<li><code>--ngap-addr</code> (AMF only) — NGAP bind address, default <code>0.0.0.0:38412</code></li>
+<li><code>--sctp-backend</code> (AMF only) — <code>userspace</code> (default, sctp-proto over UDP) or <code>kernel</code> (Linux kernel SCTP, needs the <code>kernel-sctp</code> build feature)</li>
+</ul>
+<p>Loading is lenient: if the file is missing or fails to parse, the NF logs a warning and <strong>continues with built-in defaults</strong> rather than aborting.</p>
+<p><strong>2. Shared app library (<code>src/libs/nextgcore-app/src/init.rs</code>, <code>config.rs</code>).</strong> <code>nextgcore_app_initialize()</code> mirrors Open5GS’s <code>ogs_app_initialize()</code>: it parses <code>-c</code> (config file), <code>-l</code> (log file), <code>-e</code> (log level), <code>-m</code> (domain mask), <code>-k</code> (config section id), then reads the YAML and parses the <code>db_uri</code>, <code>logger</code>, and <code>global</code> root sections. It also provides hot-reload plumbing (<code>ConfigWatcher</code> polls the file mtime every second and re-parses on change) and a snapshot/rollback <code>ConfigHistoryManager</code>.</p>
+<h2 id="common-configuration-blocks"><a class="header" href="#common-configuration-blocks">Common configuration blocks</a></h2>
+<h3 id="logger"><a class="header" href="#logger"><code>logger</code></a></h3>
+<pre><code class="language-yaml">logger:
+  file:
+    path: /var/log/nextgcore/amf.log
+  level: info
+</code></pre>
+<p><code>RUST_LOG</code> takes precedence over the configured level where NFs use <code>nf_common_init()</code> (<code>env_logger::Env::default().default_filter_or(log_level)</code>); binaries that build the logger from <code>--log_level</code> use that flag directly.</p>
+<h3 id="global"><a class="header" href="#global"><code>global</code></a></h3>
+<pre><code class="language-yaml">global:
+  max:
+    ue: 1024      # code default: 1024 (MAX_NUM_OF_UE)
+    peer: 64      # code default: 64 (MAX_NUM_OF_PEER)
+</code></pre>
+<p>Also accepted under <code>global</code>: <code>parameter</code> (NF-disable and network flags such as <code>no_ipv4</code>, <code>no_ipv6</code>, <code>prefer_ipv4</code>; setting both <code>no_ipv4</code> and <code>no_ipv6</code> fails validation), <code>sockopt</code> (<code>no_delay</code>, <code>linger</code>), and <code>pool</code> (packet-buffer pool sizes, e.g. <code>128: 65536</code> … <code>big: 8</code>).</p>
+<h3 id="nf-section-amf-smf-upf-"><a class="header" href="#nf-section-amf-smf-upf-">NF section (<code>amf:</code>, <code>smf:</code>, <code>upf:</code>, …)</a></h3>
+<p>Common sub-blocks seen in the Docker configs:</p>
+<ul>
+<li><code>sbi.server</code> — list of <code>{address, port}</code> (port 7777 everywhere)</li>
+<li><code>sbi.client.nrf</code> — list of <code>{uri}</code> pointing at the NRF</li>
+<li><code>metrics.server</code> — Prometheus endpoint, port 9090 in all shipped configs</li>
+<li><code>tls</code> — <code>enabled</code> (false by default), <code>cert</code>/<code>key</code>/<code>ca</code> paths, <code>min_version: "1.2"</code>; enabled at deploy time via <code>TLS_ENABLED=true SBI_SCHEME=https</code></li>
+<li>Protocol servers per NF: AMF <code>ngap</code> (38412), SMF/UPF <code>pfcp</code> (8805), UPF <code>gtpu</code> (2152), SMF <code>gtpc</code>/<code>gtpu</code></li>
+<li>SMF/UPF <code>session</code> subnets (<code>10.45.0.0/16</code> gw <code>10.45.0.1</code>, <code>2001:db8:cafe::/48</code>), SMF <code>dns</code> and <code>mtu: 1400</code></li>
+<li>AMF-specific: <code>guami</code>, <code>tai</code>, <code>plmn_support</code> (PLMN 999/70 in samples), <code>security.integrity_order</code>/<code>ciphering_order</code> (NIA/NEA lists), <code>network_name</code>, <code>time.t3512</code> (540 s in the Docker config), and <code>nas.use_nextgcore_security</code> (default <code>false</code> — canary for the strict TS 24.501 §4.4 NAS-security path)</li>
+</ul>
+<h2 id="environment-overrides"><a class="header" href="#environment-overrides">Environment overrides</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Effect</th><th>Source</th></tr>
+</thead>
+<tbody>
+<tr><td><code>RUST_LOG</code></td><td>Overrides log level (via <code>nf_common_init</code>)</td><td><code>init.rs</code></td></tr>
+<tr><td><code>DB_URI</code></td><td>Overrides the YAML <code>db_uri</code> (MongoDB)</td><td><code>init.rs</code> stage 4</td></tr>
+<tr><td><code>&lt;NF&gt;_SBI_ADDR</code> / <code>&lt;NF&gt;_SBI_PORT</code></td><td>SBI bind address/port (e.g. <code>AMF_SBI_ADDR</code>, <code>UDM_SBI_PORT</code>); defaults <code>127.0.0.1:7777</code></td><td>each NF <code>lib.rs</code></td></tr>
+<tr><td><code>NRF_URI</code>, <code>PCF_URI</code>, <code>NSACF_URI</code></td><td>Peer NF discovery URIs</td><td>NF binaries</td></tr>
+<tr><td><code>SMF_PFCP_ADDR/PORT</code>, <code>UPF_PFCP_ADDR/PORT</code></td><td>PFCP endpoints</td><td>SMF/UPF</td></tr>
+<tr><td><code>AMF_NAS_SECURITY=nextgcore</code></td><td>Forces the strict NAS-security path, overriding <code>nas.use_nextgcore_security</code> in YAML</td><td>amfd <code>lib.rs</code></td></tr>
+<tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>Forces OAuth2 enforcement on the SBI server regardless of YAML</td><td>amfd <code>lib.rs</code></td></tr>
+<tr><td><code>TLS_ENABLED</code>, <code>SBI_SCHEME</code></td><td>Docker-compose knobs to enable SBI TLS</td><td>config comments</td></tr>
+<tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td>OTLP collector (default <code>http://jaeger:4317</code>; no-op if absent)</td><td><code>init.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Precedence, where both exist: <strong>environment variable &gt; YAML &gt; compiled-in default.</strong></p>
+<h2 id="common-parameters-and-code-defaults"><a class="header" href="#common-parameters-and-code-defaults">Common parameters and code defaults</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Default (from code)</th><th>Where defined</th></tr>
+</thead>
+<tbody>
+<tr><td>Config file path</td><td><code>/etc/nextgcore/&lt;nf&gt;.yaml</code></td><td>clap <code>Args</code> in each NF</td></tr>
+<tr><td>Log level</td><td><code>info</code></td><td>clap <code>Args</code> / <code>nf_common_init</code></td></tr>
+<tr><td>SBI bind</td><td><code>127.0.0.1:7777</code></td><td>env fallback in NF <code>run()</code></td></tr>
+<tr><td><code>global.max.ue</code></td><td><code>1024</code></td><td><code>config.rs</code> <code>MAX_NUM_OF_UE</code></td></tr>
+<tr><td><code>global.max.peer</code></td><td><code>64</code></td><td><code>config.rs</code> <code>MAX_NUM_OF_PEER</code></td></tr>
+<tr><td>Metrics port</td><td><code>9090</code> (all shipped configs)</td><td>Docker YAMLs</td></tr>
+<tr><td>NF-instance validity</td><td><code>30</code> s (must be non-zero)</td><td><code>NextgcoreLocalConf::prepare()</code></td></tr>
+<tr><td>Subscription validity</td><td><code>86400</code> s</td><td><code>NextgcoreLocalConf::prepare()</code></td></tr>
+<tr><td>Message wait duration</td><td><code>10</code> s (derives SBI/PFCP/GTP retry timers)</td><td><code>NextgcoreLocalConf::prepare()</code></td></tr>
+<tr><td>Handover wait</td><td><code>300</code> ms</td><td><code>NextgcoreLocalConf::prepare()</code></td></tr>
+<tr><td><code>tls.enabled</code></td><td><code>false</code></td><td>Docker YAMLs</td></tr>
+<tr><td><code>nas.use_nextgcore_security</code> (AMF)</td><td><code>false</code></td><td>amf.yaml / amfd</td></tr>
+<tr><td>Max PLMNs / slices / sessions / bearers</td><td>6 / 8 / 4 / 4</td><td><code>config.rs</code> constants</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="dynamic-reconfiguration"><a class="header" href="#dynamic-reconfiguration">Dynamic reconfiguration</a></h2>
+<p><code>nextgcore-app</code> includes a <code>ConfigReloadManager</code> that watches the config file and re-parses the <code>global</code> and NF-local sections on change, plus a versioned snapshot store with rollback and JSON export/import. These are library facilities (unit-tested); how much each NF wires them in varies — check the individual NF pages before relying on hot reload in a deployment.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="amf-configuration"><a class="header" href="#amf-configuration">AMF Configuration</a></h1>
+<p><code>nextgcore-amfd</code> (Access and Mobility Management Function) reads a single YAML file, <code>/etc/nextgcore/amf.yaml</code> by default (override with <code>-c/--config</code>). Configuration is intentionally forgiving: every field is <code>Option</code>al in the typed config structs, and a missing/unreadable/unparsable file or missing <code>amf:</code> section logs a warning and continues with built-in defaults rather than failing startup.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> this configuration surface has been validated against matched nextgsim peers and in-process strict-peer tests; it is not third-party certified for 3GPP conformance.</p>
+</blockquote>
+<h2 id="example-configsamfyaml"><a class="header" href="#example-configsamfyaml">Example (<code>configs/amf.yaml</code>)</a></h2>
+<pre><code class="language-yaml"># NextGCore AMF Configuration
+# PLMN 999-70, TAC 1, S-NSSAI SST=1
+
+amf:
+  amf_name: "NextGCore AMF"
+
+  guami:
+    - plmn_id:
+        mcc: "999"
+        mnc: "70"
+      amf_id:
+        region: 1
+        set: 1
+        pointer: 1
+
+  tai:
+    - plmn_id:
+        mcc: "999"
+        mnc: "70"
+      tac: 1
+
+  plmn_support:
+    - plmn_id:
+        mcc: "999"
+        mnc: "70"
+      s_nssai:
+        - sst: 1
+
+  security:
+    integrity_order: ["NIA2", "NIA1", "NIA0"]
+    ciphering_order: ["NEA2", "NEA1", "NEA0"]
+</code></pre>
+<h2 id="parameters"><a class="header" href="#parameters">Parameters</a></h2>
+<p>All keys live under the top-level <code>amf:</code> section. Types and defaults below come from the <code>#[derive(Deserialize)]</code> structs and the <code>load_config</code> logic in <code>src/bins/nextgcore-amfd/src/lib.rs</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>amf_name</code></td><td>string</td><td>none</td><td>Human-readable AMF name, stored in the AMF context and logged at startup.</td></tr>
+<tr><td><code>network_name.full</code></td><td>string</td><td>empty (<code>NetworkName::default()</code>)</td><td>Full network name presented to UEs.</td></tr>
+<tr><td><code>network_name.short</code></td><td>string</td><td>empty</td><td>Short network name presented to UEs.</td></tr>
+<tr><td><code>guami</code></td><td>list</td><td>empty list</td><td>Served GUAMI list. Entries without a resolvable <code>plmn_id</code> are silently skipped.</td></tr>
+<tr><td><code>guami[].plmn_id.mcc</code> / <code>.mnc</code></td><td>string or int</td><td>required per entry</td><td>PLMN identity; accepts quoted strings (<code>"999"</code>) or bare integers — both are normalized.</td></tr>
+<tr><td><code>guami[].amf_id.region</code></td><td>u8</td><td><code>0</code></td><td>AMF Region ID.</td></tr>
+<tr><td><code>guami[].amf_id.set</code></td><td>u16</td><td><code>0</code></td><td>AMF Set ID.</td></tr>
+<tr><td><code>guami[].amf_id.pointer</code></td><td>u8</td><td><code>0</code></td><td>AMF Pointer.</td></tr>
+<tr><td><code>tai</code></td><td>list</td><td>empty list</td><td>Served TAI list.</td></tr>
+<tr><td><code>tai[].plmn_id</code></td><td>object</td><td>required per entry</td><td>PLMN identity (same string-or-int handling as GUAMI).</td></tr>
+<tr><td><code>tai[].tac</code></td><td>u32</td><td><code>0</code></td><td>Tracking Area Code for this TAI (single TAC per entry, stored as a TAI list-0).</td></tr>
+<tr><td><code>plmn_support</code></td><td>list</td><td>empty list</td><td>Supported PLMN + slice list.</td></tr>
+<tr><td><code>plmn_support[].plmn_id</code></td><td>object</td><td>required per entry</td><td>Supported PLMN identity.</td></tr>
+<tr><td><code>plmn_support[].s_nssai</code></td><td>list</td><td>empty list</td><td>Slices for the PLMN.</td></tr>
+<tr><td><code>plmn_support[].s_nssai[].sst</code></td><td>u8</td><td><code>1</code></td><td>Slice/Service Type.</td></tr>
+<tr><td><code>plmn_support[].s_nssai[].sd</code></td><td>u32</td><td>none</td><td>Slice Differentiator (optional; omitted = no SD).</td></tr>
+<tr><td><code>security.integrity_order</code></td><td>list of strings</td><td>empty list</td><td>NAS integrity preference order. Recognized: <code>NIA0</code>–<code>NIA3</code> (with or without <code>128-</code> prefix); unknown names fall back to <code>0</code> (NIA0).</td></tr>
+<tr><td><code>security.ciphering_order</code></td><td>list of strings</td><td>empty list</td><td>NAS ciphering preference order. Recognized: <code>NEA0</code>–<code>NEA3</code>; unknown names fall back to <code>0</code> (NEA0).</td></tr>
+<tr><td><code>sbi.client.nrf</code></td><td>list of <code>{uri}</code></td><td>none</td><td>NRF client endpoints. Only the <strong>first</strong> entry’s <code>uri</code> is used, seeded into the SBI context for NF registration.</td></tr>
+<tr><td><code>sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>Opt-in SBI OAuth2 enforcement (producer token verification + outbound Bearer-token attach; code comments cite TS 33.501 §13.4.1, TS 29.510 §5.4.2). Parsed root-key-agnostically: true if any top-level section sets it. <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> env var takes precedence. With enforcement on but no NRF URI configured, the server fails closed (503).</td></tr>
+<tr><td><code>nas.use_nextgcore_security</code></td><td>bool</td><td><code>false</code></td><td>NAS-security canary knob. Default off keeps the legacy byte-for-byte NAS path. The <code>AMF_NAS_SECURITY</code> env var overrides this YAML value.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
+<p>The binary also takes flags that are not part of the YAML file:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-c, --config</code></td><td><code>/etc/nextgcore/amf.yaml</code></td><td>Configuration file path.</td></tr>
+<tr><td><code>-l, --log-level</code></td><td><code>info</code></td><td><code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
+<tr><td><code>--ngap-addr</code></td><td><code>0.0.0.0:38412</code></td><td>NGAP (N2) bind address.</td></tr>
+<tr><td><code>--sctp-backend</code></td><td><code>userspace</code></td><td><code>userspace</code> (sctp-proto over UDP, matched nextgsim gNB) or <code>kernel</code> (Linux kernel SCTP for an external RAN; requires the <code>kernel-sctp</code> build feature and libsctp).</td></tr>
+<tr><td><code>--no-color</code></td><td>off</td><td>Disable colored log output.</td></tr>
+<tr><td><code>-d, --daemon</code></td><td>off</td><td>Run in daemon mode.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="environment-overrides-1"><a class="header" href="#environment-overrides-1">Environment overrides</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>AMF_NAS_SECURITY</code></td><td>Overrides <code>amf.nas.use_nextgcore_security</code> (truthy: <code>1</code>/<code>true</code>/<code>yes</code>).</td></tr>
+<tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>Overrides <code>sbi.oauth2.require</code> (truthy: <code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code>); useful for docker overlays without editing the YAML.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="behavior-notes-and-caveats"><a class="header" href="#behavior-notes-and-caveats">Behavior notes and caveats</a></h2>
+<ul>
+<li><strong>Lenient loading:</strong> a missing config file, YAML parse error, or missing <code>amf:</code> section logs a warning and starts the AMF with defaults — it does not abort. Typos in key names are therefore silently ignored; check the startup log lines (<code>Configured GUAMI: ...</code>, <code>AMF configuration loaded: N GUAMI, N TAI, N PLMN support</code>) to confirm what was actually applied.</li>
+<li><strong>PLMN flexibility:</strong> <code>mcc</code>/<code>mnc</code> accept YAML strings or integers; a 2-digit MNC is encoded with the filler digit per standard PLMN encoding.</li>
+<li><strong>Empty security lists:</strong> if <code>security</code> is omitted, the integrity/ciphering preference lists in the AMF context stay empty; supply explicit orders (as in the example) for deterministic algorithm selection.</li>
+<li><strong>Multiple NRF entries</strong> in <code>sbi.client.nrf</code> are parsed but only the first is used — additional entries are currently inert.</li>
+<li>There is no <code>amf.sbi.server</code> bind-address key in the typed config; the SBI server and NGAP addresses are controlled by code defaults and the <code>--ngap-addr</code> flag, not this YAML file.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="smf-configuration"><a class="header" href="#smf-configuration">SMF Configuration</a></h1>
+<p>The SMF (Session Management Function, <code>nextgcore-smfd</code>) handles PDU session management over N4 (PFCP to UPF), N7 (PCF), N10 (UDM), N11 (AMF), and S5/S8 GTP-C in EPC mode.</p>
+<p>The config file path is resolved in this order: the <code>-c</code>/<code>--config</code> CLI argument, then the <code>SMF_CONFIG</code> environment variable, then <code>/etc/nextgcore/smf.yaml</code>. If the file is missing or fails to parse, the SMF logs a warning and starts with built-in defaults rather than exiting.</p>
+<h2 id="example-dockerrustconfigs5gcsmfyaml"><a class="header" href="#example-dockerrustconfigs5gcsmfyaml">Example (<code>docker/rust/configs/5gc/smf.yaml</code>)</a></h2>
+<pre><code class="language-yaml">logger:
+  file:
+    path: /var/log/nextgcore/smf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+smf:
+  sbi:
+    server:
+      - address: 172.23.0.4
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
+  pfcp:
+    server:
+      - address: 172.23.0.4
+        port: 8805
+    client:
+      upf:
+        - address: 172.23.0.7
+  gtpc:
+    server:
+      - address: 172.23.0.4
+  gtpu:
+    server:
+      - address: 172.23.0.4
+  metrics:
+    server:
+      - address: 172.23.0.4
+        port: 9090
+  session:
+    - subnet: 10.45.0.0/16
+      gateway: 10.45.0.1
+    - subnet: 2001:db8:cafe::/48
+      gateway: 2001:db8:cafe::1
+  dns:
+    - 8.8.8.8
+    - 8.8.4.4
+    - 2001:4860:4860::8888
+    - 2001:4860:4860::8844
+  mtu: 1400
+  tls:
+    enabled: false
+    cert: /etc/nextgcore/certs/smf.crt
+    key: /etc/nextgcore/certs/smf.key
+    ca: /etc/nextgcore/certs/ca.crt
+    min_version: "1.2"
+</code></pre>
+<h2 id="parsed-parameters"><a class="header" href="#parsed-parameters">Parsed parameters</a></h2>
+<p>The typed loader (<code>SmfYaml</code>/<code>SmfConfig</code> in <code>src/bins/nextgcore-smfd/src/main.rs</code>) deserializes only the <code>smf.sbi</code> subtree. Only the <strong>first</strong> entry of each list is used.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>smf.sbi.server[0].address</code></td><td>string</td><td><code>0.0.0.0</code></td><td>Bind address for the SBI HTTP/2 server.</td></tr>
+<tr><td><code>smf.sbi.server[0].port</code></td><td>u16</td><td><code>7777</code></td><td>SBI server port. Address+port also derive the advertised callback base URI (with <code>0.0.0.0</code> replaced by <code>127.0.0.1</code> unless <code>SMF_SBI_ADVERTISE_URI</code> is set).</td></tr>
+<tr><td><code>smf.sbi.client.nrf[0].uri</code></td><td>string</td><td>none</td><td>NRF base URI; seeded into the SBI context for NF registration. Without it the SMF operates NRF-less.</td></tr>
+<tr><td><code>smf.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>Opt-in SBI OAuth2 enforcement (TS 33.501 §13.4.1, TS 29.510 §5.4.2, per code comments). Read by a separate generic YAML scan: true if <em>any</em> top-level section sets it, or if <code>NEXTGCORE_SBI_OAUTH2_REQUIRE=1/true/yes</code>. With no NRF URI configured the producer side fails closed (503).</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="internal-defaults-not-settable-via-yaml"><a class="header" href="#internal-defaults-not-settable-via-yaml">Internal defaults not settable via YAML</a></h3>
+<p><code>SmfConfig</code> also carries context-sizing limits, but the parsed struct has no YAML fields for them — they are always the hard-coded defaults:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_ue</code></td><td>usize</td><td><code>1024</code></td><td>UE context pool size (also used as capacity basis for the NRF load gauge, TS 29.510 §5.2.2.3.2 per code comment).</td></tr>
+<tr><td><code>max_sess</code></td><td>usize</td><td><code>4096</code></td><td>PDU session context pool size.</td></tr>
+<tr><td><code>max_bearer</code></td><td>usize</td><td><code>8192</code></td><td>Bearer/QoS-flow context pool size.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h2>
+<p>The N4/PFCP endpoints are configured by environment variables, <strong>not</strong> by the <code>smf.pfcp</code> YAML section:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>SMF_CONFIG</code></td><td><code>/etc/nextgcore/smf.yaml</code></td><td>Config file path (overridden by <code>-c</code>/<code>--config</code>).</td></tr>
+<tr><td><code>SMF_PFCP_ADDR</code> / <code>SMF_PFCP_PORT</code></td><td><code>0.0.0.0</code> / <code>8805</code></td><td>N4 PFCP bind address (single socket; sequence-number matching per TS 29.244 §7.2.1, per code comment). <code>SMF_PFCP_ADDR</code> also supplies the PFCP Node ID (falls back to <code>127.0.0.1</code> if not a dotted IPv4).</td></tr>
+<tr><td><code>UPF_PFCP_ADDR</code> / <code>UPF_PFCP_PORT</code></td><td><code>127.0.0.1</code> / <code>8805</code></td><td>UPF N4 peer address.</td></tr>
+<tr><td><code>SMF_SBI_ADVERTISE_URI</code></td><td>derived from SBI server address/port</td><td>Externally reachable base URI used in PCF callback (<code>notificationUri</code>) URIs.</td></tr>
+<tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>unset</td><td><code>1</code>/<code>true</code>/<code>yes</code> forces OAuth2 enforcement, taking precedence over the YAML knob.</td></tr>
+<tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OpenTelemetry OTLP trace exporter endpoint.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="parsed-but-inert-yaml-sections"><a class="header" href="#parsed-but-inert-yaml-sections">Parsed-but-inert YAML sections</a></h2>
+<p>The example file follows an Open5GS-style layout, but the typed deserializer ignores everything outside <code>smf.sbi</code> (unknown keys are silently dropped). The following sections in the shipped example currently have <strong>no effect</strong> on <code>nextgcore-smfd</code>:</p>
+<ul>
+<li><code>logger</code> — logging is controlled by <code>env_logger</code> (<code>RUST_LOG</code>, default <code>info</code>), not this section.</li>
+<li><code>global.max.ue</code> / <code>global.max.peer</code> — not read; context limits use the hard-coded defaults above.</li>
+<li><code>smf.pfcp</code> — PFCP addressing comes from the <code>SMF_PFCP_*</code> / <code>UPF_PFCP_*</code> environment variables.</li>
+<li><code>smf.gtpc</code>, <code>smf.gtpu</code>, <code>smf.metrics</code> — not deserialized by the config structs.</li>
+<li><code>smf.session</code> (UE IP subnets/gateways), <code>smf.dns</code>, <code>smf.mtu</code> — not deserialized by the config structs.</li>
+<li><code>smf.tls</code> — not read by the SMF loader; the file comment ties TLS to <code>TLS_ENABLED</code>/<code>SBI_SCHEME</code> deployment variables.</li>
+</ul>
+<h2 id="honesty-notes"><a class="header" href="#honesty-notes">Honesty notes</a></h2>
+<ul>
+<li>Behavior above is grounded in <code>nextgcore/src/bins/nextgcore-smfd/src/main.rs</code> and the docker example config; 3GPP TS references are quoted from code comments, not a conformance claim.</li>
+<li>The SMF is validated in matched-simulator and docker E2E runs against nextgsim peers; it has not been certified against third-party equipment or an external conformance suite.</li>
+<li>There is no <code>nextgcore/configs/smf.yaml</code>; example configs live at <code>docker/rust/configs/5gc/smf.yaml</code> (plus <code>k8s/manifests/smf.yaml</code> and the Helm template).</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="upf-configuration"><a class="header" href="#upf-configuration">UPF Configuration</a></h1>
+<p>The UPF (User Plane Function, <code>nextgcore-upfd</code>) terminates the N4/PFCP interface toward the SMF and the N3/GTP-U interface toward the gNB, and forwards user traffic through a TUN device.</p>
+<blockquote>
+<p><strong>Important — how the UPF is actually configured:</strong> unlike most other NextGCore NFs, <code>nextgcore-upfd</code> currently takes its runtime settings from <strong>command-line flags</strong>, not from the YAML file. The <code>-c/--config</code> flag points at a YAML file, and if that file exists the daemon reads it — but it only logs the file size (<code>main.rs</code>, “Configuration file loaded (N bytes)”) and <strong>does not deserialize or apply any of its contents</strong>. There is no <code>#[derive(Deserialize)]</code> config struct in the UPF binary. The entire YAML file is therefore parsed-but-inert today; it is shipped for deployment-layout consistency with the other NFs (Docker/k8s/Helm mount it), and CLI flags are the source of truth.</p>
+</blockquote>
+<h2 id="example-yaml-dockerrustconfigs5gcupfyaml"><a class="header" href="#example-yaml-dockerrustconfigs5gcupfyaml">Example YAML (<code>docker/rust/configs/5gc/upf.yaml</code>)</a></h2>
+<p>This is the file mounted in the Docker E2E deployment. Every key below is currently ignored by the daemon (see note above):</p>
+<pre><code class="language-yaml"># UPF (User Plane Function) Configuration
+# Docker container configuration for 5G Core deployment
+
+logger:
+  file:
+    path: /var/log/nextgcore/upf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+upf:
+  pfcp:
+    server:
+      - address: 172.23.0.7
+        port: 8805
+  gtpu:
+    server:
+      - address: 172.23.0.7
+        port: 2152
+  session:
+    - subnet: 10.45.0.0/16
+      gateway: 10.45.0.1
+      dev: ogstun
+    - subnet: 2001:db8:cafe::/48
+      gateway: 2001:db8:cafe::1
+      dev: ogstun
+  metrics:
+    server:
+      - address: 172.23.0.7
+        port: 9090
+  # TLS configuration (G36: SBI TLS)
+  # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
+  tls:
+    enabled: false
+    cert: /etc/nextgcore/certs/upf.crt
+    key: /etc/nextgcore/certs/upf.key
+    ca: /etc/nextgcore/certs/ca.crt
+    min_version: "1.2"
+</code></pre>
+<p>In Docker deployments the container is instead launched with matching CLI flags; the YAML values above mirror those flags but do not drive them.</p>
+<h2 id="effective-parameters-cli-flags-args-struct-in-binsnextgcore-upfdsrcmainrs"><a class="header" href="#effective-parameters-cli-flags-args-struct-in-binsnextgcore-upfdsrcmainrs">Effective parameters (CLI flags, <code>Args</code> struct in <code>bins/nextgcore-upfd/src/main.rs</code>)</a></h2>
+<p>Defaults below are the real clap <code>default_value</code>s from the source.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-c, --config</code></td><td>string</td><td><code>/etc/nextgcore/upf.yaml</code></td><td>Configuration file path. Read if present, but contents are not applied (see note above).</td></tr>
+<tr><td><code>-l, --log-file</code></td><td>string</td><td><em>(none)</em></td><td>Log file path.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level: <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
+<tr><td><code>-m, --no-color</code></td><td>bool</td><td><code>false</code></td><td>Disable colored log output.</td></tr>
+<tr><td><code>-k, --kill</code></td><td>bool</td><td><code>false</code></td><td>Kill a running instance (currently logs intent and exits).</td></tr>
+<tr><td><code>--pfcp-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N4 PFCP server bind address.</td></tr>
+<tr><td><code>--pfcp-port</code></td><td>u16</td><td><code>8805</code></td><td>N4 PFCP server port.</td></tr>
+<tr><td><code>--gtpu-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N3 GTP-U bind address.</td></tr>
+<tr><td><code>--gtpu-port</code></td><td>u16</td><td><code>2152</code></td><td>N3 GTP-U port.</td></tr>
+<tr><td><code>--tun-ifname</code></td><td>string</td><td><code>ogstun</code></td><td>TUN interface name for the user-plane subnet.</td></tr>
+<tr><td><code>--tun-ip</code></td><td>IPv4</td><td><code>10.45.0.1</code></td><td>TUN interface IP address (UE subnet gateway).</td></tr>
+<tr><td><code>--tun-prefix</code></td><td>u8</td><td><code>16</code></td><td>TUN interface prefix length.</td></tr>
+<tr><td><code>--max-sessions</code></td><td>usize</td><td><code>1024</code></td><td>Maximum number of PFCP sessions (sizes the UPF context).</td></tr>
+<tr><td><code>--no-dataplane</code></td><td>bool</td><td><code>false</code></td><td>Disable the TUN data plane; control-plane-only mode (no user traffic forwarding).</td></tr>
+<tr><td><code>--nrf-uri</code></td><td>string</td><td><code>""</code> (empty = disabled)</td><td>Opt-in NRF base URI (e.g. <code>http://127.0.0.10:7777</code>). When set, the UPF registers a UPF NFProfile and PATCHes a real PFCP-session <code>/load</code> gauge on each heartbeat (code comment cites TS 29.510 §5.2.2.3.2). Empty disables the SBI/NRF plane entirely; NRF failures are log-only and never affect packet forwarding.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="environment-variables-1"><a class="header" href="#environment-variables-1">Environment variables</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored).</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
+<ul>
+<li><strong>PFCP heartbeats:</strong> the UPF also initiates PFCP heartbeats toward the associated CP function every 10 seconds (code comment cites TS 29.244 §6.2.2: either node may initiate).</li>
+<li><strong>Reports:</strong> the data plane emits Downlink Data Reports (on first buffered downlink packet) and Error Indication Reports over N4.</li>
+<li><strong>Validation status:</strong> UPF behavior has been exercised in the project’s matched-simulator Docker E2E suite (UE→UPF GTP-U traffic). This is internal test validation, not third-party conformance certification.</li>
+</ul>
+<h2 id="parsed-but-inert-summary"><a class="header" href="#parsed-but-inert-summary">Parsed-but-inert summary</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>YAML section</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>logger.*</code></td><td>Ignored — use <code>-l</code> / <code>-e</code> flags.</td></tr>
+<tr><td><code>global.max.*</code></td><td>Ignored — use <code>--max-sessions</code>.</td></tr>
+<tr><td><code>upf.pfcp.server</code></td><td>Ignored — use <code>--pfcp-addr</code> / <code>--pfcp-port</code>.</td></tr>
+<tr><td><code>upf.gtpu.server</code></td><td>Ignored — use <code>--gtpu-addr</code> / <code>--gtpu-port</code>.</td></tr>
+<tr><td><code>upf.session</code></td><td>Ignored — use <code>--tun-ifname</code> / <code>--tun-ip</code> / <code>--tun-prefix</code> (single IPv4 subnet only via CLI; the YAML’s IPv6 entry has no CLI equivalent).</td></tr>
+<tr><td><code>upf.metrics.server</code></td><td>Ignored by the UPF binary.</td></tr>
+<tr><td><code>upf.tls.*</code></td><td>Ignored by the UPF binary; the deployment’s TLS switch is the <code>TLS_ENABLED</code> / <code>SBI_SCHEME</code> compose environment, per the file’s own comment.</td></tr>
+</tbody>
+</table>
+</div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="nrf-configuration"><a class="header" href="#nrf-configuration">NRF Configuration</a></h1>
+<p>The NRF (Network Repository Function, <code>nextgcore-nrfd</code>) handles NF registration, discovery, status notifications, and acts as the OAuth2 Authorization Server for the SBI (per code comments citing 3GPP TS 29.510 and TS 33.501). It reads a YAML file whose path defaults to <code>/etc/nextgcore/nrf.yaml</code> (override with <code>-c/--config</code>).</p>
+<p><strong>Important:</strong> the NRF’s typed config (<code>NrfYaml</code> in <code>src/bins/nextgcore-nrfd/src/main.rs</code>) only parses the <code>nrf:</code> section. The <code>logger:</code>, <code>global:</code>, <code>nrf.serving:</code>, and <code>nrf.sbi.server:</code> blocks in the shipped example are accepted but <strong>not consumed by nrfd</strong> — listen address/port and TLS come from CLI flags instead (<code>--sbi-addr</code>, <code>--sbi-port</code>, <code>--tls</code>, <code>--tls-cert</code>, <code>--tls-key</code>, <code>--mtls</code>, <code>--tls-ca-cert</code>). If the file is absent or fails to parse, conservative built-in defaults apply and startup continues.</p>
+<h2 id="example-dockerrustconfigs5gcnrfyaml"><a class="header" href="#example-dockerrustconfigs5gcnrfyaml">Example (<code>docker/rust/configs/5gc/nrf.yaml</code>)</a></h2>
+<pre><code class="language-yaml">logger:
+  file:
+    path: /var/log/nextgcore/nrf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+nrf:
+  serving:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: 172.23.0.10
+        port: 7777
+        tls:
+          enabled: false
+          cert: /etc/nextgcore/certs/nrf.crt
+          key: /etc/nextgcore/certs/nrf.key
+          ca: /etc/nextgcore/certs/ca.crt
+          # Minimum TLS version per 3GPP TS 33.501 §13.2
+          min_version: "1.2"
+</code></pre>
+<h2 id="parsed-parameters-nrf-section"><a class="header" href="#parsed-parameters-nrf-section">Parsed parameters (<code>nrf:</code> section)</a></h2>
+<p>Defaults below are the real values from <code>NrfPolicy::default()</code> and its constants in <code>main.rs</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nrf.heartBeatTimer</code></td><td>u32 (seconds)</td><td><code>10</code></td><td>NRF-preconfigured heartbeat default, used when an NF proposes no <code>heartBeatTimer</code> or an out-of-range one (code cites TS 29.510 Table 6.1.6.2.2-1).</td></tr>
+<tr><td><code>nrf.heartBeatTimerMin</code></td><td>u32 (seconds)</td><td><code>1</code></td><td>Lower bound of accepted heartbeat proposals; proposals below are overridden to the default.</td></tr>
+<tr><td><code>nrf.heartBeatTimerMax</code></td><td>u32 (seconds)</td><td><code>3600</code></td><td>Upper bound of accepted heartbeat proposals. The no-heartbeat supervision timer fires at 2x the negotiated interval.</td></tr>
+<tr><td><code>nrf.discovery.validity_period</code></td><td>u32 (seconds)</td><td><code>3600</code></td><td><code>validityPeriod</code> stamped into discovery SearchResults.</td></tr>
+<tr><td><code>nrf.discovery.default_page_size</code></td><td>usize</td><td><code>100</code></td><td>Discovery page size when the consumer specifies none (values ≤ 0 ignored).</td></tr>
+<tr><td><code>nrf.discovery.max_page_size</code></td><td>usize</td><td><code>1000</code></td><td>Cap on consumer-requested discovery page size.</td></tr>
+<tr><td><code>nrf.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>Client-side: the NRF attaches NRF-issued Bearer tokens to its own outbound calls (status notifications).</td></tr>
+<tr><td><code>nrf.sbi.oauth2.require_server</code></td><td>bool</td><td><code>false</code></td><td>Server-side OAuth2 enforcement on the NRF’s own <code>nnrf-nfm</code>/<code>nnrf-disc</code> producer endpoints. The <code>/nnrf-oauth2/v1/access-token</code> and <code>/jwks</code> endpoints always stay exempt (the NRF is the Authorization Server).</td></tr>
+<tr><td><code>nrf.sbi.oauth2.require_client_auth</code></td><td>bool</td><td><code>false</code></td><td>Token endpoint requires client authentication: a Client-Credentials-Assertion (CCA) bound to the body <code>nfInstanceId</code>, or an mTLS client identity.</td></tr>
+<tr><td><code>nrf.sbi.oauth2.require_client_cert_binding</code></td><td>bool</td><td><code>false</code></td><td>Mandates a transport-authenticated (mTLS) client identity — conveyed via <code>x-forwarded-client-cert</code> — whose URI SAN matches the request <code>nfInstanceId</code> (code cites TS 33.501 §13.3.1/§13.4.1, TS 33.310). Mismatch checks always run when an identity is present, even with this off.</td></tr>
+<tr><td><code>nrf.sbi.oauth2.cca_verify_signature</code></td><td>bool</td><td><code>false</code></td><td>Cryptographically verify the CCA’s ES256 JWS signature against <code>cca_trusted_keys</code> (code cites TS 33.501 §13.3.8.3). Fail-closed for issuers with no trusted key.</td></tr>
+<tr><td><code>nrf.sbi.oauth2.cca_trusted_keys</code></td><td>list</td><td>empty</td><td>Entries of <code>nfInstanceId</code> + RFC 7517 EC/P-256 <code>jwk</code>. Malformed keys are logged and dropped (the issuer then fails closed when verification is on).</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="parsed-but-inert--non-yaml-settings"><a class="header" href="#parsed-but-inert--non-yaml-settings">Parsed-but-inert / non-YAML settings</a></h2>
+<ul>
+<li><code>logger</code>, <code>global.max.{ue,peer}</code>, <code>nrf.serving[].plmn_id</code>, and <code>nrf.sbi.server[]</code> (address, advertise, port, tls block) are present in the example YAML but ignored by nrfd’s config structs. Equivalent runtime behavior comes from CLI flags: <code>--sbi-addr</code> (default <code>0.0.0.0</code>), <code>--sbi-port</code> (default <code>7777</code>), <code>--max-ue</code> (default <code>1024</code>), <code>--log-level</code> (default <code>info</code>), <code>--log-file</code>, and the TLS/mTLS flags.</li>
+<li><code>--nf-instance-id</code> sets the NRF’s NF Instance ID (OAuth2 <code>iss</code> per TS 29.510 §6.3.5.2.4, per code comments); auto-generated UUID otherwise.</li>
+<li><code>--state-file</code> (or <code>NEXTGCORE_NRF_STATE_FILE</code>) enables JSON-snapshot persistence of the NF registry; without it the registry is in-memory and lost on restart.</li>
+<li>Env overrides <code>NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH</code> and <code>NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING</code> (<code>1</code>/<code>true</code>) force those knobs <strong>on</strong> only; they never turn a YAML-enabled knob off.</li>
+<li><code>OTEL_EXPORTER_OTLP_ENDPOINT</code> sets the OpenTelemetry export target (default <code>http://jaeger:4317</code>).</li>
+</ul>
+<h2 id="honesty-notes-1"><a class="header" href="#honesty-notes-1">Honesty notes</a></h2>
+<ul>
+<li>All security knobs default <strong>off</strong> so the matched in-house simulator keeps working; enabling them is a deliberate operator step.</li>
+<li>Behavior is validated against the project’s matched simulator and unit/E2E tests, not third-party certified. Statements above describe what the code does; TS references are those cited in code comments, not conformance claims.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="nsacf-configuration"><a class="header" href="#nsacf-configuration">NSACF Configuration</a></h1>
+<p>The NSACF (Network Slice Admission Control Function, <code>nextgcore-nsacfd</code>) enforces per-slice admission quotas for UE registrations and PDU session establishment, per TS 23.502 §4.2.9 and TS 29.536 (as cited in the daemon’s source comments). It serves the <code>Nnsacf_NSAC</code> (<code>/nnsacf-nsac/v1/slices/ues</code>, <code>/nnsacf-nsac/v1/slices/pdus</code>) and <code>Nnsacf_SliceEventExposure</code> APIs, plus Early Admission Control (EAC) notifications.</p>
+<p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/nsacf.yaml</code>, overridable with <code>-c/--config</code>) and command-line flags. The YAML file is the source for slice quotas, the NRF URI, and OAuth2 enforcement; most runtime knobs (bind address/port, TLS, thresholds) are CLI flags only.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> NSACF behavior is validated by this project’s own unit and matched-simulator E2E tests (84/84 docker E2E as of 2026-07-02), not by third-party conformance certification. The vendored OpenAPI sets do not include <code>TS29536_Nnsacf_*.yaml</code>; field names mirror TS 29.536 terminology as documented in code comments.</p>
+</blockquote>
+<h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
+<p>From <code>nextgcore/docker/rust/configs/5gc/nsacf.yaml</code>:</p>
+<pre><code class="language-yaml"># NSACF (Network Slice Admission Control Function) Configuration
+logger:
+  level: info
+
+nsacf:
+  sbi:
+    server:
+      - address: 172.23.0.34
+        port: 7777
+  nrf:
+    uri: http://172.23.0.10:7777
+  slice_quotas:
+    - sst: 1
+      max_ues: 1000
+      max_pdu_sessions: 2000
+    - sst: 2
+      max_ues: 500
+      max_pdu_sessions: 1000
+    - sst: 3
+      max_ues: 2000
+      max_pdu_sessions: 4000
+</code></pre>
+<p>An OAuth2-enforcing variant (<code>nsacf-oauth2.yaml</code>, used via <code>docker-compose.oauth2.yml</code>) is identical except it adds:</p>
+<pre><code class="language-yaml">nsacf:
+  sbi:
+    oauth2:
+      require: true
+</code></pre>
+<h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
+<p>These are the fields actually deserialized by the daemon (<code>#[derive(Deserialize)]</code> structs <code>NsacfYaml</code>/<code>NsacfSection</code>/<code>SbiYaml</code>/<code>SbiOauth2Yaml</code>/<code>NrfYaml</code>/<code>SliceQuotaYaml</code> in <code>src/bins/nextgcore-nsacfd/src/main.rs</code>).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nsacf.nrf.uri</code></td><td>string</td><td>falls back to CLI <code>--nrf-uri</code> (<code>http://127.0.0.1:7777</code>)</td><td>NRF base URI for NF registration, heartbeat, and (when OAuth2 is on) token issuance/JWKS.</td></tr>
+<tr><td><code>nsacf.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>SBI OAuth2 bearer-token enforcement. When <code>true</code>, incoming requests must carry an NRF-issued token with audience <code>NSACF</code> (verified against the NRF JWKS, TS 33.501 §13.4.1 per code comment) and outbound SBI calls attach tokens. Default off so the dev/E2E path works without tokens. Overridden by CLI <code>--oauth2-require</code>.</td></tr>
+<tr><td><code>nsacf.slice_quotas</code></td><td>list</td><td><em>(none — see below)</em></td><td>Local NSAC provisioning (TS 29.536 §6.1.3.4 per code comment). If omitted, the NSACF starts with an <strong>empty quota table and rejects every admission request</strong> with <code>SLICE_NOT_AVAILABLE</code>.</td></tr>
+<tr><td><code>nsacf.slice_quotas[].sst</code></td><td>u8</td><td><strong>required</strong></td><td>Slice/Service Type of the S-NSSAI.</td></tr>
+<tr><td><code>nsacf.slice_quotas[].sd</code></td><td>string</td><td>absent (no SD)</td><td>Slice Differentiator as a 6-hex-digit string (TS 23.003 §28.4.2 form, e.g. <code>"000000"</code>).</td></tr>
+<tr><td><code>nsacf.slice_quotas[].max_ues</code></td><td>u64</td><td>uncapped (<code>u64::MAX</code>)</td><td>Maximum registered UEs for the slice. Absent means the UE count is <strong>not subject to NSAC</strong> (uncapped), not a zero quota.</td></tr>
+<tr><td><code>nsacf.slice_quotas[].max_pdu_sessions</code></td><td>u64</td><td>uncapped (<code>u64::MAX</code>)</td><td>Maximum PDU sessions for the slice. Same absent-means-uncapped semantic.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
+<p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In particular, in the shipped example files:</p>
+<ul>
+<li><strong><code>logger.level</code> is inert.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>) or <code>RUST_LOG</code>, not the YAML.</li>
+<li><strong><code>nsacf.sbi.server[]</code> (address/port) is inert.</strong> The SBI bind address and port come from the CLI flags <code>--sbi-addr</code>/<code>--sbi-port</code>; the YAML <code>server</code> list exists for visual consistency with other NF configs but is not read by <code>nextgcore-nsacfd</code>.</li>
+</ul>
+<h2 id="command-line-flags-1"><a class="header" href="#command-line-flags-1">Command-line flags</a></h2>
+<p>Runtime knobs with real defaults from the clap <code>Args</code> struct in <code>main.rs</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/nsacf.yaml</code></td><td>Configuration file path.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>).</td></tr>
+<tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Log file path.</td></tr>
+<tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
+<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address.</td></tr>
+<tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7813</code></td><td>SBI server port (docker deployments pass <code>7777</code>).</td></tr>
+<tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Enable TLS on the SBI server.</td></tr>
+<tr><td><code>--tls-cert</code></td><td>path</td><td><code>/etc/nextgcore/tls/server.crt</code> (when <code>--tls</code>)</td><td>TLS certificate file.</td></tr>
+<tr><td><code>--tls-key</code></td><td>path</td><td><code>/etc/nextgcore/tls/server.key</code> (when <code>--tls</code>)</td><td>TLS private key file.</td></tr>
+<tr><td><code>--max-quotas</code></td><td>usize</td><td><code>64</code></td><td>Maximum number of slice quotas in the context pool.</td></tr>
+<tr><td><code>--nrf-uri</code></td><td>string</td><td><code>http://127.0.0.1:7777</code></td><td>NRF URI fallback when <code>nsacf.nrf.uri</code> is absent.</td></tr>
+<tr><td><code>--state-file</code></td><td>path</td><td>unset</td><td>File for persisting admission counters across restarts (loaded at startup, saved on graceful shutdown).</td></tr>
+<tr><td><code>--eac-threshold</code></td><td>u8</td><td><code>80</code></td><td>Early Admission Control activation threshold, percent of max UEs (TS 23.502 §4.2.9.5 per code comment).</td></tr>
+<tr><td><code>--oauth2-require</code></td><td>bool</td><td>unset (follow config)</td><td>Dev override for <code>nsacf.sbi.oauth2.require</code>; wins over the config value in either direction.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="behavior-notes-1"><a class="header" href="#behavior-notes-1">Behavior notes</a></h2>
+<ul>
+<li><strong>Admission result encoding</strong> (TS 29.536 §6.1.3.2.3.1 per code comment): HTTP <strong>204</strong> = all requested S-NSSAIs admitted; <strong>200</strong> with <code>acuFailureList</code> keyed by SUPI = partial failure; <strong>403</strong> ProblemDetails = total failure. Failure reasons include <code>SLICE_NOT_FOUND</code>, <code>EXCEED_MAX_UE_NUM[_3GPP/_N3GPP]</code>, <code>EXCEED_MAX_PDU_NUM[_3GPP/_N3GPP]</code>.</li>
+<li><strong>Supported features</strong>: the NSACF advertises <code>supportedFeatures: "0"</code> — no optional TS 29.536 §6.1.8 features; HNSAC/VHNSAC home/visited delegation is <strong>not</strong> supported.</li>
+<li><strong>Runtime reprovisioning</strong>: quotas can also be updated at runtime via the spec custom operation <code>POST /nnsacf-nsac/v1/slices/local-configs/update</code>, and via a NextGCore admin-only extension at <code>/nnsacf-nsac/v1/slice-quotas</code> (explicitly <em>not</em> a TS 29.536 resource). The admin extension applies its own defaults when omitted: <code>maxUes</code> 10000, <code>maxPduSessions</code> 50000 — different from the YAML’s uncapped semantic.</li>
+<li><strong>Per-access ceilings</strong> (<code>maxUes3gpp</code>, <code>maxUesN3gpp</code>, <code>maxPdu3gpp</code>, <code>maxPduN3gpp</code>) are configurable only through <code>local-configs/update</code>, not through the YAML file.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="features--apis"><a class="header" href="#features--apis">Features &amp; APIs</a></h1>
+<p>Reference material lives in three generated/maintained artifacts on the docs site:</p>
+<h2 id="supported-features-matrix"><a class="header" href="#supported-features-matrix">Supported-Features Matrix</a></h2>
+<p>The <a href="../features.html">feature matrix</a> lists, per Network Function, the services actually served,
+key procedures, the governing 3GPP spec, and an honest status badge:</p>
+<ul>
+<li><strong>implemented</strong> — wired into the live dispatch path and handled</li>
+<li><strong>partial</strong> — surface exists but some operations are stubbed or gated</li>
+<li><strong>prototype</strong> — non-normative / off-wire research code (6G, NTN, etc.)</li>
+</ul>
+<p>The matrix is extracted from the live router/handler code, not from claims.</p>
+<h2 id="openapi-specifications"><a class="header" href="#openapi-specifications">OpenAPI Specifications</a></h2>
+<p>The <a href="../api.html">API index</a> serves 31 OpenAPI specs from <code>docs/openapi/*.yaml</code>, covering the
+SBI service surfaces (Namf, Nsmf, Nudm, Npcf incl. UE Policy, Nausf incl. SoR/UPU protection,
+Nnrf incl. the <code>/oauth2/token</code> endpoint, and more). Regenerate the index with:</p>
+<pre><code class="language-bash">bash docs/scripts/update-api-docs.sh
+</code></pre>
+<h2 id="observability"><a class="header" href="#observability">Observability</a></h2>
+<p>Every NF exposes Prometheus metrics on port 9090 (<code>/metrics</code>) and OpenTelemetry traces
+(Jaeger in the Docker/K8s stacks). The Docker Compose stack wires both up automatically.</p>
+<h2 id="validation-status"><a class="header" href="#validation-status">Validation status</a></h2>
+<p>E2E validation runs against the matched NextGSim UE/gNB simulator (84/84 suite, including a
+UE→UPF GTP-U data-plane path). This proves internal consistency of the pair — it is <strong>not</strong>
+third-party conformance certification. 6G/Rel-20 items are research prototypes; no frozen
+Rel-20 Stage-3 specs exist.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="nextgcore-6g-gap-analysis-report"><a class="header" href="#nextgcore-6g-gap-analysis-report">NextGCore 6G Gap Analysis Report</a></h1>
+<p><strong>Date:</strong> 2026-02-07
+<strong>Scope:</strong> Comprehensive source code analysis of the network functions and shared libraries <em>(as of 2026-02-07: 17 NFs / 18 libs; the workspace now ships <strong>24 NF binaries</strong> and <strong>17 libraries</strong> — see stale-snapshot banner)</em>
+<strong>Standards Reference:</strong> 3GPP Rel-18/19, ITU-R IMT-2030 Framework</p>
+<blockquote>
+<p><strong>⚠️ STALE SNAPSHOT (2026-02-07).</strong> This report predates the Wave-1..6 remediation and the peripheral-NF build-out; it is retained for historical context only and several “does not exist” / “0%” statements below are now FALSE. As of 2026-07 the workspace ships <strong>24 NF binaries (19 5GC + 5 EPC)</strong> and <strong>17 shared libraries</strong> — including NWDAF (<code>nextgcore-nwdafd</code>: NRF-driven NF_LOAD collection, analytics, ML-service and federation scaffolding), NSACF (<code>nextgcore-nsacfd</code>: config-provisioned slice quotas per TS 29.536), plus DCCF, EES, LMF, MBSMF and PIN NFs; SBI OAuth2 (<code>/oauth2/token</code>); and wired NAS security (<code>bins/nextgcore-amfd/src/nas_security.rs</code>). A matched-sim Docker E2E (<code>docker/rust/e2e-test.sh</code>) exercises full registration + PDU session + data plane. These 6G-oriented items remain <strong>research-/prototype-level and are NOT Rel-20 conformant — no frozen 6G stage-3 spec exists.</strong></p>
+</blockquote>
+<hr>
+<h2 id="executive-summary"><a class="header" href="#executive-summary">Executive Summary</a></h2>
+<p>NextGCore is a pure Rust port of the Open5GS C codebase implementing <strong>19 5G Core (5GC) network functions and 5 EPC network functions, supported by 17 shared libraries</strong> <em>(counts as of 2026-07; this report was written against an earlier 12+5 / 18-lib layout)</em>. The project has established strong foundational infrastructure – FSM frameworks, SBI HTTP/2 server/client, PFCP protocol library, NAS message encoding/decoding, and a working UPF data plane – but the majority of service-specific handlers remain stubbed. There are <strong>316 documented TODOs</strong> across 8 phases required to reach basic 5G operational parity, and (at the time of writing) no 6G-specific features existed in the codebase. <em>(Historical: as of 2026-07 several 6G-oriented research NFs/features have since landed — NWDAF <code>nextgcore-nwdafd</code>, NSACF <code>nextgcore-nsacfd</code>, DCCF <code>nextgcore-dccfd</code>, plus ISAC/FL prototypes in nextgsim — all prototype-level, not Rel-20-conformant. See banner.)</em></p>
+<p>The gap to a 6G-ready core network is therefore two-layered:</p>
+<ol>
+<li><strong>Layer 1 (5G Completion):</strong> ~17 weeks of work to implement timer management, SBI infrastructure, error responses, NRF integration, and service-specific handlers across all NFs.</li>
+<li><strong>Layer 2 (6G Evolution):</strong> Entirely new capabilities required for AI-native networking, SBA 2.0, compute-aware networking, digital twins, intent-driven management, enhanced slicing, zero-trust security, green networking, NTN support, and TSN integration.</li>
+</ol>
+<p><strong>Overall 5G Implementation Completeness: ~25%</strong> <em>(as of 2026-02-07; substantially higher after Wave-1..6 remediation — see banner)</em>
+<strong>6G Readiness: 0%</strong> <em>(STALE — 6G-oriented research NFs/features have since landed; still prototype-level, not Rel-20-conformant)</em></p>
+<hr>
+<h2 id="1-network-function-by-nf-analysis"><a class="header" href="#1-network-function-by-nf-analysis">1. Network Function-by-NF Analysis</a></h2>
+<h3 id="11-5g-core-network-functions"><a class="header" href="#11-5g-core-network-functions">1.1 5G Core Network Functions</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>NF</th><th>Source Files</th><th>FSM</th><th>SBI Server</th><th>SBI Client</th><th>Service Handlers</th><th>Config</th><th>Tests</th><th>Completeness</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>AMF</strong></td><td>18</td><td>Working (6 event types)</td><td>Scaffolding</td><td>Scaffolding</td><td>Stubbed (NGAP dispatch noted)</td><td>YAML parsing (GUAMI, TAI, PLMN, security)</td><td>Basic</td><td><strong>35%</strong></td></tr>
+<tr><td><strong>AUSF</strong></td><td>~8</td><td>Working + UE sub-FSMs</td><td>Routing (nausf-auth)</td><td>Routing (nudm-ueau)</td><td>Stubbed (UE lookup by SUCI/SUPI)</td><td>Basic</td><td>Comprehensive (845 lines)</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>BSF</strong></td><td>~6</td><td>Working</td><td>Routing (nbsf-management)</td><td>NRF stubs</td><td>Stubbed (PCF binding CRUD)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
+<tr><td><strong>NRF</strong></td><td>~8</td><td>Working</td><td><strong>Functional</strong> (full HTTP/2 routing)</td><td>N/A</td><td><strong>Working</strong> (NF registration, discovery, subscriptions)</td><td>Basic</td><td>Good</td><td><strong>65%</strong></td></tr>
+<tr><td><strong>NSSF</strong></td><td>~6</td><td>Working</td><td>Routing (nnssf-nsselection v2)</td><td>H-NSSF response</td><td>Stubbed</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
+<tr><td><strong>PCF</strong></td><td>~8</td><td>Working + AM/SM sub-FSMs</td><td>Routing (3 services)</td><td>NUDR/BSF response</td><td>Stubbed (AM policy, SM policy, policy auth)</td><td>Basic</td><td>Comprehensive (890 lines)</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>SCP</strong></td><td>~6</td><td>Working</td><td>Minimal (forwards via sbi_path)</td><td>NF discovery</td><td>Stubbed</td><td>Basic</td><td>Basic</td><td><strong>15%</strong></td></tr>
+<tr><td><strong>SEPP</strong></td><td>~8</td><td>Working + Handshake sub-FSMs</td><td>Routing (n32c-handshake)</td><td>N32c response</td><td>Partial (find_or_create returns None)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
+<tr><td><strong>SMF</strong></td><td>~12</td><td>Working (14 event types)</td><td><strong>Functional</strong> (comprehensive HTTP/2 routes)</td><td>Scaffolding</td><td>Stubbed (PDU session CRUD, event exposure)</td><td>YAML parsing</td><td>Basic</td><td><strong>30%</strong></td></tr>
+<tr><td><strong>UDM</strong></td><td>~8</td><td>Working + UE/Session sub-FSMs</td><td>Routing (3 services, v2 SDM)</td><td>NUDR response routing</td><td>Stubbed (SUPI extraction works)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
+<tr><td><strong>UDR</strong></td><td>~6</td><td>Working (stateless)</td><td>Routing (nudr-dr)</td><td>N/A</td><td>Delegated to nudr_handler</td><td>Basic</td><td>Basic</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>UPF</strong></td><td>~10</td><td>Working + Exception state</td><td>N/A (PFCP)</td><td>N/A</td><td><strong>Working</strong> (TUN, GTP-U, session mgmt)</td><td>Basic</td><td>Good</td><td><strong>55%</strong></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="12-epc-network-functions"><a class="header" href="#12-epc-network-functions">1.2 EPC Network Functions</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>NF</th><th>Source Files</th><th>FSM</th><th>Protocol Interfaces</th><th>Service Handlers</th><th>Completeness</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>HSS</strong></td><td>10</td><td>Working + DB poll timer</td><td>S6a/Cx/SWx (Diameter) init/fini scaffolding</td><td>Stubbed (AIR/ULR/PUR/CLR/IDR structures defined)</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>MME</strong></td><td>21</td><td>Working (5 FSMs: MME, EMM, ESM, S1AP, SGsAP)</td><td>S1AP/S11/S6a/SGsAP init scaffolding</td><td>Comprehensive type definitions, handlers stubbed</td><td><strong>30%</strong></td></tr>
+<tr><td><strong>PCRF</strong></td><td>8</td><td>Working + Exception state</td><td>Gx/Rx (Diameter) init/fini scaffolding</td><td>Stubbed</td><td><strong>15%</strong></td></tr>
+<tr><td><strong>SGW-C</strong></td><td>13</td><td>Working + PFCP sub-FSM (5 states)</td><td>S11/S5C/SXA event routing</td><td>Stubbed (GTP message types documented)</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>SGW-U</strong></td><td>10</td><td>Working (returns SgwuSmResult)</td><td>SXA (PFCP) event routing</td><td>Stubbed (dispatch to PFCP node)</td><td><strong>20%</strong></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="13-shared-libraries"><a class="header" href="#13-shared-libraries">1.3 Shared Libraries</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Library</th><th>Purpose</th><th>Status</th><th>Key Types/Features</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>nextgcore-sbi</strong></td><td>SBI HTTP/2</td><td><strong>Functional</strong></td><td>Client, Server (hyper/h2), ProblemDetails, NfInstance, discovery context, TLS config</td></tr>
+<tr><td><strong>nextgcore-pfcp</strong></td><td>PFCP protocol</td><td><strong>Functional</strong></td><td>Header/IE/Message encode/decode, Session/Association/Heartbeat types, TS 29.244</td></tr>
+<tr><td><strong>nextgcore-nas</strong></td><td>NAS protocol</td><td><strong>Functional</strong></td><td>5GMM + EPS message build/parse, security context, Registration/Auth/SMC messages</td></tr>
+<tr><td><strong>nextgcore-core</strong></td><td>Core utilities</td><td><strong>Functional</strong></td><td>26 modules: list, hash, pool, pkbuf, timer, FSM, TLV, socket, poll, TCP/UDP</td></tr>
+<tr><td><strong>nextgcore-metrics</strong></td><td>Prometheus metrics</td><td><strong>Functional</strong></td><td>Counter/Gauge/Histogram, labels, Prometheus HTTP server</td></tr>
+<tr><td><strong>nextgcore-ngap</strong></td><td>NGAP protocol</td><td><strong>Minimal</strong></td><td>Only lib.rs stub (ASN.1 APER note)</td></tr>
+<tr><td><strong>nextgcore-s1ap</strong></td><td>S1AP protocol</td><td>Scaffolding</td><td>ASN.1 encoding via nextgcore-asn1c</td></tr>
+<tr><td><strong>nextgcore-sctp</strong></td><td>SCTP transport</td><td><strong>Working</strong></td><td>sctp-proto 0.6 integration (migration complete per must_be_implemented.txt)</td></tr>
+<tr><td><strong>nextgcore-gtp</strong></td><td>GTPv2-C protocol</td><td>Scaffolding</td><td>GTP-C message building</td></tr>
+<tr><td><strong>nextgcore-diameter</strong></td><td>Diameter protocol</td><td>Scaffolding</td><td>FreeDiameter integration stubs</td></tr>
+<tr><td><strong>nextgcore-crypt</strong></td><td>Crypto functions</td><td>Scaffolding</td><td>Auth vector generation</td></tr>
+<tr><td><strong>nextgcore-dbi</strong></td><td>Database interface</td><td>Scaffolding</td><td>MongoDB integration stubs</td></tr>
+<tr><td><strong>nextgcore-tun</strong></td><td>TUN device</td><td><strong>Working</strong></td><td>Used by UPF for data plane</td></tr>
+<tr><td><strong>nextgcore-ipfw</strong></td><td>IP firewall/NAT</td><td><strong>Working</strong></td><td>Used by UPF for NAT</td></tr>
+<tr><td><strong>nextgcore-ffi</strong></td><td>C FFI bindings</td><td>Scaffolding</td><td>FreeDiameter/ASN.1 C library bridges</td></tr>
+<tr><td><strong>nextgcore-asn1c</strong></td><td>ASN.1 compiler</td><td>Scaffolding</td><td>NGAP/S1AP ASN.1 types</td></tr>
+<tr><td><strong>nextgcore-app</strong></td><td>Application framework</td><td>Scaffolding</td><td>Common app initialization</td></tr>
+<tr><td><strong>nextgcore-proto</strong></td><td>Protocol definitions</td><td>Scaffolding</td><td>Shared protocol types</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="2-critical-5g-gaps-from-todotxt-analysis"><a class="header" href="#2-critical-5g-gaps-from-todotxt-analysis">2. Critical 5G Gaps (from todo.txt Analysis)</a></h2>
+<p>The project documents 316 TODOs across 8 phases. These represent the prerequisite work before any 6G features can be considered.</p>
+<h3 id="phase-1-timer-management--sbi-infrastructure-critical-40-todos"><a class="header" href="#phase-1-timer-management--sbi-infrastructure-critical-40-todos">Phase 1: Timer Management + SBI Infrastructure (CRITICAL, ~40 TODOs)</a></h3>
+<ul>
+<li><strong>Timer Manager:</strong> No centralized async timer system. All NFs use placeholder <code>thread::sleep</code> polling loops.</li>
+<li><strong>SBI Event Loop:</strong> Event queue dispatch from SBI server to state machines is not wired.</li>
+<li><strong>Impact:</strong> Without timers, no NF can perform registration retries, heartbeats, or session timeouts.</li>
+</ul>
+<h3 id="phase-2-error-response-framework-high-50-todos"><a class="header" href="#phase-2-error-response-framework-high-50-todos">Phase 2: Error Response Framework (HIGH, ~50 TODOs)</a></h3>
+<ul>
+<li><strong>ProblemDetails:</strong> Library type exists in nextgcore-sbi but no NF generates proper 3GPP error responses.</li>
+<li><strong>HTTP Status Codes:</strong> Server helper functions exist (<code>send_bad_request</code>, <code>send_not_found</code>, etc.) but are unused.</li>
+<li><strong>Impact:</strong> No interoperability with compliant clients; no error recovery.</li>
+</ul>
+<h3 id="phase-3-nrf-integration-high-35-todos"><a class="header" href="#phase-3-nrf-integration-high-35-todos">Phase 3: NRF Integration (HIGH, ~35 TODOs)</a></h3>
+<ul>
+<li><strong>NRF Server:</strong> Functional (registration, discovery, subscriptions work).</li>
+<li><strong>NRF Clients:</strong> No NF registers itself with NRF on startup, no NF performs NF discovery.</li>
+<li><strong>Impact:</strong> Service-based architecture is non-functional without NRF integration.</li>
+</ul>
+<h3 id="phase-4-service-specific-handlers-medium-80-todos"><a class="header" href="#phase-4-service-specific-handlers-medium-80-todos">Phase 4: Service-Specific Handlers (MEDIUM, ~80 TODOs)</a></h3>
+<ul>
+<li><strong>AMF:</strong> NGAP message dispatch to sub-FSMs, NAS message processing, UE context management.</li>
+<li><strong>SMF:</strong> N4 session establishment with UPF, PDU session lifecycle, QoS rule installation.</li>
+<li><strong>AUSF/UDM/UDR:</strong> Authentication vector generation, subscriber data retrieval, database queries.</li>
+<li><strong>PCF:</strong> Policy decision logic, PCC rule generation, QoS flow binding.</li>
+<li><strong>Impact:</strong> No actual mobile connectivity possible.</li>
+</ul>
+<h3 id="phase-5-scpsepp-routing-medium-40-todos"><a class="header" href="#phase-5-scpsepp-routing-medium-40-todos">Phase 5: SCP/SEPP Routing (MEDIUM, ~40 TODOs)</a></h3>
+<ul>
+<li><strong>SCP:</strong> Request forwarding, load balancing, service mesh capabilities.</li>
+<li><strong>SEPP:</strong> N32 interface, PRINS/TLS security, message filtering.</li>
+<li><strong>Impact:</strong> No inter-PLMN roaming or service mesh support.</li>
+</ul>
+<h3 id="phase-6-protocol-libraries---ngaps1ap-medium-20-todos"><a class="header" href="#phase-6-protocol-libraries---ngaps1ap-medium-20-todos">Phase 6: Protocol Libraries - NGAP/S1AP (MEDIUM, ~20 TODOs)</a></h3>
+<ul>
+<li><strong>nextgcore-ngap:</strong> Only a single-line stub. ASN.1 APER encoding not implemented.</li>
+<li><strong>nextgcore-s1ap:</strong> Scaffolding only.</li>
+<li><strong>Impact:</strong> AMF cannot communicate with gNBs; MME cannot communicate with eNBs.</li>
+</ul>
+<h3 id="phase-7-epcdiameter-low-25-todos"><a class="header" href="#phase-7-epcdiameter-low-25-todos">Phase 7: EPC/Diameter (LOW, ~25 TODOs)</a></h3>
+<ul>
+<li><strong>nextgcore-diameter:</strong> FreeDiameter integration is stub-only.</li>
+<li><strong>HSS/PCRF:</strong> S6a, Cx, SWx, Gx, Rx handlers are all stubbed.</li>
+<li><strong>Impact:</strong> No EPC authentication or policy control.</li>
+</ul>
+<h3 id="phase-8-upf-enhancements-low-5-todos"><a class="header" href="#phase-8-upf-enhancements-low-5-todos">Phase 8: UPF Enhancements (LOW, ~5 TODOs)</a></h3>
+<ul>
+<li><strong>UPF:</strong> Already the most complete NF. Remaining work: URR (usage reporting), QER (QoS enforcement), FAR enhancements.</li>
+</ul>
+<hr>
+<h2 id="3-6g-gap-analysis-per-itu-r-imt-2030-and-3gpp-rel-1819"><a class="header" href="#3-6g-gap-analysis-per-itu-r-imt-2030-and-3gpp-rel-1819">3. 6G Gap Analysis per ITU-R IMT-2030 and 3GPP Rel-18/19</a></h2>
+<h3 id="31-aiml-native-network-automation-nwdaf"><a class="header" href="#31-aiml-native-network-automation-nwdaf">3.1 AI/ML-Native Network Automation (NWDAF)</a></h3>
+<p><strong>Current State (2026-02-07 — now STALE):</strong> No NWDAF NF existed at the time of writing. <em>Update: NWDAF now exists as <code>nextgcore-nwdafd</code> with an NRF-driven NF_LOAD collector (<code>nrf_collector.rs</code>), analytics (<code>analytics.rs</code>), ML service (<code>ml_service.rs</code>) and federation scaffolding (<code>federation.rs</code>) — research/prototype-level, not Rel-18/Rel-20 conformant.</em></p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No NWDAF binary or scaffolding in <code>src/bins/</code></li>
+<li>No ML model serving infrastructure (ONNX runtime, TensorFlow Serving integration)</li>
+<li>No data collection APIs (Nnwdaf_AnalyticsInfo, Nnwdaf_EventsSubscription)</li>
+<li>No analytics exposure to consumers (AMF, SMF, PCF, NSSF)</li>
+<li>No Federated Learning support for distributed model training</li>
+<li>No real-time inference pipeline for anomaly detection, load prediction, or QoE optimization</li>
+<li>No MTLF (Model Training Logical Function) or AnLF (Analytics Logical Function) decomposition</li>
+<li><strong>3GPP Rel-18 NWDAF Phase 3:</strong> Root cause analysis, QoE prediction, network energy saving analytics</li>
+<li><strong>6G Extension:</strong> Autonomous network operations, self-healing, predictive resource management</li>
+</ul>
+<p><strong>Priority:</strong> CRITICAL for 6G – AI-native networking is a cornerstone of IMT-2030.</p>
+<h3 id="32-enhanced-network-slicing"><a class="header" href="#32-enhanced-network-slicing">3.2 Enhanced Network Slicing</a></h3>
+<p><strong>Current State:</strong> NSSF has basic scaffolding for <code>nnssf-nsselection</code> (v2 API). AMF context defines <code>SNssai</code> type. No slice isolation, lifecycle management, or SLA assurance.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No slice admission control or resource reservation</li>
+<li>No Network Slice Instance (NSI) lifecycle management (creation, activation, deactivation, termination)</li>
+<li>No Network Slice Subnet Instance (NSSI) management</li>
+<li>No slice SLA monitoring or assurance framework</li>
+<li>No per-slice QoS enforcement (PCF policies are stubbed)</li>
+<li>No slice-level analytics (requires NWDAF)</li>
+<li>No inter-slice resource sharing or isolation enforcement</li>
+<li>No slice template/blueprint management</li>
+<li><strong>3GPP Rel-18:</strong> Enhanced NSSF for slice-specific authentication, NSACF (Network Slice Admission Control Function)</li>
+<li><strong>6G Extension:</strong> Dynamic micro-slicing with sub-ms granularity, AI-driven slice orchestration, intent-based slice management</li>
+</ul>
+<p><strong>Priority:</strong> HIGH – Network slicing is fundamental to both 5G-Advanced and 6G.</p>
+<h3 id="33-service-based-architecture-sba-20"><a class="header" href="#33-service-based-architecture-sba-20">3.3 Service-Based Architecture (SBA) 2.0</a></h3>
+<p><strong>Current State:</strong> nextgcore-sbi library provides functional HTTP/2 client/server with hyper. NRF has working NF registration and discovery. No other NF uses SBI client for NRF registration or service discovery.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No service mesh capabilities (SCP is minimal stub)</li>
+<li>No event exposure framework (NSEF - Network Service Exposure Function)</li>
+<li>No API gateway / rate limiting / request routing</li>
+<li>No service authorization (OAuth 2.0 tokens not implemented)</li>
+<li>No event subscription/notification framework</li>
+<li>No bulk operations or batch API support</li>
+<li>No HTTP/3 (QUIC) support</li>
+<li><strong>3GPP Rel-18:</strong> Enhanced SBA with indirect communication via SCP, service routing</li>
+<li><strong>6G Extension:</strong> SBA 2.0 with native gRPC/protocol buffers, GraphQL APIs, event-driven architecture, serverless NF execution, WebAssembly NF plugins</li>
+</ul>
+<p><strong>Priority:</strong> HIGH – SBA 2.0 is an architectural pillar of 6G.</p>
+<h3 id="34-multi-access-edge-computing-mec--edge-intelligence"><a class="header" href="#34-multi-access-edge-computing-mec--edge-intelligence">3.4 Multi-Access Edge Computing (MEC) / Edge Intelligence</a></h3>
+<p><strong>Current State:</strong> No edge computing support. No EASDF (Edge Application Server Discovery Function). No edge NF deployment model.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No EASDF NF</li>
+<li>No edge discovery and selection</li>
+<li>No local breakout / local data path management</li>
+<li>No UPF selection based on edge proximity</li>
+<li>No edge application lifecycle management</li>
+<li>No edge-cloud orchestration</li>
+<li>No latency-aware traffic steering</li>
+<li><strong>3GPP Rel-18:</strong> Enhanced EASDF, edge computing phase 2</li>
+<li><strong>6G Extension:</strong> Distributed AI at the edge, compute-aware networking (see 3.8), ultra-low-latency edge processing (&lt;1ms)</li>
+</ul>
+<p><strong>Priority:</strong> HIGH – Edge computing is critical for 6G’s ultra-low-latency and immersive use cases.</p>
+<h3 id="35-zero-trust-security-architecture"><a class="header" href="#35-zero-trust-security-architecture">3.5 Zero-Trust Security Architecture</a></h3>
+<p><strong>Current State:</strong> SBI server has TLS config fields (private_key, cert, verify_client) but no implementation. No authentication, authorization, or integrity protection between NFs.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No mTLS between NFs (SBI server TLS config is unused)</li>
+<li>No OAuth 2.0 client credentials flow for NF authorization</li>
+<li>No NF token validation</li>
+<li>No security context management for UE sessions</li>
+<li>No NAS security (library types exist but not wired to NFs)</li>
+<li>No SUPI/SUCI privacy (AUSF handler stubbed)</li>
+<li>No security event logging or audit trail</li>
+<li>No SEPP N32 security (PRINS or TLS not implemented)</li>
+<li><strong>3GPP Rel-18:</strong> Enhanced network security, AKMA (Authentication and Key Management for Applications)</li>
+<li><strong>6G Extension:</strong> Zero-trust architecture with continuous authentication, AI-driven threat detection, quantum-safe cryptography (post-quantum algorithms), decentralized identity management (DID/SSI)</li>
+</ul>
+<p><strong>Priority:</strong> CRITICAL – Zero-trust is non-negotiable for 6G deployment.</p>
+<h3 id="36-digital-twin-network-functions"><a class="header" href="#36-digital-twin-network-functions">3.6 Digital Twin Network Functions</a></h3>
+<p><strong>Current State:</strong> No digital twin capability. No simulation, modeling, or state replication infrastructure.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No digital twin framework or data model</li>
+<li>No real-time network state mirroring</li>
+<li>No what-if scenario simulation</li>
+<li>No predictive maintenance capabilities</li>
+<li>No network topology modeling</li>
+<li>No protocol behavior simulation</li>
+<li><strong>6G Requirement:</strong> Digital twins of physical network for planning, optimization, and autonomous operations</li>
+<li>Requires integration with AI/ML (3.1), metrics collection (partially exists via nextgcore-metrics), and comprehensive state export</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM-HIGH – Emerging 6G requirement per ITU-R IMT-2030.</p>
+<h3 id="37-intent-driven-network-management"><a class="header" href="#37-intent-driven-network-management">3.7 Intent-Driven Network Management</a></h3>
+<p><strong>Current State:</strong> No intent management. All configuration is imperative (YAML files, CLI arguments).</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No intent translation engine (natural language / policy to configuration)</li>
+<li>No intent lifecycle management (creation, conflict resolution, verification)</li>
+<li>No closed-loop automation (monitor -&gt; analyze -&gt; plan -&gt; execute)</li>
+<li>No declarative network configuration framework</li>
+<li>No policy conflict detection and resolution</li>
+<li><strong>6G Requirement:</strong> Operators express desired outcomes; network autonomously achieves them</li>
+<li>Requires AI/ML (3.1), digital twins (3.6), and comprehensive telemetry</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM – Important for 6G operational efficiency.</p>
+<h3 id="38-compute-aware-networking-can"><a class="header" href="#38-compute-aware-networking-can">3.8 Compute-Aware Networking (CAN)</a></h3>
+<p><strong>Current State:</strong> No compute awareness. UPF selection is not implemented. No resource monitoring.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No compute resource discovery and monitoring</li>
+<li>No compute-aware traffic steering</li>
+<li>No workload placement optimization</li>
+<li>No compute resource abstraction layer</li>
+<li>No joint compute-communication optimization</li>
+<li><strong>3GPP Rel-19:</strong> Compute-aware networking study items</li>
+<li><strong>6G Extension:</strong> Native compute-communication convergence, distributed computing fabric</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM – Growing importance in 6G for edge and AI workloads.</p>
+<h3 id="39-green-networking--energy-efficiency"><a class="header" href="#39-green-networking--energy-efficiency">3.9 Green Networking / Energy Efficiency</a></h3>
+<p><strong>Current State:</strong> No energy management. No NF sleep/wake capabilities. No traffic-adaptive resource scaling.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No energy-aware NF scheduling</li>
+<li>No NF sleep mode or dynamic scaling</li>
+<li>No traffic prediction for energy optimization (requires NWDAF)</li>
+<li>No energy consumption metrics collection</li>
+<li>No carbon-aware workload placement</li>
+<li><strong>3GPP Rel-18:</strong> Network energy saving (NES) features</li>
+<li><strong>6G Extension:</strong> Zero-energy devices support, energy harvesting integration, sustainable networking targets</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM – ITU-R IMT-2030 includes sustainability as a key design principle.</p>
+<h3 id="310-non-terrestrial-networks-ntn-support"><a class="header" href="#310-non-terrestrial-networks-ntn-support">3.10 Non-Terrestrial Networks (NTN) Support</a></h3>
+<p><strong>Current State:</strong> Research prototypes only. <code>nextgcore-proto</code> carries NTN constellation-planning types (<code>ntn_constellation.rs</code>: <code>SatelliteId</code>, orbit parameters, timing advance) and bespoke NAS IEs (NTN timing advance / access barring) exist, but <strong>none of this is wired into live NF procedures or the wire</strong> — no NF consumes the types and there is no NTN signaling path. UAV is separate and IS implemented: UAV Service-level-AA (TS 23.256, IEI 0x72) with geofencing lives in the AMF.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No NTN-specific timing/delay compensation in AMF/SMF (prototype types exist but are unused)</li>
+<li>No discontinuous coverage handling</li>
+<li>No satellite ephemeris data management</li>
+<li>No NTN-specific mobility management</li>
+<li>No store-and-forward mechanism for intermittent connectivity</li>
+<li>No NTN-specific QoS profiles</li>
+<li><strong>3GPP Rel-17/18:</strong> NTN phases 1 &amp; 2 for NR-NTN and IoT-NTN</li>
+<li><strong>6G Extension:</strong> Ubiquitous 3D coverage (terrestrial + NTN + aerial), seamless handover across domains</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM – Critical for 6G’s ubiquitous coverage vision.</p>
+<h3 id="311-time-sensitive-networking-tsn-integration"><a class="header" href="#311-time-sensitive-networking-tsn-integration">3.11 Time-Sensitive Networking (TSN) Integration</a></h3>
+<p><strong>Current State:</strong> No TSN support. No deterministic networking capabilities.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No TSN translator functions (DS-TT, NW-TT)</li>
+<li>No IEEE 802.1Q integration</li>
+<li>No deterministic QoS guarantees</li>
+<li>No time synchronization (gPTP/IEEE 1588)</li>
+<li>No TSN bridge configuration</li>
+<li><strong>3GPP Rel-16/17:</strong> 5G TSN integration</li>
+<li><strong>6G Extension:</strong> Native deterministic networking, ultra-reliable low-latency (&lt;100us), factory automation support</li>
+</ul>
+<p><strong>Priority:</strong> MEDIUM – Important for industrial 6G use cases.</p>
+<h3 id="312-integrated-sensing-and-communication-isac"><a class="header" href="#312-integrated-sensing-and-communication-isac">3.12 Integrated Sensing and Communication (ISAC)</a></h3>
+<p><strong>Current State:</strong> No sensing capability. This is a fundamentally new 6G capability.</p>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li>No sensing NF or sensing data management</li>
+<li>No joint radar-communication waveform support</li>
+<li>No sensing data collection and processing pipeline</li>
+<li>No location/environment sensing service exposure</li>
+<li><strong>6G Requirement:</strong> Radio signals used simultaneously for communication and sensing (radar, positioning, imaging)</li>
+<li>Requires new RAN-core interfaces beyond current NGAP</li>
+</ul>
+<p><strong>Priority:</strong> LOW (near-term) / HIGH (6G target) – A defining 6G feature per ITU-R IMT-2030.</p>
+<hr>
+<h2 id="4-cross-cutting-infrastructure-gaps"><a class="header" href="#4-cross-cutting-infrastructure-gaps">4. Cross-Cutting Infrastructure Gaps</a></h2>
+<h3 id="41-observability-stack"><a class="header" href="#41-observability-stack">4.1 Observability Stack</a></h3>
+<ul>
+<li><strong>Metrics:</strong> nextgcore-metrics provides Prometheus Counter/Gauge/Histogram framework. Not wired to any NF except AMF (has metrics field).</li>
+<li><strong>Logging:</strong> Uses <code>env_logger</code> + <code>log</code> crate. No structured logging (JSON). No distributed tracing.</li>
+<li><strong>Tracing:</strong> No OpenTelemetry integration. No span propagation across NF boundaries.</li>
+<li><strong>Gap:</strong> Need structured logging, distributed tracing (OpenTelemetry), and metrics integration across all NFs.</li>
+</ul>
+<h3 id="42-configuration-management"><a class="header" href="#42-configuration-management">4.2 Configuration Management</a></h3>
+<ul>
+<li><strong>Current:</strong> Each NF has its own YAML parsing (AMF and SMF have manual line-by-line parsers). No unified config framework.</li>
+<li><strong>Gap:</strong> Need centralized configuration management, hot-reload, environment variable override, config validation.</li>
+</ul>
+<h3 id="43-deployment-and-orchestration"><a class="header" href="#43-deployment-and-orchestration">4.3 Deployment and Orchestration</a></h3>
+<ul>
+<li><strong>Current:</strong> Standalone binaries with <code>clap</code> CLI parsing. No containerization files. No Helm charts.</li>
+<li><strong>Gap:</strong> Need Dockerfiles, Kubernetes manifests, Helm charts, operator pattern for lifecycle management.</li>
+</ul>
+<h3 id="44-testing-infrastructure"><a class="header" href="#44-testing-infrastructure">4.4 Testing Infrastructure</a></h3>
+<ul>
+<li><strong>Current:</strong> Unit tests exist for most NFs (FSM state transitions, type creation). No integration tests. No end-to-end tests.</li>
+<li><strong>Gap:</strong> Need integration test framework (multi-NF), protocol conformance tests, performance benchmarks, chaos testing.</li>
+</ul>
+<h3 id="45-database-layer"><a class="header" href="#45-database-layer">4.5 Database Layer</a></h3>
+<ul>
+<li><strong>Current:</strong> nextgcore-dbi has MongoDB stubs. HSS and PCRF reference MongoDB for subscriber data.</li>
+<li><strong>Gap:</strong> No working database integration. Need MongoDB driver implementation, schema management, connection pooling.</li>
+</ul>
+<hr>
+<h2 id="5-prioritized-roadmap"><a class="header" href="#5-prioritized-roadmap">5. Prioritized Roadmap</a></h2>
+<h3 id="phase-a-5g-foundation-estimated-effort-17-weeks-per-todotxt"><a class="header" href="#phase-a-5g-foundation-estimated-effort-17-weeks-per-todotxt">Phase A: 5G Foundation (Estimated effort: 17 weeks per todo.txt)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Step</th><th>Work Items</th><th>Dependencies</th><th>Priority</th></tr>
+</thead>
+<tbody>
+<tr><td>A1</td><td>Timer management system + SBI event loop wiring</td><td>None</td><td>CRITICAL</td></tr>
+<tr><td>A2</td><td>Error response framework (ProblemDetails integration)</td><td>A1</td><td>HIGH</td></tr>
+<tr><td>A3</td><td>NRF client integration for all NFs</td><td>A1, A2</td><td>HIGH</td></tr>
+<tr><td>A4</td><td>NGAP/S1AP ASN.1 encoding library</td><td>A1</td><td>HIGH</td></tr>
+<tr><td>A5</td><td>AMF: NGAP handler, NAS processing, UE context</td><td>A1, A3, A4</td><td>HIGH</td></tr>
+<tr><td>A6</td><td>SMF: N4/PFCP session establishment with UPF</td><td>A1, A3</td><td>HIGH</td></tr>
+<tr><td>A7</td><td>AUSF/UDM/UDR: Authentication and subscriber data</td><td>A1, A3</td><td>HIGH</td></tr>
+<tr><td>A8</td><td>PCF: Policy decision engine, PCC rules</td><td>A1, A3</td><td>MEDIUM</td></tr>
+<tr><td>A9</td><td>SCP: Request forwarding, load balancing</td><td>A1, A3</td><td>MEDIUM</td></tr>
+<tr><td>A10</td><td>SEPP: N32 security, message filtering</td><td>A1, A3</td><td>MEDIUM</td></tr>
+<tr><td>A11</td><td>EPC: Diameter integration, HSS/MME handlers</td><td>A1</td><td>LOW</td></tr>
+<tr><td>A12</td><td>UPF: URR, QER, FAR enhancements</td><td>A6</td><td>LOW</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="phase-b-5g-advanced--pre-6g-new-development"><a class="header" href="#phase-b-5g-advanced--pre-6g-new-development">Phase B: 5G-Advanced / Pre-6G (New development)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Step</th><th>Work Items</th><th>Dependencies</th><th>Priority</th></tr>
+</thead>
+<tbody>
+<tr><td>B1</td><td>mTLS + OAuth 2.0 for NF-to-NF security</td><td>A3</td><td>CRITICAL</td></tr>
+<tr><td>B2</td><td>NWDAF NF (data collection, basic analytics)</td><td>A3, A5, A6</td><td>HIGH</td></tr>
+<tr><td>B3</td><td>Enhanced slicing (NSACF, slice SLA monitoring)</td><td>A3, A5, A8</td><td>HIGH</td></tr>
+<tr><td>B4</td><td>Observability (OpenTelemetry, structured logging)</td><td>A1</td><td>HIGH</td></tr>
+<tr><td>B5</td><td>Database layer (MongoDB driver, schema management)</td><td>A7</td><td>HIGH</td></tr>
+<tr><td>B6</td><td>EASDF + edge computing support</td><td>A3, A6</td><td>MEDIUM</td></tr>
+<tr><td>B7</td><td>NTN timing/mobility extensions (prototype types exist in nextgcore-proto, unwired)</td><td>A5</td><td>MEDIUM</td></tr>
+<tr><td>B8</td><td>TSN integration (DS-TT, NW-TT stubs)</td><td>A6</td><td>MEDIUM</td></tr>
+<tr><td>B9</td><td>Containerization (Docker, K8s, Helm)</td><td>All A-phase</td><td>MEDIUM</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="phase-c-6g-core-evolution"><a class="header" href="#phase-c-6g-core-evolution">Phase C: 6G Core Evolution</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Step</th><th>Work Items</th><th>Dependencies</th><th>Priority</th></tr>
+</thead>
+<tbody>
+<tr><td>C1</td><td>SBA 2.0 (gRPC/protobuf, event-driven, HTTP/3)</td><td>B4</td><td>HIGH</td></tr>
+<tr><td>C2</td><td>AI-native NWDAF (ML model serving, federated learning)</td><td>B2</td><td>HIGH</td></tr>
+<tr><td>C3</td><td>Zero-trust architecture (continuous auth, post-quantum crypto)</td><td>B1</td><td>HIGH</td></tr>
+<tr><td>C4</td><td>Digital twin framework</td><td>B2, B4</td><td>MEDIUM</td></tr>
+<tr><td>C5</td><td>Intent-driven management engine</td><td>B2, C4</td><td>MEDIUM</td></tr>
+<tr><td>C6</td><td>Compute-aware networking</td><td>B6</td><td>MEDIUM</td></tr>
+<tr><td>C7</td><td>Green networking (energy-aware scheduling, NF sleep)</td><td>B2, B4</td><td>MEDIUM</td></tr>
+<tr><td>C8</td><td>ISAC support (sensing NF, data pipeline)</td><td>C1</td><td>LOW</td></tr>
+<tr><td>C9</td><td>Dynamic micro-slicing (&lt;ms granularity)</td><td>B3, C2</td><td>LOW</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="6-new-6g-network-functions-required"><a class="header" href="#6-new-6g-network-functions-required">6. New 6G Network Functions Required</a></h2>
+<p>The following NFs do not exist in the codebase and must be created for 6G:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>New NF</th><th>Purpose</th><th>3GPP Reference</th><th>6G Relevance</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>NWDAF</strong></td><td>Network Data Analytics</td><td>TS 23.288</td><td>AI-native core, predictive automation</td></tr>
+<tr><td><strong>EASDF</strong></td><td>Edge Application Server Discovery</td><td>TS 23.548</td><td>Edge computing, MEC integration</td></tr>
+<tr><td><strong>NSACF</strong></td><td>Network Slice Admission Control</td><td>TS 23.502 Rel-17</td><td>Slice SLA assurance</td></tr>
+<tr><td><strong>TSCTSF</strong></td><td>Time-Sensitive Communication and TSN System</td><td>TS 23.501 Rel-17</td><td>Deterministic networking</td></tr>
+<tr><td><strong>DCCF</strong></td><td>Data Collection Coordination Function</td><td>TS 23.288 Rel-17</td><td>Analytics data pipeline</td></tr>
+<tr><td><strong>MFAF</strong></td><td>Messaging Framework Adaptation Function</td><td>TS 23.288 Rel-17</td><td>Analytics messaging</td></tr>
+<tr><td><strong>AF</strong></td><td>Application Function (generic)</td><td>TS 23.501</td><td>Application-network integration</td></tr>
+<tr><td><strong>NEF</strong></td><td>Network Exposure Function</td><td>TS 23.502</td><td>Capability exposure to 3rd parties</td></tr>
+<tr><td><strong>CHF</strong></td><td>Charging Function</td><td>TS 32.240</td><td>Converged charging</td></tr>
+<tr><td><strong>Digital Twin NF</strong></td><td>Network digital twin management</td><td>ITU-R IMT-2030</td><td>Simulation, planning, optimization</td></tr>
+<tr><td><strong>Intent Engine</strong></td><td>Intent-to-configuration translation</td><td>ITU-R IMT-2030</td><td>Autonomous network operations</td></tr>
+<tr><td><strong>Sensing NF</strong></td><td>ISAC data management</td><td>ITU-R IMT-2030</td><td>Integrated sensing and communication</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="7-recommendations"><a class="header" href="#7-recommendations">7. Recommendations</a></h2>
+<h3 id="71-immediate-0-3-months"><a class="header" href="#71-immediate-0-3-months">7.1 Immediate (0-3 months)</a></h3>
+<ol>
+<li><strong>Complete Phase A1-A3</strong> (timer management, SBI event loop, error responses, NRF integration). This unblocks all other work.</li>
+<li><strong>Implement nextgcore-ngap</strong> ASN.1 encoding to enable AMF-gNB communication.</li>
+<li><strong>Wire nextgcore-metrics</strong> to all NFs for basic observability.</li>
+<li><strong>Add mTLS</strong> between NFs as a security baseline.</li>
+</ol>
+<h3 id="72-short-term-3-6-months"><a class="header" href="#72-short-term-3-6-months">7.2 Short-term (3-6 months)</a></h3>
+<ol start="5">
+<li><strong>Complete Phase A5-A8</strong> (AMF, SMF, AUSF/UDM/UDR, PCF handlers) for basic mobile connectivity.</li>
+<li><strong>Implement NWDAF</strong> with data collection from AMF/SMF/UPF as the foundational 6G capability.</li>
+<li><strong>Deploy observability stack</strong> (OpenTelemetry, structured logging, Prometheus dashboards).</li>
+<li><strong>Begin containerization</strong> (Dockerfiles, CI/CD pipeline).</li>
+</ol>
+<h3 id="73-medium-term-6-12-months"><a class="header" href="#73-medium-term-6-12-months">7.3 Medium-term (6-12 months)</a></h3>
+<ol start="9">
+<li><strong>Complete SBA 2.0 planning</strong>: Evaluate gRPC/HTTP3 as SBI transport alongside HTTP/2.</li>
+<li><strong>Implement enhanced slicing</strong> with NSACF and slice SLA monitoring.</li>
+<li><strong>Build edge computing</strong> support with EASDF and latency-aware UPF selection.</li>
+<li><strong>Prototype digital twin</strong> framework using network state exports and metrics.</li>
+</ol>
+<h3 id="74-long-term-12-24-months"><a class="header" href="#74-long-term-12-24-months">7.4 Long-term (12-24 months)</a></h3>
+<ol start="13">
+<li><strong>AI-native NWDAF</strong> with ML model serving, federated learning, autonomous operations.</li>
+<li><strong>Zero-trust evolution</strong> with post-quantum cryptography, continuous authentication.</li>
+<li><strong>Intent-driven management</strong> engine with natural language policy translation.</li>
+<li><strong>ISAC support</strong> pending 3GPP standardization progress.</li>
+</ol>
+<hr>
+<h2 id="8-architecture-strengths-for-6g-evolution"><a class="header" href="#8-architecture-strengths-for-6g-evolution">8. Architecture Strengths for 6G Evolution</a></h2>
+<p>Despite the gaps, the project has several architectural strengths that position it well for 6G:</p>
+<ol>
+<li><strong>Pure Rust:</strong> Memory safety, concurrency safety, and performance characteristics align with 6G requirements for reliability and efficiency.</li>
+<li><strong>Tokio async runtime:</strong> All NFs use async I/O, which enables high-throughput, low-latency processing required for 6G.</li>
+<li><strong>Clean FSM architecture:</strong> Consistent state machine pattern across all NFs enables systematic feature extension.</li>
+<li><strong>Modular library design:</strong> 17 shared libraries with clear separation of concerns enable independent evolution.</li>
+<li><strong>Working data plane (UPF):</strong> TUN device, GTP-U, PFCP session management provide a solid user plane foundation.</li>
+<li><strong>Working SBI stack:</strong> HTTP/2 server/client with hyper/h2 provides a modern SBA foundation.</li>
+<li><strong>Comprehensive NAS library:</strong> Both 5GS and EPS NAS message support with security context.</li>
+<li><strong>Metrics framework:</strong> Prometheus-compatible metrics collection exists and needs wiring, not creation.</li>
+</ol>
+<hr>
+<p><em>Report generated by deep source code analysis of 17 NFs and 17 shared libraries across ~50,000 lines of Rust code.</em></p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="nextgcore-infrastructure-libraries--6g-gap-analysis"><a class="header" href="#nextgcore-infrastructure-libraries--6g-gap-analysis">NextGCore Infrastructure Libraries – 6G Gap Analysis</a></h1>
+<blockquote>
+<p>Generated: 2026-02-07 | Scope: 9 infrastructure libraries under nextgcore/src/libs/</p>
+</blockquote>
+<blockquote>
+<p><strong>Partial staleness (2026-07):</strong> Most entries here remain accurate, with corrections: <code>nextgcore-dbi</code> is now consumed by <code>nextgcore-udrd</code> (in-memory Nudr <code>data_store</code> via the <code>test-helpers</code> feature), so it is no longer unused. Note: SBI TLS/mTLS + OAuth2 and the NGAP/S1AP/PFCP protocol codecs are covered in gap-libs-proto.md, which is now substantially out of date - see its notice. Post-quantum crypto is still absent (<code>nextgcore-crypt</code> remains 0% PQC).</p>
+</blockquote>
+<hr>
+<h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Library</th><th>Purpose</th><th>Modules</th><th>Completeness</th><th>6G Readiness</th></tr>
+</thead>
+<tbody>
+<tr><td>nextgcore-core</td><td>Core runtime (data structures, networking, timers)</td><td>31</td><td><strong>85%</strong></td><td>Medium</td></tr>
+<tr><td>nextgcore-app</td><td>Application framework (config, init)</td><td>4</td><td><strong>80%</strong></td><td>Low</td></tr>
+<tr><td>nextgcore-crypt</td><td>3GPP cryptographic algorithms</td><td>10</td><td><strong>80%</strong></td><td>Low</td></tr>
+<tr><td>nextgcore-dbi</td><td>MongoDB database interface</td><td>5</td><td><strong>70%</strong></td><td>Low</td></tr>
+<tr><td>nextgcore-ffi</td><td>FFI bindings for C comparison testing</td><td>2</td><td><strong>90%</strong></td><td>N/A</td></tr>
+<tr><td>nextgcore-metrics</td><td>Prometheus metrics collection</td><td>5</td><td><strong>75%</strong></td><td>Medium</td></tr>
+<tr><td>nextgcore-tun</td><td>TUN/TAP device management</td><td>4</td><td><strong>80%</strong></td><td>Low</td></tr>
+<tr><td>nextgcore-ipfw</td><td>IP firewall rule parsing</td><td>3</td><td><strong>85%</strong></td><td>Low</td></tr>
+<tr><td>nextgcore-proto</td><td>Common protocol definitions (PlmnId, AmfId, etc.)</td><td>4</td><td><strong>90%</strong></td><td>Low</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-nextgcore-core--core-runtime"><a class="header" href="#1-nextgcore-core--core-runtime">1. nextgcore-core – Core Runtime</a></h2>
+<p><strong>Port of</strong>: lib/core/ from C implementation</p>
+<h3 id="modules-31"><a class="header" href="#modules-31">Modules (31)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Category</th><th>Modules</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td>Data Structures</td><td><code>list</code> (doubly-linked), <code>hash</code> (hash table), <code>pool</code> (object pool), <code>rbtree</code> (red-black tree), <code>queue</code> (thread-safe)</td><td>Complete</td></tr>
+<tr><td>Networking</td><td><code>sockaddr</code>, <code>socket</code>, <code>sockopt</code>, <code>poll</code> (epoll), <code>tcp</code>, <code>udp</code></td><td>Complete</td></tr>
+<tr><td>Buffers</td><td><code>pkbuf</code> (packet buffer), <code>tlv</code> (TLV encoding)</td><td>Complete</td></tr>
+<tr><td>State Machine</td><td><code>fsm</code> (finite state machine)</td><td>Complete</td></tr>
+<tr><td>Timers</td><td><code>timer</code> (timer wheel), <code>async_timer</code> (async timer for NF event loops)</td><td>Complete</td></tr>
+<tr><td>Utilities</td><td><code>errno</code>, <code>log</code>, <code>memory</code>, <code>strings</code>, <code>time</code>, <code>conv</code>, <code>rand</code>, <code>uuid</code>, <code>signal</code>, <code>thread</code></td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps"><a class="header" href="#6g-gaps">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No async I/O primitives</td><td><code>poll</code> module uses sync epoll; NFs need full async support</td></tr>
+<tr><td>No distributed timer</td><td>Timer wheel is process-local; 6G needs distributed coordination</td></tr>
+<tr><td>No structured logging</td><td>Basic log module; needs OpenTelemetry-compatible structured logging</td></tr>
+<tr><td>No lock-free data structures</td><td>Hash/list use locks; high-performance 6G data paths need lock-free alternatives</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-85--most-comprehensive-library-direct-c-port-with-all-data-structures"><a class="header" href="#completeness-85--most-comprehensive-library-direct-c-port-with-all-data-structures">Completeness: <strong>85%</strong> – Most comprehensive library; direct C port with all data structures</a></h3>
+<hr>
+<h2 id="2-nextgcore-app--application-framework"><a class="header" href="#2-nextgcore-app--application-framework">2. nextgcore-app – Application Framework</a></h2>
+<h3 id="modules-4"><a class="header" href="#modules-4">Modules (4)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Key Types</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>yaml.rs</code></td><td><code>NextgcoreYamlDocument</code>, <code>NextgcoreYamlIter</code></td><td>Complete</td></tr>
+<tr><td><code>config.rs</code></td><td><code>NextgcoreGlobalConf</code>, <code>NextgcoreLocalConf</code>, <code>NextgcorePlmnId</code>, <code>MaxConf</code>, <code>TimeConf</code></td><td>Complete</td></tr>
+<tr><td><code>context.rs</code></td><td><code>NextgcoreApp</code>, <code>NextgcoreAppContext</code>, <code>LoggerConf</code>, <code>PoolConf</code>, <code>MetricsConf</code></td><td>Complete</td></tr>
+<tr><td><code>init.rs</code></td><td><code>NextgcoreAppInitializer</code>, command line options, initialize/terminate</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps-1"><a class="header" href="#6g-gaps-1">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No dynamic reconfiguration</td><td>Config is read once at startup; 6G needs runtime reconfiguration</td></tr>
+<tr><td>No intent-based config</td><td>Imperative YAML only; no declarative intent translation</td></tr>
+<tr><td>No config versioning</td><td>No support for config rollback or A/B deployment</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-80"><a class="header" href="#completeness-80">Completeness: <strong>80%</strong></a></h3>
+<hr>
+<h2 id="3-nextgcore-crypt--cryptographic-library"><a class="header" href="#3-nextgcore-crypt--cryptographic-library">3. nextgcore-crypt – Cryptographic Library</a></h2>
+<h3 id="modules-10"><a class="header" href="#modules-10">Modules (10)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Algorithm</th><th>Spec</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>milenage.rs</code></td><td>Milenage (f1-f5, f1*/f5*)</td><td>TS 35.206</td><td>Complete</td></tr>
+<tr><td><code>kasumi.rs</code></td><td>KASUMI block cipher</td><td>TS 35.202</td><td>Complete</td></tr>
+<tr><td><code>snow3g.rs</code></td><td>SNOW 3G stream cipher</td><td>TS 35.216</td><td>Complete</td></tr>
+<tr><td><code>zuc.rs</code></td><td>ZUC stream cipher</td><td>TS 35.221</td><td>Complete</td></tr>
+<tr><td><code>aes.rs</code></td><td>AES-128 operations</td><td>FIPS 197</td><td>Complete</td></tr>
+<tr><td><code>aes_cmac.rs</code></td><td>AES-CMAC</td><td>RFC 4493</td><td>Complete</td></tr>
+<tr><td><code>sha.rs</code></td><td>SHA-1, SHA-256, SHA-384, SHA-512</td><td>FIPS 180</td><td>Complete</td></tr>
+<tr><td><code>kdf.rs</code></td><td>Key derivation functions</td><td>TS 33.501</td><td>Complete</td></tr>
+<tr><td><code>ecc.rs</code></td><td>Elliptic curve (ECIES Profile A)</td><td>TS 33.501</td><td>Complete</td></tr>
+<tr><td><code>base64.rs</code></td><td>Base64 encoding/decoding</td><td>RFC 4648</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps-2"><a class="header" href="#6g-gaps-2">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Severity</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>No post-quantum cryptography</strong> (ML-KEM, ML-DSA)</td><td>Critical</td></tr>
+<tr><td>No ZUC-256 (256-bit variant)</td><td>High</td></tr>
+<tr><td>No SNOW5G (next-gen stream cipher)</td><td>Medium</td></tr>
+<tr><td>No ECIES Profile B (secp256r1)</td><td>Medium</td></tr>
+<tr><td>No hybrid key exchange (classical + PQC)</td><td>Medium</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-80-for-5g--0-for-post-quantum"><a class="header" href="#completeness-80-for-5g--0-for-post-quantum">Completeness: <strong>80%</strong> for 5G | <strong>0%</strong> for post-quantum</a></h3>
+<hr>
+<h2 id="4-nextgcore-dbi--database-interface"><a class="header" href="#4-nextgcore-dbi--database-interface">4. nextgcore-dbi – Database Interface</a></h2>
+<h3 id="modules-5"><a class="header" href="#modules-5">Modules (5)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Key Functions</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>types.rs</code></td><td>Subscriber data types, auth info</td><td>Complete</td></tr>
+<tr><td><code>mongoc.rs</code></td><td><code>NextgcoreMongoc</code>, <code>NextgcoreDbi</code> MongoDB client</td><td>Partial (connection mgmt)</td></tr>
+<tr><td><code>subscription.rs</code></td><td>Auth info, SQN update, subscription data</td><td>Partial</td></tr>
+<tr><td><code>session.rs</code></td><td>PDU session data queries</td><td>Partial</td></tr>
+<tr><td><code>ims.rs</code></td><td>MSISDN, IMS data queries</td><td>Partial</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps-3"><a class="header" href="#6g-gaps-3">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No graph database support</td><td>6G knowledge graphs need Neo4j/similar</td></tr>
+<tr><td>No time-series database</td><td>Analytics and metrics storage</td></tr>
+<tr><td>No distributed database</td><td>Single MongoDB instance only</td></tr>
+<tr><td>No data federation</td><td>Cross-operator data sharing</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-70"><a class="header" href="#completeness-70">Completeness: <strong>70%</strong></a></h3>
+<hr>
+<h2 id="5-nextgcore-ffi--ffi-bindings"><a class="header" href="#5-nextgcore-ffi--ffi-bindings">5. nextgcore-ffi – FFI Bindings</a></h2>
+<p>Testing utility for C comparison. Provides stub bindings by default, optional generated bindings.</p>
+<h3 id="completeness-90--na-for-6g"><a class="header" href="#completeness-90--na-for-6g">Completeness: <strong>90%</strong> | N/A for 6G</a></h3>
+<hr>
+<h2 id="6-nextgcore-metrics--prometheus-metrics"><a class="header" href="#6-nextgcore-metrics--prometheus-metrics">6. nextgcore-metrics – Prometheus Metrics</a></h2>
+<h3 id="modules-5-1"><a class="header" href="#modules-5-1">Modules (5)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Key Types</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>context.rs</code></td><td>Metrics context, global registry</td><td>Complete</td></tr>
+<tr><td><code>server.rs</code></td><td>HTTP server for <code>/metrics</code> endpoint</td><td>Complete</td></tr>
+<tr><td><code>spec.rs</code></td><td>Metric specification (Counter, Gauge, Histogram)</td><td>Complete</td></tr>
+<tr><td><code>instance.rs</code></td><td>Metric instances with labels</td><td>Complete</td></tr>
+<tr><td><code>types.rs</code></td><td>MetricType enum, label types</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps-4"><a class="header" href="#6g-gaps-4">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No OpenTelemetry support</td><td>Only Prometheus; 6G needs OTel for traces + logs + metrics</td></tr>
+<tr><td>No AI-native observability</td><td>No anomaly detection or predictive alerting</td></tr>
+<tr><td>No distributed tracing</td><td>No span/trace context propagation</td></tr>
+<tr><td>No SLA metric enforcement</td><td>No automated SLA violation detection</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-75--functional-prometheus-metrics-needs-otel-for-6g"><a class="header" href="#completeness-75--functional-prometheus-metrics-needs-otel-for-6g">Completeness: <strong>75%</strong> – Functional Prometheus metrics; needs OTel for 6G</a></h3>
+<hr>
+<h2 id="7-nextgcore-tun--tun-device-management"><a class="header" href="#7-nextgcore-tun--tun-device-management">7. nextgcore-tun – TUN Device Management</a></h2>
+<h3 id="modules-4-1"><a class="header" href="#modules-4-1">Modules (4)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>types.rs</code></td><td>TUN device types</td></tr>
+<tr><td><code>io.rs</code></td><td>Read/write operations</td></tr>
+<tr><td><code>linux.rs</code></td><td>Linux TUN/TAP via ioctl</td></tr>
+<tr><td><code>macos.rs</code></td><td>macOS utun support</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-80-1"><a class="header" href="#completeness-80-1">Completeness: <strong>80%</strong></a></h3>
+<hr>
+<h2 id="8-nextgcore-ipfw--ip-firewall-rules"><a class="header" href="#8-nextgcore-ipfw--ip-firewall-rules">8. nextgcore-ipfw – IP Firewall Rules</a></h2>
+<h3 id="modules-3"><a class="header" href="#modules-3">Modules (3)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Key Functions</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>types.rs</code></td><td><code>IpfwRule</code> struct</td><td>Complete</td></tr>
+<tr><td><code>rule.rs</code></td><td><code>compile_rule()</code> parser</td><td>Complete</td></tr>
+<tr><td><code>packet_filter.rs</code></td><td>SDF filter matching</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-85--functional-for-3gpp-flow-descriptions"><a class="header" href="#completeness-85--functional-for-3gpp-flow-descriptions">Completeness: <strong>85%</strong> – Functional for 3GPP flow descriptions</a></h3>
+<hr>
+<h2 id="9-nextgcore-proto--protocol-definitions"><a class="header" href="#9-nextgcore-proto--protocol-definitions">9. nextgcore-proto – Protocol Definitions</a></h2>
+<h3 id="modules-4-2"><a class="header" href="#modules-4-2">Modules (4)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Key Types</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>types.rs</code></td><td><code>PlmnId</code>, <code>AmfId</code>, <code>Guami</code>, <code>SNssai</code>, <code>Tai</code>, <code>Supi</code>, <code>Gpsi</code>, <code>Dnn</code></td><td>Complete</td></tr>
+<tr><td><code>conv.rs</code></td><td>BCD encoding, hex conversion, IP address conversion</td><td>Complete</td></tr>
+<tr><td><code>event.rs</code></td><td>Event types for NF communication</td><td>Complete</td></tr>
+<tr><td><code>timer.rs</code></td><td>Timer ID types and constants</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="6g-gaps-5"><a class="header" href="#6g-gaps-5">6G Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No 6G-specific types</td><td>Missing: ISAC config, semantic comm parameters, SHE compute descriptors</td></tr>
+<tr><td>NTN types unwired</td><td>Satellite orbit parameters and timing-advance types now exist in <code>nextgcore-proto</code> (<code>ntn_constellation.rs</code>) but are not consumed by any NF</td></tr>
+<tr><td>No AI/ML types</td><td>No model metadata, inference request/response types</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-90-for-5g"><a class="header" href="#completeness-90-for-5g">Completeness: <strong>90%</strong> for 5G</a></h3>
+<hr>
+<h2 id="cross-library-6g-readiness-summary"><a class="header" href="#cross-library-6g-readiness-summary">Cross-Library 6G Readiness Summary</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Capability</th><th>Current Support</th><th>Gap Severity</th></tr>
+</thead>
+<tbody>
+<tr><td>Post-quantum crypto</td><td>None</td><td>Critical</td></tr>
+<tr><td>OpenTelemetry observability</td><td>None (Prometheus only)</td><td>High</td></tr>
+<tr><td>Dynamic reconfiguration</td><td>None</td><td>High</td></tr>
+<tr><td>Async I/O throughout</td><td>Partial (nextgcore-core has sync poll)</td><td>High</td></tr>
+<tr><td>Structured logging</td><td>None</td><td>Medium</td></tr>
+<tr><td>Distributed coordination</td><td>None</td><td>Medium</td></tr>
+<tr><td>Graph/time-series DB</td><td>None (MongoDB only)</td><td>Medium</td></tr>
+<tr><td>6G protocol types</td><td>None</td><td>Medium</td></tr>
+<tr><td>Lock-free data structures</td><td>None</td><td>Low</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="priority-recommendations"><a class="header" href="#priority-recommendations">Priority Recommendations</a></h3>
+<ol>
+<li><strong>Add post-quantum crypto</strong> to nextgcore-crypt (ML-KEM, ML-DSA)</li>
+<li><strong>Add OpenTelemetry</strong> alongside Prometheus in nextgcore-metrics</li>
+<li><strong>Migrate to full async I/O</strong> in nextgcore-core networking modules</li>
+<li><strong>Add dynamic config reload</strong> to nextgcore-app</li>
+<li><strong>Add 6G types</strong> to nextgcore-proto (ISAC, NTN, AI/ML, semantic comm)</li>
+<li><strong>Add ZUC-256</strong> to nextgcore-crypt for 256-bit security</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="contributing-to-nextgcore"><a class="header" href="#contributing-to-nextgcore">Contributing to NextGCore</a></h1>
+<p>NextGCore is a research-faithful 5G Core Network implementation in Rust targeting 3GPP Rel-15 with selected Rel-17/18 features. 6G/Rel-20 items (ISAC, FL, PQC, semantic, agent-native) are non-normative prototypes — no frozen Rel-20 3GPP specs exist.</p>
+<h2 id="prerequisites-1"><a class="header" href="#prerequisites-1">Prerequisites</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td>Rust</td><td>stable (≥1.75)</td><td>Build toolchain</td></tr>
+<tr><td>protobuf-compiler</td><td>≥3.21</td><td>Protobuf codegen</td></tr>
+<tr><td>clang / libclang-dev</td><td>any</td><td>LLVM bindings</td></tr>
+<tr><td>libssl-dev</td><td>any</td><td>TLS support</td></tr>
+<tr><td>cmake</td><td>≥3.16</td><td>FFI build scripts</td></tr>
+<tr><td>Docker + docker-compose</td><td>≥24</td><td>E2E testing</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-bash"># Ubuntu/Debian
+sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler clang
+
+# macOS (Homebrew)
+brew install protobuf cmake openssl
+</code></pre>
+<h2 id="building"><a class="header" href="#building">Building</a></h2>
+<p>The workspace root is <code>nextgcore/src/</code> (not <code>nextgcore/</code>):</p>
+<pre><code class="language-bash">cd nextgcore/src
+cargo build --workspace            # debug
+cargo build --workspace --release  # release
+</code></pre>
+<p>To build a single NF binary:</p>
+<pre><code class="language-bash">cargo build -p nextgcore-amfd
+</code></pre>
+<h2 id="testing"><a class="header" href="#testing">Testing</a></h2>
+<pre><code class="language-bash">cd nextgcore/src
+cargo test --workspace                          # all tests
+cargo test -p nextgcore-amfd                    # single NF
+cargo test --workspace -- --nocapture           # with log output
+</code></pre>
+<p>Integration / E2E tests require Docker:</p>
+<pre><code class="language-bash">cd nextgcore/docker/rust
+docker compose up -d
+bash e2e-test.sh
+</code></pre>
+<p>Multi-UE stress test:</p>
+<pre><code class="language-bash">bash test-multi-ue.sh               # 5 UEs (default)
+bash test-multi-ue.sh --ue-count 10 # 10 UEs
+</code></pre>
+<h2 id="code-style"><a class="header" href="#code-style">Code Style</a></h2>
+<p>All code must pass <code>cargo fmt</code> and <code>cargo clippy</code>:</p>
+<pre><code class="language-bash">cd nextgcore/src
+cargo fmt --all
+cargo clippy --workspace -- -D warnings
+</code></pre>
+<p>Pre-commit checklist:</p>
+<ul>
+<li><input disabled="" type="checkbox"> <code>cargo fmt --all</code> — no formatting changes</li>
+<li><input disabled="" type="checkbox"> <code>cargo clippy --workspace -- -D warnings</code> — zero warnings</li>
+<li><input disabled="" type="checkbox"> <code>cargo test --workspace</code> — all tests pass</li>
+<li><input disabled="" type="checkbox"> <code>cargo audit</code> — no unpatched advisories</li>
+</ul>
+<h2 id="security-auditing"><a class="header" href="#security-auditing">Security Auditing</a></h2>
+<pre><code class="language-bash">cargo install cargo-audit
+cd nextgcore/src
+cargo audit
+</code></pre>
+<h2 id="project-layout"><a class="header" href="#project-layout">Project Layout</a></h2>
+<pre><code>nextgcore/
+├── src/                     # Workspace root
+│   ├── bins/                # 24 NF binaries + webui
+│   │   ├── nextgcore-amfd/  # AMF
+│   │   ├── nextgcore-smfd/  # SMF
+│   │   ├── nextgcore-upfd/  # UPF
+│   │   └── ...              # (all 24 NFs)
+│   ├── libs/                # Shared libraries
+│   │   ├── nextgcore-core/        # Core types
+│   │   ├── nextgcore-sbi/         # HTTP/2 SBI client + server
+│   │   ├── nextgcore-crypt/       # 5G cryptography (SUCI, AKA, PQC)
+│   │   ├── nextgcore-metrics/     # Prometheus + OpenTelemetry
+│   │   └── ...
+│   └── tests/               # Integration tests
+├── k8s/                     # Kubernetes manifests + Helm
+├── docker/rust/             # Docker Compose E2E stack
+└── docs/                    # OpenAPI specs, architecture docs
+</code></pre>
+<h2 id="3gpp-specification-references"><a class="header" href="#3gpp-specification-references">3GPP Specification References</a></h2>
+<p>Each file includes a doc comment referencing the 3GPP TS number and section (e.g. <code>//! TS 23.501 §5.15</code>). When adding new protocol logic, always cite the relevant spec:</p>
+<ul>
+<li><strong>TS 23.501</strong> — 5G system architecture</li>
+<li><strong>TS 23.502</strong> — 5G procedures</li>
+<li><strong>TS 29.xxx</strong> — SBI service definitions</li>
+<li><strong>TS 38.331</strong> — NR RRC</li>
+<li><strong>TS 38.413</strong> — NGAP</li>
+</ul>
+<h2 id="commit-messages"><a class="header" href="#commit-messages">Commit Messages</a></h2>
+<p>Follow conventional commits:</p>
+<pre><code>feat(smf): add MBS multicast session context (TS 23.247)
+fix(amf): release SMF session on UE context release
+test(upf): add SDF filter 5-tuple matching unit tests
+</code></pre>
+<ul>
+<li><strong>Never</strong> include <code>Co-Authored-By: Claude</code> or any AI attribution</li>
+<li>Sign commits: <code>Signed-off-by: Your Name &lt;email&gt;</code></li>
+</ul>
+<h2 id="pull-request-process"><a class="header" href="#pull-request-process">Pull Request Process</a></h2>
+<ol>
+<li>Fork the repository</li>
+<li>Create a feature branch from <code>main</code></li>
+<li>Implement your change with tests</li>
+<li>Ensure all CI checks pass</li>
+<li>Open a PR with a description referencing the 3GPP TS item</li>
+</ol>
+<h2 id="nf-implementation-standards"><a class="header" href="#nf-implementation-standards">NF Implementation Standards</a></h2>
+<p>Each NF binary must:</p>
+<ul>
+<li>Register with NRF on startup (via <code>nextgcore-sbi</code> NF management)</li>
+<li>Expose <code>/metrics</code> (Prometheus, port 9090)</li>
+<li>Respond to SIGTERM with graceful shutdown</li>
+<li>Log at <code>info</code> level by default, configurable via <code>RUST_LOG</code></li>
+<li>Have ≥ 1 unit test per public function</li>
+</ul>
+<h2 id="license"><a class="header" href="#license">License</a></h2>
+<p>AGPL-3.0. See <a href="LICENSE">LICENSE</a>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>
