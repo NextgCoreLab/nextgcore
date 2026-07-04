@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Contributing - NextGCore Documentation</title>
+        <title>AUSF - NextGCore Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -12,33 +12,33 @@
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
-        <link rel="icon" href="favicon-de23e50b.svg">
-        <link rel="shortcut icon" href="favicon-8114d1fc.png">
-        <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
-        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
-        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
 
         <!-- Highlight.js Stylesheets -->
-        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
-        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
-        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
-            const path_to_root = "";
+            const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-51e55ca4.js";
+            window.path_to_searchindex_js = "../searchindex-51e55ca4.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-06d290c2.js"></script>
+        <script src="../toc-06d290c2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -105,7 +105,7 @@
             <!-- populated by js -->
             <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
             <noscript>
-                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
             </noscript>
             <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -140,7 +140,7 @@
                     <h1 class="menu-title">NextGCore Documentation</h1>
 
                     <div class="right-buttons">
-                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
                             <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
                         </a>
                         <a href="https://github.com/NextgCoreLab/nextgcore" title="Git repository" aria-label="Git repository">
@@ -177,138 +177,115 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="contributing-to-nextgcore"><a class="header" href="#contributing-to-nextgcore">Contributing to NextGCore</a></h1>
-<p>NextGCore is a research-faithful 5G Core Network implementation in Rust targeting 3GPP Rel-15 with selected Rel-17/18 features. 6G/Rel-20 items (ISAC, FL, PQC, semantic, agent-native) are non-normative prototypes — no frozen Rel-20 3GPP specs exist.</p>
-<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+                        <h1 id="ausf-configuration"><a class="header" href="#ausf-configuration">AUSF Configuration</a></h1>
+<p>The AUSF (Authentication Server Function, <code>nextgcore-ausfd</code>) runs primary UE authentication — both 5G-AKA and EAP-AKA’ (RFC 5448/9048) — deriving KAUSF/KSEAF and confirming results to the UDM, per TS 33.501 and TS 29.509 (as cited in the daemon’s source comments). Its SBI router (<code>ausf_sbi_request_handler</code> in <code>src/bins/nextgcore-ausfd/src/app.rs</code>) serves the <code>Nausf_UEAuthentication</code> API (<code>POST /nausf-auth/v1/ue-authentications</code>, <code>PUT .../{authCtxId}/5g-aka-confirmation</code>, <code>POST .../{authCtxId}/eap-session</code>, <code>DELETE .../{authCtxId}</code>) plus the Wave-6 F-03 producer services <code>Nausf_SoRProtection</code> (<code>POST /nausf-sorprotection/v1/{supi}/ue-sor</code>) and <code>Nausf_UPUProtection</code> (<code>POST /nausf-upuprotection/v1/{supi}/ue-upu</code>), both TS 29.509 per code comments (the vendored <code>specs/TS29509_Nausf_SoRProtection.yaml</code> / <code>TS29509_Nausf_UPUProtection.yaml</code> are referenced from <code>sor_protection.rs</code> / <code>upu_protection.rs</code>).</p>
+<p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/ausf.yaml</code>, overridable with <code>-c/--config</code>) and command-line flags, with a precedence quirk worth knowing: when the YAML lists an SBI server entry, its address/port <strong>override</strong> the <code>--sbi-addr</code>/<code>--sbi-port</code> CLI flags (the code comment explains this is so the NRF NFProfile advertises a routable endpoint instead of <code>0.0.0.0</code>). The YAML carries only the SBI endpoint, the NRF URI, and the OAuth2 knob; everything else (log level, UE capacity, TLS flags) is CLI-only. A few environment variables are also read — see the behavior notes. Since the Wave-6 H1 lib split, <code>main.rs</code> is a thin wrapper around <code>nextgcore_ausfd::run()</code>; all logic including the clap <code>Args</code> struct lives in <code>src/bins/nextgcore-ausfd/src/app.rs</code>.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> AUSF behavior is validated by this project’s own unit tests, in-crate strict-peer integration tests (the lib-target exists precisely so peer NF crates can drive the real <code>ausf_sbi_request_handler</code> in-process), and the matched-simulator docker E2E suite (84/84 as of 2026-07-02) — not by third-party conformance certification. Known bespoke/non-normative points, all documented in code comments: the consumer-PLMN entitlement check (<code>extract_consumer_plmns</code>) decodes the OAuth2 JWT payload <strong>without signature verification</strong> and is default-permissive for token-less peers; the <code>--tls*</code> CLI flags and the YAML <code>tls:</code> block are not wired to the live HTTP/2 server (see below), so all shipped deployments serve plain HTTP; and the registered NFProfile is a simplified subset of TS 29.510.</p>
+</blockquote>
+<h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
+<p>From <code>nextgcore/docker/rust/configs/5gc/ausf.yaml</code>:</p>
+<pre><code class="language-yaml"># AUSF (Authentication Server Function) Configuration
+# Docker container configuration for 5G Core deployment
+
+logger:
+  file:
+    path: /var/log/nextgcore/ausf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+ausf:
+  sbi:
+    server:
+      - address: 172.23.0.11
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
+    # TLS configuration (G36: SBI TLS)
+    # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
+    tls:
+      enabled: false
+      cert: /etc/nextgcore/certs/ausf.crt
+      key: /etc/nextgcore/certs/ausf.key
+      ca: /etc/nextgcore/certs/ca.crt
+      min_version: "1.2"
+  security:
+    pqc:
+      enabled: false
+      prefer_pqc: false
+</code></pre>
+<p>There is no <code>ausf-oauth2.yaml</code> variant (despite a code comment mentioning one): the OAuth2 compose overlay (<code>docker-compose.oauth2.yml</code>) enables enforcement for the AUSF via the <code>NEXTGCORE_SBI_OAUTH2_REQUIRE=1</code> environment variable instead.</p>
+<h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
+<p>These are the fields actually deserialized by the daemon (<code>#[derive(Deserialize)]</code> structs <code>AusfYaml</code>/<code>AusfSection</code>/<code>SbiYaml</code>/<code>SbiServerYaml</code>/<code>SbiClientYaml</code>/<code>NrfClientYaml</code> in <code>src/bins/nextgcore-ausfd/src/app.rs</code>), plus one knob read via a raw <code>serde_yaml::Value</code> scan. If the file is missing, or fails to parse as <code>AusfYaml</code>, the daemon silently proceeds on CLI defaults (<code>if let Ok(...)</code> — a malformed file is not an error).</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td>Rust</td><td>stable (≥1.75)</td><td>Build toolchain</td></tr>
-<tr><td>protobuf-compiler</td><td>≥3.21</td><td>Protobuf codegen</td></tr>
-<tr><td>clang / libclang-dev</td><td>any</td><td>LLVM bindings</td></tr>
-<tr><td>libssl-dev</td><td>any</td><td>TLS support</td></tr>
-<tr><td>cmake</td><td>≥3.16</td><td>FFI build scripts</td></tr>
-<tr><td>Docker + docker-compose</td><td>≥24</td><td>E2E testing</td></tr>
+<tr><td><code>ausf.sbi.server[].address</code></td><td>string</td><td>absent → CLI <code>--sbi-addr</code> (<code>0.0.0.0</code>)</td><td>SBI bind <strong>and</strong> NRF-advertised address. Only the <strong>first</strong> list entry is read; when present it overrides the CLI flag.</td></tr>
+<tr><td><code>ausf.sbi.server[].port</code></td><td>u16</td><td>absent → CLI <code>--sbi-port</code> (<code>7777</code>)</td><td>SBI bind/advertised port. First entry only; overrides the CLI flag.</td></tr>
+<tr><td><code>ausf.sbi.client.nrf[].uri</code></td><td>string</td><td>absent → <strong>no NRF</strong></td><td>NRF base URI seeded into the SBI context for NF registration, heartbeat, discovery, and (when OAuth2 is on) token/JWKS. First entry only. If absent, NRF registration and discovery are skipped entirely — the AUSF “will operate without NRF”.</td></tr>
+<tr><td><code>ausf.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>SBI OAuth2 enforcement (Wave-6 H8; TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comment). Not part of the typed structs: <code>oauth2_required()</code> re-reads the file as a raw YAML value, root-key agnostic (true iff <strong>any</strong> top-level section sets <code>sbi.oauth2.require: true</code>). When on, incoming requests need an NRF-issued Bearer token with audience <code>AUSF</code> and outbound Nudm calls attach tokens. The <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> env var, <strong>when set to any value</strong>, wins in both directions.</td></tr>
 </tbody>
 </table>
 </div>
-<pre><code class="language-bash"># Ubuntu/Debian
-sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler clang
-
-# macOS (Homebrew)
-brew install protobuf cmake openssl
-</code></pre>
-<h2 id="building"><a class="header" href="#building">Building</a></h2>
-<p>The workspace root is <code>nextgcore/src/</code> (not <code>nextgcore/</code>):</p>
-<pre><code class="language-bash">cd nextgcore/src
-cargo build --workspace            # debug
-cargo build --workspace --release  # release
-</code></pre>
-<p>To build a single NF binary:</p>
-<pre><code class="language-bash">cargo build -p nextgcore-amfd
-</code></pre>
-<h2 id="testing"><a class="header" href="#testing">Testing</a></h2>
-<pre><code class="language-bash">cd nextgcore/src
-cargo test --workspace                          # all tests
-cargo test -p nextgcore-amfd                    # single NF
-cargo test --workspace -- --nocapture           # with log output
-</code></pre>
-<p>Integration / E2E tests require Docker:</p>
-<pre><code class="language-bash">cd nextgcore/docker/rust
-docker compose up -d
-bash e2e-test.sh
-</code></pre>
-<p>Multi-UE stress test:</p>
-<pre><code class="language-bash">bash test-multi-ue.sh               # 5 UEs (default)
-bash test-multi-ue.sh --ue-count 10 # 10 UEs
-</code></pre>
-<h2 id="code-style"><a class="header" href="#code-style">Code Style</a></h2>
-<p>All code must pass <code>cargo fmt</code> and <code>cargo clippy</code>:</p>
-<pre><code class="language-bash">cd nextgcore/src
-cargo fmt --all
-cargo clippy --workspace -- -D warnings
-</code></pre>
-<p>Pre-commit checklist:</p>
+<h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
+<p>Unknown YAML keys are silently ignored by serde. In the shipped <code>ausf.yaml</code>, the following blocks are decorative:</p>
 <ul>
-<li><input disabled="" type="checkbox"> <code>cargo fmt --all</code> — no formatting changes</li>
-<li><input disabled="" type="checkbox"> <code>cargo clippy --workspace -- -D warnings</code> — zero warnings</li>
-<li><input disabled="" type="checkbox"> <code>cargo test --workspace</code> — all tests pass</li>
-<li><input disabled="" type="checkbox"> <code>cargo audit</code> — no unpatched advisories</li>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes solely from the CLI flag <code>-e/--log-level</code>; <code>init_logging</code> builds an <code>env_logger::Builder::new()</code> with <code>filter_level</code>, so even <code>RUST_LOG</code> (which the docker compose sets) is not consulted by this daemon. Nothing writes to the YAML’s log-file path.</li>
+<li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> The auth-context pool capacity comes from the CLI flag <code>--max-ue</code> (default <code>1024</code> — the example’s matching <code>1024</code> is coincidence, not causation). <code>max.peer</code> is read by nothing in this binary.</li>
+<li><strong><code>ausf.sbi.tls.*</code> (enabled/cert/key/ca/min_version) is inert.</strong> More honestly: even the CLI <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> flags only populate the legacy <code>SbiServerConfig</code> consumed by the <code>ausf_sbi_open()</code> logging shim (<code>sbi_path.rs</code>, marked inert by the “ausfd-10” note). The live HTTP/2 server is built from <code>nextgcore_sbi::server::SbiServerConfig::new(addr)</code> with no TLS fields set, so the served endpoint is plain HTTP regardless.</li>
+<li><strong><code>ausf.security.pqc.*</code> is inert.</strong> No PQC code path exists in this binary.</li>
 </ul>
-<h2 id="security-auditing"><a class="header" href="#security-auditing">Security Auditing</a></h2>
-<pre><code class="language-bash">cargo install cargo-audit
-cd nextgcore/src
-cargo audit
-</code></pre>
-<h2 id="project-layout"><a class="header" href="#project-layout">Project Layout</a></h2>
-<pre><code>nextgcore/
-├── src/                     # Workspace root
-│   ├── bins/                # 24 NF binaries + webui
-│   │   ├── nextgcore-amfd/  # AMF
-│   │   ├── nextgcore-smfd/  # SMF
-│   │   ├── nextgcore-upfd/  # UPF
-│   │   └── ...              # (all 24 NFs)
-│   ├── libs/                # Shared libraries
-│   │   ├── nextgcore-core/        # Core types
-│   │   ├── nextgcore-sbi/         # HTTP/2 SBI client + server
-│   │   ├── nextgcore-crypt/       # 5G cryptography (SUCI, AKA, PQC)
-│   │   ├── nextgcore-metrics/     # Prometheus + OpenTelemetry
-│   │   └── ...
-│   └── tests/               # Integration tests
-├── k8s/                     # Kubernetes manifests + Helm
-├── docker/rust/             # Docker Compose E2E stack
-└── docs/                    # OpenAPI specs, architecture docs
-</code></pre>
-<h2 id="3gpp-specification-references"><a class="header" href="#3gpp-specification-references">3GPP Specification References</a></h2>
-<p>Each file includes a doc comment referencing the 3GPP TS number and section (e.g. <code>//! TS 23.501 §5.15</code>). When adding new protocol logic, always cite the relevant spec:</p>
+<h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
+<p>From the clap <code>Args</code> struct in <code>src/bins/nextgcore-ausfd/src/app.rs</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/ausf.yaml</code></td><td>Configuration file path (docker passes exactly <code>-c /etc/nextgcore/ausf.yaml</code>).</td></tr>
+<tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Accepted but <strong>not wired</strong> — <code>init_logging</code> never reads it; logs go to stdout/stderr.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
+<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Stub: logs “would send SIGTERM to running instance” and exits 0 without signaling anything.</td></tr>
+<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI bind address — <strong>overridden</strong> by <code>ausf.sbi.server[0].address</code> when the YAML sets it.</td></tr>
+<tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>SBI port — <strong>overridden</strong> by <code>ausf.sbi.server[0].port</code> when the YAML sets it.</td></tr>
+<tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Feeds only the inert legacy <code>ausf_sbi_open</code> config; the live HTTP/2 server ignores it (see above).</td></tr>
+<tr><td><code>--tls-cert</code></td><td>path</td><td>unset</td><td>Same caveat as <code>--tls</code>.</td></tr>
+<tr><td><code>--tls-key</code></td><td>path</td><td>unset</td><td>Same caveat as <code>--tls</code>.</td></tr>
+<tr><td><code>--max-ue</code></td><td>usize</td><td><code>1024</code></td><td>Capacity of the in-memory authentication-context pool.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
-<li><strong>TS 23.501</strong> — 5G system architecture</li>
-<li><strong>TS 23.502</strong> — 5G procedures</li>
-<li><strong>TS 29.xxx</strong> — SBI service definitions</li>
-<li><strong>TS 38.331</strong> — NR RRC</li>
-<li><strong>TS 38.413</strong> — NGAP</li>
+<li><strong>Admission/rejection on <code>Nausf_UEAuthentication</code>:</strong> a malformed or non-5G <code>servingNetworkName</code> → 403 <code>SERVING_NETWORK_NOT_AUTHORIZED</code> (TS 33.501 §6.1.2, TS 29.509 §6.1.7.3 per code comments); a null/absent <code>resStar</code> in the 5G-AKA confirmation → 200 with <code>AUTHENTICATION_FAILURE</code> while present-but-bad hex → 400 (TS 29.509 §6.1.6.2.6/§6.1.6.2.8 per code comments); <code>kseaf</code>/<code>supi</code> appear in responses only on success (and <code>supi</code> only when the original identity was a SUCI). Pool exhaustion at <code>--max-ue</code> yields a <strong>400</strong> “Failed to allocate UE context” (cause <code>INTERNAL_ERROR</code>), not a 5xx. Unmatched routes get 405; the API version path segment is not validated.</li>
+<li><strong>NRF registration is best-effort, no retry loop:</strong> with an NRF URI configured, the AUSF PUTs a NFProfile (<code>/nnrf-nfm/v1/nf-instances/{uuid}</code>) advertising <code>nausf-auth</code>, <code>nausf-sorprotection</code>, and <code>nausf-upuprotection</code> with <code>allowedNfTypes</code> [AMF, UDM, SCP] and <code>heartBeatTimer: 10</code>; on success a heartbeat worker runs every 5 s, PATCHing a real load gauge (auth contexts vs <code>--max-ue</code>, TS 29.510 §5.2.2.3.2 per code comment). On failure it logs a warning and continues without NRF.</li>
+<li><strong>UDM resolution order:</strong> startup discovery via <code>/nnrf-disc</code> (target <code>UDM</code>, service <code>nudm-ueau</code>, failure = “will retry on demand”); per-request, cached discovery results win, else the <code>UDM_SBI_ADDR</code>/<code>UDM_SBI_PORT</code> env fallback (port defaults to <code>7777</code>; the docker compose sets <code>172.23.0.12:7777</code>). An unreachable UDM turns <code>POST /ue-authentications</code> into a 503 <code>UDM_UNAVAILABLE</code>.</li>
+<li><strong>SoR/UPU are fail-closed</strong> (per the module-header invariants in <code>sor_protection.rs</code>/<code>upu_protection.rs</code>): no per-SUPI KAUSF anchor (no completed primary authentication) → 404 <code>CONTEXT_NOT_FOUND</code>, never a MAC over a zero key; counter about to wrap → 503 <code>COUNTER_WRAP</code> with the counter not consumed (TS 33.501 §14.1.3/§6.14.2.3 per code comments); anything not encodable byte-exactly → 400.</li>
+<li><strong>No state files — everything is in-memory.</strong> A restart loses all auth contexts and the SoR/UPU anchors/counters. <code>DELETE .../{authCtxId}</code> zeroizes the context’s KAUSF/KSEAF/XRES* (TS 33.501 §6.1.4.1a per code comment) but deliberately keeps the per-SUPI anchor store so SoR/UPU keep working afterwards (TS 33.501 §6.14.1 per code comment).</li>
+<li><strong>Environment variables</strong> read by this binary: <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> (checked <em>before</em> the YAML; truthy = <code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code> — any other set value forces OAuth2 <strong>off</strong> even if the YAML says <code>true</code>), <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OTLP trace exporter, default <code>http://jaeger:4317</code>), and <code>UDM_SBI_ADDR</code>/<code>UDM_SBI_PORT</code> (UDM fallback only — NRF discovery results take precedence). With OAuth2 enabled but no NRF URI configured, the server fails closed and 503s every request (per the code comment referencing <code>nextgcore-sbi</code> <code>server.rs</code>).</li>
 </ul>
-<h2 id="commit-messages"><a class="header" href="#commit-messages">Commit Messages</a></h2>
-<p>Follow conventional commits:</p>
-<pre><code>feat(smf): add MBS multicast session context (TS 23.247)
-fix(amf): release SMF session on UE context release
-test(upf): add SDF filter 5-tuple matching unit tests
-</code></pre>
-<ul>
-<li><strong>Never</strong> include <code>Co-Authored-By: Claude</code> or any AI attribution</li>
-<li>Sign commits: <code>Signed-off-by: Your Name &lt;email&gt;</code></li>
-</ul>
-<h2 id="pull-request-process"><a class="header" href="#pull-request-process">Pull Request Process</a></h2>
-<ol>
-<li>Fork the repository</li>
-<li>Create a feature branch from <code>main</code></li>
-<li>Implement your change with tests</li>
-<li>Ensure all CI checks pass</li>
-<li>Open a PR with a description referencing the 3GPP TS item</li>
-</ol>
-<h2 id="nf-implementation-standards"><a class="header" href="#nf-implementation-standards">NF Implementation Standards</a></h2>
-<p>Each NF binary must:</p>
-<ul>
-<li>Register with NRF on startup (via <code>nextgcore-sbi</code> NF management)</li>
-<li>Expose <code>/metrics</code> (Prometheus, port 9090)</li>
-<li>Respond to SIGTERM with graceful shutdown</li>
-<li>Log at <code>info</code> level by default, configurable via <code>RUST_LOG</code></li>
-<li>Have ≥ 1 unit test per public function</li>
-</ul>
-<h2 id="license"><a class="header" href="#license">License</a></h2>
-<p>AGPL-3.0. See <a href="LICENSE">LICENSE</a>.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="gaps/gap-libs-infra.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../configuration/nsacf.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
+                            <a rel="next prefetch" href="../configuration/udm.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
 
                         <div style="clear: both"></div>
                     </nav>
@@ -316,10 +293,13 @@ test(upf): add SDF filter 5-tuple matching unit tests
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="gaps/gap-libs-infra.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../configuration/nsacf.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
+                    <a rel="next prefetch" href="../configuration/udm.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
             </nav>
 
         </div>
@@ -337,13 +317,13 @@ test(upf): add SDF filter 5-tuple matching unit tests
         </script>
 
 
-        <script src="elasticlunr-ef4e11c1.min.js"></script>
-        <script src="mark-09e88c2c.min.js"></script>
-        <script src="searcher-09f2665d.js"></script>
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
 
-        <script src="clipboard-1626706a.min.js"></script>
-        <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
 
         <!-- Custom JS scripts -->
 

@@ -1,0 +1,392 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Observability &amp; Troubleshooting - NextGCore Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-0392ca55.css">
+        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-51e55ca4.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-06d290c2.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGCore Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgcore" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="observability--troubleshooting"><a class="header" href="#observability--troubleshooting">Observability &amp; Troubleshooting</a></h1>
+<p>NextGCore ships a Docker-based observability stack (Prometheus, Grafana, Jaeger) alongside its 24 network-function daemons, plus an in-tree metrics/tracing library (<code>src/libs/nextgcore-metrics/</code>). This chapter documents what actually works today — which endpoints exist, which are scaffolding, how logging is really configured per NF — and gives a code-grounded troubleshooting table and the one-command E2E recipe.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> NextGCore behavior is validated by this project’s own unit tests and matched-simulator docker E2E (84/84 green as of 2026-07-02), not by third-party conformance certification. The observability stack described here is exactly what ships in this repo — it is <strong>not</strong> a certified telco OAM system. In particular, the Prometheus <code>/metrics</code> HTTP endpoint and the OpenTelemetry OTLP exporters in <code>nextgcore-metrics</code> are <strong>structural stubs</strong>: the compose stack starts Prometheus, Grafana, and Jaeger, but no NF currently serves scrapeable metrics or exports spans to them. Each such gap is called out explicitly below.</p>
+</blockquote>
+<h2 id="metrics"><a class="header" href="#metrics">Metrics</a></h2>
+<h3 id="what-the-library-provides--and-what-it-does-not"><a class="header" href="#what-the-library-provides--and-what-it-does-not">What the library provides — and what it does not</a></h3>
+<p><code>src/libs/nextgcore-metrics/src/server.rs</code> defines a <code>MetricsServer</code> documented to serve two HTTP endpoints — <code>/</code> (health check, returns “OK”) and <code>/metrics</code> (Prometheus text exposition) — and <code>src/libs/nextgcore-metrics/src/lib.rs</code> defines <code>DEFAULT_PROMETHEUS_HTTP_PORT: u16 = 9090</code>. However, <code>MetricsServer::start()</code> does <strong>not</strong> bind a socket: it logs <code>metrics_server() [http://&lt;addr&gt;]:&lt;port&gt;</code>, flips its state to <code>Running</code>, and returns (the code comment reads “In a real implementation, this would start an HTTP server using hyper”). A repo-wide grep confirms no NF binary registers a <code>"/metrics"</code> HTTP route anywhere.</p>
+<p>Consequently, <strong>none of the 24 NF daemons serves Prometheus metrics over HTTP today</strong>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>NF daemon</th><th>Prometheus metrics served</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nextgcore-amfd</code></td><td>none</td><td>Defines full metric families in <code>src/bins/nextgcore-amfd/src/metrics.rs</code> — which the file’s own header attributes as a “Port of src/amf/metrics.c”, the Open5GS AMF metrics module — with a <code>export_prometheus()</code> exposition method (see below), but no HTTP endpoint serves it, and no runtime code path increments the counters (call sites exist only in unit tests). The <strong>only</strong> NF binary that does <em>not</em> call <code>init_otel</code> at startup.</td></tr>
+<tr><td><code>nextgcore-ausfd</code></td><td>none</td><td>Links <code>nextgcore-metrics</code>; calls <code>otel::init_otel</code> at startup (<code>src/app.rs</code>).</td></tr>
+<tr><td><code>nextgcore-bsfd</code></td><td>none</td><td>Same; <code>init_otel</code> in <code>src/lib.rs</code>.</td></tr>
+<tr><td><code>nextgcore-dccfd</code></td><td>none</td><td>Same; <code>init_otel</code> in <code>src/main.rs</code>.</td></tr>
+<tr><td><code>nextgcore-eesd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-hssd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-lmfd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-mbsmfd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-mmed</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-nrfd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-nsacfd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-nssfd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-nwdafd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-pcfd</code></td><td>none</td><td>Same; <code>init_otel</code> in <code>src/app.rs</code>.</td></tr>
+<tr><td><code>nextgcore-pcrfd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-pind</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-scpd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-seppd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-sgwcd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-sgwud</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-smfd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-udmd</code></td><td>none</td><td>Same; <code>init_otel</code> in <code>src/app.rs</code>.</td></tr>
+<tr><td><code>nextgcore-udrd</code></td><td>none</td><td>Same.</td></tr>
+<tr><td><code>nextgcore-upfd</code></td><td>none</td><td>Same.</td></tr>
+</tbody>
+</table>
+</div>
+<p>All 24 NF binary crates depend on <code>nextgcore-metrics</code> in their <code>Cargo.toml</code>, but 23 of them use it solely for the <code>init_otel</code> call (see Tracing); the AMF is the one NF with real metric-family definitions.</p>
+<h3 id="amf-metric-families-srcbinsnextgcore-amfdsrcmetricsrs"><a class="header" href="#amf-metric-families-srcbinsnextgcore-amfdsrcmetricsrs">AMF metric families (<code>src/bins/nextgcore-amfd/src/metrics.rs</code>)</a></h3>
+<p>These are the metric names the AMF defines, mirroring Open5GS’s <code>src/amf/metrics.c</code> (the only attribution the file itself gives — TS 28.552 is not cited anywhere in this repo). They are held in an in-process <code>AmfMetrics</code> registry with a Prometheus-format <code>export_prometheus()</code> method — ready to be wired to an HTTP endpoint, but not yet served or incremented at runtime:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Type</th><th>Counts</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ran_ue</code></td><td>gauge</td><td>RAN UEs</td></tr>
+<tr><td><code>amf_session</code></td><td>gauge</td><td>AMF sessions</td></tr>
+<tr><td><code>gnb</code></td><td>gauge</td><td>gNodeBs</td></tr>
+<tr><td><code>fivegs_amffunction_rm_reginitreq</code> / <code>_reginitsucc</code></td><td>counter</td><td>Initial registration requests / successes</td></tr>
+<tr><td><code>fivegs_amffunction_rm_regmobreq</code> / <code>_regmobsucc</code></td><td>counter</td><td>Mobility registration update requests / successes</td></tr>
+<tr><td><code>fivegs_amffunction_rm_regperiodreq</code> / <code>_regperiodsucc</code></td><td>counter</td><td>Periodic registration update requests / successes</td></tr>
+<tr><td><code>fivegs_amffunction_rm_regemergreq</code> / <code>_regemergsucc</code></td><td>counter</td><td>Emergency registration requests / successes</td></tr>
+<tr><td><code>fivegs_amffunction_mm_paging5greq</code> / <code>_paging5gsucc</code></td><td>counter</td><td>5G paging procedures initiated / succeeded</td></tr>
+<tr><td><code>fivegs_amffunction_amf_authreq</code> / <code>_authreject</code></td><td>counter</td><td>Authentication requests sent / rejections sent</td></tr>
+<tr><td><code>fivegs_amffunction_mm_confupdate</code> / <code>_confupdatesucc</code></td><td>counter</td><td>UE Configuration Update commands / completes</td></tr>
+<tr><td><code>fivegs_amffunction_rm_registeredsubnbr{plmn_id,snssai}</code></td><td>gauge</td><td>Registered subscribers per slice</td></tr>
+<tr><td><code>fivegs_amffunction_rm_reginitfail</code> / <code>_regmobfail</code> / <code>_regperiodfail</code> / <code>_regemergfail</code> / <code>_amf_authfail</code> <code>{cause}</code></td><td>counter</td><td>Failed registrations / authentication failures, labeled by cause</td></tr>
+</tbody>
+</table>
+</div>
+<p>The library’s <code>NfMetrics</code> helper (<code>src/libs/nextgcore-metrics/src/otel.rs</code>) additionally defines a generic per-NF exposition (<code>nextgcore_&lt;nf&gt;_sbi_request_total</code>, <code>_sbi_error_total</code>, <code>_active_sessions</code>, <code>_uptime_seconds</code>, <code>_nrf_registered</code>) — also not served by any NF.</p>
+<h3 id="the-metricsserver-yaml-blocks-are-deploy-time-decoration"><a class="header" href="#the-metricsserver-yaml-blocks-are-deploy-time-decoration">The <code>metrics.server</code> YAML blocks are deploy-time decoration</a></h3>
+<p>Four docker config files — <code>docker/rust/configs/5gc/amf.yaml</code>, <code>pcf.yaml</code>, <code>smf.yaml</code>, <code>upf.yaml</code> — contain a <code>metrics.server</code> block with <code>port: 9090</code>. <strong>None of these four NFs parses it:</strong></p>
+<ul>
+<li><strong>AMF</strong>: <code>AmfSection</code> in <code>src/bins/nextgcore-amfd/src/lib.rs</code> deserializes only <code>amf_name</code>, <code>network_name</code>, <code>guami</code>, <code>tai</code>, <code>plmn_support</code>, <code>security</code>, <code>sbi</code>, <code>nas</code> — no <code>metrics</code> field (serde silently ignores unknown keys).</li>
+<li><strong>SMF</strong>: <code>SmfYaml</code>/<code>SmfSection</code> in <code>src/bins/nextgcore-smfd/src/main.rs</code> deserializes only <code>smf.sbi</code>.</li>
+<li><strong>PCF</strong>: <code>PcfSection</code> in <code>src/bins/nextgcore-pcfd/src/app.rs</code> deserializes only <code>pcf.sbi</code>.</li>
+<li><strong>UPF</strong>: <code>src/bins/nextgcore-upfd/src/main.rs</code> reads the config file only to log its byte count (“Configuration file loaded (N bytes)”) — no YAML deserialization at all; every UPF runtime knob is a CLI flag.</li>
+</ul>
+<h3 id="the-shipped-scrape-stack"><a class="header" href="#the-shipped-scrape-stack">The shipped scrape stack</a></h3>
+<p><code>docker compose up -d</code> in <code>docker/rust/</code> starts the full observability trio unconditionally (no compose profile gating):</p>
+<ul>
+<li><strong>Prometheus</strong> (<code>prom/prometheus:v2.51.0</code>, container <code>nextgcore-prometheus</code>, <code>172.23.0.200</code>, host port <code>9090</code>) — config <code>docker/rust/configs/observability/prometheus.yml</code>: 15s scrape interval, static targets for 10 NFs (NRF, AUSF, UDM, UDR, PCF, NSSF, BSF, AMF, SMF, UPF) at their fixed <code>172.23.0.x:9090</code> addresses, each labeled with <code>nf_type</code> and <code>instance_name</code>, plus self-scrape. Because no NF listens on 9090, <strong>all 10 NF jobs read <code>up == 0</code></strong> in the current build.</li>
+<li><strong>Grafana</strong> (<code>grafana/grafana:10.4.0</code>, <code>172.23.0.201</code>, host port <code>3000</code>, login <code>admin</code>/<code>nextgcore</code>) — provisioned datasources (<code>grafana-datasources.yml</code>: Prometheus at <code>http://172.23.0.200:9090</code>, Jaeger at <code>http://172.23.0.202:16686</code>) and dashboards from <code>configs/observability/dashboards/</code> with <code>overview.json</code> as the home dashboard.</li>
+<li><strong>Alert rules</strong> (<code>configs/observability/alert-rules.yml</code>) — <code>NfInstanceDown</code> (<code>up == 0</code> for 1m) and <code>NfSlowResponse</code> are generic and will actually evaluate; the NF-specific rules reference metric names (<code>amf_registration_failure_total</code>, <code>amf_connected_ue_count</code>, <code>smf_pfcp_association_up</code>, <code>upf_packets_dropped_total</code>, <code>nrf_registered_nf_count</code>, <code>mongodb_up</code>, …) that <strong>no code in this repo emits</strong> — they are aspirational, written for a future exporter wiring.</li>
+</ul>
+<h2 id="tracing-opentelemetry"><a class="header" href="#tracing-opentelemetry">Tracing (OpenTelemetry)</a></h2>
+<p><strong>What exists.</strong> <code>src/libs/nextgcore-metrics/src/otel.rs</code> provides <code>OtelConfig</code> (service name, OTLP endpoint — default <code>http://localhost:4317</code> — 10s export interval, traces/metrics/logs toggles), <code>OtelProvider</code>, W3C <code>traceparent</code> parse/generate helpers (<code>OtelSpanContext::from_traceparent</code>/<code>to_traceparent</code>), an <code>SbiSpan</code> wrapper with <code>nf.type</code>/<code>sbi.service</code>/<code>http.*</code> attributes, and a <code>JaegerConfig</code> (default endpoint <code>http://localhost:14268/api/traces</code>, sampling 1.0).</p>
+<p><strong>Startup wiring.</strong> 23 of the 24 NF daemons call <code>init_otel(OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(...))</code> at startup, taking the endpoint from the <strong><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></strong> environment variable and defaulting to <strong><code>http://jaeger:4317</code></strong> when unset (which resolves to the compose <code>jaeger</code> service). The AMF is the exception — it never calls <code>init_otel</code>. The shared helper <code>nf_common_init</code> in <code>src/libs/nextgcore-app/src/init.rs</code> bundles the same logic (same env var, same default) but is currently not called by any NF binary.</p>
+<p><strong>No-op behavior — the honest part.</strong> <code>OtelProvider::init()</code> is structural: it prints <code>Initializing OpenTelemetry for service '&lt;name&gt;' (endpoint: &lt;url&gt;)</code> and per-signal init lines to stderr, but creates <strong>no</strong> actual OTLP exporters (the code comments read “In a real implementation, this would use the opentelemetry crate”). Initialization failure is deliberately non-fatal (<code>let _ = init_otel(...)</code> / <code>.ok()</code>). Net effect: whether or not a collector is reachable, <strong>no spans, metrics, or logs are ever exported</strong>. The Jaeger all-in-one container in the compose stack (UI on <code>16686</code>, OTLP gRPC <code>4317</code>, OTLP HTTP <code>4318</code>) will show no NextGCore traces.</p>
+<p><strong>What IS real: wire-level trace propagation.</strong> The SBI client (<code>src/libs/nextgcore-sbi/src/client.rs</code>, <code>prepare_request</code>) stamps every outbound SBI request with a W3C <code>traceparent</code> header — respecting a caller-supplied one, otherwise generating a new sampled root span with CSPRNG-random trace/span IDs — and echoes the inbound correlation ID as <code>x-request-id</code>. So cross-NF request correlation works today by grepping IDs across <code>docker logs</code>, even without a trace backend.</p>
+<h2 id="logging"><a class="header" href="#logging">Logging</a></h2>
+<p>All NFs log to <strong>stdout/stderr</strong> via <code>env_logger</code>. 22 of the 24 NF binaries enable millisecond timestamps (<code>format_timestamp_millis</code>); the two exceptions are <strong>smfd</strong> (<code>src/bins/nextgcore-smfd/src/main.rs:299</code>, plain <code>Builder::from_env(...).init()</code>) and <strong>sgwud</strong> (<code>src/bins/nextgcore-sgwud/src/main.rs:18</code>, <code>env_logger::init()</code>), which fall back to env_logger’s default seconds-resolution timestamp format. In the docker deployment, logs are consumed with <code>docker logs &lt;container&gt;</code> / <code>docker compose logs -f amf gnb ue</code>. The compose file’s <code>x-common</code> anchor (<code>docker/rust/docker-compose.yml</code>, line 15) sets <code>RUST_LOG: info</code> as the baseline, but four services override it with more verbose crate-level filters: <code>amf</code> (line 218: <code>info,nextgcore_amfd=debug</code>), <code>upf</code> (line 300), <code>gnb</code> (line 331), and <code>ue</code> (line 355). <code>RUST_BACKTRACE: 1</code> is uniform across all services (merged via <code>&lt;&lt;: *common-env</code>).</p>
+<p><strong>CLI flags vary per NF</strong> — check <code>--help</code> for the daemon you are running. Two verified patterns:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Pattern</th><th>Flags</th><th>Verified in</th></tr>
+</thead>
+<tbody>
+<tr><td>Open5GS-style</td><td><code>-e, --log-level</code> (default <code>info</code>), <code>-l, --log-file</code>, <code>-m, --no-color</code>; <strong>nrfd additionally has <code>-k, --kill</code></strong></td><td><code>nextgcore-nrfd</code> (<code>src/bins/nextgcore-nrfd/src/main.rs:369-370</code> for <code>-k/--kill</code>), <code>nextgcore-nsacfd</code> (<code>src/bins/nextgcore-nsacfd/src/main.rs:136-152</code> — only <code>-c</code> config, <code>-l</code> log-file, <code>-e</code> log-level, <code>-m</code> no-color plus long-only flags; <strong>no kill flag</strong>)</td></tr>
+<tr><td>AMF-style</td><td><code>-l, --log-level</code> (default <code>info</code>), <code>--no-color</code>, <code>-d, --daemon</code> — <strong>no</strong> log-file flag</td><td><code>nextgcore-amfd</code> (<code>src/bins/nextgcore-amfd/src/lib.rs</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>nextgcore-smfd</code> is a third case: it has no clap parser at all — it scans <code>std::env::args()</code> only for <code>-c &lt;config&gt;</code> and takes its log level purely from <code>RUST_LOG</code> (default <code>info</code>).</p>
+<p><strong><code>RUST_LOG</code> precedence is inconsistent by design stage.</strong> Nine NFs honor <code>RUST_LOG</code>: the eight that build their logger with <code>env_logger::Builder::from_env</code> (with the CLI flag or <code>"info"</code> as fallback) — <strong>smfd, nsacfd, eesd, dccfd, lmfd, mbsmfd, nwdafd, pind</strong> (verified by grep across <code>src/bins/*/src/*.rs</code>) — plus <strong>sgwud</strong>, whose plain <code>env_logger::init()</code> (<code>src/bins/nextgcore-sgwud/src/main.rs:18</code>) also reads <code>RUST_LOG</code> via env_logger’s default <code>Env</code>. The rest — including amfd (<code>lib.rs:780</code>, <code>Builder::new().filter_level(...)</code>), nrfd, udrd, udmd, upfd — set the filter solely from their <code>--log-level</code> flag and <strong>ignore <code>RUST_LOG</code></strong>. So the compose-wide <code>RUST_LOG: info</code> is only effective for the first group.</p>
+<p><strong><code>--log-file</code> is accepted but not wired.</strong> Most NFs — 19 binary crates in total (nrfd, upfd, udrd, udmd, nsacfd, ausfd, bsfd, dccfd, eesd, hssd, lmfd, mbsmfd, nssfd, pcfd, pcrfd, pind, scpd, seppd — verified by grepping <code>log_file</code> across <code>src/bins/*/src/*.rs</code>) — declare a <code>log_file</code> CLI arg, but in none of them is the parsed value ever consumed by the logging setup — e.g. nrfd’s <code>init_logging()</code> never references <code>args.log_file</code>. Logs always go to stdout/stderr; rely on <code>docker logs</code> or shell redirection.</p>
+<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
+<p>Every row below is grounded in a specific file in this repo.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Symptom</th><th>Likely cause</th><th>What to check / fix</th></tr>
+</thead>
+<tbody>
+<tr><td>Prometheus shows every NF target <code>DOWN</code> (<code>up == 0</code>), <code>NfInstanceDown</code> alerts fire for all 10 NF jobs</td><td><strong>Expected in the current build</strong>: no NF binary serves <code>/metrics</code>; <code>MetricsServer::start()</code> is a stub that never binds port 9090</td><td><code>src/libs/nextgcore-metrics/src/server.rs</code>; scrape targets in <code>docker/rust/configs/observability/prometheus.yml</code></td></tr>
+<tr><td>Grafana/Jaeger show no NF traces despite “Initializing OpenTelemetry” in NF stderr</td><td><code>OtelProvider::init()</code> creates no real OTLP exporter (structural stub); export never happens</td><td><code>src/libs/nextgcore-metrics/src/otel.rs</code> (<code>init_traces</code>/<code>init_metrics</code>/<code>init_logs</code> bodies)</td></tr>
+<tr><td>NF-specific alert rules never fire</td><td>Rules reference metric names (<code>amf_registration_failure_total</code>, <code>smf_pfcp_association_up</code>, …) that no code emits</td><td><code>docker/rust/configs/observability/alert-rules.yml</code>; grep the names in <code>src/</code> — zero hits</td></tr>
+<tr><td>NF starts with built-in defaults although you passed a config file</td><td>Lenient config loading: an unreadable or unparsable YAML logs a <strong>warning</strong> and continues with defaults instead of aborting</td><td>e.g. amfd <code>load_config</code> (<code>src/bins/nextgcore-amfd/src/lib.rs</code>): look for <code>Could not read config file '...'</code> / <code>Failed to parse YAML config '...'. Using defaults.</code> in startup logs</td></tr>
+<tr><td>Editing <code>metrics.server</code> (or other unknown keys) in <code>amf.yaml</code>/<code>smf.yaml</code>/<code>pcf.yaml</code>/<code>upf.yaml</code> changes nothing</td><td>Those NFs deserialize only a small typed subset (UPF parses nothing at all — it only logs the file’s byte count); serde ignores unknown keys silently</td><td><code>AmfSection</code> in <code>src/bins/nextgcore-amfd/src/lib.rs</code>; <code>SmfYaml</code> in <code>src/bins/nextgcore-smfd/src/main.rs</code>; <code>PcfSection</code> in <code>src/bins/nextgcore-pcfd/src/app.rs</code>; <code>src/bins/nextgcore-upfd/src/main.rs</code> (~line 196)</td></tr>
+<tr><td>Every NSAC admission fails (per-UE <code>SLICE_NOT_FOUND</code> failures / 403), breaking registration or PDU establishment</td><td><code>nsacf.slice_quotas</code> missing from <code>nsacf.yaml</code> → NSACF starts with an <strong>empty quota table</strong> and no S-NSSAI is provisioned</td><td><code>src/bins/nextgcore-nsacfd/src/main.rs</code> (quota provisioning ~line 250, failure-reason mapping ~lines 623–702); add <code>slice_quotas</code> entries as in <code>docker/rust/configs/5gc/nsacf.yaml</code></td></tr>
+<tr><td>SBI calls suddenly return <strong>401</strong> (or <strong>503</strong>) after enabling OAuth2</td><td>Producer now requires an NRF-issued Bearer token (bad/absent token → 401; NRF JWKS unreachable → 503) but a consumer isn’t attaching one</td><td><code>docker/rust/docker-compose.oauth2.yml</code> (per-NF enablement map); <code>NEXTGCORE_SBI_OAUTH2_REQUIRE=1</code> env / <code>--oauth2-require</code> flags; enforcement semantics in <code>src/libs/nextgcore-sbi/src/server.rs</code></td></tr>
+<tr><td>NF log shows <code>NRF registration failed (will operate without NRF)</code></td><td>NRF was unreachable at startup; registration (<code>PUT /nnrf-nfm/v1/nf-instances/{id}</code>) is attempted <strong>once</strong>, with no retry loop</td><td><code>src/bins/nextgcore-amfd/src/lib.rs</code> (~line 831) + <code>src/bins/nextgcore-amfd/src/sbi_path.rs</code> <code>amf_nrf_register</code>; ensure NRF is healthy first (compose <code>depends_on</code> does this), else restart the NF</td></tr>
+<tr><td>Repeated <code>Heartbeat failed for &lt;id&gt;</code> / <code>Heartbeat got unexpected status ...</code> warnings</td><td>The heartbeat worker PATCHes <code>/nnrf-nfm/v1/nf-instances/{id}</code> (JSON-Patch <code>/load</code> gauge, every 5s for AMF/SMF) and only logs failures — it does not re-register a lost profile</td><td><code>src/libs/nextgcore-sbi/src/heartbeat.rs</code> <code>spawn_heartbeat_worker_with_load</code>; restart the NF to re-register if the NRF lost its record</td></tr>
+<tr><td>UDR cannot reach MongoDB (E2E assert <code>MongoDB connected</code> fails)</td><td>Wrong DB URI. Resolution order: <code>db_uri:</code> line in the config file → <code>DB_URI</code> env var → default <code>mongodb://172.23.0.2/nextgcore</code> (the compose MongoDB)</td><td><code>src/bins/nextgcore-udrd/src/main.rs</code> (~lines 2250–2268); <code>docker compose ps mongodb</code> health (mongosh ping healthcheck); hssd takes <code>--db-uri</code></td></tr>
+<tr><td>A real/external gNB cannot establish an N2 (NGAP) association with the AMF</td><td>AMF’s default SCTP backend is <code>userspace</code> (sctp-proto over UDP, matched to the nextgsim gNB) — a standard RAN needs native kernel SCTP</td><td><code>--sctp-backend kernel</code> (needs the <code>kernel-sctp</code> build feature + libsctp), see <code>Args</code> in <code>src/bins/nextgcore-amfd/src/lib.rs</code> and <code>docker/rust/docker-compose.kernel-sctp.yml</code>; verify with <code>docker exec nextgcore-amf cat /proc/net/sctp/assocs</code></td></tr>
+<tr><td>Setting <code>RUST_LOG=debug</code> has no effect on a given NF</td><td>That NF ignores <code>RUST_LOG</code> (only smfd, nsacfd, eesd, dccfd, lmfd, mbsmfd, nwdafd, pind, sgwud honor it); use its <code>--log-level</code>/<code>-e</code> flag instead</td><td>amfd <code>src/bins/nextgcore-amfd/src/lib.rs:780</code> (<code>filter_level</code>, env ignored) vs smfd <code>src/bins/nextgcore-smfd/src/main.rs:299</code> (<code>from_env</code>) and sgwud <code>src/bins/nextgcore-sgwud/src/main.rs:18</code> (<code>env_logger::init()</code>)</td></tr>
+<tr><td><code>TLS_ENABLED=true SBI_SCHEME=https docker compose up</code> doesn’t turn on TLS</td><td>No Rust code reads <code>TLS_ENABLED</code>/<code>SBI_SCHEME</code> — they are compose-level env decoration; real TLS knobs are per-NF CLI flags</td><td>grep in <code>src/</code> returns zero <code>.rs</code> hits; use <code>--tls --tls-cert --tls-key</code> (nrfd also <code>--mtls</code>, <code>--tls-ca-cert</code>), certs from <code>docker/rust/certs/generate-dev-certs.sh</code></td></tr>
+<tr><td>Docker build fails or (worse) Docker Desktop wipes its image store mid-build</td><td>Building under disk pressure — a full rebuild needs ~20 GB; this destroyed the image store once (hazard #269)</td><td><code>docker/rust/preflight.sh</code> refuses to build below the free-space minimum (default 25 GB, checked on host <strong>and</strong> inside the Docker VM) and trims BuildKit cache to 20 GB; don’t use <code>--no-preflight</code> casually</td></tr>
+<tr><td>Manual log-grep “fails” even though the line is present</td><td><code>docker logs | grep -q</code> under <code>pipefail</code> dies via SIGPIPE on first match, turning a match into a false negative</td><td>header note in <code>docker/rust/e2e-test.sh</code>: always capture <code>docker logs</code> to a file, then grep the file (as <code>assert_log_contains</code> does)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="running-the-e2e-suite"><a class="header" href="#running-the-e2e-suite">Running the E2E suite</a></h2>
+<p>The single entrypoint is <code>docker/rust/e2e.sh</code> (Wave-6 H10):</p>
+<pre><code class="language-bash">cd nextgcore/docker/rust
+./e2e.sh                         # preflight + full build + baseline E2E
+./e2e.sh --quick                 # reuse existing binaries (build.sh --skip-rust)
+./e2e.sh --overlay oauth2        # baseline suite with OAuth2 enforcement overlay
+./e2e.sh --overlay kernel-sctp   # baseline suite over native kernel SCTP N2
+./e2e.sh --overlay features      # baseline E2E + Rel-17/18 feature harness
+./e2e.sh --keep                  # leave the stack running afterwards
+</code></pre>
+<p>Exit codes: <code>0</code> all passed, <code>1</code> test assertion failure, <code>2</code> infrastructure failure (preflight refusal, build, startup). Overlay names map to <code>docker-compose.&lt;name&gt;.yml</code>; <code>w6</code> is accepted as an alias for <code>features</code>.</p>
+<p><strong>Prerequisites.</strong> A Docker daemon with compose, and disk headroom: <code>preflight.sh</code> runs first and exits <code>2</code> if free space is below the minimum (default 25 GB) on the host filesystem holding Docker data <strong>or</strong> inside the Docker VM; it also trims the BuildKit cache with <code>docker builder prune --keep-storage=20GB</code>. Everything else (Rust compilation, images) is built by <code>build.sh</code> inside the builder image.</p>
+<p><strong>What it runs.</strong> <code>e2e.sh</code> chains preflight → <code>build.sh</code> → <code>e2e-test.sh --no-build --no-preflight --keep</code> (it owns teardown itself so artifacts can be captured first). <code>e2e-test.sh</code> then:</p>
+<ol>
+<li><code>docker compose up -d</code> the full stack (MongoDB + 5GC NFs + nextgsim gNB + UE) and waits up to <strong>120 s</strong> for 13 services (<code>mongodb nrf udr udm ausf pcf nssf bsf smf amf upf gnb ue</code>) to report healthy (NF healthcheck is <code>kill -0 1</code>; MongoDB uses a mongosh ping), printing the unhealthy ones on timeout.</li>
+<li>Runs log-anchored assertions: per-NF process + <code>NextGCore &lt;NF&gt; ready</code> startup lines, <code>MongoDB connected</code> (UDR), AMF NGAP setup (<code>NGAP server listening</code>, <code>NG Setup successful</code>), and the full source-anchored registration flow (<code>Initial UE Message</code>, <code>Registration Request: type=</code>, <code>Calling AUSF authenticate</code>, <code>result=AUTHENTICATION_SUCCESS</code>, <code>keys derived; selected NIA</code>, …) through <code>UE PDU session 1 ACTIVE with IPv4 address</code>.</li>
+<li>Verifies the data plane by pinging <strong>through the UE’s GTP-U tunnel</strong> from the <code>nextgsim-ue</code> container: <code>10.45.0.1</code> (UPF gateway), <code>172.23.0.1</code> (Docker gateway), <code>172.23.0.7</code> (UPF host), then prints a Total/Passed/Failed summary. The full baseline suite was 84/84 green on 2026-07-02.</li>
+</ol>
+<p><strong>When it fails, look here:</strong></p>
+<ul>
+<li>The <code>FAIL:</code> line names the container and the exact log pattern that was not found.</li>
+<li>On any failure, <code>e2e.sh</code> saves <code>docker logs</code> of <strong>every</strong> <code>nextgcore-*</code>/<code>nextgsim-*</code> container — before teardown — under <code>docker/rust/artifacts/e2e-YYYYMMDD-HHMMSS/</code> (one <code>&lt;container&gt;.log</code> per container, plus <code>docker-ps.txt</code> and <code>docker-system-df.txt</code>). Override the location with <code>--artifacts DIR</code>.</li>
+<li>To debug interactively, rerun with <code>--keep</code> and inspect the live stack (<code>docker compose logs -f amf gnb ue</code>, <code>docker exec nextgsim-ue ping 10.45.0.1</code>).</li>
+<li>Some historical assertions were removed as stale (e.g. Identity Request/Response — the UE sends its SUCI in the initial Registration Request, so the identity procedure never runs); the comments in <code>e2e-test.sh</code> explain each pattern’s source anchor, which is the right place to start when an assertion and the logs disagree.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="configuration/pcrf.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="reference.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="configuration/pcrf.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="reference.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

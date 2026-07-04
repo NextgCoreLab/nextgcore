@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>UPF - NextGCore Documentation</title>
+        <title>UDM - NextGCore Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,19 +177,20 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="upf-configuration"><a class="header" href="#upf-configuration">UPF Configuration</a></h1>
-<p>The UPF (User Plane Function, <code>nextgcore-upfd</code>) terminates the N4/PFCP interface toward the SMF and the N3/GTP-U interface toward the gNB, and forwards user traffic through a TUN device.</p>
+                        <h1 id="udm-configuration"><a class="header" href="#udm-configuration">UDM Configuration</a></h1>
+<p>The UDM (Unified Data Management, <code>nextgcore-udmd</code>) is the subscriber-data front-end of the core: it manages UE context registrations, serves subscription data, and generates 5G authentication vectors, backed by the UDR over <code>Nudr_DataRepository</code>. Its SBI router (<code>udm_sbi_request_handler</code> in <code>src/bins/nextgcore-udmd/src/app.rs</code>) serves four services: <code>Nudm_UECM</code> (<code>/nudm-uecm/v1</code> — AMF 3GPP/non-3GPP-access and SMF registrations, TS 29.503 §5.3.3 per code comments), <code>Nudm_SDM</code> (<code>/nudm-sdm/v1</code> — am-data, sm-data, smf-select-data, nssai, sdm-subscriptions, and SoR/UPU acknowledgements, TS 29.503 §5.2.2.6 per code comments), <code>Nudm_UEAU</code> (<code>/nudm-ueau/v1</code> — <code>generate-auth-data</code> with 5G-AKA/EAP-AKA’ per TS 33.501 §6.1.2 as cited in the daemon source, plus <code>auth-events</code>), and <code>Nudm_EE</code> (<code>/nudm-ee/v1</code> — event-exposure subscriptions, TS 29.503 §5.5 per code comments). SUCI deconcealment (SIDF role) is implemented in <code>context.rs</code> per TS 33.501 §6.12 as cited in the source, and Steering-of-Roaming / UE-Parameters-Update injection into am-data goes through the AUSF’s protection services (TS 33.501 §6.14.2.1 / §6.15.2.1 per code comments).</p>
+<p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/udm.yaml</code>, overridable with <code>-c/--config</code>) and command-line flags, with a small set of environment variables on top. Unlike some NFs, the UDM’s YAML <code>sbi.server</code> entry <em>overrides</em> the CLI bind address/port so the NRF NFProfile advertises a routable endpoint instead of <code>0.0.0.0</code> (per the inline comment in <code>app.rs</code>). If the config file is missing the daemon logs at debug level and runs on pure CLI defaults; a YAML file that fails to deserialize is silently ignored.</p>
 <blockquote>
-<p><strong>Important — how the UPF is actually configured:</strong> unlike most other NextGCore NFs, <code>nextgcore-upfd</code> currently takes its runtime settings from <strong>command-line flags</strong>, not from the YAML file. The <code>-c/--config</code> flag points at a YAML file, and if that file exists the daemon reads it — but it only logs the file size (<code>main.rs</code>, “Configuration file loaded (N bytes)”) and <strong>does not deserialize or apply any of its contents</strong>. There is no <code>#[derive(Deserialize)]</code> config struct in the UPF binary. The entire YAML file is therefore parsed-but-inert today; it is shipped for deployment-layout consistency with the other NFs (Docker/k8s/Helm mount it), and CLI flags are the source of truth.</p>
+<p><strong>Honesty note:</strong> UDM behavior is validated by this project’s own unit tests and matched-simulator docker E2E runs (84/84 as of 2026-07-02), not by third-party conformance certification. Several routes are honest stubs: <code>ue-context-in-smf-data</code> GET, <code>id-translation-result</code> GET, and <code>sdm-subscriptions</code> PATCH return <strong>501 NOT_IMPLEMENTED</strong>; <code>Nudm_EE</code> subscription PATCH returns 204 on an existing subscription <em>without applying the JSON-Patch</em> (deferred, per code comment). Notification-driven UPU delivery (post-registration <code>Nudm_SDM_Notification</code>) is explicitly deferred — only the am-data-attribute UPU path exists. The <code>-k/--kill</code> flag and the TLS flags are also stubs (see below).</p>
 </blockquote>
-<h2 id="example-yaml-dockerrustconfigs5gcupfyaml"><a class="header" href="#example-yaml-dockerrustconfigs5gcupfyaml">Example YAML (<code>docker/rust/configs/5gc/upf.yaml</code>)</a></h2>
-<p>This is the file mounted in the Docker E2E deployment. Every key below is currently ignored by the daemon (see note above):</p>
-<pre><code class="language-yaml"># UPF (User Plane Function) Configuration
+<h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
+<p>From <code>nextgcore/docker/rust/configs/5gc/udm.yaml</code>:</p>
+<pre><code class="language-yaml"># UDM (Unified Data Management) Configuration
 # Docker container configuration for 5G Core deployment
 
 logger:
   file:
-    path: /var/log/nextgcore/upf.log
+    path: /var/log/nextgcore/udm.log
   level: info
 
 global:
@@ -197,106 +198,103 @@ global:
     ue: 1024
     peer: 64
 
-upf:
-  pfcp:
+udm:
+  hnet:
+    - id: 1
+      scheme: 1
+      key: /etc/nextgcore/hnet/curve25519-1.key
+    - id: 2
+      scheme: 2
+      key: /etc/nextgcore/hnet/secp256r1-2.key
+  sbi:
     server:
-      - address: 172.23.0.7
-        port: 8805
-  gtpu:
-    server:
-      - address: 172.23.0.7
-        port: 2152
-  session:
-    - subnet: 10.45.0.0/16
-      gateway: 10.45.0.1
-      dev: ogstun
-    - subnet: 2001:db8:cafe::/48
-      gateway: 2001:db8:cafe::1
-      dev: ogstun
-  metrics:
-    server:
-      - address: 172.23.0.7
-        port: 9090
-  # TLS configuration (G36: SBI TLS)
-  # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
-  tls:
-    enabled: false
-    cert: /etc/nextgcore/certs/upf.crt
-    key: /etc/nextgcore/certs/upf.key
-    ca: /etc/nextgcore/certs/ca.crt
-    min_version: "1.2"
+      - address: 172.23.0.12
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
+    # TLS configuration (G36: SBI TLS)
+    # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
+    tls:
+      enabled: false
+      cert: /etc/nextgcore/certs/udm.crt
+      key: /etc/nextgcore/certs/udm.key
+      ca: /etc/nextgcore/certs/ca.crt
+      min_version: "1.2"
 </code></pre>
-<p>In Docker deployments the container is instead launched with matching CLI flags; the YAML values above mirror those flags but do not drive them.</p>
-<h2 id="effective-parameters-cli-flags-args-struct-in-binsnextgcore-upfdsrcmainrs"><a class="header" href="#effective-parameters-cli-flags-args-struct-in-binsnextgcore-upfdsrcmainrs">Effective parameters (CLI flags, <code>Args</code> struct in <code>bins/nextgcore-upfd/src/main.rs</code>)</a></h2>
-<p>Defaults below are the real clap <code>default_value</code>s from the source.</p>
+<h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
+<p>These are the fields actually deserialized by the daemon (<code>#[derive(Deserialize)]</code> structs <code>UdmYaml</code>/<code>UdmSection</code>/<code>SbiYaml</code>/<code>SbiServerYaml</code>/<code>SbiClientYaml</code>/<code>NrfClientYaml</code>/<code>HnetYaml</code>/<code>SorYaml</code>/<code>UpuYaml</code> in <code>src/bins/nextgcore-udmd/src/app.rs</code>), plus one knob (<code>sbi.oauth2.require</code>) read by a separate untyped <code>serde_yaml::Value</code> scan in <code>oauth2_required()</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-c, --config</code></td><td>string</td><td><code>/etc/nextgcore/upf.yaml</code></td><td>Configuration file path. Read if present, but contents are not applied (see note above).</td></tr>
-<tr><td><code>-l, --log-file</code></td><td>string</td><td><em>(none)</em></td><td>Log file path.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level: <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
-<tr><td><code>-m, --no-color</code></td><td>bool</td><td><code>false</code></td><td>Disable colored log output.</td></tr>
-<tr><td><code>-k, --kill</code></td><td>bool</td><td><code>false</code></td><td>Kill a running instance (currently logs intent and exits).</td></tr>
-<tr><td><code>--pfcp-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N4 PFCP server bind address.</td></tr>
-<tr><td><code>--pfcp-port</code></td><td>u16</td><td><code>8805</code></td><td>N4 PFCP server port.</td></tr>
-<tr><td><code>--gtpu-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N3 GTP-U bind address.</td></tr>
-<tr><td><code>--gtpu-port</code></td><td>u16</td><td><code>2152</code></td><td>N3 GTP-U port.</td></tr>
-<tr><td><code>--tun-ifname</code></td><td>string</td><td><code>ogstun</code></td><td>TUN interface name for the user-plane subnet.</td></tr>
-<tr><td><code>--tun-ip</code></td><td>IPv4</td><td><code>10.45.0.1</code></td><td>TUN interface IP address (UE subnet gateway).</td></tr>
-<tr><td><code>--tun-prefix</code></td><td>u8</td><td><code>16</code></td><td>TUN interface prefix length.</td></tr>
-<tr><td><code>--max-sessions</code></td><td>usize</td><td><code>1024</code></td><td>Maximum number of PFCP sessions (sizes the UPF context).</td></tr>
-<tr><td><code>--no-dataplane</code></td><td>bool</td><td><code>false</code></td><td>Disable the TUN data plane; control-plane-only mode (no user traffic forwarding).</td></tr>
-<tr><td><code>--nrf-uri</code></td><td>string</td><td><code>""</code> (empty = disabled)</td><td>Opt-in NRF base URI (e.g. <code>http://127.0.0.10:7777</code>). When set, the UPF registers a UPF NFProfile and PATCHes a real PFCP-session <code>/load</code> gauge on each heartbeat (code comment cites TS 29.510 §5.2.2.3.2). Empty disables the SBI/NRF plane entirely; NRF failures are log-only and never affect packet forwarding.</td></tr>
+<tr><td><code>udm.sbi.server[].address</code></td><td>string</td><td>absent → CLI <code>--sbi-addr</code> (<code>0.0.0.0</code>)</td><td>Only the <strong>first</strong> list entry is read. Overrides the CLI bind address and becomes the address advertised in the NRF NFProfile.</td></tr>
+<tr><td><code>udm.sbi.server[].port</code></td><td>u16</td><td>absent → CLI <code>--sbi-port</code> (<code>7777</code>)</td><td>First entry only; overrides the CLI SBI port.</td></tr>
+<tr><td><code>udm.sbi.client.nrf[].uri</code></td><td>string</td><td>absent → <strong>no NRF registration</strong></td><td>First entry only; seeds the NRF URI in the shared SBI context. If absent, NRF registration is skipped entirely (debug log) and the UDM operates without NRF.</td></tr>
+<tr><td><code>udm.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>SBI OAuth2 enforcement (Wave-6 H8; TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comments). Read via a raw YAML scan that is root-key agnostic (true iff <em>any</em> top-level section sets <code>sbi.oauth2.require: true</code>). The env var <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> takes precedence over the YAML. When on, incoming requests must carry an NRF-issued Bearer token with audience <code>UDM</code> (verified against the NRF JWKS; fails closed with 503 when no NRF URI is configured, per code comment) and outbound SBI calls attach tokens.</td></tr>
+<tr><td><code>udm.hnet[].id</code></td><td>u8</td><td><strong>required</strong> per entry</td><td>Home-network key identifier for SUCI deconcealment (TS 33.501 §6.12 per code comment); matched against the SUCI’s key id.</td></tr>
+<tr><td><code>udm.hnet[].scheme</code></td><td>u8</td><td><strong>required</strong> per entry</td><td>Protection scheme: <code>1</code> = Profile A (ECIES X25519), <code>2</code> = Profile B (ECIES P-256), per the <code>deconceal_suci</code> doc comment in <code>context.rs</code>. A key whose scheme mismatches the SUCI’s scheme is rejected.</td></tr>
+<tr><td><code>udm.hnet[].key</code></td><td>string</td><td><strong>required</strong> per entry</td><td>Either a 64-hex-char private key inline, or a <strong>path to a file containing 64 hex chars</strong> (not PEM, despite the <code>.key</code> extension in the example). A key that fails to load logs a warning and every SUCI using that key id is rejected.</td></tr>
+<tr><td><code>udm.allow_null_scheme</code></td><td>bool</td><td><code>true</code> (context default <code>AtomicBool::new(true)</code>; YAML applied only when present)</td><td>udmd-11: gate for null-scheme SUCIs. When <code>false</code>, null-scheme SUCIs are rejected at deconcealment; <code>imsi-</code> passthrough is always allowed.</td></tr>
+<tr><td><code>udm.sor.steering</code></td><td>array of JSON objects</td><td>absent/empty → <strong>no SoR injection</strong>, am-data passthrough is byte-identical</td><td>Wave-6 F-04: TS 29.509 <code>SteeringContainer</code> as a <code>SteeringInfo[]</code> array (<code>{plmnId: {mcc, mnc}, accessTechList: [..]}</code>; quote <code>mcc</code>/<code>mnc</code> as strings, per the struct doc comment). The AUSF performs the TS 24.501 §9.11.3.51 wire encoding per code comment.</td></tr>
+<tr><td><code>udm.sor.ack_ind</code></td><td>bool</td><td><code>true</code> (<code>unwrap_or(true)</code>)</td><td>Request UE acknowledgement (<code>SorInfo.ackInd</code>).</td></tr>
+<tr><td><code>udm.upu.data</code></td><td>array of JSON objects</td><td>absent/empty → <strong>no UPU injection</strong>, am-data passthrough is byte-identical</td><td>Wave-6 F-05: TS 29.509 <code>UpuData[]</code> entries (<code>{routingId}</code>, <code>{defaultConfNssai: [..]}</code>, <code>{secPacket}</code>, …, per the struct doc comment). The AUSF performs the TS 24.501 §9.11.3.53A wire encoding and MAC per code comment.</td></tr>
+<tr><td><code>udm.upu.ack_ind</code></td><td>bool</td><td><code>true</code> (<code>unwrap_or(true)</code>)</td><td>Request UE acknowledgement (<code>UpuInfo.upuAckInd</code>).</td></tr>
 </tbody>
 </table>
 </div>
-<h3 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h3>
+<h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
+<p>Unknown YAML keys are silently ignored by serde. In the shipped <code>udm.yaml</code>:</p>
+<ul>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>); <code>init_logging()</code> never opens a log file (see the CLI table — even <code>-l/--log-file</code> is inert).</li>
+<li><strong><code>global.max.ue</code> and <code>global.max.peer</code> are inert.</strong> Context capacities come from the CLI flags <code>--max-ue</code> (default <code>1024</code>) and <code>--max-sess</code> (default <code>4096</code>); the example’s <code>ue: 1024</code> merely coincides with the CLI default.</li>
+<li><strong><code>udm.sbi.tls.*</code> (<code>enabled</code>/<code>cert</code>/<code>key</code>/<code>ca</code>/<code>min_version</code>) is entirely inert.</strong> <code>SbiYaml</code> has no <code>tls</code> field, and even the CLI TLS flags only populate a legacy placeholder config (see behavior notes).</li>
+</ul>
+<p>Everything else in the shipped example (<code>udm.hnet[]</code>, <code>udm.sbi.server[]</code>, <code>udm.sbi.client.nrf[]</code>) is genuinely read.</p>
+<h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
+<p>From the clap <code>Args</code> struct in <code>src/bins/nextgcore-udmd/src/app.rs</code> (the binary’s <code>main.rs</code> is a thin wrapper around <code>nextgcore_udmd::run</code>):</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+<tr><th>Flag</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored).</td></tr>
+<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/udm.yaml</code></td><td>Configuration file path.</td></tr>
+<tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td><strong>Parsed but unused</strong> — <code>init_logging()</code> never references it; logging goes to stderr via <code>env_logger</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else falls back to <code>info</code>).</td></tr>
+<tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
+<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td><strong>Stub</strong>: logs “would send SIGTERM to running instance” and exits; does not actually signal anything.</td></tr>
+<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI bind address — <strong>overridden</strong> by <code>udm.sbi.server[0].address</code> when present in the YAML.</td></tr>
+<tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>SBI port — <strong>overridden</strong> by <code>udm.sbi.server[0].port</code> when present in the YAML.</td></tr>
+<tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Stored only in the legacy <code>SbiServerConfig</code> placeholder (affects its reported URI scheme); the real HTTP/2 listener is built from <code>NextgcoreSbiServerConfig::new(addr)</code> with no TLS wiring, so <strong>the actual SBI socket is always plaintext</strong>.</td></tr>
+<tr><td><code>--tls-cert</code></td><td>path</td><td>unset</td><td>Same placeholder-only caveat as <code>--tls</code>.</td></tr>
+<tr><td><code>--tls-key</code></td><td>path</td><td>unset</td><td>Same placeholder-only caveat as <code>--tls</code>.</td></tr>
+<tr><td><code>--max-ue</code></td><td>usize</td><td><code>1024</code></td><td>UE context pool capacity (also the denominator of the NRF load gauge).</td></tr>
+<tr><td><code>--max-sess</code></td><td>usize</td><td><code>4096</code></td><td>Session context pool capacity.</td></tr>
 </tbody>
 </table>
 </div>
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
-<li><strong>PFCP heartbeats:</strong> the UPF also initiates PFCP heartbeats toward the associated CP function every 10 seconds (code comment cites TS 29.244 §6.2.2: either node may initiate).</li>
-<li><strong>Reports:</strong> the data plane emits Downlink Data Reports (on first buffered downlink packet) and Error Indication Reports over N4.</li>
-<li><strong>Validation status:</strong> UPF behavior has been exercised in the project’s matched-simulator Docker E2E suite (UE→UPF GTP-U traffic). This is internal test validation, not third-party conformance certification.</li>
+<li><strong>NRF registration and load-reporting heartbeat.</strong> When an NRF URI is configured, the UDM PUTs an NFProfile advertising the <code>nudm-sdm</code>, <code>nudm-uecm</code>, and <code>nudm-ueau</code> services (note: <code>nudm-ee</code> is served but <em>not</em> advertised), <code>allowedNfTypes</code> <code>[AMF, SMF, AUSF, PCF, SCP]</code>, and <code>heartBeatTimer: 10</code>. On success it spawns a heartbeat worker every 5 s that PATCHes a real <code>/load</code> gauge — registered UEs as a percentage of <code>--max-ue</code>, clamped 0–100 (TS 29.510 §5.2.2.3.2 per code comment). Registration failure is non-fatal: the UDM logs a warning and operates without NRF.</li>
+<li><strong>Hard UDR dependency with env-var fallback.</strong> All subscription data, authentication material, and UECM persistence go to the UDR via <code>Nudr_DataRepository</code>. UDR selection uses NRF discovery-cache instances first, then falls back to <code>UDR_SBI_ADDR</code>/<code>UDR_SBI_PORT</code> (port default <code>7777</code>); with neither available, SDM/UEAU requests answer <strong>503</strong>. The AUSF client for SoR/UPU protection follows the same pattern: the AUSF that authenticated the UE first, then any cached AUSF, then <code>AUSF_SBI_ADDR</code>/<code>AUSF_SBI_PORT</code> (port default <code>7777</code>), failing closed (withholding <code>sorInfo</code>/<code>upuInfo</code>) on any AUSF failure since TS 33.501 defines no unprotected delivery path, per code comments.</li>
+<li><strong>Auth-vector admission is strict.</strong> <code>generate-auth-data</code> rejects: missing <code>servingNetworkName</code>/<code>ausfInstanceId</code> (400 <code>MANDATORY_IE_MISSING</code>), malformed serving-network names (403 <code>SERVING_NETWORK_NOT_AUTHORIZED</code>, anti-bidding-down per TS 33.501 §6.1.2 code comment), SUCI deconcealment failure (403 <code>AUTHENTICATION_REJECTED</code>), unknown subscribers (404 <code>USER_NOT_FOUND</code>), auth methods other than <code>5G_AKA</code>/<code>EAP_AKA_PRIME</code> (501), and subscriptions whose AMF separation bit is unset (403, TS 33.102 Annex H per code comment).</li>
+<li><strong>SQN replay protection gates AV issuance.</strong> After Milenage AV generation the SQN is advanced per TS 33.102 Annex C.3.2 (per code comment) and PATCHed to the UDR. A UDR 5xx or transport failure makes the UDM <strong>refuse to issue the AV</strong> (503) to prevent SQN replay; other non-success statuses (e.g. 404 in the matched sim) degrade with a warning and the AV is issued anyway.</li>
+<li><strong>SoR/UPU acks are MAC-verified, single-use.</strong> When an am-data response carried a protected SoR/UPU payload, the expected XMAC-I_UE is pinned; the UE’s ack MAC is compared constant-time and a match yields 204 <em>and clears the pin</em> (a replayed ack is rejected). Mismatch or missing MAC → 400 (<code>SOR_MAC_FAILURE</code>/<code>UPU_MAC_FAILURE</code>/<code>MANDATORY_IE_MISSING</code>); a MAC with nothing outstanding → 400 <code>UNEXPECTED_MESSAGE</code>. A plain ack with nothing outstanding stays 204 (backward-compatible with the matched sim, which never sends acks, per code comment). <code>ueNotReachable: true</code> is recorded without a MAC check.</li>
+<li><strong>Environment variables</strong> read by this binary: <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> (<code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code> = on; checked <em>before</em> and overriding the YAML <code>sbi.oauth2.require</code>), <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OTLP tracing endpoint, default <code>http://jaeger:4317</code>), and the peer fallbacks <code>UDR_SBI_ADDR</code>/<code>UDR_SBI_PORT</code> and <code>AUSF_SBI_ADDR</code>/<code>AUSF_SBI_PORT</code> used only when NRF discovery yields no instance.</li>
 </ul>
-<h2 id="parsed-but-inert-summary"><a class="header" href="#parsed-but-inert-summary">Parsed-but-inert summary</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>YAML section</th><th>Status</th></tr>
-</thead>
-<tbody>
-<tr><td><code>logger.*</code></td><td>Ignored — use <code>-l</code> / <code>-e</code> flags.</td></tr>
-<tr><td><code>global.max.*</code></td><td>Ignored — use <code>--max-sessions</code>.</td></tr>
-<tr><td><code>upf.pfcp.server</code></td><td>Ignored — use <code>--pfcp-addr</code> / <code>--pfcp-port</code>.</td></tr>
-<tr><td><code>upf.gtpu.server</code></td><td>Ignored — use <code>--gtpu-addr</code> / <code>--gtpu-port</code>.</td></tr>
-<tr><td><code>upf.session</code></td><td>Ignored — use <code>--tun-ifname</code> / <code>--tun-ip</code> / <code>--tun-prefix</code> (single IPv4 subnet only via CLI; the YAML’s IPv6 entry has no CLI equivalent).</td></tr>
-<tr><td><code>upf.metrics.server</code></td><td>Ignored by the UPF binary.</td></tr>
-<tr><td><code>upf.tls.*</code></td><td>Ignored by the UPF binary; the deployment’s TLS switch is the <code>TLS_ENABLED</code> / <code>SBI_SCHEME</code> compose environment, per the file’s own comment.</td></tr>
-</tbody>
-</table>
-</div>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../configuration/smf.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../configuration/ausf.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../configuration/nrf.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../configuration/udr.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -306,11 +304,11 @@ upf:
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../configuration/smf.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../configuration/ausf.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../configuration/nrf.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../configuration/udr.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

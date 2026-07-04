@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Contributing - NextGCore Documentation</title>
+        <title>MME (4G/EPC) - NextGCore Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -12,33 +12,33 @@
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
-        <link rel="icon" href="favicon-de23e50b.svg">
-        <link rel="shortcut icon" href="favicon-8114d1fc.png">
-        <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
-        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
-        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
 
         <!-- Highlight.js Stylesheets -->
-        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
-        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
-        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
-            const path_to_root = "";
+            const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-51e55ca4.js";
+            window.path_to_searchindex_js = "../searchindex-51e55ca4.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-06d290c2.js"></script>
+        <script src="../toc-06d290c2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -105,7 +105,7 @@
             <!-- populated by js -->
             <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
             <noscript>
-                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
             </noscript>
             <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -140,7 +140,7 @@
                     <h1 class="menu-title">NextGCore Documentation</h1>
 
                     <div class="right-buttons">
-                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
                             <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
                         </a>
                         <a href="https://github.com/NextgCoreLab/nextgcore" title="Git repository" aria-label="Git repository">
@@ -177,138 +177,118 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="contributing-to-nextgcore"><a class="header" href="#contributing-to-nextgcore">Contributing to NextGCore</a></h1>
-<p>NextGCore is a research-faithful 5G Core Network implementation in Rust targeting 3GPP Rel-15 with selected Rel-17/18 features. 6G/Rel-20 items (ISAC, FL, PQC, semantic, agent-native) are non-normative prototypes — no frozen Rel-20 3GPP specs exist.</p>
-<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+                        <h1 id="mme-configuration"><a class="header" href="#mme-configuration">MME Configuration</a></h1>
+<p>The MME (Mobility Management Entity, <code>nextgcore-mmed</code>) is the 4G/EPS control-plane anchor of the dual 5G+4G core, ported from the C reference <code>src/mme/</code>. Its crate implements the protocol logic for five EPC interfaces: S1AP toward eNBs (APER-encoded via the <code>nextgcore-s1ap</code> codec per TS 36.413, as cited in <code>s1ap_build.rs</code>), NAS EMM/ESM toward UEs (cause codes and bitrate/APN-AMBR encodings per TS 24.301, per code comments) with NAS integrity/ciphering EIA0–EIA3/EEA0–EEA3 (<code>nas_security.rs</code>), S11 GTPv2-C toward the SGW-C (<code>s11_build.rs</code>/<code>s11_handler.rs</code>), S6a Diameter toward the HSS (Application ID 16777251; AIR/ULR/CLR/IDR/PUR grouped-AVP wire format per TS 29.272 §7.3.x, per code comments in <code>fd_path.rs</code>), plus SGsAP toward the MSC/VLR (<code>sgsap_build.rs</code>) and SBc-AP warning-message handling (TS 29.168 / TS 23.041, as cited in <code>sbc_message.rs</code>).</p>
+<p>Configuration is nominally split between a YAML file (default path <code>/etc/nextgcore/mme.yaml</code>, overridable with <code>-c/--config</code>) and command-line flags — but unlike most NextGCore NFs, <strong>this daemon currently parses no YAML at all</strong>. The crate contains no <code>#[derive(Deserialize)]</code> config structs and no file reads; <code>MmeApp::init</code> in <code>src/bins/nextgcore-mmed/src/main.rs</code> receives the config path as <code>_config_path</code> and ignores it. All runtime knobs that exist come from the four CLI flags, one environment variable, and hardcoded defaults in <code>context.rs</code>.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> <code>nextgcore-mmed</code> is a protocol-logic port, not yet a wired daemon. The message builders, decoders, state machines (<code>MmeFsm</code>/<code>EmmFsm</code>/<code>EsmFsm</code>/<code>S1apFsm</code>/<code>SgsapFsm</code>), and NAS security functions are real and unit-tested — including proptest state-machine property tests and a 128-EIA2 check against TS 33.401 Annex C.2 Test Set 2, per code comments — but the binary’s main loop only sleeps in 100 ms ticks (the code comment reads “In a real implementation, this would: 1. Poll for S1AP messages from eNBs…”). No SCTP/UDP socket is bound anywhere in the crate: <code>gtp_open</code> just sets a flag, and the S6a Diameter client is created in deferred-connect mode and never connected from <code>main</code>. The MME is <strong>not</strong> exercised by the 84/84 docker E2E suite (that suite covers the 5GC); validation is in-crate unit and property tests only, not third-party certification.</p>
+</blockquote>
+<h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
+<p>From <code>nextgcore/docker/rust/configs/epc/mme.yaml</code> (mounted by <code>docker-compose-epc.yml</code>, which runs the daemon as <code>-c /etc/nextgcore/mme.yaml</code> at <code>172.24.0.5</code> and publishes <code>36412/sctp</code>):</p>
+<pre><code class="language-yaml"># NextGCore MME Configuration for Docker EPC Deployment
+# Rust implementation
+
+logger:
+  file:
+    path: /var/log/nextgcore/mme.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+mme:
+  freeDiameter: /etc/freeDiameter/mme.conf
+  s1ap:
+    server:
+      - address: 172.24.0.5
+  gtpc:
+    server:
+      - address: 172.24.0.5
+    client:
+      sgwc:
+        - address: 172.24.0.3
+      smf:
+        - address: 172.24.0.4
+  metrics:
+    server:
+      - address: 172.24.0.5
+        port: 9090
+  gummei:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+      mme_gid: 2
+      mme_code: 1
+  tai:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+      tac: 1
+  security:
+    integrity_order: [EIA2, EIA1, EIA0]
+    ciphering_order: [EEA0, EEA1, EEA2]
+  network_name:
+    full: NextGCore
+    short: Next
+  mme_name: nextgcore-mme0
+</code></pre>
+<h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
+<p><strong>None.</strong> The daemon deserializes no YAML fields: there are no <code>#[derive(Deserialize)]</code> structs in <code>src/bins/nextgcore-mmed/src/</code> and no <code>serde</code>/<code>std::fs</code> usage in the crate. The values an operator would expect to set in YAML are instead hardcoded defaults in <code>MmeContext::new()</code> (<code>src/bins/nextgcore-mmed/src/context.rs</code>):</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
+<tr><th>Setting (in-memory field)</th><th>Hardcoded value</th><th>Notes</th></tr>
 </thead>
 <tbody>
-<tr><td>Rust</td><td>stable (≥1.75)</td><td>Build toolchain</td></tr>
-<tr><td>protobuf-compiler</td><td>≥3.21</td><td>Protobuf codegen</td></tr>
-<tr><td>clang / libclang-dev</td><td>any</td><td>LLVM bindings</td></tr>
-<tr><td>libssl-dev</td><td>any</td><td>TLS support</td></tr>
-<tr><td>cmake</td><td>≥3.16</td><td>FFI build scripts</td></tr>
-<tr><td>Docker + docker-compose</td><td>≥24</td><td>E2E testing</td></tr>
+<tr><td><code>s1ap_port</code></td><td><code>36412</code></td><td>S1AP port constant; no listener is actually bound.</td></tr>
+<tr><td><code>sgsap_port</code></td><td><code>29118</code></td><td>SGsAP port constant; no listener is actually bound.</td></tr>
+<tr><td><code>relative_capacity</code></td><td><code>255</code></td><td>RelativeMMECapacity advertised in S1 Setup Response builders.</td></tr>
+<tr><td><code>mme_ue_s1ap_id</code></td><td>starts at <code>1</code></td><td>Wraps back to 1 on reaching the invalid value <code>0xffffffff</code>.</td></tr>
+<tr><td><code>served_gummei</code>, <code>served_tai</code>, <code>integrity_order</code>, <code>ciphering_order</code>, <code>network_name</code>, <code>mme_name</code>, timers (<code>t3402</code>/<code>t3412</code>/<code>t3423</code>)</td><td>empty / <code>Default</code></td><td><code>MmeContext</code> has fields for all of these, but nothing populates them from the YAML file.</td></tr>
 </tbody>
 </table>
 </div>
-<pre><code class="language-bash"># Ubuntu/Debian
-sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler clang
-
-# macOS (Homebrew)
-brew install protobuf cmake openssl
-</code></pre>
-<h2 id="building"><a class="header" href="#building">Building</a></h2>
-<p>The workspace root is <code>nextgcore/src/</code> (not <code>nextgcore/</code>):</p>
-<pre><code class="language-bash">cd nextgcore/src
-cargo build --workspace            # debug
-cargo build --workspace --release  # release
-</code></pre>
-<p>To build a single NF binary:</p>
-<pre><code class="language-bash">cargo build -p nextgcore-amfd
-</code></pre>
-<h2 id="testing"><a class="header" href="#testing">Testing</a></h2>
-<pre><code class="language-bash">cd nextgcore/src
-cargo test --workspace                          # all tests
-cargo test -p nextgcore-amfd                    # single NF
-cargo test --workspace -- --nocapture           # with log output
-</code></pre>
-<p>Integration / E2E tests require Docker:</p>
-<pre><code class="language-bash">cd nextgcore/docker/rust
-docker compose up -d
-bash e2e-test.sh
-</code></pre>
-<p>Multi-UE stress test:</p>
-<pre><code class="language-bash">bash test-multi-ue.sh               # 5 UEs (default)
-bash test-multi-ue.sh --ue-count 10 # 10 UEs
-</code></pre>
-<h2 id="code-style"><a class="header" href="#code-style">Code Style</a></h2>
-<p>All code must pass <code>cargo fmt</code> and <code>cargo clippy</code>:</p>
-<pre><code class="language-bash">cd nextgcore/src
-cargo fmt --all
-cargo clippy --workspace -- -D warnings
-</code></pre>
-<p>Pre-commit checklist:</p>
+<h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
+<p>Because the config file is never read, <strong>every field in the shipped <code>mme.yaml</code> is decorative</strong> for this daemon: <code>logger.*</code>, <code>global.max.*</code>, <code>mme.freeDiameter</code>, <code>mme.s1ap.server</code>, <code>mme.gtpc.server/client</code>, <code>mme.metrics.server</code>, <code>mme.gummei</code>, <code>mme.tai</code>, <code>mme.security.integrity_order/ciphering_order</code>, <code>mme.network_name</code>, and <code>mme.mme_name</code>. The file documents the intended deployment shape (its keys mirror the <code>MmeContext</code> fields above) but changing it has no effect on the running binary.</p>
+<p>The same applies to the freeDiameter configs: <code>docker-compose-epc.yml</code> mounts <code>configs/epc/freeDiameter/</code> (containing <code>mme.conf</code>, <code>hss.conf</code>, <code>pcrf.conf</code>) at <code>/etc/freeDiameter:ro</code>, and the YAML points at <code>/etc/freeDiameter/mme.conf</code>, but the daemon never opens these files. The S6a stack is pure Rust (<code>nextgcore-diameter</code>); its <code>DiameterConfig</code> would be supplied programmatically to <code>mme_fd_init_async()</code>, which <code>main</code> does not call.</p>
+<h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
+<p>From the clap <code>Args</code> struct in <code>src/bins/nextgcore-mmed/src/main.rs</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/mme.yaml</code></td><td>Configuration file path. Logged at startup, then <strong>ignored</strong> (<code>init</code> takes it as <code>_config_path</code>).</td></tr>
+<tr><td><code>-l, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>--no-color</code></td><td>flag</td><td>off</td><td>Parsed but never referenced after parsing — has no effect.</td></tr>
+<tr><td><code>-d, --daemon</code></td><td>flag</td><td>off</td><td>Parsed but never referenced after parsing — has no effect.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
-<li><input disabled="" type="checkbox"> <code>cargo fmt --all</code> — no formatting changes</li>
-<li><input disabled="" type="checkbox"> <code>cargo clippy --workspace -- -D warnings</code> — zero warnings</li>
-<li><input disabled="" type="checkbox"> <code>cargo test --workspace</code> — all tests pass</li>
-<li><input disabled="" type="checkbox"> <code>cargo audit</code> — no unpatched advisories</li>
+<li><strong>The config file is logged, not loaded.</strong> Startup prints <code>Configuration: &lt;path&gt;</code>, then initializes the global <code>MmeContext</code> (a <code>OnceLock</code> singleton) purely from hardcoded defaults. Operators cannot currently change GUMMEI/TAI, security algorithm order, or peer addresses without recompiling.</li>
+<li><strong>S6a is deferred-connect and never connected by <code>main</code>.</strong> <code>mme_fd_init()</code> only initializes client state; <code>mme_fd_init_async(config, hss_addr)</code> plus <code>mme_fd_connect()</code> (which retries the HSS connection 3 times via <code>connect_with_retry(3)</code>) exist in <code>fd_path.rs</code> but are not invoked from the binary’s startup path. HSS-initiated CLR/IDR polling (<code>TS 29.272 §7.2.7/7.2.9</code> mandatory-AVP checks, per code comments) is implemented in the same module.</li>
+<li><strong>Environment variables:</strong> the only one this binary reads is <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (default <code>http://jaeger:4317</code>) for OpenTelemetry trace export at startup. Note that <code>RUST_LOG</code> is <strong>not</strong> honored — logging uses <code>env_logger::Builder::new().filter_level(...)</code> without parsing the environment, so the level comes solely from <code>-l/--log-level</code>. The <code>RUST_LOG: info</code> set in <code>docker-compose-epc.yml</code> is therefore inert for the MME.</li>
+<li><strong>Docker publishes <code>36412/sctp</code>, but nothing listens.</strong> The compose file’s port mapping and the <code>kill -0 1</code> healthcheck both succeed because the process stays alive in its sleep loop, not because S1AP is serviceable.</li>
+<li><strong>Built-in capacity constants</strong> (<code>context.rs</code>): max 8 served GUMMEIs, 16 supported TAs, 6 PLMNs per MME, 4 sessions and 8 bearers per UE, EPS bearer IDs 5–15. GUTI space is 256 MME group IDs × 256 MME codes per MME.</li>
+<li><strong>What is real and tested:</strong> S1AP APER decode/dispatch including S1 handover paths (TS 36.413, per code comments), UE paging identity index <code>IMSI mod 1024</code> (TS 36.304 §7.1, per code comment), byte-level NAS builders with TAI-list encoding (TS 24.301 §9.9.3.33, per code comment), GTPv2-C S11 builders with TS 23.003 APN label encoding, SBc-AP/ETWS message codecs (TS 23.041), and proptest-based FSM equivalence tests (<code>property_tests.rs</code>) — all as library logic exercised by <code>cargo test</code>, not over the wire by this binary.</li>
 </ul>
-<h2 id="security-auditing"><a class="header" href="#security-auditing">Security Auditing</a></h2>
-<pre><code class="language-bash">cargo install cargo-audit
-cd nextgcore/src
-cargo audit
-</code></pre>
-<h2 id="project-layout"><a class="header" href="#project-layout">Project Layout</a></h2>
-<pre><code>nextgcore/
-├── src/                     # Workspace root
-│   ├── bins/                # 24 NF binaries + webui
-│   │   ├── nextgcore-amfd/  # AMF
-│   │   ├── nextgcore-smfd/  # SMF
-│   │   ├── nextgcore-upfd/  # UPF
-│   │   └── ...              # (all 24 NFs)
-│   ├── libs/                # Shared libraries
-│   │   ├── nextgcore-core/        # Core types
-│   │   ├── nextgcore-sbi/         # HTTP/2 SBI client + server
-│   │   ├── nextgcore-crypt/       # 5G cryptography (SUCI, AKA, PQC)
-│   │   ├── nextgcore-metrics/     # Prometheus + OpenTelemetry
-│   │   └── ...
-│   └── tests/               # Integration tests
-├── k8s/                     # Kubernetes manifests + Helm
-├── docker/rust/             # Docker Compose E2E stack
-└── docs/                    # OpenAPI specs, architecture docs
-</code></pre>
-<h2 id="3gpp-specification-references"><a class="header" href="#3gpp-specification-references">3GPP Specification References</a></h2>
-<p>Each file includes a doc comment referencing the 3GPP TS number and section (e.g. <code>//! TS 23.501 §5.15</code>). When adding new protocol logic, always cite the relevant spec:</p>
-<ul>
-<li><strong>TS 23.501</strong> — 5G system architecture</li>
-<li><strong>TS 23.502</strong> — 5G procedures</li>
-<li><strong>TS 29.xxx</strong> — SBI service definitions</li>
-<li><strong>TS 38.331</strong> — NR RRC</li>
-<li><strong>TS 38.413</strong> — NGAP</li>
-</ul>
-<h2 id="commit-messages"><a class="header" href="#commit-messages">Commit Messages</a></h2>
-<p>Follow conventional commits:</p>
-<pre><code>feat(smf): add MBS multicast session context (TS 23.247)
-fix(amf): release SMF session on UE context release
-test(upf): add SDF filter 5-tuple matching unit tests
-</code></pre>
-<ul>
-<li><strong>Never</strong> include <code>Co-Authored-By: Claude</code> or any AI attribution</li>
-<li>Sign commits: <code>Signed-off-by: Your Name &lt;email&gt;</code></li>
-</ul>
-<h2 id="pull-request-process"><a class="header" href="#pull-request-process">Pull Request Process</a></h2>
-<ol>
-<li>Fork the repository</li>
-<li>Create a feature branch from <code>main</code></li>
-<li>Implement your change with tests</li>
-<li>Ensure all CI checks pass</li>
-<li>Open a PR with a description referencing the 3GPP TS item</li>
-</ol>
-<h2 id="nf-implementation-standards"><a class="header" href="#nf-implementation-standards">NF Implementation Standards</a></h2>
-<p>Each NF binary must:</p>
-<ul>
-<li>Register with NRF on startup (via <code>nextgcore-sbi</code> NF management)</li>
-<li>Expose <code>/metrics</code> (Prometheus, port 9090)</li>
-<li>Respond to SIGTERM with graceful shutdown</li>
-<li>Log at <code>info</code> level by default, configurable via <code>RUST_LOG</code></li>
-<li>Have ≥ 1 unit test per public function</li>
-</ul>
-<h2 id="license"><a class="header" href="#license">License</a></h2>
-<p>AGPL-3.0. See <a href="LICENSE">LICENSE</a>.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="gaps/gap-libs-infra.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../configuration/sepp.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
+                            <a rel="next prefetch" href="../configuration/hss.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
 
                         <div style="clear: both"></div>
                     </nav>
@@ -316,10 +296,13 @@ test(upf): add SDF filter 5-tuple matching unit tests
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="gaps/gap-libs-infra.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../configuration/sepp.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
+                    <a rel="next prefetch" href="../configuration/hss.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
             </nav>
 
         </div>
@@ -337,13 +320,13 @@ test(upf): add SDF filter 5-tuple matching unit tests
         </script>
 
 
-        <script src="elasticlunr-ef4e11c1.min.js"></script>
-        <script src="mark-09e88c2c.min.js"></script>
-        <script src="searcher-09f2665d.js"></script>
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
 
-        <script src="clipboard-1626706a.min.js"></script>
-        <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
 
         <!-- Custom JS scripts -->
 

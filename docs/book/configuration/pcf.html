@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>UPF - NextGCore Documentation</title>
+        <title>PCF - NextGCore Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,19 +177,22 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="upf-configuration"><a class="header" href="#upf-configuration">UPF Configuration</a></h1>
-<p>The UPF (User Plane Function, <code>nextgcore-upfd</code>) terminates the N4/PFCP interface toward the SMF and the N3/GTP-U interface toward the gNB, and forwards user traffic through a TUN device.</p>
+                        <h1 id="pcf-configuration"><a class="header" href="#pcf-configuration">PCF Configuration</a></h1>
+<p>The PCF (Policy Control Function, <code>nextgcore-pcfd</code>) makes access-, session-, and application-level policy decisions for the 5G core, per TS 29.507, TS 29.512, TS 29.514 and TS 29.525 (as cited in the daemon’s source comments). Its SBI router (<code>pcf_sbi_request_handler</code> in <code>src/bins/nextgcore-pcfd/src/app.rs</code>) serves four services: <code>Npcf_AMPolicyControl</code> (<code>/npcf-am-policy-control/v1/policies</code>), <code>Npcf_SMPolicyControl</code> (<code>/npcf-smpolicycontrol/v1/sm-policies</code>), <code>Npcf_PolicyAuthorization</code> (<code>/npcf-policyauthorization/v1/app-sessions</code>), and <code>Npcf_UEPolicyControl</code> (<code>/npcf-ue-policy-control/v1/policies</code>), plus a <code>N1MessageNotify</code> callback route (<code>/npcf-ue-policy-control/v1/notify/{polAssoId}/n1-message-notify</code>, TS 29.518 per code comments) on which the AMF returns the UE’s MANAGE UE POLICY COMPLETE/REJECT. The binary itself is a thin wrapper: <code>main.rs</code> only calls <code>nextgcore_pcfd::run()</code>; all logic lives in the library crate (<code>lib.rs</code>/<code>app.rs</code>, Wave-6 lib-targetization).</p>
+<p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/pcf.yaml</code>, overridable with <code>-c/--config</code>), command-line flags, and an unusually large set of environment variables. The YAML file supplies the advertised SBI address/port, an optional FQDN, and the NRF URI; capacities and TLS-related flags are CLI-only; UE-policy delivery, URSP rules, UAV gating, the local PLMN, OAuth2 enforcement, and the OTLP endpoint are env-var driven.</p>
 <blockquote>
-<p><strong>Important — how the UPF is actually configured:</strong> unlike most other NextGCore NFs, <code>nextgcore-upfd</code> currently takes its runtime settings from <strong>command-line flags</strong>, not from the YAML file. The <code>-c/--config</code> flag points at a YAML file, and if that file exists the daemon reads it — but it only logs the file size (<code>main.rs</code>, “Configuration file loaded (N bytes)”) and <strong>does not deserialize or apply any of its contents</strong>. There is no <code>#[derive(Deserialize)]</code> config struct in the UPF binary. The entire YAML file is therefore parsed-but-inert today; it is shipped for deployment-layout consistency with the other NFs (Docker/k8s/Helm mount it), and CLI flags are the source of truth.</p>
+<p><strong>Honesty note:</strong> PCF behavior is validated by this project’s own unit tests and matched-simulator Docker E2E runs, not by third-party conformance certification. Several pieces are explicitly bespoke or partial: the <code>urspRules</code> member the PCF reads from the UDR UePolicySet is a provisioning-side convention of this deployment, never a 3GPP wire field (documented as such in <code>ue_policy.rs</code>); the UAV flight-zone gate uses a hardcoded geofence (lat 37–38, lon −123…−122); the <code>intent_policy</code> module is Rel-20 research scaffolding not wired to any live handler; the <code>--tls*</code> flags do <strong>not</strong> enable TLS on the live HTTP/2 listener (see below); and <code>-k/--kill</code> and <code>-l/--log-file</code> are accepted but not functional (kill only logs and exits; no file logging is wired in <code>init_logging</code>).</p>
 </blockquote>
-<h2 id="example-yaml-dockerrustconfigs5gcupfyaml"><a class="header" href="#example-yaml-dockerrustconfigs5gcupfyaml">Example YAML (<code>docker/rust/configs/5gc/upf.yaml</code>)</a></h2>
-<p>This is the file mounted in the Docker E2E deployment. Every key below is currently ignored by the daemon (see note above):</p>
-<pre><code class="language-yaml"># UPF (User Plane Function) Configuration
+<h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
+<p>From <code>nextgcore/docker/rust/configs/5gc/pcf.yaml</code>:</p>
+<pre><code class="language-yaml"># PCF (Policy Control Function) Configuration
 # Docker container configuration for 5G Core deployment
+
+db_uri: mongodb://172.23.0.2/nextgcore
 
 logger:
   file:
-    path: /var/log/nextgcore/upf.log
+    path: /var/log/nextgcore/pcf.log
   level: info
 
 global:
@@ -197,106 +200,125 @@ global:
     ue: 1024
     peer: 64
 
-upf:
-  pfcp:
+pcf:
+  sbi:
     server:
-      - address: 172.23.0.7
-        port: 8805
-  gtpu:
-    server:
-      - address: 172.23.0.7
-        port: 2152
-  session:
-    - subnet: 10.45.0.0/16
-      gateway: 10.45.0.1
-      dev: ogstun
-    - subnet: 2001:db8:cafe::/48
-      gateway: 2001:db8:cafe::1
-      dev: ogstun
+      - address: 172.23.0.13
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
   metrics:
     server:
-      - address: 172.23.0.7
+      - address: 172.23.0.13
         port: 9090
   # TLS configuration (G36: SBI TLS)
   # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
   tls:
     enabled: false
-    cert: /etc/nextgcore/certs/upf.crt
-    key: /etc/nextgcore/certs/upf.key
+    cert: /etc/nextgcore/certs/pcf.crt
+    key: /etc/nextgcore/certs/pcf.key
     ca: /etc/nextgcore/certs/ca.crt
     min_version: "1.2"
 </code></pre>
-<p>In Docker deployments the container is instead launched with matching CLI flags; the YAML values above mirror those flags but do not drive them.</p>
-<h2 id="effective-parameters-cli-flags-args-struct-in-binsnextgcore-upfdsrcmainrs"><a class="header" href="#effective-parameters-cli-flags-args-struct-in-binsnextgcore-upfdsrcmainrs">Effective parameters (CLI flags, <code>Args</code> struct in <code>bins/nextgcore-upfd/src/main.rs</code>)</a></h2>
-<p>Defaults below are the real clap <code>default_value</code>s from the source.</p>
+<h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
+<p>These are the fields actually deserialized by the daemon (<code>#[derive(Deserialize)]</code> structs <code>PcfYaml</code>/<code>PcfSection</code>/<code>SbiYaml</code>/<code>SbiServerYaml</code>/<code>SbiClientYaml</code>/<code>NrfClientYaml</code> in <code>src/bins/nextgcore-pcfd/src/app.rs</code>), plus one knob read via an untyped <code>serde_yaml</code> pass.</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-c, --config</code></td><td>string</td><td><code>/etc/nextgcore/upf.yaml</code></td><td>Configuration file path. Read if present, but contents are not applied (see note above).</td></tr>
-<tr><td><code>-l, --log-file</code></td><td>string</td><td><em>(none)</em></td><td>Log file path.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level: <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
-<tr><td><code>-m, --no-color</code></td><td>bool</td><td><code>false</code></td><td>Disable colored log output.</td></tr>
-<tr><td><code>-k, --kill</code></td><td>bool</td><td><code>false</code></td><td>Kill a running instance (currently logs intent and exits).</td></tr>
-<tr><td><code>--pfcp-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N4 PFCP server bind address.</td></tr>
-<tr><td><code>--pfcp-port</code></td><td>u16</td><td><code>8805</code></td><td>N4 PFCP server port.</td></tr>
-<tr><td><code>--gtpu-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N3 GTP-U bind address.</td></tr>
-<tr><td><code>--gtpu-port</code></td><td>u16</td><td><code>2152</code></td><td>N3 GTP-U port.</td></tr>
-<tr><td><code>--tun-ifname</code></td><td>string</td><td><code>ogstun</code></td><td>TUN interface name for the user-plane subnet.</td></tr>
-<tr><td><code>--tun-ip</code></td><td>IPv4</td><td><code>10.45.0.1</code></td><td>TUN interface IP address (UE subnet gateway).</td></tr>
-<tr><td><code>--tun-prefix</code></td><td>u8</td><td><code>16</code></td><td>TUN interface prefix length.</td></tr>
-<tr><td><code>--max-sessions</code></td><td>usize</td><td><code>1024</code></td><td>Maximum number of PFCP sessions (sizes the UPF context).</td></tr>
-<tr><td><code>--no-dataplane</code></td><td>bool</td><td><code>false</code></td><td>Disable the TUN data plane; control-plane-only mode (no user traffic forwarding).</td></tr>
-<tr><td><code>--nrf-uri</code></td><td>string</td><td><code>""</code> (empty = disabled)</td><td>Opt-in NRF base URI (e.g. <code>http://127.0.0.10:7777</code>). When set, the UPF registers a UPF NFProfile and PATCHes a real PFCP-session <code>/load</code> gauge on each heartbeat (code comment cites TS 29.510 §5.2.2.3.2). Empty disables the SBI/NRF plane entirely; NRF failures are log-only and never affect packet forwarding.</td></tr>
+<tr><td><code>pcf.sbi.server[].address</code></td><td>string</td><td>absent → CLI <code>--sbi-addr</code> (<code>0.0.0.0</code>)</td><td>Overrides the SBI bind <strong>and</strong> advertised address so the NRF NFProfile carries a routable endpoint (not 0.0.0.0). Only the <strong>first</strong> list entry is read.</td></tr>
+<tr><td><code>pcf.sbi.server[].port</code></td><td>u16</td><td>absent → CLI <code>--sbi-port</code> (<code>7777</code>)</td><td>Overrides the SBI bind/advertised port. First entry only.</td></tr>
+<tr><td><code>pcf.sbi.server[].fqdn</code></td><td>string</td><td>absent (no FQDN)</td><td>Optional advertised FQDN, emitted as <code>pcfFqdn</code> in TS 29.521 PcfBinding registrations towards the BSF (per code comment); never invented when absent — <code>pcfIpEndPoints</code> alone satisfies the spec NOTE.</td></tr>
+<tr><td><code>pcf.sbi.client.nrf[].uri</code></td><td>string</td><td>absent → no NRF (unless CLI <code>--nrf-uri</code>)</td><td>NRF base URI seeded into the shared SBI context for NF registration, discovery, heartbeat, and (when OAuth2 is on) token/JWKS. Only the <strong>first</strong> list entry is used.</td></tr>
+<tr><td><code>&lt;any-section&gt;.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>SBI OAuth2 enforcement (TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comments). Read by <code>oauth2_required()</code> via a raw <code>serde_yaml::Value</code> traversal that is root-key agnostic: <code>true</code> iff <em>any</em> top-level section sets <code>sbi.oauth2.require: true</code>. When on, incoming requests must carry an NRF-issued token with audience <code>PCF</code> (fails closed with 503 when no NRF URI is configured) and outbound SBI calls attach tokens. The env var <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> takes precedence over the YAML in either direction. Note: no <code>pcf-oauth2.yaml</code> overlay ships in <code>docker/rust/configs/5gc/</code> — the env var is the practical switch.</td></tr>
 </tbody>
 </table>
 </div>
-<h3 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h3>
+<h2 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h2>
+<p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In the shipped example file:</p>
+<ul>
+<li><strong><code>db_uri</code> is inert.</strong> <code>nextgcore-pcfd</code> never calls <code>nextgcore_dbi_init</code> — its subscription/session-data lookups through <code>nextgcore-dbi</code> therefore error out at runtime and fall back to built-in defaults (see Behavior notes). The key exists for visual consistency with NFs that do open MongoDB.</li>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes only from the CLI flag <code>-e/--log-level</code> (default <code>info</code>); <code>init_logging</code> builds an <code>env_logger</code> with <code>filter_level</code> and does not wire file output (the <code>-l/--log-file</code> flag is accepted but unused).</li>
+<li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> Context capacities come from the CLI flags <code>--max-ue</code> (1024) and <code>--max-sess</code> (4096).</li>
+<li><strong><code>pcf.metrics.server[]</code> is inert.</strong> The daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP via <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>.</li>
+<li><strong><code>pcf.tls.*</code> is inert.</strong> No code reads this section. Even the CLI <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> flags only flow into the legacy <code>SbiServerConfig</code> (<code>sbi_path.rs</code>), where they flip the <em>advertised</em> URI scheme to <code>https</code> in the legacy NF-instance builder; the live HTTP/2 listener is created from <code>NextgcoreSbiServerConfig::new(addr)</code> without any TLS wiring and serves cleartext h2c.</li>
+</ul>
+<h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
+<p>Runtime knobs with real defaults from the clap <code>Args</code> struct in <code>src/bins/nextgcore-pcfd/src/app.rs</code>:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+<tr><th>Flag</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored).</td></tr>
+<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/pcf.yaml</code></td><td>Configuration file path.</td></tr>
+<tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Log file path — parsed but currently <strong>not used</strong> by <code>init_logging</code> (no file logging).</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else falls back to <code>info</code>).</td></tr>
+<tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
+<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Stub: logs “would send SIGTERM to running instance” and exits — does not actually signal anything.</td></tr>
+<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI bind address; overridden by <code>pcf.sbi.server[0].address</code> when the YAML sets one.</td></tr>
+<tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>SBI port; overridden by <code>pcf.sbi.server[0].port</code>.</td></tr>
+<tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Sets the advertised scheme to <code>https</code> in the legacy NF-instance builder only; does <strong>not</strong> enable TLS on the live listener.</td></tr>
+<tr><td><code>--tls-cert</code></td><td>path</td><td>unset</td><td>TLS certificate path (stored in the legacy config; not wired to the listener).</td></tr>
+<tr><td><code>--tls-key</code></td><td>path</td><td>unset</td><td>TLS key path (same caveat).</td></tr>
+<tr><td><code>--nrf-uri</code></td><td>string</td><td>unset</td><td>NRF URI. When set, the legacy SBI-open path stores it <em>after</em> the YAML seed, so it wins over <code>pcf.sbi.client.nrf[0].uri</code>; it also triggers an additional legacy NFProfile registration with its own instance ID.</td></tr>
+<tr><td><code>--max-ue</code></td><td>usize</td><td><code>1024</code></td><td>Maximum UEs (sizes the context pool and the load-gauge denominator).</td></tr>
+<tr><td><code>--max-sess</code></td><td>usize</td><td><code>4096</code></td><td>Maximum sessions.</td></tr>
 </tbody>
 </table>
 </div>
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
-<li><strong>PFCP heartbeats:</strong> the UPF also initiates PFCP heartbeats toward the associated CP function every 10 seconds (code comment cites TS 29.244 §6.2.2: either node may initiate).</li>
-<li><strong>Reports:</strong> the data plane emits Downlink Data Reports (on first buffered downlink packet) and Error Indication Reports over N4.</li>
-<li><strong>Validation status:</strong> UPF behavior has been exercised in the project’s matched-simulator Docker E2E suite (UE→UPF GTP-U traffic). This is internal test validation, not third-party conformance certification.</li>
-</ul>
-<h2 id="parsed-but-inert-summary"><a class="header" href="#parsed-but-inert-summary">Parsed-but-inert summary</a></h2>
+<li>
+<p><strong>NRF registration and heartbeat</strong>: at startup the PCF PUTs an NFProfile (<code>/nnrf-nfm/v1/nf-instances/{id}</code>) advertising <code>npcf-am-policy-control</code>, <code>npcf-smpolicycontrol</code> and <code>npcf-ue-policy-control</code> with <code>heartBeatTimer: 10</code> and <code>allowedNfTypes: [AMF, SMF, SCP]</code>, then spawns a heartbeat worker every 5 s that PATCHes a real <code>/load</code> gauge (TS 29.510 §5.2.2.3.2 per code comment): <code>load = (AM + SM policy associations) × 100 / (2 × max_ue)</code>, clamped 0–100. Registration failure is non-fatal — the PCF logs a warning and “will operate without NRF”. The same NF instance ID doubles as <code>pcfId</code> in BSF PcfBinding registrations (TS 29.510 per comment).</p>
+</li>
+<li>
+<p><strong>Mandatory-IE rejection</strong>: AM and UE policy create require <code>notificationUri</code>, <code>supi</code> and <code>suppFeat</code> (TS 29.507 §5.6.2.3 / TS 29.525 per comments); SM policy create requires <code>supi</code>, <code>pduSessionId</code>, <code>dnn</code>, <code>pduSessionType</code>, <code>notificationUri</code> and <code>sliceInfo.sst</code> (TS 29.512 §5.6.2.3). Anything missing → HTTP 400 with cause <code>MANDATORY_IE_MISSING</code>. <code>suppFeat</code> is negotiated (consumer ∩ producer): producer masks are <code>0x0</code> for AM/UE-policy/PolicyAuthorization and <code>0x3</code> for SM. Updates use the spec custom operations <code>POST …/policies/{id}/update</code> and <code>POST …/sm-policies/{id}/{update,delete}</code>; legacy <code>PATCH</code>/<code>DELETE</code> arms are kept for backward compatibility. Unmatched routes get 405.</p>
+</li>
+<li>
+<p><strong>Policy-data sources</strong>: because the MongoDB layer is never initialized (see <code>db_uri</code> above), <code>nudr_handler</code> falls back to built-in defaults — AM UE-AMBR 1 Gbps up/down; SM 5QI 9, ARP 8, session AMBR 100/100 Mbps, no PCC rules. On the live SM path the PCF additionally does a bounded (3 s) NRF-discovered <code>nudr-dr</code> GET of SmPolicyData (TS 29.519 per comment) and maps only the <code>online</code>/<code>offline</code> charging flags into the decision; 404/unreachable falls back silently.</p>
+</li>
+<li>
+<p><strong>URSP delivery (UE policy)</strong>: on UE-policy create the PCF builds a MANAGE UE POLICY COMMAND (TS 24.501 Annex D / TS 24.526 per comments) and delivers it via the AMF’s N1N2MessageTransfer, subscribing for the uplink result <em>before</em> the transfer (TS 29.525 §4.2.2.2 order). Rules come from the UDR UePolicySet <code>urspRules</code> extension when provisioned, else a static catch-all default (<code>dnn: internet</code>, sst 1). The association stays <code>Pending</code> until a COMPLETE arrives; T3501 (default 30 s) retransmits exactly once, then marks the delivery <code>Failed</code> — fail-closed, never a fake <code>Delivered</code>.</p>
+</li>
+<li>
+<p><strong>UAV gating and BSF bindings</strong>: an SM policy create whose DNN matches <code>PCF_UAV_DNN</code> (default <code>uav</code>) passes an altitude/flight-zone gate (Rel-18, TS 23.256 per comment) and is rejected with HTTP 403 <code>UAV_FLIGHT_NOT_AUTHORIZED</code> when out of policy. Each SM policy create/delete also best-effort registers/deregisters a PcfBinding at the BSF (TS 29.521 per comment) — a no-op when no BSF/NRF is reachable.</p>
+</li>
+<li>
+<p><strong>Environment variables</strong> (all read directly by this binary):</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>YAML section</th><th>Status</th></tr>
+<tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
 </thead>
 <tbody>
-<tr><td><code>logger.*</code></td><td>Ignored — use <code>-l</code> / <code>-e</code> flags.</td></tr>
-<tr><td><code>global.max.*</code></td><td>Ignored — use <code>--max-sessions</code>.</td></tr>
-<tr><td><code>upf.pfcp.server</code></td><td>Ignored — use <code>--pfcp-addr</code> / <code>--pfcp-port</code>.</td></tr>
-<tr><td><code>upf.gtpu.server</code></td><td>Ignored — use <code>--gtpu-addr</code> / <code>--gtpu-port</code>.</td></tr>
-<tr><td><code>upf.session</code></td><td>Ignored — use <code>--tun-ifname</code> / <code>--tun-ip</code> / <code>--tun-prefix</code> (single IPv4 subnet only via CLI; the YAML’s IPv6 entry has no CLI equivalent).</td></tr>
-<tr><td><code>upf.metrics.server</code></td><td>Ignored by the UPF binary.</td></tr>
-<tr><td><code>upf.tls.*</code></td><td>Ignored by the UPF binary; the deployment’s TLS switch is the <code>TLS_ENABLED</code> / <code>SBI_SCHEME</code> compose environment, per the file’s own comment.</td></tr>
+<tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>unset (follow YAML)</td><td><code>1/true/TRUE/yes</code> forces OAuth2 enforcement on; any other value forces it off. Checked <strong>before</strong> the YAML knob.</td></tr>
+<tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry tracing.</td></tr>
+<tr><td><code>PCF_LOCAL_PLMN</code></td><td><code>001-01</code></td><td>Home PLMN as <code>MCC-MNC</code>; drives V-PCF vs H-PCF role detection per serving PLMN.</td></tr>
+<tr><td><code>PCF_UE_POLICY_DELIVERY</code></td><td>on</td><td>Kill-switch: <code>off/0/false/disabled/no</code> disables URSP N1N2 delivery (association-only, pre-Wave-6 behavior).</td></tr>
+<tr><td><code>PCF_T3501_SECS</code></td><td><code>30</code></td><td>T3501 duration in seconds; zero/invalid falls back to 30.</td></tr>
+<tr><td><code>PCF_URSP_RULES</code></td><td>unset</td><td>JSON array overriding the entire default URSP rule set; invalid/empty JSON falls back to the built-in catch-all with a warning.</td></tr>
+<tr><td><code>PCF_UAV_DNN</code></td><td><code>uav</code></td><td>Comma-separated DNN list treated as UAV sessions.</td></tr>
+<tr><td><code>PCF_UAV_MAX_ALTITUDE</code></td><td><code>120</code> (meters)</td><td>UAV altitude ceiling.</td></tr>
+<tr><td><code>PCF_UAV_POSITION</code></td><td><code>37.5,-122.5,min(max_alt,100)</code></td><td><code>lat,lon,alt</code> gated against the flight zone; the default is deliberately in-zone so the authorize path is exercised.</td></tr>
 </tbody>
 </table>
 </div>
+</li>
+</ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../configuration/smf.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../configuration/udr.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../configuration/nrf.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../configuration/nssf.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -306,11 +328,11 @@ upf:
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../configuration/smf.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../configuration/udr.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../configuration/nrf.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../configuration/nssf.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

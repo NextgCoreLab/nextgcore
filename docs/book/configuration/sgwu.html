@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Contributing - NextGCore Documentation</title>
+        <title>SGW-U (4G/EPC) - NextGCore Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -12,33 +12,33 @@
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
-        <link rel="icon" href="favicon-de23e50b.svg">
-        <link rel="shortcut icon" href="favicon-8114d1fc.png">
-        <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
-        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
-        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
 
         <!-- Highlight.js Stylesheets -->
-        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
-        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
-        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
-            const path_to_root = "";
+            const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-51e55ca4.js";
+            window.path_to_searchindex_js = "../searchindex-51e55ca4.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-06d290c2.js"></script>
+        <script src="../toc-06d290c2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -105,7 +105,7 @@
             <!-- populated by js -->
             <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
             <noscript>
-                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
             </noscript>
             <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -140,7 +140,7 @@
                     <h1 class="menu-title">NextGCore Documentation</h1>
 
                     <div class="right-buttons">
-                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
                             <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
                         </a>
                         <a href="https://github.com/NextgCoreLab/nextgcore" title="Git repository" aria-label="Git repository">
@@ -177,138 +177,85 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="contributing-to-nextgcore"><a class="header" href="#contributing-to-nextgcore">Contributing to NextGCore</a></h1>
-<p>NextGCore is a research-faithful 5G Core Network implementation in Rust targeting 3GPP Rel-15 with selected Rel-17/18 features. 6G/Rel-20 items (ISAC, FL, PQC, semantic, agent-native) are non-normative prototypes — no frozen Rel-20 3GPP specs exist.</p>
-<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+                        <h1 id="sgw-u-configuration"><a class="header" href="#sgw-u-configuration">SGW-U Configuration</a></h1>
+<p>The SGW-U (Serving Gateway User Plane, <code>nextgcore-sgwud</code>) is the 4G/EPS user-plane NF in NextGCore’s dual 5G+4G core. It owns a real GTP-U UDP socket on port 2152 (TS 29.281, as cited in the daemon source) and implements the forwarding path <em>G-PDU in → PDR match by TEID → FAR apply (FORW/BUFF/DROP) → G-PDU out</em> between the S1-U (eNB) and S5-U (PGW) interfaces (<code>src/bins/nextgcore-sgwud/src/gtp_path.rs</code>, <code>main.rs</code> comments). Its control plane is PFCP over the Sxa reference point toward the SGW-C — session establishment/modification/deletion/report handling in <code>sxa_handler.rs</code>, response building in <code>sxa_build.rs</code>, and an association/heartbeat state machine in <code>pfcp_sm.rs</code> (TS 29.244 and TS 23.214 per code comments). It has <strong>no SBI/HTTP surface, no GTP-C, and no Diameter interface</strong>.</p>
+<p>Unlike most NextGCore NFs, this daemon has <strong>no YAML config loading and no CLI parser at all</strong>: <code>main.rs</code> defines no clap <code>Args</code> struct and no <code>#[derive(Deserialize)]</code> config structs, and never opens a config file. The only configuration surface is <strong>environment variables</strong> (<code>SGWU_GTPU_BIND</code>, <code>SGWU_GTPU_ADVERTISE</code>, <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>, plus <code>RUST_LOG</code> via <code>env_logger::init()</code>). The Docker deployment still mounts a YAML file and passes <code>-c /etc/nextgcore/sgwu.yaml</code> on the command line (<code>Dockerfile.nf</code> <code>CMD</code> / <code>docker-compose-epc.yml</code> <code>command:</code>), but the binary never reads <code>argv</code>, so both the flag and the file are ignored.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> SGW-U behavior is validated by this project’s own in-crate unit tests only — not by third-party conformance certification, and (per the project directive) not against Open5GS as an oracle, although the modules are documented as ports of a C reference (<code>Port of src/sgwu/*.c</code> per module comments). Two gaps are worth knowing: <code>pfcp_path::pfcp_open()</code> is a stub that logs but binds no PFCP socket (UDP 8805 appears only in comments), and <code>main()</code> initializes the subsystems, dispatches the entry event, and then immediately runs the shutdown sequence — the long-running poll loop is described only in a <code>// Note:</code> comment. The GTP-U server, PFCP FSM, and Sxa handlers are real and unit-tested, but the wired-together daemon lifecycle is not exercised end-to-end; the project’s 84/84 Docker E2E result covers the 5GC (UPF) data path, not this EPC NF.</p>
+</blockquote>
+<h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
+<p>From <code>nextgcore/docker/rust/configs/epc/sgwu.yaml</code> (mounted read-only into the container by <code>docker-compose-epc.yml</code>):</p>
+<pre><code class="language-yaml"># NextGCore SGW-U Configuration for Docker EPC Deployment
+# Rust implementation
+
+logger:
+  file:
+    path: /var/log/nextgcore/sgwu.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+sgwu:
+  pfcp:
+    server:
+      - address: 172.24.0.6
+  gtpu:
+    server:
+      - address: 172.24.0.6
+</code></pre>
+<h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
+<p><strong>None.</strong> The binary contains no <code>#[derive(Deserialize)]</code> configuration structs and never opens the YAML file — there is no <code>-c/--config</code> handling in <code>src/bins/nextgcore-sgwud/src/main.rs</code> (its <code>Cargo.toml</code> does not even depend on serde or clap). Every key in the shipped example file is therefore decorative; see below.</p>
+<h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
+<p>The <strong>entire shipped <code>sgwu.yaml</code> is inert</strong> for this daemon:</p>
+<ul>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> Logging is <code>env_logger</code> configured by <code>RUST_LOG</code> (the compose file sets <code>RUST_LOG: info</code>); nothing writes to <code>/var/log/nextgcore/sgwu.log</code>.</li>
+<li><strong><code>global.max.ue: 1024</code> is inert but coincidental.</strong> The session pool really is 1024, but it is hard-coded as <code>context::sgwu_context_init(1024)</code> in <code>main.rs</code>, not read from YAML.</li>
+<li><strong><code>global.max.peer: 64</code> is inert.</strong> No peer-pool sizing exists in this binary.</li>
+<li><strong><code>sgwu.pfcp.server[].address</code> is inert.</strong> <code>pfcp_open()</code> binds nothing; the address is never read.</li>
+<li><strong><code>sgwu.gtpu.server[].address</code> is inert.</strong> The GTP-U bind comes from <code>SGWU_GTPU_BIND</code> (default <code>0.0.0.0:2152</code>), not from YAML. The <code>172.24.0.6</code> value merely mirrors the container’s compose-assigned IP.</li>
+<li><strong>freeDiameter configs are not consumed.</strong> <code>docker/rust/configs/epc/freeDiameter/</code> serves the Diameter NFs (MME/HSS/PCRF); <code>nextgcore-sgwud</code> has no Diameter code and never reads those files.</li>
+</ul>
+<h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
+<p><strong>None.</strong> There is no clap parser; <code>main()</code> never inspects <code>std::env::args</code>. The Docker image entrypoint appends <code>-c /etc/nextgcore/sgwu.yaml</code> (<code>Dockerfile.nf</code> default <code>CMD</code>, overridden with the same shape in <code>docker-compose-epc.yml</code>), which the process accepts and silently ignores.</p>
+<h2 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h2>
+<p>The actual configuration surface (all read in <code>main.rs</code> and <code>gtp_path.rs</code>):</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
+<tr><th>Variable</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td>Rust</td><td>stable (≥1.75)</td><td>Build toolchain</td></tr>
-<tr><td>protobuf-compiler</td><td>≥3.21</td><td>Protobuf codegen</td></tr>
-<tr><td>clang / libclang-dev</td><td>any</td><td>LLVM bindings</td></tr>
-<tr><td>libssl-dev</td><td>any</td><td>TLS support</td></tr>
-<tr><td>cmake</td><td>≥3.16</td><td>FFI build scripts</td></tr>
-<tr><td>Docker + docker-compose</td><td>≥24</td><td>E2E testing</td></tr>
+<tr><td><code>SGWU_GTPU_BIND</code></td><td><code>0.0.0.0:2152</code></td><td>GTP-U bind address:port (<code>DEFAULT_GTPU_BIND</code>, TS 29.281 §4.4.2.3 per code comment).</td></tr>
+<tr><td><code>SGWU_GTPU_ADVERTISE</code></td><td>unset</td><td>IPv4 address advertised in UP-allocated F-TEIDs. Consulted <strong>only</strong> when the bound address is wildcard/non-IPv4; a concrete bound IPv4 always wins. Unparseable values are silently discarded (advertise address becomes <code>None</code>).</td></tr>
+<tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry traces (service name <code>nextgcore-sgwud</code> from <code>CARGO_PKG_NAME</code>); init is best-effort (<code>.ok()</code>), failures are non-fatal.</td></tr>
+<tr><td><code>RUST_LOG</code></td><td><code>env_logger</code> default (<code>error</code>)</td><td>Log filter; the EPC compose sets <code>info</code>.</td></tr>
 </tbody>
 </table>
 </div>
-<pre><code class="language-bash"># Ubuntu/Debian
-sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler clang
-
-# macOS (Homebrew)
-brew install protobuf cmake openssl
-</code></pre>
-<h2 id="building"><a class="header" href="#building">Building</a></h2>
-<p>The workspace root is <code>nextgcore/src/</code> (not <code>nextgcore/</code>):</p>
-<pre><code class="language-bash">cd nextgcore/src
-cargo build --workspace            # debug
-cargo build --workspace --release  # release
-</code></pre>
-<p>To build a single NF binary:</p>
-<pre><code class="language-bash">cargo build -p nextgcore-amfd
-</code></pre>
-<h2 id="testing"><a class="header" href="#testing">Testing</a></h2>
-<pre><code class="language-bash">cd nextgcore/src
-cargo test --workspace                          # all tests
-cargo test -p nextgcore-amfd                    # single NF
-cargo test --workspace -- --nocapture           # with log output
-</code></pre>
-<p>Integration / E2E tests require Docker:</p>
-<pre><code class="language-bash">cd nextgcore/docker/rust
-docker compose up -d
-bash e2e-test.sh
-</code></pre>
-<p>Multi-UE stress test:</p>
-<pre><code class="language-bash">bash test-multi-ue.sh               # 5 UEs (default)
-bash test-multi-ue.sh --ue-count 10 # 10 UEs
-</code></pre>
-<h2 id="code-style"><a class="header" href="#code-style">Code Style</a></h2>
-<p>All code must pass <code>cargo fmt</code> and <code>cargo clippy</code>:</p>
-<pre><code class="language-bash">cd nextgcore/src
-cargo fmt --all
-cargo clippy --workspace -- -D warnings
-</code></pre>
-<p>Pre-commit checklist:</p>
+<h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
-<li><input disabled="" type="checkbox"> <code>cargo fmt --all</code> — no formatting changes</li>
-<li><input disabled="" type="checkbox"> <code>cargo clippy --workspace -- -D warnings</code> — zero warnings</li>
-<li><input disabled="" type="checkbox"> <code>cargo test --workspace</code> — all tests pass</li>
-<li><input disabled="" type="checkbox"> <code>cargo audit</code> — no unpatched advisories</li>
+<li><strong>GTP-U datagram handling</strong> (<code>gtp_path.rs</code>): Echo Request is answered with an Echo Response carrying the mandatory Recovery IE with restart counter 0 (TS 29.281 §8.2 per code comment); received Echo Response recovery values are ignored; End Marker and G-PDU are dispatched through PDR/FAR lookup; undecodable packets and unknown message types are dropped with an error log.</li>
+<li><strong>Error Indication → ERIR</strong>: an inbound Error Indication is mapped back to the FAR carrying that TEID and reported to the SGW-C via a PFCP Session Report Request (TS 29.244 §5.10 per code comment). If no FAR matches, it is logged and swallowed.</li>
+<li><strong>Session admission</strong>: the pool is hard-coded to 1024 sessions (<code>sgwu_context_init(1024)</code>); when full, <code>sess_add</code> logs <code>Maximum number of sessions [1024] reached</code> and the establishment fails. Per-FAR buffering (BUFF action) holds at most <code>MAX_BUFFERED_PACKETS = 64</code> packets, flushed when forwarding resumes (TS 29.244 §5.3.1 per code comment).</li>
+<li><strong>F-TEID CH allocation can fail silently in the shipped deployment</strong>: when a Create PDR carries the CH (CHOOSE) flag (TS 29.244 §8.2.3 per code comment), the UP allocates a TEID and must advertise its own GTP-U address; with no address configured it returns PFCP cause <code>NO_RESOURCES_AVAILABLE</code>. Because the default bind is wildcard <code>0.0.0.0:2152</code> and <code>docker-compose-epc.yml</code> sets neither <code>SGWU_GTPU_BIND</code> nor <code>SGWU_GTPU_ADVERTISE</code>, the advertised address resolves to <code>None</code> — set <code>SGWU_GTPU_ADVERTISE</code> (or bind a concrete IPv4) for CH allocation to work.</li>
+<li><strong>PFCP association/heartbeat FSM</strong> (<code>pfcp_sm.rs</code>, <code>timer.rs</code>): <code>will_associate</code> retries association every 3 s and moves to <code>Associated</code> on an Association Setup Request/Response; both timers have <code>max_count = 0</code>, meaning <strong>unlimited retries</strong>. On entry to <code>Associated</code> the node sends a Heartbeat Request and answers incoming ones; the no-heartbeat timer is 10 s. A restoration path exists (<code>pfcp_restoration</code>, <code>sess_remove_all_for_pfcp_node</code>, and Create-PDR restoration-indication TEID reuse).</li>
+<li><strong>No state files</strong> are read or written; all session/PDR/FAR/QER/BAR state is in-memory and lost on restart.</li>
 </ul>
-<h2 id="security-auditing"><a class="header" href="#security-auditing">Security Auditing</a></h2>
-<pre><code class="language-bash">cargo install cargo-audit
-cd nextgcore/src
-cargo audit
-</code></pre>
-<h2 id="project-layout"><a class="header" href="#project-layout">Project Layout</a></h2>
-<pre><code>nextgcore/
-├── src/                     # Workspace root
-│   ├── bins/                # 24 NF binaries + webui
-│   │   ├── nextgcore-amfd/  # AMF
-│   │   ├── nextgcore-smfd/  # SMF
-│   │   ├── nextgcore-upfd/  # UPF
-│   │   └── ...              # (all 24 NFs)
-│   ├── libs/                # Shared libraries
-│   │   ├── nextgcore-core/        # Core types
-│   │   ├── nextgcore-sbi/         # HTTP/2 SBI client + server
-│   │   ├── nextgcore-crypt/       # 5G cryptography (SUCI, AKA, PQC)
-│   │   ├── nextgcore-metrics/     # Prometheus + OpenTelemetry
-│   │   └── ...
-│   └── tests/               # Integration tests
-├── k8s/                     # Kubernetes manifests + Helm
-├── docker/rust/             # Docker Compose E2E stack
-└── docs/                    # OpenAPI specs, architecture docs
-</code></pre>
-<h2 id="3gpp-specification-references"><a class="header" href="#3gpp-specification-references">3GPP Specification References</a></h2>
-<p>Each file includes a doc comment referencing the 3GPP TS number and section (e.g. <code>//! TS 23.501 §5.15</code>). When adding new protocol logic, always cite the relevant spec:</p>
-<ul>
-<li><strong>TS 23.501</strong> — 5G system architecture</li>
-<li><strong>TS 23.502</strong> — 5G procedures</li>
-<li><strong>TS 29.xxx</strong> — SBI service definitions</li>
-<li><strong>TS 38.331</strong> — NR RRC</li>
-<li><strong>TS 38.413</strong> — NGAP</li>
-</ul>
-<h2 id="commit-messages"><a class="header" href="#commit-messages">Commit Messages</a></h2>
-<p>Follow conventional commits:</p>
-<pre><code>feat(smf): add MBS multicast session context (TS 23.247)
-fix(amf): release SMF session on UE context release
-test(upf): add SDF filter 5-tuple matching unit tests
-</code></pre>
-<ul>
-<li><strong>Never</strong> include <code>Co-Authored-By: Claude</code> or any AI attribution</li>
-<li>Sign commits: <code>Signed-off-by: Your Name &lt;email&gt;</code></li>
-</ul>
-<h2 id="pull-request-process"><a class="header" href="#pull-request-process">Pull Request Process</a></h2>
-<ol>
-<li>Fork the repository</li>
-<li>Create a feature branch from <code>main</code></li>
-<li>Implement your change with tests</li>
-<li>Ensure all CI checks pass</li>
-<li>Open a PR with a description referencing the 3GPP TS item</li>
-</ol>
-<h2 id="nf-implementation-standards"><a class="header" href="#nf-implementation-standards">NF Implementation Standards</a></h2>
-<p>Each NF binary must:</p>
-<ul>
-<li>Register with NRF on startup (via <code>nextgcore-sbi</code> NF management)</li>
-<li>Expose <code>/metrics</code> (Prometheus, port 9090)</li>
-<li>Respond to SIGTERM with graceful shutdown</li>
-<li>Log at <code>info</code> level by default, configurable via <code>RUST_LOG</code></li>
-<li>Have ≥ 1 unit test per public function</li>
-</ul>
-<h2 id="license"><a class="header" href="#license">License</a></h2>
-<p>AGPL-3.0. See <a href="LICENSE">LICENSE</a>.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="gaps/gap-libs-infra.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../configuration/sgwc.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
+                            <a rel="next prefetch" href="../configuration/pcrf.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
 
                         <div style="clear: both"></div>
                     </nav>
@@ -316,10 +263,13 @@ test(upf): add SDF filter 5-tuple matching unit tests
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="gaps/gap-libs-infra.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../configuration/sgwc.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
+                    <a rel="next prefetch" href="../configuration/pcrf.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
             </nav>
 
         </div>
@@ -337,13 +287,13 @@ test(upf): add SDF filter 5-tuple matching unit tests
         </script>
 
 
-        <script src="elasticlunr-ef4e11c1.min.js"></script>
-        <script src="mark-09e88c2c.min.js"></script>
-        <script src="searcher-09f2665d.js"></script>
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
 
-        <script src="clipboard-1626706a.min.js"></script>
-        <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
 
         <!-- Custom JS scripts -->
 

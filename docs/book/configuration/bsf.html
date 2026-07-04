@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Contributing - NextGCore Documentation</title>
+        <title>BSF - NextGCore Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -12,33 +12,33 @@
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
-        <link rel="icon" href="favicon-de23e50b.svg">
-        <link rel="shortcut icon" href="favicon-8114d1fc.png">
-        <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
-        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
-        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
 
         <!-- Highlight.js Stylesheets -->
-        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
-        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
-        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
-            const path_to_root = "";
+            const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-51e55ca4.js";
+            window.path_to_searchindex_js = "../searchindex-51e55ca4.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-06d290c2.js"></script>
+        <script src="../toc-06d290c2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -105,7 +105,7 @@
             <!-- populated by js -->
             <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
             <noscript>
-                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
             </noscript>
             <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -140,7 +140,7 @@
                     <h1 class="menu-title">NextGCore Documentation</h1>
 
                     <div class="right-buttons">
-                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
                             <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
                         </a>
                         <a href="https://github.com/NextgCoreLab/nextgcore" title="Git repository" aria-label="Git repository">
@@ -177,138 +177,116 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="contributing-to-nextgcore"><a class="header" href="#contributing-to-nextgcore">Contributing to NextGCore</a></h1>
-<p>NextGCore is a research-faithful 5G Core Network implementation in Rust targeting 3GPP Rel-15 with selected Rel-17/18 features. 6G/Rel-20 items (ISAC, FL, PQC, semantic, agent-native) are non-normative prototypes — no frozen Rel-20 3GPP specs exist.</p>
-<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+                        <h1 id="bsf-configuration"><a class="header" href="#bsf-configuration">BSF Configuration</a></h1>
+<p>The BSF (Binding Support Function, <code>nextgcore-bsfd</code>) stores and serves PCF binding information so that policy consumers (e.g. an AF or NEF via PCF) can find the PCF that owns a given PDU session, UE, or MBS session. It serves the <code>Nbsf_Management</code> API (TS 29.521, as cited throughout the daemon’s source comments): <code>/nbsf-management/v1/pcfBindings</code> (PDU-session bindings, full POST/GET/PATCH/DELETE plus query-based discovery), <code>/nbsf-management/v1/pcf-ue-bindings</code> (UE-policy bindings, TS 29.521 §4.2.2.3/§4.2.4.3 per code comments), and <code>/nbsf-management/v1/pcf-mbs-bindings</code> (MBS-session bindings, TS 29.521 §4.2.2.4/§4.2.4.4 per code comments). The <code>Nbsf_Management</code> Subscribe/Unsubscribe sub-resource (<code>pcfBindings/.../subscriptions</code>) is a deliberate stub that returns <strong>501 Not Implemented</strong>. Routing and handlers live in <code>bsf_sbi_request_handler</code> in <code>src/bins/nextgcore-bsfd/src/lib.rs</code> — since the Wave-6 H1 lib-targetization, <code>main.rs</code> is a thin wrapper around <code>nextgcore_bsfd::run()</code>.</p>
+<p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/bsf.yaml</code>, overridable with <code>-c/--config</code>; the docker deployment passes <code>-c /etc/nextgcore/bsf.yaml</code>) and command-line flags. Unusually for this codebase, the YAML SBI <code>server</code> entry <strong>overrides</strong> the CLI <code>--sbi-addr</code>/<code>--sbi-port</code> (so the NRF NFProfile advertises a routable endpoint instead of <code>0.0.0.0</code>, per the code comment); everything else — TLS flags, session capacity, log level — is CLI-only. The only environment variable the binary reads is <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> BSF behavior is validated by this project’s own unit tests and matched-simulator Docker E2E runs (84/84 as of 2026-07-02), not by third-party conformance certification. Known gaps visible in the source: <code>Nbsf_Management</code> subscriptions are a 501 stub (<code>bsfd-13</code>); the <code>--tls</code> flag does <strong>not</strong> enable TLS on the actual HTTP/2 listener (it only flips the advertised URI scheme in the legacy NF-instance metadata built in <code>sbi_path.rs</code>); the MongoDB persistence layer (<code>bsf_bindings</code> collection) is best-effort and the daemon never initializes a MongoDB connection itself — no <code>nextgcore_mongoc_init</code>/<code>nextgcore_dbi_init</code> call exists in this crate, so in the standalone binary bindings live in memory only; and <code>sbi_path.rs</code> still contains legacy placeholder helpers (<code>bsf_sbi_send_request</code>/<code>bsf_sbi_discover_and_send</code> return a hardcoded transaction ID).</p>
+</blockquote>
+<h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
+<p>From <code>nextgcore/docker/rust/configs/5gc/bsf.yaml</code>:</p>
+<pre><code class="language-yaml"># BSF (Binding Support Function) Configuration
+# Docker container configuration for 5G Core deployment
+
+logger:
+  file:
+    path: /var/log/nextgcore/bsf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+bsf:
+  sbi:
+    server:
+      - address: 172.23.0.15
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
+    # TLS configuration (G36: SBI TLS)
+    # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
+    tls:
+      enabled: false
+      cert: /etc/nextgcore/certs/bsf.crt
+      key: /etc/nextgcore/certs/bsf.key
+      ca: /etc/nextgcore/certs/ca.crt
+      min_version: "1.2"
+</code></pre>
+<p>An OAuth2-enforcing variant (<code>bsf-oauth2.yaml</code>, used via <code>docker-compose.oauth2.yml</code>) is identical except it adds:</p>
+<pre><code class="language-yaml">bsf:
+  sbi:
+    oauth2:
+      require: true
+</code></pre>
+<h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
+<p>These are the fields actually deserialized by the daemon (<code>#[derive(Deserialize)]</code> structs <code>BsfYaml</code>/<code>BsfSection</code>/<code>SbiYaml</code>/<code>SbiServerYaml</code>/<code>SbiClientYaml</code>/<code>NrfClientYaml</code>/<code>SbiOauth2Yaml</code> in <code>src/bins/nextgcore-bsfd/src/lib.rs</code>). Only the <strong>first</strong> entry of each list (<code>server</code>, <code>client.nrf</code>) is read.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td>Rust</td><td>stable (≥1.75)</td><td>Build toolchain</td></tr>
-<tr><td>protobuf-compiler</td><td>≥3.21</td><td>Protobuf codegen</td></tr>
-<tr><td>clang / libclang-dev</td><td>any</td><td>LLVM bindings</td></tr>
-<tr><td>libssl-dev</td><td>any</td><td>TLS support</td></tr>
-<tr><td>cmake</td><td>≥3.16</td><td>FFI build scripts</td></tr>
-<tr><td>Docker + docker-compose</td><td>≥24</td><td>E2E testing</td></tr>
+<tr><td><code>bsf.sbi.server[0].address</code></td><td>string</td><td>absent → CLI <code>--sbi-addr</code> (<code>0.0.0.0</code>)</td><td>Bind <strong>and</strong> advertised SBI address. When present it overrides the CLI value so the NRF NFProfile advertises a reachable endpoint instead of <code>0.0.0.0</code> (per code comment).</td></tr>
+<tr><td><code>bsf.sbi.server[0].port</code></td><td>u16</td><td>absent → CLI <code>--sbi-port</code> (<code>7777</code>)</td><td>Bind and advertised SBI port; overrides the CLI value when present.</td></tr>
+<tr><td><code>bsf.sbi.client.nrf[0].uri</code></td><td>string</td><td>absent → CLI <code>--nrf-uri</code> (unset → no NRF registration)</td><td>NRF base URI, seeded into the global SBI context for NF registration, heartbeat, and (when OAuth2 is on) token issuance/JWKS. <code>uri</code> is a <strong>required</strong> field of the list entry — if an <code>nrf</code> entry omits it, deserialization of the whole file fails and is silently ignored (the parse is wrapped in <code>if let Ok(...)</code>), leaving the BSF unregistered.</td></tr>
+<tr><td><code>bsf.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>SBI OAuth2 bearer-token enforcement. When <code>true</code>, incoming requests must carry an NRF-issued token whose audience includes <code>BSF</code>, verified against the NRF JWKS (TS 33.501 §13.4.1 per code comment); with no NRF URI configured the server fails closed with 503 (per code comment). Also installs a process-wide OAuth2 client so outbound SBI calls attach tokens. Unlike NSACF, there is <strong>no</strong> CLI override flag for this knob.</td></tr>
 </tbody>
 </table>
 </div>
-<pre><code class="language-bash"># Ubuntu/Debian
-sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler clang
-
-# macOS (Homebrew)
-brew install protobuf cmake openssl
-</code></pre>
-<h2 id="building"><a class="header" href="#building">Building</a></h2>
-<p>The workspace root is <code>nextgcore/src/</code> (not <code>nextgcore/</code>):</p>
-<pre><code class="language-bash">cd nextgcore/src
-cargo build --workspace            # debug
-cargo build --workspace --release  # release
-</code></pre>
-<p>To build a single NF binary:</p>
-<pre><code class="language-bash">cargo build -p nextgcore-amfd
-</code></pre>
-<h2 id="testing"><a class="header" href="#testing">Testing</a></h2>
-<pre><code class="language-bash">cd nextgcore/src
-cargo test --workspace                          # all tests
-cargo test -p nextgcore-amfd                    # single NF
-cargo test --workspace -- --nocapture           # with log output
-</code></pre>
-<p>Integration / E2E tests require Docker:</p>
-<pre><code class="language-bash">cd nextgcore/docker/rust
-docker compose up -d
-bash e2e-test.sh
-</code></pre>
-<p>Multi-UE stress test:</p>
-<pre><code class="language-bash">bash test-multi-ue.sh               # 5 UEs (default)
-bash test-multi-ue.sh --ue-count 10 # 10 UEs
-</code></pre>
-<h2 id="code-style"><a class="header" href="#code-style">Code Style</a></h2>
-<p>All code must pass <code>cargo fmt</code> and <code>cargo clippy</code>:</p>
-<pre><code class="language-bash">cd nextgcore/src
-cargo fmt --all
-cargo clippy --workspace -- -D warnings
-</code></pre>
-<p>Pre-commit checklist:</p>
+<h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
+<p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In particular, in the shipped example files:</p>
 <ul>
-<li><input disabled="" type="checkbox"> <code>cargo fmt --all</code> — no formatting changes</li>
-<li><input disabled="" type="checkbox"> <code>cargo clippy --workspace -- -D warnings</code> — zero warnings</li>
-<li><input disabled="" type="checkbox"> <code>cargo test --workspace</code> — all tests pass</li>
-<li><input disabled="" type="checkbox"> <code>cargo audit</code> — no unpatched advisories</li>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes solely from the CLI flag <code>-e/--log-level</code> (default <code>info</code>). Note that <code>RUST_LOG</code> has <em>no</em> effect either — <code>init_logging</code> builds a fresh <code>env_logger::Builder::new()</code> without reading the environment. Logs go to stderr; no file sink is wired (see <code>--log-file</code> below).</li>
+<li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> No <code>global</code> section exists in the deserialize structs; session capacity is the CLI flag <code>--max-sess</code>.</li>
+<li><strong><code>bsf.sbi.tls.*</code> (<code>enabled</code>/<code>cert</code>/<code>key</code>/<code>ca</code>/<code>min_version</code>) is inert.</strong> No <code>tls</code> field exists in <code>SbiYaml</code>. TLS-related knobs are the CLI flags <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> — and even those only affect the advertised scheme (see Behavior notes). The <code>TLS_ENABLED</code>/<code>SBI_SCHEME</code> variables mentioned in the YAML comment, and the <code>TLS_CERT</code>/<code>TLS_KEY</code> environment variables set by <code>docker-compose.yml</code>, are not read by this binary.</li>
 </ul>
-<h2 id="security-auditing"><a class="header" href="#security-auditing">Security Auditing</a></h2>
-<pre><code class="language-bash">cargo install cargo-audit
-cd nextgcore/src
-cargo audit
-</code></pre>
-<h2 id="project-layout"><a class="header" href="#project-layout">Project Layout</a></h2>
-<pre><code>nextgcore/
-├── src/                     # Workspace root
-│   ├── bins/                # 24 NF binaries + webui
-│   │   ├── nextgcore-amfd/  # AMF
-│   │   ├── nextgcore-smfd/  # SMF
-│   │   ├── nextgcore-upfd/  # UPF
-│   │   └── ...              # (all 24 NFs)
-│   ├── libs/                # Shared libraries
-│   │   ├── nextgcore-core/        # Core types
-│   │   ├── nextgcore-sbi/         # HTTP/2 SBI client + server
-│   │   ├── nextgcore-crypt/       # 5G cryptography (SUCI, AKA, PQC)
-│   │   ├── nextgcore-metrics/     # Prometheus + OpenTelemetry
-│   │   └── ...
-│   └── tests/               # Integration tests
-├── k8s/                     # Kubernetes manifests + Helm
-├── docker/rust/             # Docker Compose E2E stack
-└── docs/                    # OpenAPI specs, architecture docs
-</code></pre>
-<h2 id="3gpp-specification-references"><a class="header" href="#3gpp-specification-references">3GPP Specification References</a></h2>
-<p>Each file includes a doc comment referencing the 3GPP TS number and section (e.g. <code>//! TS 23.501 §5.15</code>). When adding new protocol logic, always cite the relevant spec:</p>
+<h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
+<p>Runtime knobs with real defaults from the clap <code>Args</code> struct in <code>src/bins/nextgcore-bsfd/src/lib.rs</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/bsf.yaml</code></td><td>Configuration file path. A missing file is tolerated (logged at debug); a malformed file is silently ignored.</td></tr>
+<tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Parsed but <strong>never used</strong> — <code>init_logging</code> wires no file sink; logging goes to stderr.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
+<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Stub: logs “would send SIGTERM to running instance” and exits without signaling anything.</td></tr>
+<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address; <strong>overridden</strong> by <code>bsf.sbi.server[0].address</code> when the YAML provides one.</td></tr>
+<tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>SBI server port; <strong>overridden</strong> by <code>bsf.sbi.server[0].port</code> when present.</td></tr>
+<tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Sets <code>tls_enabled</code> in the legacy context config; switches the advertised URI scheme to <code>https</code> but does not enable TLS on the HTTP/2 listener (see Behavior notes).</td></tr>
+<tr><td><code>--tls-cert</code></td><td>path</td><td>unset</td><td>TLS certificate path (stored in the legacy context config only).</td></tr>
+<tr><td><code>--tls-key</code></td><td>path</td><td>unset</td><td>TLS key path (stored in the legacy context config only).</td></tr>
+<tr><td><code>--nrf-uri</code></td><td>string</td><td>unset</td><td>NRF URI fallback when <code>bsf.sbi.client.nrf</code> is absent. With neither set, NRF registration is skipped and the BSF runs standalone.</td></tr>
+<tr><td><code>--max-sess</code></td><td>usize</td><td><code>1024</code></td><td>Maximum number of PDU-session bindings in the context pool.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
-<li><strong>TS 23.501</strong> — 5G system architecture</li>
-<li><strong>TS 23.502</strong> — 5G procedures</li>
-<li><strong>TS 29.xxx</strong> — SBI service definitions</li>
-<li><strong>TS 38.331</strong> — NR RRC</li>
-<li><strong>TS 38.413</strong> — NGAP</li>
+<li><strong>Create/validation semantics</strong> (<code>POST /nbsf-management/v1/pcfBindings</code>): mandatory <code>dnn</code> + <code>snssai</code> (TS 29.521 PcfBinding, per code comment), at least one UE address (<code>ipv4Addr</code>/<code>ipv6Prefix</code>/<code>macAddr48</code> — MAC-only Ethernet bindings are valid), and at least one PCF address (<code>pcfFqdn</code>, non-empty <code>pcfIpEndPoints</code>, or <code>pcfDiamHost</code>+<code>pcfDiamRealm</code>; <code>bsfd-05</code>), each violation returning 400 <code>MANDATORY_IE_MISSING</code>. When the <code>--max-sess</code> pool (default 1024) is full, creation fails with 400 / <code>SYSTEM_FAILURE</code>. Success is 201 with a <code>Location</code> header; PDU-session binding IDs are numeric (a non-numeric ID on DELETE yields 400 <code>INVALID_BINDING_ID</code>), while UE/MBS binding IDs are UUIDs.</li>
+<li><strong>Feature negotiation and duplicate detection</strong>: the BSF advertises <code>suppFeat</code> <code>0x6</code> — BindingUpdate + SamePcf, not MultiUeAddr (TS 29.521 Table 5.8-1 per code comment) — and echoes the negotiated intersection per session. With SamePcf negotiated and <code>paraCom</code> present, a duplicate <code>dnn</code>+<code>snssai</code>+<code>supi</code> binding is rejected 403 <code>EXISTING_BINDING_INFO_FOUND</code> with <code>pcfSmFqdn</code>/<code>pcfSmIpEndPoints</code> extensions; MBS binding creation likewise rejects a duplicate <code>mbsSessionId</code> with 403.</li>
+<li><strong>Discovery semantics</strong>: <code>GET /pcfBindings</code> requires a UE-address query parameter (TS 29.521 §4.2.4.2 per code comment) — SUPI/GPSI/DNN-only queries get 400 <code>MANDATORY_QUERY_PARAM_MISSING</code>; no match returns <strong>204</strong> (not 404); multiple matches return 400 <code>MULTIPLE_BINDING_INFO_FOUND</code>. MBS discovery uses the <code>mbs-session-id</code> query parameter (TS 29.521 §4.2.4.4 per code comment), accepting legacy <code>mbsSessionId</code> leniently. PATCH bodies must be <code>application/merge-patch+json</code> (TS 29.521 §5.2 per code comment); <code>application/json</code> and an absent Content-Type are accepted leniently, anything else is 415.</li>
+<li><strong>Binding TTL</strong>: every PDU-session binding arms an expiry timer — from the RFC 3339 <code>expiry</code> attribute when supplied (invalid values are rejected 400), otherwise the default TTL of <strong>3600 s</strong> (<code>timer::defaults::BINDING_EXPIRY</code> in <code>src/bins/nextgcore-bsfd/src/timer.rs</code>). The event loop removes expired bindings, and expired-but-unswept bindings are excluded from GET/discovery.</li>
+<li><strong>NRF registration and load reporting</strong>: the BSF PUTs an NFProfile (<code>nfType: BSF</code>, service <code>nbsf-management</code>, <code>allowedNfTypes: PCF/SMF/SCP</code>, <code>heartBeatTimer: 10</code>) to <code>/nnrf-nfm/v1/nf-instances/{id}</code> and, on success, spawns a heartbeat worker every <strong>5 s</strong> that PATCHes a live <code>/load</code> gauge computed as bindings vs. <code>--max-sess</code> capacity (TS 29.510 §5.2.2.3.2 per code comment). Registration failure is non-fatal (“will operate without NRF”). Quirk: passing <code>--nrf-uri</code> on the CLI additionally triggers a second, legacy registration with a separate random NF instance ID from <code>bsf_sbi_open</code> (<code>sbi_path.rs</code>); the YAML-configured URI only drives the main registration path.</li>
+<li><strong>Environment variables</strong>: the only one read is <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (default <code>http://jaeger:4317</code>) for the OpenTelemetry OTLP exporter. <code>RUST_LOG</code> is not honored, and MongoDB persistence has no URI source in this binary at all — the <code>bsf_bindings</code> upsert/delete/load calls are best-effort no-ops (failures logged at debug) unless some in-process embedder initializes the shared DBI layer first.</li>
 </ul>
-<h2 id="commit-messages"><a class="header" href="#commit-messages">Commit Messages</a></h2>
-<p>Follow conventional commits:</p>
-<pre><code>feat(smf): add MBS multicast session context (TS 23.247)
-fix(amf): release SMF session on UE context release
-test(upf): add SDF filter 5-tuple matching unit tests
-</code></pre>
-<ul>
-<li><strong>Never</strong> include <code>Co-Authored-By: Claude</code> or any AI attribution</li>
-<li>Sign commits: <code>Signed-off-by: Your Name &lt;email&gt;</code></li>
-</ul>
-<h2 id="pull-request-process"><a class="header" href="#pull-request-process">Pull Request Process</a></h2>
-<ol>
-<li>Fork the repository</li>
-<li>Create a feature branch from <code>main</code></li>
-<li>Implement your change with tests</li>
-<li>Ensure all CI checks pass</li>
-<li>Open a PR with a description referencing the 3GPP TS item</li>
-</ol>
-<h2 id="nf-implementation-standards"><a class="header" href="#nf-implementation-standards">NF Implementation Standards</a></h2>
-<p>Each NF binary must:</p>
-<ul>
-<li>Register with NRF on startup (via <code>nextgcore-sbi</code> NF management)</li>
-<li>Expose <code>/metrics</code> (Prometheus, port 9090)</li>
-<li>Respond to SIGTERM with graceful shutdown</li>
-<li>Log at <code>info</code> level by default, configurable via <code>RUST_LOG</code></li>
-<li>Have ≥ 1 unit test per public function</li>
-</ul>
-<h2 id="license"><a class="header" href="#license">License</a></h2>
-<p>AGPL-3.0. See <a href="LICENSE">LICENSE</a>.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="gaps/gap-libs-infra.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../configuration/nssf.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
+                            <a rel="next prefetch" href="../configuration/nwdaf.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
 
                         <div style="clear: both"></div>
                     </nav>
@@ -316,10 +294,13 @@ test(upf): add SDF filter 5-tuple matching unit tests
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="gaps/gap-libs-infra.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../configuration/nssf.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
+                    <a rel="next prefetch" href="../configuration/nwdaf.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
             </nav>
 
         </div>
@@ -337,13 +318,13 @@ test(upf): add SDF filter 5-tuple matching unit tests
         </script>
 
 
-        <script src="elasticlunr-ef4e11c1.min.js"></script>
-        <script src="mark-09e88c2c.min.js"></script>
-        <script src="searcher-09f2665d.js"></script>
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
 
-        <script src="clipboard-1626706a.min.js"></script>
-        <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
 
         <!-- Custom JS scripts -->
 
