@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NextGCore — Contributing Guide</title>
+  <meta name="description" content="How to contribute to NextGCore: environment setup, building, testing, code style, 3GPP spec references, commit sign-off, and the pull-request process.">
+  <link rel="stylesheet" href="css/style.css">
+<style>
+.cg-table{width:100%;border-collapse:collapse;margin:0.75rem 0 1.5rem;font-size:0.85rem;}
+.cg-table th,.cg-table td{border:1px solid var(--border-card,#2a2f3a);padding:0.45rem 0.6rem;text-align:left;}
+.cg-table th{background:rgba(127,127,127,0.12);}
+.cg-section{margin-bottom:2.5rem;}
+.cg-section p,.cg-section li{color:var(--text-secondary,#8b949e);font-size:0.95rem;line-height:1.7;}
+.cg-section ul,.cg-section ol{padding-left:1.4rem;margin:0.5rem 0 1rem;}
+.cg-section h3{margin-top:0;}
+.cg-toc{display:flex;flex-wrap:wrap;gap:0.5rem;margin:1rem 0 2rem;}
+.cg-toc a{font-size:0.8rem;padding:0.3rem 0.8rem;border:1px solid var(--border-card,#2a2f3a);border-radius:999px;text-decoration:none;}
+</style>
+</head>
+<body>
+<nav class="nav">
+  <a href="index.html" class="nav-logo">Next<span>GCore</span></a>
+  <ul class="nav-links">
+    <li><a href="index.html#features">Features</a></li>
+    <li><a href="features.html">Feature Matrix</a></li>
+    <li><a href="index.html#components">Components</a></li>
+    <li><a href="api.html">API Docs</a></li>
+    <li><a href="https://github.com/NextgCoreLab/nextgcore" class="btn btn-secondary" style="padding:0.4rem 1rem;font-size:0.8rem;">GitHub</a></li>
+  </ul>
+  <button class="mobile-menu-btn">&#9776;</button>
+</nav>
+
+<section>
+  <div class="container">
+    <h2 class="section-title">Contributing Guide</h2>
+    <p class="section-subtitle">NextGCore is a research-faithful 5G core in Rust (3GPP Rel-15 baseline + selected Rel-17/18 features; 6G items are non-normative prototypes). This guide covers everything from a clean machine to a merged pull request.</p>
+    <div class="cg-toc">
+      <a href="#what">What to work on</a>
+      <a href="#env">Environment</a>
+      <a href="#build">Building</a>
+      <a href="#test">Testing</a>
+      <a href="#style">Code style</a>
+      <a href="#specs">3GPP references</a>
+      <a href="#submit">Submitting a PR</a>
+      <a href="#merge">Getting merged</a>
+      <a href="#license">License &amp; DCO</a>
+    </div>
+
+    <div class="cg-section" id="what">
+      <h3 class="group-heading">1. How to contribute — finding work</h3>
+      <ul>
+        <li><strong>Good first targets:</strong> any row marked <em>partial</em> or <em>prototype</em> in the <a href="features.html">supported-features matrix</a> — each names the service, procedures, and the governing 3GPP spec.</li>
+        <li><strong>Known gaps:</strong> the gap-analysis docs in <code>docs/</code> (protocols, libraries, 6G) list concrete missing procedures with spec references.</li>
+        <li><strong>Bugs &amp; proposals:</strong> open a GitHub issue first for significant changes (new NF surfaces, new dependencies, protocol-behavior changes) so the approach can be agreed before you invest in code.</li>
+      </ul>
+    </div>
+
+    <div class="cg-section" id="env">
+      <h3 class="group-heading">2. Clone &amp; provision your environment</h3>
+      <table class="cg-table">
+        <tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
+        <tr><td>Rust</td><td>stable (&ge;1.75)</td><td>Build toolchain</td></tr>
+        <tr><td>protobuf-compiler</td><td>&ge;3.21</td><td>Protobuf codegen</td></tr>
+        <tr><td>clang / libclang-dev</td><td>any</td><td>LLVM bindings</td></tr>
+        <tr><td>libssl-dev</td><td>any</td><td>TLS support</td></tr>
+        <tr><td>cmake</td><td>&ge;3.16</td><td>FFI build scripts</td></tr>
+        <tr><td>Docker + docker-compose</td><td>&ge;24</td><td>E2E testing</td></tr>
+      </table>
+      <div class="code-block">
+        <button class="copy-btn">Copy</button>
+        <code><span class="comment"># Ubuntu/Debian</span>
+<span class="cmd">sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler clang</span>
+
+<span class="comment"># macOS (Homebrew)</span>
+<span class="cmd">brew install protobuf cmake openssl</span>
+
+<span class="comment"># Fork on GitHub, then:</span>
+<span class="cmd">git clone https://github.com/&lt;you&gt;/nextgcore.git &amp;&amp; cd nextgcore</span></code>
+      </div>
+    </div>
+
+    <div class="cg-section" id="build">
+      <h3 class="group-heading">3. Building</h3>
+      <p>The Cargo workspace root is <code>nextgcore/src/</code>, not the repo root.</p>
+      <div class="code-block">
+        <button class="copy-btn">Copy</button>
+        <code><span class="cmd">cd src</span>
+<span class="cmd">cargo build --workspace</span>            <span class="comment"># debug</span>
+<span class="cmd">cargo build --workspace --release</span>  <span class="comment"># release</span>
+<span class="cmd">cargo build -p nextgcore-amfd</span>      <span class="comment"># a single NF binary</span></code>
+      </div>
+    </div>
+
+    <div class="cg-section" id="test">
+      <h3 class="group-heading">4. Testing</h3>
+      <div class="code-block">
+        <button class="copy-btn">Copy</button>
+        <code><span class="cmd">cd src</span>
+<span class="cmd">cargo test --workspace</span>                 <span class="comment"># all unit + integration tests</span>
+<span class="cmd">cargo test -p nextgcore-amfd</span>           <span class="comment"># a single NF</span>
+<span class="cmd">cargo test --workspace -- --nocapture</span>  <span class="comment"># with log output</span>
+
+<span class="comment"># E2E against the matched RAN simulator (requires Docker)</span>
+<span class="cmd">cd ../docker/rust &amp;&amp; bash e2e.sh</span>
+<span class="cmd">bash e2e-test.sh --no-build --keep</span>     <span class="comment"># iterate without rebuilding</span></code>
+      </div>
+      <p><strong>Honesty rule:</strong> E2E validation runs against the matched NextGSim UE/gNB — it proves internal consistency, not third-party conformance. Never claim spec conformance in code, docs, or commit messages beyond what the tests actually demonstrate.</p>
+    </div>
+
+    <div class="cg-section" id="style">
+      <h3 class="group-heading">5. Code style &amp; pre-commit checklist</h3>
+      <div class="code-block">
+        <button class="copy-btn">Copy</button>
+        <code><span class="cmd">cd src</span>
+<span class="cmd">cargo fmt --all</span>
+<span class="cmd">cargo clippy --workspace -- -D warnings</span>
+<span class="cmd">cargo test --workspace</span>
+<span class="cmd">cargo audit</span>   <span class="comment"># cargo install cargo-audit</span></code>
+      </div>
+      <ul>
+        <li>Zero clippy warnings and zero <code>cargo fmt</code> diffs — CI enforces both.</li>
+        <li>Every new NF binary must: register with NRF on startup, expose Prometheus <code>/metrics</code>, shut down gracefully on SIGTERM, and log via <code>RUST_LOG</code>.</li>
+        <li>&ge; 1 unit test per public function on new code.</li>
+      </ul>
+    </div>
+
+    <div class="cg-section" id="specs">
+      <h3 class="group-heading">6. 3GPP specification references</h3>
+      <p>Every protocol file carries a doc comment citing its spec (e.g. <code>//! TS 23.502 §4.2.2</code>). When you add or change protocol logic, cite the exact TS and section: TS 23.501/23.502 (architecture/procedures), TS 24.501 (NAS), TS 29.xxx (SBI services), TS 38.413 (NGAP), TS 29.244 (PFCP). PRs that add protocol behavior without a spec reference will be asked to add one.</p>
+    </div>
+
+    <div class="cg-section" id="submit">
+      <h3 class="group-heading">7. Submitting a pull request</h3>
+      <ol>
+        <li>Create a feature branch from <code>main</code> with a descriptive name.</li>
+        <li>Keep PRs small and focused — one logical change per PR; split large work into a reviewable series.</li>
+        <li>Use conventional-commit titles that name the NF and the spec item:</li>
+      </ol>
+      <div class="code-block">
+        <button class="copy-btn">Copy</button>
+        <code><span class="cmd">feat(smf): add MBS multicast session context (TS 23.247)</span>
+<span class="cmd">fix(amf): release SMF session on UE context release</span>
+<span class="cmd">test(upf): add SDF filter 5-tuple matching unit tests</span></code>
+      </div>
+      <ul>
+        <li>Sign every commit: <code>git commit -s</code> → <code>Signed-off-by: Your Name &lt;email&gt;</code> (Developer Certificate of Origin).</li>
+        <li>Never include AI attributions (e.g. <code>Co-Authored-By</code> bot trailers).</li>
+        <li>The PR description should state what changed, why, the governing 3GPP TS item, and how it was tested.</li>
+      </ul>
+    </div>
+
+    <div class="cg-section" id="merge">
+      <h3 class="group-heading">8. Getting your PR merged</h3>
+      <p>CI must be green before review: <code>cargo check</code>, <code>cargo test --workspace</code> (flake-retried once), <code>cargo clippy</code>, and <code>cargo fmt --check</code> all run on every push. A maintainer reviews for correctness, spec fidelity, and test coverage; address review comments with follow-up commits (no force-push during review). Docs changes to <code>docs/</code> deploy to this site on release or manual dispatch of the <em>Deploy to GitHub Pages</em> workflow.</p>
+    </div>
+
+    <div class="cg-section" id="license">
+      <h3 class="group-heading">9. License &amp; Developer Certificate of Origin</h3>
+      <p>NextGCore is licensed under <strong>AGPL-3.0</strong>. By signing off your commits (<code>git commit -s</code>) you certify the DCO: that you wrote the contribution or otherwise have the right to submit it under this license.</p>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container">
+    <p><a href="index.html">Home</a> &middot; <a href="https://github.com/NextgCoreLab/nextgcore">GitHub</a> &middot; AGPL-3.0 License</p>
+  </div>
+</footer>
+<script src="js/main.js"></script>
+</body>
+</html>

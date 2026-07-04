@@ -412,6 +412,8 @@ section {
   font-size: 0.85rem;
   color: var(--text-primary);
   line-height: 1.7;
+  display: block;
+  white-space: pre;
 }
 
 .code-block .comment { color: var(--text-muted); }

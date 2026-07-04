@@ -90,11 +90,11 @@ cargo audit
 ```
 nextgcore/
 ├── src/                     # Workspace root
-│   ├── bins/                # 22 NF binaries
+│   ├── bins/                # 24 NF binaries + webui
 │   │   ├── nextgcore-amfd/  # AMF
 │   │   ├── nextgcore-smfd/  # SMF
 │   │   ├── nextgcore-upfd/  # UPF
-│   │   └── ...              # (all 22 NFs)
+│   │   └── ...              # (all 24 NFs)
 │   ├── libs/                # Shared libraries
 │   │   ├── nextgcore-core/        # Core types
 │   │   ├── nextgcore-sbi/         # HTTP/2 SBI client + server
@@ -133,7 +133,7 @@ test(upf): add SDF filter 5-tuple matching unit tests
 ## Pull Request Process
 
 1. Fork the repository
-2. Create a feature branch from `initial_commit`
+2. Create a feature branch from `main`
 3. Implement your change with tests
 4. Ensure all CI checks pass
 5. Open a PR with a description referencing the 3GPP TS item
@@ -149,4 +149,4 @@ Each NF binary must:
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+AGPL-3.0. See [LICENSE](LICENSE).
