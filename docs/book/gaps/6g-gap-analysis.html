@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-39f105b7.js";
+            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-1b88980e.js"></script>
@@ -177,441 +177,62 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="nextgcore-6g-gap-analysis-report"><a class="header" href="#nextgcore-6g-gap-analysis-report">NextGCore 6G Gap Analysis Report</a></h1>
-<p><strong>Date:</strong> 2026-02-07
-<strong>Scope:</strong> Comprehensive source code analysis of the network functions and shared libraries <em>(as of 2026-02-07: 17 NFs / 18 libs; the workspace now ships <strong>24 NF binaries</strong> and <strong>17 libraries</strong> — see stale-snapshot banner)</em>
-<strong>Standards Reference:</strong> 3GPP Rel-18/19, ITU-R IMT-2030 Framework</p>
-<blockquote>
-<p><strong>⚠️ STALE SNAPSHOT (2026-02-07).</strong> This report predates the Wave-1..6 remediation and the peripheral-NF build-out; it is retained for historical context only and several “does not exist” / “0%” statements below are now FALSE. As of 2026-07 the workspace ships <strong>24 NF binaries (19 5GC + 5 EPC)</strong> and <strong>17 shared libraries</strong> — including NWDAF (<code>nextgcore-nwdafd</code>: NRF-driven NF_LOAD collection, analytics, ML-service and federation scaffolding), NSACF (<code>nextgcore-nsacfd</code>: config-provisioned slice quotas per TS 29.536), plus DCCF, EES, LMF, MBSMF and PIN NFs; SBI OAuth2 (<code>/oauth2/token</code>); and wired NAS security (<code>bins/nextgcore-amfd/src/nas_security.rs</code>). A matched-sim Docker E2E (<code>docker/rust/e2e-test.sh</code>) exercises full registration + PDU session + data plane. These 6G-oriented items remain <strong>research-/prototype-level and are NOT Rel-20 conformant — no frozen 6G stage-3 spec exists.</strong></p>
-</blockquote>
+                        <h1 id="nextgcore--6g-readiness-and-missing-component-register"><a class="header" href="#nextgcore--6g-readiness-and-missing-component-register">NextGCore — 6G Readiness and Missing-Component Register</a></h1>
+<p><strong>Standards baseline:</strong> 3GPP Rel-18/19; ITU-R IMT-2030 (IMT for 2030 and beyond).</p>
+<p><strong>Status.</strong> This document reflects the current codebase. NextGCore ships <strong>24 network-function binaries</strong> (19 5G Core + 5 4G/EPC) and <strong>17 shared libraries</strong>, validated by unit tests and a matched-simulator Docker end-to-end run covering registration, PDU-session establishment, and user-plane data. Items in the 6G evolution register below are <strong>non-normative research prototypes</strong>: there is no frozen 3GPP Rel-20 / 6G Stage-3 specification to conform to. Each missing or partial component is itemized with a stable task ID and a tracked implementation issue.</p>
 <hr>
-<h2 id="1-network-function-by-nf-analysis"><a class="header" href="#1-network-function-by-nf-analysis">1. Network Function-by-NF Analysis</a></h2>
-<h3 id="11-5g-core-network-functions"><a class="header" href="#11-5g-core-network-functions">1.1 5G Core Network Functions</a></h3>
+<h2 id="1-implemented-network-functions-and-libraries"><a class="header" href="#1-implemented-network-functions-and-libraries">1. Implemented network functions and libraries</a></h2>
+<p>The following inventory reflects what the codebase implements today. Behaviour is exercised by unit tests and the matched-simulator E2E; it is not third-party conformance-certified.</p>
+<p><strong>5G Core — control plane:</strong> AMF, SMF, PCF, AUSF, UDM, UDR, NSSF, NRF, BSF, SCP, SEPP.</p>
+<p><strong>5G Core — user plane:</strong> UPF (TUN device, GTP-U, PFCP session management).</p>
+<p><strong>5G Core — analytics, edge, exposure and slicing:</strong> NWDAF (<code>nextgcore-nwdafd</code>), NSACF (<code>nextgcore-nsacfd</code>), DCCF (<code>nextgcore-dccfd</code>), EES (<code>nextgcore-eesd</code>), LMF (<code>nextgcore-lmfd</code>), MB-SMF (<code>nextgcore-mbsmfd</code>), PIN (<code>nextgcore-pind</code>).</p>
+<p><strong>4G/EPC interworking:</strong> MME, HSS, SGW-C, SGW-U, PCRF.</p>
+<p><strong>Shared libraries (17):</strong> <code>nextgcore-sbi</code> (SBI HTTP/2), <code>nextgcore-pfcp</code>, <code>nextgcore-nas</code>, <code>nextgcore-ngap</code>, <code>nextgcore-s1ap</code>, <code>nextgcore-sctp</code>, <code>nextgcore-gtp</code>, <code>nextgcore-diameter</code>, <code>nextgcore-crypt</code>, <code>nextgcore-dbi</code>, <code>nextgcore-tun</code>, <code>nextgcore-ipfw</code>, <code>nextgcore-asn1c</code>, <code>nextgcore-app</code>, <code>nextgcore-proto</code>, <code>nextgcore-metrics</code>, <code>nextgcore-core</code>.</p>
+<p>Security and service-based-architecture baselines already in place include SBI OAuth2 (<code>/oauth2/token</code>), TLS on the SBI plane, NRF-based registration/discovery, and wired NAS security.</p>
+<hr>
+<h2 id="2-missing-component-register-6g--rel-18-evolution"><a class="header" href="#2-missing-component-register-6g--rel-18-evolution">2. Missing-component register (6G / Rel-18+ evolution)</a></h2>
+<p>The table itemizes each missing or partial capability required for the 6G / IMT-2030 evolution. Every row has a stable task ID and a tracked implementation issue.</p>
+<ul>
+<li><strong>Status — Missing:</strong> not started; scoped in the linked issue.</li>
+<li><strong>Status — Partial:</strong> a baseline or prototype exists; the linked issue scopes the remainder.</li>
+<li><strong>Status — Research:</strong> dependent on 3GPP work that is not yet frozen; the linked issue captures a bounded design/spike.</li>
+</ul>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>NF</th><th>Source Files</th><th>FSM</th><th>SBI Server</th><th>SBI Client</th><th>Service Handlers</th><th>Config</th><th>Tests</th><th>Completeness</th></tr>
+<tr><th>Task ID</th><th>Component</th><th>Missing / partial capability</th><th>Reference</th><th>Status</th><th>Tracking</th></tr>
 </thead>
 <tbody>
-<tr><td><strong>AMF</strong></td><td>18</td><td>Working (6 event types)</td><td>Scaffolding</td><td>Scaffolding</td><td>Stubbed (NGAP dispatch noted)</td><td>YAML parsing (GUAMI, TAI, PLMN, security)</td><td>Basic</td><td><strong>35%</strong></td></tr>
-<tr><td><strong>AUSF</strong></td><td>~8</td><td>Working + UE sub-FSMs</td><td>Routing (nausf-auth)</td><td>Routing (nudm-ueau)</td><td>Stubbed (UE lookup by SUCI/SUPI)</td><td>Basic</td><td>Comprehensive</td><td><strong>25%</strong></td></tr>
-<tr><td><strong>BSF</strong></td><td>~6</td><td>Working</td><td>Routing (nbsf-management)</td><td>NRF stubs</td><td>Stubbed (PCF binding CRUD)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
-<tr><td><strong>NRF</strong></td><td>~8</td><td>Working</td><td><strong>Functional</strong> (full HTTP/2 routing)</td><td>N/A</td><td><strong>Working</strong> (NF registration, discovery, subscriptions)</td><td>Basic</td><td>Good</td><td><strong>65%</strong></td></tr>
-<tr><td><strong>NSSF</strong></td><td>~6</td><td>Working</td><td>Routing (nnssf-nsselection v2)</td><td>H-NSSF response</td><td>Stubbed</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
-<tr><td><strong>PCF</strong></td><td>~8</td><td>Working + AM/SM sub-FSMs</td><td>Routing (3 services)</td><td>NUDR/BSF response</td><td>Stubbed (AM policy, SM policy, policy auth)</td><td>Basic</td><td>Comprehensive</td><td><strong>25%</strong></td></tr>
-<tr><td><strong>SCP</strong></td><td>~6</td><td>Working</td><td>Minimal (forwards via sbi_path)</td><td>NF discovery</td><td>Stubbed</td><td>Basic</td><td>Basic</td><td><strong>15%</strong></td></tr>
-<tr><td><strong>SEPP</strong></td><td>~8</td><td>Working + Handshake sub-FSMs</td><td>Routing (n32c-handshake)</td><td>N32c response</td><td>Partial (find_or_create returns None)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
-<tr><td><strong>SMF</strong></td><td>~12</td><td>Working (14 event types)</td><td><strong>Functional</strong> (comprehensive HTTP/2 routes)</td><td>Scaffolding</td><td>Stubbed (PDU session CRUD, event exposure)</td><td>YAML parsing</td><td>Basic</td><td><strong>30%</strong></td></tr>
-<tr><td><strong>UDM</strong></td><td>~8</td><td>Working + UE/Session sub-FSMs</td><td>Routing (3 services, v2 SDM)</td><td>NUDR response routing</td><td>Stubbed (SUPI extraction works)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
-<tr><td><strong>UDR</strong></td><td>~6</td><td>Working (stateless)</td><td>Routing (nudr-dr)</td><td>N/A</td><td>Delegated to nudr_handler</td><td>Basic</td><td>Basic</td><td><strong>25%</strong></td></tr>
-<tr><td><strong>UPF</strong></td><td>~10</td><td>Working + Exception state</td><td>N/A (PFCP)</td><td>N/A</td><td><strong>Working</strong> (TUN, GTP-U, session mgmt)</td><td>Basic</td><td>Good</td><td><strong>55%</strong></td></tr>
+<tr><td>NGC-6G-01</td><td>AI-native analytics (NWDAF)</td><td>NWDAF NF exists; ML model serving and federation are scaffolding, not a working inference path</td><td>TS 23.288</td><td>Partial</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/26">#26</a></td></tr>
+<tr><td>NGC-6G-02</td><td>Enhanced network slicing</td><td>Slice admission (NSACF) exists; no slice SLA monitoring or assurance loop</td><td>TS 28.530 / 28.541</td><td>Missing</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/27">#27</a></td></tr>
+<tr><td>NGC-6G-03</td><td>Service-Based Architecture 2.0</td><td>SBI transport beyond HTTP/2 (HTTP/3/QUIC or gRPC)</td><td>ITU-R IMT-2030</td><td>Missing</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/15">#15</a></td></tr>
+<tr><td>NGC-6G-04</td><td>Edge computing (EASDF)</td><td>Edge Application Server Discovery, local breakout, latency-aware UPF selection</td><td>TS 23.548</td><td>Missing</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/21">#21</a></td></tr>
+<tr><td>NGC-6G-05</td><td>Zero-trust security / PQC</td><td>mTLS and OAuth2 in place; post-quantum key exchange in the SBI TLS path is missing</td><td>TR 33.871</td><td>Partial</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/17">#17</a></td></tr>
+<tr><td>NGC-6G-06</td><td>Digital twin</td><td>Read-only network-state export foundation for modelling and planning</td><td>ITU-R IMT-2030</td><td>Missing</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/25">#25</a></td></tr>
+<tr><td>NGC-6G-07</td><td>Intent-driven management</td><td>Declarative intent → policy translation with a closed loop over analytics</td><td>ITU-R IMT-2030</td><td>Missing</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/24">#24</a></td></tr>
+<tr><td>NGC-6G-08</td><td>Compute-aware networking</td><td>Compute/load-aware UPF selection in the SMF</td><td>Rel-19 study</td><td>Missing</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/20">#20</a></td></tr>
+<tr><td>NGC-6G-09</td><td>Network energy saving</td><td>Per-NF energy/utilisation metrics and an NF idle/sleep hook</td><td>TS 23.501 (NES)</td><td>Missing</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/22">#22</a></td></tr>
+<tr><td>NGC-6G-10</td><td>Non-terrestrial networks</td><td>NTN timing/constellation types exist in <code>nextgcore-proto</code> but are not wired into any NF procedure</td><td>Rel-17/18 NTN</td><td>Partial</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/18">#18</a></td></tr>
+<tr><td>NGC-6G-11</td><td>Deterministic networking (TSN)</td><td>TSCTSF control-plane NF and DS-TT/NW-TT translator scaffolding</td><td>TS 23.501</td><td>Missing</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/23">#23</a></td></tr>
+<tr><td>NGC-6G-12</td><td>Integrated sensing (ISAC)</td><td>Core-side sensing data pipeline and exposure</td><td>ITU-R IMT-2030</td><td>Research</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/16">#16</a></td></tr>
+<tr><td>NGC-6G-13</td><td>Network exposure (NEF)</td><td>Nnef_EventExposure and northbound monitoring/device-triggering APIs</td><td>TS 23.502 / 29.522</td><td>Missing</td><td><a href="https://github.com/NextgCoreLab/nextgcore/issues/19">#19</a></td></tr>
 </tbody>
 </table>
 </div>
-<h3 id="12-epc-network-functions"><a class="header" href="#12-epc-network-functions">1.2 EPC Network Functions</a></h3>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>NF</th><th>Source Files</th><th>FSM</th><th>Protocol Interfaces</th><th>Service Handlers</th><th>Completeness</th></tr>
-</thead>
-<tbody>
-<tr><td><strong>HSS</strong></td><td>10</td><td>Working + DB poll timer</td><td>S6a/Cx/SWx (Diameter) init/fini scaffolding</td><td>Stubbed (AIR/ULR/PUR/CLR/IDR structures defined)</td><td><strong>25%</strong></td></tr>
-<tr><td><strong>MME</strong></td><td>21</td><td>Working (5 FSMs: MME, EMM, ESM, S1AP, SGsAP)</td><td>S1AP/S11/S6a/SGsAP init scaffolding</td><td>Comprehensive type definitions, handlers stubbed</td><td><strong>30%</strong></td></tr>
-<tr><td><strong>PCRF</strong></td><td>8</td><td>Working + Exception state</td><td>Gx/Rx (Diameter) init/fini scaffolding</td><td>Stubbed</td><td><strong>15%</strong></td></tr>
-<tr><td><strong>SGW-C</strong></td><td>13</td><td>Working + PFCP sub-FSM (5 states)</td><td>S11/S5C/SXA event routing</td><td>Stubbed (GTP message types documented)</td><td><strong>25%</strong></td></tr>
-<tr><td><strong>SGW-U</strong></td><td>10</td><td>Working (returns SgwuSmResult)</td><td>SXA (PFCP) event routing</td><td>Stubbed (dispatch to PFCP node)</td><td><strong>20%</strong></td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="13-shared-libraries"><a class="header" href="#13-shared-libraries">1.3 Shared Libraries</a></h3>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Library</th><th>Purpose</th><th>Status</th><th>Key Types/Features</th></tr>
-</thead>
-<tbody>
-<tr><td><strong>nextgcore-sbi</strong></td><td>SBI HTTP/2</td><td><strong>Functional</strong></td><td>Client, Server (hyper/h2), ProblemDetails, NfInstance, discovery context, TLS config</td></tr>
-<tr><td><strong>nextgcore-pfcp</strong></td><td>PFCP protocol</td><td><strong>Functional</strong></td><td>Header/IE/Message encode/decode, Session/Association/Heartbeat types, TS 29.244</td></tr>
-<tr><td><strong>nextgcore-nas</strong></td><td>NAS protocol</td><td><strong>Functional</strong></td><td>5GMM + EPS message build/parse, security context, Registration/Auth/SMC messages</td></tr>
-<tr><td><strong>nextgcore-core</strong></td><td>Core utilities</td><td><strong>Functional</strong></td><td>26 modules: list, hash, pool, pkbuf, timer, FSM, TLV, socket, poll, TCP/UDP</td></tr>
-<tr><td><strong>nextgcore-metrics</strong></td><td>Prometheus metrics</td><td><strong>Functional</strong></td><td>Counter/Gauge/Histogram, labels, Prometheus HTTP server</td></tr>
-<tr><td><strong>nextgcore-ngap</strong></td><td>NGAP protocol</td><td><strong>Minimal</strong></td><td>Only lib.rs stub (ASN.1 APER note)</td></tr>
-<tr><td><strong>nextgcore-s1ap</strong></td><td>S1AP protocol</td><td>Scaffolding</td><td>ASN.1 encoding via nextgcore-asn1c</td></tr>
-<tr><td><strong>nextgcore-sctp</strong></td><td>SCTP transport</td><td><strong>Working</strong></td><td>sctp-proto 0.6 integration (migration complete per must_be_implemented.txt)</td></tr>
-<tr><td><strong>nextgcore-gtp</strong></td><td>GTPv2-C protocol</td><td>Scaffolding</td><td>GTP-C message building</td></tr>
-<tr><td><strong>nextgcore-diameter</strong></td><td>Diameter protocol</td><td>Scaffolding</td><td>FreeDiameter integration stubs</td></tr>
-<tr><td><strong>nextgcore-crypt</strong></td><td>Crypto functions</td><td>Scaffolding</td><td>Auth vector generation</td></tr>
-<tr><td><strong>nextgcore-dbi</strong></td><td>Database interface</td><td>Scaffolding</td><td>MongoDB integration stubs</td></tr>
-<tr><td><strong>nextgcore-tun</strong></td><td>TUN device</td><td><strong>Working</strong></td><td>Used by UPF for data plane</td></tr>
-<tr><td><strong>nextgcore-ipfw</strong></td><td>IP firewall/NAT</td><td><strong>Working</strong></td><td>Used by UPF for NAT</td></tr>
-<tr><td><strong>nextgcore-ffi</strong></td><td>C FFI bindings</td><td>Scaffolding</td><td>FreeDiameter/ASN.1 C library bridges</td></tr>
-<tr><td><strong>nextgcore-asn1c</strong></td><td>ASN.1 compiler</td><td>Scaffolding</td><td>NGAP/S1AP ASN.1 types</td></tr>
-<tr><td><strong>nextgcore-app</strong></td><td>Application framework</td><td>Scaffolding</td><td>Common app initialization</td></tr>
-<tr><td><strong>nextgcore-proto</strong></td><td>Protocol definitions</td><td>Scaffolding</td><td>Shared protocol types</td></tr>
-</tbody>
-</table>
-</div>
+<p>Progress against this register is tracked on the <a href="https://github.com/NextgCoreLab/nextgcore/issues">issue tracker</a>; the code and the tracker are the source of truth.</p>
 <hr>
-<h2 id="2-critical-5g-gaps-from-todotxt-analysis"><a class="header" href="#2-critical-5g-gaps-from-todotxt-analysis">2. Critical 5G Gaps (from todo.txt Analysis)</a></h2>
-<p>The project documents 316 TODOs across 8 phases. These represent the prerequisite work before any 6G features can be considered.</p>
-<h3 id="phase-1-timer-management--sbi-infrastructure-critical-40-todos"><a class="header" href="#phase-1-timer-management--sbi-infrastructure-critical-40-todos">Phase 1: Timer Management + SBI Infrastructure (CRITICAL, ~40 TODOs)</a></h3>
+<h2 id="3-foundations-for-6g-evolution"><a class="header" href="#3-foundations-for-6g-evolution">3. Foundations for 6G evolution</a></h2>
+<p>The current architecture provides a solid base for the work above:</p>
 <ul>
-<li><strong>Timer Manager:</strong> No centralized async timer system. All NFs use placeholder <code>thread::sleep</code> polling loops.</li>
-<li><strong>SBI Event Loop:</strong> Event queue dispatch from SBI server to state machines is not wired.</li>
-<li><strong>Impact:</strong> Without timers, no NF can perform registration retries, heartbeats, or session timeouts.</li>
+<li><strong>Pure Rust</strong> across all NFs and libraries — memory and concurrency safety with predictable performance.</li>
+<li><strong>Tokio async runtime</strong> throughout, enabling high-throughput, low-latency I/O.</li>
+<li><strong>Consistent finite-state-machine architecture</strong> across NFs, so features extend systematically.</li>
+<li><strong>Modular library design</strong> — 17 shared libraries with clear separation of concerns evolve independently.</li>
+<li><strong>Working user plane</strong> — the UPF provides TUN, GTP-U, and PFCP session management.</li>
+<li><strong>Modern service-based stack</strong> — HTTP/2 SBI client/server with NRF registration/discovery, OAuth2, and TLS.</li>
+<li><strong>Comprehensive NAS library</strong> — 5GS and EPS message support with security contexts.</li>
+<li><strong>Metrics framework</strong> — a Prometheus-compatible metrics library wired across NFs, with OpenTelemetry tracing.</li>
 </ul>
-<h3 id="phase-2-error-response-framework-high-50-todos"><a class="header" href="#phase-2-error-response-framework-high-50-todos">Phase 2: Error Response Framework (HIGH, ~50 TODOs)</a></h3>
-<ul>
-<li><strong>ProblemDetails:</strong> Library type exists in nextgcore-sbi but no NF generates proper 3GPP error responses.</li>
-<li><strong>HTTP Status Codes:</strong> Server helper functions exist (<code>send_bad_request</code>, <code>send_not_found</code>, etc.) but are unused.</li>
-<li><strong>Impact:</strong> No interoperability with compliant clients; no error recovery.</li>
-</ul>
-<h3 id="phase-3-nrf-integration-high-35-todos"><a class="header" href="#phase-3-nrf-integration-high-35-todos">Phase 3: NRF Integration (HIGH, ~35 TODOs)</a></h3>
-<ul>
-<li><strong>NRF Server:</strong> Functional (registration, discovery, subscriptions work).</li>
-<li><strong>NRF Clients:</strong> No NF registers itself with NRF on startup, no NF performs NF discovery.</li>
-<li><strong>Impact:</strong> Service-based architecture is non-functional without NRF integration.</li>
-</ul>
-<h3 id="phase-4-service-specific-handlers-medium-80-todos"><a class="header" href="#phase-4-service-specific-handlers-medium-80-todos">Phase 4: Service-Specific Handlers (MEDIUM, ~80 TODOs)</a></h3>
-<ul>
-<li><strong>AMF:</strong> NGAP message dispatch to sub-FSMs, NAS message processing, UE context management.</li>
-<li><strong>SMF:</strong> N4 session establishment with UPF, PDU session lifecycle, QoS rule installation.</li>
-<li><strong>AUSF/UDM/UDR:</strong> Authentication vector generation, subscriber data retrieval, database queries.</li>
-<li><strong>PCF:</strong> Policy decision logic, PCC rule generation, QoS flow binding.</li>
-<li><strong>Impact:</strong> No actual mobile connectivity possible.</li>
-</ul>
-<h3 id="phase-5-scpsepp-routing-medium-40-todos"><a class="header" href="#phase-5-scpsepp-routing-medium-40-todos">Phase 5: SCP/SEPP Routing (MEDIUM, ~40 TODOs)</a></h3>
-<ul>
-<li><strong>SCP:</strong> Request forwarding, load balancing, service mesh capabilities.</li>
-<li><strong>SEPP:</strong> N32 interface, PRINS/TLS security, message filtering.</li>
-<li><strong>Impact:</strong> No inter-PLMN roaming or service mesh support.</li>
-</ul>
-<h3 id="phase-6-protocol-libraries---ngaps1ap-medium-20-todos"><a class="header" href="#phase-6-protocol-libraries---ngaps1ap-medium-20-todos">Phase 6: Protocol Libraries - NGAP/S1AP (MEDIUM, ~20 TODOs)</a></h3>
-<ul>
-<li><strong>nextgcore-ngap:</strong> Only a single-line stub. ASN.1 APER encoding not implemented.</li>
-<li><strong>nextgcore-s1ap:</strong> Scaffolding only.</li>
-<li><strong>Impact:</strong> AMF cannot communicate with gNBs; MME cannot communicate with eNBs.</li>
-</ul>
-<h3 id="phase-7-epcdiameter-low-25-todos"><a class="header" href="#phase-7-epcdiameter-low-25-todos">Phase 7: EPC/Diameter (LOW, ~25 TODOs)</a></h3>
-<ul>
-<li><strong>nextgcore-diameter:</strong> FreeDiameter integration is stub-only.</li>
-<li><strong>HSS/PCRF:</strong> S6a, Cx, SWx, Gx, Rx handlers are all stubbed.</li>
-<li><strong>Impact:</strong> No EPC authentication or policy control.</li>
-</ul>
-<h3 id="phase-8-upf-enhancements-low-5-todos"><a class="header" href="#phase-8-upf-enhancements-low-5-todos">Phase 8: UPF Enhancements (LOW, ~5 TODOs)</a></h3>
-<ul>
-<li><strong>UPF:</strong> Already the most complete NF. Remaining work: URR (usage reporting), QER (QoS enforcement), FAR enhancements.</li>
-</ul>
-<hr>
-<h2 id="3-6g-gap-analysis-per-itu-r-imt-2030-and-3gpp-rel-1819"><a class="header" href="#3-6g-gap-analysis-per-itu-r-imt-2030-and-3gpp-rel-1819">3. 6G Gap Analysis per ITU-R IMT-2030 and 3GPP Rel-18/19</a></h2>
-<h3 id="31-aiml-native-network-automation-nwdaf"><a class="header" href="#31-aiml-native-network-automation-nwdaf">3.1 AI/ML-Native Network Automation (NWDAF)</a></h3>
-<p><strong>Current State (2026-02-07 — now STALE):</strong> No NWDAF NF existed at the time of writing. <em>Update: NWDAF now exists as <code>nextgcore-nwdafd</code> with an NRF-driven NF_LOAD collector (<code>nrf_collector.rs</code>), analytics (<code>analytics.rs</code>), ML service (<code>ml_service.rs</code>) and federation scaffolding (<code>federation.rs</code>) — research/prototype-level, not Rel-18/Rel-20 conformant.</em></p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No NWDAF binary or scaffolding in <code>src/bins/</code></li>
-<li>No ML model serving infrastructure (ONNX runtime, TensorFlow Serving integration)</li>
-<li>No data collection APIs (Nnwdaf_AnalyticsInfo, Nnwdaf_EventsSubscription)</li>
-<li>No analytics exposure to consumers (AMF, SMF, PCF, NSSF)</li>
-<li>No Federated Learning support for distributed model training</li>
-<li>No real-time inference pipeline for anomaly detection, load prediction, or QoE optimization</li>
-<li>No MTLF (Model Training Logical Function) or AnLF (Analytics Logical Function) decomposition</li>
-<li><strong>3GPP Rel-18 NWDAF Phase 3:</strong> Root cause analysis, QoE prediction, network energy saving analytics</li>
-<li><strong>6G Extension:</strong> Autonomous network operations, self-healing, predictive resource management</li>
-</ul>
-<p><strong>Priority:</strong> CRITICAL for 6G – AI-native networking is a cornerstone of IMT-2030.</p>
-<h3 id="32-enhanced-network-slicing"><a class="header" href="#32-enhanced-network-slicing">3.2 Enhanced Network Slicing</a></h3>
-<p><strong>Current State:</strong> NSSF has basic scaffolding for <code>nnssf-nsselection</code> (v2 API). AMF context defines <code>SNssai</code> type. No slice isolation, lifecycle management, or SLA assurance.</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No slice admission control or resource reservation</li>
-<li>No Network Slice Instance (NSI) lifecycle management (creation, activation, deactivation, termination)</li>
-<li>No Network Slice Subnet Instance (NSSI) management</li>
-<li>No slice SLA monitoring or assurance framework</li>
-<li>No per-slice QoS enforcement (PCF policies are stubbed)</li>
-<li>No slice-level analytics (requires NWDAF)</li>
-<li>No inter-slice resource sharing or isolation enforcement</li>
-<li>No slice template/blueprint management</li>
-<li><strong>3GPP Rel-18:</strong> Enhanced NSSF for slice-specific authentication, NSACF (Network Slice Admission Control Function)</li>
-<li><strong>6G Extension:</strong> Dynamic micro-slicing with sub-ms granularity, AI-driven slice orchestration, intent-based slice management</li>
-</ul>
-<p><strong>Priority:</strong> HIGH – Network slicing is fundamental to both 5G-Advanced and 6G.</p>
-<h3 id="33-service-based-architecture-sba-20"><a class="header" href="#33-service-based-architecture-sba-20">3.3 Service-Based Architecture (SBA) 2.0</a></h3>
-<p><strong>Current State:</strong> nextgcore-sbi library provides functional HTTP/2 client/server with hyper. NRF has working NF registration and discovery. No other NF uses SBI client for NRF registration or service discovery.</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No service mesh capabilities (SCP is minimal stub)</li>
-<li>No event exposure framework (NSEF - Network Service Exposure Function)</li>
-<li>No API gateway / rate limiting / request routing</li>
-<li>No service authorization (OAuth 2.0 tokens not implemented)</li>
-<li>No event subscription/notification framework</li>
-<li>No bulk operations or batch API support</li>
-<li>No HTTP/3 (QUIC) support</li>
-<li><strong>3GPP Rel-18:</strong> Enhanced SBA with indirect communication via SCP, service routing</li>
-<li><strong>6G Extension:</strong> SBA 2.0 with native gRPC/protocol buffers, GraphQL APIs, event-driven architecture, serverless NF execution, WebAssembly NF plugins</li>
-</ul>
-<p><strong>Priority:</strong> HIGH – SBA 2.0 is an architectural pillar of 6G.</p>
-<h3 id="34-multi-access-edge-computing-mec--edge-intelligence"><a class="header" href="#34-multi-access-edge-computing-mec--edge-intelligence">3.4 Multi-Access Edge Computing (MEC) / Edge Intelligence</a></h3>
-<p><strong>Current State:</strong> No edge computing support. No EASDF (Edge Application Server Discovery Function). No edge NF deployment model.</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No EASDF NF</li>
-<li>No edge discovery and selection</li>
-<li>No local breakout / local data path management</li>
-<li>No UPF selection based on edge proximity</li>
-<li>No edge application lifecycle management</li>
-<li>No edge-cloud orchestration</li>
-<li>No latency-aware traffic steering</li>
-<li><strong>3GPP Rel-18:</strong> Enhanced EASDF, edge computing phase 2</li>
-<li><strong>6G Extension:</strong> Distributed AI at the edge, compute-aware networking (see 3.8), ultra-low-latency edge processing (&lt;1ms)</li>
-</ul>
-<p><strong>Priority:</strong> HIGH – Edge computing is critical for 6G’s ultra-low-latency and immersive use cases.</p>
-<h3 id="35-zero-trust-security-architecture"><a class="header" href="#35-zero-trust-security-architecture">3.5 Zero-Trust Security Architecture</a></h3>
-<p><strong>Current State:</strong> SBI server has TLS config fields (private_key, cert, verify_client) but no implementation. No authentication, authorization, or integrity protection between NFs.</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No mTLS between NFs (SBI server TLS config is unused)</li>
-<li>No OAuth 2.0 client credentials flow for NF authorization</li>
-<li>No NF token validation</li>
-<li>No security context management for UE sessions</li>
-<li>No NAS security (library types exist but not wired to NFs)</li>
-<li>No SUPI/SUCI privacy (AUSF handler stubbed)</li>
-<li>No security event logging or audit trail</li>
-<li>No SEPP N32 security (PRINS or TLS not implemented)</li>
-<li><strong>3GPP Rel-18:</strong> Enhanced network security, AKMA (Authentication and Key Management for Applications)</li>
-<li><strong>6G Extension:</strong> Zero-trust architecture with continuous authentication, AI-driven threat detection, quantum-safe cryptography (post-quantum algorithms), decentralized identity management (DID/SSI)</li>
-</ul>
-<p><strong>Priority:</strong> CRITICAL – Zero-trust is non-negotiable for 6G deployment.</p>
-<h3 id="36-digital-twin-network-functions"><a class="header" href="#36-digital-twin-network-functions">3.6 Digital Twin Network Functions</a></h3>
-<p><strong>Current State:</strong> No digital twin capability. No simulation, modeling, or state replication infrastructure.</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No digital twin framework or data model</li>
-<li>No real-time network state mirroring</li>
-<li>No what-if scenario simulation</li>
-<li>No predictive maintenance capabilities</li>
-<li>No network topology modeling</li>
-<li>No protocol behavior simulation</li>
-<li><strong>6G Requirement:</strong> Digital twins of physical network for planning, optimization, and autonomous operations</li>
-<li>Requires integration with AI/ML (3.1), metrics collection (partially exists via nextgcore-metrics), and comprehensive state export</li>
-</ul>
-<p><strong>Priority:</strong> MEDIUM-HIGH – Emerging 6G requirement per ITU-R IMT-2030.</p>
-<h3 id="37-intent-driven-network-management"><a class="header" href="#37-intent-driven-network-management">3.7 Intent-Driven Network Management</a></h3>
-<p><strong>Current State:</strong> No intent management. All configuration is imperative (YAML files, CLI arguments).</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No intent translation engine (natural language / policy to configuration)</li>
-<li>No intent lifecycle management (creation, conflict resolution, verification)</li>
-<li>No closed-loop automation (monitor -&gt; analyze -&gt; plan -&gt; execute)</li>
-<li>No declarative network configuration framework</li>
-<li>No policy conflict detection and resolution</li>
-<li><strong>6G Requirement:</strong> Operators express desired outcomes; network autonomously achieves them</li>
-<li>Requires AI/ML (3.1), digital twins (3.6), and comprehensive telemetry</li>
-</ul>
-<p><strong>Priority:</strong> MEDIUM – Important for 6G operational efficiency.</p>
-<h3 id="38-compute-aware-networking-can"><a class="header" href="#38-compute-aware-networking-can">3.8 Compute-Aware Networking (CAN)</a></h3>
-<p><strong>Current State:</strong> No compute awareness. UPF selection is not implemented. No resource monitoring.</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No compute resource discovery and monitoring</li>
-<li>No compute-aware traffic steering</li>
-<li>No workload placement optimization</li>
-<li>No compute resource abstraction layer</li>
-<li>No joint compute-communication optimization</li>
-<li><strong>3GPP Rel-19:</strong> Compute-aware networking study items</li>
-<li><strong>6G Extension:</strong> Native compute-communication convergence, distributed computing fabric</li>
-</ul>
-<p><strong>Priority:</strong> MEDIUM – Growing importance in 6G for edge and AI workloads.</p>
-<h3 id="39-green-networking--energy-efficiency"><a class="header" href="#39-green-networking--energy-efficiency">3.9 Green Networking / Energy Efficiency</a></h3>
-<p><strong>Current State:</strong> No energy management. No NF sleep/wake capabilities. No traffic-adaptive resource scaling.</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No energy-aware NF scheduling</li>
-<li>No NF sleep mode or dynamic scaling</li>
-<li>No traffic prediction for energy optimization (requires NWDAF)</li>
-<li>No energy consumption metrics collection</li>
-<li>No carbon-aware workload placement</li>
-<li><strong>3GPP Rel-18:</strong> Network energy saving (NES) features</li>
-<li><strong>6G Extension:</strong> Zero-energy devices support, energy harvesting integration, sustainable networking targets</li>
-</ul>
-<p><strong>Priority:</strong> MEDIUM – ITU-R IMT-2030 includes sustainability as a key design principle.</p>
-<h3 id="310-non-terrestrial-networks-ntn-support"><a class="header" href="#310-non-terrestrial-networks-ntn-support">3.10 Non-Terrestrial Networks (NTN) Support</a></h3>
-<p><strong>Current State:</strong> Research prototypes only. <code>nextgcore-proto</code> carries NTN constellation-planning types (<code>ntn_constellation.rs</code>: <code>SatelliteId</code>, orbit parameters, timing advance) and bespoke NAS IEs (NTN timing advance / access barring) exist, but <strong>none of this is wired into live NF procedures or the wire</strong> — no NF consumes the types and there is no NTN signaling path. UAV is separate and IS implemented: UAV Service-level-AA (TS 23.256, IEI 0x72) with geofencing lives in the AMF.</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No NTN-specific timing/delay compensation in AMF/SMF (prototype types exist but are unused)</li>
-<li>No discontinuous coverage handling</li>
-<li>No satellite ephemeris data management</li>
-<li>No NTN-specific mobility management</li>
-<li>No store-and-forward mechanism for intermittent connectivity</li>
-<li>No NTN-specific QoS profiles</li>
-<li><strong>3GPP Rel-17/18:</strong> NTN phases 1 &amp; 2 for NR-NTN and IoT-NTN</li>
-<li><strong>6G Extension:</strong> Ubiquitous 3D coverage (terrestrial + NTN + aerial), seamless handover across domains</li>
-</ul>
-<p><strong>Priority:</strong> MEDIUM – Critical for 6G’s ubiquitous coverage vision.</p>
-<h3 id="311-time-sensitive-networking-tsn-integration"><a class="header" href="#311-time-sensitive-networking-tsn-integration">3.11 Time-Sensitive Networking (TSN) Integration</a></h3>
-<p><strong>Current State:</strong> No TSN support. No deterministic networking capabilities.</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No TSN translator functions (DS-TT, NW-TT)</li>
-<li>No IEEE 802.1Q integration</li>
-<li>No deterministic QoS guarantees</li>
-<li>No time synchronization (gPTP/IEEE 1588)</li>
-<li>No TSN bridge configuration</li>
-<li><strong>3GPP Rel-16/17:</strong> 5G TSN integration</li>
-<li><strong>6G Extension:</strong> Native deterministic networking, ultra-reliable low-latency (&lt;100us), factory automation support</li>
-</ul>
-<p><strong>Priority:</strong> MEDIUM – Important for industrial 6G use cases.</p>
-<h3 id="312-integrated-sensing-and-communication-isac"><a class="header" href="#312-integrated-sensing-and-communication-isac">3.12 Integrated Sensing and Communication (ISAC)</a></h3>
-<p><strong>Current State:</strong> No sensing capability. This is a fundamentally new 6G capability.</p>
-<p><strong>Gaps:</strong></p>
-<ul>
-<li>No sensing NF or sensing data management</li>
-<li>No joint radar-communication waveform support</li>
-<li>No sensing data collection and processing pipeline</li>
-<li>No location/environment sensing service exposure</li>
-<li><strong>6G Requirement:</strong> Radio signals used simultaneously for communication and sensing (radar, positioning, imaging)</li>
-<li>Requires new RAN-core interfaces beyond current NGAP</li>
-</ul>
-<p><strong>Priority:</strong> LOW (near-term) / HIGH (6G target) – A defining 6G feature per ITU-R IMT-2030.</p>
-<hr>
-<h2 id="4-cross-cutting-infrastructure-gaps"><a class="header" href="#4-cross-cutting-infrastructure-gaps">4. Cross-Cutting Infrastructure Gaps</a></h2>
-<h3 id="41-observability-stack"><a class="header" href="#41-observability-stack">4.1 Observability Stack</a></h3>
-<ul>
-<li><strong>Metrics:</strong> nextgcore-metrics provides Prometheus Counter/Gauge/Histogram framework. Not wired to any NF except AMF (has metrics field).</li>
-<li><strong>Logging:</strong> Uses <code>env_logger</code> + <code>log</code> crate. No structured logging (JSON). No distributed tracing.</li>
-<li><strong>Tracing:</strong> No OpenTelemetry integration. No span propagation across NF boundaries.</li>
-<li><strong>Gap:</strong> Need structured logging, distributed tracing (OpenTelemetry), and metrics integration across all NFs.</li>
-</ul>
-<h3 id="42-configuration-management"><a class="header" href="#42-configuration-management">4.2 Configuration Management</a></h3>
-<ul>
-<li><strong>Current:</strong> Each NF has its own YAML parsing (AMF and SMF have manual line-by-line parsers). No unified config framework.</li>
-<li><strong>Gap:</strong> Need centralized configuration management, hot-reload, environment variable override, config validation.</li>
-</ul>
-<h3 id="43-deployment-and-orchestration"><a class="header" href="#43-deployment-and-orchestration">4.3 Deployment and Orchestration</a></h3>
-<ul>
-<li><strong>Current:</strong> Standalone binaries with <code>clap</code> CLI parsing. No containerization files. No Helm charts.</li>
-<li><strong>Gap:</strong> Need Dockerfiles, Kubernetes manifests, Helm charts, operator pattern for lifecycle management.</li>
-</ul>
-<h3 id="44-testing-infrastructure"><a class="header" href="#44-testing-infrastructure">4.4 Testing Infrastructure</a></h3>
-<ul>
-<li><strong>Current:</strong> Unit tests exist for most NFs (FSM state transitions, type creation). No integration tests. No end-to-end tests.</li>
-<li><strong>Gap:</strong> Need integration test framework (multi-NF), protocol conformance tests, performance benchmarks, chaos testing.</li>
-</ul>
-<h3 id="45-database-layer"><a class="header" href="#45-database-layer">4.5 Database Layer</a></h3>
-<ul>
-<li><strong>Current:</strong> nextgcore-dbi has MongoDB stubs. HSS and PCRF reference MongoDB for subscriber data.</li>
-<li><strong>Gap:</strong> No working database integration. Need MongoDB driver implementation, schema management, connection pooling.</li>
-</ul>
-<hr>
-<h2 id="5-prioritized-roadmap"><a class="header" href="#5-prioritized-roadmap">5. Prioritized Roadmap</a></h2>
-<h3 id="phase-a-5g-foundation-estimated-effort-17-weeks-per-todotxt"><a class="header" href="#phase-a-5g-foundation-estimated-effort-17-weeks-per-todotxt">Phase A: 5G Foundation (Estimated effort: 17 weeks per todo.txt)</a></h3>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Step</th><th>Work Items</th><th>Dependencies</th><th>Priority</th></tr>
-</thead>
-<tbody>
-<tr><td>A1</td><td>Timer management system + SBI event loop wiring</td><td>None</td><td>CRITICAL</td></tr>
-<tr><td>A2</td><td>Error response framework (ProblemDetails integration)</td><td>A1</td><td>HIGH</td></tr>
-<tr><td>A3</td><td>NRF client integration for all NFs</td><td>A1, A2</td><td>HIGH</td></tr>
-<tr><td>A4</td><td>NGAP/S1AP ASN.1 encoding library</td><td>A1</td><td>HIGH</td></tr>
-<tr><td>A5</td><td>AMF: NGAP handler, NAS processing, UE context</td><td>A1, A3, A4</td><td>HIGH</td></tr>
-<tr><td>A6</td><td>SMF: N4/PFCP session establishment with UPF</td><td>A1, A3</td><td>HIGH</td></tr>
-<tr><td>A7</td><td>AUSF/UDM/UDR: Authentication and subscriber data</td><td>A1, A3</td><td>HIGH</td></tr>
-<tr><td>A8</td><td>PCF: Policy decision engine, PCC rules</td><td>A1, A3</td><td>MEDIUM</td></tr>
-<tr><td>A9</td><td>SCP: Request forwarding, load balancing</td><td>A1, A3</td><td>MEDIUM</td></tr>
-<tr><td>A10</td><td>SEPP: N32 security, message filtering</td><td>A1, A3</td><td>MEDIUM</td></tr>
-<tr><td>A11</td><td>EPC: Diameter integration, HSS/MME handlers</td><td>A1</td><td>LOW</td></tr>
-<tr><td>A12</td><td>UPF: URR, QER, FAR enhancements</td><td>A6</td><td>LOW</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="phase-b-5g-advanced--pre-6g-new-development"><a class="header" href="#phase-b-5g-advanced--pre-6g-new-development">Phase B: 5G-Advanced / Pre-6G (New development)</a></h3>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Step</th><th>Work Items</th><th>Dependencies</th><th>Priority</th></tr>
-</thead>
-<tbody>
-<tr><td>B1</td><td>mTLS + OAuth 2.0 for NF-to-NF security</td><td>A3</td><td>CRITICAL</td></tr>
-<tr><td>B2</td><td>NWDAF NF (data collection, basic analytics)</td><td>A3, A5, A6</td><td>HIGH</td></tr>
-<tr><td>B3</td><td>Enhanced slicing (NSACF, slice SLA monitoring)</td><td>A3, A5, A8</td><td>HIGH</td></tr>
-<tr><td>B4</td><td>Observability (OpenTelemetry, structured logging)</td><td>A1</td><td>HIGH</td></tr>
-<tr><td>B5</td><td>Database layer (MongoDB driver, schema management)</td><td>A7</td><td>HIGH</td></tr>
-<tr><td>B6</td><td>EASDF + edge computing support</td><td>A3, A6</td><td>MEDIUM</td></tr>
-<tr><td>B7</td><td>NTN timing/mobility extensions (prototype types exist in nextgcore-proto, unwired)</td><td>A5</td><td>MEDIUM</td></tr>
-<tr><td>B8</td><td>TSN integration (DS-TT, NW-TT stubs)</td><td>A6</td><td>MEDIUM</td></tr>
-<tr><td>B9</td><td>Containerization (Docker, K8s, Helm)</td><td>All A-phase</td><td>MEDIUM</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="phase-c-6g-core-evolution"><a class="header" href="#phase-c-6g-core-evolution">Phase C: 6G Core Evolution</a></h3>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Step</th><th>Work Items</th><th>Dependencies</th><th>Priority</th></tr>
-</thead>
-<tbody>
-<tr><td>C1</td><td>SBA 2.0 (gRPC/protobuf, event-driven, HTTP/3)</td><td>B4</td><td>HIGH</td></tr>
-<tr><td>C2</td><td>AI-native NWDAF (ML model serving, federated learning)</td><td>B2</td><td>HIGH</td></tr>
-<tr><td>C3</td><td>Zero-trust architecture (continuous auth, post-quantum crypto)</td><td>B1</td><td>HIGH</td></tr>
-<tr><td>C4</td><td>Digital twin framework</td><td>B2, B4</td><td>MEDIUM</td></tr>
-<tr><td>C5</td><td>Intent-driven management engine</td><td>B2, C4</td><td>MEDIUM</td></tr>
-<tr><td>C6</td><td>Compute-aware networking</td><td>B6</td><td>MEDIUM</td></tr>
-<tr><td>C7</td><td>Green networking (energy-aware scheduling, NF sleep)</td><td>B2, B4</td><td>MEDIUM</td></tr>
-<tr><td>C8</td><td>ISAC support (sensing NF, data pipeline)</td><td>C1</td><td>LOW</td></tr>
-<tr><td>C9</td><td>Dynamic micro-slicing (&lt;ms granularity)</td><td>B3, C2</td><td>LOW</td></tr>
-</tbody>
-</table>
-</div>
-<hr>
-<h2 id="6-new-6g-network-functions-required"><a class="header" href="#6-new-6g-network-functions-required">6. New 6G Network Functions Required</a></h2>
-<p>The following NFs do not exist in the codebase and must be created for 6G:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>New NF</th><th>Purpose</th><th>3GPP Reference</th><th>6G Relevance</th></tr>
-</thead>
-<tbody>
-<tr><td><strong>NWDAF</strong></td><td>Network Data Analytics</td><td>TS 23.288</td><td>AI-native core, predictive automation</td></tr>
-<tr><td><strong>EASDF</strong></td><td>Edge Application Server Discovery</td><td>TS 23.548</td><td>Edge computing, MEC integration</td></tr>
-<tr><td><strong>NSACF</strong></td><td>Network Slice Admission Control</td><td>TS 23.502 Rel-17</td><td>Slice SLA assurance</td></tr>
-<tr><td><strong>TSCTSF</strong></td><td>Time-Sensitive Communication and TSN System</td><td>TS 23.501 Rel-17</td><td>Deterministic networking</td></tr>
-<tr><td><strong>DCCF</strong></td><td>Data Collection Coordination Function</td><td>TS 23.288 Rel-17</td><td>Analytics data pipeline</td></tr>
-<tr><td><strong>MFAF</strong></td><td>Messaging Framework Adaptation Function</td><td>TS 23.288 Rel-17</td><td>Analytics messaging</td></tr>
-<tr><td><strong>AF</strong></td><td>Application Function (generic)</td><td>TS 23.501</td><td>Application-network integration</td></tr>
-<tr><td><strong>NEF</strong></td><td>Network Exposure Function</td><td>TS 23.502</td><td>Capability exposure to 3rd parties</td></tr>
-<tr><td><strong>CHF</strong></td><td>Charging Function</td><td>TS 32.240</td><td>Converged charging</td></tr>
-<tr><td><strong>Digital Twin NF</strong></td><td>Network digital twin management</td><td>ITU-R IMT-2030</td><td>Simulation, planning, optimization</td></tr>
-<tr><td><strong>Intent Engine</strong></td><td>Intent-to-configuration translation</td><td>ITU-R IMT-2030</td><td>Autonomous network operations</td></tr>
-<tr><td><strong>Sensing NF</strong></td><td>ISAC data management</td><td>ITU-R IMT-2030</td><td>Integrated sensing and communication</td></tr>
-</tbody>
-</table>
-</div>
-<hr>
-<h2 id="7-open-work"><a class="header" href="#7-open-work">7. Open work</a></h2>
-<p>Forward-looking work items from this analysis are tracked as
-<a href="https://github.com/NextgCoreLab/nextgcore/issues">GitHub issues</a> rather than as a
-roadmap here, so the code and the tracker stay the source of truth. Each issue
-records the verified current state, a bounded scope, and acceptance criteria.
-Many items from earlier revisions of this report (NWDAF, NSACF, DCCF/EES, SBI
-OAuth2, the metrics/OTel stack, containerization, the matched-sim E2E) are
-already implemented — see the stale-snapshot banner at the top.</p>
-<hr>
-<h2 id="8-architecture-strengths-for-6g-evolution"><a class="header" href="#8-architecture-strengths-for-6g-evolution">8. Architecture Strengths for 6G Evolution</a></h2>
-<p>Despite the gaps, the project has several architectural strengths that position it well for 6G:</p>
-<ol>
-<li><strong>Pure Rust:</strong> Memory safety, concurrency safety, and performance characteristics align with 6G requirements for reliability and efficiency.</li>
-<li><strong>Tokio async runtime:</strong> All NFs use async I/O, which enables high-throughput, low-latency processing required for 6G.</li>
-<li><strong>Clean FSM architecture:</strong> Consistent state machine pattern across all NFs enables systematic feature extension.</li>
-<li><strong>Modular library design:</strong> 17 shared libraries with clear separation of concerns enable independent evolution.</li>
-<li><strong>Working data plane (UPF):</strong> TUN device, GTP-U, PFCP session management provide a solid user plane foundation.</li>
-<li><strong>Working SBI stack:</strong> HTTP/2 server/client with hyper/h2 provides a modern SBA foundation.</li>
-<li><strong>Comprehensive NAS library:</strong> Both 5GS and EPS NAS message support with security context.</li>
-<li><strong>Metrics framework:</strong> Prometheus-compatible metrics collection exists and needs wiring, not creation.</li>
-</ol>
-<hr>
-<p><em>Report generated by deep source code analysis of 17 NFs and 17 shared libraries.</em></p>
 
                     </main>
 
