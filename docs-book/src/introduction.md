@@ -1,6 +1,6 @@
 # Introduction
 
-**NextGCore** is a research-faithful 5G core network implemented entirely in Rust. It provides **24 network function (NF) binaries** — a full 5G Standalone (SA) control and user plane, an AI/analytics overlay, and a complete **4G/EPC interworking core** (MME, HSS, SGW-C, SGW-U, PCRF) — built on **17 shared libraries** totaling roughly **400k lines of Rust**.
+**NextGCore** is a research-faithful 5G core network implemented entirely in Rust. It provides **24 network function (NF) binaries** — a full 5G Standalone (SA) control and user plane, an AI/analytics overlay, and a complete **4G/EPC interworking core** (MME, HSS, SGW-C, SGW-U, PCRF) — built on **17 shared libraries**.
 
 The project targets **3GPP Release 15** with selected **Release 17/18** features (MBS multicast, NSACF slice admission, LMF positioning, RedCap admission, XR QoS, SNPN, MINT disaster roaming, UAV Service-Level-AA per TS 23.256). Any 6G/Release-20 items (ISAC, federated learning, PQC, semantic communications) are **non-normative research prototypes** — no frozen Rel-20 Stage-3 specifications exist, and those modules are informed by TR 22.870 use cases only.
 

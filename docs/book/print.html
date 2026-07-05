@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d1172b21.js";
+            window.path_to_searchindex_js = "searchindex-39f105b7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-1b88980e.js"></script>
@@ -179,7 +179,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
-<p><strong>NextGCore</strong> is a research-faithful 5G core network implemented entirely in Rust. It provides <strong>24 network function (NF) binaries</strong> — a full 5G Standalone (SA) control and user plane, an AI/analytics overlay, and a complete <strong>4G/EPC interworking core</strong> (MME, HSS, SGW-C, SGW-U, PCRF) — built on <strong>17 shared libraries</strong> totaling roughly <strong>400k lines of Rust</strong>.</p>
+<p><strong>NextGCore</strong> is a research-faithful 5G core network implemented entirely in Rust. It provides <strong>24 network function (NF) binaries</strong> — a full 5G Standalone (SA) control and user plane, an AI/analytics overlay, and a complete <strong>4G/EPC interworking core</strong> (MME, HSS, SGW-C, SGW-U, PCRF) — built on <strong>17 shared libraries</strong>.</p>
 <p>The project targets <strong>3GPP Release 15</strong> with selected <strong>Release 17/18</strong> features (MBS multicast, NSACF slice admission, LMF positioning, RedCap admission, XR QoS, SNPN, MINT disaster roaming, UAV Service-Level-AA per TS 23.256). Any 6G/Release-20 items (ISAC, federated learning, PQC, semantic communications) are <strong>non-normative research prototypes</strong> — no frozen Rel-20 Stage-3 specifications exist, and those modules are informed by TR 22.870 use cases only.</p>
 <h2 id="at-a-glance"><a class="header" href="#at-a-glance">At a Glance</a></h2>
 <div class="table-wrapper">
@@ -3625,11 +3625,11 @@ Rel-20 Stage-3 specs exist.</p>
 </thead>
 <tbody>
 <tr><td><strong>AMF</strong></td><td>18</td><td>Working (6 event types)</td><td>Scaffolding</td><td>Scaffolding</td><td>Stubbed (NGAP dispatch noted)</td><td>YAML parsing (GUAMI, TAI, PLMN, security)</td><td>Basic</td><td><strong>35%</strong></td></tr>
-<tr><td><strong>AUSF</strong></td><td>~8</td><td>Working + UE sub-FSMs</td><td>Routing (nausf-auth)</td><td>Routing (nudm-ueau)</td><td>Stubbed (UE lookup by SUCI/SUPI)</td><td>Basic</td><td>Comprehensive (845 lines)</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>AUSF</strong></td><td>~8</td><td>Working + UE sub-FSMs</td><td>Routing (nausf-auth)</td><td>Routing (nudm-ueau)</td><td>Stubbed (UE lookup by SUCI/SUPI)</td><td>Basic</td><td>Comprehensive</td><td><strong>25%</strong></td></tr>
 <tr><td><strong>BSF</strong></td><td>~6</td><td>Working</td><td>Routing (nbsf-management)</td><td>NRF stubs</td><td>Stubbed (PCF binding CRUD)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
 <tr><td><strong>NRF</strong></td><td>~8</td><td>Working</td><td><strong>Functional</strong> (full HTTP/2 routing)</td><td>N/A</td><td><strong>Working</strong> (NF registration, discovery, subscriptions)</td><td>Basic</td><td>Good</td><td><strong>65%</strong></td></tr>
 <tr><td><strong>NSSF</strong></td><td>~6</td><td>Working</td><td>Routing (nnssf-nsselection v2)</td><td>H-NSSF response</td><td>Stubbed</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
-<tr><td><strong>PCF</strong></td><td>~8</td><td>Working + AM/SM sub-FSMs</td><td>Routing (3 services)</td><td>NUDR/BSF response</td><td>Stubbed (AM policy, SM policy, policy auth)</td><td>Basic</td><td>Comprehensive (890 lines)</td><td><strong>25%</strong></td></tr>
+<tr><td><strong>PCF</strong></td><td>~8</td><td>Working + AM/SM sub-FSMs</td><td>Routing (3 services)</td><td>NUDR/BSF response</td><td>Stubbed (AM policy, SM policy, policy auth)</td><td>Basic</td><td>Comprehensive</td><td><strong>25%</strong></td></tr>
 <tr><td><strong>SCP</strong></td><td>~6</td><td>Working</td><td>Minimal (forwards via sbi_path)</td><td>NF discovery</td><td>Stubbed</td><td>Basic</td><td>Basic</td><td><strong>15%</strong></td></tr>
 <tr><td><strong>SEPP</strong></td><td>~8</td><td>Working + Handshake sub-FSMs</td><td>Routing (n32c-handshake)</td><td>N32c response</td><td>Partial (find_or_create returns None)</td><td>Basic</td><td>Basic</td><td><strong>20%</strong></td></tr>
 <tr><td><strong>SMF</strong></td><td>~12</td><td>Working (14 event types)</td><td><strong>Functional</strong> (comprehensive HTTP/2 routes)</td><td>Scaffolding</td><td>Stubbed (PDU session CRUD, event exposure)</td><td>YAML parsing</td><td>Basic</td><td><strong>30%</strong></td></tr>
@@ -4042,7 +4042,7 @@ already implemented — see the stale-snapshot banner at the top.</p>
 <li><strong>Metrics framework:</strong> Prometheus-compatible metrics collection exists and needs wiring, not creation.</li>
 </ol>
 <hr>
-<p><em>Report generated by deep source code analysis of 17 NFs and 17 shared libraries across ~50,000 lines of Rust code.</em></p>
+<p><em>Report generated by deep source code analysis of 17 NFs and 17 shared libraries.</em></p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="nextgcore-infrastructure-libraries--6g-gap-analysis"><a class="header" href="#nextgcore-infrastructure-libraries--6g-gap-analysis">NextGCore Infrastructure Libraries – 6G Gap Analysis</a></h1>
 <blockquote>
