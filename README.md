@@ -344,6 +344,7 @@ cargo audit
 
 - [CHANGELOG.md](CHANGELOG.md) — release notes and version history
 - [docs/ci-and-release.md](docs/ci-and-release.md) — CI pipeline (GitHub Actions jobs) and the release process
+- [docs/sba-transport-evaluation.md](docs/sba-transport-evaluation.md) — HTTP/2 vs HTTP/3 SBI transport benchmark and evaluation (non-normative 6G research)
 - [docker/rust/CI.md](docker/rust/CI.md) — the one-command matched-sim end-to-end suite (`e2e.sh`)
 - [docs/](docs/) — per-component gap analyses and architecture notes
 
