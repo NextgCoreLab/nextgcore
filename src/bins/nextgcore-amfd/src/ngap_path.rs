@@ -261,17 +261,54 @@ enum NasProcTimer {
 }
 
 impl NasProcTimer {
-    fn config(self, configs: &AmfTimerConfigs) -> (u32, Duration) {
-        let id = match self {
+    fn timer_id(self) -> AmfTimerId {
+        match self {
             Self::T3550 => AmfTimerId::T3550,
             Self::T3560 => AmfTimerId::T3560,
             Self::T3570 => AmfTimerId::T3570,
             Self::T3522 => AmfTimerId::T3522,
-        };
+        }
+    }
+
+    fn config(self, configs: &AmfTimerConfigs) -> (u32, Duration) {
         configs
-            .get(id)
+            .get(self.timer_id())
             .map(|c| (c.max_count, c.duration))
             .unwrap_or((4, Duration::from_secs(6)))
+    }
+
+    /// Issue #18 (non-normative NTN research): extend `base` by the UE's
+    /// satellite round-trip delay when a valid TimingAdvance is present.
+    #[cfg(feature = "ntn")]
+    fn ntn_compensated(
+        self,
+        configs: &AmfTimerConfigs,
+        base: Duration,
+        ta: Option<nextgcore_proto::TimingAdvance>,
+    ) -> Duration {
+        // Per-UE advance wins; otherwise fall back to the per-AMF default.
+        let Some(ta) = ta.or(configs.ntn_default_timing_advance) else {
+            return base;
+        };
+        // Prefer the TimerConfig method; if a future timer has no config
+        // entry (config() substitutes a fallback duration for that case),
+        // compensate the passed-in base directly instead of silently
+        // skipping the extension.
+        let compensated = match configs.get(self.timer_id()) {
+            Some(config) => config.with_ntn_compensation(&ta),
+            None if ta.valid => base + Duration::from_micros(u64::from(ta.value_us) * 2),
+            None => base,
+        };
+        if compensated != base {
+            log::debug!(
+                "NTN: {} duration {:?} -> {:?} (timing advance {}us)",
+                self.timer_id().name(),
+                base,
+                compensated,
+                ta.value_us
+            );
+        }
+        compensated
     }
 }
 
@@ -430,7 +467,26 @@ impl NgapServer {
             event_tx,
             server_event_rx,
             ue_auth_state: HashMap::new(),
-            timer_configs: AmfTimerConfigs::default(),
+            timer_configs: {
+                let configs = AmfTimerConfigs::default();
+                #[cfg(feature = "ntn")]
+                let configs = {
+                    let mut configs = configs;
+                    configs.ntn_default_timing_advance = std::env::var("AMF_NTN_TIMING_ADVANCE_US")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .map(nextgcore_proto::TimingAdvance::new);
+                    if let Some(ta) = configs.ntn_default_timing_advance {
+                        log::info!(
+                            "NTN: per-AMF default timing advance {}us (GMM retransmission timers extended by {}us round trip)",
+                            ta.value_us,
+                            u64::from(ta.value_us) * 2
+                        );
+                    }
+                    configs
+                };
+                configs
+            },
         })
     }
 
@@ -3885,6 +3941,14 @@ impl NgapServer {
     /// Arm a GMM procedure retransmission timer for a UE
     fn arm_retx(&mut self, amf_ue_ngap_id: u64, timer: NasProcTimer, ngap_pdu: Vec<u8>) {
         let (_max, duration) = timer.config(&self.timer_configs);
+        #[cfg(feature = "ntn")]
+        let duration = timer.ntn_compensated(
+            &self.timer_configs,
+            duration,
+            self.ue_auth_state
+                .get(&amf_ue_ngap_id)
+                .and_then(|s| s.amf_ue.ntn_timing_advance),
+        );
         if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
             state.retx = Some(NasRetx {
                 timer,
@@ -3916,6 +3980,12 @@ impl NgapServer {
                 continue;
             };
             let (max_count, duration) = retx.timer.config(&self.timer_configs);
+            #[cfg(feature = "ntn")]
+            let duration = retx.timer.ntn_compensated(
+                &self.timer_configs,
+                duration,
+                state.amf_ue.ntn_timing_advance,
+            );
 
             if retx.retries < max_count {
                 retx.retries += 1;
@@ -7300,5 +7370,40 @@ mod tests {
         let ctx = crate::context::amf_self();
         let guard = ctx.read().expect("ctx lock");
         guard.n1n2_subscription_remove(supi, sub_id);
+    }
+}
+
+#[cfg(all(test, feature = "ntn"))]
+mod ntn_retx_tests {
+    use super::*;
+    use nextgcore_proto::TimingAdvance;
+
+    /// Issue #18: a per-AMF default advance extends every GMM retransmission
+    /// timer resolved through the live retx path (T3550/T3560/T3570, and
+    /// T3522 which shares the same arming machinery) even when the UE has no
+    /// per-UE advance; with no advance at all the base duration is unchanged.
+    #[test]
+    fn per_amf_default_extends_retx_durations() {
+        let mut configs = AmfTimerConfigs::default();
+        configs.ntn_default_timing_advance = Some(TimingAdvance::new(270_000));
+        for timer in [
+            NasProcTimer::T3550,
+            NasProcTimer::T3560,
+            NasProcTimer::T3570,
+            NasProcTimer::T3522,
+        ] {
+            let (_, base) = timer.config(&configs);
+            assert_eq!(
+                timer.ntn_compensated(&configs, base, None),
+                base + Duration::from_micros(540_000)
+            );
+        }
+
+        let no_ta = AmfTimerConfigs::default();
+        let (_, base) = NasProcTimer::T3550.config(&no_ta);
+        assert_eq!(
+            NasProcTimer::T3550.ntn_compensated(&no_ta, base, None),
+            base
+        );
     }
 }

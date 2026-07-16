@@ -2323,6 +2323,7 @@ dependencies = [
  "nextgcore-metrics",
  "nextgcore-nas",
  "nextgcore-ngap",
+ "nextgcore-proto",
  "nextgcore-sbi",
  "nextgcore-sctp",
  "once_cell",

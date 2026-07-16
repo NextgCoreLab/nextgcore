@@ -23,12 +23,20 @@ path = "src/lib.rs"
 # standard SCTP. Requires Linux + libsctp at link/run time; off by default so
 # the host build keeps using the pure-Rust sctp-proto backend.
 kernel-sctp = ["nextgcore-sctp/kernel"]
+## Non-normative NTN research (issue #18, no frozen 6G Stage-3): extend the
+## GMM retransmission timers armed via the NAS retx path (T3550/T3560/T3570,
+## plus T3522 which shares that machinery) by the satellite round-trip delay
+## from a per-UE TimingAdvance, falling back to a per-AMF default set via the
+## AMF_NTN_TIMING_ADVANCE_US env var. Off by default: --features ntn
+ntn = ["dep:nextgcore-proto"]
 
 [dependencies]
 nextgcore-asn1c = { workspace = true }
 nextgcore-core = { workspace = true }
 nextgcore-crypt = { workspace = true }
 nextgcore-nas = { workspace = true }
+# ntn-feature-only: bespoke NTN research types (issue #18).
+nextgcore-proto = { workspace = true, optional = true }
 nextgcore-ngap = { workspace = true }
 nextgcore-sbi = { workspace = true }
 nextgcore-sctp = { workspace = true }
