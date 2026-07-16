@@ -2800,6 +2800,7 @@ dependencies = [
  "nextgcore-core",
  "nextgcore-metrics",
  "nextgcore-nrfd",
+ "nextgcore-proto",
  "nextgcore-sbi",
  "p256",
  "proptest",

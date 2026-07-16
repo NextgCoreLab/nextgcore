@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn test_spec_creation() {
-        let ctx = MetricsContext::new();
+        let _ctx = MetricsContext::new();
 
         let spec = MetricsSpec::new(
             MetricType::Counter,

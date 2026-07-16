@@ -5,6 +5,10 @@
 
 use crate::analytics::AnalyticsEngine;
 use std::collections::HashMap;
+#[cfg(feature = "sensing")]
+use std::collections::VecDeque;
+#[cfg(feature = "sensing")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
@@ -521,6 +525,19 @@ pub struct NwdafContext {
     max_subscriptions: usize,
     /// Context initialized flag
     initialized: AtomicBool,
+    /// Bounded ISAC sensing-result store (issue #16, non-normative 6G).
+    /// LOCK ORDER (nf-context-lock-deadlocks): outer context RwLock (read)
+    /// FIRST, then only this lock — never while holding another interior lock.
+    #[cfg(feature = "sensing")]
+    sensing_results: RwLock<VecDeque<nextgcore_proto::SensingResult>>,
+    /// NF-owned event broker for `SbiEventCategory::Isac` publications
+    /// (issue #16). Same lock-order rule as `sensing_results`.
+    #[cfg(feature = "sensing")]
+    event_broker: Mutex<nextgcore_sbi::pubsub::EventBroker>,
+    /// Running total of ingested sensing results — the value behind the
+    /// `nextgcore_metrics::ai_native::ISAC_SENSING_RESULTS` counter.
+    #[cfg(feature = "sensing")]
+    sensing_ingested_total: AtomicU64,
 }
 
 impl NwdafContext {
@@ -537,6 +554,12 @@ impl NwdafContext {
             next_id: AtomicUsize::new(1),
             max_subscriptions: 0,
             initialized: AtomicBool::new(false),
+            #[cfg(feature = "sensing")]
+            sensing_results: RwLock::new(VecDeque::new()),
+            #[cfg(feature = "sensing")]
+            event_broker: Mutex::new(nextgcore_sbi::pubsub::EventBroker::new()),
+            #[cfg(feature = "sensing")]
+            sensing_ingested_total: AtomicU64::new(0),
         }
     }
 
@@ -553,9 +576,81 @@ impl NwdafContext {
         );
     }
 
+    /// Bounded ISAC store capacity (issue #16); matches the ~100-sample house
+    /// style of `AnalyticsEngine::MAX_SAMPLES`.
+    #[cfg(feature = "sensing")]
+    const MAX_SENSING_RESULTS: usize = 100;
+
+    /// Ingest one sensing result into the bounded ring buffer and return the
+    /// running ingest total (the `ISAC_SENSING_RESULTS` metric value).
+    #[cfg(feature = "sensing")]
+    pub fn push_sensing_result(&self, result: nextgcore_proto::SensingResult) -> u64 {
+        let mut buf = self
+            .sensing_results
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while buf.len() >= Self::MAX_SENSING_RESULTS {
+            buf.pop_front();
+        }
+        buf.push_back(result);
+        // Counter bumped while the buffer lock is held so sensing_snapshot()
+        // can never observe a pushed result alongside a stale total.
+        self.sensing_ingested_total.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Snapshot of the sensing store: (total ingested, buffered count,
+    /// latest result if any).
+    #[cfg(feature = "sensing")]
+    pub fn sensing_snapshot(&self) -> (u64, usize, Option<nextgcore_proto::SensingResult>) {
+        let buf = self
+            .sensing_results
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Counter read while the buffer lock is held — pairs with the locked
+        // increment in push_sensing_result for a consistent view.
+        let total = self.sensing_ingested_total.load(Ordering::SeqCst);
+        (total, buf.len(), buf.back().cloned())
+    }
+
+    /// Publish an `SbiEventCategory::Isac` event on the NF-owned broker and
+    /// return the number of matched subscribers.
+    #[cfg(feature = "sensing")]
+    pub fn publish_isac_event(&self, event_type: &str, payload: String) -> usize {
+        let mut broker = self
+            .event_broker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let event = nextgcore_sbi::SbiEvent::new(
+            broker.alloc_event_id(),
+            nextgcore_sbi::SbiEventCategory::Isac,
+            event_type,
+            self.nf_instance_id.clone(),
+            payload,
+        );
+        broker.publish(&event).len()
+    }
+
+    /// Access the NF-owned event broker (tests/introspection).
+    #[cfg(feature = "sensing")]
+    pub fn lock_event_broker(&self) -> MutexGuard<'_, nextgcore_sbi::pubsub::EventBroker> {
+        self.event_broker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn fini(&mut self) {
         if !self.initialized.load(Ordering::SeqCst) {
             return;
+        }
+        #[cfg(feature = "sensing")]
+        {
+            let mut buf = self
+                .sensing_results
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            buf.clear();
+            drop(buf);
+            self.sensing_ingested_total.store(0, Ordering::SeqCst);
         }
         if let Ok(mut subs) = self.analytics_subscriptions.write() {
             subs.clear();

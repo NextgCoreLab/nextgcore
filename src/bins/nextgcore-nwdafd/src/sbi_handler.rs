@@ -201,6 +201,18 @@ pub async fn handle_analytics_info_query_with_ctx(
         }
     };
 
+    // Issue #16 (non-normative 6G ISAC): sensing-summary surface. Not a TS
+    // 29.520 NwdafEvent token, so intercept before AnalyticsId parsing.
+    #[cfg(feature = "sensing")]
+    if event_token == "ISAC_SENSING" {
+        // Fail closed on a malformed optional event-filter, matching the
+        // TS 29.520 path below (INVALID_QUERY_PARAM).
+        if let Err(detail) = parse_event_filter(params.get("event-filter")) {
+            return send_bad_request(&detail, Some("INVALID_QUERY_PARAM"));
+        }
+        return isac_sensing_summary_with_ctx(ctx);
+    }
+
     let analytics_id = match AnalyticsId::from_str(event_token) {
         Some(id) => id,
         None => {
@@ -275,6 +287,85 @@ pub async fn handle_analytics_info_query_with_ctx(
 pub async fn handle_analytics_info_query(request: &SbiRequest) -> SbiResponse {
     let ctx = nwdaf_self();
     handle_analytics_info_query_with_ctx(&ctx, request).await
+}
+
+/// Issue #16 (non-normative 6G ISAC): ingest one `SensingResult` posted to
+/// `POST /nnwdaf-sensingdata/v1/results`, against the global context.
+#[cfg(feature = "sensing")]
+pub async fn handle_sensing_result_post(request: &SbiRequest) -> SbiResponse {
+    let ctx = nwdaf_self();
+    handle_sensing_result_post_with_ctx(&ctx, request).await
+}
+
+/// Ingest one sensing result: store in the bounded ring buffer, publish an
+/// `SbiEventCategory::Isac` event, bump the `ISAC_SENSING_RESULTS` counter.
+#[cfg(feature = "sensing")]
+pub async fn handle_sensing_result_post_with_ctx(
+    ctx: &Arc<RwLock<NwdafContext>>,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+    let result: nextgcore_proto::SensingResult = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Invalid SensingResult JSON: {e}"),
+                Some("INVALID_JSON"),
+            )
+        }
+    };
+
+    // Lock order (nf-context-lock-deadlocks): context read → one interior
+    // lock at a time (ring buffer inside push, then broker inside publish).
+    let (total, subscribers) = match ctx.read() {
+        Ok(guard) => {
+            let total = guard.push_sensing_result(result);
+            let subscribers = guard.publish_isac_event("SENSING_RESULT", body.clone());
+            (total, subscribers)
+        }
+        Err(e) => {
+            log::error!("handle_sensing_result_post: failed to read context: {e}");
+            return nextgcore_sbi::server::send_internal_error("context unavailable");
+        }
+    };
+    log::info!(
+        "ISAC sensing result ingested: {}={total}, subscribers_notified={subscribers}",
+        nextgcore_metrics::ai_native::ISAC_SENSING_RESULTS.name
+    );
+
+    SbiResponse::with_status(201)
+        .with_json_body(&serde_json::json!({ "ingestedTotal": total }))
+        .unwrap_or_else(|_| SbiResponse::with_status(201))
+}
+
+/// Issue #16: sensing summary for `GET ...analytics?event-id=ISAC_SENSING` —
+/// count + latest result; 204 when nothing has been ingested (house style for
+/// "requested analytics data does not exist").
+#[cfg(feature = "sensing")]
+fn isac_sensing_summary_with_ctx(ctx: &Arc<RwLock<NwdafContext>>) -> SbiResponse {
+    let (total, buffered, latest) = match ctx.read() {
+        Ok(guard) => guard.sensing_snapshot(),
+        Err(e) => {
+            log::error!("isac_sensing_summary: failed to read context: {e}");
+            return nextgcore_sbi::server::send_internal_error("context unavailable");
+        }
+    };
+    if total == 0 {
+        return SbiResponse::with_status(204);
+    }
+    let summary = serde_json::json!({
+        "isacSensingSummary": {
+            "ingestedTotal": total,
+            "buffered": buffered,
+            "latest": latest,
+        }
+    });
+    SbiResponse::with_status(200)
+        .with_json_body(&summary)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
 /// Shared parser for the `NnwdafEventsSubscription` request body used by both
@@ -1478,5 +1569,107 @@ mod tests {
             Some(55),
             "NF_LOAD threshold must be read from nfLoadLvlThds[].nfLoadLevel, not the absent `loadLevel` field"
         );
+    }
+}
+
+#[cfg(all(test, feature = "sensing"))]
+mod sensing_tests {
+    use super::*;
+    use nextgcore_proto::{SensingMode, SensingResult, SensingType};
+    use nextgcore_sbi::pubsub::{EventFilter, Subscription};
+    use nextgcore_sbi::SbiEventCategory;
+
+    fn fresh_ctx() -> Arc<RwLock<NwdafContext>> {
+        Arc::new(RwLock::new(NwdafContext::new("nwdaf-test".to_string())))
+    }
+
+    fn sensing_result_json() -> String {
+        serde_json::to_string(&SensingResult {
+            sensing_type: SensingType::TargetDetection,
+            mode: SensingMode::GnbMonostatic,
+            timestamp_us: 1_000_000,
+            targets: vec![],
+            snr_db: 12.5,
+        })
+        .expect("serialize SensingResult")
+    }
+
+    fn summary_request() -> SbiRequest {
+        let mut request = SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics");
+        request
+            .http
+            .params
+            .insert("event-id".to_string(), "ISAC_SENSING".to_string());
+        request
+    }
+
+    /// Acceptance (issue #16): POST a SensingResult -> 2xx, then the analytics
+    /// GET returns the summary with count >= 1.
+    #[tokio::test]
+    async fn sensing_ingest_then_query_roundtrip() {
+        let ctx = fresh_ctx();
+
+        // Nothing ingested yet -> 204 (requested data does not exist).
+        let empty = handle_analytics_info_query_with_ctx(&ctx, &summary_request()).await;
+        assert_eq!(empty.status, 204);
+
+        let post = SbiRequest::post("/nnwdaf-sensingdata/v1/results")
+            .with_body(sensing_result_json(), "application/json");
+        let response = handle_sensing_result_post_with_ctx(&ctx, &post).await;
+        assert_eq!(response.status, 201);
+
+        let summary = handle_analytics_info_query_with_ctx(&ctx, &summary_request()).await;
+        assert_eq!(summary.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(summary.http.content.as_deref().expect("summary body"))
+                .expect("summary JSON");
+        assert_eq!(body["isacSensingSummary"]["ingestedTotal"], 1);
+        assert_eq!(body["isacSensingSummary"]["buffered"], 1);
+        assert_eq!(
+            body["isacSensingSummary"]["latest"]["snr_db"],
+            serde_json::json!(12.5)
+        );
+    }
+
+    /// Acceptance (issue #16): ingest publishes an SbiEventCategory::Isac
+    /// event on the pub-sub bus (subscriber matched, publish counter bumped).
+    #[tokio::test]
+    async fn sensing_ingest_publishes_isac_event() {
+        let ctx = fresh_ctx();
+
+        // Subscribe to Isac events before ingesting.
+        {
+            let guard = ctx.read().expect("ctx read");
+            let mut broker = guard.lock_event_broker();
+            let sub_id = broker.alloc_subscription_id();
+            broker.subscribe(Subscription::new(
+                sub_id,
+                "consumer-1",
+                "http://consumer:8080/callback",
+                EventFilter::category(SbiEventCategory::Isac),
+            ));
+        }
+
+        let post = SbiRequest::post("/nnwdaf-sensingdata/v1/results")
+            .with_body(sensing_result_json(), "application/json");
+        let response = handle_sensing_result_post_with_ctx(&ctx, &post).await;
+        assert_eq!(response.status, 201);
+
+        let guard = ctx.read().expect("ctx read");
+        let broker = guard.lock_event_broker();
+        assert_eq!(broker.total_published(), 1);
+        assert_eq!(broker.total_delivered(), 1);
+    }
+
+    /// Malformed body fails closed with 400, ingesting nothing.
+    #[tokio::test]
+    async fn sensing_ingest_rejects_bad_json() {
+        let ctx = fresh_ctx();
+        let post = SbiRequest::post("/nnwdaf-sensingdata/v1/results")
+            .with_body("{not json", "application/json");
+        let response = handle_sensing_result_post_with_ctx(&ctx, &post).await;
+        assert_eq!(response.status, 400);
+        let (total, buffered, _) = ctx.read().expect("ctx read").sensing_snapshot();
+        assert_eq!((total, buffered), (0, 0));
     }
 }

@@ -522,82 +522,8 @@ pub struct Session {
     pub smf_ip: IpAddr,
 }
 
-// ============================================================================
-// 6G ISAC (Integrated Sensing and Communication) Types
-// ============================================================================
-
-/// ISAC sensing configuration for 6G networks.
-///
-/// Defines operational parameters for integrated sensing and communication
-/// at the network level.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SensingConfig {
-    /// Whether ISAC sensing is enabled
-    pub enabled: bool,
-    /// Sensing mode (0=passive, 1=active radar, 2=hybrid)
-    pub mode: u8,
-    /// Sensing bandwidth in MHz
-    pub bandwidth_mhz: u32,
-    /// Maximum sensing range in meters
-    pub max_range_meters: f64,
-    /// Minimum detection threshold in dBm
-    pub detection_threshold_dbm: f32,
-}
-
-impl SensingConfig {
-    /// Creates a new sensing configuration.
-    pub fn new(mode: u8, bandwidth_mhz: u32, max_range_meters: f64) -> Self {
-        Self {
-            enabled: true,
-            mode,
-            bandwidth_mhz,
-            max_range_meters,
-            detection_threshold_dbm: -100.0,
-        }
-    }
-}
-
-impl Default for SensingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mode: 0,
-            bandwidth_mhz: 100,
-            max_range_meters: 1000.0,
-            detection_threshold_dbm: -100.0,
-        }
-    }
-}
-
-/// ISAC sensing result containing detection information.
-///
-/// Aggregated result from ISAC operations at the network layer.
-#[derive(Debug, Clone, Default)]
-pub struct SensingResult {
-    /// Timestamp of result (milliseconds since epoch)
-    pub timestamp_ms: u64,
-    /// Number of detections
-    pub detection_count: u32,
-    /// Average signal strength (dBm)
-    pub avg_signal_strength_dbm: f32,
-    /// Average range (meters)
-    pub avg_range_meters: f64,
-    /// Confidence level (0.0-1.0)
-    pub confidence: f32,
-}
-
-impl SensingResult {
-    /// Creates a new sensing result.
-    pub fn new(timestamp_ms: u64, detection_count: u32) -> Self {
-        Self {
-            timestamp_ms,
-            detection_count,
-            avg_signal_strength_dbm: 0.0,
-            avg_range_meters: 0.0,
-            confidence: 0.0,
-        }
-    }
-}
+// NOTE: the 6G ISAC types (SensingResult etc.) live in `crate::isac` — the
+// canonical, serde-capable set (issue #16 removed a duplicate set here).
 
 // ============================================================================
 // 6G Semantic Communication Types
@@ -930,23 +856,6 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ISAC tests
-    #[test]
-    fn test_sensing_config_new() {
-        let config = SensingConfig::new(1, 200, 500.0);
-        assert!(config.enabled);
-        assert_eq!(config.mode, 1);
-        assert_eq!(config.bandwidth_mhz, 200);
-        assert_eq!(config.max_range_meters, 500.0);
-    }
-
-    #[test]
-    fn test_sensing_result_new() {
-        let result = SensingResult::new(1000, 5);
-        assert_eq!(result.timestamp_ms, 1000);
-        assert_eq!(result.detection_count, 5);
-    }
 
     // Semantic communication tests
     #[test]

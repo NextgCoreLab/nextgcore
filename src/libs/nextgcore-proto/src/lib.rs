@@ -14,6 +14,11 @@ mod types; // #217: Sub-THz spectrum types (6G)
 
 pub use conv::*;
 pub use event::*;
+// Canonical ISAC sensing types at the crate root (issue #16: the duplicate
+// non-serde set that lived in `types` was removed in favour of these).
+pub use isac::{
+    DetectedTarget, IsacResourceConfig, SensingMode, SensingQos, SensingResult, SensingType,
+};
 pub use timer::*;
 pub use types::*;
 
