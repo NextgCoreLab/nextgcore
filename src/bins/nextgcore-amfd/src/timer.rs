@@ -105,6 +105,19 @@ impl TimerConfig {
             duration: Duration::from_secs(duration_secs),
         }
     }
+
+    /// Issue #18 (non-normative NTN research; no frozen 6G Stage-3): return
+    /// this timer's duration extended by the satellite round-trip
+    /// propagation delay derived from a `TimingAdvance` — twice the one-way
+    /// advance in microseconds — when the advance is valid. An invalid
+    /// advance yields exactly the base duration.
+    #[cfg(feature = "ntn")]
+    pub fn with_ntn_compensation(&self, ta: &nextgcore_proto::TimingAdvance) -> Duration {
+        if !ta.valid {
+            return self.duration;
+        }
+        self.duration + Duration::from_micros(u64::from(ta.value_us) * 2)
+    }
 }
 
 /// AMF timer configurations
@@ -124,6 +137,11 @@ pub struct AmfTimerConfigs {
     pub t3570: TimerConfig,
     /// NG holding configuration
     pub ng_holding: TimerConfig,
+    /// Per-AMF default NTN timing advance (issue #18, non-normative
+    /// research). Applied to any UE without a per-UE advance; populated at
+    /// NGAP-server startup from the `AMF_NTN_TIMING_ADVANCE_US` env var.
+    #[cfg(feature = "ntn")]
+    pub ntn_default_timing_advance: Option<nextgcore_proto::TimingAdvance>,
 }
 
 impl Default for AmfTimerConfigs {
@@ -147,6 +165,8 @@ impl Default for AmfTimerConfigs {
                 max_count: 0,
                 duration: Duration::from_secs(30),
             },
+            #[cfg(feature = "ntn")]
+            ntn_default_timing_advance: None,
         }
     }
 }
@@ -433,5 +453,32 @@ mod tests {
 
         manager.stop_all_ue_timers(100);
         assert_eq!(manager.active_timer_count(), 1);
+    }
+}
+
+#[cfg(all(test, feature = "ntn"))]
+mod ntn_tests {
+    use super::*;
+    use nextgcore_proto::TimingAdvance;
+
+    /// Issue #18 acceptance: a valid TimingAdvance strictly extends the base
+    /// duration by the round-trip delay; an invalid one changes nothing.
+    #[test]
+    fn ntn_compensation_extends_valid_and_ignores_invalid() {
+        let config = TimerConfig::new(4, 6);
+
+        // GEO-ish one-way advance of 270ms -> +540ms round trip.
+        let ta = TimingAdvance::new(270_000);
+        let compensated = config.with_ntn_compensation(&ta);
+        assert!(compensated > config.duration);
+        assert_eq!(
+            compensated,
+            config.duration + Duration::from_micros(540_000)
+        );
+
+        assert_eq!(
+            config.with_ntn_compensation(&TimingAdvance::invalid()),
+            config.duration
+        );
     }
 }

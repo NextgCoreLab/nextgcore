@@ -2244,6 +2244,11 @@ pub struct AmfUe {
     /// when the UE registers as an aerial UE (UAV indication IE); drives the
     /// geofence on UAV tracking reports.
     pub uav_auth: Option<UavAuthorizationContext>,
+    /// NTN timing advance for this UE (issue #18, non-normative research).
+    /// When valid, GMM retransmission timers are extended by the satellite
+    /// round-trip delay it encodes.
+    #[cfg(feature = "ntn")]
+    pub ntn_timing_advance: Option<nextgcore_proto::TimingAdvance>,
 }
 
 /// URSP policy rule for UE policy delivery (TS 24.526)
@@ -2661,6 +2666,8 @@ impl AmfUe {
             prose_capable: false,
             pin_role: None,
             uav_auth: None,
+            #[cfg(feature = "ntn")]
+            ntn_timing_advance: None,
         }
     }
 
