@@ -14,6 +14,10 @@ description = "NextGCore SBI (Service Based Interface) Library"
 ## Loopback research spike only — no NF uses it; TS 29.500 mandates HTTP/2.
 ## Enable with: cargo build -p nextgcore-sbi --features http3
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:http"]
+## Gate the non-normative hybrid PQC TLS key exchange (issue #17): rustls
+## aws-lc-rs provider offering X25519MLKEM768 when PqcTlsConfig.enabled.
+## The default provider stays ring. Enable with: --features pqc-tls
+pqc-tls = ["rustls/aws-lc-rs"]
 
 [dependencies]
 nextgcore-core = { workspace = true }

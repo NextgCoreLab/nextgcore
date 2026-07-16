@@ -95,13 +95,13 @@ fn get_pqc_signature_schemes(config: &PqcTlsConfig) -> Vec<SignatureScheme> {
     let mut schemes = Vec::new();
 
     if config.enabled {
-        // Note: These are placeholder values as rustls doesn't natively support PQC yet.
-        // In a real implementation, this would require a custom CryptoProvider with
-        // PQC algorithm support (e.g., via liboqs or AWS libcrypto).
+        // Key exchange is the real PQC surface (see `select_provider`, which
+        // negotiates X25519MLKEM768 under the `pqc-tls` feature). Signature
+        // schemes remain classical: rustls 0.23 ships no ML-DSA certificate
+        // support, so the hybrid choice maps to ECDSA P-256 for now.
         match config.signature_scheme {
             PqcSignatureScheme::MlDsa65 => {
-                // Future: Add ML-DSA-65 signature scheme
-                log::debug!("PQC: ML-DSA-65 signature requested (not yet in rustls)");
+                log::debug!("PQC: ML-DSA-65 signature requested (unsupported: rustls 0.23 ships no ML-DSA certificates; staying classical)");
             }
             PqcSignatureScheme::HybridEcdsaP256MlDsa65 => {
                 // Use ECDSA P-256 for now, with planned ML-DSA-65 hybrid
@@ -127,6 +127,47 @@ fn get_pqc_signature_schemes(config: &PqcTlsConfig) -> Vec<SignatureScheme> {
 /// Get the ring crypto provider.
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// Select the crypto provider for a PQC-aware builder (issue #17,
+/// non-normative — no frozen 3GPP Stage-3 covers PQC TLS).
+///
+/// With the `pqc-tls` feature compiled in and `pqc_config.enabled`, returns
+/// the rustls aws-lc-rs provider with the requested ML-KEM key-exchange group
+/// first (`X25519MLKEM768` for the hybrid suite, pure `MLKEM768` otherwise);
+/// `allow_fallback` keeps the classical groups after it. In every other case
+/// this is exactly the default ring provider, byte-for-byte the pre-existing
+/// behaviour.
+#[cfg(feature = "pqc-tls")]
+fn select_provider(pqc_config: &PqcTlsConfig) -> Arc<rustls::crypto::CryptoProvider> {
+    use rustls::crypto::aws_lc_rs::kx_group;
+
+    if !pqc_config.enabled {
+        return provider();
+    }
+    let preferred: &'static dyn rustls::crypto::SupportedKxGroup = match pqc_config.cipher_suite {
+        PqcCipherSuite::HybridX25519MlKem768 => kx_group::X25519MLKEM768,
+        PqcCipherSuite::MlKem768 => kx_group::MLKEM768,
+    };
+    let mut pqc_provider = rustls::crypto::aws_lc_rs::default_provider();
+    pqc_provider.kx_groups = if pqc_config.allow_fallback {
+        vec![
+            preferred,
+            kx_group::X25519,
+            kx_group::SECP256R1,
+            kx_group::SECP384R1,
+        ]
+    } else {
+        vec![preferred]
+    };
+    Arc::new(pqc_provider)
+}
+
+/// Without the `pqc-tls` feature the PQC-aware builders compile to exactly
+/// the classical ring path.
+#[cfg(not(feature = "pqc-tls"))]
+fn select_provider(_pqc_config: &PqcTlsConfig) -> Arc<rustls::crypto::CryptoProvider> {
+    provider()
 }
 
 /// Load PEM-encoded certificates from a file path.
@@ -187,7 +228,7 @@ pub fn build_server_config_with_pqc(
     key: PrivateKeyDer<'static>,
     pqc_config: &PqcTlsConfig,
 ) -> SbiResult<ServerConfig> {
-    let config = ServerConfig::builder_with_provider(provider())
+    let config = ServerConfig::builder_with_provider(select_provider(pqc_config))
         .with_safe_default_protocol_versions()
         .map_err(|e| SbiError::TlsError(format!("Failed to set protocol versions: {e}")))?
         .with_no_client_auth()
@@ -201,8 +242,8 @@ pub fn build_server_config_with_pqc(
             pqc_config.signature_scheme,
             pqc_config.allow_fallback
         );
-        // Note: Actual PQC cipher suite configuration would require custom CryptoProvider
-        // This is a framework for future PQC integration
+        // Key-exchange group selection happened in `select_provider` above;
+        // under `--features pqc-tls` this handshake offers X25519MLKEM768.
     }
 
     Ok(config)
@@ -226,11 +267,18 @@ pub fn build_server_config_mtls_with_pqc(
 ) -> SbiResult<ServerConfig> {
     let root_store = load_root_store(client_ca_path)?;
 
-    let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
-        .build()
-        .map_err(|e| SbiError::TlsError(format!("Failed to build client verifier: {e}")))?;
+    // builder() would resolve the ambient process-default CryptoProvider,
+    // which is ambiguous in this workspace (tokio-rustls enables aws-lc-rs
+    // beside our ring pin) and panics at runtime — pass the provider
+    // explicitly, same as every config builder in this module.
+    let client_verifier = WebPkiClientVerifier::builder_with_provider(
+        Arc::new(root_store),
+        select_provider(pqc_config),
+    )
+    .build()
+    .map_err(|e| SbiError::TlsError(format!("Failed to build client verifier: {e}")))?;
 
-    let config = ServerConfig::builder_with_provider(provider())
+    let config = ServerConfig::builder_with_provider(select_provider(pqc_config))
         .with_safe_default_protocol_versions()
         .map_err(|e| SbiError::TlsError(format!("Failed to set protocol versions: {e}")))?
         .with_client_cert_verifier(client_verifier)
@@ -243,8 +291,8 @@ pub fn build_server_config_mtls_with_pqc(
             pqc_config.cipher_suite,
             pqc_config.signature_scheme
         );
-        // PQC certificate chain validation would be implemented here
-        // with custom verifier supporting ML-DSA signatures
+        // Certificate chains remain classical (no ML-DSA certificate
+        // support in rustls 0.23); only the key exchange is hybrid.
     }
 
     Ok(config)
@@ -277,7 +325,7 @@ pub fn build_client_config_with_pqc(
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
-    let mut config = ClientConfig::builder_with_provider(provider())
+    let mut config = ClientConfig::builder_with_provider(select_provider(pqc_config))
         .with_safe_default_protocol_versions()
         .map_err(|e| SbiError::TlsError(format!("Failed to set protocol versions: {e}")))?
         .with_root_certificates(root_store)
@@ -291,7 +339,7 @@ pub fn build_client_config_with_pqc(
             pqc_config.cipher_suite,
             pqc_config.signature_scheme
         );
-        // PQC cipher suite negotiation would be configured here
+        // Key-exchange group selection happened in `select_provider` above.
     }
 
     if insecure_skip_verify {
@@ -340,7 +388,7 @@ pub fn build_client_config_mtls_with_pqc(
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
-    let mut config = ClientConfig::builder_with_provider(provider())
+    let mut config = ClientConfig::builder_with_provider(select_provider(pqc_config))
         .with_safe_default_protocol_versions()
         .map_err(|e| SbiError::TlsError(format!("Failed to set protocol versions: {e}")))?
         .with_root_certificates(root_store)
@@ -355,7 +403,8 @@ pub fn build_client_config_mtls_with_pqc(
             pqc_config.cipher_suite,
             pqc_config.signature_scheme
         );
-        // PQC client certificate and key exchange would be configured here
+        // Key-exchange selection happened in `select_provider`; the client
+        // certificate remains classical (no ML-DSA in rustls 0.23).
     }
 
     if insecure_skip_verify {
@@ -691,5 +740,167 @@ mod tests {
         assert!(!server.is_handshaking(), "server handshake incomplete");
 
         HandshakeOutput { client, server }
+    }
+}
+
+#[cfg(all(test, feature = "pqc-tls"))]
+mod pqc_tls_tests {
+    use super::*;
+
+    /// In-memory handshake through the real PQC-aware builders; returns the
+    /// negotiated key-exchange group plus both peers' N32 exporter keys.
+    fn pqc_handshake(pqc: &PqcTlsConfig) -> (rustls::NamedGroup, Vec<u8>, Vec<u8>) {
+        use rustls::pki_types::ServerName;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key");
+
+        let server_config =
+            build_server_config_with_pqc(vec![cert_der], key_der, pqc).expect("server config");
+
+        // Feed the self-signed cert through the real CA-path loading. The
+        // dir must be unique per call: tests run in parallel in one process,
+        // and a shared path races create/write against remove_dir_all.
+        static DIR_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("nextgcore-sbi-pqc-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let ca_path = dir.join("ca.pem");
+        std::fs::write(&ca_path, cert.cert.pem()).expect("write ca");
+        let client_config =
+            build_client_config_with_pqc(Some(ca_path.to_str().expect("ca path")), false, pqc)
+                .expect("client config");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut client =
+            rustls::ClientConnection::new(Arc::new(client_config), server_name).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
+
+        for _ in 0..16 {
+            let mut buf = Vec::new();
+            client.write_tls(&mut buf).unwrap();
+            if !buf.is_empty() {
+                server.read_tls(&mut buf.as_slice()).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut buf2 = Vec::new();
+            server.write_tls(&mut buf2).unwrap();
+            if !buf2.is_empty() {
+                client.read_tls(&mut buf2.as_slice()).unwrap();
+                client.process_new_packets().unwrap();
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "client handshake incomplete");
+        assert!(!server.is_handshaking(), "server handshake incomplete");
+
+        let group = client
+            .negotiated_key_exchange_group()
+            .expect("negotiated kx group")
+            .name();
+        let client_key = export_n32_master_key(&client, None).expect("client exporter");
+        let server_key = export_n32_master_key(&server, None).expect("server exporter");
+        (group, client_key, server_key)
+    }
+
+    /// Issue #17 acceptance: PQC enabled on both ends negotiates the hybrid
+    /// X25519MLKEM768 group, and the N32-f exporter still agrees.
+    #[test]
+    fn pqc_enabled_negotiates_x25519mlkem768() {
+        let (group, client_key, server_key) = pqc_handshake(&PqcTlsConfig::hybrid());
+        assert_eq!(group, rustls::NamedGroup::X25519MLKEM768);
+        assert_eq!(client_key, server_key, "N32 exporter keys must agree");
+        assert_eq!(client_key.len(), N32_MASTER_KEY_LEN);
+    }
+
+    /// Issue #17 acceptance: with PQC disabled the same builders negotiate a
+    /// classical group (ring provider, X25519 first).
+    #[test]
+    fn pqc_disabled_negotiates_classical_group() {
+        let (group, client_key, server_key) = pqc_handshake(&PqcTlsConfig::default());
+        assert_eq!(group, rustls::NamedGroup::X25519);
+        assert_eq!(client_key, server_key);
+    }
+
+    /// Pure ML-KEM mode (no hybrid, no fallback) negotiates MLKEM768.
+    #[test]
+    fn pqc_pure_mode_negotiates_mlkem768() {
+        let (group, client_key, server_key) = pqc_handshake(&PqcTlsConfig::pure_pqc());
+        assert_eq!(group, rustls::crypto::aws_lc_rs::kx_group::MLKEM768.name());
+        assert_eq!(client_key, server_key);
+    }
+
+    /// mTLS builders complete a hybrid handshake end-to-end — in particular
+    /// the client-cert verifier must not resolve the ambient (ambiguous)
+    /// process-default provider.
+    #[test]
+    fn pqc_mtls_handshake_negotiates_hybrid() {
+        use rustls::pki_types::ServerName;
+
+        let pqc = PqcTlsConfig::hybrid();
+        let server_cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let client_cert = rcgen::generate_simple_self_signed(vec!["client".to_string()]).unwrap();
+
+        static DIR_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "nextgcore-sbi-pqc-mtls-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let server_ca = dir.join("server-ca.pem");
+        let client_ca = dir.join("client-ca.pem");
+        std::fs::write(&server_ca, server_cert.cert.pem()).expect("write server ca");
+        std::fs::write(&client_ca, client_cert.cert.pem()).expect("write client ca");
+
+        let server_config = build_server_config_mtls_with_pqc(
+            vec![CertificateDer::from(server_cert.cert.der().to_vec())],
+            PrivateKeyDer::try_from(server_cert.key_pair.serialize_der()).unwrap(),
+            client_ca.to_str().expect("client ca path"),
+            &pqc,
+        )
+        .expect("mtls server config");
+        let client_config = build_client_config_mtls_with_pqc(
+            vec![CertificateDer::from(client_cert.cert.der().to_vec())],
+            PrivateKeyDer::try_from(client_cert.key_pair.serialize_der()).unwrap(),
+            Some(server_ca.to_str().expect("server ca path")),
+            false,
+            &pqc,
+        )
+        .expect("mtls client config");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut client =
+            rustls::ClientConnection::new(Arc::new(client_config), server_name).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
+        for _ in 0..16 {
+            let mut buf = Vec::new();
+            client.write_tls(&mut buf).unwrap();
+            if !buf.is_empty() {
+                server.read_tls(&mut buf.as_slice()).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut buf2 = Vec::new();
+            server.write_tls(&mut buf2).unwrap();
+            if !buf2.is_empty() {
+                client.read_tls(&mut buf2.as_slice()).unwrap();
+                client.process_new_packets().unwrap();
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert_eq!(
+            client.negotiated_key_exchange_group().expect("kx").name(),
+            rustls::NamedGroup::X25519MLKEM768
+        );
     }
 }
