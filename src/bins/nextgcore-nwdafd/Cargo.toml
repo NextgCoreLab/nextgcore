@@ -10,9 +10,17 @@ description = "NextGCore NWDAF (Network Data Analytics Function, TS 23.288)"
 name = "nextgcore-nwdafd"
 path = "src/main.rs"
 
+[features]
+## Non-normative 6G ISAC sensing pipeline (issue #16): collection endpoint,
+## bounded in-memory store, Isac pub-sub event + ingest metric. Off by default.
+## Enable with: cargo build -p nextgcore-nwdafd --features sensing
+sensing = ["dep:nextgcore-proto", "nextgcore-sbi/6g-extensions"]
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }
+# sensing-feature-only: canonical ISAC types (issue #16, non-normative).
+nextgcore-proto = { workspace = true, optional = true }
 nextgcore-metrics = { workspace = true }
 nextgcore-app = { workspace = true }
 log.workspace = true

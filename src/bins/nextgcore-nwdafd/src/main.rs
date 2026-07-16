@@ -355,6 +355,14 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "notify"),
         },
 
+        // Issue #16 (non-normative 6G ISAC, no frozen Stage-3): sensing-result
+        // collection endpoint, feature-gated and off by default.
+        #[cfg(feature = "sensing")]
+        ["nnwdaf-sensingdata", "v1", "results"] => match method {
+            "POST" => handle_sensing_result_post(&request).await,
+            _ => send_method_not_allowed(method, "results"),
+        },
+
         _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
 }

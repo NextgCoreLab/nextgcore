@@ -109,6 +109,14 @@ pub const NWDAF_FEEDBACK_RECEIVED: AiMetricDef = AiMetricDef {
     labels: &["consumer_nf", "analytics_id"],
 };
 
+/// ISAC sensing results ingested (counter) - non-normative 6G research
+pub const ISAC_SENSING_RESULTS: AiMetricDef = AiMetricDef {
+    name: "nwdaf_isac_sensing_results_total",
+    help: "Total ISAC sensing results ingested by NWDAF",
+    category: AiMetricCategory::IsacSensing,
+    labels: &[],
+};
+
 // ============================================================================
 // Predefined Energy Efficiency Metrics (Rel-18, TS 28.310)
 // ============================================================================
