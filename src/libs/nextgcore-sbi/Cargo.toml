@@ -10,6 +10,10 @@ description = "NextGCore SBI (Service Based Interface) Library"
 ## Gate 6G research modules (gRPC/SBI-2.0, event pub-sub).
 ## Enable with: cargo build -p nextgcore-sbi --features 6g-extensions
 6g-extensions = []
+## Gate the non-normative HTTP/3-over-QUIC SBI transport prototype (issue #15).
+## Loopback research spike only — no NF uses it; TS 29.500 mandates HTTP/2.
+## Enable with: cargo build -p nextgcore-sbi --features http3
+http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:http"]
 
 [dependencies]
 nextgcore-core = { workspace = true }
@@ -33,11 +37,23 @@ hex.workspace = true
 # probabilistic reaction (sbi-08). Workspace-pinned; no root Cargo.toml change.
 rand.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
+# http3-feature-only: HTTP/3 transport prototype (issue #15). Crate-local, not
+# workspace-pinned — no other crate may depend on these (non-normative research).
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+http = { version = "1.4", optional = true }
 
 [dev-dependencies]
+# Bench-only: SBA transport benchmark harness (issue #15).
+criterion = "0.8.2"
 proptest.workspace = true
 # Test-only: generate a self-signed cert for the in-memory TLS exporter test.
 rcgen = "0.13"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "transport"
+harness = false

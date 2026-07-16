@@ -44,6 +44,8 @@ pub mod error;
 #[cfg(feature = "6g-extensions")]
 pub mod grpc; // SBI 2.0 gRPC support (B6.1)
 pub mod heartbeat;
+#[cfg(feature = "http3")]
+pub mod http3; // HTTP/3 SBI transport prototype (issue #15, non-normative)
 pub mod message;
 pub mod multipart;
 pub mod oauth;
@@ -72,6 +74,8 @@ pub use heartbeat::{
     global_heartbeat_manager, init_heartbeat_manager, spawn_heartbeat_worker, HeartbeatConfig,
     HeartbeatManager, HeartbeatRecord, HeartbeatStats, HeartbeatStatus,
 };
+#[cfg(feature = "http3")]
+pub use http3::{Http3Client, Http3LoopbackServer, Http3ServerConfig};
 pub use message::{
     Guami, InvalidParam, PlmnId, ProblemDetails, SNssai, SbiDiscoveryOption, SbiHeader,
     SbiHttpMessage, SbiMessageParams, SbiPart, SbiRequest, SbiResponse, Tai, UriComponents,
