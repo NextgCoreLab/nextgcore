@@ -10,6 +10,15 @@ description = "NextGCore UPF (User Plane Function)"
 name = "nextgcore-upfd"
 path = "src/main.rs"
 
+[features]
+## Issue #20: attach a Load Control Information IE (TS 29.244 7.4.3.2:
+## Sequence Number + Metric = session-occupancy percentage from get_load())
+## to UPF-initiated PFCP Heartbeat Requests so the SMF can do load/compute-
+## aware UPF selection. Off by default: heartbeat wire bytes are unchanged.
+## Rel-19 "Compute-Aware Networking" has no frozen Stage-3 (research knob).
+## Enable with: cargo build -p nextgcore-upfd --features compute-aware-upf
+compute-aware-upf = []
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-pfcp = { workspace = true }

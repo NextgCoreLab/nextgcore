@@ -1787,6 +1787,80 @@ impl MeasurementMethod {
     }
 }
 
+/// Load Control Information - grouped IE (TS 29.244 Section 7.4.3.2)
+///
+/// Carried by a UP function to convey its load toward the CP function.
+/// Children: Load Control Sequence Number (IE 52, u32, mandatory) and Load
+/// Metric (IE 53, one octet 0..=100 percentage per Section 8.2.53,
+/// mandatory). The sequence number lets the receiver order metric updates;
+/// a stale (lower) sequence number must not overwrite a newer metric.
+///
+/// Issue #20 note: TS 29.244 defines this IE for session-level responses and
+/// Session Report Requests; nextgcore additionally carries it on the PFCP
+/// Heartbeat Request (a self-contained UPF->SMF periodic channel) for
+/// load/compute-aware UPF selection. The Rel-19 "Compute-Aware Networking"
+/// study has no frozen Stage-3, so treating the metric as a compute signal
+/// is a non-normative research prototype; the load-aware use itself is a
+/// TS 23.501 Section 6.3.3 UPF-selection input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadControlInformation {
+    /// Load Control Sequence Number (TS 29.244 Section 8.2.52).
+    pub sequence_number: u32,
+    /// Load Metric: percentage 0..=100 of the UP function's nominal capacity
+    /// in use (TS 29.244 Section 8.2.53).
+    pub metric: u8,
+}
+
+impl LoadControlInformation {
+    pub fn new(sequence_number: u32, metric: u8) -> Self {
+        Self {
+            sequence_number,
+            metric,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{encode_u32_ie, encode_u8_ie, IeType};
+
+        encode_u32_ie(buf, IeType::SequenceNumber, self.sequence_number);
+        encode_u8_ie(buf, IeType::Metric, self.metric);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut sequence_number = None;
+        let mut metric = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::SequenceNumber as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        sequence_number = Some(data.get_u32());
+                    }
+                }
+                t if t == IeType::Metric as u16 => {
+                    if !ie.data.is_empty() {
+                        metric = Some(ie.data[0]);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let sequence_number = sequence_number
+            .ok_or_else(|| PfcpError::MissingMandatoryIe("Sequence Number".to_string()))?;
+        let metric = metric.ok_or_else(|| PfcpError::MissingMandatoryIe("Metric".to_string()))?;
+
+        Ok(Self {
+            sequence_number,
+            metric,
+        })
+    }
+}
+
 /// PDI (Packet Detection Information) - grouped IE within PDR
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pdi {
