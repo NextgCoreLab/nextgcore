@@ -2248,7 +2248,9 @@ mod tests {
         // Serialize on udmd's global-context/UDR-env guard: this test re-inits
         // the process-global UDM context and/or sets UDR_SBI_* env vars, which
         // races any other udmd test doing the same (the CI-flaky AUTS-resync).
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ = env_logger::try_init();
         tokio::time::timeout(Duration::from_secs(60), async {
             udm_context_init(64, 64);
@@ -2659,7 +2661,9 @@ mod tests {
         // Serialize on udmd's global-context/UDR-env guard: this test re-inits
         // the process-global UDM context and/or sets UDR_SBI_* env vars, which
         // races any other udmd test doing the same (the CI-flaky AUTS-resync).
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ = env_logger::try_init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
@@ -2757,7 +2761,9 @@ mod tests {
         // Serialize on udmd's global-context/UDR-env guard: this test re-inits
         // the process-global UDM context and/or sets UDR_SBI_* env vars, which
         // races any other udmd test doing the same (the CI-flaky AUTS-resync).
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ = env_logger::try_init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
@@ -2813,7 +2819,9 @@ mod tests {
         // Serialize on udmd's global-context/UDR-env guard: this test re-inits
         // the process-global UDM context and/or sets UDR_SBI_* env vars, which
         // races any other udmd test doing the same (the CI-flaky AUTS-resync).
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ = env_logger::try_init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
         udm_context_init(64, 64);
@@ -2883,7 +2891,9 @@ mod tests {
         // Serialize on udmd's global-context/UDR-env guard: this test re-inits
         // the process-global UDM context and/or sets UDR_SBI_* env vars, which
         // races any other udmd test doing the same (the CI-flaky AUTS-resync).
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
         let supi = "imsi-udmdsor-0001";
         // Missing provisioningTime -> 400.
@@ -2998,8 +3008,15 @@ mod tests {
     /// SoR happy path: expected XMAC seeded (F-04 path) + correct SoR-MAC-I_UE
     /// (F-01 KDF) → 204, ack recorded, expected XMAC consumed; a SECOND identical
     /// PUT → 400 (single-use / replay defence).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn f06_sor_ack_happy_then_replay_rejected() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         udm_context_init(64, 64);
         let supi = "imsi-f06sor-0001";
         let kausf = f06_kausf(0xB1);
@@ -3046,8 +3063,15 @@ mod tests {
 
     /// SoR wrong MAC: one flipped hex digit → 400 and NO ack state recorded,
     /// expected XMAC preserved (a 204 on a mismatched MAC would be a fail).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn f06_sor_ack_wrong_mac_rejected_state_unchanged() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         udm_context_init(64, 64);
         let supi = "imsi-f06sor-0002";
         let kausf = f06_kausf(0x5C);
@@ -3085,8 +3109,15 @@ mod tests {
 
     /// Outstanding XMAC but the UE omits the MAC → 400 (the MAC is required to
     /// acknowledge a protected update); no ack recorded.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn f06_sor_ack_missing_mac_when_outstanding_rejected() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         udm_context_init(64, 64);
         let supi = "imsi-f06sor-0003";
         let xmac = nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iue(&f06_kausf(0x21), 0x0001);
@@ -3106,8 +3137,15 @@ mod tests {
     }
 
     /// A MAC supplied with NO outstanding update → 400 (unexpected ack).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn f06_sor_ack_unexpected_mac_rejected() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         udm_context_init(64, 64);
         let supi = "imsi-f06sor-0004";
         let mac = crate::nudm_handler::bytes_to_hex(&[0xAB; 16]);
@@ -3124,8 +3162,15 @@ mod tests {
 
     /// Legacy plain ack (no MAC, nothing outstanding) → 204 — the pre-F-06
     /// contract and the matched sim (which never sends SoR acks) stay green.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn f06_legacy_plain_ack_still_204() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         udm_context_init(64, 64);
         let supi = "imsi-f06legacy-0001";
         let req = put_ack(
@@ -3138,8 +3183,15 @@ mod tests {
 
     /// ueNotReachable=true (AMF-reported) → 204 without a MAC check; ack state
     /// recorded and the outstanding XMAC consumed.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn f06_sor_ack_ue_not_reachable_records_without_mac() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         udm_context_init(64, 64);
         let supi = "imsi-f06sor-0005";
         let xmac = nextgcore_crypt::kdf::nextgcore_kdf_sor_mac_iue(&f06_kausf(0x33), 0x0001);
@@ -3164,8 +3216,15 @@ mod tests {
     /// Transparent-container-form ack (TS 24.501 §9.11.3.51): the SoR-MAC-I_UE
     /// occupies octets 5-20 (0-indexed `[4..20]`) of the base64 `Bytes`
     /// container. Golden container vector locks the octet-slice rule.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn f06_sor_ack_transparent_container_form_verifies() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         udm_context_init(64, 64);
         let supi = "imsi-f06sor-0006";
         let counter = 0x0001u16;
@@ -3202,8 +3261,15 @@ mod tests {
 
     /// UPU mirror: happy path (correct UPU-MAC-I_UE via F-01 A.20 KDF) → 204,
     /// then replay → 400; a wrong MAC → 400 with state preserved.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn f06_upu_ack_happy_replay_and_wrong_mac() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         udm_context_init(64, 64);
         let supi = "imsi-f06upu-0001";
         let counter = 0x0001u16;
@@ -3344,8 +3410,15 @@ mod oauth2_h8_tests {
         let _ = std::fs::remove_file(on);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_oauth2_missing_token_rejected_401() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -3360,8 +3433,15 @@ mod oauth2_h8_tests {
         server.stop().await.expect("stop");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_oauth2_wrong_audience_rejected_401() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -3376,8 +3456,15 @@ mod oauth2_h8_tests {
         server.stop().await.expect("stop");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_oauth2_valid_token_reaches_handler() {
+        // Serialize on the shared context guard: this test mutates the
+        // process-global UDM context (udm_context_init/udm_self) and must
+        // not interleave with other guarded tests (CI flake root cause).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
