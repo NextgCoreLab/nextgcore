@@ -286,17 +286,15 @@ impl PqcTlsConfig {
 
     /// Get the cipher suite identifiers for TLS configuration
     pub fn cipher_suite_names(&self) -> Vec<&'static str> {
-        let mut suites = vec![
+        let suites = vec![
             "TLS_AES_256_GCM_SHA384",
             "TLS_AES_128_GCM_SHA256",
             "TLS_CHACHA20_POLY1305_SHA256",
         ];
 
-        if self.enabled {
-            // PQC hybrid cipher suites (IANA assignments pending, using draft IDs)
-            suites.insert(0, "TLS_AES_256_GCM_SHA384_MLKEM768");
-        }
-
+        // The hybrid ML-KEM exchange lives in the key-exchange groups (see
+        // kex_group_names), not in the cipher-suite list: TLS 1.3 keeps the
+        // standard suites. No fabricated "…_MLKEM768" suite is advertised.
         suites
     }
 
@@ -305,7 +303,11 @@ impl PqcTlsConfig {
         let mut groups = vec!["x25519", "secp256r1", "secp384r1"];
 
         if self.enabled {
-            groups.insert(0, "x25519_mlkem768");
+            // IETF/rustls group name for the default hybrid suite that
+            // tls.rs::select_provider offers first under the `pqc-tls`
+            // feature (issue #17). Pure-ML-KEM mode negotiates "MLKEM768"
+            // instead; this advisory list covers the hybrid default.
+            groups.insert(0, "X25519MLKEM768");
         }
 
         groups
@@ -313,17 +315,16 @@ impl PqcTlsConfig {
 
     /// Get the signature algorithm names
     pub fn sig_alg_names(&self) -> Vec<&'static str> {
-        let mut algs = vec![
+        let algs = vec![
             "ecdsa_secp256r1_sha256",
             "ecdsa_secp384r1_sha384",
             "rsa_pss_rsae_sha256",
             "ed25519",
         ];
 
-        if self.enabled {
-            algs.insert(0, "mldsa65");
-        }
-
+        // Signature algorithms stay classical even with PQC enabled: rustls
+        // 0.23 ships no ML-DSA certificate support (see tls.rs). "mldsa65"
+        // is deliberately NOT advertised until it can actually be negotiated.
         algs
     }
 }
@@ -525,19 +526,21 @@ mod tests {
         let suites = pqc.cipher_suite_names();
         assert!(!suites.iter().any(|s| s.contains("MLKEM")));
         let groups = pqc.kex_group_names();
-        assert!(!groups.iter().any(|s| s.contains("mlkem")));
+        assert!(!groups.iter().any(|s| s.contains("MLKEM")));
     }
 
     #[test]
     fn test_pqc_tls_config_enabled() {
         let pqc = PqcTlsConfig::enabled();
         assert!(pqc.enabled);
+        // TLS 1.3 keeps standard suites: the hybrid lives in the kx groups.
         let suites = pqc.cipher_suite_names();
-        assert!(suites[0].contains("MLKEM"));
+        assert!(!suites.iter().any(|s| s.contains("MLKEM")));
         let groups = pqc.kex_group_names();
-        assert!(groups[0].contains("mlkem"));
+        assert_eq!(groups[0], "X25519MLKEM768");
+        // Signatures stay classical until rustls ships ML-DSA support.
         let algs = pqc.sig_alg_names();
-        assert!(algs[0].contains("mldsa"));
+        assert!(!algs.iter().any(|s| s.contains("mldsa")));
     }
 
     #[test]
