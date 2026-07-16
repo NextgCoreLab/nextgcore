@@ -27,6 +27,7 @@ members = [
     "bins/nextgcore-bsfd",
     "bins/nextgcore-hssd",
     "bins/nextgcore-mmed",
+    "bins/nextgcore-nefd",
     "bins/nextgcore-nrfd",
     "bins/nextgcore-nssfd",
     "bins/nextgcore-pcfd",

@@ -2702,6 +2702,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-nefd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger",
+ "log",
+ "nextgcore-app",
+ "nextgcore-core",
+ "nextgcore-metrics",
+ "nextgcore-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nextgcore-ngap"
 version = "0.1.0"
 dependencies = [
