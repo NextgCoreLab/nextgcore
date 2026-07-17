@@ -438,7 +438,7 @@ impl IntentTranslator {
 
         // Sort by priority
         let mut sorted_intents = intents.to_vec();
-        sorted_intents.sort_by(|a, b| b.priority.cmp(&a.priority));
+        sorted_intents.sort_by_key(|i| std::cmp::Reverse(i.priority));
 
         // Translate highest priority first
         let mut merged_config = self.translate(&sorted_intents[0])?;

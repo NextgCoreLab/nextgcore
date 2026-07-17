@@ -7,9 +7,17 @@ license.workspace = true
 description = "NextGCore Application Framework Library"
 
 [features]
-## Gate 6G research modules (intent engine, cross-NF AI/ML hooks).
+## Gate 6G research modules (intent engine, cross-NF AI/ML hooks, and the
+## issue #25 aggregate network-state snapshot / digital-twin export).
 ## Enable with: cargo build -p nextgcore-app --features 6g-extensions
 6g-extensions = []
+
+# Issue #25: offline network-state export example. required-features keeps
+# every default-features workspace build/test byte-unchanged — cargo skips
+# the example unless 6g-extensions is enabled.
+[[example]]
+name = "export_network_state"
+required-features = ["6g-extensions"]
 
 [dependencies]
 nextgcore-core = { workspace = true }

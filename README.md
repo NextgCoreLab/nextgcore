@@ -347,6 +347,7 @@ cargo audit
 - [docs/sba-transport-evaluation.md](docs/sba-transport-evaluation.md) — HTTP/2 vs HTTP/3 SBI transport benchmark and evaluation (non-normative 6G research)
 - [docs/isac-sensing-pipeline.md](docs/isac-sensing-pipeline.md) — ISAC sensing data pipeline design note (non-normative 6G research)
 - [docs/intent-driven-policy-loop.md](docs/intent-driven-policy-loop.md) — intent-driven closed-loop policy design note (non-normative 6G research)
+- [docs/network-state-snapshot.md](docs/network-state-snapshot.md) — aggregate network-state snapshot / digital-twin export design note (non-normative 6G research)
 - [docker/rust/CI.md](docker/rust/CI.md) — the one-command matched-sim end-to-end suite (`e2e.sh`)
 - [docs/](docs/) — per-component gap analyses and architecture notes
 
