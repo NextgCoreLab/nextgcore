@@ -632,8 +632,12 @@ pub async fn pcf_discover_endpoint(
 /// Build a bounded-timeout SBI client for a discovered endpoint. Attaches an
 /// NRF-issued Bearer token scoped to `target` when OAuth2 enforcement is on
 /// (Wave-6 H8 Phase A, TS 33.501 §13.4.1); a no-op otherwise so the matched-sim
-/// default path is byte-unchanged.
-fn client_for(ep: &DiscoveredEndpoint, target: NfType) -> nextgcore_sbi::client::SbiClient {
+/// default path is byte-unchanged. `pub(crate)`: also used by the feature-gated
+/// intent-loop controller (issue #24) for its PCF→NWDAF analytics poll.
+pub(crate) fn client_for(
+    ep: &DiscoveredEndpoint,
+    target: NfType,
+) -> nextgcore_sbi::client::SbiClient {
     use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
     use std::time::Duration;
     crate::app::attach_oauth2(

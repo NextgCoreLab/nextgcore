@@ -15,10 +15,19 @@ pub mod am_sm;
 pub mod app;
 pub mod context;
 pub mod event;
-/// Future-use intent-policy translation (Rel-20 research scaffolding): not
-/// wired to any live handler, kept crate-internal (mirrors udrd's non-public
-/// `nudr_handler` precedent) and NOT part of the public crate API.
-#[allow(dead_code)]
+/// Issue #24: intent-driven closed-loop policy controller (non-normative 6G
+/// research spike, off by default). Crate-internal like `intent_policy`; the
+/// `pcf.intent` YAML block + `--features intent-loop` activate it.
+#[cfg(feature = "intent-loop")]
+pub(crate) mod intent_loop;
+/// Intent-policy translation (TS 28.312-inspired research scaffolding),
+/// consumed by the feature-gated `intent_loop` controller (issue #24). Kept
+/// crate-internal (mirrors udrd's non-public `nudr_handler` precedent) and
+/// NOT part of the public crate API. Without the `intent-loop` feature
+/// nothing references it; the conditional allowance documents that intent —
+/// the workspace-wide `dead_code = "allow"` (src/Cargo.toml) already
+/// suppresses the lint in both configurations.
+#[cfg_attr(not(feature = "intent-loop"), allow(dead_code))]
 mod intent_policy;
 pub mod npcf_handler;
 pub mod nudr_handler;
