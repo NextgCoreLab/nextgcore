@@ -12,6 +12,8 @@ pub mod init;
 pub mod intent; // B3.2: Intent-based configuration translation
 #[cfg(feature = "6g-extensions")]
 pub mod nf_hooks;
+#[cfg(feature = "6g-extensions")]
+pub mod state_export; // issue #25: aggregate read-only network-state snapshot
 pub mod yaml; // #197: Cross-NF AI/ML hooks, digital twin, energy, intent API
 
 #[cfg(test)]
@@ -106,6 +108,13 @@ pub use nf_hooks::{
     SnapshotHistoryEntry,
     // B6.6: Digital twin scenario simulator
     WhatIfScenario,
+};
+// Issue #25: aggregate read-only network-state snapshot (digital-twin
+// foundation) — offline merge of the persisted NRF + NSACF state docs.
+#[cfg(feature = "6g-extensions")]
+pub use state_export::{
+    registrations_by_type, NetworkStateSnapshot, NfRegistrationEntry, SessionSummary,
+    SliceQuotaEntry, StateExportError,
 };
 
 // Macros are automatically exported via #[macro_export]

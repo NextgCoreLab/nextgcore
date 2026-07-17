@@ -141,7 +141,9 @@ impl AiMlHookRegistry {
 // ============================================================================
 
 /// NF state snapshot for digital twin synchronization.
-#[derive(Debug, Clone)]
+/// Serde derives (issue #25): serializable so twin snapshots can be exported
+/// as JSON by the `state_export` aggregator.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NfStateSnapshot {
     /// NF instance ID.
     pub nf_instance_id: String,
@@ -164,7 +166,7 @@ pub struct NfStateSnapshot {
 }
 
 /// NF operational status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NfStatus {
     /// NF is registered and operational.
     Registered,
@@ -527,7 +529,7 @@ impl CrossNfIntentCoordinator {
 // ============================================================================
 
 /// Delta between two NF state snapshots for efficient sync.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NfStateDelta {
     /// NF instance ID.
     pub nf_instance_id: String,
@@ -544,7 +546,7 @@ pub struct NfStateDelta {
 }
 
 /// Snapshot history entry with sequence number for ordering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotHistoryEntry {
     /// Monotonic sequence number.
     pub sequence: u64,
@@ -1248,7 +1250,7 @@ mod tests {
     fn test_aiml_hook_registry() {
         let mut registry = AiMlHookRegistry::new();
         let id1 = registry.register(AiMlHookPoint::PreRequest, "AMF", 1);
-        let id2 = registry.register(AiMlHookPoint::PreRequest, "SMF", 2);
+        let _id2 = registry.register(AiMlHookPoint::PreRequest, "SMF", 2);
         assert_eq!(registry.hook_count(), 2);
 
         let hooks = registry.get_hooks(AiMlHookPoint::PreRequest);
