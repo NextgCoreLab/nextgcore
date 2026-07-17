@@ -3111,6 +3111,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-tsctsf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger",
+ "log",
+ "nextgcore-app",
+ "nextgcore-core",
+ "nextgcore-metrics",
+ "nextgcore-sbi",
+ "proptest",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nextgcore-tun"
 version = "0.1.0"
 dependencies = [

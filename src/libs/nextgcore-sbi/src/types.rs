@@ -76,6 +76,7 @@ pub enum SbiServiceType {
     NdccfDatamanagement,
     NpinPinmanagement,
     NeasdfDnscontext,
+    NtsctsfTimeSynchronization,
 }
 
 impl SbiServiceType {
@@ -151,6 +152,7 @@ impl SbiServiceType {
             Self::NdccfDatamanagement => "ndccf-datamanagement",
             Self::NpinPinmanagement => "npin-pinmanagement",
             Self::NeasdfDnscontext => "neasdf-dnscontext",
+            Self::NtsctsfTimeSynchronization => "ntsctsf-time-synchronization",
         }
     }
 
@@ -222,6 +224,7 @@ impl SbiServiceType {
             "ndccf-datamanagement" => Some(Self::NdccfDatamanagement),
             "npin-pinmanagement" => Some(Self::NpinPinmanagement),
             "neasdf-dnscontext" => Some(Self::NeasdfDnscontext),
+            "ntsctsf-time-synchronization" => Some(Self::NtsctsfTimeSynchronization),
             _ => None,
         }
     }
@@ -532,6 +535,21 @@ impl fmt::Display for SbiAppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #23: the TSCTSF service name round-trips through the enum
+    /// (acceptance criterion; the SCP routes by this wire string).
+    #[test]
+    fn test_ntsctsf_service_name_round_trip() {
+        assert_eq!(
+            SbiServiceType::NtsctsfTimeSynchronization.to_name(),
+            "ntsctsf-time-synchronization"
+        );
+        assert_eq!(
+            SbiServiceType::from_name("ntsctsf-time-synchronization"),
+            Some(SbiServiceType::NtsctsfTimeSynchronization)
+        );
+        assert_eq!(NfType::Tsctsf.to_str(), "TSCTSF");
+    }
 
     #[test]
     fn test_service_type_conversion() {

@@ -49,6 +49,7 @@ members = [
     "bins/nextgcore-lmfd",
     "bins/nextgcore-dccfd",
     "bins/nextgcore-easdfd",
+    "bins/nextgcore-tsctsf",
 
     # WebUI
     "bins/nextgcore-webui",
