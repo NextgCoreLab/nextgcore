@@ -1,0 +1,33 @@
+[package]
+name = "nextgcore-easdfd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore EASDF (Edge Application Server Discovery Function, TS 23.548 / TS 29.556)"
+
+[[bin]]
+name = "nextgcore-easdfd"
+path = "src/main.rs"
+
+[dependencies]
+nextgcore-core = { workspace = true }
+nextgcore-sbi = { workspace = true }
+nextgcore-metrics = { workspace = true }
+nextgcore-app = { workspace = true }
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_yaml.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

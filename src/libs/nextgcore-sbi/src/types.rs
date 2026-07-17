@@ -75,6 +75,7 @@ pub enum SbiServiceType {
     NnsacfNsac,
     NdccfDatamanagement,
     NpinPinmanagement,
+    NeasdfDnscontext,
 }
 
 impl SbiServiceType {
@@ -149,6 +150,7 @@ impl SbiServiceType {
             Self::NnsacfNsac => "nnsacf-nsac",
             Self::NdccfDatamanagement => "ndccf-datamanagement",
             Self::NpinPinmanagement => "npin-pinmanagement",
+            Self::NeasdfDnscontext => "neasdf-dnscontext",
         }
     }
 
@@ -219,6 +221,7 @@ impl SbiServiceType {
             "nnsacf-nsac" => Some(Self::NnsacfNsac),
             "ndccf-datamanagement" => Some(Self::NdccfDatamanagement),
             "npin-pinmanagement" => Some(Self::NpinPinmanagement),
+            "neasdf-dnscontext" => Some(Self::NeasdfDnscontext),
             _ => None,
         }
     }
