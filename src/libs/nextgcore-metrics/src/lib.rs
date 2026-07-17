@@ -6,6 +6,7 @@
 pub mod ai_native;
 pub mod context;
 pub mod instance;
+pub mod nes_energy;
 pub mod otel;
 pub mod server;
 pub mod spec;

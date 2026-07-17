@@ -1090,6 +1090,24 @@ pub fn compute_profile_changes(
 /// (TS 29.510 also allows 204; we return the profile for visibility).
 /// A failed RFC 6902 `test` op maps to 409 Conflict (RFC 5789 §2.2);
 /// malformed/inapplicable patches map to 400 ProblemDetails.
+/// Issue #22 NES: does this NFUpdate body explicitly set
+/// `nfStatus=SUSPENDED`? Such a PATCH is a self-suspension (energy saving)
+/// the NRF must honor rather than treat as a liveness signal that
+/// reactivates the profile. Covers both RFC 6902 arrays and merge-patch
+/// objects (the same shapes `handle_nf_update` dispatches on).
+fn patch_requests_self_suspension(patch: &serde_json::Value, is_json_patch: bool) -> bool {
+    if is_json_patch {
+        patch.as_array().is_some_and(|ops| {
+            ops.iter().any(|op| {
+                op.get("path").and_then(|p| p.as_str()) == Some("/nfStatus")
+                    && op.get("value").and_then(|v| v.as_str()) == Some("SUSPENDED")
+            })
+        })
+    } else {
+        patch.get("nfStatus").and_then(|v| v.as_str()) == Some("SUSPENDED")
+    }
+}
+
 async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("NF Update: {nf_instance_id}");
 
@@ -1217,7 +1235,16 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
     // A heartbeat on a SUSPENDED NF restores it to REGISTERED (TS 29.510).
     // The status transition is always a material change — notify regardless
     // of whether other fields changed (nrfd-02 reactivate path).
-    if manager.reactivate(nf_instance_id) {
+    //
+    // Issue #22 NES exception: a PATCH whose body itself sets nfStatus to
+    // SUSPENDED is an explicit self-suspension (energy saving), not a
+    // liveness signal — honor it instead of reactivating. The liveness
+    // timer was still re-armed above, so a sleeping-but-heartbeating NF is
+    // not auto-deregistered.
+    let self_suspension = patch_requests_self_suspension(&patch, is_json_patch);
+    if self_suspension {
+        log::info!("NF {nf_instance_id} self-suspended (NES); skipping heartbeat reactivation");
+    } else if manager.reactivate(nf_instance_id) {
         log::info!("NF {nf_instance_id} heartbeat received while SUSPENDED, back to REGISTERED");
         // Build the status-change ChangeItem from the reactivation.
         let reactivate_changes = vec![ChangeItem {
@@ -3336,6 +3363,38 @@ mod tests {
         );
         assert!(result.is_ok(), "dispatch must succeed: {result:?}");
         assert_eq!(result.unwrap(), 1, "exactly one notification dispatched");
+    }
+
+    /// Issue #22 NES: a PATCH that itself sets nfStatus=SUSPENDED is a
+    /// self-suspension and must NOT be treated as a reactivating heartbeat;
+    /// ordinary heartbeat/load patches still reactivate.
+    #[test]
+    fn test_nes_self_suspension_detection() {
+        use serde_json::json;
+
+        // RFC 6902 self-suspension (the NES heartbeat shape).
+        let suspend = json!([
+            {"op": "replace", "path": "/nfStatus", "value": "SUSPENDED"},
+            {"op": "add",     "path": "/load",     "value": 0}
+        ]);
+        assert!(patch_requests_self_suspension(&suspend, true));
+
+        // Ordinary heartbeat (REGISTERED) — reactivation stays allowed.
+        let heartbeat = json!([
+            {"op": "replace", "path": "/nfStatus", "value": "REGISTERED"},
+            {"op": "add",     "path": "/load",     "value": 12}
+        ]);
+        assert!(!patch_requests_self_suspension(&heartbeat, true));
+
+        // Load-only patch — not a self-suspension.
+        let load_only = json!([{"op": "replace", "path": "/load", "value": 50}]);
+        assert!(!patch_requests_self_suspension(&load_only, true));
+
+        // Merge-patch object form.
+        let merge = json!({"nfStatus": "SUSPENDED"});
+        assert!(patch_requests_self_suspension(&merge, false));
+        let merge_reg = json!({"nfStatus": "REGISTERED", "load": 3});
+        assert!(!patch_requests_self_suspension(&merge_reg, false));
     }
 
     /// Assert that the SUSPENDED→REGISTERED reactivate path produces a

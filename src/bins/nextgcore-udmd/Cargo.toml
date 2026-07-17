@@ -17,6 +17,15 @@ path = "src/main.rs"
 name = "nextgcore_udmd"
 path = "src/lib.rs"
 
+[features]
+## Issue #22: Network Energy Saving (non-normative research prototype; no
+## frozen Rel-20 Stage-3 exists). Adds an idle->drain->suspend runtime that
+## reflects sleep to the NRF (nfStatus=SUSPENDED or deregistration) and a
+## live /metrics energy endpoint fed by a SYNTHETIC power model. Off by
+## default: the default build is byte-for-byte unchanged.
+## Enable with: cargo build -p nextgcore-udmd --features nes
+nes = []
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-crypt = { workspace = true }
