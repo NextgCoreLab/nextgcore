@@ -123,9 +123,35 @@ struct SbiYaml {
     client: Option<SbiClientYaml>,
 }
 
+/// Declarative intent block (issue #24, feature `intent-loop`): ONE slice
+/// latency outcome for the closed-loop controller. Converted leniently from
+/// the raw `PcfSection::intent` value under the feature; without the feature
+/// the block is ignored.
+#[derive(Debug, Default, Deserialize, Clone)]
+pub(crate) struct IntentYaml {
+    pub(crate) enabled: Option<bool>,
+    /// Target slice S-NSSAI SST.
+    pub(crate) sst: Option<u8>,
+    /// Target slice S-NSSAI SD (hex string; informational in the spike).
+    pub(crate) sd: Option<String>,
+    /// The declared outcome: keep slice latency below this many ms.
+    pub(crate) max_latency_ms: Option<f64>,
+    pub(crate) poll_interval_secs: Option<u64>,
+    /// SlaPolicyAdapter aggressiveness (0.0..=1.0).
+    pub(crate) aggressiveness: Option<f64>,
+    /// Synthetic NF_LOAD→latency proxy slope (ms per load percent); see
+    /// docs/intent-driven-policy-loop.md.
+    pub(crate) nf_load_latency_ms_per_pct: Option<f64>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PcfSection {
     sbi: Option<SbiYaml>,
+    /// Raw YAML value, NOT the typed [`IntentYaml`]: a malformed intent
+    /// block must never fail the whole `PcfYaml` parse (which would silently
+    /// skip SBI-address/NRF-URI seeding, in the default build too). The
+    /// typed conversion happens leniently under the `intent-loop` feature.
+    intent: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -264,6 +290,8 @@ pub async fn run() -> Result<()> {
 
     // Parse configuration (if file exists) and seed NRF URI
     let mut sbi_fqdn: Option<String> = None;
+    #[cfg(feature = "intent-loop")]
+    let mut intent_yaml: Option<IntentYaml> = None;
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         match std::fs::read_to_string(&args.config) {
@@ -272,6 +300,20 @@ pub async fn run() -> Result<()> {
                 // Seed NRF URI into SBI context for NF registration
                 if let Ok(yaml) = serde_yaml::from_str::<PcfYaml>(&content) {
                     if let Some(pcf) = yaml.pcf {
+                        #[cfg(feature = "intent-loop")]
+                        {
+                            intent_yaml = pcf.intent.clone().and_then(|v| {
+                                match serde_yaml::from_value::<IntentYaml>(v) {
+                                    Ok(y) => Some(y),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "intent-loop: invalid pcf.intent block ignored: {e}"
+                                        );
+                                        None
+                                    }
+                                }
+                            });
+                        }
                         if let Some(sbi) = pcf.sbi {
                             // Override the advertised/bind SBI address with the
                             // routable address from config so the NRF NFProfile
@@ -370,6 +412,17 @@ pub async fn run() -> Result<()> {
     }
 
     log::info!("NextGCore PCF ready");
+
+    // Issue #24: intent-driven closed-loop policy controller (feature
+    // `intent-loop`, off by default). Spawned regardless of NRF-registration
+    // outcome: without an NRF, NWDAF discovery degrades to
+    // `observed=unavailable` rather than blocking startup.
+    #[cfg(feature = "intent-loop")]
+    crate::intent_loop::spawn_if_enabled(
+        intent_yaml
+            .as_ref()
+            .map(crate::intent_loop::IntentSettings::from_yaml),
+    );
 
     // Main event loop (async)
     run_event_loop_async(&mut pcf_sm, shutdown).await?;

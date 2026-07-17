@@ -33,3 +33,19 @@ pcf:
     key: /etc/nextgcore/certs/pcf.key
     ca: /etc/nextgcore/certs/ca.crt
     min_version: "1.2"
+  # Issue #24: intent-driven closed-loop policy spike (non-normative 6G
+  # research). Declares ONE outcome — keep slice (sst/sd) latency below
+  # max_latency_ms — for the PCF→NWDAF monitor→decide→act controller.
+  # Requires a pcfd built with `--features intent-loop`; with the block
+  # absent or enabled: false the controller never starts, and without the
+  # feature the block is ignored. See docs/intent-driven-policy-loop.md.
+  intent:
+    enabled: false
+    sst: 1
+    sd: "000001"
+    max_latency_ms: 20.0
+    poll_interval_secs: 30
+    aggressiveness: 0.5
+    # Synthetic NF_LOAD -> latency proxy slope (ms per load percent):
+    # today's nwdafd serves real data only for NF_LOAD.
+    nf_load_latency_ms_per_pct: 0.5

@@ -17,6 +17,17 @@ path = "src/main.rs"
 name = "nextgcore_pcfd"
 path = "src/lib.rs"
 
+[features]
+## Issue #24: intent-driven closed-loop policy spike (non-normative 6G /
+## autonomous-networks research; no frozen Rel-20 Stage-3 exists — nearest
+## anchor TS 28.312). Wires the pre-existing intent_policy scaffolding to a
+## live NWDAF Nnwdaf_AnalyticsInfo poll for ONE outcome: keep slice X latency
+## below N ms (pcf.intent YAML block). Off by default: the controller is
+## fully compiled out of the default build and the pcf.intent block is
+## ignored (only an inert raw-YAML field capture is unconditional).
+## Enable with: cargo build -p nextgcore-pcfd --features intent-loop
+intent-loop = []
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }
