@@ -710,3 +710,247 @@ mod tests {
         assert!(notif.get("accuracy").is_none());
     }
 }
+
+// ============================================================================
+// Issue #26: inference abstraction (load-by-id + predict)
+// ============================================================================
+
+/// A loaded prediction model: one-step-ahead forecasting over a numeric
+/// series (issue #26). `Send + Sync` because the analytics engine that owns
+/// the active model lives behind a shared `Mutex` in the NWDAF context.
+///
+/// Non-normative: TS 23.288 does not specify model internals; the baselines
+/// here need no model file so the default build and E2E path are unchanged.
+pub trait InferenceModel: Send + Sync {
+    /// Stable identifier (also what `load_model` resolves).
+    fn model_id(&self) -> &str;
+    /// Predict the next value of `series` (values in 0.0..=1.0).
+    /// Returns `(prediction clamped to 0..=1, confidence 0..=1)`, or `None`
+    /// when the series is empty or shorter than the model's input window.
+    fn predict_series(&self, series: &[f64]) -> Option<(f64, f64)>;
+}
+
+/// Default baseline: ordinary-least-squares linear fit over the last ≤5
+/// samples — byte-for-byte the math `AnalyticsEngine::compute_nf_load`
+/// used inline before issue #26 (confidence = R² of the fit; single sample
+/// → (value, 0.0)).
+#[derive(Debug, Clone, Default)]
+pub struct OlsLinearModel;
+
+impl InferenceModel for OlsLinearModel {
+    fn model_id(&self) -> &str {
+        "ols-linear"
+    }
+
+    fn predict_series(&self, series: &[f64]) -> Option<(f64, f64)> {
+        if series.is_empty() {
+            return None;
+        }
+        let n = series.len().min(5);
+        if n < 2 {
+            // A single sample yields no residual basis; report no confidence.
+            return Some((series[series.len() - 1].clamp(0.0, 1.0), 0.0));
+        }
+        let last = &series[series.len() - n..];
+        let nf = n as f64;
+        let sum_x: f64 = (0..n).map(|i| i as f64).sum();
+        let sum_y: f64 = last.iter().sum();
+        let sum_xx: f64 = (0..n).map(|i| (i as f64).powi(2)).sum();
+        let sum_xy: f64 = last.iter().enumerate().map(|(i, y)| i as f64 * y).sum();
+        // denom = N·Σx² − (Σx)² is strictly positive for N ≥ 2 distinct x.
+        let denom = nf * sum_xx - sum_x * sum_x;
+        let b = (nf * sum_xy - sum_x * sum_y) / denom;
+        let a = (sum_y - b * sum_x) / nf;
+        let predicted = (a + b * nf).clamp(0.0, 1.0);
+        // R² = 1 − SS_res / SS_tot.
+        let mean_y = sum_y / nf;
+        let ss_tot: f64 = last.iter().map(|y| (y - mean_y).powi(2)).sum();
+        let ss_res: f64 = last
+            .iter()
+            .enumerate()
+            .map(|(i, y)| (y - (a + b * i as f64)).powi(2))
+            .sum();
+        let r_squared = if ss_tot <= f64::EPSILON {
+            // Flat series: the predictor reproduces it exactly → R² = 1.
+            1.0
+        } else {
+            (1.0 - ss_res / ss_tot).clamp(0.0, 1.0)
+        };
+        Some((predicted, r_squared))
+    }
+}
+
+/// EWMA baseline: exponentially weighted moving average as the next-step
+/// prediction; confidence is `1 − mean(|one-step EWMA error|)` over the
+/// series (a documented heuristic, NOT a goodness-of-fit statistic).
+#[derive(Debug, Clone)]
+pub struct EwmaModel {
+    alpha: f64,
+}
+
+impl EwmaModel {
+    pub fn new(alpha: f64) -> Self {
+        Self {
+            alpha: if alpha.is_finite() {
+                alpha.clamp(0.01, 1.0)
+            } else {
+                0.3
+            },
+        }
+    }
+
+    pub fn alpha(&self) -> f64 {
+        self.alpha
+    }
+}
+
+impl Default for EwmaModel {
+    fn default() -> Self {
+        Self::new(0.3)
+    }
+}
+
+impl InferenceModel for EwmaModel {
+    fn model_id(&self) -> &str {
+        "ewma"
+    }
+
+    fn predict_series(&self, series: &[f64]) -> Option<(f64, f64)> {
+        let (first, rest) = series.split_first()?;
+        if rest.is_empty() {
+            return Some((first.clamp(0.0, 1.0), 0.0));
+        }
+        let mut ewma = *first;
+        let mut abs_err_sum = 0.0;
+        for y in rest {
+            // The pre-update EWMA is the one-step prediction for `y`.
+            abs_err_sum += (y - ewma).abs();
+            ewma = self.alpha * y + (1.0 - self.alpha) * ewma;
+        }
+        let confidence = (1.0 - abs_err_sum / rest.len() as f64).clamp(0.0, 1.0);
+        Some((ewma.clamp(0.0, 1.0), confidence))
+    }
+}
+
+/// Wrapper giving the boxed active model `Debug` + `Default` (the analytics
+/// engine derives both; the default is the OLS baseline, keeping default
+/// builds behavior-identical).
+pub struct Predictor(pub Box<dyn InferenceModel>);
+
+impl std::fmt::Debug for Predictor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Predictor")
+            .field(&self.0.model_id())
+            .finish()
+    }
+}
+
+impl Default for Predictor {
+    fn default() -> Self {
+        Self(Box::new(OlsLinearModel))
+    }
+}
+
+/// Load a prediction model by id (issue #26 "load-by-id" surface):
+/// - `"ols-linear"` — the default OLS baseline (no model file)
+/// - `"ewma"` or `"ewma:<alpha>"` — EWMA baseline (no model file)
+/// - `"onnx:<path>"` — ONNX-backed linear model, only with the off-by-default
+///   `onnx-model` cargo feature (zero-dependency minimal subset reader)
+pub fn load_model(model_id: &str) -> Result<Box<dyn InferenceModel>, String> {
+    if model_id == "ols-linear" {
+        return Ok(Box::new(OlsLinearModel));
+    }
+    if model_id == "ewma" {
+        return Ok(Box::new(EwmaModel::default()));
+    }
+    if let Some(alpha) = model_id.strip_prefix("ewma:") {
+        let alpha: f64 = alpha
+            .parse()
+            .map_err(|e| format!("invalid ewma alpha {alpha:?}: {e}"))?;
+        return Ok(Box::new(EwmaModel::new(alpha)));
+    }
+    if let Some(path) = model_id.strip_prefix("onnx:") {
+        #[cfg(feature = "onnx-model")]
+        {
+            return crate::onnx_model::OnnxLinearRegressor::load(std::path::Path::new(path))
+                .map(|m| Box::new(m) as Box<dyn InferenceModel>);
+        }
+        #[cfg(not(feature = "onnx-model"))]
+        {
+            return Err(format!(
+                "model {path:?} requires the off-by-default `onnx-model` cargo feature"
+            ));
+        }
+    }
+    Err(format!(
+        "unknown model id {model_id:?} (expected ols-linear, ewma[:<alpha>], or onnx:<path>)"
+    ))
+}
+
+#[cfg(test)]
+mod inference_tests {
+    use super::*;
+
+    #[test]
+    fn ols_matches_legacy_inline_math() {
+        // Clean rising trend → high R² (mirrors test_confidence_reflects_fit_quality).
+        let clean: Vec<f64> = (0..10).map(|i| 0.1 + 0.05 * i as f64).collect();
+        let (pred, conf) = OlsLinearModel.predict_series(&clean).unwrap();
+        assert!(conf > 0.9, "clean trend must have high confidence ({conf})");
+        assert!(
+            pred > *clean.last().unwrap(),
+            "rising trend projects upward"
+        );
+
+        // Zig-zag → poor fit.
+        let zigzag = [0.3, 0.7, 0.3, 0.7, 0.3, 0.7, 0.3, 0.7];
+        let (_, zconf) = OlsLinearModel.predict_series(&zigzag).unwrap();
+        assert!(zconf < 0.5, "zig-zag must have low confidence ({zconf})");
+        assert!(zconf < conf);
+
+        // Single sample → (value, 0.0); empty → None.
+        assert_eq!(OlsLinearModel.predict_series(&[0.4]), Some((0.4, 0.0)));
+        assert!(OlsLinearModel.predict_series(&[]).is_none());
+
+        // Flat series → R² = 1.
+        let (fp, fc) = OlsLinearModel.predict_series(&[0.5; 6]).unwrap();
+        assert!((fp - 0.5).abs() < 1e-9);
+        assert!((fc - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ewma_predicts_and_scores() {
+        let m = EwmaModel::default();
+        assert_eq!(m.model_id(), "ewma");
+        let (pred, conf) = m.predict_series(&[0.5; 8]).unwrap();
+        assert!((pred - 0.5).abs() < 1e-9, "flat series predicts itself");
+        assert!((conf - 1.0).abs() < 1e-9, "no error → full confidence");
+        let (_, noisy_conf) = m.predict_series(&[0.1, 0.9, 0.1, 0.9]).unwrap();
+        assert!(noisy_conf < 0.5);
+        assert!(m.predict_series(&[]).is_none());
+        // Alpha clamping.
+        assert!((EwmaModel::new(f64::NAN).alpha() - 0.3).abs() < 1e-9);
+        assert!((EwmaModel::new(7.0).alpha() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn load_model_resolves_ids() {
+        assert_eq!(load_model("ols-linear").unwrap().model_id(), "ols-linear");
+        assert_eq!(load_model("ewma").unwrap().model_id(), "ewma");
+        assert_eq!(load_model("ewma:0.5").unwrap().model_id(), "ewma");
+        assert!(load_model("ewma:x").is_err());
+        assert!(load_model("bogus").is_err());
+        #[cfg(not(feature = "onnx-model"))]
+        assert!(load_model("onnx:/tmp/m.onnx")
+            .err()
+            .expect("onnx must fail without the feature")
+            .contains("onnx-model"));
+    }
+
+    #[test]
+    fn predictor_wrapper_debug_and_default() {
+        let p = Predictor::default();
+        assert_eq!(p.0.model_id(), "ols-linear");
+        assert!(format!("{p:?}").contains("ols-linear"));
+    }
+}

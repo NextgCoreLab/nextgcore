@@ -180,9 +180,11 @@ fn parse_event_filter(raw: Option<&String>) -> Result<EventInfoFilter, String> {
 /// cannot exist. Only tokens outside the `NwdafEvent` enum are 400
 /// `INVALID_ANALYTICS_TYPE`. The former non-spec `tgtUe` echo is removed.
 ///
-/// T5.4 HONESTY NOTE: the analytics engine uses linear regression (slope on
-/// the last N samples), NOT a trained ML model. `confidence` is the regression
-/// R² scaled to a Uinteger, not model accuracy (TS 23.288 §6.14).
+/// T5.4/issue #26 HONESTY NOTE: the analytics engine routes prediction and
+/// `confidence` through the active `ml_service::InferenceModel` (default: the
+/// OLS linear-regression baseline, whose confidence is the regression R²
+/// scaled to a Uinteger; the feature-gated `onnx-model` backend loads real
+/// linear model files — TS 23.288 §6.14).
 pub async fn handle_analytics_info_query_with_ctx(
     ctx: &Arc<RwLock<NwdafContext>>,
     request: &SbiRequest,

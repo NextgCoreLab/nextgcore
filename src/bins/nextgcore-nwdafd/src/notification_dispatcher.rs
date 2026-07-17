@@ -223,9 +223,12 @@ fn nf_status_json(status: &str) -> Value {
 /// (`round(R² × 100)`). The former non-spec vendor keys `predictedLoad` and
 /// float `confidence` are dropped (documented per the G2-1 spec item).
 ///
-/// T5.4 HONESTY NOTE: `compute_nf_load` is linear regression on the last N
-/// samples, not a trained ML model; `confidence` is the regression R², not
-/// model accuracy (TS 23.288 §6.14).
+/// T5.4/issue #26 HONESTY NOTE: `compute_nf_load` routes prediction and
+/// `confidence` through the active `ml_service::InferenceModel`. The default
+/// is the OLS baseline (confidence = regression R², byte-identical to the
+/// formerly inline math); the feature-gated `onnx-model` backend loads real
+/// linear model files, and each model documents its own confidence
+/// semantics (TS 23.288 §6.14).
 pub fn compute_event_infos(
     engine: &AnalyticsEngine,
     event: AnalyticsId,
@@ -1072,6 +1075,38 @@ mod tests {
     /// 0..=100 (never the old float R²), the non-spec `predictedLoad` vendor
     /// key is gone, and `nfStatus` is the TS 29.520 object form sourced from
     /// the cached NRF profile (never a bare string literal).
+    /// Issue #26 acceptance: a swapped inference model's output reaches the
+    /// wire — the emitted `confidence` Uinteger is the model's confidence.
+    #[test]
+    fn swapped_model_output_reaches_wire_confidence() {
+        struct FixedModel;
+        impl crate::ml_service::InferenceModel for FixedModel {
+            fn model_id(&self) -> &str {
+                "fixed-test"
+            }
+            fn predict_series(&self, _series: &[f64]) -> Option<(f64, f64)> {
+                Some((0.87, 0.42))
+            }
+        }
+        let mut engine = AnalyticsEngine::new();
+        for v in [0.1_f64, 0.2, 0.3] {
+            engine.ingest_nf_load(crate::analytics::NfLoadSample::now(
+                "AMF",
+                "amf-fixed-01",
+                v,
+                0.0,
+                0,
+            ));
+        }
+        engine.set_predictor(Box::new(FixedModel));
+        let infos = compute_event_infos(&engine, AnalyticsId::NfLoad, &EventInfoFilter::none());
+        assert_eq!(infos[0]["nfInstanceId"], "amf-fixed-01");
+        assert_eq!(
+            infos[0]["confidence"], 42,
+            "wire confidence = model output x100"
+        );
+    }
+
     #[test]
     fn test_nf_load_info_spec_shape() {
         use crate::analytics::NfProfileMeta;

@@ -9,8 +9,10 @@
 //!
 //! # OPERATIONAL ALGORITHM
 //!
-//! **All analytics in this module use ordinary least-squares linear regression
-//! on the last N samples.** The `confidence` field is the regression R² (the
+//! **NF_LOAD prediction is routed through the pluggable
+//! `ml_service::InferenceModel` (issue #26); the default model is ordinary
+//! least-squares linear regression on the last N samples, and the other
+//! analytics in this module use the same OLS approach inline.** The `confidence` field is the regression R² (the
 //! fraction of variance the linear fit explains, nwafd-10) — it reflects how
 //! well the predictor fits the observed data, NOT trained-model accuracy. No ML
 //! model is used. When `Nnwdaf_MLModelProvision` models are integrated, the
@@ -134,9 +136,12 @@ pub struct AnalyticsEngine {
     ue_cells: HashMap<String, Vec<(u64, u64)>>, // (cell_id, timestamp)
     /// Anomaly scores per SUPI
     anomaly_scores: HashMap<String, Vec<AbnormalBehaviourRecord>>,
+    /// Active prediction model for NF_LOAD (issue #26): defaults to the OLS
+    /// baseline, swappable via `set_predictor` / NWDAF_PREDICTION_MODEL.
+    predictor: crate::ml_service::Predictor,
 }
 
-const MAX_SAMPLES: usize = 100;
+pub(crate) const MAX_SAMPLES: usize = 100;
 
 impl AnalyticsEngine {
     pub fn new() -> Self {
@@ -151,6 +156,16 @@ impl AnalyticsEngine {
             buf.remove(0);
         }
         buf.push(sample);
+    }
+
+    /// Swap the active NF_LOAD prediction model (issue #26).
+    pub fn set_predictor(&mut self, model: Box<dyn crate::ml_service::InferenceModel>) {
+        self.predictor = crate::ml_service::Predictor(model);
+    }
+
+    /// Identifier of the active prediction model.
+    pub fn predictor_id(&self) -> &str {
+        self.predictor.0.model_id()
     }
 
     /// Upsert the cached NRF profile metadata for an NF instance (G2-1).
@@ -190,14 +205,15 @@ impl AnalyticsEngine {
     /// last N samples (up to 5). `predicted_load` is the fitted value projected
     /// one step ahead, clamped to [0, 1].
     ///
-    /// `confidence` (nwafd-10) is the regression **coefficient of determination
-    /// (R²)** — the fraction of the window's CPU variance explained by the
-    /// linear fit — clamped to [0, 1]. It therefore reflects how well the
-    /// straight-line predictor actually fits the observed samples (high for a
-    /// clean trend, low for noisy input), instead of the previous synthetic
-    /// sample-count ratio. HONESTY NOTE: this remains linear regression, NOT a
-    /// trained ML model; when `Nnwdaf_MLModelProvision` models are integrated
-    /// this should switch to model-accuracy metrics (TS 23.288 §6.14).
+    /// `predicted_load` and `confidence` are produced by the active
+    /// `ml_service::InferenceModel` (issue #26). The default model is the OLS
+    /// baseline whose confidence (nwafd-10) is the regression **R²** — the
+    /// fraction of the window's CPU variance explained by the linear fit,
+    /// clamped to [0, 1] — byte-identical to the math this method previously
+    /// inlined. HONESTY NOTE: the baselines are statistical predictors, NOT
+    /// trained ML models; the feature-gated `onnx-model` backend loads real
+    /// (linear) model files, and each model documents its own confidence
+    /// semantics (TS 23.288 §6.14).
     pub fn compute_nf_load(&self, nf_instance_id: &str) -> Option<NfLoadAnalytics> {
         let samples = self.nf_samples.get(nf_instance_id)?;
         if samples.is_empty() {
@@ -206,48 +222,16 @@ impl AnalyticsEngine {
         let mean_cpu = samples.iter().map(|s| s.cpu_usage).sum::<f64>() / samples.len() as f64;
         let peak_cpu = samples.iter().map(|s| s.cpu_usage).fold(0.0f64, f64::max);
 
-        // Least-squares linear fit y = a + b·x over the last N (≤5) samples,
-        // with x = 0..N-1. `predicted_load` projects to x = N; `confidence` is
-        // the R² of the fit.
-        let n = samples.len().min(5);
-        let (predicted_load, confidence) = if n >= 2 {
-            let last = &samples[samples.len() - n..];
-            let nf = n as f64;
-            let sum_x: f64 = (0..n).map(|i| i as f64).sum();
-            let sum_y: f64 = last.iter().map(|s| s.cpu_usage).sum();
-            let sum_xx: f64 = (0..n).map(|i| (i as f64).powi(2)).sum();
-            let sum_xy: f64 = last
-                .iter()
-                .enumerate()
-                .map(|(i, s)| i as f64 * s.cpu_usage)
-                .sum();
-
-            // denom = N·Σx² − (Σx)² is strictly positive for N ≥ 2 distinct x.
-            let denom = nf * sum_xx - sum_x * sum_x;
-            let b = (nf * sum_xy - sum_x * sum_y) / denom;
-            let a = (sum_y - b * sum_x) / nf;
-            let predicted = (a + b * nf).clamp(0.0, 1.0);
-
-            // R² = 1 − SS_res / SS_tot.
-            let mean_y = sum_y / nf;
-            let ss_tot: f64 = last.iter().map(|s| (s.cpu_usage - mean_y).powi(2)).sum();
-            let ss_res: f64 = last
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (s.cpu_usage - (a + b * i as f64)).powi(2))
-                .sum();
-            let r_squared = if ss_tot <= f64::EPSILON {
-                // Flat series: the predictor reproduces it exactly → R² = 1.
-                1.0
-            } else {
-                (1.0 - ss_res / ss_tot).clamp(0.0, 1.0)
-            };
-
-            (predicted, r_squared)
-        } else {
-            // A single sample yields no residual basis; report no confidence.
-            (mean_cpu, 0.0)
-        };
+        // Issue #26: route the prediction through the active inference model
+        // (default: the OLS baseline, byte-identical to the formerly inline
+        // least-squares fit). A model that declines (window too short) falls
+        // back to (mean, no-confidence), preserving the pre-#26 contract.
+        let values: Vec<f64> = samples.iter().map(|s| s.cpu_usage).collect();
+        let (predicted_load, confidence) = self
+            .predictor
+            .0
+            .predict_series(&values)
+            .unwrap_or((mean_cpu, 0.0));
 
         Some(NfLoadAnalytics {
             nf_type: samples[0].nf_type.clone(),
@@ -415,5 +399,48 @@ mod tests {
             engine.ingest_nf_load(NfLoadSample::now("SMF", "smf-01", 0.5, 0.5, 0));
         }
         assert!(engine.nf_samples["smf-01"].len() <= MAX_SAMPLES);
+    }
+}
+
+#[cfg(test)]
+mod inference_wiring_tests {
+    use super::*;
+
+    /// Issue #26 acceptance: the NF_LOAD analytics values are produced by the
+    /// active `ml_service::InferenceModel` — a swapped model changes the
+    /// computed prediction/confidence.
+    struct FixedModel;
+    impl crate::ml_service::InferenceModel for FixedModel {
+        fn model_id(&self) -> &str {
+            "fixed-test"
+        }
+        fn predict_series(&self, _series: &[f64]) -> Option<(f64, f64)> {
+            Some((0.87, 0.42))
+        }
+    }
+
+    #[test]
+    fn compute_nf_load_uses_active_model() {
+        let mut engine = AnalyticsEngine::new();
+        for i in 0..6 {
+            engine.ingest_nf_load(NfLoadSample::now(
+                "AMF",
+                "amf-01",
+                0.1 + 0.05 * f64::from(i),
+                0.0,
+                0,
+            ));
+        }
+        assert_eq!(engine.predictor_id(), "ols-linear");
+        let default_result = engine.compute_nf_load("amf-01").unwrap();
+
+        engine.set_predictor(Box::new(FixedModel));
+        assert_eq!(engine.predictor_id(), "fixed-test");
+        let r = engine.compute_nf_load("amf-01").unwrap();
+        assert!((r.predicted_load - 0.87).abs() < 1e-9);
+        assert!((r.confidence - 0.42).abs() < 1e-9);
+        // mean/peak are engine statistics, unaffected by the model swap.
+        assert!((r.mean_cpu - default_result.mean_cpu).abs() < 1e-9);
+        assert!((r.peak_cpu - default_result.peak_cpu).abs() < 1e-9);
     }
 }

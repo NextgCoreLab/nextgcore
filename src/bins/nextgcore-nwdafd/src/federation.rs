@@ -4,7 +4,8 @@
 //! - DCCF (Data Collection Co-ordination Function) consumer interface
 //! - MFAF (Messaging Framework Adaptor Function) forwarding
 //! - Cross-PLMN analytics federation for roaming scenarios
-//! - Model federated learning aggregation stubs
+//! - Local FedAvg aggregation rounds (element-wise mean of participant
+//!   updates) — real, tested computation, kept as an internal library
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -73,21 +74,6 @@ impl FederationPeer {
     }
 }
 
-/// Federated analytics request: forward analytics query to a peer
-#[derive(Debug, Clone)]
-pub struct FederatedRequest {
-    /// Local subscription or query ID
-    pub local_ref: String,
-    /// Target peer instance ID
-    pub peer_instance_id: String,
-    /// Analytics IDs requested
-    pub analytics_ids: Vec<AnalyticsId>,
-    /// Request timestamp
-    pub sent_at: u64,
-    /// Whether a response has been received
-    pub completed: bool,
-}
-
 /// FL (Federated Learning) aggregation round
 ///
 /// NWDAF acts as aggregator for distributed model updates from UPFs/gNBs.
@@ -99,7 +85,7 @@ pub struct FlAggregationRound {
     pub analytics_id: AnalyticsId,
     /// Expected number of participant updates
     pub expected_participants: u32,
-    /// Received gradient updates (participant ID → update vector hash)
+    /// Received gradient updates (participant ID → raw update vector)
     pub received_updates: HashMap<String, Vec<f64>>,
     /// Aggregated global model update (FedAvg result)
     pub aggregated_update: Option<Vec<f64>>,
@@ -151,8 +137,6 @@ impl FlAggregationRound {
 pub struct FederationManager {
     /// Known federation peers
     peers: HashMap<String, FederationPeer>,
-    /// Active federated requests
-    requests: HashMap<String, FederatedRequest>,
     /// Active FL rounds
     fl_rounds: HashMap<u32, FlAggregationRound>,
 }
