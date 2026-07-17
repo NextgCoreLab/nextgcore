@@ -425,11 +425,95 @@ fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
 /// nrfd auto-detects an array body as JSON Patch (`main.rs` dispatch on shape)
 /// and applies both the merge-object and json-patch load PATCH forms.
 pub fn build_load_patch(load: u8) -> serde_json::Value {
+    build_status_patch(load, self_nf_status())
+}
+
+/// Like [`build_load_patch`] but with an explicit `nfStatus` (issue #22
+/// NES: a self-suspended NF keeps heartbeating with `SUSPENDED` so the
+/// NRF's liveness timer stays armed without reactivating the profile).
+/// With the default [`self_nf_status`] of `Registered` the output is
+/// byte-identical to the historical `build_load_patch`.
+pub fn build_status_patch(load: u8, status: crate::context::NfStatus) -> serde_json::Value {
     let load = load.min(100);
     serde_json::json!([
-        {"op": "replace", "path": "/nfStatus", "value": "REGISTERED"},
+        {"op": "replace", "path": "/nfStatus", "value": nf_status_wire(status)},
         {"op": "add",     "path": "/load",     "value": load}
     ])
+}
+
+/// TS 29.510 wire string for an [`crate::context::NfStatus`].
+pub fn nf_status_wire(status: crate::context::NfStatus) -> &'static str {
+    match status {
+        crate::context::NfStatus::Registered => "REGISTERED",
+        crate::context::NfStatus::Suspended => "SUSPENDED",
+        crate::context::NfStatus::Undiscoverable => "UNDISCOVERABLE",
+    }
+}
+
+// ─── NES self-status plumbing (issue #22) ────────────────────────────────────
+// Defaults (Registered, unpaused) keep the heartbeat worker byte-for-byte on
+// its pre-NES behavior; only an NF that opts into NES ever mutates these.
+
+static SELF_NF_STATUS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static HEARTBEAT_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set the status this NF advertises in its own NRF heartbeats.
+pub fn set_self_nf_status(status: crate::context::NfStatus) {
+    let value = match status {
+        crate::context::NfStatus::Registered => 0,
+        crate::context::NfStatus::Suspended => 1,
+        crate::context::NfStatus::Undiscoverable => 2,
+    };
+    SELF_NF_STATUS.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The status this NF currently advertises in its own NRF heartbeats.
+pub fn self_nf_status() -> crate::context::NfStatus {
+    match SELF_NF_STATUS.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => crate::context::NfStatus::Suspended,
+        2 => crate::context::NfStatus::Undiscoverable,
+        _ => crate::context::NfStatus::Registered,
+    }
+}
+
+/// Pause/resume the outbound heartbeat worker (issue #22 NES `deregister`
+/// action: a deregistered NF must not keep PATCHing its deleted profile).
+pub fn set_heartbeat_paused(paused: bool) {
+    HEARTBEAT_PAUSED.store(paused, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the outbound heartbeat worker is paused.
+pub fn heartbeat_paused() -> bool {
+    HEARTBEAT_PAUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One-off `nfStatus` PATCH toward the NRF (issue #22 NES transitions),
+/// using the exact wire shape of the heartbeat worker (RFC 6902 array,
+/// `application/json-patch+json`).
+pub async fn patch_nf_status(
+    nf_instance_id: &str,
+    status: crate::context::NfStatus,
+    load: u8,
+) -> Result<(), String> {
+    let ctx = crate::context::global_context();
+    let nrf_uri = ctx
+        .get_nrf_uri()
+        .await
+        .ok_or_else(|| "no NRF URI configured".to_string())?;
+    let (nrf_host, nrf_port) =
+        parse_nrf_host_port(&nrf_uri).ok_or_else(|| format!("invalid NRF URI '{nrf_uri}'"))?;
+    let client = SbiClient::with_host_port(&nrf_host, nrf_port);
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    let body = build_status_patch(load, status);
+    let request = SbiRequest::patch(&path)
+        .with_json_body(&body)
+        .map_err(|e| format!("failed to serialize nfStatus patch: {e}"))?
+        .with_header("Content-Type", "application/json-patch+json");
+    match client.send_request(request).await {
+        Ok(resp) if resp.status == 200 || resp.status == 204 => Ok(()),
+        Ok(resp) => Err(format!("NRF returned status {}", resp.status)),
+        Err(e) => Err(format!("nfStatus PATCH failed: {e}")),
+    }
 }
 
 /// Spawn a background tokio task that periodically sends a heartbeat
@@ -474,6 +558,13 @@ where
 
         loop {
             ticker.tick().await;
+
+            // Issue #22 NES: while paused (deregistered sleep) skip the
+            // tick entirely — a deleted NF profile must not be PATCHed.
+            if heartbeat_paused() {
+                log::debug!("Heartbeat paused for {nf_instance_id}, skipping tick");
+                continue;
+            }
 
             let ctx = crate::context::global_context();
             let nrf_uri = ctx.get_nrf_uri().await;
@@ -536,6 +627,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #22 NES: the default heartbeat body is byte-identical to the
+    /// historical hardcoded-REGISTERED patch, the status builder emits the
+    /// requested status, and the self-status/pause plumbing round-trips.
+    /// One test (not several): the statics are process-global, so mutation
+    /// and restoration happen under a single test to avoid races.
+    #[test]
+    fn test_nes_status_patch_plumbing() {
+        // Defaults: Registered, unpaused, historical JSON shape (load
+        // saturated at 100).
+        assert_eq!(self_nf_status(), crate::context::NfStatus::Registered);
+        assert!(!heartbeat_paused());
+        assert_eq!(
+            build_load_patch(150),
+            serde_json::json!([
+                {"op": "replace", "path": "/nfStatus", "value": "REGISTERED"},
+                {"op": "add",     "path": "/load",     "value": 100}
+            ])
+        );
+
+        // Explicit status builder.
+        let suspended = build_status_patch(7, crate::context::NfStatus::Suspended);
+        assert_eq!(suspended[0]["value"], "SUSPENDED");
+        assert_eq!(suspended[1]["value"], 7);
+        assert_eq!(
+            nf_status_wire(crate::context::NfStatus::Undiscoverable),
+            "UNDISCOVERABLE"
+        );
+
+        // NES plumbing round-trip; restore defaults for other tests.
+        set_self_nf_status(crate::context::NfStatus::Suspended);
+        assert_eq!(build_load_patch(1)[0]["value"], "SUSPENDED");
+        set_heartbeat_paused(true);
+        assert!(heartbeat_paused());
+        set_self_nf_status(crate::context::NfStatus::Registered);
+        set_heartbeat_paused(false);
+        assert_eq!(build_load_patch(0)[0]["value"], "REGISTERED");
+    }
 
     #[test]
     fn test_heartbeat_record_creation() {
@@ -646,7 +775,10 @@ mod tests {
     #[test]
     fn test_build_load_patch_shape() {
         use serde_json::json;
-        let patch = build_load_patch(42);
+        // Review fix (issue #22): use the explicit-status builder so this
+        // test cannot observe another test's mutation of the process-global
+        // SELF_NF_STATUS (test_nes_status_patch_plumbing is the sole mutator).
+        let patch = build_status_patch(42, crate::context::NfStatus::Registered);
         let items = patch.as_array().expect("json-patch array");
         assert_eq!(items.len(), 2, "nfStatus + load");
 
@@ -665,10 +797,10 @@ mod tests {
     fn test_build_load_patch_saturates_at_100() {
         use serde_json::json;
         // u8 max is 255; anything over 100 saturates to 100 (NFProfile.load 0..=100).
-        let patch = build_load_patch(200);
+        let patch = build_status_patch(200, crate::context::NfStatus::Registered);
         assert_eq!(patch.as_array().unwrap()[1]["value"], json!(100));
 
-        let patch = build_load_patch(0);
+        let patch = build_status_patch(0, crate::context::NfStatus::Registered);
         assert_eq!(patch.as_array().unwrap()[1]["value"], json!(0));
     }
 }

@@ -48,6 +48,7 @@ pub mod heartbeat;
 pub mod http3; // HTTP/3 SBI transport prototype (issue #15, non-normative)
 pub mod message;
 pub mod multipart;
+pub mod nes; // NES idle/sleep state machine (issue #22, non-normative)
 pub mod oauth;
 pub mod overload;
 #[cfg(feature = "6g-extensions")]

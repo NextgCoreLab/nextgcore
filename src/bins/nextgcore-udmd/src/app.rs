@@ -135,9 +135,28 @@ struct UpuYaml {
     ack_ind: Option<bool>,
 }
 
+/// Issue #22 NES sleep-policy block (off by default; only read under the
+/// `nes` cargo feature).
+#[derive(Debug, Default, Deserialize, Clone)]
+pub(crate) struct NesYaml {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) idle_threshold_secs: Option<u64>,
+    pub(crate) drain_timeout_secs: Option<u64>,
+    pub(crate) poll_interval_secs: Option<u64>,
+    /// "suspend" (PATCH nfStatus=SUSPENDED) or "deregister".
+    pub(crate) action: Option<String>,
+    pub(crate) metrics_port: Option<u16>,
+    /// Synthetic power model knobs (documented in docs/NES.md).
+    pub(crate) capacity_rps: Option<f64>,
+    pub(crate) idle_power_w: Option<f64>,
+    pub(crate) max_power_w: Option<f64>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct UdmSection {
     sbi: Option<SbiYaml>,
+    /// Issue #22 NES sleep-policy block (only read under the `nes` feature).
+    nes: Option<NesYaml>,
     hnet: Option<Vec<HnetYaml>>,
     /// udmd-11: explicitly enable null-scheme SUCI (default: true).
     allow_null_scheme: Option<bool>,
@@ -156,6 +175,13 @@ struct UdmYaml {
 
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Issue #22 NES bookkeeping (inert without the `nes` feature): inbound SBI
+/// request counter (activity detection) and in-flight tracker (the graceful
+/// drain gate).
+pub(crate) static NES_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static NES_IN_FLIGHT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // OAuth2 rollout (Wave-6 H8): opt-in producer verification + outbound consumer
@@ -296,6 +322,8 @@ pub async fn run() -> Result<()> {
     log::info!("UDM state machine initialized");
 
     // Parse configuration (if file exists) and seed NRF URI
+    #[cfg(feature = "nes")]
+    let mut nes_yaml: Option<NesYaml> = None;
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         match std::fs::read_to_string(&args.config) {
@@ -304,6 +332,10 @@ pub async fn run() -> Result<()> {
                 // Seed NRF URI into SBI context for NF registration
                 if let Ok(yaml) = serde_yaml::from_str::<UdmYaml>(&content) {
                     if let Some(udm) = yaml.udm {
+                        #[cfg(feature = "nes")]
+                        {
+                            nes_yaml = udm.nes.clone();
+                        }
                         if let Some(sbi) = udm.sbi {
                             // Override the advertised/bind SBI address with the
                             // routable address from config so the NRF NFProfile
@@ -449,6 +481,16 @@ pub async fn run() -> Result<()> {
     // Register with NRF and start heartbeat worker
     match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
+            // Issue #22 NES (off by default): idle->drain->suspend runtime.
+            #[cfg(feature = "nes")]
+            crate::nes_driver::spawn_if_enabled(
+                nes_yaml
+                    .as_ref()
+                    .map(crate::nes_driver::NesSettings::from_yaml),
+                nf_instance_id.clone(),
+                args.sbi_addr.clone(),
+                args.sbi_port,
+            );
             // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
             // (registered UEs vs configured capacity; TS 29.510 §5.2.2.3.2).
             nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
@@ -496,6 +538,26 @@ pub async fn run() -> Result<()> {
 
 /// SBI request handler for UDM
 pub async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
+    // Issue #22 NES bookkeeping (inert without the `nes` feature): count
+    // inbound activity and track in-flight work for the graceful drain.
+    NES_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // RAII guard (issue #22 review fix): the decrement must run on EVERY
+    // exit path — normal completion, panic-unwind (caught by the SBI
+    // server), and future-drop on client cancellation — or the NES drain
+    // gate never reaches zero and sleep is permanently blocked.
+    struct InFlightGuard;
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            NES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    NES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _guard = InFlightGuard;
+    udm_sbi_route(request).await
+}
+
+/// Route an inbound SBI request to the UDM service handlers.
+async fn udm_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
@@ -1979,6 +2041,19 @@ async fn run_event_loop_async(udm_sm: &mut UdmSmContext, shutdown: Arc<AtomicBoo
 /// Returns the NF instance ID on success so the caller can start a heartbeat
 /// worker.
 async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    register_with_nrf_id(&nf_instance_id, sbi_addr, sbi_port).await
+}
+
+/// Register — or, for the issue #22 NES resume path, RE-register — the UDM
+/// with the NRF under a caller-supplied NF instance ID. Returns the ID
+/// actually registered, or an empty string when no NRF is configured
+/// (registration skipped, matching the historical behavior).
+pub(crate) async fn register_with_nrf_id(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+) -> Result<String, String> {
     let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -1994,8 +2069,6 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
     let (nrf_host, nrf_port) = parse_nrf_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
-
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
 
     let nf_profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,
@@ -2041,7 +2114,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
     match response.status {
         200 | 201 => {
             log::info!("UDM registered with NRF successfully (id={nf_instance_id})");
-            Ok(nf_instance_id)
+            Ok(nf_instance_id.to_string())
         }
         _ => Err(format!(
             "NRF registration returned status {}",
@@ -2051,7 +2124,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 }
 
 /// Parse host and port from a URI string (e.g., "http://localhost:7777").
-fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
+pub(crate) fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
     let without_scheme = uri
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))

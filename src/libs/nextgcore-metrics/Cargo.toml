@@ -11,6 +11,8 @@ nextgcore-core = { workspace = true }
 prometheus.workspace = true
 log.workspace = true
 serde_yaml.workspace = true
+# NES (issue #22): minimal live /metrics HTTP listener + async tests
+tokio.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 
