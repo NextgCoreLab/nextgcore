@@ -249,6 +249,14 @@ pub struct AssociationState {
     pub peer_recovery_time_stamp: Option<u32>,
     /// UP Function Features advertised by the UPF
     pub up_function_features: Option<UpFunctionFeatures>,
+    /// Latest load metric (0..=100) the peer reported via a Load Control
+    /// Information IE on its heartbeat (issue #20, TS 29.244 §8.2.53).
+    /// None until the peer reports one — standard peers never do.
+    pub peer_load: Option<u8>,
+    /// Load Control Sequence Number of the stored `peer_load`; a stale
+    /// (lower) sequence number must not overwrite a newer metric
+    /// (TS 29.244 §8.2.52).
+    pub peer_load_seq: Option<u32>,
 }
 
 // ============================================================================
@@ -278,6 +286,134 @@ pub fn set_global_client(client: Arc<PfcpClient>) {
 /// The process-wide PFCP client, if initialised.
 pub fn global_client() -> Option<Arc<PfcpClient>> {
     PFCP_CLIENT.get().cloned()
+}
+
+// ============================================================================
+// UPF pool + load-aware selection (issue #20)
+// ============================================================================
+
+static PFCP_POOL: OnceLock<Vec<Arc<PfcpClient>>> = OnceLock::new();
+
+/// Install the process-wide UPF pool (once, at startup). The first entry is
+/// also installed as the process-wide default client, so every legacy
+/// single-client path keeps its pre-pool behavior.
+pub fn set_global_pool(clients: Vec<Arc<PfcpClient>>) {
+    if let Some(first) = clients.first() {
+        set_global_client(first.clone());
+    }
+    let _ = PFCP_POOL.set(clients);
+}
+
+/// The process-wide UPF pool (all configured peers), if initialised.
+pub fn global_pool() -> Option<&'static [Arc<PfcpClient>]> {
+    PFCP_POOL.get().map(|v| v.as_slice())
+}
+
+/// Session → UPF binding: the SMF's own N4 SEID → PFCP peer address,
+/// recorded at session establishment. Modification/deletion of an existing
+/// session must keep signalling the UPF the session was established on,
+/// which stops being implicit once more than one UPF is configured.
+///
+/// Keyed by the SMF-side SEID (unique per SM context within this SMF), NOT
+/// the UPF-chosen SEID: every UPF allocates its SEIDs independently from 1,
+/// so UPF SEIDs collide across a multi-UPF pool.
+static SESSION_PEERS: OnceLock<std::sync::RwLock<HashMap<u64, SocketAddr>>> = OnceLock::new();
+
+fn session_peers() -> &'static std::sync::RwLock<HashMap<u64, SocketAddr>> {
+    SESSION_PEERS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Record which UPF a newly established session lives on (keyed by the
+/// SMF-side N4 SEID).
+pub fn record_session_peer(smf_n4_seid: u64, peer: SocketAddr) {
+    if let Ok(mut map) = session_peers().write() {
+        map.insert(smf_n4_seid, peer);
+    }
+}
+
+/// Drop the session → UPF binding once the session is deleted.
+pub fn forget_session_peer(smf_n4_seid: u64) {
+    if let Ok(mut map) = session_peers().write() {
+        map.remove(&smf_n4_seid);
+    }
+}
+
+/// Resolve the PFCP client serving an EXISTING session by the SMF-side N4
+/// SEID. Falls back to the process-wide default client when no binding is
+/// recorded; with a single configured UPF that is always the same client,
+/// so the legacy behavior is unchanged.
+pub fn client_for_session(smf_n4_seid: u64) -> Option<Arc<PfcpClient>> {
+    let peer = session_peers()
+        .read()
+        .ok()
+        .and_then(|map| map.get(&smf_n4_seid).copied());
+    if let (Some(peer), Some(pool)) = (peer, global_pool()) {
+        if let Some(client) = pool.iter().find(|c| c.peer() == peer) {
+            return Some(client.clone());
+        }
+    }
+    global_client()
+}
+
+/// Pick the UPF for a NEW session (issue #20; UPF load is a TS 23.501
+/// §6.3.3 selection input).
+///
+/// Off by default: without the `compute-aware-upf` cargo feature — or with a
+/// pool of at most one UPF — this returns the process-wide default client,
+/// i.e. exactly the pre-pool single-client path. With the feature enabled
+/// and several UPFs configured it returns the least-loaded *associated*
+/// peer, using the metric each UPF reports via Load Control Information on
+/// its heartbeat.
+///
+/// Rel-19 "Compute-Aware Networking" has no frozen Stage-3, so treating the
+/// metric as a compute signal (rather than plain session-occupancy load) is
+/// a non-normative research prototype.
+pub async fn select_upf() -> Option<Arc<PfcpClient>> {
+    if !cfg!(feature = "compute-aware-upf") {
+        return global_client();
+    }
+    let pool = match global_pool() {
+        Some(pool) if pool.len() > 1 => pool,
+        _ => return global_client(),
+    };
+    match select_upf_from(pool).await {
+        Some(client) => Some(client),
+        None => {
+            log::warn!(
+                "select_upf: no associated UPF in the pool; falling back to the default peer"
+            );
+            global_client()
+        }
+    }
+}
+
+/// Least-loaded-associated selection over an explicit candidate slice.
+/// Deliberately NOT feature-gated so the default CI build compiles and
+/// tests the full selection path; [`select_upf`] gates whether session
+/// establishment actually uses it.
+pub async fn select_upf_from(pool: &[Arc<PfcpClient>]) -> Option<Arc<PfcpClient>> {
+    let mut candidates = Vec::with_capacity(pool.len());
+    for client in pool {
+        let assoc = client.association().await;
+        candidates.push((assoc.associated, assoc.peer_load));
+    }
+    select_least_loaded(&candidates).map(|idx| pool[idx].clone())
+}
+
+/// Pure selection core: index of the least-loaded associated candidate.
+///
+/// Each slot is `(associated, reported load)`. Un-associated peers are never
+/// selected (TS 29.244 §6.2.6.2: no session signalling without an
+/// association). An associated peer that has not reported a metric is
+/// eligible but ranked worst (unknown load); ties resolve to the lowest
+/// index, so the choice is deterministic.
+pub fn select_least_loaded(candidates: &[(bool, Option<u8>)]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, (associated, _))| *associated)
+        .min_by_key(|(_, (_, load))| load.map(u16::from).unwrap_or(u16::MAX))
+        .map(|(idx, _)| idx)
 }
 
 impl PfcpClient {
@@ -316,6 +452,21 @@ impl PfcpClient {
     /// Snapshot of the association state.
     pub async fn association(&self) -> AssociationState {
         self.assoc.read().await.clone()
+    }
+
+    /// Test-only: force association/load state. Unit tests cannot run the
+    /// full Association Setup handshake for every selection scenario.
+    #[cfg(test)]
+    pub(crate) async fn set_assoc_state_for_test(
+        &self,
+        associated: bool,
+        peer_load: Option<u8>,
+        peer_load_seq: Option<u32>,
+    ) {
+        let mut assoc = self.assoc.write().await;
+        assoc.associated = associated;
+        assoc.peer_load = peer_load;
+        assoc.peer_load_seq = peer_load_seq;
     }
 
     /// T1/N1 parameters for a given request type.
@@ -449,6 +600,25 @@ impl PfcpClient {
                 {
                     self.check_peer_restart(rts).await;
                 }
+                // Issue #20: the UPF may piggy-back its load metric (Load
+                // Control Information) on the heartbeat. Store it for
+                // load-aware selection, discarding stale sequence numbers.
+                {
+                    let mut body_bytes = Bytes::copy_from_slice(body);
+                    if let Ok(hb) = HeartbeatRequest::decode(&mut body_bytes) {
+                        if let Some(lci) = hb.load_control_information {
+                            let mut assoc = self.assoc.write().await;
+                            let newer = match assoc.peer_load_seq {
+                                Some(seq) => lci.sequence_number >= seq,
+                                None => true,
+                            };
+                            if newer {
+                                assoc.peer_load = Some(lci.metric.min(100));
+                                assoc.peer_load_seq = Some(lci.sequence_number);
+                            }
+                        }
+                    }
+                }
                 let msg = PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(
                     self.recovery_time_stamp,
                 ));
@@ -502,6 +672,12 @@ impl PfcpClient {
         {
             let mut assoc = self.assoc.write().await;
             assoc.associated = false;
+            // Issue #20: a restarted UPF restarts its LCI sequence counter
+            // from 1, so the stored high-watermark would reject every fresh
+            // (low-seq) load report. Clear the load state so the first
+            // post-restart report (peer_load_seq == None) is accepted.
+            assoc.peer_load = None;
+            assoc.peer_load_seq = None;
         }
         let cleared = clear_pfcp_sessions();
         log::warn!("PFCP association torn down ({reason}); {cleared} stale sessions flushed");
@@ -958,6 +1134,159 @@ mod tests {
         assert_eq!(
             h.msg_type,
             pfcp_message_type::VERSION_NOT_SUPPORTED_RESPONSE
+        );
+    }
+
+    // ── Issue #20: load/compute-aware UPF selection ─────────────────────────
+
+    #[test]
+    fn test_select_least_loaded_prefers_associated_minimum() {
+        // Least-loaded associated peer wins; the unassociated peer with the
+        // lowest metric is never eligible.
+        let candidates = [
+            (true, Some(80)),
+            (false, Some(1)),
+            (true, Some(20)),
+            (true, None),
+        ];
+        assert_eq!(select_least_loaded(&candidates), Some(2));
+
+        // Unknown load ranks worst among associated peers.
+        assert_eq!(
+            select_least_loaded(&[(true, None), (true, Some(100))]),
+            Some(1)
+        );
+
+        // Ties resolve to the lowest index (deterministic).
+        assert_eq!(
+            select_least_loaded(&[(true, Some(10)), (true, Some(10))]),
+            Some(0)
+        );
+
+        // No associated peer -> no selection.
+        assert_eq!(
+            select_least_loaded(&[(false, Some(3)), (false, None)]),
+            None
+        );
+        assert_eq!(select_least_loaded(&[]), None);
+    }
+
+    /// Acceptance (issue #20): with the feature off — or a pool of one —
+    /// session establishment selects the sole/global client, i.e. the
+    /// pre-pool single-client path. This is the ONLY test that installs the
+    /// process-global pool (OnceLock allows a single set per test process).
+    #[tokio::test]
+    async fn test_select_upf_defaults_to_global_client_and_bindings_resolve() {
+        let (client, _upf) = make_client_with_peer().await;
+        set_global_pool(vec![client.clone()]);
+
+        let selected = select_upf().await.expect("pool installed");
+        assert_eq!(
+            selected.peer(),
+            client.peer(),
+            "sole/default client must be selected"
+        );
+
+        // client_for_session: unknown SEID falls back to the default client.
+        let resolved = client_for_session(0xDEAD).expect("default client");
+        assert_eq!(resolved.peer(), client.peer());
+
+        // A recorded binding resolves to the bound peer and survives until
+        // the session is forgotten.
+        record_session_peer(0x77, client.peer());
+        assert_eq!(client_for_session(0x77).unwrap().peer(), client.peer());
+        forget_session_peer(0x77);
+        assert_eq!(client_for_session(0x77).unwrap().peer(), client.peer());
+    }
+
+    /// Acceptance (issue #20): a PFCP Heartbeat Request carrying Load
+    /// Control Information is parsed and updates the originating peer's
+    /// stored metric on `AssociationState`; stale sequence numbers are
+    /// discarded.
+    #[tokio::test]
+    async fn test_heartbeat_lci_updates_association_state() {
+        let (client, upf) = make_client_with_peer().await;
+        let local_addr = client.socket.local_addr().unwrap();
+
+        let hb = |seq: u32, lci_seq: u32, metric: u8| {
+            let mut req = HeartbeatRequest::new(1111);
+            req.load_control_information = Some(
+                nextgcore_pfcp::types::LoadControlInformation::new(lci_seq, metric),
+            );
+            build_message(&PfcpMessage::HeartbeatRequest(req), seq, None)
+        };
+        // Each send is followed by the engine's Heartbeat Response; waiting
+        // for it guarantees the request (and its LCI) was processed.
+        async fn exchange(upf: &UdpSocket, to: SocketAddr, pkt: &[u8]) {
+            upf.send_to(pkt, to).await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            tokio::time::timeout(Duration::from_secs(2), upf.recv_from(&mut buf))
+                .await
+                .expect("heartbeat response expected")
+                .unwrap();
+        }
+
+        // First report: stored.
+        exchange(&upf, local_addr, &hb(1, 10, 30)).await;
+        let assoc = client.association().await;
+        assert_eq!(assoc.peer_load, Some(30));
+        assert_eq!(assoc.peer_load_seq, Some(10));
+
+        // Stale sequence number: ignored.
+        exchange(&upf, local_addr, &hb(2, 5, 90)).await;
+        assert_eq!(client.association().await.peer_load, Some(30));
+
+        // Newer sequence number: applied.
+        exchange(&upf, local_addr, &hb(3, 11, 55)).await;
+        let assoc = client.association().await;
+        assert_eq!(assoc.peer_load, Some(55));
+        assert_eq!(assoc.peer_load_seq, Some(11));
+    }
+
+    /// Acceptance (issue #20): the full selection path over real clients —
+    /// the least-loaded ASSOCIATED peer wins and an un-associated peer is
+    /// never selected. Runs in the default build (select_upf_from is not
+    /// feature-gated); the feature only gates whether establishment calls it.
+    #[tokio::test]
+    async fn test_select_upf_from_picks_least_loaded_associated() {
+        let (a, _peer_a) = make_client_with_peer().await;
+        let (b, _peer_b) = make_client_with_peer().await;
+        let (c, _peer_c) = make_client_with_peer().await;
+        a.set_assoc_state_for_test(true, Some(70), Some(1)).await;
+        // Least-loaded overall, but un-associated: never eligible.
+        b.set_assoc_state_for_test(false, Some(5), Some(1)).await;
+        c.set_assoc_state_for_test(true, Some(20), Some(1)).await;
+
+        let pool = vec![a.clone(), b, c.clone()];
+        let picked = select_upf_from(&pool)
+            .await
+            .expect("associated peers exist");
+        assert_eq!(picked.peer(), c.peer());
+
+        // All un-associated -> no selection.
+        a.set_assoc_state_for_test(false, Some(70), Some(1)).await;
+        c.set_assoc_state_for_test(false, Some(20), Some(1)).await;
+        assert!(select_upf_from(&pool).await.is_none());
+    }
+
+    /// Issue #20 review regression: association teardown clears the stored
+    /// load state, so a restarted UPF (whose LCI sequence counter restarts
+    /// from 1) is not stuck behind the old high-watermark.
+    #[tokio::test]
+    async fn test_teardown_clears_load_state() {
+        let (client, _upf) = make_client_with_peer().await;
+        client
+            .set_assoc_state_for_test(true, Some(40), Some(5000))
+            .await;
+
+        client.teardown_association("test: peer restarted").await;
+
+        let assoc = client.association().await;
+        assert!(!assoc.associated);
+        assert_eq!(assoc.peer_load, None);
+        assert_eq!(
+            assoc.peer_load_seq, None,
+            "a fresh low-seq post-restart report must be acceptable again"
         );
     }
 }

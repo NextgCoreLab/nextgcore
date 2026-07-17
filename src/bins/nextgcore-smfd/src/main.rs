@@ -422,15 +422,31 @@ async fn main() -> Result<()> {
             .parse()
             .context("Invalid SMF PFCP listen address")?
     };
-    let upf_pfcp_addr: SocketAddr = {
-        let addr = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let port: u16 = std::env::var("UPF_PFCP_PORT")
+    // Issue #20: UPF_PFCP_ADDR accepts a comma-separated peer list
+    // ("10.0.0.5,10.0.0.6:8806"); an entry without a port uses
+    // UPF_PFCP_PORT. A single entry — the default — behaves exactly as the
+    // pre-pool single-UPF configuration.
+    let upf_pfcp_addrs: Vec<SocketAddr> = {
+        let addrs = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let default_port: u16 = std::env::var("UPF_PFCP_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(8805);
-        format!("{addr}:{port}")
-            .parse()
-            .context("Invalid UPF PFCP address")?
+        let mut peers = Vec::new();
+        for entry in addrs.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let candidate = if entry.contains(':') {
+                entry.to_string()
+            } else {
+                format!("{entry}:{default_port}")
+            };
+            peers.push(
+                candidate
+                    .parse()
+                    .with_context(|| format!("Invalid UPF PFCP address '{entry}'"))?,
+            );
+        }
+        anyhow::ensure!(!peers.is_empty(), "UPF_PFCP_ADDR contains no usable peer");
+        peers
     };
     let smf_node_ip: [u8; 4] = {
         let s = std::env::var("SMF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -447,20 +463,28 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("Failed to bind SMF PFCP socket on {pfcp_bind_addr}"))?,
     );
-    log::info!("SMF N4 PFCP socket bound on {pfcp_bind_addr} (UPF peer: {upf_pfcp_addr})");
+    log::info!("SMF N4 PFCP socket bound on {pfcp_bind_addr} (UPF peers: {upf_pfcp_addrs:?})");
 
-    let pfcp_client = Arc::new(pfcp_path::PfcpClient::new(
-        pfcp_socket.clone(),
-        upf_pfcp_addr,
-        smf_node_ip,
-    ));
-    pfcp_path::set_global_client(pfcp_client.clone());
+    let pfcp_clients: Vec<Arc<pfcp_path::PfcpClient>> = upf_pfcp_addrs
+        .iter()
+        .map(|&peer| {
+            Arc::new(pfcp_path::PfcpClient::new(
+                pfcp_socket.clone(),
+                peer,
+                smf_node_ip,
+            ))
+        })
+        .collect();
+    // Installs the whole pool and pool slot 0 as the process-wide default
+    // client (the legacy single-client paths keep working unchanged).
+    pfcp_path::set_global_pool(pfcp_clients.clone());
+    let pfcp_client = pfcp_clients[0].clone();
 
     // PFCP receive/dispatch loop: responses complete pending transactions;
     // node-level requests (heartbeat, association release) are answered by
     // the engine; Session Report Requests are handled here.
     let shutdown_pfcp = shutdown.clone();
-    let client_rx = pfcp_client.clone();
+    let clients_rx = pfcp_clients.clone();
     let sock_rx = pfcp_socket.clone();
     let pfcp_listener_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
@@ -476,7 +500,15 @@ async fn main() -> Result<()> {
             {
                 Ok(Ok((len, peer))) => {
                     let pkt = buf[..len].to_vec();
-                    if !client_rx.on_datagram(&pkt, peer).await {
+                    // Route the datagram to the client owning this peer so
+                    // transaction matching and association state stay
+                    // per-UPF. Unknown sources fall back to pool slot 0,
+                    // preserving the single-UPF behavior.
+                    let client = clients_rx
+                        .iter()
+                        .find(|c| c.peer() == peer)
+                        .unwrap_or(&clients_rx[0]);
+                    if !client.on_datagram(&pkt, peer).await {
                         handle_pfcp_incoming(&sock_rx, &pkt, peer).await;
                     }
                 }
@@ -493,7 +525,7 @@ async fn main() -> Result<()> {
     // Stamp tears the association down (stale sessions flushed) and
     // triggers re-association.
     let shutdown_assoc = shutdown.clone();
-    let client_assoc = pfcp_client.clone();
+    let clients_assoc = pfcp_clients.clone();
     let pfcp_assoc_handle = tokio::spawn(async move {
         let heartbeat_period = std::time::Duration::from_secs(10);
         let reassociate_holdoff = std::time::Duration::from_secs(10);
@@ -501,19 +533,18 @@ async fn main() -> Result<()> {
             if shutdown_assoc.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
                 break;
             }
-            if !client_assoc.is_associated().await {
-                match client_assoc.associate().await {
-                    Ok(()) => {}
-                    Err(e) => {
+            for client_assoc in &clients_assoc {
+                if !client_assoc.is_associated().await {
+                    if let Err(e) = client_assoc.associate().await {
                         // Abnormal action on association failure: declare the
-                        // UPF unreachable and hold off before a new cycle.
+                        // UPF unreachable and retry next cycle. Handled
+                        // per-peer (issue #20 review): one unreachable UPF
+                        // must not starve heartbeats to healthy pool members.
                         log::error!(
                             "PFCP Association Setup with {} failed: {e}; retrying in {}s",
                             client_assoc.peer(),
                             reassociate_holdoff.as_secs()
                         );
-                        tokio::time::sleep(reassociate_holdoff).await;
-                        continue;
                     }
                 }
             }
@@ -521,11 +552,13 @@ async fn main() -> Result<()> {
             if shutdown_assoc.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
                 break;
             }
-            if client_assoc.is_associated().await {
-                if let Err(e) = client_assoc.heartbeat_once().await {
-                    // Exhaustion already marked the association down inside
-                    // the engine; the next loop turn re-associates.
-                    log::error!("PFCP heartbeat to {} failed: {e}", client_assoc.peer());
+            for client_assoc in &clients_assoc {
+                if client_assoc.is_associated().await {
+                    if let Err(e) = client_assoc.heartbeat_once().await {
+                        // Exhaustion already marked the association down inside
+                        // the engine; the next loop turn re-associates.
+                        log::error!("PFCP heartbeat to {} failed: {e}", client_assoc.peer());
+                    }
                 }
             }
         }
@@ -1109,8 +1142,12 @@ async fn pfcp_session_establish(
 ) -> Result<PfcpSessionResult> {
     use n4_build::{pfcp_ie, FarParams, PdrParams, PfcpMessageBuilder, QerParams};
 
-    let client =
-        pfcp_path::global_client().ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    // Issue #20: pick the UPF for this NEW session — the least-loaded
+    // associated pool peer when the compute-aware-upf feature is enabled,
+    // the sole/default client otherwise (identical to the legacy path).
+    let client = pfcp_path::select_upf()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
 
     // TS 29.244 6.2.6.2: no session signalling without an association
     if !client.is_associated().await {
@@ -1363,6 +1400,11 @@ async fn pfcp_session_establish(
 
     log::info!("PFCP Session Established: UPF SEID=0x{upf_seid:016x}, UPF TEID=0x{upf_teid:08x}");
 
+    // Issue #20: remember which UPF this session was established on so
+    // modification/deletion keep signalling the same peer. Keyed by the
+    // SMF-side SEID: UPF-chosen SEIDs collide across a multi-UPF pool.
+    pfcp_path::record_session_peer(smf_n4_seid, client.peer());
+
     Ok(PfcpSessionResult {
         upf_seid,
         upf_teid,
@@ -1371,11 +1413,16 @@ async fn pfcp_session_establish(
 }
 
 /// Send PFCP Session Modification Request to UPF to activate DL FAR with gNB TEID
-async fn pfcp_session_modify(upf_seid: u64, gnb_teid: u32, gnb_addr: [u8; 4]) -> Result<()> {
+async fn pfcp_session_modify(
+    smf_n4_seid: u64,
+    upf_seid: u64,
+    gnb_teid: u32,
+    gnb_addr: [u8; 4],
+) -> Result<()> {
     use n4_build::{build_session_modification_request, SessionModificationParams};
 
-    let client =
-        pfcp_path::global_client().ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    let client = pfcp_path::client_for_session(smf_n4_seid)
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
     if !client.is_associated().await {
         anyhow::bail!("no established PFCP association with {}", client.peer());
     }
@@ -1431,9 +1478,9 @@ async fn pfcp_session_modify(upf_seid: u64, gnb_teid: u32, gnb_addr: [u8; 4]) ->
 }
 
 /// Send PFCP Session Deletion Request to UPF
-async fn pfcp_session_delete(upf_seid: u64) -> Result<()> {
-    let client =
-        pfcp_path::global_client().ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+async fn pfcp_session_delete(smf_n4_seid: u64, upf_seid: u64) -> Result<()> {
+    let client = pfcp_path::client_for_session(smf_n4_seid)
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
     if !client.is_associated().await {
         anyhow::bail!("no established PFCP association with {}", client.peer());
     }
@@ -1457,6 +1504,8 @@ async fn pfcp_session_delete(upf_seid: u64) -> Result<()> {
     }
     match pfcp_path::parse_cause(&resp_body) {
         Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => {
+            // Issue #20: the session is gone — drop its UPF binding.
+            pfcp_path::forget_session_peer(smf_n4_seid);
             log::info!("PFCP Session Deletion successful");
             Ok(())
         }
@@ -2188,7 +2237,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // ---- N4: PFCP Session Establishment with policy-derived QoS ----
     // A failed N4 establishment is a hard failure for the PDU session — no
     // fabricated TEID fallback (the data path would be a black hole).
-    let smf_n4_seid = (sm_context_ref.parse::<u64>().unwrap_or(1)) | 0x1000;
+    let smf_n4_seid = smf_n4_seid_for(&sm_context_ref);
 
     let (upf_teid, upf_addr) =
         match pfcp_session_establish(smf_n4_seid, ue_ip_octets, &dnn, sst, &session_qos).await {
@@ -2363,6 +2412,13 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
 
 /// Look up the stored UPF SEID for an SM context (copy-then-drop the guards
 /// per the lock-order rule).
+/// The SMF-side N4 SEID for an SM context reference. Must match the
+/// derivation used at session establishment (it is the SEID the UPF
+/// addresses us by, and — issue #20 — the session→UPF binding key).
+fn smf_n4_seid_for(sm_context_ref: &str) -> u64 {
+    (sm_context_ref.parse::<u64>().unwrap_or(1)) | 0x1000
+}
+
 fn lookup_upf_seid(sm_context_ref: &str) -> Option<u64> {
     smf_self().read().ok().and_then(|ctx| {
         ctx.pfcp_sessions
@@ -2383,9 +2439,15 @@ fn lookup_policy_binding(sm_context_ref: &str) -> Option<context::PolicyBinding>
 }
 
 /// Send a PFCP QER modification carrying an authorized Session-AMBR.
-async fn pfcp_update_session_qer(upf_seid: u64, qfi: u8, ambr_ul: u64, ambr_dl: u64) -> Result<()> {
-    let client =
-        pfcp_path::global_client().ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+async fn pfcp_update_session_qer(
+    smf_n4_seid: u64,
+    upf_seid: u64,
+    qfi: u8,
+    ambr_ul: u64,
+    ambr_dl: u64,
+) -> Result<()> {
+    let client = pfcp_path::client_for_session(smf_n4_seid)
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
     let params = n4_build::SessionModificationParams {
         update_qers: vec![n4_build::QerParams {
             qer_id: 1,
@@ -2413,9 +2475,9 @@ async fn pfcp_update_session_qer(upf_seid: u64, qfi: u8, ambr_ul: u64, ambr_dl: 
 
 /// Deactivate the downlink FAR (back to BUFF) — used when the AN-side
 /// resources failed or the UP connection is deactivated.
-async fn pfcp_deactivate_dl_far(upf_seid: u64) -> Result<()> {
-    let client =
-        pfcp_path::global_client().ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+async fn pfcp_deactivate_dl_far(smf_n4_seid: u64, upf_seid: u64) -> Result<()> {
+    let client = pfcp_path::client_for_session(smf_n4_seid)
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
     let params = n4_build::SessionModificationParams {
         update_fars_deactivate: vec![2],
         ..Default::default()
@@ -2497,7 +2559,14 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 log::error!("No stored UPF SEID for ref={sm_context_ref}");
                 return SbiResponse::with_status(404);
             };
-            match pfcp_session_modify(upf_seid, gnb_teid, gnb_addr).await {
+            match pfcp_session_modify(
+                smf_n4_seid_for(sm_context_ref),
+                upf_seid,
+                gnb_teid,
+                gnb_addr,
+            )
+            .await
+            {
                 Ok(()) => {
                     log::info!(
                         "PFCP Session Modified: DL FAR activated with gNB TEID=0x{gnb_teid:08x}"
@@ -2522,7 +2591,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         "PDU_RES_SETUP_FAIL" | "PATH_SWITCH_SETUP_FAIL" | "HANDOVER_RES_ALLOC_FAIL" => {
             log::warn!("SM Context Update ({n2_sm_info_type}): AN resource failure for ref={sm_context_ref}");
             if let Some(upf_seid) = lookup_upf_seid(sm_context_ref) {
-                if let Err(e) = pfcp_deactivate_dl_far(upf_seid).await {
+                if let Err(e) =
+                    pfcp_deactivate_dl_far(smf_n4_seid_for(sm_context_ref), upf_seid).await
+                {
                     log::warn!("DL FAR deactivation after AN failure failed: {e}");
                 }
             }
@@ -2604,7 +2675,15 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
 
             // Apply the authorized QoS to the N4 session QER
             if let Some(seid) = lookup_upf_seid(sm_context_ref) {
-                if let Err(e) = pfcp_update_session_qer(seid, qfi, ambr_ul, ambr_dl).await {
+                if let Err(e) = pfcp_update_session_qer(
+                    smf_n4_seid_for(sm_context_ref),
+                    seid,
+                    qfi,
+                    ambr_ul,
+                    ambr_dl,
+                )
+                .await
+                {
                     log::error!("{e}");
                     return SbiResponse::with_status(504);
                 }
@@ -2660,7 +2739,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             if up_cnx_state == "DEACTIVATED" {
                 // UE went idle: buffer downlink traffic at the UPF
                 if let Some(upf_seid) = lookup_upf_seid(sm_context_ref) {
-                    if let Err(e) = pfcp_deactivate_dl_far(upf_seid).await {
+                    if let Err(e) =
+                        pfcp_deactivate_dl_far(smf_n4_seid_for(sm_context_ref), upf_seid).await
+                    {
                         log::warn!("DL FAR deactivation failed: {e}");
                         return SbiResponse::with_status(504);
                     }
@@ -2801,7 +2882,7 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
 
     if let Some(seid) = upf_seid {
         // Send PFCP Session Deletion Request to UPF (with retransmission)
-        match pfcp_session_delete(seid).await {
+        match pfcp_session_delete(smf_n4_seid_for(sm_context_ref), seid).await {
             Ok(()) => {
                 log::info!("PFCP Session Deleted: UPF SEID=0x{seid:016x} for ref={sm_context_ref}");
                 if let Some(ref mut f) = fsm {
@@ -3006,6 +3087,7 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
     // Apply to the N4 session QER (copy SEID out, no guards across await)
     if let Some(seid) = lookup_upf_seid(sm_context_ref) {
         if let Err(e) = pfcp_update_session_qer(
+            smf_n4_seid_for(sm_context_ref),
             seid,
             binding.qfi,
             dec.sess_ambr_ul_bps,

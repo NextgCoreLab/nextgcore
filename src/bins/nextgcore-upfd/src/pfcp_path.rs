@@ -863,8 +863,21 @@ impl PfcpServer {
     /// direction, TS 29.244 7.4.2). Returns the peer address if one was sent.
     pub async fn send_heartbeat_request(&self) -> Option<SocketAddr> {
         let peer = self.association.read().await.as_ref()?.peer_addr;
-        let payload = crate::n4_build::build_heartbeat_request(self.recovery_time_stamp);
         let seq = self.alloc_seq();
+        // Issue #20 (compute-aware-upf): piggy-back the session-occupancy
+        // load metric on the periodic heartbeat as a Load Control
+        // Information IE. The LCI sequence number reuses this request's
+        // monotonic PFCP sequence number so the SMF can discard stale
+        // updates. Off by default: the wire bytes are unchanged unless the
+        // feature is enabled.
+        #[cfg(feature = "compute-aware-upf")]
+        let payload = crate::n4_build::build_heartbeat_request_with_load(
+            self.recovery_time_stamp,
+            seq,
+            crate::context::upf_self().get_load(),
+        );
+        #[cfg(not(feature = "compute-aware-upf"))]
+        let payload = crate::n4_build::build_heartbeat_request(self.recovery_time_stamp);
         let message = self.build_response(pfcp_type::HEARTBEAT_REQUEST, 0, seq, &payload, false);
         match self.socket.send_to(&message, peer).await {
             Ok(_) => {

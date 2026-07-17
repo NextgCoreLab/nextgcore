@@ -7,10 +7,10 @@ use crate::header::{PfcpHeader, PfcpMessageType};
 use crate::ie::{encode_u16_ie, encode_u32_ie, encode_u8_ie, IeHeader, IeType, RawIe};
 use crate::types::{
     ApplicationIdsPfds, CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer, CreateUrr,
-    DownlinkDataReport, FSeid, FqCsid, GracefulReleasePeriod, NodeId, NodeReportType,
-    PfcpAssociationReleaseRequest, PfcpCause, PfcpSessionChangeInfo, PfdPartialFailureInformation,
-    RemoveFar, RemovePdr, ReportType, UpFunctionFeatures, UpdateFar, UpdatePdr, UsageReportSrr,
-    UserPlanePathFailureReport,
+    DownlinkDataReport, FSeid, FqCsid, GracefulReleasePeriod, LoadControlInformation, NodeId,
+    NodeReportType, PfcpAssociationReleaseRequest, PfcpCause, PfcpSessionChangeInfo,
+    PfdPartialFailureInformation, RemoveFar, RemovePdr, ReportType, UpFunctionFeatures, UpdateFar,
+    UpdatePdr, UsageReportSrr, UserPlanePathFailureReport,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -18,32 +18,58 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeartbeatRequest {
     pub recovery_time_stamp: u32,
+    /// Optional Load Control Information (issue #20): a UP function may
+    /// piggy-back its load metric on the periodic heartbeat so the CP
+    /// function can do load-aware UPF selection (TS 23.501 Section 6.3.3
+    /// input; heartbeat carriage itself is a nextgcore extension, see
+    /// [`LoadControlInformation`]). Absent on standard peers.
+    pub load_control_information: Option<LoadControlInformation>,
 }
 
 impl HeartbeatRequest {
     pub fn new(recovery_time_stamp: u32) -> Self {
         Self {
             recovery_time_stamp,
+            load_control_information: None,
         }
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
         encode_u32_ie(buf, IeType::RecoveryTimeStamp, self.recovery_time_stamp);
+
+        if let Some(lci) = &self.load_control_information {
+            let mut lci_buf = BytesMut::new();
+            lci.encode(&mut lci_buf);
+            let header = IeHeader::new(IeType::LoadControlInformation as u16, lci_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&lci_buf);
+        }
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut recovery_time_stamp = 0u32;
+        let mut load_control_information = None;
 
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
-            if ie.ie_type == IeType::RecoveryTimeStamp as u16 && ie.data.len() >= 4 {
-                let mut data = ie.data;
-                recovery_time_stamp = data.get_u32();
+            match ie.ie_type {
+                t if t == IeType::RecoveryTimeStamp as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        recovery_time_stamp = data.get_u32();
+                    }
+                }
+                t if t == IeType::LoadControlInformation as u16 => {
+                    let mut data = ie.data;
+                    load_control_information = Some(LoadControlInformation::decode(&mut data)?);
+                }
+                _ => {}
             }
         }
 
         Ok(Self {
             recovery_time_stamp,
+            load_control_information,
         })
     }
 }
@@ -2122,9 +2148,71 @@ mod tests {
 
         if let PfcpMessage::HeartbeatRequest(req) = decoded {
             assert_eq!(req.recovery_time_stamp, 1234567890);
+            // A plain heartbeat carries no Load Control Information.
+            assert!(req.load_control_information.is_none());
         } else {
             panic!("Wrong message type");
         }
+    }
+
+    // Issue #20: Load Control Information piggy-backed on the heartbeat.
+    #[test]
+    fn test_build_parse_heartbeat_with_load_control() {
+        let mut hb = HeartbeatRequest::new(1234567890);
+        hb.load_control_information = Some(LoadControlInformation::new(7, 42));
+        let msg = PfcpMessage::HeartbeatRequest(hb);
+        let buf = build_message(&msg, 2, None);
+
+        let mut bytes = buf.freeze();
+        let (header, decoded) = parse_message(&mut bytes).unwrap();
+
+        assert_eq!(header.message_type, PfcpMessageType::HeartbeatRequest);
+        if let PfcpMessage::HeartbeatRequest(req) = decoded {
+            assert_eq!(req.recovery_time_stamp, 1234567890);
+            let lci = req.load_control_information.expect("LCI must round-trip");
+            assert_eq!(lci.sequence_number, 7);
+            assert_eq!(lci.metric, 42);
+        } else {
+            panic!("Wrong message type");
+        }
+    }
+
+    #[test]
+    fn test_heartbeat_load_control_exact_bytes() {
+        // RTS IE (96, len 4) + LCI grouped IE (51, len 13) containing
+        // Sequence Number (52, len 4) + Metric (53, len 1).
+        let mut hb = HeartbeatRequest::new(0x0102_0304);
+        hb.load_control_information = Some(LoadControlInformation::new(1, 100));
+        let mut buf = BytesMut::new();
+        hb.encode(&mut buf);
+        assert_eq!(
+            buf.as_ref(),
+            &[
+                0x00, 0x60, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04, // RecoveryTimeStamp
+                0x00, 0x33, 0x00, 0x0D, // LoadControlInformation header
+                0x00, 0x34, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, // SequenceNumber
+                0x00, 0x35, 0x00, 0x01, 0x64, // Metric = 100
+            ]
+        );
+
+        let mut bytes = buf.freeze();
+        let decoded = HeartbeatRequest::decode(&mut bytes).unwrap();
+        assert_eq!(
+            decoded.load_control_information,
+            Some(LoadControlInformation::new(1, 100))
+        );
+    }
+
+    #[test]
+    fn test_load_control_information_missing_children_rejected() {
+        // A Metric-less LCI (only a Sequence Number child) must be rejected.
+        let mut inner = BytesMut::new();
+        encode_u32_ie(&mut inner, IeType::SequenceNumber, 9);
+        let mut bytes = inner.freeze();
+        assert!(matches!(
+            LoadControlInformation::decode(&mut bytes),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
     }
 
     #[test]

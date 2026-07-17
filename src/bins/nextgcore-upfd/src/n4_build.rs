@@ -117,6 +117,9 @@ pub mod pfcp_ie {
     pub const DESTINATION_INTERFACE: u16 = 42;
     pub const UP_FUNCTION_FEATURES: u16 = 43;
     pub const APPLY_ACTION: u16 = 44;
+    pub const LOAD_CONTROL_INFORMATION: u16 = 51;
+    pub const SEQUENCE_NUMBER: u16 = 52;
+    pub const METRIC: u16 = 53;
     pub const PDR_ID: u16 = 56;
     pub const F_SEID: u16 = 57;
     pub const NODE_ID: u16 = 60;
@@ -1697,6 +1700,34 @@ pub fn build_heartbeat_request(recovery_time_stamp: u32) -> Vec<u8> {
     builder.build()
 }
 
+/// Build a Heartbeat Request carrying a Load Control Information grouped IE
+/// (issue #20: load/compute-aware UPF selection).
+///
+/// Children per TS 29.244 §7.4.3.2: Load Control Sequence Number (IE 52,
+/// u32) + Load Metric (IE 53, one octet, 0..=100 percentage per §8.2.53).
+/// Carrying the IE on the heartbeat is a nextgcore extension (TS 29.244
+/// defines it for session-level messages); the Rel-19 "Compute-Aware
+/// Networking" study has no frozen Stage-3, so the compute reading of the
+/// metric is a non-normative research prototype.
+pub fn build_heartbeat_request_with_load(
+    recovery_time_stamp: u32,
+    load_seq: u32,
+    load_metric: u8,
+) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
+    // Grouped LCI: encode the two child TLVs into a scratch buffer first.
+    let mut lci = Vec::with_capacity(13);
+    lci.extend_from_slice(&pfcp_ie::SEQUENCE_NUMBER.to_be_bytes());
+    lci.extend_from_slice(&4u16.to_be_bytes());
+    lci.extend_from_slice(&load_seq.to_be_bytes());
+    lci.extend_from_slice(&pfcp_ie::METRIC.to_be_bytes());
+    lci.extend_from_slice(&1u16.to_be_bytes());
+    lci.push(load_metric.min(100));
+    builder.add_tlv(pfcp_ie::LOAD_CONTROL_INFORMATION, &lci);
+    builder.build()
+}
+
 /// UP Function Features actually implemented by this UPF.
 ///
 /// Only features with working code paths are advertised (TS 29.244 8.2.25):
@@ -1817,6 +1848,46 @@ pub fn parse_pfcpsmreq_flags(payload: &[u8]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #20 cross-codec check: the raw-TLV heartbeat-with-load builder
+    /// must produce bytes the workspace nextgcore-pfcp codec (used by the
+    /// SMF receive side) parses back into the same Load Control Information.
+    #[test]
+    fn test_heartbeat_request_with_load_parses_via_lib_codec() {
+        let payload = build_heartbeat_request_with_load(0xDEAD_BEEF, 41, 87);
+        let mut bytes = bytes::Bytes::from(payload);
+        let decoded = nextgcore_pfcp::message::HeartbeatRequest::decode(&mut bytes)
+            .expect("lib codec must parse the UPF-built heartbeat");
+        assert_eq!(decoded.recovery_time_stamp, 0xDEAD_BEEF);
+        let lci = decoded
+            .load_control_information
+            .expect("LCI must survive the cross-codec round trip");
+        assert_eq!(lci.sequence_number, 41);
+        assert_eq!(lci.metric, 87);
+    }
+
+    /// The metric is a TS 29.244 §8.2.53 percentage: values above 100 are
+    /// clamped at build time.
+    #[test]
+    fn test_heartbeat_request_with_load_clamps_metric() {
+        let payload = build_heartbeat_request_with_load(1, 1, 250);
+        let mut bytes = bytes::Bytes::from(payload);
+        let decoded = nextgcore_pfcp::message::HeartbeatRequest::decode(&mut bytes).unwrap();
+        assert_eq!(decoded.load_control_information.unwrap().metric, 100);
+    }
+
+    /// Regression: the default heartbeat builder stays byte-for-byte free of
+    /// the Load Control Information IE (feature-off wire compatibility).
+    #[test]
+    fn test_plain_heartbeat_request_has_no_lci() {
+        let payload = build_heartbeat_request(7);
+        // One RecoveryTimeStamp TLV only: 4-byte IE header + 4-byte value.
+        assert_eq!(payload.len(), 8);
+        let mut bytes = bytes::Bytes::from(payload);
+        let decoded = nextgcore_pfcp::message::HeartbeatRequest::decode(&mut bytes).unwrap();
+        assert_eq!(decoded.recovery_time_stamp, 7);
+        assert!(decoded.load_control_information.is_none());
+    }
 
     #[test]
     fn test_pfcp_cause_from_u8() {

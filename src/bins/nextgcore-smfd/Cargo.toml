@@ -10,6 +10,17 @@ description = "NextGCore SMF (Session Management Function)"
 name = "nextgcore-smfd"
 path = "src/main.rs"
 
+[features]
+## Issue #20: load/compute-aware UPF selection. With the feature enabled and
+## several UPFs configured (comma-separated UPF_PFCP_ADDR), a NEW session is
+## placed on the least-loaded *associated* peer, using the load metric each
+## UPF reports via Load Control Information on its PFCP heartbeat
+## (TS 23.501 6.3.3 selection input). Off by default: session establishment
+## uses the single default client exactly as before. Rel-19 "Compute-Aware
+## Networking" has no frozen Stage-3 (non-normative research knob).
+## Enable with: cargo build -p nextgcore-smfd --features compute-aware-upf
+compute-aware-upf = []
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-nas = { workspace = true }
