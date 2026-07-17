@@ -1,0 +1,32 @@
+[package]
+name = "nextgcore-tsctsf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore TSCTSF (Time Sensitive Communication and Time Synchronization Function, TS 23.501 5.27-5.28 / TS 29.565)"
+
+[[bin]]
+name = "nextgcore-tsctsf"
+path = "src/main.rs"
+
+[dependencies]
+nextgcore-core = { workspace = true }
+nextgcore-sbi = { workspace = true }
+nextgcore-metrics = { workspace = true }
+nextgcore-app = { workspace = true }
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_yaml.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
