@@ -24,6 +24,8 @@ pub mod federation;
 pub mod ml_service;
 pub mod notification_dispatcher;
 pub mod nrf_collector;
+#[cfg(feature = "onnx-model")]
+pub mod onnx_model; // issue #26: zero-dep ONNX LinearRegressor subset backend
 mod sbi_handler;
 
 pub use context::*;
@@ -197,6 +199,22 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("nwdaf-{}", uuid::Uuid::new_v4()));
 
     nwdaf_context_init(nf_instance_id.clone(), args.max_subscriptions);
+
+    // Issue #26: optional prediction-model selection. Default (env unset) is
+    // the OLS baseline — behavior-identical to the pre-#26 inline math.
+    if let Ok(model_id) = std::env::var("NWDAF_PREDICTION_MODEL") {
+        match ml_service::load_model(&model_id) {
+            Ok(model) => {
+                let ctx = nwdaf_self();
+                let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+                guard.lock_engine().set_predictor(model);
+                log::info!("NF_LOAD prediction model set to {model_id}");
+            }
+            Err(e) => {
+                log::warn!("NWDAF_PREDICTION_MODEL={model_id} ignored ({e}); keeping ols-linear");
+            }
+        }
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());

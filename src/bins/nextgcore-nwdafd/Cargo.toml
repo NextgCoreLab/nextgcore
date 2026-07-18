@@ -15,6 +15,12 @@ path = "src/main.rs"
 ## bounded in-memory store, Isac pub-sub event + ingest metric. Off by default.
 ## Enable with: cargo build -p nextgcore-nwdafd --features sensing
 sensing = ["dep:nextgcore-proto", "nextgcore-sbi/6g-extensions"]
+## Issue #26: ONNX-backed NF_LOAD prediction (non-normative). Zero-dependency
+## hand-rolled reader for a minimal ONNX subset — exactly one ai.onnx.ml
+## LinearRegressor node; anything else is a hard error. Off by default; the
+## default build keeps the OLS baseline and needs no model file.
+## Enable with: cargo build -p nextgcore-nwdafd --features onnx-model
+onnx-model = []
 
 [dependencies]
 nextgcore-core = { workspace = true }
