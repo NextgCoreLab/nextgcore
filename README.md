@@ -349,6 +349,7 @@ cargo audit
 - [docs/intent-driven-policy-loop.md](docs/intent-driven-policy-loop.md) — intent-driven closed-loop policy design note (non-normative 6G research)
 - [docs/network-state-snapshot.md](docs/network-state-snapshot.md) — aggregate network-state snapshot / digital-twin export design note (non-normative 6G research)
 - [docs/nwdaf-inference.md](docs/nwdaf-inference.md) — NWDAF analytics inference abstraction and ONNX-subset backend design note (non-normative 6G research)
+- [docs/slice-sla-observe.md](docs/slice-sla-observe.md) — observe-only slice-SLA assurance loop design note (non-normative research)
 - [docker/rust/CI.md](docker/rust/CI.md) — the one-command matched-sim end-to-end suite (`e2e.sh`)
 - [docs/](docs/) — per-component gap analyses and architecture notes
 

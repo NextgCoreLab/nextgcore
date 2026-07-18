@@ -10,6 +10,15 @@ description = "NextGCore NSACF (Network Slice Admission Control Function, TS 23.
 name = "nextgcore-nsacfd"
 path = "src/main.rs"
 
+[features]
+## Issue #27: observe-only slice-SLA assurance loop (non-normative; aligns
+## with TS 28.530/28.541 but is a prototype). Evaluates configured per-slice
+## admission-utilization thresholds against live NSACF counters and emits
+## breach metrics/log transitions. Off by default: admission behavior is
+## untouched and no listener is bound unless nsacf.sla.metrics_port opts in.
+## Enable with: cargo build -p nextgcore-nsacfd --features sla-observe
+sla-observe = []
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }

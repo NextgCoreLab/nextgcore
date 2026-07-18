@@ -204,7 +204,7 @@ pub async fn serve_metrics(
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    log::info!("NES metrics endpoint listening on http://{bound}/metrics");
+    log::info!("metrics endpoint listening on http://{bound}/metrics");
 
     let handle = tokio::spawn(async move {
         loop {
