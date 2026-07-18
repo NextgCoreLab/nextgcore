@@ -37,6 +37,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 mod context;
+#[cfg(feature = "sla-observe")]
+mod sla_observe; // issue #27: observe-only slice-SLA loop (off by default)
 
 pub use context::*;
 
@@ -82,6 +84,12 @@ struct NsacfSection {
     sbi: Option<SbiYaml>,
     nrf: Option<NrfYaml>,
     slice_quotas: Option<Vec<SliceQuotaYaml>>,
+    /// Raw YAML value, NOT typed (issue #27): a malformed sla block must
+    /// never fail the whole `NsacfYaml` parse — that would silently drop
+    /// `slice_quotas` provisioning and reject every admission
+    /// SLICE_NOT_AVAILABLE. Lenient typed conversion happens under the
+    /// `sla-observe` feature.
+    sla: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -248,9 +256,15 @@ async fn main() -> Result<()> {
     // --oauth2-require is a dev override of the config value.
     let mut nrf_uri_cfg: Option<String> = Some(args.nrf_uri.clone());
     let mut require_oauth2 = false;
+    #[cfg(feature = "sla-observe")]
+    let mut sla_raw: Option<serde_yaml::Value> = None;
     if let Ok(content) = std::fs::read_to_string(&args.config) {
         if let Ok(yaml) = serde_yaml::from_str::<NsacfYaml>(&content) {
             if let Some(nsacf) = yaml.nsacf {
+                #[cfg(feature = "sla-observe")]
+                {
+                    sla_raw = nsacf.sla.clone();
+                }
                 // Provision the locally-configured slice quotas (TS 29.536
                 // §6.1.3.4 local NSAC config). Without this, the NSACF starts
                 // with an EMPTY quota table and every admission request is
@@ -387,6 +401,11 @@ async fn main() -> Result<()> {
             },
         );
     }
+
+    // Issue #27: observe-only slice-SLA loop (feature `sla-observe`,
+    // off by default). No listener unless nsacf.sla.metrics_port opts in.
+    #[cfg(feature = "sla-observe")]
+    sla_observe::spawn_if_enabled(sla_raw);
 
     log::info!("NextGCore NSACF ready (instance: {nf_instance_id})");
 
@@ -1753,6 +1772,24 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #27: the `nsacf.sla` field is a raw Value precisely so a
+    /// malformed block can NEVER fail the whole config parse (which would
+    /// silently drop slice_quotas provisioning and reject every admission).
+    #[test]
+    fn test_malformed_sla_block_does_not_break_config_parse() {
+        let yaml = r#"
+nsacf:
+  slice_quotas:
+    - sst: 1
+      max_ues: 10
+  sla: "this is not a mapping"
+"#;
+        let parsed: NsacfYaml = serde_yaml::from_str(yaml).expect("whole parse must survive");
+        let nsacf = parsed.nsacf.expect("nsacf section");
+        assert_eq!(nsacf.slice_quotas.as_deref().map(|q| q.len()), Some(1));
+        assert!(nsacf.sla.is_some(), "raw sla value captured verbatim");
+    }
     use super::*;
     use nextgcore_sbi::client::SbiClient;
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};

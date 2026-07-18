@@ -19,3 +19,16 @@ nsacf:
     - sst: 3
       max_ues: 2000
       max_pdu_sessions: 4000
+  # Issue #27: observe-only slice-SLA assurance (non-normative; requires a
+  # build with --features sla-observe). Evaluates per-slice admission
+  # utilization against the thresholds and emits breach gauges + log
+  # transitions. Off by default; metrics_port 0/absent binds NO listener.
+  # See docs/slice-sla-observe.md.
+  sla:
+    enabled: false
+    poll_interval_secs: 30
+    metrics_port: 0
+    slices:
+      - sst: 1
+        max_ue_utilization_pct: 80.0
+        max_pdu_utilization_pct: 80.0
