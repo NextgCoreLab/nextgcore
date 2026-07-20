@@ -30,7 +30,7 @@ use crate::gmm_handler::payload_container_type;
 use crate::gmm_sm::GmmFsm;
 use crate::nas_security;
 use crate::ngap_asn1;
-use crate::ngap_handler::{self, time_to_wait, NgSetupRequest, NgapHandlerResult};
+use crate::ngap_handler::{self, time_to_wait, NgapHandlerResult};
 use crate::ngap_sm::NgapFsm;
 use crate::timer::{AmfTimerConfigs, AmfTimerId};
 
@@ -833,6 +833,28 @@ impl NgapServer {
                 self.handle_uplink_non_ue_associated_nrppa_transport(association_id, data)
                     .await?;
             }
+            Some(35) => {
+                // RAN CONFIGURATION UPDATE (TS 38.413 §8.7.2): gNB->AMF
+                // InitiatingMessage. Acknowledge it instead of rejecting it with
+                // an Error Indication (which would break NG-C config sync).
+                if data[0] == 0x00 {
+                    self.handle_ran_configuration_update(association_id, data)
+                        .await?;
+                }
+            }
+            Some(19) | Some(27) | Some(30) | Some(44) | Some(48) | Some(49) | Some(52) => {
+                // Expected gNB-initiated procedures the AMF accepts without a
+                // response (TS 38.413): NAS Non Delivery Indication (19), PDU
+                // Session Resource Modify Indication (27), Notify (30), UE Radio
+                // Capability Info Indication (44), Uplink RAN Configuration
+                // Transfer (48), Uplink RAN Status Transfer (49), Secondary RAT
+                // Data Usage Report (52). Accept and log rather than answering
+                // with an (incorrect) Error Indication; full relay to the SMF /
+                // target gNB is tracked as follow-up work.
+                log::info!(
+                    "NGAP procedure {procedure_code:?} from association {association_id} accepted (no AMF response required)"
+                );
+            }
             _ => {
                 // Unknown / unsupported procedure: the PDU is either undecodable
                 // or for a procedure the AMF does not implement. Per TS 38.413
@@ -945,8 +967,21 @@ impl NgapServer {
                 req
             }
             None => {
-                log::warn!("Failed to parse NG Setup Request, using fallback");
-                self.parse_ng_setup_request_fallback(data)
+                // TS 38.413 §8.7.3: an undecodable / unacceptable NG SETUP
+                // REQUEST must be answered with NG SETUP FAILURE — never a
+                // fabricated request accepted with NG SETUP RESPONSE.
+                log::warn!(
+                    "Undecodable NG Setup Request from association {association_id}; sending NG SETUP FAILURE"
+                );
+                let failure = ngap_asn1::build_ng_setup_failure_asn1(
+                    ngap_handler::cause_group::PROTOCOL,
+                    4, // Protocol / SemanticError
+                    Some(time_to_wait::V1S),
+                );
+                if !failure.is_empty() {
+                    self.send_to_association(association_id, &failure).await?;
+                }
+                return Ok(());
             }
         };
 
@@ -1076,24 +1111,35 @@ impl NgapServer {
     }
 
     /// Parse NG Setup Request (fallback when ASN.1 parsing fails)
-    fn parse_ng_setup_request_fallback(&self, _data: &[u8]) -> NgSetupRequest {
-        NgSetupRequest {
-            global_ran_node_id_present: true,
-            gnb_id: 1,
-            gnb_id_len: 22,
-            plmn_id: crate::context::PlmnId::new("999", "70"),
-            ran_node_name: Some("gNB-nextgsim".to_string()),
-            supported_ta_list: vec![crate::context::SupportedTa {
-                tac: 1,
-                num_of_bplmn_list: 1,
-                bplmn_list: vec![crate::context::BplmnEntry {
-                    plmn_id: crate::context::PlmnId::new("999", "70"),
-                    num_of_s_nssai: 1,
-                    s_nssai: vec![crate::context::SNssai { sst: 1, sd: None }],
-                }],
-            }],
-            default_paging_drx: 0,
+    /// Handle an inbound RAN CONFIGURATION UPDATE (TS 38.413 §8.7.2) by replying
+    /// with RAN CONFIGURATION UPDATE ACKNOWLEDGE. The advertised TA list is
+    /// logged; persisting it into the stored gNB context is tracked as follow-up.
+    async fn handle_ran_configuration_update(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        if let Ok(nextgcore_ngap::NgapMessage::RanConfigurationUpdate(upd)) =
+            nextgcore_ngap::parser::decode_ngap_pdu(data)
+        {
+            log::info!(
+                "RAN Configuration Update from association {}: ran_node_name={:?}, ta_list_len={}",
+                association_id,
+                upd.ran_node_name,
+                upd.supported_ta_list.as_ref().map_or(0, |l| l.len())
+            );
         }
+        match nextgcore_ngap::builder::build_ran_configuration_update_acknowledge(
+            &nextgcore_ngap::types::RanConfigurationUpdateAcknowledge {
+                criticality_diagnostics: None,
+            },
+        ) {
+            Ok(ack) => self.send_to_association(association_id, &ack).await?,
+            Err(e) => {
+                log::error!("Failed to build RAN Configuration Update Acknowledge: {e:?}")
+            }
+        }
+        Ok(())
     }
 
     /// Handle Initial UE Message
@@ -7370,6 +7416,37 @@ mod tests {
         let ctx = crate::context::amf_self();
         let guard = ctx.read().expect("ctx lock");
         guard.n1n2_subscription_remove(supi, sub_id);
+    }
+
+    /// Issue #71: expected gNB-initiated procedures (NAS Non Delivery
+    /// Indication, PDU Session Resource Modify Indication / Notify, UE Radio
+    /// Capability Info Indication, Uplink RAN Configuration / Status Transfer,
+    /// Secondary RAT Data Usage Report) must be accepted and NOT answered with a
+    /// blanket Error Indication (TS 38.413). On the association-less test server
+    /// an accepted procedure returns `Ok` (no egress) whereas the catch-all
+    /// Error-Indication path returns `Err` (the SCTP send fails).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_accepted_gnb_procedures_do_not_error_indicate() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        // Control: an unknown procedure still hits the `_` arm → attempts an
+        // Error Indication → (no association) send fails → Err.
+        assert!(
+            ngap.process_ngap_message(1, &[0x00u8, 99, 0x00])
+                .await
+                .is_err(),
+            "control: unknown procedure must still attempt an Error Indication"
+        );
+
+        // Each accepted gNB-initiated procedure returns Ok (no Error Indication).
+        for pc in [19u8, 27, 30, 44, 48, 49, 52] {
+            ngap.process_ngap_message(1, &[0x00u8, pc, 0x00])
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("procedure {pc} must be accepted without an Error Indication, got {e:?}")
+                });
+        }
     }
 }
 
