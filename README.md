@@ -19,11 +19,18 @@ NextGCore is a pure Rust implementation of a 5G/LTE mobile core network, derived
 The fastest way to deploy a complete 5G core:
 
 ```bash
-# Clone the repository
-git clone https://github.com/nextgcore/nextgcore.git
+
+# Clone the repo for 5G/LTE Core Network 
+git clone https://github.com/NextgCoreLab/nextgcore.git
+
+# Clone the repo for UE/gNB Simulator
+git clone https://github.com/NextgCoreLab/nextgsim.git
+
+# Go to directory containing Docker yamls and configurations for deploying the NextGCore Rust implementation.
 cd nextgcore/docker/rust
 
 # Build all images (compiles both workspaces in a builder container)
+# This step will show a warning - "WARN[0000] No services to build" - which can be ignored. 
 docker compose -f docker-compose.yml build
 
 # Start the 5G core
