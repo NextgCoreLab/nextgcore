@@ -380,8 +380,11 @@ pub fn handle_authentication_response(
     amf_ue: &mut AmfUe,
     response: &AuthenticationResponse,
 ) -> Result<(), GmmCause> {
-    log::debug!(
-        "[{}] Authentication response",
+    // INFO, not DEBUG: receiving the Authentication Response is a milestone in
+    // the registration procedure, and the default deployment log level is info,
+    // so at debug this step was invisible in an otherwise complete auth trace.
+    log::info!(
+        "[{}] Received Authentication Response",
         amf_ue.suci.as_deref().unwrap_or("Unknown")
     );
 
@@ -401,6 +404,14 @@ pub fn handle_authentication_response(
         log::error!("HXRES* mismatch - MAC failure");
         return Err(GmmCause::MacFailure);
     }
+    // Log the success case too, not just the mismatch. HXRES* comparison is the
+    // point where the AMF decides the UE proved knowledge of K (TS 33.501
+    // §6.1.3.2), so "it passed" is exactly as diagnostic as "it failed" -- and
+    // previously only the failure branch was observable.
+    log::info!(
+        "[{}] HXRES* verification passed",
+        amf_ue.suci.as_deref().unwrap_or("Unknown")
+    );
 
     // Store XRES*
     amf_ue.xres_star.copy_from_slice(&response.res_star);
