@@ -1,0 +1,33 @@
+# Base kustomization for the nextgcore 5G core manifests.
+#
+# These manifests were written for Kind (see deploy.sh). This file only groups
+# them so they can be consumed as a kustomize base; it changes nothing.
+#
+# Environment overlays live elsewhere:
+#   nextgcore/deploy/eks/   - EKS overlay (addressing, probes, storage, ECR)
+#
+# Rendered standalone:
+#   kubectl kustomize nextgcore/k8s
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - base/namespace.yaml
+  - manifests/configmap.yaml
+  - manifests/mongodb.yaml
+  - manifests/mongodb-init.yaml
+  # Dependency order is enforced by initContainers in each manifest, not by
+  # ordering here - kustomize does not sequence applies.
+  - manifests/nrf.yaml
+  - manifests/ausf.yaml
+  - manifests/udm.yaml
+  - manifests/udr.yaml
+  - manifests/pcf.yaml
+  - manifests/nssf.yaml
+  - manifests/bsf.yaml
+  - manifests/amf.yaml
+  - manifests/smf.yaml
+  - manifests/upf.yaml
+  - monitoring/prometheus.yaml
+  - monitoring/grafana.yaml
+  - monitoring/jaeger.yaml

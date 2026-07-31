@@ -1,0 +1,3 @@
+# Output of `DRY_RUN=true ./deploy-eks.sh` - regenerated on demand, and it
+# embeds an account-specific ECR registry host.
+rendered.dryrun.yaml

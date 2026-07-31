@@ -1,0 +1,46 @@
+# EKS overlay over the Kind manifests in nextgcore/k8s/ and nextgsim/k8s/.
+#
+# Rendered without applying:
+#   kubectl kustomize .
+#
+# Applied by deploy-eks.sh, which orders the rollout and creates the
+# udm-hnet-keys Secret first (kustomize has no ordering guarantees).
+#
+# Image tags are rewritten from the local `nextgcore-rust/<nf>:latest` names
+# the Kind manifests use to ECR. deploy-eks.sh substitutes the registry.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nextg-system
+
+resources:
+  # nextgcore base: namespace, config, MongoDB + init Job, 10 NFs, monitoring
+  - ../../k8s
+  # nextgsim base: gNB + UE
+  - ../../../nextgsim/k8s
+
+patches:
+  # Addressing: replaces the nslookup|grep|awk resolvers. The reasoning is in
+  # each patch header and in README.md; the short version is that the
+  # simulator's config types are IpAddr, so literal IPs are mandatory and a
+  # hostname is silently dropped by the UE.
+  - path: patches/gnb-addressing.yaml
+  - path: patches/ue-addressing.yaml
+  # Headless Services so the resolvers get pod IPs, not ClusterIPs.
+  - path: patches/headless-services.yaml
+  # Real probes + explicit userspace-SCTP-over-UDP transport for NGAP.
+  - path: patches/amf-probes.yaml
+  # Mount the SUCI de-concealment keys the Kind manifests forgot.
+  - path: patches/udm-hnet-secret.yaml
+  # gp3 PVC; an unbound PVC would leave MongoDB Pending on EKS.
+  - path: patches/storage-class.yaml
+  # UPF control-plane-only. deploy-eks.sh swaps in upf-dataplane.yaml when
+  # ENABLE_DATAPLANE=true.
+  - path: patches/upf-nodataplane.yaml
+
+# All 6G/AI features stay off. That is the validated configuration - the
+# 84/84 E2E result is with every 6G flag disabled.
+labels:
+  - includeSelectors: false
+    pairs:
+      nextg.io/environment: eks-lab

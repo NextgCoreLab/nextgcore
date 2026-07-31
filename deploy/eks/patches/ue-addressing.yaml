@@ -1,0 +1,131 @@
+# UE addressing for EKS.
+#
+# The UE's failure mode here is the nastiest one in the deployment:
+#
+#   nextgsim-ue/src/rls/task.rs:100-106
+#     let gnb_search_list: Vec<SocketAddr> = ...
+#         .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+#
+# gnb_search_list is Vec<String>, so a hostname *deserializes fine* and is
+# then SILENTLY DROPPED by filter_map. The UE starts with an empty search
+# list, never finds a cell, and emits no error naming the config. Symptom is
+# "UE just sits there".
+#
+# So the resolver below treats a failed resolution as fatal, and asserts the
+# rewritten value is a literal IPv4 address before the UE container starts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ue
+  namespace: nextg-system
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: wait-gnb
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              echo "[wait-gnb] waiting for gNB DNS..."
+              i=0
+              until nslookup gnb.nextg-system.svc.cluster.local >/dev/null 2>&1; do
+                i=$((i+1))
+                [ "$i" -ge 60 ] && { echo "[wait-gnb] FATAL: gNB DNS never resolved"; exit 1; }
+                sleep 2
+              done
+              echo "[wait-gnb] gNB DNS resolves."
+              # RLS is UDP so there is no connect() to test. The gNB Deployment
+              # carries a readiness probe on its UDP 4997 bind, and this
+              # Deployment's initContainer ordering plus that probe is the
+              # actual gate. A short settle is still needed because DNS can
+              # resolve a pod that has not yet bound its socket.
+              sleep 3
+
+        - name: resolve-dns
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+
+              resolve() {
+                _host="$1"; _ip=""; _i=0
+                while [ "$_i" -lt 60 ]; do
+                  _ip=$(nslookup "$_host" 2>/dev/null \
+                        | awk '/^Name:/{n=1;next} n&&/^Address( 1)?:/{print $NF; exit}')
+                  case "$_ip" in
+                    *.*.*.*) echo "$_ip"; return 0 ;;
+                  esac
+                  _i=$((_i+1))
+                  echo "[resolve-dns] waiting for $_host ($_i/60)" >&2
+                  sleep 2
+                done
+                echo "[resolve-dns] FATAL: could not resolve $_host" >&2
+                return 1
+              }
+
+              GNB_IP=$(resolve gnb.nextg-system.svc.cluster.local)
+              case "$GNB_IP" in
+                *[0-9].[0-9]*) ;;
+                *) echo "[resolve-dns] FATAL: gNB IP not IPv4: '$GNB_IP'" >&2; exit 1 ;;
+              esac
+              echo "[resolve-dns] gNB=$GNB_IP"
+
+              cp /tmp/config-template/ue.yaml /etc/nextgsim/ue.yaml
+              sed -i "s|gnb\.nextg-system\.svc\.cluster\.local|$GNB_IP|g" \
+                /etc/nextgsim/ue.yaml
+
+              # This is the check that prevents the silent-drop failure. If any
+              # gnb_search_list entry is still a hostname, the UE would discard
+              # it and search nothing.
+              if grep -q 'svc\.cluster\.local' /etc/nextgsim/ue.yaml; then
+                echo "[resolve-dns] FATAL: gnb_search_list still contains a hostname." >&2
+                echo "[resolve-dns] The UE would silently drop it (rls/task.rs:104)." >&2
+                grep -n 'svc\.cluster\.local' /etc/nextgsim/ue.yaml >&2
+                exit 1
+              fi
+
+              echo "[resolve-dns] final ue.yaml:"
+              cat /etc/nextgsim/ue.yaml
+          volumeMounts:
+            - name: config-template
+              mountPath: /tmp/config-template/ue.yaml
+              subPath: ue.yaml
+              readOnly: true
+            - name: config-resolved
+              mountPath: /etc/nextgsim
+      containers:
+        - name: ue
+          # No socket-based probes, and $patch: replace to remove any the base
+          # may define.
+          #
+          # The premise of the previous probes -- "the UE binds a CLI socket on
+          # UDP 4998" -- is false. The UE binds no fixed port:
+          #   * CLI server: 127.0.0.1 on an OS-assigned port
+          #     (nextgsim-common/src/cli_server.rs:24,272 -- bind "127.0.0.1:0")
+          #   * RLS socket: 0.0.0.0:0, also ephemeral
+          #     (nextgsim-ue/src/rls/task.rs:170)
+          # Observed: "CLI server listening on port 55207", a different port
+          # each start. 4998 appears only in the manifest's containerPort and
+          # Service, which correspond to nothing the process listens on.
+          #
+          # So `grep ':1386' /proc/net/udp` could never match. The readiness
+          # probe kept the pod 0/1 forever and the liveness probe SIGKILLed a
+          # healthy, registered UE every 40s (exit code 137) -- the UE reached
+          # "Cell discovered ... plmn=999-70" and was then killed mid-flow.
+          #
+          # Nothing depends on the UE being Ready (it is the client at the end
+          # of the chain), so having no probe is correct rather than a gap.
+          # Registration is asserted from logs by the E2E suite, which is the
+          # real signal. A meaningful probe would need the UE to expose a fixed
+          # health port -- a code change, not a manifest fix.
+          # Explicit nulls delete the keys. `$patch: replace` with an empty body
+          # would instead leave `readinessProbe: {}` -- a probe with zero
+          # handlers, which the API server rejects. (`$patch: delete` is not
+          # usable here: at container level it would remove the container.)
+          readinessProbe: null
+          livenessProbe: null

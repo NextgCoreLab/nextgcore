@@ -1,0 +1,84 @@
+# UPF with a real user plane. OPT-IN: applied only when
+# ENABLE_DATAPLANE=true is passed to deploy-eks.sh.
+#
+# This is a privileged pod. It needs to be, to create a TUN device:
+#   privileged: true + NET_ADMIN + SYS_ADMIN  -> ip tuntap add
+#   hostPath /dev/net/tun                     -> the device node
+#   runAsUser: 0                              -> ip/iptables/sysctl
+#   net.ipv4.ip_forward=1 + MASQUERADE        -> egress for UE traffic
+#
+# The one non-obvious fix over the Kind manifest: runAsUser: 0. The core image
+# ends with `USER nextgcore` (docker/rust/Dockerfile.core:34), and the Kind
+# manifest sets no runAsUser, so wrapper.sh runs unprivileged and every
+# ip/iptables/sysctl call fails - which then silently trips the
+# --no-dataplane fallback. docker-compose.yml gets this right with
+# `user: root`; the k8s manifest did not.
+#
+# Preconditions on the cluster:
+#   * namespace label pod-security.kubernetes.io/enforce=privileged
+#   * nodes that permit privileged pods
+#   * CloudFormation deployed with EnableDataPlanePrivileges=true, so nodes
+#     carry nextg.io/dataplane=true
+#
+# Also note the UE subnet (10.45.0.0/16, from upf.yaml's session config) must
+# not overlap the VPC CIDR, or GTP-U inner traffic collides with pod routing.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: upf
+  namespace: nextg-system
+spec:
+  template:
+    spec:
+      nodeSelector:
+        nextg.io/dataplane: "true"
+      containers:
+        - name: upf
+          command: ["/bin/sh", "/scripts/wrapper.sh"]
+          securityContext:
+            privileged: true
+            # The fix the Kind manifest is missing.
+            runAsUser: 0
+            allowPrivilegeEscalation: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_ADMIN
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nextgcore/upf.yaml
+              subPath: upf.yaml
+              readOnly: true
+            - name: logs
+              mountPath: /var/log/nextgcore
+            - name: dev-tun
+              mountPath: /dev/net/tun
+            - name: wrapper
+              mountPath: /scripts
+              readOnly: true
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                # Asserts the data plane actually came up, rather than that the
+                # process exists. If ogstun is missing, wrapper.sh fell back to
+                # --no-dataplane and this pod should not be marked ready.
+                - "ip link show ogstun >/dev/null 2>&1"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+      volumes:
+        - name: config
+          configMap:
+            name: nextgcore-configs
+        - name: logs
+          emptyDir: {}
+        - name: dev-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+        - name: wrapper
+          configMap:
+            name: upf-wrapper
+            defaultMode: 0755

@@ -1,0 +1,102 @@
+# Headless Services for the three peers whose IPs get baked into simulator
+# config (see README.md "Why the addressing needed real work").
+#
+# With clusterIP: None, DNS resolves straight to the pod IP. That matters for
+# more than tidiness:
+#
+#  * The gNB writes the resolved AMF/UPF address into its config once, at pod
+#    start. A ClusterIP is a kube-proxy virtual IP; baking it in puts a NAT hop
+#    in the NGAP and GTP-U paths for the whole pod lifetime and leaves a stale
+#    value if the Service is ever recreated.
+#  * NGAP here is userspace SCTP over UDP. kube-proxy load-balances UDP
+#    per-flow with a conntrack timeout, which is a poor fit for a long-lived
+#    association that expects one stable peer.
+#  * RLS is a heartbeat-driven reconciliation loop (nextgsim-rls). It assumes a
+#    stable peer address; per-flow balancing across replicas would make cell
+#    tracking flap.
+#
+# Single replica per NF makes this safe: there is exactly one A record.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amf
+  namespace: nextg-system
+spec:
+  clusterIP: None
+  ports:
+    # 38412 is UDP, not SCTP: --sctp-backend defaults to "userspace"
+    # (sctp-proto over UDP). See nextgcore-amfd/src/ngap_path.rs:53-56.
+    - name: ngap
+      port: 38412
+      targetPort: 38412
+      protocol: UDP
+    - name: sbi
+      port: 7777
+      targetPort: 7777
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: upf
+  namespace: nextg-system
+spec:
+  clusterIP: None
+  ports:
+    - name: gtpu
+      port: 2152
+      targetPort: 2152
+      protocol: UDP
+    - name: pfcp
+      port: 8805
+      targetPort: 8805
+      protocol: UDP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gnb
+  namespace: nextg-system
+spec:
+  clusterIP: None
+  ports:
+    - name: rls
+      port: 4997
+      targetPort: 4997
+      protocol: UDP
+    - name: gtpu
+      port: 2152
+      targetPort: 2152
+      protocol: UDP
+---
+# The NRF is NodePort 30777 in the Kind manifests, which exists only so
+# kind-config.yaml can map hostPort 7777. On EKS that opens a port on every
+# node for no reason - use `kubectl port-forward` instead.
+#
+# $patch: replace on ports is required. Without it the list is merged by name
+# and the base's `nodePort: 30777` survives alongside `type: ClusterIP`, which
+# the API server rejects outright:
+#   Service "nrf" is invalid: spec.ports[0].nodePort: Forbidden:
+#   may not be used when `type` is 'ClusterIP'
+apiVersion: v1
+kind: Service
+metadata:
+  name: nrf
+  namespace: nextg-system
+spec:
+  type: ClusterIP
+  ports:
+    - $patch: replace
+    - name: sbi
+      port: 7777
+      targetPort: 7777
+      protocol: TCP
