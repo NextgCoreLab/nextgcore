@@ -264,18 +264,11 @@ impl Default for ScpRouter {
 }
 
 /// Global SCP router instance
-static mut GLOBAL_SCP_ROUTER: Option<ScpRouter> = None;
-static ROUTER_INIT: std::sync::Once = std::sync::Once::new();
+static GLOBAL_SCP_ROUTER: std::sync::OnceLock<ScpRouter> = std::sync::OnceLock::new();
 
 /// Get global SCP router
 pub fn global_scp_router() -> &'static ScpRouter {
-    #[allow(static_mut_refs)]
-    unsafe {
-        ROUTER_INIT.call_once(|| {
-            GLOBAL_SCP_ROUTER = Some(ScpRouter::new());
-        });
-        GLOBAL_SCP_ROUTER.as_ref().expect("value expected")
-    }
+    GLOBAL_SCP_ROUTER.get_or_init(ScpRouter::new)
 }
 
 /// Initialize SCP router

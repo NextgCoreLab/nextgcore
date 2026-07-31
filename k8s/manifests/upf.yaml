@@ -11,21 +11,115 @@ data:
     #!/bin/sh
     set -e
     # Try to create TUN device (Open5GS/UERANSIM pattern)
-    # Works on production K8s with privileged: true
+    # Works on production K8s with privileged: true + runAsUser: 0
     # Fails on Kind/Docker Desktop macOS (nested containers)
-    if ip tuntap add name ogstun mode tun 2>/dev/null; then
+    #
+    # The fallback to --no-dataplane is OPT-IN via UPF_ALLOW_NO_DATAPLANE=true.
+    # Without that flag a TUN failure is fatal, because a UPF that silently
+    # drops its user plane and still reports Ready is worse than one that does
+    # not start: the E2E suite skips the data-plane assertions and reports a
+    # pass. If you are on Kind/macOS and want control-plane-only, set the flag
+    # explicitly.
+    if [ "$(id -u)" != "0" ]; then
+      echo "[wrapper] WARNING: running as uid $(id -u), not root."
+      echo "[wrapper] ip/iptables/sysctl need uid 0 even with NET_ADMIN/SYS_ADMIN"
+      echo "[wrapper] in the bounding set. Set runAsUser: 0 on this container."
+    fi
+    # Every step below is idempotent, because this script must survive a
+    # CONTAINER restart as well as a pod restart. A container restart reuses the
+    # pod's network namespace, so ogstun and the nat rules are still there from
+    # the previous run. An unguarded `ip tuntap add` then fails with
+    # "ioctl(TUNSETIFF): Device or resource busy", which would otherwise be
+    # treated as "no data plane" and turn a recoverable restart into a
+    # CrashLoopBackOff.
+    #
+    # stderr is kept (not sent to /dev/null) so the real reason for a genuine
+    # failure is visible instead of being attributed to nested containers.
+    if ip link show ogstun >/dev/null 2>&1; then
+      echo "[wrapper] ogstun already exists (container restart, netns retained) - reusing it"
+      TUN_OK=true
+    elif ip tuntap add name ogstun mode tun; then
       echo "[wrapper] TUN device created successfully"
-      ip addr add 10.45.0.1/16 dev ogstun
+      TUN_OK=true
+    else
+      TUN_OK=false
+    fi
+
+    if [ "${TUN_OK}" = "true" ]; then
+      # `|| true` on each: the address may already be assigned and the link may
+      # already be up from the previous container.
+      ip addr add 10.45.0.1/16 dev ogstun 2>/dev/null || true
       sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
       ip link set ogstun up
       sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-      iptables -t nat -A POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE 2>/dev/null || true
+      # -C before -A to avoid appending a duplicate MASQUERADE on a container
+      # restart (the pod netns, and so the nat table, survives one).
+      #
+      # Caveat, measured on this cluster (iptables v1.8.9 nf_tables backend):
+      # the guard reduces but does not fully eliminate duplicates -- a restart
+      # was still observed going from 0 to 2 identical rules in one wrapper run,
+      # while the same -C/-A construct run by hand goes 0 to 1. Root cause not
+      # pinned down; it is cosmetic, since the rules are identical and
+      # MASQUERADE is idempotent, so `iptables -S` is just noisier than it
+      # should be. Left as-is rather than papered over with a flush, which would
+      # be worse: POSTROUTING is shared with kube-proxy's chains.
+      iptables -t nat -C POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE 2>/dev/null \
+        || true
+      # Fail loudly if the interface is somehow not usable, rather than starting
+      # a UPF whose readiness probe will then flap.
+      ip link show ogstun >/dev/null 2>&1 || {
+        echo "[wrapper] FATAL: ogstun vanished after configuration" >&2
+        exit 1
+      }
       echo "[wrapper] TUN configured: ogstun 10.45.0.1/16, NAT enabled"
-      exec /usr/local/bin/nf-binary -c /etc/nextgcore/upf.yaml --pfcp-addr 0.0.0.0 --gtpu-addr 0.0.0.0
+      # --gtpu-addr is BOTH the bind address and the N3 endpoint the UPF
+      # advertises to the SMF in the PFCP F-TEID, which the SMF then relays to
+      # the gNB in the NGAP PDU Session Resource Setup transfer
+      # (nextgcore-upfd/src/main.rs:214 binds it, main.rs:164 registers it).
+      #
+      # With 0.0.0.0 the gNB was told "UPF addr=0.0.0.0" and sent uplink G-PDUs
+      # to 0.0.0.0:2152, which loops back into its own GTP-U socket. Symptom in
+      # the gNB log, once per uplink packet:
+      #   Sent uplink GTP-U: teid=0x10000, 100 bytes
+      #   ERROR Downlink decapsulation failed: tunnel not found: TEID 0x10000
+      # -- it was decapsulating its own transmission. The UPF's ogstun stayed at
+      # 0 bytes received and a UE ping got 100% loss.
+      #
+      # POD_IP is a single-homed pod address, so it is correct for both roles.
+      # PFCP stays on 0.0.0.0: that is only a listen socket, and the F-SEID the
+      # UPF sends is derived separately.
+      if [ -z "${POD_IP}" ]; then
+        echo "[wrapper] FATAL: POD_IP is not set. Inject it with a fieldRef on" >&2
+        echo "[wrapper] status.podIP, or the gNB will be told to send uplink to" >&2
+        echo "[wrapper] 0.0.0.0 and the user plane will silently loop back." >&2
+        exit 1
+      fi
+      # --pfcp-addr must ALSO be the pod IP, not 0.0.0.0. The UPF derives its
+      # PFCP Node ID from the pfcp bind address (pfcp_path.rs:520), and that
+      # Node ID -- NOT --gtpu-addr -- is what it writes into the N3 F-TEID's
+      # IPv4 field in the Created PDR (pfcp_path.rs:1028, `self.local_node_id`).
+      # The SMF then relays that F-TEID address to the gNB as the uplink N3
+      # endpoint (nextgcore-smfd/src/main.rs:1376,2359). So a 0.0.0.0 pfcp-addr
+      # made the gNB send uplink to 0.0.0.0 even with --gtpu-addr set correctly.
+      # Binding the pod IP is fine here: single-homed pod, one routable address.
+      echo "[wrapper] advertising N3 (GTP-U) endpoint ${POD_IP}:2152, PFCP node ${POD_IP}"
+      exec /usr/local/bin/nf-binary -c /etc/nextgcore/upf.yaml --pfcp-addr "${POD_IP}" --gtpu-addr "${POD_IP}"
     else
-      echo "[wrapper] TUN creation failed (nested containers / Kind on macOS)"
-      echo "[wrapper] Starting UPF in control-plane-only mode (--no-dataplane)"
-      exec /usr/local/bin/nf-binary -c /etc/nextgcore/upf.yaml --pfcp-addr 0.0.0.0 --gtpu-addr 0.0.0.0 --no-dataplane
+      echo "[wrapper] TUN device creation failed (see the error above)."
+      if [ "${UPF_ALLOW_NO_DATAPLANE}" = "true" ]; then
+        echo "[wrapper] UPF_ALLOW_NO_DATAPLANE=true: starting control-plane-only (--no-dataplane)"
+        echo "[wrapper] GTP-U forwarding is DISABLED. A UE ping will not work."
+        exec /usr/local/bin/nf-binary -c /etc/nextgcore/upf.yaml --pfcp-addr 0.0.0.0 --gtpu-addr 0.0.0.0 --no-dataplane
+      fi
+      echo "[wrapper] FATAL: refusing to start without a data plane."
+      echo "[wrapper] Common causes:"
+      echo "[wrapper]   * container not running as uid 0 (need runAsUser: 0)"
+      echo "[wrapper]   * /dev/net/tun not present on the node"
+      echo "[wrapper]   * Pod Security Admission rejecting privileged (need enforce=privileged)"
+      echo "[wrapper]   * nested containers (Kind/Docker Desktop on macOS)"
+      echo "[wrapper] To run control-plane-only on purpose, set UPF_ALLOW_NO_DATAPLANE=true."
+      exit 1
     fi
 ---
 apiVersion: v1
@@ -71,10 +165,24 @@ spec:
         app.kubernetes.io/name: upf
         app.kubernetes.io/part-of: nextgcore
     spec:
-      initContainers:
-        - name: wait-smf
-          image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z smf.nextg-system.svc.cluster.local 7777; do echo waiting for smf; sleep 2; done']
+      # No wait-smf initContainer, deliberately.
+      #
+      # It used to block on smf:7777, but the dependency runs the other way:
+      # the SMF initiates the PFCP Association Setup Request and retries on a
+      # timer (nextgcore-smfd/src/pfcp_sm.rs:116,138), so the UPF only has to
+      # be listening on 8805 -- it never calls the SMF first.
+      #
+      # Worse, that wait deadlocked the bring-up. The SMF needs the UPF's IP at
+      # startup (UPF_PFCP_ADDR is parsed as a SocketAddr), so it resolves the
+      # UPF's DNS name in an initContainer. The UPF Service is headless, so its
+      # DNS record only appears once a UPF pod is Ready. That gave:
+      #
+      #   UPF.wait-smf -> waits for SMF:7777
+      #   SMF.resolve-upf -> waits for UPF DNS -> waits for UPF Ready
+      #
+      # Neither side could ever start. Removing this wait lets the UPF come up
+      # first, publish its endpoint, and the SMF then resolves it and
+      # associates.
       containers:
         - name: upf
           image: nextgcore-rust/upf:latest
@@ -94,12 +202,44 @@ spec:
               value: info
             - name: RUST_BACKTRACE
               value: "1"
+            # Consumed by wrapper.sh as --gtpu-addr: the N3 endpoint the UPF
+            # advertises to the SMF, and thence to the gNB. Must be a routable
+            # address, not 0.0.0.0.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           securityContext:
             privileged: true
+            # Required, not optional. Dockerfile.core ends with
+            # `USER nextgcore`, and capabilities in the bounding set are not
+            # usable by a non-root uid without file capabilities on the
+            # binaries -- so ip/iptables/sysctl all fail without this and
+            # wrapper.sh cannot create the TUN device. docker-compose.yml has
+            # always set `user: root` for this image; the manifest did not.
+            runAsUser: 0
+            allowPrivilegeEscalation: true
             capabilities:
               add:
                 - NET_ADMIN
                 - SYS_ADMIN
+          # Asserts the data plane is actually up, not merely that the process
+          # exists. If ogstun is missing the pod must not be Ready, otherwise
+          # dependents proceed against a UPF that cannot forward.
+          #
+          # When control-plane-only mode is requested on purpose the ogstun
+          # check is skipped -- otherwise that (legitimate) configuration could
+          # never become Ready. The point is to catch an UNINTENDED loss of the
+          # data plane, not to forbid the intended one.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - '[ "${UPF_ALLOW_NO_DATAPLANE}" = "true" ] || ip link show ogstun >/dev/null 2>&1'
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
           resources:
             requests:
               cpu: 200m

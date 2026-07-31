@@ -68,6 +68,13 @@ spec:
               readOnly: true
             - name: logs
               mountPath: /var/log/nextgcore
+            # configmap.yaml points the UDM at /etc/nextgcore/hnet/*.key for
+            # SUCI de-concealment, but nothing mounted them -- so only the null
+            # protection scheme worked and ECIES profile A/B failed at first
+            # de-concealment. These are private keys, hence a Secret.
+            - name: hnet-keys
+              mountPath: /etc/nextgcore/hnet
+              readOnly: true
           readinessProbe:
             tcpSocket:
               port: 7777
@@ -84,3 +91,11 @@ spec:
             name: nextgcore-configs
         - name: logs
           emptyDir: {}
+        # Created by k8s/deploy.sh and deploy/eks/deploy-eks.sh from the repo's
+        # development keys under docker/rust/configs/5gc/hnet/. Marked optional
+        # so a control-plane-only bring-up with a null-scheme SUCI still starts;
+        # ECIES profile A/B requires the Secret to exist.
+        - name: hnet-keys
+          secret:
+            secretName: udm-hnet-keys
+            optional: true

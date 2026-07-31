@@ -424,6 +424,18 @@ pub struct NgapServer {
     server_event_rx: mpsc::UnboundedReceiver<ServerEvent>,
     /// Per-UE NAS/registration state (keyed by AMF-UE-NGAP-ID)
     ue_auth_state: HashMap<u64, UeNasContext>,
+    /// SM context reference the SMF returned from Nsmf_PDUSession_CreateSMContext,
+    /// keyed by (AMF-UE-NGAP-ID, PSI).
+    ///
+    /// The ref is opaque and SMF-chosen (TS 29.502 §5.2.2.2.1: the AMF must use
+    /// the URI/reference from the Create response). It is NOT derivable from the
+    /// PSI: this SMF allocates a monotonic session index, so the second PDU
+    /// session in an AMF's lifetime is ref="2" while its PSI is still 1.
+    /// Fabricating `format!("{psi}")` therefore addressed session 1 forever --
+    /// every SM Context Update after the first landed on the wrong N4 session,
+    /// so the downlink FAR (gNB TEID) was installed on a stale session and
+    /// downlink user traffic was silently black-holed.
+    sm_context_refs: HashMap<(u64, u8), String>,
     /// GMM procedure timer configuration (T3550/T3560/T3570/T3522)
     timer_configs: AmfTimerConfigs,
 }
@@ -467,6 +479,7 @@ impl NgapServer {
             event_tx,
             server_event_rx,
             ue_auth_state: HashMap::new(),
+            sm_context_refs: HashMap::new(),
             timer_configs: {
                 let configs = AmfTimerConfigs::default();
                 #[cfg(feature = "ntn")]
@@ -1908,6 +1921,11 @@ impl NgapServer {
             return Ok(());
         };
 
+        // Milestone in the registration procedure, and previously unlogged on
+        // the success path: a complete 5G-AKA trace jumped from "Authentication
+        // Request sent" straight to the AUSF confirmation.
+        log::info!("Received Authentication Response from UE {amf_ue_ngap_id} (RES* 16 bytes)");
+
         // Stop T3560
         if matches!(
             state.retx,
@@ -1940,6 +1958,10 @@ impl NgapServer {
                 .await?;
             return Ok(());
         }
+        // Log the pass, not just the failure. HRES*/HXRES* comparison is where
+        // the AMF concludes the UE proved knowledge of K (TS 33.501 §6.1.3.2.0),
+        // so it is exactly as diagnostic as the reject branch above.
+        log::info!("UE {amf_ue_ngap_id} HXRES* verification passed");
 
         // 5G-AKA confirmation toward AUSF -> KSEAF + SUPI
         let (ausf_host, ausf_port) =
@@ -2330,6 +2352,15 @@ impl NgapServer {
                         log::info!(
                             "UE {amf_ue_ngap_id} security capabilities verified against replayed \
                              RegistrationRequest (no bidding-down)"
+                        );
+                        // Security Mode Complete accepted and the anti-bidding-down
+                        // check passed, so the NAS security context is now active in
+                        // both directions (TS 33.501 §6.7.2). Logged explicitly: this
+                        // is the boundary after which every NAS message is integrity
+                        // protected, and it had no observable marker.
+                        log::info!(
+                            "UE {amf_ue_ngap_id} NAS security context established \
+                             (integrity + ciphering active)"
                         );
                     }
                 }
@@ -3404,6 +3435,12 @@ impl NgapServer {
                             resp.n1_sm_msg.len(),
                             resp.n2_sm_info.len()
                         );
+                        // Remember the SMF-chosen reference: every later
+                        // Nsmf_PDUSession_UpdateSMContext for this session must
+                        // use it verbatim (TS 29.502 §5.2.2.2.1). It is not the
+                        // PSI and must not be reconstructed from one.
+                        self.sm_context_refs
+                            .insert((amf_ue_ngap_id, psi), resp.sm_context_ref.clone());
 
                         // N1: PDU Session Establishment Accept via DL NAS
                         // TRANSPORT (protected when a context exists)
@@ -3415,6 +3452,18 @@ impl NgapServer {
                             &resp.n1_sm_msg,
                         )
                         .await?;
+                        // The N1 container the SMF produced is the 5GSM PDU Session
+                        // Establishment Accept; the AMF only relays it. Logged here
+                        // because the relay was previously silent, so the last
+                        // AMF-visible step of a successful session establishment left
+                        // no trace.
+                        if !resp.n1_sm_msg.is_empty() {
+                            log::info!(
+                                "PDU Session Establishment Accept sent to UE \
+                                 {amf_ue_ngap_id} (PSI={psi}, {} bytes)",
+                                resp.n1_sm_msg.len()
+                            );
+                        }
 
                         // N2: PDU Session Resource Setup Request toward the gNB.
                         // The UE context (AS-layer security) must be established
@@ -3476,7 +3525,16 @@ impl NgapServer {
             // PDU Session Modification Request
             0xC9 => {
                 log::info!("PDU Session Modification Request from UE: PSI={psi}, PTI={pti}");
-                let sm_context_ref = format!("{psi}");
+                // SMF-chosen ref, not the PSI -- see sm_context_refs.
+                let Some(sm_context_ref) =
+                    self.sm_context_refs.get(&(amf_ue_ngap_id, psi)).cloned()
+                else {
+                    log::warn!(
+                        "PDU Session Modification for UE {amf_ue_ngap_id} PSI {psi} with no \
+                         stored SM context ref: dropping (no session to modify)"
+                    );
+                    return Ok(());
+                };
 
                 match crate::sbi_path::call_smf_update_sm_context_with_n1(
                     &smf_host,
@@ -3546,7 +3604,16 @@ impl NgapServer {
             // PDU Session Release Request
             0xD1 => {
                 log::info!("PDU Session Release Request from UE: PSI={psi}, PTI={pti}");
-                let sm_context_ref = format!("{psi}");
+                // SMF-chosen ref, not the PSI -- see sm_context_refs.
+                let Some(sm_context_ref) =
+                    self.sm_context_refs.get(&(amf_ue_ngap_id, psi)).cloned()
+                else {
+                    log::warn!(
+                        "PDU Session Release for UE {amf_ue_ngap_id} PSI {psi} with no stored \
+                         SM context ref: dropping (no session to release)"
+                    );
+                    return Ok(());
+                };
 
                 match crate::sbi_path::call_smf_release_sm_context(
                     &smf_host,
@@ -4990,7 +5057,23 @@ impl NgapServer {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(7777);
-            let sm_context_ref = format!("{pdu_session_id}");
+            // Use the SMF-chosen reference from the Create response, never
+            // format!("{pdu_session_id}"). The PSI is 1 for the first session of
+            // every UE, while the SMF's ref is a monotonic index -- so the old
+            // code sent every update to session "1" and the gNB's downlink TEID
+            // was installed on a stale N4 session, black-holing downlink.
+            let Some(sm_context_ref) = self
+                .sm_context_refs
+                .get(&(response_data.amf_ue_ngap_id, pdu_session_id))
+                .cloned()
+            else {
+                log::error!(
+                    "No SM context ref stored for UE {} PSI {pdu_session_id}: cannot \
+                     update the SMF with the gNB DL TEID, downlink would black-hole",
+                    response_data.amf_ue_ngap_id
+                );
+                return Ok(());
+            };
 
             match crate::sbi_path::call_smf_update_sm_context(
                 &smf_update_host,

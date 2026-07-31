@@ -1,0 +1,82 @@
+# UPF in control-plane-only mode. This is the DEFAULT for this overlay.
+#
+# The Kind manifest's wrapper.sh tries `ip tuntap add name ogstun`, and falls
+# back to `--no-dataplane` when that fails. That flag is real:
+# nextgcore-upfd/src/main.rs:104 (`no_dataplane: bool`), main.rs:230
+# (`let data_plane_enabled = !args.no_dataplane`).
+#
+# On EKS the TUN creation attempt fails for a compounding set of reasons:
+#   * Pod Security Admission at baseline/restricted rejects privileged pods
+#   * docker/rust/Dockerfile.core sets `USER nextgcore`, and this manifest sets
+#     no runAsUser, so `ip`/`iptables`/`sysctl` run unprivileged and fail even
+#     where the capabilities would have permitted them (docker-compose.yml runs
+#     the UPF as `user: root`; the Kind manifest never replicated that)
+#
+# Rather than rely on the fallback firing, this patch asks for --no-dataplane
+# explicitly and drops the privileges the data plane would need. The result:
+#   * PFCP session establishment, rule installation, SBI - all work
+#   * GTP-U forwarding does not; a UE ping will fail
+#
+# For a real data plane use patches/upf-dataplane.yaml instead.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: upf
+  namespace: nextg-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: upf
+          # Bypass wrapper.sh entirely - no TUN attempt, no privilege needed.
+          command: ["/usr/local/bin/nf-binary"]
+          args:
+            - "-c"
+            - "/etc/nextgcore/upf.yaml"
+            - "--pfcp-addr"
+            - "0.0.0.0"
+            - "--gtpu-addr"
+            - "0.0.0.0"
+            - "--no-dataplane"
+          # $patch: replace drops the base's capabilities.add [NET_ADMIN,
+          # SYS_ADMIN]. A plain merge unions the two lists, leaving a container
+          # that both drops ALL and adds NET_ADMIN.
+          securityContext:
+            $patch: replace
+            privileged: false
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          # Keyed by mountPath so the base's /dev/net/tun and /scripts mounts
+          # are removed rather than merged.
+          volumeMounts:
+            - $patch: replace
+            - name: config
+              mountPath: /etc/nextgcore/upf.yaml
+              subPath: upf.yaml
+              readOnly: true
+            - name: logs
+              mountPath: /var/log/nextgcore
+          # $patch: replace so the base's `exec` ogstun check is dropped rather
+          # than merged. A plain merge leaves a probe with both exec and
+          # tcpSocket handlers, which the API server rejects -- and the ogstun
+          # check could never pass in this variant anyway, since --no-dataplane
+          # means the device is intentionally absent.
+          readinessProbe:
+            $patch: replace
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+      # $patch: replace, so the base's hostPath dev-tun and the upf-wrapper
+      # ConfigMap volume are dropped entirely. Merging them by name would leave
+      # a volume with BOTH emptyDir and hostPath set, which the API rejects.
+      volumes:
+        - $patch: replace
+        - name: config
+          configMap:
+            name: nextgcore-configs
+        - name: logs
+          emptyDir: {}

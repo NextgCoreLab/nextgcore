@@ -479,6 +479,7 @@ fn parse_initial_ue_message(container: ProtocolIeContainer) -> NgapResult<Initia
     let mut user_location_info = None;
     let mut rrc_establishment_cause = RrcEstablishmentCause::default();
     let mut ue_context_request = None;
+    let mut allowed_nssai = Vec::new();
 
     for field in &container.ies {
         match field.id {
@@ -496,6 +497,16 @@ fn parse_initial_ue_message(container: ProtocolIeContainer) -> NgapResult<Initia
             }
             _ if field.id.0 == ie::IE_ID_UE_CONTEXT_REQUEST => {
                 ue_context_request = Some(true);
+            }
+            // AllowedNSSAI (IE id 0) is optional-but-legal here per the
+            // TS 38.413 ASN.1, and the nextgsim gNB sends it with criticality
+            // "reject" whenever the UE requested a slice. Without this arm the
+            // field fell through to handle_unknown_ie, which honours the reject
+            // criticality and failed the whole PDU -- so every registration was
+            // dropped with "Failed to parse Initial UE Message" and the UE
+            // retransmitted on T3510 forever.
+            _ if field.id.0 == ie::IE_ID_ALLOWED_NSSAI => {
+                allowed_nssai = ie::decode_allowed_nssai(field)?;
             }
             _ => ie::handle_unknown_ie(field)?,
         }
@@ -516,6 +527,7 @@ fn parse_initial_ue_message(container: ProtocolIeContainer) -> NgapResult<Initia
         })?,
         rrc_establishment_cause,
         ue_context_request,
+        allowed_nssai,
     })
 }
 

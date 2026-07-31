@@ -1,0 +1,72 @@
+# Real probes for the AMF, and an explicit NGAP transport declaration.
+#
+# The Kind manifest uses:
+#     exec: ["sh","-c","kill -0 1"]
+# which only asks whether PID 1 exists. It passes for a deadlocked process, so
+# `kubectl rollout status` gating on it proves nothing.
+#
+# nextgcore-sbi/src/server.rs:341 does handle /health, /ready and /live -- but
+# they are NOT usable from a kubelet httpGet probe. The SBI server is HTTP/2
+# prior-knowledge (h2c): server.rs:899,926 build with
+# `hyper::server::conn::http2::Builder` only, with no HTTP/1.1 fallback and no
+# ALPN negotiation. kubelet's httpGet speaks HTTP/1.1, so the probe can never
+# succeed. Observed symptom: the SBI log fills with "HTTP/2 connection error:
+# http2 error" (one per probe), readiness never goes green, and the liveness
+# probe then restarts a perfectly healthy AMF every ~90s. The gNB never sees an
+# AMF endpoint in DNS because the pod is never Ready, so NG Setup never happens.
+#
+# tcpSocket on the SBI port is the honest check available today: the AMF binds
+# 7777 only after context init, NRF registration and peer-NF discovery have
+# completed (see the startup sequence in nextgcore-amfd/src/main.rs), so a
+# successful connect does imply more than "the process exists".
+#
+# To get a true HTTP readiness endpoint, the SBI server would need
+# `hyper_util::server::conn::auto::Builder`, which negotiates h2c and HTTP/1.1
+# on the same port. That is a code change in nextgcore-sbi, not a manifest fix.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amf
+  namespace: nextg-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: amf
+          # NGAP transport is userspace SCTP over UDP. Stated explicitly here
+          # because the Helm chart declares protocol: SCTP for the same port,
+          # which does not work with the shipped binaries.
+          args:
+            - "-c"
+            - "/etc/nextgcore/amf.yaml"
+            - "--ngap-addr"
+            - "0.0.0.0:38412"
+            - "--sctp-backend"
+            - "userspace"
+          ports:
+            - containerPort: 38412
+              name: ngap
+              protocol: UDP
+            - containerPort: 7777
+              name: sbi
+              protocol: TCP
+            - containerPort: 9090
+              name: metrics
+              protocol: TCP
+          # $patch: replace is required. Without it a strategic merge keeps
+          # the base's `exec: kill -0 1` alongside the new httpGet, producing a
+          # probe with two handlers, which the API server rejects.
+          readinessProbe:
+            $patch: replace
+            tcpSocket:
+              port: 7777
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            $patch: replace
+            tcpSocket:
+              port: 7777
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3

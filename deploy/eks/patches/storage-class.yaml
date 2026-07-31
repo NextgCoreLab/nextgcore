@@ -1,0 +1,29 @@
+# MongoDB StatefulSet for EKS.
+#
+# The Kind manifest requests a 1Gi PVC with no storageClassName. On Kind the
+# default local-path provisioner binds it; on EKS an unbound PVC leaves the
+# StatefulSet Pending forever, and every NF that waits on MongoDB stalls in
+# its init container. gp3 is set explicitly via the EBS CSI driver, which the
+# CloudFormation template installs with IRSA.
+#
+# 8Gi rather than 1Gi: gp3's minimum is 1Gi but IOPS scale with size, and
+# subscriber lookups go through a single Mutex + the SYNC mongodb driver
+# (nextgcore-dbi/src/mongoc.rs:60), so the DB is the first bottleneck in the
+# core. Cheap insurance.
+#
+# Still not production: no auth, no replica set, no backup.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: nextg-system
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: mongodb-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests:
+            storage: 8Gi

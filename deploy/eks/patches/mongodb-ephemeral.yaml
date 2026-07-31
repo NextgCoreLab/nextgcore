@@ -1,0 +1,50 @@
+# MongoDB on ephemeral storage. OPT-IN: applied only when
+# EPHEMERAL_STORAGE=true is passed to deploy-eks.sh.
+#
+# Why this exists: patches/storage-class.yaml requests storageClassName gp3,
+# which assumes the cluster was built by this repo's CloudFormation template
+# (it installs the EBS CSI driver with IRSA). On a pre-existing or shared
+# cluster that driver is often absent, and then:
+#
+#   * `kubectl get csidrivers` shows no ebs.csi.aws.com
+#   * the mongodb-data PVC stays Pending forever
+#   * the StatefulSet never becomes Ready
+#   * every NF stalls in its wait-for-mongodb initContainer
+#   * the whole bring-up hangs with no obvious cause
+#
+# A `gp2` StorageClass may still be present on such clusters, but it usually
+# names the in-tree provisioner `kubernetes.io/aws-ebs`, which was removed in
+# upstream Kubernetes 1.27+. It cannot provision either, so falling back to
+# gp2 does not help.
+#
+# This patch replaces the volumeClaimTemplate with an emptyDir so no dynamic
+# provisioner is needed at all.
+#
+# The trade-off, stated plainly: MongoDB data does not survive a pod restart.
+# For an E2E validation run that is acceptable and arguably correct -- the
+# mongodb-init Job re-seeds subscribers on every deploy, so the DB is derived
+# state, not a source of truth. Do NOT use this for anything you expect to
+# keep.
+#
+# Preferred alternative when you control the cluster: install the EBS CSI
+# driver and use patches/storage-class.yaml instead.
+#
+#   aws eks create-addon --cluster-name <c> --addon-name aws-ebs-csi-driver \
+#     --service-account-role-arn <role-with-AmazonEBSCSIDriverPolicy>
+#
+# $patch: replace on volumeClaimTemplates is required: a strategic merge would
+# keep the base's claim template (matched by metadata.name) alongside the new
+# volume, leaving the PVC Pending and defeating the point.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: nextg-system
+spec:
+  volumeClaimTemplates:
+    - $patch: replace
+  template:
+    spec:
+      volumes:
+        - name: mongodb-data
+          emptyDir: {}

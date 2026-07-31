@@ -28,9 +28,15 @@ spec:
             - name: sbi
               containerPort: {{ .Values.amf.service.sbiPort }}
               protocol: TCP
+            # UDP, not SCTP. nextgcore-amfd's --sctp-backend defaults to
+            # "userspace" = sctp-proto over UDP (src/bins/nextgcore-amfd/src/
+            # ngap_path.rs:53-56). Declaring SCTP here does not match the
+            # shipped binaries and the gNB association fails.
+            # Native SCTP needs a rebuild with --features kernel-sctp plus
+            # --sctp-backend kernel.
             - name: ngap
               containerPort: {{ .Values.amf.service.ngapPort }}
-              protocol: SCTP
+              protocol: UDP
             {{- if .Values.amf.metrics.enabled }}
             - name: metrics
               containerPort: {{ .Values.amf.metrics.port }}
@@ -72,7 +78,7 @@ spec:
       name: sbi
     - port: {{ .Values.amf.service.ngapPort }}
       targetPort: ngap
-      protocol: SCTP
+      protocol: UDP
       name: ngap
     {{- if .Values.amf.metrics.enabled }}
     - port: {{ .Values.amf.metrics.port }}

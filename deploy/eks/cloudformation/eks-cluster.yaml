@@ -1,0 +1,647 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NextG 5G/6G core + simulator on EKS. Provisions a dedicated VPC, an EKS
+  control plane, one managed node group, the ECR repositories the workload
+  images are pushed to, and the IRSA plumbing for the EBS CSI driver
+  (MongoDB needs a PersistentVolume).
+
+  NOT production-grade. Deliberate simplifications are called out in the
+  parameter descriptions and in Outputs.Caveats. Read those before using
+  this for anything that matters.
+
+  Deploy:
+    aws cloudformation deploy \
+      --template-file eks-cluster.yaml \
+      --stack-name nextg-eks \
+      --capabilities CAPABILITY_IAM \
+      --parameter-overrides ClusterName=nextg AllowedAdminCidr=<your.ip>/32
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Cluster}
+        Parameters: [ClusterName, KubernetesVersion, AllowedAdminCidr]
+      - Label: {default: Networking}
+        Parameters: [VpcCidr, PublicSubnet1Cidr, PublicSubnet2Cidr, PrivateSubnet1Cidr, PrivateSubnet2Cidr]
+      - Label: {default: Node group}
+        Parameters: [NodeInstanceType, NodeDesiredSize, NodeMinSize, NodeMaxSize, NodeDiskSize]
+      - Label: {default: Workload}
+        Parameters: [CreateEcrRepositories, EnableDataPlanePrivileges]
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: nextg
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$'
+    Description: EKS cluster name. Also used as a prefix for dependent resources.
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.32'
+    AllowedValues: ['1.30', '1.31', '1.32', '1.33']
+    Description: >-
+      EKS control plane version. 1.32 matches the kubectl client this repo was
+      tested with.
+
+  AllowedAdminCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >-
+      CIDR permitted to reach the public Kubernetes API endpoint. The default
+      0.0.0.0/0 is open to the internet - override it with your own /32. The
+      API still requires IAM auth, but narrowing this is free.
+
+  VpcCidr:
+    Type: String
+    Default: 10.60.0.0/16
+    Description: >-
+      VPC CIDR. Must NOT overlap the UE subnet the UPF hands out
+      (10.45.0.0/16, set in the nextgcore upf.yaml session config) or GTP-U
+      inner traffic will collide with pod/node routing.
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.60.0.0/20
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.60.16.0/20
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.60.32.0/20
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.60.48.0/20
+
+  NodeInstanceType:
+    Type: String
+    Default: t3.xlarge
+    Description: >-
+      4 vCPU / 16 GiB. The 10 NF pods plus MongoDB, Prometheus, Grafana and
+      Jaeger request roughly 1.5 vCPU / 2.5 GiB in total, so one node fits the
+      whole stack with headroom for the simulator.
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  NodeMinSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+  NodeMaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+  NodeDiskSize:
+    Type: Number
+    Default: 50
+    Description: Node root volume (GiB). Container images for 10 NFs are small (~5 MB each).
+
+  CreateEcrRepositories:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Create one ECR repository per workload image (12 total). Set false if you
+      already have a registry.
+
+  EnableDataPlanePrivileges:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, labels the node group so the UPF can be scheduled onto nodes
+      intended to host a privileged data plane, and does NOT apply a
+      restricted Pod Security label to the namespace.
+
+      The UPF needs privileged + NET_ADMIN + SYS_ADMIN + hostPath /dev/net/tun
+      to create its ogstun TUN device. When false (the default) the UPF runs
+      with --no-dataplane: NGAP/PFCP signalling works end to end, but there is
+      no user-plane forwarding and no UE ping. Start with false.
+
+Conditions:
+  MakeEcr: !Equals [!Ref CreateEcrRepositories, 'true']
+  DataPlane: !Equals [!Ref EnableDataPlanePrivileges, 'true']
+
+Resources:
+
+  # ---------------------------------------------------------------- networking
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-vpc'}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-igw'}
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-public-1'}
+        - {Key: kubernetes.io/role/elb, Value: '1'}
+        - {Key: !Sub 'kubernetes.io/cluster/${ClusterName}', Value: shared}
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-public-2'}
+        - {Key: kubernetes.io/role/elb, Value: '1'}
+        - {Key: !Sub 'kubernetes.io/cluster/${ClusterName}', Value: shared}
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-private-1'}
+        - {Key: kubernetes.io/role/internal-elb, Value: '1'}
+        - {Key: !Sub 'kubernetes.io/cluster/${ClusterName}', Value: shared}
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-private-2'}
+        - {Key: kubernetes.io/role/internal-elb, Value: '1'}
+        - {Key: !Sub 'kubernetes.io/cluster/${ClusterName}', Value: shared}
+
+  # Single NAT gateway. Cheaper than one per AZ and adequate for a lab; it is
+  # also a single point of failure for egress from both private subnets.
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-nat'}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-public-rt'}
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-private-rt'}
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # --------------------------------------------------------- security groups
+
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'EKS control plane SG for ${ClusterName}'
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-cluster-sg'}
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'EKS worker node SG for ${ClusterName}'
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        # Intra-node: pod-to-pod for NGAP (userspace SCTP over UDP 38412),
+        # RLS (UDP 4997/4998), GTP-U (UDP 2152), PFCP (UDP 8805) and SBI
+        # (TCP 7777). The VPC CNI gives pods VPC IPs, so this SG governs
+        # pod-to-pod traffic across nodes, not just node-to-node.
+        - IpProtocol: '-1'
+          SourceSecurityGroupId: !Ref ClusterSecurityGroup
+          Description: All traffic from control plane SG
+      Tags:
+        - {Key: Name, Value: !Sub '${ClusterName}-node-sg'}
+        - {Key: !Sub 'kubernetes.io/cluster/${ClusterName}', Value: owned}
+
+  NodeSgSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: >-
+        All protocols between nodes/pods in this cluster. Required: the 5G
+        control and user planes span UDP 38412/4997/4998/2152/8805 and TCP
+        7777/9090, and pods talk directly pod-IP to pod-IP under the VPC CNI.
+
+  ClusterSgFromNodes:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Kubelet and pods to the Kubernetes API
+
+  # ------------------------------------------------------------------- IAM
+
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-eks-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: eks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-eks-node-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  # ------------------------------------------------------------ EKS cluster
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - !Ref AllowedAdminCidr
+      AccessConfig:
+        # API mode replaces the aws-auth ConfigMap. The deploying principal is
+        # granted admin below via AccessEntry.
+        AuthenticationMode: API_AND_CONFIG_MAP
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - {Type: api}
+            - {Type: audit}
+            - {Type: authenticator}
+      Tags:
+        - {Key: Name, Value: !Ref ClusterName}
+        - {Key: Workload, Value: nextg-5g-core}
+
+  # ------------------------------------------------------- IRSA for EBS CSI
+
+  OidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !GetAtt Cluster.OpenIdConnectIssuerUrl
+      ClientIdList: [sts.amazonaws.com]
+      # EKS OIDC endpoints are fronted by a public CA; the thumbprint below is
+      # the well-known root used by every EKS cluster.
+      ThumbprintList: ['9e99a48a9960b14926bb7f3b02e22da2b0ab7280']
+
+  # The trust policy is written as a JSON string because the IRSA condition key
+  # is itself interpolated ("<issuer>:sub"), and a Fn::Sub cannot produce a
+  # YAML mapping key.
+  EbsCsiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-ebs-csi-role'
+      AssumeRolePolicyDocument: !Sub
+        - |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": { "Federated": "${ProviderArn}" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${Issuer}:sub": "system:serviceaccount:kube-system:ebs-csi-controller-sa",
+                    "${Issuer}:aud": "sts.amazonaws.com"
+                  }
+                }
+              }
+            ]
+          }
+        - ProviderArn: !Ref OidcProvider
+          Issuer: !Select [1, !Split ['https://', !GetAtt Cluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+
+  # ----------------------------------------------------------------- addons
+
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    # CoreDNS needs schedulable nodes before its pods can become ready.
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  EbsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: aws-ebs-csi-driver
+      ServiceAccountRoleArn: !GetAtt EbsCsiRole.Arn
+      ResolveConflicts: OVERWRITE
+
+  # ------------------------------------------------------------- node group
+
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub '${ClusterName}-ng'
+      NodeRole: !GetAtt NodeRole.Arn
+      # Private subnets: nodes egress via NAT, no public IPs.
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      AmiType: AL2023_x86_64_STANDARD
+      DiskSize: !Ref NodeDiskSize
+      ScalingConfig:
+        DesiredSize: !Ref NodeDesiredSize
+        MinSize: !Ref NodeMinSize
+        MaxSize: !Ref NodeMaxSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      Labels:
+        !If
+          - DataPlane
+          - workload: nextg
+            nextg.io/dataplane: 'true'
+          - workload: nextg
+      Tags:
+        Name: !Sub '${ClusterName}-node'
+        Workload: nextg-5g-core
+
+  # ----------------------------------------------------------- ECR (12 repos)
+
+  EcrNrf:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/nrf'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrAmf:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/amf'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrSmf:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/smf'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrUpf:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/upf'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrAusf:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/ausf'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrUdm:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/udm'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrUdr:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/udr'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrPcf:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/pcf'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrNssf:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/nssf'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrBsf:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/bsf'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrGnb:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/gnb'
+      ImageScanningConfiguration: {ScanOnPush: true}
+  EcrUe:
+    Type: AWS::ECR::Repository
+    Condition: MakeEcr
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub '${ClusterName}/ue'
+      ImageScanningConfiguration: {ScanOnPush: true}
+
+  # --------------------------------------------- cluster admin access entry
+
+  DeployerAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope: {Type: cluster}
+
+Outputs:
+  ClusterNameOut:
+    Description: EKS cluster name
+    Value: !Ref Cluster
+    Export: {Name: !Sub '${AWS::StackName}-ClusterName'}
+
+  ClusterEndpoint:
+    Description: Kubernetes API endpoint
+    Value: !GetAtt Cluster.Endpoint
+
+  OidcIssuer:
+    Description: OIDC issuer URL (for additional IRSA roles)
+    Value: !GetAtt Cluster.OpenIdConnectIssuerUrl
+
+  EcrRegistry:
+    Description: ECR registry host. Use as IMAGE_REGISTRY when pushing images.
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+
+  EcrRepoPrefix:
+    Condition: MakeEcr
+    Description: Repository prefix, e.g. <registry>/<prefix>/amf:latest
+    Value: !Ref ClusterName
+
+  VpcId:
+    Value: !Ref Vpc
+
+  UpdateKubeconfig:
+    Description: Run this to get cluster credentials
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}'
+
+  NextSteps:
+    Description: Post-provision sequence
+    Value: !Sub >-
+      1) aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}
+      2) cd nextgcore/deploy/eks && ./build-and-push.sh
+      3) ./deploy-eks.sh
+
+  Caveats:
+    Description: Known non-production simplifications in this template
+    Value: >-
+      (a) Public API endpoint is enabled and defaults to 0.0.0.0/0 - override
+      AllowedAdminCidr. (b) Single NAT gateway is a shared egress SPOF.
+      (c) Node SG allows all protocols between nodes/pods, which the 5G planes
+      need but is broader than a locked-down policy. (d) Cluster admin is
+      granted to the whole account root principal - narrow DeployerAccessEntry
+      to a specific role. (e) No encryption-at-rest KMS key for secrets.
+      (f) MongoDB runs unauthenticated in-cluster with a 1Gi EBS volume; it is
+      not a managed database and has no backup. (g) EnableDataPlanePrivileges
+      only labels nodes - the UPF still needs privileged pod admission, which
+      this template does not configure.
