@@ -66,8 +66,15 @@ assert_log_contains() {
     TOTAL=$((TOTAL + 1))
     local tmplog
     tmplog=$(mktemp)
-    kubectl logs "deployment/${deployment}" -n "${NAMESPACE}" --all-containers >"$tmplog" 2>&1 || true
-    if grep -q "$pattern" "$tmplog"; then
+    # --tail=-1 requests the FULL log, not the default recent window. Without it
+    # a long-lived pod's initial registration scrolls out of view and every
+    # authentication assertion fails on a working deployment: the UE registers
+    # once at startup, then only sends periodic registration updates (type=3,
+    # no SUCI), so the 5G-AKA exchange never reappears.
+    kubectl logs "deployment/${deployment}" -n "${NAMESPACE}" --all-containers --tail=-1 \
+        >"$tmplog" 2>&1 || true
+    # -E: several patterns are extended regexes (e.g. "AUSF auth.*success").
+    if grep -qE "$pattern" "$tmplog"; then
         PASSED=$((PASSED + 1))
         log_info "PASS: $desc"
     else
@@ -75,6 +82,17 @@ assert_log_contains() {
         log_error "FAIL: $desc (pattern '$pattern' not found in $deployment logs)"
     fi
     rm -f "$tmplog"
+}
+
+# Record a step that is deliberately not exercised by this configuration, with
+# the reason. Counted as skipped rather than passed so the report stays honest,
+# and kept in the list rather than deleted so the coverage gap stays visible.
+skip_test() {
+    local desc="$1"
+    local reason="$2"
+    TOTAL=$((TOTAL + 1))
+    SKIPPED=$((SKIPPED + 1))
+    log_warn "SKIP: $desc ($reason)"
 }
 
 # ============================================================================
@@ -203,20 +221,33 @@ assert_log_contains "amf" "NG Setup successful" \
 assert_log_contains "amf" "Initial UE Message" \
     "AMF received Initial UE Message"
 
-assert_log_contains "amf" "Sending Identity Request" \
-    "AMF sent Identity Request"
+# The Identity procedure (TS 24.501 §5.4.3) is NOT part of this flow, by design.
+# The AMF only sends an IDENTITY REQUEST when the UE identified itself with a
+# GUTI unknown to this AMF (TS 23.502 §4.2.2.2.2 step 4) -- see the explicit
+# "No blanket Identity Request" note at nextgcore-amfd/src/ngap_path.rs:1149.
+# Our UE carries its SUCI in the initial REGISTRATION REQUEST, so identification
+# is already complete and these three steps correctly never occur. Asserting
+# them made a conformant deployment look broken.
+skip_test "AMF sent Identity Request" \
+    "not triggered: UE supplies SUCI in Registration Request, no unknown GUTI"
+skip_test "AMF received Identity Response" \
+    "not triggered: no Identity Request was sent"
+skip_test "AMF extracted SUCI from Identity Response" \
+    "SUCI arrives in the Registration Request instead"
 
-assert_log_contains "amf" "Received Identity Response" \
-    "AMF received Identity Response"
-
-assert_log_contains "amf" "SUCI:" \
-    "AMF extracted SUCI from Identity Response"
+# The SUCI is still asserted -- just from where it actually appears.
+assert_log_contains "amf" "suci=Some" \
+    "AMF extracted SUCI from Registration Request"
 
 assert_log_contains "amf" "Calling AUSF authenticate" \
     "AMF called AUSF SBI for authentication"
 
-assert_log_contains "amf" "AUSF auth.*success" \
-    "AMF got AUSF auth success"
+# The AMF logs the AV delivery as "AUSF auth response: ctx_id=..., RAND=..."
+# (sbi_path.rs). The old pattern looked for the word "success" on that line,
+# which never appears there -- the success verdict comes later, from the 5G-AKA
+# confirmation ("AUTHENTICATION_SUCCESS"), asserted separately below.
+assert_log_contains "amf" "AUSF auth response" \
+    "AMF got AUSF authentication vector"
 
 assert_log_contains "amf" "Authentication Request sent" \
     "AMF sent Authentication Request to UE"
@@ -285,8 +316,19 @@ assert_log_contains "udm" "Generate Auth Data" \
     "UDM generated authentication data"
 
 # --- UDR subscription data ---
-assert_log_contains "udr" "Converted SUCI.*SUPI" \
-    "UDR converted SUCI to SUPI"
+# SUCI -> SUPI is a UDM function, not a UDR one: the SIDF lives in the UDM
+# (TS 33.501 §6.12), which holds the home network private key and logs
+# "SIDF de-concealed SUCI ... -> SUPI ..." (nextgcore-udmd/src/app.rs:1561).
+# The UDR only stores subscription data keyed by SUPI. This assertion was
+# pointed at the wrong NF and could never pass.
+#
+# Skipped rather than re-pointed at the UDM because this UE is configured with
+# protection_scheme 0 (null scheme, nextgsim/k8s/configmap.yaml), so the SUPI
+# arrives unconcealed and the SIDF de-concealment path is genuinely not
+# exercised. Re-enable as a UDM assertion when the E2E moves to ECIES
+# profile A/B.
+skip_test "SUCI to SUPI de-concealment (SIDF)" \
+    "UE uses protection_scheme 0 (null); SIDF is a UDM function, not UDR"
 
 assert_log_contains "udr" "GET authentication-subscription" \
     "UDR retrieved auth subscription"
@@ -384,13 +426,15 @@ assert_log_contains "ue" "Cell discovered" \
 assert_log_contains "ue" "Sending Registration Request" \
     "UE sent Registration Request"
 
-assert_log_contains "ue" "Identity Request" \
-    "UE received Identity Request"
+# Mirrors the AMF-side skips above: no IDENTITY REQUEST is sent in this flow,
+# so the UE has nothing to respond to (TS 23.502 §4.2.2.2.2 step 4).
+skip_test "UE received Identity Request" \
+    "not triggered: SUCI already supplied in Registration Request"
+skip_test "UE sent Identity Response" \
+    "not triggered: no Identity Request was received"
 
-assert_log_contains "ue" "Sending Identity Response" \
-    "UE sent Identity Response"
-
-assert_log_contains "ue" "Authentication Request received" \
+# The UE logs the decoded 5GMM message type, not the phrase "received".
+assert_log_contains "ue" "5GMM message AuthenticationRequest" \
     "UE received Authentication Request"
 
 assert_log_contains "ue" "AUTN MAC verified" \
@@ -462,7 +506,12 @@ if [ $FAILED -gt 0 ]; then
     exit 1
 else
     if [ $SKIPPED -gt 0 ]; then
-        log_info "All $PASSED tests passed ($SKIPPED skipped - UPF no-dataplane mode)"
+        # Do not attribute skips to no-dataplane mode: skips also come from steps
+        # that this configuration legitimately never exercises (the Identity
+        # procedure, SIDF de-concealment). Each SKIP line above carries its own
+        # reason; blaming the data plane here was misleading when the data plane
+        # was in fact up and the ping had passed.
+        log_info "All $PASSED tests passed ($SKIPPED skipped - see SKIP reasons above)"
     else
         log_info "All $PASSED tests passed"
     fi

@@ -44,11 +44,58 @@ spec:
         - name: wait-nrf
           image: busybox:1.36
           command: ['sh', '-c', 'until nc -z nrf.nextg-system.svc.cluster.local 7777; do echo waiting for nrf; sleep 2; done']
+        # UPF_PFCP_ADDR is parsed as a SocketAddr
+        # (nextgcore-smfd/src/main.rs:443), so a Service DNS name does not
+        # deserialize and the SMF exits with "Invalid UPF PFCP address". PFCP
+        # peers are fixed at startup, so the name has to be resolved to a
+        # literal IP before the process runs.
+        - name: resolve-upf
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              echo "[resolve-upf] resolving UPF PFCP address..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                # busybox has no getent, so nslookup is the only resolver here.
+                # Anchoring on ^Name: first and only then taking the following
+                # Address: skips the "Server:/Address: <dns-ip>:53" preamble --
+                # a plain `grep Address` returns the DNS server's own IP.
+                IP=$(nslookup upf.nextg-system.svc.cluster.local 2>/dev/null \
+                     | awk '/^Name:/{n=1;next} n&&/^Address( 1)?:/{print $NF; exit}')
+                case "$IP" in
+                  *.*.*.*) break ;;
+                esac
+                i=$((i+1))
+                echo "[resolve-upf] waiting for UPF DNS ($i/60)"
+                sleep 2
+              done
+              case "$IP" in
+                *[0-9].[0-9]*) ;;
+                *) echo "[resolve-upf] FATAL: could not resolve UPF to an IPv4 address" >&2; exit 1 ;;
+              esac
+              echo "[resolve-upf] UPF=$IP"
+              printf '%s' "$IP" > /shared/upf-ip
+          volumeMounts:
+            - name: resolved
+              mountPath: /shared
       containers:
         - name: smf
           image: nextgcore-rust/smf:latest
           imagePullPolicy: IfNotPresent
-          args: ["-c", "/etc/nextgcore/smf.yaml"]
+          # UPF_PFCP_ADDR is overridden from the resolved file before exec.
+          # `exec` matters: the SMF must stay PID 1 so it receives SIGTERM
+          # directly and the container's exit status is the SMF's.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              UPF_PFCP_ADDR="$(cat /shared/upf-ip)"
+              export UPF_PFCP_ADDR
+              echo "[smf] UPF_PFCP_ADDR=${UPF_PFCP_ADDR}"
+              exec /usr/local/bin/nf-binary -c /etc/nextgcore/smf.yaml
           ports:
             - containerPort: 7777
               name: sbi
@@ -64,6 +111,9 @@ spec:
               value: "1"
             - name: SMF_PFCP_ADDR
               value: "0.0.0.0"
+            # Overridden at start from /shared/upf-ip (see args above). Kept
+            # here as documentation of the expected shape; the literal value is
+            # unusable because it is a DNS name, not an IP.
             - name: UPF_PFCP_ADDR
               value: "upf.nextg-system.svc.cluster.local"
             - name: UPF_PFCP_PORT
@@ -82,6 +132,9 @@ spec:
               readOnly: true
             - name: logs
               mountPath: /var/log/nextgcore
+            - name: resolved
+              mountPath: /shared
+              readOnly: true
           readinessProbe:
             tcpSocket:
               port: 7777
@@ -97,4 +150,8 @@ spec:
           configMap:
             name: nextgcore-configs
         - name: logs
+          emptyDir: {}
+        # Carries the resolved UPF IP from the resolve-upf initContainer to the
+        # SMF container.
+        - name: resolved
           emptyDir: {}
