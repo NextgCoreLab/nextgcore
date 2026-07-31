@@ -13,3 +13,12 @@ docker/rust/artifacts/
 # Local tooling (GitNexus code-intelligence index + Claude Code local config)
 .gitnexus
 .claude/
+
+# Compiled NF binaries. Build artifacts, not sources: regenerate with
+#   cd src && cargo build --release          (then copy from src/target/release/)
+# or via the builder image (docker/rust/Dockerfile.builder), which is what CI
+# does. They were tracked historically for "fast builds", but a ~40 MB blob per
+# rebuild is not something git should carry, and a stale committed binary
+# silently produces images that do not match the source.
+# deploy/eks/build-and-push.sh checks for these and fails loudly if absent.
+/binaries/

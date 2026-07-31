@@ -57,8 +57,9 @@ REGISTRY="${REGISTRY:-${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com}"
 log "registry: ${REGISTRY}"
 log "prefix:   ${REPO_PREFIX}    tag: ${IMAGE_TAG}"
 
-# Fail early and loudly if the committed binaries are missing, rather than
-# producing images that crash on start.
+# Fail early and loudly if the binaries are missing, rather than producing
+# images that crash on start. They are build artifacts and no longer tracked in
+# git, so a fresh clone has none until you build.
 MISSING=()
 for entry in "${CORE_NFS[@]}"; do
   bin="${entry#*:}"
@@ -68,7 +69,12 @@ done
 [[ -f "${SIM_DIR}/docker/binaries/nr-ue"  ]] || MISSING+=("nextgsim/docker/binaries/nr-ue")
 if (( ${#MISSING[@]} )); then
   printf 'missing prebuilt binaries:\n'; printf '  %s\n' "${MISSING[@]}"
-  die "build them first, or check out the committed binaries"
+  printf 'build them with:\n'
+  printf '  cd %s/src && cargo build --release && \\\n' "${CORE_DIR}"
+  printf '    cp target/release/nextgcore-*d ../binaries/\n'
+  printf '  cd %s && cargo build --release && \\\n' "${SIM_DIR}"
+  printf '    cp target/release/nr-gnb target/release/nr-ue docker/binaries/\n'
+  die "no binaries to package"
 fi
 
 # --- ECR login + repos -----------------------------------------------------
