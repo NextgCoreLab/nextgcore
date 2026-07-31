@@ -372,18 +372,11 @@ pub struct HeartbeatStats {
 }
 
 /// Global heartbeat manager instance
-static mut GLOBAL_HEARTBEAT_MANAGER: Option<HeartbeatManager> = None;
-static MANAGER_INIT: std::sync::Once = std::sync::Once::new();
+static GLOBAL_HEARTBEAT_MANAGER: std::sync::OnceLock<HeartbeatManager> = std::sync::OnceLock::new();
 
 /// Get global heartbeat manager
 pub fn global_heartbeat_manager() -> &'static HeartbeatManager {
-    #[allow(static_mut_refs)]
-    unsafe {
-        MANAGER_INIT.call_once(|| {
-            GLOBAL_HEARTBEAT_MANAGER = Some(HeartbeatManager::default());
-        });
-        GLOBAL_HEARTBEAT_MANAGER.as_ref().expect("value expected")
-    }
+    GLOBAL_HEARTBEAT_MANAGER.get_or_init(HeartbeatManager::default)
 }
 
 /// Initialize heartbeat manager
