@@ -64,6 +64,11 @@ pub struct InitialUeMessage {
     pub rrc_establishment_cause: RrcEstablishmentCause,
     /// UE Context Request (optional)
     pub ue_context_request: Option<bool>,
+    /// Allowed NSSAI (optional, IE id 0). Permitted in InitialUEMessage by the
+    /// TS 38.413 ASN.1 (`InitialUEMessage-IEs` includes `id-AllowedNSSAI`), and
+    /// sent by a gNB that wants the AMF to see the slice context it used for
+    /// selection. Empty when the peer omits the IE.
+    pub allowed_nssai: Vec<SNssai>,
 }
 
 /// Downlink NAS Transport - sent by AMF to gNB (TS 38.413 Section 9.2.5.2)
