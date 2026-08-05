@@ -345,37 +345,44 @@ impl QosCharacteristics {
                 max_data_burst_volume: 0,
                 averaging_window_ms: 0,
             }),
-            // Rel-18 XR 5QI values (TS 23.501 Table 5.7.4-1)
+            // Delay-critical GBR range, TS 23.501 Table 5.7.4-1.
+            //
+            // These four were previously wrong in every field except the
+            // averaging window, and were labelled "Rel-18 XR" -- which is not
+            // what the spec assigns them to. 82/83 are Discrete Automation
+            // (83 also V2X platooning), 84 Intelligent transport systems,
+            // 85 Electricity Distribution at high voltage. Note resource_type
+            // is 1 (delay-critical GBR), not 0 (GBR).
             82 => Some(Self {
-                resource_type: 0,
-                priority_level: 21,
+                resource_type: 1,
+                priority_level: 19,
                 packet_delay_budget_ms: 10,
-                packet_error_rate_exp: 3,
-                max_data_burst_volume: 60_000,
+                packet_error_rate_exp: 4,
+                max_data_burst_volume: 255,
                 averaging_window_ms: 2000,
             }),
             83 => Some(Self {
-                resource_type: 0,
-                priority_level: 20,
-                packet_delay_budget_ms: 5,
+                resource_type: 1,
+                priority_level: 22,
+                packet_delay_budget_ms: 10,
                 packet_error_rate_exp: 4,
-                max_data_burst_volume: 1_500,
+                max_data_burst_volume: 1354,
                 averaging_window_ms: 2000,
             }),
             84 => Some(Self {
-                resource_type: 0,
-                priority_level: 22,
-                packet_delay_budget_ms: 15,
-                packet_error_rate_exp: 3,
-                max_data_burst_volume: 30_000,
+                resource_type: 1,
+                priority_level: 24,
+                packet_delay_budget_ms: 30,
+                packet_error_rate_exp: 5,
+                max_data_burst_volume: 1354,
                 averaging_window_ms: 2000,
             }),
             85 => Some(Self {
-                resource_type: 0,
-                priority_level: 19,
+                resource_type: 1,
+                priority_level: 21,
                 packet_delay_budget_ms: 5,
                 packet_error_rate_exp: 5,
-                max_data_burst_volume: 500,
+                max_data_burst_volume: 255,
                 averaging_window_ms: 2000,
             }),
             _ => None,

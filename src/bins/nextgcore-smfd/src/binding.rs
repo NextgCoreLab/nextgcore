@@ -917,7 +917,7 @@ pub enum QosResourceType {
     DelayCriticalGbr,
 }
 
-/// XR/URLLC 5QI characteristics (TS 23.501 Table 5.7.4-1)
+/// A standardised 5QI row from TS 23.501 Table 5.7.4-1.
 #[derive(Debug, Clone)]
 pub struct FiveQiCharacteristics {
     /// 5QI value
@@ -930,50 +930,60 @@ pub struct FiveQiCharacteristics {
     pub packet_delay_budget_ms: u32,
     /// Packet error rate (e.g., 1e-6 stored as 6)
     pub packet_error_rate_exp: u8,
+    /// Maximum Data Burst Volume in bytes.
+    ///
+    /// Standardised for the delay-critical GBR range and mandatory in the QoS
+    /// profile sent to the NG-RAN for those 5QIs (TS 23.501 §5.7.3.7), so it
+    /// belongs in the table rather than being left for a caller to supply.
+    pub max_data_burst_volume: u32,
     /// Default averaging window (ms), only for GBR
     pub averaging_window_ms: Option<u32>,
 }
 
-/// Standard 5QI table for XR/URLLC (Rel-18, TS 23.501)
+/// Standardised 5QI characteristics for the delay-critical GBR range 82-85,
+/// verbatim from **TS 23.501 Table 5.7.4-1** (checked against V20.2.0).
+///
+/// | 5QI | Resource type       | Priority | PDB   | PER  | MDBV       | Avg window | Example service                      |
+/// |-----|---------------------|----------|-------|------|------------|------------|--------------------------------------|
+/// | 82  | Delay-critical GBR  | 19       | 10 ms | 1e-4 | 255 bytes  | 2000 ms    | Discrete Automation                  |
+/// | 83  | Delay-critical GBR  | 22       | 10 ms | 1e-4 | 1354 bytes | 2000 ms    | Discrete Automation; V2X (platooning)|
+/// | 84  | Delay-critical GBR  | 24       | 30 ms | 1e-5 | 1354 bytes | 2000 ms    | Intelligent transport systems        |
+/// | 85  | Delay-critical GBR  | 21       | 5 ms  | 1e-5 | 255 bytes  | 2000 ms    | Electricity Distribution (high volt.)|
+///
+/// Two corrections are folded in here. The values for 5QI 83 were wrong (PDB
+/// 15 ms and PER 1e-3 rather than 10 ms / 1e-4), and the whole range was
+/// labelled "XR/cloud gaming" and "XR split rendering", which is not what the
+/// spec assigns these 5QIs to — XR traffic uses the Rel-18 additions in the
+/// non-GBR range, not 82-85. The misleading names are why a second, differently
+/// wrong copy of this table could sit in `context.rs` without anyone noticing
+/// the two disagreed on all four entries.
+///
+/// `MaxDataBurstVolume` is part of the standardised row and is now carried, so
+/// this really is the whole spec row rather than a subset that invites a second
+/// table to fill the gap.
 pub fn xr_urllc_5qi_table() -> Vec<FiveQiCharacteristics> {
-    vec![
-        // 5QI 82: Delay-critical GBR, XR/cloud gaming DL
-        FiveQiCharacteristics {
-            five_qi: 82,
-            resource_type: QosResourceType::DelayCriticalGbr,
-            priority: 19,
-            packet_delay_budget_ms: 10,
-            packet_error_rate_exp: 4,
-            averaging_window_ms: Some(2000),
-        },
-        // 5QI 83: Delay-critical GBR, XR/cloud gaming DL with higher error tolerance
-        FiveQiCharacteristics {
-            five_qi: 83,
-            resource_type: QosResourceType::DelayCriticalGbr,
-            priority: 22,
-            packet_delay_budget_ms: 15,
-            packet_error_rate_exp: 3,
-            averaging_window_ms: Some(2000),
-        },
-        // 5QI 84: Delay-critical GBR, XR split rendering DL
-        FiveQiCharacteristics {
-            five_qi: 84,
-            resource_type: QosResourceType::DelayCriticalGbr,
-            priority: 24,
-            packet_delay_budget_ms: 30,
-            packet_error_rate_exp: 5,
-            averaging_window_ms: Some(2000),
-        },
-        // 5QI 85: Delay-critical GBR, XR split rendering UL
-        FiveQiCharacteristics {
-            five_qi: 85,
-            resource_type: QosResourceType::DelayCriticalGbr,
-            priority: 21,
-            packet_delay_budget_ms: 5,
-            packet_error_rate_exp: 5,
-            averaging_window_ms: Some(2000),
-        },
-    ]
+    // Derived from QosCharacteristics::from_5qi rather than restated here.
+    // Two hand-maintained copies of the same spec table is what produced the
+    // original defect: this one and the one in context.rs disagreed on all four
+    // entries, and nothing detected it because only one had callers.
+    (82u8..=85)
+        .filter_map(|five_qi| {
+            let c = crate::context::QosCharacteristics::from_5qi(five_qi)?;
+            Some(FiveQiCharacteristics {
+                five_qi,
+                resource_type: match c.resource_type {
+                    0 => QosResourceType::Gbr,
+                    1 => QosResourceType::DelayCriticalGbr,
+                    _ => QosResourceType::NonGbr,
+                },
+                priority: c.priority_level,
+                packet_delay_budget_ms: u32::from(c.packet_delay_budget_ms),
+                packet_error_rate_exp: c.packet_error_rate_exp,
+                max_data_burst_volume: c.max_data_burst_volume,
+                averaging_window_ms: (c.averaging_window_ms != 0).then_some(c.averaging_window_ms),
+            })
+        })
+        .collect()
 }
 
 /// Look up XR/URLLC 5QI characteristics
@@ -1372,7 +1382,9 @@ mod tests {
 
         assert_eq!(xr_meta.len(), 1);
         assert_eq!(xr_meta[0].five_qi, 83);
-        assert_eq!(xr_meta[0].delay_budget_ms, 15);
+        // 10 ms per TS 23.501 Table 5.7.4-1. This assertion previously read 15,
+        // which was pinning the incorrect table value rather than the spec.
+        assert_eq!(xr_meta[0].delay_budget_ms, 10);
         assert_eq!(xr_meta[0].gbr_dl_bps, 30_000_000);
         assert!(xr_meta[0].requires_pdb_enforcement);
     }
@@ -1385,6 +1397,74 @@ mod tests {
             assert!(is_xr_5qi(entry.five_qi));
             assert_eq!(entry.resource_type, QosResourceType::DelayCriticalGbr);
             assert!(entry.averaging_window_ms.is_some());
+        }
+    }
+
+    #[test]
+    fn test_5qi_82_85_match_ts23501_table_5_7_4_1() {
+        // The VALUES, not just the shape. The pre-existing completeness test
+        // above only checked length, resource type and that a window was
+        // present, which is why two copies of this table could disagree on
+        // every numeric field without any test failing.
+        //
+        // Verbatim from TS 23.501 Table 5.7.4-1 (checked against V20.2.0):
+        //   5QI | prio | PDB   | PER  | MDBV
+        //    82 |  19  | 10 ms | 1e-4 |  255
+        //    83 |  22  | 10 ms | 1e-4 | 1354
+        //    84 |  24  | 30 ms | 1e-5 | 1354
+        //    85 |  21  |  5 ms | 1e-5 |  255
+        let expected: [(u8, u8, u32, u8, u32); 4] = [
+            (82, 19, 10, 4, 255),
+            (83, 22, 10, 4, 1354),
+            (84, 24, 30, 5, 1354),
+            (85, 21, 5, 5, 255),
+        ];
+
+        let table = xr_urllc_5qi_table();
+        for (five_qi, priority, pdb, per_exp, mdbv) in expected {
+            let entry = table
+                .iter()
+                .find(|e| e.five_qi == five_qi)
+                .unwrap_or_else(|| panic!("5QI {five_qi} missing from the table"));
+            assert_eq!(entry.priority, priority, "5QI {five_qi} priority");
+            assert_eq!(
+                entry.packet_delay_budget_ms, pdb,
+                "5QI {five_qi} packet delay budget"
+            );
+            assert_eq!(
+                entry.packet_error_rate_exp, per_exp,
+                "5QI {five_qi} packet error rate exponent"
+            );
+            assert_eq!(
+                entry.max_data_burst_volume, mdbv,
+                "5QI {five_qi} maximum data burst volume"
+            );
+            assert_eq!(entry.averaging_window_ms, Some(2000));
+            // All four are delay-critical GBR, not plain GBR.
+            assert_eq!(entry.resource_type, QosResourceType::DelayCriticalGbr);
+        }
+    }
+
+    #[test]
+    fn test_binding_and_context_5qi_tables_cannot_diverge() {
+        // Regression: binding.rs and context.rs each carried a hand-written copy
+        // of TS 23.501 Table 5.7.4-1 and disagreed on all four of 82-85. Only
+        // binding.rs was reachable, so the divergence was invisible.
+        //
+        // binding.rs now derives from context.rs. This asserts the two agree
+        // field by field, so reintroducing a second literal table fails here.
+        for entry in xr_urllc_5qi_table() {
+            let c = crate::context::QosCharacteristics::from_5qi(entry.five_qi)
+                .unwrap_or_else(|| panic!("context table missing 5QI {}", entry.five_qi));
+            assert_eq!(entry.priority, c.priority_level);
+            assert_eq!(
+                entry.packet_delay_budget_ms,
+                u32::from(c.packet_delay_budget_ms)
+            );
+            assert_eq!(entry.packet_error_rate_exp, c.packet_error_rate_exp);
+            assert_eq!(entry.max_data_burst_volume, c.max_data_burst_volume);
+            // resource_type 1 == delay-critical GBR in the context encoding.
+            assert_eq!(c.resource_type, 1, "5QI {} must be 1", entry.five_qi);
         }
     }
 }
