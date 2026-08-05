@@ -351,7 +351,7 @@ mod tests {
     fn test_sbi_server_event() {
         let request = SbiRequest {
             method: "GET".to_string(),
-            uri: "/nudr-dr/v1/subscription-data/imsi-001010000000001".to_string(),
+            uri: "/nudr-dr/v2/subscription-data/imsi-001010000000001".to_string(),
             body: None,
         };
         let event = UdrEvent::sbi_server(456, request);

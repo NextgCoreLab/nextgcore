@@ -727,7 +727,7 @@ pub async fn pcf_udr_sm_policy_dnn_data(
 }
 
 /// Discover a UDR and GET the UE PolicySet for `supi`
-/// (TS 29.519 §5.4: `GET /nudr-dr/v1/policy-data/ues/{ueId}/ue-policy-set`;
+/// (TS 29.519 §5.4: `GET /nudr-dr/v2/policy-data/ues/{ueId}/ue-policy-set`;
 /// the ue-policy-set resource is served at v1 by udrd, TS29519_Policy_Data.yaml
 /// / udrd `handle_policy_data`). Returns the decoded UePolicySet body on 200,
 /// `Ok(None)` on 404 or when no UDR is reachable — the caller (E3 rule source)
@@ -738,7 +738,7 @@ pub async fn pcf_udr_get_ue_policy_set(supi: &str) -> Result<Option<serde_json::
     };
     let client = client_for(&ep, NfType::Udr);
     let path = format!(
-        "/nudr-dr/v1/policy-data/ues/{}/ue-policy-set",
+        "/nudr-dr/v2/policy-data/ues/{}/ue-policy-set",
         percent_encode(supi),
     );
     let resp = client
@@ -1388,7 +1388,7 @@ mod tests {
         // E3: ue-policy-set is served at v1 by udrd. The body carries the
         // 3GPP subscPolicySections alongside our structured `urspRules`
         // provisioning extension (compiled to wire by the E2 codec).
-        if path.starts_with("/nudr-dr/v1/policy-data/") && path.ends_with("/ue-policy-set") {
+        if path.starts_with("/nudr-dr/v2/policy-data/") && path.ends_with("/ue-policy-set") {
             let body = serde_json::json!({
                 "subscPolicySections": {},
                 "urspRules": [{

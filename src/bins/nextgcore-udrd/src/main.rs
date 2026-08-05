@@ -360,10 +360,10 @@ async fn udr_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
     // Expected paths:
-    // /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription
-    // /nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}
-    // /nudr-dr/v1/subscription-data/{supi}/{plmn}/provisioned-data/{dataset}
-    // /nudr-dr/v1/policy-data/ues/{supi}/{resource}
+    // /nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription
+    // /nudr-dr/v2/subscription-data/{supi}/provisioned-data/{dataset}
+    // /nudr-dr/v2/subscription-data/{supi}/{plmn}/provisioned-data/{dataset}
+    // /nudr-dr/v2/policy-data/ues/{supi}/{resource}
 
     if parts.len() < 3 {
         return send_not_found("Invalid path", None);
@@ -441,7 +441,7 @@ fn pct_decode(s: &str) -> String {
 }
 
 /// Handle subscription-data requests
-/// Path: /nudr-dr/v1/subscription-data/{supi}/...
+/// Path: /nudr-dr/v2/subscription-data/{supi}/...
 async fn handle_subscription_data(
     parts: &[&str],
     method: &str,
@@ -543,7 +543,7 @@ fn is_valid_plmn_id(s: &str) -> bool {
 }
 
 /// Handle authentication-data requests
-/// Path: /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription
+/// Path: /nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription
 async fn handle_auth_data(
     supi: &str,
     parts: &[&str],
@@ -624,7 +624,7 @@ async fn handle_auth_data(
             {
                 Ok(created) => {
                     let path = format!(
-                        "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+                        "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription"
                     );
                     notify_subscription_data_change(supi, &path, Some(&body));
                     if created {
@@ -705,14 +705,14 @@ async fn handle_auth_data(
             log::warn!("[{supi}] Unknown auth resource: {method} {resource}");
             send_method_not_allowed(
                 method,
-                &format!("/nudr-dr/v1/subscription-data/{supi}/authentication-data/{resource}"),
+                &format!("/nudr-dr/v2/subscription-data/{supi}/authentication-data/{resource}"),
             )
         }
     }
 }
 
 /// Handle context-data requests
-/// Path: /nudr-dr/v1/subscription-data/{supi}/context-data/{resource}
+/// Path: /nudr-dr/v2/subscription-data/{supi}/context-data/{resource}
 ///
 /// Implements:
 /// - GET/PUT/PATCH/DELETE amf-3gpp-access: AMF 3GPP access registration context
@@ -747,7 +747,7 @@ async fn handle_context_data(
 
 /// Path of the amf-3gpp-access resource for a SUPI (notification resourceId).
 fn amf_3gpp_access_path(supi: &str) -> String {
-    format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access")
+    format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access")
 }
 
 /// Handle AMF 3GPP access registration context (TS 29.505).
@@ -1095,7 +1095,7 @@ fn apply_fields_param(value: serde_json::Value, request: &SbiRequest) -> serde_j
 }
 
 /// Handle provisioned-data requests
-/// Path: /nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}
+/// Path: /nudr-dr/v2/subscription-data/{supi}/provisioned-data/{dataset}
 async fn handle_provisioned_data(
     supi: &str,
     parts: &[&str],
@@ -1172,7 +1172,7 @@ async fn handle_provisioned_data(
 /// - GET/PUT policy-data/ues/{supi}/sm-data: SM policy data
 /// - GET policy-data/ues/{supi}/ue-policy-set: UE policy set
 async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
-    // /nudr-dr/v1/policy-data/ues/{supi}/{resource}
+    // /nudr-dr/v2/policy-data/ues/{supi}/{resource}
     let sub_resource = parts.get(3).copied().unwrap_or("");
 
     if sub_resource != "ues" {
@@ -1217,7 +1217,7 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                     }
                     let ds = nextgcore_udrd::data_store::store();
                     let created = ds.policy_am_put(supi, body.clone());
-                    let path = format!("/nudr-dr/v1/policy-data/ues/{supi}/am-data");
+                    let path = format!("/nudr-dr/v2/policy-data/ues/{supi}/am-data");
                     notify_subscription_data_change(supi, &path, Some(&body));
                     if created {
                         SbiResponse::with_status(201)
@@ -1273,7 +1273,7 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                     // udrd-04: persist the provisioned SmPolicyData.
                     let ds = nextgcore_udrd::data_store::store();
                     let created = ds.policy_sm_put(supi, body.clone());
-                    let path = format!("/nudr-dr/v1/policy-data/ues/{supi}/sm-data");
+                    let path = format!("/nudr-dr/v2/policy-data/ues/{supi}/sm-data");
                     notify_subscription_data_change(supi, &path, Some(&body));
                     if created {
                         SbiResponse::with_status(201)
@@ -1349,7 +1349,7 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                     // udrd-04: persist the provisioned UePolicySet.
                     let ds = nextgcore_udrd::data_store::store();
                     let created = ds.policy_ue_put(supi, body.clone());
-                    let path = format!("/nudr-dr/v1/policy-data/ues/{supi}/ue-policy-set");
+                    let path = format!("/nudr-dr/v2/policy-data/ues/{supi}/ue-policy-set");
                     notify_subscription_data_change(supi, &path, Some(&body));
                     if created {
                         SbiResponse::with_status(201)
@@ -1411,7 +1411,7 @@ fn build_sm_policy_data(
 // subscription-data/subs-to-notify (TS 29.505)
 // ============================================================================
 
-/// Handle /nudr-dr/v1/subscription-data/subs-to-notify[/{subsId}]
+/// Handle /nudr-dr/v2/subscription-data/subs-to-notify[/{subsId}]
 async fn handle_subscription_data_subs(
     parts: &[&str],
     method: &str,
@@ -1449,7 +1449,7 @@ async fn handle_subscription_data_subs(
                 SbiResponse::with_status(201)
                     .with_header(
                         "Location",
-                        format!("/nudr-dr/v1/subscription-data/subs-to-notify/{}", sub.id),
+                        format!("/nudr-dr/v2/subscription-data/subs-to-notify/{}", sub.id),
                     )
                     .with_body(stored_body.to_string(), "application/json")
             }
@@ -1543,7 +1543,7 @@ async fn handle_subscription_data_subs(
 // exposure-data (TS 29.519 shapes via TS 29.504 paths)
 // ============================================================================
 
-/// Handle /nudr-dr/v1/exposure-data/...
+/// Handle /nudr-dr/v2/exposure-data/...
 async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
     let ds = data_store::store();
 
@@ -1569,7 +1569,7 @@ async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest
                 SbiResponse::with_status(201)
                     .with_header(
                         "Location",
-                        format!("/nudr-dr/v1/exposure-data/subs-to-notify/{}", sub.id),
+                        format!("/nudr-dr/v2/exposure-data/subs-to-notify/{}", sub.id),
                     )
                     .with_body(body.to_string(), "application/json")
             }
@@ -1604,7 +1604,7 @@ async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest
     };
     match parts.get(4).copied() {
         Some("access-and-mobility-data") => {
-            let path = format!("/nudr-dr/v1/exposure-data/{ue_id}/access-and-mobility-data");
+            let path = format!("/nudr-dr/v2/exposure-data/{ue_id}/access-and-mobility-data");
             match method {
                 "PUT" => {
                     let body = match parse_json_body(request) {
@@ -1673,7 +1673,7 @@ async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest
             let Some(psi) = parts.get(5).copied() else {
                 return send_bad_request("Missing pduSessionId", Some("MANDATORY_IE_MISSING"));
             };
-            let path = format!("/nudr-dr/v1/exposure-data/{ue_id}/session-management-data/{psi}");
+            let path = format!("/nudr-dr/v2/exposure-data/{ue_id}/session-management-data/{psi}");
             match method {
                 "PUT" => {
                     let body = match parse_json_body(request) {
@@ -1737,7 +1737,7 @@ fn csv_param(request: &SbiRequest, name: &str) -> Option<Vec<String>> {
     })
 }
 
-/// Handle /nudr-dr/v1/application-data/...
+/// Handle /nudr-dr/v2/application-data/...
 async fn handle_application_data(
     parts: &[&str],
     method: &str,
@@ -1778,7 +1778,7 @@ async fn handle_application_data(
                 {
                     return missing_mandatory("pfds");
                 }
-                let path = format!("/nudr-dr/v1/application-data/pfds/{app_id}");
+                let path = format!("/nudr-dr/v2/application-data/pfds/{app_id}");
                 let created = ds.pfd_put(app_id, body.clone());
                 notify_application_data_change(&path, app_id, false);
                 if created {
@@ -1791,7 +1791,7 @@ async fn handle_application_data(
             }
             (Some(app_id), "DELETE") => {
                 if ds.pfd_remove(app_id).is_some() {
-                    let path = format!("/nudr-dr/v1/application-data/pfds/{app_id}");
+                    let path = format!("/nudr-dr/v2/application-data/pfds/{app_id}");
                     notify_application_data_change(&path, app_id, true);
                     SbiResponse::with_status(204)
                 } else {
@@ -1842,7 +1842,7 @@ async fn handle_application_data(
                         .with_header(
                             "Location",
                             format!(
-                                "/nudr-dr/v1/application-data/influenceData/subs-to-notify/{}",
+                                "/nudr-dr/v2/application-data/influenceData/subs-to-notify/{}",
                                 sub.id
                             ),
                         )
@@ -1887,7 +1887,7 @@ async fn handle_application_data(
             },
             // /influenceData/{influenceId}
             Some(influence_id) => {
-                let path = format!("/nudr-dr/v1/application-data/influenceData/{influence_id}");
+                let path = format!("/nudr-dr/v2/application-data/influenceData/{influence_id}");
                 match method {
                     "PUT" => {
                         let body = match parse_json_body(request) {
@@ -1961,7 +1961,7 @@ async fn handle_application_data(
                 SbiResponse::with_status(201)
                     .with_header(
                         "Location",
-                        format!("/nudr-dr/v1/application-data/subs-to-notify/{}", sub.id),
+                        format!("/nudr-dr/v2/application-data/subs-to-notify/{}", sub.id),
                     )
                     .with_body(body.to_string(), "application/json")
             }
@@ -2330,6 +2330,36 @@ async fn run_event_loop_async(shutdown: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
+/// Build the UDR's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
+///
+/// Split out of `register_with_nrf` so the advertised API version can be
+/// asserted without standing up an NRF. **Nudr_DataRepository is v2**
+/// (TS 29.504 §6.1.1, "The `<apiVersion>` shall be v2"), unlike
+/// Nnrf_NFManagement which the UDR consumes at v1.
+fn build_udr_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "UDR",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": [
+            {
+                "serviceInstanceId": format!("{nf_instance_id}-nudr-dr"),
+                "serviceName": "nudr-dr",
+                // TS 29.504 §6.1.1: "The <apiVersion> shall be v2" for
+                // Nudr_DataRepository. Advertising v1 while the PCF already
+                // called v2 meant discovery and the live consumer disagreed.
+                "versions": [{"apiVersionInUri": "v2", "apiFullVersion": "2.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            }
+        ],
+        "allowedNfTypes": ["UDM", "PCF", "AUSF", "SCP"],
+        "heartBeatTimer": 10
+    })
+}
+
 /// Register UDR with NRF.
 ///
 /// Returns the NF instance ID on success so the caller can start a heartbeat
@@ -2353,24 +2383,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
     let nf_instance_id = uuid::Uuid::new_v4().to_string();
 
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "UDR",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-nudr-dr"),
-                "serviceName": "nudr-dr",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            }
-        ],
-        "allowedNfTypes": ["UDM", "PCF", "AUSF", "SCP"],
-        "heartBeatTimer": 10
-    });
+    let nf_profile = build_udr_nf_profile(&nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     let response = client
@@ -2411,6 +2424,34 @@ fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_nrf_profile_advertises_nudr_dr_at_v2() {
+        // TS 29.504 §6.1.1: "The <apiVersion> shall be v2" for
+        // Nudr_DataRepository, and the OpenAPI server URL is
+        // `{apiRoot}/nudr-dr/v2`.
+        //
+        // Regression: this profile advertised v1 while the PCF already called
+        // /nudr-dr/v2/policy-data/... The disagreement was invisible because
+        // the UDR's live router discards the version segment
+        // (`let _version = parts[1]`), so both spellings routed. Against a
+        // strict peer, or once the version is ever enforced, one side breaks.
+        let profile = build_udr_nf_profile("udr-test-instance", "10.45.0.11", 7777);
+
+        let service = profile["nfServices"]
+            .as_array()
+            .expect("nfServices must be an array")
+            .iter()
+            .find(|s| s["serviceName"] == "nudr-dr")
+            .expect("nudr-dr must be registered");
+
+        assert_eq!(
+            service["versions"][0]["apiVersionInUri"], "v2",
+            "Nudr_DataRepository must be advertised at v2 per TS 29.504 6.1.1"
+        );
+        // apiFullVersion must track the URI version rather than lag it.
+        assert_eq!(service["versions"][0]["apiFullVersion"], "2.0.0");
+    }
 
     #[test]
     fn test_udr_yaml_oauth2_knob() {
@@ -2637,7 +2678,7 @@ udr:
     async fn test_http_amf3gpp_lifecycle_and_notify() {
         let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
         let supi = "imsi-001019900000001";
-        let resource = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+        let resource = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access");
 
         // Subscribe to changes for this UE.
         let cb_uri = format!("http://127.0.0.1:{cb_port}/cb/data-change");
@@ -2647,7 +2688,7 @@ udr:
             "monitoredResourceUris": [format!("http://udr{resource}")]
         });
         let resp = client
-            .post_json("/nudr-dr/v1/subscription-data/subs-to-notify", &sub_body)
+            .post_json("/nudr-dr/v2/subscription-data/subs-to-notify", &sub_body)
             .await
             .expect("POST sub");
         assert_eq!(resp.status, 201);
@@ -2657,7 +2698,7 @@ udr:
         // Missing mandatory callbackReference -> 400 ProblemDetails
         let resp = client
             .post_json(
-                "/nudr-dr/v1/subscription-data/subs-to-notify",
+                "/nudr-dr/v2/subscription-data/subs-to-notify",
                 &json!({"monitoredResourceUris": ["/x"]}),
             )
             .await
@@ -2759,7 +2800,7 @@ udr:
         assert_eq!(problem["status"], 404);
 
         // Unsubscribe by ue-id.
-        let mut req = SbiRequest::delete("/nudr-dr/v1/subscription-data/subs-to-notify");
+        let mut req = SbiRequest::delete("/nudr-dr/v2/subscription-data/subs-to-notify");
         req.http.set_param("ue-id", supi);
         let resp = client.send_request(req).await.expect("DELETE subs");
         assert_eq!(resp.status, 204);
@@ -2780,7 +2821,7 @@ udr:
         // Unknown UE, collection GET -> 200 + empty JSON array (no panic).
         let unknown = "imsi-001019999999999";
         let coll =
-            format!("/nudr-dr/v1/subscription-data/{unknown}/context-data/smf-registrations");
+            format!("/nudr-dr/v2/subscription-data/{unknown}/context-data/smf-registrations");
         let resp = client.get(&coll).await.expect("GET unknown smf-regs");
         assert_eq!(resp.status, 200, "unknown UE collection GET must be 200");
         let body: serde_json::Value =
@@ -2799,7 +2840,7 @@ udr:
         // Success path: PUT a full SmfRegistration then GET the actual stored
         // values back (not a hardcoded summary). A new registration is 201.
         let supi = "imsi-001019900000077";
-        let coll = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations");
+        let coll = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/smf-registrations");
         let single = format!("{coll}/5");
         let reg = json!({
             "smfInstanceId": "11111111-2222-3333-4444-555555555555",
@@ -2859,13 +2900,13 @@ udr:
     async fn test_http_exposure_data_lifecycle_and_notify() {
         let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
         let ue = "imsi-001019900000002";
-        let am_path = format!("/nudr-dr/v1/exposure-data/{ue}/access-and-mobility-data");
-        let sm_path = format!("/nudr-dr/v1/exposure-data/{ue}/session-management-data/5");
+        let am_path = format!("/nudr-dr/v2/exposure-data/{ue}/access-and-mobility-data");
+        let sm_path = format!("/nudr-dr/v2/exposure-data/{ue}/session-management-data/5");
 
         // Strict-peer: subscription without notificationUri -> 400.
         let resp = client
             .post_json(
-                "/nudr-dr/v1/exposure-data/subs-to-notify",
+                "/nudr-dr/v2/exposure-data/subs-to-notify",
                 &json!({"monitoredResourceUris": [am_path]}),
             )
             .await
@@ -2875,10 +2916,10 @@ udr:
         // Valid subscription -> 201 + Location.
         let resp = client
             .post_json(
-                "/nudr-dr/v1/exposure-data/subs-to-notify",
+                "/nudr-dr/v2/exposure-data/subs-to-notify",
                 &json!({
                     "notificationUri": format!("http://127.0.0.1:{cb_port}/cb/exposure"),
-                    "monitoredResourceUris": [format!("/nudr-dr/v1/exposure-data/{ue}")]
+                    "monitoredResourceUris": [format!("/nudr-dr/v2/exposure-data/{ue}")]
                 }),
             )
             .await
@@ -2945,14 +2986,14 @@ udr:
         // Remove the subscription -> 204; second delete -> 404.
         let resp = client
             .delete(&format!(
-                "/nudr-dr/v1/exposure-data/subs-to-notify/{sub_id}"
+                "/nudr-dr/v2/exposure-data/subs-to-notify/{sub_id}"
             ))
             .await
             .expect("DELETE sub");
         assert_eq!(resp.status, 204);
         let resp = client
             .delete(&format!(
-                "/nudr-dr/v1/exposure-data/subs-to-notify/{sub_id}"
+                "/nudr-dr/v2/exposure-data/subs-to-notify/{sub_id}"
             ))
             .await
             .expect("DELETE sub again");
@@ -2971,7 +3012,7 @@ udr:
         // Strict-peer: PFD data without pfds -> 400.
         let resp = client
             .put_json(
-                "/nudr-dr/v1/application-data/pfds/app-w42",
+                "/nudr-dr/v2/application-data/pfds/app-w42",
                 &json!({"applicationId": "app-w42"}),
             )
             .await
@@ -2984,12 +3025,12 @@ udr:
             "pfds": [{"pfdId": "pfd-1", "flowDescriptions": ["permit out ip from any to any"]}]
         });
         let resp = client
-            .put_json("/nudr-dr/v1/application-data/pfds/app-w42", &pfd)
+            .put_json("/nudr-dr/v2/application-data/pfds/app-w42", &pfd)
             .await
             .expect("PUT pfd");
         assert_eq!(resp.status, 201);
         let resp = client
-            .get("/nudr-dr/v1/application-data/pfds")
+            .get("/nudr-dr/v2/application-data/pfds")
             .await
             .expect("GET pfds");
         assert_eq!(resp.status, 200);
@@ -3004,7 +3045,7 @@ udr:
         // Influence subscription (supis filter) -> 201.
         let resp = client
             .post_json(
-                "/nudr-dr/v1/application-data/influenceData/subs-to-notify",
+                "/nudr-dr/v2/application-data/influenceData/subs-to-notify",
                 &json!({
                     "notificationUri": format!("http://127.0.0.1:{cb_port}/cb/influence"),
                     "supis": ["imsi-001019900000003"]
@@ -3017,7 +3058,7 @@ udr:
         // Strict-peer: subscription without any oneOf filter -> 400.
         let resp = client
             .post_json(
-                "/nudr-dr/v1/application-data/influenceData/subs-to-notify",
+                "/nudr-dr/v2/application-data/influenceData/subs-to-notify",
                 &json!({"notificationUri": "http://x/cb"}),
             )
             .await
@@ -3027,7 +3068,7 @@ udr:
         // Strict-peer: influence data without afAppId -> 400.
         let resp = client
             .put_json(
-                "/nudr-dr/v1/application-data/influenceData/inf-w42",
+                "/nudr-dr/v2/application-data/influenceData/inf-w42",
                 &json!({"dnn": "internet"}),
             )
             .await
@@ -3042,7 +3083,7 @@ udr:
             "trafficRoutes": [{"dnai": "edge-1"}]
         });
         let resp = client
-            .put_json("/nudr-dr/v1/application-data/influenceData/inf-w42", &influ)
+            .put_json("/nudr-dr/v2/application-data/influenceData/inf-w42", &influ)
             .await
             .expect("PUT influence");
         assert_eq!(resp.status, 201);
@@ -3053,14 +3094,14 @@ udr:
         assert_eq!(notify[0]["trafficInfluData"]["afAppId"], "app-w42");
 
         // Collection read with filters.
-        let mut req = SbiRequest::get("/nudr-dr/v1/application-data/influenceData");
+        let mut req = SbiRequest::get("/nudr-dr/v2/application-data/influenceData");
         req.http.set_param("supis", "imsi-001019900000003");
         let resp = client.send_request(req).await.expect("GET influence");
         assert_eq!(resp.status, 200);
         let list: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
-        let mut req = SbiRequest::get("/nudr-dr/v1/application-data/influenceData");
+        let mut req = SbiRequest::get("/nudr-dr/v2/application-data/influenceData");
         req.http.set_param("dnns", "no-such-dnn");
         let resp = client.send_request(req).await.expect("GET influence empty");
         let list: serde_json::Value =
@@ -3069,7 +3110,7 @@ udr:
 
         // DELETE influence -> 204 + deletion notification (resUri only).
         let resp = client
-            .delete("/nudr-dr/v1/application-data/influenceData/inf-w42")
+            .delete("/nudr-dr/v2/application-data/influenceData/inf-w42")
             .await
             .expect("DELETE influence");
         assert_eq!(resp.status, 204);
@@ -3079,12 +3120,12 @@ udr:
 
         // DELETE pfd -> 204; GET -> 404.
         let resp = client
-            .delete("/nudr-dr/v1/application-data/pfds/app-w42")
+            .delete("/nudr-dr/v2/application-data/pfds/app-w42")
             .await
             .expect("DELETE pfd");
         assert_eq!(resp.status, 204);
         let resp = client
-            .get("/nudr-dr/v1/application-data/pfds/app-w42")
+            .get("/nudr-dr/v2/application-data/pfds/app-w42")
             .await
             .expect("GET deleted pfd");
         assert_eq!(resp.status, 404);
@@ -3110,7 +3151,7 @@ udr:
         let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
         let supi = "imsi-001019900000004";
         let auth_path = format!(
-            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription"
         );
 
         // Missing authenticationMethod -> 400 MANDATORY_IE_MISSING.
@@ -3158,7 +3199,7 @@ udr:
         // Invalid servingPlmnId in the PLMN-scoped provisioned-data layout -> 400.
         let resp = client
             .get(&format!(
-                "/nudr-dr/v1/subscription-data/{supi}/12a45/provisioned-data/am-data"
+                "/nudr-dr/v2/subscription-data/{supi}/12a45/provisioned-data/am-data"
             ))
             .await
             .expect("GET bad plmn");
@@ -3170,7 +3211,7 @@ udr:
         // Valid PLMN routes through (404 without a subscriber DB, not 400).
         let resp = client
             .get(&format!(
-                "/nudr-dr/v1/subscription-data/{supi}/00101/provisioned-data/am-data"
+                "/nudr-dr/v2/subscription-data/{supi}/00101/provisioned-data/am-data"
             ))
             .await
             .expect("GET good plmn");
@@ -3392,14 +3433,14 @@ udr:
 
         // imsi- is unchanged (404 when no DB, not 400)
         let resp = client
-            .get("/nudr-dr/v1/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription")
+            .get("/nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription")
             .await
             .expect("GET imsi");
         assert_eq!(resp.status, 404, "imsi- should 404 (no DB), not 400");
 
         // nai- is a valid VarUeId, returns 404 (not 400 INVALID_SUPI)
         let resp = client
-            .get("/nudr-dr/v1/subscription-data/nai-user@example.com/authentication-data/authentication-subscription")
+            .get("/nudr-dr/v2/subscription-data/nai-user@example.com/authentication-data/authentication-subscription")
             .await
             .expect("GET nai");
         assert_eq!(resp.status, 404, "nai- should be 404, not 400");
@@ -3412,14 +3453,14 @@ udr:
 
         // gci- is a valid VarUeId, returns 404
         let resp = client
-            .get("/nudr-dr/v1/subscription-data/gci-001010000000001/authentication-data/authentication-subscription")
+            .get("/nudr-dr/v2/subscription-data/gci-001010000000001/authentication-data/authentication-subscription")
             .await
             .expect("GET gci");
         assert_eq!(resp.status, 404, "gci- should be 404");
 
         // extgroupid- returns 501 Not Implemented
         let resp = client
-            .get("/nudr-dr/v1/subscription-data/extgroupid-grp001/authentication-data/authentication-subscription")
+            .get("/nudr-dr/v2/subscription-data/extgroupid-grp001/authentication-data/authentication-subscription")
             .await
             .expect("GET extgroupid");
         assert_eq!(resp.status, 501, "extgroupid- must return 501");
@@ -3429,7 +3470,7 @@ udr:
 
         // Unknown prefix still returns 400 INVALID_SUPI
         let resp = client
-            .get("/nudr-dr/v1/subscription-data/bogus-12345/authentication-data/authentication-subscription")
+            .get("/nudr-dr/v2/subscription-data/bogus-12345/authentication-data/authentication-subscription")
             .await
             .expect("GET bogus");
         assert_eq!(resp.status, 400, "unknown prefix must still be 400");
@@ -3597,7 +3638,7 @@ udr:
         let supi = "imsi-001019900000042";
 
         // --- am-data ---
-        let am_path = format!("/nudr-dr/v1/policy-data/ues/{supi}/am-data");
+        let am_path = format!("/nudr-dr/v2/policy-data/ues/{supi}/am-data");
         // No PUT yet → GET returns {} default
         let resp = client.get(&am_path).await.expect("GET am-data default");
         assert_eq!(resp.status, 200);
@@ -3628,7 +3669,7 @@ udr:
         assert_eq!(resp.status, 204, "second PUT must be 204");
 
         // --- sm-data ---
-        let sm_path = format!("/nudr-dr/v1/policy-data/ues/{supi}/sm-data");
+        let sm_path = format!("/nudr-dr/v2/policy-data/ues/{supi}/sm-data");
         let sm_doc = json!({"smPolicySnssaiData": {"01": {"snssai": {"sst": 1}}}});
         let resp = client
             .put_json(&sm_path, &sm_doc)
@@ -3642,7 +3683,7 @@ udr:
         assert_eq!(got, sm_doc, "GET must return stored sm-data");
 
         // --- ue-policy-set ---
-        let ue_path = format!("/nudr-dr/v1/policy-data/ues/{supi}/ue-policy-set");
+        let ue_path = format!("/nudr-dr/v2/policy-data/ues/{supi}/ue-policy-set");
         let ue_doc = json!({"subscPolicySections": {"01": {"upsi": []}}});
         let resp = client
             .put_json(&ue_path, &ue_doc)
@@ -3680,7 +3721,7 @@ udr:
     /// (TS 29.505 AuthenticationSubscription shape) and return the auth path.
     async fn wsb6_provision(client: &SbiClient, supi: &str, sqn: u64) -> String {
         let auth_path = format!(
-            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription"
         );
         let resp = client
             .put_json(
@@ -3774,7 +3815,7 @@ udr:
         let s0: u64 = 0x40;
         wsb6_provision(&client, supi, s0).await;
         let status_path = format!(
-            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status"
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-status"
         );
 
         // TS 29.503 AuthEvent body, as udmd PUTs it on auth confirmation
@@ -3834,7 +3875,7 @@ udr:
         let s0: u64 = 0x20;
         let auth_path = wsb6_provision(&client, supi, s0).await;
         let status_path = format!(
-            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status"
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-status"
         );
         let auth_event = json!({
             "nfInstanceId": "6874ed4b-262c-4a53-a8a4-e846a41ad0e8",

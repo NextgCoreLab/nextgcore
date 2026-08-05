@@ -12,7 +12,7 @@
 //! (`pcf_udr_get_ue_policy_set`) is covered separately by the mock-NRF/UDR unit
 //! test in `sbi_path.rs` (`discover_and_send_udr_mock`).
 //!
-//! Specs: TS 29.519 §5.4 UePolicySet (`GET /nudr-dr/v1/policy-data/ues/{ueId}/
+//! Specs: TS 29.519 §5.4 UePolicySet (`GET /nudr-dr/v2/policy-data/ues/{ueId}/
 //! ue-policy-set`); TS 23.503 §6.6.2.2 (URSP configuration/provision);
 //! TS 24.501 Table D.5.1.1.1 (MANAGE UE POLICY COMMAND) + TS 24.526 §5.2 (URSP
 //! contents).

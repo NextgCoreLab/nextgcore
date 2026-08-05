@@ -399,14 +399,14 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
 
 /// Build and send authentication subscription GET to UDR
 ///
-/// Builds: GET /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription
+/// Builds: GET /nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription
 pub async fn udm_nudr_dr_send_auth_subscription_get(
     supi: &str,
     udm_ue_id: u64,
     stream_id: u64,
 ) -> Result<SbiResponse, String> {
     let path = format!(
-        "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+        "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription"
     );
     let request = SbiRequest::get(&path);
     udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
@@ -414,7 +414,7 @@ pub async fn udm_nudr_dr_send_auth_subscription_get(
 
 /// Build and send SQN update PATCH to UDR
 ///
-/// Builds: PATCH /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription
+/// Builds: PATCH /nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription
 pub async fn udm_nudr_dr_send_auth_subscription_patch(
     supi: &str,
     sqn_hex: &str,
@@ -422,7 +422,7 @@ pub async fn udm_nudr_dr_send_auth_subscription_patch(
     stream_id: u64,
 ) -> Result<SbiResponse, String> {
     let path = format!(
-        "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+        "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription"
     );
     let patch_body = serde_json::json!([{
         "op": "replace",
@@ -438,14 +438,14 @@ pub async fn udm_nudr_dr_send_auth_subscription_patch(
 
 /// Build and send provisioned data GET to UDR
 ///
-/// Builds: GET /nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}
+/// Builds: GET /nudr-dr/v2/subscription-data/{supi}/provisioned-data/{dataset}
 pub async fn udm_nudr_dr_send_provisioned_data_get(
     supi: &str,
     dataset: &str,
     udm_ue_id: u64,
     stream_id: u64,
 ) -> Result<SbiResponse, String> {
-    let path = format!("/nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}");
+    let path = format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/{dataset}");
     let request = SbiRequest::get(&path);
     udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
 }
@@ -460,7 +460,7 @@ pub async fn udm_nudr_dr_send_provisioned_data_get_with_params(
     dataset: &str,
     params: &std::collections::HashMap<String, String>,
 ) -> Result<SbiResponse, String> {
-    let path = format!("/nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}");
+    let path = format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/{dataset}");
     let mut request = SbiRequest::get(&path);
     for (k, v) in params {
         request = request.with_param(k, v);
@@ -474,20 +474,20 @@ pub async fn udm_nudr_dr_send_provisioned_data_get_with_params(
 
 /// GET the stored AMF 3GPP-access registration from UDR (udmd-02 prior read).
 ///
-/// Builds: `GET /nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access`
+/// Builds: `GET /nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access`
 pub async fn udm_nudr_dr_send_amf_context_get(supi: &str) -> Result<SbiResponse, String> {
-    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+    let path = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access");
     udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::get(&path)).await
 }
 
 /// PUT the AMF 3GPP-access registration to UDR (udmd-01).
 ///
-/// Builds: `PUT /nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access`
+/// Builds: `PUT /nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access`
 pub async fn udm_nudr_dr_send_amf_context_put(
     supi: &str,
     body: &serde_json::Value,
 ) -> Result<SbiResponse, String> {
-    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+    let path = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access");
     let request = SbiRequest::put(&path)
         .with_json_body(body)
         .map_err(|e| format!("Failed to serialize AMF context: {e}"))?;
@@ -496,13 +496,13 @@ pub async fn udm_nudr_dr_send_amf_context_put(
 
 /// PUT a per-PDU-session SMF registration to UDR (udmd-01).
 ///
-/// Builds: `PUT /nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}`
+/// Builds: `PUT /nudr-dr/v2/subscription-data/{supi}/context-data/smf-registrations/{psi}`
 pub async fn udm_nudr_dr_send_smf_context_put(
     supi: &str,
     psi: &str,
     body: &serde_json::Value,
 ) -> Result<SbiResponse, String> {
-    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}");
+    let path = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/smf-registrations/{psi}");
     let request = SbiRequest::put(&path)
         .with_json_body(body)
         .map_err(|e| format!("Failed to serialize SMF registration: {e}"))?;
@@ -513,23 +513,23 @@ pub async fn udm_nudr_dr_send_smf_context_put(
 ///
 /// `relative_path` is the resource under `context-data/`, e.g.
 /// `amf-3gpp-access` or `smf-registrations/{psi}`. Builds:
-/// `DELETE /nudr-dr/v1/subscription-data/{supi}/context-data/{relative_path}`
+/// `DELETE /nudr-dr/v2/subscription-data/{supi}/context-data/{relative_path}`
 pub async fn udm_nudr_dr_send_context_delete(
     supi: &str,
     relative_path: &str,
 ) -> Result<SbiResponse, String> {
-    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/{relative_path}");
+    let path = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/{relative_path}");
     udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::delete(&path)).await
 }
 
 /// PATCH the AMF 3GPP-access registration in UDR (udmd-05: purgeFlag / modification).
 ///
-/// Builds: `PATCH /nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access`
+/// Builds: `PATCH /nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access`
 pub async fn udm_nudr_dr_send_amf_context_patch(
     supi: &str,
     body: &serde_json::Value,
 ) -> Result<SbiResponse, String> {
-    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+    let path = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access");
     let request = SbiRequest::patch(&path)
         .with_json_body(body)
         .map_err(|e| format!("Failed to serialize AMF context patch: {e}"))?;
@@ -538,24 +538,24 @@ pub async fn udm_nudr_dr_send_amf_context_patch(
 
 /// GET the stored SMF registration from UDR (udmd-06: create vs update check).
 ///
-/// Builds: `GET /nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}`
+/// Builds: `GET /nudr-dr/v2/subscription-data/{supi}/context-data/smf-registrations/{psi}`
 pub async fn udm_nudr_dr_send_smf_context_get(
     supi: &str,
     psi: &str,
 ) -> Result<SbiResponse, String> {
-    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}");
+    let path = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/smf-registrations/{psi}");
     udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::get(&path)).await
 }
 
 /// PUT an AuthEvent to the UDR authentication-status resource (udmd-09).
 ///
-/// Builds: `PUT /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status`
+/// Builds: `PUT /nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-status`
 pub async fn udm_nudr_dr_send_auth_status_put(
     supi: &str,
     body: &serde_json::Value,
 ) -> Result<SbiResponse, String> {
     let path =
-        format!("/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status");
+        format!("/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-status");
     let request = SbiRequest::put(&path)
         .with_json_body(body)
         .map_err(|e| format!("Failed to serialize auth status body: {e}"))?;

@@ -955,20 +955,20 @@ mod tests {
 
     #[test]
     fn test_uri_covers() {
-        let changed = "/nudr-dr/v1/subscription-data/imsi-1/context-data/amf-3gpp-access";
+        let changed = "/nudr-dr/v2/subscription-data/imsi-1/context-data/amf-3gpp-access";
         // Exact full-URI match
         assert!(uri_covers(
-            "http://udr:7777/nudr-dr/v1/subscription-data/imsi-1/context-data/amf-3gpp-access",
+            "http://udr:7777/nudr-dr/v2/subscription-data/imsi-1/context-data/amf-3gpp-access",
             changed
         ));
         // Ancestor match (monitored subtree)
         assert!(uri_covers(
-            "http://udr:7777/nudr-dr/v1/subscription-data/imsi-1/context-data",
+            "http://udr:7777/nudr-dr/v2/subscription-data/imsi-1/context-data",
             changed
         ));
         // Different UE does not match
         assert!(!uri_covers(
-            "http://udr:7777/nudr-dr/v1/subscription-data/imsi-2/context-data",
+            "http://udr:7777/nudr-dr/v2/subscription-data/imsi-2/context-data",
             changed
         ));
     }
@@ -1003,7 +1003,7 @@ mod tests {
             SubKind::SubscriptionData,
             "http://x:1/cb",
             json!({"ueId": "imsi-1", "callbackReference": "http://x:1/cb",
-                   "monitoredResourceUris": ["/nudr-dr/v1/subscription-data/imsi-1"]}),
+                   "monitoredResourceUris": ["/nudr-dr/v2/subscription-data/imsi-1"]}),
         );
         assert!(s.sub_get(&sub.id).is_some());
         // kind mismatch on replace
@@ -1107,7 +1107,7 @@ mod tests {
             "ueId": "imsi-001010000000001",
             "callbackReference": cb_uri,
             "monitoredResourceUris": [
-                "/nudr-dr/v1/subscription-data/imsi-001010000000001/context-data"
+                "/nudr-dr/v2/subscription-data/imsi-001010000000001/context-data"
             ]
         });
         let sub = s.sub_create(SubKind::SubscriptionData, cb_uri, body);
@@ -1116,7 +1116,7 @@ mod tests {
         // payload constructed by the notify logic (we can re-derive it here
         // directly, mirroring the implementation, to assert its shape).
         let changed_path =
-            "/nudr-dr/v1/subscription-data/imsi-001010000000001/context-data/amf-3gpp-access";
+            "/nudr-dr/v2/subscription-data/imsi-001010000000001/context-data/amf-3gpp-access";
         let new_value = json!({"amfInstanceId": "x"});
 
         // Build the expected payload shape (mirrors notify_subscription_data_change).
@@ -1163,7 +1163,7 @@ mod tests {
         // Body intentionally omits "callbackReference"
         let body = json!({
             "ueId": "imsi-001010000000002",
-            "monitoredResourceUris": ["/nudr-dr/v1/subscription-data/imsi-001010000000002"]
+            "monitoredResourceUris": ["/nudr-dr/v2/subscription-data/imsi-001010000000002"]
         });
         let sub = s.sub_create(SubKind::SubscriptionData, cb_uri, body);
 
