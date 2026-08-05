@@ -23,7 +23,18 @@ pub const IPV6_LEN: usize = 16;
 /// PFCP bitrate length (5 bytes uplink + 5 bytes downlink)
 pub const PFCP_BITRATE_LEN: usize = 10;
 
-/// PFCP Cause Values (TS 29.244 Section 8.2.1)
+/// PFCP Cause Values (TS 29.244 Table 8.2.1-1)
+///
+/// The full set of values defined up to Rel-20 (TS 29.244 V20.0.0). Values
+/// 2..=63 are the acceptance range and 64..=255 the rejection range; both are
+/// declared extendable by the spec, so a peer may legitimately send a value
+/// this enum does not name. Decode unknown values with [`PfcpCause::from_wire`]
+/// rather than `try_from` so an unrecognised cause degrades to its range
+/// semantics instead of failing the whole message.
+///
+/// This stays a fieldless `#[repr(u8)]` enum on purpose: the encode path casts
+/// `self.cause as u8` in eleven places, so an `Unknown(u8)` variant would
+/// silently serialise a discriminant rather than the original byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PfcpCause {
@@ -42,6 +53,21 @@ pub enum PfcpCause {
     NoResourcesAvailable = 75,
     ServiceNotSupported = 76,
     SystemFailure = 77,
+    RedirectionRequested = 78,
+    AllDynamicAddressesAreOccupied = 79,
+    UnknownPredefinedRule = 80,
+    UnknownApplicationId = 81,
+    L2tpTunnelEstablishmentFailure = 82,
+    L2tpSessionEstablishmentFailure = 83,
+    L2tpTunnelRelease = 84,
+    L2tpSessionRelease = 85,
+    PfcpSessionRestorationFailure = 86,
+    L2tpTunnelAuthFailure = 87,
+    L2tpSessionAuthFailure = 88,
+    L2tpLnsNotReachable = 89,
+    PfdContentsSyntaxError = 90,
+    PfdContentsSemanticsError = 91,
+    PfdApplicationIdUnknown = 92,
 }
 
 impl TryFrom<u8> for PfcpCause {
@@ -64,12 +90,52 @@ impl TryFrom<u8> for PfcpCause {
             75 => Ok(Self::NoResourcesAvailable),
             76 => Ok(Self::ServiceNotSupported),
             77 => Ok(Self::SystemFailure),
+            78 => Ok(Self::RedirectionRequested),
+            79 => Ok(Self::AllDynamicAddressesAreOccupied),
+            80 => Ok(Self::UnknownPredefinedRule),
+            81 => Ok(Self::UnknownApplicationId),
+            82 => Ok(Self::L2tpTunnelEstablishmentFailure),
+            83 => Ok(Self::L2tpSessionEstablishmentFailure),
+            84 => Ok(Self::L2tpTunnelRelease),
+            85 => Ok(Self::L2tpSessionRelease),
+            86 => Ok(Self::PfcpSessionRestorationFailure),
+            87 => Ok(Self::L2tpTunnelAuthFailure),
+            88 => Ok(Self::L2tpSessionAuthFailure),
+            89 => Ok(Self::L2tpLnsNotReachable),
+            90 => Ok(Self::PfdContentsSyntaxError),
+            91 => Ok(Self::PfdContentsSemanticsError),
+            92 => Ok(Self::PfdApplicationIdUnknown),
             _ => Err(PfcpError::InvalidCause(value)),
         }
     }
 }
 
 impl PfcpCause {
+    /// Decode a Cause octet off the wire without failing on unknown values.
+    ///
+    /// TS 29.244 §8.2.1 splits the Cause space into an acceptance range
+    /// (2..=63) and a rejection range (64..=255), and declares both
+    /// extendable. A future release can therefore add a value this build does
+    /// not know, and a strict `try_from` would reject the entire enclosing
+    /// message rather than the one IE — which is how a peer sending cause 78
+    /// ("Redirection Requested", added before Rel-20 but absent here until
+    /// now) made every N4 response unparseable.
+    ///
+    /// An unrecognised value is mapped to the generic outcome for its range so
+    /// the accept/reject decision is still correct. Callers that want to report
+    /// the unmapped octet should pair this with [`PfcpCause::try_from`], which
+    /// still returns [`PfcpError::InvalidCause`] carrying the raw value. This
+    /// crate deliberately takes no logging dependency — it is a codec.
+    pub fn from_wire(value: u8) -> Self {
+        match Self::try_from(value) {
+            Ok(cause) => cause,
+            // TS 29.244 §8.2.1: 64..=255 is the rejection range, 2..=63 the
+            // acceptance range. Both are extendable.
+            Err(_) if value >= 64 => Self::RequestRejected,
+            Err(_) => Self::RequestAccepted,
+        }
+    }
+
     /// Get the name of the cause
     pub fn name(&self) -> &'static str {
         match self {
@@ -88,10 +154,36 @@ impl PfcpCause {
             Self::NoResourcesAvailable => "No Resources Available",
             Self::ServiceNotSupported => "Service Not Supported",
             Self::SystemFailure => "System Failure",
+            Self::RedirectionRequested => "Redirection Requested",
+            Self::AllDynamicAddressesAreOccupied => "All dynamic addresses are occupied",
+            Self::UnknownPredefinedRule => "Unknown Pre-defined Rule",
+            Self::UnknownApplicationId => "Unknown Application ID",
+            Self::L2tpTunnelEstablishmentFailure => "L2TP tunnel Establishment failure",
+            Self::L2tpSessionEstablishmentFailure => "L2TP session Establishment failure",
+            Self::L2tpTunnelRelease => "L2TP tunnel release",
+            Self::L2tpSessionRelease => "L2TP session release",
+            Self::PfcpSessionRestorationFailure => {
+                "PFCP session restoration failure due to requested resource not available"
+            }
+            Self::L2tpTunnelAuthFailure => {
+                "L2TP tunnel Establishment failure - Tunnel Auth Failure"
+            }
+            Self::L2tpSessionAuthFailure => {
+                "L2TP Session Establishment failure - Session Auth Failure"
+            }
+            Self::L2tpLnsNotReachable => "L2TP tunnel Establishment failure - LNS not reachable",
+            Self::PfdContentsSyntaxError => "PFD Contents Syntax Error",
+            Self::PfdContentsSemanticsError => "PFD Contents Semantics Error",
+            Self::PfdApplicationIdUnknown => "PFD Application Id Unknown",
         }
     }
 
     /// Check if cause indicates success
+    ///
+    /// Only value 1 is a positive acknowledgement; every other named value is
+    /// in the rejection range. Note `RedirectionRequested` (78) is *not* a
+    /// success — the request was not carried out, the peer is being asked to
+    /// re-target a different SMF.
     pub fn is_success(&self) -> bool {
         matches!(self, Self::RequestAccepted)
     }
@@ -3432,7 +3524,7 @@ impl PfdPartialFailureInformation {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        failure_cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        failure_cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 _ => {}
@@ -3861,6 +3953,50 @@ mod tests {
         let mut bytes = encoded.clone();
         let decoded = FTeid::decode(&mut bytes).unwrap();
         (encoded, decoded)
+    }
+
+    #[test]
+    fn test_cause_78_redirection_requested_decodes() {
+        // Regression: cause 78 is defined in TS 29.244 Table 8.2.1-1 and was
+        // already named in smfd's local table, but was absent from this enum.
+        // Because every decode site propagated the error with `?`, a real UPF
+        // returning 78 made the whole enclosing N4 response unparseable.
+        let cause = PfcpCause::try_from(78).expect("cause 78 must decode");
+        assert_eq!(cause, PfcpCause::RedirectionRequested);
+        assert_eq!(cause.name(), "Redirection Requested");
+        // 78 asks the UPF to re-target another SMF: the request was NOT carried out.
+        assert!(!cause.is_success());
+    }
+
+    #[test]
+    fn test_all_ts29244_table_8_2_1_1_causes_decode() {
+        // Every value the spec defines up to Rel-20 must round-trip through
+        // both TryFrom and the u8 discriminant used by the encode path.
+        for value in [
+            1u8, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83,
+            84, 85, 86, 87, 88, 89, 90, 91, 92,
+        ] {
+            let cause = PfcpCause::try_from(value)
+                .unwrap_or_else(|_| panic!("TS 29.244 cause {value} must decode"));
+            assert_eq!(cause as u8, value, "discriminant must equal the wire value");
+            assert_ne!(cause.name(), "", "cause {value} needs a name");
+        }
+    }
+
+    #[test]
+    fn test_from_wire_maps_unknown_causes_to_range_semantics() {
+        // Both Cause ranges are extendable, so a newer peer may send a value
+        // this build does not name. from_wire must keep the accept/reject
+        // decision correct instead of failing the message.
+        assert_eq!(PfcpCause::from_wire(200), PfcpCause::RequestRejected);
+        assert_eq!(PfcpCause::from_wire(64), PfcpCause::RequestRejected);
+        assert_eq!(PfcpCause::from_wire(2), PfcpCause::RequestAccepted);
+        assert_eq!(PfcpCause::from_wire(63), PfcpCause::RequestAccepted);
+        // Known values must still decode exactly, not via the range fallback.
+        assert_eq!(PfcpCause::from_wire(78), PfcpCause::RedirectionRequested);
+        assert_eq!(PfcpCause::from_wire(1), PfcpCause::RequestAccepted);
+        // An unknown rejection value must not be mistaken for success.
+        assert!(!PfcpCause::from_wire(200).is_success());
     }
 
     #[test]

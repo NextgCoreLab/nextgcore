@@ -275,7 +275,7 @@ impl AssociationSetupResponse {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 t if t == IeType::RecoveryTimeStamp as u16 => {
@@ -381,7 +381,7 @@ impl AssociationReleaseResponse {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 _ => {}
@@ -611,7 +611,7 @@ impl SessionEstablishmentResponse {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 t if t == IeType::FSeid as u16 => {
@@ -688,7 +688,7 @@ impl SessionDeletionResponse {
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
             if ie.ie_type == IeType::Cause as u16 && !ie.data.is_empty() {
-                cause = Some(PfcpCause::try_from(ie.data[0])?);
+                cause = Some(PfcpCause::from_wire(ie.data[0]));
             }
         }
 
@@ -927,7 +927,7 @@ impl SessionModificationResponse {
             match ie.ie_type {
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 t if t == IeType::OffendingIe as u16 => {
@@ -1122,7 +1122,7 @@ impl SessionReportResponse {
             match ie.ie_type {
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 t if t == IeType::OffendingIe as u16 => {
@@ -1250,7 +1250,7 @@ impl NodeReportResponse {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 t if t == IeType::OffendingIe as u16 => {
@@ -1407,7 +1407,7 @@ impl AssociationUpdateResponse {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 t if t == IeType::UpFunctionFeatures as u16 => {
@@ -1538,7 +1538,7 @@ impl PfdManagementResponse {
             match ie.ie_type {
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 t if t == IeType::OffendingIe as u16 => {
@@ -1654,7 +1654,7 @@ impl SessionSetDeletionResponse {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 t if t == IeType::OffendingIe as u16 => {
@@ -1760,7 +1760,7 @@ impl SessionSetModificationResponse {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                        cause = Some(PfcpCause::from_wire(ie.data[0]));
                     }
                 }
                 t if t == IeType::OffendingIe as u16 => {
@@ -2026,6 +2026,61 @@ mod tests {
         let mut bytes = buf.freeze();
         let decoded = HeartbeatRequest::decode(&mut bytes).unwrap();
 
+        assert_eq!(decoded.recovery_time_stamp, 1234567890);
+    }
+
+    /// Build an Association Setup Response body carrying an arbitrary Cause
+    /// octet, so a cause value the encoder cannot express can still be fed to
+    /// the decoder the way a third-party UPF would send it.
+    ///
+    /// Encoded with the real encoder and then patched in place, rather than
+    /// hand-assembled: `NodeId::encode` writes only the IE payload (the header
+    /// is added by the caller), so a hand-built body is easy to get subtly
+    /// wrong and would test the fixture instead of the decoder.
+    fn assoc_setup_response_with_raw_cause(cause: u8) -> Bytes {
+        let msg = AssociationSetupResponse::new(
+            NodeId::new_ipv4([10, 45, 0, 1]),
+            PfcpCause::RequestAccepted,
+            1234567890,
+        );
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        let mut body = buf.to_vec();
+
+        // Overwrite the Cause IE value with the raw octet under test. Layout is
+        // [IE header 4B][value 1B], so find the header and step over it.
+        let cause_ie = (IeType::Cause as u16).to_be_bytes();
+        let pos = body
+            .windows(4)
+            .position(|w| w[0..2] == cause_ie && w[2..4] == 1u16.to_be_bytes())
+            .expect("encoded response must contain a 1-octet Cause IE");
+        body[pos + 4] = cause;
+
+        Bytes::from(body)
+    }
+
+    #[test]
+    fn test_message_with_cause_78_is_parseable() {
+        // Regression for the real interop failure: a UPF answering with cause
+        // 78 ("Redirection Requested") used to make the ENTIRE response
+        // unparseable, because the Cause decode propagated its error with `?`.
+        // The whole message must now decode, not just the cause.
+        let mut body = assoc_setup_response_with_raw_cause(78);
+        let decoded = AssociationSetupResponse::decode(&mut body)
+            .expect("a response carrying cause 78 must parse");
+        assert_eq!(decoded.cause, PfcpCause::RedirectionRequested);
+        assert_eq!(decoded.recovery_time_stamp, 1234567890);
+    }
+
+    #[test]
+    fn test_message_with_unknown_cause_still_parses() {
+        // The Cause ranges are extendable. An unrecognised rejection value must
+        // degrade to Request Rejected and leave the rest of the message intact
+        // rather than discarding a well-formed response.
+        let mut body = assoc_setup_response_with_raw_cause(201);
+        let decoded = AssociationSetupResponse::decode(&mut body)
+            .expect("an unknown cause must not fail the message");
+        assert_eq!(decoded.cause, PfcpCause::RequestRejected);
         assert_eq!(decoded.recovery_time_stamp, 1234567890);
     }
 
