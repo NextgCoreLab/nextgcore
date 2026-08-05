@@ -44,24 +44,15 @@ fn attach_oauth2(client: SbiClient, target: NfType) -> SbiClient {
     }
 }
 
-/// Best-effort map of an NF type string (TS 29.510 NFType) to [`NfType`] for
-/// OAuth2 token scoping. Only the common NRF-notification consumers are
-/// recognised; unknown values fall back to the caller's default.
+/// Map an NF type string (TS 29.510 NFType) to [`NfType`] for OAuth2 token
+/// scoping.
+///
+/// Delegates to [`NfType::from_nf_type_str`], which covers all 41 spec variants.
+/// This used to be a local 11-entry table, so the 30 unlisted NF types — SEPP,
+/// UPF, NWDAF, CHF, EASDF, TSCTSF and the rest — all returned `None` and were
+/// then silently coerced to `AMF` by the caller.
 fn nf_type_from_str(s: &str) -> Option<NfType> {
-    Some(match s.to_uppercase().as_str() {
-        "AMF" => NfType::Amf,
-        "SMF" => NfType::Smf,
-        "PCF" => NfType::Pcf,
-        "UDM" => NfType::Udm,
-        "UDR" => NfType::Udr,
-        "AUSF" => NfType::Ausf,
-        "NSSF" => NfType::Nssf,
-        "NEF" => NfType::Nef,
-        "BSF" => NfType::Bsf,
-        "SCP" => NfType::Scp,
-        "NRF" => NfType::Nrf,
-        _ => return None,
-    })
+    NfType::from_nf_type_str(s)
 }
 
 /// SBI server configuration
@@ -223,10 +214,45 @@ async fn dispatch_notify_request_async(
 
     let client_config = SbiClientConfig::new(&host, port).with_scheme(scheme);
     let client = SbiClient::new(client_config);
-    let target = req_nf_type
-        .and_then(nf_type_from_str)
-        .unwrap_or(NfType::Amf);
-    let client = attach_oauth2(client, target);
+
+    // OAuth2 audience must be the ACTUAL subscriber NF type (TS 33.501 §13.4.1:
+    // the access token's `audience` claim identifies the NF service producer the
+    // token is valid for).
+    //
+    // This previously did `.unwrap_or(NfType::Amf)`, so any NF type the local
+    // table did not recognise — every one of SEPP, UPF, NWDAF, CHF, EASDF,
+    // TSCTSF, ... — silently received a token minted for an AMF audience. Two
+    // consequences, both bad: a conformant consumer rejects the token on an
+    // audience mismatch (so the notification is lost for a reason the log does
+    // not explain), and an AMF-audience token is handed to a party that never
+    // asked for one.
+    //
+    // Now: send the notification WITHOUT a token rather than with a wrong one.
+    // The subscriber rejects an unauthenticated notify with 401, which is a
+    // truthful and debuggable failure, unlike a plausible token for the wrong
+    // audience.
+    let client = match req_nf_type {
+        Some(raw) => match nf_type_from_str(raw) {
+            Some(target) => attach_oauth2(client, target),
+            None => {
+                log::warn!(
+                    "NF status notify to {notification_uri}: unrecognised subscriber NFType \
+                     '{raw}' (TS 29.510 NFType); sending WITHOUT an OAuth2 token rather than \
+                     minting one for the wrong audience"
+                );
+                client
+            }
+        },
+        None => {
+            // No reqNfType on the subscription: nothing identifies the audience,
+            // so there is no correct token to mint.
+            log::debug!(
+                "NF status notify to {notification_uri}: subscription carries no reqNfType; \
+                 sending without an OAuth2 token"
+            );
+            client
+        }
+    };
 
     let sbi_request = SbiRequest::post(&path)
         .with_header("Content-Type", &notify_request.content_type)
@@ -862,9 +888,41 @@ mod tests {
         assert_eq!(nf_type_from_str("smf"), Some(NfType::Smf));
         assert_eq!(nf_type_from_str("Pcf"), Some(NfType::Pcf));
         assert_eq!(nf_type_from_str("UDR"), Some(NfType::Udr));
-        // Unknown / non-NF strings fall through to None so the caller can
-        // pick a default.
+        // Genuinely unknown values stay None. The caller must NOT substitute a
+        // default: for OAuth2 scoping a default means a token minted for the
+        // wrong audience.
         assert_eq!(nf_type_from_str("WHATEVER"), None);
         assert_eq!(nf_type_from_str(""), None);
+    }
+
+    #[test]
+    fn test_nf_type_from_str_covers_types_beyond_the_old_local_table() {
+        // Regression: this mapping used to be a local 11-entry table, so every
+        // other TS 29.510 NFType returned None and was then coerced to
+        // NfType::Amf by dispatch_notify_request_async's `.unwrap_or`. Those
+        // subscribers got an AMF-audience OAuth2 token.
+        //
+        // Each of these is a legitimate NRF subscriber that the old table missed.
+        assert_eq!(nf_type_from_str("SEPP"), Some(NfType::Sepp));
+        assert_eq!(nf_type_from_str("UPF"), Some(NfType::Upf));
+        assert_eq!(nf_type_from_str("NWDAF"), Some(NfType::Nwdaf));
+        assert_eq!(nf_type_from_str("CHF"), Some(NfType::Chf));
+        assert_eq!(nf_type_from_str("EASDF"), Some(NfType::Easdf));
+        assert_eq!(nf_type_from_str("TSCTSF"), Some(NfType::Tsctsf));
+        assert_eq!(nf_type_from_str("NSACF"), Some(NfType::Nsacf));
+        assert_eq!(nf_type_from_str("MBSMF"), Some(NfType::Mbsmf));
+        // Underscored spellings from TS 29.510 must parse too.
+        assert_eq!(nf_type_from_str("5G_EIR"), Some(NfType::FiveGEir));
+        assert_eq!(nf_type_from_str("SMSF_5G"), Some(NfType::Smsf5G));
+        // None of them may resolve to AMF.
+        for raw in [
+            "SEPP", "UPF", "NWDAF", "CHF", "EASDF", "TSCTSF", "NSACF", "MBSMF", "5G_EIR", "SMSF_5G",
+        ] {
+            assert_ne!(
+                nf_type_from_str(raw),
+                Some(NfType::Amf),
+                "{raw} must not be scoped as AMF"
+            );
+        }
     }
 }
