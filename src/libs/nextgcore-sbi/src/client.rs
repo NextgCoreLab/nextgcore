@@ -1148,7 +1148,7 @@ mod tests {
 
         // A request without an Authorization header gets a Bearer token
         // acquired from the NRF and attached automatically.
-        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data");
+        let request = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
         let response = client.send_request(request).await.expect("request sent");
         let body = response.http.content.as_deref().expect("echo body");
         assert!(
@@ -1166,7 +1166,7 @@ mod tests {
 
         // No OAuth2 configured on the client (default off): no token attached.
         let client = SbiClient::with_host_port("127.0.0.1", addr.port());
-        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data");
+        let request = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
         let response = client.send_request(request).await.expect("request sent");
         let body = response.http.content.as_deref().expect("echo body");
         assert!(
@@ -1243,7 +1243,7 @@ mod tests {
         let client = SbiClient::with_host_port("127.0.0.1", addr.port())
             .with_client_identity(NfType::Amf, "3fa85f64-5717-4562-b3fc-2c963f66afa6");
 
-        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data");
+        let request = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
         let response = client.send_request(request).await.expect("request sent");
         let body = response.http.content.as_deref().expect("echo body");
         assert!(
@@ -1257,7 +1257,7 @@ mod tests {
         // Default client (no identity) emits no User-Agent (prior behaviour).
         let addr = serve_user_agent_echo().await;
         let client = SbiClient::with_host_port("127.0.0.1", addr.port());
-        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data");
+        let request = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
         let response = client.send_request(request).await.expect("request sent");
         let body = response.http.content.as_deref().expect("echo body");
         assert!(
@@ -1272,7 +1272,7 @@ mod tests {
         let client = SbiClient::with_host_port("127.0.0.1", addr.port())
             .with_client_identity(NfType::Amf, "amf-1");
         // A caller-supplied User-Agent is not overwritten.
-        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data")
+        let request = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data")
             .with_header("User-Agent", "custom-agent/1.0");
         let response = client.send_request(request).await.expect("request sent");
         let body = response.http.content.as_deref().expect("echo body");
@@ -1292,7 +1292,7 @@ mod tests {
 
         // A caller-supplied Authorization header is respected (not replaced by
         // an NRF-acquired token).
-        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data")
+        let request = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data")
             .with_header("Authorization", "Bearer caller-supplied");
         let response = client.send_request(request).await.expect("request sent");
         let body = response.http.content.as_deref().expect("echo body");
@@ -1489,7 +1489,7 @@ mod tests {
         let addr = serve_echo_method_body(counter.clone()).await;
         let client = SbiClient::with_host_port("127.0.0.1", addr.port());
 
-        let request = SbiRequest::post("/nudm-sdm/v1/imsi-1/x").with_body("hello", "text/plain");
+        let request = SbiRequest::post("/nudm-sdm/v2/imsi-1/x").with_body("hello", "text/plain");
         let response = client.send_request(request).await.expect("request sent");
         assert_eq!(response.status, 200);
         let body = response.http.content.as_deref().unwrap();
@@ -1529,7 +1529,7 @@ mod tests {
 
         let client = SbiClient::with_host_port("127.0.0.1", redir_addr.port());
         let request =
-            SbiRequest::post("/nudm-sdm/v1/imsi-1/x").with_body("payload-307", "text/plain");
+            SbiRequest::post("/nudm-sdm/v2/imsi-1/x").with_body("payload-307", "text/plain");
         let response = client
             .send_request(request)
             .await
@@ -1566,7 +1566,7 @@ mod tests {
 
         let client = SbiClient::with_host_port("127.0.0.1", redir_addr.port());
         let response = client
-            .send_request(SbiRequest::get("/nudm-sdm/v1/imsi-1/x"))
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/x"))
             .await
             .expect("redirect followed");
         assert_eq!(response.status, 200);

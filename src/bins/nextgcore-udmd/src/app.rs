@@ -571,9 +571,9 @@ async fn udm_sbi_route(request: SbiRequest) -> SbiResponse {
     // Expected paths:
     // - /nudm-uecm/v1/{supi}/registrations/amf-3gpp-access
     // - /nudm-uecm/v1/{supi}/registrations/smf-registrations/{pduSessionId}
-    // - /nudm-sdm/v1/{supi}/am-data
-    // - /nudm-sdm/v1/{supi}/smf-select-data
-    // - /nudm-sdm/v1/{supi}/sm-data
+    // - /nudm-sdm/v2/{supi}/am-data          (Nudm_SDM is v2, TS 29.503 6.1.1)
+    // - /nudm-sdm/v2/{supi}/smf-select-data
+    // - /nudm-sdm/v2/{supi}/sm-data
     // - /nudm-ueau/v1/{supi}/security-information/generate-auth-data
 
     if parts.len() < 3 {
@@ -1053,8 +1053,11 @@ pub async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiRespon
 
     SbiResponse::with_status(201)
         .with_header(
+            // TS 29.503 §6.1.1: Nudm_SDM is v2. The Location URI is what the
+            // consumer will use for the subsequent DELETE, so a v1 value here
+            // hands out a path the spec does not define.
             "Location",
-            format!("/nudm-sdm/v1/{supi}/sdm-subscriptions/{subscription_id}"),
+            format!("/nudm-sdm/v2/{supi}/sdm-subscriptions/{subscription_id}"),
         )
         .with_json_body(&serde_json::json!({
             "subscriptionId": subscription_id,
@@ -2049,28 +2052,14 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 /// with the NRF under a caller-supplied NF instance ID. Returns the ID
 /// actually registered, or an empty string when no NRF is configured
 /// (registration skipped, matching the historical behavior).
-pub(crate) async fn register_with_nrf_id(
-    nf_instance_id: &str,
-    sbi_addr: &str,
-    sbi_port: u16,
-) -> Result<String, String> {
-    let sbi_ctx = nextgcore_sbi::context::global_context();
-
-    let nrf_uri = sbi_ctx.get_nrf_uri().await;
-    let nrf_uri = match nrf_uri {
-        Some(uri) => uri,
-        None => {
-            log::debug!("No NRF URI configured, skipping NRF registration");
-            return Ok(String::new());
-        }
-    };
-
-    log::info!("Registering UDM with NRF at {nrf_uri}");
-
-    let (nrf_host, nrf_port) = parse_nrf_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
-
-    let nf_profile = serde_json::json!({
+/// Build the UDM's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
+///
+/// Split out of `register_with_nrf_id` so the advertised API versions can be
+/// asserted without standing up an NRF. The version per service is normative
+/// and easy to get wrong: **Nudm_SDM is v2** (TS 29.503 §6.1.1, "The
+/// `<apiVersion>` shall be v2") while Nudm_UECM and Nudm_UEAU are v1.
+fn build_udm_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+    serde_json::json!({
         "nfInstanceId": nf_instance_id,
         "nfType": "UDM",
         "nfStatus": "REGISTERED",
@@ -2079,7 +2068,11 @@ pub(crate) async fn register_with_nrf_id(
             {
                 "serviceInstanceId": format!("{nf_instance_id}-nudm-sdm"),
                 "serviceName": "nudm-sdm",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                // TS 29.503 §6.1.1: "The <apiVersion> shall be v2" for
+                // Nudm_SDM. The other Nudm services stay at v1. Advertising v1
+                // here made discovery hand consumers a URI a strict producer
+                // would 404.
+                "versions": [{"apiVersionInUri": "v2", "apiFullVersion": "2.0.0"}],
                 "scheme": "http",
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
@@ -2103,7 +2096,31 @@ pub(crate) async fn register_with_nrf_id(
         ],
         "allowedNfTypes": ["AMF", "SMF", "AUSF", "PCF", "SCP"],
         "heartBeatTimer": 10
-    });
+    })
+}
+
+pub(crate) async fn register_with_nrf_id(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+) -> Result<String, String> {
+    let sbi_ctx = nextgcore_sbi::context::global_context();
+
+    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => {
+            log::debug!("No NRF URI configured, skipping NRF registration");
+            return Ok(String::new());
+        }
+    };
+
+    log::info!("Registering UDM with NRF at {nrf_uri}");
+
+    let (nrf_host, nrf_port) = parse_nrf_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+
+    let nf_profile = build_udm_nf_profile(nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     let response = client
@@ -2144,6 +2161,49 @@ pub(crate) fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pull the advertised `apiVersionInUri` for one service out of an NFProfile.
+    fn advertised_version(profile: &serde_json::Value, service_name: &str) -> String {
+        profile["nfServices"]
+            .as_array()
+            .expect("nfServices must be an array")
+            .iter()
+            .find(|s| s["serviceName"] == service_name)
+            .unwrap_or_else(|| panic!("{service_name} must be registered"))["versions"][0]
+            ["apiVersionInUri"]
+            .as_str()
+            .expect("apiVersionInUri must be a string")
+            .to_string()
+    }
+
+    #[test]
+    fn test_nrf_profile_advertises_nudm_sdm_at_v2() {
+        // TS 29.503 §6.1.1: "The <apiVersion> shall be v2" for Nudm_SDM, while
+        // Nudm_UECM and Nudm_UEAU are v1.
+        //
+        // Regression: this profile advertised nudm-sdm at v1. Because the live
+        // router discards the version segment (`let _version = parts[1]`), the
+        // mismatch was invisible between our own NFs but would 404 against a
+        // strict v2 producer, and discovery handed consumers the wrong URI.
+        let profile = build_udm_nf_profile("udm-test-instance", "10.45.0.10", 7777);
+
+        assert_eq!(
+            advertised_version(&profile, "nudm-sdm"),
+            "v2",
+            "Nudm_SDM must be advertised at v2 per TS 29.503 6.1.1"
+        );
+        assert_eq!(advertised_version(&profile, "nudm-uecm"), "v1");
+        assert_eq!(advertised_version(&profile, "nudm-ueau"), "v1");
+
+        // apiFullVersion must agree with the URI version, not lag it.
+        let sdm = profile["nfServices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["serviceName"] == "nudm-sdm")
+            .unwrap();
+        assert_eq!(sdm["versions"][0]["apiFullVersion"], "2.0.0");
+    }
 
     #[test]
     fn test_split_snpn_supi() {
@@ -2687,7 +2747,7 @@ mod tests {
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
         let mut request = SbiRequest {
-            header: SbiHeader::with_method_uri("GET", "/nudm-sdm/v1/imsi-x/am-data"),
+            header: SbiHeader::with_method_uri("GET", "/nudm-sdm/v2/imsi-x/am-data"),
             http: SbiHttpMessage::default(),
             ..Default::default()
         };
@@ -2746,7 +2806,7 @@ mod tests {
         let request = SbiRequest {
             header: SbiHeader::with_method_uri(
                 "POST",
-                format!("/nudm-sdm/v1/{supi}/sdm-subscriptions"),
+                format!("/nudm-sdm/v2/{supi}/sdm-subscriptions"),
             ),
             http: SbiHttpMessage {
                 content: Some(
@@ -2754,7 +2814,7 @@ mod tests {
                         "nfInstanceId": "amf-test-001",
                         "callbackReference": "http://amf.example.org/sdm-notify",
                         "monitoredResourceUris": [
-                            format!("/nudm-sdm/v1/{supi}/am-data")
+                            format!("/nudm-sdm/v2/{supi}/am-data")
                         ]
                     })
                     .to_string(),
@@ -2973,7 +3033,7 @@ mod tests {
         let bad = SbiRequest {
             header: SbiHeader::with_method_uri(
                 "PUT",
-                format!("/nudm-sdm/v1/{supi}/am-data/sor-ack"),
+                format!("/nudm-sdm/v2/{supi}/am-data/sor-ack"),
             ),
             http: SbiHttpMessage {
                 content: Some("{}".to_string()),
@@ -2986,7 +3046,7 @@ mod tests {
         let ok = SbiRequest {
             header: SbiHeader::with_method_uri(
                 "PUT",
-                format!("/nudm-sdm/v1/{supi}/am-data/sor-ack"),
+                format!("/nudm-sdm/v2/{supi}/am-data/sor-ack"),
             ),
             http: SbiHttpMessage {
                 content: Some(
@@ -3001,7 +3061,7 @@ mod tests {
         let ok_upu = SbiRequest {
             header: SbiHeader::with_method_uri(
                 "PUT",
-                format!("/nudm-sdm/v1/{supi}/am-data/upu-ack"),
+                format!("/nudm-sdm/v2/{supi}/am-data/upu-ack"),
             ),
             http: SbiHttpMessage {
                 content: Some(
@@ -3035,7 +3095,7 @@ mod tests {
         SbiRequest {
             header: SbiHeader::with_method_uri(
                 "PUT",
-                format!("/nudm-sdm/v1/{supi}/am-data/{resource}"),
+                format!("/nudm-sdm/v2/{supi}/am-data/{resource}"),
             ),
             http: SbiHttpMessage {
                 content: Some(body.to_string()),
@@ -3497,7 +3557,7 @@ mod oauth2_h8_tests {
         let client = SbiClient::with_host_port("127.0.0.1", port);
         let resp = tokio::time::timeout(
             Duration::from_secs(5),
-            client.get("/nudm-sdm/v1/imsi-001/am-data"),
+            client.get("/nudm-sdm/v2/imsi-001/am-data"),
         )
         .await
         .expect("bounded")
@@ -3519,7 +3579,7 @@ mod oauth2_h8_tests {
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
         let token = build_es256_token(&sk, "nrf-es256", "AMF", "nudm-sdm");
-        let req = SbiRequest::get("/nudm-sdm/v1/imsi-001/am-data")
+        let req = SbiRequest::get("/nudm-sdm/v2/imsi-001/am-data")
             .with_header("Authorization", format!("Bearer {token}"));
         let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
             .await
@@ -3542,7 +3602,7 @@ mod oauth2_h8_tests {
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
         let token = build_es256_token(&sk, "nrf-es256", "UDM", "nudm-sdm");
-        let req = SbiRequest::get("/nudm-sdm/v1/imsi-001/am-data")
+        let req = SbiRequest::get("/nudm-sdm/v2/imsi-001/am-data")
             .with_header("Authorization", format!("Bearer {token}"));
         let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
             .await

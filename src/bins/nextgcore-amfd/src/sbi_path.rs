@@ -1474,7 +1474,11 @@ pub struct AmDataResponse {
     pub nssai: Vec<(u8, Option<u32>)>,
 }
 
-/// Nudm_SDM_Get (am-data): GET /nudm-sdm/v1/{supi}/am-data (TS 29.503 5.2.2.2.1)
+/// Nudm_SDM_Get (am-data): GET /nudm-sdm/v2/{supi}/am-data (TS 29.503 5.2.2.2.1)
+///
+/// Nudm_SDM is at v2 per TS 29.503 6.1.1, unlike the other Nudm services which
+/// are v1. This consumer emitted v1 against a UDM that advertised v1, so the
+/// pair agreed with each other and disagreed with the spec.
 pub async fn call_udm_sdm_get_am_data(
     udm_host: &str,
     udm_port: u16,
@@ -1484,7 +1488,7 @@ pub async fn call_udm_sdm_get_am_data(
         SbiClient::with_host_port(udm_host, udm_port),
         nextgcore_sbi::types::NfType::Udm,
     );
-    let path = format!("/nudm-sdm/v1/{supi}/am-data");
+    let path = format!("/nudm-sdm/v2/{supi}/am-data");
     let response = client
         .get(&path)
         .await
@@ -1525,7 +1529,7 @@ pub async fn call_udm_sdm_get_am_data(
     Ok(out)
 }
 
-/// Nudm_SDM_Subscribe: POST /nudm-sdm/v1/{supi}/sdm-subscriptions (TS 29.503 5.2.2.3.2)
+/// Nudm_SDM_Subscribe: POST /nudm-sdm/v2/{supi}/sdm-subscriptions (TS 29.503 5.2.2.3.2)
 ///
 /// Returns the subscription ID assigned by UDM.
 pub async fn call_udm_sdm_subscribe(
@@ -1542,11 +1546,11 @@ pub async fn call_udm_sdm_subscribe(
     let body = serde_json::json!({
         "nfInstanceId": amf_instance_id,
         "callbackReference": format!("/namf-callback/v1/{supi}/sdmsubscription-notify"),
-        "monitoredResourceUris": [format!("/nudm-sdm/v1/{supi}/am-data")],
+        "monitoredResourceUris": [format!("/nudm-sdm/v2/{supi}/am-data")],
         "implicitUnsubscribe": true
     });
 
-    let path = format!("/nudm-sdm/v1/{supi}/sdm-subscriptions");
+    let path = format!("/nudm-sdm/v2/{supi}/sdm-subscriptions");
     let response = client
         .post_json(&path, &body)
         .await
