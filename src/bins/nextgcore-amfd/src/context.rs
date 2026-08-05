@@ -436,9 +436,16 @@ pub struct AmfContext {
     pub ngap_port: u16,
 
     // Timers
-    /// T3502 timer value
+    /// T3502 timer value, in **seconds**.
+    ///
+    /// Not currently emitted: `build_registration_accept` sends
+    /// `t3502_value: None`, so this is carried for future use.
     pub t3502_value: u64,
-    /// T3512 timer value
+    /// T3512 periodic registration update timer, in **seconds**.
+    ///
+    /// Encoded into every Registration Accept as GPRS Timer 3 (IEI 0x5E) by
+    /// `gmm_build::encode_gprs_timer3_seconds`, which requires the value to be
+    /// exactly representable as `n x unit` with `n <= 31`.
     pub t3512_value: u64,
 
     // ID generators
@@ -651,7 +658,15 @@ impl AmfContext {
             supi_hash: RwLock::new(HashMap::new()),
             ngap_port: 38412,
             t3502_value: 720,
-            t3512_value: 3240,
+            // 540 s = 9 minutes, matching both the wire value the AMF has
+            // always emitted and `time.t3512.value: 540` in
+            // docker/rust/configs/5gc/amf.yaml.
+            //
+            // Was 3240 (54 minutes) while nothing read the field and
+            // gmm_build.rs hardcoded 9 minutes. Now that the field feeds the
+            // emitted IE, a stale default would silently change the timer every
+            // UE receives, so it is corrected to the value actually in use.
+            t3512_value: 540,
             next_gnb_id: AtomicUsize::new(1),
             next_ran_ue_id: AtomicUsize::new(1),
             next_amf_ue_id: AtomicUsize::new(1),

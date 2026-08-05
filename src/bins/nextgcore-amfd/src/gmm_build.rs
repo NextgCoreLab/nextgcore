@@ -335,6 +335,62 @@ impl Default for NasMessageBuilder {
 ///
 /// Includes: 5GS registration result (mandatory), 5G-GUTI (0x77),
 /// TAI list (0x54), Allowed NSSAI (0x15) and T3512 (0x5E).
+/// Encode a duration in seconds as a GPRS Timer 3 IE (TS 24.008 §10.5.7.4a,
+/// Table 10.5.163b).
+///
+/// The IE carries a 3-bit unit and a 5-bit value (0..=31), so it can only
+/// express `value × unit`. This picks the *coarsest* unit that represents the
+/// requested duration exactly and fits in 5 bits, so a configured value is
+/// either encoded faithfully or rejected — never silently rounded to something
+/// the operator did not ask for.
+///
+/// Coarsest-first is deliberate. A duration is often expressible in several
+/// units (540 s is both 18 × 30 s and 9 × 1 min), and the conventional
+/// encoding — the one peers and packet captures expect, and the one this AMF has
+/// always emitted — is the coarser 9 × 1 min (wire octet 0xA9). Choosing the
+/// finest unit instead would silently change the bytes on the wire for the exact
+/// same configured duration.
+///
+/// Units, coarsest first: 320 h, 10 h, 1 h, 10 min, 1 min, 30 s, 2 s.
+///
+/// Returns the deactivated encoding (unit 111) for 0, per the spec's
+/// "timer is deactivated" row. Falls back to 9 minutes — the historical
+/// hardcoded default — for a duration no unit can express exactly, logging a
+/// warning rather than emitting a wrong timer.
+fn encode_gprs_timer3_seconds(seconds: u64) -> nextgcore_types::GprsTimer3 {
+    use nextgcore_types::GprsTimer3 as T3;
+
+    if seconds == 0 {
+        return T3::new(T3::UNIT_DEACTIVATED, 0);
+    }
+
+    // (unit code, seconds per tick), coarsest granularity first.
+    const UNITS: [(u8, u64); 7] = [
+        (T3::UNIT_320_HOURS, 1_152_000),
+        (T3::UNIT_10_HOURS, 36_000),
+        (T3::UNIT_1_HOUR, 3600),
+        (T3::UNIT_10_MINUTES, 600),
+        (T3::UNIT_1_MINUTE, 60),
+        (T3::UNIT_30_SECONDS, 30),
+        (T3::UNIT_2_SECONDS, 2),
+    ];
+
+    for (unit, tick) in UNITS {
+        if seconds.is_multiple_of(tick) {
+            let ticks = seconds / tick;
+            if (1..=31).contains(&ticks) {
+                return T3::new(unit, ticks as u8);
+            }
+        }
+    }
+
+    log::warn!(
+        "T3512 value {seconds}s is not representable as a GPRS Timer 3 \
+         (value x unit, value <= 31); falling back to 9 minutes"
+    );
+    T3::new(T3::UNIT_1_MINUTE, 9)
+}
+
 pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     // nas-06 Phase 2 (Tier C, REGISTRATION-CRITICAL): encoded via nextgcore-nas. Byte-
     // identical to the prior hand-rolled output — 5GS registration result LV
@@ -410,12 +466,23 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     };
 
     // T3512 value (IEI 0x5E, GPRS timer 3 — TS 24.501 §9.11.3.44 / TS 24.008
-    // §10.5.7.4a Table 10.5.163b): 9 minutes — unit 101 (multiples of
-    // 1 minute), value 9 → 9 min, wire octet 0xA9.
-    let t3512_value = Some(nextgcore_types::GprsTimer3::new(
-        nextgcore_types::GprsTimer3::UNIT_1_MINUTE,
-        9,
-    ));
+    // §10.5.7.4a Table 10.5.163b).
+    //
+    // Derived from the AMF context's t3512_value (seconds) rather than
+    // hardcoded. Previously this was a literal 9 minutes while
+    // `context.rs` carried `t3512_value: 3240` — 54 minutes — with no reader,
+    // and `docker/rust/configs/5gc/amf.yaml` declared `time.t3512.value: 540`
+    // (9 min) which `parse_time` silently drops into its `_ => {}` arm. Three
+    // values, two of them dead, and the live one agreeing with the YAML only by
+    // coincidence.
+    //
+    // A poisoned context lock falls back to the historical 9 minutes rather
+    // than dropping a mandatory-for-this-message IE.
+    let t3512_seconds = crate::context::amf_self()
+        .read()
+        .map(|ctx| ctx.t3512_value)
+        .unwrap_or(540);
+    let t3512_value = Some(encode_gprs_timer3_seconds(t3512_seconds));
 
     let msg =
         nextgcore_msg::FiveGmmMessage::RegistrationAccept(nextgcore_msg::RegistrationAccept {
@@ -905,6 +972,79 @@ fn get_pdu_session_status(amf_ue: &AmfUe) -> u16 {
 mod tests {
     use super::*;
     use crate::context::{PlmnId, NEXTGCORE_RAND_LEN};
+
+    #[test]
+    fn test_gprs_timer3_encodes_the_coarsest_exact_unit() {
+        use nextgcore_types::GprsTimer3 as T3;
+
+        // The value the AMF has always emitted: 9 min -> unit 101, value 9,
+        // wire octet 0xA9. This is what the golden vectors pin.
+        //
+        // 540 s is ALSO exactly 18 x 30 s. Coarsest-exact is what keeps the
+        // conventional 9 x 1 min encoding; a finest-first rule would emit
+        // (unit 100, value 18) here and silently change the wire bytes for the
+        // same configured duration.
+        let t = encode_gprs_timer3_seconds(540);
+        assert_eq!((t.unit, t.value), (T3::UNIT_1_MINUTE, 9));
+        assert_eq!((t.unit << 5) | t.value, 0xA9);
+
+        // Sub-minute durations still reach the finer units, because no coarser
+        // one represents them exactly.
+        assert_eq!(
+            encode_gprs_timer3_seconds(30),
+            T3::new(T3::UNIT_30_SECONDS, 1)
+        );
+        assert_eq!(
+            encode_gprs_timer3_seconds(4),
+            T3::new(T3::UNIT_2_SECONDS, 2)
+        );
+
+        // 3240 s = 54 min. Not a whole number of 10-minute ticks, and 54 > 31 so
+        // 1-minute units cannot hold it either -- NOT representable. This was
+        // the stale context default, which is why the field could not simply be
+        // wired through as-is.
+        assert_eq!(
+            encode_gprs_timer3_seconds(3240),
+            T3::new(T3::UNIT_1_MINUTE, 9),
+            "an unrepresentable value must fall back, not encode something wrong"
+        );
+
+        // Coarser units for longer durations.
+        assert_eq!(
+            encode_gprs_timer3_seconds(3600),
+            T3::new(T3::UNIT_1_HOUR, 1)
+        );
+        assert_eq!(
+            encode_gprs_timer3_seconds(7200),
+            T3::new(T3::UNIT_1_HOUR, 2)
+        );
+        // 1800 s = 30 min: exact in 10-minute units (3).
+        assert_eq!(
+            encode_gprs_timer3_seconds(1800),
+            T3::new(T3::UNIT_10_MINUTES, 3)
+        );
+
+        // Zero means deactivated, not "fire immediately".
+        assert_eq!(
+            encode_gprs_timer3_seconds(0),
+            T3::new(T3::UNIT_DEACTIVATED, 0)
+        );
+    }
+
+    #[test]
+    fn test_t3512_context_default_matches_the_emitted_timer() {
+        // Regression: context.rs carried t3512_value: 3240 (54 min) with no
+        // reader while gmm_build hardcoded 9 min, and amf.yaml declared 540.
+        // Now that the field feeds the wire, its default must equal what the
+        // AMF has always sent -- otherwise wiring it up silently changes the
+        // timer every UE receives.
+        let ctx_default = crate::context::AmfContext::new();
+        assert_eq!(ctx_default.t3512_value, 540, "9 minutes, matching amf.yaml");
+        assert_eq!(
+            encode_gprs_timer3_seconds(ctx_default.t3512_value),
+            nextgcore_types::GprsTimer3::new(nextgcore_types::GprsTimer3::UNIT_1_MINUTE, 9)
+        );
+    }
 
     fn create_test_amf_ue() -> AmfUe {
         AmfUe {
