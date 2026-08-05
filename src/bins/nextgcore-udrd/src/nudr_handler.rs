@@ -868,7 +868,7 @@ mod tests {
             sbi: Some(SbiEventData {
                 request: Some(SbiRequest {
                     method: method.to_string(),
-                    uri: "/nudr-dr/v1/test".to_string(),
+                    uri: "/nudr-dr/v2/test".to_string(),
                     body: None,
                 }),
                 response: None,

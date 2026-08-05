@@ -163,10 +163,21 @@ impl UdrSmContext {
             )
         };
 
-        // Check API version
-        // In C: if (strcmp(message.h.api.version, NEXTGCORE_SBI_API_V1) != 0)
-        if api_version != "v1" {
-            log::error!("Not supported version [{api_version}]");
+        // Check API version, per service.
+        //
+        // A single flat "must be v1" check cannot be right here: this dispatch
+        // handles both nnrf-nfm (v1) and nudr-dr, which TS 29.504 §6.1.1 puts
+        // at v2. The original check was inherited from the C original
+        // (`strcmp(..., NEXTGCORE_SBI_API_V1)`) and would reject every
+        // conformant Nudr request if this path were ever wired to live traffic.
+        let expected_version = match service_name.as_str() {
+            "nudr-dr" => "v2",
+            _ => "v1",
+        };
+        if api_version != expected_version {
+            log::error!(
+                "Not supported version [{api_version}] for {service_name} (expected {expected_version})"
+            );
             log::warn!("[stream={stream_id}] Would send 400 Bad Request: Unsupported API version");
             return;
         }
@@ -314,7 +325,10 @@ impl UdrSmContext {
             )
         };
 
-        // Check API version
+        // Check API version. This dispatch only ever handles nnrf-nfm responses
+        // (the UDR as an NRF *consumer*), and Nnrf_NFManagement is v1 per
+        // TS 29.510 §6.1.1, so a flat v1 check is correct here -- unlike the
+        // request-side dispatch above, which also carries nudr-dr at v2.
         if api_version != "v1" {
             log::error!("Not supported version [{api_version}]");
             return;

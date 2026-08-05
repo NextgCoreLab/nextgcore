@@ -658,7 +658,7 @@ pub fn default_wire_rules() -> Vec<UrspRule> {
 // --- Wave-6 E3: UDR ue-policy-set as the URSP rule source -------------------
 
 /// Operator provisioning convention for URSP rules inside the TS 29.519
-/// UePolicySet document (`GET /nudr-dr/v1/policy-data/ues/{supi}/ue-policy-set`).
+/// UePolicySet document (`GET /nudr-dr/v2/policy-data/ues/{supi}/ue-policy-set`).
 ///
 /// TS 29.519 §5.4 models the standardized UE policy section contents
 /// (`subscPolicySections`/`uePolicySections`) as OPAQUE octet strings — hand

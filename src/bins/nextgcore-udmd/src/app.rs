@@ -2271,7 +2271,7 @@ mod tests {
             return SbiResponse::with_status(204);
         }
 
-        // /nudr-dr/v1/subscription-data/{supi}/authentication-data/...
+        // /nudr-dr/v2/subscription-data/{supi}/authentication-data/...
         let supi = path
             .trim_start_matches('/')
             .split('/')
