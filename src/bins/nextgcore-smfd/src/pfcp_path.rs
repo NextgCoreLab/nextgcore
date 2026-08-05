@@ -177,25 +177,16 @@ pub mod pfcp_cause {
 }
 
 /// Human-readable PFCP cause name for error reporting
+///
+/// Delegates to `nextgcore_pfcp::types::PfcpCause` rather than carrying a second
+/// copy of TS 29.244 Table 8.2.1-1. The local copy this replaced had drifted
+/// from the library enum in a way that mattered: it listed cause 78
+/// ("Redirection requested") while the enum did not, so the SMF could *name* a
+/// cause its own decoder rejected outright.
 pub fn cause_name(cause: u8) -> &'static str {
-    match cause {
-        1 => "Request accepted",
-        64 => "Request rejected",
-        65 => "Session context not found",
-        66 => "Mandatory IE missing",
-        67 => "Conditional IE missing",
-        68 => "Invalid length",
-        69 => "Mandatory IE incorrect",
-        70 => "Invalid Forwarding Policy",
-        71 => "Invalid F-TEID allocation option",
-        72 => "No established PFCP Association",
-        73 => "Rule creation/modification failure",
-        74 => "PFCP entity in congestion",
-        75 => "No resources available",
-        76 => "Service not supported",
-        77 => "System failure",
-        78 => "Redirection requested",
-        _ => "Unknown cause",
+    match nextgcore_pfcp::types::PfcpCause::try_from(cause) {
+        Ok(c) => c.name(),
+        Err(_) => "Unknown cause",
     }
 }
 
