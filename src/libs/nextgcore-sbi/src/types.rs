@@ -336,6 +336,62 @@ impl NfType {
     pub fn as_server_token(&self) -> &'static str {
         self.to_str()
     }
+
+    /// Parse a TS 29.510 NFType enumeration value.
+    ///
+    /// The exact inverse of [`NfType::to_str`], covering every variant, so the
+    /// two cannot drift. Comparison is case-insensitive because the NFType
+    /// string arrives over the wire from a peer.
+    ///
+    /// Returns `None` for an unrecognised value. Callers must **not** substitute
+    /// a default: when the value feeds OAuth2 token scoping, defaulting means
+    /// minting a token for the wrong audience (see `nextgcore-nrfd`'s notify
+    /// path, which previously fell back to `AMF`).
+    pub fn from_nf_type_str(s: &str) -> Option<Self> {
+        let upper = s.to_ascii_uppercase();
+        Some(match upper.as_str() {
+            "NRF" => Self::Nrf,
+            "UDM" => Self::Udm,
+            "AMF" => Self::Amf,
+            "SMF" => Self::Smf,
+            "AUSF" => Self::Ausf,
+            "NEF" => Self::Nef,
+            "PCF" => Self::Pcf,
+            "SMSF" => Self::Smsf,
+            "NSSF" => Self::Nssf,
+            "UDR" => Self::Udr,
+            "LMF" => Self::Lmf,
+            "GMLC" => Self::Gmlc,
+            "5G_EIR" => Self::FiveGEir,
+            "SEPP" => Self::Sepp,
+            "UPF" => Self::Upf,
+            "N3IWF" => Self::N3iwf,
+            "AF" => Self::Af,
+            "UDSF" => Self::Udsf,
+            "BSF" => Self::Bsf,
+            "CHF" => Self::Chf,
+            "NWDAF" => Self::Nwdaf,
+            "PCSCF" => Self::Pcscf,
+            "CBCF" => Self::Cbcf,
+            "HSS" => Self::Hss,
+            "UCMF" => Self::Ucmf,
+            "SCP" => Self::Scp,
+            "NSSAAF" => Self::Nssaaf,
+            "MFAF" => Self::Mfaf,
+            "MBSMF" => Self::Mbsmf,
+            "MBSTF" => Self::Mbstf,
+            "PANF" => Self::Panf,
+            "TSCTSF" => Self::Tsctsf,
+            "EASDF" => Self::Easdf,
+            "EES" => Self::Ees,
+            "DCCF" => Self::Dccf,
+            "NSACF" => Self::Nsacf,
+            "PKMF" => Self::Pkmf,
+            "MNPF" => Self::Mnpf,
+            "SMSF_5G" => Self::Smsf5G,
+            _ => return None,
+        })
+    }
 }
 
 /// URI Scheme - matches OpenAPI_uri_scheme_e
@@ -535,6 +591,77 @@ impl fmt::Display for SbiAppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `NfType` variant round-trips through `to_str` -> `from_nf_type_str`.
+    ///
+    /// This is the guard that keeps the two mappings from drifting. A partial
+    /// reverse map is not a cosmetic problem: `nextgcore-nrfd` used a local
+    /// 11-entry table for OAuth2 audience scoping and coerced every unmatched
+    /// type to `AMF`, so 30 NF types received tokens for the wrong audience.
+    #[test]
+    fn test_nf_type_str_round_trip_is_total() {
+        const ALL: &[NfType] = &[
+            NfType::Nrf,
+            NfType::Udm,
+            NfType::Amf,
+            NfType::Smf,
+            NfType::Ausf,
+            NfType::Nef,
+            NfType::Pcf,
+            NfType::Smsf,
+            NfType::Nssf,
+            NfType::Udr,
+            NfType::Lmf,
+            NfType::Gmlc,
+            NfType::FiveGEir,
+            NfType::Sepp,
+            NfType::Upf,
+            NfType::N3iwf,
+            NfType::Af,
+            NfType::Udsf,
+            NfType::Bsf,
+            NfType::Chf,
+            NfType::Nwdaf,
+            NfType::Pcscf,
+            NfType::Cbcf,
+            NfType::Hss,
+            NfType::Ucmf,
+            NfType::Scp,
+            NfType::Nssaaf,
+            NfType::Mfaf,
+            NfType::Mbsmf,
+            NfType::Mbstf,
+            NfType::Panf,
+            NfType::Tsctsf,
+            NfType::Easdf,
+            NfType::Ees,
+            NfType::Dccf,
+            NfType::Nsacf,
+            NfType::Pkmf,
+            NfType::Mnpf,
+            NfType::Smsf5G,
+        ];
+
+        for nf in ALL {
+            let s = nf.to_str();
+            assert_eq!(
+                NfType::from_nf_type_str(s),
+                Some(*nf),
+                "{s} must parse back to the same variant"
+            );
+            // The NFType string arrives from a peer, so parsing is
+            // case-insensitive.
+            assert_eq!(
+                NfType::from_nf_type_str(&s.to_ascii_lowercase()),
+                Some(*nf),
+                "{s} must parse case-insensitively"
+            );
+        }
+
+        // Unrecognised values must stay None rather than resolving to anything.
+        assert_eq!(NfType::from_nf_type_str("NOT_AN_NF"), None);
+        assert_eq!(NfType::from_nf_type_str(""), None);
+    }
 
     /// Issue #23: the TSCTSF service name round-trips through the enum
     /// (acceptance criterion; the SCP routes by this wire string).
