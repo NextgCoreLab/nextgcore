@@ -18,13 +18,22 @@ data:
     db.sessions.createIndex({ "dnn": 1 });
     db.policyData.createIndex({ "supi": 1 });
     db.accounts.createIndex({ "username": 1 }, { unique: true });
-    db.accounts.insertOne({
-        username: "admin",
-        password: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
-        roles: ["admin"],
-        created: new Date()
-    });
-    db.subscribers.insertOne({
+    // updateOne+upsert rather than insertOne: this Job is re-applied by every
+    // deploy.sh run, and insertOne against the existing unique index aborted
+    // the script with "E11000 duplicate key error ... username: admin",
+    // CrashLoopBackOff-ing the Job even though the seed data was already
+    // correct. $setOnInsert so a re-run never overwrites a changed password.
+    db.accounts.updateOne(
+        { username: "admin" },
+        { $setOnInsert: {
+            username: "admin",
+            password: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+            roles: ["admin"],
+            created: new Date()
+        } },
+        { upsert: true }
+    );
+    db.subscribers.updateOne({ imsi: "999700000000001" }, { $setOnInsert: {
         imsi: "999700000000001",
         msisdn: ["821000000001"],
         security: {
@@ -51,8 +60,8 @@ data:
         network_access_mode: 0,
         subscribed_rau_tau_timer: 12,
         created: new Date()
-    });
-    db.subscribers.insertOne({
+    } }, { upsert: true });
+    db.subscribers.updateOne({ imsi: "001010123456789" }, { $setOnInsert: {
         imsi: "001010123456789",
         msisdn: ["821012345678"],
         security: {
@@ -79,7 +88,7 @@ data:
         network_access_mode: 0,
         subscribed_rau_tau_timer: 12,
         created: new Date()
-    });
+    } }, { upsert: true });
     print("NextGCore MongoDB initialization completed.");
 ---
 apiVersion: batch/v1

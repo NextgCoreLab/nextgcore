@@ -79,6 +79,25 @@ echo ""
 echo "[4/9] Deploying nextgcore configuration"
 kubectl apply -f "${SCRIPT_DIR}/manifests/configmap.yaml"
 
+# udm.yaml mounts the Secret udm-hnet-keys at /etc/nextgcore/hnet, which is
+# where configmap.yaml points the UDM for SUCI de-concealment. The mount is
+# `optional: true`, so without this the UDM starts with NO key material and
+# silently cannot de-conceal a SUCI -- deploy-eks.sh creates the Secret but
+# this path never did.
+HNET_DIR="${SCRIPT_DIR}/../docker/rust/configs/5gc/hnet"
+if [ -f "${HNET_DIR}/curve25519-1.key" ] && [ -f "${HNET_DIR}/secp256r1-2.key" ]; then
+  echo "  Creating udm-hnet-keys Secret (repo DEVELOPMENT keys - replace for real use)"
+  kubectl create secret generic udm-hnet-keys \
+    --namespace "${NAMESPACE}" \
+    --from-file="curve25519-1.key=${HNET_DIR}/curve25519-1.key" \
+    --from-file="secp256r1-2.key=${HNET_DIR}/secp256r1-2.key" \
+    --dry-run=client -o yaml | kubectl apply -f -
+else
+  echo "ERROR: hnet keys not found under ${HNET_DIR}." >&2
+  echo "       The UDM cannot de-conceal a SUCI without them." >&2
+  exit 1
+fi
+
 # --- Step 5: Deploy nextgcore NFs in dependency order ---
 echo ""
 echo "[5/9] Deploying nextgcore 5G Core Network Functions"
@@ -120,12 +139,16 @@ echo "  Deploying AMF..."
 kubectl apply -f "${SCRIPT_DIR}/manifests/amf.yaml"
 kubectl rollout status deployment/amf -n "${NAMESPACE}" --timeout=120s
 
-echo "  Deploying SMF..."
+# The UPF is applied BEFORE waiting on the SMF: the SMF's resolve-upf
+# initContainer blocks until upf.<ns>.svc.cluster.local resolves, so waiting
+# for the SMF first deadlocks -- the SMF can never become ready and the UPF is
+# never applied. Only the UPF *Service* has to exist for DNS to resolve, not a
+# ready UPF pod, so applying both and then waiting is enough.
+echo "  Deploying SMF and UPF..."
 kubectl apply -f "${SCRIPT_DIR}/manifests/smf.yaml"
-kubectl rollout status deployment/smf -n "${NAMESPACE}" --timeout=120s
-
-echo "  Deploying UPF..."
 kubectl apply -f "${SCRIPT_DIR}/manifests/upf.yaml"
+
+kubectl rollout status deployment/smf -n "${NAMESPACE}" --timeout=120s
 kubectl rollout status deployment/upf -n "${NAMESPACE}" --timeout=120s
 
 # --- Step 8: Deploy monitoring stack ---
