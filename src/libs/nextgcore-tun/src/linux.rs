@@ -3,7 +3,6 @@
 use crate::types::{IpSubnet, TunDevice, TunError, TunResult};
 use crate::IFNAMSIZ;
 use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
 
 /// Linux TUN device path
 const TUN_DEV_PATH: &str = "/dev/net/tun";

@@ -571,7 +571,33 @@ impl PfcpServer {
 
     /// Handle a peer restart or association teardown: drop the association,
     /// clear all sessions, and tell the data plane to flush its state.
+    ///
+    /// Only the peer that currently HOLDS the association may tear it down.
+    /// An association is scoped to one CP/UP function pair (TS 29.244 6.2.6),
+    /// Association Release is scoped to the requesting peer's own association
+    /// (7.4.4.2), and stale-session cleanup is scoped to the failed peer's
+    /// sessions (TS 23.527 4.2). Without this guard a departing SMF's Release
+    /// wiped the association a NEWLY started SMF had just set up -- every
+    /// following Session Establishment was rejected with cause 72, which is
+    /// exactly what a rolling restart produces once two SMF pods overlap.
     async fn declare_peer_failure(&self, peer: SocketAddr, reason: &str) {
+        match self.association.read().await.as_ref() {
+            Some(a) if a.peer_addr == peer => {}
+            Some(a) => {
+                log::warn!(
+                    "ignoring PFCP peer failure from {peer} ({reason}): the association \
+                     belongs to {} -- not clearing it",
+                    a.peer_addr
+                );
+                return;
+            }
+            None => {
+                log::warn!(
+                    "ignoring PFCP peer failure from {peer} ({reason}): no association is up"
+                );
+                return;
+            }
+        }
         log::warn!("PFCP peer {peer} failure ({reason}): clearing association and sessions");
         *self.association.write().await = None;
         let count = {
@@ -711,11 +737,14 @@ impl PfcpServer {
 
     /// Compare a peer-reported Recovery Time Stamp against the stored
     /// association; a change means the peer restarted (TS 29.244 6.2.7.2).
+    /// Only the associated peer's own timestamp is meaningful here: a datagram
+    /// from any other address says nothing about whether THIS association's
+    /// peer restarted.
     async fn check_peer_recovery(&self, src_addr: SocketAddr, rts: u32) {
         let restarted = {
             let assoc = self.association.read().await;
             match assoc.as_ref() {
-                Some(a) => a.recovery_time_stamp != rts,
+                Some(a) => a.peer_addr == src_addr && a.recovery_time_stamp != rts,
                 None => false,
             }
         };
@@ -2062,6 +2091,70 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(evt, PfcpSessionEvent::PeerFailure { .. }));
+    }
+
+    /// A rolling SMF restart briefly runs two pods. The old one sends its
+    /// Association Release on shutdown, AFTER the new one has associated.
+    /// That Release must not touch the new peer's association -- otherwise
+    /// every following Session Establishment is rejected with cause 72.
+    #[tokio::test]
+    async fn test_association_release_from_other_peer_is_ignored() {
+        let (server, smf_a, addr, mut rx) = spawn_test_server().await;
+
+        // Peer A associates and owns the association.
+        let assoc = build_association_setup_request_payload(Some(100));
+        let _ = exchange(&smf_a, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        assert!(server.is_associated().await);
+
+        // Peer B (a different source address) releases ITS association.
+        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut rel = crate::n4_build::PfcpMessageBuilder::new();
+        rel.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        let resp = exchange(&smf_b, addr, &encode_pfcp(9, None, 2, &rel.build())).await;
+
+        // B is still answered per TS 29.244 7.4.4.2 ...
+        assert_eq!(resp[1], pfcp_type::ASSOCIATION_RELEASE_RESPONSE);
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        // ... but A's association and sessions survive.
+        assert!(
+            server.is_associated().await,
+            "a Release from a non-owning peer must not clear the association"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "no PeerFailure may be raised for a peer that holds no association"
+        );
+    }
+
+    /// The same guard for the heartbeat path: another peer's Recovery Time
+    /// Stamp says nothing about whether THIS association's peer restarted.
+    #[tokio::test]
+    async fn test_recovery_timestamp_change_from_other_peer_is_ignored() {
+        let (server, smf_a, addr, mut rx) = spawn_test_server().await;
+
+        let assoc = build_association_setup_request_payload(Some(100));
+        let _ = exchange(&smf_a, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        assert!(server.is_associated().await);
+
+        // Peer B heartbeats with a DIFFERENT RTS.
+        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut hb = crate::n4_build::PfcpMessageBuilder::new();
+        hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 200);
+        let resp = exchange(&smf_b, addr, &encode_pfcp(1, None, 2, &hb.build())).await;
+        assert_eq!(resp[1], pfcp_type::HEARTBEAT_RESPONSE);
+
+        assert!(
+            server.is_associated().await,
+            "another peer's RTS must not declare failure for the associated peer"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "no PeerFailure may be raised from a non-owning peer's heartbeat"
+        );
     }
 
     #[tokio::test]
