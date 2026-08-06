@@ -19,11 +19,69 @@ spec:
       labels:
         app.kubernetes.io/name: smf
         app.kubernetes.io/instance: {{ .Release.Name }}-smf
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      initContainers:
+        {{- include "nextgcore.advertiseInit" (dict "nf" "smf") | nindent 8 }}
+        {{- include "nextgcore.waitForNrf" . | nindent 8 }}
+        {{- if .Values.upf.enabled }}
+        # The SMF needs the UPF's PFCP endpoint as an IP: PFCP is UDP and the
+        # SMF resolves its peer once at startup. Only the UPF *Service* has to
+        # exist for this to resolve -- not a ready UPF pod -- so this does not
+        # deadlock against the UPF's own startup.
+        - name: resolve-upf
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              echo "[resolve-upf] resolving UPF PFCP address..."
+              i=0
+              while [ "$i" -lt 60 ]; do
+                # busybox has no getent, so nslookup is the only resolver here.
+                # Anchoring on ^Name: first and only then taking the following
+                # Address: skips the "Server:/Address: <dns-ip>:53" preamble --
+                # a plain `grep Address` returns the DNS server's own IP.
+                IP=$(nslookup {{ .Release.Name }}-upf.{{ .Release.Namespace }}.svc.cluster.local 2>/dev/null \
+                     | awk '/^Name:/{n=1;next} n&&/^Address( 1)?:/{print $NF; exit}')
+                case "$IP" in
+                  *.*.*.*) break ;;
+                esac
+                i=$((i+1))
+                echo "[resolve-upf] waiting for UPF DNS ($i/60)"
+                sleep 2
+              done
+              case "$IP" in
+                *[0-9].[0-9]*) ;;
+                *) echo "[resolve-upf] FATAL: could not resolve UPF to an IPv4 address" >&2; exit 1 ;;
+              esac
+              echo "[resolve-upf] UPF=$IP"
+              printf '%s' "$IP" > /shared/upf-ip
+          volumeMounts:
+            - name: resolved
+              mountPath: /shared
+        {{- end }}
       containers:
         - name: smf
-          image: {{ .Values.smf.image.repository }}:{{ .Values.smf.image.tag }}
+          image: {{ include "nextgcore.image" (dict "global" .Values.global "nf" .Values.smf) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- if .Values.upf.enabled }}
+          # UPF_PFCP_ADDR is overridden from the resolved file before exec.
+          # `exec` matters: the SMF must stay PID 1 so it receives SIGTERM
+          # directly and the container's exit status is the SMF's.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              UPF_PFCP_ADDR="$(cat /shared/upf-ip)"
+              export UPF_PFCP_ADDR
+              echo "[smf] UPF_PFCP_ADDR=${UPF_PFCP_ADDR}"
+              exec /usr/local/bin/nf-binary -c /etc/nextgcore/smf.yaml
+          {{- else }}
+          args: ["-c", "/etc/nextgcore/smf.yaml"]
+          {{- end }}
           ports:
             - name: sbi
               containerPort: {{ .Values.smf.service.sbiPort }}
@@ -36,25 +94,28 @@ spec:
               containerPort: {{ .Values.smf.metrics.port }}
               protocol: TCP
             {{- end }}
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: sbi
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: sbi
-            initialDelaySeconds: 5
-            periodSeconds: 5
+          {{- include "nextgcore.sbiProbes" . | nindent 10 }}
+          volumeMounts:
+            {{- include "nextgcore.configMounts" (dict "nf" "smf" "rewritten" true) | nindent 12 }}
+            {{- if .Values.upf.enabled }}
+            - name: resolved
+              mountPath: /shared
+            {{- end }}
           env:
             - name: RUST_LOG
-              value: info,nextgcore_smfd=debug
-            - name: NRF_SBI_ADDR
-              value: {{ .Release.Name }}-nrf
-            - name: NRF_SBI_PORT
-              value: "{{ .Values.global.sbi.port }}"
+              value: {{ .Values.global.logLevel }}
+            - name: RUST_BACKTRACE
+              value: "1"
+            - name: SMF_PFCP_ADDR
+              value: "0.0.0.0"
+            - name: UPF_PFCP_PORT
+              value: "{{ .Values.upf.service.pfcpPort }}"
+      volumes:
+        {{- include "nextgcore.configVolumes" . | nindent 8 }}
+        {{- if .Values.upf.enabled }}
+        - name: resolved
+          emptyDir: {}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -83,22 +144,4 @@ spec:
   selector:
     app.kubernetes.io/name: smf
     app.kubernetes.io/instance: {{ .Release.Name }}-smf
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ .Release.Name }}-smf-config
-  labels:
-    app.kubernetes.io/name: smf
-    {{- include "nextgcore.labels" . | nindent 4 }}
-data:
-  nf.yaml: |
-    smf:
-      sbi:
-        addr: 0.0.0.0
-        port: {{ .Values.smf.service.sbiPort }}
-      pfcp:
-        port: {{ .Values.smf.service.pfcpPort }}
-      subnet: {{ .Values.smf.config.subnet }}
-      dnn: {{ .Values.smf.config.dnn }}
 {{- end }}

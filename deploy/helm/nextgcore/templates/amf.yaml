@@ -19,11 +19,16 @@ spec:
       labels:
         app.kubernetes.io/name: amf
         app.kubernetes.io/instance: {{ .Release.Name }}-amf
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      initContainers:
+        {{- include "nextgcore.waitForNrf" . | nindent 8 }}
       containers:
         - name: amf
-          image: {{ .Values.amf.image.repository }}:{{ .Values.amf.image.tag }}
+          image: {{ include "nextgcore.image" (dict "global" .Values.global "nf" .Values.amf) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          args: ["-c", "/etc/nextgcore/amf.yaml"]
           ports:
             - name: sbi
               containerPort: {{ .Values.amf.service.sbiPort }}
@@ -42,25 +47,40 @@ spec:
               containerPort: {{ .Values.amf.metrics.port }}
               protocol: TCP
             {{- end }}
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: sbi
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: sbi
-            initialDelaySeconds: 5
-            periodSeconds: 5
+          {{- include "nextgcore.sbiProbes" . | nindent 10 }}
+          volumeMounts:
+            {{- include "nextgcore.configMounts" (dict "nf" "amf" "rewritten" false) | nindent 12 }}
           env:
             - name: RUST_LOG
-              value: info,nextgcore_amfd=debug
-            - name: NRF_SBI_ADDR
-              value: {{ .Release.Name }}-nrf
-            - name: NRF_SBI_PORT
-              value: "{{ .Values.global.sbi.port }}"
+              value: {{ .Values.global.logLevel }}
+            # The pod IP, NOT 0.0.0.0. The AMF is the one NF that takes its SBI
+            # address from the environment (nextgcore-amfd/src/lib.rs:811) and
+            # uses it for BOTH the listen socket and the ipv4Addresses it
+            # registers with the NRF -- it never reads sbi.server[0].address
+            # from its YAML, so the rewrite-advertise-addr initContainer the
+            # other NFs use cannot help it. With 0.0.0.0 the AMF advertised an
+            # unusable endpoint and, resolving peers through discovery, dialled
+            # 0.0.0.0:7777 -- itself -- getting 404 from its own SBI router and
+            # failing every registration.
+            - name: AMF_SBI_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Peer fallbacks for when discovery has not populated a peer yet.
+            # SMF_SBI_ADDR is not merely a fallback: the SM-context-update path
+            # reads it from env directly (ngap_path.rs:5054), so it must be a
+            # routable Service name or the gNB's downlink TEID never reaches
+            # the SMF.
+            - name: SMF_SBI_ADDR
+              value: {{ .Release.Name }}-smf.{{ .Release.Namespace }}.svc.cluster.local
+            - name: SMF_SBI_PORT
+              value: "{{ .Values.smf.service.sbiPort }}"
+            - name: AUSF_SBI_ADDR
+              value: {{ .Release.Name }}-ausf.{{ .Release.Namespace }}.svc.cluster.local
+            - name: AUSF_SBI_PORT
+              value: "{{ .Values.ausf.service.port }}"
+      volumes:
+        {{- include "nextgcore.configVolumes" . | nindent 8 }}
 ---
 apiVersion: v1
 kind: Service
@@ -70,7 +90,15 @@ metadata:
     app.kubernetes.io/name: amf
     {{- include "nextgcore.labels" . | nindent 4 }}
 spec:
+  {{- if .Values.amf.service.headless }}
+  # Headless: N2/NGAP is userspace SCTP over UDP. kube-proxy balances UDP
+  # per-flow with a conntrack timeout, which breaks a long-lived NGAP
+  # association, and the gNB must reach the specific pod holding its UE
+  # contexts. Matches deploy/eks/patches/headless-services.yaml.
+  clusterIP: None
+  {{- else }}
   type: {{ .Values.amf.service.type }}
+  {{- end }}
   ports:
     - port: {{ .Values.amf.service.sbiPort }}
       targetPort: sbi

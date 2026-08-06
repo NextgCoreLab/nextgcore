@@ -92,10 +92,11 @@ Two consequences worth stating plainly:
 - **A third-party RAN cannot attach.** Real gNBs speak SCTP over IP proto 132.
   Interop needs binaries rebuilt with `--features kernel-sctp` and
   `--sctp-backend kernel`, plus SCTP support on the node and load balancer.
-- The Helm chart at `nextgcore/deploy/helm/` declares 38412 as
-  `protocol: SCTP`, which contradicts this and does not work with the current
-  binaries. The chart has other gaps too (8 of 10 NFs get no config
-  ConfigMap). **Prefer this overlay over the chart.**
+- The Helm chart at `nextgcore/deploy/helm/` declares 38412 as `protocol: UDP`
+  for the same reason, and mounts a real config for all 10 NFs. Both gaps this
+  section used to warn about are fixed (see #124). The chart deploys the
+  **control plane only** — no gNB/UE, no monitoring — so prefer this overlay
+  for a full EKS bring-up, and the chart when you want just a 5GC.
 
 ## Prerequisites
 

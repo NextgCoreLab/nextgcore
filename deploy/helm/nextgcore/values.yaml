@@ -1,5 +1,8 @@
-# Default values for NextGCore 5G Core Helm chart
-# Item 126: Helm charts from K8s YAML manifests
+# Default values for the NextGCore 5G Core control-plane chart.
+#
+# Scope: 10 control-plane NFs + MongoDB. The gNB/UE simulator and the
+# monitoring stack are NOT part of this chart -- see nextgsim/k8s/ and
+# k8s/monitoring/. Rationale in specs/fix-helm-chart-control-plane.md.
 
 global:
   image:
@@ -8,14 +11,70 @@ global:
   sbi:
     scheme: http
     port: 7777
+  logLevel: info
+  max:
+    ue: 1024
+    peer: 64
+  # Shared by amf/nrf guami, tai and plmn_support, and by the subscribers the
+  # mongodb-init Job seeds. Changing the PLMN here must match the simulator's.
+  plmn:
+    mcc: "999"
+    mnc: "70"
+  # UE address pools. Shared by the SMF (allocation) and the UPF (TUN routes),
+  # which must agree -- so they are defined once here.
+  session:
+    - subnet: "10.45.0.0/16"
+      gateway: "10.45.0.1"
+    - subnet: "2001:db8:cafe::/48"
+      gateway: "2001:db8:cafe::1"
 
-# MongoDB
+# MongoDB. Templated in-chart (templates/mongodb.yaml) rather than pulled from
+# charts.bitnami.com: the chart must render offline. See Chart.yaml.
 mongodb:
   enabled: true
-  auth:
-    enabled: false
+  image:
+    repository: mongo
+    tag: "6.0"
+  database: nextgcore
+  # Set to reuse an existing MongoDB instead of the in-chart StatefulSet.
+  externalUri: ""
   persistence:
-    size: 8Gi
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  # Seeds subscribers + indexes. Registration cannot succeed without it.
+  init:
+    enabled: true
+
+# Subscriber seeded by the mongodb-init Job. Must match the UE's USIM config.
+subscriber:
+  imsi: "999700000000001"
+  key: "465B5CE8B199B49FAA5F0A2EE238A6BC"
+  opc: "E8ED289DEBA952E4283B54E88E6D834D"
+  amf: "8000"
+  dnn: "internet"
+  sst: 1
+
+# UDM home-network keys for SUCI de-concealment (ECIES profile A/B).
+#
+# The chart does NOT ship key material. The keys live outside the chart
+# directory (docker/rust/configs/5gc/hnet/), and Helm's .Files.Get cannot read
+# above the chart root -- so the Secret is created out-of-band and merely
+# mounted here. NOTES.txt prints the exact command after install.
+#
+# The mount is optional: without the Secret the UDM still starts and the
+# null protection scheme works, but a profile A/B SUCI fails to de-conceal.
+hnetKeys:
+  # Name of a Secret holding curve25519-1.key and secp256r1-2.key.
+  # Defaults to <release>-udm-hnet-keys.
+  existingSecret: ""
 
 # NRF - Network Repository Function
 nrf:
@@ -30,7 +89,6 @@ nrf:
   metrics:
     enabled: true
     port: 9090
-  config: {}
 
 # AMF - Access and Mobility Management Function
 amf:
@@ -40,24 +98,26 @@ amf:
     repository: nextgcore-rust/amf
     tag: latest
   service:
+    # Headless: NGAP is userspace SCTP over UDP and GTP-U-adjacent traffic
+    # tolerates kube-proxy per-flow UDP balancing poorly. Matches
+    # deploy/eks/patches/headless-services.yaml.
+    headless: true
     type: ClusterIP
     sbiPort: 7777
     ngapPort: 38412
-  ngap:
-    nodePort: null  # Set for NodePort service
   metrics:
     enabled: true
     port: 9090
   config:
-    plmn:
-      mcc: "999"
-      mnc: "70"
-    guami:
-      amfId: "cafe00"
+    amfId:
+      region: 2
+      set: 1
     tai:
       tac: 1
     nssai:
       - sst: 1
+    # T3512 periodic registration timer, seconds. 540 = 9 min.
+    t3512: 540
 
 # SMF - Session Management Function
 smf:
@@ -74,8 +134,12 @@ smf:
     enabled: true
     port: 9090
   config:
-    subnet: "10.45.0.0/16"
-    dnn: "internet"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+      - 2001:4860:4860::8888
+      - 2001:4860:4860::8844
+    mtu: 1400
 
 # UPF - User Plane Function
 upf:
@@ -85,16 +149,27 @@ upf:
     repository: nextgcore-rust/upf
     tag: latest
   service:
+    # Headless is REQUIRED for GTP-U: kube-proxy's per-flow UDP balancing with a
+    # conntrack timeout is a poor fit for a long-lived N3 tunnel, and the gNB
+    # must reach the pod that holds the PFCP session. The chart used to render
+    # ClusterIP here, reintroducing what the EKS overlay removes.
+    headless: true
     type: ClusterIP
     pfcpPort: 8805
     gtpuPort: 2152
-  securityContext:
-    privileged: true
-    capabilities:
-      add: ["NET_ADMIN", "SYS_ADMIN"]
+  metrics:
+    enabled: true
+    port: 9090
+  # The data plane needs a real TUN device, which needs uid 0 and
+  # /dev/net/tun. Set enabled=false for a control-plane-only UPF (no user
+  # plane: PFCP sessions establish but no packets are forwarded).
+  dataPlane:
+    enabled: true
+    hostPathTun: /dev/net/tun
+    # Restrict to nodes prepared for the data plane, mirroring the EKS overlay.
+    nodeSelector: {}
   config:
-    tunIp: "10.45.0.1"
-    tunPrefix: 16
+    tunDevice: ogstun
 
 # AUSF - Authentication Server Function
 ausf:
@@ -139,6 +214,9 @@ pcf:
   service:
     type: ClusterIP
     port: 7777
+  metrics:
+    enabled: true
+    port: 9090
 
 # NSSF - Network Slice Selection Function
 nssf:
@@ -162,7 +240,8 @@ bsf:
     type: ClusterIP
     port: 7777
 
-# Observability
+# Not shipped by this chart. Left here so an operator overriding them sees
+# they are inert rather than silently ineffective. Use k8s/monitoring/.
 prometheus:
   enabled: false
 grafana:

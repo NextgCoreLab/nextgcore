@@ -19,34 +19,32 @@ spec:
       labels:
         app.kubernetes.io/name: nssf
         app.kubernetes.io/instance: {{ .Release.Name }}-nssf
+      annotations:
+        # Roll the pods when the rendered config changes; without this a
+        # `helm upgrade` that only edits the ConfigMap leaves the old config
+        # running, since the Deployment spec is unchanged.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      initContainers:
+        {{- include "nextgcore.advertiseInit" (dict "nf" "nssf") | nindent 8 }}
+        {{- include "nextgcore.waitForNrf" . | nindent 8 }}
       containers:
         - name: nssf
-          image: {{ .Values.nssf.image.repository }}:{{ .Values.nssf.image.tag }}
+          image: {{ include "nextgcore.image" (dict "global" .Values.global "nf" .Values.nssf) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          args: ["-c", "/etc/nextgcore/nssf.yaml"]
           ports:
             - name: sbi
               containerPort: {{ .Values.nssf.service.port }}
               protocol: TCP
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: sbi
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: sbi
-            initialDelaySeconds: 5
-            periodSeconds: 5
+          {{- include "nextgcore.sbiProbes" . | nindent 10 }}
+          volumeMounts:
+            {{- include "nextgcore.configMounts" (dict "nf" "nssf" "rewritten" true) | nindent 12 }}
           env:
             - name: RUST_LOG
-              value: info
-            - name: NRF_SBI_ADDR
-              value: {{ .Release.Name }}-nrf
-            - name: NRF_SBI_PORT
-              value: "{{ .Values.global.sbi.port }}"
+              value: {{ .Values.global.logLevel }}
+      volumes:
+        {{- include "nextgcore.configVolumes" . | nindent 8 }}
 ---
 apiVersion: v1
 kind: Service
