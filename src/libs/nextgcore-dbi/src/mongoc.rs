@@ -104,7 +104,7 @@ pub fn nextgcore_mongoc_init(db_uri: &str) -> DbiResult<()> {
     let db_name = client_options
         .default_database
         .clone()
-        .unwrap_or_else(|| "nextgcore".to_string());
+        .unwrap_or_else(|| crate::types::NEXTGCORE_DEFAULT_DB_NAME.to_string());
 
     // Create client
     let client = Client::with_options(client_options)?;

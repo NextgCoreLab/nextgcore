@@ -11,6 +11,14 @@ pub const NEXTGCORE_AMF_LEN: usize = 2;
 pub const NEXTGCORE_RAND_LEN: usize = 16;
 pub const NEXTGCORE_MAX_SQN: u64 = 0xFFFFFFFFFFFF; // 48-bit max
 
+/// Database used when the connection URI names none.
+///
+/// Single source of truth: mongoc.rs falls back to this, the WebUI's
+/// --db-name defaults to it, and docs/assets/webui/mongo-init.js seeds it.
+/// These drifted before -- the standalone WebUI defaulted to "open5gs" -- so
+/// provisioning landed in a database the UDR never read.
+pub const NEXTGCORE_DEFAULT_DB_NAME: &str = "nextgcore";
+
 // String lengths
 pub const NEXTGCORE_MAX_IMSI_LEN: usize = 15;
 pub const NEXTGCORE_MAX_IMSI_BCD_LEN: usize = 15;
@@ -430,7 +438,16 @@ pub fn nextgcore_id_get_value(supi: &str) -> Option<String> {
     }
 }
 
-/// Helper function to convert hex string to bytes
+/// Convert a hex string to bytes, lenient: non-hex pairs are DROPPED and the
+/// result is truncated to `buf`.
+///
+/// This silence is a trap for provisioning -- a mistyped key is written wrong
+/// with no diagnostic and authentication just fails later. The lenient
+/// behaviour is kept because the callers here parse already-persisted
+/// documents, where a hard error would turn one corrupt record into a failed
+/// read of the whole subscriber. Validate at the ingress instead (the WebUI
+/// does), or use [`nextgcore_ascii_to_hex_checked`] when the input is
+/// untrusted.
 pub fn nextgcore_ascii_to_hex(ascii: &str, buf: &mut [u8]) -> usize {
     let bytes: Vec<u8> = (0..ascii.len())
         .step_by(2)
@@ -444,6 +461,35 @@ pub fn nextgcore_ascii_to_hex(ascii: &str, buf: &mut [u8]) -> usize {
     let len = bytes.len().min(buf.len());
     buf[..len].copy_from_slice(&bytes[..len]);
     len
+}
+
+/// Convert a hex string to bytes, rejecting anything malformed.
+///
+/// Errors on an odd length, a non-hex character, or a value that does not fit
+/// `buf` -- the three cases [`nextgcore_ascii_to_hex`] hides. On success the
+/// two functions agree byte for byte.
+pub fn nextgcore_ascii_to_hex_checked(ascii: &str, buf: &mut [u8]) -> Result<usize, String> {
+    if !ascii.len().is_multiple_of(2) {
+        return Err(format!(
+            "hex string has odd length {} (expected an even number of characters)",
+            ascii.len()
+        ));
+    }
+    let want = ascii.len() / 2;
+    if want > buf.len() {
+        return Err(format!(
+            "hex string decodes to {want} bytes, which exceeds the {} byte buffer",
+            buf.len()
+        ));
+    }
+    for i in (0..ascii.len()).step_by(2) {
+        let pair = ascii
+            .get(i..i + 2)
+            .ok_or_else(|| format!("hex string is not valid UTF-8 at byte {i}"))?;
+        buf[i / 2] = u8::from_str_radix(pair, 16)
+            .map_err(|_| format!("'{pair}' at position {i} is not hexadecimal"))?;
+    }
+    Ok(want)
 }
 
 #[cfg(test)]
@@ -491,6 +537,62 @@ mod tests {
         assert_eq!(buf[0], 0x46);
         assert_eq!(buf[1], 0x5B);
         assert_eq!(buf[15], 0xBC);
+    }
+
+    /// Pins the lenient function's trap so it cannot be mistaken for safe: a
+    /// non-hex pair is DROPPED and the result silently shortens. A key
+    /// provisioned this way is wrong with no diagnostic.
+    #[test]
+    fn test_ascii_to_hex_silently_drops_bad_pairs() {
+        let mut buf = [0u8; 16];
+        // 'ZZ' in the middle: 32 chars in, only 15 bytes out.
+        let len = nextgcore_ascii_to_hex("465B5CE8B199B49FAA5F0A2EE238ZZBC", &mut buf);
+        assert_eq!(len, 15, "the bad pair is dropped rather than reported");
+    }
+
+    #[test]
+    fn test_ascii_to_hex_checked_accepts_valid_input() {
+        let mut buf = [0u8; 16];
+        let len = nextgcore_ascii_to_hex_checked("465B5CE8B199B49FAA5F0A2EE238A6BC", &mut buf)
+            .expect("valid hex must decode");
+        assert_eq!(len, 16);
+        assert_eq!(buf[0], 0x46);
+        assert_eq!(buf[15], 0xBC);
+
+        // Agrees byte for byte with the lenient function on valid input.
+        let mut lenient = [0u8; 16];
+        let llen = nextgcore_ascii_to_hex("465B5CE8B199B49FAA5F0A2EE238A6BC", &mut lenient);
+        assert_eq!((len, buf), (llen, lenient));
+    }
+
+    #[test]
+    fn test_ascii_to_hex_checked_rejects_malformed_input() {
+        let mut buf = [0u8; 16];
+
+        assert!(
+            nextgcore_ascii_to_hex_checked("465B5CE8B199B49FAA5F0A2EE238A6B", &mut buf).is_err(),
+            "odd length must be rejected"
+        );
+        assert!(
+            nextgcore_ascii_to_hex_checked("465B5CE8B199B49FAA5F0A2EE238ZZBC", &mut buf).is_err(),
+            "non-hex characters must be rejected, not dropped"
+        );
+        assert!(
+            nextgcore_ascii_to_hex_checked("465B5CE8B199B49FAA5F0A2EE238A6BCDD", &mut buf).is_err(),
+            "input longer than the buffer must be rejected, not truncated"
+        );
+        assert_eq!(
+            nextgcore_ascii_to_hex_checked("", &mut buf),
+            Ok(0),
+            "empty input decodes to zero bytes"
+        );
+    }
+
+    /// The WebUI's --db-name default and the mongoc fallback must agree, or
+    /// provisioning lands in a database the UDR never reads.
+    #[test]
+    fn test_default_db_name_is_nextgcore() {
+        assert_eq!(NEXTGCORE_DEFAULT_DB_NAME, "nextgcore");
     }
 
     #[test]
