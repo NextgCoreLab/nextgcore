@@ -100,8 +100,13 @@ kubectl kustomize "${SCRIPT_DIR}" > "${RENDERED}" || die "kustomize render faile
 # Done post-render rather than as 9 near-identical kustomize patches: each NF
 # needs its own container name, config filename and volumeMount set preserved
 # (the UDM additionally mounts hnet keys, which a blanket volumeMounts replace
-# would drop). Kind is unaffected -- there 0.0.0.0 happens to be reachable on a
-# single node, so the base manifests are not wrong for their target.
+# would drop).
+#
+# Kind is NOT unaffected, contrary to what this comment used to claim: on a
+# single-node Kind cluster the AMF resolved its peers through discovery, dialled
+# 0.0.0.0:7777 -- itself -- and got 404 from its own SBI router, so every
+# registration failed. The base manifests now carry an equivalent
+# rewrite-advertise-addr initContainer plus AMF_SBI_ADDR from status.podIP.
 log "rewriting NF advertise addresses to the pod IP..."
 python3 - "${RENDERED}" <<'PY' > "${RENDERED}.tmp" || die "advertise-address rewrite failed"
 import sys, yaml
@@ -136,6 +141,35 @@ for d in yaml.safe_load_all(open(sys.argv[1])):
     if d.get('kind') == 'Deployment' and d['metadata']['name'] in NFS:
         nf = d['metadata']['name']
         pod = d['spec']['template']['spec']
+
+        # The base manifests now carry this initContainer themselves. Applying
+        # it twice yields duplicate initContainer and volume names, which the
+        # API server rejects, so do not re-add it.
+        #
+        # But a kustomize patch that REPLACES a container's volumeMounts (the
+        # UDM's hnet-keys patch does) drops the base manifest's redirect to
+        # config-resolved, leaving the container reading the un-rewritten
+        # template while the initContainer writes the rewritten copy nobody
+        # reads -- so the UDM silently advertised 0.0.0.0 again. Re-assert the
+        # redirect here rather than trusting the render.
+        if any(c.get('name') == 'rewrite-advertise-addr'
+               for c in pod.get('initContainers', [])):
+            cont = next((c for c in pod['containers'] if c['name'] == nf), None)
+            if cont is None:
+                sys.exit(f'{nf}: container not found')
+            cfg_mount = next(
+                (m for m in cont.get('volumeMounts', [])
+                 if m.get('subPath') == f'{nf}.yaml'), None)
+            if cfg_mount is None:
+                sys.exit(f'{nf}: no {nf}.yaml config mount to redirect')
+            cfg_mount['name'] = 'config-resolved'
+            if not any(v.get('name') == 'config-resolved'
+                       for v in pod.get('volumes', [])):
+                pod.setdefault('volumes', []).append(
+                    {'name': 'config-resolved', 'emptyDir': {}})
+            patched.append(nf)
+            out.append(d)
+            continue
 
         # Find the container's existing config mount so we can redirect just it.
         cont = next((c for c in pod['containers'] if c['name'] == nf), None)

@@ -34,6 +34,43 @@ spec:
         app.kubernetes.io/part-of: nextgcore
     spec:
       initContainers:
+        # Rewrite sbi.server[0].address from 0.0.0.0 to the pod IP. That single
+        # config value is used for BOTH the listen socket and the ipv4Addresses
+        # registered with the NRF, so 0.0.0.0 made discovery hand consumers an
+        # address they cannot dial. A ConfigMap mount is read-only and the pod
+        # IP is unknown until scheduling, so the rewrite lands in an emptyDir.
+        - name: rewrite-advertise-addr
+          image: busybox:1.36
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NF_NAME
+              value: ausf
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              echo "[advertise] pod IP: $POD_IP"
+              case "$POD_IP" in
+                *[0-9].[0-9]*) ;;
+                *) echo "[advertise] FATAL: POD_IP is not IPv4: '$POD_IP'" >&2; exit 1 ;;
+              esac
+              cp "/tmp/config-template/${NF_NAME}.yaml" "/etc/nextgcore-resolved/${NF_NAME}.yaml"
+              sed -i "s|^\( *- address:\) *0\.0\.0\.0 *$|\1 $POD_IP|" "/etc/nextgcore-resolved/${NF_NAME}.yaml"
+              if grep -qE '^ *- address: *0\.0\.0\.0 *$' "/etc/nextgcore-resolved/${NF_NAME}.yaml"; then
+                echo "[advertise] FATAL: a 0.0.0.0 advertise address survived" >&2
+                exit 1
+              fi
+              echo "[advertise] ${NF_NAME}.yaml advertise address set to $POD_IP"
+          volumeMounts:
+            - name: config
+              mountPath: /tmp/config-template
+              readOnly: true
+            - name: config-resolved
+              mountPath: /etc/nextgcore-resolved
         - name: wait-nrf
           image: busybox:1.36
           command: ['sh', '-c', 'until nc -z nrf.nextg-system.svc.cluster.local 7777; do echo waiting for nrf; sleep 2; done']
@@ -62,7 +99,7 @@ spec:
               cpu: 200m
               memory: 128Mi
           volumeMounts:
-            - name: config
+            - name: config-resolved
               mountPath: /etc/nextgcore/ausf.yaml
               subPath: ausf.yaml
               readOnly: true
@@ -82,5 +119,7 @@ spec:
         - name: config
           configMap:
             name: nextgcore-configs
+        - name: config-resolved
+          emptyDir: {}
         - name: logs
           emptyDir: {}
