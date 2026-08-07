@@ -1,9 +1,13 @@
-# Item 126: Helm chart for NextGCore 5G Core
+# Helm chart for the NextGCore 5G Core control plane.
+#
+# Scope: control plane only (10 NFs + MongoDB). The gNB/UE simulator and
+# the monitoring stack are deliberately NOT here -- use nextgsim/k8s/ and
+# k8s/monitoring/. See specs/fix-helm-chart-control-plane.md.
 apiVersion: v2
 name: nextgcore
-description: NextGCore 5G Core Network Functions
+description: NextGCore 5G Core Network Functions (control plane)
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.1.0"
 keywords:
   - 5g
@@ -15,8 +19,10 @@ sources:
   - https://github.com/nextgsim/nextgcore
 maintainers:
   - name: NextGCore Contributors
-dependencies:
-  - name: mongodb
-    version: "14.x.x"
-    repository: https://charts.bitnami.com/bitnami
-    condition: mongodb.enabled
+# No dependencies on purpose. This chart previously declared
+# mongodb 14.x.x from charts.bitnami.com, which was never vendored into
+# charts/ -- so EVERY `helm template` and `helm install` failed offline with
+# "found in Chart.yaml, but missing in charts/ directory: mongodb", even with
+# --set mongodb.enabled=false. A floating remote dependency also makes renders
+# non-reproducible. MongoDB is now templated directly from
+# templates/mongodb.yaml, mirroring k8s/manifests/mongodb.yaml.

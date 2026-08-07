@@ -19,34 +19,36 @@ spec:
       labels:
         app.kubernetes.io/name: ausf
         app.kubernetes.io/instance: {{ .Release.Name }}-ausf
+      annotations:
+        # Roll the pods when the rendered config changes; without this a
+        # `helm upgrade` that only edits the ConfigMap leaves the old config
+        # running, since the Deployment spec is unchanged.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      initContainers:
+        {{- include "nextgcore.advertiseInit" (dict "nf" "ausf") | nindent 8 }}
+        {{- include "nextgcore.waitForNrf" . | nindent 8 }}
       containers:
         - name: ausf
-          image: {{ .Values.ausf.image.repository }}:{{ .Values.ausf.image.tag }}
+          image: {{ include "nextgcore.image" (dict "global" .Values.global "nf" .Values.ausf) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          args: ["-c", "/etc/nextgcore/ausf.yaml"]
           ports:
             - name: sbi
               containerPort: {{ .Values.ausf.service.port }}
               protocol: TCP
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: sbi
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: sbi
-            initialDelaySeconds: 5
-            periodSeconds: 5
+          {{- include "nextgcore.sbiProbes" . | nindent 10 }}
+          volumeMounts:
+            {{- include "nextgcore.configMounts" (dict "nf" "ausf" "rewritten" true) | nindent 12 }}
           env:
             - name: RUST_LOG
-              value: info
-            - name: NRF_SBI_ADDR
-              value: {{ .Release.Name }}-nrf
-            - name: NRF_SBI_PORT
-              value: "{{ .Values.global.sbi.port }}"
+              value: {{ .Values.global.logLevel }}
+            - name: UDM_SBI_ADDR
+              value: {{ .Release.Name }}-udm.{{ .Release.Namespace }}.svc.cluster.local
+            - name: UDM_SBI_PORT
+              value: "{{ .Values.udm.service.port }}"
+      volumes:
+        {{- include "nextgcore.configVolumes" . | nindent 8 }}
 ---
 apiVersion: v1
 kind: Service

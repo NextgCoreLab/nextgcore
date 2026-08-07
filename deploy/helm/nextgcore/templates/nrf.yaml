@@ -19,11 +19,18 @@ spec:
       labels:
         app.kubernetes.io/name: nrf
         app.kubernetes.io/instance: {{ .Release.Name }}-nrf
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      {{- if .Values.mongodb.enabled }}
+      initContainers:
+        {{- include "nextgcore.waitForMongo" . | nindent 8 }}
+      {{- end }}
       containers:
         - name: nrf
-          image: {{ .Values.nrf.image.repository }}:{{ .Values.nrf.image.tag }}
+          image: {{ include "nextgcore.image" (dict "global" .Values.global "nf" .Values.nrf) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          args: ["-c", "/etc/nextgcore/nrf.yaml"]
           ports:
             - name: sbi
               containerPort: {{ .Values.nrf.service.port }}
@@ -33,21 +40,14 @@ spec:
               containerPort: {{ .Values.nrf.metrics.port }}
               protocol: TCP
             {{- end }}
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: sbi
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: sbi
-            initialDelaySeconds: 5
-            periodSeconds: 5
+          {{- include "nextgcore.sbiProbes" . | nindent 10 }}
+          volumeMounts:
+            {{- include "nextgcore.configMounts" (dict "nf" "nrf" "rewritten" false) | nindent 12 }}
           env:
             - name: RUST_LOG
-              value: info
+              value: {{ .Values.global.logLevel }}
+      volumes:
+        {{- include "nextgcore.configVolumes" . | nindent 8 }}
 ---
 apiVersion: v1
 kind: Service

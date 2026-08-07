@@ -1,0 +1,115 @@
+{{- if .Values.mongodb.init.enabled }}
+{{/*
+Gated on init.enabled ALONE, not on mongodb.enabled: an external MongoDB
+(mongodb.enabled=false + externalUri) still needs its subscribers seeded, and
+gating on both silently skipped the seed and left registration failing with an
+empty subscriber collection. The wait-for-mongo initContainer is only added for
+the in-chart StatefulSet, whose host this chart knows.
+*/}}
+{{/*
+Seeds subscribers and indexes. Without this the subscriber DB is empty and
+registration cannot succeed -- the chart previously pointed the UDR at MongoDB
+with no init Job at all.
+
+Every write is an upsert, not an insert: this Job is re-applied by every
+`helm upgrade`, and insertOne against the unique username index aborted the
+script with "E11000 duplicate key error ... username: admin", CrashLoopBackOff-
+ing the Job even though the seed data was already correct. $setOnInsert so a
+re-run never overwrites a changed password.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-mongodb-init-scripts
+  labels:
+    {{- include "nextgcore.labels" . | nindent 4 }}
+data:
+  mongo-init.js: |
+    db = db.getSiblingDB('{{ .Values.mongodb.database }}');
+    db.nfInstances.createIndex({ "nfInstanceId": 1 }, { unique: true });
+    db.nfInstances.createIndex({ "nfType": 1 });
+    db.nfInstances.createIndex({ "nfStatus": 1 });
+    db.subscribers.createIndex({ "imsi": 1 }, { unique: true });
+    db.sessions.createIndex({ "supi": 1 });
+    db.policyData.createIndex({ "supi": 1 });
+    db.accounts.createIndex({ "username": 1 }, { unique: true });
+    db.accounts.updateOne(
+        { username: "admin" },
+        { $setOnInsert: {
+            username: "admin",
+            password: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+            roles: ["admin"],
+            created: new Date()
+        } },
+        { upsert: true }
+    );
+    db.subscribers.updateOne({ imsi: "{{ .Values.subscriber.imsi }}" }, { $setOnInsert: {
+        imsi: "{{ .Values.subscriber.imsi }}",
+        security: {
+            k: "{{ .Values.subscriber.key }}",
+            opc: "{{ .Values.subscriber.opc }}",
+            amf: "{{ .Values.subscriber.amf }}"
+        },
+        ambr: {
+            uplink: { value: 1, unit: 3 },
+            downlink: { value: 1, unit: 3 }
+        },
+        slice: [{
+            sst: {{ .Values.subscriber.sst }},
+            default_indicator: true,
+            session: [{
+                name: "{{ .Values.subscriber.dnn }}",
+                type: 3,
+                qos: { index: 9, arp: { priority_level: 8, pre_emption_capability: 1, pre_emption_vulnerability: 1 } },
+                ambr: { uplink: { value: 1, unit: 3 }, downlink: { value: 1, unit: 3 } }
+            }]
+        }],
+        access_restriction_data: 32,
+        subscriber_status: 0,
+        network_access_mode: 0,
+        subscribed_rau_tau_timer: 12,
+        created: new Date()
+    } }, { upsert: true });
+    print("NextGCore MongoDB initialization completed.");
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-mongodb-init
+  labels:
+    {{- include "nextgcore.labels" . | nindent 4 }}
+  annotations:
+    # Runs on install AND upgrade: the seed is idempotent, and an upgrade that
+    # changes values.subscriber must reach the database.
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 5
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "nextgcore.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- if .Values.mongodb.enabled }}
+      initContainers:
+        {{- include "nextgcore.waitForMongo" . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: init
+          image: {{ .Values.mongodb.image.repository }}:{{ .Values.mongodb.image.tag }}
+          command:
+            - mongosh
+            - {{ include "nextgcore.dbUri" . }}
+            - /scripts/mongo-init.js
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: {{ .Release.Name }}-mongodb-init-scripts
+{{- end }}

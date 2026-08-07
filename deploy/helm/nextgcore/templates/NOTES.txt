@@ -1,0 +1,49 @@
+NextGCore 5G Core control plane — release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+This chart deploys the CONTROL PLANE ONLY (10 NFs + MongoDB).
+It does NOT ship the gNB/UE simulator or the monitoring stack.
+  simulator:  nextgsim/k8s/
+  monitoring: k8s/monitoring/
+
+Check the rollout:
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/part-of=nextgcore
+
+Confirm every NF registered with a ROUTABLE address (never 0.0.0.0):
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ .Release.Name }}-nrf -- \
+    curl -s --http2-prior-knowledge http://127.0.0.1:{{ .Values.global.sbi.port }}/nnrf-nfm/v1/nf-instances
+{{ if not .Values.hnetKeys.existingSecret }}
+ACTION REQUIRED — SUCI de-concealment keys are not installed.
+
+The UDM mounts Secret "{{ .Release.Name }}-udm-hnet-keys" (optional), which this
+chart cannot create: the keys live outside the chart directory and Helm's
+.Files.Get cannot read above the chart root. Until it exists the null
+protection scheme works but ECIES profile A/B fails to de-conceal a SUCI.
+
+From the repo root, using the DEVELOPMENT keys (replace for real use):
+
+  kubectl create secret generic {{ .Release.Name }}-udm-hnet-keys \
+    --namespace {{ .Release.Namespace }} \
+    --from-file=curve25519-1.key=docker/rust/configs/5gc/hnet/curve25519-1.key \
+    --from-file=secp256r1-2.key=docker/rust/configs/5gc/hnet/secp256r1-2.key
+
+  kubectl rollout restart deploy/{{ .Release.Name }}-udm -n {{ .Release.Namespace }}
+{{- end }}
+{{- if and .Values.upf.enabled .Values.upf.dataPlane.enabled }}
+
+The UPF runs privileged with runAsUser 0 and hostPath {{ .Values.upf.dataPlane.hostPathTun }}.
+That requires a namespace at pod-security enforce=privileged:
+
+  kubectl label namespace {{ .Release.Namespace }} \
+    pod-security.kubernetes.io/enforce=privileged --overwrite
+
+If the UPF crash-loops with "refusing to start without a data plane", the node
+cannot give it a TUN device (common on Kind/Docker Desktop macOS). To run
+control-plane-only ON PURPOSE — no user plane, a UE ping will not work:
+
+  helm upgrade {{ .Release.Name }} <chart> --set upf.dataPlane.enabled=false
+{{- end }}
+{{- if not .Values.mongodb.persistence.enabled }}
+
+WARNING: mongodb.persistence.enabled=false — MongoDB is on an emptyDir and
+subscriber data is LOST on pod restart.
+{{- end }}

@@ -1,4 +1,105 @@
 {{- if .Values.upf.enabled }}
+{{- $gw := (index .Values.global.session 0).gateway }}
+{{- $subnet := (index .Values.global.session 0).subnet }}
+{{- $tun := .Values.upf.config.tunDevice }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-upf-wrapper
+  labels:
+    app.kubernetes.io/name: upf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+data:
+  wrapper.sh: |
+    #!/bin/sh
+    set -e
+    # Creates the TUN device the user plane forwards through, then execs the
+    # UPF with the addressing it must advertise. Ported from
+    # k8s/manifests/upf.yaml; the reasoning below is load-bearing, not
+    # decoration.
+    #
+    # The fallback to --no-dataplane is OPT-IN via UPF_ALLOW_NO_DATAPLANE=true.
+    # Without that flag a TUN failure is fatal, because a UPF that silently
+    # drops its user plane and still reports Ready is worse than one that does
+    # not start: the E2E suite skips the data-plane assertions and reports a
+    # pass.
+    if [ "$(id -u)" != "0" ]; then
+      echo "[wrapper] WARNING: running as uid $(id -u), not root."
+      echo "[wrapper] ip/iptables/sysctl need uid 0 even with NET_ADMIN/SYS_ADMIN"
+      echo "[wrapper] in the bounding set. Set runAsUser: 0 on this container."
+    fi
+    # Every step below is idempotent, because this script must survive a
+    # CONTAINER restart as well as a pod restart. A container restart reuses the
+    # pod's network namespace, so {{ $tun }} and the nat rules are still there
+    # from the previous run. An unguarded `ip tuntap add` then fails with
+    # "ioctl(TUNSETIFF): Device or resource busy", turning a recoverable
+    # restart into a CrashLoopBackOff.
+    if ip link show {{ $tun }} >/dev/null 2>&1; then
+      echo "[wrapper] {{ $tun }} already exists (container restart, netns retained) - reusing it"
+      TUN_OK=true
+    elif ip tuntap add name {{ $tun }} mode tun; then
+      echo "[wrapper] TUN device created successfully"
+      TUN_OK=true
+    else
+      TUN_OK=false
+    fi
+
+    if [ "${TUN_OK}" = "true" ]; then
+      # `|| true` on each: the address may already be assigned and the link may
+      # already be up from the previous container.
+      ip addr add {{ $gw }}/{{ (splitList "/" $subnet) | last }} dev {{ $tun }} 2>/dev/null || true
+      sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+      ip link set {{ $tun }} up
+      sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+      # -C before -A to avoid appending a duplicate MASQUERADE on a container
+      # restart (the pod netns, and so the nat table, survives one). Not a
+      # flush: POSTROUTING is shared with kube-proxy's chains.
+      iptables -t nat -C POSTROUTING -s {{ $subnet }} ! -o {{ $tun }} -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -s {{ $subnet }} ! -o {{ $tun }} -j MASQUERADE 2>/dev/null \
+        || true
+      ip link show {{ $tun }} >/dev/null 2>&1 || {
+        echo "[wrapper] FATAL: {{ $tun }} vanished after configuration" >&2
+        exit 1
+      }
+      echo "[wrapper] TUN configured: {{ $tun }} {{ $gw }}, NAT enabled"
+      # --gtpu-addr is BOTH the bind address and the N3 endpoint the UPF
+      # advertises to the SMF in the PFCP F-TEID, which the SMF relays to the
+      # gNB in the NGAP PDU Session Resource Setup transfer.
+      #
+      # With 0.0.0.0 the gNB was told "UPF addr=0.0.0.0" and sent uplink G-PDUs
+      # to 0.0.0.0:2152, looping back into its own GTP-U socket -- it
+      # decapsulated its own transmission, {{ $tun }} stayed at 0 bytes and a UE
+      # ping got 100% loss.
+      if [ -z "${POD_IP}" ]; then
+        echo "[wrapper] FATAL: POD_IP is not set. Inject it with a fieldRef on" >&2
+        echo "[wrapper] status.podIP, or the gNB will be told to send uplink to" >&2
+        echo "[wrapper] 0.0.0.0 and the user plane will silently loop back." >&2
+        exit 1
+      fi
+      # --pfcp-addr must ALSO be the pod IP. The UPF derives its PFCP Node ID
+      # from the pfcp bind address, and that Node ID -- NOT --gtpu-addr -- is
+      # what it writes into the N3 F-TEID's IPv4 field in the Created PDR. So a
+      # 0.0.0.0 pfcp-addr made the gNB send uplink to 0.0.0.0 even with
+      # --gtpu-addr set correctly.
+      echo "[wrapper] advertising N3 (GTP-U) endpoint ${POD_IP}:{{ .Values.upf.service.gtpuPort }}, PFCP node ${POD_IP}"
+      exec /usr/local/bin/nf-binary -c /etc/nextgcore/upf.yaml --pfcp-addr "${POD_IP}" --gtpu-addr "${POD_IP}"
+    else
+      echo "[wrapper] TUN device creation failed (see the error above)."
+      if [ "${UPF_ALLOW_NO_DATAPLANE}" = "true" ]; then
+        echo "[wrapper] UPF_ALLOW_NO_DATAPLANE=true: starting control-plane-only (--no-dataplane)"
+        echo "[wrapper] GTP-U forwarding is DISABLED. A UE ping will not work."
+        exec /usr/local/bin/nf-binary -c /etc/nextgcore/upf.yaml --pfcp-addr 0.0.0.0 --gtpu-addr 0.0.0.0 --no-dataplane
+      fi
+      echo "[wrapper] FATAL: refusing to start without a data plane."
+      echo "[wrapper] Common causes:"
+      echo "[wrapper]   * container not running as uid 0 (need runAsUser: 0)"
+      echo "[wrapper]   * /dev/net/tun not present on the node"
+      echo "[wrapper]   * Pod Security Admission rejecting privileged (need enforce=privileged)"
+      echo "[wrapper]   * nested containers (Kind/Docker Desktop on macOS)"
+      echo "[wrapper] To run control-plane-only on purpose, set UPF_ALLOW_NO_DATAPLANE=true."
+      exit 1
+    fi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,15 +120,22 @@ spec:
       labels:
         app.kubernetes.io/name: upf
         app.kubernetes.io/instance: {{ .Release.Name }}-upf
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      # No wait-smf initContainer, deliberately: the SMF initiates the PFCP
+      # Association Setup and retries on a timer, so the UPF only has to be
+      # listening. A wait here deadlocks -- the SMF's resolve-upf waits on UPF
+      # DNS, which a headless Service only publishes once a UPF pod is Ready.
+      {{- with .Values.upf.dataPlane.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: upf
-          image: {{ .Values.upf.image.repository }}:{{ .Values.upf.image.tag }}
+          image: {{ include "nextgcore.image" (dict "global" .Values.global "nf" .Values.upf) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
-          {{- with .Values.upf.securityContext }}
-          securityContext:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
+          command: ["/bin/sh", "/scripts/wrapper.sh"]
           ports:
             - name: pfcp
               containerPort: {{ .Values.upf.service.pfcpPort }}
@@ -35,13 +143,87 @@ spec:
             - name: gtpu
               containerPort: {{ .Values.upf.service.gtpuPort }}
               protocol: UDP
+            {{- if .Values.upf.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.upf.metrics.port }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: RUST_LOG
-              value: info,nextgcore_upfd=debug
-            - name: TUN_IP
-              value: "{{ .Values.upf.config.tunIp }}"
-            - name: TUN_PREFIX
-              value: "{{ .Values.upf.config.tunPrefix }}"
+              value: {{ .Values.global.logLevel }}
+            - name: RUST_BACKTRACE
+              value: "1"
+            # Consumed by wrapper.sh as --gtpu-addr AND --pfcp-addr: the N3
+            # endpoint the UPF advertises to the SMF, and thence to the gNB.
+            # Must be a routable address, not 0.0.0.0.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: UPF_ALLOW_NO_DATAPLANE
+              value: "{{ not .Values.upf.dataPlane.enabled }}"
+          {{- if .Values.upf.dataPlane.enabled }}
+          securityContext:
+            privileged: true
+            # Required, not optional. Dockerfile.core ends with
+            # `USER nextgcore`, and capabilities in the bounding set are not
+            # usable by a non-root uid without file capabilities on the
+            # binaries -- so ip/iptables/sysctl all fail without this and
+            # wrapper.sh cannot create the TUN device. The chart used to grant
+            # privileged+NET_ADMIN while omitting runAsUser, the TUN device and
+            # the wrapper: all the privilege, none of the mechanism.
+            runAsUser: 0
+            allowPrivilegeEscalation: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_ADMIN
+          {{- end }}
+          # Asserts the data plane is actually up, not merely that the process
+          # exists. If the TUN device is missing the pod must not be Ready,
+          # otherwise dependents proceed against a UPF that cannot forward.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - '[ "${UPF_ALLOW_NO_DATAPLANE}" = "true" ] || ip link show {{ $tun }} >/dev/null 2>&1'
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nextgcore/upf.yaml
+              subPath: upf.yaml
+              readOnly: true
+            - name: logs
+              mountPath: /var/log/nextgcore
+            {{- if .Values.upf.dataPlane.enabled }}
+            - name: dev-tun
+              mountPath: /dev/net/tun
+            {{- end }}
+            - name: wrapper
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        # The UPF mounts the RAW ConfigMap, not the rewritten copy: it takes its
+        # advertise addresses from --pfcp-addr/--gtpu-addr on the command line
+        # (see wrapper.sh), so it needs no advertise-address rewrite.
+        - name: config
+          configMap:
+            name: {{ include "nextgcore.configMapName" . }}
+        - name: logs
+          emptyDir: {}
+        {{- if .Values.upf.dataPlane.enabled }}
+        - name: dev-tun
+          hostPath:
+            path: {{ .Values.upf.dataPlane.hostPathTun }}
+            type: CharDevice
+        {{- end }}
+        - name: wrapper
+          configMap:
+            name: {{ .Release.Name }}-upf-wrapper
+            defaultMode: 0755
 ---
 apiVersion: v1
 kind: Service
@@ -51,35 +233,31 @@ metadata:
     app.kubernetes.io/name: upf
     {{- include "nextgcore.labels" . | nindent 4 }}
 spec:
+  {{- if .Values.upf.service.headless }}
+  # Headless is REQUIRED for GTP-U. kube-proxy balances UDP per-flow with a
+  # conntrack timeout, a poor fit for a long-lived N3 tunnel, and the gNB must
+  # reach the specific pod holding the PFCP session. The chart used to render
+  # ClusterIP here, reintroducing exactly what the EKS overlay removes.
+  clusterIP: None
+  {{- else }}
   type: {{ .Values.upf.service.type }}
+  {{- end }}
   ports:
-    - port: {{ .Values.upf.service.pfcpPort }}
-      targetPort: pfcp
-      protocol: UDP
-      name: pfcp
-    - port: {{ .Values.upf.service.gtpuPort }}
+    - name: gtpu
+      port: {{ .Values.upf.service.gtpuPort }}
       targetPort: gtpu
       protocol: UDP
-      name: gtpu
+    - name: pfcp
+      port: {{ .Values.upf.service.pfcpPort }}
+      targetPort: pfcp
+      protocol: UDP
+    {{- if .Values.upf.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.upf.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}
   selector:
     app.kubernetes.io/name: upf
     app.kubernetes.io/instance: {{ .Release.Name }}-upf
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ .Release.Name }}-upf-config
-  labels:
-    app.kubernetes.io/name: upf
-    {{- include "nextgcore.labels" . | nindent 4 }}
-data:
-  nf.yaml: |
-    upf:
-      pfcp:
-        port: {{ .Values.upf.service.pfcpPort }}
-      gtpu:
-        port: {{ .Values.upf.service.gtpuPort }}
-      tun:
-        ip: {{ .Values.upf.config.tunIp }}
-        prefix: {{ .Values.upf.config.tunPrefix }}
 {{- end }}
