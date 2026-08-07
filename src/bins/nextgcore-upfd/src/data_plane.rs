@@ -292,10 +292,9 @@ impl TunDevice {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to bring up interface: {}", stderr),
-            ));
+            return Err(io::Error::other(format!(
+                "Failed to bring up interface: {stderr}"
+            )));
         }
 
         // Set MTU
