@@ -5,7 +5,7 @@
 //!
 //! # Usage
 //! ```bash
-//! nextgcore-webui --db-uri mongodb://localhost:27017 --db-name open5gs --port 3000
+//! nextgcore-webui --db-uri mongodb://localhost:27017 --db-name nextgcore --port 3000
 //! ```
 
 use std::net::SocketAddr;
@@ -20,8 +20,13 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use nextgcore_dbi::types::NEXTGCORE_DEFAULT_DB_NAME;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
+
+/// Default MongoDB database, taken from nextgcore-dbi so the WebUI and the UDR
+/// cannot disagree about where subscribers live.
+const DEFAULT_DB_NAME: &str = NEXTGCORE_DEFAULT_DB_NAME;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -37,8 +42,14 @@ struct Args {
     #[arg(long, default_value = "mongodb://localhost:27017")]
     db_uri: String,
 
-    /// MongoDB database name
-    #[arg(long, default_value = "open5gs")]
+    /// MongoDB database name.
+    ///
+    /// Must match what the UDR reads. nextgcore-dbi falls back to "nextgcore"
+    /// (mongoc.rs) and docs/assets/webui/mongo-init.js seeds "nextgcore"; this
+    /// used to default to "open5gs", so provisioning through the standalone UI
+    /// without an explicit --db-name landed in a database the UDR never reads
+    /// and presented as "subscriber not found" after a successful create.
+    #[arg(long, default_value = DEFAULT_DB_NAME)]
     db_name: String,
 
     /// HTTP listen port
@@ -77,8 +88,101 @@ pub struct SecurityContext {
     pub op: String,
     #[serde(default = "default_amf")]
     pub amf: String,
-    #[serde(default)]
-    pub sqn: String,
+    /// AKA sequence number, a 48-bit counter (TS 33.102 6.3).
+    ///
+    /// i64, NOT String: this serialises to a BSON Int64, which is what the
+    /// rest of the stack requires. nextgcore-dbi reads it with `get_i64`
+    /// (subscription.rs) and advances it with `$inc` then a `$bit` 48-bit mask
+    /// -- both numeric-only Mongo operators. While this was a String, a
+    /// subscriber provisioned here read back as SQN 0 and the maintenance
+    /// operators errored, so SQN_HE could never advance: AKA de-synchronised,
+    /// AUTS re-sync failed repeatedly, and attach could block. The Node model
+    /// (webui/server/models/subscriber.js) always used Schema.Types.Long.
+    ///
+    /// Deserialisation accepts a String too, so documents written by the older
+    /// build still load instead of failing the whole read.
+    #[serde(default, deserialize_with = "deserialize_sqn")]
+    pub sqn: i64,
+}
+
+/// Accept Int64, Int32 or String for `sqn`.
+///
+/// Existing deployments already hold String values written by the previous
+/// build; rejecting them would turn a legacy record into a failed read rather
+/// than the recoverable one it is. A non-numeric string is the one case with
+/// no sensible reading, so it is an error.
+fn deserialize_sqn<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error as DeError, Unexpected, Visitor};
+    use std::fmt;
+
+    // A hand-written Visitor rather than an intermediate Value: this runs under
+    // BOTH bson::from_document (the Mongo read path) and serde_json (the HTTP
+    // request path), and an intermediate serde_json::Value cannot represent a
+    // BSON Int64, which is exactly the type this field now stores.
+    struct SqnVisitor;
+
+    impl<'de> Visitor<'de> for SqnVisitor {
+        type Value = i64;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an integer sqn, or a numeric string from a legacy document")
+        }
+
+        fn visit_i64<E: DeError>(self, v: i64) -> Result<i64, E> {
+            Ok(v)
+        }
+
+        fn visit_i32<E: DeError>(self, v: i32) -> Result<i64, E> {
+            Ok(i64::from(v))
+        }
+
+        fn visit_u64<E: DeError>(self, v: u64) -> Result<i64, E> {
+            i64::try_from(v).map_err(|_| E::custom(format!("sqn {v} exceeds i64")))
+        }
+
+        fn visit_u32<E: DeError>(self, v: u32) -> Result<i64, E> {
+            Ok(i64::from(v))
+        }
+
+        fn visit_f64<E: DeError>(self, v: f64) -> Result<i64, E> {
+            // JSON numbers may arrive as f64. Accept only exact integers: a
+            // fractional SQN is a client bug, not something to round silently.
+            if v.fract() == 0.0 && v >= i64::MIN as f64 && v <= i64::MAX as f64 {
+                Ok(v as i64)
+            } else {
+                Err(E::custom(format!("sqn {v} is not an integer")))
+            }
+        }
+
+        fn visit_str<E: DeError>(self, v: &str) -> Result<i64, E> {
+            let t = v.trim();
+            if t.is_empty() {
+                return Ok(0);
+            }
+            t.parse::<i64>()
+                .map_err(|_| E::invalid_value(Unexpected::Str(v), &self))
+        }
+
+        fn visit_unit<E: DeError>(self) -> Result<i64, E> {
+            Ok(0)
+        }
+
+        fn visit_none<E: DeError>(self) -> Result<i64, E> {
+            Ok(0)
+        }
+
+        fn visit_some<D2>(self, d: D2) -> Result<i64, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            d.deserialize_any(self)
+        }
+    }
+
+    deserializer.deserialize_any(SqnVisitor)
 }
 
 fn default_amf() -> String {
@@ -180,6 +284,77 @@ fn default_priority() -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/// Reject a malformed subscriber before it reaches MongoDB.
+///
+/// Provisioning used to check only that `imsi` and `security.k` were non-empty.
+/// Everything downstream then trusted the record, and
+/// `nextgcore_ascii_to_hex` silently DROPS non-hex pairs and truncates -- so a
+/// mistyped K was persisted wrong with no diagnostic and authentication simply
+/// failed later for no visible reason. Catching it here is the cheap place.
+///
+/// Lengths follow TS 23.003 2.2 for the IMSI and the fixed widths the crypto
+/// layer expects: K/OPc/OP are 16 bytes, AMF 2, SD 3.
+fn validate_subscriber(sub: &Subscriber) -> Result<(), String> {
+    fn is_hex(s: &str, want: usize, field: &str) -> Result<(), String> {
+        if s.len() != want {
+            return Err(format!(
+                "{field} must be {want} hex characters, got {}",
+                s.len()
+            ));
+        }
+        if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("{field} must be hexadecimal"));
+        }
+        Ok(())
+    }
+
+    let imsi = sub.imsi.trim();
+    if !(5..=15).contains(&imsi.len()) {
+        return Err(format!(
+            "imsi must be 5-15 digits (TS 23.003 2.2), got {}",
+            imsi.len()
+        ));
+    }
+    if !imsi.chars().all(|c| c.is_ascii_digit()) {
+        return Err("imsi must be decimal digits only".to_string());
+    }
+
+    is_hex(&sub.security.k, 32, "security.k")?;
+    // OPc and OP are each optional, but a supplied value must be well formed.
+    // At least one is needed to derive an authentication vector.
+    if !sub.security.opc.is_empty() {
+        is_hex(&sub.security.opc, 32, "security.opc")?;
+    }
+    if !sub.security.op.is_empty() {
+        is_hex(&sub.security.op, 32, "security.op")?;
+    }
+    if sub.security.opc.is_empty() && sub.security.op.is_empty() {
+        return Err("one of security.opc or security.op is required".to_string());
+    }
+    is_hex(&sub.security.amf, 4, "security.amf")?;
+
+    if sub.security.sqn < 0 {
+        return Err("security.sqn must not be negative".to_string());
+    }
+    if sub.security.sqn as u64 > nextgcore_dbi::types::NEXTGCORE_MAX_SQN {
+        return Err("security.sqn exceeds the 48-bit range (TS 33.102 6.3)".to_string());
+    }
+
+    for slice in &sub.slice {
+        if let Some(sd) = slice.sd.as_deref() {
+            if !sd.is_empty() {
+                is_hex(sd, 6, "slice.sd")?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
 
@@ -213,8 +388,8 @@ async fn create_subscriber(
     State(state): State<SharedState>,
     Json(sub): Json<Subscriber>,
 ) -> Response {
-    if sub.imsi.is_empty() || sub.security.k.is_empty() {
-        return (StatusCode::BAD_REQUEST, "imsi and security.k are required").into_response();
+    if let Err(e) = validate_subscriber(&sub) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
     }
     match db_create_subscriber(&state.db_uri, &state.db_name, &sub) {
         Ok(()) => (StatusCode::CREATED, Json(sub)).into_response(),
@@ -227,6 +402,11 @@ async fn update_subscriber(
     Path(imsi): Path<String>,
     Json(sub): Json<Subscriber>,
 ) -> Response {
+    // Update validates too: an update writes the same document shape, so
+    // skipping it here would leave a hole straight to the create-path defect.
+    if let Err(e) = validate_subscriber(&sub) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
     match db_update_subscriber(&state.db_uri, &state.db_name, &imsi, &sub) {
         Ok(true) => Json(sub).into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
@@ -596,4 +776,220 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await.context("server error")?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mongodb::bson::{doc, Bson};
+
+    fn good_subscriber() -> Subscriber {
+        Subscriber {
+            imsi: "999700000000001".to_string(),
+            msisdn: vec![],
+            security: SecurityContext {
+                k: "465B5CE8B199B49FAA5F0A2EE238A6BC".to_string(),
+                opc: "E8ED289DEBA952E4283B54E88E6D834D".to_string(),
+                op: String::new(),
+                amf: "8000".to_string(),
+                sqn: 0,
+            },
+            ambr: Ambr::default(),
+            slice: vec![],
+            status: 0,
+        }
+    }
+
+    /// The defect this issue is about: `$inc`/`$bit` are numeric-only Mongo
+    /// operators, so `sqn` must land in BSON as an Int64. While it was a
+    /// String the maintenance path errored and SQN_HE could never advance.
+    #[test]
+    fn sqn_serialises_as_bson_int64() {
+        let mut sub = good_subscriber();
+        sub.security.sqn = 42;
+        let doc = mongodb::bson::to_document(&sub).expect("serialize");
+        let security = doc.get_document("security").expect("security subdoc");
+        match security.get("sqn") {
+            Some(Bson::Int64(v)) => assert_eq!(*v, 42),
+            other => panic!("sqn must serialise to BSON Int64, got {other:?}"),
+        }
+    }
+
+    /// nextgcore-dbi reads the field with `get_i64`, so that exact call must
+    /// succeed against what we write.
+    #[test]
+    fn stored_sqn_is_readable_via_get_i64() {
+        let mut sub = good_subscriber();
+        sub.security.sqn = 1_234_567;
+        let doc = mongodb::bson::to_document(&sub).expect("serialize");
+        let security = doc.get_document("security").expect("security subdoc");
+        assert_eq!(security.get_i64("sqn").expect("get_i64"), 1_234_567);
+    }
+
+    /// Documents written by the previous build hold a String. They must still
+    /// load: refusing them would turn a legacy record into a failed read.
+    #[test]
+    fn legacy_string_sqn_deserialises() {
+        let legacy = doc! {
+            "imsi": "999700000000001",
+            "security": {
+                "k": "465B5CE8B199B49FAA5F0A2EE238A6BC",
+                "opc": "E8ED289DEBA952E4283B54E88E6D834D",
+                "amf": "8000",
+                "sqn": "42",
+            },
+        };
+        let sub: Subscriber = mongodb::bson::from_document(legacy).expect("legacy doc must load");
+        assert_eq!(sub.security.sqn, 42);
+    }
+
+    #[test]
+    fn int64_and_absent_sqn_deserialise() {
+        let with_i64 = doc! {
+            "imsi": "999700000000001",
+            "security": {
+                "k": "465B5CE8B199B49FAA5F0A2EE238A6BC",
+                "opc": "E8ED289DEBA952E4283B54E88E6D834D",
+                "amf": "8000",
+                "sqn": 99_i64,
+            },
+        };
+        let sub: Subscriber = mongodb::bson::from_document(with_i64).expect("int64 doc");
+        assert_eq!(sub.security.sqn, 99);
+
+        let absent = doc! {
+            "imsi": "999700000000001",
+            "security": {
+                "k": "465B5CE8B199B49FAA5F0A2EE238A6BC",
+                "opc": "E8ED289DEBA952E4283B54E88E6D834D",
+                "amf": "8000",
+            },
+        };
+        let sub: Subscriber = mongodb::bson::from_document(absent).expect("absent sqn defaults");
+        assert_eq!(sub.security.sqn, 0);
+    }
+
+    /// An empty legacy string is "unset", not an error.
+    #[test]
+    fn empty_string_sqn_is_zero() {
+        let d = doc! {
+            "imsi": "999700000000001",
+            "security": {
+                "k": "465B5CE8B199B49FAA5F0A2EE238A6BC",
+                "opc": "E8ED289DEBA952E4283B54E88E6D834D",
+                "amf": "8000",
+                "sqn": "",
+            },
+        };
+        let sub: Subscriber = mongodb::bson::from_document(d).expect("empty string sqn");
+        assert_eq!(sub.security.sqn, 0);
+    }
+
+    /// A non-numeric string has no sensible reading, so it must not be
+    /// silently coerced to 0 -- that would hide corruption.
+    #[test]
+    fn non_numeric_string_sqn_is_rejected() {
+        let d = doc! {
+            "imsi": "999700000000001",
+            "security": {
+                "k": "465B5CE8B199B49FAA5F0A2EE238A6BC",
+                "opc": "E8ED289DEBA952E4283B54E88E6D834D",
+                "amf": "8000",
+                "sqn": "not-a-number",
+            },
+        };
+        let r: Result<Subscriber, _> = mongodb::bson::from_document(d);
+        assert!(r.is_err(), "a non-numeric sqn string must be an error");
+    }
+
+    /// The WebUI and the UDR must agree on which database holds subscribers.
+    /// These drifted before: the WebUI defaulted to "open5gs" while dbi and the
+    /// seed script used "nextgcore", so provisioning silently went nowhere.
+    #[test]
+    fn default_db_name_matches_dbi_fallback() {
+        assert_eq!(DEFAULT_DB_NAME, "nextgcore");
+        assert_eq!(
+            DEFAULT_DB_NAME,
+            nextgcore_dbi::types::NEXTGCORE_DEFAULT_DB_NAME
+        );
+        let args = Args::parse_from(["nextgcore-webui"]);
+        assert_eq!(
+            args.db_name,
+            nextgcore_dbi::types::NEXTGCORE_DEFAULT_DB_NAME
+        );
+    }
+
+    #[test]
+    fn validation_accepts_a_good_subscriber() {
+        assert!(validate_subscriber(&good_subscriber()).is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_malformed_imsi() {
+        let mut sub = good_subscriber();
+        sub.imsi = "9997".to_string();
+        assert!(validate_subscriber(&sub).is_err(), "4-digit imsi");
+
+        sub.imsi = "9997000000000012345".to_string();
+        assert!(validate_subscriber(&sub).is_err(), "19-digit imsi");
+
+        sub.imsi = "99970000000000X".to_string();
+        assert!(validate_subscriber(&sub).is_err(), "non-digit imsi");
+    }
+
+    /// The case that motivated this: a mistyped key used to be persisted with
+    /// the bad pairs dropped, and authentication then failed with no clue why.
+    #[test]
+    fn validation_rejects_malformed_key() {
+        let mut sub = good_subscriber();
+        sub.security.k = "465B5CE8B199B49FAA5F0A2EE238A6B".to_string(); // 31 chars
+        assert!(validate_subscriber(&sub).is_err(), "31-char k");
+
+        sub.security.k = "465B5CE8B199B49FAA5F0A2EE238A6ZZ".to_string(); // non-hex
+        assert!(validate_subscriber(&sub).is_err(), "non-hex k");
+    }
+
+    #[test]
+    fn validation_rejects_malformed_amf_and_requires_a_key_material() {
+        let mut sub = good_subscriber();
+        sub.security.amf = "800".to_string();
+        assert!(validate_subscriber(&sub).is_err(), "3-char amf");
+
+        let mut sub = good_subscriber();
+        sub.security.opc = String::new();
+        sub.security.op = String::new();
+        assert!(
+            validate_subscriber(&sub).is_err(),
+            "neither opc nor op supplied"
+        );
+    }
+
+    #[test]
+    fn validation_bounds_sqn_to_48_bits() {
+        let mut sub = good_subscriber();
+        sub.security.sqn = nextgcore_dbi::types::NEXTGCORE_MAX_SQN as i64;
+        assert!(validate_subscriber(&sub).is_ok(), "max 48-bit sqn is valid");
+
+        sub.security.sqn = nextgcore_dbi::types::NEXTGCORE_MAX_SQN as i64 + 1;
+        assert!(validate_subscriber(&sub).is_err(), "sqn beyond 48 bits");
+
+        sub.security.sqn = -1;
+        assert!(validate_subscriber(&sub).is_err(), "negative sqn");
+    }
+
+    #[test]
+    fn validation_rejects_malformed_slice_sd() {
+        let mut sub = good_subscriber();
+        sub.slice = vec![SliceConfig {
+            sst: 1,
+            sd: Some("ZZZZZZ".to_string()),
+            default_indicator: true,
+            session: vec![],
+        }];
+        assert!(validate_subscriber(&sub).is_err(), "non-hex sd");
+    }
 }
