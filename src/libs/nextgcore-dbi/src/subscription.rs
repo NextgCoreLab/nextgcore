@@ -4,6 +4,7 @@
 //! Ported from lib/dbi/subscription.c in the C implementation.
 
 use mongodb::bson::{doc, Bson, Document};
+use nextgcore_crypt::milenage::milenage_opc;
 use serde::{Deserialize, Serialize};
 
 use crate::mongoc::{get_subscriber_collection, DbiError, DbiResult};
@@ -55,7 +56,17 @@ pub fn nextgcore_dbi_auth_info(supi: &str) -> DbiResult<NextgcoreDbiAuthInfo> {
         .get_document(NEXTGCORE_SECURITY_STRING)
         .map_err(|_| DbiError::FieldNotFound(NEXTGCORE_SECURITY_STRING.to_string()))?;
 
+    Ok(parse_auth_info(security, supi))
+}
+
+/// Parses a subscriber's `security` sub-document into [`NextgcoreDbiAuthInfo`].
+///
+/// Split out of [`nextgcore_dbi_auth_info`] so the OPc-derivation invariant is
+/// reachable in tests: that function reaches MongoDB, and its `test_store`
+/// short-circuit returns a pre-built struct without ever running this parse.
+pub(crate) fn parse_auth_info(security: &Document, supi: &str) -> NextgcoreDbiAuthInfo {
     let mut auth_info = NextgcoreDbiAuthInfo::default();
+    let mut has_op = false;
 
     // Parse K
     if let Ok(k_str) = security.get_str(NEXTGCORE_K_STRING) {
@@ -71,6 +82,47 @@ pub fn nextgcore_dbi_auth_info(supi: &str) -> DbiResult<NextgcoreDbiAuthInfo> {
     // Parse OP
     if let Ok(op_str) = security.get_str(NEXTGCORE_OP_STRING) {
         nextgcore_ascii_to_hex(op_str, &mut auth_info.op);
+        has_op = true;
+    }
+
+    // Derive OPc from (K, OP) when only OP was provisioned.
+    //
+    // OPc = OP XOR E_K(OP) (TS 33.102 Annex C.4). MILENAGE must be driven with
+    // OPc, never with OP (TS 33.501 §6.1), and `encOpcKey` carries the OPc
+    // (TS 29.505 §5.4.2.4).
+    //
+    // Deriving HERE rather than at each consumer makes `opc` an invariant of
+    // this struct: whenever key material was provisioned at all, `opc` holds a
+    // usable OPc and `use_opc` is true. That is what stops a consumer from
+    // serving the raw OP by omitting a derivation step -- which is exactly the
+    // bug this fixes: nextgcore-udrd emitted
+    // `if use_opc { opc } else { op }` into encOpcKey, so an OP-only
+    // subscriber authenticated with OP as its OPc and 5G-AKA failed.
+    // nextgcore-hssd already derived correctly on all three Diameter paths
+    // (swx_path.rs:259, cx_path.rs:173, s6a_path.rs:314); only the 5G path
+    // skipped it. Those sites still work -- their `if use_opc` branch now
+    // simply always takes the provisioned arm.
+    //
+    // An explicitly provisioned OPc is never overwritten: provisioning wins,
+    // because deriving over operator-supplied material would silently discard
+    // it. `op` stays populated for any other reader.
+    if !auth_info.use_opc && has_op {
+        match milenage_opc(&auth_info.k, &auth_info.op) {
+            Ok(opc) => {
+                auth_info.opc = opc;
+                auth_info.use_opc = true;
+            }
+            Err(e) => {
+                // Leave use_opc false rather than fall back to OP: a consumer
+                // seeing no OPc fails authentication, which is the correct
+                // outcome. Serving OP would authenticate against the wrong key.
+                log::error!(
+                    "OPc derivation from OP failed for {supi}: {e:?}. \
+                     Authentication will fail for this subscriber -- \
+                     provision opc directly, or fix the k/op values."
+                );
+            }
+        }
     }
 
     // Parse AMF
@@ -94,7 +146,7 @@ pub fn nextgcore_dbi_auth_info(supi: &str) -> DbiResult<NextgcoreDbiAuthInfo> {
         auth_info.authentication_method = m.to_string();
     }
 
-    Ok(auth_info)
+    auth_info
 }
 
 /// Update SQN for a subscriber
@@ -772,4 +824,96 @@ pub fn nextgcore_dbi_policy_subscription(supi: &str) -> DbiResult<NextgcoreSubsc
     }
 
     Ok(subscription_data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 3GPP TS 35.208 Test Set 1, mirroring the constants in
+    // nextgcore-crypt/src/milenage.rs so the expected OPc is anchored to the
+    // published vectors rather than to our own output.
+    const K1_HEX: &str = "465b5ce8b199b49faa5f0a2ee238a6bc";
+    const OP1_HEX: &str = "cdc202d5123e20f62b6d676ac72cb318";
+    const OPC1_HEX: &str = "cd63cb71954a9f4e48a5994e37a02baf";
+
+    fn security_doc(fields: &[(&str, &str)]) -> Document {
+        let mut d = Document::new();
+        for (k, v) in fields {
+            d.insert(*k, *v);
+        }
+        d
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// OP-only provisioning must yield the DERIVED OPc, never the raw OP.
+    ///
+    /// This is the #86 defect: nextgcore-udrd emitted
+    /// `if use_opc { opc } else { op }` into `encOpcKey`, so an OP-only
+    /// subscriber had MILENAGE driven with OP where TS 33.501 §6.1 requires
+    /// OPc, and 5G-AKA failed for that subscriber.
+    #[test]
+    fn test_op_only_derives_opc_and_never_serves_raw_op() {
+        let doc = security_doc(&[(NEXTGCORE_K_STRING, K1_HEX), (NEXTGCORE_OP_STRING, OP1_HEX)]);
+        let info = parse_auth_info(&doc, "imsi-001010000000001");
+
+        assert!(
+            info.use_opc,
+            "use_opc must be set once OPc is derived, so consumers take the OPc arm"
+        );
+        assert_eq!(
+            hex(&info.opc),
+            OPC1_HEX,
+            "opc must be the TS 35.208 Set-1 derived value OPc = OP XOR E_K(OP)"
+        );
+        assert_ne!(
+            hex(&info.opc),
+            OP1_HEX,
+            "serving the raw OP as OPc is the authentication-breaking bug"
+        );
+        // The UDR's encOpcKey expression must now select the derived OPc.
+        let served = if info.use_opc { &info.opc } else { &info.op };
+        assert_eq!(hex(served), OPC1_HEX);
+    }
+
+    /// An explicitly provisioned OPc is served verbatim and never re-derived.
+    #[test]
+    fn test_provisioned_opc_is_not_rederived() {
+        let doc = security_doc(&[
+            (NEXTGCORE_K_STRING, K1_HEX),
+            (NEXTGCORE_OPC_STRING, OPC1_HEX),
+            // Both present: provisioning must win over derivation.
+            (NEXTGCORE_OP_STRING, OP1_HEX),
+        ]);
+        let info = parse_auth_info(&doc, "imsi-001010000000002");
+
+        assert!(info.use_opc);
+        assert_eq!(
+            hex(&info.opc),
+            OPC1_HEX,
+            "a provisioned OPc must pass through untouched"
+        );
+    }
+
+    /// A record with neither OPc nor OP leaves use_opc false: there is nothing
+    /// to derive from, and inventing key material would be worse than failing.
+    #[test]
+    fn test_no_key_material_leaves_use_opc_false() {
+        let doc = security_doc(&[(NEXTGCORE_K_STRING, K1_HEX)]);
+        let info = parse_auth_info(&doc, "imsi-001010000000003");
+        assert!(!info.use_opc);
+        assert_eq!(info.opc, [0u8; NEXTGCORE_KEY_LEN]);
+    }
+
+    /// `op` stays populated after derivation: it is no longer used for AKA, but
+    /// zeroing it would be an unrelated behaviour change for other readers.
+    #[test]
+    fn test_op_is_retained_after_derivation() {
+        let doc = security_doc(&[(NEXTGCORE_K_STRING, K1_HEX), (NEXTGCORE_OP_STRING, OP1_HEX)]);
+        let info = parse_auth_info(&doc, "imsi-001010000000004");
+        assert_eq!(hex(&info.op), OP1_HEX);
+    }
 }

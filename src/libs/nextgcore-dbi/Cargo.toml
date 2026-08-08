@@ -8,6 +8,10 @@ description = "NextGCore Database Interface Library"
 
 [dependencies]
 nextgcore-core = { workspace = true }
+# OPc derivation (milenage_opc) on the OP-only provisioning path, so no
+# consumer can serve the raw OP as OPc. No cycle: nextgcore-crypt depends
+# only on nextgcore-core.
+nextgcore-crypt = { workspace = true }
 thiserror.workspace = true
 mongodb = { version = "2.8", default-features = false, features = ["sync"] }
 serde.workspace = true

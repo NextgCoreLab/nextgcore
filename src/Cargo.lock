@@ -2461,6 +2461,7 @@ dependencies = [
  "log",
  "mongodb",
  "nextgcore-core",
+ "nextgcore-crypt",
  "proptest",
  "serde",
  "thiserror 1.0.69",
