@@ -471,8 +471,27 @@ mod tests {
         assert!(!config.tls_enabled);
     }
 
+    /// Serialises the tests that drive the process-global SBI_SERVER_RUNNING
+    /// lifecycle flag.
+    ///
+    /// `store(false)` at the top of each test is not isolation: cargo runs the
+    /// tests of one binary on parallel threads, so a second test's reset or its
+    /// `scp_sbi_open` can land between this test's open and its assert. Observed
+    /// as `test_sbi_open_close` failing on `assert!(result.is_ok())` because
+    /// `test_sbi_open_already_running` had already set the flag, making open
+    /// return Err("SBI server already running"). Rare (it needs the two threads
+    /// to interleave inside a few instructions) but a real race, not an
+    /// environment artefact.
+    fn sbi_lifecycle_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn test_sbi_open_close() {
+        let _serial = sbi_lifecycle_lock();
         // Reset state
         SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
@@ -486,6 +505,7 @@ mod tests {
 
     #[test]
     fn test_sbi_open_already_running() {
+        let _serial = sbi_lifecycle_lock();
         // Reset state
         SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 

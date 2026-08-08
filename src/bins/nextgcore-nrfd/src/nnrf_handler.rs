@@ -1372,6 +1372,16 @@ pub struct DiscoveryQuery {
     pub target_nf_fqdn: Option<String>,
     /// limit (minimum 1)
     pub limit: Option<usize>,
+    /// supi — select the UDM/UDR/AUSF instance whose `supiRanges` cover this
+    /// subscriber (TS 29.510 §5.3.2.2.2).
+    pub supi: Option<String>,
+    /// gpsi — as `supi`, matched against `gpsiRanges`.
+    pub gpsi: Option<String>,
+    /// routing-indicator — matched against the profile's `routingIndicators`.
+    pub routing_indicator: Option<String>,
+    /// group-id-list — matched against the profile's NF `groupId`
+    /// (style: form, explode: false => comma-separated).
+    pub group_id_list: Vec<String>,
 }
 
 /// Two S-NSSAIs match when sst is equal and sd is equal (an absent sd only
@@ -1384,6 +1394,122 @@ fn snssai_matches(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 fn plmn_matches(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     a.get("mcc").and_then(|v| v.as_str()) == b.get("mcc").and_then(|v| v.as_str())
         && a.get("mnc").and_then(|v| v.as_str()) == b.get("mnc").and_then(|v| v.as_str())
+}
+
+/// The digit run that identifies a subscriber, with the scheme prefix removed:
+/// `imsi-001010000000001` -> `001010000000001`, `msisdn-14155550100` ->
+/// `14155550100`. Returns `None` when no leading digit run is present (e.g. a
+/// `nai-` GPSI), which makes range matching inapplicable rather than false.
+fn identity_digits(id: &str) -> Option<&str> {
+    let rest = id.split_once('-').map_or(id, |(_, rest)| rest);
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(rest, |end| &rest[..end]);
+    (!digits.is_empty()).then_some(digits)
+}
+
+/// Whether `digits` falls inside one `SupiRange`/`IdentityRange`
+/// (TS29510_Nnrf_NFManagement.yaml SupiRange: `oneOf [{start,end}, {pattern}]`).
+///
+/// Comparison is NUMERIC, not lexical: both bounds are constrained to
+/// `^[0-9]+$` precisely so they denote numbers, and `"100" < "99"` as strings
+/// would silently mis-bucket subscribers. Identities exceeding u128 are
+/// compared by (length, lexical) order, which is equivalent for digit strings.
+///
+/// The `pattern` alternative is NOT evaluated: `regex` is not a declared
+/// dependency of this workspace (it reaches Cargo.lock only transitively via
+/// env_logger), and hand-rolling a regex engine here would be worse than
+/// declining. `None` is returned so a pattern-only range leaves the candidate
+/// undisqualified rather than wrongly excluded -- see `identity_matches`.
+fn identity_in_range(digits: &str, range: &serde_json::Value) -> Option<bool> {
+    let start = range.get("start").and_then(|v| v.as_str())?;
+    let end = range.get("end").and_then(|v| v.as_str())?;
+    if !start.bytes().all(|b| b.is_ascii_digit()) || !end.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let cmp = |a: &str, b: &str| {
+        let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+    };
+    Some(cmp(digits, start).is_ge() && cmp(digits, end).is_le())
+}
+
+/// The identity-bearing info container for a UDM/UDR/AUSF profile, whichever is
+/// present (TS 29.510 §6.1.6.2.x UdmInfo/UdrInfo/AusfInfo all carry groupId,
+/// supiRanges, gpsiRanges and routingIndicators).
+fn nf_info_for_type(doc: &serde_json::Value) -> Option<&serde_json::Value> {
+    ["udmInfo", "udrInfo", "ausfInfo"]
+        .iter()
+        .find_map(|key| doc.get(key))
+}
+
+/// Applies the identity-selection filters (`supi`, `gpsi`, `routing-indicator`,
+/// `group-id-list`) to one candidate profile.
+///
+/// Follows the same absence rule `profile_matches` documents for sNssais and
+/// plmnList: **a profile that declares no ranges is not disqualified**. A
+/// single-instance deployment normally declares nothing and serves everyone, so
+/// failing closed here would turn the first `supi`-bearing query into an outage
+/// rather than a refinement. A profile that DOES declare ranges but none
+/// covering the request is excluded -- that is the whole point of the filter.
+fn identity_matches(info: &serde_json::Value, query: &DiscoveryQuery) -> bool {
+    let ranges_allow = |id: &Option<String>, key: &str| -> bool {
+        let Some(id) = id else { return true }; // filter not requested
+        let Some(ranges) = info.get(key).and_then(|v| v.as_array()) else {
+            return true; // declares no ranges => serves any
+        };
+        if ranges.is_empty() {
+            return true;
+        }
+        let Some(digits) = identity_digits(id) else {
+            return true; // non-numeric identity: ranges inapplicable
+        };
+        // Evaluatable ranges only. If every declared range is pattern-only the
+        // candidate stays eligible (see identity_in_range).
+        let mut saw_evaluatable = false;
+        for range in ranges {
+            match identity_in_range(digits, range) {
+                Some(true) => return true,
+                Some(false) => saw_evaluatable = true,
+                None => {}
+            }
+        }
+        if !saw_evaluatable {
+            log::debug!(
+                "NF Discovery: {key} on this candidate declares only pattern ranges, \
+                 which this NRF does not evaluate; not excluding it"
+            );
+        }
+        !saw_evaluatable
+    };
+
+    if !ranges_allow(&query.supi, "supiRanges") {
+        return false;
+    }
+    if !ranges_allow(&query.gpsi, "gpsiRanges") {
+        return false;
+    }
+
+    // routingIndicators: exact match against the declared list (each is
+    // ^[0-9]{1,4}$; there is no pattern form).
+    if let Some(ref ri) = query.routing_indicator {
+        if let Some(list) = info.get("routingIndicators").and_then(|v| v.as_array()) {
+            if !list.is_empty() && !list.iter().filter_map(|v| v.as_str()).any(|v| v == ri) {
+                return false;
+            }
+        }
+    }
+
+    // group-id-list: the profile's groupId must be among those requested.
+    if !query.group_id_list.is_empty() {
+        if let Some(group) = info.get("groupId").and_then(|v| v.as_str()) {
+            if !query.group_id_list.iter().any(|g| g == group) {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 /// Collects every DNN advertised in the NF-type-specific info containers
@@ -1518,6 +1644,16 @@ fn profile_matches(doc: &serde_json::Value, status: &str, query: &DiscoveryQuery
     if let Some(ref dnn) = query.dnn {
         let dnns = advertised_dnns(doc);
         if !dnns.is_empty() && !dnns.iter().any(|d| d == dnn) {
+            return false;
+        }
+    }
+
+    // Identity selection (supi / gpsi / routing-indicator / group-id-list):
+    // route the subscriber to the UDM/UDR/AUSF instance that actually serves it
+    // (TS 29.510 §5.3.2.2.2). Only these three NF types carry the identity
+    // containers, so a profile without one is unaffected.
+    if let Some(info) = nf_info_for_type(doc) {
+        if !identity_matches(info, query) {
             return false;
         }
     }
@@ -2095,6 +2231,205 @@ mod tests {
         manager.deregister(smf_id).ok();
         manager.deregister(upf_id).ok();
         manager.deregister(suspended_id).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // Identity-based producer selection (issue #67, TS 29.510 §5.3.2.2.2)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_identity_range_numeric_not_lexical() {
+        // The trap this guards: as STRINGS "100" < "99", so a lexical compare
+        // would place 100 outside {99..101}. Both bounds are ^[0-9]+$ precisely
+        // because they denote numbers.
+        let range = serde_json::json!({"start": "99", "end": "101"});
+        assert_eq!(identity_in_range("100", &range), Some(true));
+        assert_eq!(identity_in_range("98", &range), Some(false));
+        assert_eq!(identity_in_range("102", &range), Some(false));
+        // Inclusive at both bounds.
+        assert_eq!(identity_in_range("99", &range), Some(true));
+        assert_eq!(identity_in_range("101", &range), Some(true));
+        // Leading zeros do not change the value.
+        let padded = serde_json::json!({"start": "0099", "end": "0101"});
+        assert_eq!(identity_in_range("00100", &padded), Some(true));
+        // A pattern-only range is not evaluatable => None, never a false verdict.
+        assert_eq!(
+            identity_in_range("100", &serde_json::json!({"pattern": "^1.*$"})),
+            None
+        );
+        // Identities far beyond u128 still order correctly (length, then lexical).
+        let big = serde_json::json!({
+            "start": "100000000000000000000000000000000000000000",
+            "end":   "300000000000000000000000000000000000000000"
+        });
+        assert_eq!(
+            identity_in_range("200000000000000000000000000000000000000000", &big),
+            Some(true)
+        );
+        assert_eq!(
+            identity_in_range("400000000000000000000000000000000000000000", &big),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_identity_digits_strips_scheme_prefix() {
+        assert_eq!(
+            identity_digits("imsi-001010000000001"),
+            Some("001010000000001")
+        );
+        assert_eq!(identity_digits("msisdn-14155550100"), Some("14155550100"));
+        // Bare digits (no prefix) are accepted as-is.
+        assert_eq!(identity_digits("001010000000001"), Some("001010000000001"));
+        // A non-numeric GPSI has no digit run to range-match on.
+        assert_eq!(identity_digits("nai-user@example.com"), None);
+    }
+
+    #[test]
+    fn test_discovery_identity_selection() {
+        let manager = nf_manager();
+        let in_range = "disc-udm-in-range";
+        let out_of_range = "disc-udm-out-of-range";
+        let no_ranges = "disc-udm-no-ranges";
+
+        // Two sharded UDMs plus one that declares nothing.
+        manager
+            .register(
+                NfProfile::from_json(&serde_json::json!({
+                    "nfInstanceId": in_range,
+                    "nfType": "UDM",
+                    "nfStatus": "REGISTERED",
+                    "udmInfo": {
+                        "groupId": "udm-group-a",
+                        "supiRanges": [{"start": "001010000000000", "end": "001010000000999"}],
+                        "gpsiRanges": [{"start": "14155550100", "end": "14155550199"}],
+                        "routingIndicators": ["0001", "0002"]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        manager
+            .register(
+                NfProfile::from_json(&serde_json::json!({
+                    "nfInstanceId": out_of_range,
+                    "nfType": "UDM",
+                    "nfStatus": "REGISTERED",
+                    "udmInfo": {
+                        "groupId": "udm-group-b",
+                        "supiRanges": [{"start": "001010000001000", "end": "001010000001999"}],
+                        "routingIndicators": ["0003"]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        manager
+            .register(
+                NfProfile::from_json(&serde_json::json!({
+                    "nfInstanceId": no_ranges,
+                    "nfType": "UDM",
+                    "nfStatus": "REGISTERED",
+                    "udmInfo": {}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let base = || DiscoveryQuery {
+            target_nf_type: "UDM".to_string(),
+            requester_nf_type: "AMF".to_string(),
+            ..Default::default()
+        };
+        let ids = |q: &DiscoveryQuery| -> Vec<String> {
+            discover_profiles(q)
+                .iter()
+                .filter_map(|p| {
+                    p.get("nfInstanceId")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        };
+
+        // No supi => every registered UDM is a candidate (unchanged behaviour).
+        let all = ids(&base());
+        assert!(all.contains(&in_range.to_string()));
+        assert!(all.contains(&out_of_range.to_string()));
+        assert!(all.contains(&no_ranges.to_string()));
+
+        // supi inside the first shard's range: the other shard is EXCLUDED, and
+        // the range-less profile still matches (absence means "serves any").
+        let mut q = base();
+        q.supi = Some("imsi-001010000000042".to_string());
+        let got = ids(&q);
+        assert!(
+            got.contains(&in_range.to_string()),
+            "the shard whose supiRanges cover the SUPI must be returned"
+        );
+        assert!(
+            !got.contains(&out_of_range.to_string()),
+            "a shard declaring ranges that do NOT cover the SUPI must be excluded"
+        );
+        assert!(
+            got.contains(&no_ranges.to_string()),
+            "a profile declaring no supiRanges serves any subscriber"
+        );
+
+        // The complementary SUPI selects the other shard.
+        let mut q = base();
+        q.supi = Some("imsi-001010000001500".to_string());
+        let got = ids(&q);
+        assert!(got.contains(&out_of_range.to_string()));
+        assert!(!got.contains(&in_range.to_string()));
+
+        // gpsi is matched against gpsiRanges, independently of supiRanges.
+        let mut q = base();
+        q.gpsi = Some("msisdn-14155550142".to_string());
+        assert!(ids(&q).contains(&in_range.to_string()));
+        let mut q = base();
+        q.gpsi = Some("msisdn-14155559999".to_string());
+        assert!(!ids(&q).contains(&in_range.to_string()));
+
+        // routing-indicator: exact match against the declared list.
+        let mut q = base();
+        q.routing_indicator = Some("0002".to_string());
+        let got = ids(&q);
+        assert!(got.contains(&in_range.to_string()));
+        assert!(!got.contains(&out_of_range.to_string()));
+        let mut q = base();
+        q.routing_indicator = Some("9999".to_string());
+        let got = ids(&q);
+        assert!(!got.contains(&in_range.to_string()));
+        assert!(!got.contains(&out_of_range.to_string()));
+        // ...but a profile declaring no routingIndicators is still eligible.
+        assert!(got.contains(&no_ranges.to_string()));
+
+        // group-id-list: only the named group's instance comes back.
+        let mut q = base();
+        q.group_id_list = vec!["udm-group-b".to_string()];
+        let got = ids(&q);
+        assert!(got.contains(&out_of_range.to_string()));
+        assert!(!got.contains(&in_range.to_string()));
+
+        // A non-identity NF type is untouched by these filters: an SMF has no
+        // udmInfo/udrInfo/ausfInfo container, so supi must not exclude it.
+        let smf_id = "disc-identity-smf";
+        manager
+            .register(NfProfile::from_json(&full_profile_doc(smf_id, "SMF")).unwrap())
+            .unwrap();
+        let mut q = DiscoveryQuery {
+            target_nf_type: "SMF".to_string(),
+            requester_nf_type: "AMF".to_string(),
+            ..Default::default()
+        };
+        q.supi = Some("imsi-999999999999999".to_string());
+        assert!(ids(&q).contains(&smf_id.to_string()));
+
+        manager.deregister(in_range).ok();
+        manager.deregister(out_of_range).ok();
+        manager.deregister(no_ranges).ok();
+        manager.deregister(smf_id).ok();
     }
 
     fn temp_state_path(tag: &str) -> PathBuf {
