@@ -1581,6 +1581,22 @@ async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
         target_nf_fqdn: param("target-nf-fqdn"),
         // Page in the handler; ask discover_profiles for the full match set.
         limit: None,
+        // Identity selection for UDM/UDR/AUSF (TS 29.510 §5.3.2.2.2): route the
+        // request to the instance whose supiRanges/gpsiRanges/routingIndicators/
+        // groupId actually cover this subscriber, rather than to any registered
+        // producer of the target type.
+        supi: param("supi"),
+        gpsi: param("gpsi"),
+        routing_indicator: param("routing-indicator"),
+        // style: form, explode: false => comma-separated, as service-names.
+        group_id_list: param("group-id-list")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
 
     let all_matches = discover_profiles(&query);
