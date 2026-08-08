@@ -1,0 +1,79 @@
+# Build-context exclusions for Dockerfile.builder.
+#
+# WHY THIS FILE IS HERE AND NOT AT THE CONTEXT ROOT
+#
+# build.sh and build-multiarch.sh pass $PROJECT_ROOT -- the nextg PARENT
+# directory, one level above this repository -- as the build context, because
+# Dockerfile.builder COPYs both nextgcore/src and nextgsim. Docker normally
+# reads .dockerignore from the root of the CONTEXT, and that directory is not
+# part of any git repository, so an ignore file placed there cannot be
+# committed, reviewed, or cloned: every fresh checkout would silently lose it.
+#
+# BuildKit also honours a Dockerfile-scoped ignore file named
+# <dockerfile>.dockerignore, resolved next to the Dockerfile rather than at the
+# context root. That lets this file live INSIDE the repo -- tracked and
+# reviewable -- while still governing a context that sits above it. Its patterns
+# are still interpreted relative to the CONTEXT root (hence the nextgcore/ and
+# nextgsim/ prefixes below), not relative to this directory.
+#
+# WHAT IT PREVENTS
+#
+# Without it, both cargo target/ trees ship to the daemon on every build:
+# nextgcore/src/target (~27GB) and nextgsim/target (~12GB). Measured on a real
+# build: the context went from 39GB to 26.83MB. preflight.sh cannot catch this
+# because it checks free space BEFORE the transfer that consumes it.
+#
+# TWO CAVEATS
+#
+# 1. Requires BuildKit. Docker >= 23 uses it by default; with DOCKER_BUILDKIT=0
+#    the legacy builder ignores this file and the full 39GB transfers again.
+# 2. A Dockerfile-scoped ignore file REPLACES the context-root .dockerignore
+#    rather than merging with it, so this file must be complete on its own.
+#
+# Dockerfile.builder COPYs exactly two paths:
+#   COPY nextgcore/src /build/nextgcore/src
+#   COPY nextgsim      /build/nextgsim
+# Keep nextgsim/config/ue.yaml: it is include_str!'d by
+# nextgsim-common/src/config.rs and the build fails without it.
+
+# Rust build artifacts -- the whole reason this file exists
+target/
+**/target/
+
+# Git metadata (never COPYed; hundreds of MB across the sibling repos)
+.git/
+**/.git/
+.gitignore
+.gitmodules
+
+# Sibling repo: 3GPP specs and audit notes, never COPYed by any Dockerfile
+6g_docs/
+
+# Staged build outputs -- regenerated per build. The images that consume them
+# (Dockerfile.nf, Dockerfile.gnb-local) use a narrower context of their own.
+nextgcore/binaries/
+nextgcore/docker/rust/binaries/
+nextgsim/binaries/
+nextgsim/docker/binaries/
+nextgcore/docker/rust/build-cache/
+
+# Agent/context tooling and local editor state
+.context/
+.claude/
+ideas/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local development noise
+*.log
+*.tmp
+.env
+.env.local
+.DS_Store
+
+# Test and coverage artifacts
+*.profraw
+*.profdata

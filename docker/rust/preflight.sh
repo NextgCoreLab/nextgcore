@@ -78,6 +78,29 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1b. BuildKit enabled?
+#
+# Dockerfile.builder.dockerignore is a DOCKERFILE-SCOPED ignore file, which
+# only BuildKit resolves. It is the sole thing keeping the two cargo target/
+# trees (~39GB combined) out of the build context, and it has to live next to
+# the Dockerfile rather than at the context root because the context is the
+# nextg parent directory, which is not in any git repository.
+#
+# Under the legacy builder (DOCKER_BUILDKIT=0) that file is silently ignored
+# and the full 39GB transfers to the daemon -- which is precisely the
+# image-store-wipe-under-disk-pressure hazard (#269) this script exists to
+# prevent, and which the disk checks below CANNOT catch because they run
+# before the transfer that consumes the space.
+# ---------------------------------------------------------------------------
+if [ "${DOCKER_BUILDKIT:-1}" = "0" ]; then
+    log_error "DOCKER_BUILDKIT=0: the legacy builder ignores"
+    log_error "docker/rust/Dockerfile.builder.dockerignore, so ~39GB of cargo"
+    log_error "target/ would ship to the daemon (hazard #269). Unset"
+    log_error "DOCKER_BUILDKIT or set it to 1, then re-run."
+    exit 2
+fi
+
+# ---------------------------------------------------------------------------
 # 2. Trim the BuildKit cache (keep recent layers), 3. usage snapshot
 # ---------------------------------------------------------------------------
 if [ "$DO_PRUNE" = true ]; then

@@ -56,7 +56,15 @@ if [ "$SKIP_RUST" = false ]; then
     echo "(This builds both nextgcore and nextgsim inside a Rust container)"
     echo ""
 
-    # Build using Docker builder
+    # Build using Docker builder.
+    #
+    # The context is PROJECT_ROOT (the nextg parent dir) because
+    # Dockerfile.builder COPYs both nextgcore/src and the sibling nextgsim.
+    # Exclusions come from Dockerfile.builder.dockerignore next to the
+    # Dockerfile, NOT from a .dockerignore at the context root -- that
+    # directory is outside any git repo, so a file there could not be
+    # committed. BuildKit is required to honour it (preflight.sh refuses when
+    # DOCKER_BUILDKIT=0); without it ~39GB of cargo target/ transfers.
     docker build \
         -f "$SCRIPT_DIR/Dockerfile.builder" \
         -t nextg-builder:latest \
