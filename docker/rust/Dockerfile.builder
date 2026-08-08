@@ -11,6 +11,15 @@
 # Build (multi-platform with buildx):
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     -f Dockerfile.builder -t nextg-builder .
+#
+# BUILD CONTEXT: the nextg PARENT directory (one level above this repo), since
+# the COPY lines below need both nextgcore/src and the sibling nextgsim tree.
+# Exclusions therefore live in Dockerfile.builder.dockerignore next to this
+# file -- a Dockerfile-scoped ignore file -- because the context root is not
+# part of any git repository and an ignore file there could not be committed.
+# That file requires BuildKit; under DOCKER_BUILDKIT=0 it is silently ignored
+# and ~39GB of cargo target/ ships to the daemon. preflight.sh refuses in that
+# case.
 
 # Use buildplatform for faster cross-compilation.
 # Pin matches the `channel` in nextgcore/src/rust-toolchain.toml and
