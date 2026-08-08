@@ -2649,7 +2649,9 @@ mod tests {
     /// is built, and the transfer is accepted (200) — the SM path is skipped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_lpp_to_connected_ue_relays() {
-        let supi = "imsi-001010000060030";
+        // Unique SUPI: test_ue_context_transfer_roundtrip also registered
+        // imsi-001010000060030 in the shared process-global supi_hash.
+        let supi = "imsi-001010000060036";
         setup_ue(supi, true, true);
 
         let body = json!({
@@ -2742,7 +2744,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_updp_to_connected_ue_relays_verbatim() {
         let _serial = updp_queue_test_lock().lock().await;
-        let supi = "imsi-001010000060032";
+        // Unique SUPI. The queue lock above serialises the DRAIN, but the
+        // enqueue in try_ue_policy_relay uses the UE that
+        // `amf_ue_find_by_supi` resolves from the process-global supi_hash --
+        // which the lock does not cover. test_registration_status_update
+        // registered this same SUPI, so whichever test called setup_ue last
+        // owned the hash entry; the handler then enqueued under the OTHER
+        // test's ue.id and drain_downlinks_for(ue.id) filtered its own item
+        // away, failing with "exactly one UPDP downlink enqueued: left 0".
+        // See test_ue_context_transfer_error_paths for the same trap.
+        let supi = "imsi-001010000060035";
         let ue = setup_ue(supi, true, true);
 
         // Opaque MANAGE UE POLICY COMMAND-ish bytes (payload is opaque to the

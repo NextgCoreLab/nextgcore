@@ -12,8 +12,11 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     -f Dockerfile.builder -t nextg-builder .
 
-# Use buildplatform for faster cross-compilation
-FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
+# Use buildplatform for faster cross-compilation.
+# Pin matches the `channel` in nextgcore/src/rust-toolchain.toml and
+# nextgsim/rust-toolchain.toml -- if they diverge, rustup silently downloads
+# the pinned toolchain on every build and this base image's rustc is unused.
+FROM --platform=$BUILDPLATFORM rust:1.95.0-bookworm AS builder
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
