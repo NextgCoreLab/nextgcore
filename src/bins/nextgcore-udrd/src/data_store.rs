@@ -100,6 +100,13 @@ pub struct UdrDataStore {
     policy_sm: RwLock<HashMap<String, Value>>,
     /// supi -> provisioned UePolicySet (TS 29.519 §5.4)
     policy_ue: RwLock<HashMap<String, Value>>,
+    /// (supi, servingNetworkName) -> (insertion seq, AuthEvent) per TS 29.505
+    /// authentication-status / TS 29.503 AuthEvent. The sequence number orders
+    /// events for `auth_status_latest_for_supi`; the AuthEvent's own timeStamp
+    /// is consumer-supplied and cannot be trusted for ordering.
+    auth_status: RwLock<HashMap<(String, String), (u64, Value)>>,
+    /// Insertion counter for `auth_status` ordering.
+    next_auth_status_seq: AtomicU64,
     /// subId -> subscription
     subs: RwLock<HashMap<String, StoredSub>>,
     /// Subscription id allocator
@@ -134,6 +141,21 @@ impl UdrDataStore {
             .expect("lock")
             .iter()
             .map(|((ue, psi), v)| (format!("{ue}\u{1f}{psi}"), v.clone()))
+            .collect();
+        // Same \u{1f} key flattening as exposure_sm. The insertion seq rides
+        // along so `auth_status_latest_for_supi` still orders correctly after a
+        // restart.
+        let auth_status: HashMap<String, Value> = self
+            .auth_status
+            .read()
+            .expect("lock")
+            .iter()
+            .map(|((supi, snn), (seq, v))| {
+                (
+                    format!("{supi}\u{1f}{snn}"),
+                    serde_json::json!({ "seq": seq, "event": v }),
+                )
+            })
             .collect();
         let pfds: HashMap<String, Value> = self.pfds.read().expect("lock").clone();
         let influence: HashMap<String, Value> = self.influence.read().expect("lock").clone();
@@ -173,6 +195,8 @@ impl UdrDataStore {
             "policy_am": policy_am,
             "policy_sm": policy_sm,
             "policy_ue": policy_ue,
+            "auth_status": auth_status,
+            "next_auth_status_seq": self.next_auth_status_seq.load(Ordering::SeqCst),
             "subs": subs,
         })
     }
@@ -251,6 +275,34 @@ impl UdrDataStore {
                     }
                 }
             }
+        }
+        {
+            let mut au = self.auth_status.write().expect("lock");
+            au.clear();
+            let mut max_seq = 0u64;
+            if let Some(m) = doc.get("auth_status").and_then(Value::as_object) {
+                for (k, v) in m {
+                    if let Some((supi, snn)) = k.split_once('\u{1f}') {
+                        // Snapshot form is {seq, event}; tolerate a bare event
+                        // document so an older state file still loads.
+                        let (seq, event) =
+                            match (v.get("seq").and_then(Value::as_u64), v.get("event")) {
+                                (Some(s), Some(e)) => (s, e.clone()),
+                                _ => (0, v.clone()),
+                            };
+                        max_seq = max_seq.max(seq);
+                        au.insert((supi.to_string(), snn.to_string()), (seq, event));
+                    }
+                }
+            }
+            // Resume the counter above every restored value, so a post-restart
+            // PUT never ties an existing entry and break `latest_for_supi`.
+            let resume = doc
+                .get("next_auth_status_seq")
+                .and_then(Value::as_u64)
+                .unwrap_or(max_seq + 1)
+                .max(max_seq + 1);
+            self.next_auth_status_seq.store(resume, Ordering::SeqCst);
         }
         {
             let mut subs = self.subs.write().expect("lock");
@@ -351,6 +403,84 @@ impl UdrDataStore {
             .expect("lock")
             .remove(&(ue_id.to_string(), psi.to_string()));
         self.persist();
+        removed
+    }
+
+    // -- authentication-status ---------------------------------------------
+
+    /// Store an `AuthEvent` for (supi, servingNetworkName). Returns true when
+    /// this created the resource rather than replacing one (TS 29.505
+    /// authentication-status; the AuthEvent shape is TS 29.503).
+    pub fn auth_status_put(&self, supi: &str, serving_network_name: &str, doc: Value) -> bool {
+        let created = {
+            let mut map = self.auth_status.write().expect("lock");
+            map.insert(
+                (supi.to_string(), serving_network_name.to_string()),
+                (
+                    self.next_auth_status_seq.fetch_add(1, Ordering::SeqCst),
+                    doc,
+                ),
+            )
+            .is_none()
+        };
+        self.persist();
+        created
+    }
+
+    pub fn auth_status_get(&self, supi: &str, serving_network_name: &str) -> Option<Value> {
+        self.auth_status
+            .read()
+            .expect("lock")
+            .get(&(supi.to_string(), serving_network_name.to_string()))
+            .map(|(_, doc)| doc.clone())
+    }
+
+    /// The most recently stored `AuthEvent` for a SUPI, across serving
+    /// networks.
+    ///
+    /// The collection-form resource
+    /// (`…/authentication-data/authentication-status`, no
+    /// `{servingNetworkName}` segment) carries neither a path segment nor a
+    /// body on GET/DELETE, so there is nothing to select a specific serving
+    /// network with. "Most recent" is the useful reading of a UDM asking
+    /// whether this subscriber authenticated. Ordering comes from an insertion
+    /// counter rather than the AuthEvent's own `timeStamp`, because that field
+    /// is consumer-supplied and may be skewed or duplicated across NFs.
+    pub fn auth_status_latest_for_supi(&self, supi: &str) -> Option<Value> {
+        self.auth_status
+            .read()
+            .expect("lock")
+            .iter()
+            .filter(|((s, _), _)| s == supi)
+            .max_by_key(|(_, (seq, _))| *seq)
+            .map(|(_, (_, doc))| doc.clone())
+    }
+
+    pub fn auth_status_remove(&self, supi: &str, serving_network_name: &str) -> Option<Value> {
+        let removed = self
+            .auth_status
+            .write()
+            .expect("lock")
+            .remove(&(supi.to_string(), serving_network_name.to_string()))
+            .map(|(_, doc)| doc);
+        self.persist();
+        removed
+    }
+
+    /// Remove every stored `AuthEvent` for a SUPI (collection-form DELETE).
+    /// Returns how many were removed.
+    pub fn auth_status_remove_all_for_supi(&self, supi: &str) -> usize {
+        let removed = {
+            let mut map = self.auth_status.write().expect("lock");
+            let keys: Vec<_> = map.keys().filter(|(s, _)| s == supi).cloned().collect();
+            for k in &keys {
+                map.remove(k);
+            }
+            keys.len()
+        };
+        if removed > 0 {
+            self.persist();
+        }
         removed
     }
 
