@@ -663,43 +663,149 @@ async fn handle_auth_data(
             // PATCHing the new value (advance_sqn_ind).  The previous
             // unconditional SQN-increment side effect here corrupted every
             // stored SQN by an extra +32 SEQ step (WSB-6).
-            if let Some(content) = &request.http.content {
-                if let Ok(patches) = serde_json::from_str::<serde_json::Value>(content) {
-                    if let Some(arr) = patches.as_array() {
-                        for patch in arr {
-                            let path = patch.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                            if path == "/sequenceNumber/sqn" {
-                                if let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) {
-                                    let sqn = u64::from_str_radix(sqn_hex, 16).unwrap_or(0);
-                                    if let Err(e) =
-                                        nextgcore_dbi::subscription::nextgcore_dbi_update_sqn_async(
-                                            supi.to_string(),
-                                            sqn,
-                                        )
-                                        .await
-                                    {
-                                        log::error!("[{supi}] DB update_sqn failed: {e:?}");
-                                    }
-                                }
-                            }
-                        }
+            // Failures are REPORTED, not swallowed. Previously every path here
+            // fell through to 204, so a consumer could not tell an applied
+            // patch from a malformed body, an unsupported path, or a database
+            // error -- and a non-hex SQN silently became 0 via
+            // unwrap_or(0), corrupting the stored value rather than rejecting
+            // it. TS 29.505 §5.2.2.x reports failed modifications via
+            // PatchResult {report: [ReportItem{path, reason}]} (TS 29.571),
+            // and errors carry ProblemDetails (TS 29.500 §5.2.7).
+            let Some(content) = &request.http.content else {
+                return send_bad_request(
+                    "PATCH requires a PatchItem array body",
+                    Some("INVALID_MSG_FORMAT"),
+                );
+            };
+            let Ok(patches) = serde_json::from_str::<serde_json::Value>(content) else {
+                return send_bad_request("Body is not valid JSON", Some("INVALID_MSG_FORMAT"));
+            };
+            let Some(arr) = patches.as_array() else {
+                return send_bad_request(
+                    "Body must be a JSON array of PatchItem",
+                    Some("INVALID_MSG_FORMAT"),
+                );
+            };
+            if arr.is_empty() {
+                // PatchResult.report is minItems: 1, so an empty patch list can
+                // be reported neither as success nor as a failure item.
+                return send_bad_request(
+                    "PatchItem array must not be empty",
+                    Some("INVALID_MSG_FORMAT"),
+                );
+            }
+
+            // ReportItem.reason should identify the failing operation by its
+            // array index (TS 29.571 ReportItem).
+            let mut report: Vec<serde_json::Value> = Vec::new();
+            let mut applied = 0usize;
+            for (idx, patch) in arr.iter().enumerate() {
+                let path = patch.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                if path != "/sequenceNumber/sqn" {
+                    report.push(serde_json::json!({
+                        "path": path,
+                        "reason": format!(
+                            "unsupported path; this UDR applies only \
+                             /sequenceNumber/sqn (failed operation index= {idx})"
+                        ),
+                    }));
+                    continue;
+                }
+                let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) else {
+                    report.push(serde_json::json!({
+                        "path": path,
+                        "reason": format!(
+                            "value is absent or not a string \
+                             (failed operation index= {idx})"
+                        ),
+                    }));
+                    continue;
+                };
+                // Reject rather than coerce: the SQN is 48 bits (TS 33.102), so
+                // a non-hex or oversized value is a client error, not a 0.
+                let sqn = match u64::from_str_radix(sqn_hex, 16) {
+                    Ok(v) if v <= 0xFFFF_FFFF_FFFF => v,
+                    Ok(_) => {
+                        report.push(serde_json::json!({
+                            "path": path,
+                            "reason": format!(
+                                "value exceeds the 48-bit SQN range \
+                                 (failed operation index= {idx})"
+                            ),
+                        }));
+                        continue;
+                    }
+                    Err(_) => {
+                        report.push(serde_json::json!({
+                            "path": path,
+                            "reason": format!(
+                                "value is not hexadecimal \
+                                 (failed operation index= {idx})"
+                            ),
+                        }));
+                        continue;
+                    }
+                };
+                match nextgcore_dbi::subscription::nextgcore_dbi_update_sqn_async(
+                    supi.to_string(),
+                    sqn,
+                )
+                .await
+                {
+                    Ok(()) => applied += 1,
+                    // A storage failure is ours, not the consumer's: surface it
+                    // as 5xx immediately rather than as a PatchResult item.
+                    Err(nextgcore_dbi::DbiError::NotInitialized) => {
+                        return send_error(
+                            503,
+                            "Service Unavailable",
+                            "Subscriber database unavailable",
+                            Some("SYSTEM_FAILURE"),
+                        );
+                    }
+                    Err(e) => {
+                        log::error!("[{supi}] DB update_sqn failed: {e:?}");
+                        return send_error(
+                            500,
+                            "Internal Server Error",
+                            "Failed to store the patched sequence number",
+                            Some("SYSTEM_FAILURE"),
+                        );
                     }
                 }
             }
 
+            if !report.is_empty() {
+                log::warn!(
+                    "[{supi}] PATCH authentication-subscription: {} of {} items failed",
+                    report.len(),
+                    arr.len()
+                );
+                return SbiResponse::with_status(400).with_body(
+                    serde_json::json!({ "report": report }).to_string(),
+                    "application/json",
+                );
+            }
+
+            log::info!("[{supi}] PATCH applied {applied} item(s)");
             SbiResponse::with_status(204)
         }
-        ("authentication-status", "PUT") | ("authentication-status", "DELETE") => {
-            log::info!("[{supi}] {method} authentication-status");
-
+        ("authentication-status", "PUT" | "GET" | "DELETE") => {
             // TS 29.505 §6.3.3 / TS 29.503 §5.4.2: the authentication-status
-            // resource carries the AuthEvent from the UDM on auth
-            // confirmation.  It has NO SQN semantics — the previous
-            // unconditional SQN-increment side effect here advanced the
-            // stored SQN by another +32 SEQ step on every confirmation
-            // (WSB-6).  Follow-up (noted, out of WSB-6 scope): persist the
-            // AuthEvent body, which is currently acknowledged but discarded.
-            SbiResponse::with_status(204)
+            // resource carries the AuthEvent the UDM writes on authentication
+            // confirmation (TS 33.501 §6.1.4 result storage). It has NO SQN
+            // semantics -- an earlier unconditional SQN increment here advanced
+            // the stored SQN by an extra +32 SEQ step on every confirmation
+            // (WSB-6).
+            //
+            // The AuthEvent used to be acknowledged with a bare 204 and then
+            // DISCARDED, and GET fell through to the catch-all 405 even though
+            // TS 29.505 defines PUT/GET/DELETE on both the collection form and
+            // the individual .../{servingNetworkName} form. It is now stored.
+            //
+            // parts[6], when present, is {servingNetworkName}.
+            let path_snn = parts.get(6).copied().filter(|s| !s.is_empty());
+            handle_auth_status(supi, path_snn, method, request)
         }
         _ => {
             log::warn!("[{supi}] Unknown auth resource: {method} {resource}");
@@ -1000,6 +1106,131 @@ fn handle_smf_registrations(
             SbiResponse::with_status(204)
         }
         _ => send_method_not_allowed(method, "context-data/smf-registrations"),
+    }
+}
+
+/// TS 29.503 `AuthEvent` required attributes (nfInstanceId, success, timeStamp,
+/// authType, servingNetworkName).
+const AUTH_EVENT_REQUIRED_IES: [&str; 5] = [
+    "nfInstanceId",
+    "success",
+    "timeStamp",
+    "authType",
+    "servingNetworkName",
+];
+
+/// `authentication-data/authentication-status` (TS 29.505), both the collection
+/// form and the individual `.../{servingNetworkName}` form. Stores the UDM's
+/// `AuthEvent` on authentication confirmation (TS 33.501 §6.1.4).
+///
+/// `path_snn` is the `{servingNetworkName}` path segment when the individual
+/// form was addressed, else `None`.
+fn handle_auth_status(
+    supi: &str,
+    path_snn: Option<&str>,
+    method: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let ds = nextgcore_udrd::data_store::store();
+    log::info!(
+        "[{supi}] {method} authentication-status{}",
+        path_snn.map(|s| format!("/{s}")).unwrap_or_default()
+    );
+
+    match method {
+        "PUT" => {
+            let Some(content) = request.http.content.as_ref() else {
+                return send_bad_request("Missing AuthEvent body", Some("MANDATORY_IE_MISSING"));
+            };
+            let doc: serde_json::Value = match serde_json::from_str(content) {
+                Ok(v @ serde_json::Value::Object(_)) => v,
+                _ => {
+                    return send_bad_request(
+                        "Invalid AuthEvent document",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+            };
+            let missing: Vec<&str> = AUTH_EVENT_REQUIRED_IES
+                .iter()
+                .filter(|ie| match doc.get(**ie) {
+                    None | Some(serde_json::Value::Null) => true,
+                    Some(serde_json::Value::String(s)) => s.is_empty(),
+                    Some(_) => false,
+                })
+                .copied()
+                .collect();
+            if !missing.is_empty() {
+                return send_bad_request(
+                    &format!("Missing mandatory IE(s): {}", missing.join(", ")),
+                    Some("MANDATORY_IE_MISSING"),
+                );
+            }
+
+            // Owned: `doc` is moved into the store below, so the key cannot
+            // borrow from it.
+            let body_snn = doc
+                .get("servingNetworkName")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            // On the individual form the path segment is authoritative and the
+            // body must agree, so the stored key cannot disagree with the URI
+            // the consumer will GET back.
+            if let Some(p) = path_snn {
+                if p != body_snn {
+                    return send_bad_request(
+                        "servingNetworkName in body does not match URI",
+                        Some("INVALID_MSG_FORMAT"),
+                    );
+                }
+            }
+            // The collection form has no path segment, so the required body
+            // field supplies the key.
+            let key = path_snn.unwrap_or(&body_snn).to_string();
+
+            // 204 on create AND on replace. TS 29.505 defines ONLY 204 for
+            // success on both authentication-status forms -- unlike
+            // smf-registrations, which does define 201 Created. Returning 201
+            // here would be a fabricated status code the consumer's OpenAPI
+            // validator can reject.
+            ds.auth_status_put(supi, &key, doc);
+            SbiResponse::with_status(204)
+        }
+        "GET" => {
+            // Individual form: that serving network's event. Collection form:
+            // the most recent one, since neither a path segment nor a body
+            // identifies a specific network there.
+            let found = match path_snn {
+                Some(snn) => ds.auth_status_get(supi, snn),
+                None => ds.auth_status_latest_for_supi(supi),
+            };
+            match found {
+                Some(doc) => {
+                    SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+                }
+                None => send_not_found(
+                    "No authentication status stored for this UE",
+                    Some("DATA_NOT_FOUND"),
+                ),
+            }
+        }
+        "DELETE" => {
+            let removed = match path_snn {
+                Some(snn) => ds.auth_status_remove(supi, snn).is_some(),
+                None => ds.auth_status_remove_all_for_supi(supi) > 0,
+            };
+            if removed {
+                SbiResponse::with_status(204)
+            } else {
+                send_not_found(
+                    "No authentication status stored for this UE",
+                    Some("DATA_NOT_FOUND"),
+                )
+            }
+        }
+        // PATCH is not defined on either form by TS 29.505.
+        _ => send_method_not_allowed(method, "authentication-data/authentication-status"),
     }
 }
 
@@ -3747,6 +3978,298 @@ udr:
             "provisioned SQN must be stored exactly"
         );
         auth_path
+    }
+
+    // ------------------------------------------------------------------
+    // #86 secondary: PATCH reports failures, authentication-status persists
+    // ------------------------------------------------------------------
+
+    /// Spin up the UDR SBI server and return a client for it.
+    async fn start_udr() -> (SbiServer, SbiClient) {
+        let addr = ephemeral_addr();
+        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+        (udr, client)
+    }
+
+    /// A malformed / non-array / empty PATCH body must be REJECTED, not
+    /// acknowledged with 204. Previously every one of these fell through to
+    /// `SbiResponse::with_status(204)`, so a consumer could not tell an applied
+    /// patch from a silently discarded one (TS 29.505 §5.2.2.x, TS 29.500
+    /// §5.2.7 ProblemDetails).
+    #[tokio::test]
+    async fn patch_auth_subscription_rejects_unusable_bodies() {
+        let _store = DbiTestStore::enable().await;
+        let (_udr, client) = start_udr().await;
+        let supi = "imsi-999990000000861";
+        let auth_path = wsb6_provision(&client, supi, 0x40).await;
+
+        // Not JSON at all. Built directly because patch_json would serialise
+        // the string INTO valid JSON, which is not the case under test.
+        let resp = client
+            .send_request(SbiRequest::patch(&auth_path).with_body("not json", "application/json"))
+            .await
+            .expect("PATCH garbage");
+        assert_eq!(resp.status, 400, "a non-JSON body must be 400, never 204");
+
+        // Valid JSON but not an array of PatchItem.
+        let resp = client
+            .patch_json(&auth_path, &json!({"op": "replace"}))
+            .await
+            .expect("PATCH object");
+        assert_eq!(resp.status, 400, "a non-array body must be 400");
+
+        // Empty array: PatchResult.report is minItems 1, so an empty patch list
+        // can be reported neither as success nor as a failure item.
+        let resp = client
+            .patch_json(&auth_path, &json!([]))
+            .await
+            .expect("PATCH empty");
+        assert_eq!(resp.status, 400, "an empty PatchItem array must be 400");
+
+        // None of the rejected requests may have altered the stored SQN.
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(0x40),
+            "a rejected PATCH must not change stored state"
+        );
+    }
+
+    /// An unsupported patch path is reported in a PatchResult rather than
+    /// silently dropped, and the reason names the failing operation index as
+    /// TS 29.571 ReportItem recommends.
+    #[tokio::test]
+    async fn patch_auth_subscription_reports_unsupported_path() {
+        let _store = DbiTestStore::enable().await;
+        let (_udr, client) = start_udr().await;
+        let supi = "imsi-999990000000862";
+        let auth_path = wsb6_provision(&client, supi, 0x40).await;
+
+        let resp = client
+            .patch_json(
+                &auth_path,
+                &json!([{"op": "replace", "path": "/encPermanentKey", "value": "00"}]),
+            )
+            .await
+            .expect("PATCH unsupported path");
+        assert_eq!(resp.status, 400);
+        let doc: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let report = doc["report"].as_array().expect("PatchResult.report array");
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0]["path"], "/encPermanentKey");
+        assert!(
+            report[0]["reason"].as_str().unwrap().contains("index= 0"),
+            "reason should identify the failed operation index (TS 29.571)"
+        );
+    }
+
+    /// A non-hex SQN must be REJECTED, leaving the stored value untouched.
+    ///
+    /// This is the silent-corruption case: the old handler did
+    /// `u64::from_str_radix(sqn_hex, 16).unwrap_or(0)`, so "zzzz" became SQN 0
+    /// -- a valid-looking sequence number written over good data, reported as
+    /// 204 success.
+    #[tokio::test]
+    async fn patch_auth_subscription_rejects_non_hex_sqn_without_corrupting() {
+        let _store = DbiTestStore::enable().await;
+        let (_udr, client) = start_udr().await;
+        let supi = "imsi-999990000000863";
+        let auth_path = wsb6_provision(&client, supi, 0x40).await;
+
+        let resp = client
+            .patch_json(
+                &auth_path,
+                &json!([{"op": "replace", "path": "/sequenceNumber/sqn", "value": "zzzz"}]),
+            )
+            .await
+            .expect("PATCH non-hex");
+        assert_eq!(resp.status, 400, "a non-hex SQN must be 400, never 204");
+        assert_eq!(
+            nextgcore_dbi::test_store::stored_sqn(supi),
+            Some(0x40),
+            "the stored SQN must be UNCHANGED -- unwrap_or(0) used to write 0 here"
+        );
+
+        // Beyond the 48-bit SQN range (TS 33.102) is likewise rejected, not
+        // truncated.
+        let resp = client
+            .patch_json(
+                &auth_path,
+                &json!([{"op": "replace", "path": "/sequenceNumber/sqn",
+                         "value": "1000000000000"}]),
+            )
+            .await
+            .expect("PATCH oversized");
+        assert_eq!(resp.status, 400);
+        assert_eq!(nextgcore_dbi::test_store::stored_sqn(supi), Some(0x40));
+    }
+
+    /// PUT stores the AuthEvent and GET serves it back; previously the body was
+    /// acknowledged with 204 and DISCARDED, and GET fell through to 405
+    /// (TS 29.505 authentication-status, TS 29.503 AuthEvent, TS 33.501
+    /// §6.1.4 result storage).
+    #[tokio::test]
+    async fn auth_status_put_get_delete_roundtrip() {
+        let _store = DbiTestStore::enable().await;
+        let (_udr, client) = start_udr().await;
+        let supi = "imsi-999990000000864";
+        let base = format!(
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-status"
+        );
+
+        // Nothing stored yet: 404 DATA_NOT_FOUND, NOT 405 method-not-allowed.
+        let resp = client.get(&base).await.expect("GET empty");
+        assert_eq!(
+            resp.status, 404,
+            "GET must be a defined operation returning 404 when absent, not 405"
+        );
+
+        let event = json!({
+            "nfInstanceId": "b2c3d4e5-0000-4000-8000-000000000001",
+            "success": true,
+            "timeStamp": "2026-08-08T12:00:00Z",
+            "authType": "5G_AKA",
+            "servingNetworkName": "5G:mnc099.mcc999.3gppnetwork.org"
+        });
+        // TS 29.505 defines ONLY 204 for a successful PUT on this resource --
+        // no 201 -- unlike smf-registrations, which does define 201 Created.
+        let resp = client.put_json(&base, &event).await.expect("PUT event");
+        assert_eq!(
+            resp.status, 204,
+            "PUT success on auth-status is 204, never 201"
+        );
+
+        // GET returns the stored AuthEvent verbatim.
+        let resp = client.get(&base).await.expect("GET stored");
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(doc["nfInstanceId"], event["nfInstanceId"]);
+        assert_eq!(doc["authType"], "5G_AKA");
+        assert_eq!(doc["success"], true);
+
+        // Re-PUT replaces, also 204.
+        let resp = client.put_json(&base, &event).await.expect("PUT again");
+        assert_eq!(resp.status, 204, "replacing an existing resource is 204");
+
+        // DELETE removes it; a second GET is 404 again.
+        let resp = client.delete(&base).await.expect("DELETE");
+        assert_eq!(resp.status, 204);
+        let resp = client.get(&base).await.expect("GET after delete");
+        assert_eq!(resp.status, 404);
+    }
+
+    /// A PUT missing any required AuthEvent attribute is rejected.
+    #[tokio::test]
+    async fn auth_status_put_rejects_missing_required_ie() {
+        let _store = DbiTestStore::enable().await;
+        let (_udr, client) = start_udr().await;
+        let supi = "imsi-999990000000865";
+        let base = format!(
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-status"
+        );
+
+        // authType omitted (TS 29.503 AuthEvent requires it).
+        let resp = client
+            .put_json(
+                &base,
+                &json!({
+                    "nfInstanceId": "b2c3d4e5-0000-4000-8000-000000000002",
+                    "success": true,
+                    "timeStamp": "2026-08-08T12:00:00Z",
+                    "servingNetworkName": "5G:mnc099.mcc999.3gppnetwork.org"
+                }),
+            )
+            .await
+            .expect("PUT incomplete");
+        assert_eq!(resp.status, 400);
+        // And nothing was stored.
+        let resp = client.get(&base).await.expect("GET after reject");
+        assert_eq!(resp.status, 404);
+    }
+
+    /// The individual `.../{servingNetworkName}` form keys independently, so two
+    /// serving networks coexist for one SUPI and the collection GET returns the
+    /// most recent.
+    #[tokio::test]
+    async fn auth_status_individual_form_keys_per_serving_network() {
+        let _store = DbiTestStore::enable().await;
+        let (_udr, client) = start_udr().await;
+        let supi = "imsi-999990000000866";
+        let base = format!(
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-status"
+        );
+        let snn_a = "5G:mnc001.mcc001.3gppnetwork.org";
+        let snn_b = "5G:mnc002.mcc002.3gppnetwork.org";
+
+        let ev = |snn: &str, ok: bool| {
+            json!({
+                "nfInstanceId": "b2c3d4e5-0000-4000-8000-000000000003",
+                "success": ok,
+                "timeStamp": "2026-08-08T12:00:00Z",
+                "authType": "5G_AKA",
+                "servingNetworkName": snn
+            })
+        };
+
+        let resp = client
+            .put_json(&format!("{base}/{snn_a}"), &ev(snn_a, true))
+            .await
+            .expect("PUT A");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .put_json(&format!("{base}/{snn_b}"), &ev(snn_b, false))
+            .await
+            .expect("PUT B");
+        assert_eq!(
+            resp.status, 204,
+            "a different serving network is a distinct resource, still 204"
+        );
+
+        // Each is retrievable independently.
+        let resp = client.get(&format!("{base}/{snn_a}")).await.expect("GET A");
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(doc["success"], true);
+        assert_eq!(doc["servingNetworkName"], snn_a);
+
+        let resp = client.get(&format!("{base}/{snn_b}")).await.expect("GET B");
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(doc["success"], false);
+
+        // Collection GET yields the most recently stored one (B).
+        let resp = client.get(&base).await.expect("GET collection");
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(doc["servingNetworkName"], snn_b);
+
+        // A body whose servingNetworkName disagrees with the URI is rejected,
+        // so the stored key can never contradict the URI used to GET it.
+        let resp = client
+            .put_json(&format!("{base}/{snn_a}"), &ev(snn_b, true))
+            .await
+            .expect("PUT mismatched");
+        assert_eq!(resp.status, 400);
+
+        // Deleting one leaves the other.
+        let resp = client
+            .delete(&format!("{base}/{snn_a}"))
+            .await
+            .expect("DELETE A");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .get(&format!("{base}/{snn_b}"))
+            .await
+            .expect("GET B after deleting A");
+        assert_eq!(resp.status, 200);
     }
 
     /// WSB-6 acceptance test: PATCH /sequenceNumber/sqn = X through the real
