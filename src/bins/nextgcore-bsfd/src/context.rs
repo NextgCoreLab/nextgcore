@@ -64,8 +64,11 @@ pub struct PcfUeBinding {
     pub pcf_set_id: Option<String>,
     pub bind_level: Option<String>,
     pub recovery_time: Option<String>,
-    pub pcf_diam_host: Option<String>,
-    pub pcf_diam_realm: Option<String>,
+    // NOTE: no pcf_diam_host / pcf_diam_realm here. Those ARE valid members of
+    // PcfBinding (the PDU-session binding, TS29521_Nbsf_Management.yaml:1097)
+    // and PcfBindingPatch (:1176), and the PDU path stores them -- but
+    // PcfForUeBinding (:1390-1420) does not define them, so emitting them here
+    // polluted the resource representation.
     pub management_features: u64,
 }
 
@@ -2066,8 +2069,6 @@ mod tests {
             pcf_set_id: None,
             bind_level: None,
             recovery_time: None,
-            pcf_diam_host: None,
-            pcf_diam_realm: None,
             management_features: 0x1,
         };
         ctx.ue_binding_add(b.clone());

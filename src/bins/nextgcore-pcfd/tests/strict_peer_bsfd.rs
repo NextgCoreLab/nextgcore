@@ -104,11 +104,30 @@ async fn pcfd_production_binding_accepted_at_session_site() {
 }
 
 /// WSB-1 acceptance site 2 (UE-policy bindings, bsfd pcf-ue-bindings):
-/// the same production body (it carries supi + pcfIpEndPoints) -> 201.
+/// the production body's PCF address, RE-KEYED to this resource's schema.
+///
+/// PcfForUeBinding (TS 29.521) names the address members `pcfForUeFqdn` /
+/// `pcfForUeIpEndPoints`; the unprefixed `pcfFqdn` / `pcfIpEndPoints` this test
+/// used to send belong to `PcfBinding`, the PDU-session binding. Reusing one
+/// body across all three sites only passed because bsfd read the unprefixed
+/// names on every resource -- which is exactly the #97 defect. The PCF-address
+/// requirement under test is unchanged; only the member names are now the ones
+/// this resource actually defines.
+///
+/// pcfd has no production UE-binding registration path (it POSTs only to
+/// /pcfBindings), so there is no builder to re-key -- the mapping lives here.
 #[tokio::test]
 async fn pcfd_production_binding_accepted_at_ue_site() {
     init_peers();
-    let body = production_body("imsi-001010000000702", "10.45.0.72");
+    let src = production_body("imsi-001010000000702", "10.45.0.72");
+    let mut body = serde_json::json!({ "supi": src["supi"].clone() });
+    body["pcfForUeIpEndPoints"] = src["pcfIpEndPoints"].clone();
+    if let Some(fqdn) = src.get("pcfFqdn") {
+        body["pcfForUeFqdn"] = fqdn.clone();
+    }
+    if let Some(id) = src.get("pcfId") {
+        body["pcfId"] = id.clone();
+    }
 
     let resp = post("/nbsf-management/v1/pcf-ue-bindings", &body).await;
     assert_eq!(

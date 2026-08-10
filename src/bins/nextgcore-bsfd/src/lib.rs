@@ -1315,18 +1315,23 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
 /// Build the PcfForUeBinding JSON representation of a UE binding.
 fn ue_binding_json(b: &context::PcfUeBinding) -> serde_json::Value {
     let mut m = serde_json::Map::new();
-    m.insert(
-        "pcfUeBindingId".to_string(),
-        serde_json::Value::String(b.binding_id.clone()),
-    );
+    // No pcfUeBindingId member: that identifier appears nowhere in TS 29.521.
+    // The binding id is the store key and the Location URI path segment
+    // (/nbsf-management/v1/pcf-ue-bindings/{id}), so the resource stays
+    // addressable without polluting the body.
     if let Some(ref v) = b.supi {
         m.insert("supi".to_string(), serde_json::Value::String(v.clone()));
     }
     if let Some(ref v) = b.gpsi {
         m.insert("gpsi".to_string(), serde_json::Value::String(v.clone()));
     }
+    // pcfForUe*-prefixed on this resource (TS 29.521 PcfForUeBinding). The
+    // unprefixed spellings belong to PcfBinding, the PDU-session binding.
     if let Some(ref v) = b.pcf_fqdn {
-        m.insert("pcfFqdn".to_string(), serde_json::Value::String(v.clone()));
+        m.insert(
+            "pcfForUeFqdn".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
     }
     if !b.pcf_ip.is_empty() {
         let eps: Vec<serde_json::Value> = b
@@ -1355,7 +1360,10 @@ fn ue_binding_json(b: &context::PcfUeBinding) -> serde_json::Value {
                 serde_json::Value::Object(e)
             })
             .collect();
-        m.insert("pcfIpEndPoints".to_string(), serde_json::Value::Array(eps));
+        m.insert(
+            "pcfForUeIpEndPoints".to_string(),
+            serde_json::Value::Array(eps),
+        );
     }
     if let Some(ref v) = b.pcf_id {
         m.insert("pcfId".to_string(), serde_json::Value::String(v.clone()));
@@ -1372,18 +1380,6 @@ fn ue_binding_json(b: &context::PcfUeBinding) -> serde_json::Value {
     if let Some(ref v) = b.recovery_time {
         m.insert(
             "recoveryTime".to_string(),
-            serde_json::Value::String(v.clone()),
-        );
-    }
-    if let Some(ref v) = b.pcf_diam_host {
-        m.insert(
-            "pcfDiamHost".to_string(),
-            serde_json::Value::String(v.clone()),
-        );
-    }
-    if let Some(ref v) = b.pcf_diam_realm {
-        m.insert(
-            "pcfDiamRealm".to_string(),
             serde_json::Value::String(v.clone()),
         );
     }
@@ -1409,23 +1405,32 @@ async fn handle_pcf_ue_binding_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
-    // Mandatory: supi or gpsi (UE identifier for UE-policy bindings).
+    // Mandatory: supi. TS 29.521 PcfForUeBinding declares `required: - supi`
+    // with gpsi merely optional, so a gpsi-only registration is NOT valid --
+    // this previously accepted one whenever either identifier was present.
     let supi = data.get("supi").and_then(|v| v.as_str());
     let gpsi = data.get("gpsi").and_then(|v| v.as_str());
-    if supi.is_none() && gpsi.is_none() {
-        return missing_mandatory("supi|gpsi");
+    if supi.is_none() {
+        return missing_mandatory("supi");
     }
 
-    // Mandatory: PCF address (same requirement as PDU-session binding, bsfd-05).
-    let pcf_fqdn = data.get("pcfFqdn").and_then(|v| v.as_str());
+    // Mandatory: PCF address, per the schema's
+    // `anyOf: [required: [pcfForUeFqdn], required: [pcfForUeIpEndPoints]]`.
+    //
+    // These are pcfForUe*-prefixed on THIS resource. The unprefixed pcfFqdn /
+    // pcfIpEndPoints spellings this used to read belong to PcfBinding (the
+    // PDU-session binding), so a conformant PCF's UE-policy registration was
+    // rejected 400 while the resource this BSF emitted could not be parsed
+    // back by a conformant reader. pcfDiamHost/pcfDiamRealm are likewise not
+    // PcfForUeBinding members and no longer satisfy the address requirement
+    // here (they remain valid, and are still handled, on the PDU path).
+    let pcf_fqdn = data.get("pcfForUeFqdn").and_then(|v| v.as_str());
     let has_eps = data
-        .get("pcfIpEndPoints")
+        .get("pcfForUeIpEndPoints")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty());
-    let diam_host = data.get("pcfDiamHost").and_then(|v| v.as_str());
-    let diam_realm = data.get("pcfDiamRealm").and_then(|v| v.as_str());
-    if pcf_fqdn.is_none() && !has_eps && !(diam_host.is_some() && diam_realm.is_some()) {
-        return missing_mandatory("pcfFqdn|pcfIpEndPoints");
+    if pcf_fqdn.is_none() && !has_eps {
+        return missing_mandatory("pcfForUeFqdn|pcfForUeIpEndPoints");
     }
 
     let consumer_feat = data
@@ -1442,7 +1447,7 @@ async fn handle_pcf_ue_binding_create(request: &SbiRequest) -> SbiResponse {
         gpsi: gpsi.map(|s| s.to_string()),
         pcf_fqdn: pcf_fqdn.map(|s| s.to_string()),
         pcf_ip: data
-            .get("pcfIpEndPoints")
+            .get("pcfForUeIpEndPoints")
             .map(parse_pcf_ip_endpoints)
             .unwrap_or_default(),
         pcf_id: data
@@ -1461,8 +1466,6 @@ async fn handle_pcf_ue_binding_create(request: &SbiRequest) -> SbiResponse {
             .get("recoveryTime")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        pcf_diam_host: diam_host.map(|s| s.to_string()),
-        pcf_diam_realm: diam_realm.map(|s| s.to_string()),
         management_features: negotiated,
     };
 
@@ -1590,14 +1593,14 @@ async fn handle_pcf_ue_binding_update(binding_id: &str, request: &SbiRequest) ->
             }
         };
     }
-    patch_opt!(b.pcf_fqdn, "pcfFqdn");
+    // pcfForUe*-prefixed here too: PcfForUeBindingPatch (TS 29.521) defines
+    // pcfForUeFqdn / pcfForUeIpEndPoints / pcfId / cleanUpCallbackUri.
+    patch_opt!(b.pcf_fqdn, "pcfForUeFqdn");
     patch_opt!(b.pcf_id, "pcfId");
     patch_opt!(b.pcf_set_id, "pcfSetId");
     patch_opt!(b.bind_level, "bindLevel");
     patch_opt!(b.recovery_time, "recoveryTime");
-    patch_opt!(b.pcf_diam_host, "pcfDiamHost");
-    patch_opt!(b.pcf_diam_realm, "pcfDiamRealm");
-    match data.get("pcfIpEndPoints") {
+    match data.get("pcfForUeIpEndPoints") {
         Some(serde_json::Value::Null) => b.pcf_ip.clear(),
         Some(v) if v.is_array() => b.pcf_ip = parse_pcf_ip_endpoints(v),
         _ => {}
@@ -3088,12 +3091,17 @@ mod tests {
         assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
 
         // Valid POST → 201 + Location.
+        //
+        // pcfForUeFqdn, not pcfFqdn: this test previously sent and asserted the
+        // unprefixed spelling, which PINNED the #97 non-conformance -- TS 29.521
+        // PcfForUeBinding names the member pcfForUeFqdn, and the unprefixed form
+        // belongs to PcfBinding (the PDU-session binding).
         let resp = client
             .post_json(
                 "/nbsf-management/v1/pcf-ue-bindings",
                 &json!({
                     "supi": "imsi-001019900111001",
-                    "pcfFqdn": "pcf.ue.example.com",
+                    "pcfForUeFqdn": "pcf.ue.example.com",
                     "suppFeat": "2"
                 }),
             )
@@ -3105,8 +3113,19 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["supi"], "imsi-001019900111001");
-        assert_eq!(body["pcfFqdn"], "pcf.ue.example.com");
+        assert_eq!(body["pcfForUeFqdn"], "pcf.ue.example.com");
         assert_eq!(body["suppFeat"], "2");
+        // The non-schema members are gone from the representation.
+        assert!(
+            body.get("pcfFqdn").is_none(),
+            "pcfFqdn is not a PcfForUeBinding member"
+        );
+        assert!(
+            body.get("pcfUeBindingId").is_none(),
+            "pcfUeBindingId appears nowhere in TS 29.521"
+        );
+        assert!(body.get("pcfDiamHost").is_none());
+        assert!(body.get("pcfDiamRealm").is_none());
 
         // GET by id → 200.
         let resp = client
@@ -3133,17 +3152,17 @@ mod tests {
         assert_eq!(resp.status, 400);
         assert_eq!(problem(&resp)["cause"], "MANDATORY_QUERY_PARAM_MISSING");
 
-        // PATCH pcfFqdn → 200.
+        // PATCH pcfForUeFqdn → 200 (PcfForUeBindingPatch member name).
         let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcf-ue-bindings/{ue_id}"));
         req.http
-            .set_content(json!({"pcfFqdn": "pcf.ue2.example.com"}).to_string());
+            .set_content(json!({"pcfForUeFqdn": "pcf.ue2.example.com"}).to_string());
         req.http
             .set_header("Content-Type", "application/merge-patch+json");
         let resp = client.send_request(req).await.expect("PATCH ue");
         assert_eq!(resp.status, 200);
         let patched: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(patched["pcfFqdn"], "pcf.ue2.example.com");
+        assert_eq!(patched["pcfForUeFqdn"], "pcf.ue2.example.com");
 
         // DELETE → 204; GET → 404 afterwards.
         let resp = client
@@ -3167,6 +3186,150 @@ mod tests {
         assert_eq!(resp.status, 204);
 
         server.stop().await.expect("server stops");
+    }
+
+    /// #97 defects 1-2: PcfForUeBinding wire conformance.
+    ///
+    /// TS 29.521 PcfForUeBinding names the PCF address members pcfForUeFqdn /
+    /// pcfForUeIpEndPoints (the unprefixed spellings belong to PcfBinding, the
+    /// PDU-session binding), declares `required: - supi` with gpsi optional, and
+    /// defines no pcfUeBindingId / pcfDiamHost / pcfDiamRealm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pcf_for_ue_binding_conformant_attribute_names() {
+        let (_srv, client) = start_bsf().await;
+
+        // The conformant fqdn form is ACCEPTED. This returned 400 before the
+        // fix, so a spec-compliant PCF could not register at all.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({
+                    "supi": "imsi-001019900197001",
+                    "pcfForUeFqdn": "pcf-ue.example.com"
+                }),
+            )
+            .await
+            .expect("POST pcfForUeFqdn");
+        assert_eq!(
+            resp.status, 201,
+            "a conformant PcfForUeBinding must be accepted"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["pcfForUeFqdn"], "pcf-ue.example.com");
+        assert!(body.get("pcfFqdn").is_none());
+        assert!(body.get("pcfUeBindingId").is_none());
+        assert!(body.get("pcfDiamHost").is_none());
+        assert!(body.get("pcfDiamRealm").is_none());
+
+        // The endpoints-only form also satisfies the schema's
+        // `anyOf: [pcfForUeFqdn, pcfForUeIpEndPoints]`.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({
+                    "supi": "imsi-001019900197002",
+                    "pcfForUeIpEndPoints": [{"ipv4Address": "10.45.0.77", "port": 7777}]
+                }),
+            )
+            .await
+            .expect("POST pcfForUeIpEndPoints");
+        assert_eq!(
+            resp.status, 201,
+            "pcfForUeIpEndPoints alone satisfies anyOf"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["pcfForUeIpEndPoints"][0]["ipv4Address"], "10.45.0.77");
+        assert!(body.get("pcfIpEndPoints").is_none());
+
+        // supi is MANDATORY: a gpsi-only registration used to be accepted.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({
+                    "gpsi": "msisdn-14155550197",
+                    "pcfForUeFqdn": "pcf-ue.example.com"
+                }),
+            )
+            .await
+            .expect("POST gpsi only");
+        assert_eq!(
+            resp.status, 400,
+            "TS 29.521 declares `required: - supi`; gpsi alone is not enough"
+        );
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        // Neither address form -> 400, naming the spec attributes.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({"supi": "imsi-001019900197003"}),
+            )
+            .await
+            .expect("POST no address");
+        assert_eq!(resp.status, 400);
+        let detail = problem(&resp)["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            detail.contains("pcfForUeFqdn"),
+            "the error should name the conformant attribute, got: {detail}"
+        );
+
+        // The unprefixed spelling is no longer an accepted address: it is not a
+        // member of this resource, so it cannot satisfy the anyOf.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({
+                    "supi": "imsi-001019900197004",
+                    "pcfFqdn": "pcf-ue.example.com"
+                }),
+            )
+            .await
+            .expect("POST legacy spelling");
+        assert_eq!(
+            resp.status, 400,
+            "pcfFqdn belongs to PcfBinding, not PcfForUeBinding"
+        );
+    }
+
+    /// Guard for the scoping of the above: pcfDiamHost / pcfDiamRealm ARE valid
+    /// members of PcfBinding (TS29521_Nbsf_Management.yaml:1097-1099) and of
+    /// PcfBindingPatch (:1176-1178). Removing them from PcfForUeBinding must not
+    /// leak into the PDU-session path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pdu_binding_still_accepts_diameter_members() {
+        let (_srv, client) = start_bsf().await;
+
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "supi": "imsi-001019900197010",
+                    "ipv4Addr": "10.45.0.197",
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "pcfDiamHost": "pcf.diam.example.com",
+                    "pcfDiamRealm": "example.com",
+                    "pcfFqdn": "pcf.example.com"
+                }),
+            )
+            .await
+            .expect("POST pdu binding with diam members");
+        assert_eq!(
+            resp.status, 201,
+            "the PDU-session binding legitimately carries pcfDiamHost/Realm"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["pcfDiamHost"], "pcf.diam.example.com");
+        assert_eq!(body["pcfDiamRealm"], "example.com");
+        // And the PDU resource keeps the UNPREFIXED pcfFqdn, correct for
+        // PcfBinding.
+        assert_eq!(body["pcfFqdn"], "pcf.example.com");
     }
 
     // bsfd-12: pcf-mbs-bindings lifecycle + duplicate 403 + multi-match 400
