@@ -46,6 +46,18 @@ fn legacy_body(supi: &str, ipv4: &str) -> serde_json::Value {
     build_pcf_binding_body_with(None, supi, "internet", 1, Some(0x010203), Some(ipv4))
 }
 
+/// A conformant TS 29.571 `MbsSessionId` OBJECT (anyOf tmgi / ssm).
+///
+/// These tests previously set `mbsSessionId` to a bare string
+/// ("mbs-session-703"), which is not a valid MbsSessionId in any form -- it only
+/// passed because bsfd read the field with `.as_str()`, the #97 defect 3 being
+/// fixed. `mbsServiceId` is `^[A-Fa-f0-9]{6}$`.
+fn mbs_session_id(svc_hex: &str) -> serde_json::Value {
+    serde_json::json!({
+        "tmgi": {"mbsServiceId": svc_hex, "plmnId": {"mcc": "001", "mnc": "01"}}
+    })
+}
+
 fn problem(resp: &SbiResponse) -> serde_json::Value {
     serde_json::from_str(resp.http.content.as_deref().expect("problem body")).expect("json body")
 }
@@ -149,7 +161,7 @@ async fn pcfd_production_binding_accepted_at_ue_site() {
 async fn pcfd_production_binding_accepted_at_mbs_site() {
     init_peers();
     let mut body = production_body("imsi-001010000000703", "10.45.0.73");
-    body["mbsSessionId"] = serde_json::json!("mbs-session-703");
+    body["mbsSessionId"] = mbs_session_id("000703");
 
     let resp = post("/nbsf-management/v1/pcf-mbs-bindings", &body).await;
     assert_eq!(
@@ -190,9 +202,11 @@ async fn legacy_binding_still_rejected_400_at_all_three_sites() {
     assert_eq!(resp.status, 400);
     assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
 
-    // Site 3: MBS bindings (mbsSessionId present, PCF address absent).
+    // Site 3: MBS bindings (mbsSessionId present and VALID, PCF address absent).
+    // The id must be a conformant object, or the mbsSessionId validation fires
+    // first and this stops testing the PCF-address requirement it exists for.
     let mut mbs = body.clone();
-    mbs["mbsSessionId"] = serde_json::json!("mbs-session-704");
+    mbs["mbsSessionId"] = mbs_session_id("000704");
     let resp = post("/nbsf-management/v1/pcf-mbs-bindings", &mbs).await;
     assert_eq!(resp.status, 400);
     assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
