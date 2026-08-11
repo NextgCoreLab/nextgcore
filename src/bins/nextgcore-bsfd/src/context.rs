@@ -441,10 +441,20 @@ pub struct BsfSess {
     /// DNN (Data Network Name)
     pub dnn: Option<String>,
 
-    /// PCF FQDN
+    /// PCF FQDN hosting Npcf_PolicyAuthorization (TS 29.521 PcfBinding.pcfFqdn)
     pub pcf_fqdn: Option<String>,
-    /// PCF IP endpoints
+    /// PCF IP endpoints (PcfBinding.pcfIpEndPoints)
     pub pcf_ip: Vec<PcfIpEndpoint>,
+    /// FQDN of the PCF hosting **Npcf_SMPolicyControl**
+    /// (PcfBinding.pcfSmFqdn, TS29521_Nbsf_Management.yaml:1101). This is a
+    /// DISTINCT endpoint from pcf_fqdn above, and it is what the SamePcf
+    /// duplicate-detection 403 must advertise -- BindingResp (the ExtProblemDetails
+    /// extension) defines pcfSmFqdn / pcfSmIpEndPoints, not the
+    /// PolicyAuthorization address.
+    pub pcf_sm_fqdn: Option<String>,
+    /// IP end points of the PCF hosting Npcf_SMPolicyControl
+    /// (PcfBinding.pcfSmIpEndPoints, :1104).
+    pub pcf_sm_ip: Vec<PcfIpEndpoint>,
     /// PCF instance ID (TS 29.512 NF instance ID, bsfd-08)
     pub pcf_id: Option<String>,
     /// PCF set ID (bsfd-08)
@@ -485,6 +495,8 @@ impl BsfSess {
             s_nssai: SNssai::default(),
             dnn: None,
             pcf_fqdn: None,
+            pcf_sm_fqdn: None,
+            pcf_sm_ip: Vec::new(),
             pcf_ip: Vec::new(),
             pcf_id: None,
             pcf_set_id: None,
@@ -1301,6 +1313,9 @@ pub fn sess_to_doc(sess: &BsfSess) -> nextgcore_dbi::mongodb::bson::Document {
     if let Some(sd) = sess.s_nssai.sd {
         d.insert("sd", sd as i64);
     }
+    if let Some(ref v) = sess.pcf_sm_fqdn {
+        d.insert("pcf_sm_fqdn", v);
+    }
     if let Some(ref pcf_fqdn) = sess.pcf_fqdn {
         d.insert("pcf_fqdn", pcf_fqdn);
     }
@@ -1382,6 +1397,9 @@ pub fn doc_to_sess(doc: &nextgcore_dbi::mongodb::bson::Document) -> BsfSess {
     }
     if let Ok(sd) = doc.get_i64("sd") {
         sess.s_nssai.sd = Some(sd as u32);
+    }
+    if let Ok(v) = doc.get_str("pcf_sm_fqdn") {
+        sess.pcf_sm_fqdn = Some(v.to_string());
     }
     if let Ok(pcf_fqdn) = doc.get_str("pcf_fqdn") {
         sess.pcf_fqdn = Some(pcf_fqdn.to_string());
