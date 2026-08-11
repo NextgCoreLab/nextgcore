@@ -751,15 +751,36 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                     "cause".to_string(),
                     serde_json::json!("EXISTING_BINDING_INFO_FOUND"),
                 );
-                if let Some(ref fqdn) = dup.pcf_fqdn {
+                // BindingResp (the ExtProblemDetails extension) defines
+                // pcfSmFqdn / pcfSmIpEndPoints: the Npcf_SMPolicyControl
+                // endpoint, NOT the PolicyAuthorization address. Emitting
+                // dup.pcf_fqdn here advertised the wrong service and routed
+                // SamePcf recovery to the wrong node. Fall back to the
+                // PolicyAuthorization address only when no SM address was
+                // registered, and say so rather than substituting silently.
+                let sm_fqdn = dup.pcf_sm_fqdn.as_ref().or_else(|| {
+                    if dup.pcf_fqdn.is_some() {
+                        log::warn!(
+                            "SamePcf 403: no pcfSmFqdn registered for this binding; \
+                             falling back to pcfFqdn, which may not host \
+                             Npcf_SMPolicyControl"
+                        );
+                    }
+                    dup.pcf_fqdn.as_ref()
+                });
+                if let Some(fqdn) = sm_fqdn {
                     ext.insert(
                         "pcfSmFqdn".to_string(),
                         serde_json::Value::String(fqdn.clone()),
                     );
                 }
-                if !dup.pcf_ip.is_empty() {
-                    let eps: Vec<serde_json::Value> = dup
-                        .pcf_ip
+                let sm_eps = if !dup.pcf_sm_ip.is_empty() {
+                    &dup.pcf_sm_ip
+                } else {
+                    &dup.pcf_ip
+                };
+                if !sm_eps.is_empty() {
+                    let eps: Vec<serde_json::Value> = sm_eps
                         .iter()
                         .map(|ep| {
                             let mut e = serde_json::Map::new();
@@ -789,9 +810,15 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                         serde_json::Value::Array(eps),
                     );
                 }
-                return SbiResponse::with_status(403)
-                    .with_json_body(&serde_json::Value::Object(ext))
-                    .unwrap_or_else(|_| SbiResponse::with_status(403));
+                // TS 29.521 declares this 403 as application/problem+json with
+                // ExtProblemDetails. with_json_body hardcodes application/json
+                // (message.rs:553), and with_problem cannot be used because
+                // ExtProblemDetails is allOf [ProblemDetails, BindingResp] -- it
+                // carries members the typed ProblemDetails has no room for.
+                return SbiResponse::with_status(403).with_body(
+                    serde_json::Value::Object(ext).to_string(),
+                    "application/problem+json",
+                );
             }
         }
     }
@@ -830,6 +857,39 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
             }
             if let Some(endpoints) = binding_data.get("pcfIpEndPoints") {
                 sess.pcf_ip = parse_pcf_ip_endpoints(endpoints);
+            }
+            // The SM-PCF address is a DISTINCT PcfBinding member from the
+            // PolicyAuthorization one above (TS 29.521 :1101-1108) and is what the
+            // SamePcf 403 must advertise. It was never parsed, so that 403
+            // relabelled the PolicyAuthorization address as the SM one.
+            if let Some(v) = binding_data.get("pcfSmFqdn").and_then(|v| v.as_str()) {
+                sess.pcf_sm_fqdn = Some(v.to_string());
+            }
+            if let Some(endpoints) = binding_data.get("pcfSmIpEndPoints") {
+                sess.pcf_sm_ip = parse_pcf_ip_endpoints(endpoints);
+            }
+            // Framed routes (PcfBinding.ipv4FrameRouteList / ipv6FrameRouteList,
+            // :1126-1134). Only the PATCH path parsed these, yet discovery
+            // matching depends on them (context ipv4_in_frame_routes /
+            // ipv6_in_frame_routes), so a UE reachable only via a framed route was
+            // undiscoverable after a conformant registration.
+            if let Some(routes) = binding_data
+                .get("ipv4FrameRouteList")
+                .and_then(|v| v.as_array())
+            {
+                sess.ipv4_frame_route_list = routes
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+            }
+            if let Some(routes) = binding_data
+                .get("ipv6FrameRouteList")
+                .and_then(|v| v.as_array())
+            {
+                sess.ipv6_frame_route_list = routes
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
             }
             if let Some(e) = expiry {
                 sess.set_expiry(e);
@@ -1315,18 +1375,23 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
 /// Build the PcfForUeBinding JSON representation of a UE binding.
 fn ue_binding_json(b: &context::PcfUeBinding) -> serde_json::Value {
     let mut m = serde_json::Map::new();
-    m.insert(
-        "pcfUeBindingId".to_string(),
-        serde_json::Value::String(b.binding_id.clone()),
-    );
+    // No pcfUeBindingId member: that identifier appears nowhere in TS 29.521.
+    // The binding id is the store key and the Location URI path segment
+    // (/nbsf-management/v1/pcf-ue-bindings/{id}), so the resource stays
+    // addressable without polluting the body.
     if let Some(ref v) = b.supi {
         m.insert("supi".to_string(), serde_json::Value::String(v.clone()));
     }
     if let Some(ref v) = b.gpsi {
         m.insert("gpsi".to_string(), serde_json::Value::String(v.clone()));
     }
+    // pcfForUe*-prefixed on this resource (TS 29.521 PcfForUeBinding). The
+    // unprefixed spellings belong to PcfBinding, the PDU-session binding.
     if let Some(ref v) = b.pcf_fqdn {
-        m.insert("pcfFqdn".to_string(), serde_json::Value::String(v.clone()));
+        m.insert(
+            "pcfForUeFqdn".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
     }
     if !b.pcf_ip.is_empty() {
         let eps: Vec<serde_json::Value> = b
@@ -1355,7 +1420,10 @@ fn ue_binding_json(b: &context::PcfUeBinding) -> serde_json::Value {
                 serde_json::Value::Object(e)
             })
             .collect();
-        m.insert("pcfIpEndPoints".to_string(), serde_json::Value::Array(eps));
+        m.insert(
+            "pcfForUeIpEndPoints".to_string(),
+            serde_json::Value::Array(eps),
+        );
     }
     if let Some(ref v) = b.pcf_id {
         m.insert("pcfId".to_string(), serde_json::Value::String(v.clone()));
@@ -1372,18 +1440,6 @@ fn ue_binding_json(b: &context::PcfUeBinding) -> serde_json::Value {
     if let Some(ref v) = b.recovery_time {
         m.insert(
             "recoveryTime".to_string(),
-            serde_json::Value::String(v.clone()),
-        );
-    }
-    if let Some(ref v) = b.pcf_diam_host {
-        m.insert(
-            "pcfDiamHost".to_string(),
-            serde_json::Value::String(v.clone()),
-        );
-    }
-    if let Some(ref v) = b.pcf_diam_realm {
-        m.insert(
-            "pcfDiamRealm".to_string(),
             serde_json::Value::String(v.clone()),
         );
     }
@@ -1409,23 +1465,32 @@ async fn handle_pcf_ue_binding_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
-    // Mandatory: supi or gpsi (UE identifier for UE-policy bindings).
+    // Mandatory: supi. TS 29.521 PcfForUeBinding declares `required: - supi`
+    // with gpsi merely optional, so a gpsi-only registration is NOT valid --
+    // this previously accepted one whenever either identifier was present.
     let supi = data.get("supi").and_then(|v| v.as_str());
     let gpsi = data.get("gpsi").and_then(|v| v.as_str());
-    if supi.is_none() && gpsi.is_none() {
-        return missing_mandatory("supi|gpsi");
+    if supi.is_none() {
+        return missing_mandatory("supi");
     }
 
-    // Mandatory: PCF address (same requirement as PDU-session binding, bsfd-05).
-    let pcf_fqdn = data.get("pcfFqdn").and_then(|v| v.as_str());
+    // Mandatory: PCF address, per the schema's
+    // `anyOf: [required: [pcfForUeFqdn], required: [pcfForUeIpEndPoints]]`.
+    //
+    // These are pcfForUe*-prefixed on THIS resource. The unprefixed pcfFqdn /
+    // pcfIpEndPoints spellings this used to read belong to PcfBinding (the
+    // PDU-session binding), so a conformant PCF's UE-policy registration was
+    // rejected 400 while the resource this BSF emitted could not be parsed
+    // back by a conformant reader. pcfDiamHost/pcfDiamRealm are likewise not
+    // PcfForUeBinding members and no longer satisfy the address requirement
+    // here (they remain valid, and are still handled, on the PDU path).
+    let pcf_fqdn = data.get("pcfForUeFqdn").and_then(|v| v.as_str());
     let has_eps = data
-        .get("pcfIpEndPoints")
+        .get("pcfForUeIpEndPoints")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty());
-    let diam_host = data.get("pcfDiamHost").and_then(|v| v.as_str());
-    let diam_realm = data.get("pcfDiamRealm").and_then(|v| v.as_str());
-    if pcf_fqdn.is_none() && !has_eps && !(diam_host.is_some() && diam_realm.is_some()) {
-        return missing_mandatory("pcfFqdn|pcfIpEndPoints");
+    if pcf_fqdn.is_none() && !has_eps {
+        return missing_mandatory("pcfForUeFqdn|pcfForUeIpEndPoints");
     }
 
     let consumer_feat = data
@@ -1442,7 +1507,7 @@ async fn handle_pcf_ue_binding_create(request: &SbiRequest) -> SbiResponse {
         gpsi: gpsi.map(|s| s.to_string()),
         pcf_fqdn: pcf_fqdn.map(|s| s.to_string()),
         pcf_ip: data
-            .get("pcfIpEndPoints")
+            .get("pcfForUeIpEndPoints")
             .map(parse_pcf_ip_endpoints)
             .unwrap_or_default(),
         pcf_id: data
@@ -1461,8 +1526,6 @@ async fn handle_pcf_ue_binding_create(request: &SbiRequest) -> SbiResponse {
             .get("recoveryTime")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        pcf_diam_host: diam_host.map(|s| s.to_string()),
-        pcf_diam_realm: diam_realm.map(|s| s.to_string()),
         management_features: negotiated,
     };
 
@@ -1522,10 +1585,9 @@ async fn handle_pcf_ue_binding_discovery(request: &SbiRequest) -> SbiResponse {
         .map(|g| g.ue_binding_find_matching(supi, gpsi))
         .unwrap_or_default();
 
-    if results.is_empty() {
-        return SbiResponse::with_status(204);
-    }
-
+    // TS 29.521 defines only a 200 whose schema is `type: array, minItems: 0`
+    // for this operation -- no 204 exists, so an empty result is an empty ARRAY.
+    // (The SM GET /pcfBindings legitimately defines 204 and keeps it.)
     let arr: Vec<serde_json::Value> = results.iter().map(ue_binding_json).collect();
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::Value::Array(arr))
@@ -1590,14 +1652,14 @@ async fn handle_pcf_ue_binding_update(binding_id: &str, request: &SbiRequest) ->
             }
         };
     }
-    patch_opt!(b.pcf_fqdn, "pcfFqdn");
+    // pcfForUe*-prefixed here too: PcfForUeBindingPatch (TS 29.521) defines
+    // pcfForUeFqdn / pcfForUeIpEndPoints / pcfId / cleanUpCallbackUri.
+    patch_opt!(b.pcf_fqdn, "pcfForUeFqdn");
     patch_opt!(b.pcf_id, "pcfId");
     patch_opt!(b.pcf_set_id, "pcfSetId");
     patch_opt!(b.bind_level, "bindLevel");
     patch_opt!(b.recovery_time, "recoveryTime");
-    patch_opt!(b.pcf_diam_host, "pcfDiamHost");
-    patch_opt!(b.pcf_diam_realm, "pcfDiamRealm");
-    match data.get("pcfIpEndPoints") {
+    match data.get("pcfForUeIpEndPoints") {
         Some(serde_json::Value::Null) => b.pcf_ip.clear(),
         Some(v) if v.is_array() => b.pcf_ip = parse_pcf_ip_endpoints(v),
         _ => {}
@@ -1616,6 +1678,71 @@ async fn handle_pcf_ue_binding_update(binding_id: &str, request: &SbiRequest) ->
 // bsfd-12: pcf-mbs-bindings resource (TS 29.521 §4.2.2.4/§4.2.4.4)
 // ---------------------------------------------------------------------------
 
+/// Validate a TS 29.571 `MbsSessionId` object.
+///
+/// Schema: `type: object`, `anyOf: [required: [tmgi], required: [ssm]]`, with
+/// `Tmgi` requiring `mbsServiceId` + `plmnId` and `Ssm` requiring
+/// `sourceIpAddr` + `destIpAddr`. Returns a human-readable detail on rejection.
+///
+/// A bare string is rejected explicitly rather than coerced, so the pre-fix
+/// spelling fails loudly instead of being accepted as a degenerate object.
+fn validate_mbs_session_id(v: &serde_json::Value) -> Result<(), String> {
+    let Some(obj) = v.as_object() else {
+        return Err(
+            "mbsSessionId must be an object with tmgi or ssm (TS 29.571 MbsSessionId), \
+             not a string"
+                .to_string(),
+        );
+    };
+    let has_tmgi = obj.contains_key("tmgi");
+    let has_ssm = obj.contains_key("ssm");
+    if !has_tmgi && !has_ssm {
+        return Err("mbsSessionId requires tmgi or ssm (TS 29.571 anyOf)".to_string());
+    }
+    if has_tmgi {
+        let Some(t) = obj.get("tmgi").and_then(|t| t.as_object()) else {
+            return Err("mbsSessionId.tmgi must be an object".to_string());
+        };
+        if !t
+            .get("mbsServiceId")
+            .and_then(|x| x.as_str())
+            .is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(
+                "mbsSessionId.tmgi.mbsServiceId must be 6 hex digits (TS 29.571 Tmgi)".to_string(),
+            );
+        }
+        let plmn_ok = t
+            .get("plmnId")
+            .and_then(|p| p.as_object())
+            .is_some_and(|p| {
+                p.get("mcc").and_then(|x| x.as_str()).is_some()
+                    && p.get("mnc").and_then(|x| x.as_str()).is_some()
+            });
+        if !plmn_ok {
+            return Err(
+                "mbsSessionId.tmgi.plmnId must carry mcc and mnc (TS 29.571 Tmgi)".to_string(),
+            );
+        }
+    }
+    if has_ssm {
+        let Some(m) = obj.get("ssm").and_then(|x| x.as_object()) else {
+            return Err("mbsSessionId.ssm must be an object".to_string());
+        };
+        if !m.contains_key("sourceIpAddr") || !m.contains_key("destIpAddr") {
+            return Err(
+                "mbsSessionId.ssm requires sourceIpAddr and destIpAddr (TS 29.571 Ssm)".to_string(),
+            );
+        }
+    }
+    // Belt-and-braces: the canonical key must be derivable, or discovery could
+    // never find what we are about to store.
+    if context::mbs_session_key(v).is_none() {
+        return Err("mbsSessionId is not usable as a binding key".to_string());
+    }
+    Ok(())
+}
+
 /// Build the PcfMbsBinding JSON representation.
 fn mbs_binding_json(b: &context::PcfMbsBinding) -> serde_json::Value {
     let mut m = serde_json::Map::new();
@@ -1623,10 +1750,9 @@ fn mbs_binding_json(b: &context::PcfMbsBinding) -> serde_json::Value {
         "pcfMbsBindingId".to_string(),
         serde_json::Value::String(b.binding_id.clone()),
     );
-    m.insert(
-        "mbsSessionId".to_string(),
-        serde_json::Value::String(b.mbs_session_id.clone()),
-    );
+    // Echoed verbatim: MbsSessionId is an object, and TS 29.521 requires the
+    // create response to carry the PcfMbsBinding that was stored.
+    m.insert("mbsSessionId".to_string(), b.mbs_session_id.clone());
     if let Some(ref v) = b.pcf_fqdn {
         m.insert("pcfFqdn".to_string(), serde_json::Value::String(v.clone()));
     }
@@ -1665,6 +1791,19 @@ fn mbs_binding_json(b: &context::PcfMbsBinding) -> serde_json::Value {
     if let Some(ref v) = b.pcf_set_id {
         m.insert("pcfSetId".to_string(), serde_json::Value::String(v.clone()));
     }
+    // PcfMbsBinding members that the MBS path previously dropped entirely.
+    if let Some(ref v) = b.bind_level {
+        m.insert(
+            "bindLevel".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(ref v) = b.recovery_time {
+        m.insert(
+            "recoveryTime".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
     if b.management_features != 0 {
         m.insert(
             "suppFeat".to_string(),
@@ -1687,10 +1826,16 @@ async fn handle_pcf_mbs_binding_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
-    // Mandatory: mbsSessionId.
-    let Some(mbs_session_id) = data.get("mbsSessionId").and_then(|v| v.as_str()) else {
+    // Mandatory: mbsSessionId, which TS 29.571 defines as an OBJECT
+    // (anyOf tmgi / ssm, plus optional nid) -- not a scalar string. This used to
+    // read it with .as_str(), so a conformant object body yielded None and every
+    // spec-compliant MBS registration was rejected 400.
+    let Some(mbs_session_id) = data.get("mbsSessionId") else {
         return missing_mandatory("mbsSessionId");
     };
+    if let Err(detail) = validate_mbs_session_id(mbs_session_id) {
+        return send_bad_request(&detail, Some("MANDATORY_IE_INCORRECT"));
+    }
 
     // Mandatory: PCF address.
     let pcf_fqdn = data.get("pcfFqdn").and_then(|v| v.as_str());
@@ -1716,15 +1861,48 @@ async fn handle_pcf_mbs_binding_create(request: &SbiRequest) -> SbiResponse {
             "cause".to_string(),
             serde_json::json!("EXISTING_BINDING_INFO_FOUND"),
         );
+        // MbsExtProblemDetails extends ProblemDetails with MbsBindingResp, whose
+        // members are pcfFqdn / pcfIpEndPoints (anyOf) -- NOT pcfSmFqdn. An MBS
+        // binding has no Npcf_SMPolicyControl notion at all.
         if let Some(ref fqdn) = first.pcf_fqdn {
             ext.insert(
-                "pcfSmFqdn".to_string(),
+                "pcfFqdn".to_string(),
                 serde_json::Value::String(fqdn.clone()),
             );
         }
-        return SbiResponse::with_status(403)
-            .with_json_body(&serde_json::Value::Object(ext))
-            .unwrap_or_else(|_| SbiResponse::with_status(403));
+        if !first.pcf_ip.is_empty() {
+            let eps: Vec<serde_json::Value> = first
+                .pcf_ip
+                .iter()
+                .map(|ep| {
+                    let mut e = serde_json::Map::new();
+                    if let Some(ref a) = ep.addr {
+                        e.insert(
+                            "ipv4Address".to_string(),
+                            serde_json::Value::String(a.clone()),
+                        );
+                    }
+                    if let Some(ref a6) = ep.addr6 {
+                        e.insert(
+                            "ipv6Address".to_string(),
+                            serde_json::Value::String(a6.clone()),
+                        );
+                    }
+                    if ep.is_port {
+                        e.insert(
+                            "port".to_string(),
+                            serde_json::Value::Number(ep.port.into()),
+                        );
+                    }
+                    serde_json::Value::Object(e)
+                })
+                .collect();
+            ext.insert("pcfIpEndPoints".to_string(), serde_json::Value::Array(eps));
+        }
+        return SbiResponse::with_status(403).with_body(
+            serde_json::Value::Object(ext).to_string(),
+            "application/problem+json",
+        );
     }
 
     let consumer_feat = data
@@ -1736,7 +1914,7 @@ async fn handle_pcf_mbs_binding_create(request: &SbiRequest) -> SbiResponse {
     let binding_id = uuid::Uuid::new_v4().to_string();
     let binding = context::PcfMbsBinding {
         binding_id: binding_id.clone(),
-        mbs_session_id: mbs_session_id.to_string(),
+        mbs_session_id: mbs_session_id.clone(),
         pcf_fqdn: pcf_fqdn.map(|s| s.to_string()),
         pcf_ip: data
             .get("pcfIpEndPoints")
@@ -1748,6 +1926,16 @@ async fn handle_pcf_mbs_binding_create(request: &SbiRequest) -> SbiResponse {
             .map(|s| s.to_string()),
         pcf_set_id: data
             .get("pcfSetId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        // TS 29.521 PcfMbsBinding defines bindLevel and recoveryTime; the MBS
+        // path never parsed them even though the PDU and UE paths both do.
+        bind_level: data
+            .get("bindLevel")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        recovery_time: data
+            .get("recoveryTime")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         management_features: consumer_feat & BSF_SUPPORTED_FEATURES,
@@ -1792,7 +1980,7 @@ async fn handle_pcf_mbs_binding_get(binding_id: &str) -> SbiResponse {
 async fn handle_pcf_mbs_binding_discovery(request: &SbiRequest) -> SbiResponse {
     // TS 29.521 §4.2.4.4: the query parameter is `mbs-session-id`; accept the
     // legacy `mbsSessionId` spelling only as a lenient fallback.
-    let Some(mbs_session_id) = request
+    let Some(raw) = request
         .http
         .params
         .get("mbs-session-id")
@@ -1804,17 +1992,43 @@ async fn handle_pcf_mbs_binding_discovery(request: &SbiRequest) -> SbiResponse {
         );
     };
 
+    // The parameter is declared `content: application/json` with schema
+    // MbsSessionId, so a conformant consumer sends URL-encoded JSON -- an
+    // object, not a bare string. This used to compare the raw query text
+    // against the stored value, which no conformant request could match.
+    let decoded = pct_decode(raw);
+    let query_id: serde_json::Value = match serde_json::from_str(&decoded) {
+        Ok(v) => v,
+        Err(e) => {
+            return send_bad_request(
+                &format!("mbs-session-id must be JSON-encoded MbsSessionId: {e}"),
+                Some("INVALID_QUERY_PARAM"),
+            )
+        }
+    };
+    if let Err(detail) = validate_mbs_session_id(&query_id) {
+        return send_bad_request(&detail, Some("INVALID_QUERY_PARAM"));
+    }
+
     let ctx = bsf_self();
     let results = ctx
         .read()
-        .map(|g| g.mbs_binding_find_by_mbs_session_id(mbs_session_id))
+        .map(|g| g.mbs_binding_find_by_mbs_session_id(&query_id))
         .unwrap_or_default();
 
     match results.as_slice() {
-        [] => SbiResponse::with_status(204),
-        [b] => SbiResponse::with_status(200)
-            .with_json_body(&mbs_binding_json(b))
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        // As above: a 200 array with minItems 0, never a 204 and never a bare
+        // object -- a consumer following the array contract breaks on both.
+        [] | [_] => {
+            let arr: Vec<serde_json::Value> = results.iter().map(mbs_binding_json).collect();
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::Value::Array(arr))
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        // Multi-match now indicates corrupt state rather than a normal outcome:
+        // defect 3's canonical keying refuses a second binding for one session at
+        // create time with 403, and the spec's array response does not describe
+        // how to rank duplicates.
         _ => nextgcore_sbi::server::send_error(
             400,
             "Bad Request",
@@ -2368,6 +2582,23 @@ mod tests {
         assert_eq!(resp.status, 401, "wrong-audience token must be 401");
 
         server.stop().await.expect("stop");
+    }
+
+    /// Percent-encode a JSON query-parameter value the way a conformant
+    /// consumer must: TS 29.521 declares `mbs-session-id` as
+    /// `content: application/json`, and raw `{`/`}`/`"` are not legal URI
+    /// characters, so the JSON has to be escaped before it goes on the wire.
+    fn pct_encode_query(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 3);
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
     }
 
     fn problem(resp: &SbiResponse) -> serde_json::Value {
@@ -3088,12 +3319,17 @@ mod tests {
         assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
 
         // Valid POST → 201 + Location.
+        //
+        // pcfForUeFqdn, not pcfFqdn: this test previously sent and asserted the
+        // unprefixed spelling, which PINNED the #97 non-conformance -- TS 29.521
+        // PcfForUeBinding names the member pcfForUeFqdn, and the unprefixed form
+        // belongs to PcfBinding (the PDU-session binding).
         let resp = client
             .post_json(
                 "/nbsf-management/v1/pcf-ue-bindings",
                 &json!({
                     "supi": "imsi-001019900111001",
-                    "pcfFqdn": "pcf.ue.example.com",
+                    "pcfForUeFqdn": "pcf.ue.example.com",
                     "suppFeat": "2"
                 }),
             )
@@ -3105,8 +3341,19 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["supi"], "imsi-001019900111001");
-        assert_eq!(body["pcfFqdn"], "pcf.ue.example.com");
+        assert_eq!(body["pcfForUeFqdn"], "pcf.ue.example.com");
         assert_eq!(body["suppFeat"], "2");
+        // The non-schema members are gone from the representation.
+        assert!(
+            body.get("pcfFqdn").is_none(),
+            "pcfFqdn is not a PcfForUeBinding member"
+        );
+        assert!(
+            body.get("pcfUeBindingId").is_none(),
+            "pcfUeBindingId appears nowhere in TS 29.521"
+        );
+        assert!(body.get("pcfDiamHost").is_none());
+        assert!(body.get("pcfDiamRealm").is_none());
 
         // GET by id → 200.
         let resp = client
@@ -3133,17 +3380,17 @@ mod tests {
         assert_eq!(resp.status, 400);
         assert_eq!(problem(&resp)["cause"], "MANDATORY_QUERY_PARAM_MISSING");
 
-        // PATCH pcfFqdn → 200.
+        // PATCH pcfForUeFqdn → 200 (PcfForUeBindingPatch member name).
         let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcf-ue-bindings/{ue_id}"));
         req.http
-            .set_content(json!({"pcfFqdn": "pcf.ue2.example.com"}).to_string());
+            .set_content(json!({"pcfForUeFqdn": "pcf.ue2.example.com"}).to_string());
         req.http
             .set_header("Content-Type", "application/merge-patch+json");
         let resp = client.send_request(req).await.expect("PATCH ue");
         assert_eq!(resp.status, 200);
         let patched: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(patched["pcfFqdn"], "pcf.ue2.example.com");
+        assert_eq!(patched["pcfForUeFqdn"], "pcf.ue2.example.com");
 
         // DELETE → 204; GET → 404 afterwards.
         let resp = client
@@ -3157,22 +3404,545 @@ mod tests {
             .expect("GET deleted ue");
         assert_eq!(resp.status, 404);
 
-        // Discovery after delete → 204 (empty).
+        // Discovery after delete → 200 with an EMPTY ARRAY.
+        //
+        // This asserted 204, which is the #97 defect 5 non-conformance: TS 29.521
+        // defines only a 200 of `type: array, minItems: 0` for this operation.
+        // (The SM GET /pcfBindings legitimately defines 204 -- see the guard in
+        // test_discovery_success_shapes.)
         let mut req = SbiRequest::get("/nbsf-management/v1/pcf-ue-bindings");
         req.http.set_param("supi", "imsi-001019900111001");
         let resp = client
             .send_request(req)
             .await
             .expect("discover ue after delete");
-        assert_eq!(resp.status, 204);
+        assert_eq!(resp.status, 200);
+        let arr: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(arr, json!([]), "empty result is an empty array, not a 204");
 
         server.stop().await.expect("server stops");
+    }
+
+    /// #97 defects 1-2: PcfForUeBinding wire conformance.
+    ///
+    /// TS 29.521 PcfForUeBinding names the PCF address members pcfForUeFqdn /
+    /// pcfForUeIpEndPoints (the unprefixed spellings belong to PcfBinding, the
+    /// PDU-session binding), declares `required: - supi` with gpsi optional, and
+    /// defines no pcfUeBindingId / pcfDiamHost / pcfDiamRealm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pcf_for_ue_binding_conformant_attribute_names() {
+        let (_srv, client) = start_bsf().await;
+
+        // The conformant fqdn form is ACCEPTED. This returned 400 before the
+        // fix, so a spec-compliant PCF could not register at all.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({
+                    "supi": "imsi-001019900197001",
+                    "pcfForUeFqdn": "pcf-ue.example.com"
+                }),
+            )
+            .await
+            .expect("POST pcfForUeFqdn");
+        assert_eq!(
+            resp.status, 201,
+            "a conformant PcfForUeBinding must be accepted"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["pcfForUeFqdn"], "pcf-ue.example.com");
+        assert!(body.get("pcfFqdn").is_none());
+        assert!(body.get("pcfUeBindingId").is_none());
+        assert!(body.get("pcfDiamHost").is_none());
+        assert!(body.get("pcfDiamRealm").is_none());
+
+        // The endpoints-only form also satisfies the schema's
+        // `anyOf: [pcfForUeFqdn, pcfForUeIpEndPoints]`.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({
+                    "supi": "imsi-001019900197002",
+                    "pcfForUeIpEndPoints": [{"ipv4Address": "10.45.0.77", "port": 7777}]
+                }),
+            )
+            .await
+            .expect("POST pcfForUeIpEndPoints");
+        assert_eq!(
+            resp.status, 201,
+            "pcfForUeIpEndPoints alone satisfies anyOf"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["pcfForUeIpEndPoints"][0]["ipv4Address"], "10.45.0.77");
+        assert!(body.get("pcfIpEndPoints").is_none());
+
+        // supi is MANDATORY: a gpsi-only registration used to be accepted.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({
+                    "gpsi": "msisdn-14155550197",
+                    "pcfForUeFqdn": "pcf-ue.example.com"
+                }),
+            )
+            .await
+            .expect("POST gpsi only");
+        assert_eq!(
+            resp.status, 400,
+            "TS 29.521 declares `required: - supi`; gpsi alone is not enough"
+        );
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        // Neither address form -> 400, naming the spec attributes.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({"supi": "imsi-001019900197003"}),
+            )
+            .await
+            .expect("POST no address");
+        assert_eq!(resp.status, 400);
+        let detail = problem(&resp)["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            detail.contains("pcfForUeFqdn"),
+            "the error should name the conformant attribute, got: {detail}"
+        );
+
+        // The unprefixed spelling is no longer an accepted address: it is not a
+        // member of this resource, so it cannot satisfy the anyOf.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({
+                    "supi": "imsi-001019900197004",
+                    "pcfFqdn": "pcf-ue.example.com"
+                }),
+            )
+            .await
+            .expect("POST legacy spelling");
+        assert_eq!(
+            resp.status, 400,
+            "pcfFqdn belongs to PcfBinding, not PcfForUeBinding"
+        );
+    }
+
+    /// Guard for the scoping of the above: pcfDiamHost / pcfDiamRealm ARE valid
+    /// members of PcfBinding (TS29521_Nbsf_Management.yaml:1097-1099) and of
+    /// PcfBindingPatch (:1176-1178). Removing them from PcfForUeBinding must not
+    /// leak into the PDU-session path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pdu_binding_still_accepts_diameter_members() {
+        let (_srv, client) = start_bsf().await;
+
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "supi": "imsi-001019900197010",
+                    "ipv4Addr": "10.45.0.197",
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "pcfDiamHost": "pcf.diam.example.com",
+                    "pcfDiamRealm": "example.com",
+                    "pcfFqdn": "pcf.example.com"
+                }),
+            )
+            .await
+            .expect("POST pdu binding with diam members");
+        assert_eq!(
+            resp.status, 201,
+            "the PDU-session binding legitimately carries pcfDiamHost/Realm"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["pcfDiamHost"], "pcf.diam.example.com");
+        assert_eq!(body["pcfDiamRealm"], "example.com");
+        // And the PDU resource keeps the UNPREFIXED pcfFqdn, correct for
+        // PcfBinding.
+        assert_eq!(body["pcfFqdn"], "pcf.example.com");
+    }
+
+    /// #97 defect 3: MbsSessionId is an OBJECT (TS 29.571), not a string.
+    ///
+    /// A conformant PCF sends `{tmgi: {mbsServiceId, plmnId}}` or
+    /// `{ssm: {sourceIpAddr, destIpAddr}}`; bsfd read the field with `.as_str()`
+    /// so every such registration was rejected 400 missing_mandatory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mbs_session_id_object_form() {
+        let (_srv, client) = start_bsf().await;
+
+        let tmgi = json!({
+            "tmgi": {"mbsServiceId": "aabbcc", "plmnId": {"mcc": "001", "mnc": "01"}}
+        });
+
+        // The conformant tmgi object form is ACCEPTED (was 400).
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({
+                    "mbsSessionId": tmgi.clone(),
+                    "pcfFqdn": "pcf.mbs97.example.com",
+                    "bindLevel": "NF_SET",
+                    "recoveryTime": "2026-08-10T00:00:00Z"
+                }),
+            )
+            .await
+            .expect("POST tmgi object");
+        assert_eq!(
+            resp.status, 201,
+            "a conformant object MbsSessionId must be accepted"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["mbsSessionId"], tmgi, "echoed as an object, verbatim");
+        // bindLevel / recoveryTime are PcfMbsBinding members and must round-trip;
+        // the MBS path never parsed them before.
+        assert_eq!(body["bindLevel"], "NF_SET");
+        assert_eq!(body["recoveryTime"], "2026-08-10T00:00:00Z");
+
+        // The ssm form also satisfies the schema's anyOf.
+        let ssm = json!({
+            "ssm": {"sourceIpAddr": {"ipv4Addr": "10.0.0.9"},
+                    "destIpAddr": {"ipv4Addr": "232.0.0.9"}}
+        });
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({"mbsSessionId": ssm.clone(), "pcfFqdn": "pcf.ssm.example.com"}),
+            )
+            .await
+            .expect("POST ssm object");
+        assert_eq!(resp.status, 201, "the ssm form satisfies anyOf");
+
+        // A bare string is rejected LOUDLY rather than coerced.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({"mbsSessionId": "TMGI-001", "pcfFqdn": "pcf.example.com"}),
+            )
+            .await
+            .expect("POST string form");
+        assert_eq!(
+            resp.status, 400,
+            "the pre-fix string spelling must not be accepted"
+        );
+        let detail = problem(&resp)["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            detail.contains("object"),
+            "the error should name the expected shape, got: {detail}"
+        );
+
+        // Neither tmgi nor ssm -> 400 per the anyOf.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({"mbsSessionId": {"nid": "000007ABCDE"}, "pcfFqdn": "pcf.example.com"}),
+            )
+            .await
+            .expect("POST neither");
+        assert_eq!(resp.status, 400);
+
+        // tmgi missing plmnId -> 400 (Tmgi requires mbsServiceId AND plmnId).
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({
+                    "mbsSessionId": {"tmgi": {"mbsServiceId": "aabbcc"}},
+                    "pcfFqdn": "pcf.example.com"
+                }),
+            )
+            .await
+            .expect("POST tmgi no plmn");
+        assert_eq!(resp.status, 400);
+
+        // Discovery with the JSON-encoded query parameter finds the binding, and
+        // matching is case-insensitive on mbsServiceId and order-independent --
+        // a textual comparison would miss both.
+        let upper = json!({
+            "tmgi": {"plmnId": {"mnc": "01", "mcc": "001"}, "mbsServiceId": "AABBCC"}
+        });
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
+        req.http
+            .set_param("mbs-session-id", &pct_encode_query(&upper.to_string()));
+        let resp = client
+            .send_request(req)
+            .await
+            .expect("discover upper/reordered");
+        assert_eq!(
+            resp.status, 200,
+            "hex case and key order must not affect discovery"
+        );
+
+        // A duplicate differing only in hex case is still caught as a duplicate.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({"mbsSessionId": upper.clone(), "pcfFqdn": "pcf.dup.example.com"}),
+            )
+            .await
+            .expect("POST duplicate different case");
+        assert_eq!(
+            resp.status, 403,
+            "canonical matching must catch the duplicate"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "EXISTING_BINDING_INFO_FOUND");
+
+        // A non-JSON query parameter is a client error, not a 500.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
+        req.http.set_param("mbs-session-id", "TMGI-001");
+        let resp = client.send_request(req).await.expect("discover non-json");
+        assert_eq!(resp.status, 400);
+    }
+
+    /// #97 defect 5: discovery success shapes.
+    ///
+    /// TS 29.521 defines for GET /pcf-ue-bindings and GET /pcf-mbs-bindings ONLY
+    /// a 200 whose schema is `type: array, minItems: 0` -- no 204 on either, and
+    /// never a bare object. The SM GET /pcfBindings DOES define 204 (:104-105),
+    /// and that asymmetry is deliberate: the fix must not make all three uniform.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_discovery_success_shapes() {
+        let (_srv, client) = start_bsf().await;
+
+        // UE: no match -> 200 [].
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcf-ue-bindings");
+        req.http.set_param("supi", "imsi-001019900975001");
+        let resp = client.send_request(req).await.expect("ue discover empty");
+        assert_eq!(resp.status, 200, "no 204 is defined for this operation");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body, json!([]));
+
+        // MBS: no match -> 200 [].
+        let id = json!({
+            "tmgi": {"mbsServiceId": "975002", "plmnId": {"mcc": "001", "mnc": "01"}}
+        });
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
+        req.http
+            .set_param("mbs-session-id", &pct_encode_query(&id.to_string()));
+        let resp = client.send_request(req).await.expect("mbs discover empty");
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body, json!([]));
+
+        // MBS: ONE match -> a one-element ARRAY, not a bare object. A consumer
+        // iterating the array contract breaks on a bare object.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({"mbsSessionId": id.clone(), "pcfFqdn": "pcf.shapes.example.com"}),
+            )
+            .await
+            .expect("POST mbs");
+        assert_eq!(resp.status, 201);
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
+        req.http
+            .set_param("mbs-session-id", &pct_encode_query(&id.to_string()));
+        let resp = client.send_request(req).await.expect("mbs discover one");
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let arr = body
+            .as_array()
+            .expect("must be an array, not a bare object");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["mbsSessionId"], id);
+
+        // ASYMMETRY GUARD: the SM GET /pcfBindings legitimately defines 204 and
+        // must keep it.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv4Addr", "10.45.99.199");
+        let resp = client.send_request(req).await.expect("sm discover empty");
+        assert_eq!(
+            resp.status, 204,
+            "GET /pcfBindings DOES define 204; this must not be normalised away"
+        );
+    }
+
+    /// #97 defect 4: the SamePcf duplicate 403 media type and the SM-PCF address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_same_pcf_403_problem_json_and_sm_address() {
+        let (_srv, client) = start_bsf().await;
+
+        // Register with DISTINCT PolicyAuthorization and SM-PCF addresses, plus
+        // paraCom so SamePcf detection can fire.
+        let body = json!({
+            "supi": "imsi-001019900974001",
+            "ipv4Addr": "10.45.0.174",
+            "dnn": "internet",
+            "snssai": {"sst": 1},
+            "pcfFqdn": "pcf-authz.example.com",
+            "pcfSmFqdn": "pcf-smpolicy.example.com",
+            "pcfSmIpEndPoints": [{"ipv4Address": "10.45.0.199", "port": 8888}],
+            "suppFeat": "4",
+            "paraCom": {"supi": "imsi-001019900974001", "dnn": "internet",
+                        "snssai": {"sst": 1}}
+        });
+        let resp = client
+            .post_json("/nbsf-management/v1/pcfBindings", &body)
+            .await
+            .expect("POST first");
+        assert_eq!(resp.status, 201);
+
+        // Duplicate -> 403.
+        let resp = client
+            .post_json("/nbsf-management/v1/pcfBindings", &body)
+            .await
+            .expect("POST duplicate");
+        assert_eq!(resp.status, 403);
+
+        // application/problem+json, not application/json: TS 29.521 declares the
+        // 403 as ExtProblemDetails. with_json_body hardcoded application/json.
+        let ct = resp
+            .http
+            .get_header("Content-Type")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            ct.contains("application/problem+json"),
+            "403 must be application/problem+json, got {ct:?}"
+        );
+
+        let ext: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(ext["cause"], "EXISTING_BINDING_INFO_FOUND");
+        // BindingResp defines pcfSmFqdn as the Npcf_SMPolicyControl endpoint. The
+        // handler used to emit the PolicyAuthorization address under this name,
+        // routing SamePcf recovery to the wrong service.
+        assert_eq!(
+            ext["pcfSmFqdn"], "pcf-smpolicy.example.com",
+            "the 403 must advertise the SM-PCF address, not the PolicyAuthorization one"
+        );
+        assert_eq!(ext["pcfSmIpEndPoints"][0]["ipv4Address"], "10.45.0.199");
+        assert_eq!(ext["pcfSmIpEndPoints"][0]["port"], 8888);
+    }
+
+    /// #97 defect 4 (MBS half): MbsExtProblemDetails extends MbsBindingResp,
+    /// whose members are pcfFqdn / pcfIpEndPoints -- an MBS binding has no
+    /// Npcf_SMPolicyControl notion, so pcfSmFqdn is wrong there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mbs_duplicate_403_uses_pcf_fqdn_and_problem_json() {
+        let (_srv, client) = start_bsf().await;
+        let id = json!({
+            "tmgi": {"mbsServiceId": "974100", "plmnId": {"mcc": "001", "mnc": "01"}}
+        });
+        let body = json!({
+            "mbsSessionId": id.clone(),
+            "pcfFqdn": "pcf.mbs974.example.com",
+            "pcfIpEndPoints": [{"ipv4Address": "10.45.0.174", "port": 7777}]
+        });
+
+        let resp = client
+            .post_json("/nbsf-management/v1/pcf-mbs-bindings", &body)
+            .await
+            .expect("POST mbs first");
+        assert_eq!(resp.status, 201);
+
+        let resp = client
+            .post_json("/nbsf-management/v1/pcf-mbs-bindings", &body)
+            .await
+            .expect("POST mbs duplicate");
+        assert_eq!(resp.status, 403);
+        let ct = resp
+            .http
+            .get_header("Content-Type")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            ct.contains("application/problem+json"),
+            "MBS 403 must be application/problem+json, got {ct:?}"
+        );
+        let ext: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(ext["pcfFqdn"], "pcf.mbs974.example.com");
+        assert_eq!(ext["pcfIpEndPoints"][0]["ipv4Address"], "10.45.0.174");
+        assert!(
+            ext.get("pcfSmFqdn").is_none(),
+            "pcfSmFqdn is not an MbsBindingResp member"
+        );
+    }
+
+    /// #97 defect 6: framed-route lists must be stored on CREATE, not only on
+    /// PATCH -- discovery matching (context ipv4_in_frame_routes /
+    /// ipv6_in_frame_routes) depends on them, so a UE reachable only via a framed
+    /// route was undiscoverable after a conformant registration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_framed_routes_stored_on_create() {
+        let (_srv, client) = start_bsf().await;
+
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "supi": "imsi-001019900976001",
+                    "ipv4Addr": "10.45.0.176",
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "pcfFqdn": "pcf.routes.example.com",
+                    "ipv4FrameRouteList": ["10.76.0.0/24"],
+                    "ipv6FrameRouteList": ["2001:db8:76::/64"]
+                }),
+            )
+            .await
+            .expect("POST with framed routes");
+        assert_eq!(resp.status, 201);
+
+        // An address INSIDE the framed route resolves to this binding. Before the
+        // fix, create dropped the lists so this found nothing.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv4Addr", "10.76.0.9");
+        let resp = client
+            .send_request(req)
+            .await
+            .expect("discover by framed route");
+        assert_eq!(
+            resp.status, 200,
+            "a UE inside an ipv4FrameRouteList must be discoverable"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["supi"], "imsi-001019900976001");
+
+        // Same for the IPv6 framed route.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv6Prefix", "2001:db8:76::5/128");
+        let resp = client
+            .send_request(req)
+            .await
+            .expect("discover by ipv6 route");
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["supi"], "imsi-001019900976001");
     }
 
     // bsfd-12: pcf-mbs-bindings lifecycle + duplicate 403 + multi-match 400
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_pcf_mbs_bindings_lifecycle() {
         let (server, client) = start_bsf().await;
+
+        // TS 29.571 MbsSessionId is an OBJECT (anyOf tmgi / ssm), not a string.
+        // This test previously used the bare string "TMGI-001", which is not a
+        // valid MbsSessionId in any form -- it only passed because bsfd read the
+        // field with .as_str(), which is the #97 defect being fixed here.
+        let mbs_id_obj = json!({
+            "tmgi": {"mbsServiceId": "0a1b2c", "plmnId": {"mcc": "001", "mnc": "01"}}
+        });
+        let mbs_id_other = json!({
+            "tmgi": {"mbsServiceId": "ffeedd", "plmnId": {"mcc": "001", "mnc": "01"}}
+        });
 
         // POST without mbsSessionId → 400.
         let resp = client
@@ -3189,7 +3959,7 @@ mod tests {
         let resp = client
             .post_json(
                 "/nbsf-management/v1/pcf-mbs-bindings",
-                &json!({"mbsSessionId": "TMGI-001"}),
+                &json!({"mbsSessionId": mbs_id_obj.clone()}),
             )
             .await
             .expect("POST mbs no pcf");
@@ -3201,7 +3971,7 @@ mod tests {
             .post_json(
                 "/nbsf-management/v1/pcf-mbs-bindings",
                 &json!({
-                    "mbsSessionId": "TMGI-001",
+                    "mbsSessionId": mbs_id_obj.clone(),
                     "pcfFqdn": "pcf.mbs.example.com"
                 }),
             )
@@ -3212,14 +3982,15 @@ mod tests {
         let mbs_id = loc.rsplit('/').next().unwrap().to_string();
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(body["mbsSessionId"], "TMGI-001");
+        // Echoed back as an OBJECT, not a string.
+        assert_eq!(body["mbsSessionId"], mbs_id_obj);
 
         // Duplicate mbsSessionId → 403 EXISTING_BINDING_INFO_FOUND.
         let resp = client
             .post_json(
                 "/nbsf-management/v1/pcf-mbs-bindings",
                 &json!({
-                    "mbsSessionId": "TMGI-001",
+                    "mbsSessionId": mbs_id_obj.clone(),
                     "pcfFqdn": "pcf.mbs2.example.com"
                 }),
             )
@@ -3232,7 +4003,8 @@ mod tests {
 
         // Discovery by mbsSessionId → 200 single result.
         let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
-        req.http.set_param("mbsSessionId", "TMGI-001");
+        req.http
+            .set_param("mbs-session-id", &pct_encode_query(&mbs_id_obj.to_string()));
         let resp = client.send_request(req).await.expect("discover mbs");
         assert_eq!(resp.status, 200);
 
@@ -3247,9 +4019,16 @@ mod tests {
 
         // Unknown mbsSessionId → 204.
         let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
-        req.http.set_param("mbsSessionId", "TMGI-999");
+        req.http.set_param(
+            "mbs-session-id",
+            &pct_encode_query(&mbs_id_other.to_string()),
+        );
         let resp = client.send_request(req).await.expect("discover mbs miss");
-        assert_eq!(resp.status, 204);
+        // 200 with an empty array, not 204 (see the UE site above).
+        assert_eq!(resp.status, 200);
+        let arr: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(arr, json!([]));
 
         // PATCH → 200.
         let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcf-mbs-bindings/{mbs_id}"));

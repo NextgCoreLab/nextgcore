@@ -64,8 +64,11 @@ pub struct PcfUeBinding {
     pub pcf_set_id: Option<String>,
     pub bind_level: Option<String>,
     pub recovery_time: Option<String>,
-    pub pcf_diam_host: Option<String>,
-    pub pcf_diam_realm: Option<String>,
+    // NOTE: no pcf_diam_host / pcf_diam_realm here. Those ARE valid members of
+    // PcfBinding (the PDU-session binding, TS29521_Nbsf_Management.yaml:1097)
+    // and PcfBindingPatch (:1176), and the PDU path stores them -- but
+    // PcfForUeBinding (:1390-1420) does not define them, so emitting them here
+    // polluted the resource representation.
     pub management_features: u64,
 }
 
@@ -74,13 +77,79 @@ pub struct PcfUeBinding {
 #[derive(Debug, Clone)]
 pub struct PcfMbsBinding {
     pub binding_id: String,
-    /// Opaque MBS Session ID (TMGI or SSM form per TS 29.571).
-    pub mbs_session_id: String,
+    /// MBS Session ID as received. TS 29.571 `MbsSessionId` is an OBJECT
+    /// (`anyOf` tmgi / ssm, plus optional nid), not a scalar -- it is stored
+    /// verbatim so the create response and GET can echo the representation the
+    /// consumer sent, and matched via [`mbs_session_key`] rather than by text.
+    pub mbs_session_id: serde_json::Value,
     pub pcf_fqdn: Option<String>,
     pub pcf_ip: Vec<PcfIpEndpoint>,
     pub pcf_id: Option<String>,
     pub pcf_set_id: Option<String>,
+    pub bind_level: Option<String>,
+    pub recovery_time: Option<String>,
     pub management_features: u64,
+}
+
+/// Canonical comparison key for a TS 29.571 `MbsSessionId`.
+///
+/// Two objects can denote the SAME session yet differ byte-for-byte: JSON key
+/// order is not significant, and `Tmgi.mbsServiceId` is `^[A-Fa-f0-9]{6}$` so
+/// `0A1B2C` and `0a1b2c` are the same service. Comparing serialized text would
+/// therefore make discovery miss a binding the consumer had just created, and
+/// would let a duplicate registration slip past the EXISTING_BINDING_INFO_FOUND
+/// check. Reducing to an order-independent, case-folded key fixes both.
+///
+/// `None` when the value carries neither a usable `tmgi` nor `ssm`, so a
+/// malformed id never compares equal to anything (including another malformed
+/// one).
+pub fn mbs_session_key(v: &serde_json::Value) -> Option<String> {
+    let obj = v.as_object()?;
+    let nid = obj
+        .get("nid")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if let Some(tmgi) = obj.get("tmgi").and_then(|t| t.as_object()) {
+        let svc = tmgi.get("mbsServiceId").and_then(|s| s.as_str())?;
+        let plmn = tmgi.get("plmnId").and_then(|p| p.as_object())?;
+        let mcc = plmn.get("mcc").and_then(|s| s.as_str())?;
+        let mnc = plmn.get("mnc").and_then(|s| s.as_str())?;
+        return Some(format!(
+            "tmgi:{}:{}:{}:{}",
+            svc.to_ascii_lowercase(),
+            mcc,
+            mnc,
+            nid
+        ));
+    }
+    if let Some(ssm) = obj.get("ssm").and_then(|s| s.as_object()) {
+        // IpAddr is itself a oneOf (ipv4Addr / ipv6Addr / ipv6Prefix); fold the
+        // whole address object to a stable string rather than assuming a form.
+        let fold = |k: &str| -> Option<String> {
+            let a = ssm.get(k)?;
+            match a {
+                serde_json::Value::String(s) => Some(s.to_ascii_lowercase()),
+                serde_json::Value::Object(m) => {
+                    let mut parts: Vec<String> = m
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            v.as_str()
+                                .map(|s| format!("{k}={}", s.to_ascii_lowercase()))
+                        })
+                        .collect();
+                    parts.sort();
+                    Some(parts.join(","))
+                }
+                _ => None,
+            }
+        };
+        let src = fold("sourceIpAddr")?;
+        let dst = fold("destIpAddr")?;
+        return Some(format!("ssm:{src}:{dst}:{nid}"));
+    }
+    None
 }
 
 /// IPv6 prefix structure
@@ -372,10 +441,20 @@ pub struct BsfSess {
     /// DNN (Data Network Name)
     pub dnn: Option<String>,
 
-    /// PCF FQDN
+    /// PCF FQDN hosting Npcf_PolicyAuthorization (TS 29.521 PcfBinding.pcfFqdn)
     pub pcf_fqdn: Option<String>,
-    /// PCF IP endpoints
+    /// PCF IP endpoints (PcfBinding.pcfIpEndPoints)
     pub pcf_ip: Vec<PcfIpEndpoint>,
+    /// FQDN of the PCF hosting **Npcf_SMPolicyControl**
+    /// (PcfBinding.pcfSmFqdn, TS29521_Nbsf_Management.yaml:1101). This is a
+    /// DISTINCT endpoint from pcf_fqdn above, and it is what the SamePcf
+    /// duplicate-detection 403 must advertise -- BindingResp (the ExtProblemDetails
+    /// extension) defines pcfSmFqdn / pcfSmIpEndPoints, not the
+    /// PolicyAuthorization address.
+    pub pcf_sm_fqdn: Option<String>,
+    /// IP end points of the PCF hosting Npcf_SMPolicyControl
+    /// (PcfBinding.pcfSmIpEndPoints, :1104).
+    pub pcf_sm_ip: Vec<PcfIpEndpoint>,
     /// PCF instance ID (TS 29.512 NF instance ID, bsfd-08)
     pub pcf_id: Option<String>,
     /// PCF set ID (bsfd-08)
@@ -416,6 +495,8 @@ impl BsfSess {
             s_nssai: SNssai::default(),
             dnn: None,
             pcf_fqdn: None,
+            pcf_sm_fqdn: None,
+            pcf_sm_ip: Vec::new(),
             pcf_ip: Vec::new(),
             pcf_id: None,
             pcf_set_id: None,
@@ -1108,11 +1189,19 @@ impl BsfContext {
 
     /// Return all MBS bindings keyed by the given mbs_session_id.
     /// TS 29.521 §4.2.2.4: a duplicate is 403; multi-match is 400.
-    pub fn mbs_binding_find_by_mbs_session_id(&self, mbs_session_id: &str) -> Vec<PcfMbsBinding> {
+    pub fn mbs_binding_find_by_mbs_session_id(
+        &self,
+        mbs_session_id: &serde_json::Value,
+    ) -> Vec<PcfMbsBinding> {
+        // Semantic match on the canonical key, not on serialized text -- see
+        // mbs_session_key. An unusable query id matches nothing.
+        let Some(want) = mbs_session_key(mbs_session_id) else {
+            return Vec::new();
+        };
         match self.mbs_binding_list.read() {
             Ok(list) => list
                 .values()
-                .filter(|b| b.mbs_session_id == mbs_session_id)
+                .filter(|b| mbs_session_key(&b.mbs_session_id).as_deref() == Some(want.as_str()))
                 .cloned()
                 .collect(),
             Err(_) => Vec::new(),
@@ -1224,6 +1313,9 @@ pub fn sess_to_doc(sess: &BsfSess) -> nextgcore_dbi::mongodb::bson::Document {
     if let Some(sd) = sess.s_nssai.sd {
         d.insert("sd", sd as i64);
     }
+    if let Some(ref v) = sess.pcf_sm_fqdn {
+        d.insert("pcf_sm_fqdn", v);
+    }
     if let Some(ref pcf_fqdn) = sess.pcf_fqdn {
         d.insert("pcf_fqdn", pcf_fqdn);
     }
@@ -1305,6 +1397,9 @@ pub fn doc_to_sess(doc: &nextgcore_dbi::mongodb::bson::Document) -> BsfSess {
     }
     if let Ok(sd) = doc.get_i64("sd") {
         sess.s_nssai.sd = Some(sd as u32);
+    }
+    if let Ok(v) = doc.get_str("pcf_sm_fqdn") {
+        sess.pcf_sm_fqdn = Some(v.to_string());
     }
     if let Ok(pcf_fqdn) = doc.get_str("pcf_fqdn") {
         sess.pcf_fqdn = Some(pcf_fqdn.to_string());
@@ -2066,8 +2161,6 @@ mod tests {
             pcf_set_id: None,
             bind_level: None,
             recovery_time: None,
-            pcf_diam_host: None,
-            pcf_diam_realm: None,
             management_features: 0x1,
         };
         ctx.ue_binding_add(b.clone());
@@ -2109,13 +2202,26 @@ mod tests {
         let mut ctx = BsfContext::new();
         ctx.init(100);
 
+        // A real TS 29.571 MbsSessionId object. This test previously used the
+        // string "TMGI-ABC", which is not a valid MbsSessionId in any form --
+        // that spelling only worked because the store compared raw strings.
+        let tmgi = |svc: &str| {
+            serde_json::json!({
+                "tmgi": {"mbsServiceId": svc, "plmnId": {"mcc": "001", "mnc": "01"}}
+            })
+        };
+        let id_abc = tmgi("0a1b2c");
+        let id_xyz = tmgi("ffeedd");
+
         let b1 = PcfMbsBinding {
             binding_id: "mbs-1".to_string(),
-            mbs_session_id: "TMGI-ABC".to_string(),
+            mbs_session_id: id_abc.clone(),
             pcf_fqdn: Some("pcf.example.com".to_string()),
             pcf_ip: Vec::new(),
             pcf_id: None,
             pcf_set_id: None,
+            bind_level: None,
+            recovery_time: None,
             management_features: 0x1,
         };
         ctx.mbs_binding_add(b1.clone());
@@ -2124,30 +2230,101 @@ mod tests {
         assert!(ctx.mbs_binding_find_by_id("mbs-1").is_some());
 
         // Find by mbs_session_id (single match).
-        let found = ctx.mbs_binding_find_by_mbs_session_id("TMGI-ABC");
+        let found = ctx.mbs_binding_find_by_mbs_session_id(&id_abc);
         assert_eq!(found.len(), 1);
 
         // Duplicate mbs_session_id: two bindings → caller detects multi-match.
         let b2 = PcfMbsBinding {
             binding_id: "mbs-2".to_string(),
-            mbs_session_id: "TMGI-ABC".to_string(),
+            mbs_session_id: id_abc.clone(),
             pcf_fqdn: Some("pcf2.example.com".to_string()),
             pcf_ip: Vec::new(),
             pcf_id: None,
             pcf_set_id: None,
+            bind_level: None,
+            recovery_time: None,
             management_features: 0x1,
         };
         ctx.mbs_binding_add(b2);
-        assert_eq!(ctx.mbs_binding_find_by_mbs_session_id("TMGI-ABC").len(), 2);
+        assert_eq!(ctx.mbs_binding_find_by_mbs_session_id(&id_abc).len(), 2);
 
         // Remove one; only one left.
         ctx.mbs_binding_remove("mbs-1");
-        assert_eq!(ctx.mbs_binding_find_by_mbs_session_id("TMGI-ABC").len(), 1);
+        assert_eq!(ctx.mbs_binding_find_by_mbs_session_id(&id_abc).len(), 1);
 
         // Different mbs_session_id: no match.
+        assert!(ctx.mbs_binding_find_by_mbs_session_id(&id_xyz).is_empty());
+
+        // Matching is SEMANTIC, not textual: mbsServiceId is ^[A-Fa-f0-9]{6}$,
+        // so hex case must not matter, and JSON key order is not significant.
+        // A textual == would miss both of these.
+        let upper = serde_json::json!({
+            "tmgi": {"mbsServiceId": "0A1B2C", "plmnId": {"mcc": "001", "mnc": "01"}}
+        });
+        assert_eq!(
+            ctx.mbs_binding_find_by_mbs_session_id(&upper).len(),
+            1,
+            "hex case in mbsServiceId must not affect matching"
+        );
+        let reordered = serde_json::json!({
+            "tmgi": {"plmnId": {"mnc": "01", "mcc": "001"}, "mbsServiceId": "0a1b2c"}
+        });
+        assert_eq!(
+            ctx.mbs_binding_find_by_mbs_session_id(&reordered).len(),
+            1,
+            "JSON key order must not affect matching"
+        );
+
+        // A different PLMN is a different session even with the same service id.
+        let other_plmn = serde_json::json!({
+            "tmgi": {"mbsServiceId": "0a1b2c", "plmnId": {"mcc": "999", "mnc": "99"}}
+        });
         assert!(ctx
-            .mbs_binding_find_by_mbs_session_id("TMGI-XYZ")
+            .mbs_binding_find_by_mbs_session_id(&other_plmn)
             .is_empty());
+
+        // An unusable id matches nothing rather than everything.
+        assert!(ctx
+            .mbs_binding_find_by_mbs_session_id(&serde_json::json!({}))
+            .is_empty());
+        assert!(ctx
+            .mbs_binding_find_by_mbs_session_id(&serde_json::json!("TMGI-ABC"))
+            .is_empty());
+    }
+
+    /// The canonical key folds representational differences and separates
+    /// genuinely different sessions (TS 29.571 MbsSessionId / Tmgi / Ssm).
+    #[test]
+    fn test_mbs_session_key_canonicalisation() {
+        let a = serde_json::json!({
+            "tmgi": {"mbsServiceId": "0A1B2C", "plmnId": {"mcc": "001", "mnc": "01"}}
+        });
+        let b = serde_json::json!({
+            "tmgi": {"plmnId": {"mnc": "01", "mcc": "001"}, "mbsServiceId": "0a1b2c"}
+        });
+        assert_eq!(mbs_session_key(&a), mbs_session_key(&b));
+        assert!(mbs_session_key(&a).is_some());
+
+        // nid disambiguates SNPN sessions.
+        let mut with_nid = a.clone();
+        with_nid["nid"] = serde_json::json!("000007ABCDE");
+        assert_ne!(mbs_session_key(&a), mbs_session_key(&with_nid));
+
+        // ssm form keys on both addresses.
+        let ssm = serde_json::json!({
+            "ssm": {"sourceIpAddr": {"ipv4Addr": "10.0.0.1"},
+                    "destIpAddr": {"ipv4Addr": "232.0.0.1"}}
+        });
+        assert!(mbs_session_key(&ssm).is_some());
+        assert_ne!(mbs_session_key(&ssm), mbs_session_key(&a));
+
+        // Neither tmgi nor ssm, and non-objects, are unusable.
+        assert!(mbs_session_key(&serde_json::json!({"nid": "000007ABCDE"})).is_none());
+        assert!(mbs_session_key(&serde_json::json!("TMGI-ABC")).is_none());
+        // tmgi missing plmnId is unusable.
+        assert!(
+            mbs_session_key(&serde_json::json!({"tmgi": {"mbsServiceId": "0a1b2c"}})).is_none()
+        );
     }
 
     #[test]
