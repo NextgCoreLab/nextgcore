@@ -2424,11 +2424,9 @@ mod tests {
     use nextgcore_sbi::client::SbiClient;
     use serde_json::json;
 
+    /// Loopback address on a shared-helper-issued ephemeral port.
     fn ephemeral_addr() -> SocketAddr {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
-        let addr = probe.local_addr().expect("probe addr");
-        drop(probe);
-        addr
+        nextgcore_sbi::test_support::ephemeral_addr()
     }
 
     async fn start_bsf() -> (SbiServer, SbiClient) {

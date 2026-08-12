@@ -477,12 +477,13 @@ mod tests {
     /// index, return `(status, Retry-After?)`.
     type Responder = Arc<dyn Fn(usize) -> (u16, Option<String>) + Send + Sync>;
 
+    /// Reserve a loopback port for a test server.
+    ///
+    /// Delegates to the shared helper: 21 crates each had a private
+    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
+    /// `cargo test`. One implementation means one place to harden.
     fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+        nextgcore_sbi::test_support::free_port()
     }
 
     /// Spin a `nextgcore-sbi` `SbiServer` on `127.0.0.1:port` acting as the

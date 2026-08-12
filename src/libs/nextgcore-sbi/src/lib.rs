@@ -55,6 +55,7 @@ pub mod overload;
 pub mod pubsub;
 pub mod scp;
 pub mod security;
+pub mod test_support; // Shared test helpers (NOT cfg(test): other crates' tests use it)
 pub mod tls;
 pub mod types; // Event-driven pub-sub (B6.1)
 

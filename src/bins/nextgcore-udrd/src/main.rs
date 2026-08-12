@@ -2820,12 +2820,9 @@ udr:
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    /// Bind an ephemeral port (probe-and-release) for an SBI server.
+    /// Loopback address on a shared-helper-issued ephemeral port.
     fn ephemeral_addr() -> SocketAddr {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
-        let addr = probe.local_addr().expect("probe addr");
-        drop(probe);
-        addr
+        nextgcore_sbi::test_support::ephemeral_addr()
     }
 
     /// Serializes tests that depend on the global nextgcore-dbi backend

@@ -1223,10 +1223,7 @@ mod tests {
             Resp::with_status(404)
         }
 
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .map(|a| a.port())
-            .expect("probe ephemeral port");
+        let port = nextgcore_sbi::test_support::free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let server = SbiServer::new(SbiServerConfig::new(addr));
         server.start(stub_smf).await.expect("start stub SMF");
@@ -1257,10 +1254,10 @@ mod tests {
         assert_eq!(status, 204);
 
         // Unreachable receiver → bounded error, not a hang
-        let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .map(|a| a.port())
-            .unwrap();
+        // Intentionally NOT served: the test needs a port with nothing listening.
+        // The shared helper still guarantees no other test is handed this port,
+        // which is what makes "unreachable" reliable rather than accidental.
+        let dead_port = nextgcore_sbi::test_support::free_port();
         let dead_uri = format!("http://127.0.0.1:{dead_port}/cb");
         let res = tokio::time::timeout(
             Duration::from_secs(8),
@@ -1289,10 +1286,7 @@ mod tests {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::time::Duration;
 
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .map(|a| a.port())
-            .expect("probe ephemeral port");
+        let port = nextgcore_sbi::test_support::free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let server = SbiServer::new(SbiServerConfig::new(addr));
 

@@ -1437,9 +1437,7 @@ mod tests {
         use crate::message::SbiPart;
 
         // Find a free localhost port for the test server.
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("value expected");
-        let port = probe.local_addr().expect("value expected").port();
-        drop(probe);
+        let port = crate::test_support::free_port();
 
         let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
             [127, 0, 0, 1],
@@ -1520,9 +1518,7 @@ mod tests {
         mut config: SbiServerConfig,
         handler: H,
     ) -> (SbiServer, u16) {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("value expected");
-        let port = probe.local_addr().expect("value expected").port();
-        drop(probe);
+        let port = crate::test_support::free_port();
         config.addr = SocketAddr::from(([127, 0, 0, 1], port));
         let server = SbiServer::new(config);
         server.start(handler).await.expect("value expected");
