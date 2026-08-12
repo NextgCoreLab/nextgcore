@@ -2361,11 +2361,13 @@ mod tests {
             .unwrap_or_else(|_| SbiResponse::with_status(500))
     }
 
+    /// Reserve a loopback port for a test server.
+    ///
+    /// Delegates to the shared helper: 21 crates each had a private
+    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
+    /// `cargo test`. One implementation means one place to harden.
     fn free_port() -> u16 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
-        port
+        nextgcore_sbi::test_support::free_port()
     }
 
     fn unhex(s: &str) -> Vec<u8> {
@@ -3466,11 +3468,7 @@ mod oauth2_h8_tests {
     use std::time::Duration;
 
     fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+        nextgcore_sbi::test_support::free_port()
     }
 
     fn build_es256_token(

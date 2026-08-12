@@ -1502,37 +1502,13 @@ mod tests {
     // (ephemeral ports, bounded timeouts, fully async — no blocking threads)
     // ------------------------------------------------------------------
 
-    /// Reserve an ephemeral localhost port, never handing the same port to two
-    /// callers in this process.
+    /// Reserve a loopback port for a test server.
     ///
-    /// Binding a probe and dropping it is inherently TOCTOU: between the drop
-    /// and the caller's real bind the port is free, so the OS is entitled to
-    /// hand it to the next probe. Under parallel test threads that happened
-    /// often enough to fail ~1 run in 10 with
-    /// `producer start: ServerError("Failed to bind: Address already in use")`
-    /// at the `start_mock_producer` / `start_scp` bind. (The flake was
-    /// originally diagnosed as hardcoded port numbers, but these helpers
-    /// always used ephemeral ports -- the defect is the reuse window, not a
-    /// fixed constant.)
-    ///
-    /// Excluding already-issued ports closes the in-process race, which is the
-    /// one parallel `cargo test` threads create. A foreign process claiming the
-    /// port in the same window remains theoretically possible and is not worth
-    /// synchronising against here.
+    /// Delegates to the shared helper. This crate previously carried its own
+    /// process-wide dedup (PR #138); that logic now lives in one place so all
+    /// 21 crates share it and there is a single site to harden further.
     fn ephemeral_port() -> u16 {
-        static ISSUED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
-            std::sync::OnceLock::new();
-        let issued = ISSUED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-
-        for _ in 0..256 {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-            let port = probe.local_addr().expect("probe addr").port();
-            drop(probe);
-            if issued.lock().expect("issued lock").insert(port) {
-                return port;
-            }
-        }
-        panic!("could not obtain an unused ephemeral port in 256 attempts");
+        nextgcore_sbi::test_support::free_port()
     }
 
     /// Start a mock producer that echoes the request (method, uri, body and

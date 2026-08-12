@@ -2247,11 +2247,13 @@ mod tests {
             .to_string()
     }
 
+    /// Reserve a loopback port for a test server.
+    ///
+    /// Delegates to the shared helper: 21 crates each had a private
+    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
+    /// `cargo test`. One implementation means one place to harden.
     fn free_port() -> u16 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-        let port = probe.local_addr().expect("local_addr").port();
-        drop(probe);
-        port
+        nextgcore_sbi::test_support::free_port()
     }
 
     /// Start a capture server on an ephemeral port; returns (server, port, rx)

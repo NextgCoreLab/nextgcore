@@ -2941,10 +2941,7 @@ mod tests {
     async fn test_http_lifecycle_register_discover_patch_deregister() {
         use serde_json::json;
 
-        // Ephemeral port: bind a probe listener, reuse its address.
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
-        let addr = probe.local_addr().expect("probe addr");
-        drop(probe);
+        let addr = nextgcore_sbi::test_support::ephemeral_addr();
 
         let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
         server

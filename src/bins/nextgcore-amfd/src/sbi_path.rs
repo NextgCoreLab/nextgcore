@@ -1912,11 +1912,9 @@ mod tests {
     // UeACRequestData and maps 204 / 200-acuFailureList / 403, degrade-open.
     // ------------------------------------------------------------------
 
+    /// Reserve a loopback port for the NSACF stub server.
     fn nsacf_free_port() -> u16 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
-        port
+        nextgcore_sbi::test_support::free_port()
     }
 
     /// Stub NSACF: validates the nested UeACRequestData shape (TS 29.536), then

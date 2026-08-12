@@ -7182,9 +7182,7 @@ mod tests {
     ) {
         use nextgcore_sbi::message::{SbiRequest, SbiResponse};
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-        let port = probe.local_addr().expect("local_addr").port();
-        drop(probe);
+        let port = nextgcore_sbi::test_support::free_port();
         let (tx, rx) = mpsc::channel(8);
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
         let server = SbiServer::new(SbiServerConfig::new(addr));

@@ -478,9 +478,7 @@ mod tests {
         let (h2_server, port) = {
             let mut started = None;
             for _ in 0..5 {
-                let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-                let port = probe.local_addr().expect("probe addr").port();
-                drop(probe);
+                let port = crate::test_support::free_port();
                 let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
                     [127, 0, 0, 1],
                     port,
