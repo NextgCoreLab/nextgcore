@@ -9,6 +9,11 @@
 #   nextgcore/binaries/nextgcore-*d       (17 NF binaries, 10 used here)
 #   nextgsim/docker/binaries/nr-gnb,nr-ue
 #
+# Images are tagged by the git SHA of the repository they are built from, not
+# :latest. See lib/image-tag.sh for why a mutable tag makes the deploy a silent
+# no-op. IMAGE_TAG still overrides, for a release tag or to reproduce an old
+# deploy.
+#
 # Usage:
 #   ./build-and-push.sh                        # infer registry from STS
 #   REGISTRY=<acct>.dkr.ecr.<region>.amazonaws.com ./build-and-push.sh
@@ -19,9 +24,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SIM_DIR="$(cd "${CORE_DIR}/../nextgsim" && pwd)"
 
+# shellcheck source=lib/image-tag.sh
+source "${SCRIPT_DIR}/lib/image-tag.sh"
+
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
 REPO_PREFIX="${REPO_PREFIX:-nextg}"
-IMAGE_TAG="${IMAGE_TAG:-latest}"
 
 # NF -> binary name. The image name is the short NF name; the binary is the
 # daemon name. Dockerfile.nf symlinks it to /usr/local/bin/nf-binary.
@@ -41,6 +48,31 @@ CORE_NFS=(
 log()  { printf '\033[0;32m[build]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn ]\033[0m %s\n' "$*"; }
 die()  { printf '\033[0;31m[fail ]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- image tags ------------------------------------------------------------
+
+# Two repositories, two tags: the core NFs are built from nextgcore and the
+# gnb/ue from the sibling nextgsim, which sits at its own commit. Tagging both
+# groups with one SHA would label an image with a commit that does not describe
+# it. An explicit IMAGE_TAG overrides both.
+if [[ -n "${IMAGE_TAG:-}" ]]; then
+  CORE_TAG="${IMAGE_TAG}"
+  SIM_TAG="${IMAGE_TAG}"
+  if [[ "${IMAGE_TAG}" == "latest" ]]; then
+    warn "IMAGE_TAG=latest is MUTABLE: deploy-eks.sh's kubectl apply becomes a"
+    warn "no-op because the Deployment spec text never changes, so pods keep"
+    warn "running the old image while the deploy reports success."
+  fi
+else
+  CORE_TAG="$(nextg_image_tag "${CORE_DIR}")" || die "cannot derive nextgcore image tag"
+  SIM_TAG="$(nextg_image_tag "${SIM_DIR}")"   || die "cannot derive nextgsim image tag"
+fi
+
+for repo_tag in "nextgcore:${CORE_TAG}" "nextgsim:${SIM_TAG}"; do
+  if [[ "${repo_tag#*:}" == *-dirty ]]; then
+    warn "${repo_tag%%:*} tree is dirty; tagging ${repo_tag#*:} (not reproducible from the SHA)"
+  fi
+done
 
 # --- preflight -------------------------------------------------------------
 
@@ -111,7 +143,7 @@ docker build \
 for entry in "${CORE_NFS[@]}"; do
   nf="${entry%%:*}"
   bin="${entry#*:}"
-  remote="${REGISTRY}/${REPO_PREFIX}/${nf}:${IMAGE_TAG}"
+  remote="${REGISTRY}/${REPO_PREFIX}/${nf}:${CORE_TAG}"
 
   ensure_repo "${nf}"
   log "building ${nf} (${bin})"
@@ -133,7 +165,7 @@ done
 for pair in "gnb:Dockerfile.gnb-local" "ue:Dockerfile.ue-local"; do
   node="${pair%%:*}"
   dockerfile="${pair#*:}"
-  remote="${REGISTRY}/${REPO_PREFIX}/${node}:${IMAGE_TAG}"
+  remote="${REGISTRY}/${REPO_PREFIX}/${node}:${SIM_TAG}"
 
   ensure_repo "${node}"
   log "building ${node}"
@@ -156,11 +188,14 @@ cat <<EOF
 
 All 12 images pushed.
 
-  registry: ${REGISTRY}
-  prefix:   ${REPO_PREFIX}
-  tag:      ${IMAGE_TAG}
+  registry:      ${REGISTRY}
+  prefix:        ${REPO_PREFIX}
+  core NF tag:   ${CORE_TAG}
+  gnb/ue tag:    ${SIM_TAG}
 
-Next:
-  REGISTRY=${REGISTRY} REPO_PREFIX=${REPO_PREFIX} IMAGE_TAG=${IMAGE_TAG} \\
-    ./deploy-eks.sh
+Next (deploy-eks.sh derives the SAME tags from the same two repos, so it needs
+no tag argument -- commit either repo in between and it will fail fast on a
+missing ECR tag rather than deploying a stale image):
+
+  REGISTRY=${REGISTRY} REPO_PREFIX=${REPO_PREFIX} ./deploy-eks.sh
 EOF
