@@ -398,6 +398,26 @@ impl DiameterClient {
     /// message carries zero values; answers are matched on Hop-by-Hop ID.
     /// Peer-initiated requests received while waiting (e.g. S6a CLR/IDR) are
     /// queued and can be drained with [`DiameterClient::recv_inbound_request`].
+    ///
+    /// # Timeout
+    ///
+    /// Gives up after `config.request_timeout` seconds with
+    /// [`DiameterError::RequestTimeout`]. This loop previously had no bound at
+    /// all. It did handle `Disconnected`, so a peer that drops the TCP
+    /// connection unblocks it -- but a peer that stays CONNECTED and simply never
+    /// answers does not, and neither does one that keeps answering watchdogs
+    /// while dropping application requests (`WatchdogAck` hits `continue`).
+    /// Either case parked the caller forever.
+    ///
+    /// That is what makes it more than a hung request: `nextgcore-mmed` holds a
+    /// process-global mutex across this call, so one unanswered AIR/ULR/PUR
+    /// wedges the MME's entire S6a plane -- every subscriber's authentication,
+    /// not just the one that stalled. Bounding the wait here contains that;
+    /// removing the lock is tracked separately.
+    ///
+    /// The deadline covers the whole exchange rather than being reset per event,
+    /// so a peer streaming watchdogs or unmatched answers cannot extend it
+    /// indefinitely.
     pub async fn send_request(&mut self, msg: &DiameterMessage) -> DiameterResult<DiameterMessage> {
         let mut request = msg.clone();
         if request.header.hop_by_hop_id == 0 {
@@ -407,6 +427,8 @@ impl DiameterClient {
             request.header.end_to_end_id = self.next_end_to_end();
         }
         let hop_by_hop_id = request.header.hop_by_hop_id;
+        let command = request.header.command_code;
+        let timeout = Duration::from_secs(self.config.request_timeout as u64);
 
         let peer = self
             .peer
@@ -415,9 +437,32 @@ impl DiameterClient {
 
         peer.send_message(&request).await?;
 
+        // Deadline is computed AFTER the send so a slow write does not eat into
+        // the answer window.
+        let deadline = tokio::time::Instant::now() + timeout;
+
         // Wait for the answer (handle any watchdog messages in between)
         loop {
-            match peer.next_event().await? {
+            let event = match tokio::time::timeout_at(deadline, peer.next_event()).await {
+                Ok(ev) => ev?,
+                Err(_) => {
+                    // The connection is left OPEN: a timeout is a stalled
+                    // procedure, not necessarily a broken peer, and the watchdog
+                    // (RFC 3539) owns the decision to tear a peer down. Tearing
+                    // it down here would turn one slow subscriber lookup into a
+                    // reconnect storm.
+                    log::warn!(
+                        "Diameter request (command {command}, hop-by-hop {hop_by_hop_id}) \
+                         timed out after {}s with no answer",
+                        timeout.as_secs()
+                    );
+                    return Err(DiameterError::RequestTimeout {
+                        command,
+                        seconds: timeout.as_secs(),
+                    });
+                }
+            };
+            match event {
                 PeerEvent::Message(answer) => {
                     if answer.header.is_answer() && answer.header.hop_by_hop_id == hop_by_hop_id {
                         return Ok(answer);
@@ -982,6 +1027,158 @@ impl SctpDiameterListener {
             std::io::ErrorKind::Unsupported,
             "SCTP support not yet implemented",
         )))
+    }
+}
+
+#[cfg(test)]
+mod request_timeout_tests {
+    //! `send_request` must not wait forever for an answer.
+    //!
+    //! Both tests use a peer that stays CONNECTED, because the pre-fix loop did
+    //! already handle `Disconnected` -- a peer that drops the socket was never
+    //! the hang. The hang needed a peer that completes CER/CEA and then either
+    //! goes silent or answers only watchdogs, which is what these reproduce.
+    use super::*;
+    use crate::avp::{Avp, AvpData};
+    use crate::config::DiameterConfig;
+    use crate::message::DiameterMessage;
+
+    /// Short window so the test is fast; the production default is 30s.
+    const TEST_TIMEOUT_SECS: u32 = 1;
+
+    fn client_config() -> DiameterConfig {
+        DiameterConfig {
+            diameter_id: "mme.example.com".to_string(),
+            diameter_realm: "example.com".to_string(),
+            request_timeout: TEST_TIMEOUT_SECS,
+            ..Default::default()
+        }
+    }
+
+    fn server_config() -> DiameterConfig {
+        DiameterConfig {
+            diameter_id: "hss.example.com".to_string(),
+            diameter_realm: "example.com".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A peer that answers CER then never answers the application request must
+    /// produce RequestTimeout rather than parking the caller forever.
+    #[tokio::test]
+    async fn silent_peer_yields_request_timeout() {
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let cfg = server_config();
+        let server = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = crate::peer::DiameterPeer::new_responder(transport, &cfg);
+            peer.start().await.unwrap();
+            let _cer = peer.next_event().await.unwrap();
+            // Receive the AIR and deliberately send NOTHING back, while holding
+            // the connection open so the client cannot escape via Disconnected.
+            let _air = peer.next_event().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut client = DiameterClient::new(client_config(), listen_addr);
+        client.connect().await.unwrap();
+
+        let air = DiameterMessage::new_request(318, 16777251);
+        let result = client.send_request(&air).await;
+
+        match result {
+            Err(DiameterError::RequestTimeout { command, seconds }) => {
+                assert_eq!(command, 318, "the stalled command is named");
+                assert_eq!(seconds, u64::from(TEST_TIMEOUT_SECS));
+            }
+            other => panic!("expected RequestTimeout, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    /// A peer that keeps the watchdog alive but never answers the request must
+    /// also time out. This is the case the `PeerEvent::WatchdogAck => continue`
+    /// arm would otherwise let run indefinitely, and it is why the deadline
+    /// spans the whole exchange instead of being reset per event.
+    #[tokio::test]
+    async fn watchdog_traffic_does_not_extend_the_deadline() {
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let cfg = server_config();
+        let server = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = crate::peer::DiameterPeer::new_responder(transport, &cfg);
+            peer.start().await.unwrap();
+            let _cer = peer.next_event().await.unwrap();
+            let _air = peer.next_event().await.unwrap();
+            // Never answer the AIR, but keep sending watchdogs so the client
+            // sees a steady stream of events it is designed to skip.
+            loop {
+                if peer.send_watchdog().await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        let mut client = DiameterClient::new(client_config(), listen_addr);
+        client.connect().await.unwrap();
+
+        let air = DiameterMessage::new_request(318, 16777251);
+        let started = tokio::time::Instant::now();
+        let result = client.send_request(&air).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(DiameterError::RequestTimeout { .. })),
+            "expected RequestTimeout, got {result:?}"
+        );
+        // Generous upper bound: the point is that it is BOUNDED, not that the
+        // timer is precise under a loaded test runner.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "watchdog traffic extended the deadline: {elapsed:?}"
+        );
+        server.abort();
+    }
+
+    /// The timeout must not break the normal path: a peer that answers promptly
+    /// still gets its answer matched on Hop-by-Hop ID.
+    #[tokio::test]
+    async fn answering_peer_still_succeeds() {
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let cfg = server_config();
+        let server = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = crate::peer::DiameterPeer::new_responder(transport, &cfg);
+            peer.start().await.unwrap();
+            let _cer = peer.next_event().await.unwrap();
+            if let PeerEvent::Message(msg) = peer.next_event().await.unwrap() {
+                let mut answer = DiameterMessage::new_answer(&msg);
+                answer.add_avp(Avp::mandatory(268, AvpData::Unsigned32(2001)));
+                peer.send_message(&answer).await.unwrap();
+            }
+        });
+
+        let mut client = DiameterClient::new(client_config(), listen_addr);
+        client.connect().await.unwrap();
+
+        let air = DiameterMessage::new_request(318, 16777251);
+        let answer = client.send_request(&air).await.expect("answer expected");
+        assert!(answer.header.is_answer());
+        assert_eq!(answer.result_code(), Some(2001));
+        server.abort();
     }
 }
 

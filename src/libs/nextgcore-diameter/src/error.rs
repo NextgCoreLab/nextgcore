@@ -29,6 +29,16 @@ pub enum DiameterError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// No answer arrived for a request within the configured window.
+    ///
+    /// Distinct from [`DiameterError::Protocol`] on purpose: a timeout says
+    /// nothing about the peer being wrong, and a caller may reasonably retry it
+    /// or fail the one subscriber procedure, whereas a protocol error means the
+    /// exchange itself is broken. Carries the command code so a log line
+    /// identifies which procedure stalled.
+    #[error("No answer for request (command {command}) within {seconds}s")]
+    RequestTimeout { command: u32, seconds: u64 },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

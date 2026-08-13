@@ -584,13 +584,39 @@ impl Default for PeerTable {
     }
 }
 
-/// Generate an Origin-State-Id (seconds since process start, simplified)
+/// This node's Origin-State-Id: constant for the lifetime of the process,
+/// advancing only across a restart (RFC 6733 §8.16).
+///
+/// # Why this is latched rather than computed per call
+///
+/// This used to return `SystemTime::now().as_secs()` on every call, so the
+/// advertised value increased once per second. Origin-State-Id is how a peer
+/// detects that a node has RESTARTED and its session state is therefore gone:
+/// a value that keeps climbing tells every peer this node is perpetually
+/// rebooting. A conformant HSS/PCRF/DRA is entitled to discard the sessions it
+/// holds for us each time it sees a higher value, so the bug is not cosmetic --
+/// it invites peers to drop live state, and it does so more often the longer the
+/// connection lives (CER, CEA, DWR and DWA all carry the value, and the watchdog
+/// re-sends it periodically).
+///
+/// Seeding from the wall clock at first use is deliberate and matches the RFC's
+/// suggestion: it must increase monotonically ACROSS restarts, so it cannot be a
+/// fixed constant or a counter that starts at zero. A restart within the same
+/// second reuses the value, which is acceptable -- the RFC only requires that it
+/// not decrease, and one second of ambiguity after a crash-restart is a far
+/// smaller problem than announcing a reboot every second.
+static ORIGIN_STATE_ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// This node's Origin-State-Id (RFC 6733 §8.16). Stable for the process
+/// lifetime; see [`ORIGIN_STATE_ID`].
 fn origin_state_id() -> u32 {
-    use std::time::SystemTime;
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
+    *ORIGIN_STATE_ID.get_or_init(|| {
+        use std::time::SystemTime;
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0)
+    })
 }
 
 /// Generate a pseudo-random u32 for sequence initialization
@@ -616,6 +642,42 @@ mod tests {
             diameter_realm: realm.to_string(),
             timer_tc: 30,
             ..Default::default()
+        }
+    }
+
+    /// Origin-State-Id must be CONSTANT while the process runs (RFC 6733 §8.16):
+    /// it is how a peer detects a genuine restart. It previously returned
+    /// `SystemTime::now().as_secs()` per call, so it advanced every second and
+    /// told every peer this node was perpetually rebooting -- inviting a
+    /// conformant peer to discard our live session state repeatedly.
+    ///
+    /// Sleeping past a second boundary is what makes this a real regression
+    /// test: the old implementation returned a different value here, the latched
+    /// one cannot.
+    #[test]
+    fn origin_state_id_is_stable_across_a_second_boundary() {
+        let first = origin_state_id();
+        assert_ne!(first, 0, "a zero state id would mean the clock read failed");
+
+        // Comfortably longer than one second, since the old code changed value
+        // on each wall-clock second tick.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+        assert_eq!(
+            origin_state_id(),
+            first,
+            "Origin-State-Id changed while the process kept running"
+        );
+    }
+
+    /// Every call site (CER, CEA, DWR, DWA) must see the same value; a peer that
+    /// compares the CER's id against a later DWR's would otherwise conclude the
+    /// node restarted mid-connection.
+    #[test]
+    fn origin_state_id_is_identical_across_repeated_reads() {
+        let baseline = origin_state_id();
+        for _ in 0..1000 {
+            assert_eq!(origin_state_id(), baseline);
         }
     }
 
