@@ -21,6 +21,18 @@ pub struct DiameterConfig {
     /// Default Tc timer value
     pub timer_tc: u32,
 
+    /// How long to wait for an answer to a request, in seconds, before giving
+    /// up (`DiameterError::RequestTimeout`).
+    ///
+    /// Separate from `timer_tc`, which governs reconnection: an answer can be
+    /// outstanding on a connection that is perfectly healthy at the transport
+    /// level, which is exactly the case an unbounded wait cannot escape.
+    ///
+    /// 30s follows the RFC 6733 §12 guidance for Tw and is longer than any
+    /// interactive EPC procedure; a request still outstanding at that point is
+    /// not going to be answered.
+    pub request_timeout: u32,
+
     /// Configuration flags
     pub flags: DiameterConfigFlags,
 
@@ -43,6 +55,7 @@ impl Default for DiameterConfig {
             port: crate::DIAMETER_PORT,
             port_tls: crate::DIAMETER_TLS_PORT,
             timer_tc: 30,
+            request_timeout: 30,
             flags: DiameterConfigFlags::default(),
             extensions: Vec::new(),
             connections: Vec::new(),
