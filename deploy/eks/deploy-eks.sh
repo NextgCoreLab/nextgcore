@@ -14,11 +14,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+SIM_DIR="$(cd "${CORE_DIR}/../nextgsim" && pwd)"
 NAMESPACE="nextg-system"
+
+# shellcheck source=lib/image-tag.sh
+source "${SCRIPT_DIR}/lib/image-tag.sh"
 
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
 REPO_PREFIX="${REPO_PREFIX:-nextg}"
-IMAGE_TAG="${IMAGE_TAG:-latest}"
 ENABLE_DATAPLANE="${ENABLE_DATAPLANE:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 # Swap MongoDB's gp3 PVC for an emptyDir. Needed on clusters without the EBS
@@ -31,6 +34,24 @@ EPHEMERAL_STORAGE="${EPHEMERAL_STORAGE:-false}"
 log()  { printf '\033[0;32m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn  ]\033[0m %s\n' "$*"; }
 die()  { printf '\033[0;31m[fail  ]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- image tags ------------------------------------------------------------
+
+# Derived from the same two repositories build-and-push.sh reads, so the tags
+# match without either script passing anything to the other. IMAGE_TAG still
+# overrides (both groups), for a release tag or to redeploy an older build.
+if [[ -n "${IMAGE_TAG:-}" ]]; then
+  CORE_TAG="${IMAGE_TAG}"
+  SIM_TAG="${IMAGE_TAG}"
+  if [[ "${IMAGE_TAG}" == "latest" ]]; then
+    warn "IMAGE_TAG=latest is MUTABLE: the kubectl apply below cannot detect a"
+    warn "new image, so pods keep the old one and the rollout waits pass"
+    warn "trivially against stale pods. Prefer the default SHA tags."
+  fi
+else
+  CORE_TAG="$(nextg_image_tag "${CORE_DIR}")" || die "cannot derive nextgcore image tag"
+  SIM_TAG="$(nextg_image_tag "${SIM_DIR}")"   || die "cannot derive nextgsim image tag"
+fi
 
 # --- preflight -------------------------------------------------------------
 
@@ -52,7 +73,8 @@ if [[ "${DRY_RUN}" != "true" ]]; then
   target cluster : ${CTX}
   namespace      : ${NAMESPACE}
   registry       : ${REGISTRY}/${REPO_PREFIX}
-  tag            : ${IMAGE_TAG}
+  core NF tag    : ${CORE_TAG}
+  gnb/ue tag     : ${SIM_TAG}
   data plane     : ${ENABLE_DATAPLANE}
   mongo storage  : $([[ "${EPHEMERAL_STORAGE}" == "true" ]] && echo "emptyDir (EPHEMERAL - data lost on restart)" || echo "gp3 PVC")
 
@@ -292,20 +314,33 @@ fi
 # nextgcore-rust/<nf>:latest and nextgsim-<node>:latest, which do not exist on
 # EKS - without this every pod ends in ErrImagePull.
 log "rewriting image references to ${REGISTRY}/${REPO_PREFIX}..."
-python3 - "${RENDERED}" "${REGISTRY}" "${REPO_PREFIX}" "${IMAGE_TAG}" <<'PY'
+python3 - "${RENDERED}" "${REGISTRY}" "${REPO_PREFIX}" "${CORE_TAG}" "${SIM_TAG}" <<'PY'
 import re, sys
-path, registry, prefix, tag = sys.argv[1:5]
+path, registry, prefix, core_tag, sim_tag = sys.argv[1:6]
 src = open(path).read()
+# Two tags, because the core NFs and the simulator come from different
+# repositories at different commits (see lib/image-tag.sh).
 src, n1 = re.subn(r'nextgcore-rust/([a-z0-9]+):latest',
-                  rf'{registry}/{prefix}/\1:{tag}', src)
+                  rf'{registry}/{prefix}/\1:{core_tag}', src)
 src, n2 = re.subn(r'\bnextgsim-(gnb|ue):latest',
-                  rf'{registry}/{prefix}/\1:{tag}', src)
-# imagePullPolicy IfNotPresent is right for Kind (images side-loaded); on EKS
-# it means a :latest tag is never refreshed after the first pull.
+                  rf'{registry}/{prefix}/\1:{sim_tag}', src)
+# imagePullPolicy IfNotPresent is right for Kind (images side-loaded). On EKS an
+# immutable SHA tag makes the choice moot for correctness -- a changed tag is a
+# changed spec, so the pod is recreated and pulled regardless -- but Always is
+# kept as defence in depth for an explicit IMAGE_TAG that is mutable.
 src, n3 = re.subn(r'imagePullPolicy: IfNotPresent',
                   'imagePullPolicy: Always', src)
 open(path, 'w').write(src)
-print(f'  {n1} core NF images, {n2} simulator images, {n3} pull policies')
+print(f'  {n1} core NF images @ {core_tag}, {n2} simulator images @ {sim_tag}, '
+      f'{n3} pull policies')
+# A Kind-local image name left anywhere means a rewrite pattern missed, which on
+# EKS is an ErrImagePull. Match on the SOURCE names rather than on a ':latest'
+# suffix: IMAGE_TAG=latest is a supported (if discouraged) override, so a
+# ':latest' that carries the registry prefix has been rewritten correctly and
+# must not fail here.
+missed = sorted(set(re.findall(r'image:\s*(nextgcore-rust/\S+|nextgsim-\S+)', src)))
+if missed:
+    sys.exit('image rewrite missed: ' + ', '.join(missed))
 PY
 
 if [[ "${DRY_RUN}" == "true" ]]; then
@@ -445,6 +480,88 @@ kubectl rollout status deployment/gnb -n "${NAMESPACE}" --timeout=300s \
 log "waiting for the UE..."
 kubectl rollout status deployment/ue -n "${NAMESPACE}" --timeout=300s \
   || warn "UE not ready - check the resolve-dns initContainer logs"
+
+# --- verify the running pods carry the images we just deployed --------------
+#
+# `kubectl rollout status` alone cannot establish this. With a mutable tag the
+# apply is a no-op, no new ReplicaSet is written, and the rollout wait then
+# passes TRIVIALLY against the pods that were already Running -- reporting
+# success for a deploy that changed nothing. SHA tags make that far less likely
+# (a changed tag is a changed spec), but "less likely" is not a check, and an
+# explicit IMAGE_TAG can still be mutable.
+#
+# So assert it directly: every running container's image must be the image the
+# rendered manifests asked for. Compared by spec image reference rather than by
+# resolved digest, because a digest comparison needs an ECR round trip per image
+# and answers a different question -- what we care about here is that no pod is
+# still running a spec we replaced.
+log "verifying running pods match the deployed image tags..."
+PODS_JSON="${RENDERED}.pods.json"
+trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${PODS_JSON}"' EXIT
+if kubectl get pods -n "${NAMESPACE}" -o json > "${PODS_JSON}" 2>/dev/null; then
+  # Both inputs are passed as FILES: a heredoc on stdin would override a pipe
+  # (shellcheck SC2259), silently handing the script no pod data at all.
+  python3 - "${RENDERED}" "${PODS_JSON}" <<'PY' || die "image verification failed"
+import json, re, sys, yaml
+
+rendered, pods_json = sys.argv[1], sys.argv[2]
+
+# Wanted image per (kind-owner) container name, taken from the manifests just
+# applied. Keyed by container name because that is what a pod status reports.
+wanted = {}
+for d in yaml.safe_load_all(open(rendered)):
+    if not d or d.get('kind') not in ('Deployment', 'StatefulSet', 'Job'):
+        continue
+    for c in d['spec']['template']['spec'].get('containers', []):
+        wanted.setdefault(c['name'], set()).add(c['image'])
+
+pods = json.load(open(pods_json))
+mismatched, checked = [], 0
+for p in pods.get('items', []):
+    phase = p.get('status', {}).get('phase')
+    if phase not in ('Running', 'Succeeded'):
+        continue
+    pod_name = p['metadata']['name']
+    for cs in p.get('status', {}).get('containerStatuses', []):
+        want = wanted.get(cs['name'])
+        if not want:
+            continue          # not one of ours (sidecar, or renamed)
+        checked += 1
+        # `image` in a pod status is the spec reference as resolved by kubelet;
+        # it can gain a docker.io/ prefix or lose an implicit :latest, so compare
+        # on a normalised suffix rather than requiring string equality.
+        got = cs['image']
+        def norm(ref):
+            ref = re.sub(r'^docker\.io/(library/)?', '', ref)
+            return ref if ':' in ref.rsplit('/', 1)[-1] else ref + ':latest'
+        if norm(got) not in {norm(w) for w in want}:
+            mismatched.append(f'{pod_name}/{cs["name"]}: running {got}, '
+                              f'expected {" or ".join(sorted(want))}')
+
+if mismatched:
+    print('pods are NOT running the images just deployed:', file=sys.stderr)
+    for m in mismatched:
+        print(f'  {m}', file=sys.stderr)
+    print('\nThis is the stale-image failure mode: the apply did not replace '
+          'these pods.\nForce it bottom-up, then re-run this script:\n'
+          '  kubectl rollout restart -n <ns> deploy/udr deploy/udm deploy/ausf '
+          'deploy/pcf deploy/nssf deploy/bsf\n'
+          '  kubectl rollout restart -n <ns> deploy/upf deploy/smf deploy/amf '
+          'deploy/gnb deploy/ue', file=sys.stderr)
+    sys.exit(1)
+
+if not checked:
+    # Not a hard failure: an earlier rollout warn already covered the
+    # not-ready case. But "0 checked" must not read like a clean bill of
+    # health, which a bare success line would.
+    print('  WARNING: no running containers matched a deployed container name, '
+          'so nothing was verified', file=sys.stderr)
+else:
+    print(f'  {checked} running containers all match the deployed image tags')
+PY
+else
+  warn "could not list pods; skipped image verification"
+fi
 
 # --- summary ---------------------------------------------------------------
 

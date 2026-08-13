@@ -3,6 +3,7 @@
 //! Port of src/hss/hss-context.c - HSS context with IMSI/IMPI/IMPU hash tables,
 //! DB operations, and CX identity management
 
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -587,17 +588,351 @@ pub fn hss_context_final() {
     }
 }
 
-/// Parse HSS configuration from YAML
-pub fn hss_context_parse_config(_config_path: &str) -> Result<(), String> {
-    // Note: Implement YAML configuration parsing
-    // This would parse the hss section from the config file
-    // Configuration parsing uses the serde_yaml crate for YAML deserialization
+// ---------------------------------------------------------------------------
+// YAML configuration (`hss:` section)
+// ---------------------------------------------------------------------------
+
+/// One `hss.diameter.connections[]` peer entry.
+#[derive(Debug, Default, Deserialize)]
+pub struct DiamConnectionYaml {
+    pub identity: Option<String>,
+    pub addr: Option<String>,
+    pub port: Option<u16>,
+    /// Per-peer Tc override, seconds. Absent means "use the node-level Tc",
+    /// which `DiamConnection` represents as 0.
+    pub timer_tc: Option<i32>,
+}
+
+/// The `hss.diameter` block: this node's Diameter identity and listener.
+///
+/// Field names mirror the freeDiameter vocabulary the deployment already uses
+/// (`Identity`, `Realm`, `ListenOn`, `Port`) in snake_case, so an operator
+/// translating an existing `hss.conf` does not have to learn new names.
+#[derive(Debug, Default, Deserialize)]
+pub struct DiameterYaml {
+    /// Origin-Host (RFC 6733 §6.3) — this node's Diameter identity.
+    pub identity: Option<String>,
+    /// Origin-Realm (RFC 6733 §6.4). TS 23.003 §19.2 formats the EPC home
+    /// realm as `epc.mncNNN.mccMMM.3gppnetwork.org`.
+    pub realm: Option<String>,
+    /// Listen address for the S6a server.
+    pub addr: Option<String>,
+    pub port: Option<u16>,
+    pub port_tls: Option<u16>,
+    /// Tc timer, seconds (RFC 6733 §12).
+    pub timer_tc: Option<i32>,
+    pub no_fwd: Option<bool>,
+    pub connections: Option<Vec<DiamConnectionYaml>>,
+}
+
+/// The `hss:` section. Only the keys this daemon acts on are declared; unknown
+/// keys are ignored rather than rejected, because the shipped configs carry
+/// `freeDiameter:` and `metrics:` keys owned by other subsystems.
+#[derive(Debug, Default, Deserialize)]
+pub struct HssSectionYaml {
+    pub diameter: Option<DiameterYaml>,
+    /// Path to a freeDiameter-style config. Recorded in `diam_conf_path` so a
+    /// deployment can be diagnosed; this daemon does not parse that format.
+    #[serde(rename = "freeDiameter")]
+    pub free_diameter: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct HssYaml {
+    pub hss: Option<HssSectionYaml>,
+}
+
+/// Parse HSS configuration from YAML and apply it to the global context.
+///
+/// # Why this exists
+///
+/// This function used to `return Ok(())` without reading the file, while
+/// `main()` logged "Loading configuration from <file>". Because hssd exposes no
+/// `--diameter-id`/`--diameter-realm` CLI flag either, the daemon was
+/// hard-locked to the `unwrap_or_else` fallbacks in `main.rs`
+/// (`hss.epc.mnc001.mcc001.3gppnetwork.org` / `epc.mnc001.mcc001...`). RFC 6733
+/// §6.1 routes and authorizes requests on Destination-Realm matched against the
+/// receiver's Origin-Realm, so an HSS on any real PLMN could not be reached:
+/// there was no runtime workaround at all.
+///
+/// # Errors
+///
+/// Returns `Err` when the file cannot be read or is not valid YAML. This
+/// deliberately FAILS rather than warning and continuing, unlike the lenient
+/// `if let Ok(..)` pattern the 5GC NFs use for their optional SBI knobs: here a
+/// silently-ignored config does not degrade one feature, it silently reverts the
+/// node's identity to a different PLMN, which is far worse to diagnose than a
+/// refusal to start. `main()` is responsible for exiting non-zero.
+///
+/// A file that parses but carries no `hss.diameter` block is NOT an error: the
+/// shipped `docker/rust/configs/epc/hss.yaml` is exactly that, and it must keep
+/// working. Absent keys leave the existing defaults untouched.
+pub fn hss_context_parse_config(config_path: &str) -> Result<(), String> {
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("cannot read {config_path}: {e}"))?;
+
+    let parsed: HssYaml = serde_yaml::from_str(&content)
+        .map_err(|e| format!("invalid YAML in {config_path}: {e}"))?;
+
+    let Some(section) = parsed.hss else {
+        log::debug!("{config_path}: no 'hss' section; keeping defaults");
+        return Ok(());
+    };
+
+    let ctx = hss_self();
+    let mut ctx = ctx
+        .write()
+        .map_err(|_| "HSS context lock poisoned".to_string())?;
+
+    if let Some(path) = section.free_diameter {
+        ctx.diam_conf_path = Some(path);
+    }
+
+    let Some(diam) = section.diameter else {
+        log::debug!("{config_path}: no 'hss.diameter' block; keeping defaults");
+        return Ok(());
+    };
+
+    apply_diameter_yaml(&mut ctx.diam_config, diam);
+    log::info!(
+        "HSS Diameter identity: {} realm: {} listen: {}:{}",
+        ctx.diam_config.cnf_diamid.as_deref().unwrap_or("<default>"),
+        ctx.diam_config
+            .cnf_diamrlm
+            .as_deref()
+            .unwrap_or("<default>"),
+        ctx.diam_config.cnf_addr.as_deref().unwrap_or("<default>"),
+        ctx.diam_config.cnf_port,
+    );
     Ok(())
+}
+
+/// Copy the parsed `diameter` block onto a [`DiamConfig`].
+///
+/// Absent keys are left at their existing value rather than being zeroed, so a
+/// partial config cannot clear `cnf_port` (which `main.rs` reads as "unset" and
+/// replaces with 3868) or reduce `cnf_timer_tc` below its `.max(1)` floor.
+/// Shared with the unit tests so the mapping is verified directly.
+pub fn apply_diameter_yaml(cfg: &mut DiamConfig, diam: DiameterYaml) {
+    if let Some(v) = diam.identity {
+        cfg.cnf_diamid = Some(v);
+    }
+    if let Some(v) = diam.realm {
+        cfg.cnf_diamrlm = Some(v);
+    }
+    if let Some(v) = diam.addr {
+        cfg.cnf_addr = Some(v);
+    }
+    if let Some(v) = diam.port {
+        cfg.cnf_port = v;
+    }
+    if let Some(v) = diam.port_tls {
+        cfg.cnf_port_tls = v;
+    }
+    if let Some(v) = diam.timer_tc {
+        cfg.cnf_timer_tc = v;
+    }
+    if let Some(v) = diam.no_fwd {
+        cfg.cnf_flags_no_fwd = v;
+    }
+    if let Some(conns) = diam.connections {
+        cfg.connections = conns
+            .into_iter()
+            .filter_map(|c| {
+                // An entry with no identity cannot be routed to, so it is
+                // dropped with a warning rather than stored as an empty peer.
+                let identity = match c.identity {
+                    Some(id) => id,
+                    None => {
+                        log::warn!("hss.diameter.connections[]: entry without identity; ignored");
+                        return None;
+                    }
+                };
+                Some(DiamConnection {
+                    identity,
+                    // `addr` is a plain String here, so an omitted address
+                    // becomes empty rather than absent. Callers treat empty as
+                    // "resolve the identity by DNS", matching freeDiameter's
+                    // ConnectPeer without an explicit ConnectTo.
+                    addr: c.addr.unwrap_or_default(),
+                    port: c.port.unwrap_or(0),
+                    tc_timer: c.timer_tc.unwrap_or(0),
+                })
+            })
+            .collect();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // YAML Diameter configuration (issue #58)
+    //
+    // Asserted against `apply_diameter_yaml` / a local `DiamConfig` rather than
+    // through `hss_context_parse_config`, because that writes the PROCESS-GLOBAL
+    // context: two of these tests running in parallel would race, and the
+    // surviving value would depend on scheduling. The parse function is a thin
+    // read-file + deserialize + apply wrapper over this mapping.
+    // -----------------------------------------------------------------------
+
+    /// A realistic operator config must reach every DiamConfig field, so an HSS
+    /// on a real PLMN advertises its own Origin-Realm instead of the hardcoded
+    /// mnc001/mcc001 fallback in main.rs (RFC 6733 §6.1, TS 23.003 §19.2).
+    #[test]
+    fn diameter_yaml_populates_every_diam_config_field() {
+        let yaml = r#"
+hss:
+  diameter:
+    identity: hss.epc.mnc070.mcc310.3gppnetwork.org
+    realm: epc.mnc070.mcc310.3gppnetwork.org
+    addr: 10.0.0.5
+    port: 3869
+    port_tls: 5869
+    timer_tc: 30
+    no_fwd: true
+    connections:
+      - identity: mme.epc.mnc070.mcc310.3gppnetwork.org
+        addr: 10.0.0.6
+        port: 3868
+        timer_tc: 15
+"#;
+        let parsed: HssYaml = serde_yaml::from_str(yaml).expect("fixture must deserialize");
+        let diam = parsed
+            .hss
+            .expect("hss section")
+            .diameter
+            .expect("diameter block");
+
+        let mut cfg = DiamConfig {
+            cnf_port: 3868,
+            cnf_port_tls: 5868,
+            ..Default::default()
+        };
+        apply_diameter_yaml(&mut cfg, diam);
+
+        assert_eq!(
+            cfg.cnf_diamid.as_deref(),
+            Some("hss.epc.mnc070.mcc310.3gppnetwork.org")
+        );
+        assert_eq!(
+            cfg.cnf_diamrlm.as_deref(),
+            Some("epc.mnc070.mcc310.3gppnetwork.org")
+        );
+        assert_eq!(cfg.cnf_addr.as_deref(), Some("10.0.0.5"));
+        assert_eq!(cfg.cnf_port, 3869);
+        assert_eq!(cfg.cnf_port_tls, 5869);
+        assert_eq!(cfg.cnf_timer_tc, 30);
+        assert!(cfg.cnf_flags_no_fwd);
+        assert_eq!(cfg.connections.len(), 1);
+        assert_eq!(
+            cfg.connections[0].identity,
+            "mme.epc.mnc070.mcc310.3gppnetwork.org"
+        );
+        assert_eq!(cfg.connections[0].addr, "10.0.0.6");
+        assert_eq!(cfg.connections[0].port, 3868);
+        assert_eq!(cfg.connections[0].tc_timer, 15);
+    }
+
+    /// A partial config must not zero the fields it omits. `main.rs` reads
+    /// `cnf_port == 0` as "unset" and substitutes 3868, so clearing the port
+    /// here would silently move the listener.
+    #[test]
+    fn absent_diameter_keys_leave_existing_values_untouched() {
+        let parsed: HssYaml =
+            serde_yaml::from_str("hss:\n  diameter:\n    realm: epc.example.org\n")
+                .expect("fixture must deserialize");
+        let mut cfg = DiamConfig {
+            cnf_diamid: Some("keep.me".to_string()),
+            cnf_port: 3868,
+            cnf_port_tls: 5868,
+            cnf_timer_tc: 7,
+            ..Default::default()
+        };
+        apply_diameter_yaml(&mut cfg, parsed.hss.unwrap().diameter.unwrap());
+
+        assert_eq!(cfg.cnf_diamrlm.as_deref(), Some("epc.example.org"));
+        assert_eq!(cfg.cnf_diamid.as_deref(), Some("keep.me"), "not cleared");
+        assert_eq!(cfg.cnf_port, 3868, "not zeroed");
+        assert_eq!(cfg.cnf_port_tls, 5868, "not zeroed");
+        assert_eq!(cfg.cnf_timer_tc, 7, "not zeroed");
+    }
+
+    /// A peer with no identity cannot be routed to, so it is dropped rather than
+    /// stored as an empty-identity connection that would fail obscurely later.
+    #[test]
+    fn connection_without_identity_is_dropped() {
+        let parsed: HssYaml = serde_yaml::from_str(
+            "hss:\n  diameter:\n    connections:\n      - addr: 10.0.0.6\n      - identity: real.peer\n",
+        )
+        .expect("fixture must deserialize");
+        let mut cfg = DiamConfig::default();
+        apply_diameter_yaml(&mut cfg, parsed.hss.unwrap().diameter.unwrap());
+
+        assert_eq!(cfg.connections.len(), 1);
+        assert_eq!(cfg.connections[0].identity, "real.peer");
+        assert_eq!(
+            cfg.connections[0].addr, "",
+            "omitted addr means DNS-resolve"
+        );
+    }
+
+    /// The SHIPPED config (docker/rust/configs/epc/hss.yaml) has an `hss:`
+    /// section with no `diameter:` block, plus keys owned by other subsystems.
+    /// It must keep parsing, or this change breaks every existing deployment.
+    #[test]
+    fn shipped_config_shape_parses_and_keeps_defaults() {
+        let yaml = r#"
+db_uri: mongodb://mongodb:27017/nextgcore
+logger:
+  file:
+    path: /var/log/nextgcore/hss.log
+  level: info
+global:
+  max:
+    ue: 1024
+hss:
+  freeDiameter: /etc/freeDiameter/hss.conf
+  metrics:
+    server:
+      - address: 172.24.0.8
+        port: 9090
+"#;
+        let parsed: HssYaml = serde_yaml::from_str(yaml).expect("shipped shape must deserialize");
+        let section = parsed.hss.expect("hss section");
+        assert_eq!(
+            section.free_diameter.as_deref(),
+            Some("/etc/freeDiameter/hss.conf")
+        );
+        assert!(
+            section.diameter.is_none(),
+            "no diameter block: defaults must survive"
+        );
+    }
+
+    /// Malformed YAML must be an Err so main() can exit non-zero, rather than
+    /// warn-and-continue on a different PLMN's identity.
+    #[test]
+    fn malformed_yaml_is_an_error() {
+        let path = std::env::temp_dir().join(format!(
+            "nextgcore-hssd-bad-{}-{:?}.yaml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "hss:\n  diameter:\n    port: \"not a number\"\n").unwrap();
+        let result = hss_context_parse_config(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+        assert!(result.is_err(), "a malformed config must not be accepted");
+    }
+
+    /// An unreadable/missing path is an Err too. main() only calls this when the
+    /// file exists, so reaching here means a genuine I/O problem.
+    #[test]
+    fn unreadable_config_is_an_error() {
+        let missing = std::env::temp_dir().join("nextgcore-hssd-does-not-exist-58.yaml");
+        assert!(hss_context_parse_config(missing.to_str().unwrap()).is_err());
+    }
 
     #[test]
     fn test_hss_context_new() {
@@ -737,5 +1072,52 @@ mod tests {
 
         impu.set_server_name("sip:scscf.example.com");
         assert_eq!(impu.server_name, Some("sip:scscf.example.com".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod shipped_config_smoke {
+    //! Parses the REAL shipped config from the repo, not a fixture copy, so a
+    //! future edit to that file cannot silently break the daemon's startup path.
+    use super::*;
+
+    #[test]
+    fn repo_shipped_hss_yaml_parses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docker/rust/configs/epc/hss.yaml"
+        );
+        let content = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read shipped config {path}: {e}"));
+        let parsed: HssYaml = serde_yaml::from_str(&content).expect("shipped hss.yaml must parse");
+        let section = parsed.hss.expect("hss section");
+        assert!(section.free_diameter.is_some());
+        // The diameter block ships commented out, so defaults must survive.
+        assert!(section.diameter.is_none());
+    }
+
+    /// Uncommenting the documented block must actually take effect -- otherwise
+    /// the comment in the shipped file is advice that does not work.
+    #[test]
+    fn documented_diameter_block_takes_effect_when_uncommented() {
+        let yaml = r#"
+hss:
+  freeDiameter: /etc/freeDiameter/hss.conf
+  diameter:
+    identity: hss.epc.mnc001.mcc001.3gppnetwork.org
+    realm: epc.mnc001.mcc001.3gppnetwork.org
+    addr: 172.24.0.8
+    port: 3868
+"#;
+        let parsed: HssYaml = serde_yaml::from_str(yaml).expect("must parse");
+        let diam = parsed.hss.unwrap().diameter.expect("diameter block");
+        let mut cfg = DiamConfig::default();
+        apply_diameter_yaml(&mut cfg, diam);
+        assert_eq!(
+            cfg.cnf_diamid.as_deref(),
+            Some("hss.epc.mnc001.mcc001.3gppnetwork.org")
+        );
+        assert_eq!(cfg.cnf_addr.as_deref(), Some("172.24.0.8"));
+        assert_eq!(cfg.cnf_port, 3868);
     }
 }

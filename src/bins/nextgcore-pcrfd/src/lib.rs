@@ -15,9 +15,10 @@ pub mod sm;
 
 // Re-export commonly used types
 pub use context::{
-    pcrf_context_final, pcrf_context_init, pcrf_context_parse_config, pcrf_self,
-    pcrf_sess_find_by_ipv4, pcrf_sess_find_by_ipv6, pcrf_sess_set_ipv4, pcrf_sess_set_ipv6,
-    PcrfContext, PcrfGxSession, PcrfRxSession,
+    apply_diameter_yaml, pcrf_context_final, pcrf_context_init, pcrf_context_parse_config,
+    pcrf_self, pcrf_sess_find_by_ipv4, pcrf_sess_find_by_ipv6, pcrf_sess_set_ipv4,
+    pcrf_sess_set_ipv6, DiamConfig, DiameterYaml, PcrfContext, PcrfGxSession, PcrfRxSession,
+    PcrfSectionYaml, PcrfYaml,
 };
 pub use event::{PcrfEvent, PcrfEventId};
 pub use fd_path::{

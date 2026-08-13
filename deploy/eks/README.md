@@ -15,10 +15,38 @@ deploy/eks/
 │   └── eks-cluster.yaml      VPC, EKS, node group, ECR, EBS CSI IRSA
 ├── kustomization.yaml        overlay entrypoint (patches k8s/ + nextgsim/k8s/)
 ├── patches/                  per-concern strategic-merge patches
+├── lib/image-tag.sh          git-SHA image tag, shared by both scripts
 ├── build-and-push.sh         build 12 images, push to ECR
 ├── deploy-eks.sh             apply the overlay in dependency order
 └── README.md
 ```
+
+## Images are tagged by git SHA, not `:latest`
+
+Both scripts derive the tag from `git rev-parse --short=12 HEAD` of the
+repository each image is built from — nextgcore for the 10 core NFs,
+nextgsim for `gnb`/`ue`, since those are separate repos at separate
+commits. A dirty tree appends `-dirty`. Neither script passes the tag to
+the other: both read the same two repos, so they agree by construction
+(`lib/image-tag.sh`).
+
+**Why this matters.** With a mutable `:latest`, the Deployment spec text
+is identical before and after a rebuild, so `kubectl apply` writes no new
+ReplicaSet and the running pods keep the **old** image — while the script
+exits 0, prints `Deployed.`, and its `kubectl rollout status` loop passes
+trivially against those stale pods. Observed on devtest1: the running AMF
+was `sha256:1338b825` while the freshly pushed tag was `sha256:2665d4ca`,
+so an E2E run was reporting on code that had never been deployed.
+`imagePullPolicy: Always` does not save this — with no spec change no
+container is restarted, so nothing is re-pulled.
+
+After the rollout waits, `deploy-eks.sh` additionally asserts that every
+running container's image is the one the manifests asked for, and fails
+with the bottom-up `rollout restart` command if any pod is stale. A
+rollout wait alone cannot detect this.
+
+To pin a release or redeploy an older build, set `IMAGE_TAG` on **both**
+scripts; `IMAGE_TAG=latest` still works but warns.
 
 ## Why the addressing needed real work
 
@@ -125,10 +153,10 @@ aws cloudformation deploy \
 # 2. Credentials
 aws eks update-kubeconfig --region us-west-2 --name nextg
 
-# 3. Images -> ECR
+# 3. Images -> ECR (tagged by git SHA; see below)
 ./build-and-push.sh
 
-# 4. Workload
+# 4. Workload (derives the same SHA tags, so needs no tag argument)
 ./deploy-eks.sh
 ```
 

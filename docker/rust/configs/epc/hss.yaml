@@ -15,6 +15,17 @@ global:
 
 hss:
   freeDiameter: /etc/freeDiameter/hss.conf
+  # Diameter identity for this node. Commented out so this file keeps the
+  # built-in defaults; uncomment and set your PLMN to advertise a real
+  # Origin-Host/Origin-Realm. RFC 6733 6.1 routes and authorizes on
+  # Destination-Realm, so a wrong realm breaks interop with real peers.
+  # TS 23.003 19.2 formats the EPC realm as epc.mncNNN.mccMMM.3gppnetwork.org.
+  # An explicit --diameter-id/--diameter-realm flag overrides these.
+  # diameter:
+  #   identity: hss.epc.mnc001.mcc001.3gppnetwork.org
+  #   realm: epc.mnc001.mcc001.3gppnetwork.org
+  #   addr: 172.24.0.8
+  #   port: 3868
   metrics:
     server:
       - address: 172.24.0.8
