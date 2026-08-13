@@ -472,9 +472,10 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     // hardcoded. Previously this was a literal 9 minutes while
     // `context.rs` carried `t3512_value: 3240` — 54 minutes — with no reader,
     // and `docker/rust/configs/5gc/amf.yaml` declared `time.t3512.value: 540`
-    // (9 min) which `parse_time` silently drops into its `_ => {}` arm. Three
-    // values, two of them dead, and the live one agreeing with the YAML only by
-    // coincidence.
+    // (9 min) that nothing read. Three values, two of them dead, and the live
+    // one agreeing with the YAML only by coincidence. `lib.rs`'s `load_config`
+    // now applies `amf.time.t3512.value` to the context field, so the YAML is
+    // authoritative and this call site stays the single encoder.
     //
     // A poisoned context lock falls back to the historical 9 minutes rather
     // than dropping a mandatory-for-this-message IE.
