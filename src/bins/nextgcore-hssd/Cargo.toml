@@ -25,6 +25,8 @@ tokio.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 ctrlc.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_yaml.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

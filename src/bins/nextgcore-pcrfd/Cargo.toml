@@ -25,6 +25,8 @@ clap.workspace = true
 ctrlc.workspace = true
 tokio.workspace = true
 bytes.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_yaml.workspace = true
 
 # Internal crates
 nextgcore-core = { path = "../../libs/nextgcore-core" }

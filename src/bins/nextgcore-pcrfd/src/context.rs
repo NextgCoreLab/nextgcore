@@ -3,6 +3,7 @@
 //! Port of src/pcrf/pcrf-context.c - PCRF context with IP hash tables for
 //! Gx session lookup, DB operations, and session management
 
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -533,11 +534,119 @@ pub fn pcrf_context_final() {
     }
 }
 
-/// Parse PCRF configuration from YAML
-pub fn pcrf_context_parse_config(_config_path: &str) -> Result<(), String> {
-    // Note: Implement YAML configuration parsing
-    // YAML configuration loading handled by serde_yaml with DiamConfig struct mapping
+// ---------------------------------------------------------------------------
+// YAML configuration (`pcrf:` section)
+// ---------------------------------------------------------------------------
+
+/// The `pcrf.diameter` block: this node's Diameter identity and listener.
+///
+/// Only the keys `PcrfContext`'s [`DiamConfig`] can hold are declared. It is a
+/// smaller struct than the HSS's -- no Tc timer, no forwarding flag, no peer
+/// connections -- so those keys are deliberately absent here rather than parsed
+/// and dropped, which would be the same silently-ignored-config defect this
+/// change removes.
+#[derive(Debug, Default, Deserialize)]
+pub struct DiameterYaml {
+    /// Origin-Host (RFC 6733 §6.3) — this node's Diameter identity.
+    pub identity: Option<String>,
+    /// Origin-Realm (RFC 6733 §6.4).
+    pub realm: Option<String>,
+    /// Listen address for the shared Gx + Rx listener.
+    pub addr: Option<String>,
+    pub port: Option<u16>,
+    pub port_tls: Option<u16>,
+}
+
+/// The `pcrf:` section. Unknown keys are ignored: the shipped configs carry
+/// `freeDiameter:` and `metrics:` keys owned by other subsystems.
+#[derive(Debug, Default, Deserialize)]
+pub struct PcrfSectionYaml {
+    pub diameter: Option<DiameterYaml>,
+    /// Path to a freeDiameter-style config, recorded for diagnosis only; this
+    /// daemon does not parse that format.
+    #[serde(rename = "freeDiameter")]
+    pub free_diameter: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PcrfYaml {
+    pub pcrf: Option<PcrfSectionYaml>,
+}
+
+/// Parse PCRF configuration from YAML and apply it to the global context.
+///
+/// # Why this exists
+///
+/// This function used to `return Ok(())` without reading the file, while
+/// `main()` logged "Loading configuration from <file>". The only source of the
+/// Diameter identity was therefore the CLI, whose defaults are
+/// `pcrf.localdomain` / `localdomain` -- well-formed but matching no real
+/// deployment, so Gx/Rx peers fail realm-based routing (RFC 6733 §6.1) until
+/// flags are supplied, and the config file could not fix it.
+///
+/// Unlike the HSS, pcrfd does expose `--diameter-id`/`--diameter-realm`/
+/// `--diameter-addr`, so those flags remain a valid workaround. `main()` applies
+/// YAML first and lets an EXPLICITLY-passed flag win; see its
+/// `resolve_diameter_identity`.
+///
+/// # Errors
+///
+/// Returns `Err` when the file cannot be read or is not valid YAML — a fatal
+/// condition for `main()`, deliberately not a warn-and-continue, because
+/// silently falling back to `localdomain` is much harder to diagnose than a
+/// refusal to start. A file with no `pcrf.diameter` block is not an error: the
+/// shipped `docker/rust/configs/epc/pcrf.yaml` is exactly that.
+pub fn pcrf_context_parse_config(config_path: &str) -> Result<(), String> {
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("cannot read {config_path}: {e}"))?;
+
+    let parsed: PcrfYaml = serde_yaml::from_str(&content)
+        .map_err(|e| format!("invalid YAML in {config_path}: {e}"))?;
+
+    let Some(section) = parsed.pcrf else {
+        log::debug!("{config_path}: no 'pcrf' section; keeping defaults");
+        return Ok(());
+    };
+
+    let ctx = pcrf_self();
+    let mut ctx = ctx
+        .write()
+        .map_err(|_| "PCRF context lock poisoned".to_string())?;
+
+    if let Some(path) = section.free_diameter {
+        ctx.diam_conf_path = Some(path);
+    }
+
+    let Some(diam) = section.diameter else {
+        log::debug!("{config_path}: no 'pcrf.diameter' block; keeping defaults");
+        return Ok(());
+    };
+
+    apply_diameter_yaml(&mut ctx.diam_config, diam);
     Ok(())
+}
+
+/// Copy the parsed `diameter` block onto a [`DiamConfig`].
+///
+/// Absent keys leave the existing value untouched, so a partial config cannot
+/// zero `cnf_port`. Shared with the unit tests so the mapping is verified
+/// directly rather than only through `main()`.
+pub fn apply_diameter_yaml(cfg: &mut DiamConfig, diam: DiameterYaml) {
+    if let Some(v) = diam.identity {
+        cfg.cnf_diamid = Some(v);
+    }
+    if let Some(v) = diam.realm {
+        cfg.cnf_diamrlm = Some(v);
+    }
+    if let Some(v) = diam.addr {
+        cfg.cnf_addr = Some(v);
+    }
+    if let Some(v) = diam.port {
+        cfg.cnf_port = v;
+    }
+    if let Some(v) = diam.port_tls {
+        cfg.cnf_port_tls = v;
+    }
 }
 
 /// Set IPv4 to Session-Id mapping (global function)

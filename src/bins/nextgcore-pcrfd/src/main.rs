@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_pcrfd::{
     pcrf_context_final, pcrf_context_init, pcrf_context_parse_config, pcrf_fd_final, pcrf_fd_init,
-    pcrf_fd_listen, pcrf_gx_final, pcrf_gx_init, pcrf_rx_final, pcrf_rx_init, LocalIdentity,
-    PcrfEvent, PcrfSmContext,
+    pcrf_fd_listen, pcrf_gx_final, pcrf_gx_init, pcrf_rx_final, pcrf_rx_init, pcrf_self,
+    LocalIdentity, PcrfEvent, PcrfSmContext,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -46,17 +46,22 @@ struct Args {
     #[arg(long, default_value = "/etc/nextgcore/freeDiameter/pcrf.conf")]
     diameter_config: String,
 
-    /// Diameter Origin-Host identity of this PCRF
-    #[arg(long, default_value = "pcrf.localdomain")]
-    diameter_id: String,
+    // These three are Option rather than carrying a clap default_value so that
+    // "not passed" is distinguishable from "passed the default". The precedence
+    // is CLI > YAML > built-in default (see `resolve_diameter_identity`); with a
+    // clap default the flag would always look explicit and would silently
+    // outrank every value from the config file.
+    /// Diameter Origin-Host identity of this PCRF [default: pcrf.localdomain]
+    #[arg(long)]
+    diameter_id: Option<String>,
 
-    /// Diameter Origin-Realm of this PCRF
-    #[arg(long, default_value = "localdomain")]
-    diameter_realm: String,
+    /// Diameter Origin-Realm of this PCRF [default: localdomain]
+    #[arg(long)]
+    diameter_realm: Option<String>,
 
-    /// Diameter listen address (Gx and Rx share one listener)
-    #[arg(long, default_value = "0.0.0.0:3868")]
-    diameter_addr: String,
+    /// Diameter listen address, Gx and Rx share one listener [default: 0.0.0.0:3868]
+    #[arg(long)]
+    diameter_addr: Option<String>,
 
     /// Maximum number of sessions
     #[arg(long, default_value = "1024")]
@@ -73,6 +78,61 @@ struct Args {
 
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Built-in Diameter identity, used when neither the CLI nor the config file
+/// supplies one. Preserved from the previous clap `default_value`s so a daemon
+/// started with no config and no flags behaves exactly as before.
+const DEFAULT_DIAMETER_ID: &str = "pcrf.localdomain";
+const DEFAULT_DIAMETER_REALM: &str = "localdomain";
+const DEFAULT_DIAMETER_ADDR: &str = "0.0.0.0:3868";
+
+/// Resolve the Diameter identity, realm and listen address by precedence:
+/// **CLI flag > YAML config > built-in default**.
+///
+/// Kept a pure function of its two inputs so the precedence is unit-testable
+/// without starting a daemon, binding a socket, or touching the global context.
+///
+/// The listen address is assembled from the config's separate `addr` and `port`
+/// fields, since `DiamConfig` stores them apart while the CLI takes one
+/// `host:port` string. A config that sets only `addr` still gets the default
+/// port, and one that sets only `port` still gets the default host -- neither
+/// half forces the other to be specified.
+fn resolve_diameter_identity(
+    args: &Args,
+    cfg: &nextgcore_pcrfd::DiamConfig,
+) -> (String, String, String) {
+    let id = args
+        .diameter_id
+        .clone()
+        .or_else(|| cfg.cnf_diamid.clone())
+        .unwrap_or_else(|| DEFAULT_DIAMETER_ID.to_string());
+
+    let realm = args
+        .diameter_realm
+        .clone()
+        .or_else(|| cfg.cnf_diamrlm.clone())
+        .unwrap_or_else(|| DEFAULT_DIAMETER_REALM.to_string());
+
+    let addr = args.diameter_addr.clone().unwrap_or_else(|| {
+        match (cfg.cnf_addr.as_deref(), cfg.cnf_port) {
+            (None, 0) => DEFAULT_DIAMETER_ADDR.to_string(),
+            (host, port) => {
+                // Split the default once so each half can fall back on its own.
+                let (default_host, default_port) = DEFAULT_DIAMETER_ADDR
+                    .rsplit_once(':')
+                    .expect("DEFAULT_DIAMETER_ADDR must contain a port");
+                let host = host.unwrap_or(default_host);
+                if port == 0 {
+                    format!("{host}:{default_port}")
+                } else {
+                    format!("{host}:{port}")
+                }
+            }
+        }
+    });
+
+    (id, realm, addr)
+}
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -104,12 +164,20 @@ fn main() -> Result<()> {
     pcrf_context_init(args.max_sess);
     log::info!("PCRF context initialized (max_sess={})", args.max_sess);
 
-    // Parse configuration file
+    // Parse configuration file.
+    //
+    // A present-but-unparseable config is FATAL. Previously this warned and
+    // continued, which silently left the PCRF advertising the CLI default
+    // `localdomain` realm -- Gx/Rx peers then fail realm-based routing
+    // (RFC 6733 §6.1) while the log claimed the config had been loaded.
+    //
+    // A MISSING config file stays non-fatal: the CLI defaults are a working dev
+    // configuration and existing deployments rely on them.
     if std::path::Path::new(&args.config).exists() {
-        log::info!("Loading configuration from {}", args.config);
-        if let Err(e) = pcrf_context_parse_config(&args.config) {
-            log::warn!("Failed to parse config: {e}");
-        }
+        pcrf_context_parse_config(&args.config)
+            .map_err(|e| anyhow::anyhow!("Failed to parse config {}: {e}", args.config))?;
+        // Logged AFTER the parse succeeds, so the line means what it says.
+        log::info!("Loaded configuration from {}", args.config);
     } else {
         log::debug!("Configuration file not found: {}", args.config);
     }
@@ -127,15 +195,26 @@ fn main() -> Result<()> {
     }
     log::info!("Diameter stack initialized");
 
-    // Start the Diameter listener (Gx + Rx) on a dedicated runtime thread
-    let identity = LocalIdentity {
-        host: args.diameter_id.clone(),
-        realm: args.diameter_realm.clone(),
+    // Start the Diameter listener (Gx + Rx) on a dedicated runtime thread.
+    //
+    // Precedence is CLI > YAML > built-in default, so an explicitly-passed flag
+    // remains a working override for a deployment whose config file is wrong,
+    // while the config file becomes the primary source.
+    let (diam_id, diam_realm, diam_addr) = {
+        let ctx = pcrf_self();
+        let cfg = ctx.read().map_err(|_| {
+            anyhow::anyhow!("PCRF context lock poisoned while reading Diameter config")
+        })?;
+        resolve_diameter_identity(&args, &cfg.diam_config)
     };
-    let listen_addr: std::net::SocketAddr = args
-        .diameter_addr
+    log::info!("PCRF Diameter identity: {diam_id} realm: {diam_realm} listen: {diam_addr}");
+    let identity = LocalIdentity {
+        host: diam_id,
+        realm: diam_realm,
+    };
+    let listen_addr: std::net::SocketAddr = diam_addr
         .parse()
-        .context("Invalid --diameter-addr")?;
+        .with_context(|| format!("Invalid Diameter listen address: {diam_addr}"))?;
     std::thread::Builder::new()
         .name("pcrf-diameter".to_string())
         .spawn(move || {
@@ -333,6 +412,170 @@ mod tests {
     fn test_args_kill() {
         let args = Args::parse_from(["nextgcore-pcrfd", "-k"]);
         assert!(args.kill);
+    }
+
+    // -----------------------------------------------------------------------
+    // Diameter identity precedence: CLI > YAML > built-in default (issue #58)
+    // -----------------------------------------------------------------------
+
+    /// With neither a flag nor a config value, the built-in defaults apply —
+    /// byte-identical to the clap `default_value`s these flags used to carry, so
+    /// a daemon started bare behaves exactly as before this change.
+    #[test]
+    fn identity_falls_back_to_builtin_defaults() {
+        let args = Args::parse_from(["nextgcore-pcrfd"]);
+        let cfg = nextgcore_pcrfd::DiamConfig::default();
+        let (id, realm, addr) = resolve_diameter_identity(&args, &cfg);
+        assert_eq!(id, "pcrf.localdomain");
+        assert_eq!(realm, "localdomain");
+        assert_eq!(addr, "0.0.0.0:3868");
+    }
+
+    /// With no flags, the YAML values win over the built-in defaults — the whole
+    /// point of the issue: the config file must actually take effect.
+    #[test]
+    fn yaml_values_win_over_builtin_defaults() {
+        let args = Args::parse_from(["nextgcore-pcrfd"]);
+        let cfg = nextgcore_pcrfd::DiamConfig {
+            cnf_diamid: Some("pcrf.epc.mnc070.mcc310.3gppnetwork.org".to_string()),
+            cnf_diamrlm: Some("epc.mnc070.mcc310.3gppnetwork.org".to_string()),
+            cnf_addr: Some("10.0.0.9".to_string()),
+            cnf_port: 3869,
+            cnf_port_tls: 5869,
+        };
+        let (id, realm, addr) = resolve_diameter_identity(&args, &cfg);
+        assert_eq!(id, "pcrf.epc.mnc070.mcc310.3gppnetwork.org");
+        assert_eq!(realm, "epc.mnc070.mcc310.3gppnetwork.org");
+        assert_eq!(addr, "10.0.0.9:3869");
+    }
+
+    /// An explicitly-passed flag outranks the config file, so the CLI remains a
+    /// usable override for a deployment whose config is wrong.
+    #[test]
+    fn explicit_cli_flags_override_yaml() {
+        let args = Args::parse_from([
+            "nextgcore-pcrfd",
+            "--diameter-id",
+            "cli.example.org",
+            "--diameter-realm",
+            "cli-realm.example.org",
+            "--diameter-addr",
+            "127.0.0.1:4000",
+        ]);
+        let cfg = nextgcore_pcrfd::DiamConfig {
+            cnf_diamid: Some("yaml.example.org".to_string()),
+            cnf_diamrlm: Some("yaml-realm.example.org".to_string()),
+            cnf_addr: Some("10.0.0.9".to_string()),
+            cnf_port: 3869,
+            cnf_port_tls: 5869,
+        };
+        let (id, realm, addr) = resolve_diameter_identity(&args, &cfg);
+        assert_eq!(id, "cli.example.org");
+        assert_eq!(realm, "cli-realm.example.org");
+        assert_eq!(addr, "127.0.0.1:4000");
+    }
+
+    /// Precedence is per-field: a flag for one value must not suppress the YAML
+    /// values for the others.
+    ///
+    /// Each of the three fields is driven independently here. An earlier version
+    /// of this test only passed `--diameter-realm`, which meant an inverted
+    /// precedence on `identity` alone went undetected — found by deliberately
+    /// inverting it and seeing this test still pass.
+    #[test]
+    fn cli_override_is_per_field_not_all_or_nothing() {
+        let yaml_cfg = || nextgcore_pcrfd::DiamConfig {
+            cnf_diamid: Some("yaml.example.org".to_string()),
+            cnf_diamrlm: Some("yaml-realm.example.org".to_string()),
+            cnf_addr: Some("10.0.0.9".to_string()),
+            cnf_port: 3869,
+            cnf_port_tls: 5869,
+        };
+
+        // Only --diameter-realm: realm from CLI, other two from YAML.
+        let args = Args::parse_from(["nextgcore-pcrfd", "--diameter-realm", "cli-realm.example"]);
+        let (id, realm, addr) = resolve_diameter_identity(&args, &yaml_cfg());
+        assert_eq!(realm, "cli-realm.example", "flag wins for realm");
+        assert_eq!(id, "yaml.example.org", "yaml still wins for identity");
+        assert_eq!(addr, "10.0.0.9:3869", "yaml still wins for address");
+
+        // Only --diameter-id: identity from CLI, other two from YAML.
+        let args = Args::parse_from(["nextgcore-pcrfd", "--diameter-id", "cli.example.org"]);
+        let (id, realm, addr) = resolve_diameter_identity(&args, &yaml_cfg());
+        assert_eq!(id, "cli.example.org", "flag wins for identity");
+        assert_eq!(realm, "yaml-realm.example.org", "yaml still wins for realm");
+        assert_eq!(addr, "10.0.0.9:3869", "yaml still wins for address");
+
+        // Only --diameter-addr: address from CLI, other two from YAML.
+        let args = Args::parse_from(["nextgcore-pcrfd", "--diameter-addr", "127.0.0.1:4001"]);
+        let (id, realm, addr) = resolve_diameter_identity(&args, &yaml_cfg());
+        assert_eq!(addr, "127.0.0.1:4001", "flag wins for address");
+        assert_eq!(id, "yaml.example.org", "yaml still wins for identity");
+        assert_eq!(realm, "yaml-realm.example.org", "yaml still wins for realm");
+    }
+
+    /// `addr` and `port` are separate config fields but one CLI string, so each
+    /// half must fall back independently: setting only one must not force the
+    /// other to be specified.
+    #[test]
+    fn config_addr_and_port_fall_back_independently() {
+        let args = Args::parse_from(["nextgcore-pcrfd"]);
+
+        let host_only = nextgcore_pcrfd::DiamConfig {
+            cnf_addr: Some("10.1.2.3".to_string()),
+            cnf_port: 0,
+            ..Default::default()
+        };
+        let (_, _, addr) = resolve_diameter_identity(&args, &host_only);
+        assert_eq!(addr, "10.1.2.3:3868", "default port kept");
+
+        let port_only = nextgcore_pcrfd::DiamConfig {
+            cnf_addr: None,
+            cnf_port: 3999,
+            ..Default::default()
+        };
+        let (_, _, addr) = resolve_diameter_identity(&args, &port_only);
+        assert_eq!(addr, "0.0.0.0:3999", "default host kept");
+    }
+
+    /// The shipped `docker/rust/configs/epc/pcrf.yaml` has a `pcrf:` section with
+    /// no `diameter:` block; it must keep parsing and keep the defaults.
+    #[test]
+    fn shipped_pcrf_config_shape_parses() {
+        let yaml = r#"
+db_uri: mongodb://mongodb:27017/nextgcore
+logger:
+  level: info
+pcrf:
+  freeDiameter: /etc/freeDiameter/pcrf.conf
+  metrics:
+    server:
+      - address: 172.24.0.9
+        port: 9090
+"#;
+        let parsed: nextgcore_pcrfd::PcrfYaml =
+            serde_yaml::from_str(yaml).expect("shipped shape must deserialize");
+        let section = parsed.pcrf.expect("pcrf section");
+        assert_eq!(
+            section.free_diameter.as_deref(),
+            Some("/etc/freeDiameter/pcrf.conf")
+        );
+        assert!(section.diameter.is_none());
+    }
+
+    /// A malformed config must be an Err so main() exits non-zero instead of
+    /// silently advertising `localdomain`.
+    #[test]
+    fn malformed_pcrf_yaml_is_an_error() {
+        let path = std::env::temp_dir().join(format!(
+            "nextgcore-pcrfd-bad-{}-{:?}.yaml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "pcrf:\n  diameter:\n    port: \"nope\"\n").unwrap();
+        let result = pcrf_context_parse_config(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+        assert!(result.is_err());
     }
 
     #[test]

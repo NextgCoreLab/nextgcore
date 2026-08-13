@@ -47,6 +47,31 @@ struct Args {
     #[arg(long, default_value = "/etc/nextgcore/freeDiameter/hss.conf")]
     diameter_config: String,
 
+    // Parity with pcrfd, which has had these three since it was written. hssd
+    // had NEITHER a config path nor a CLI flag for its Diameter identity, so it
+    // was hard-locked to the mnc001/mcc001 defaults below with no runtime
+    // workaround at all -- that combination is what made issue #58 a blocker
+    // rather than an inconvenience. Option (no clap default) so "not passed" is
+    // distinguishable from "passed the default": precedence is
+    // CLI > YAML > built-in default.
+    /// Diameter Origin-Host identity of this HSS
+    /// [default: hss.epc.mnc001.mcc001.3gppnetwork.org]
+    #[arg(long)]
+    diameter_id: Option<String>,
+
+    /// Diameter Origin-Realm of this HSS
+    /// [default: epc.mnc001.mcc001.3gppnetwork.org]
+    #[arg(long)]
+    diameter_realm: Option<String>,
+
+    /// Diameter listen address for S6a [default: 0.0.0.0]
+    #[arg(long)]
+    diameter_addr: Option<String>,
+
+    /// Diameter listen port for S6a [default: 3868]
+    #[arg(long)]
+    diameter_port: Option<u16>,
+
     /// Maximum number of UEs
     #[arg(long, default_value = "1024")]
     max_ue: usize,
@@ -98,12 +123,22 @@ fn main() -> Result<()> {
         args.max_ue * 4
     );
 
-    // Parse configuration file
+    // Parse configuration file.
+    //
+    // A present-but-unparseable config is FATAL. Previously this warned and
+    // continued, which silently reverted the HSS to the hardcoded
+    // mnc001/mcc001 identity below -- an S6a realm mismatch (RFC 6733 §6.1)
+    // presenting as peers rejecting or misrouting traffic, with a
+    // "Loading configuration from ..." line in the log implying the file had
+    // been applied. Refusing to start is far easier to diagnose.
+    //
+    // A MISSING config file stays non-fatal: the defaults are a working
+    // single-PLMN dev configuration and existing deployments rely on them.
     if std::path::Path::new(&args.config).exists() {
-        log::info!("Loading configuration from {}", args.config);
-        if let Err(e) = hss_context_parse_config(&args.config) {
-            log::warn!("Failed to parse config: {e}");
-        }
+        hss_context_parse_config(&args.config)
+            .map_err(|e| anyhow::anyhow!("Failed to parse config {}: {e}", args.config))?;
+        // Logged AFTER the parse succeeds, so the line means what it says.
+        log::info!("Loaded configuration from {}", args.config);
     } else {
         log::debug!("Configuration file not found: {}", args.config);
     }
@@ -133,28 +168,42 @@ fn main() -> Result<()> {
     // Start the S6a Diameter server (accepts MME connections; answers
     // AIR/ULR/PUR and carries HSS-initiated CLR/IDR on the same connections)
     {
+        // Precedence: CLI flag > YAML config > built-in default. The config file
+        // is the primary source (it is the only one that can express peers and
+        // Tc), while an explicit flag stays a usable override for a deployment
+        // whose config is wrong.
         let (diam_id, diam_realm, diam_addr, diam_port, timer_tc) = {
             let ctx = nextgcore_hssd::hss_self();
             let ctx = ctx.read().expect("HSS context lock poisoned");
             let diam = &ctx.diam_config;
             (
-                diam.cnf_diamid
+                args.diameter_id
                     .clone()
+                    .or_else(|| diam.cnf_diamid.clone())
                     .unwrap_or_else(|| "hss.epc.mnc001.mcc001.3gppnetwork.org".to_string()),
-                diam.cnf_diamrlm
+                args.diameter_realm
                     .clone()
+                    .or_else(|| diam.cnf_diamrlm.clone())
                     .unwrap_or_else(|| "epc.mnc001.mcc001.3gppnetwork.org".to_string()),
-                diam.cnf_addr
+                args.diameter_addr
                     .clone()
+                    .or_else(|| diam.cnf_addr.clone())
                     .unwrap_or_else(|| "0.0.0.0".to_string()),
-                if diam.cnf_port == 0 {
-                    3868
-                } else {
-                    diam.cnf_port
-                },
+                args.diameter_port
+                    .or(if diam.cnf_port == 0 {
+                        None
+                    } else {
+                        Some(diam.cnf_port)
+                    })
+                    .unwrap_or(3868),
+                // .max(1) preserved: a Tc of 0 would mean "reconnect with no
+                // delay", which the Diameter stack treats as unset.
                 diam.cnf_timer_tc.max(1) as u32,
             )
         };
+        log::info!(
+            "HSS S6a Diameter identity: {diam_id} realm: {diam_realm} listen: {diam_addr}:{diam_port}"
+        );
         let diameter_config = nextgcore_diameter::config::DiameterConfig {
             diameter_id: diam_id,
             diameter_realm: diam_realm,
@@ -329,6 +378,40 @@ mod tests {
         assert_eq!(args.max_ue, 1024);
         assert_eq!(args.db_name, "nextgcore");
         assert!(!args.kill);
+        // Unset by default so the YAML config can win; a clap default_value
+        // would make the flag always look explicit and outrank the file.
+        assert_eq!(args.diameter_id, None);
+        assert_eq!(args.diameter_realm, None);
+        assert_eq!(args.diameter_addr, None);
+        assert_eq!(args.diameter_port, None);
+    }
+
+    /// hssd previously had no CLI path to its Diameter identity at all, which is
+    /// what made #58 a hard blocker: with the parse function also a no-op, the
+    /// daemon was pinned to PLMN mnc001/mcc001 with no runtime workaround.
+    #[test]
+    fn diameter_identity_flags_parse() {
+        let args = Args::parse_from([
+            "nextgcore-hssd",
+            "--diameter-id",
+            "hss.epc.mnc070.mcc310.3gppnetwork.org",
+            "--diameter-realm",
+            "epc.mnc070.mcc310.3gppnetwork.org",
+            "--diameter-addr",
+            "10.0.0.5",
+            "--diameter-port",
+            "3869",
+        ]);
+        assert_eq!(
+            args.diameter_id.as_deref(),
+            Some("hss.epc.mnc070.mcc310.3gppnetwork.org")
+        );
+        assert_eq!(
+            args.diameter_realm.as_deref(),
+            Some("epc.mnc070.mcc310.3gppnetwork.org")
+        );
+        assert_eq!(args.diameter_addr.as_deref(), Some("10.0.0.5"));
+        assert_eq!(args.diameter_port, Some(3869));
     }
 
     #[test]
