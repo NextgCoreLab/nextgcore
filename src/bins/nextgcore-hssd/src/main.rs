@@ -204,11 +204,25 @@ fn main() -> Result<()> {
         log::info!(
             "HSS S6a Diameter identity: {diam_id} realm: {diam_realm} listen: {diam_addr}:{diam_port}"
         );
+        // Advertise the applications this HSS actually implements (s6a_path.rs,
+        // cx_path.rs, swx_path.rs) so a peer can discover them, and so a peer
+        // with none in common is refused DIAMETER_NO_COMMON_APPLICATION instead
+        // of being accepted and failing later (RFC 6733 §5.3).
+        use nextgcore_diameter::applications::{well_known, ApplicationRegistry};
+        let applications = ApplicationRegistry::new("NextGCore HSS")
+            .with_application(well_known::S6A)
+            .with_application(well_known::CX)
+            .with_application(well_known::SWX);
+
         let diameter_config = nextgcore_diameter::config::DiameterConfig {
             diameter_id: diam_id,
             diameter_realm: diam_realm,
+            // Advertised as Host-IP-Address; 0.0.0.0 is filtered out below since
+            // advertising a wildcard tells a peer nothing routable.
+            address: (diam_addr != "0.0.0.0").then(|| diam_addr.clone()),
             port: diam_port,
             timer_tc,
+            applications,
             ..Default::default()
         };
         let listen_addr: std::net::SocketAddr = format!("{diam_addr}:{diam_port}")

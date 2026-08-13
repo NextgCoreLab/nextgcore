@@ -16,6 +16,22 @@ pub mod avp_code {
     pub const AUTH_APPLICATION_ID: u32 = 258;
     pub const VENDOR_ID: u32 = 266;
     pub const VENDOR_SPECIFIC_APPLICATION_ID: u32 = 260;
+    /// Accounting application, RFC 6733 §6.9. Declared for completeness of the
+    /// CER/CEA capability set; nothing in this tree advertises an accounting
+    /// application yet.
+    pub const ACCT_APPLICATION_ID: u32 = 259;
+    /// RFC 6733 §5.3.5 — mandatory in CER/CEA (`1* { Host-IP-Address }`).
+    pub const HOST_IP_ADDRESS: u32 = 257;
+    /// RFC 6733 §5.3.7 — mandatory in CER/CEA.
+    pub const PRODUCT_NAME: u32 = 269;
+    /// RFC 6733 §5.3.6 — vendors whose AVPs this node understands.
+    pub const SUPPORTED_VENDOR_ID: u32 = 265;
+    /// RFC 6733 §5.3.4 — optional in CER/CEA.
+    pub const FIRMWARE_REVISION: u32 = 267;
+    /// RFC 6733 §7.5 — names the offending AVP in an error answer.
+    pub const FAILED_AVP: u32 = 279;
+    /// RFC 6733 §5.4.3 — DPR reason.
+    pub const DISCONNECT_CAUSE: u32 = 273;
     pub const EXPERIMENTAL_RESULT: u32 = 297;
     pub const EXPERIMENTAL_RESULT_CODE: u32 = 298;
     pub const ORIGIN_STATE_ID: u32 = 278;

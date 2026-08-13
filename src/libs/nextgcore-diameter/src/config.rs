@@ -33,6 +33,16 @@ pub struct DiameterConfig {
     /// not going to be answered.
     pub request_timeout: u32,
 
+    /// Applications this node advertises in CER/CEA, and the vendors whose AVPs
+    /// it understands (RFC 6733 §5.3).
+    ///
+    /// Defaults to empty, which means "do not participate in capability
+    /// negotiation": the CER still gains its mandatory AVPs, but no application
+    /// is advertised and no peer is refused. That keeps every existing caller
+    /// working unchanged; a daemon opts in by declaring its interfaces. See
+    /// [`crate::applications::ApplicationRegistry::negotiate`].
+    pub applications: crate::applications::ApplicationRegistry,
+
     /// Configuration flags
     pub flags: DiameterConfigFlags,
 
@@ -56,6 +66,9 @@ impl Default for DiameterConfig {
             port_tls: crate::DIAMETER_TLS_PORT,
             timer_tc: 30,
             request_timeout: 30,
+            // Empty: no application advertised, no peer refused. A daemon opts
+            // in by populating this.
+            applications: crate::applications::ApplicationRegistry::default(),
             flags: DiameterConfigFlags::default(),
             extensions: Vec::new(),
             connections: Vec::new(),

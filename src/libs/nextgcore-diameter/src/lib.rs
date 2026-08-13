@@ -12,6 +12,7 @@
 //! The implementation follows RFC 6733 (Diameter Base Protocol) and
 //! 3GPP specifications for each interface.
 
+pub mod applications;
 pub mod avp;
 pub mod common;
 pub mod config;
