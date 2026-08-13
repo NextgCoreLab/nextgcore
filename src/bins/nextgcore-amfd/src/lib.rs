@@ -141,6 +141,34 @@ struct NasYaml {
     use_nextgcore_security: Option<bool>,
 }
 
+/// A single `<timer>: { value: <seconds> }` entry under `amf.time`.
+///
+/// The nesting under `value` mirrors the shipped configs
+/// (`docker/rust/configs/5gc/amf.yaml`, `k8s/manifests/configmap.yaml`,
+/// `deploy/helm/.../configmap.yaml`), all of which write
+/// `time: { t3512: { value: 540 } }`.
+#[derive(Debug, Default, Deserialize)]
+struct TimerValueYaml {
+    value: Option<u64>,
+}
+
+/// The `amf.time` block: 5GMM timers the AMF signals to the UE, in seconds.
+///
+/// Only the timers the AMF actually emits are read here. `t3512` lands in the
+/// Registration Accept as GPRS Timer 3; `t3502` has a context field that
+/// `build_registration_accept` still sends as `None`, so it is parsed and
+/// stored but not yet signalled — see the timer task in TASKS.md.
+///
+/// Note this is NOT read by `nextgcore_app`'s `parse_time`: that path hangs off
+/// `NextgcoreLocalConf::parse`, which only `ConfigReloadManager` reaches, and
+/// that type is never constructed nor exported. The AMF's own serde path (here)
+/// is the one that actually runs at startup.
+#[derive(Debug, Default, Deserialize)]
+struct TimeYaml {
+    t3502: Option<TimerValueYaml>,
+    t3512: Option<TimerValueYaml>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct AmfSection {
     amf_name: Option<String>,
@@ -151,6 +179,7 @@ struct AmfSection {
     security: Option<SecurityYaml>,
     sbi: Option<SbiYaml>,
     nas: Option<NasYaml>,
+    time: Option<TimeYaml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -483,14 +512,55 @@ impl AmfApp {
             }
         }
 
+        // 5GMM timers (`amf.time`). Previously dropped: the shipped configs all
+        // declare `time.t3512.value: 540`, but nothing read it, so the emitted
+        // T3512 came solely from the context default and agreed with the YAML
+        // only by coincidence. A config change was silently inert.
+        //
+        // These are applied to BOTH contexts on purpose. `self.amf_context` (the
+        // one this function fills, and the one NGAP is handed) and the global
+        // `context::amf_self()` are separate `AmfContext` instances today — see
+        // `apply_timer_conf`. `build_registration_accept` reads the global, so
+        // writing only `ctx` here would leave the YAML inert for the one message
+        // that actually carries T3512.
+        let timers = amf_section.time.unwrap_or_default();
+        Self::apply_timer_conf(&mut ctx, &timers);
+        if let Ok(mut global) = context::amf_self().write() {
+            Self::apply_timer_conf(&mut global, &timers);
+        } else {
+            log::warn!("global AMF context lock poisoned; T3512/T3502 left at defaults");
+        }
+
         log::info!(
-            "AMF configuration loaded: {} GUAMI, {} TAI, {} PLMN support",
+            "AMF configuration loaded: {} GUAMI, {} TAI, {} PLMN support, T3512={}s",
             ctx.num_of_served_guami,
             ctx.num_of_served_tai,
-            ctx.num_of_plmn_support
+            ctx.num_of_plmn_support,
+            ctx.t3512_value
         );
 
         Ok(())
+    }
+
+    /// Apply the parsed `amf.time` timers to one `AmfContext`.
+    ///
+    /// Split out because the values must land in two distinct contexts (see the
+    /// call site), and because it makes the mapping unit-testable without
+    /// standing up an `AmfApp` or touching process-wide state.
+    ///
+    /// An absent key leaves the context default untouched. A present `0` is
+    /// applied rather than rejected: `gmm_build::encode_gprs_timer3_seconds`
+    /// maps 0 to the spec's "timer is deactivated" unit (TS 24.008
+    /// Table 10.5.163b), so it is a meaningful configuration.
+    fn apply_timer_conf(ctx: &mut context::AmfContext, timers: &TimeYaml) {
+        if let Some(seconds) = timers.t3512.as_ref().and_then(|t| t.value) {
+            log::info!("T3512 periodic registration update timer: {seconds}s");
+            ctx.t3512_value = seconds;
+        }
+        if let Some(seconds) = timers.t3502.as_ref().and_then(|t| t.value) {
+            log::info!("T3502 timer: {seconds}s (stored; not yet signalled)");
+            ctx.t3502_value = seconds;
+        }
     }
 
     /// Resolve a PLMN ID from the typed YAML struct (mcc/mnc may be int or string)
@@ -905,6 +975,66 @@ mod tests {
         let app = AmfApp::new();
         app.metrics().inc(metrics::GlobalMetric::RmRegInitReq);
         assert_eq!(app.metrics().get(metrics::GlobalMetric::RmRegInitReq), 1);
+    }
+
+    /// The `amf.time` block deserializes from the shape the shipped configs
+    /// actually use — `time: { t3512: { value: 540 } }`, nested under `value`,
+    /// as written by `docker/rust/configs/5gc/amf.yaml`,
+    /// `k8s/manifests/configmap.yaml` and the Helm configmap template.
+    #[test]
+    fn amf_time_block_parses_the_shipped_config_shape() {
+        let yaml: AmfYaml = serde_yaml::from_str(
+            "amf:\n  amf_name: nextgcore-amf0\n  time:\n    t3512:\n      value: 540\n",
+        )
+        .expect("shipped time block must deserialize");
+
+        let time = yaml.amf.expect("amf section").time.expect("time block");
+        assert_eq!(time.t3512.and_then(|t| t.value), Some(540));
+    }
+
+    /// A configured T3512 must reach the context field that
+    /// `build_registration_accept` reads. Before this wiring the YAML key was
+    /// parsed by nothing at all, so the emitted timer came only from the context
+    /// default and matched the config by coincidence.
+    #[test]
+    fn configured_t3512_overrides_the_context_default() {
+        let mut ctx = context::AmfContext::new();
+        assert_eq!(ctx.t3512_value, 540, "context default, per amf.yaml");
+
+        let timers = TimeYaml {
+            t3502: None,
+            t3512: Some(TimerValueYaml { value: Some(3240) }),
+        };
+        AmfApp::apply_timer_conf(&mut ctx, &timers);
+
+        assert_eq!(ctx.t3512_value, 3240, "YAML must win over the default");
+        assert_eq!(ctx.t3502_value, 720, "absent key leaves the default alone");
+    }
+
+    /// An absent `time` block must not zero the timers: `unwrap_or_default()` at
+    /// the call site yields an all-`None` `TimeYaml`, which has to be a no-op
+    /// rather than an assignment of 0 (which would encode as "deactivated").
+    #[test]
+    fn absent_time_block_leaves_timer_defaults_intact() {
+        let mut ctx = context::AmfContext::new();
+        let before = (ctx.t3512_value, ctx.t3502_value);
+
+        AmfApp::apply_timer_conf(&mut ctx, &TimeYaml::default());
+
+        assert_eq!((ctx.t3512_value, ctx.t3502_value), before);
+    }
+
+    /// An explicit 0 is a real setting — TS 24.008 Table 10.5.163b has a
+    /// "timer is deactivated" unit — so it is applied, not filtered out.
+    #[test]
+    fn explicit_zero_t3512_is_applied_not_ignored() {
+        let mut ctx = context::AmfContext::new();
+        let timers = TimeYaml {
+            t3502: None,
+            t3512: Some(TimerValueYaml { value: Some(0) }),
+        };
+        AmfApp::apply_timer_conf(&mut ctx, &timers);
+        assert_eq!(ctx.t3512_value, 0, "0 means deactivated, not unset");
     }
 }
 
