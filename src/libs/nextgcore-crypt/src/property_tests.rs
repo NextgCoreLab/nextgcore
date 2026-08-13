@@ -19,6 +19,12 @@ mod tests {
 
         // Feature: nextgcore-rust-conversion, Property 8: Cryptographic Algorithm Bit-Identical Output
         // Test: OPc generation is deterministic - same K and OP always produce same OPc
+        //
+        // Determinism alone cannot pin the ARGUMENT ORDER: this test previously
+        // called `milenage_opc(&op, &k)` against a `(k, op)` signature and still
+        // passed, because two identical transposed calls agree with each other.
+        // `prop_opc_matches_3gpp_test_set_1` below pins the order to the spec
+        // vector, so a future transposition fails a test instead of hiding.
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -27,8 +33,8 @@ mod tests {
                 k in prop::array::uniform16(any::<u8>()),
                 op in prop::array::uniform16(any::<u8>()),
             ) {
-                let opc1 = milenage_opc(&op, &k);
-                let opc2 = milenage_opc(&op, &k);
+                let opc1 = milenage_opc(&k, &op);
+                let opc2 = milenage_opc(&k, &op);
                 prop_assert_eq!(opc1, opc2, "OPc generation must be deterministic");
             }
 
@@ -48,6 +54,42 @@ mod tests {
                     prop_assert_eq!(r1, r2, "f2345 must be deterministic");
                 }
             }
+        }
+
+        /// Pins `milenage_opc`'s argument order to 3GPP TS 35.208 Test Set 1.
+        ///
+        /// OPc = E_K(OP) XOR OP, which is NOT symmetric in its two arguments, so
+        /// a transposed call yields a different OPc and fails here. That is the
+        /// point: the neighbouring determinism property is blind to argument
+        /// order, so this vector is what actually holds the contract.
+        #[test]
+        fn prop_opc_matches_3gpp_test_set_1() {
+            const K: [u8; 16] = [
+                0x46, 0x5b, 0x5c, 0xe8, 0xb1, 0x99, 0xb4, 0x9f, 0xaa, 0x5f, 0x0a, 0x2e, 0xe2, 0x38,
+                0xa6, 0xbc,
+            ];
+            const OP: [u8; 16] = [
+                0xcd, 0xc2, 0x02, 0xd5, 0x12, 0x3e, 0x20, 0xf6, 0x2b, 0x6d, 0x67, 0x6a, 0xc7, 0x2c,
+                0xb3, 0x18,
+            ];
+            const OPC: [u8; 16] = [
+                0xcd, 0x63, 0xcb, 0x71, 0x95, 0x4a, 0x9f, 0x4e, 0x48, 0xa5, 0x99, 0x4e, 0x37, 0xa0,
+                0x2b, 0xaf,
+            ];
+
+            assert_eq!(
+                milenage_opc(&K, &OP).expect("OPc derivation must succeed"),
+                OPC,
+                "milenage_opc(k, op) must match TS 35.208 Test Set 1"
+            );
+
+            // Guard the guard: if the function were symmetric the assertion above
+            // could not detect a transposition at all.
+            assert_ne!(
+                milenage_opc(&OP, &K).expect("transposed call still computes"),
+                OPC,
+                "OPc must depend on argument order, else this test proves nothing"
+            );
         }
     }
 
