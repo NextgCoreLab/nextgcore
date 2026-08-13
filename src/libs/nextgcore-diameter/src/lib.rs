@@ -24,6 +24,7 @@ pub mod peer;
 pub mod rx;
 pub mod s6a;
 pub mod s6b;
+pub mod session;
 pub mod swx;
 pub mod transport;
 
