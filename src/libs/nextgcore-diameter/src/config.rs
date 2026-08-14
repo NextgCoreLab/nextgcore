@@ -83,7 +83,17 @@ pub struct DiameterConfigFlags {
     /// The peer does not relay messages (0xffffff app id)
     pub no_fwd: bool,
 
-    /// Disable the use of SCTP
+    /// Refuse SCTP even when the `kernel-sctp` feature is compiled in.
+    ///
+    /// Honoured by [`crate::transport::SctpDiameterTransport::connect_checked`]
+    /// and [`crate::transport::SctpDiameterListener::bind_checked`], which is
+    /// what a caller selecting a transport from config should use. It has no
+    /// effect on the TCP path, and none on a build without `kernel-sctp` (where
+    /// there is no SCTP to disable).
+    ///
+    /// Note the unchecked `connect`/`bind` do not consult it: they take an
+    /// address, not a config, and silently ignoring a flag they never received
+    /// would be worse than not offering it.
     pub no_sctp: bool,
 }
 

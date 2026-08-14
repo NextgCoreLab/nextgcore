@@ -6,8 +6,24 @@ authors.workspace = true
 license.workspace = true
 description = "NextGCore Diameter Protocol Library"
 
+[features]
+default = []
+# Diameter over kernel SCTP (RFC 6733 2.1). Default OFF because it links against
+# libsctp (-lsctp): a host without libsctp-dev type-checks and builds fine but
+# FAILS TO LINK, so enabling it by default would break every build that does not
+# have the library. Requires `libsctp-dev` at build time, `libsctp1` plus
+# `modprobe sctp` at runtime.
+kernel-sctp = ["nextgcore-sctp"]
+
 [dependencies]
 nextgcore-core = { workspace = true }
+# Only pulled in by the kernel-sctp feature; see above.
+# Declared by PATH rather than `workspace = true` so `default-features = false`
+# is honoured: the workspace entry does not set it, which makes the override
+# silently ignored (cargo warns, and says it may become a hard error). Without
+# it the default `sctp-proto` backend -- SCTP-over-UDP, NOT standards SCTP --
+# would be compiled in alongside the kernel one.
+nextgcore-sctp = { path = "../nextgcore-sctp", optional = true, default-features = false, features = ["kernel"] }
 nextgcore-crypt = { workspace = true }
 thiserror.workspace = true
 bytes.workspace = true

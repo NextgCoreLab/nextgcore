@@ -26,15 +26,26 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use nextgcore_core::pkbuf::NextgcorePkbuf;
 use nextgcore_core::sockaddr::NextgcoreSockaddr;
 
 use thiserror::Error;
+
+// Used only by the `sctp_proto_impl` module below. Gated because a
+// `--no-default-features --features kernel` build (which nextgcore-diameter's
+// `kernel-sctp` feature selects, to avoid pulling in the SCTP-over-UDP backend)
+// compiles this file without that module and would otherwise emit four
+// unused-import warnings.
+#[cfg(feature = "sctp-proto")]
+use std::net::SocketAddr;
+#[cfg(feature = "sctp-proto")]
+use std::sync::Arc;
+#[cfg(feature = "sctp-proto")]
+use std::time::Instant;
+#[cfg(feature = "sctp-proto")]
 use tokio::sync::Mutex;
 
 // Kernel SCTP module (Linux only, requires libsctp)
