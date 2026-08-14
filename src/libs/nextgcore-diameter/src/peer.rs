@@ -79,6 +79,37 @@ pub struct DiameterPeer {
     hop_by_hop_seq: u32,
     end_to_end_seq: u32,
     watchdog_interval: Duration,
+    /// Applications advertised in CER/CEA and used to reject a peer with none in
+    /// common (RFC 6733 §5.3). Empty means "do not negotiate".
+    applications: crate::applications::ApplicationRegistry,
+    /// Addresses advertised as `Host-IP-Address`. Derived from
+    /// `DiameterConfig::address`; empty when unset, in which case the AVP is
+    /// omitted -- the RFC makes it mandatory, but inventing an address would
+    /// advertise something unroutable, which is worse than omitting it.
+    host_addresses: Vec<std::net::IpAddr>,
+}
+
+/// Parse `DiameterConfig::address` into advertisable Host-IP-Addresses.
+///
+/// A comma-separated list is accepted so a multi-homed node can advertise every
+/// address, as `1* { Host-IP-Address }` allows. Unparseable entries are warned
+/// about and skipped rather than failing peer construction: a bad address in
+/// config should degrade the advertisement, not stop the node from starting.
+fn parse_host_addresses(config: &DiameterConfig) -> Vec<std::net::IpAddr> {
+    let Some(raw) = config.address.as_deref() else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.parse::<std::net::IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(_) => {
+                log::warn!("ignoring unparseable Diameter address '{s}' for Host-IP-Address");
+                None
+            }
+        })
+        .collect()
 }
 
 impl DiameterPeer {
@@ -94,6 +125,8 @@ impl DiameterPeer {
             hop_by_hop_seq: rand_u32(),
             end_to_end_seq: rand_u32(),
             watchdog_interval: Duration::from_secs(config.timer_tc as u64),
+            applications: config.applications.clone(),
+            host_addresses: parse_host_addresses(config),
         }
     }
 
@@ -109,6 +142,8 @@ impl DiameterPeer {
             hop_by_hop_seq: rand_u32(),
             end_to_end_seq: rand_u32(),
             watchdog_interval: Duration::from_secs(config.timer_tc as u64),
+            applications: config.applications.clone(),
+            host_addresses: parse_host_addresses(config),
         }
     }
 
@@ -270,6 +305,14 @@ impl DiameterPeer {
             AvpData::Unsigned32(origin_state_id()),
         ));
 
+        // Host-IP-Address, Vendor-Id, Product-Name (all mandatory per RFC 6733
+        // §5.3.1 and all previously absent), plus one advertisement per declared
+        // application. With an empty registry this still adds the mandatory AVPs
+        // and advertises nothing, which is what the old code did minus the
+        // conformance violation.
+        self.applications
+            .append_capabilities(&mut msg, &self.host_addresses);
+
         self.transport.send(&msg).await
     }
 
@@ -284,12 +327,46 @@ impl DiameterPeer {
             .ok_or_else(|| DiameterError::MissingAvp("Origin-Realm".into()))?
             .to_string();
 
+        // Capability negotiation (RFC 6733 §5.3). `negotiate` returns None only
+        // when both sides advertised applications and none matched; an empty
+        // registry on either side is accepted for backward compatibility, with
+        // the reasoning on `ApplicationRegistry::negotiate`.
+        let peer_apps = crate::applications::advertised_applications(&cer);
+        let negotiated = self.applications.negotiate(&peer_apps);
+
+        let result_code = match &negotiated {
+            Some(common) => {
+                if !common.is_empty() {
+                    log::info!(
+                        "CER from {origin_host}: {} common application(s): {}",
+                        common.len(),
+                        common
+                            .iter()
+                            .map(|a| a.id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                crate::error::ResultCode::Success as u32
+            }
+            None => {
+                log::warn!(
+                    "CER from {origin_host} rejected: no common application (local {:?}, peer {:?})",
+                    self.applications
+                        .applications()
+                        .map(|a| a.id)
+                        .collect::<Vec<_>>(),
+                    peer_apps.iter().map(|a| a.id).collect::<Vec<_>>()
+                );
+                crate::error::ResultCode::NoCommonApplication as u32
+            }
+        };
+
         // Build CEA
         let mut cea = DiameterMessage::new_answer(&cer);
-        // Result-Code: Success
         cea.add_avp(Avp::mandatory(
             avp_code::RESULT_CODE,
-            AvpData::Unsigned32(crate::error::ResultCode::Success as u32),
+            AvpData::Unsigned32(result_code),
         ));
         // Origin-Host
         cea.add_avp(Avp::mandatory(
@@ -306,8 +383,24 @@ impl DiameterPeer {
             avp_code::ORIGIN_STATE_ID,
             AvpData::Unsigned32(origin_state_id()),
         ));
+        // The CEA advertises our own capabilities too: §5.3.2 gives it the same
+        // mandatory AVPs as the CER, and the initiator has no other way to learn
+        // what we support.
+        self.applications
+            .append_capabilities(&mut cea, &self.host_addresses);
 
         self.transport.send(&cea).await?;
+
+        // Only reach Open on success. On 5010 the RFC closes the connection, so
+        // the peer is reported as Disconnected rather than Established and stays
+        // out of PeerState::Open -- which is what makes `send_message` refuse to
+        // carry application traffic over it.
+        if negotiated.is_none() {
+            self.state = PeerState::Closed;
+            self.transport.shutdown().await?;
+            return Ok(PeerEvent::Disconnected);
+        }
+
         self.remote_host = Some(origin_host.clone());
         self.remote_realm = Some(origin_realm.clone());
         self.state = PeerState::Open;
@@ -769,6 +862,195 @@ mod tests {
         assert_eq!(client.state(), PeerState::Open);
 
         let _server_peer = handle.await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // CER/CEA application negotiation (RFC 6733 §5.3), issue #55
+    // -----------------------------------------------------------------------
+
+    fn config_with_apps(host: &str, apps: &[crate::applications::ApplicationId]) -> DiameterConfig {
+        let mut registry = crate::applications::ApplicationRegistry::new("NextGCore test");
+        for app in apps {
+            registry = registry.with_application(*app);
+        }
+        DiameterConfig {
+            diameter_id: host.to_string(),
+            diameter_realm: "epc.example.org".to_string(),
+            address: Some("127.0.0.1".to_string()),
+            applications: registry,
+            ..Default::default()
+        }
+    }
+
+    /// An MME advertising only S6a meeting a PCRF that speaks only Gx/Rx must be
+    /// refused with 5010 and must NOT reach Open — the case RFC 6733 §5.3
+    /// describes and that `handle_cer` previously could not express, because it
+    /// answered 2001 unconditionally.
+    #[tokio::test]
+    async fn cer_with_no_common_application_is_rejected_with_5010() {
+        use crate::applications::well_known;
+
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        // Responder speaks Gx and Rx only.
+        let server_cfg = config_with_apps("pcrf.example.org", &[well_known::GX, well_known::RX]);
+        let server = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = DiameterPeer::new_responder(transport, &server_cfg);
+            peer.start().await.unwrap();
+            let event = peer.next_event().await.unwrap();
+            // The responder reports a disconnect, not an establishment.
+            assert!(
+                matches!(event, PeerEvent::Disconnected),
+                "expected Disconnected on no-common-application"
+            );
+            assert_ne!(
+                peer.state(),
+                PeerState::Open,
+                "a refused peer must never reach Open"
+            );
+        });
+
+        // Initiator speaks S6a only.
+        let client_cfg = config_with_apps("mme.example.org", &[well_known::S6A]);
+        let transport = DiameterTransport::connect(listen_addr).await.unwrap();
+        let mut client = DiameterPeer::new_initiator(transport, &client_cfg);
+        client.start().await.unwrap();
+
+        // The initiator sees the 5010 CEA as an error (is_success is 2000..3000).
+        let result = client.next_event().await;
+        assert!(
+            result.is_err(),
+            "a 5010 CEA must not be treated as a successful handshake"
+        );
+        assert_ne!(client.state(), PeerState::Open);
+
+        server.await.unwrap();
+    }
+
+    /// One application in common is enough: an MME (S6a) and an HSS
+    /// (S6a + Cx + SWx) must both reach Open.
+    #[tokio::test]
+    async fn cer_with_one_common_application_succeeds() {
+        use crate::applications::well_known;
+
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let server_cfg = config_with_apps(
+            "hss.example.org",
+            &[well_known::S6A, well_known::CX, well_known::SWX],
+        );
+        let server = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = DiameterPeer::new_responder(transport, &server_cfg);
+            peer.start().await.unwrap();
+            let event = peer.next_event().await.unwrap();
+            assert!(matches!(event, PeerEvent::Established { .. }));
+            assert_eq!(peer.state(), PeerState::Open);
+        });
+
+        let client_cfg = config_with_apps("mme.example.org", &[well_known::S6A]);
+        let transport = DiameterTransport::connect(listen_addr).await.unwrap();
+        let mut client = DiameterPeer::new_initiator(transport, &client_cfg);
+        client.start().await.unwrap();
+        let event = client.next_event().await.unwrap();
+        assert!(matches!(event, PeerEvent::Established { .. }));
+        assert_eq!(client.state(), PeerState::Open);
+
+        server.await.unwrap();
+    }
+
+    /// A CER must now carry the three AVPs the ABNF makes mandatory and that
+    /// were entirely absent, plus the advertised application. Asserted by
+    /// inspecting the CER the responder actually receives, not by re-reading the
+    /// builder, so the check covers encode/decode too.
+    #[tokio::test]
+    async fn cer_carries_mandatory_avps_and_advertises_applications() {
+        use crate::applications::well_known;
+
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut transport = listener.accept().await.unwrap();
+            transport.recv().await.unwrap()
+        });
+
+        let client_cfg = config_with_apps("mme.example.org", &[well_known::S6A]);
+        let transport = DiameterTransport::connect(listen_addr).await.unwrap();
+        let mut client = DiameterPeer::new_initiator(transport, &client_cfg);
+        client.start().await.unwrap();
+
+        let cer = server.await.unwrap();
+        assert_eq!(cer.header.command_code, base_cmd::CAPABILITIES_EXCHANGE);
+        assert!(
+            cer.find_avp(avp_code::HOST_IP_ADDRESS).is_some(),
+            "Host-IP-Address (RFC 6733 §5.3.1) was missing entirely before this change"
+        );
+        assert!(cer.find_avp(avp_code::VENDOR_ID).is_some(), "Vendor-Id");
+        assert!(
+            cer.find_avp(avp_code::PRODUCT_NAME).is_some(),
+            "Product-Name"
+        );
+
+        let advertised = crate::applications::advertised_applications(&cer);
+        assert_eq!(
+            advertised.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![well_known::S6A.id],
+            "the CER must advertise the declared application"
+        );
+    }
+
+    /// Backward compatibility: peers whose config declares no applications (every
+    /// existing caller, including the other tests in this file) must still
+    /// complete the handshake. Negotiation is opt-in.
+    #[tokio::test]
+    async fn peers_without_declared_applications_still_handshake() {
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let server_cfg = test_config("hss.example.org", "epc.example.org");
+        let server = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = DiameterPeer::new_responder(transport, &server_cfg);
+            peer.start().await.unwrap();
+            let event = peer.next_event().await.unwrap();
+            assert!(matches!(event, PeerEvent::Established { .. }));
+            assert_eq!(peer.state(), PeerState::Open);
+        });
+
+        let client_cfg = test_config("mme.example.org", "epc.example.org");
+        let transport = DiameterTransport::connect(listen_addr).await.unwrap();
+        let mut client = DiameterPeer::new_initiator(transport, &client_cfg);
+        client.start().await.unwrap();
+        assert!(matches!(
+            client.next_event().await.unwrap(),
+            PeerEvent::Established { .. }
+        ));
+        server.await.unwrap();
+    }
+
+    /// An unparseable configured address degrades the advertisement rather than
+    /// preventing the node from starting: the CER simply omits Host-IP-Address.
+    #[test]
+    fn unparseable_configured_address_is_skipped_not_fatal() {
+        let cfg = DiameterConfig {
+            address: Some("not-an-ip, 10.0.0.7".to_string()),
+            ..Default::default()
+        };
+        let addrs = parse_host_addresses(&cfg);
+        assert_eq!(addrs.len(), 1, "the good half is kept");
+        assert_eq!(addrs[0].to_string(), "10.0.0.7");
     }
 
     #[tokio::test]

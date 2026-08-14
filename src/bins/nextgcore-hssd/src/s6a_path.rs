@@ -1703,6 +1703,71 @@ mod tests {
         assert_ne!(answer.result_code(), Some(2001));
     }
 
+    /// An HSS advertising S6a/Cx/SWx must accept an MME advertising S6a, and
+    /// must REFUSE a peer that speaks only Gx/Rx (RFC 6733 §5.3).
+    ///
+    /// Distinct from the end-to-end test below, which leaves both registries
+    /// empty and therefore exercises the backward-compatibility path rather than
+    /// negotiation. This one drives the real `hss_s6a_serve` with the same
+    /// application set `main.rs` configures.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s6a_server_negotiates_applications_with_its_peer() {
+        use nextgcore_diameter::applications::{well_known, ApplicationRegistry};
+        use nextgcore_diameter::config::DiameterConfig;
+        use nextgcore_diameter::transport::{DiameterClient, DiameterListener};
+
+        let hss_apps = || {
+            ApplicationRegistry::new("NextGCore HSS")
+                .with_application(well_known::S6A)
+                .with_application(well_known::CX)
+                .with_application(well_known::SWX)
+        };
+
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_cfg = DiameterConfig {
+            diameter_id: "hss.neg.example.org".to_string(),
+            diameter_realm: "neg.example.org".to_string(),
+            address: Some("127.0.0.1".to_string()),
+            applications: hss_apps(),
+            ..Default::default()
+        };
+        tokio::spawn(async move {
+            let _ = hss_s6a_serve(listener, server_cfg).await;
+        });
+
+        // An MME (S6a) shares an application with the HSS: accepted.
+        let mme_cfg = DiameterConfig {
+            diameter_id: "mme.neg.example.org".to_string(),
+            diameter_realm: "neg.example.org".to_string(),
+            applications: ApplicationRegistry::new("NextGCore MME")
+                .with_application(well_known::S6A),
+            ..Default::default()
+        };
+        let mut mme = DiameterClient::new(mme_cfg, addr);
+        mme.connect().await.expect("S6a is common, must connect");
+        assert!(mme.is_connected());
+
+        // A PCRF (Gx/Rx) shares nothing with an S6a/Cx/SWx HSS: refused.
+        let pcrf_cfg = DiameterConfig {
+            diameter_id: "pcrf.neg.example.org".to_string(),
+            diameter_realm: "neg.example.org".to_string(),
+            applications: ApplicationRegistry::new("NextGCore PCRF")
+                .with_application(well_known::GX)
+                .with_application(well_known::RX),
+            ..Default::default()
+        };
+        let mut pcrf = DiameterClient::new(pcrf_cfg, addr);
+        let result = pcrf.connect().await;
+        assert!(
+            result.is_err(),
+            "a peer with no common application must be refused, got {result:?}"
+        );
+        assert!(!pcrf.is_connected());
+    }
+
     /// Full S6a integration over real TCP: CER/CEA, AIR dispatched off the
     /// Diameter thread, and an HSS-initiated CLR actually transmitted to the
     /// connected MME peer and answered with a CLA.

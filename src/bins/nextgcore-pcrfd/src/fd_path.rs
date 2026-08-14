@@ -559,9 +559,20 @@ pub async fn pcrf_fd_listen(
 ) -> DiameterResult<SocketAddr> {
     pcrf_fd_set_local_identity(identity.clone());
 
+    // Gx (gx_path.rs) and Rx (rx_path.rs) are the applications this PCRF
+    // implements. Advertising them lets a peer discover our capabilities, and
+    // lets us refuse a peer with none in common (RFC 6733 §5.3).
+    let applications = nextgcore_diameter::applications::ApplicationRegistry::new("NextGCore PCRF")
+        .with_application(nextgcore_diameter::applications::well_known::GX)
+        .with_application(nextgcore_diameter::applications::well_known::RX);
+
     let config = DiameterConfig {
         diameter_id: identity.host.clone(),
         diameter_realm: identity.realm.clone(),
+        // Advertised as Host-IP-Address. A wildcard bind tells a peer nothing
+        // routable, so it is omitted rather than advertised.
+        address: (!addr.ip().is_unspecified()).then(|| addr.ip().to_string()),
+        applications,
         ..Default::default()
     };
 
