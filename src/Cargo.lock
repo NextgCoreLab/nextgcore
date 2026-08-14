@@ -2500,6 +2500,7 @@ dependencies = [
  "log",
  "nextgcore-core",
  "nextgcore-crypt",
+ "nextgcore-sctp",
  "proptest",
  "thiserror 1.0.69",
  "tokio",
