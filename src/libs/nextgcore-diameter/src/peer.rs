@@ -69,8 +69,8 @@ pub enum PeerEvent {
 }
 
 /// Diameter peer representing a single connection to a remote node
-pub struct DiameterPeer {
-    transport: DiameterTransport,
+pub struct DiameterPeer<T = DiameterTransport> {
+    transport: T,
     state: PeerState,
     local_host: String,
     local_realm: String,
@@ -112,9 +112,9 @@ fn parse_host_addresses(config: &DiameterConfig) -> Vec<std::net::IpAddr> {
         .collect()
 }
 
-impl DiameterPeer {
+impl<T: crate::transport::DiameterTransportIo> DiameterPeer<T> {
     /// Create a new peer from an established transport (responder side)
-    pub fn new_responder(transport: DiameterTransport, config: &DiameterConfig) -> Self {
+    pub fn new_responder(transport: T, config: &DiameterConfig) -> Self {
         Self {
             transport,
             state: PeerState::WaitCER,
@@ -131,7 +131,7 @@ impl DiameterPeer {
     }
 
     /// Create a new peer and initiate connection (initiator side)
-    pub fn new_initiator(transport: DiameterTransport, config: &DiameterConfig) -> Self {
+    pub fn new_initiator(transport: T, config: &DiameterConfig) -> Self {
         Self {
             transport,
             state: PeerState::Closed,
@@ -145,6 +145,21 @@ impl DiameterPeer {
             applications: config.applications.clone(),
             host_addresses: parse_host_addresses(config),
         }
+    }
+
+    /// Alias for [`Self::new_responder`], named to make a non-TCP transport
+    /// explicit at the call site.
+    ///
+    /// The plain constructors are generic now, so these add no capability; they
+    /// exist so a reader of a test or a daemon can see that the peer is not on
+    /// the default TCP transport without inspecting the argument's type.
+    pub fn new_responder_generic(transport: T, config: &DiameterConfig) -> Self {
+        Self::new_responder(transport, config)
+    }
+
+    /// Alias for [`Self::new_initiator`]. See [`Self::new_responder_generic`].
+    pub fn new_initiator_generic(transport: T, config: &DiameterConfig) -> Self {
+        Self::new_initiator(transport, config)
     }
 
     /// Get the current peer state
@@ -198,7 +213,7 @@ impl DiameterPeer {
     /// This handles all base protocol messages (CER/CEA, DWR/DWA, DPR/DPA)
     /// internally and returns application-level events to the caller.
     pub async fn next_event(&mut self) -> DiameterResult<PeerEvent> {
-        let msg = self.transport.recv().await?;
+        let msg = self.transport.recv_message().await?;
         self.process_message(msg).await
     }
 
@@ -225,7 +240,7 @@ impl DiameterPeer {
             // Closing: received DPA (disconnect answer)
             (PeerState::Closing, base_cmd::DISCONNECT_PEER, false) => {
                 self.state = PeerState::Closed;
-                self.transport.shutdown().await?;
+                self.transport.close().await?;
                 Ok(PeerEvent::Disconnected)
             }
             // Open: application message
@@ -246,7 +261,7 @@ impl DiameterPeer {
                 self.state
             )));
         }
-        self.transport.send(msg).await
+        self.transport.send_message(msg).await
     }
 
     /// Build and send Capabilities-Exchange-Request
@@ -280,7 +295,7 @@ impl DiameterPeer {
         self.applications
             .append_capabilities(&mut msg, &self.host_addresses);
 
-        self.transport.send(&msg).await
+        self.transport.send_message(&msg).await
     }
 
     /// Handle incoming CER: validate and respond with CEA
@@ -356,7 +371,7 @@ impl DiameterPeer {
         self.applications
             .append_capabilities(&mut cea, &self.host_addresses);
 
-        self.transport.send(&cea).await?;
+        self.transport.send_message(&cea).await?;
 
         // Only reach Open on success. On 5010 the RFC closes the connection, so
         // the peer is reported as Disconnected rather than Established and stays
@@ -364,7 +379,7 @@ impl DiameterPeer {
         // carry application traffic over it.
         if negotiated.is_none() {
             self.state = PeerState::Closed;
-            self.transport.shutdown().await?;
+            self.transport.close().await?;
             return Ok(PeerEvent::Disconnected);
         }
 
@@ -431,7 +446,7 @@ impl DiameterPeer {
             AvpData::Unsigned32(origin_state_id()),
         ));
 
-        self.transport.send(&dwa).await?;
+        self.transport.send_message(&dwa).await?;
         Ok(PeerEvent::WatchdogAck)
     }
 
@@ -460,7 +475,7 @@ impl DiameterPeer {
             AvpData::Unsigned32(origin_state_id()),
         ));
 
-        self.transport.send(&dwr).await
+        self.transport.send_message(&dwr).await
     }
 
     /// Handle incoming DPR: respond with DPA and close
@@ -479,9 +494,9 @@ impl DiameterPeer {
             AvpData::DiameterIdentity(self.local_realm.clone()),
         ));
 
-        self.transport.send(&dpa).await?;
+        self.transport.send_message(&dpa).await?;
         self.state = PeerState::Closed;
-        self.transport.shutdown().await?;
+        self.transport.close().await?;
         Ok(PeerEvent::Disconnected)
     }
 
@@ -508,7 +523,7 @@ impl DiameterPeer {
         // Disconnect-Cause AVP (code 273)
         dpr.add_avp(Avp::mandatory(273, AvpData::Enumerated(cause as i32)));
 
-        self.transport.send(&dpr).await?;
+        self.transport.send_message(&dpr).await?;
         self.state = PeerState::Closing;
         Ok(())
     }

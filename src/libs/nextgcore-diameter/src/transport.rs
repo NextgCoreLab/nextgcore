@@ -41,6 +41,47 @@ use crate::DIAMETER_PORT;
 /// Maximum Diameter message size (default 64KB, RFC allows up to 16MB)
 const MAX_MESSAGE_SIZE: usize = 65536;
 
+/// The three operations [`crate::peer::DiameterPeer`] needs from a transport.
+///
+/// # Why this exists
+///
+/// `DiameterPeer` held a concrete `DiameterTransport` (TCP), so the peer state
+/// machine — CER/CEA, watchdog, DPR — could not run over SCTP even once an SCTP
+/// transport existed. The transport was reachable but nothing could drive
+/// Diameter across it, which made the SCTP support real only at the byte level.
+///
+/// Deliberately narrow: `send`/`recv`/`shutdown` is the entire surface the peer
+/// uses (verified by grepping every `self.transport.*` call), so widening it
+/// would invite transports to differ in ways the state machine cannot honour.
+/// Framing stays inside each implementation, since TCP is a byte stream that
+/// must be reassembled while SCTP is message-oriented.
+#[async_trait::async_trait]
+pub trait DiameterTransportIo: Send {
+    /// Send one encoded Diameter message.
+    async fn send_message(&mut self, msg: &DiameterMessage) -> DiameterResult<()>;
+
+    /// Receive the next complete Diameter message.
+    async fn recv_message(&mut self) -> DiameterResult<DiameterMessage>;
+
+    /// Close the connection.
+    async fn close(&mut self) -> DiameterResult<()>;
+}
+
+#[async_trait::async_trait]
+impl DiameterTransportIo for DiameterTransport {
+    async fn send_message(&mut self, msg: &DiameterMessage) -> DiameterResult<()> {
+        self.send(msg).await
+    }
+
+    async fn recv_message(&mut self) -> DiameterResult<DiameterMessage> {
+        self.recv().await
+    }
+
+    async fn close(&mut self) -> DiameterResult<()> {
+        self.shutdown().await
+    }
+}
+
 /// Diameter transport connection wrapping a TCP stream
 pub struct DiameterTransport {
     stream: TcpStream,
@@ -1007,6 +1048,39 @@ impl SctpDiameterTransport {
     }
 }
 
+#[cfg(feature = "kernel-sctp")]
+#[async_trait::async_trait]
+impl DiameterTransportIo for SctpDiameterTransport {
+    async fn send_message(&mut self, msg: &DiameterMessage) -> DiameterResult<()> {
+        // Uses the default stream; RFC 6733 does not require a specific one.
+        self.send(msg).await
+    }
+
+    async fn recv_message(&mut self) -> DiameterResult<DiameterMessage> {
+        self.recv().await
+    }
+
+    async fn close(&mut self) -> DiameterResult<()> {
+        self.shutdown().await
+    }
+}
+
+/// Convert an [`nextgcore_sctp::SctpError`] into an `io::Error`, PRESERVING the
+/// original `ErrorKind` where the SCTP layer wrapped one.
+///
+/// This matters for `AsyncFd::try_io`, which decides whether an operation
+/// would-block purely from `ErrorKind::WouldBlock`. `SctpError::{ReceiveFailed,
+/// SendFailed}` carry the real `io::Error` from `last_os_error()`, so they are
+/// unwrapped; anything else has no os error behind it and is stringified.
+#[cfg(feature = "kernel-sctp")]
+fn sctp_io_error(e: nextgcore_sctp::SctpError) -> std::io::Error {
+    match e {
+        nextgcore_sctp::SctpError::ReceiveFailed(inner)
+        | nextgcore_sctp::SctpError::SendFailed(inner) => inner,
+        other => std::io::Error::other(other.to_string()),
+    }
+}
+
 /// Diameter Payload Protocol Identifier for SCTP (RFC 6733 §2.1.1).
 ///
 /// 46 = "DIAMETER in a SCTP DATA chunk"; 47 is the DTLS/SCTP variant, which this
@@ -1090,9 +1164,15 @@ impl SctpStream {
         loop {
             let mut ready = self.async_fd.writable().await?;
             let attempt = ready.try_io(|_| {
+                // The inner io::Error must be surfaced UNWRAPPED: try_io only
+                // recognises a would-block by its ErrorKind, and flattening
+                // through `to_string()` erases it. That turned a routine EAGAIN
+                // on a non-blocking socket into a fatal error -- which is what
+                // the first real run of this code produced ("Send failed:
+                // Resource temporarily unavailable (os error 11)").
                 self.socket
                     .send(data, DIAMETER_SCTP_PPID, stream_id)
-                    .map_err(|e| std::io::Error::other(e.to_string()))
+                    .map_err(sctp_io_error)
             });
             match attempt {
                 Ok(Ok(_)) => return Ok(()),
@@ -1113,9 +1193,8 @@ impl SctpStream {
         loop {
             let mut ready = self.async_fd.readable().await?;
             let attempt = ready.try_io(|_| {
-                self.socket
-                    .recv_msg(&mut scratch)
-                    .map_err(|e| std::io::Error::other(e.to_string()))
+                // Unwrapped for the same reason as `send`; see the note there.
+                self.socket.recv_msg(&mut scratch).map_err(sctp_io_error)
             });
             match attempt {
                 Ok(Ok((0, _info, _flags))) => return Ok((0, 0)),
@@ -1191,9 +1270,8 @@ impl SctpDiameterListener {
         loop {
             let mut ready = self.async_fd.readable().await.map_err(DiameterError::Io)?;
             let attempt = ready.try_io(|_| {
-                self.socket
-                    .accept()
-                    .map_err(|e| std::io::Error::other(e.to_string()))
+                // Unwrapped so a would-block is retried, not reported.
+                self.socket.accept().map_err(sctp_io_error)
             });
             match attempt {
                 Ok(Ok((sock, _peer))) => {
@@ -1423,5 +1501,156 @@ mod sctp_tests {
             Err(e) => assert!(e.to_string().contains("no_sctp"), "got: {e}"),
             Ok(_) => panic!("no_sctp must refuse to bind"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Real SCTP end-to-end
+    //
+    // These are the first tests to actually OPEN an SCTP socket. Everything
+    // else under this feature is either pure logic or refuses before touching
+    // the network, which is why the transport shipped unexercised: the code
+    // type-checked, and on a host without libsctp it could not even link.
+    //
+    // Requirements: `libsctp` (to link) and the `sctp` kernel module loaded
+    // (`modprobe sctp`). No root is needed at RUN time -- an unprivileged
+    // process may open `IPPROTO_SCTP` SOCK_STREAM sockets, unlike raw sockets.
+    // If the module is absent, `bind` fails with EPROTONOSUPPORT and these
+    // tests fail loudly rather than silently passing, which is the intent: a
+    // skipped test here would recreate the false confidence being fixed.
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "kernel-sctp")]
+    fn sctp_config(host: &str) -> DiameterConfig {
+        DiameterConfig {
+            diameter_id: host.to_string(),
+            diameter_realm: "sctp.example.org".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A full Diameter exchange over real SCTP: bind, connect, CER/CEA, then an
+    /// AIR answered with an AIA.
+    ///
+    /// This covers the two parts of the transport that were least certain by
+    /// inspection: the PPID-46 send path, and the `recv` loop's skipping of SCTP
+    /// notifications (an unfiltered notification would enter the Diameter framer
+    /// as a malformed header and kill the association).
+    #[cfg(feature = "kernel-sctp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sctp_carries_a_full_diameter_exchange() {
+        use crate::avp::{Avp, AvpData};
+        use crate::peer::{DiameterPeer, PeerEvent};
+
+        const AIR: u32 = 318;
+        const S6A_APP: u32 = 16777251;
+
+        // Port 0: the kernel assigns a free SCTP port, so concurrent test runs
+        // cannot collide.
+        let listener = SctpDiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .expect("SCTP bind failed -- is the sctp kernel module loaded?");
+        let addr = listener.local_addr().expect("local_addr");
+        assert_ne!(addr.port(), 0, "the kernel must assign a real port");
+
+        // Responder: accept one association, complete CER/CEA, answer the AIR.
+        let server = tokio::spawn(async move {
+            let transport = listener.accept().await.expect("accept");
+            let cfg = sctp_config("hss.sctp.example.org");
+            let mut peer = DiameterPeer::new_responder_generic(transport, &cfg);
+            peer.start().await.expect("responder start");
+
+            match peer.next_event().await.expect("CER") {
+                PeerEvent::Established { origin_host, .. } => {
+                    assert_eq!(origin_host, "mme.sctp.example.org");
+                }
+                other => panic!("expected Established, got {other:?}"),
+            }
+
+            match peer.next_event().await.expect("AIR") {
+                PeerEvent::Message(request) => {
+                    assert_eq!(request.header.command_code, AIR);
+                    let mut answer = DiameterMessage::new_answer(&request);
+                    answer.add_avp(Avp::mandatory(268, AvpData::Unsigned32(2001)));
+                    peer.send_message(&answer).await.expect("send AIA");
+                }
+                other => panic!("expected the AIR, got {other:?}"),
+            }
+        });
+
+        // Initiator.
+        let transport = SctpDiameterTransport::connect(addr)
+            .await
+            .expect("SCTP connect");
+        let cfg = sctp_config("mme.sctp.example.org");
+        let mut client = DiameterPeer::new_initiator_generic(transport, &cfg);
+        client.start().await.expect("send CER");
+
+        match client.next_event().await.expect("CEA") {
+            PeerEvent::Established { origin_host, .. } => {
+                assert_eq!(origin_host, "hss.sctp.example.org");
+            }
+            other => panic!("expected Established, got {other:?}"),
+        }
+
+        let air = DiameterMessage::new_request(AIR, S6A_APP);
+        client.send_message(&air).await.expect("send AIR");
+
+        match client.next_event().await.expect("AIA") {
+            PeerEvent::Message(answer) => {
+                assert!(answer.header.is_answer());
+                assert_eq!(answer.result_code(), Some(2001));
+            }
+            other => panic!("expected the AIA, got {other:?}"),
+        }
+
+        server.await.expect("responder task");
+    }
+
+    /// Framing must survive messages larger than one read: SCTP is
+    /// message-oriented, so this also proves a Diameter message is not being
+    /// silently truncated at an SCTP message boundary.
+    #[cfg(feature = "kernel-sctp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sctp_preserves_framing_for_a_large_message() {
+        use crate::avp::{Avp, AvpData};
+
+        let listener = SctpDiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .expect("SCTP bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let server = tokio::spawn(async move {
+            let mut transport = listener.accept().await.expect("accept");
+            transport.recv().await.expect("recv large message")
+        });
+
+        let mut transport = SctpDiameterTransport::connect(addr)
+            .await
+            .expect("SCTP connect");
+
+        // ~4KB of AVP payload: comfortably past the 4096-byte initial read
+        // buffer, so the framer must reassemble rather than assume one read.
+        let mut msg = DiameterMessage::new_request(316, 16777251);
+        msg.add_avp(Avp::mandatory(
+            crate::common::avp_code::USER_NAME,
+            AvpData::Utf8String("x".repeat(4096)),
+        ));
+        let expected_len = msg.encode().len();
+        transport.send(&msg).await.expect("send");
+
+        let received = server.await.expect("server task");
+        assert_eq!(received.header.command_code, 316);
+        assert_eq!(
+            received.encode().len(),
+            expected_len,
+            "the message must survive framing intact"
+        );
+        assert_eq!(
+            received
+                .find_avp(crate::common::avp_code::USER_NAME)
+                .and_then(|a| a.as_utf8_string())
+                .map(|s| s.len()),
+            Some(4096)
+        );
     }
 }
