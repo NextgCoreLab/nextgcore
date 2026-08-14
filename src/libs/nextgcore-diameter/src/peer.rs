@@ -212,8 +212,46 @@ impl<T: crate::transport::DiameterTransportIo> DiameterPeer<T> {
     ///
     /// This handles all base protocol messages (CER/CEA, DWR/DWA, DPR/DPA)
     /// internally and returns application-level events to the caller.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is **not** cancel-safe and must not be used as a `select!`
+    /// branch: [`Self::handle_message`] can await a write (a DWA answering a
+    /// watchdog, a DPA answering a disconnect), so dropping the future mid-write
+    /// would leave a partial message on the wire and desynchronise framing for
+    /// every subsequent message. Use [`Self::recv_raw`] plus
+    /// [`Self::handle_message`] when the read has to race another branch — see
+    /// [`crate::session`], which does exactly that.
     pub async fn next_event(&mut self) -> DiameterResult<PeerEvent> {
-        let msg = self.transport.recv_message().await?;
+        let msg = self.recv_raw().await?;
+        self.handle_message(msg).await
+    }
+
+    /// Read the next message off the wire without interpreting it.
+    ///
+    /// # Cancel safety
+    ///
+    /// This **is** cancel-safe, which is the reason it is split out. The only
+    /// await is the transport's own read into a buffer it owns: if the future is
+    /// dropped, no bytes are consumed from the socket and any partial message
+    /// already buffered stays buffered, so a later call resumes exactly where
+    /// this one left off. That makes it sound as a `select!` branch, unlike
+    /// [`Self::next_event`].
+    ///
+    /// The cancel-safety guarantee is a property of each
+    /// [`crate::transport::DiameterTransportIo`] implementation, not of this
+    /// wrapper: TCP buffers into `read_buf` and SCTP reads one whole message, so
+    /// both hold. A future transport must preserve it.
+    pub async fn recv_raw(&mut self) -> DiameterResult<DiameterMessage> {
+        self.transport.recv_message().await
+    }
+
+    /// Advance the state machine for a message obtained from [`Self::recv_raw`].
+    ///
+    /// Handles the base protocol (CER/CEA, DWR/DWA, DPR/DPA) internally,
+    /// answering where the RFC requires it, and returns application-level events
+    /// to the caller. Not cancel-safe: see [`Self::next_event`].
+    pub async fn handle_message(&mut self, msg: DiameterMessage) -> DiameterResult<PeerEvent> {
         self.process_message(msg).await
     }
 

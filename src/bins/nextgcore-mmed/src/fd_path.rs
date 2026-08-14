@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 
 use nextgcore_diameter::config::DiameterConfig;
 use nextgcore_diameter::s6a;
+use nextgcore_diameter::session::DiameterSession;
 use nextgcore_diameter::transport::DiameterClient;
 
 use crate::context::MmeUe;
@@ -312,13 +313,31 @@ pub struct SessionState {
 // ============================================================================
 
 /// Diameter client state for the S6a interface (MME -> HSS)
+///
+/// # Why this no longer holds a `DiameterClient`
+///
+/// It used to, and every S6a operation took the global mutex below and then
+/// called `client.send_request(..)` **while holding the guard**. Because
+/// `send_request` awaits the HSS answer, one slow or unanswered exchange blocked
+/// every other subscriber's AIR/ULR/PUR — the whole S6a plane, not just the UE
+/// that stalled. A request timeout (added separately) bounded that to 30s of
+/// total outage per stalled request, which is better than forever but still an
+/// availability defect, and the lock was the cause.
+///
+/// The connection now lives in a [`DiameterSession`], which multiplexes requests
+/// over it by Hop-by-Hop Identifier (RFC 6733 §3) and is `Clone` + `&self`. So
+/// this struct keeps only what genuinely needs serialising: the session-id
+/// counter. The lock is taken to build a request and released before the await.
 struct S6aClientState {
-    /// Diameter client connection to HSS
-    client: DiameterClient,
+    /// Multiplexing handle for the HSS connection. Cloned out under the lock and
+    /// used without it, which is what allows concurrent exchanges.
+    session: DiameterSession,
     /// Diameter configuration
     config: DiameterConfig,
     /// Session ID counter
     session_counter: u64,
+    /// Reader task driving the session; aborted on shutdown.
+    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl S6aClientState {
@@ -338,6 +357,37 @@ fn s6a_client() -> &'static Mutex<Option<S6aClientState>> {
     S6A_CLIENT.get_or_init(|| Mutex::new(None))
 }
 
+/// Configuration recorded by [`mme_fd_init_async`], consumed by
+/// [`mme_fd_connect`].
+///
+/// Kept separate from `S6A_CLIENT` because the connection is now established in
+/// one step (connect + session start), so `mme_fd_connect` needs the config
+/// before any session exists — and it must not hold the state lock while dialling.
+static S6A_CONFIG: OnceLock<Mutex<Option<(DiameterConfig, SocketAddr)>>> = OnceLock::new();
+
+fn s6a_config() -> &'static Mutex<Option<(DiameterConfig, SocketAddr)>> {
+    S6A_CONFIG.get_or_init(|| Mutex::new(None))
+}
+
+/// Take the session handle and a fresh session id, releasing the lock before the
+/// caller awaits anything.
+///
+/// Every S6a request path goes through this rather than holding the guard across
+/// its exchange. Returning owned values (a cloned handle, a `String`, the two
+/// identity strings) is what makes that possible: nothing borrowed from the
+/// guard outlives it.
+async fn s6a_begin_request() -> DiameterResult<(DiameterSession, String, String, String)> {
+    let mut guard = s6a_client().lock().await;
+    let state = guard.as_mut().ok_or(DiameterError::NotInitialized)?;
+    let session_id = state.next_session_id();
+    Ok((
+        state.session.clone(),
+        session_id,
+        state.config.diameter_id.clone(),
+        state.config.diameter_realm.clone(),
+    ))
+}
+
 // ============================================================================
 // Diameter Path Functions
 // ============================================================================
@@ -354,34 +404,62 @@ pub fn mme_fd_init() -> DiameterResult<()> {
     Ok(())
 }
 
-/// Initialize Diameter S6a interface with configuration (async version)
+/// Record the S6a configuration. The connection itself is established by
+/// [`mme_fd_connect`].
+///
+/// The peer address is stashed rather than dialled here, preserving the previous
+/// deferred-connect behaviour: `mme_fd_init` runs before the async runtime is
+/// necessarily useful, and startup must not block on an HSS that is not up yet.
 ///
 /// # Arguments
 /// * `config` - Diameter configuration (origin host, realm, etc.)
 /// * `hss_addr` - HSS peer address
 pub async fn mme_fd_init_async(config: DiameterConfig, hss_addr: SocketAddr) -> DiameterResult<()> {
     log::info!("Initializing Diameter S6a interface, HSS={hss_addr}");
-
-    let client = DiameterClient::new(config.clone(), hss_addr);
-    let state = S6aClientState {
-        client,
-        config,
-        session_counter: 0,
-    };
-
-    let mut guard = s6a_client().lock().await;
-    *guard = Some(state);
+    let mut guard = s6a_config().lock().await;
+    *guard = Some((config, hss_addr));
     Ok(())
 }
 
-/// Connect the S6a client to the HSS
+/// Connect to the HSS and start multiplexing S6a requests over the connection.
+///
+/// `DiameterSession::start` consumes the connected client, so the CER/CEA
+/// exchange has to complete first -- hence connect and session-start being one
+/// step rather than the previous init-then-connect pair. Calling this again after
+/// a connection loss replaces the session and aborts the old reader task.
 pub async fn mme_fd_connect() -> DiameterResult<()> {
-    let mut guard = s6a_client().lock().await;
-    let state = guard.as_mut().ok_or(DiameterError::NotInitialized)?;
-    state.client.connect_with_retry(3).await.map_err(|e| {
+    let (config, hss_addr) = {
+        let guard = s6a_config().lock().await;
+        guard.clone().ok_or(DiameterError::NotInitialized)?
+    };
+
+    // Dialled OUTSIDE the state lock: connect_with_retry sleeps between
+    // attempts, and holding the lock across that would reintroduce exactly the
+    // stall this change removes.
+    let mut client = DiameterClient::new(config.clone(), hss_addr);
+    client.connect_with_retry(3).await.map_err(|e| {
         log::error!("Failed to connect to HSS: {e}");
         DiameterError::ConnectionFailed
-    })
+    })?;
+
+    let (session, reader) = DiameterSession::start(client)?;
+
+    let mut guard = s6a_client().lock().await;
+    // Replacing an existing session: stop its reader so two tasks never own
+    // connections to the same peer.
+    if let Some(old) = guard.take() {
+        if let Some(handle) = old.reader {
+            handle.abort();
+        }
+    }
+    *guard = Some(S6aClientState {
+        session,
+        config,
+        session_counter: 0,
+        reader: Some(reader),
+    });
+    log::info!("S6a session established with HSS={hss_addr}");
+    Ok(())
 }
 
 /// Finalize Diameter S6a interface (sync version for shutdown)
@@ -394,10 +472,15 @@ pub fn mme_fd_final() {
 pub async fn mme_fd_final_async() {
     log::info!("Finalizing Diameter S6a interface");
     let mut guard = s6a_client().lock().await;
-    if let Some(ref mut state) = *guard {
-        let _ = state.client.disconnect().await;
+    if let Some(state) = guard.take() {
+        // Aborting the reader drops the peer, which closes the socket. There is
+        // no graceful DPR here: the session owns the peer, and adding a
+        // disconnect path through the multiplexer is only worth it once
+        // reconnection exists (tracked with the failover work).
+        if let Some(handle) = state.reader {
+            handle.abort();
+        }
     }
-    *guard = None;
 }
 
 /// True when the ULR did not set Skip-Subscriber-Data, i.e. the ULA is
@@ -434,10 +517,10 @@ pub async fn mme_s6a_send_air(
         return Err(DiameterError::BuildFailed);
     }
 
-    let mut guard = s6a_client().lock().await;
-    let state = guard.as_mut().ok_or(DiameterError::NotInitialized)?;
+    // The lock is released here, BEFORE the exchange below, so a slow answer
+    // cannot block another subscriber's request.
+    let (session, session_id, origin_host, origin_realm) = s6a_begin_request().await?;
 
-    let session_id = state.next_session_id();
     let visited_plmn = encode_plmn_id(&mme_ue.tai.plmn_id);
 
     log::debug!(
@@ -448,9 +531,9 @@ pub async fn mme_s6a_send_air(
 
     let mut air = s6a::create_air(
         &session_id,
-        &state.config.diameter_id,
-        &state.config.diameter_realm,
-        &state.config.diameter_realm, // destination realm (same or from hssmap)
+        &origin_host,
+        &origin_realm,
+        &origin_realm, // destination realm (same or from hssmap)
         &mme_ue.imsi_bcd,
         &visited_plmn,
         1, // request 1 vector
@@ -470,7 +553,7 @@ pub async fn mme_s6a_send_air(
         }
     }
 
-    let answer = state.client.send_request(&air).await?;
+    let answer = session.send_request(&air).await?;
 
     // Parse the AIA response
     let result_code = answer.result_code().unwrap_or(0);
@@ -516,10 +599,9 @@ pub async fn mme_s6a_send_ulr(mme_ue: &MmeUe, initial_attach: bool) -> DiameterR
         return Err(DiameterError::BuildFailed);
     }
 
-    let mut guard = s6a_client().lock().await;
-    let state = guard.as_mut().ok_or(DiameterError::NotInitialized)?;
+    // Lock released before the exchange; see `s6a_begin_request`.
+    let (session, session_id, origin_host, origin_realm) = s6a_begin_request().await?;
 
-    let session_id = state.next_session_id();
     let visited_plmn = encode_plmn_id(&mme_ue.tai.plmn_id);
 
     // Build ULR flags
@@ -537,16 +619,16 @@ pub async fn mme_s6a_send_ulr(mme_ue: &MmeUe, initial_attach: bool) -> DiameterR
 
     let ulr = s6a::create_ulr(
         &session_id,
-        &state.config.diameter_id,
-        &state.config.diameter_realm,
-        &state.config.diameter_realm,
+        &origin_host,
+        &origin_realm,
+        &origin_realm,
         &mme_ue.imsi_bcd,
         &visited_plmn,
         flags,
         1004, // E-UTRAN RAT type
     );
 
-    let answer = state.client.send_request(&ulr).await?;
+    let answer = session.send_request(&ulr).await?;
 
     // Parse ULA
     let result_code = answer.result_code().unwrap_or(0);
@@ -603,10 +685,8 @@ pub async fn mme_s6a_send_pur(mme_ue: &MmeUe) -> DiameterResult<(u32, u32)> {
         return Err(DiameterError::BuildFailed);
     }
 
-    let mut guard = s6a_client().lock().await;
-    let state = guard.as_mut().ok_or(DiameterError::NotInitialized)?;
-
-    let session_id = state.next_session_id();
+    // Lock released before the exchange; see `s6a_begin_request`.
+    let (session, session_id, origin_host, origin_realm) = s6a_begin_request().await?;
 
     log::debug!("[{}] Sending Purge-UE-Request", mme_ue.imsi_bcd);
 
@@ -623,17 +703,17 @@ pub async fn mme_s6a_send_pur(mme_ue: &MmeUe) -> DiameterResult<(u32, u32)> {
     // Origin-Host
     pur.add_avp(nextgcore_diameter::avp::Avp::mandatory(
         nextgcore_diameter::common::avp_code::ORIGIN_HOST,
-        nextgcore_diameter::avp::AvpData::DiameterIdentity(state.config.diameter_id.clone()),
+        nextgcore_diameter::avp::AvpData::DiameterIdentity(origin_host.clone()),
     ));
     // Origin-Realm
     pur.add_avp(nextgcore_diameter::avp::Avp::mandatory(
         nextgcore_diameter::common::avp_code::ORIGIN_REALM,
-        nextgcore_diameter::avp::AvpData::DiameterIdentity(state.config.diameter_realm.clone()),
+        nextgcore_diameter::avp::AvpData::DiameterIdentity(origin_realm.clone()),
     ));
     // Destination-Realm
     pur.add_avp(nextgcore_diameter::avp::Avp::mandatory(
         nextgcore_diameter::common::avp_code::DESTINATION_REALM,
-        nextgcore_diameter::avp::AvpData::DiameterIdentity(state.config.diameter_realm.clone()),
+        nextgcore_diameter::avp::AvpData::DiameterIdentity(origin_realm.clone()),
     ));
     // User-Name (IMSI)
     pur.add_avp(nextgcore_diameter::avp::Avp::mandatory(
@@ -652,7 +732,7 @@ pub async fn mme_s6a_send_pur(mme_ue: &MmeUe) -> DiameterResult<(u32, u32)> {
         nextgcore_diameter::avp::AvpData::Unsigned32(s6a::pur_flags::UE_PURGED_IN_MME),
     ));
 
-    let answer = state.client.send_request(&pur).await?;
+    let answer = session.send_request(&pur).await?;
 
     let result_code = answer.result_code().unwrap_or(0);
     let pua_flags = answer
@@ -695,17 +775,23 @@ pub struct InboundS6aRequest {
 pub async fn mme_fd_recv_inbound(
     timeout: std::time::Duration,
 ) -> DiameterResult<Option<InboundS6aRequest>> {
-    let mut guard = s6a_client().lock().await;
-    let state = guard.as_mut().ok_or(DiameterError::NotInitialized)?;
-
-    let Some(request) = state.client.recv_inbound_request(timeout).await? else {
-        return Ok(None);
+    // Clone the handle and identities, then RELEASE the lock: this function
+    // waits up to `timeout` for a peer-initiated request, and holding the state
+    // lock for that whole window would block every outbound AIR/ULR/PUR -- the
+    // same defect as the request paths, just with a longer hold.
+    let (session, origin_host, origin_realm) = {
+        let guard = s6a_client().lock().await;
+        let state = guard.as_ref().ok_or(DiameterError::NotInitialized)?;
+        (
+            state.session.clone(),
+            state.config.diameter_id.clone(),
+            state.config.diameter_realm.clone(),
+        )
     };
 
-    let (origin_host, origin_realm) = (
-        state.config.diameter_id.clone(),
-        state.config.diameter_realm.clone(),
-    );
+    let Some(request) = session.recv_inbound_request(timeout).await? else {
+        return Ok(None);
+    };
 
     let build_answer =
         |req: &nextgcore_diameter::message::DiameterMessage, result: u32, protocol_error: bool| {
@@ -742,7 +828,7 @@ pub async fn mme_fd_recv_inbound(
     let Some(imsi_bcd) = request.user_name().map(str::to_string) else {
         log::error!("Inbound S6a request missing User-Name");
         let answer = build_answer(&request, result_code::DIAMETER_MISSING_AVP, false);
-        state.client.send_answer(&answer).await?;
+        session.send_answer(&answer).await?;
         return Ok(None);
     };
 
@@ -758,7 +844,7 @@ pub async fn mme_fd_recv_inbound(
             let Some(cancellation_type) = cancellation_type else {
                 log::error!("[{imsi_bcd}] CLR missing Cancellation-Type");
                 let answer = build_answer(&request, result_code::DIAMETER_MISSING_AVP, false);
-                state.client.send_answer(&answer).await?;
+                session.send_answer(&answer).await?;
                 return Ok(None);
             };
             let clr_flags = request
@@ -773,7 +859,7 @@ pub async fn mme_fd_recv_inbound(
                 "[{imsi_bcd}] Received CLR (type={cancellation_type}, flags={clr_flags:#x})"
             );
             let answer = build_answer(&request, result_code::DIAMETER_SUCCESS, false);
-            state.client.send_answer(&answer).await?;
+            session.send_answer(&answer).await?;
 
             Ok(Some(InboundS6aRequest {
                 imsi_bcd,
@@ -788,7 +874,7 @@ pub async fn mme_fd_recv_inbound(
             let Some(sub_avp) = request.find_avp(avp_code::SUBSCRIPTION_DATA) else {
                 log::error!("[{imsi_bcd}] IDR missing Subscription-Data");
                 let answer = build_answer(&request, result_code::DIAMETER_MISSING_AVP, false);
-                state.client.send_answer(&answer).await?;
+                session.send_answer(&answer).await?;
                 return Ok(None);
             };
             let subscription_data = s6a::parse_subscription_data_avp(sub_avp);
@@ -802,7 +888,7 @@ pub async fn mme_fd_recv_inbound(
 
             log::info!("[{imsi_bcd}] Received IDR (flags={idr_flags:#x})");
             let answer = build_answer(&request, result_code::DIAMETER_SUCCESS, false);
-            state.client.send_answer(&answer).await?;
+            session.send_answer(&answer).await?;
 
             Ok(Some(InboundS6aRequest {
                 imsi_bcd,
@@ -819,7 +905,7 @@ pub async fn mme_fd_recv_inbound(
                 result_code::DIAMETER_COMMAND_UNSUPPORTED,
                 true, // protocol error: E-bit (RFC 6733 7.2)
             );
-            state.client.send_answer(&answer).await?;
+            session.send_answer(&answer).await?;
             Ok(None)
         }
     }

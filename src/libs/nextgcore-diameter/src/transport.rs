@@ -454,6 +454,31 @@ impl DiameterClient {
             .unwrap_or(false)
     }
 
+    /// This client's configuration.
+    pub fn config(&self) -> &DiameterConfig {
+        &self.config
+    }
+
+    /// The current Hop-by-Hop and End-to-End counter values.
+    ///
+    /// Handing these to [`crate::session::DiameterSession`] keeps identifier
+    /// allocation continuous across the handover: RFC 6733 §3 wants Hop-by-Hop
+    /// unique per connection, and restarting from zero could collide with an
+    /// identifier already in flight from the CER/CEA exchange.
+    pub fn identifier_seeds(&self) -> (u32, u32) {
+        (self.hop_by_hop, self.end_to_end)
+    }
+
+    /// Consume the client and yield its connected peer, or `None` if it never
+    /// connected.
+    ///
+    /// Exists so [`crate::session::DiameterSession`] can take ownership of an
+    /// already-established connection (including its completed CER/CEA) rather
+    /// than dialling a second one.
+    pub fn into_peer(self) -> Option<DiameterPeer> {
+        self.peer
+    }
+
     /// Send an application-level Diameter request and wait for an answer.
     ///
     /// Hop-by-Hop and End-to-End identifiers are assigned per RFC 6733 if the
