@@ -47,7 +47,7 @@ use crate::kernel::{
     SCTP_SHUTDOWN_EVENT,
 };
 use crate::server::{SctpServerConfig, ServerError, ServerEvent};
-use crate::{ReceivedMessage, SctpError, MSG_NOTIFICATION, NEXTGCORE_MAX_SDU_LEN, NGAP_PPID};
+use crate::{ReceivedMessage, SctpError, MSG_NOTIFICATION, NEXTGCORE_MAX_SDU_LEN};
 
 type Result<T> = std::result::Result<T, ServerError>;
 
@@ -120,9 +120,10 @@ impl KernelSctpServer {
         let associations = Arc::clone(&self.associations);
         let next_id = Arc::clone(&self.next_id);
         let recv_cap = (self.config.max_message_size as usize).max(NEXTGCORE_MAX_SDU_LEN);
+        let ppid = self.config.ppid;
 
         let handle = tokio::spawn(async move {
-            accept_loop(listener, associations, next_id, tx, recv_cap).await;
+            accept_loop(listener, associations, next_id, tx, recv_cap, ppid).await;
         });
         self.accept_task = Some(handle);
     }
@@ -139,7 +140,8 @@ impl KernelSctpServer {
         Ok(false)
     }
 
-    /// Send `data` to `association_id` on `stream_id` with the NGAP PPID.
+    /// Send `data` to `association_id` on `stream_id` with the configured PPID
+    /// ([`SctpServerConfig::ppid`]; NGAP 60 by default, S1AP 18 for S1-MME).
     pub async fn send(&mut self, association_id: u64, stream_id: u16, data: &[u8]) -> Result<()> {
         let (sock, afd) = {
             let guard = self.associations.lock().unwrap();
@@ -148,10 +150,11 @@ impl KernelSctpServer {
                 None => return Err(ServerError::AssociationNotFound(association_id)),
             }
         };
+        let ppid = self.config.ppid;
 
         loop {
             let mut ready = afd.writable().await.map_err(ServerError::Io)?;
-            let attempt = ready.try_io(|_| match sock.send(data, NGAP_PPID, stream_id) {
+            let attempt = ready.try_io(|_| match sock.send(data, ppid, stream_id) {
                 Ok(n) => Ok(n),
                 Err(SctpError::SendFailed(e)) => Err(e),
                 Err(other) => Err(io::Error::other(other.to_string())),
@@ -195,6 +198,7 @@ async fn accept_loop(
     next_id: Arc<AtomicU64>,
     tx: mpsc::UnboundedSender<ServerEvent>,
     recv_cap: usize,
+    ppid: u32,
 ) {
     let afd = match AsyncFd::new(FdRef(listener.as_raw_fd())) {
         Ok(afd) => afd,
@@ -249,7 +253,7 @@ async fn accept_loop(
                 let read_tx = tx.clone();
                 let read_assocs = Arc::clone(&associations);
                 tokio::spawn(async move {
-                    read_loop(id, sock, sub_afd, read_tx, read_assocs, recv_cap).await;
+                    read_loop(id, sock, sub_afd, read_tx, read_assocs, recv_cap, ppid).await;
                 });
             }
             Ok(Err(e)) => {
@@ -268,6 +272,7 @@ async fn read_loop(
     tx: mpsc::UnboundedSender<ServerEvent>,
     associations: Arc<Mutex<HashMap<u64, Assoc>>>,
     recv_cap: usize,
+    ppid: u32,
 ) {
     loop {
         let mut ready = match afd.readable().await {
@@ -301,7 +306,9 @@ async fn read_loop(
                     continue;
                 }
                 buf.truncate(n);
-                let ppid = if info.ppid == 0 { NGAP_PPID } else { info.ppid };
+                // An inbound PPID of 0 means the peer did not stamp one; fall
+                // back to the association's configured application protocol.
+                let ppid = if info.ppid == 0 { ppid } else { info.ppid };
                 let _ = tx.send(ServerEvent::DataReceived {
                     association_id: id,
                     message: ReceivedMessage {

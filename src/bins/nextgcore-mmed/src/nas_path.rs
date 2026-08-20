@@ -9,6 +9,7 @@ use crate::emm_build::{self, EmmCause, SecurityHeaderType};
 use crate::esm_build::{self, EsmCause};
 use crate::nas_security;
 use crate::s1ap_build;
+use crate::s1ap_path;
 
 // ============================================================================
 // Result Types
@@ -101,19 +102,30 @@ pub enum S1apCauseNas {
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_to_enb(_mme_ue: &MmeUe, enb_ue: &EnbUe, message: Vec<u8>) -> NasResult<()> {
+pub fn nas_eps_send_to_enb(_mme_ue: &MmeUe, enb_ue: &EnbUe, s1ap_pdu: Vec<u8>) -> NasResult<()> {
     if enb_ue.id == 0 {
         log::error!("S1 context has already been removed");
         return Err(NasError::EnbUeNotFound);
     }
 
-    // In actual implementation, this would call s1ap_send_to_enb_ue
     log::debug!(
-        "Sending NAS message to eNB UE (mme_ue_s1ap_id={}, enb_ue_s1ap_id={}), len={}",
+        "Sending S1AP PDU to eNB UE (mme_ue_s1ap_id={}, enb_ue_s1ap_id={}, enb_id={}), len={}",
         enb_ue.mme_ue_s1ap_id,
         enb_ue.enb_ue_s1ap_id,
-        message.len()
+        enb_ue.enb_id,
+        s1ap_pdu.len()
     );
+
+    // Queue for transmission on the eNB's S1 association (issue #42). This
+    // previously only logged and returned Ok, so every downlink PDU the MME
+    // built was silently discarded while the caller saw success.
+    //
+    // A failed queue push is NOT an error for the caller: it means no live S1
+    // association to that eNB, which is indistinguishable from an eNB that has
+    // gone away mid-procedure. It is logged by `s1ap_send_pdu`, and the EPS
+    // procedure continues (its own timer will govern the retry), exactly as it
+    // would for a lost message on the radio side.
+    s1ap_path::s1ap_send_pdu(enb_ue.enb_id, s1ap_pdu);
 
     Ok(())
 }
@@ -134,15 +146,21 @@ pub fn nas_eps_send_to_downlink_nas_transport(enb_ue: &EnbUe, message: Vec<u8>) 
     }
 
     // Build S1AP downlink NAS transport message (APER via nextgcore-s1ap)
-    let _s1ap_message = s1ap_build::build_downlink_nas_transport(enb_ue, &message)
+    let s1ap_message = s1ap_build::build_downlink_nas_transport(enb_ue, &message)
         .map_err(|_| NasError::BuildFailed)?;
 
     log::debug!(
-        "Sending downlink NAS transport (mme_ue_s1ap_id={}, enb_ue_s1ap_id={}), len={}",
+        "Sending downlink NAS transport (mme_ue_s1ap_id={}, enb_ue_s1ap_id={}, enb_id={}), \
+         nas_len={}, s1ap_len={}",
         enb_ue.mme_ue_s1ap_id,
         enb_ue.enb_ue_s1ap_id,
-        message.len()
+        enb_ue.enb_id,
+        message.len(),
+        s1ap_message.len()
     );
+
+    // Transmit the built PDU instead of dropping it (issue #42).
+    s1ap_path::s1ap_send_pdu(enb_ue.enb_id, s1ap_message);
 
     Ok(())
 }
@@ -240,8 +258,10 @@ pub fn nas_eps_send_attach_accept(
     // Clear UE radio capability as per TS24.301
     mme_ue.ue_radio_capability.clear();
 
-    // Build S1AP initial context setup request (APER via nextgcore-s1ap)
-    let _s1ap_message = s1ap_build::build_initial_context_setup_request(
+    // Build S1AP initial context setup request (APER via nextgcore-s1ap). The
+    // Attach Accept NAS message travels inside this PDU, so the PDU — not the
+    // bare NAS message — is what goes to the eNB (issue #42).
+    let s1ap_message = s1ap_build::build_initial_context_setup_request(
         mme_ue,
         enb_ue,
         std::slice::from_ref(default_bearer),
@@ -249,7 +269,7 @@ pub fn nas_eps_send_attach_accept(
     )
     .map_err(|_| NasError::BuildFailed)?;
 
-    nas_eps_send_to_enb(mme_ue, enb_ue, secured_message)
+    nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
 }
 
 /// Send attach reject message
@@ -569,14 +589,16 @@ pub fn nas_eps_send_tau_accept(
     mme_ue.t3450.pkbuf = Some(emm_message.clone());
 
     if use_initial_context_setup {
-        let _s1ap_message = s1ap_build::build_initial_context_setup_request(
+        // The TAU Accept travels inside the Initial Context Setup Request, so
+        // transmit that PDU rather than the bare NAS message (issue #42).
+        let s1ap_message = s1ap_build::build_initial_context_setup_request(
             mme_ue,
             enb_ue,
             bearers,
             Some(&emm_message),
         )
         .map_err(|_| NasError::BuildFailed)?;
-        nas_eps_send_to_enb(mme_ue, enb_ue, emm_message)
+        nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
     } else {
         nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
     }
@@ -794,11 +816,12 @@ pub fn nas_eps_send_activate_default_bearer_context_request(
 
     let esm_message = esm_build::build_activate_default_bearer_context_request(sess, create_action);
 
-    // Build S1AP E-RAB setup request (APER via nextgcore-s1ap)
-    let _s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message)
+    // Build S1AP E-RAB setup request (APER via nextgcore-s1ap). The ESM message
+    // is carried inside it, so transmit the PDU (issue #42).
+    let s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message)
         .map_err(|_| NasError::BuildFailed)?;
 
-    nas_eps_send_to_enb(mme_ue, enb_ue, esm_message)
+    nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
 }
 
 /// Send activate dedicated bearer context request message
@@ -828,11 +851,12 @@ pub fn nas_eps_send_activate_dedicated_bearer_context_request(
 
     let esm_message = esm_build::build_activate_dedicated_bearer_context_request(bearer);
 
-    // Build S1AP E-RAB setup request (APER via nextgcore-s1ap)
-    let _s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message)
+    // Build S1AP E-RAB setup request (APER via nextgcore-s1ap). The ESM message
+    // is carried inside it, so transmit the PDU (issue #42).
+    let s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message)
         .map_err(|_| NasError::BuildFailed)?;
 
-    nas_eps_send_to_enb(mme_ue, enb_ue, esm_message)
+    nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
 }
 
 /// Send modify bearer context request message
@@ -868,10 +892,11 @@ pub fn nas_eps_send_modify_bearer_context_request(
         esm_build::build_modify_bearer_context_request(bearer, qos_presence, tft_presence);
 
     if qos_presence {
-        // Build S1AP E-RAB modify request (APER via nextgcore-s1ap)
-        let _s1ap_message = s1ap_build::build_e_rab_modify_request(enb_ue, bearer, &esm_message)
+        // Build S1AP E-RAB modify request (APER via nextgcore-s1ap). The ESM
+        // message is carried inside it, so transmit the PDU (issue #42).
+        let s1ap_message = s1ap_build::build_e_rab_modify_request(enb_ue, bearer, &esm_message)
             .map_err(|_| NasError::BuildFailed)?;
-        nas_eps_send_to_enb(mme_ue, enb_ue, esm_message)
+        nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
     } else {
         nas_eps_send_to_downlink_nas_transport(enb_ue, esm_message)
     }
@@ -905,8 +930,9 @@ pub fn nas_eps_send_deactivate_bearer_context_request(
     let esm_message =
         esm_build::build_deactivate_bearer_context_request(bearer, EsmCause::RegularDeactivation);
 
-    // Build S1AP E-RAB release command (APER via nextgcore-s1ap)
-    let _s1ap_message = s1ap_build::build_e_rab_release_command(
+    // Build S1AP E-RAB release command (APER via nextgcore-s1ap). The ESM
+    // message is carried inside it, so transmit the PDU (issue #42).
+    let s1ap_message = s1ap_build::build_e_rab_release_command(
         enb_ue,
         bearer.ebi,
         S1apCauseGroup::Nas,
@@ -915,7 +941,7 @@ pub fn nas_eps_send_deactivate_bearer_context_request(
     )
     .map_err(|_| NasError::BuildFailed)?;
 
-    nas_eps_send_to_enb(mme_ue, enb_ue, esm_message)
+    nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
 }
 
 /// Send bearer resource allocation reject message

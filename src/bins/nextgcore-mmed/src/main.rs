@@ -20,6 +20,7 @@ pub mod s11_build;
 pub mod s11_handler;
 pub mod s1ap_build;
 pub mod s1ap_handler;
+pub mod s1ap_path;
 pub mod s6a_handler;
 pub mod sbc_handler;
 pub mod sbc_message;
@@ -62,6 +63,8 @@ pub struct MmeApp {
     gtp_state: gtp_path::GtpPathState,
     /// MME state machine
     mme_fsm: sm::MmeFsm,
+    /// S1-MME transport (issue #42). `None` until [`MmeApp::init`] binds it.
+    s1ap: Option<s1ap_path::S1apServer>,
 }
 
 impl MmeApp {
@@ -71,11 +74,12 @@ impl MmeApp {
             running: Arc::new(AtomicBool::new(true)),
             gtp_state: gtp_path::GtpPathState::default(),
             mme_fsm: sm::MmeFsm::new(),
+            s1ap: None,
         }
     }
 
     /// Initialize the MME application
-    pub fn init(&mut self, _config_path: &str) -> Result<()> {
+    pub async fn init(&mut self, _config_path: &str) -> Result<()> {
         log::info!("Initializing MME...");
 
         // Initialize MME context
@@ -100,26 +104,53 @@ impl MmeApp {
         }
         log::debug!("Diameter S6a interface initialized");
 
+        // Bind the S1-MME SCTP transport (TS 36.412: port 36412, PPID 18).
+        // Without this nothing can reach the S1AP layer, so no eNB can
+        // associate and no EPS procedure can run (issue #42).
+        let ctx = context::mme_self();
+        let s1ap_bind = std::net::SocketAddr::from(([0, 0, 0, 0], ctx.s1ap_port));
+        let send_rx = s1ap_path::install_send_queue().ok_or_else(|| {
+            anyhow::anyhow!("S1AP send queue already installed (MmeApp::init called twice)")
+        })?;
+        let s1ap = s1ap_path::S1apServer::bind(s1ap_bind, send_rx, ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!("S1-MME transport initialization failed: {e}"))?;
+        if let Some(addr) = s1ap.local_addr() {
+            log::info!("S1-MME interface ready on {addr}");
+        }
+        self.s1ap = Some(s1ap);
+
         log::info!("MME initialized successfully");
         Ok(())
     }
 
-    /// Run the MME main loop
-    pub fn run(&self) -> Result<()> {
+    /// Run the MME main loop.
+    ///
+    /// Drives the S1AP data path — inbound eNB signalling into
+    /// [`s1ap_handler::handle_s1ap_message`] and queued downlink PDUs out to the
+    /// addressed eNB — alongside the shutdown check. Previously this was a bare
+    /// `thread::sleep` loop, which is why the whole S1AP layer was unreachable
+    /// at runtime (issue #42).
+    pub async fn run(&mut self) -> Result<()> {
         log::info!("MME running...");
 
-        while self.running.load(Ordering::SeqCst) {
-            // Process events
-            // In a real implementation, this would:
-            // 1. Poll for S1AP messages from eNBs
-            // 2. Poll for GTP-C messages from SGW/PGW
-            // 3. Poll for Diameter messages from HSS
-            // 4. Poll for SGsAP messages from VLR
-            // 5. Process timer events
-            // 6. Handle state machine transitions
+        // Interval at which the loop re-checks the shutdown flag when no S1AP
+        // event is pending. Keeps Ctrl-C responsive without polling hard.
+        const SHUTDOWN_CHECK: std::time::Duration = std::time::Duration::from_millis(100);
 
-            // For now, just sleep briefly
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        while self.running.load(Ordering::SeqCst) {
+            match self.s1ap.as_mut() {
+                Some(s1ap) => {
+                    // Race the S1AP data path against the shutdown tick so a
+                    // signal is honoured even while idle. `poll_once` is
+                    // cancel-safe, so losing this race consumes no message.
+                    tokio::select! {
+                        () = s1ap.poll_once() => {}
+                        () = tokio::time::sleep(SHUTDOWN_CHECK) => {}
+                    }
+                }
+                None => tokio::time::sleep(SHUTDOWN_CHECK).await,
+            }
         }
 
         log::info!("MME main loop exited");
@@ -129,6 +160,13 @@ impl MmeApp {
     /// Shutdown the MME application
     pub fn shutdown(&mut self) {
         log::info!("Shutting down MME...");
+
+        // Stop the S1-MME transport first so no new eNB signalling arrives
+        // while the layers below it are being torn down.
+        if let Some(mut s1ap) = self.s1ap.take() {
+            s1ap.stop();
+            log::debug!("S1-MME transport closed");
+        }
 
         // Close Diameter S6a interface
         fd_path::mme_fd_final();
@@ -168,7 +206,15 @@ impl Default for MmeApp {
     }
 }
 
-fn main() -> Result<()> {
+/// The MME runs on a tokio runtime.
+///
+/// Required by the S1-MME SCTP transport (issue #42), which is `AsyncFd`-driven.
+/// It also unblocks `fd_path`'s S6a layer, which was already fully async but
+/// stranded because the daemon had no runtime — see `fd_path::mme_fd_init`,
+/// whose comment defers connecting "once the async runtime is available".
+/// Actually connecting that peer is separate work and deliberately not done here.
+#[tokio::main]
+async fn main() -> Result<()> {
     // Parse command line arguments
     let args = Args::parse();
 
@@ -209,10 +255,10 @@ fn main() -> Result<()> {
     })?;
 
     // Initialize
-    app.init(&args.config)?;
+    app.init(&args.config).await?;
 
     // Run main loop
-    app.run()?;
+    app.run().await?;
 
     // Shutdown
     app.shutdown();
