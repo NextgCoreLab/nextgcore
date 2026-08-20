@@ -454,6 +454,9 @@ impl NgapServer {
             max_outbound_streams: 2,
             max_message_size: MAX_NGAP_MSG_SIZE as u32,
             receive_buffer_size: 262144,
+            // NGAP PPID 60 (TS 38.412) — the default, named explicitly here so
+            // the contrast with the S1AP server's PPID 18 is visible.
+            ppid: nextgcore_sctp::NGAP_PPID,
         };
 
         let mut transport = NgapTransport::bind(backend, bind_addr, config).await?;

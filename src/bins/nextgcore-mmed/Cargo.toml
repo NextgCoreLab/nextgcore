@@ -10,11 +10,22 @@ description = "NextGCore MME (Mobility Management Entity)"
 name = "nextgcore-mmed"
 path = "src/main.rs"
 
+[features]
+# Native Linux kernel-SCTP S1-MME transport (issue #42). S1AP runs over SCTP on
+# port 36412 with PPID 18 (TS 36.412), and only a kernel SCTP socket is on the
+# wire as real SCTP — the userspace `sctp-proto` backend is SCTP-over-UDP and
+# could not carry an association from any third-party eNB. Requires Linux +
+# libsctp at link/run time, so it is off by default and the default build keeps
+# compiling (and logs that S1AP transport needs this feature). Mirrors amfd's
+# `kernel-sctp` wiring for NGAP.
+kernel-sctp = ["nextgcore-sctp/kernel"]
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-crypt = { workspace = true }
 nextgcore-nas = { workspace = true }
 nextgcore-s1ap = { workspace = true }
+nextgcore-sctp = { workspace = true }
 nextgcore-gtp = { workspace = true }
 nextgcore-diameter = { workspace = true }
 nextgcore-app = { workspace = true }

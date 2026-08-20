@@ -2712,6 +2712,7 @@ dependencies = [
  "nextgcore-metrics",
  "nextgcore-nas",
  "nextgcore-s1ap",
+ "nextgcore-sctp",
  "proptest",
  "tokio",
 ]

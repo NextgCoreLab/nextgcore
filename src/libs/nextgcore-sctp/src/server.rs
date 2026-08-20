@@ -53,6 +53,15 @@ pub struct SctpServerConfig {
     pub max_message_size: u32,
     /// Receive buffer size
     pub receive_buffer_size: u32,
+    /// SCTP Payload Protocol Identifier stamped on outbound messages, and
+    /// substituted for an inbound PPID of 0.
+    ///
+    /// Defaults to [`crate::NGAP_PPID`] (60) so every existing NGAP call site is
+    /// unchanged. An S1-MME server must set [`crate::NEXTGCORE_SCTP_S1AP_PPID`]
+    /// (18) instead (TS 36.412): the application protocol carried over the
+    /// association is what the PPID identifies, so it belongs to the server's
+    /// configuration rather than being hardcoded at the send site.
+    pub ppid: u32,
 }
 
 impl Default for SctpServerConfig {
@@ -62,6 +71,7 @@ impl Default for SctpServerConfig {
             max_outbound_streams: 2,
             max_message_size: 65536,
             receive_buffer_size: 262144,
+            ppid: crate::NGAP_PPID,
         }
     }
 }
@@ -643,11 +653,15 @@ mod tests {
             max_outbound_streams: 4,
             max_message_size: 131072,
             receive_buffer_size: 524288,
+            ..Default::default()
         };
         assert_eq!(config.max_inbound_streams, 4);
         assert_eq!(config.max_outbound_streams, 4);
         assert_eq!(config.max_message_size, 131072);
         assert_eq!(config.receive_buffer_size, 524288);
+        // Unset ppid keeps the NGAP default, so existing NGAP callers are
+        // unaffected by the field being added.
+        assert_eq!(config.ppid, crate::NGAP_PPID);
     }
 
     #[tokio::test]
