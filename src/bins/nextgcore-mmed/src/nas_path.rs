@@ -4,9 +4,10 @@
 //!
 //! Implements NAS message transmission to eNB and UE.
 
-use crate::context::{EnbUe, MmeBearer, MmeSess, MmeUe, S1apCauseGroup};
+use crate::context::{EnbUe, MmeBearer, MmeContext, MmeSess, MmeUe, S1apCauseGroup};
 use crate::emm_build::{self, EmmCause, SecurityHeaderType};
 use crate::esm_build::{self, EsmCause};
+use crate::nas_dispatch;
 use crate::nas_security;
 use crate::s1ap_build;
 use crate::s1ap_path;
@@ -165,16 +166,28 @@ pub fn nas_eps_send_to_downlink_nas_transport(enb_ue: &EnbUe, message: Vec<u8>) 
     Ok(())
 }
 
-/// Forward EMM message to ESM
+/// Forward the ESM message container carried by an EMM message to the ESM
+/// entity (TS 24.301 §5.5.1.2.2).
 ///
 /// # Arguments
+/// * `ctx` - MME context (the ESM entity owns sessions and bearers)
+/// * `enb_ue` - eNB UE context the message arrived on
 /// * `mme_ue` - MME UE context
-/// * `esm_message_container` - ESM message container from EMM message
+/// * `esm_message_container` - ESM message container from the EMM message
 ///
 /// # Returns
-/// * `Ok(())` - Message forwarded successfully
+/// * `Ok(())` - Message forwarded to the ESM handler
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_emm_to_esm(mme_ue: &MmeUe, esm_message_container: &[u8]) -> NasResult<()> {
+///
+/// Must not be called while the `mme_ue_pool` lock is held: the ESM dispatch
+/// looks up session and bearer contexts, and `std::sync::RwLock` is not
+/// reentrant. Take a snapshot of `mme_ue` and drop the guard first.
+pub fn nas_eps_send_emm_to_esm(
+    ctx: &MmeContext,
+    enb_ue: &EnbUe,
+    mme_ue: &MmeUe,
+    esm_message_container: &[u8],
+) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
         return Err(NasError::UeNotFound);
@@ -191,7 +204,11 @@ pub fn nas_eps_send_emm_to_esm(mme_ue: &MmeUe, esm_message_container: &[u8]) -> 
         esm_message_container.len()
     );
 
-    // In actual implementation, this would create a pkbuf and send to ESM handler
+    // Deliver it (issue #43). This previously logged and returned Ok, so the
+    // piggybacked ESM message — the PDN Connectivity Request that carries the
+    // APN of the default bearer — never reached `esm_handler`.
+    nas_dispatch::handle_esm_message(ctx, enb_ue, mme_ue, esm_message_container);
+
     Ok(())
 }
 
@@ -1107,20 +1124,30 @@ mod tests {
 
     #[test]
     fn test_send_emm_to_esm_empty_container() {
+        let ctx = MmeContext::new();
+        let enb_ue = EnbUe {
+            id: 1,
+            ..Default::default()
+        };
         let mme_ue = MmeUe {
             id: 1,
             ..Default::default()
         };
 
-        let result = nas_eps_send_emm_to_esm(&mme_ue, &[]);
+        let result = nas_eps_send_emm_to_esm(&ctx, &enb_ue, &mme_ue, &[]);
         assert_eq!(result, Err(NasError::InvalidParameter));
     }
 
     #[test]
     fn test_send_emm_to_esm_no_ue() {
+        let ctx = MmeContext::new();
+        let enb_ue = EnbUe {
+            id: 1,
+            ..Default::default()
+        };
         let mme_ue = MmeUe::default(); // id = 0
 
-        let result = nas_eps_send_emm_to_esm(&mme_ue, &[1, 2, 3]);
+        let result = nas_eps_send_emm_to_esm(&ctx, &enb_ue, &mme_ue, &[1, 2, 3]);
         assert_eq!(result, Err(NasError::UeNotFound));
     }
 }

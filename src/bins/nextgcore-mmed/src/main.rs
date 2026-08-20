@@ -14,6 +14,7 @@ pub mod esm_build;
 pub mod esm_handler;
 pub mod fd_path;
 pub mod gtp_path;
+pub mod nas_dispatch;
 pub mod nas_path;
 pub mod nas_security;
 pub mod s11_build;
