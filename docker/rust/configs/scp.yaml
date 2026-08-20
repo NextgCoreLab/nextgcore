@@ -26,3 +26,23 @@ scp:
       key: /etc/nextgcore/certs/scp.key
       ca: /etc/nextgcore/certs/ca.crt
       min_version: "1.2"
+
+  # Optional SCP-level settings (scpd-#102). Left commented so this file keeps
+  # its current behaviour; uncomment to override the built-in defaults.
+  # Precedence for each is CLI flag > env var > this file > built-in default.
+  #
+  # SCP identity for Via / Server headers and SCP-<fqdn> loop detection
+  # (TS 29.500 §6.10.10). Set a UNIQUE value in a multi-SCP deployment.
+  # fqdn: scp1.5gc.example.org
+  #
+  # The SCP's own nfInstanceId, used when acquiring delegated OAuth2 tokens.
+  # nf_instance_id: 00000000-0000-0000-0000-000000000000
+  #
+  # Upstream timeouts, in whole seconds (defaults 2 / 10).
+  # connect_timeout: 2
+  # request_timeout: 10
+  #
+  # Proxy cache bounds (defaults 4096 entries / 3600s TTL). Bound the
+  # peer-influenced binding / discovery / client caches (TS 33.522 §4.2.3.3).
+  # max_cache_entries: 4096
+  # cache_ttl: 3600

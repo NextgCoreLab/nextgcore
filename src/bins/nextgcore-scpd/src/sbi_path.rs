@@ -242,12 +242,26 @@ impl DiscoveryCacheEntry {
 /// (TS 29.500 §6.10.3.2 / §6.10.3.4 NOTE 2).
 pub struct DiscoveryCache {
     entries: std::sync::RwLock<HashMap<(String, String, String), DiscoveryCacheEntry>>,
+    /// Hard ceiling on cached SearchResults (scpd-#102). The discriminator is
+    /// header-influenced, so an unbounded map is a slow-memory-growth concern
+    /// (TS 33.522 §4.2.3.3). Unlike the other proxy caches this keeps its own
+    /// per-entry `validityPeriod` TTL, so only a size bound is added here.
+    max_entries: usize,
 }
+
+/// Default ceiling for the discovery cache when constructed with [`new`].
+const DEFAULT_DISCOVERY_MAX_ENTRIES: usize = 4096;
 
 impl DiscoveryCache {
     pub fn new() -> Self {
+        Self::with_max_entries(DEFAULT_DISCOVERY_MAX_ENTRIES)
+    }
+
+    /// Create a discovery cache bounded to `max_entries` (clamped to >= 1).
+    pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             entries: std::sync::RwLock::new(HashMap::new()),
+            max_entries: max_entries.max(1),
         }
     }
 
@@ -289,6 +303,21 @@ impl DiscoveryCache {
                 service_name.to_string(),
                 discriminator.to_string(),
             );
+            // Enforce the size bound (scpd-#102): when the key is new and the
+            // cache is full, drop expired entries first and, failing that, evict
+            // the oldest by insertion time so the ceiling is a hard bound.
+            if !entries.contains_key(&key) && entries.len() >= self.max_entries {
+                entries.retain(|_, v| !v.is_expired());
+                if entries.len() >= self.max_entries {
+                    if let Some(oldest) = entries
+                        .iter()
+                        .min_by_key(|(_, v)| v.cached_at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        entries.remove(&oldest);
+                    }
+                }
+            }
             entries.insert(
                 key,
                 DiscoveryCacheEntry {
@@ -312,6 +341,17 @@ impl DiscoveryCache {
         if let Ok(mut entries) = self.entries.write() {
             entries.clear();
         }
+    }
+
+    /// Number of cached entries (including any not-yet-purged expired ones).
+    /// For tests and observability.
+    pub fn len(&self) -> usize {
+        self.entries.read().map(|e| e.len()).unwrap_or(0)
+    }
+
+    /// Whether the cache holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -843,6 +883,60 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         // TCP endpoint (port 8888) wins over the first (SCTP, port 9999).
         assert_eq!(candidates[0].port, 8888);
+    }
+
+    /// Build a one-instance candidate list for cache tests.
+    fn one_candidate(id: &str) -> Vec<NfInstanceCandidate> {
+        vec![NfInstanceCandidate {
+            nf_instance_id: id.to_string(),
+            nf_type: NfType::Smf,
+            host: "smf.local".to_string(),
+            port: 7777,
+            priority: 10,
+            capacity: 100,
+            load: 0,
+            healthy: true,
+            scheme: UriScheme::Http,
+            prefix: String::new(),
+        }]
+    }
+
+    /// scpd-#102: the discovery cache enforces its max-entry bound, evicting the
+    /// oldest entry when a new one is inserted at capacity.
+    #[test]
+    fn test_discovery_cache_bound_evicts_oldest() {
+        let cache = DiscoveryCache::with_max_entries(2);
+        let ttl = std::time::Duration::from_secs(3600);
+        cache.put("SMF", "svc", "d1", one_candidate("a"), ttl);
+        cache.put("SMF", "svc", "d2", one_candidate("b"), ttl);
+        assert_eq!(cache.len(), 2);
+        // Third insert at capacity evicts the oldest (d1).
+        cache.put("SMF", "svc", "d3", one_candidate("c"), ttl);
+        assert_eq!(cache.len(), 2, "the bound is a hard ceiling");
+        assert!(cache.get("SMF", "svc", "d1").is_none(), "oldest evicted");
+        assert!(cache.get("SMF", "svc", "d3").is_some(), "newest present");
+    }
+
+    /// scpd-#102: purge_expired removes entries past their per-entry TTL, so a
+    /// sweep from the main loop shrinks the map.
+    #[test]
+    fn test_discovery_cache_purge_expired_shrinks() {
+        let cache = DiscoveryCache::with_max_entries(8);
+        // ttl of zero => immediately expired (elapsed >= 0), deterministic.
+        cache.put(
+            "SMF",
+            "svc",
+            "d1",
+            one_candidate("a"),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(cache.len(), 1, "entry occupies a slot until purged");
+        assert!(
+            cache.get("SMF", "svc", "d1").is_none(),
+            "expired: get misses"
+        );
+        cache.purge_expired();
+        assert!(cache.is_empty(), "purge_expired reclaims the expired entry");
     }
 
     /// scpd-01: fqdn is chosen when ipv4Addresses is absent.

@@ -23,7 +23,7 @@
 //! `3gpp-Sbi-Routing-Binding` headers are stripped before forwarding.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
@@ -35,12 +35,25 @@ use nextgcore_sbi::oauth::OAuth2Client;
 use nextgcore_sbi::types::{NfType, UriScheme};
 use nextgcore_sbi::SbiError;
 
+use crate::cache::BoundedCache;
+use crate::circuit_breaker::CircuitBreaker;
 use crate::sbi_path::{parse_search_result, select_nf_instance, DiscoveryCache};
 
 /// Default upstream connect timeout (bounded per TS 29.500 §6.11 guidance).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Default upstream request timeout.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default hard ceiling on entries in each proxy cache (scpd-#102). Bounds the
+/// peer-influenced binding / discovery / client maps against slow-memory-growth
+/// (TS 33.522 §4.2.3.3).
+const DEFAULT_MAX_CACHE_ENTRIES: usize = 4096;
+/// Default cache entry lifetime for the client / binding / circuit-breaker
+/// caches. The discovery cache keeps its own per-entry `validityPeriod` TTL.
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// Default consecutive failures before a producer's circuit trips Open.
+const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
+/// Default time a tripped circuit stays Open before admitting a probe.
+const DEFAULT_CIRCUIT_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Fallback NF Instance ID claimed by the SCP when acquiring delegated OAuth2
 /// access tokens (`nfInstanceId` in the TS 29.510 token request) if none is
 /// configured. A stable value keeps NRF-side token bookkeeping coherent.
@@ -110,6 +123,16 @@ pub struct ScpProxyConfig {
     /// `3gpp-Sbi-Target-apiRoot` instead of being stripped (TS 29.500
     /// §6.10.2.5, scpd-10). Defaults to `false` (next hop is the producer).
     pub next_hop_scp: bool,
+    /// Hard ceiling on entries in each proxy cache (client pools, binding
+    /// stickiness, discovery cache, circuit breakers) — scpd-#102.
+    pub max_cache_entries: usize,
+    /// Lifetime of a client / binding / circuit-breaker cache entry. The
+    /// discovery cache keeps its own per-entry `validityPeriod` TTL.
+    pub cache_ttl: Duration,
+    /// Consecutive failures before a producer's circuit trips Open.
+    pub circuit_failure_threshold: u32,
+    /// Time a tripped circuit stays Open before admitting a probe.
+    pub circuit_open_timeout: Duration,
 }
 
 impl Default for ScpProxyConfig {
@@ -121,6 +144,10 @@ impl Default for ScpProxyConfig {
             nf_instance_id: None,
             own_fqdn: DEFAULT_SCP_FQDN.to_string(),
             next_hop_scp: false,
+            max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
+            cache_ttl: DEFAULT_CACHE_TTL,
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_open_timeout: DEFAULT_CIRCUIT_OPEN_TIMEOUT,
         }
     }
 }
@@ -583,20 +610,26 @@ enum RouteDecision {
 pub struct ScpProxy {
     config: ScpProxyConfig,
     /// HTTP/2 client cache keyed by `scheme://host:port` (no OAuth2 — used for
-    /// Model C / sticky-binding forwarding and NRF discovery).
-    clients: RwLock<HashMap<String, Arc<SbiClient>>>,
+    /// Model C / sticky-binding forwarding and NRF discovery). Bounded and
+    /// TTL'd (scpd-#102) so idle producer connections are reclaimed.
+    clients: BoundedCache<String, Arc<SbiClient>>,
     /// HTTP/2 client cache for OAuth2-attaching clients, keyed by
     /// `scheme://host:port|TARGET_NF_TYPE`. Used only on the Model D
     /// (delegated) path so the SCP, acting as the consumer's delegate,
     /// attaches a valid access token for the discovered producer.
-    oauth_clients: RwLock<HashMap<String, Arc<SbiClient>>>,
+    oauth_clients: BoundedCache<String, Arc<SbiClient>>,
     /// Binding stickiness cache: normalized `3gpp-Sbi-Binding` value →
-    /// producer apiRoot it was returned from (TS 29.500 §6.12).
-    bindings: RwLock<HashMap<String, ApiRoot>>,
+    /// producer apiRoot it was returned from (TS 29.500 §6.12). Peer-influenced,
+    /// so bounded and TTL'd (scpd-#102).
+    bindings: BoundedCache<String, ApiRoot>,
     /// NF-set stickiness cache (scpd-11): lowercased `nfset` id → a learnt
     /// member apiRoot, so an `nf-set` Routing-Binding can reselect another set
     /// member when the originally-bound instance is gone (TS 29.500 §5.2.3.2.6).
-    set_bindings: RwLock<HashMap<String, ApiRoot>>,
+    set_bindings: BoundedCache<String, ApiRoot>,
+    /// Per-endpoint circuit breakers keyed by target authority
+    /// `scheme://host:port` (scpd-#102). An Open circuit short-circuits
+    /// `forward` to 503 so a flapping/down producer cannot amplify latency.
+    circuit_breakers: BoundedCache<String, Arc<Mutex<CircuitBreaker>>>,
     /// Per-instance NF discovery cache (scpd-08): Model D SearchResults are
     /// cached with their `validityPeriod` TTL so repeated requests for the same
     /// target do not re-query the NRF (TS 29.500 §6.10.3). Per-instance (not the
@@ -619,14 +652,62 @@ impl ScpProxy {
                 .unwrap_or_else(|| DEFAULT_SCP_NF_INSTANCE_ID.to_string());
             Arc::new(OAuth2Client::new(nrf_uri, nf_instance_id, NfType::Scp))
         });
+        let max = config.max_cache_entries;
+        let ttl = config.cache_ttl;
         Self {
-            config,
-            clients: RwLock::new(HashMap::new()),
-            oauth_clients: RwLock::new(HashMap::new()),
-            bindings: RwLock::new(HashMap::new()),
-            set_bindings: RwLock::new(HashMap::new()),
-            discovery_cache: DiscoveryCache::new(),
+            clients: BoundedCache::new(max, ttl),
+            oauth_clients: BoundedCache::new(max, ttl),
+            bindings: BoundedCache::new(max, ttl),
+            set_bindings: BoundedCache::new(max, ttl),
+            circuit_breakers: BoundedCache::new(max, ttl),
+            discovery_cache: DiscoveryCache::with_max_entries(max),
             oauth2,
+            config,
+        }
+    }
+
+    /// Sweep expired entries from every bounded cache. Called periodically from
+    /// the SCP main loop (scpd-#102) so idle/expired entries are reclaimed
+    /// without waiting for the next `insert` on that key.
+    pub fn purge_expired_caches(&self) {
+        self.clients.purge_expired();
+        self.oauth_clients.purge_expired();
+        self.bindings.purge_expired();
+        self.set_bindings.purge_expired();
+        self.circuit_breakers.purge_expired();
+        self.discovery_cache.purge_expired();
+    }
+
+    /// Get or create the circuit breaker for a target authority key.
+    fn circuit_breaker_for(&self, key: &str) -> Arc<Mutex<CircuitBreaker>> {
+        if let Some(cb) = self.circuit_breakers.get(&key.to_string()) {
+            return cb;
+        }
+        let cb = Arc::new(Mutex::new(CircuitBreaker::new(
+            self.config.circuit_failure_threshold,
+            self.config.circuit_open_timeout,
+        )));
+        self.circuit_breakers.insert(key.to_string(), cb.clone());
+        cb
+    }
+
+    /// Whether the circuit for `target_key` admits a request. In Open this
+    /// transitions to HalfOpen once the open timeout has elapsed. The breaker
+    /// lock is taken and released here — never held across the forward await.
+    fn circuit_allows(&self, target_key: &str) -> bool {
+        let cb = self.circuit_breaker_for(target_key);
+        let mut guard = cb.lock().unwrap_or_else(|p| p.into_inner());
+        guard.allow_request()
+    }
+
+    /// Record the outcome of a forward against `target_key`'s circuit breaker.
+    fn circuit_record(&self, target_key: &str, success: bool) {
+        let cb = self.circuit_breaker_for(target_key);
+        let mut guard = cb.lock().unwrap_or_else(|p| p.into_inner());
+        if success {
+            guard.record_success();
+        } else {
+            guard.record_failure();
         }
     }
 
@@ -666,6 +747,26 @@ impl ScpProxy {
         header_set(headers, VIA_HEADER, value);
     }
 
+    /// True when a received `Via` header lists this SCP's own identity
+    /// (`SCP-<fqdn>`), indicating the request has already transited this SCP
+    /// (TS 29.500 §6.10.10.3). `Via` is a comma-separated list of
+    /// `received-protocol received-by [comment]` elements (RFC 9110 §7.6.3);
+    /// loop detection is defined over those discrete tokens, NOT over a
+    /// substring of the concatenated value. Each element is split on whitespace
+    /// (a trailing `(comment)` dropped) and every token compared for exact
+    /// case-insensitive equality — so a peer token that merely *contains* this
+    /// SCP's identity as a substring (e.g. `SCP-scp.5gc.local2` vs
+    /// `SCP-scp.5gc.local`) does not raise a false `MSG_LOOP_DETECTED`.
+    fn via_lists_self(&self, via: &str) -> bool {
+        let self_token = self.scp_node_id();
+        via.split(',').any(|element| {
+            let element = element.split('(').next().unwrap_or(element);
+            element
+                .split_whitespace()
+                .any(|tok| tok.eq_ignore_ascii_case(&self_token))
+        })
+    }
+
     /// scpd-04: ingress loop / hop-exhaustion guard (TS 29.500 §6.10.10).
     /// Returns a Server-stamped error when the request must be rejected:
     /// - own `SCP-<FQDN>` already present in a received `Via` → 400
@@ -675,9 +776,8 @@ impl ScpProxy {
     ///
     /// A normal single-hop request (no `Via`, no hop header) is never blocked.
     fn ingress_guard(&self, request: &SbiRequest) -> Option<SbiResponse> {
-        let self_token = self.scp_node_id().to_ascii_lowercase();
         if let Some(via) = request.http.get_header(VIA_HEADER) {
-            if via.to_ascii_lowercase().contains(&self_token) {
+            if self.via_lists_self(via) {
                 return Some(self.stamp_server(problem_response(
                     400,
                     "Bad Request",
@@ -732,11 +832,7 @@ impl ScpProxy {
     /// Look up a producer apiRoot previously learnt from a
     /// `3gpp-Sbi-Binding` response header.
     pub fn binding_lookup(&self, routing_binding: &str) -> Option<ApiRoot> {
-        self.bindings
-            .read()
-            .ok()?
-            .get(&normalize_binding(routing_binding))
-            .cloned()
+        self.bindings.get(&normalize_binding(routing_binding))
     }
 
     /// Record a `3gpp-Sbi-Binding` value from a producer response so later
@@ -745,13 +841,11 @@ impl ScpProxy {
     /// at the set level (scpd-11) so an `nf-set` Routing-Binding can reselect a
     /// set member after the originally-bound instance is gone.
     pub fn binding_store(&self, binding: &str, target: &ApiRoot) {
-        if let Ok(mut map) = self.bindings.write() {
-            map.insert(normalize_binding(binding), target.clone());
-        }
+        self.bindings
+            .insert(normalize_binding(binding), target.clone());
         if let Some(set) = ParsedBinding::parse(binding).nfset {
-            if let Ok(mut sets) = self.set_bindings.write() {
-                sets.insert(set.to_ascii_lowercase(), target.clone());
-            }
+            self.set_bindings
+                .insert(set.to_ascii_lowercase(), target.clone());
         }
     }
 
@@ -765,12 +859,7 @@ impl ScpProxy {
         let parsed = ParsedBinding::parse(routing_binding);
         if parsed.is_set_level() {
             if let Some(set) = parsed.nfset {
-                return self
-                    .set_bindings
-                    .read()
-                    .ok()?
-                    .get(&set.to_ascii_lowercase())
-                    .cloned();
+                return self.set_bindings.get(&set.to_ascii_lowercase());
             }
         }
         None
@@ -779,19 +868,15 @@ impl ScpProxy {
     /// Get or create a pooled HTTP/2 client for a target authority.
     fn client_for(&self, target: &ApiRoot) -> Arc<SbiClient> {
         let key = format!("{}://{}:{}", target.scheme, target.host, target.port);
-        if let Ok(clients) = self.clients.read() {
-            if let Some(client) = clients.get(&key) {
-                return client.clone();
-            }
+        if let Some(client) = self.clients.get(&key) {
+            return client;
         }
         let mut config = SbiClientConfig::new(target.host.clone(), target.port)
             .with_connect_timeout(self.config.connect_timeout)
             .with_request_timeout(self.config.request_timeout);
         config.scheme = target.scheme;
         let client = Arc::new(SbiClient::new(config));
-        if let Ok(mut clients) = self.clients.write() {
-            clients.insert(key, client.clone());
-        }
+        self.clients.insert(key, client.clone());
         client
     }
 
@@ -814,19 +899,15 @@ impl ScpProxy {
             target.port,
             target_nf_type.to_str()
         );
-        if let Ok(clients) = self.oauth_clients.read() {
-            if let Some(client) = clients.get(&key) {
-                return Some(client.clone());
-            }
+        if let Some(client) = self.oauth_clients.get(&key) {
+            return Some(client);
         }
         let mut config = SbiClientConfig::new(target.host.clone(), target.port)
             .with_connect_timeout(self.config.connect_timeout)
             .with_request_timeout(self.config.request_timeout);
         config.scheme = target.scheme;
         let client = Arc::new(SbiClient::new(config).with_oauth2(oauth2, target_nf_type));
-        if let Ok(mut clients) = self.oauth_clients.write() {
-            clients.insert(key, client.clone());
-        }
+        self.oauth_clients.insert(key, client.clone());
         Some(client)
     }
 
@@ -1036,6 +1117,22 @@ impl ScpProxy {
         group_id: Option<&str>,
         delegated_nf_type: Option<NfType>,
     ) -> SbiResponse {
+        // scpd-#102: consult this producer's circuit breaker before forwarding.
+        // An Open circuit short-circuits to 503 without contacting the producer,
+        // so a flapping/down backend cannot amplify latency across consumers.
+        let target_key = format!("{}://{}:{}", target.scheme, target.host, target.port);
+        if !self.circuit_allows(&target_key) {
+            return self.stamp_server(problem_response(
+                503,
+                "Service Unavailable",
+                &format!(
+                    "SCP circuit breaker is open for {} (recent failures)",
+                    target.to_uri()
+                ),
+                "TARGET_NF_NOT_REACHABLE",
+            ));
+        }
+
         let mut fwd = SbiRequest::default();
         fwd.header.method = request.header.method.clone();
         fwd.header.uri = format!("{}{}", target.prefix, request.header.uri);
@@ -1103,7 +1200,12 @@ impl ScpProxy {
 
         let mut upstream = match client.send_request(fwd).await {
             Ok(response) => response,
-            Err(e) => return self.stamp_server(upstream_error_response(&target.to_uri(), &e)),
+            Err(e) => {
+                // scpd-#102: a transport failure (connect refused / timeout) is
+                // a circuit failure.
+                self.circuit_record(&target_key, false);
+                return self.stamp_server(upstream_error_response(&target.to_uri(), &e));
+            }
         };
 
         // scpd-07: on a delegated forward that the producer rejects with
@@ -1121,6 +1223,11 @@ impl ScpProxy {
                 }
             }
         }
+
+        // scpd-#102: record the forward outcome against the circuit breaker.
+        // A producer 5xx counts as a failure (the backend is unhealthy); a 4xx
+        // is a client error, so the producer is up and it counts as a success.
+        self.circuit_record(&target_key, upstream.status < 500);
 
         // §6.12: learn the producer's Binding for later Routing-Binding
         // stickiness, and still relay the header to the consumer.
@@ -3040,5 +3147,219 @@ mod tests {
             None
         );
         assert_eq!(nnrf_disc_param_from_discovery_header("content-type"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // scpd-#102: tokenised Via, bounded caches, per-endpoint circuit breaker
+    // ------------------------------------------------------------------
+
+    /// scpd-#102: loop detection is over discrete `Via` tokens, not a substring
+    /// of the concatenated value. A peer token that is a strict superstring of
+    /// this SCP's identity must NOT be treated as a loop; an exact self-token
+    /// must be.
+    #[test]
+    fn test_via_loop_detection_is_tokenised() {
+        // Default identity is SCP-scp.5gc.local.
+        let proxy = ScpProxy::new(ScpProxyConfig::default());
+
+        // Exact self-token -> loop.
+        assert!(proxy.via_lists_self("2.0 SCP-scp.5gc.local"));
+        // Case-insensitive exact match -> loop.
+        assert!(proxy.via_lists_self("2.0 scp-SCP.5GC.LOCAL"));
+        // Strict superstring peer token -> NOT a loop (the substring-match bug).
+        assert!(!proxy.via_lists_self("2.0 SCP-scp.5gc.local2"));
+        // An exact self-token among several Via elements -> loop.
+        assert!(proxy.via_lists_self("2.0 SCP-other.example, 2.0 SCP-scp.5gc.local"));
+        // A trailing RFC 9110 comment is ignored around the token.
+        assert!(proxy.via_lists_self("2.0 SCP-scp.5gc.local (nextgcore)"));
+        // No self-token anywhere -> not a loop.
+        assert!(!proxy.via_lists_self("2.0 SCP-a.example, 2.0 SCP-b.example"));
+    }
+
+    /// scpd-#102 end-to-end: a `Via` peer token that is a strict superstring of
+    /// this SCP's identity is NOT rejected as a loop (it proceeds to forward),
+    /// whereas the exact self-token IS rejected `MSG_LOOP_DETECTED`.
+    #[tokio::test]
+    async fn test_ingress_via_superstring_is_not_a_loop() {
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            connect_timeout: Duration::from_millis(300),
+            request_timeout: Duration::from_millis(300),
+            ..Default::default()
+        });
+
+        // Superstring peer identity: not a loop, so it forwards and fails to
+        // reach the (refused) port 1 -> 502, NOT 400 MSG_LOOP_DETECTED.
+        let mut req = SbiRequest::get("/nudm-sdm/v1/x");
+        req.http.set_header("Via", "2.0 SCP-scp.5gc.local2");
+        req.http.set_target_apiroot("http://127.0.0.1:1");
+        let response = proxy.handle(req).await;
+        assert_ne!(
+            response.status, 400,
+            "a superstring peer Via token must not be treated as a loop"
+        );
+
+        // Exact self-token IS a loop.
+        let mut looped = SbiRequest::get("/nudm-sdm/v1/x");
+        looped.http.set_header("Via", "2.0 SCP-scp.5gc.local");
+        looped.http.set_target_apiroot("http://127.0.0.1:1");
+        let response = proxy.handle(looped).await;
+        assert_eq!(response.status, 400);
+        let problem: ProblemDetails = response.json_body().unwrap();
+        assert_eq!(problem.cause.as_deref(), Some("MSG_LOOP_DETECTED"));
+    }
+
+    /// scpd-#102: purge_expired_caches (called periodically from the main loop)
+    /// reclaims expired entries so the bounded caches shrink between inserts.
+    #[test]
+    fn test_purge_expired_caches_shrinks() {
+        // cache_ttl of zero => every entry is immediately expired.
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            cache_ttl: Duration::ZERO,
+            ..Default::default()
+        });
+        let target = ApiRoot::parse("http://smf1:7778").unwrap();
+        proxy.binding_store("bl=nf-instance; nfinst=x", &target);
+        assert_eq!(proxy.bindings.len(), 1, "entry present until purged");
+        proxy.purge_expired_caches();
+        assert_eq!(proxy.bindings.len(), 0, "purge reclaims the expired entry");
+    }
+
+    /// scpd-#102: the proxy caches are bounded — inserting past the ceiling
+    /// evicts the oldest entry rather than growing without limit.
+    #[test]
+    fn test_binding_cache_is_bounded() {
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            max_cache_entries: 2,
+            ..Default::default()
+        });
+        let t = ApiRoot::parse("http://smf:7778").unwrap();
+        proxy.binding_store("bl=nf-instance; nfinst=a", &t);
+        proxy.binding_store("bl=nf-instance; nfinst=b", &t);
+        proxy.binding_store("bl=nf-instance; nfinst=c", &t);
+        assert_eq!(
+            proxy.bindings.len(),
+            2,
+            "the binding cache honours its bound"
+        );
+    }
+
+    /// A producer that always answers 500 and counts the requests that reach it.
+    async fn start_counting_500_producer(
+        port: u16,
+        hits: Arc<AtomicU64>,
+    ) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
+        server
+            .start(move |_request: SbiRequest| {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    SbiResponse::with_status(500).with_body(
+                        r#"{"status":500,"cause":"INTERNAL"}"#,
+                        "application/problem+json",
+                    )
+                }
+            })
+            .await
+            .expect("producer start");
+        server
+    }
+
+    /// scpd-#102: repeated producer 5xx trips the per-endpoint circuit breaker;
+    /// once Open the SCP sheds load with a 503 without contacting the producer,
+    /// and after the open timeout admits a single half-open probe.
+    #[tokio::test]
+    async fn test_circuit_breaker_opens_sheds_load_then_probes() {
+        let producer_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let hits = Arc::new(AtomicU64::new(0));
+
+        let producer = start_counting_500_producer(producer_port, hits.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                circuit_failure_threshold: 2,
+                circuit_open_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let client = fast_client(scp_port);
+        let make = || {
+            SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
+                "3gpp-Sbi-Target-apiRoot",
+                format!("http://127.0.0.1:{producer_port}"),
+            )
+        };
+
+        // Two 5xx forwards reach the producer and trip the breaker.
+        assert_eq!(client.send_request(make()).await.unwrap().status, 500);
+        assert_eq!(client.send_request(make()).await.unwrap().status, 500);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // Circuit now Open: the next request is shed with 503, producer untouched.
+        let shed = client.send_request(make()).await.unwrap();
+        assert_eq!(shed.status, 503);
+        let problem: ProblemDetails = shed.json_body().unwrap();
+        assert_eq!(problem.cause.as_deref(), Some("TARGET_NF_NOT_REACHABLE"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "an open circuit must not contact the producer"
+        );
+        // SCP-originated 503 carries the SCP's Server identity.
+        assert_eq!(
+            shed.http.get_header(SERVER_HEADER).map(String::as_str),
+            Some("SCP-scp.5gc.local")
+        );
+
+        // After the open timeout, one probe is admitted (HalfOpen) and reaches
+        // the producer.
+        tokio::time::sleep(Duration::from_millis(260)).await;
+        let probe = client.send_request(make()).await.unwrap();
+        assert_eq!(
+            probe.status, 500,
+            "half-open admits a probe to the producer"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "the half-open probe reached the producer"
+        );
+
+        scp.stop().await.expect("scp stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-#102: a healthy producer (2xx) never trips the breaker even across
+    /// many forwards — success resets the failure count.
+    #[tokio::test]
+    async fn test_circuit_breaker_stays_closed_on_success() {
+        let producer_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let producer = start_mock_producer(producer_port).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                circuit_failure_threshold: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        let client = fast_client(scp_port);
+
+        for _ in 0..5 {
+            let req = SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
+                "3gpp-Sbi-Target-apiRoot",
+                format!("http://127.0.0.1:{producer_port}"),
+            );
+            assert_eq!(client.send_request(req).await.unwrap().status, 200);
+        }
+
+        scp.stop().await.expect("scp stop");
+        producer.stop().await.expect("producer stop");
     }
 }
