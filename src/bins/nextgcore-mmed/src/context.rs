@@ -1630,6 +1630,24 @@ impl MmeContext {
         self.guti_ue_hash.read().unwrap().get(guti).copied()
     }
 
+    /// Find MME UE by S-TMSI (MME code + M-TMSI).
+    ///
+    /// The eNB offers the S-TMSI the UE used in `INITIAL UE MESSAGE`
+    /// (TS 36.413 §9.2.3.6), which lets the MME recover an existing context for
+    /// a Service Request or paging response instead of treating the UE as new.
+    /// Matched against the *current* GUTI, since that is the one the UE is
+    /// using; `next` holds a GUTI that has been allocated but not yet accepted.
+    pub fn mme_ue_find_by_s_tmsi(&self, mme_code: u8, m_tmsi: u32) -> Option<u64> {
+        self.mme_ue_pool
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, ue)| {
+                ue.current.m_tmsi == Some(m_tmsi) && ue.current.guti.mme_code == mme_code
+            })
+            .map(|(id, _)| *id)
+    }
+
     /// Find MME UE by S11 local TEID
     pub fn mme_ue_find_by_s11_local_teid(&self, teid: u32) -> Option<u64> {
         self.mme_s11_teid_hash.read().unwrap().get(&teid).copied()

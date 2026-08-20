@@ -11,6 +11,7 @@ use crate::context::{
     ECgi, EpsTai, MmeContext, PagingType, S1apCause, S1apCauseGroup, UeCtxRelAction,
     INVALID_UE_S1AP_ID, NEXTGCORE_INVALID_POOL_ID,
 };
+use crate::nas_dispatch;
 use crate::s1ap_build::{
     self, cause_from_s1ap, decode_plmn_id, ecgi_from_s1ap, misc_cause, protocol_cause,
     radio_network_cause, tai_from_s1ap, transport_address_to_ip, ue_security_capabilities_from,
@@ -125,12 +126,45 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
     match message {
         S1apMessage::S1SetupRequest(msg) => handle_s1_setup_request(ctx, enb_id, &msg),
         S1apMessage::InitialUeMessage(msg) => {
-            handle_initial_ue_message(ctx, enb_id, &msg);
+            // TS 36.413 §8.6.2.1: the NAS-PDU IE carries the UE's initial
+            // uplink NAS message and must reach the NAS layer (issue #43).
+            if let Some(enb_ue_id) = handle_initial_ue_message(ctx, enb_id, &msg) {
+                nas_dispatch::nas_eps_handle_uplink(
+                    ctx,
+                    nas_dispatch::UplinkNas {
+                        enb_ue_id,
+                        nas_pdu: &msg.nas_pdu,
+                        s_tmsi: msg
+                            .s_tmsi
+                            .as_ref()
+                            .map(|s_tmsi| (s_tmsi.mmec, s_tmsi.m_tmsi)),
+                    },
+                );
+            }
             Vec::new()
         }
         S1apMessage::UplinkNasTransport(msg) => {
-            handle_uplink_nas_transport(ctx, enb_id, &msg);
-            Vec::new()
+            // TS 36.413 §8.6.2.2 for the NAS-PDU, §10.6 for the unknown-id case.
+            match handle_uplink_nas_transport(ctx, enb_id, &msg) {
+                Some(enb_ue_id) => {
+                    nas_dispatch::nas_eps_handle_uplink(
+                        ctx,
+                        nas_dispatch::UplinkNas {
+                            enb_ue_id,
+                            nas_pdu: &msg.nas_pdu,
+                            s_tmsi: None,
+                        },
+                    );
+                    Vec::new()
+                }
+                None => error_indication(
+                    enb_id,
+                    Some(msg.enb_ue_s1ap_id),
+                    Some(msg.mme_ue_s1ap_id),
+                    S1apCauseGroup::RadioNetwork,
+                    radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+                ),
+            }
         }
         S1apMessage::NasNonDeliveryIndication(msg) => {
             handle_nas_non_delivery_indication(ctx, enb_id, &msg);
@@ -384,8 +418,13 @@ pub fn handle_initial_ue_message(
     Some(enb_ue_id)
 }
 
-/// Handle Uplink NAS Transport: refresh the UE's location and hand the NAS
-/// PDU to the NAS layer. Returns the MME UE pool ID when the UE is known.
+/// Handle Uplink NAS Transport: refresh the UE's location and return the eNB UE
+/// pool ID so the NAS layer can be handed the PDU.
+///
+/// `None` means the `MME-UE-S1AP-ID` names no S1 connection, which the caller
+/// answers with an Error Indication (TS 36.413 §10.6). A *known* connection
+/// that has no MME UE context yet still returns its id: resolving or creating
+/// that context belongs to the NAS layer, not here.
 pub fn handle_uplink_nas_transport(
     ctx: &MmeContext,
     enb_id: u64,
@@ -409,7 +448,7 @@ pub fn handle_uplink_nas_transport(
         msg.mme_ue_s1ap_id,
         msg.nas_pdu.len()
     );
-    (enb_ue.mme_ue_id != NEXTGCORE_INVALID_POOL_ID).then_some(enb_ue.mme_ue_id)
+    Some(enb_ue_id)
 }
 
 /// Handle NAS Non Delivery Indication (TS 36.413 §8.6.4).
@@ -1916,6 +1955,140 @@ mod tests {
         assert_eq!(enb_ue.enb_ue_s1ap_id, 55);
         assert_eq!(enb_ue.saved.tai.tac, 1);
         assert_eq!(enb_ue.saved.e_cgi.cell_id, 0x100);
+    }
+
+    /// Plain EPS ATTACH REQUEST for IMSI 001010123456789 with a piggybacked PDN
+    /// CONNECTIVITY REQUEST for APN "inet" (TS 24.301 §8.2.4).
+    fn attach_request_pdu() -> Vec<u8> {
+        vec![
+            0x07, 0x41, // EMM protocol discriminator (plain), Attach Request
+            0x71, // EPS attach type 1, KSI 7 (no key available)
+            0x08, // EPS mobile identity length
+            0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98, // IMSI
+            0x02, 0xf0, 0xf0, // UE network capability: EEA/EIA
+            0x00, 0x0b, // ESM message container length
+            0x02, 0x01, 0xd0, // ESM: EBI 0, PTI 1, PDN Connectivity Request
+            0x11, // request type 1 (initial), PDN type 1 (IPv4)
+            0x28, 0x05, 0x04, b'i', b'n', b'e', b't', // APN
+        ]
+    }
+
+    #[test]
+    fn test_initial_ue_message_dispatches_attach_request_into_emm() {
+        let ctx = ctx_with_gummei();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+
+        let msg = InitialUeMessage {
+            enb_ue_s1ap_id: 77,
+            nas_pdu: attach_request_pdu(),
+            tai: nextgcore_s1ap::Tai {
+                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+                tac: 1,
+            },
+            eutran_cgi: nextgcore_s1ap::EutranCgi {
+                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+                cell_identity: 0x100,
+            },
+            rrc_establishment_cause: nextgcore_s1ap::RrcEstablishmentCause::MoSignalling,
+            s_tmsi: None,
+        };
+
+        let out = handle_s1ap_message(
+            &ctx,
+            enb_id,
+            &builder::build_initial_ue_message(&msg).unwrap(),
+        );
+        assert!(out.is_empty(), "no S1AP-level response is due");
+
+        // The EMM attach handler ran: the NAS PDU was decoded, the subscriber
+        // identity parsed onto a UE context, and that context indexed by IMSI.
+        // Before issue #43 the PDU was logged and dropped here.
+        let mme_ue_id = ctx
+            .mme_ue_find_by_imsi("001010123456789")
+            .expect("the Attach Request must reach emm_handler");
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(mme_ue.nas_eps.attach_type, 1);
+        assert_eq!(mme_ue.tai.tac, 1);
+        assert_eq!(mme_ue.e_cgi.cell_id, 0x100);
+        // The piggybacked ESM container is held until a security context exists
+        // (TS 24.301 §5.5.1.2.2).
+        assert_eq!(mme_ue.pdn_connectivity_request.len(), 11);
+    }
+
+    #[test]
+    fn test_uplink_nas_transport_unknown_ue_id_triggers_error_indication() {
+        let ctx = ctx_with_gummei();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+
+        let msg = UlNasTransport {
+            mme_ue_s1ap_id: 4242,
+            enb_ue_s1ap_id: 77,
+            nas_pdu: attach_request_pdu(),
+            eutran_cgi: nextgcore_s1ap::EutranCgi {
+                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+                cell_identity: 0x100,
+            },
+            tai: nextgcore_s1ap::Tai {
+                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+                tac: 1,
+            },
+        };
+
+        let out = handle_s1ap_message(
+            &ctx,
+            enb_id,
+            &builder::build_uplink_nas_transport(&msg).unwrap(),
+        );
+
+        // TS 36.413 §10.6: the unknown MME-UE-S1AP-ID must be reported so the
+        // eNB can release its stale S1 context.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].enb_id, enb_id);
+        match decode_s1ap_pdu(&out[0].pdu).unwrap() {
+            S1apMessage::ErrorIndication(ind) => {
+                assert_eq!(ind.mme_ue_s1ap_id, Some(4242));
+                assert_eq!(ind.enb_ue_s1ap_id, Some(77));
+                assert_eq!(
+                    ind.cause,
+                    Some(Cause::RadioNetwork(CauseRadioNetwork::UnknownMmeUeS1apId))
+                );
+            }
+            other => panic!("expected ErrorIndication, got {other:?}"),
+        }
+        assert!(ctx.mme_ue_pool.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_uplink_nas_transport_dispatches_into_emm() {
+        let ctx = ctx_with_gummei();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 77);
+        let mme_ue_s1ap_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().mme_ue_s1ap_id;
+
+        let msg = UlNasTransport {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 77,
+            nas_pdu: attach_request_pdu(),
+            eutran_cgi: nextgcore_s1ap::EutranCgi {
+                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+                cell_identity: 0x100,
+            },
+            tai: nextgcore_s1ap::Tai {
+                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+                tac: 1,
+            },
+        };
+
+        let out = handle_s1ap_message(
+            &ctx,
+            enb_id,
+            &builder::build_uplink_nas_transport(&msg).unwrap(),
+        );
+        assert!(out.is_empty());
+        assert!(
+            ctx.mme_ue_find_by_imsi("001010123456789").is_some(),
+            "a known S1 connection must have its NAS PDU dispatched"
+        );
     }
 
     #[test]
