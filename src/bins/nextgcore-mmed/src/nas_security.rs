@@ -4,7 +4,7 @@
 //!
 //! Implements NAS message integrity protection and ciphering for EPS.
 
-use crate::context::MmeUe;
+use crate::context::{MmeUe, UeNetworkCapability};
 use crate::emm_build::SecurityHeaderType;
 
 // ============================================================================
@@ -13,6 +13,21 @@ use crate::emm_build::SecurityHeaderType;
 
 /// NAS security bearer (always 0 for NAS)
 pub const NAS_SECURITY_BEARER: u32 = 0;
+
+/// Highest NAS algorithm identity this codec implements.
+///
+/// [`nas_mac_calculate`] and [`nas_encrypt`] cover identities 0-3 (null,
+/// SNOW 3G, AES, ZUC) and fall through to a **zero MAC / no encryption** with a
+/// warning for anything else. Selecting 4-7 would therefore reintroduce the
+/// silent downgrade this module exists to prevent, so
+/// [`select_nas_algorithms`] refuses to consider them.
+pub const MAX_IMPLEMENTED_ALGORITHM: u8 = 3;
+
+/// TS 33.401 Annex A.7 algorithm type distinguisher for NAS ciphering.
+pub const NAS_ENC_ALG_DISTINGUISHER: u8 = 0x01;
+
+/// TS 33.401 Annex A.7 algorithm type distinguisher for NAS integrity.
+pub const NAS_INT_ALG_DISTINGUISHER: u8 = 0x02;
 
 /// NAS security MAC size in bytes
 pub const NAS_SECURITY_MAC_SIZE: usize = 4;
@@ -25,6 +40,106 @@ pub const NAS_SECURITY_UPLINK_DIRECTION: u32 = 0;
 
 /// NAS headroom for security header
 pub const NEXTGCORE_NAS_HEADROOM: usize = 16;
+
+// ============================================================================
+// Algorithm Selection and Key Derivation
+// ============================================================================
+
+/// The NAS security algorithms selected for a UE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedNasAlgorithms {
+    /// EIA identity (never 0 — see [`select_nas_algorithms`])
+    pub integrity: u8,
+    /// EEA identity (0 = EEA0, null ciphering, is a valid choice)
+    pub ciphering: u8,
+}
+
+/// Whether the UE advertises support for `algorithm`.
+///
+/// TS 24.301 §9.9.3.34: in the UE network capability the EEA and EIA octets are
+/// bitmaps whose most significant bit is algorithm 0, so algorithm *n* is
+/// supported iff bit `0x80 >> n` is set.
+fn ue_supports(capability: u8, algorithm: u8) -> bool {
+    algorithm <= 7 && capability & (0x80 >> algorithm) != 0
+}
+
+/// Pick the NAS algorithms for a UE (TS 33.401 §7.2.4.3).
+///
+/// Each ordered list is the MME's preference, most preferred first; the first
+/// entry the UE advertises and this codec implements wins.
+///
+/// Returns `None` when no usable integrity algorithm matches. Null integrity is
+/// deliberately *not* a fallback: TS 33.401 §5.1.4.1 permits EIA0 only for
+/// unauthenticated emergency calls, so a UE that supports nothing else must be
+/// rejected (TS 24.301 EMM cause #23) rather than admitted unprotected. Null
+/// ciphering is different — EEA0 is a legitimate configured choice for any UE,
+/// and is what the shipped configuration asks for first.
+pub fn select_nas_algorithms(
+    integrity_order: &[u8],
+    ciphering_order: &[u8],
+    capability: &UeNetworkCapability,
+) -> Option<SelectedNasAlgorithms> {
+    let integrity = integrity_order
+        .iter()
+        .copied()
+        .find(|algorithm| {
+            *algorithm != 0
+                && *algorithm <= MAX_IMPLEMENTED_ALGORITHM
+                && ue_supports(capability.eia, *algorithm)
+        })
+        .or_else(|| {
+            log::warn!(
+                "No usable NAS integrity algorithm: MME order {integrity_order:?} vs UE EIA \
+                 bitmap 0x{:02x}",
+                capability.eia
+            );
+            None
+        })?;
+
+    // Falling back to EEA0 is safe and matches the spec's "null ciphering is
+    // always supported" assumption, so an empty or unmatched list is not fatal.
+    let ciphering = ciphering_order
+        .iter()
+        .copied()
+        .find(|algorithm| {
+            *algorithm <= MAX_IMPLEMENTED_ALGORITHM && ue_supports(capability.eea, *algorithm)
+        })
+        .unwrap_or(0);
+
+    Some(SelectedNasAlgorithms {
+        integrity,
+        ciphering,
+    })
+}
+
+/// Take the selected algorithms into use and derive the NAS keys from `KASME`.
+///
+/// TS 33.401 Annex A.7: `KNASenc` and `KNASint` come from the FC=0x15 KDF keyed
+/// on `KASME`, with the algorithm type distinguisher and the selected algorithm
+/// identity as inputs — so this must run *after* selection, and re-running it
+/// with different algorithms yields different keys.
+pub fn derive_nas_keys(mme_ue: &mut MmeUe, selected: SelectedNasAlgorithms) {
+    mme_ue.selected_int_algorithm = selected.integrity;
+    mme_ue.selected_enc_algorithm = selected.ciphering;
+
+    mme_ue.knas_int = nextgcore_crypt::kdf::nextgcore_kdf_nas_eps(
+        NAS_INT_ALG_DISTINGUISHER,
+        selected.integrity,
+        &mme_ue.kasme,
+    );
+    mme_ue.knas_enc = nextgcore_crypt::kdf::nextgcore_kdf_nas_eps(
+        NAS_ENC_ALG_DISTINGUISHER,
+        selected.ciphering,
+        &mme_ue.kasme,
+    );
+
+    log::debug!(
+        "[{}] NAS security context: EIA{} / EEA{}",
+        mme_ue.imsi_bcd,
+        selected.integrity,
+        selected.ciphering
+    );
+}
 
 // ============================================================================
 // Security Header Type Parsing
@@ -535,7 +650,13 @@ pub fn nas_eps_security_decode(
                     header.message_authentication_code,
                     calculated_mac_u32
                 );
+                // TS 24.301 §4.4.4.3: a message that fails the integrity check
+                // is discarded and must not be processed further. The flag is
+                // kept for the caller's diagnostics, but the error is what makes
+                // that impossible to ignore: this used to strip the header,
+                // decrypt, and answer Ok.
                 mme_ue.mac_failed = true;
+                return Err("NAS integrity check failed");
             }
         }
 
@@ -616,7 +737,10 @@ fn decode_service_request(mme_ue: &mut MmeUe, message: &mut Vec<u8>) -> Result<(
             original_mac[0],
             original_mac[1]
         );
+        // TS 24.301 §4.4.4.3, as on the full-MAC path: a SERVICE REQUEST whose
+        // short MAC does not verify is discarded, not admitted.
         mme_ue.mac_failed = true;
+        return Err("NAS integrity check failed");
     }
 
     Ok(())
@@ -767,5 +891,244 @@ mod tests {
 
         // security_context_available should be set
         assert!(mme_ue.security_context_available);
+    }
+
+    // ========================================================================
+    // Algorithm selection and key derivation (issue #44)
+    // ========================================================================
+
+    /// A UE advertising EEA/EIA 0-3, i.e. the top four bits of each bitmap.
+    fn capability_0_to_3() -> UeNetworkCapability {
+        UeNetworkCapability {
+            eea: 0xf0,
+            eia: 0xf0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_select_honours_the_mme_order() {
+        // The shipped configuration's order.
+        let selected = select_nas_algorithms(&[2, 1, 0], &[0, 1, 2], &capability_0_to_3()).unwrap();
+        assert_eq!(selected.integrity, 2);
+        assert_eq!(selected.ciphering, 0);
+
+        // Reordering the MME's preference changes the outcome, so the order is
+        // genuinely consulted rather than a hardcoded pick.
+        let selected = select_nas_algorithms(&[1, 2], &[2, 1, 0], &capability_0_to_3()).unwrap();
+        assert_eq!(selected.integrity, 1);
+        assert_eq!(selected.ciphering, 2);
+    }
+
+    #[test]
+    fn test_select_intersects_with_ue_capability() {
+        // TS 24.301 9.9.3.34: bit 0x80 >> n advertises algorithm n. This UE
+        // supports EIA2 and EEA2 only.
+        let capability = UeNetworkCapability {
+            eea: 0x20,
+            eia: 0x20,
+            ..Default::default()
+        };
+        let selected = select_nas_algorithms(&[3, 2, 1], &[1, 2], &capability).unwrap();
+        assert_eq!(selected.integrity, 2, "EIA3 is not advertised, EIA2 is");
+        assert_eq!(selected.ciphering, 2);
+    }
+
+    #[test]
+    fn test_select_rejects_when_only_null_integrity_is_possible() {
+        // TS 33.401 5.1.4.1: EIA0 is for unauthenticated emergency calls only,
+        // so a UE offering nothing else must be rejected, not admitted with
+        // null integrity.
+        let capability = UeNetworkCapability {
+            eea: 0xf0,
+            eia: 0x80, // EIA0 only
+            ..Default::default()
+        };
+        assert!(select_nas_algorithms(&[2, 1, 0], &[0, 1, 2], &capability).is_none());
+        // Same when the MME offers nothing at all.
+        assert!(select_nas_algorithms(&[], &[0], &capability_0_to_3()).is_none());
+    }
+
+    #[test]
+    fn test_select_skips_algorithms_this_codec_does_not_implement() {
+        // EIA4-7 / EEA4-7 have no implementation: `nas_mac_calculate` returns a
+        // zero MAC for them, so selecting one would silently disable protection.
+        let capability = UeNetworkCapability {
+            eea: 0xff,
+            eia: 0xff,
+            ..Default::default()
+        };
+        let selected = select_nas_algorithms(&[7, 4, 3], &[6, 5, 1], &capability).unwrap();
+        assert_eq!(selected.integrity, 3);
+        assert_eq!(selected.ciphering, 1);
+
+        // Nothing implemented on the integrity side leaves no usable choice.
+        assert!(select_nas_algorithms(&[7, 6, 5, 4], &[0], &capability).is_none());
+    }
+
+    #[test]
+    fn test_select_falls_back_to_null_ciphering_but_never_null_integrity() {
+        // A UE advertising no ciphering algorithm the MME offers still gets a
+        // security context: EEA0 is always acceptable.
+        let capability = UeNetworkCapability {
+            eea: 0x00,
+            eia: 0xf0,
+            ..Default::default()
+        };
+        let selected = select_nas_algorithms(&[2], &[2, 1], &capability).unwrap();
+        assert_eq!(selected.integrity, 2);
+        assert_eq!(selected.ciphering, 0);
+    }
+
+    #[test]
+    fn test_derive_nas_keys_is_keyed_on_kasme_algorithm_and_distinguisher() {
+        let mut ue = MmeUe {
+            kasme: [0x44; 32],
+            ..Default::default()
+        };
+        derive_nas_keys(
+            &mut ue,
+            SelectedNasAlgorithms {
+                integrity: 2,
+                ciphering: 0,
+            },
+        );
+
+        assert_eq!(ue.selected_int_algorithm, 2);
+        assert_eq!(ue.selected_enc_algorithm, 0);
+        assert_ne!(ue.knas_int, [0u8; 16]);
+        assert_ne!(
+            ue.knas_int, ue.knas_enc,
+            "the algorithm type distinguisher must separate the two keys"
+        );
+
+        // TS 33.401 Annex A.7 takes the algorithm identity as an input, so a
+        // different selection must yield different keys...
+        let mut other_algorithm = MmeUe {
+            kasme: [0x44; 32],
+            ..Default::default()
+        };
+        derive_nas_keys(
+            &mut other_algorithm,
+            SelectedNasAlgorithms {
+                integrity: 1,
+                ciphering: 0,
+            },
+        );
+        assert_ne!(ue.knas_int, other_algorithm.knas_int);
+        assert_eq!(
+            ue.knas_enc, other_algorithm.knas_enc,
+            "the ciphering key must not move when only the integrity algorithm did"
+        );
+
+        // ...and so must a different KASME.
+        let mut other_kasme = MmeUe {
+            kasme: [0x45; 32],
+            ..Default::default()
+        };
+        derive_nas_keys(
+            &mut other_kasme,
+            SelectedNasAlgorithms {
+                integrity: 2,
+                ciphering: 0,
+            },
+        );
+        assert_ne!(ue.knas_int, other_kasme.knas_int);
+
+        // Regression snapshot for KASME = 0x44 repeated, EIA2. TS 33.401
+        // Annex A publishes no numeric vectors for FC=0x15, so this pins *this*
+        // implementation's inputs and ordering rather than claiming to be a
+        // 3GPP vector. It is verifiable by hand: the value is the low 16 bytes
+        // of HMAC-SHA256(KASME, S) with
+        // S = FC(0x15) || P0(0x02) || L0(0x0001) || P1(0x02) || L1(0x0001),
+        // i.e. TS 33.220 Annex B's S-string with the NAS-int-alg
+        // distinguisher and the selected algorithm identity.
+        assert_eq!(
+            ue.knas_int,
+            [
+                0x16, 0xd0, 0x84, 0x8a, 0x13, 0x38, 0xb8, 0x0e, 0xd1, 0xc3, 0xf1, 0xad, 0x9c, 0x75,
+                0xad, 0x3f
+            ]
+        );
+    }
+
+    #[test]
+    fn test_decode_rejects_a_failed_mac_instead_of_returning_ok() {
+        let mut ue = MmeUe {
+            security_context_available: true,
+            selected_int_algorithm: 2,
+            knas_int: [0x33; 16],
+            ..Default::default()
+        };
+        // Integrity-protected header with a deliberately wrong MAC.
+        let mut message = vec![0x17, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x07, 0x5e];
+        let before = message.clone();
+
+        let result = nas_eps_security_decode(
+            &mut ue,
+            SecurityHeaderTypeFlags::from_header_type(1),
+            &mut message,
+        );
+
+        assert!(result.is_err(), "a MAC failure must not answer Ok");
+        assert!(ue.mac_failed);
+        assert_eq!(
+            message, before,
+            "the message must not be stripped or decrypted"
+        );
+    }
+
+    #[test]
+    fn test_decode_accepts_a_correct_mac_and_strips_the_header() {
+        let mut ue = MmeUe {
+            security_context_available: true,
+            selected_int_algorithm: 2,
+            knas_int: [0x33; 16],
+            ..Default::default()
+        };
+        let inner = [0x07u8, 0x5e];
+        let mut message = vec![0x17, 0, 0, 0, 0, 0x01];
+        message.extend_from_slice(&inner);
+        let mac = nas_mac_calculate(
+            2,
+            &ue.knas_int,
+            1, // the count the MME derives from sequence number 1
+            NAS_SECURITY_BEARER,
+            NAS_SECURITY_UPLINK_DIRECTION,
+            &message[5..],
+        );
+        message[1..5].copy_from_slice(&mac);
+
+        nas_eps_security_decode(
+            &mut ue,
+            SecurityHeaderTypeFlags::from_header_type(1),
+            &mut message,
+        )
+        .expect("a correct MAC must verify");
+
+        assert!(!ue.mac_failed);
+        assert_eq!(message, inner, "the security header must be stripped");
+        assert_eq!(ue.ul_count, 1);
+    }
+
+    #[test]
+    fn test_service_request_short_mac_failure_is_rejected() {
+        let mut ue = MmeUe {
+            security_context_available: true,
+            selected_int_algorithm: 2,
+            knas_int: [0x33; 16],
+            ..Default::default()
+        };
+        // SERVICE REQUEST with a wrong short MAC (TS 24.301 8.2.25).
+        let mut message = vec![0xc7, 0x01, 0xba, 0xad];
+
+        let result = nas_eps_security_decode(
+            &mut ue,
+            SecurityHeaderTypeFlags::from_header_type(12),
+            &mut message,
+        );
+
+        assert!(result.is_err());
+        assert!(ue.mac_failed);
     }
 }

@@ -401,15 +401,11 @@ pub fn build_attach_accept(
 ) -> Result<Vec<u8>, &'static str> {
     let mut buf = NasBuffer::new();
 
-    // Security header
-    buf.write_u8(
-        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
-            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
-    );
-    buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0); // Sequence number placeholder
-
-    // EMM header
+    // EMM header. The security header is deliberately NOT written here: every
+    // caller passes this message through `nas_security::nas_eps_security_encode`,
+    // which prepends the real 6-octet header with a computed MAC. Writing a
+    // placeholder as well produced a message with two headers, the inner one
+    // covered by the MAC (issue #44).
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::AttachAccept as u8);
 
@@ -528,15 +524,8 @@ pub fn build_security_mode_command(
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
 
-    // Security header (integrity protected with new security context)
-    buf.write_u8(
-        (SecurityHeaderType::IntegrityProtectedNewContext as u8) << 4
-            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
-    );
-    buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0); // Sequence number placeholder
-
-    // EMM header
+    // EMM header only; `nas_eps_security_encode` prepends the security header
+    // with the new-context header type and the real MAC (issue #44).
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::SecurityModeCommand as u8);
 
@@ -573,15 +562,8 @@ pub fn build_security_mode_command(
 pub fn build_detach_request(_mme_ue: &MmeUe, detach_type: DetachTypeToUe) -> Vec<u8> {
     let mut buf = NasBuffer::new();
 
-    // Security header
-    buf.write_u8(
-        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
-            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
-    );
-    buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0); // Sequence number placeholder
-
-    // EMM header
+    // EMM header only; `nas_eps_security_encode` prepends the security header
+    // and the real MAC (issue #44).
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::DetachRequest as u8);
 
@@ -601,15 +583,8 @@ pub fn build_detach_request(_mme_ue: &MmeUe, detach_type: DetachTypeToUe) -> Vec
 pub fn build_detach_accept(_mme_ue: &MmeUe) -> Vec<u8> {
     let mut buf = NasBuffer::new();
 
-    // Security header
-    buf.write_u8(
-        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
-            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
-    );
-    buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0); // Sequence number placeholder
-
-    // EMM header
+    // EMM header only; `nas_eps_security_encode` prepends the security header
+    // and the real MAC (issue #44).
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::DetachAccept as u8);
 
@@ -625,15 +600,8 @@ pub fn build_tau_accept(
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
 
-    // Security header
-    buf.write_u8(
-        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
-            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
-    );
-    buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0); // Sequence number placeholder
-
-    // EMM header
+    // EMM header only; `nas_eps_security_encode` prepends the security header
+    // and the real MAC (issue #44).
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::TauAccept as u8);
 
@@ -728,15 +696,8 @@ pub fn build_emm_information(
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
 
-    // Security header
-    buf.write_u8(
-        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
-            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
-    );
-    buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0); // Sequence number placeholder
-
-    // EMM header
+    // EMM header only; `nas_eps_security_encode` prepends the security header
+    // and the real MAC (issue #44).
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::EmmInformation as u8);
 
