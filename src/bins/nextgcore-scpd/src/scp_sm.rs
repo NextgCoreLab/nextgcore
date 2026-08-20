@@ -1,9 +1,15 @@
 //! SCP Main State Machine
 //!
-//! Port of src/scp/scp-sm.c - Main SCP state machine implementation
+//! The live SCP forwarding path runs inline in [`crate::proxy::ScpProxy`]; the
+//! state machine is driven only by the timer loop in `main.rs`. The former
+//! `SbiServer` / `SbiClient` event handlers (nnrf-nfm / nnrf-disc dispatch)
+//! were compiled but never reached — no code ever dispatched a `SbiServer` or
+//! `SbiClient` event into the machine — so they were removed (scpd-#102). What
+//! remains is the FSM lifecycle and the timer handling that `main.rs` actually
+//! exercises.
 
 use crate::event::{ScpEvent, ScpEventId, ScpTimerId};
-use crate::sbi_response::{send_error_response, send_gateway_timeout_response};
+use crate::sbi_response::send_gateway_timeout_response;
 
 /// SCP state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,190 +80,8 @@ impl ScpSmContext {
             ScpEventId::FsmExit => {
                 log::info!("SCP exiting operational state");
             }
-            ScpEventId::SbiServer => {
-                self.handle_sbi_server_event(event);
-            }
-            ScpEventId::SbiClient => {
-                self.handle_sbi_client_event(event);
-            }
             ScpEventId::SbiTimer => {
                 self.handle_sbi_timer_event(event);
-            }
-        }
-    }
-
-    fn handle_sbi_server_event(&mut self, event: &mut ScpEvent) {
-        let (stream_id, service_name, api_version, _method, _resource_components) = {
-            let sbi = match &event.sbi {
-                Some(sbi) => sbi,
-                None => {
-                    log::error!("No SBI data in server event");
-                    return;
-                }
-            };
-
-            let stream_id = match sbi.stream_id {
-                Some(id) => id,
-                None => {
-                    log::error!("No stream ID in SBI event");
-                    return;
-                }
-            };
-
-            let message = match &sbi.message {
-                Some(msg) => msg,
-                None => {
-                    log::error!("No message in SBI event");
-                    return;
-                }
-            };
-
-            (
-                stream_id,
-                message.service_name.clone(),
-                message.api_version.clone(),
-                message.method.clone(),
-                message.resource_components.clone(),
-            )
-        };
-
-        // Check API version (SCP uses v1)
-        if api_version != "v1" {
-            log::error!("Not supported version [{api_version}], expected [v1]");
-            send_error_response(
-                stream_id,
-                400,
-                &format!("Unsupported API version: {api_version}"),
-            );
-            return;
-        }
-
-        // SCP primarily handles nnrf-nfm notifications
-        // Most requests are forwarded to target NFs via sbi_path handlers
-        match service_name.as_str() {
-            "nnrf-nfm" => {
-                self.handle_nnrf_nfm_request(event, stream_id);
-            }
-            _ => {
-                // SCP forwards most requests - this is handled in sbi_path.rs
-                log::debug!("SCP forwarding request for service [{service_name}]");
-            }
-        }
-    }
-
-    fn handle_nnrf_nfm_request(&mut self, event: &mut ScpEvent, _stream_id: u64) {
-        let (method, resource_components) = {
-            let sbi = match &event.sbi {
-                Some(sbi) => sbi,
-                None => return,
-            };
-            let message = match &sbi.message {
-                Some(msg) => msg,
-                None => return,
-            };
-            (message.method.clone(), message.resource_components.clone())
-        };
-
-        let resource = resource_components.first().map(|s| s.as_str());
-
-        match resource {
-            Some("nf-status-notify") => match method.as_str() {
-                "POST" => {
-                    log::debug!("NF status notify received");
-                    // Note: Call nextgcore_nnrf_nfm_handle_nf_status_notify
-                    // NF status notify processing is handled by the nnrf integration module
-                }
-                _ => {
-                    log::error!("Invalid HTTP method [{method}]");
-                }
-            },
-            _ => {
-                log::error!("Invalid resource name [{:?}]", resource_components.first());
-            }
-        }
-    }
-
-    fn handle_sbi_client_event(&mut self, event: &mut ScpEvent) {
-        let (service_name, api_version, resource_components, _res_status) = {
-            let sbi = match &event.sbi {
-                Some(sbi) => sbi,
-                None => {
-                    log::error!("No SBI data in client event");
-                    return;
-                }
-            };
-
-            let message = match &sbi.message {
-                Some(msg) => msg,
-                None => {
-                    log::error!("No message in SBI client event");
-                    return;
-                }
-            };
-
-            (
-                message.service_name.clone(),
-                message.api_version.clone(),
-                message.resource_components.clone(),
-                message.res_status,
-            )
-        };
-
-        // Check API version
-        if api_version != "v1" {
-            log::error!("Not supported version [{api_version}]");
-            return;
-        }
-
-        // Route based on service name
-        match service_name.as_str() {
-            "nnrf-nfm" => {
-                self.handle_nnrf_nfm_response(event, &resource_components);
-            }
-            "nnrf-disc" => {
-                self.handle_nnrf_disc_response(event, &resource_components);
-            }
-            _ => {
-                // SCP forwards responses back to original requester
-                log::debug!("SCP forwarding response for service [{service_name}]");
-            }
-        }
-    }
-
-    fn handle_nnrf_nfm_response(&mut self, event: &mut ScpEvent, resource_components: &[String]) {
-        let resource = resource_components.first().map(|s| s.as_str());
-
-        match resource {
-            Some("nf-instances") => {
-                log::debug!("NF instances response received");
-                if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{nf_instance_id}] NF instance response");
-                }
-            }
-            Some("subscriptions") => {
-                log::debug!("Subscriptions response received");
-            }
-            _ => {
-                log::error!("Invalid resource name [{:?}]", resource_components.first());
-            }
-        }
-    }
-
-    fn handle_nnrf_disc_response(&mut self, event: &mut ScpEvent, resource_components: &[String]) {
-        let resource = resource_components.first().map(|s| s.as_str());
-
-        match resource {
-            Some("nf-instances") => {
-                log::debug!("NF discover response received");
-                if let Some(sbi_xact_id) = event.sbi_xact_id {
-                    log::debug!("SBI xact ID: {sbi_xact_id}");
-                    // Delegated discovery and request forwarding run inline
-                    // in the proxy data path (crate::proxy::ScpProxy), not
-                    // through the event machine.
-                }
-            }
-            _ => {
-                log::error!("Invalid resource name [{:?}]", resource_components.first());
             }
         }
     }
@@ -278,22 +102,16 @@ impl ScpSmContext {
             | ScpTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
                     log::debug!("[{nf_instance_id}] NF instance timer: {timer_id:?}");
-                    // Note: Dispatch to NF FSM
-                    // NF instance timer handling is done by the nnrf integration module
                 }
             }
             ScpTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
                     log::error!("[{subscription_id}] Subscription validity expired");
-                    // Note: Send new subscription and remove old one
-                    // Subscription renewal is handled by the nnrf integration module
                 }
             }
             ScpTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
                     log::info!("[{subscription_id}] Need to update Subscription");
-                    // Note: Send subscription update
-                    // Subscription update is handled by the nnrf integration module
                 }
             }
             ScpTimerId::SbiClientWait => {
@@ -332,19 +150,13 @@ mod tests {
     }
 
     #[test]
-    fn test_scp_sm_dispatch_entry() {
+    fn test_scp_sm_dispatch_timer() {
         let mut ctx = ScpSmContext::new();
         ctx.init();
-        let mut event = ScpEvent::entry();
+        let mut event = ScpEvent::sbi_timer(ScpTimerId::NfInstanceHeartbeatInterval)
+            .with_nf_instance("nf-1".to_string());
         ctx.dispatch(&mut event);
-    }
-
-    #[test]
-    fn test_scp_sm_dispatch_exit() {
-        let mut ctx = ScpSmContext::new();
-        ctx.init();
-        let mut event = ScpEvent::exit();
-        ctx.dispatch(&mut event);
+        assert!(ctx.is_operational());
     }
 
     #[test]
