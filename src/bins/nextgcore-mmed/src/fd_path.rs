@@ -996,6 +996,15 @@ pub enum PendingS6aRequest {
         /// MME UE pool id the vectors are for
         mme_ue_id: u64,
     },
+    /// Register this MME as the subscriber's serving node and fetch the
+    /// subscription data (ULR/ULA, TS 29.272 §5.2.1.1).
+    UpdateLocation {
+        /// MME UE pool id the subscription is for
+        mme_ue_id: u64,
+        /// Whether this is an initial attach, which sets the ULR-Flags bit the
+        /// HSS uses to decide whether to cancel a previous MME's registration
+        initial_attach: bool,
+    },
 }
 
 /// Process-global sender for the pending-request queue.
@@ -1040,6 +1049,30 @@ pub fn queue_authentication_information(mme_ue_id: u64) -> bool {
     }
 }
 
+/// Register with the HSS and fetch subscription data for `mme_ue_id`.
+///
+/// Same contract as [`queue_authentication_information`]: safe from synchronous
+/// code, never fails the caller's procedure.
+pub fn queue_update_location(mme_ue_id: u64, initial_attach: bool) -> bool {
+    let Some(tx) = REQUEST_TX.get() else {
+        log::warn!("S6a request dropped: no queue installed (mme_ue_id={mme_ue_id})");
+        return false;
+    };
+    match tx.send(PendingS6aRequest::UpdateLocation {
+        mme_ue_id,
+        initial_attach,
+    }) {
+        Ok(()) => {
+            log::debug!("S6a ULR queued for UE {mme_ue_id} (initial_attach={initial_attach})");
+            true
+        }
+        Err(_) => {
+            log::warn!("S6a request dropped: queue closed (mme_ue_id={mme_ue_id})");
+            false
+        }
+    }
+}
+
 /// Run every queued S6a request that is ready, without waiting for more.
 ///
 /// Called from the main loop beside the NAS timer sweep. Each request is a full
@@ -1055,6 +1088,12 @@ pub async fn poll_pending(
         match request {
             PendingS6aRequest::AuthenticationInformation { mme_ue_id } => {
                 run_authentication_information(ctx, mme_ue_id).await;
+            }
+            PendingS6aRequest::UpdateLocation {
+                mme_ue_id,
+                initial_attach,
+            } => {
+                run_update_location(ctx, mme_ue_id, initial_attach).await;
             }
         }
     }
@@ -1141,6 +1180,93 @@ async fn run_authentication_information(ctx: &'static crate::context::MmeContext
             }
         }
         Err(e) => log::error!("[{}] AIA rejected: {e:?}", mme_ue.imsi_bcd),
+    }
+}
+
+/// ULR/ULA for one UE: register this MME as the serving node and take the
+/// subscription data the Attach Accept is built from.
+async fn run_update_location(
+    ctx: &'static crate::context::MmeContext,
+    mme_ue_id: u64,
+    initial_attach: bool,
+) {
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+        log::debug!("S6a ULR skipped: UE {mme_ue_id} is gone");
+        return;
+    };
+    if mme_ue.imsi_bcd.is_empty() {
+        log::warn!("S6a ULR skipped: UE {mme_ue_id} has no IMSI");
+        return;
+    }
+    if mme_ue.num_of_session != 0 {
+        // A retransmitted SECURITY MODE COMPLETE queues a second ULR for a
+        // context that already holds its subscription, same as the AIR path.
+        log::debug!("S6a ULR skipped: UE {mme_ue_id} already holds subscription data");
+        return;
+    }
+
+    let answer = mme_s6a_send_ulr(&mme_ue, initial_attach).await;
+
+    let enb_ue = ctx
+        .enb_ue_find_by_id(mme_ue.enb_ue_id)
+        .filter(|enb_ue| enb_ue.id != 0);
+
+    let mut pool = ctx.mme_ue_pool.write().unwrap();
+    let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
+        return;
+    };
+
+    let ula = match answer {
+        Ok(ula) => ula,
+        Err(e) => {
+            log::error!("[{}] S6a ULR failed: {e}", mme_ue.imsi_bcd);
+            reject_attach(&enb_ue, mme_ue, EmmCause::NetworkFailure);
+            return;
+        }
+    };
+
+    match crate::s6a_handler::mme_s6a_handle_ula(mme_ue, &ula) {
+        Ok(EmmCause::RequestAccepted) => {
+            log::info!(
+                "[{}] Subscription data received: {} APN(s), AMBR {}/{} bps",
+                mme_ue.imsi_bcd,
+                mme_ue.num_of_session,
+                mme_ue.ambr.uplink,
+                mme_ue.ambr.downlink
+            );
+            // The ATTACH ACCEPT itself is the remainder of #46: it needs the
+            // subscribed APNs turned into sessions and bearers, a GUTI, and the
+            // subscribed T3412 — none of which this change delivers.
+            log::info!(
+                "[{}] Attach Accept not yet built from this subscription (#46)",
+                mme_ue.imsi_bcd
+            );
+        }
+        Ok(cause) => {
+            // The HSS refused to register us: unknown subscriber, roaming not
+            // allowed, RAT not allowed. The UE is told the mapped EMM cause.
+            log::warn!(
+                "[{}] HSS refused location update: {cause:?}",
+                mme_ue.imsi_bcd
+            );
+            reject_attach(&enb_ue, mme_ue, cause);
+        }
+        Err(e) => log::error!("[{}] ULA rejected: {e:?}", mme_ue.imsi_bcd),
+    }
+}
+
+/// Tell the UE its attach failed, when there is still an S1 connection to say it
+/// on.
+fn reject_attach(enb_ue: &Option<crate::context::EnbUe>, mme_ue: &mut MmeUe, cause: EmmCause) {
+    let Some(enb_ue) = enb_ue else {
+        log::warn!(
+            "[{}] cannot send Attach Reject: no S1 connection",
+            mme_ue.imsi_bcd
+        );
+        return;
+    };
+    if let Err(e) = crate::nas_path::nas_eps_send_attach_reject(enb_ue, mme_ue, cause, None) {
+        log::error!("Attach Reject send failed: {e}");
     }
 }
 
