@@ -146,14 +146,21 @@ pub fn nas_eps_handle_uplink(ctx: &MmeContext, uplink: UplinkNas<'_>) {
     };
 
     match uplink.nas_pdu[0] & 0x0f {
+        // Every security-protected NAS message carries the EMM protocol
+        // discriminator in its outer header (TS 24.301 §9.3), whatever the inner
+        // message is, so this is also the entry point for protected ESM.
         NAS_PROTOCOL_DISCRIMINATOR_EMM => dispatch_emm(ctx, &enb_ue, mme_ue_id, uplink.nas_pdu),
         NAS_PROTOCOL_DISCRIMINATOR_ESM => {
-            // An ESM message may arrive standalone (TS 24.301 §8.3), not only
-            // piggybacked in an EMM container.
-            let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
-                return;
-            };
-            handle_esm_message(ctx, &enb_ue, &mme_ue, uplink.nas_pdu);
+            // A standalone ESM message with no security header. TS 24.301
+            // §4.4.4.2 forbids forwarding unprotected messages to the ESM
+            // entity; the one legitimate unprotected ESM message is the
+            // container piggybacked on ATTACH REQUEST, which is held on the UE
+            // context and replayed once security is established.
+            log::warn!(
+                "Unprotected standalone ESM message from enb_ue_s1ap_id={} discarded (TS 24.301 \
+                 4.4.4.2)",
+                enb_ue.enb_ue_s1ap_id
+            );
         }
         other => log::warn!(
             "Uplink NAS with unknown protocol discriminator 0x{other:02x} discarded \
@@ -212,6 +219,27 @@ fn resolve_mme_ue(ctx: &MmeContext, enb_ue: &EnbUe, s_tmsi: Option<(u8, u32)>) -
 // EMM dispatch
 // ============================================================================
 
+/// Whether an EMM message may be processed without integrity protection.
+///
+/// TS 24.301 §4.4.4.2 lists the messages the MME accepts before a NAS security
+/// context exists — the ones a UE legitimately has no key for. Everything else
+/// must arrive integrity protected, so a plain copy is discarded (§4.4.4.3).
+/// SECURITY MODE COMPLETE is deliberately absent: it is always protected with
+/// the new context the Security Mode Command established.
+fn may_be_sent_unprotected(message_type: u8) -> bool {
+    matches!(
+        message_type,
+        emm_type::ATTACH_REQUEST
+            | emm_type::IDENTITY_RESPONSE
+            | emm_type::AUTHENTICATION_RESPONSE
+            | emm_type::AUTHENTICATION_FAILURE
+            | emm_type::SECURITY_MODE_REJECT
+            | emm_type::DETACH_REQUEST
+            | emm_type::DETACH_ACCEPT
+            | emm_type::TAU_REQUEST
+    )
+}
+
 fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
     let security_header_type = pdu[0] >> 4;
 
@@ -221,6 +249,18 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
     }
 
     let plain = if security_header_type == 0 {
+        // TS 24.301 §4.4.4.2: outside an enumerated allowlist, an EMM message
+        // that is not integrity protected must not be processed, nor forwarded
+        // to the ESM entity.
+        if !may_be_sent_unprotected(pdu[1]) {
+            log::warn!(
+                "Unprotected EMM message type 0x{:02x} from enb_ue_s1ap_id={} discarded: it is \
+                 not in the TS 24.301 4.4.4.2 allowlist",
+                pdu[1],
+                enb_ue.enb_ue_s1ap_id
+            );
+            return;
+        }
         pdu.to_vec()
     } else {
         match decode_protected(ctx, mme_ue_id, security_header_type, pdu) {
@@ -232,6 +272,32 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
     if plain.len() < 2 {
         log::warn!("Decoded EMM message too short ({} bytes)", plain.len());
         return;
+    }
+
+    // What came out of the security container: an EMM message, an ESM message,
+    // or — when no algorithm was in use, so `nas_eps_security_decode` left the
+    // 6-octet header attached — the protected message itself. A plain EMM
+    // header is exactly 0x07 (security header type 0, PD 7), an inner ESM
+    // message has PD 2 in its low nibble, and an unstripped header keeps PD 7
+    // with a non-zero security-header-type nibble.
+    match plain[0] & 0x0f {
+        NAS_PROTOCOL_DISCRIMINATOR_ESM => {
+            let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+                return;
+            };
+            handle_esm_message(ctx, enb_ue, &mme_ue, &plain);
+            return;
+        }
+        NAS_PROTOCOL_DISCRIMINATOR_EMM if plain[0] == NAS_PROTOCOL_DISCRIMINATOR_EMM => {}
+        _ => {
+            log::warn!(
+                "NAS security decode left a protected message (first octet {:#04x}) from \
+                 enb_ue_s1ap_id={}; discarded",
+                plain[0],
+                enb_ue.enb_ue_s1ap_id
+            );
+            return;
+        }
     }
 
     let message_type = plain[1];
@@ -333,32 +399,16 @@ fn decode_protected(
         return None;
     }
 
-    if let Err(e) = nas_security::nas_eps_security_decode(mme_ue, flags, &mut message) {
-        log::warn!("[{}] NAS security decode failed: {e}", mme_ue.imsi_bcd);
-        return None;
-    }
+    let decoded = nas_security::nas_eps_security_decode(mme_ue, flags, &mut message);
 
-    // TS 24.301 §4.4.4.3: a message that fails the integrity check is
-    // discarded. `mac_failed` is cleared so it cannot leak into the next
-    // message on this context.
-    if std::mem::take(&mut mme_ue.mac_failed) {
+    // TS 24.301 §4.4.4.3: a message that fails the integrity check is discarded.
+    // The decode reports that as an error; the flag is cleared as well so it
+    // cannot leak into the next message on this context.
+    let mac_failed = std::mem::take(&mut mme_ue.mac_failed);
+    if let Err(e) = decoded {
         log::warn!(
-            "[{}] NAS integrity check failed; message discarded",
+            "[{}] NAS security decode failed: {e} (mac_failed={mac_failed})",
             mme_ue.imsi_bcd
-        );
-        return None;
-    }
-
-    // The security header is only stripped when an algorithm is actually in
-    // use, and NAS algorithm selection is not implemented (#44). Rather than
-    // read a MAC octet as a message type, insist the decode produced a plain
-    // EMM header (TS 24.301 §9.3.1: security header type 0, PD 0x07).
-    if message.first() != Some(&NAS_PROTOCOL_DISCRIMINATOR_EMM) {
-        log::warn!(
-            "[{}] NAS security decode left a protected message (first octet {:#04x}); discarded — \
-             no NAS algorithm is selected (#44)",
-            mme_ue.imsi_bcd,
-            message.first().copied().unwrap_or(0)
         );
         return None;
     }
@@ -511,7 +561,32 @@ fn emm_authentication_response(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64,
     match emm_handler::handle_authentication_response(enb_ue, mme_ue, body) {
         Ok(true) => {
             // TS 24.301 §5.4.3.2: authentication done, take the NAS security
-            // context into use.
+            // context into use. TS 33.401 §7.2.4.3: the algorithms are chosen
+            // here, from the UE's advertised capabilities and the MME's ordered
+            // preference, and the NAS keys are derived from KASME for exactly
+            // those algorithms (Annex A.7) — so both must happen before the
+            // Security Mode Command is built with them.
+            let Some(selected) = nas_security::select_nas_algorithms(
+                &ctx.integrity_order,
+                &ctx.ciphering_order,
+                &mme_ue.ue_network_capability,
+            ) else {
+                log::warn!(
+                    "[{}] No NAS integrity algorithm in common with the UE; rejecting the attach",
+                    mme_ue.imsi_bcd
+                );
+                if let Err(e) = nas_path::nas_eps_send_attach_reject(
+                    enb_ue,
+                    mme_ue,
+                    EmmCause::UeSecurityCapabilitiesMismatch,
+                    None,
+                ) {
+                    log::error!("Attach Reject send failed: {e}");
+                }
+                return;
+            };
+            nas_security::derive_nas_keys(mme_ue, selected);
+
             mme_ue.t3460.pkbuf = None;
             if let Err(e) = nas_path::nas_eps_send_security_mode_command(mme_ue, enb_ue) {
                 log::error!(
@@ -1383,6 +1458,72 @@ mod tests {
             .flatten()
     }
 
+    /// Message type of a message the MME sent under a security header
+    /// (6 octets: header type / PD, 4-octet MAC, sequence number).
+    fn protected_message_type(pkbuf: &Option<Vec<u8>>) -> Option<u8> {
+        let buf = pkbuf.as_ref()?;
+        (buf.len() > 7 && buf[0] & 0x0f == NAS_PROTOCOL_DISCRIMINATOR_EMM && buf[0] >> 4 != 0)
+            .then(|| buf[7])
+    }
+
+    /// Wrap `plain` in an integrity-protected uplink security header carrying
+    /// the MAC a UE holding the same NAS context would compute.
+    ///
+    /// The MME derives its verification count from the sequence number in the
+    /// header, so with no overflow the count *is* that sequence number.
+    fn protect_uplink(mme_ue: &MmeUe, sequence_number: u8, plain: &[u8]) -> Vec<u8> {
+        let mut protected = vec![
+            ((crate::emm_build::SecurityHeaderType::IntegrityProtected as u8) << 4)
+                | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+            0,
+            0,
+            0,
+            0, // MAC, filled in below
+            sequence_number,
+        ];
+        protected.extend_from_slice(plain);
+
+        let mac = nas_security::nas_mac_calculate(
+            mme_ue.selected_int_algorithm,
+            &mme_ue.knas_int,
+            u32::from(sequence_number),
+            nas_security::NAS_SECURITY_BEARER,
+            nas_security::NAS_SECURITY_UPLINK_DIRECTION,
+            &protected[5..],
+        );
+        protected[1..5].copy_from_slice(&mac);
+        protected
+    }
+
+    /// A UE context with an HSS vector and the capabilities of a UE supporting
+    /// EEA/EIA 0-3, as an Attach Request would have left it.
+    fn ue_with_vector(ctx: &MmeContext, enb_ue_id: u64) -> u64 {
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        ctx.mme_ue_set_imsi(mme_ue_id, TEST_IMSI);
+        let mut pool = ctx.mme_ue_pool.write().unwrap();
+        let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+        mme_ue.xres[..8].copy_from_slice(&[0xaa; 8]);
+        mme_ue.xres_len = 8;
+        mme_ue.rand = [0x11; 16];
+        mme_ue.autn = [0x22; 16];
+        mme_ue.kasme = [0x44; 32];
+        mme_ue.ue_network_capability.eea = 0xf0;
+        mme_ue.ue_network_capability.eia = 0xf0;
+        mme_ue_id
+    }
+
+    /// AUTHENTICATION RESPONSE echoing the XRES `ue_with_vector` seeded.
+    fn authentication_response() -> Vec<u8> {
+        let mut pdu = vec![
+            NAS_PROTOCOL_DISCRIMINATOR_EMM,
+            NasEpsMessageType::AuthenticationResponse as u8,
+            0x08,
+        ];
+        pdu.extend_from_slice(&[0xaa; 8]);
+        pdu
+    }
+
     #[test]
     fn test_attach_request_with_imsi_indexes_ue_and_awaits_a_vector() {
         let ctx = test_ctx();
@@ -1626,34 +1767,190 @@ mod tests {
     }
 
     #[test]
-    fn test_authentication_response_match_sends_security_mode_command() {
+    fn test_authentication_response_selects_algorithms_and_derives_keys() {
         let ctx = test_ctx();
         let enb_ue_id = enb_with_connection(&ctx);
-        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
-        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        // The shipped configuration's order is [EIA2, EIA1, EIA0] and
+        // [EEA0, EEA1, EEA2], and this UE supports 0-3.
+        assert_eq!(mme_ue.selected_int_algorithm, 2, "EIA2 must be selected");
+        assert_eq!(
+            mme_ue.selected_enc_algorithm, 0,
+            "EEA0 is what the shipped ciphering order asks for first"
+        );
+        // TS 33.401 Annex A.7 keys, derived for exactly those algorithms.
+        assert_eq!(
+            mme_ue.knas_int,
+            nextgcore_crypt::kdf::nextgcore_kdf_nas_eps(
+                nas_security::NAS_INT_ALG_DISTINGUISHER,
+                2,
+                &[0x44; 32]
+            )
+        );
+        assert_eq!(
+            mme_ue.knas_enc,
+            nextgcore_crypt::kdf::nextgcore_kdf_nas_eps(
+                nas_security::NAS_ENC_ALG_DISTINGUISHER,
+                0,
+                &[0x44; 32]
+            )
+        );
+        assert_ne!(mme_ue.knas_int, [0u8; 16], "the keys must not be null");
+        assert_eq!(
+            protected_message_type(&mme_ue.t3460.pkbuf),
+            Some(NasEpsMessageType::SecurityModeCommand as u8),
+            "a Security Mode Command must be armed on T3460"
+        );
+        // Non-null integrity means the command carries a real MAC.
+        let smc = mme_ue.t3460.pkbuf.clone().unwrap();
+        assert_ne!(&smc[1..5], &[0u8; 4], "the MAC must not be null");
+        // Selected NAS security algorithms IE: EEA in the high nibble, EIA in
+        // the low one, so EEA0/EIA2 is 0x02.
+        assert_eq!(
+            smc[8], 0x02,
+            "the command must carry the selected EEA0/EIA2"
+        );
+        assert!(mme_ue.security_context_available);
+    }
+
+    #[test]
+    fn test_no_common_integrity_algorithm_rejects_the_attach() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        {
+            // A UE advertising EIA0 only: TS 33.401 5.1.4.1 allows null
+            // integrity for unauthenticated emergency calls only.
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            pool.get_mut(&mme_ue_id).unwrap().ue_network_capability.eia = 0x80;
+        }
+
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(
+            mme_ue.selected_int_algorithm, 0,
+            "no algorithm may be taken into use"
+        );
+        assert_eq!(mme_ue.knas_int, [0u8; 16], "no keys may be derived");
+        assert!(
+            mme_ue.t3460.pkbuf.is_none(),
+            "no Security Mode Command may go out; the attach is rejected instead"
+        );
+    }
+
+    #[test]
+    fn test_protected_uplink_round_trip_completes_the_security_procedure() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
         {
             let mut pool = ctx.mme_ue_pool.write().unwrap();
             let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
-            mme_ue.xres[..8].copy_from_slice(&[0xaa; 8]);
-            mme_ue.xres_len = 8;
+            mme_ue.nas_eps.type_ = MmeEpsType::AttachRequest;
+            mme_ue.pdn_connectivity_request = pdn_connectivity_request(5, false);
         }
-        let mut pdu = vec![
-            NAS_PROTOCOL_DISCRIMINATOR_EMM,
-            NasEpsMessageType::AuthenticationResponse as u8,
-            0x08,
-        ];
-        pdu.extend_from_slice(&[0xaa; 8]);
 
-        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+        // Authentication Response -> real Security Mode Command.
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+
+        // The UE answers with an integrity-protected SECURITY MODE COMPLETE,
+        // MAC'd with the key both sides now hold.
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        let complete = protect_uplink(
+            &mme_ue,
+            1,
+            &[
+                NAS_PROTOCOL_DISCRIMINATOR_EMM,
+                NasEpsMessageType::SecurityModeComplete as u8,
+            ],
+        );
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &complete));
 
         let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(mme_ue.ul_count, 1, "the verified message advanced UL COUNT");
         assert!(
-            mme_ue.t3460.pkbuf.is_some(),
-            "a Security Mode Command must be armed on T3460"
+            mme_ue.pdn_connectivity_request.is_empty(),
+            "the held ESM container must be consumed"
         );
+        // The container reached the ESM entity through a verified message.
+        let sess_id = ctx
+            .sess_find_by_pti(mme_ue_id, 5)
+            .expect("the ESM handler must have created the session");
+        let sess = ctx.sess_find_by_id(sess_id).unwrap();
+        assert_eq!(sess.apn, TEST_APN);
+        assert_eq!(sess.ue_request_pdn_type, PdnType::Ipv4);
+    }
+
+    #[test]
+    fn test_protected_standalone_esm_reaches_the_esm_entity() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+
+        // A standalone ESM message under a security header: the outer header
+        // carries the EMM protocol discriminator, the inner message ESM's
+        // (TS 24.301 9.3), so the dispatch must route on the INNER one.
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        let request = protect_uplink(&mme_ue, 1, &pdn_connectivity_request(3, true));
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &request));
+
+        // TS 24.301 6.5.1.2: the transfer flag with no APN means the UE will
+        // send them separately, so the MME asks.
+        let sess_id = ctx.sess_find_by_pti(mme_ue_id, 3).expect("session created");
+        let bearer_id = ctx.sess_find_by_id(sess_id).unwrap().bearer_list[0];
+        let bearer = ctx.bearer_find_by_id(bearer_id).unwrap();
         assert!(
-            mme_ue.security_context_available,
-            "encoding the Security Mode Command establishes the security context"
+            bearer.t3489.pkbuf.is_some(),
+            "an ESM Information Request must be armed on T3489"
+        );
+    }
+
+    #[test]
+    fn test_unprotected_messages_outside_the_allowlist_are_discarded() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            pool.get_mut(&mme_ue_id).unwrap().pdn_connectivity_request =
+                pdn_connectivity_request(5, false);
+        }
+
+        // SECURITY MODE COMPLETE is always protected with the new context, so a
+        // plain copy must not be processed (TS 24.301 4.4.4.2).
+        nas_eps_handle_uplink(
+            &ctx,
+            uplink(
+                enb_ue_id,
+                &[
+                    NAS_PROTOCOL_DISCRIMINATOR_EMM,
+                    NasEpsMessageType::SecurityModeComplete as u8,
+                ],
+            ),
+        );
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(!mme_ue.security_context_available);
+        assert!(!mme_ue.pdn_connectivity_request.is_empty());
+
+        // A standalone unprotected ESM message must not reach the ESM entity.
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdn_connectivity_request(9, false)));
+        assert!(ctx.sess_find_by_pti(mme_ue_id, 9).is_none());
+
+        // An allowlisted message still is: this one a UE has no key for.
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+        assert!(
+            ctx.mme_ue_find_by_id(mme_ue_id)
+                .unwrap()
+                .t3460
+                .pkbuf
+                .is_some(),
+            "an ATTACH/AUTHENTICATION-class message may arrive unprotected"
         );
     }
 
@@ -1682,81 +1979,29 @@ mod tests {
     }
 
     #[test]
-    fn test_security_mode_complete_replays_the_held_esm_container() {
+    fn test_rejected_esm_request_hands_back_its_session() {
         let ctx = test_ctx();
         let enb_ue_id = enb_with_connection(&ctx);
-        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
-        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
-        ctx.mme_ue_set_imsi(mme_ue_id, TEST_IMSI);
-        {
-            let mut pool = ctx.mme_ue_pool.write().unwrap();
-            let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
-            mme_ue.nas_eps.type_ = MmeEpsType::AttachRequest;
-            mme_ue.pdn_connectivity_request = pdn_connectivity_request(5, false);
-        }
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
 
-        // Plain SECURITY MODE COMPLETE: no security context is established, so
-        // it arrives unprotected in this test and only the dispatch is exercised.
-        let pdu = vec![
-            NAS_PROTOCOL_DISCRIMINATOR_EMM,
-            NasEpsMessageType::SecurityModeComplete as u8,
-        ];
-        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
-
+        // A PDN CONNECTIVITY REQUEST whose body is shorter than its mandatory
+        // IEs: protected and verified, but the ESM handler refuses it.
         let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
-        assert!(mme_ue.security_context_available);
-        assert!(
-            mme_ue.pdn_connectivity_request.is_empty(),
-            "the held container must be consumed"
+        let malformed = protect_uplink(
+            &mme_ue,
+            1,
+            &[
+                NAS_PROTOCOL_DISCRIMINATOR_ESM,
+                7, // procedure transaction identity
+                EsmMessageType::PdnConnectivityRequest as u8,
+                0x11, // one octet where two are mandatory
+            ],
         );
-        // The replayed container reached the ESM entity, which created the
-        // session it names.
-        let sess_id = ctx
-            .sess_find_by_pti(mme_ue_id, 5)
-            .expect("the ESM handler must have created the session");
-        let sess = ctx.sess_find_by_id(sess_id).unwrap();
-        assert_eq!(sess.ue_request_type, 1);
-        assert_eq!(sess.ue_request_pdn_type, PdnType::Ipv4);
-        assert_eq!(sess.apn, TEST_APN);
-        assert_eq!(mme_ue.sess_list, vec![sess_id]);
-    }
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &malformed));
 
-    #[test]
-    fn test_standalone_pdn_connectivity_request_asks_for_esm_information() {
-        let ctx = test_ctx();
-        let enb_ue_id = enb_with_connection(&ctx);
-        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
-        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
-        ctx.mme_ue_set_imsi(mme_ue_id, TEST_IMSI);
-        {
-            let mut pool = ctx.mme_ue_pool.write().unwrap();
-            pool.get_mut(&mme_ue_id).unwrap().security_context_available = true;
-        }
-
-        // TS 24.301 §6.5.1.2: the transfer flag with no APN means the UE will
-        // send them separately, so the MME asks.
-        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdn_connectivity_request(3, true)));
-
-        let sess_id = ctx.sess_find_by_pti(mme_ue_id, 3).expect("session created");
-        let bearer_id = ctx.sess_find_by_id(sess_id).unwrap().bearer_list[0];
-        let bearer = ctx.bearer_find_by_id(bearer_id).unwrap();
-        assert!(
-            bearer.t3489.pkbuf.is_some(),
-            "an ESM Information Request must be armed on T3489"
-        );
-    }
-
-    #[test]
-    fn test_esm_message_without_a_security_context_is_rejected() {
-        let ctx = test_ctx();
-        let enb_ue_id = enb_with_connection(&ctx);
-        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
-        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
-
-        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdn_connectivity_request(7, false)));
-
-        // The ESM handler refused it (no security context), so the contexts the
-        // request allocated are handed back rather than accumulating.
+        // The contexts the rejected request allocated are handed back rather
+        // than accumulating.
         assert!(ctx.sess_find_by_pti(mme_ue_id, 7).is_none());
         assert!(ctx.sess_pool.read().unwrap().is_empty());
         assert!(ctx.bearer_pool.read().unwrap().is_empty());

@@ -1415,6 +1415,26 @@ pub struct MmeContext {
 
 use std::sync::atomic::AtomicU64;
 
+/// Default NAS integrity algorithm priority, most preferred first.
+///
+/// Mirrors `security.integrity_order: [EIA2, EIA1, EIA0]` in the shipped
+/// `docker/rust/configs/epc/mme.yaml`. It lives here as a default because mmed
+/// does not parse its configuration file yet; once it does, the parsed list
+/// overwrites this field and behaviour is unchanged for that deployment.
+///
+/// Note that EIA0 is present for completeness only: TS 33.401 §5.1.4.1 permits
+/// null integrity solely for unauthenticated emergency calls, so
+/// `nas_security::select_nas_algorithms` never selects it.
+pub const DEFAULT_INTEGRITY_ORDER: [u8; 3] = [2, 1, 0];
+
+/// Default NAS ciphering algorithm priority, most preferred first.
+///
+/// Mirrors `security.ciphering_order: [EEA0, EEA1, EEA2]` in the shipped
+/// `docker/rust/configs/epc/mme.yaml`, which asks for null ciphering first. That
+/// is a deliberate operator preference rather than a fallback, and unlike null
+/// integrity it is permitted for any UE.
+pub const DEFAULT_CIPHERING_ORDER: [u8; 3] = [0, 1, 2];
+
 impl MmeContext {
     /// Create a new MME context
     pub fn new() -> Self {
@@ -1425,6 +1445,8 @@ impl MmeContext {
             mme_ue_s1ap_id: AtomicU32::new(1),
             pool_id_counter: AtomicU64::new(NEXTGCORE_MIN_POOL_ID),
             initialized: AtomicBool::new(false),
+            integrity_order: DEFAULT_INTEGRITY_ORDER.to_vec(),
+            ciphering_order: DEFAULT_CIPHERING_ORDER.to_vec(),
             ..Default::default()
         }
     }
