@@ -319,22 +319,21 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
         }
         emm_type::DETACH_REQUEST => emm_detach_request(ctx, enb_ue, mme_ue_id, body),
         emm_type::AUTHENTICATION_FAILURE => {
-            // AUTS resynchronisation and MAC-failure handling are #45.
-            log::warn!(
-                "Authentication Failure from enb_ue_s1ap_id={} (EMM cause #{}); AUTS \
-                 resynchronisation is not implemented (#45)",
-                enb_ue.enb_ue_s1ap_id,
-                body.first().copied().unwrap_or(0)
-            );
+            emm_authentication_failure(ctx, enb_ue, mme_ue_id, body);
         }
         emm_type::SECURITY_MODE_REJECT => {
-            // TS 24.301 §5.4.3.5: the network aborts the procedure.
+            // TS 24.301 §5.4.3.5: the network aborts the procedure and releases
+            // the NAS signalling connection.
             log::error!(
                 "Security Mode Reject from enb_ue_s1ap_id={} (EMM cause #{}); aborting the \
                  security mode control procedure",
                 enb_ue.enb_ue_s1ap_id,
                 body.first().copied().unwrap_or(0)
             );
+            if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+                mme_ue.t3460.stop();
+            }
+            release_ue_context(ctx, enb_ue);
         }
         emm_type::DETACH_ACCEPT => {
             log::info!(
@@ -348,6 +347,10 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
                 "EMM 0x{message_type:02x} acknowledged by enb_ue_s1ap_id={}",
                 enb_ue.enb_ue_s1ap_id
             );
+            // TS 24.301 §5.5.3.2.4: the TAU procedure completed (issue #45).
+            if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+                mme_ue.t3450.stop();
+            }
         }
         emm_type::EMM_STATUS => {
             log::warn!(
@@ -508,7 +511,12 @@ fn emm_attach_complete(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &
             return;
         };
         match emm_handler::handle_attach_complete(enb_ue, mme_ue, body) {
-            Ok(esm_message) => esm_message,
+            Ok(esm_message) => {
+                // TS 24.301 §5.5.1.2.4: the attach procedure completed, so T3450
+                // stops and the stored ATTACH ACCEPT is discarded (issue #45).
+                mme_ue.t3450.stop();
+                esm_message
+            }
             Err(e) => {
                 log::warn!("[{}] Attach Complete rejected: {e}", mme_ue.imsi_bcd);
                 return;
@@ -534,6 +542,8 @@ fn emm_identity_response(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body:
             );
             return;
         }
+        // TS 24.301 §5.4.4.3: the identification procedure completed (issue #45).
+        mme_ue.t3470.stop();
         // `handle_identity_response` writes `imsi_bcd` only for an IMSI
         // identity; an IMEI/IMEISV answer leaves it untouched.
         mme_ue.imsi_bcd.clone()
@@ -587,7 +597,9 @@ fn emm_authentication_response(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64,
             };
             nas_security::derive_nas_keys(mme_ue, selected);
 
-            mme_ue.t3460.pkbuf = None;
+            // TS 24.301 §5.4.2.3 / §5.4.3.3: the procedure completed, so T3460
+            // stops and its retransmission buffer goes with it (issue #45).
+            mme_ue.t3460.stop();
             if let Err(e) = nas_path::nas_eps_send_security_mode_command(mme_ue, enb_ue) {
                 log::error!(
                     "[{}] Security Mode Command send failed: {e}",
@@ -616,6 +628,81 @@ fn emm_authentication_response(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64,
     }
 }
 
+/// Handle AUTHENTICATION FAILURE (TS 24.301 §5.4.2.7).
+fn emm_authentication_failure(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]) {
+    let outcome = {
+        let mut pool = ctx.mme_ue_pool.write().unwrap();
+        let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
+            return;
+        };
+        // The authentication procedure is over either way, so T3460 stops and
+        // the challenge is not retransmitted.
+        mme_ue.t3460.stop();
+
+        match emm_handler::handle_authentication_failure(enb_ue, mme_ue, body) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                log::warn!(
+                    "[{}] Authentication Failure malformed: {e}; rejecting",
+                    mme_ue.imsi_bcd
+                );
+                if let Err(e) = nas_path::nas_eps_send_authentication_reject(mme_ue, enb_ue) {
+                    log::error!("Authentication Reject send failed: {e}");
+                }
+                return;
+            }
+        }
+    };
+
+    match outcome {
+        emm_handler::AuthenticationFailure::SynchFailure(auts) => {
+            // TS 33.401 §6.1.1: the AUTS goes to the HSS as
+            // Re-synchronization-Info in a fresh AIR, and the vector it returns
+            // restarts authentication. `fd_path::mme_s6a_send_air` already takes
+            // the AUTS and `s6a::add_resync_info` already encodes it — what is
+            // missing is the connected S6a peer, so the AUTS is stored for that
+            // request rather than dropped or pretended to be sent.
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
+                return;
+            };
+            mme_ue.resync_auts = Some(*auts);
+            mme_ue.xres_len = 0;
+            log::warn!(
+                "[{}] Synch failure: AUTS stored for a re-synchronisation AIR, which needs \
+                 mmed's S6a peer to be connected",
+                mme_ue.imsi_bcd
+            );
+        }
+        emm_handler::AuthenticationFailure::MacFailure => {
+            // TS 24.301 §5.4.2.7 e): on MAC failure the network may re-initiate
+            // the identification procedure and authenticate the UE it names,
+            // which is the only branch that can make progress without the HSS.
+            log::warn!("MAC failure reported for UE {mme_ue_id}; re-identifying");
+            {
+                // The vector the UE rejected must not be reused. `imsi_bcd` is
+                // deliberately left in place: clearing it would strand the
+                // context's entry in the IMSI index, which is keyed by that
+                // string, and the Identity Response re-indexes it anyway.
+                let mut pool = ctx.mme_ue_pool.write().unwrap();
+                if let Some(mme_ue) = pool.get_mut(&mme_ue_id) {
+                    mme_ue.xres_len = 0;
+                }
+            }
+            request_identity(ctx, enb_ue, mme_ue_id);
+        }
+        emm_handler::AuthenticationFailure::Other(cause) => {
+            // Anything else (e.g. #26 non-EPS authentication unacceptable)
+            // aborts the procedure and releases the connection.
+            log::warn!(
+                "Authentication Failure cause #{cause} for UE {mme_ue_id}; aborting and \
+                 releasing the S1 connection"
+            );
+            release_ue_context(ctx, enb_ue);
+        }
+    }
+}
+
 fn emm_security_mode_complete(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]) {
     let held_esm = {
         let mut pool = ctx.mme_ue_pool.write().unwrap();
@@ -626,7 +713,9 @@ fn emm_security_mode_complete(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, 
             log::warn!("[{}] Security Mode Complete rejected: {e}", mme_ue.imsi_bcd);
             return;
         }
-        mme_ue.t3460.pkbuf = None;
+        // TS 24.301 §5.4.3.3: the security mode control procedure completed, so
+        // T3460 stops and the stored command is discarded (issue #45).
+        mme_ue.t3460.stop();
         // Replay the container held since Attach Request, now that
         // `security_context_available` is set (TS 24.301 §5.5.1.2.2).
         std::mem::take(&mut mme_ue.pdn_connectivity_request)
@@ -919,10 +1008,13 @@ fn index_imsi(ctx: &MmeContext, mme_ue_id: u64, imsi_bcd: &str) {
 
 /// Ask the eNB to release a UE-associated logical S1 connection.
 ///
+/// Crate-visible because `nas_timer` releases the connection when a NAS
+/// procedure exhausts its retransmissions (TS 24.301 §5.4.2.7).
+///
 /// The eNB answers `UE CONTEXT RELEASE COMPLETE`, which
 /// `s1ap_handler::handle_ue_context_release_complete` turns into the local
 /// teardown — so the contexts are not dropped here.
-fn release_ue_context(ctx: &MmeContext, enb_ue: &EnbUe) {
+pub(crate) fn release_ue_context(ctx: &MmeContext, enb_ue: &EnbUe) {
     if let Some(stored) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue.id) {
         stored.ue_ctx_rel_action = UeCtxRelAction::UeContextRemove;
         stored.relcause.group = S1apCauseGroup::Nas;
@@ -1975,6 +2067,203 @@ mod tests {
             ctx.enb_ue_find_by_id(enb_ue_id).unwrap().ue_ctx_rel_action,
             UeCtxRelAction::UeContextRemove,
             "the S1 connection must be marked for release"
+        );
+    }
+
+    #[test]
+    fn test_truncated_res_does_not_establish_a_security_context() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+
+        // A one-octet RES matching the first octet of the seeded XRES (0xaa).
+        let mut pdu = vec![
+            NAS_PROTOCOL_DISCRIMINATOR_EMM,
+            NasEpsMessageType::AuthenticationResponse as u8,
+            0x01,
+        ];
+        pdu.push(0xaa);
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(
+            !mme_ue.security_context_available,
+            "a truncated RES must not authenticate the UE"
+        );
+        assert_eq!(mme_ue.selected_int_algorithm, 0);
+        assert_eq!(mme_ue.knas_int, [0u8; 16]);
+        assert!(
+            mme_ue.t3460.pkbuf.is_none(),
+            "no Security Mode Command is due"
+        );
+    }
+
+    #[test]
+    fn test_synch_failure_stores_the_auts_and_stops_t3460() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        // An outstanding AUTHENTICATION REQUEST.
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+            mme_ue.t3460.pkbuf = Some(vec![0x07, 0x52]);
+            mme_ue.t3460.start(crate::nas_timer::T3460_DURATION);
+        }
+
+        let auts = [0x5a; 14];
+        let mut pdu = vec![
+            NAS_PROTOCOL_DISCRIMINATOR_EMM,
+            NasEpsMessageType::AuthenticationFailure as u8,
+            21,   // EMM cause #21, synch failure
+            0x30, // Authentication Failure Parameter
+            14,
+        ];
+        pdu.extend_from_slice(&auts);
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(
+            mme_ue.resync_auts,
+            Some(auts),
+            "the AUTS must be kept for the re-synchronisation AIR"
+        );
+        assert_eq!(mme_ue.xres_len, 0, "the rejected vector must be discarded");
+        assert!(!mme_ue.t3460.is_running(), "T3460 must be stopped");
+        assert!(mme_ue.t3460.pkbuf.is_none());
+    }
+
+    #[test]
+    fn test_mac_failure_re_identifies_the_ue() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+
+        let pdu = vec![
+            NAS_PROTOCOL_DISCRIMINATOR_EMM,
+            NasEpsMessageType::AuthenticationFailure as u8,
+            20, // EMM cause #20, MAC failure
+        ];
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(mme_ue.xres_len, 0, "the rejected vector must be discarded");
+        assert_eq!(
+            emm_message_type(&mme_ue.t3470.pkbuf),
+            Some(NasEpsMessageType::IdentityRequest as u8),
+            "TS 24.301 5.4.2.7 e): the network may re-identify the UE"
+        );
+        assert!(mme_ue.t3470.is_running(), "T3470 must be armed");
+        // The IMSI index still resolves: clearing imsi_bcd would strand it.
+        assert_eq!(ctx.mme_ue_find_by_imsi(TEST_IMSI), Some(mme_ue_id));
+    }
+
+    #[test]
+    fn test_completing_messages_stop_their_timers() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+
+        // Identity Response stops T3470.
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+            mme_ue.t3470.pkbuf = Some(vec![0x07, 0x55, 0x01]);
+            mme_ue.t3470.start(crate::nas_timer::T3470_DURATION);
+        }
+        let identity = imsi_identity();
+        let mut pdu = vec![
+            NAS_PROTOCOL_DISCRIMINATOR_EMM,
+            NasEpsMessageType::IdentityResponse as u8,
+            identity.len() as u8,
+        ];
+        pdu.extend_from_slice(&identity);
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(!mme_ue.t3470.is_running());
+        assert!(mme_ue.t3470.pkbuf.is_none());
+
+        // Authentication Response stops T3460 (and arms it again for the
+        // Security Mode Command it sends, which is a different procedure step).
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(
+            protected_message_type(&mme_ue.t3460.pkbuf),
+            Some(NasEpsMessageType::SecurityModeCommand as u8)
+        );
+        assert_eq!(mme_ue.t3460.retry_count, 0, "a fresh procedure starts at 0");
+
+        // Security Mode Complete stops T3460 for good.
+        let complete = protect_uplink(
+            &mme_ue,
+            1,
+            &[
+                NAS_PROTOCOL_DISCRIMINATOR_EMM,
+                NasEpsMessageType::SecurityModeComplete as u8,
+            ],
+        );
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &complete));
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(!mme_ue.t3460.is_running());
+        assert!(mme_ue.t3460.pkbuf.is_none());
+    }
+
+    #[test]
+    fn test_attach_complete_stops_t3450() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+        {
+            // An outstanding ATTACH ACCEPT.
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+            mme_ue.t3450.pkbuf = Some(vec![0x07, 0x42]);
+            mme_ue.t3450.start(crate::nas_timer::T3450_DURATION);
+        }
+
+        // ATTACH COMPLETE carrying a two-octet ESM container length of 0.
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        let complete = protect_uplink(
+            &mme_ue,
+            1,
+            &[
+                NAS_PROTOCOL_DISCRIMINATOR_EMM,
+                NasEpsMessageType::AttachComplete as u8,
+                0x00,
+                0x00,
+            ],
+        );
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &complete));
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(!mme_ue.t3450.is_running(), "T3450 must be stopped");
+        assert!(
+            mme_ue.t3450.pkbuf.is_none(),
+            "the stored accept is discarded"
+        );
+    }
+
+    #[test]
+    fn test_security_mode_reject_aborts_and_releases() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+
+        let pdu = vec![
+            NAS_PROTOCOL_DISCRIMINATOR_EMM,
+            NasEpsMessageType::SecurityModeReject as u8,
+            24, // EMM cause #24, security mode rejected unspecified
+        ];
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(!mme_ue.t3460.is_running());
+        assert_eq!(
+            ctx.enb_ue_find_by_id(enb_ue_id).unwrap().ue_ctx_rel_action,
+            UeCtxRelAction::UeContextRemove,
+            "TS 24.301 5.4.3.5 releases the NAS signalling connection"
         );
     }
 
