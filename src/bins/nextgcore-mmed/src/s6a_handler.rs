@@ -518,6 +518,81 @@ pub fn materialise_subscribed_sessions(ctx: &crate::context::MmeContext, mme_ue_
     created
 }
 
+/// Match the APN the UE asked for against the subscription (TS 23.401 §5.3.2.1).
+///
+/// The UE's request arrives as an ESM PDN CONNECTIVITY REQUEST, which
+/// `nas_dispatch` turns into a session carrying the UE's procedure transaction
+/// identity; the subscribed APNs are the sessions
+/// [`materialise_subscribed_sessions`] created with PTI 0. This pairs them.
+///
+/// `Ok(sess_id)` is the subscribed session to activate, with the UE's PTI and
+/// requested PDN type copied onto it. `Err(cause)` is what the UE is owed:
+/// TS 24.301 §6.5.1.4 gives ESM cause #27 for an APN the subscription does not
+/// contain, and #33 when the subscription contains nothing at all.
+pub fn reconcile_requested_apn(
+    ctx: &crate::context::MmeContext,
+    mme_ue_id: u64,
+) -> Result<u64, crate::esm_build::EsmCause> {
+    use crate::esm_build::EsmCause;
+
+    let sessions: Vec<crate::context::MmeSess> = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .map(|mme_ue| {
+            mme_ue
+                .sess_list
+                .iter()
+                .filter_map(|id| ctx.sess_find_by_id(*id))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // What the UE asked for: the session `nas_dispatch` created for its
+    // procedure transaction. An empty APN means "give me the default".
+    let requested = sessions
+        .iter()
+        .find(|sess| sess.pti != 0)
+        .map(|sess| (sess.pti, sess.ue_request_pdn_type, sess.apn.clone()));
+
+    let subscribed: Vec<&crate::context::MmeSess> =
+        sessions.iter().filter(|sess| sess.pti == 0).collect();
+    if subscribed.is_empty() {
+        return Err(EsmCause::RequestedServiceOptionNotSubscribed);
+    }
+
+    let (pti, pdn_type, requested_apn) = requested.unwrap_or_default();
+
+    let chosen = if requested_apn.is_empty() {
+        // TS 23.401 §5.3.2.1: with no APN in the request the MME uses the
+        // subscriber's default. Selecting it by Context-Identifier needs a
+        // per-APN context id that `SessionData` does not carry yet, so the first
+        // subscribed APN stands in — the shipped subscriptions have one APN, and
+        // the approximation is visible in the log rather than silent.
+        log::info!("No APN requested; using the first subscribed APN as the default");
+        subscribed.first().copied()
+    } else {
+        subscribed
+            .iter()
+            .copied()
+            .find(|sess| sess.apn.eq_ignore_ascii_case(&requested_apn))
+    };
+
+    let Some(chosen) = chosen else {
+        log::warn!("Requested APN '{requested_apn}' is not in the subscription");
+        return Err(EsmCause::MissingOrUnknownApn);
+    };
+
+    // Carry the UE's transaction onto the session that will be activated, so the
+    // ESM procedure that follows addresses the subscribed session rather than the
+    // placeholder the request created.
+    let chosen_id = chosen.id;
+    if let Some(sess) = ctx.sess_pool.write().unwrap().get_mut(&chosen_id) {
+        sess.pti = pti;
+        sess.ue_request_pdn_type = pdn_type;
+    }
+    log::info!("Activating subscribed APN '{}' (pti={pti})", chosen.apn);
+    Ok(chosen_id)
+}
+
 /// Convert buffer to BCD string
 fn buffer_to_bcd(buffer: &[u8]) -> String {
     let mut result = String::with_capacity(buffer.len() * 2);
@@ -858,6 +933,82 @@ mod tests {
         assert_eq!(materialise_subscribed_sessions(&ctx, mme_ue_id), 2);
         assert_eq!(ctx.sess_pool.read().unwrap().len(), 2);
         assert_eq!(ctx.bearer_pool.read().unwrap().len(), 2);
+    }
+
+    /// A UE with one subscribed APN materialised, plus the session the UE's own
+    /// PDN CONNECTIVITY REQUEST created under its procedure transaction.
+    fn ue_with_subscription_and_request(
+        requested_apn: &str,
+        pti: u8,
+    ) -> (crate::context::MmeContext, u64) {
+        let ctx = crate::context::MmeContext::new();
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 901);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+            mme_ue.imsi_bcd = "999990000000125".to_string();
+            mme_ue.session = vec![crate::context::SessionData {
+                name: "internet".to_string(),
+                ..Default::default()
+            }];
+            mme_ue.num_of_session = 1;
+        }
+        materialise_subscribed_sessions(&ctx, mme_ue_id);
+
+        // What nas_dispatch's ESM path leaves behind for the UE's request.
+        let requested = ctx.sess_add(mme_ue_id, pti);
+        if let Some(sess) = ctx.sess_pool.write().unwrap().get_mut(&requested) {
+            sess.apn = requested_apn.to_string();
+        }
+        if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+            mme_ue.sess_list.push(requested);
+        }
+        (ctx, mme_ue_id)
+    }
+
+    #[test]
+    fn test_requested_apn_matches_the_subscription() {
+        let (ctx, mme_ue_id) = ue_with_subscription_and_request("internet", 3);
+
+        let sess_id = reconcile_requested_apn(&ctx, mme_ue_id).expect("subscribed APN");
+
+        let sess = ctx.sess_find_by_id(sess_id).unwrap();
+        assert_eq!(sess.apn, "internet");
+        assert_eq!(sess.pti, 3, "the UE's transaction moves onto it");
+    }
+
+    #[test]
+    fn test_no_requested_apn_uses_the_default() {
+        let (ctx, mme_ue_id) = ue_with_subscription_and_request("", 4);
+
+        let sess_id = reconcile_requested_apn(&ctx, mme_ue_id).expect("default APN");
+
+        assert_eq!(ctx.sess_find_by_id(sess_id).unwrap().apn, "internet");
+    }
+
+    #[test]
+    fn test_unsubscribed_apn_is_refused_with_cause_27() {
+        let (ctx, mme_ue_id) = ue_with_subscription_and_request("not-subscribed", 5);
+
+        assert_eq!(
+            reconcile_requested_apn(&ctx, mme_ue_id),
+            Err(crate::esm_build::EsmCause::MissingOrUnknownApn)
+        );
+    }
+
+    #[test]
+    fn test_no_subscription_at_all_is_refused() {
+        let ctx = crate::context::MmeContext::new();
+        ctx.init();
+        let mme_ue_id = ctx.mme_ue_add(1);
+
+        assert_eq!(
+            reconcile_requested_apn(&ctx, mme_ue_id),
+            Err(crate::esm_build::EsmCause::RequestedServiceOptionNotSubscribed)
+        );
     }
 
     #[test]

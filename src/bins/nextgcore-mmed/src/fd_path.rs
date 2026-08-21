@@ -1259,10 +1259,41 @@ async fn run_update_location(
         // Turn the subscribed APNs into session and bearer contexts, which is
         // what the ATTACH ACCEPT and the S11 Create Session are built from.
         let created = crate::s6a_handler::materialise_subscribed_sessions(ctx, mme_ue_id);
-        log::info!(
-            "{created} session(s) created from subscription for UE {mme_ue_id}; the ATTACH ACCEPT \
-             itself still needs a GUTI, the subscribed T3412 and its result IEs (#46)"
-        );
+        log::debug!("{created} session(s) created from subscription for UE {mme_ue_id}");
+
+        // Pair the APN the UE asked for with the subscription. A UE asking for an
+        // APN it is not subscribed to is told so (TS 24.301 §6.5.1.4) instead of
+        // being left waiting.
+        match crate::s6a_handler::reconcile_requested_apn(ctx, mme_ue_id) {
+            Ok(sess_id) => log::info!(
+                "UE {mme_ue_id} will be activated on session {sess_id}; the ATTACH ACCEPT itself \
+                 still needs a GUTI, the subscribed T3412 and its result IEs (#46)"
+            ),
+            Err(esm_cause) => {
+                let enb_ue = ctx
+                    .enb_ue_find_by_id(
+                        ctx.mme_ue_find_by_id(mme_ue_id)
+                            .map(|mme_ue| mme_ue.enb_ue_id)
+                            .unwrap_or(0),
+                    )
+                    .filter(|enb_ue| enb_ue.id != 0);
+                let mut pool = ctx.mme_ue_pool.write().unwrap();
+                if let (Some(enb_ue), Some(mme_ue)) = (enb_ue, pool.get_mut(&mme_ue_id)) {
+                    log::warn!("[{}] rejecting the attach: {esm_cause:?}", mme_ue.imsi_bcd);
+                    // TS 24.301 §5.5.1.2.5: an ESM failure during attach is EMM
+                    // cause #19, with the ESM cause piggybacked so the UE learns
+                    // which APN was refused.
+                    if let Err(e) = crate::nas_path::nas_eps_send_attach_reject(
+                        &enb_ue,
+                        mme_ue,
+                        EmmCause::EsmFailure,
+                        Some(esm_cause),
+                    ) {
+                        log::error!("Attach Reject send failed: {e}");
+                    }
+                }
+            }
+        }
     }
 }
 
