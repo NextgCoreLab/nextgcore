@@ -4,7 +4,7 @@
 //!
 //! Implements handlers for Diameter S6a messages from HSS.
 
-use crate::context::{Arp, Bitrate, MmeBearer, MmeSess, MmeUe, Qos};
+use crate::context::{Arp, Bitrate, MmeUe, Qos, SessionData};
 use crate::emm_build::EmmCause;
 use crate::fd_path::{
     cancellation_type, experimental_result, result_code, AiaMessage, ApnConfiguration, ClrMessage,
@@ -405,64 +405,117 @@ fn emm_cause_from_diameter(
     EmmCause::NetworkFailure
 }
 
-/// Process APN configurations from subscription data
-fn process_apn_configurations(_mme_ue: &mut MmeUe, apn_configs: &[ApnConfiguration]) -> usize {
-    let mut num_sessions = 0;
+/// Record the subscribed APN configurations on the UE context.
+///
+/// This used to build an `MmeSess` and an `MmeBearer` as locals, log them, and
+/// drop them on the floor under the comment "In actual implementation, add
+/// session and bearer to UE context" — while returning a count its caller logged
+/// as though they had been stored. `mme_ue.session` and `num_of_session` were
+/// never assigned by anything, so a ULA reported N sessions and persisted none.
+///
+/// It now fills the subscription *record* (`mme_ue.session`), which is what that
+/// field is for. Turning the record into session and bearer contexts needs
+/// `MmeContext`, which this function deliberately does not have — see
+/// [`materialise_subscribed_sessions`].
+fn process_apn_configurations(mme_ue: &mut MmeUe, apn_configs: &[ApnConfiguration]) -> usize {
+    mme_ue.session.clear();
 
     for apn_config in apn_configs {
-        if num_sessions >= 4 {
-            log::warn!("Max sessions reached, ignoring remaining APNs");
+        if mme_ue.session.len() >= crate::context::NEXTGCORE_MAX_NUM_OF_SESS {
+            log::warn!(
+                "[{}] subscription has more than {} APNs; ignoring the rest",
+                mme_ue.imsi_bcd,
+                crate::context::NEXTGCORE_MAX_NUM_OF_SESS
+            );
             break;
         }
 
-        // Create session from APN configuration
-        let sess = MmeSess {
-            id: num_sessions as u64 + 1,
-            pti: 0,
-            apn: apn_config.service_selection.clone(),
-            ambr: Bitrate {
-                uplink: apn_config.ambr_uplink,
-                downlink: apn_config.ambr_downlink,
-            },
-            ..Default::default()
-        };
+        log::debug!(
+            "[{}] subscribed APN '{}' (QCI {}, AMBR {}/{} bps)",
+            mme_ue.imsi_bcd,
+            apn_config.service_selection,
+            apn_config.qci,
+            apn_config.ambr_uplink,
+            apn_config.ambr_downlink
+        );
 
-        // Create default bearer
-        let bearer = MmeBearer {
-            id: 1,
-            ebi: 5 + num_sessions as u8, // EBI starts at 5
+        mme_ue.session.push(SessionData {
+            name: apn_config.service_selection.clone(),
+            pdn_type: apn_config.pdn_type,
             qos: Qos {
                 qci: apn_config.qci,
                 arp: Arp {
                     priority_level: apn_config.arp_priority_level,
-                    pre_emption_capability: if apn_config.arp_pre_emption_capability {
-                        1
-                    } else {
-                        0
-                    },
-                    pre_emption_vulnerability: if apn_config.arp_pre_emption_vulnerability {
-                        1
-                    } else {
-                        0
-                    },
+                    // TS 29.212: the Diameter booleans are ENABLED, which the
+                    // NAS/GTP encoding spells as 0.
+                    pre_emption_capability: u8::from(!apn_config.arp_pre_emption_capability),
+                    pre_emption_vulnerability: u8::from(!apn_config.arp_pre_emption_vulnerability),
                 },
                 ..Default::default()
             },
-            ..Default::default()
-        };
-
-        log::debug!(
-            "Session[{}]: APN={}, QCI={}",
-            num_sessions,
-            sess.apn,
-            bearer.qos.qci
-        );
-
-        // In actual implementation, add session and bearer to UE context
-        num_sessions += 1;
+            ambr: Bitrate {
+                uplink: apn_config.ambr_uplink,
+                downlink: apn_config.ambr_downlink,
+            },
+        });
     }
 
-    num_sessions
+    mme_ue.num_of_session = mme_ue.session.len();
+    mme_ue.num_of_session
+}
+
+/// Turn the subscribed APNs into session and bearer contexts.
+///
+/// Separate from [`process_apn_configurations`] because it needs `MmeContext`,
+/// and because the caller has to have dropped the `mme_ue_pool` guard first: the
+/// links run in both directions (`mme_ue.sess_list`, `sess.bearer_list`), so this
+/// takes that lock itself.
+///
+/// Idempotent: a UE that already has sessions is left alone, so a retransmitted
+/// procedure cannot double-allocate. Returns how many sessions the UE has.
+pub fn materialise_subscribed_sessions(ctx: &crate::context::MmeContext, mme_ue_id: u64) -> usize {
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+        return 0;
+    };
+    if !mme_ue.sess_list.is_empty() {
+        return mme_ue.sess_list.len();
+    }
+
+    let mut created = 0;
+    for (index, subscribed) in mme_ue.session.iter().enumerate() {
+        // PTI 0: these sessions come from the subscription, not from a UE
+        // procedure transaction (TS 24.301 §9.9.4.15 reserves 0 for exactly
+        // "no procedure transaction identity assigned").
+        let sess_id = ctx.sess_add(mme_ue_id, 0);
+        let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+
+        // EBIs are allocated from the bottom of the range (TS 24.007 §11.2.3.1.5
+        // reserves 0-4), one per default bearer.
+        let ebi = crate::context::MIN_EPS_BEARER_ID + index as u8;
+
+        if let Some(sess) = ctx.sess_pool.write().unwrap().get_mut(&sess_id) {
+            sess.apn = subscribed.name.clone();
+            sess.ambr = subscribed.ambr.clone();
+            sess.session = Some(subscribed.clone());
+            sess.bearer_list.push(bearer_id);
+        }
+        if let Some(bearer) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+            bearer.ebi = ebi;
+            bearer.qos = subscribed.qos.clone();
+        }
+        if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+            mme_ue.sess_list.push(sess_id);
+        }
+
+        log::info!(
+            "[{}] session for APN '{}' with default bearer EBI {ebi}",
+            mme_ue.imsi_bcd,
+            subscribed.name
+        );
+        created += 1;
+    }
+
+    created
 }
 
 /// Convert buffer to BCD string
@@ -702,6 +755,109 @@ mod tests {
 
         assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_none());
         assert_eq!(ctx.mme_ue_find_by_imsi(IMSI), None);
+    }
+
+    #[test]
+    fn test_ula_records_the_subscribed_apns() {
+        // The record was previously built as locals and dropped, so num_of_session
+        // stayed 0 and a ULA reported sessions it had not stored.
+        let mut mme_ue = MmeUe {
+            imsi_bcd: "999990000000123".to_string(),
+            ..Default::default()
+        };
+        let apns = vec![
+            ApnConfiguration {
+                context_identifier: 1,
+                service_selection: "internet".to_string(),
+                pdn_type: 0,
+                qci: 9,
+                arp_priority_level: 8,
+                arp_pre_emption_capability: true,
+                arp_pre_emption_vulnerability: false,
+                ambr_uplink: 1_000_000,
+                ambr_downlink: 2_000_000,
+                ..Default::default()
+            },
+            ApnConfiguration {
+                context_identifier: 2,
+                service_selection: "ims".to_string(),
+                pdn_type: 2,
+                qci: 5,
+                ..Default::default()
+            },
+        ];
+
+        let count = process_apn_configurations(&mut mme_ue, &apns);
+
+        assert_eq!(count, 2);
+        assert_eq!(mme_ue.num_of_session, 2);
+        assert_eq!(mme_ue.session[0].name, "internet");
+        assert_eq!(mme_ue.session[0].qos.qci, 9);
+        assert_eq!(mme_ue.session[0].ambr.downlink, 2_000_000);
+        // Diameter's ENABLED booleans invert into the NAS/GTP encoding.
+        assert_eq!(mme_ue.session[0].qos.arp.pre_emption_capability, 0);
+        assert_eq!(mme_ue.session[0].qos.arp.pre_emption_vulnerability, 1);
+        assert_eq!(mme_ue.session[1].name, "ims");
+        assert_eq!(mme_ue.session[1].pdn_type, 2);
+
+        // Re-applying a subscription replaces it rather than appending.
+        assert_eq!(process_apn_configurations(&mut mme_ue, &apns), 2);
+        assert_eq!(mme_ue.session.len(), 2);
+    }
+
+    #[test]
+    fn test_materialise_creates_linked_sessions_and_bearers() {
+        let ctx = crate::context::MmeContext::new();
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 900);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+            mme_ue.imsi_bcd = "999990000000124".to_string();
+            mme_ue.session = vec![
+                crate::context::SessionData {
+                    name: "internet".to_string(),
+                    qos: Qos {
+                        qci: 9,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                crate::context::SessionData {
+                    name: "ims".to_string(),
+                    ..Default::default()
+                },
+            ];
+            mme_ue.num_of_session = 2;
+        }
+
+        assert_eq!(materialise_subscribed_sessions(&ctx, mme_ue_id), 2);
+
+        let sess_list = ctx.mme_ue_find_by_id(mme_ue_id).unwrap().sess_list;
+        assert_eq!(sess_list.len(), 2, "both sessions linked to the UE");
+
+        let first = ctx.sess_find_by_id(sess_list[0]).unwrap();
+        assert_eq!(first.apn, "internet");
+        assert_eq!(first.bearer_list.len(), 1, "one default bearer per session");
+        let bearer = ctx.bearer_find_by_id(first.bearer_list[0]).unwrap();
+        assert_eq!(bearer.ebi, crate::context::MIN_EPS_BEARER_ID);
+        assert_eq!(bearer.qos.qci, 9);
+
+        // The second session gets the next EBI, not a duplicate.
+        let second = ctx.sess_find_by_id(sess_list[1]).unwrap();
+        let second_bearer = ctx.bearer_find_by_id(second.bearer_list[0]).unwrap();
+        assert_eq!(second_bearer.ebi, crate::context::MIN_EPS_BEARER_ID + 1);
+        assert_eq!(
+            ctx.bearer_find_by_ebi(mme_ue_id, crate::context::MIN_EPS_BEARER_ID + 1),
+            Some(second_bearer.id)
+        );
+
+        // Idempotent: a retransmitted procedure must not double-allocate.
+        assert_eq!(materialise_subscribed_sessions(&ctx, mme_ue_id), 2);
+        assert_eq!(ctx.sess_pool.read().unwrap().len(), 2);
+        assert_eq!(ctx.bearer_pool.read().unwrap().len(), 2);
     }
 
     #[test]

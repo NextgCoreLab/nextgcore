@@ -1211,47 +1211,58 @@ async fn run_update_location(
         .enb_ue_find_by_id(mme_ue.enb_ue_id)
         .filter(|enb_ue| enb_ue.id != 0);
 
-    let mut pool = ctx.mme_ue_pool.write().unwrap();
-    let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
-        return;
-    };
+    // Set inside the guarded block, acted on after it: materialising sessions
+    // takes the same pool lock (the links run both ways), and this RwLock is not
+    // reentrant.
+    let mut needs_sessions = false;
 
-    let ula = match answer {
-        Ok(ula) => ula,
-        Err(e) => {
-            log::error!("[{}] S6a ULR failed: {e}", mme_ue.imsi_bcd);
-            reject_attach(&enb_ue, mme_ue, EmmCause::NetworkFailure);
+    {
+        let mut pool = ctx.mme_ue_pool.write().unwrap();
+        let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
             return;
-        }
-    };
+        };
 
-    match crate::s6a_handler::mme_s6a_handle_ula(mme_ue, &ula) {
-        Ok(EmmCause::RequestAccepted) => {
-            log::info!(
-                "[{}] Subscription data received: {} APN(s), AMBR {}/{} bps",
-                mme_ue.imsi_bcd,
-                mme_ue.num_of_session,
-                mme_ue.ambr.uplink,
-                mme_ue.ambr.downlink
-            );
-            // The ATTACH ACCEPT itself is the remainder of #46: it needs the
-            // subscribed APNs turned into sessions and bearers, a GUTI, and the
-            // subscribed T3412 — none of which this change delivers.
-            log::info!(
-                "[{}] Attach Accept not yet built from this subscription (#46)",
-                mme_ue.imsi_bcd
-            );
+        let ula = match answer {
+            Ok(ula) => ula,
+            Err(e) => {
+                log::error!("[{}] S6a ULR failed: {e}", mme_ue.imsi_bcd);
+                reject_attach(&enb_ue, mme_ue, EmmCause::NetworkFailure);
+                return;
+            }
+        };
+
+        match crate::s6a_handler::mme_s6a_handle_ula(mme_ue, &ula) {
+            Ok(EmmCause::RequestAccepted) => {
+                log::info!(
+                    "[{}] Subscription data received: {} APN(s), AMBR {}/{} bps",
+                    mme_ue.imsi_bcd,
+                    mme_ue.num_of_session,
+                    mme_ue.ambr.uplink,
+                    mme_ue.ambr.downlink
+                );
+                needs_sessions = true;
+            }
+            Ok(cause) => {
+                // The HSS refused to register us: unknown subscriber, roaming not
+                // allowed, RAT not allowed. The UE is told the mapped EMM cause.
+                log::warn!(
+                    "[{}] HSS refused location update: {cause:?}",
+                    mme_ue.imsi_bcd
+                );
+                reject_attach(&enb_ue, mme_ue, cause);
+            }
+            Err(e) => log::error!("[{}] ULA rejected: {e:?}", mme_ue.imsi_bcd),
         }
-        Ok(cause) => {
-            // The HSS refused to register us: unknown subscriber, roaming not
-            // allowed, RAT not allowed. The UE is told the mapped EMM cause.
-            log::warn!(
-                "[{}] HSS refused location update: {cause:?}",
-                mme_ue.imsi_bcd
-            );
-            reject_attach(&enb_ue, mme_ue, cause);
-        }
-        Err(e) => log::error!("[{}] ULA rejected: {e:?}", mme_ue.imsi_bcd),
+    }
+
+    if needs_sessions {
+        // Turn the subscribed APNs into session and bearer contexts, which is
+        // what the ATTACH ACCEPT and the S11 Create Session are built from.
+        let created = crate::s6a_handler::materialise_subscribed_sessions(ctx, mme_ue_id);
+        log::info!(
+            "{created} session(s) created from subscription for UE {mme_ue_id}; the ATTACH ACCEPT \
+             itself still needs a GUTI, the subscribed T3412 and its result IEs (#46)"
+        );
     }
 }
 
