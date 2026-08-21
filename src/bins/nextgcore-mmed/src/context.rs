@@ -40,6 +40,9 @@ pub const NEXTGCORE_KEY_LEN: usize = 16;
 pub const NEXTGCORE_RAND_LEN: usize = 16;
 /// AUTN length
 pub const NEXTGCORE_AUTN_LEN: usize = 16;
+
+/// AUTS length in bytes (TS 33.102 §6.3.3: CONC(SQN_MS) ‖ MAC-S)
+pub const NEXTGCORE_AUTS_LEN: usize = 14;
 /// MAX RES length
 pub const NEXTGCORE_MAX_RES_LEN: usize = 16;
 /// SHA256 digest size
@@ -908,13 +911,55 @@ pub struct PagingInfo {
 // Timer Info
 // ============================================================================
 
-/// Timer with retry info
+/// A NAS procedure timer: its deadline, the message to retransmit, and how many
+/// retransmissions have already gone out.
+///
+/// The deadline lives beside the retransmission buffer so a procedure has one
+/// owner: arming, retransmitting and discarding are all operations on the same
+/// value, and [`TimerWithRetry::stop`] on the completing message cannot forget
+/// half of it.
 #[derive(Debug, Clone, Default)]
 pub struct TimerWithRetry {
-    /// Retry count
+    /// Number of retransmissions already sent (0 = the original transmission)
     pub retry_count: u32,
     /// Packet buffer (stored message)
     pub pkbuf: Option<Vec<u8>>,
+    /// When the timer expires; `None` means it is not running
+    pub expires_at: Option<std::time::Instant>,
+}
+
+impl TimerWithRetry {
+    /// Arm (or re-arm) the timer for `duration` from now.
+    pub fn start(&mut self, duration: std::time::Duration) {
+        self.expires_at = std::time::Instant::now().checked_add(duration);
+    }
+
+    /// Stop the timer and discard what it was holding.
+    ///
+    /// Called when the procedure completes: TS 24.301 has the network stop the
+    /// timer on the matching response, and the stored retransmission must go
+    /// with it or a later expiry would resend a message the UE already answered.
+    pub fn stop(&mut self) {
+        self.expires_at = None;
+        self.pkbuf = None;
+        self.retry_count = 0;
+    }
+
+    /// Whether the timer is running and its deadline has passed.
+    pub fn is_expired(&self, now: std::time::Instant) -> bool {
+        self.expires_at.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Whether the timer is running.
+    pub fn is_running(&self) -> bool {
+        self.expires_at.is_some()
+    }
+
+    /// Count a retransmission and re-arm.
+    pub fn record_retransmission(&mut self, duration: std::time::Duration) {
+        self.retry_count += 1;
+        self.start(duration);
+    }
 }
 
 // ============================================================================
@@ -1012,6 +1057,12 @@ pub struct MmeUe {
     pub security_context_available: bool,
     /// MAC failed flag
     pub mac_failed: bool,
+    /// AUTS from an AUTHENTICATION FAILURE with cause #21 (synch failure).
+    ///
+    /// TS 33.401 §6.1.1: the MME forwards it to the HSS as
+    /// Re-synchronization-Info in the next Authentication-Information-Request,
+    /// which `fd_path::mme_s6a_send_air` already accepts.
+    pub resync_auts: Option<[u8; NEXTGCORE_AUTS_LEN]>,
     /// Can restore context flag
     pub can_restore_context: bool,
     /// Memento for context backup

@@ -17,6 +17,7 @@ pub mod gtp_path;
 pub mod nas_dispatch;
 pub mod nas_path;
 pub mod nas_security;
+pub mod nas_timer;
 pub mod s11_build;
 pub mod s11_handler;
 pub mod s1ap_build;
@@ -129,16 +130,18 @@ impl MmeApp {
     ///
     /// Drives the S1AP data path — inbound eNB signalling into
     /// [`s1ap_handler::handle_s1ap_message`] and queued downlink PDUs out to the
-    /// addressed eNB — alongside the shutdown check. Previously this was a bare
-    /// `thread::sleep` loop, which is why the whole S1AP layer was unreachable
-    /// at runtime (issue #42).
+    /// addressed eNB — plus the NAS procedure timers, alongside the shutdown
+    /// check. Previously this was a bare `thread::sleep` loop, which is why the
+    /// whole S1AP layer was unreachable at runtime (issue #42).
     pub async fn run(&mut self) -> Result<()> {
         log::info!("MME running...");
 
         // Interval at which the loop re-checks the shutdown flag when no S1AP
-        // event is pending. Keeps Ctrl-C responsive without polling hard.
+        // event is pending. Keeps Ctrl-C responsive without polling hard, and is
+        // the tick the NAS timers are swept on (issue #45).
         const SHUTDOWN_CHECK: std::time::Duration = std::time::Duration::from_millis(100);
 
+        let ctx = context::mme_self();
         while self.running.load(Ordering::SeqCst) {
             match self.s1ap.as_mut() {
                 Some(s1ap) => {
@@ -152,6 +155,11 @@ impl MmeApp {
                 }
                 None => tokio::time::sleep(SHUTDOWN_CHECK).await,
             }
+
+            // Retransmit or abort NAS procedures whose timer has run out
+            // (TS 24.301 §5.4.2.7, §5.4.4.6, §5.5.1.2.7). Cheap when idle: the
+            // sweep walks the UE pool and does nothing unless a deadline passed.
+            nas_timer::expire_nas_timers(ctx, std::time::Instant::now());
         }
 
         log::info!("MME main loop exited");

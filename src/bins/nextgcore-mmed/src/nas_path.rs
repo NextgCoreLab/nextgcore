@@ -9,6 +9,7 @@ use crate::emm_build::{self, EmmCause, SecurityHeaderType};
 use crate::esm_build::{self, EsmCause};
 use crate::nas_dispatch;
 use crate::nas_security;
+use crate::nas_timer;
 use crate::s1ap_build;
 use crate::s1ap_path;
 
@@ -269,8 +270,10 @@ pub fn nas_eps_send_attach_accept(
     )
     .ok_or(NasError::BuildFailed)?;
 
-    // Store for retransmission (T3450)
+    // Store for retransmission and arm T3450 (issue #45): storing the buffer
+    // without starting the timer is what left procedures outstanding forever.
     mme_ue.t3450.pkbuf = Some(secured_message.clone());
+    mme_ue.t3450.start(nas_timer::T3450_DURATION);
 
     // Clear UE radio capability as per TS24.301
     mme_ue.ue_radio_capability.clear();
@@ -360,8 +363,9 @@ pub fn nas_eps_send_identity_request(mme_ue: &mut MmeUe, enb_ue: &EnbUe) -> NasR
         emm_build::build_identity_request(emm_build::IdentityType2::Imsi)
     };
 
-    // Store for retransmission (T3470)
+    // Store for retransmission and arm T3470 (issue #45).
     mme_ue.t3470.pkbuf = Some(emm_message.clone());
+    mme_ue.t3470.start(nas_timer::T3470_DURATION);
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
 }
@@ -396,8 +400,9 @@ pub fn nas_eps_send_authentication_request(mme_ue: &mut MmeUe, enb_ue: &EnbUe) -
         emm_build::build_authentication_request(ksi, &mme_ue.rand, &mme_ue.autn)
     };
 
-    // Store for retransmission (T3460)
+    // Store for retransmission and arm T3460 (issue #45).
     mme_ue.t3460.pkbuf = Some(emm_message.clone());
+    mme_ue.t3460.start(nas_timer::T3460_DURATION);
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
 }
@@ -472,8 +477,9 @@ pub fn nas_eps_send_security_mode_command(mme_ue: &mut MmeUe, enb_ue: &EnbUe) ->
         .ok_or(NasError::BuildFailed)?
     };
 
-    // Store for retransmission (T3460)
+    // Store for retransmission and arm T3460 (issue #45).
     mme_ue.t3460.pkbuf = Some(emm_message.clone());
+    mme_ue.t3460.start(nas_timer::T3460_DURATION);
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
 }
@@ -602,8 +608,9 @@ pub fn nas_eps_send_tau_accept(
     )
     .ok_or(NasError::BuildFailed)?;
 
-    // Store for retransmission (T3450)
+    // Store for retransmission and arm T3450 (issue #45).
     mme_ue.t3450.pkbuf = Some(emm_message.clone());
+    mme_ue.t3450.start(nas_timer::T3450_DURATION);
 
     if use_initial_context_setup {
         // The TAU Accept travels inside the Initial Context Setup Request, so

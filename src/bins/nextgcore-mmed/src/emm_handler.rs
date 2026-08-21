@@ -2,7 +2,7 @@
 //!
 //! Port of src/mme/emm-handler.c - EMM message handling functions
 
-use crate::context::{EnbUe, EpsTai, MmeUe, PlmnId};
+use crate::context::{EnbUe, EpsTai, MmeUe, PlmnId, NEXTGCORE_AUTS_LEN};
 use crate::emm_build::EmmCause;
 
 // ============================================================================
@@ -330,15 +330,21 @@ pub fn handle_authentication_response(
 
     let res = &data[1..1 + res_len];
 
-    // Compare with expected response (XRES)
-    if res_len == 0 || res_len > mme_ue.xres_len as usize {
-        log::warn!("Authentication response length mismatch");
+    // TS 24.301 §5.4.2.4 / TS 33.401 §6.1.1: the UE returns the *whole* RES and
+    // the network compares it against the whole XRES. Accepting a shorter RES
+    // and comparing only that many octets — which this did — authenticates a UE
+    // that guessed a prefix, so a one-octet RES had a 1-in-256 chance per try.
+    if res_len == 0 || res_len != mme_ue.xres_len as usize {
+        log::warn!(
+            "Authentication response length {res_len} does not match the expected {} octets",
+            mme_ue.xres_len
+        );
         return Ok(false);
     }
 
     let xres = &mme_ue.xres[..res_len];
 
-    if res != xres {
+    if !constant_time_eq(res, xres) {
         log::warn!("Authentication response mismatch");
         log::debug!("  RES: {res:02x?}");
         log::debug!("  XRES: {xres:02x?}");
@@ -348,6 +354,105 @@ pub fn handle_authentication_response(
     log::info!("Authentication successful for IMSI[{}]", mme_ue.imsi_bcd);
 
     Ok(true)
+}
+
+/// Compare two byte strings without an early exit on the first differing octet.
+///
+/// The length check does short-circuit, which is fine: the RES length travels in
+/// the clear in the message. What must not leak is *where* the first difference
+/// is, since that would let a peer recover XRES octet by octet.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
+// ============================================================================
+// Authentication Failure Handling
+// ============================================================================
+
+/// What the UE reported in an AUTHENTICATION FAILURE (TS 24.301 §5.4.2.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticationFailure {
+    /// EMM cause #20: the UE could not verify the AUTN MAC.
+    MacFailure,
+    /// EMM cause #21: the USIM's SQN is out of range; re-synchronise with AUTS.
+    SynchFailure(Box<[u8; NEXTGCORE_AUTS_LEN]>),
+    /// EMM cause #26 or anything else the UE reported.
+    Other(u8),
+}
+
+/// Handle authentication failure (TS 24.301 §5.4.2.7, §8.2.5).
+///
+/// The message carries a mandatory EMM cause and, for a synch failure, an
+/// Authentication Failure Parameter IE (0x30) holding the 14-octet AUTS.
+pub fn handle_authentication_failure(
+    _enb_ue: &EnbUe,
+    mme_ue: &mut MmeUe,
+    data: &[u8],
+) -> EmmResult<AuthenticationFailure> {
+    if data.is_empty() {
+        return Err(EmmError::InvalidMessage(
+            "Authentication failure empty".into(),
+        ));
+    }
+
+    let emm_cause = data[0];
+    match emm_cause {
+        emm_cause::MAC_FAILURE => {
+            log::warn!("[{}] Authentication Failure: MAC failure", mme_ue.imsi_bcd);
+            Ok(AuthenticationFailure::MacFailure)
+        }
+        emm_cause::SYNCH_FAILURE => {
+            // Authentication Failure Parameter: IEI 0x30, length, AUTS.
+            let mut offset = 1;
+            while offset + 1 < data.len() {
+                let iei = data[offset];
+                let len = data[offset + 1] as usize;
+                let value_start = offset + 2;
+                if iei == AUTHENTICATION_FAILURE_PARAMETER_IEI {
+                    if len != NEXTGCORE_AUTS_LEN || value_start + len > data.len() {
+                        return Err(EmmError::InvalidMessage(format!(
+                            "Authentication Failure Parameter is {len} octets, expected \
+                             {NEXTGCORE_AUTS_LEN}"
+                        )));
+                    }
+                    let mut auts = [0u8; NEXTGCORE_AUTS_LEN];
+                    auts.copy_from_slice(&data[value_start..value_start + len]);
+                    log::warn!(
+                        "[{}] Authentication Failure: synch failure, AUTS received",
+                        mme_ue.imsi_bcd
+                    );
+                    return Ok(AuthenticationFailure::SynchFailure(Box::new(auts)));
+                }
+                offset = value_start + len;
+            }
+            // TS 24.301 §5.4.2.7 d): the AUTS is mandatory for cause #21.
+            Err(EmmError::InvalidMessage(
+                "Synch failure without an Authentication Failure Parameter".into(),
+            ))
+        }
+        other => {
+            log::warn!(
+                "[{}] Authentication Failure: EMM cause #{other}",
+                mme_ue.imsi_bcd
+            );
+            Ok(AuthenticationFailure::Other(other))
+        }
+    }
+}
+
+/// IEI of the Authentication Failure Parameter (TS 24.301 §9.9.3.1).
+const AUTHENTICATION_FAILURE_PARAMETER_IEI: u8 = 0x30;
+
+/// EMM cause values used by the authentication abnormal cases.
+mod emm_cause {
+    /// #20 MAC failure
+    pub const MAC_FAILURE: u8 = 20;
+    /// #21 Synch failure
+    pub const SYNCH_FAILURE: u8 = 21;
 }
 
 // ============================================================================
@@ -918,5 +1023,119 @@ mod tests {
 
         let err = EmmError::ProtocolError(EmmCause::PlmnNotAllowed);
         assert!(err.to_string().contains("Protocol error"));
+    }
+
+    // ========================================================================
+    // Authentication abnormal cases (issue #45)
+    // ========================================================================
+
+    /// A UE context holding an 8-octet XRES, as `mme_s6a_handle_aia` leaves it.
+    fn ue_with_xres() -> MmeUe {
+        let mut mme_ue = MmeUe {
+            id: 1,
+            ..Default::default()
+        };
+        mme_ue.xres[..8].copy_from_slice(&[0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8]);
+        mme_ue.xres_len = 8;
+        mme_ue
+    }
+
+    /// AUTHENTICATION RESPONSE body: RES length followed by the RES.
+    fn authentication_response_body(res: &[u8]) -> Vec<u8> {
+        let mut body = vec![res.len() as u8];
+        body.extend_from_slice(res);
+        body
+    }
+
+    #[test]
+    fn test_full_length_res_is_accepted() {
+        let mut mme_ue = ue_with_xres();
+        let body = authentication_response_body(&[0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8]);
+
+        let accepted =
+            handle_authentication_response(&EnbUe::default(), &mut mme_ue, &body).unwrap();
+
+        assert!(accepted);
+    }
+
+    #[test]
+    fn test_truncated_res_matching_the_xres_prefix_is_rejected() {
+        let mut mme_ue = ue_with_xres();
+
+        // TS 24.301 §5.4.2.4: the UE returns the whole RES. Comparing only the
+        // octets it chose to send let a one-octet guess authenticate with
+        // probability 1/256 per attempt.
+        for prefix_len in 1..8usize {
+            let prefix = mme_ue.xres[..prefix_len].to_vec();
+            let body = authentication_response_body(&prefix);
+            let accepted =
+                handle_authentication_response(&EnbUe::default(), &mut mme_ue, &body).unwrap();
+            assert!(
+                !accepted,
+                "a {prefix_len}-octet RES matching the XRES prefix must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_over_long_and_wrong_res_are_rejected() {
+        let mut mme_ue = ue_with_xres();
+
+        let too_long = authentication_response_body(&[0xa1; 9]);
+        assert!(
+            !handle_authentication_response(&EnbUe::default(), &mut mme_ue, &too_long).unwrap()
+        );
+
+        let mut wrong = mme_ue.xres[..8].to_vec();
+        wrong[7] ^= 0xff;
+        let wrong = authentication_response_body(&wrong);
+        assert!(!handle_authentication_response(&EnbUe::default(), &mut mme_ue, &wrong).unwrap());
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(&[1, 2, 3], &[1, 2, 3]));
+        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2, 4]));
+        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2]));
+        assert!(constant_time_eq(&[], &[]));
+    }
+
+    #[test]
+    fn test_authentication_failure_synch_failure_carries_the_auts() {
+        let mut mme_ue = MmeUe::default();
+        let auts = [0x5a; NEXTGCORE_AUTS_LEN];
+        let mut body = vec![21, AUTHENTICATION_FAILURE_PARAMETER_IEI, auts.len() as u8];
+        body.extend_from_slice(&auts);
+
+        let outcome = handle_authentication_failure(&EnbUe::default(), &mut mme_ue, &body).unwrap();
+
+        assert_eq!(outcome, AuthenticationFailure::SynchFailure(Box::new(auts)));
+    }
+
+    #[test]
+    fn test_authentication_failure_synch_failure_needs_the_auts() {
+        let mut mme_ue = MmeUe::default();
+
+        // Cause #21 with no Authentication Failure Parameter at all.
+        assert!(handle_authentication_failure(&EnbUe::default(), &mut mme_ue, &[21]).is_err());
+
+        // ...and with one of the wrong length.
+        let body = vec![21, AUTHENTICATION_FAILURE_PARAMETER_IEI, 4, 1, 2, 3, 4];
+        assert!(handle_authentication_failure(&EnbUe::default(), &mut mme_ue, &body).is_err());
+    }
+
+    #[test]
+    fn test_authentication_failure_causes() {
+        let mut mme_ue = MmeUe::default();
+
+        assert_eq!(
+            handle_authentication_failure(&EnbUe::default(), &mut mme_ue, &[20]).unwrap(),
+            AuthenticationFailure::MacFailure
+        );
+        assert_eq!(
+            handle_authentication_failure(&EnbUe::default(), &mut mme_ue, &[26]).unwrap(),
+            AuthenticationFailure::Other(26)
+        );
+        assert!(handle_authentication_failure(&EnbUe::default(), &mut mme_ue, &[]).is_err());
     }
 }
