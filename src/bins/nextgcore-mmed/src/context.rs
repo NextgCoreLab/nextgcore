@@ -2003,6 +2003,27 @@ pub fn mme_context_init() {
     mme_self().init();
 }
 
+/// Install the process-global context with `config_path` already applied.
+///
+/// The context keeps its configuration in plain fields rather than behind a lock,
+/// so it has to be *built* configured: once `mme_self()` has run, the `OnceLock`
+/// holds an immutable `&'static MmeContext` and there is no way to write
+/// `served_gummei` into it. This must therefore be the first thing that touches
+/// the context (issue #157).
+///
+/// Returns `false` when a context was already installed, in which case the
+/// configuration was not applied.
+pub fn mme_context_init_with_config(config_path: &str) -> bool {
+    let mut ctx = MmeContext::new();
+    crate::config::load_config(&mut ctx, config_path);
+
+    if MME_CONTEXT.set(ctx).is_err() {
+        return false;
+    }
+    mme_self().init();
+    true
+}
+
 /// Finalize the global MME context
 pub fn mme_context_final() {
     mme_self().final_();

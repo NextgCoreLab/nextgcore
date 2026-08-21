@@ -2714,6 +2714,8 @@ dependencies = [
  "nextgcore-s1ap",
  "nextgcore-sctp",
  "proptest",
+ "serde",
+ "serde_yaml",
  "tokio",
 ]
 

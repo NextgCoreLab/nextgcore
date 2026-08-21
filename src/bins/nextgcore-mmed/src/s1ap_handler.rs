@@ -1388,6 +1388,73 @@ mod tests {
     }
 
     #[test]
+    fn test_s1_setup_succeeds_on_the_shipped_configuration() {
+        // Configuration alone must be enough for an eNB to associate. Before
+        // #157 mmed parsed no config, so `served_gummei` was empty and this
+        // request was answered with S1 Setup Failure in every deployment.
+        let mut ctx = MmeContext::new();
+        assert!(crate::config::load_config(
+            &mut ctx,
+            "../../../docker/rust/configs/epc/mme.yaml"
+        ));
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+
+        // An eNB broadcasting the PLMN and TAC the shipped file declares.
+        let plmn = PlmnId::new("999", "70");
+        let request = S1SetupRequest {
+            global_enb_id: GlobalEnbId {
+                plmn_identity: s1ap_build::encode_plmn_id(&plmn),
+                enb_id: nextgcore_s1ap::EnbId::Macro(0x1234),
+            },
+            enb_name: Some("configured-enb".to_string()),
+            supported_tas: vec![SupportedTaItem {
+                tac: 1,
+                broadcast_plmns: vec![s1ap_build::encode_plmn_id(&plmn)],
+            }],
+            default_paging_drx: nextgcore_s1ap::PagingDrx::V64,
+        };
+
+        let out = handle_s1ap_message(
+            &ctx,
+            enb_id,
+            &builder::build_s1_setup_request(&request).unwrap(),
+        );
+
+        assert_eq!(out.len(), 1);
+        match decode_s1ap_pdu(&out[0].pdu).unwrap() {
+            S1apMessage::S1SetupResponse(rsp) => {
+                assert_eq!(rsp.relative_mme_capacity, ctx.relative_capacity);
+                assert!(
+                    !rsp.served_gummeis.is_empty(),
+                    "the response must carry the configured GUMMEI"
+                );
+            }
+            other => panic!("expected S1SetupResponse, got {other:?}"),
+        }
+        assert!(ctx.enb_find_by_id(enb_id).unwrap().state.s1_setup_success);
+
+        // An eNB in a tracking area the file does not declare is still rejected.
+        let other_enb = ctx.enb_add("127.0.0.2:36412".parse().unwrap());
+        let elsewhere = S1SetupRequest {
+            supported_tas: vec![SupportedTaItem {
+                tac: 999,
+                broadcast_plmns: vec![s1ap_build::encode_plmn_id(&PlmnId::new("310", "410"))],
+            }],
+            ..request
+        };
+        let out = handle_s1ap_message(
+            &ctx,
+            other_enb,
+            &builder::build_s1_setup_request(&elsewhere).unwrap(),
+        );
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            decode_s1ap_pdu(&out[0].pdu).unwrap(),
+            S1apMessage::S1SetupFailure(_)
+        ));
+    }
+
+    #[test]
     fn test_s1_setup_request_accept_and_reject() {
         let ctx = ctx_with_gummei();
         let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
