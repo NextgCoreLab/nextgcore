@@ -1034,6 +1034,130 @@ pub fn decode_nas_pdu(field: &ProtocolIeField) -> S1apResult<Vec<u8>> {
     Ok(pdu.0)
 }
 
+/// ASN.1 enumeration index for `TypeOfError` (not-understood(0), missing(1)).
+fn type_of_error_to_index(t: TypeOfError) -> i64 {
+    match t {
+        TypeOfError::NotUnderstood => 0,
+        TypeOfError::Missing => 1,
+    }
+}
+
+fn index_to_type_of_error(index: i64) -> TypeOfError {
+    match index {
+        1 => TypeOfError::Missing,
+        // Unknown extension values are reported as not-understood, which is what
+        // they are from this node's point of view.
+        _ => TypeOfError::NotUnderstood,
+    }
+}
+
+/// Encode the Criticality Diagnostics IE (TS 36.413 §9.2.1.21).
+///
+/// Ported from `nextgcore_ngap::ie::encode_criticality_diagnostics`: the S1AP and
+/// NGAP definitions of this IE are structurally identical, differing only in the
+/// protocol IE id (58 here, 7 in NGAP).
+pub fn encode_criticality_diagnostics(
+    container: &mut ProtocolIeContainer,
+    diag: &CriticalityDiagnostics,
+) -> S1apResult<()> {
+    let mut encoder = AperEncoder::new();
+    // CriticalityDiagnostics ::= SEQUENCE { procedureCode OPTIONAL,
+    //   triggeringMessage OPTIONAL, procedureCriticality OPTIONAL,
+    //   iEsCriticalityDiagnostics OPTIONAL, iE-Extensions OPTIONAL, ... }
+    let ies_present = !diag.ies.is_empty();
+    encoder.write_bit(false); // extension marker
+    encoder.write_bit(diag.procedure_code.is_some());
+    encoder.write_bit(diag.triggering_message.is_some());
+    encoder.write_bit(diag.procedure_criticality.is_some());
+    encoder.write_bit(ies_present);
+    encoder.write_bit(false); // no iE-Extensions
+
+    if let Some(code) = diag.procedure_code {
+        encoder.encode_constrained_whole_number(code as i64, &Constraint::new(0, 255))?;
+    }
+    if let Some(tm) = diag.triggering_message {
+        encoder.encode_enumerated(tm as i64, &Constraint::new(0, 2))?;
+    }
+    if let Some(crit) = diag.procedure_criticality {
+        encoder.encode_enumerated(crit as i64, &Constraint::new(0, 2))?;
+    }
+    if ies_present {
+        // CriticalityDiagnostics-IE-List ::= SEQUENCE (SIZE(1..maxnoofErrors))
+        // OF CriticalityDiagnostics-IE-Item, maxnoofErrors = 256.
+        encoder.encode_constrained_length(diag.ies.len(), 1, 256)?;
+        for item in &diag.ies {
+            encoder.write_bit(false); // extension marker
+            encoder.write_bit(false); // no iE-Extensions
+            item.ie_criticality.encode_aper(&mut encoder)?;
+            encoder
+                .encode_constrained_whole_number(item.ie_id as i64, &Constraint::new(0, 65535))?;
+            encoder.encode_enumerated(
+                type_of_error_to_index(item.type_of_error),
+                &Constraint::extensible(0, 1),
+            )?;
+        }
+    }
+    encoder.align();
+
+    container.push(ProtocolIeField {
+        id: ProtocolIeId::CRITICALITY_DIAGNOSTICS,
+        criticality: Criticality::Ignore,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Decode the Criticality Diagnostics IE (TS 36.413 §9.2.1.21).
+pub fn decode_criticality_diagnostics(
+    field: &ProtocolIeField,
+) -> S1apResult<CriticalityDiagnostics> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let _ext = decoder.read_bit()?;
+    let pc_present = decoder.read_bit()?;
+    let tm_present = decoder.read_bit()?;
+    let crit_present = decoder.read_bit()?;
+    let ies_present = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+
+    let procedure_code = pc_present
+        .then(|| decoder.decode_constrained_whole_number(&Constraint::new(0, 255)))
+        .transpose()?
+        .map(|v| v as u8);
+    let triggering_message = tm_present
+        .then(|| decoder.decode_enumerated(&Constraint::new(0, 2)))
+        .transpose()?
+        .map(|v| v as u8);
+    let procedure_criticality = crit_present
+        .then(|| decoder.decode_enumerated(&Constraint::new(0, 2)))
+        .transpose()?
+        .map(|v| v as u8);
+
+    let mut ies = Vec::new();
+    if ies_present {
+        let count = decoder.decode_constrained_length(1, 256)?;
+        for _ in 0..count {
+            let _item_ext = decoder.read_bit()?;
+            let _item_ie_ext = decoder.read_bit()?;
+            let ie_criticality = Criticality::decode_aper(&mut decoder)?;
+            let ie_id = decoder.decode_constrained_whole_number(&Constraint::new(0, 65535))? as u16;
+            let type_of_error =
+                index_to_type_of_error(decoder.decode_enumerated(&Constraint::extensible(0, 1))?);
+            ies.push(IeCriticalityDiagnostics {
+                ie_criticality,
+                ie_id,
+                type_of_error,
+            });
+        }
+    }
+
+    Ok(CriticalityDiagnostics {
+        procedure_code,
+        triggering_message,
+        procedure_criticality,
+        ies,
+    })
+}
+
 pub fn encode_cause(container: &mut ProtocolIeContainer, cause: &Cause) -> S1apResult<()> {
     container.push(make_ie_field(
         ProtocolIeId::CAUSE,

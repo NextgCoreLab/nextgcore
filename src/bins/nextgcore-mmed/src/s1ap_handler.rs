@@ -17,11 +17,12 @@ use crate::s1ap_build::{
     radio_network_cause, tai_from_s1ap, transport_address_to_ip, ue_security_capabilities_from,
 };
 use nextgcore_s1ap::{
-    builder, decode_s1ap_pdu, Cause, EnbId, ErabSwitchedItem, ErabToBeSetupItemHoReq,
-    HandoverCancel, HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
+    builder, decode_s1ap_pdu, Cause, CauseRadioNetwork, CriticalityDiagnostics, EnbId,
+    ErabSwitchedItem, ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel,
+    HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
     HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
-    HandoverType as S1apHandoverType, InitialContextSetupResponse, InitialUeMessage,
-    NasNonDeliveryIndication, PathSwitchRequest, PathSwitchRequestAcknowledge,
+    HandoverType as S1apHandoverType, InitialContextSetupFailure, InitialContextSetupResponse,
+    InitialUeMessage, NasNonDeliveryIndication, PathSwitchRequest, PathSwitchRequestAcknowledge,
     PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
     SecurityContext, TargetId, TimeToWait, UeAmbr, UeCapabilityInfoIndication,
     UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport,
@@ -113,12 +114,21 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
         Ok(message) => message,
         Err(e) => {
             log::error!("Failed to decode S1AP PDU from eNB {enb_id}: {e}");
-            return error_indication(
+            // The PDU did not decode, so its procedure code is unknown; the
+            // diagnostics can still say that an initiating message was what
+            // failed, which is more than the bare cause conveys.
+            return error_indication_with_diagnostics(
                 enb_id,
                 None,
                 None,
                 S1apCauseGroup::Protocol,
                 protocol_cause::TRANSFER_SYNTAX_ERROR,
+                Some(CriticalityDiagnostics {
+                    triggering_message: Some(
+                        nextgcore_s1ap::triggering_message::INITIATING_MESSAGE,
+                    ),
+                    ..Default::default()
+                }),
             );
         }
     };
@@ -186,12 +196,7 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             Vec::new()
         }
         S1apMessage::ErrorIndication(msg) => {
-            log::warn!(
-                "Error Indication from eNB {enb_id}: mme_ue={:?} enb_ue={:?} cause={:?}",
-                msg.mme_ue_s1ap_id,
-                msg.enb_ue_s1ap_id,
-                msg.cause
-            );
+            handle_error_indication(ctx, enb_id, &msg);
             Vec::new()
         }
         S1apMessage::UeCapabilityInfoIndication(msg) => {
@@ -211,12 +216,7 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             Vec::new()
         }
         S1apMessage::InitialContextSetupFailure(msg) => {
-            log::error!(
-                "Initial Context Setup Failure from eNB {enb_id}: mme_ue={} cause={:?}",
-                msg.mme_ue_s1ap_id,
-                msg.cause
-            );
-            Vec::new()
+            handle_initial_context_setup_failure(ctx, enb_id, &msg)
         }
         S1apMessage::ErabSetupResponse(msg) => {
             handle_erab_setup_response(ctx, enb_id, msg.mme_ue_s1ap_id, &msg.erab_setup_list);
@@ -263,12 +263,19 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             log::error!(
                 "Unknown S1AP {message_type} (procedure code {procedure_code}) from eNB {enb_id}"
             );
-            error_indication(
+            error_indication_with_diagnostics(
                 enb_id,
                 None,
                 None,
                 S1apCauseGroup::Protocol,
                 protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
+                Some(CriticalityDiagnostics {
+                    procedure_code: Some(procedure_code),
+                    triggering_message: Some(
+                        nextgcore_s1ap::triggering_message::INITIATING_MESSAGE,
+                    ),
+                    ..Default::default()
+                }),
             )
         }
     }
@@ -281,7 +288,27 @@ fn error_indication(
     group: S1apCauseGroup,
     value: i64,
 ) -> Vec<S1apSend> {
-    match s1ap_build::build_error_indication(enb_ue_s1ap_id, mme_ue_s1ap_id, group, value) {
+    error_indication_with_diagnostics(enb_id, enb_ue_s1ap_id, mme_ue_s1ap_id, group, value, None)
+}
+
+/// Error Indication carrying Criticality Diagnostics (TS 36.413 §9.2.1.21), so the
+/// peer learns which procedure and which IEs were at fault rather than only that
+/// something was rejected.
+fn error_indication_with_diagnostics(
+    enb_id: u64,
+    enb_ue_s1ap_id: Option<u32>,
+    mme_ue_s1ap_id: Option<u32>,
+    group: S1apCauseGroup,
+    value: i64,
+    diagnostics: Option<CriticalityDiagnostics>,
+) -> Vec<S1apSend> {
+    match s1ap_build::build_error_indication(
+        enb_ue_s1ap_id,
+        mme_ue_s1ap_id,
+        group,
+        value,
+        diagnostics,
+    ) {
         Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build Error Indication: {e}");
@@ -349,6 +376,22 @@ pub fn handle_s1_setup_request(
             S1apCauseGroup::Misc,
             misc_cause::UNSPECIFIED,
             Some(TimeToWait::V10s),
+        );
+    }
+
+    // TS 23.007 §17: a second S1 SETUP REQUEST from an eNB we have already set up
+    // means that eNB restarted, so every UE context we hold for it is stale. They
+    // are released before the setup is accepted, otherwise they linger until
+    // something else happens to clear them and their MME-UE-S1AP-IDs collide with
+    // the ids the restarted eNB is about to use.
+    let already_setup = ctx
+        .enb_find_by_id(enb_id)
+        .is_some_and(|enb| enb.state.s1_setup_success);
+    if already_setup {
+        let released = release_all_s1_connections(ctx, enb_id);
+        log::warn!(
+            "eNB 0x{enb_id_value:x} restarted (repeat S1 Setup); released {released} stale UE \
+             context(s)"
         );
     }
 
@@ -456,6 +499,94 @@ pub fn handle_uplink_nas_transport(
 /// The NAS PDU could not be delivered over the radio. The MME logs the cause
 /// and, when the failed PDU was paging-triggered, marks the paging procedure
 /// failed so it is re-attempted on the next downlink trigger.
+/// Handle Initial Context Setup Failure (TS 36.413 §8.3.1.3).
+///
+/// The eNB could not set up the UE context, so the MME must not go on believing
+/// the UE is being served: the UE-associated logical S1 connection is released
+/// with the cause the eNB reported. Previously this only logged, leaving the
+/// context and the connection in place for a UE that has no radio bearers.
+pub fn handle_initial_context_setup_failure(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &InitialContextSetupFailure,
+) -> Vec<S1apSend> {
+    log::error!(
+        "Initial Context Setup Failure from eNB {enb_id}: mme_ue={} cause={:?}",
+        msg.mme_ue_s1ap_id,
+        msg.cause
+    );
+
+    let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
+        // Nothing of ours to release; tell the eNB its id means nothing here.
+        return error_indication(
+            enb_id,
+            Some(msg.enb_ue_s1ap_id),
+            Some(msg.mme_ue_s1ap_id),
+            S1apCauseGroup::RadioNetwork,
+            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+        );
+    };
+
+    let cause = cause_from_s1ap(&msg.cause);
+    if let Some(enb_ue) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
+        enb_ue.relcause.group = cause.group;
+        enb_ue.relcause.cause = cause.cause;
+        enb_ue.ue_ctx_rel_action = UeCtxRelAction::UeContextRemove;
+    }
+
+    match s1ap_build::build_ue_context_release_command(
+        Some(msg.enb_ue_s1ap_id),
+        msg.mme_ue_s1ap_id,
+        cause.group,
+        cause.cause,
+    ) {
+        Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
+        Err(e) => {
+            log::error!("Failed to build UE Context Release Command: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Handle Error Indication (TS 36.413 §8.7.5, §10.6).
+///
+/// An indication naming one of our UE S1AP ids with an unknown-id cause is the eNB
+/// telling us *our* context is stale: it is released locally, with no release
+/// command, because the eNB already has nothing to release. Any other cause is
+/// informational. Previously every indication was logged and dropped, so a stale
+/// context survived until something else happened to clear it.
+pub fn handle_error_indication(ctx: &MmeContext, enb_id: u64, msg: &ErrorIndication) {
+    log::warn!(
+        "Error Indication from eNB {enb_id}: mme_ue={:?} enb_ue={:?} cause={:?} diagnostics={:?}",
+        msg.mme_ue_s1ap_id,
+        msg.enb_ue_s1ap_id,
+        msg.cause,
+        msg.criticality_diagnostics
+    );
+
+    let stale = matches!(
+        msg.cause,
+        Some(Cause::RadioNetwork(CauseRadioNetwork::UnknownMmeUeS1apId))
+            | Some(Cause::RadioNetwork(CauseRadioNetwork::UnknownEnbUeS1apId))
+            | Some(Cause::RadioNetwork(CauseRadioNetwork::UnknownPairUeS1apId))
+    );
+    if !stale {
+        return;
+    }
+
+    let Some(mme_ue_s1ap_id) = msg.mme_ue_s1ap_id else {
+        return;
+    };
+    let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(mme_ue_s1ap_id) else {
+        return;
+    };
+
+    log::info!(
+        "eNB {enb_id} does not know mme_ue_s1ap_id={mme_ue_s1ap_id}; releasing the local S1 context"
+    );
+    release_s1_connection(ctx, enb_ue_id);
+}
+
 pub fn handle_nas_non_delivery_indication(
     ctx: &MmeContext,
     enb_id: u64,
@@ -556,18 +687,7 @@ pub fn handle_reset(ctx: &MmeContext, enb_id: u64, msg: &Reset) -> Vec<S1apSend>
 
     let acked_connections = match &msg.reset_type {
         ResetType::S1Interface => {
-            // Release every UE-associated logical S1 connection on this eNB
-            let affected: Vec<u64> = ctx
-                .enb_ue_pool
-                .read()
-                .unwrap()
-                .iter()
-                .filter(|(_, ue)| ue.enb_id == enb_id)
-                .map(|(id, _)| *id)
-                .collect();
-            for enb_ue_id in affected {
-                release_s1_connection(ctx, enb_ue_id);
-            }
+            release_all_s1_connections(ctx, enb_id);
             Vec::new()
         }
         ResetType::PartOfS1Interface(connections) => {
@@ -613,6 +733,28 @@ pub fn handle_reset(ctx: &MmeContext, enb_id: u64, msg: &Reset) -> Vec<S1apSend>
 /// UE context (the UE moves to idle) and free the eNB UE context. The MME UE
 /// association is only cleared when it still points at this connection (it
 /// may already have moved to a handover target).
+/// Release every UE-associated logical S1 connection on `enb_id`, returning how
+/// many there were.
+///
+/// Shared by Reset with `ResetType::S1Interface` (TS 36.413 §8.7.1) and by eNB
+/// restart detection (TS 23.007 §17): both mean every UE context the MME holds for
+/// that eNB is stale.
+fn release_all_s1_connections(ctx: &MmeContext, enb_id: u64) -> usize {
+    let affected: Vec<u64> = ctx
+        .enb_ue_pool
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|(_, ue)| ue.enb_id == enb_id)
+        .map(|(id, _)| *id)
+        .collect();
+    let count = affected.len();
+    for enb_ue_id in affected {
+        release_s1_connection(ctx, enb_ue_id);
+    }
+    count
+}
+
 fn release_s1_connection(ctx: &MmeContext, enb_ue_id: u64) {
     if let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) {
         if enb_ue.mme_ue_id != NEXTGCORE_INVALID_POOL_ID {
@@ -2156,6 +2298,167 @@ mod tests {
             ctx.mme_ue_find_by_imsi("001010123456789").is_some(),
             "a known S1 connection must have its NAS PDU dispatched"
         );
+    }
+
+    #[test]
+    fn test_initial_context_setup_failure_releases_the_ue() {
+        let ctx = ctx_with_gummei();
+        let (enb_id, enb_ue_id, _, mme_ue_s1ap_id) = add_ue(&ctx);
+
+        let out = handle_initial_context_setup_failure(
+            &ctx,
+            enb_id,
+            &InitialContextSetupFailure {
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id: 100,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::RadioResourcesNotAvailable),
+            },
+        );
+
+        // TS 36.413 §8.3.1.3: the setup failed, so the connection is released
+        // rather than left in place for a UE with no radio bearers.
+        assert_eq!(out.len(), 1, "a UE Context Release Command is due");
+        assert!(matches!(
+            decode_s1ap_pdu(&out[0].pdu).unwrap(),
+            S1apMessage::UeContextReleaseCommand(_)
+        ));
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        assert_eq!(enb_ue.ue_ctx_rel_action, UeCtxRelAction::UeContextRemove);
+        assert_eq!(enb_ue.relcause.group, S1apCauseGroup::RadioNetwork);
+    }
+
+    #[test]
+    fn test_initial_context_setup_failure_for_unknown_ue_reports_it() {
+        let ctx = ctx_with_gummei();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+
+        let out = handle_initial_context_setup_failure(
+            &ctx,
+            enb_id,
+            &InitialContextSetupFailure {
+                mme_ue_s1ap_id: 4242,
+                enb_ue_s1ap_id: 7,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::RadioResourcesNotAvailable),
+            },
+        );
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            decode_s1ap_pdu(&out[0].pdu).unwrap(),
+            S1apMessage::ErrorIndication(_)
+        ));
+    }
+
+    #[test]
+    fn test_error_indication_with_unknown_id_releases_the_stale_context() {
+        let ctx = ctx_with_gummei();
+        let (enb_id, enb_ue_id, mme_ue_id, mme_ue_s1ap_id) = add_ue(&ctx);
+
+        // The eNB says it does not know this id: OUR context is the stale one.
+        handle_error_indication(
+            &ctx,
+            enb_id,
+            &ErrorIndication {
+                mme_ue_s1ap_id: Some(mme_ue_s1ap_id),
+                enb_ue_s1ap_id: Some(100),
+                cause: Some(Cause::RadioNetwork(CauseRadioNetwork::UnknownMmeUeS1apId)),
+                criticality_diagnostics: None,
+            },
+        );
+
+        assert!(
+            ctx.enb_ue_find_by_id(enb_ue_id).is_none(),
+            "the S1 connection is released locally"
+        );
+        // The UE context survives, idle, as it does for any S1 release.
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(mme_ue.enb_ue_id, NEXTGCORE_INVALID_POOL_ID);
+    }
+
+    #[test]
+    fn test_error_indication_with_another_cause_is_informational() {
+        let ctx = ctx_with_gummei();
+        let (enb_id, enb_ue_id, _, mme_ue_s1ap_id) = add_ue(&ctx);
+
+        handle_error_indication(
+            &ctx,
+            enb_id,
+            &ErrorIndication {
+                mme_ue_s1ap_id: Some(mme_ue_s1ap_id),
+                enb_ue_s1ap_id: Some(100),
+                cause: Some(Cause::Protocol(
+                    nextgcore_s1ap::CauseProtocol::SemanticError,
+                )),
+                criticality_diagnostics: None,
+            },
+        );
+
+        assert!(
+            ctx.enb_ue_find_by_id(enb_ue_id).is_some(),
+            "a semantic error says nothing about our context being stale"
+        );
+    }
+
+    #[test]
+    fn test_repeat_s1_setup_releases_the_restarted_enbs_contexts() {
+        let ctx = ctx_with_gummei();
+        let (enb_id, enb_ue_id, _, _) = add_ue(&ctx);
+        // Mark the eNB as already set up, as its first S1 Setup would have.
+        if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&enb_id) {
+            enb.state.s1_setup_success = true;
+        }
+
+        let request = S1SetupRequest {
+            global_enb_id: GlobalEnbId {
+                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+                enb_id: nextgcore_s1ap::EnbId::Macro(0x1234),
+            },
+            enb_name: Some("restarted-enb".to_string()),
+            supported_tas: vec![SupportedTaItem {
+                tac: 1,
+                broadcast_plmns: vec![s1ap_build::encode_plmn_id(&PlmnId::new("310", "410"))],
+            }],
+            default_paging_drx: nextgcore_s1ap::PagingDrx::V64,
+        };
+        let out = handle_s1ap_message(
+            &ctx,
+            enb_id,
+            &builder::build_s1_setup_request(&request).unwrap(),
+        );
+
+        // TS 23.007 §17: the setup is still accepted, but the stale contexts are
+        // gone — otherwise their MME-UE-S1AP-IDs collide with the ids the
+        // restarted eNB is about to allocate.
+        assert!(matches!(
+            decode_s1ap_pdu(&out[0].pdu).unwrap(),
+            S1apMessage::S1SetupResponse(_)
+        ));
+        assert!(
+            ctx.enb_ue_find_by_id(enb_ue_id).is_none(),
+            "the restarted eNB's stale UE context must be released"
+        );
+    }
+
+    #[test]
+    fn test_protocol_errors_carry_criticality_diagnostics() {
+        let ctx = ctx_with_gummei();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+
+        let out = handle_s1ap_message(&ctx, enb_id, &[0xff, 0x00, 0xff]);
+
+        assert_eq!(out.len(), 1);
+        match decode_s1ap_pdu(&out[0].pdu).unwrap() {
+            S1apMessage::ErrorIndication(ind) => {
+                let diag = ind
+                    .criticality_diagnostics
+                    .expect("a protocol error must say what it was about");
+                assert_eq!(
+                    diag.triggering_message,
+                    Some(nextgcore_s1ap::triggering_message::INITIATING_MESSAGE)
+                );
+            }
+            other => panic!("expected ErrorIndication, got {other:?}"),
+        }
     }
 
     #[test]

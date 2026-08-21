@@ -628,6 +628,12 @@ pub fn build_error_indication(msg: &ErrorIndication) -> S1apResult<Vec<u8>> {
         ie::encode_cause(&mut container, cause)?;
     }
 
+    // IE: Criticality Diagnostics (optional) — tells the peer which procedure and
+    // which IEs the error was about (TS 36.413 §9.2.1.21).
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
     encode_pdu(&initiating(
         ProcedureCode::ERROR_INDICATION,
         Criticality::Ignore,

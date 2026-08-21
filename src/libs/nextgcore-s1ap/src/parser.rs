@@ -932,6 +932,7 @@ fn parse_error_indication(container: ProtocolIeContainer) -> S1apResult<ErrorInd
     let mut mme_ue_s1ap_id = None;
     let mut enb_ue_s1ap_id = None;
     let mut cause = None;
+    let mut criticality_diagnostics = None;
 
     for field in &container.ies {
         match field.id {
@@ -944,6 +945,9 @@ fn parse_error_indication(container: ProtocolIeContainer) -> S1apResult<ErrorInd
             ProtocolIeId::CAUSE => {
                 cause = Some(ie::decode_cause(field)?);
             }
+            ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
+                criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
+            }
             _ => {}
         }
     }
@@ -952,6 +956,7 @@ fn parse_error_indication(container: ProtocolIeContainer) -> S1apResult<ErrorInd
         mme_ue_s1ap_id,
         enb_ue_s1ap_id,
         cause,
+        criticality_diagnostics,
     })
 }
 
