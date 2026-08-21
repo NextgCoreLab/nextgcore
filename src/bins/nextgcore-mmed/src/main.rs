@@ -117,6 +117,13 @@ impl MmeApp {
         }
         log::debug!("Diameter S6a interface initialized");
 
+        // Connect the S6a peer. `mme_fd_connect` has had no caller since it was
+        // written — its own comment defers it until "the async runtime is
+        // available" (#42 provided that) and until an HSS address existed, which
+        // the freeDiameter config now supplies. Without this the MME can never
+        // obtain an authentication vector, so no UE can complete an attach.
+        self.connect_s6a().await;
+
         // Bind the S1-MME SCTP transport (TS 36.412: port 36412, PPID 18).
         // Without this nothing can reach the S1AP layer, so no eNB can
         // associate and no EPS procedure can run (issue #42).
@@ -141,6 +148,67 @@ impl MmeApp {
 
         log::info!("MME initialized successfully");
         Ok(())
+    }
+
+    /// Establish the S6a Diameter connection to the HSS.
+    ///
+    /// A failure is logged and startup continues: an HSS that is not up yet is
+    /// the normal case in a compose deployment, and the S6a request path already
+    /// answers `NotInitialized`/`RequestTimeout` for a peer that is not there.
+    /// Taking the daemon down instead would mean an MME that cannot serve S1AP
+    /// because its HSS was slow to start.
+    async fn connect_s6a(&self) {
+        let ctx = context::mme_self();
+        let Some((peer_identity, peer_addr)) = ctx.hss_peer.clone() else {
+            log::warn!(
+                "No S6a peer configured (no ConnectPeer with a ConnectTo in {}); \
+                 authentication will not be possible",
+                ctx.diam_conf_path.as_deref().unwrap_or("<no config>")
+            );
+            return;
+        };
+
+        // Advertise only S6a: that is the single application this daemon
+        // implements, so a peer with nothing in common is refused up front
+        // (RFC 6733 §5.3) rather than accepted and failing at the first request.
+        let applications =
+            nextgcore_diameter::applications::ApplicationRegistry::new("NextGCore MME")
+                .with_application(nextgcore_diameter::applications::well_known::S6A);
+
+        let config = nextgcore_diameter::config::DiameterConfig {
+            diameter_id: ctx
+                .diam_identity
+                .clone()
+                .unwrap_or_else(|| "mme.localdomain".to_string()),
+            diameter_realm: ctx
+                .diam_realm
+                .clone()
+                .unwrap_or_else(|| "localdomain".to_string()),
+            // Advertised as Host-IP-Address. A wildcard tells a peer nothing
+            // routable, so it is omitted rather than advertised as 0.0.0.0.
+            address: ctx
+                .diam_addr
+                .clone()
+                .filter(|addr| addr != "0.0.0.0" && addr != "::"),
+            applications,
+            ..Default::default()
+        };
+
+        log::info!(
+            "Connecting S6a to {peer_identity} at {peer_addr} as {}",
+            config.diameter_id
+        );
+        if let Err(e) = fd_path::mme_fd_init_async(config, peer_addr).await {
+            log::error!("S6a client setup failed: {e}");
+            return;
+        }
+        match fd_path::mme_fd_connect().await {
+            Ok(()) => log::info!("S6a connected to {peer_identity} at {peer_addr}"),
+            Err(e) => log::warn!(
+                "S6a connection to {peer_identity} at {peer_addr} failed: {e}. Authentication \
+                 will fail until the peer is reachable."
+            ),
+        }
     }
 
     /// Run the MME main loop.
