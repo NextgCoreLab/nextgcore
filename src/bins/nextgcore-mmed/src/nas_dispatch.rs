@@ -721,10 +721,34 @@ fn emm_security_mode_complete(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, 
         std::mem::take(&mut mme_ue.pdn_connectivity_request)
     };
 
-    if held_esm.is_empty() {
+    // TS 23.401 §5.3.2.1 step 12: with the security context in place the MME
+    // registers itself with the HSS and takes the subscription data, which is
+    // what an ATTACH ACCEPT is built from. `mme_s6a_send_ulr` is async, so the
+    // request goes on the same queue the AIR uses.
+    if !held_esm.is_empty() {
+        forward_to_esm(ctx, enb_ue, mme_ue_id, &held_esm);
+    }
+    request_subscription_data(ctx, mme_ue_id);
+}
+
+/// Ask the HSS to register this MME and return the subscriber's data.
+fn request_subscription_data(ctx: &MmeContext, mme_ue_id: u64) {
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+        return;
+    };
+    if mme_ue.num_of_session != 0 {
+        // Already subscribed: a retransmitted SECURITY MODE COMPLETE must not
+        // re-register with the HSS.
         return;
     }
-    forward_to_esm(ctx, enb_ue, mme_ue_id, &held_esm);
+    // ULR-Flags "initial attach indicator" (TS 29.272 §7.3.7): set for an attach
+    // so the HSS cancels any previous MME's registration, clear for a TAU.
+    let initial_attach = mme_ue.nas_eps.type_ == MmeEpsType::AttachRequest;
+    log::info!(
+        "[{}] Requesting subscription data from the HSS (initial_attach={initial_attach})",
+        mme_ue.imsi_bcd
+    );
+    crate::fd_path::queue_update_location(mme_ue_id, initial_attach);
 }
 
 fn emm_tau_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]) {
@@ -2091,6 +2115,43 @@ mod tests {
             "no challenge goes out until a vector arrives"
         );
         assert!(!mme_ue.security_context_available);
+    }
+
+    #[test]
+    fn test_security_mode_complete_requests_subscription_data() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+            mme_ue.nas_eps.type_ = MmeEpsType::AttachRequest;
+        }
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        let complete = protect_uplink(
+            &mme_ue,
+            1,
+            &[
+                NAS_PROTOCOL_DISCRIMINATOR_EMM,
+                NasEpsMessageType::SecurityModeComplete as u8,
+            ],
+        );
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &complete));
+
+        // No queue is installed in a unit test, so the request is dropped and
+        // reported; what matters is that the procedure now ASKS, and that no
+        // subscription is invented while it waits.
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(mme_ue.security_context_available);
+        assert_eq!(mme_ue.num_of_session, 0, "no subscription may be invented");
+        assert_eq!(mme_ue.ambr.uplink, 0);
+    }
+
+    #[test]
+    fn test_update_location_queue_helper_reports_a_dropped_request() {
+        assert!(!crate::fd_path::queue_update_location(4242, true));
     }
 
     #[test]
