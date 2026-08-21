@@ -1144,6 +1144,62 @@ async fn run_authentication_information(ctx: &'static crate::context::MmeContext
     }
 }
 
+/// How long each poll waits for a peer-initiated request.
+///
+/// Short on purpose: this runs on the main loop, which also has to service S1AP,
+/// so it is a poll rather than a wait. The loop's own 100 ms cadence is what
+/// bounds how long a CLR can sit unread.
+const INBOUND_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Most HSS-initiated requests handled per pass.
+///
+/// A bound so a chatty (or hostile) HSS cannot starve the S1AP data path on this
+/// single-threaded loop. Hitting it is logged rather than passed over quietly —
+/// the remainder is read on the next pass, not dropped.
+const MAX_INBOUND_PER_PASS: usize = 8;
+
+/// Read and apply HSS-initiated S6a requests (CLR/IDR).
+///
+/// `mme_fd_recv_inbound` already parses the request and sends its answer
+/// (CLA/IDA); `s6a_handler::mme_s6a_process_inbound` applies it to the UE
+/// context — a network-initiated detach for a CLR, or refreshed subscription
+/// data for an IDR. Neither had a caller, so an HSS that cancelled a location or
+/// pushed new subscriber data got a correct answer from the Diameter layer and no
+/// effect whatsoever on the MME's state.
+pub async fn poll_inbound() {
+    for handled in 0..MAX_INBOUND_PER_PASS {
+        match mme_fd_recv_inbound(INBOUND_POLL_TIMEOUT).await {
+            Ok(Some(inbound)) => {
+                log::info!("[{}] HSS-initiated S6a request received", inbound.imsi_bcd);
+                if let Err(e) = crate::s6a_handler::mme_s6a_process_inbound(&inbound) {
+                    // A request for a subscriber this MME does not hold is
+                    // routine (the HSS may not know the UE detached), so it is
+                    // reported without alarm; the answer already went out.
+                    log::warn!("[{}] could not be applied: {e:?}", inbound.imsi_bcd);
+                }
+            }
+            // Nothing pending within the poll window.
+            Ok(None) => return,
+            Err(DiameterError::NotInitialized) => {
+                // No S6a peer connected. Expected on every pass in a deployment
+                // with no HSS configured, so it must stay silent rather than
+                // filling the log ten times a second.
+                return;
+            }
+            Err(e) => {
+                log::debug!("S6a inbound poll failed: {e}");
+                return;
+            }
+        }
+        if handled + 1 == MAX_INBOUND_PER_PASS {
+            log::info!(
+                "Handled {MAX_INBOUND_PER_PASS} HSS-initiated requests this pass; any remainder \
+                 is read on the next one"
+            );
+        }
+    }
+}
+
 // ============================================================================
 // Unit Tests
 // ============================================================================

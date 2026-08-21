@@ -260,6 +260,10 @@ impl MmeApp {
                 fd_path::poll_pending(ctx, rx).await;
             }
 
+            // Apply anything the HSS initiated (CLR/IDR). Also a no-op when no
+            // S6a peer is connected.
+            fd_path::poll_inbound().await;
+
             // Retransmit or abort NAS procedures whose timer has run out
             // (TS 24.301 §5.4.2.7, §5.4.4.6, §5.5.1.2.7). Cheap when idle: the
             // sweep walks the UE pool and does nothing unless a deadline passed.

@@ -636,6 +636,74 @@ mod tests {
         );
     }
 
+    /// Seed a connected UE on the process-global context under a dedicated
+    /// IMSI, which is how these tests stay isolated from each other (the context
+    /// is keyed by IMSI).
+    fn seed_connected_ue(imsi: &str, enb_ue_s1ap_id: u32) -> u64 {
+        let ctx = crate::context::mme_self();
+        let enb_id = ctx.enb_add(format!("127.0.0.1:{}", 36412).parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, enb_ue_s1ap_id);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        ctx.mme_ue_set_imsi(mme_ue_id, imsi);
+        mme_ue_id
+    }
+
+    fn clr(imsi: &str, cancellation_type: u32) -> crate::fd_path::InboundS6aRequest {
+        crate::fd_path::InboundS6aRequest {
+            imsi_bcd: imsi.to_string(),
+            message: crate::fd_path::S6aMessage::Clr(ClrMessage {
+                cancellation_type,
+                clr_flags: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_process_inbound_clr_subscription_withdrawal_detaches_the_ue() {
+        // The effect the main-loop drain exists to produce. Before it was wired
+        // the Diameter layer answered CLA correctly and the UE context was
+        // untouched, so a withdrawn subscription left the UE attached.
+        const IMSI: &str = "999990000000777";
+        let mme_ue_id = seed_connected_ue(IMSI, 777);
+        let ctx = crate::context::mme_self();
+
+        mme_s6a_process_inbound(&clr(IMSI, cancellation_type::SUBSCRIPTION_WITHDRAWAL))
+            .expect("a known UE must be applied");
+
+        // TS 29.272 §5.2.2.2.2: subscription withdrawal is a *network-initiated
+        // detach*, so the UE is told and the context survives until it accepts.
+        let mme_ue = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .expect("the context waits for the Detach Accept");
+        let detach = mme_ue
+            .t3422
+            .pkbuf
+            .as_ref()
+            .expect("a Detach Request must be armed on T3422");
+        // The stored message is security-encoded, so the plain NAS message starts
+        // after the 6-octet security header and its type is octet 7.
+        assert_eq!(
+            detach.get(7).copied(),
+            Some(crate::emm_build::NasEpsMessageType::DetachRequest as u8)
+        );
+    }
+
+    #[test]
+    fn test_process_inbound_clr_mme_update_removes_the_context_silently() {
+        // TS 23.401 §5.3.3.1: the UE moved to another MME, so the old context
+        // goes with no NAS signalling — there is no UE here to tell.
+        const IMSI: &str = "999990000000778";
+        let mme_ue_id = seed_connected_ue(IMSI, 778);
+        let ctx = crate::context::mme_self();
+
+        mme_s6a_process_inbound(&clr(IMSI, cancellation_type::MME_UPDATE_PROCEDURE))
+            .expect("a known UE must be applied");
+
+        assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_none());
+        assert_eq!(ctx.mme_ue_find_by_imsi(IMSI), None);
+    }
+
     #[test]
     fn test_handle_idr() {
         let mut mme_ue = MmeUe::default();
