@@ -684,16 +684,38 @@ pub fn hss_context_parse_config(config_path: &str) -> Result<(), String> {
         .write()
         .map_err(|_| "HSS context lock poisoned".to_string())?;
 
+    // The freeDiameter file is the LOWER-precedence source, so it is applied
+    // before the YAML block: `hss.diameter` wins wherever both speak, and the
+    // .conf supplies what the YAML leaves out. Until this landed the path was
+    // only recorded, so the identity came from the built-in
+    // `hss.epc.mnc001.mcc001...` default even though the deployment mounts a file
+    // that says `hss.localdomain`.
     if let Some(path) = section.free_diameter {
+        match nextgcore_diameter::fd_conf::FreeDiameterConf::load(&path) {
+            Ok(conf) => {
+                if !conf.ignored.is_empty() {
+                    log::info!(
+                        "{path}: directives not interpreted: {}",
+                        conf.ignored
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                apply_fd_conf(&mut ctx.diam_config, &conf);
+            }
+            Err(e) => log::warn!("Could not read freeDiameter config '{path}': {e}"),
+        }
         ctx.diam_conf_path = Some(path);
     }
 
-    let Some(diam) = section.diameter else {
-        log::debug!("{config_path}: no 'hss.diameter' block; keeping defaults");
-        return Ok(());
-    };
+    if let Some(diam) = section.diameter {
+        apply_diameter_yaml(&mut ctx.diam_config, diam);
+    } else {
+        log::debug!("{config_path}: no 'hss.diameter' block");
+    }
 
-    apply_diameter_yaml(&mut ctx.diam_config, diam);
     log::info!(
         "HSS Diameter identity: {} realm: {} listen: {}:{}",
         ctx.diam_config.cnf_diamid.as_deref().unwrap_or("<default>"),
@@ -705,6 +727,48 @@ pub fn hss_context_parse_config(config_path: &str) -> Result<(), String> {
         ctx.diam_config.cnf_port,
     );
     Ok(())
+}
+
+/// Copy a parsed freeDiameter `.conf` onto a [`DiamConfig`].
+///
+/// Only fields the file actually states are copied, and `connections` is only
+/// seeded when none are configured yet — a `ConnectPeer` in the .conf must not
+/// silently replace a peer list the YAML declared. `NoRelay` maps to
+/// `cnf_flags_no_fwd`: both mean "do not advertise the relay application".
+pub fn apply_fd_conf(cfg: &mut DiamConfig, conf: &nextgcore_diameter::fd_conf::FreeDiameterConf) {
+    if let Some(identity) = conf.identity.clone() {
+        cfg.cnf_diamid = Some(identity);
+    }
+    if let Some(realm) = conf.realm.clone() {
+        cfg.cnf_diamrlm = Some(realm);
+    }
+    if let Some(addr) = conf.listen_address() {
+        cfg.cnf_addr = Some(addr.to_string());
+    }
+    if let Some(port) = conf.port {
+        cfg.cnf_port = port;
+    }
+    if let Some(port) = conf.sec_port {
+        cfg.cnf_port_tls = port;
+    }
+    if conf.flags.no_relay {
+        cfg.cnf_flags_no_fwd = true;
+    }
+    if cfg.connections.is_empty() {
+        for peer in &conf.peers {
+            let Some(addr) = peer.connect_to.clone() else {
+                continue;
+            };
+            cfg.connections.push(DiamConnection {
+                identity: peer.identity.clone(),
+                addr,
+                // 0 is how `DiamConnection` spells "unset" for both of these:
+                // the node-level port and Tc apply.
+                port: peer.port.unwrap_or(0),
+                tc_timer: 0,
+            });
+        }
+    }
 }
 
 /// Copy the parsed `diameter` block onto a [`DiamConfig`].
@@ -1119,5 +1183,64 @@ hss:
         );
         assert_eq!(cfg.cnf_addr.as_deref(), Some("172.24.0.8"));
         assert_eq!(cfg.cnf_port, 3868);
+    }
+
+    /// The shipped `hss.conf`, read from the tree.
+    fn shipped_hss_conf() -> nextgcore_diameter::fd_conf::FreeDiameterConf {
+        let path = "../../../docker/rust/configs/epc/freeDiameter/hss.conf";
+        nextgcore_diameter::fd_conf::FreeDiameterConf::load(path)
+            .unwrap_or_else(|e| panic!("cannot read shipped {path}: {e}"))
+    }
+
+    #[test]
+    fn freediameter_conf_supplies_the_identity_the_deployment_mounts() {
+        let mut cfg = DiamConfig::default();
+        apply_fd_conf(&mut cfg, &shipped_hss_conf());
+
+        // Previously the mounted file was only recorded, so the identity came
+        // from the built-in `hss.epc.mnc001.mcc001...` default instead.
+        assert_eq!(cfg.cnf_diamid.as_deref(), Some("hss.localdomain"));
+        assert_eq!(cfg.cnf_diamrlm.as_deref(), Some("localdomain"));
+        assert_eq!(cfg.cnf_addr.as_deref(), Some("172.24.0.8"));
+        assert!(cfg.cnf_flags_no_fwd, "NoRelay maps to no_fwd");
+
+        // ConnectPeer becomes a dialable connection.
+        assert_eq!(cfg.connections.len(), 1);
+        assert_eq!(cfg.connections[0].identity, "mme.localdomain");
+        assert_eq!(cfg.connections[0].addr, "172.24.0.5");
+        assert_eq!(cfg.connections[0].port, 0, "0 means the node-level port");
+    }
+
+    #[test]
+    fn yaml_wins_over_the_freediameter_conf() {
+        let mut cfg = DiamConfig::default();
+        apply_fd_conf(&mut cfg, &shipped_hss_conf());
+
+        let yaml = "hss:\n  diameter:\n    identity: from.yaml\n    port: 3869\n";
+        let parsed: HssYaml = serde_yaml::from_str(yaml).expect("must parse");
+        apply_diameter_yaml(&mut cfg, parsed.hss.unwrap().diameter.unwrap());
+
+        assert_eq!(cfg.cnf_diamid.as_deref(), Some("from.yaml"));
+        assert_eq!(cfg.cnf_port, 3869);
+        // What the YAML did not state still comes from the .conf.
+        assert_eq!(cfg.cnf_diamrlm.as_deref(), Some("localdomain"));
+        assert_eq!(cfg.cnf_addr.as_deref(), Some("172.24.0.8"));
+    }
+
+    #[test]
+    fn configured_connections_are_not_replaced_by_the_conf() {
+        let mut cfg = DiamConfig {
+            connections: vec![DiamConnection {
+                identity: "configured.localdomain".to_string(),
+                addr: "10.0.0.1".to_string(),
+                port: 3868,
+                tc_timer: 0,
+            }],
+            ..Default::default()
+        };
+        apply_fd_conf(&mut cfg, &shipped_hss_conf());
+
+        assert_eq!(cfg.connections.len(), 1);
+        assert_eq!(cfg.connections[0].identity, "configured.localdomain");
     }
 }

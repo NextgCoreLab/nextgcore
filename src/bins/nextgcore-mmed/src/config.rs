@@ -165,13 +165,11 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
         }
     }
 
-    // The Diameter identity and the HSS peer live in this file's own format,
-    // which nothing parses yet: record the path so a deployment is diagnosable.
+    // The Diameter identity, realm, listener and HSS peer live in this file's
+    // own format. It is mounted into the container and is what an operator
+    // edits, so it is read rather than merely recorded.
     if let Some(free_diameter) = mme.free_diameter {
-        log::info!(
-            "Diameter configuration path recorded: {free_diameter} (its contents are not parsed \
-             yet, so the S6a identity still comes from built-in defaults)"
-        );
+        apply_fd_conf(ctx, &free_diameter);
         ctx.diam_conf_path = Some(free_diameter);
     }
 
@@ -273,6 +271,64 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
     }
 }
 
+/// Read the freeDiameter `.conf` at `path` into the S6a fields of the context.
+///
+/// The MME is the S6a *client*, so the peer that matters is the one it dials:
+/// `ConnectPeer = "hss.localdomain" { ConnectTo = "172.24.0.8"; }` becomes
+/// `hss_peer`, which is the address `mme_fd_connect` needs and which mmed
+/// previously had no way to learn.
+fn apply_fd_conf(ctx: &mut MmeContext, path: &str) {
+    let conf = match nextgcore_diameter::fd_conf::FreeDiameterConf::load(path) {
+        Ok(conf) => conf,
+        Err(e) => {
+            log::warn!("Could not read freeDiameter config '{path}': {e}");
+            return;
+        }
+    };
+
+    if !conf.ignored.is_empty() {
+        log::info!(
+            "{path}: directives not interpreted: {}",
+            conf.ignored
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    if let Some(identity) = conf.identity.clone() {
+        log::info!("Diameter identity: {identity}");
+        ctx.diam_identity = Some(identity);
+    }
+    ctx.diam_realm = conf.realm.clone();
+    ctx.diam_addr = conf.listen_address().map(str::to_string);
+
+    // Port is optional in the shipped files; RFC 6733 §2.1 puts unsecured
+    // Diameter on 3868.
+    let default_port = conf.port.unwrap_or(DIAMETER_PORT);
+    match conf.first_connect_peer() {
+        Some((identity, address, port)) => {
+            let port = port.unwrap_or(default_port);
+            match parse_socket_addr(address, port) {
+                Some(addr) => {
+                    log::info!("S6a peer: {identity} at {addr}");
+                    ctx.hss_peer = Some((identity.to_string(), addr));
+                }
+                None => log::warn!(
+                    "{path}: peer '{identity}' has unusable ConnectTo address '{address}'"
+                ),
+            }
+        }
+        None => log::warn!(
+            "{path}: no ConnectPeer with a ConnectTo address, so no S6a peer can be dialled"
+        ),
+    }
+}
+
+/// Default unsecured Diameter port (RFC 6733 §2.1).
+const DIAMETER_PORT: u16 = 3868;
+
 /// Build a `PlmnId` from the YAML `plmn_id` block.
 ///
 /// MCC and MNC are accepted as either numbers or strings, because YAML reads an
@@ -359,6 +415,12 @@ mod tests {
             ctx.diam_conf_path.as_deref(),
             Some("/etc/freeDiameter/mme.conf")
         );
+        // The .conf lives at an absolute path that only exists inside the
+        // container, so the shipped config cannot populate the identity here;
+        // `test_freediameter_conf_supplies_the_identity_and_peer` covers that
+        // mapping against the file as shipped in the tree.
+        assert_eq!(ctx.diam_identity, None);
+        assert_eq!(ctx.hss_peer, None);
 
         // The headline fix: a served GUMMEI, without which S1 Setup always fails.
         assert_eq!(ctx.num_of_served_gummei, 1);
@@ -479,6 +541,68 @@ mod tests {
         assert_eq!(
             ctx.s1ap_list,
             vec![std::net::SocketAddr::from(([10, 0, 0, 1], 36412))]
+        );
+    }
+
+    #[test]
+    fn test_freediameter_conf_supplies_the_identity_and_peer() {
+        // Point `freeDiameter:` at the file as it ships in the tree, standing in
+        // for the container path the compose deployment mounts it to.
+        let path = write_temp(
+            "nextgcore-mmed-fd.yaml",
+            "mme:\n  freeDiameter: ../../../docker/rust/configs/epc/freeDiameter/mme.conf\n",
+        );
+        let mut ctx = MmeContext::new();
+        assert!(load_config(&mut ctx, path.to_str().unwrap()));
+
+        assert_eq!(ctx.diam_identity.as_deref(), Some("mme.localdomain"));
+        assert_eq!(ctx.diam_realm.as_deref(), Some("localdomain"));
+        assert_eq!(ctx.diam_addr.as_deref(), Some("172.24.0.5"));
+        // The HSS address mmed previously had no way to learn, defaulted to the
+        // RFC 6733 port because the shipped file leaves `Port` commented out.
+        assert_eq!(
+            ctx.hss_peer,
+            Some((
+                "hss.localdomain".to_string(),
+                std::net::SocketAddr::from(([172, 24, 0, 8], 3868))
+            ))
+        );
+    }
+
+    #[test]
+    fn test_unreadable_freediameter_conf_is_recorded_but_not_fatal() {
+        let path = write_temp(
+            "nextgcore-mmed-fd-missing.yaml",
+            "mme:\n  mme_name: still-configured\n  freeDiameter: /nonexistent/mme.conf\n",
+        );
+        let mut ctx = MmeContext::new();
+        assert!(load_config(&mut ctx, path.to_str().unwrap()));
+
+        // The rest of the file still applies, and the path is recorded so the
+        // deployment can be diagnosed.
+        assert_eq!(ctx.mme_name.as_deref(), Some("still-configured"));
+        assert_eq!(ctx.diam_conf_path.as_deref(), Some("/nonexistent/mme.conf"));
+        assert_eq!(ctx.diam_identity, None);
+        assert_eq!(ctx.hss_peer, None);
+    }
+
+    #[test]
+    fn test_peer_without_connect_to_yields_no_s6a_peer() {
+        let conf = write_temp(
+            "nextgcore-mmed-noconnect.conf",
+            "Identity = \"mme.localdomain\";\nConnectPeer = \"hss.localdomain\";\n",
+        );
+        let path = write_temp(
+            "nextgcore-mmed-noconnect.yaml",
+            &format!("mme:\n  freeDiameter: {}\n", conf.to_str().unwrap()),
+        );
+        let mut ctx = MmeContext::new();
+        assert!(load_config(&mut ctx, path.to_str().unwrap()));
+
+        assert_eq!(ctx.diam_identity.as_deref(), Some("mme.localdomain"));
+        assert_eq!(
+            ctx.hss_peer, None,
+            "a peer with no address is not something to dial"
         );
     }
 

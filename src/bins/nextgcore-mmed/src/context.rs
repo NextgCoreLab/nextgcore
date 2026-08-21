@@ -1343,6 +1343,15 @@ pub struct MmeContext {
     /// Diameter configuration path
     pub diam_conf_path: Option<String>,
 
+    /// Local Diameter identity (Origin-Host), from the freeDiameter `.conf`
+    pub diam_identity: Option<String>,
+    /// Local Diameter realm (Origin-Realm)
+    pub diam_realm: Option<String>,
+    /// Local Diameter listen address, if the configuration names one
+    pub diam_addr: Option<String>,
+    /// The HSS peer to dial for S6a: `(Diameter identity, socket address)`
+    pub hss_peer: Option<(String, std::net::SocketAddr)>,
+
     /// S1AP port
     pub s1ap_port: u16,
     /// SGsAP port

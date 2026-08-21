@@ -613,17 +613,59 @@ pub fn pcrf_context_parse_config(config_path: &str) -> Result<(), String> {
         .write()
         .map_err(|_| "PCRF context lock poisoned".to_string())?;
 
+    // The freeDiameter file is the LOWER-precedence source, applied before the
+    // YAML block so `pcrf.diameter` wins wherever both speak. Until this landed
+    // the path was only recorded, so the identity came from the built-in
+    // `pcrf.localdomain` default rather than the mounted file.
     if let Some(path) = section.free_diameter {
+        match nextgcore_diameter::fd_conf::FreeDiameterConf::load(&path) {
+            Ok(conf) => {
+                if !conf.ignored.is_empty() {
+                    log::info!(
+                        "{path}: directives not interpreted: {}",
+                        conf.ignored
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                apply_fd_conf(&mut ctx.diam_config, &conf);
+            }
+            Err(e) => log::warn!("Could not read freeDiameter config '{path}': {e}"),
+        }
         ctx.diam_conf_path = Some(path);
     }
 
-    let Some(diam) = section.diameter else {
-        log::debug!("{config_path}: no 'pcrf.diameter' block; keeping defaults");
-        return Ok(());
-    };
-
-    apply_diameter_yaml(&mut ctx.diam_config, diam);
+    if let Some(diam) = section.diameter {
+        apply_diameter_yaml(&mut ctx.diam_config, diam);
+    } else {
+        log::debug!("{config_path}: no 'pcrf.diameter' block");
+    }
     Ok(())
+}
+
+/// Copy a parsed freeDiameter `.conf` onto a [`DiamConfig`].
+///
+/// Only what the file states is copied. `pcrf.conf` declares no peers this
+/// daemon dials — the PCRF is the Gx server — so `ConnectPeer` entries are
+/// ignored here rather than invented into a client list.
+pub fn apply_fd_conf(cfg: &mut DiamConfig, conf: &nextgcore_diameter::fd_conf::FreeDiameterConf) {
+    if let Some(identity) = conf.identity.clone() {
+        cfg.cnf_diamid = Some(identity);
+    }
+    if let Some(realm) = conf.realm.clone() {
+        cfg.cnf_diamrlm = Some(realm);
+    }
+    if let Some(addr) = conf.listen_address() {
+        cfg.cnf_addr = Some(addr.to_string());
+    }
+    if let Some(port) = conf.port {
+        cfg.cnf_port = port;
+    }
+    if let Some(port) = conf.sec_port {
+        cfg.cnf_port_tls = port;
+    }
 }
 
 /// Copy the parsed `diameter` block onto a [`DiamConfig`].
@@ -825,5 +867,43 @@ mod tests {
         assert_eq!(session.sid, "rx-session-1");
         assert_eq!(session.gx_session_idx, 0);
         assert!(session.pcc_rules.is_empty());
+    }
+
+    #[test]
+    fn freediameter_conf_supplies_the_identity_the_deployment_mounts() {
+        let path = "../../../docker/rust/configs/epc/freeDiameter/pcrf.conf";
+        let conf = nextgcore_diameter::fd_conf::FreeDiameterConf::load(path)
+            .unwrap_or_else(|e| panic!("cannot read shipped {path}: {e}"));
+
+        let mut cfg = DiamConfig::default();
+        apply_fd_conf(&mut cfg, &conf);
+
+        assert_eq!(cfg.cnf_diamid.as_deref(), Some("pcrf.localdomain"));
+        assert_eq!(cfg.cnf_diamrlm.as_deref(), Some("localdomain"));
+        // The listen address the deployment mounts, which was previously ignored.
+        assert_eq!(cfg.cnf_addr.as_deref(), Some("172.24.0.9"));
+    }
+
+    #[test]
+    fn yaml_wins_over_the_freediameter_conf() {
+        let mut cfg = DiamConfig::default();
+        apply_fd_conf(
+            &mut cfg,
+            &nextgcore_diameter::fd_conf::FreeDiameterConf::parse(
+                "Identity = \"from.conf\";\nRealm = \"conf.realm\";\n",
+            ),
+        );
+
+        let parsed: PcrfYaml =
+            serde_yaml::from_str("pcrf:\n  diameter:\n    identity: from.yaml\n")
+                .expect("must parse");
+        apply_diameter_yaml(&mut cfg, parsed.pcrf.unwrap().diameter.unwrap());
+
+        assert_eq!(cfg.cnf_diamid.as_deref(), Some("from.yaml"));
+        assert_eq!(
+            cfg.cnf_diamrlm.as_deref(),
+            Some("conf.realm"),
+            "what the YAML omits still comes from the .conf"
+        );
     }
 }
