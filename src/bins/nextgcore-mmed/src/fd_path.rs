@@ -980,6 +980,171 @@ pub fn encode_visited_plmn_id(mcc: &str, mnc: &str) -> Vec<u8> {
 }
 
 // ============================================================================
+// Pending Request Queue
+// ============================================================================
+
+/// An S6a exchange the synchronous NAS layer asked for.
+///
+/// The **UE id** is queued rather than a built message: the drain re-reads the
+/// context when it runs, so a UE that detached — or a second Attach Request that
+/// replaced the context — becomes a lookup miss instead of a request sent on
+/// behalf of a UE that is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingS6aRequest {
+    /// Fetch authentication vectors (AIR/AIA, TS 29.272 §5.2.3.1).
+    AuthenticationInformation {
+        /// MME UE pool id the vectors are for
+        mme_ue_id: u64,
+    },
+}
+
+/// Process-global sender for the pending-request queue.
+///
+/// A `OnceLock` for the same reason `s1ap_path::SEND_TX` is one: installed once
+/// at startup and only cloned afterwards, so the synchronous side needs no lock.
+static REQUEST_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<PendingS6aRequest>> =
+    OnceLock::new();
+
+/// Install the queue, returning the receiving half for the main loop to drain.
+///
+/// Returns `None` when a queue is already installed, so a second call cannot
+/// orphan the first.
+pub fn install_request_queue() -> Option<tokio::sync::mpsc::UnboundedReceiver<PendingS6aRequest>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    match REQUEST_TX.set(tx) {
+        Ok(()) => Some(rx),
+        Err(_) => None,
+    }
+}
+
+/// Ask for authentication vectors for `mme_ue_id`.
+///
+/// Callable from synchronous code: it never blocks and never fails the caller's
+/// procedure. `false` means the request was dropped because no queue is
+/// installed (a unit test, or a daemon whose init did not run) — which is logged,
+/// and leaves the UE without a vector exactly as before.
+pub fn queue_authentication_information(mme_ue_id: u64) -> bool {
+    let Some(tx) = REQUEST_TX.get() else {
+        log::warn!("S6a request dropped: no queue installed (mme_ue_id={mme_ue_id})");
+        return false;
+    };
+    match tx.send(PendingS6aRequest::AuthenticationInformation { mme_ue_id }) {
+        Ok(()) => {
+            log::debug!("S6a AIR queued for UE {mme_ue_id}");
+            true
+        }
+        Err(_) => {
+            log::warn!("S6a request dropped: queue closed (mme_ue_id={mme_ue_id})");
+            false
+        }
+    }
+}
+
+/// Run every queued S6a request that is ready, without waiting for more.
+///
+/// Called from the main loop beside the NAS timer sweep. Each request is a full
+/// exchange with the HSS, so this awaits them one at a time: the S6a
+/// multiplexer (#149) makes concurrent requests possible, but serialising here
+/// keeps the ordering a UE observes intact and is not a bottleneck at the rate
+/// attaches arrive.
+pub async fn poll_pending(
+    ctx: &'static crate::context::MmeContext,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<PendingS6aRequest>,
+) {
+    while let Ok(request) = rx.try_recv() {
+        match request {
+            PendingS6aRequest::AuthenticationInformation { mme_ue_id } => {
+                run_authentication_information(ctx, mme_ue_id).await;
+            }
+        }
+    }
+}
+
+/// AIR/AIA for one UE, then the AUTHENTICATION REQUEST it enables.
+async fn run_authentication_information(ctx: &'static crate::context::MmeContext, mme_ue_id: u64) {
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+        log::debug!("S6a AIR skipped: UE {mme_ue_id} is gone");
+        return;
+    };
+    if mme_ue.xres_len != 0 {
+        // A retransmitted Attach Request queues a second AIR for a context that
+        // already has a vector; a lookup is cheaper than a duplicate exchange.
+        log::debug!("S6a AIR skipped: UE {mme_ue_id} already holds a vector");
+        return;
+    }
+    if mme_ue.imsi_bcd.is_empty() {
+        log::warn!("S6a AIR skipped: UE {mme_ue_id} has no IMSI to ask about");
+        return;
+    }
+
+    // A synch failure (#45) stores the AUTS the HSS needs to resynchronise; it is
+    // consumed by exactly one request (TS 33.401 §6.1.1).
+    let resync_auts = mme_ue.resync_auts;
+    let answer = mme_s6a_send_air(&mme_ue, resync_auts.as_ref()).await;
+
+    let Some(enb_ue) = ctx
+        .enb_ue_find_by_id(mme_ue.enb_ue_id)
+        .filter(|enb_ue| enb_ue.id != 0)
+    else {
+        log::warn!(
+            "[{}] S6a answer arrived with no S1 connection to answer on",
+            mme_ue.imsi_bcd
+        );
+        return;
+    };
+
+    let mut pool = ctx.mme_ue_pool.write().unwrap();
+    let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
+        return;
+    };
+    mme_ue.resync_auts = None;
+
+    let aia = match answer {
+        Ok(aia) => aia,
+        Err(e) => {
+            log::error!("[{}] S6a AIR failed: {e}", mme_ue.imsi_bcd);
+            // TS 24.301 §5.5.1.2.5: the network could not authenticate the UE,
+            // so the attach is rejected rather than left outstanding.
+            if let Err(e) = crate::nas_path::nas_eps_send_attach_reject(
+                &enb_ue,
+                mme_ue,
+                EmmCause::NetworkFailure,
+                None,
+            ) {
+                log::error!("Attach Reject send failed: {e}");
+            }
+            return;
+        }
+    };
+
+    match crate::s6a_handler::mme_s6a_handle_aia(mme_ue, &aia) {
+        Ok(EmmCause::RequestAccepted) => {
+            log::info!("[{}] Authentication vector received", mme_ue.imsi_bcd);
+            if let Err(e) = crate::nas_path::nas_eps_send_authentication_request(mme_ue, &enb_ue) {
+                log::error!(
+                    "[{}] Authentication Request send failed: {e}",
+                    mme_ue.imsi_bcd
+                );
+            }
+        }
+        Ok(cause) => {
+            // The HSS refused: an unknown subscriber, a barred UE, a roaming
+            // restriction. The EMM cause it mapped to is what the UE is told.
+            log::warn!(
+                "[{}] HSS refused authentication: {cause:?}",
+                mme_ue.imsi_bcd
+            );
+            if let Err(e) =
+                crate::nas_path::nas_eps_send_attach_reject(&enb_ue, mme_ue, cause, None)
+            {
+                log::error!("Attach Reject send failed: {e}");
+            }
+        }
+        Err(e) => log::error!("[{}] AIA rejected: {e:?}", mme_ue.imsi_bcd),
+    }
+}
+
+// ============================================================================
 // Unit Tests
 // ============================================================================
 
