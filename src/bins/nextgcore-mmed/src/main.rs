@@ -7,6 +7,7 @@ use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+pub mod config;
 pub mod context;
 pub mod emm_build;
 pub mod emm_handler;
@@ -81,11 +82,21 @@ impl MmeApp {
     }
 
     /// Initialize the MME application
-    pub async fn init(&mut self, _config_path: &str) -> Result<()> {
+    pub async fn init(&mut self, config_path: &str) -> Result<()> {
         log::info!("Initializing MME...");
 
-        // Initialize MME context
-        context::mme_context_init();
+        // Initialize the MME context WITH the configuration file applied. This
+        // has to happen before anything else touches `mme_self()`, because the
+        // context is built configured rather than mutated afterwards (issue
+        // #157). Until this landed the path was ignored entirely, which left
+        // `served_gummei` empty and made the MME answer S1 Setup Failure to
+        // every eNB.
+        if !context::mme_context_init_with_config(config_path) {
+            log::warn!(
+                "MME context was already initialised; configuration from '{config_path}' was \
+                 not applied"
+            );
+        }
         log::debug!("MME context initialized");
 
         // Initialize MME state machine
@@ -110,7 +121,13 @@ impl MmeApp {
         // Without this nothing can reach the S1AP layer, so no eNB can
         // associate and no EPS procedure can run (issue #42).
         let ctx = context::mme_self();
-        let s1ap_bind = std::net::SocketAddr::from(([0, 0, 0, 0], ctx.s1ap_port));
+        // Bind where the configuration says, falling back to the wildcard so an
+        // unconfigured deployment behaves exactly as it did before #157.
+        let s1ap_bind = ctx
+            .s1ap_list
+            .first()
+            .copied()
+            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], ctx.s1ap_port)));
         let send_rx = s1ap_path::install_send_queue().ok_or_else(|| {
             anyhow::anyhow!("S1AP send queue already installed (MmeApp::init called twice)")
         })?;

@@ -37,6 +37,8 @@ tokio.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+serde = { workspace = true }
+serde_yaml = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true
