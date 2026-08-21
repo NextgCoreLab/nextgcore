@@ -68,6 +68,9 @@ pub struct MmeApp {
     mme_fsm: sm::MmeFsm,
     /// S1-MME transport (issue #42). `None` until [`MmeApp::init`] binds it.
     s1ap: Option<s1ap_path::S1apServer>,
+    /// Queued S6a requests from the synchronous NAS dispatch. `None` until
+    /// [`MmeApp::init`] installs the queue.
+    s6a_requests: Option<tokio::sync::mpsc::UnboundedReceiver<fd_path::PendingS6aRequest>>,
 }
 
 impl MmeApp {
@@ -78,6 +81,7 @@ impl MmeApp {
             gtp_state: gtp_path::GtpPathState::default(),
             mme_fsm: sm::MmeFsm::new(),
             s1ap: None,
+            s6a_requests: None,
         }
     }
 
@@ -116,6 +120,14 @@ impl MmeApp {
             return Err(anyhow::anyhow!("Diameter initialization failed: {e}"));
         }
         log::debug!("Diameter S6a interface initialized");
+
+        // Install the S6a pending-request queue before anything can enqueue on
+        // it: the NAS dispatch pushes AIR requests here from synchronous code,
+        // and `run` drains them (gap (c) of the S6a bring-up).
+        self.s6a_requests = fd_path::install_request_queue();
+        if self.s6a_requests.is_none() {
+            log::warn!("S6a request queue already installed; authentication requests will drop");
+        }
 
         // Connect the S6a peer. `mme_fd_connect` has had no caller since it was
         // written — its own comment defers it until "the async runtime is
@@ -239,6 +251,13 @@ impl MmeApp {
                     }
                 }
                 None => tokio::time::sleep(SHUTDOWN_CHECK).await,
+            }
+
+            // Run the S6a exchanges the NAS dispatch asked for. Each is a full
+            // request/answer with the HSS, which is why it belongs here rather
+            // than inside the synchronous dispatch that queued it.
+            if let Some(rx) = self.s6a_requests.as_mut() {
+                fd_path::poll_pending(ctx, rx).await;
             }
 
             // Retransmit or abort NAS procedures whose timer has run out

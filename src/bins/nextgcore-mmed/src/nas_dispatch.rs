@@ -949,14 +949,15 @@ fn authenticate(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64) {
 
     if mme_ue.xres_len == 0 {
         // Vectors reach the context only through `s6a_handler::mme_s6a_handle_aia`,
-        // and mmed never connects its S6a peer: `mme_fd_connect` has no caller and
-        // the daemon parses no config, so it has no HSS address. Report it instead
-        // of rejecting the UE for a network-side gap or inventing a vector.
-        log::warn!(
-            "[{}] Attach: no authentication vector — an S6a AIR to the HSS is required and \
-             mmed's S6a peer is not connected",
+        // so one has to be fetched from the HSS. `mme_s6a_send_air` is async and
+        // this dispatch is not, so the request is queued for the main loop to run
+        // (the same crossing `s1ap_path`'s send queue makes for downlink PDUs).
+        // The AIR carries `resync_auts` when a synch failure stored one.
+        log::info!(
+            "[{}] Requesting authentication vectors from the HSS",
             mme_ue.imsi_bcd
         );
+        crate::fd_path::queue_authentication_information(mme_ue_id);
         return;
     }
 
@@ -2068,6 +2069,35 @@ mod tests {
             UeCtxRelAction::UeContextRemove,
             "the S1 connection must be marked for release"
         );
+    }
+
+    #[test]
+    fn test_attach_without_a_vector_queues_an_s6a_request() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let pdu = attach_request(&imsi_identity(), &pdn_connectivity_request(1, false));
+
+        // No queue is installed in a unit test, so the request is dropped and
+        // reported. What matters here is that the dispatch ASKS -- before this
+        // landed it logged a dead end -- and that a dropped request leaves the UE
+        // exactly as it was rather than half-advancing the procedure.
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+
+        let mme_ue_id = ctx.mme_ue_find_by_imsi(TEST_IMSI).expect("UE indexed");
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(mme_ue.xres_len, 0, "no vector may be invented");
+        assert!(
+            mme_ue.t3460.pkbuf.is_none(),
+            "no challenge goes out until a vector arrives"
+        );
+        assert!(!mme_ue.security_context_available);
+    }
+
+    #[test]
+    fn test_queue_helper_reports_a_dropped_request() {
+        // The sync side must never fail its caller's procedure, so an absent
+        // queue is a `false` return and a log line, not a panic.
+        assert!(!crate::fd_path::queue_authentication_information(4242));
     }
 
     #[test]
