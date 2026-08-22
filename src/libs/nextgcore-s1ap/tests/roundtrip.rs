@@ -733,6 +733,7 @@ fn error_indication_roundtrip() {
         mme_ue_s1ap_id: Some(99),
         enb_ue_s1ap_id: None,
         cause: Some(Cause::Protocol(CauseProtocol::SemanticError)),
+        criticality_diagnostics: None,
     };
     let bytes = build_error_indication(&msg).unwrap();
     match decode_s1ap_pdu(&bytes).unwrap() {
@@ -1330,5 +1331,49 @@ proptest! {
             bytes[byte_index] ^= 1 << bit;
         }
         let _ = decode_s1ap_pdu(&bytes);
+    }
+}
+
+/// Criticality Diagnostics survives a round trip (TS 36.413 §9.2.1.21).
+///
+/// The IE had no encoder at all before, so an Error Indication could never say
+/// which procedure or which IEs a protocol error was about.
+#[test]
+fn error_indication_criticality_diagnostics_roundtrip() {
+    use nextgcore_s1ap::{
+        triggering_message, CriticalityDiagnostics, IeCriticalityDiagnostics, TypeOfError,
+    };
+
+    let diagnostics = CriticalityDiagnostics {
+        procedure_code: Some(9),
+        triggering_message: Some(triggering_message::INITIATING_MESSAGE),
+        procedure_criticality: Some(0),
+        ies: vec![
+            IeCriticalityDiagnostics {
+                ie_criticality: nextgcore_asn1c::s1ap::types::Criticality::Reject,
+                ie_id: 8,
+                type_of_error: TypeOfError::Missing,
+            },
+            IeCriticalityDiagnostics {
+                ie_criticality: nextgcore_asn1c::s1ap::types::Criticality::Ignore,
+                ie_id: 100,
+                type_of_error: TypeOfError::NotUnderstood,
+            },
+        ],
+    };
+
+    let bytes = build_error_indication(&ErrorIndication {
+        mme_ue_s1ap_id: Some(5),
+        enb_ue_s1ap_id: Some(6),
+        cause: Some(Cause::Protocol(CauseProtocol::AbstractSyntaxErrorReject)),
+        criticality_diagnostics: Some(diagnostics.clone()),
+    })
+    .unwrap();
+
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::ErrorIndication(decoded) => {
+            assert_eq!(decoded.criticality_diagnostics, Some(diagnostics));
+        }
+        other => panic!("expected ErrorIndication, got {other:?}"),
     }
 }

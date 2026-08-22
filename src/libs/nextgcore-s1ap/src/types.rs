@@ -352,6 +352,62 @@ pub struct ErrorIndication {
     pub enb_ue_s1ap_id: Option<u32>,
     /// Cause (optional)
     pub cause: Option<Cause>,
+    /// Criticality Diagnostics (optional, TS 36.413 §9.2.1.21)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// Which part of a received IE was wrong (TS 36.413 §9.2.1.21).
+///
+/// ASN.1: `TypeOfError ::= ENUMERATED { not-understood, missing, ... }`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeOfError {
+    /// The IE was present but could not be interpreted
+    NotUnderstood,
+    /// A mandatory IE was absent
+    Missing,
+}
+
+/// One offending IE inside [`CriticalityDiagnostics`].
+///
+/// ASN.1: `CriticalityDiagnostics-IE-Item ::= SEQUENCE { iECriticality,
+/// iE-ID, typeOfError, iE-Extensions OPTIONAL, ... }`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IeCriticalityDiagnostics {
+    /// Criticality the offending IE was received with
+    pub ie_criticality: nextgcore_asn1c::s1ap::types::Criticality,
+    /// Protocol IE id of the offending IE
+    pub ie_id: u16,
+    /// What was wrong with it
+    pub type_of_error: TypeOfError,
+}
+
+/// Criticality Diagnostics (TS 36.413 §9.2.1.21).
+///
+/// Tells the peer *which* procedure and *which* IEs a protocol error was about,
+/// so it can correct the message rather than only learning that something was
+/// rejected. Structurally identical to the NGAP IE of the same name
+/// (TS 38.413 §9.3.1.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CriticalityDiagnostics {
+    /// Procedure the error was detected in
+    pub procedure_code: Option<u8>,
+    /// Which message of that procedure (initiating/successful/unsuccessful)
+    pub triggering_message: Option<u8>,
+    /// Criticality the procedure was received with
+    pub procedure_criticality: Option<u8>,
+    /// The offending IEs; an empty list means the field is absent on the wire
+    pub ies: Vec<IeCriticalityDiagnostics>,
+}
+
+/// `TriggeringMessage ::= ENUMERATED { initiating-message, successful-outcome,
+/// unsuccessful-outcome }` (TS 36.413 §9.2.1.21).
+pub mod triggering_message {
+    /// initiating-message(0)
+    pub const INITIATING_MESSAGE: u8 = 0;
+    /// successful-outcome(1)
+    pub const SUCCESSFUL_OUTCOME: u8 = 1;
+    /// unsuccessful-outcome(2)
+    pub const UNSUCCESSFUL_OUTCOME: u8 = 2;
 }
 
 // ============================================================================

@@ -535,11 +535,13 @@ pub fn build_error_indication(
     mme_ue_s1ap_id: Option<u32>,
     cause_group: S1apCauseGroup,
     cause_value: i64,
+    criticality_diagnostics: Option<nextgcore_s1ap::CriticalityDiagnostics>,
 ) -> S1apResult<Vec<u8>> {
     builder::build_error_indication(&ErrorIndication {
         mme_ue_s1ap_id,
         enb_ue_s1ap_id,
         cause: Some(cause_to_s1ap(cause_group, cause_value)),
+        criticality_diagnostics,
     })
 }
 
@@ -894,6 +896,7 @@ mod tests {
             Some(42),
             S1apCauseGroup::Protocol,
             protocol_cause::SEMANTIC_ERROR,
+            None,
         )
         .unwrap();
         match decode_s1ap_pdu(&bytes).unwrap() {
