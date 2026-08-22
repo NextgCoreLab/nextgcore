@@ -53,6 +53,21 @@ pub enum S1apMessage {
     HandoverCancel(HandoverCancel),
     HandoverCancelAcknowledge(HandoverCancelAcknowledge),
     UeCapabilityInfoIndication(UeCapabilityInfoIndication),
+    EnbConfigurationUpdate(EnbConfigurationUpdate),
+    EnbConfigurationUpdateAcknowledge(EnbConfigurationUpdateAcknowledge),
+    EnbConfigurationUpdateFailure(EnbConfigurationUpdateFailure),
+    MmeConfigurationUpdate(MmeConfigurationUpdate),
+    MmeConfigurationUpdateAcknowledge(MmeConfigurationUpdateAcknowledge),
+    MmeConfigurationUpdateFailure(MmeConfigurationUpdateFailure),
+    UeContextModificationRequest(UeContextModificationRequest),
+    UeContextModificationResponse(UeContextModificationResponse),
+    UeContextModificationFailure(UeContextModificationFailure),
+    OverloadStart(OverloadStart),
+    OverloadStop(OverloadStop),
+    WriteReplaceWarningRequest(WriteReplaceWarningRequest),
+    WriteReplaceWarningResponse(WriteReplaceWarningResponse),
+    KillRequest(KillRequest),
+    KillResponse(KillResponse),
     /// Unknown/unsupported message
     Unknown {
         procedure_code: u8,
@@ -196,6 +211,21 @@ fn decode_initiating(
         ProcedureCode::UE_CAPABILITY_INFO_INDICATION => Ok(
             S1apMessage::UeCapabilityInfoIndication(parse_ue_capability_info_indication(ies)?),
         ),
+        ProcedureCode::ENB_CONFIGURATION_UPDATE => Ok(S1apMessage::EnbConfigurationUpdate(
+            parse_enb_configuration_update(ies)?,
+        )),
+        ProcedureCode::MME_CONFIGURATION_UPDATE => Ok(S1apMessage::MmeConfigurationUpdate(
+            parse_mme_configuration_update(ies)?,
+        )),
+        ProcedureCode::UE_CONTEXT_MODIFICATION => Ok(S1apMessage::UeContextModificationRequest(
+            parse_ue_context_modification_request(ies)?,
+        )),
+        ProcedureCode::OVERLOAD_START => Ok(S1apMessage::OverloadStart(parse_overload_start(ies)?)),
+        ProcedureCode::OVERLOAD_STOP => Ok(S1apMessage::OverloadStop(OverloadStop)),
+        ProcedureCode::WRITE_REPLACE_WARNING => Ok(S1apMessage::WriteReplaceWarningRequest(
+            parse_write_replace_warning_request(ies)?,
+        )),
+        ProcedureCode::KILL => Ok(S1apMessage::KillRequest(parse_kill_request(ies)?)),
         _ => Ok(S1apMessage::Unknown {
             procedure_code: procedure_code.0,
             message_type: "InitiatingMessage",
@@ -237,6 +267,23 @@ fn decode_successful(
         ProcedureCode::HANDOVER_CANCEL => Ok(S1apMessage::HandoverCancelAcknowledge(
             parse_handover_cancel_acknowledge(ies)?,
         )),
+        ProcedureCode::ENB_CONFIGURATION_UPDATE => Ok(
+            S1apMessage::EnbConfigurationUpdateAcknowledge(EnbConfigurationUpdateAcknowledge {
+                criticality_diagnostics: parse_criticality_diagnostics(&ies)?,
+            }),
+        ),
+        ProcedureCode::MME_CONFIGURATION_UPDATE => Ok(
+            S1apMessage::MmeConfigurationUpdateAcknowledge(MmeConfigurationUpdateAcknowledge {
+                criticality_diagnostics: parse_criticality_diagnostics(&ies)?,
+            }),
+        ),
+        ProcedureCode::UE_CONTEXT_MODIFICATION => Ok(S1apMessage::UeContextModificationResponse(
+            parse_ue_context_modification_response(ies)?,
+        )),
+        ProcedureCode::WRITE_REPLACE_WARNING => Ok(S1apMessage::WriteReplaceWarningResponse(
+            parse_write_replace_warning_response(ies)?,
+        )),
+        ProcedureCode::KILL => Ok(S1apMessage::KillResponse(parse_kill_response(ies)?)),
         _ => Ok(S1apMessage::Unknown {
             procedure_code: procedure_code.0,
             message_type: "SuccessfulOutcome",
@@ -261,6 +308,29 @@ fn decode_unsuccessful(
         }
         ProcedureCode::PATH_SWITCH_REQUEST => Ok(S1apMessage::PathSwitchRequestFailure(
             parse_path_switch_request_failure(ies)?,
+        )),
+        ProcedureCode::ENB_CONFIGURATION_UPDATE => {
+            let (cause, time_to_wait, criticality_diagnostics) = parse_config_update_failure(&ies)?;
+            Ok(S1apMessage::EnbConfigurationUpdateFailure(
+                EnbConfigurationUpdateFailure {
+                    cause,
+                    time_to_wait,
+                    criticality_diagnostics,
+                },
+            ))
+        }
+        ProcedureCode::MME_CONFIGURATION_UPDATE => {
+            let (cause, time_to_wait, criticality_diagnostics) = parse_config_update_failure(&ies)?;
+            Ok(S1apMessage::MmeConfigurationUpdateFailure(
+                MmeConfigurationUpdateFailure {
+                    cause,
+                    time_to_wait,
+                    criticality_diagnostics,
+                },
+            ))
+        }
+        ProcedureCode::UE_CONTEXT_MODIFICATION => Ok(S1apMessage::UeContextModificationFailure(
+            parse_ue_context_modification_failure(ies)?,
         )),
         _ => Ok(S1apMessage::Unknown {
             procedure_code: procedure_code.0,
@@ -1357,6 +1427,361 @@ fn parse_ue_capability_info_indication(
         enb_ue_s1ap_id: enb_ue_s1ap_id.ok_or(S1apError::MissingMandatoryIe("eNB-UE-S1AP-ID"))?,
         ue_radio_capability: ue_radio_capability
             .ok_or(S1apError::MissingMandatoryIe("UERadioCapability"))?,
+    })
+}
+
+// ============================================================================
+// Configuration Update parsers (§9.1.8.7-9.1.8.12)
+// ============================================================================
+
+fn parse_enb_configuration_update(
+    container: ProtocolIeContainer,
+) -> S1apResult<EnbConfigurationUpdate> {
+    let mut update = EnbConfigurationUpdate::default();
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::ENB_NAME => {
+                update.enb_name = Some(ie::decode_enb_name(field)?);
+            }
+            ProtocolIeId::SUPPORTED_TAS => {
+                update.supported_tas = Some(ie::decode_supported_tas(field)?);
+            }
+            ProtocolIeId::DEFAULT_PAGING_DRX => {
+                update.default_paging_drx = Some(ie::decode_default_paging_drx(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    // Every IE is optional, so an empty update is well-formed: it asks the MME
+    // to confirm the configuration it already holds (TS 36.413 §8.7.4.2).
+    Ok(update)
+}
+
+fn parse_mme_configuration_update(
+    container: ProtocolIeContainer,
+) -> S1apResult<MmeConfigurationUpdate> {
+    let mut update = MmeConfigurationUpdate::default();
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::MME_NAME => {
+                update.mme_name = Some(ie::decode_mme_name(field)?);
+            }
+            ProtocolIeId::SERVED_GUMMEIS => {
+                update.served_gummeis = Some(ie::decode_served_gummeis(field)?);
+            }
+            ProtocolIeId::RELATIVE_MME_CAPACITY => {
+                update.relative_mme_capacity = Some(ie::decode_relative_mme_capacity(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(update)
+}
+
+/// The `{ Cause M, TimeToWait O, CriticalityDiagnostics O }` shape shared by
+/// ENB and MME CONFIGURATION UPDATE FAILURE.
+fn parse_config_update_failure(
+    container: &ProtocolIeContainer,
+) -> S1apResult<(Cause, Option<TimeToWait>, Option<CriticalityDiagnostics>)> {
+    let mut cause = None;
+    let mut time_to_wait = None;
+    let mut criticality_diagnostics = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::CAUSE => {
+                cause = Some(ie::decode_cause(field)?);
+            }
+            ProtocolIeId::TIME_TO_WAIT => {
+                time_to_wait = Some(ie::decode_time_to_wait(field)?);
+            }
+            ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
+                criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok((
+        cause.ok_or(S1apError::MissingMandatoryIe("Cause"))?,
+        time_to_wait,
+        criticality_diagnostics,
+    ))
+}
+
+fn parse_criticality_diagnostics(
+    container: &ProtocolIeContainer,
+) -> S1apResult<Option<CriticalityDiagnostics>> {
+    for field in &container.ies {
+        if field.id == ProtocolIeId::CRITICALITY_DIAGNOSTICS {
+            return Ok(Some(ie::decode_criticality_diagnostics(field)?));
+        }
+    }
+    Ok(None)
+}
+
+// ============================================================================
+// UE Context Modification parsers (§9.1.4.8-9.1.4.10)
+// ============================================================================
+
+fn parse_ue_context_modification_request(
+    container: ProtocolIeContainer,
+) -> S1apResult<UeContextModificationRequest> {
+    let mut mme_ue_s1ap_id = None;
+    let mut enb_ue_s1ap_id = None;
+    let mut security_key = None;
+    let mut subscriber_profile_id_for_rfp = None;
+    let mut ue_ambr = None;
+    let mut cs_fallback_indicator = None;
+    let mut ue_security_capabilities = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::MME_UE_S1AP_ID => {
+                mme_ue_s1ap_id = Some(ie::decode_mme_ue_s1ap_id(field)?);
+            }
+            ProtocolIeId::ENB_UE_S1AP_ID => {
+                enb_ue_s1ap_id = Some(ie::decode_enb_ue_s1ap_id(field)?);
+            }
+            ProtocolIeId::SECURITY_KEY => {
+                security_key = Some(ie::decode_security_key(field)?);
+            }
+            ProtocolIeId::SUBSCRIBER_PROFILE_ID_FOR_RFP => {
+                subscriber_profile_id_for_rfp =
+                    Some(ie::decode_subscriber_profile_id_for_rfp(field)?);
+            }
+            ProtocolIeId::UE_AGGREGATE_MAXIMUM_BITRATE => {
+                ue_ambr = Some(ie::decode_ue_ambr(field)?);
+            }
+            ProtocolIeId::CS_FALLBACK_INDICATOR => {
+                cs_fallback_indicator = Some(ie::decode_cs_fallback_indicator(field)?);
+            }
+            ProtocolIeId::UE_SECURITY_CAPABILITIES => {
+                ue_security_capabilities = Some(ie::decode_ue_security_capabilities(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(UeContextModificationRequest {
+        mme_ue_s1ap_id: mme_ue_s1ap_id.ok_or(S1apError::MissingMandatoryIe("MME-UE-S1AP-ID"))?,
+        enb_ue_s1ap_id: enb_ue_s1ap_id.ok_or(S1apError::MissingMandatoryIe("eNB-UE-S1AP-ID"))?,
+        security_key,
+        subscriber_profile_id_for_rfp,
+        ue_ambr,
+        cs_fallback_indicator,
+        ue_security_capabilities,
+    })
+}
+
+fn parse_ue_context_modification_response(
+    container: ProtocolIeContainer,
+) -> S1apResult<UeContextModificationResponse> {
+    let (mme_ue_s1ap_id, enb_ue_s1ap_id) = parse_ue_id_pair(&container)?;
+    Ok(UeContextModificationResponse {
+        mme_ue_s1ap_id,
+        enb_ue_s1ap_id,
+        criticality_diagnostics: parse_criticality_diagnostics(&container)?,
+    })
+}
+
+fn parse_ue_context_modification_failure(
+    container: ProtocolIeContainer,
+) -> S1apResult<UeContextModificationFailure> {
+    let (mme_ue_s1ap_id, enb_ue_s1ap_id, cause) = parse_ids_and_cause(&container)?;
+    Ok(UeContextModificationFailure {
+        mme_ue_s1ap_id,
+        enb_ue_s1ap_id,
+        cause,
+        criticality_diagnostics: parse_criticality_diagnostics(&container)?,
+    })
+}
+
+// ============================================================================
+// Overload parsers (§9.1.8.13-9.1.8.14)
+// ============================================================================
+
+fn parse_overload_start(container: ProtocolIeContainer) -> S1apResult<OverloadStart> {
+    let mut overload_action = None;
+
+    for field in &container.ies {
+        if field.id == ProtocolIeId::OVERLOAD_RESPONSE {
+            overload_action = Some(ie::decode_overload_response(field)?);
+        }
+    }
+
+    Ok(OverloadStart {
+        overload_action: overload_action
+            .ok_or(S1apError::MissingMandatoryIe("OverloadResponse"))?,
+    })
+}
+
+// ============================================================================
+// PWS parsers (§9.1.13)
+// ============================================================================
+
+fn parse_write_replace_warning_request(
+    container: ProtocolIeContainer,
+) -> S1apResult<WriteReplaceWarningRequest> {
+    let mut message_identifier = None;
+    let mut serial_number = None;
+    let mut warning_area = None;
+    let mut repetition_period = None;
+    let mut number_of_broadcast_request = None;
+    let mut warning_type = None;
+    let mut warning_security_info = None;
+    let mut data_coding_scheme = None;
+    let mut warning_message_contents = None;
+    let mut concurrent_warning_message_indicator = false;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::MESSAGE_IDENTIFIER => {
+                message_identifier = Some(ie::decode_message_identifier(field)?);
+            }
+            ProtocolIeId::SERIAL_NUMBER => {
+                serial_number = Some(ie::decode_serial_number(field)?);
+            }
+            ProtocolIeId::WARNING_AREA_LIST => {
+                warning_area = Some(ie::decode_warning_area_list(field)?);
+            }
+            ProtocolIeId::REPETITION_PERIOD => {
+                repetition_period = Some(ie::decode_repetition_period(field)?);
+            }
+            ProtocolIeId::NUMBER_OF_BROADCAST_REQUEST => {
+                number_of_broadcast_request = Some(ie::decode_number_of_broadcast_request(field)?);
+            }
+            ProtocolIeId::WARNING_TYPE => {
+                warning_type = Some(ie::decode_warning_type(field)?);
+            }
+            ProtocolIeId::WARNING_SECURITY_INFO => {
+                warning_security_info = Some(ie::decode_warning_security_info(field)?);
+            }
+            ProtocolIeId::DATA_CODING_SCHEME => {
+                data_coding_scheme = Some(ie::decode_data_coding_scheme(field)?);
+            }
+            ProtocolIeId::WARNING_MESSAGE_CONTENTS => {
+                warning_message_contents = Some(ie::decode_warning_message_contents(field)?);
+            }
+            // ENUMERATED { true }: presence is the signal, the value has no bits.
+            ProtocolIeId::CONCURRENT_WARNING_MESSAGE_INDICATOR => {
+                concurrent_warning_message_indicator = true;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(WriteReplaceWarningRequest {
+        message_identifier: message_identifier
+            .ok_or(S1apError::MissingMandatoryIe("MessageIdentifier"))?,
+        serial_number: serial_number.ok_or(S1apError::MissingMandatoryIe("SerialNumber"))?,
+        warning_area,
+        repetition_period: repetition_period
+            .ok_or(S1apError::MissingMandatoryIe("RepetitionPeriod"))?,
+        number_of_broadcast_request: number_of_broadcast_request
+            .ok_or(S1apError::MissingMandatoryIe("NumberofBroadcastRequest"))?,
+        warning_type,
+        warning_security_info,
+        data_coding_scheme,
+        warning_message_contents,
+        concurrent_warning_message_indicator,
+    })
+}
+
+fn parse_write_replace_warning_response(
+    container: ProtocolIeContainer,
+) -> S1apResult<WriteReplaceWarningResponse> {
+    let mut message_identifier = None;
+    let mut serial_number = None;
+    let mut broadcast_completed_area = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::MESSAGE_IDENTIFIER => {
+                message_identifier = Some(ie::decode_message_identifier(field)?);
+            }
+            ProtocolIeId::SERIAL_NUMBER => {
+                serial_number = Some(ie::decode_serial_number(field)?);
+            }
+            ProtocolIeId::BROADCAST_COMPLETED_AREA_LIST => {
+                broadcast_completed_area = Some(ie::decode_broadcast_completed_area_list(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(WriteReplaceWarningResponse {
+        message_identifier: message_identifier
+            .ok_or(S1apError::MissingMandatoryIe("MessageIdentifier"))?,
+        serial_number: serial_number.ok_or(S1apError::MissingMandatoryIe("SerialNumber"))?,
+        broadcast_completed_area,
+        criticality_diagnostics: parse_criticality_diagnostics(&container)?,
+    })
+}
+
+fn parse_kill_request(container: ProtocolIeContainer) -> S1apResult<KillRequest> {
+    let mut message_identifier = None;
+    let mut serial_number = None;
+    let mut warning_area = None;
+    let mut kill_all_warning_messages = false;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::MESSAGE_IDENTIFIER => {
+                message_identifier = Some(ie::decode_message_identifier(field)?);
+            }
+            ProtocolIeId::SERIAL_NUMBER => {
+                serial_number = Some(ie::decode_serial_number(field)?);
+            }
+            ProtocolIeId::WARNING_AREA_LIST => {
+                warning_area = Some(ie::decode_warning_area_list(field)?);
+            }
+            ProtocolIeId::KILL_ALL_WARNING_MESSAGES => {
+                kill_all_warning_messages = true;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(KillRequest {
+        message_identifier: message_identifier
+            .ok_or(S1apError::MissingMandatoryIe("MessageIdentifier"))?,
+        serial_number: serial_number.ok_or(S1apError::MissingMandatoryIe("SerialNumber"))?,
+        warning_area,
+        kill_all_warning_messages,
+    })
+}
+
+fn parse_kill_response(container: ProtocolIeContainer) -> S1apResult<KillResponse> {
+    let mut message_identifier = None;
+    let mut serial_number = None;
+    let mut broadcast_cancelled_area = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::MESSAGE_IDENTIFIER => {
+                message_identifier = Some(ie::decode_message_identifier(field)?);
+            }
+            ProtocolIeId::SERIAL_NUMBER => {
+                serial_number = Some(ie::decode_serial_number(field)?);
+            }
+            ProtocolIeId::BROADCAST_CANCELLED_AREA_LIST => {
+                broadcast_cancelled_area = Some(ie::decode_broadcast_cancelled_area_list(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(KillResponse {
+        message_identifier: message_identifier
+            .ok_or(S1apError::MissingMandatoryIe("MessageIdentifier"))?,
+        serial_number: serial_number.ok_or(S1apError::MissingMandatoryIe("SerialNumber"))?,
+        broadcast_cancelled_area,
+        criticality_diagnostics: parse_criticality_diagnostics(&container)?,
     })
 }
 

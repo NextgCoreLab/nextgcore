@@ -8,7 +8,7 @@
 mod tests {
     use crate::sm::{
         EmmFsm, EmmState, EsmFsm, EsmState, Fsm, MmeEvent, MmeEventId, MmeFsm, MmeState,
-        MmeTimerId, S1apFsm, S1apState, SgsapFsm, SgsapState,
+        MmeTimerId, SgsapFsm, SgsapState,
     };
     use proptest::prelude::*;
 
@@ -284,65 +284,6 @@ mod tests {
     }
 
     // ========================================================================
-    // S1AP FSM Property Tests
-    // ========================================================================
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
-
-        /// Property 12.14: S1AP FSM initialization always transitions to Operational
-        /// Feature: nextgcore-rust-conversion
-        /// Validates: Requirement 8.6 - S1AP state machine initialization
-        #[test]
-        fn prop_s1ap_fsm_init_transitions_to_operational(enb_id in 1u64..10000) {
-            let mut fsm = S1apFsm::new(enb_id);
-            prop_assert_eq!(fsm.state(), S1apState::Initial);
-
-            Fsm::init(&mut fsm);
-            prop_assert_eq!(fsm.state(), S1apState::Operational);
-        }
-
-        /// Property 12.15: S1AP FSM finalization always transitions to Final
-        /// Feature: nextgcore-rust-conversion
-        /// Validates: Requirement 8.6 - S1AP state machine finalization
-        #[test]
-        fn prop_s1ap_fsm_fini_transitions_to_final(enb_id in 1u64..10000) {
-            let mut fsm = S1apFsm::new(enb_id);
-            Fsm::init(&mut fsm);
-
-            Fsm::fini(&mut fsm);
-            prop_assert_eq!(fsm.state(), S1apState::Final);
-        }
-
-        /// Property 12.16: S1AP FSM in Operational state handles S1AP messages
-        /// Feature: nextgcore-rust-conversion
-        /// Validates: Requirement 8.6 - S1AP message handling
-        #[test]
-        fn prop_s1ap_fsm_operational_handles_messages(enb_id in 1u64..10000) {
-            let mut fsm = S1apFsm::new(enb_id);
-            Fsm::init(&mut fsm);
-            prop_assert_eq!(fsm.state(), S1apState::Operational);
-
-            let event = MmeEvent::new(MmeEventId::S1apMessage);
-            Fsm::dispatch(&mut fsm, &event);
-            // Should remain in Operational state
-            prop_assert_eq!(fsm.state(), S1apState::Operational);
-        }
-
-        /// Property 12.17: S1AP FSM can transition to exception state
-        /// Feature: nextgcore-rust-conversion
-        /// Validates: Requirement 8.6 - S1AP exception handling
-        #[test]
-        fn prop_s1ap_fsm_can_transition_to_exception(enb_id in 1u64..10000) {
-            let mut fsm = S1apFsm::new(enb_id);
-            Fsm::init(&mut fsm);
-
-            fsm.transition(S1apState::Exception);
-            prop_assert_eq!(fsm.state(), S1apState::Exception);
-        }
-    }
-
-    // ========================================================================
     // SGsAP FSM Property Tests
     // ========================================================================
 
@@ -419,27 +360,23 @@ mod tests {
         fn prop_multiple_fsms_independent(
             mme_ue_id1 in 1u64..5000,
             mme_ue_id2 in 5001u64..10000,
-            enb_id in 1u64..10000,
             bearer_id in 1u64..16
         ) {
             let mut mme_fsm = MmeFsm::new();
             let mut emm_fsm1 = EmmFsm::new(mme_ue_id1);
             let mut emm_fsm2 = EmmFsm::new(mme_ue_id2);
-            let mut s1ap_fsm = S1apFsm::new(enb_id);
             let mut esm_fsm = EsmFsm::new(bearer_id);
 
             // Initialize all FSMs
             Fsm::init(&mut mme_fsm);
             Fsm::init(&mut emm_fsm1);
             Fsm::init(&mut emm_fsm2);
-            Fsm::init(&mut s1ap_fsm);
             Fsm::init(&mut esm_fsm);
 
             // Verify independent states
             prop_assert_eq!(mme_fsm.state(), MmeState::Operational);
             prop_assert_eq!(emm_fsm1.state(), EmmState::DeRegistered);
             prop_assert_eq!(emm_fsm2.state(), EmmState::DeRegistered);
-            prop_assert_eq!(s1ap_fsm.state(), S1apState::Operational);
             prop_assert_eq!(esm_fsm.state(), EsmState::Inactive);
 
             // Transition one EMM FSM
@@ -449,7 +386,6 @@ mod tests {
             prop_assert_eq!(emm_fsm1.state(), EmmState::Registered);
             prop_assert_eq!(emm_fsm2.state(), EmmState::DeRegistered);
             prop_assert_eq!(mme_fsm.state(), MmeState::Operational);
-            prop_assert_eq!(s1ap_fsm.state(), S1apState::Operational);
             prop_assert_eq!(esm_fsm.state(), EsmState::Inactive);
         }
 

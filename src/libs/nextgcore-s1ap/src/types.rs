@@ -590,6 +590,339 @@ pub struct HandoverCancelAcknowledge {
 }
 
 // ============================================================================
+// Configuration Update (TS 36.413 §9.1.8.7-9.1.8.12)
+// ============================================================================
+
+/// eNB Configuration Update - sent by eNB to MME.
+///
+/// Every IE is optional (TS 36.413 §9.1.8.7): an update may carry only a new
+/// eNB name, only a new TA list, or any combination. `supported_tas` being
+/// `None` therefore means "unchanged", not "empty" — erasing the MME's TA list
+/// for an update that never mentioned it would drop the eNB's served areas.
+#[derive(Debug, Clone, Default)]
+pub struct EnbConfigurationUpdate {
+    /// eNB Name (optional)
+    pub enb_name: Option<String>,
+    /// Supported TAs List (optional; `None` = unchanged)
+    pub supported_tas: Option<Vec<SupportedTaItem>>,
+    /// Default Paging DRX (optional)
+    pub default_paging_drx: Option<PagingDrx>,
+}
+
+/// eNB Configuration Update Acknowledge - sent by MME to eNB
+#[derive(Debug, Clone, Default)]
+pub struct EnbConfigurationUpdateAcknowledge {
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// eNB Configuration Update Failure - sent by MME to eNB
+#[derive(Debug, Clone)]
+pub struct EnbConfigurationUpdateFailure {
+    /// Cause
+    pub cause: Cause,
+    /// Time to wait (optional)
+    pub time_to_wait: Option<TimeToWait>,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// MME Configuration Update - sent by MME to eNB.
+///
+/// All IEs optional (TS 36.413 §9.1.8.10), same "absent = unchanged" reading as
+/// [`EnbConfigurationUpdate`].
+#[derive(Debug, Clone, Default)]
+pub struct MmeConfigurationUpdate {
+    /// MME Name (optional)
+    pub mme_name: Option<String>,
+    /// Served GUMMEIs (optional; `None` = unchanged)
+    pub served_gummeis: Option<Vec<ServedGummeiItem>>,
+    /// Relative MME Capacity (optional)
+    pub relative_mme_capacity: Option<u8>,
+}
+
+/// MME Configuration Update Acknowledge - sent by eNB to MME
+#[derive(Debug, Clone, Default)]
+pub struct MmeConfigurationUpdateAcknowledge {
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// MME Configuration Update Failure - sent by eNB to MME
+#[derive(Debug, Clone)]
+pub struct MmeConfigurationUpdateFailure {
+    /// Cause
+    pub cause: Cause,
+    /// Time to wait (optional)
+    pub time_to_wait: Option<TimeToWait>,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+// ============================================================================
+// UE Context Modification (TS 36.413 §9.1.4.8-9.1.4.10)
+// ============================================================================
+
+/// UE Context Modification Request - sent by MME to eNB.
+///
+/// Carries whichever of the UE's parameters changed: a fresh `KeNB` for
+/// out-of-handover rekeying, a new UE-AMBR, or the CS Fallback Indicator that
+/// triggers MT CSFB (TS 23.272).
+#[derive(Debug, Clone)]
+pub struct UeContextModificationRequest {
+    /// MME UE S1AP ID
+    pub mme_ue_s1ap_id: u32,
+    /// eNB UE S1AP ID
+    pub enb_ue_s1ap_id: u32,
+    /// Security Key (256 bits, optional - KeNB rekeying)
+    pub security_key: Option<[u8; 32]>,
+    /// Subscriber Profile ID for RAT/Frequency priority (1..256, optional)
+    pub subscriber_profile_id_for_rfp: Option<u16>,
+    /// UE Aggregate Maximum Bit Rate (optional)
+    pub ue_ambr: Option<UeAmbr>,
+    /// CS Fallback Indicator (optional)
+    pub cs_fallback_indicator: Option<CsFallbackIndicator>,
+    /// UE Security Capabilities (optional)
+    pub ue_security_capabilities: Option<UeSecurityCapabilities>,
+}
+
+/// UE Context Modification Response - sent by eNB to MME
+#[derive(Debug, Clone)]
+pub struct UeContextModificationResponse {
+    /// MME UE S1AP ID
+    pub mme_ue_s1ap_id: u32,
+    /// eNB UE S1AP ID
+    pub enb_ue_s1ap_id: u32,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// UE Context Modification Failure - sent by eNB to MME
+#[derive(Debug, Clone)]
+pub struct UeContextModificationFailure {
+    /// MME UE S1AP ID
+    pub mme_ue_s1ap_id: u32,
+    /// eNB UE S1AP ID
+    pub enb_ue_s1ap_id: u32,
+    /// Cause
+    pub cause: Cause,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// CS Fallback Indicator (TS 36.413 §9.2.3.21).
+///
+/// ASN.1: `CSFallbackIndicator ::= ENUMERATED { cs-fallback-required, ...,
+/// cs-fallback-high-priority }` — one root value plus one extension addition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsFallbackIndicator {
+    /// cs-fallback-required (root value 0)
+    CsFallbackRequired,
+    /// cs-fallback-high-priority (extension addition)
+    CsFallbackHighPriority,
+}
+
+// ============================================================================
+// Overload Start / Stop (TS 36.413 §9.1.8.13-9.1.8.14)
+// ============================================================================
+
+/// Overload Start - sent by MME to eNB
+#[derive(Debug, Clone)]
+pub struct OverloadStart {
+    /// Overload Response: the action the eNB is asked to take
+    pub overload_action: OverloadAction,
+}
+
+/// Overload Stop - sent by MME to eNB.
+///
+/// Carries no mandatory IE (TS 36.413 §9.1.8.14); an empty IE container is a
+/// conformant Overload Stop.
+#[derive(Debug, Clone, Default)]
+pub struct OverloadStop;
+
+/// Overload Action (TS 36.413 §9.2.1.32).
+///
+/// ASN.1: `OverloadAction ::= ENUMERATED { reject-non-emergency-mo-dt,
+/// reject-rrc-cr-signalling,
+/// permit-emergency-sessions-and-mobile-terminated-services-only, ...,
+/// permit-high-priority-sessions-and-mobile-terminated-services-only,
+/// reject-delay-tolerant-access,
+/// permit-high-priority-sessions-and-exception-reporting-and-mobile-terminated-services-only,
+/// not-accept-mo-data-or-delay-tolerant-access-from-CP-CIoT }` — three root
+/// values then four extension additions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OverloadAction {
+    RejectNonEmergencyMoDt = 0,
+    RejectRrcCrSignalling = 1,
+    PermitEmergencySessionsAndMtOnly = 2,
+    PermitHighPrioritySessionsAndMtOnly = 3,
+    RejectDelayTolerantAccess = 4,
+    PermitHighPrioritySessionsAndExceptionReportingAndMtOnly = 5,
+    NotAcceptMoDataOrDelayTolerantAccessFromCpCiot = 6,
+}
+
+// ============================================================================
+// PWS: Write-Replace Warning / Kill (TS 36.413 §9.1.13)
+// ============================================================================
+
+/// Write-Replace Warning Request - sent by MME to eNB (TS 36.413 §9.1.13.1).
+///
+/// The ETWS/CMAS broadcast request. `warning_area` absent means every cell the
+/// eNB serves (TS 23.041).
+#[derive(Debug, Clone)]
+pub struct WriteReplaceWarningRequest {
+    /// Message Identifier (16 bits, TS 23.041)
+    pub message_identifier: u16,
+    /// Serial Number (16 bits)
+    pub serial_number: u16,
+    /// Warning Area List (optional; absent = all cells)
+    pub warning_area: Option<WarningAreaList>,
+    /// Repetition Period in seconds (0..4095)
+    pub repetition_period: u16,
+    /// Number of Broadcasts Requested (0..65535; 0 = until stopped)
+    pub number_of_broadcast_request: u16,
+    /// Warning Type (2 octets, ETWS only)
+    pub warning_type: Option<[u8; 2]>,
+    /// Warning Security Information (50 octets, ETWS only)
+    pub warning_security_info: Option<[u8; 50]>,
+    /// Data Coding Scheme (8 bits, TS 23.038)
+    pub data_coding_scheme: Option<u8>,
+    /// Warning Message Contents (1..9600 octets)
+    pub warning_message_contents: Option<Vec<u8>>,
+    /// Concurrent Warning Message Indicator (optional; ENUMERATED {true})
+    pub concurrent_warning_message_indicator: bool,
+}
+
+/// Write-Replace Warning Response - sent by eNB to MME (TS 36.413 §9.1.13.2)
+#[derive(Debug, Clone)]
+pub struct WriteReplaceWarningResponse {
+    /// Message Identifier
+    pub message_identifier: u16,
+    /// Serial Number
+    pub serial_number: u16,
+    /// Broadcast Completed Area List (optional): where the warning actually went
+    pub broadcast_completed_area: Option<BroadcastCompletedAreaList>,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// Kill Request - sent by MME to eNB (TS 36.413 §9.1.13.3)
+#[derive(Debug, Clone)]
+pub struct KillRequest {
+    /// Message Identifier
+    pub message_identifier: u16,
+    /// Serial Number
+    pub serial_number: u16,
+    /// Warning Area List (optional; absent = all cells)
+    pub warning_area: Option<WarningAreaList>,
+    /// Kill All Warning Messages (optional; ENUMERATED {true})
+    pub kill_all_warning_messages: bool,
+}
+
+/// Kill Response - sent by eNB to MME (TS 36.413 §9.1.13.4)
+#[derive(Debug, Clone)]
+pub struct KillResponse {
+    /// Message Identifier
+    pub message_identifier: u16,
+    /// Serial Number
+    pub serial_number: u16,
+    /// Broadcast Cancelled Area List (optional)
+    pub broadcast_cancelled_area: Option<BroadcastCancelledAreaList>,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// Warning Area List (TS 36.413 §9.2.1.46).
+///
+/// ASN.1: `WarningAreaList ::= CHOICE { cellIDList ECGIList,
+/// trackingAreaListforWarning TAIListforWarning,
+/// emergencyAreaIDList EmergencyAreaIDList, ... }`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WarningAreaList {
+    /// Per-cell list
+    CellIdList(Vec<EutranCgi>),
+    /// Per-tracking-area list
+    TrackingAreaListForWarning(Vec<Tai>),
+    /// Per-emergency-area list (3-octet Emergency Area IDs)
+    EmergencyAreaIdList(Vec<[u8; 3]>),
+}
+
+/// Broadcast Completed Area List (TS 36.413 §9.2.1.47).
+///
+/// ASN.1: `CHOICE { cellID-Broadcast, tAI-Broadcast, emergencyAreaID-Broadcast,
+/// ... }`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastCompletedAreaList {
+    /// The cells that broadcast the warning
+    CellIdBroadcast(Vec<EutranCgi>),
+    /// The tracking areas that broadcast it, with the cells reached in each
+    TaiBroadcast(Vec<TaiBroadcastItem>),
+    /// The emergency areas that broadcast it, with the cells reached in each
+    EmergencyAreaIdBroadcast(Vec<EmergencyAreaIdBroadcastItem>),
+}
+
+/// One `TAI-Broadcast-Item`: a TAI plus the cells in it that broadcast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaiBroadcastItem {
+    /// The tracking area
+    pub tai: Tai,
+    /// `CompletedCellinTAI`: the cells in that TAI which broadcast
+    pub completed_cells: Vec<EutranCgi>,
+}
+
+/// One `EmergencyAreaID-Broadcast-Item`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmergencyAreaIdBroadcastItem {
+    /// Emergency Area ID (3 octets)
+    pub emergency_area_id: [u8; 3],
+    /// `CompletedCellinEAI`: the cells in that area which broadcast
+    pub completed_cells: Vec<EutranCgi>,
+}
+
+/// Broadcast Cancelled Area List (TS 36.413 §9.2.1.48).
+///
+/// The cancelled forms differ from the completed ones by carrying
+/// `numberOfBroadcasts` — how many times the warning had already gone out
+/// before it was killed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastCancelledAreaList {
+    /// Per-cell, with the broadcast count for each
+    CellIdCancelled(Vec<CellIdCancelledItem>),
+    /// Per-TAI, with the cancelled cells in each
+    TaiCancelled(Vec<TaiCancelledItem>),
+    /// Per-emergency-area, with the cancelled cells in each
+    EmergencyAreaIdCancelled(Vec<EmergencyAreaIdCancelledItem>),
+}
+
+/// One `CellID-Cancelled-Item`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellIdCancelledItem {
+    /// The cell
+    pub ecgi: EutranCgi,
+    /// How many times it had broadcast (`NumberOfBroadcasts`, 0..65535)
+    pub number_of_broadcasts: u16,
+}
+
+/// One `TAI-Cancelled-Item`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaiCancelledItem {
+    /// The tracking area
+    pub tai: Tai,
+    /// `CancelledCellinTAI`: the cells in it, with their broadcast counts
+    pub cancelled_cells: Vec<CellIdCancelledItem>,
+}
+
+/// One `EmergencyAreaID-Cancelled-Item`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmergencyAreaIdCancelledItem {
+    /// Emergency Area ID (3 octets)
+    pub emergency_area_id: [u8; 3],
+    /// `CancelledCellinEAI`: the cells in it, with their broadcast counts
+    pub cancelled_cells: Vec<CellIdCancelledItem>,
+}
+
+// ============================================================================
 // UE Capability Info Indication (TS 36.413 §9.1.10)
 // ============================================================================
 

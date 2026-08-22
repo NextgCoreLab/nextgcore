@@ -32,6 +32,22 @@ const RESET_ALL_CONSTRAINT: Constraint = Constraint::extensible(0, 0);
 const NEXT_HOP_CHAINING_COUNT_CONSTRAINT: Constraint = Constraint::new(0, 7);
 const RNC_ID_CONSTRAINT: Constraint = Constraint::new(0, 4095);
 const EXTENDED_RNC_ID_CONSTRAINT: Constraint = Constraint::new(4096, 65535);
+/// `CSFallbackIndicator ::= ENUMERATED { cs-fallback-required, ...,
+/// cs-fallback-high-priority }`: one root value, one extension addition.
+const CS_FALLBACK_INDICATOR_CONSTRAINT: Constraint = Constraint::extensible(0, 0);
+/// `OverloadAction ::= ENUMERATED { .. 3 root values .., ..., 4 additions }`
+const OVERLOAD_ACTION_CONSTRAINT: Constraint = Constraint::extensible(0, 2);
+/// `SubscriberProfileIDforRFP ::= INTEGER (1..256)`
+const SUBSCRIBER_PROFILE_ID_CONSTRAINT: Constraint = Constraint::new(1, 256);
+/// `RepetitionPeriod ::= INTEGER (0..4095)`
+const REPETITION_PERIOD_CONSTRAINT: Constraint = Constraint::new(0, 4095);
+/// `NumberofBroadcastRequest ::= INTEGER (0..65535)` and
+/// `NumberOfBroadcasts ::= INTEGER (0..65535)`
+const NUMBER_OF_BROADCASTS_CONSTRAINT: Constraint = Constraint::new(0, 65535);
+/// `KillAllWarningMessages ::= ENUMERATED { true }` and
+/// `ConcurrentWarningMessageIndicator ::= ENUMERATED { true }`: single value,
+/// not extensible, so zero bits on the wire.
+const SINGLE_VALUE_ENUM_CONSTRAINT: Constraint = Constraint::new(0, 0);
 
 const MAX_NO_OF_ERABS: usize = 256;
 const MAX_NO_OF_TAIS: usize = 256;
@@ -42,6 +58,17 @@ const MAX_NO_OF_PLMNS_PER_MME: usize = 32;
 const MAX_NO_OF_GROUP_IDS: usize = 65535;
 const MAX_NO_OF_MMECS: usize = 256;
 const MAX_NO_OF_INDIVIDUAL_S1_CONNECTIONS_TO_RESET: usize = 256;
+/// `maxnoofCellID`, `maxnoofTAIforWarning`, `maxnoofEmergencyAreaID`,
+/// `maxnoofCellinTAI` and `maxnoofCellinEAI` are all 65535 (TS 36.413 §9.4).
+/// The PWS area lists are bounded far above the 256 that bounds every E-RAB
+/// list, which is why they cannot reuse the E-RAB list helpers.
+const MAX_NO_OF_WARNING_AREAS: usize = 65535;
+/// `WarningSecurityInfo ::= OCTET STRING (SIZE (50))`
+const WARNING_SECURITY_INFO_LEN: usize = 50;
+/// `WarningMessageContents ::= OCTET STRING (SIZE(1..9600))`
+const MAX_WARNING_MESSAGE_CONTENTS: usize = 9600;
+/// `EmergencyAreaID ::= OCTET STRING (SIZE (3))`
+const EMERGENCY_AREA_ID_LEN: usize = 3;
 
 // ============================================================================
 // Generic helpers
@@ -174,13 +201,18 @@ fn decode_seq_trailer(decoder: &mut AperDecoder, ext: bool, ie_extensions: bool)
     Ok(())
 }
 
-/// Encode a SEQUENCE OF ProtocolIE-SingleContainer list into an IE
-fn push_single_container_list<T, F>(
+/// Encode a SEQUENCE OF ProtocolIE-SingleContainer list into an IE, with an
+/// explicit upper bound on the list size.
+///
+/// The bound is part of the wire format (it sizes the length determinant), so it
+/// must be the `maxnoof…` value from the IE's own ASN.1 — not a shared default.
+fn push_single_container_list_bounded<T, F>(
     container: &mut ProtocolIeContainer,
     list_id: ProtocolIeId,
     list_criticality: Criticality,
     item_id: ProtocolIeId,
     item_criticality: Criticality,
+    max_items: usize,
     items: &[T],
     mut encode_item: F,
 ) -> S1apResult<()>
@@ -188,7 +220,7 @@ where
     F: FnMut(&mut AperEncoder, &T) -> S1apResult<()>,
 {
     push_ie(container, list_id, list_criticality, |encoder| {
-        encoder.encode_constrained_length(items.len(), 1, MAX_NO_OF_ERABS)?;
+        encoder.encode_constrained_length(items.len(), 1, max_items)?;
         for item in items {
             let mut item_encoder = AperEncoder::new();
             encode_item(&mut item_encoder, item)?;
@@ -203,18 +235,51 @@ where
     })
 }
 
-/// Decode a SEQUENCE OF ProtocolIE-SingleContainer list from an IE field
-fn decode_single_container_list<T, F>(
+/// Encode an E-RAB-shaped SEQUENCE OF ProtocolIE-SingleContainer list.
+///
+/// Every E-RAB list in TS 36.413 is bounded by `maxnoofE-RABs` (256).
+fn push_single_container_list<T, F>(
+    container: &mut ProtocolIeContainer,
+    list_id: ProtocolIeId,
+    list_criticality: Criticality,
+    item_id: ProtocolIeId,
+    item_criticality: Criticality,
+    items: &[T],
+    encode_item: F,
+) -> S1apResult<()>
+where
+    F: FnMut(&mut AperEncoder, &T) -> S1apResult<()>,
+{
+    push_single_container_list_bounded(
+        container,
+        list_id,
+        list_criticality,
+        item_id,
+        item_criticality,
+        MAX_NO_OF_ERABS,
+        items,
+        encode_item,
+    )
+}
+
+/// Decode a SEQUENCE OF ProtocolIE-SingleContainer list from an IE field, with
+/// an explicit upper bound on the list size (see
+/// [`push_single_container_list_bounded`]).
+fn decode_single_container_list_bounded<T, F>(
     field: &ProtocolIeField,
     expected_item_id: ProtocolIeId,
+    max_items: usize,
     mut decode_item: F,
 ) -> S1apResult<Vec<T>>
 where
     F: FnMut(&mut AperDecoder) -> S1apResult<T>,
 {
     let mut decoder = AperDecoder::new(&field.value);
-    let count = decoder.decode_constrained_length(1, MAX_NO_OF_ERABS)?;
-    let mut items = Vec::with_capacity(count);
+    let count = decoder.decode_constrained_length(1, max_items)?;
+    // Reserve for the decoded count but never more than a plausible batch: a
+    // peer-supplied length of 65535 must not turn into a 65535-element
+    // allocation before a single item has been read.
+    let mut items = Vec::with_capacity(count.min(MAX_NO_OF_ERABS));
     for _ in 0..count {
         let item_field = ProtocolIeField::decode_aper(&mut decoder)?;
         if item_field.id != expected_item_id {
@@ -227,6 +292,18 @@ where
         items.push(decode_item(&mut item_decoder)?);
     }
     Ok(items)
+}
+
+/// Decode an E-RAB-shaped SEQUENCE OF ProtocolIE-SingleContainer list.
+fn decode_single_container_list<T, F>(
+    field: &ProtocolIeField,
+    expected_item_id: ProtocolIeId,
+    decode_item: F,
+) -> S1apResult<Vec<T>>
+where
+    F: FnMut(&mut AperDecoder) -> S1apResult<T>,
+{
+    decode_single_container_list_bounded(field, expected_item_id, MAX_NO_OF_ERABS, decode_item)
 }
 
 // ============================================================================
@@ -1523,11 +1600,20 @@ pub fn decode_s_tmsi(field: &ProtocolIeField) -> S1apResult<STmsi> {
 // Context setup / security IEs
 // ============================================================================
 
-pub fn encode_ue_ambr(container: &mut ProtocolIeContainer, ambr: &UeAmbr) -> S1apResult<()> {
+/// Encode the UE Aggregate Maximum Bitrate IE.
+///
+/// The criticality is per-message, not per-IE: TS 36.413 gives it `reject` in
+/// Initial Context Setup / E-RAB / Handover Request, but `ignore` in UE Context
+/// Modification Request (§9.1.4.8).
+pub fn encode_ue_ambr(
+    container: &mut ProtocolIeContainer,
+    ambr: &UeAmbr,
+    criticality: Criticality,
+) -> S1apResult<()> {
     push_ie(
         container,
         ProtocolIeId::UE_AGGREGATE_MAXIMUM_BITRATE,
-        Criticality::Reject,
+        criticality,
         |encoder| {
             // UEAggregateMaximumBitrate ::= SEQUENCE { dL, uL, iE-Ext OPTIONAL, ... }
             encode_seq_preamble(encoder, &[false]);
@@ -2533,4 +2619,700 @@ pub fn decode_erab_data_forwarding_list(
         ProtocolIeId::E_RAB_DATA_FORWARDING_ITEM,
         decode_erab_data_forwarding_item,
     )
+}
+
+// ============================================================================
+// UE Context Modification IEs (§9.1.4.8)
+// ============================================================================
+
+/// CS Fallback Indicator (TS 36.413 §9.2.3.21).
+///
+/// `cs-fallback-high-priority` is an extension addition, so it is encoded as
+/// extension index 0 rather than root value 1 — which
+/// [`AperEncoder::encode_enumerated`] does for us given an extensible
+/// constraint whose root is `0..=0`.
+pub fn encode_cs_fallback_indicator(
+    container: &mut ProtocolIeContainer,
+    indicator: CsFallbackIndicator,
+) -> S1apResult<()> {
+    let value = match indicator {
+        CsFallbackIndicator::CsFallbackRequired => 0,
+        CsFallbackIndicator::CsFallbackHighPriority => 1,
+    };
+    push_ie(
+        container,
+        ProtocolIeId::CS_FALLBACK_INDICATOR,
+        Criticality::Reject,
+        |encoder| {
+            encoder.encode_enumerated(value, &CS_FALLBACK_INDICATOR_CONSTRAINT)?;
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_cs_fallback_indicator(field: &ProtocolIeField) -> S1apResult<CsFallbackIndicator> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let value = decoder.decode_enumerated(&CS_FALLBACK_INDICATOR_CONSTRAINT)?;
+    match value {
+        0 => Ok(CsFallbackIndicator::CsFallbackRequired),
+        1 => Ok(CsFallbackIndicator::CsFallbackHighPriority),
+        other => Err(S1apError::InvalidIeValue {
+            ie_name: "CSFallbackIndicator",
+            reason: format!("unknown value {other}"),
+        }),
+    }
+}
+
+/// Subscriber Profile ID for RAT/Frequency priority
+/// (`INTEGER (1..256)`, TS 36.413 §9.2.1.39).
+pub fn encode_subscriber_profile_id_for_rfp(
+    container: &mut ProtocolIeContainer,
+    id: u16,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::SUBSCRIBER_PROFILE_ID_FOR_RFP,
+        Criticality::Ignore,
+        |encoder| {
+            encoder
+                .encode_constrained_whole_number(id as i64, &SUBSCRIBER_PROFILE_ID_CONSTRAINT)?;
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_subscriber_profile_id_for_rfp(field: &ProtocolIeField) -> S1apResult<u16> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.decode_constrained_whole_number(&SUBSCRIBER_PROFILE_ID_CONSTRAINT)? as u16)
+}
+
+// ============================================================================
+// Overload IEs (§9.2.1.32)
+// ============================================================================
+
+/// Overload Response: `CHOICE { overloadAction OverloadAction, ... }`.
+pub fn encode_overload_response(
+    container: &mut ProtocolIeContainer,
+    action: OverloadAction,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::OVERLOAD_RESPONSE,
+        Criticality::Reject,
+        |encoder| {
+            encoder.encode_choice_index(0, 1, true)?;
+            encoder.encode_enumerated(action as i64, &OVERLOAD_ACTION_CONSTRAINT)?;
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_overload_response(field: &ProtocolIeField) -> S1apResult<OverloadAction> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let index = decoder.decode_choice_index(1, true)?;
+    if index != 0 {
+        return Err(S1apError::InvalidIeValue {
+            ie_name: "OverloadResponse",
+            reason: format!("unsupported choice index {index}"),
+        });
+    }
+    let value = decoder.decode_enumerated(&OVERLOAD_ACTION_CONSTRAINT)?;
+    match value {
+        0 => Ok(OverloadAction::RejectNonEmergencyMoDt),
+        1 => Ok(OverloadAction::RejectRrcCrSignalling),
+        2 => Ok(OverloadAction::PermitEmergencySessionsAndMtOnly),
+        3 => Ok(OverloadAction::PermitHighPrioritySessionsAndMtOnly),
+        4 => Ok(OverloadAction::RejectDelayTolerantAccess),
+        5 => Ok(OverloadAction::PermitHighPrioritySessionsAndExceptionReportingAndMtOnly),
+        6 => Ok(OverloadAction::NotAcceptMoDataOrDelayTolerantAccessFromCpCiot),
+        other => Err(S1apError::InvalidIeValue {
+            ie_name: "OverloadAction",
+            reason: format!("unknown value {other}"),
+        }),
+    }
+}
+
+// ============================================================================
+// PWS IEs (§9.2.1.44-9.2.1.48, TS 23.041)
+// ============================================================================
+
+/// Write a fixed 16-bit BIT STRING. Not octet-aligned: X.691 §15.6 aligns only
+/// fixed-length bit strings *longer* than 16 bits.
+fn encode_bit_string_16(encoder: &mut AperEncoder, value: u16) {
+    encoder.write_bits(value as u64, 16);
+}
+
+fn decode_bit_string_16(decoder: &mut AperDecoder) -> S1apResult<u16> {
+    Ok(decoder.read_bits(16)? as u16)
+}
+
+/// Message Identifier: `BIT STRING (SIZE (16))` (TS 23.041 warning type/source).
+pub fn encode_message_identifier(
+    container: &mut ProtocolIeContainer,
+    message_identifier: u16,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::MESSAGE_IDENTIFIER,
+        Criticality::Reject,
+        |encoder| {
+            encode_bit_string_16(encoder, message_identifier);
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_message_identifier(field: &ProtocolIeField) -> S1apResult<u16> {
+    let mut decoder = AperDecoder::new(&field.value);
+    decode_bit_string_16(&mut decoder)
+}
+
+/// Serial Number: `BIT STRING (SIZE (16))`.
+pub fn encode_serial_number(
+    container: &mut ProtocolIeContainer,
+    serial_number: u16,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::SERIAL_NUMBER,
+        Criticality::Reject,
+        |encoder| {
+            encode_bit_string_16(encoder, serial_number);
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_serial_number(field: &ProtocolIeField) -> S1apResult<u16> {
+    let mut decoder = AperDecoder::new(&field.value);
+    decode_bit_string_16(&mut decoder)
+}
+
+/// Repetition Period: `INTEGER (0..4095)`, in seconds.
+pub fn encode_repetition_period(
+    container: &mut ProtocolIeContainer,
+    period: u16,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::REPETITION_PERIOD,
+        Criticality::Reject,
+        |encoder| {
+            encoder
+                .encode_constrained_whole_number(period as i64, &REPETITION_PERIOD_CONSTRAINT)?;
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_repetition_period(field: &ProtocolIeField) -> S1apResult<u16> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.decode_constrained_whole_number(&REPETITION_PERIOD_CONSTRAINT)? as u16)
+}
+
+/// Number of Broadcasts Requested: `INTEGER (0..65535)`; 0 means "until killed".
+pub fn encode_number_of_broadcast_request(
+    container: &mut ProtocolIeContainer,
+    count: u16,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::NUMBER_OF_BROADCAST_REQUEST,
+        Criticality::Reject,
+        |encoder| {
+            encoder
+                .encode_constrained_whole_number(count as i64, &NUMBER_OF_BROADCASTS_CONSTRAINT)?;
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_number_of_broadcast_request(field: &ProtocolIeField) -> S1apResult<u16> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.decode_constrained_whole_number(&NUMBER_OF_BROADCASTS_CONSTRAINT)? as u16)
+}
+
+/// Warning Type: `OCTET STRING (SIZE (2))` (ETWS only, TS 23.041 §9.3.24).
+pub fn encode_warning_type(
+    container: &mut ProtocolIeContainer,
+    warning_type: &[u8; 2],
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::WARNING_TYPE,
+        Criticality::Ignore,
+        |encoder| {
+            encoder.encode_octet_string(warning_type, Some(2), Some(2))?;
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_warning_type(field: &ProtocolIeField) -> S1apResult<[u8; 2]> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let bytes = decoder.decode_octet_string(Some(2), Some(2))?;
+    Ok([bytes[0], bytes[1]])
+}
+
+/// Warning Security Information: `OCTET STRING (SIZE (50))` (ETWS signature).
+pub fn encode_warning_security_info(
+    container: &mut ProtocolIeContainer,
+    info: &[u8; WARNING_SECURITY_INFO_LEN],
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::WARNING_SECURITY_INFO,
+        Criticality::Ignore,
+        |encoder| {
+            encoder.encode_octet_string(
+                info,
+                Some(WARNING_SECURITY_INFO_LEN),
+                Some(WARNING_SECURITY_INFO_LEN),
+            )?;
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_warning_security_info(
+    field: &ProtocolIeField,
+) -> S1apResult<[u8; WARNING_SECURITY_INFO_LEN]> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let bytes = decoder.decode_octet_string(
+        Some(WARNING_SECURITY_INFO_LEN),
+        Some(WARNING_SECURITY_INFO_LEN),
+    )?;
+    let mut info = [0u8; WARNING_SECURITY_INFO_LEN];
+    info.copy_from_slice(&bytes);
+    Ok(info)
+}
+
+/// Data Coding Scheme: `BIT STRING (SIZE (8))` (TS 23.038).
+pub fn encode_data_coding_scheme(
+    container: &mut ProtocolIeContainer,
+    scheme: u8,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::DATA_CODING_SCHEME,
+        Criticality::Ignore,
+        |encoder| {
+            encoder.write_bits(scheme as u64, 8);
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_data_coding_scheme(field: &ProtocolIeField) -> S1apResult<u8> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.read_bits(8)? as u8)
+}
+
+/// Warning Message Contents: `OCTET STRING (SIZE(1..9600))`.
+///
+/// The lower bound is 1, so an empty message is not encodable — a caller with
+/// nothing to say must omit the IE rather than send a zero-length one.
+pub fn encode_warning_message_contents(
+    container: &mut ProtocolIeContainer,
+    contents: &[u8],
+) -> S1apResult<()> {
+    if contents.is_empty() || contents.len() > MAX_WARNING_MESSAGE_CONTENTS {
+        return Err(S1apError::InvalidIeValue {
+            ie_name: "WarningMessageContents",
+            reason: format!(
+                "length {} outside 1..={MAX_WARNING_MESSAGE_CONTENTS}",
+                contents.len()
+            ),
+        });
+    }
+    push_ie(
+        container,
+        ProtocolIeId::WARNING_MESSAGE_CONTENTS,
+        Criticality::Ignore,
+        |encoder| {
+            encoder.encode_octet_string(contents, Some(1), Some(MAX_WARNING_MESSAGE_CONTENTS))?;
+            Ok(())
+        },
+    )
+}
+
+pub fn decode_warning_message_contents(field: &ProtocolIeField) -> S1apResult<Vec<u8>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.decode_octet_string(Some(1), Some(MAX_WARNING_MESSAGE_CONTENTS))?)
+}
+
+/// Concurrent Warning Message Indicator: `ENUMERATED { true }`.
+///
+/// A single-value non-extensible enumeration occupies zero bits, so the IE's
+/// *presence* is the whole signal.
+pub fn encode_concurrent_warning_message_indicator(
+    container: &mut ProtocolIeContainer,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::CONCURRENT_WARNING_MESSAGE_INDICATOR,
+        Criticality::Reject,
+        |encoder| {
+            encoder.encode_enumerated(0, &SINGLE_VALUE_ENUM_CONSTRAINT)?;
+            Ok(())
+        },
+    )
+}
+
+/// Kill All Warning Messages: `ENUMERATED { true }`. Presence is the signal.
+pub fn encode_kill_all_warning_messages(container: &mut ProtocolIeContainer) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::KILL_ALL_WARNING_MESSAGES,
+        Criticality::Reject,
+        |encoder| {
+            encoder.encode_enumerated(0, &SINGLE_VALUE_ENUM_CONSTRAINT)?;
+            Ok(())
+        },
+    )
+}
+
+/// `EmergencyAreaID ::= OCTET STRING (SIZE (3))`
+fn encode_emergency_area_id(
+    encoder: &mut AperEncoder,
+    id: &[u8; EMERGENCY_AREA_ID_LEN],
+) -> S1apResult<()> {
+    encoder.encode_octet_string(id, Some(EMERGENCY_AREA_ID_LEN), Some(EMERGENCY_AREA_ID_LEN))?;
+    Ok(())
+}
+
+fn decode_emergency_area_id(decoder: &mut AperDecoder) -> S1apResult<[u8; EMERGENCY_AREA_ID_LEN]> {
+    let bytes =
+        decoder.decode_octet_string(Some(EMERGENCY_AREA_ID_LEN), Some(EMERGENCY_AREA_ID_LEN))?;
+    let mut id = [0u8; EMERGENCY_AREA_ID_LEN];
+    id.copy_from_slice(&bytes);
+    Ok(id)
+}
+
+/// Encode a plain `SEQUENCE (SIZE(1..maxnoofWarningAreas)) OF T`.
+///
+/// The PWS area lists are bare SEQUENCE OFs, not `ProtocolIE-SingleContainer`
+/// lists like `TAIList` in Paging — there is no per-item IE header.
+fn encode_warning_area_seq_of<T, F>(
+    encoder: &mut AperEncoder,
+    items: &[T],
+    ie_name: &'static str,
+    mut encode_item: F,
+) -> S1apResult<()>
+where
+    F: FnMut(&mut AperEncoder, &T) -> S1apResult<()>,
+{
+    if items.is_empty() {
+        return Err(S1apError::InvalidIeValue {
+            ie_name,
+            reason: "the list is constrained to SIZE(1..) so it cannot be empty".to_string(),
+        });
+    }
+    encoder.encode_constrained_length(items.len(), 1, MAX_NO_OF_WARNING_AREAS)?;
+    for item in items {
+        encode_item(encoder, item)?;
+    }
+    Ok(())
+}
+
+fn decode_warning_area_seq_of<T, F>(
+    decoder: &mut AperDecoder,
+    mut decode_item: F,
+) -> S1apResult<Vec<T>>
+where
+    F: FnMut(&mut AperDecoder) -> S1apResult<T>,
+{
+    let count = decoder.decode_constrained_length(1, MAX_NO_OF_WARNING_AREAS)?;
+    let mut items = Vec::with_capacity(count.min(MAX_NO_OF_ERABS));
+    for _ in 0..count {
+        items.push(decode_item(decoder)?);
+    }
+    Ok(items)
+}
+
+/// Warning Area List: `CHOICE { cellIDList, trackingAreaListforWarning,
+/// emergencyAreaIDList, ... }` (TS 36.413 §9.2.1.46).
+pub fn encode_warning_area_list(
+    container: &mut ProtocolIeContainer,
+    area: &WarningAreaList,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::WARNING_AREA_LIST,
+        Criticality::Ignore,
+        |encoder| match area {
+            WarningAreaList::CellIdList(cells) => {
+                encoder.encode_choice_index(0, 3, true)?;
+                encode_warning_area_seq_of(encoder, cells, "ECGIList", encode_eutran_cgi_inline)
+            }
+            WarningAreaList::TrackingAreaListForWarning(tais) => {
+                encoder.encode_choice_index(1, 3, true)?;
+                encode_warning_area_seq_of(encoder, tais, "TAIListforWarning", encode_tai_inline)
+            }
+            WarningAreaList::EmergencyAreaIdList(ids) => {
+                encoder.encode_choice_index(2, 3, true)?;
+                encode_warning_area_seq_of(encoder, ids, "EmergencyAreaIDList", |encoder, id| {
+                    encode_emergency_area_id(encoder, id)
+                })
+            }
+        },
+    )
+}
+
+pub fn decode_warning_area_list(field: &ProtocolIeField) -> S1apResult<WarningAreaList> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let index = decoder.decode_choice_index(3, true)?;
+    match index {
+        0 => Ok(WarningAreaList::CellIdList(decode_warning_area_seq_of(
+            &mut decoder,
+            decode_eutran_cgi_inline,
+        )?)),
+        1 => Ok(WarningAreaList::TrackingAreaListForWarning(
+            decode_warning_area_seq_of(&mut decoder, decode_tai_inline)?,
+        )),
+        2 => Ok(WarningAreaList::EmergencyAreaIdList(
+            decode_warning_area_seq_of(&mut decoder, decode_emergency_area_id)?,
+        )),
+        _ => Err(S1apError::InvalidIeValue {
+            ie_name: "WarningAreaList",
+            reason: format!("unsupported choice index {index}"),
+        }),
+    }
+}
+
+/// `CellID-Broadcast-Item ::= SEQUENCE { eCGI, iE-Extensions OPTIONAL, ... }`,
+/// and the identically shaped `CompletedCellinTAI-Item` /
+/// `CompletedCellinEAI-Item`.
+fn encode_completed_cell_item(encoder: &mut AperEncoder, ecgi: &EutranCgi) -> S1apResult<()> {
+    encode_seq_preamble(encoder, &[false]);
+    encode_eutran_cgi_inline(encoder, ecgi)
+}
+
+fn decode_completed_cell_item(decoder: &mut AperDecoder) -> S1apResult<EutranCgi> {
+    let (ext, opts) = decode_seq_preamble(decoder, 1)?;
+    let ecgi = decode_eutran_cgi_inline(decoder)?;
+    decode_seq_trailer(decoder, ext, opts[0])?;
+    Ok(ecgi)
+}
+
+/// `CellID-Cancelled-Item ::= SEQUENCE { eCGI, numberOfBroadcasts,
+/// iE-Extensions OPTIONAL, ... }`, and the identically shaped
+/// `CancelledCellinTAI-Item` / `CancelledCellinEAI-Item`.
+fn encode_cancelled_cell_item(
+    encoder: &mut AperEncoder,
+    item: &CellIdCancelledItem,
+) -> S1apResult<()> {
+    encode_seq_preamble(encoder, &[false]);
+    encode_eutran_cgi_inline(encoder, &item.ecgi)?;
+    encoder.encode_constrained_whole_number(
+        item.number_of_broadcasts as i64,
+        &NUMBER_OF_BROADCASTS_CONSTRAINT,
+    )?;
+    Ok(())
+}
+
+fn decode_cancelled_cell_item(decoder: &mut AperDecoder) -> S1apResult<CellIdCancelledItem> {
+    let (ext, opts) = decode_seq_preamble(decoder, 1)?;
+    let ecgi = decode_eutran_cgi_inline(decoder)?;
+    let number_of_broadcasts =
+        decoder.decode_constrained_whole_number(&NUMBER_OF_BROADCASTS_CONSTRAINT)? as u16;
+    decode_seq_trailer(decoder, ext, opts[0])?;
+    Ok(CellIdCancelledItem {
+        ecgi,
+        number_of_broadcasts,
+    })
+}
+
+/// Broadcast Completed Area List (TS 36.413 §9.2.1.47).
+pub fn encode_broadcast_completed_area_list(
+    container: &mut ProtocolIeContainer,
+    area: &BroadcastCompletedAreaList,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::BROADCAST_COMPLETED_AREA_LIST,
+        Criticality::Ignore,
+        |encoder| match area {
+            BroadcastCompletedAreaList::CellIdBroadcast(cells) => {
+                encoder.encode_choice_index(0, 3, true)?;
+                encode_warning_area_seq_of(
+                    encoder,
+                    cells,
+                    "CellID-Broadcast",
+                    encode_completed_cell_item,
+                )
+            }
+            BroadcastCompletedAreaList::TaiBroadcast(items) => {
+                encoder.encode_choice_index(1, 3, true)?;
+                encode_warning_area_seq_of(encoder, items, "TAI-Broadcast", |encoder, item| {
+                    // TAI-Broadcast-Item ::= SEQUENCE { tAI, completedCellinTAI,
+                    //   iE-Extensions OPTIONAL, ... }
+                    encode_seq_preamble(encoder, &[false]);
+                    encode_tai_inline(encoder, &item.tai)?;
+                    encode_warning_area_seq_of(
+                        encoder,
+                        &item.completed_cells,
+                        "CompletedCellinTAI",
+                        encode_completed_cell_item,
+                    )
+                })
+            }
+            BroadcastCompletedAreaList::EmergencyAreaIdBroadcast(items) => {
+                encoder.encode_choice_index(2, 3, true)?;
+                encode_warning_area_seq_of(
+                    encoder,
+                    items,
+                    "EmergencyAreaID-Broadcast",
+                    |encoder, item| {
+                        encode_seq_preamble(encoder, &[false]);
+                        encode_emergency_area_id(encoder, &item.emergency_area_id)?;
+                        encode_warning_area_seq_of(
+                            encoder,
+                            &item.completed_cells,
+                            "CompletedCellinEAI",
+                            encode_completed_cell_item,
+                        )
+                    },
+                )
+            }
+        },
+    )
+}
+
+pub fn decode_broadcast_completed_area_list(
+    field: &ProtocolIeField,
+) -> S1apResult<BroadcastCompletedAreaList> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let index = decoder.decode_choice_index(3, true)?;
+    match index {
+        0 => Ok(BroadcastCompletedAreaList::CellIdBroadcast(
+            decode_warning_area_seq_of(&mut decoder, decode_completed_cell_item)?,
+        )),
+        1 => Ok(BroadcastCompletedAreaList::TaiBroadcast(
+            decode_warning_area_seq_of(&mut decoder, |decoder| {
+                let (ext, opts) = decode_seq_preamble(decoder, 1)?;
+                let tai = decode_tai_inline(decoder)?;
+                let completed_cells =
+                    decode_warning_area_seq_of(decoder, decode_completed_cell_item)?;
+                decode_seq_trailer(decoder, ext, opts[0])?;
+                Ok(TaiBroadcastItem {
+                    tai,
+                    completed_cells,
+                })
+            })?,
+        )),
+        2 => Ok(BroadcastCompletedAreaList::EmergencyAreaIdBroadcast(
+            decode_warning_area_seq_of(&mut decoder, |decoder| {
+                let (ext, opts) = decode_seq_preamble(decoder, 1)?;
+                let emergency_area_id = decode_emergency_area_id(decoder)?;
+                let completed_cells =
+                    decode_warning_area_seq_of(decoder, decode_completed_cell_item)?;
+                decode_seq_trailer(decoder, ext, opts[0])?;
+                Ok(EmergencyAreaIdBroadcastItem {
+                    emergency_area_id,
+                    completed_cells,
+                })
+            })?,
+        )),
+        _ => Err(S1apError::InvalidIeValue {
+            ie_name: "BroadcastCompletedAreaList",
+            reason: format!("unsupported choice index {index}"),
+        }),
+    }
+}
+
+/// Broadcast Cancelled Area List (TS 36.413 §9.2.1.48).
+pub fn encode_broadcast_cancelled_area_list(
+    container: &mut ProtocolIeContainer,
+    area: &BroadcastCancelledAreaList,
+) -> S1apResult<()> {
+    push_ie(
+        container,
+        ProtocolIeId::BROADCAST_CANCELLED_AREA_LIST,
+        Criticality::Ignore,
+        |encoder| match area {
+            BroadcastCancelledAreaList::CellIdCancelled(items) => {
+                encoder.encode_choice_index(0, 3, true)?;
+                encode_warning_area_seq_of(
+                    encoder,
+                    items,
+                    "CellID-Cancelled",
+                    encode_cancelled_cell_item,
+                )
+            }
+            BroadcastCancelledAreaList::TaiCancelled(items) => {
+                encoder.encode_choice_index(1, 3, true)?;
+                encode_warning_area_seq_of(encoder, items, "TAI-Cancelled", |encoder, item| {
+                    encode_seq_preamble(encoder, &[false]);
+                    encode_tai_inline(encoder, &item.tai)?;
+                    encode_warning_area_seq_of(
+                        encoder,
+                        &item.cancelled_cells,
+                        "CancelledCellinTAI",
+                        encode_cancelled_cell_item,
+                    )
+                })
+            }
+            BroadcastCancelledAreaList::EmergencyAreaIdCancelled(items) => {
+                encoder.encode_choice_index(2, 3, true)?;
+                encode_warning_area_seq_of(
+                    encoder,
+                    items,
+                    "EmergencyAreaID-Cancelled",
+                    |encoder, item| {
+                        encode_seq_preamble(encoder, &[false]);
+                        encode_emergency_area_id(encoder, &item.emergency_area_id)?;
+                        encode_warning_area_seq_of(
+                            encoder,
+                            &item.cancelled_cells,
+                            "CancelledCellinEAI",
+                            encode_cancelled_cell_item,
+                        )
+                    },
+                )
+            }
+        },
+    )
+}
+
+pub fn decode_broadcast_cancelled_area_list(
+    field: &ProtocolIeField,
+) -> S1apResult<BroadcastCancelledAreaList> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let index = decoder.decode_choice_index(3, true)?;
+    match index {
+        0 => Ok(BroadcastCancelledAreaList::CellIdCancelled(
+            decode_warning_area_seq_of(&mut decoder, decode_cancelled_cell_item)?,
+        )),
+        1 => Ok(BroadcastCancelledAreaList::TaiCancelled(
+            decode_warning_area_seq_of(&mut decoder, |decoder| {
+                let (ext, opts) = decode_seq_preamble(decoder, 1)?;
+                let tai = decode_tai_inline(decoder)?;
+                let cancelled_cells =
+                    decode_warning_area_seq_of(decoder, decode_cancelled_cell_item)?;
+                decode_seq_trailer(decoder, ext, opts[0])?;
+                Ok(TaiCancelledItem {
+                    tai,
+                    cancelled_cells,
+                })
+            })?,
+        )),
+        2 => Ok(BroadcastCancelledAreaList::EmergencyAreaIdCancelled(
+            decode_warning_area_seq_of(&mut decoder, |decoder| {
+                let (ext, opts) = decode_seq_preamble(decoder, 1)?;
+                let emergency_area_id = decode_emergency_area_id(decoder)?;
+                let cancelled_cells =
+                    decode_warning_area_seq_of(decoder, decode_cancelled_cell_item)?;
+                decode_seq_trailer(decoder, ext, opts[0])?;
+                Ok(EmergencyAreaIdCancelledItem {
+                    emergency_area_id,
+                    cancelled_cells,
+                })
+            })?,
+        )),
+        _ => Err(S1apError::InvalidIeValue {
+            ie_name: "BroadcastCancelledAreaList",
+            reason: format!("unsupported choice index {index}"),
+        }),
+    }
 }

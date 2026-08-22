@@ -46,3 +46,13 @@ mme:
     full: NextGCore
     short: Next
   mme_name: nextgcore-mme0
+  # S1AP overload control (TS 36.413 §8.7.6). Above `max_ue` attached UEs the
+  # MME sends OVERLOAD START to every eNB asking it to reject delay-tolerant
+  # access, and lifts it with OVERLOAD STOP once the count falls back to 90% of
+  # the threshold. Commented out means disabled, which is the default.
+  #
+  # Deliberately separate from `global.max.ue` above: that sizes pools, and
+  # reusing it here would switch overload signalling on for every deployment
+  # that already sets it.
+  # overload:
+  #   max_ue: 900

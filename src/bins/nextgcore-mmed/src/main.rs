@@ -19,6 +19,7 @@ pub mod nas_dispatch;
 pub mod nas_path;
 pub mod nas_security;
 pub mod nas_timer;
+pub mod overload;
 pub mod paging;
 pub mod s11_build;
 pub mod s11_handler;
@@ -269,6 +270,11 @@ impl MmeApp {
             // (TS 24.301 §5.4.2.7, §5.4.4.6, §5.5.1.2.7). Cheap when idle: the
             // sweep walks the UE pool and does nothing unless a deadline passed.
             nas_timer::expire_nas_timers(ctx, std::time::Instant::now());
+
+            // Signal or lift S1AP overload if the attached-UE count crossed the
+            // configured threshold (TS 36.413 §8.7.6). A no-op unless
+            // `mme.overload.max_ue` is set, which it is not by default.
+            overload::poll(ctx);
         }
 
         log::info!("MME main loop exited");

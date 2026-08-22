@@ -236,7 +236,11 @@ impl ProtocolIeId {
     pub const CSG_ID_LIST: Self = Self(128);
     pub const RRC_ESTABLISHMENT_CAUSE: Self = Self(134);
     pub const DEFAULT_PAGING_DRX: Self = Self(137);
+    pub const BROADCAST_CANCELLED_AREA_LIST: Self = Self(141);
+    pub const CONCURRENT_WARNING_MESSAGE_INDICATOR: Self = Self(142);
+    pub const GUMMEI_LIST: Self = Self(154);
     pub const USER_LOCATION_INFORMATION: Self = Self(189);
+    pub const KILL_ALL_WARNING_MESSAGES: Self = Self(191);
 }
 
 impl AperEncode for ProtocolIeId {

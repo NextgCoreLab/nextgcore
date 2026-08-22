@@ -17,15 +17,16 @@ use crate::s1ap_build::{
     radio_network_cause, tai_from_s1ap, transport_address_to_ip, ue_security_capabilities_from,
 };
 use nextgcore_s1ap::{
-    builder, decode_s1ap_pdu, Cause, CauseRadioNetwork, CriticalityDiagnostics, EnbId,
-    ErabSwitchedItem, ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel,
-    HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
-    HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
-    HandoverType as S1apHandoverType, InitialContextSetupFailure, InitialContextSetupResponse,
-    InitialUeMessage, NasNonDeliveryIndication, PathSwitchRequest, PathSwitchRequestAcknowledge,
+    builder, decode_s1ap_pdu, BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause,
+    CauseRadioNetwork, CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, ErabSwitchedItem,
+    ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel, HandoverCancelAcknowledge,
+    HandoverCommand, HandoverFailure, HandoverNotify, HandoverPreparationFailure, HandoverRequest,
+    HandoverRequestAcknowledge, HandoverRequired, HandoverType as S1apHandoverType,
+    InitialContextSetupFailure, InitialContextSetupResponse, InitialUeMessage, KillResponse,
+    NasNonDeliveryIndication, PathSwitchRequest, PathSwitchRequestAcknowledge,
     PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
     SecurityContext, TargetId, TimeToWait, UeAmbr, UeCapabilityInfoIndication,
-    UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport,
+    UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
 };
 
 // ============================================================================
@@ -231,6 +232,51 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             log_erab_failures(enb_id, &msg.erab_failed_list);
             Vec::new()
         }
+        S1apMessage::EnbConfigurationUpdate(msg) => {
+            handle_enb_configuration_update(ctx, enb_id, &msg)
+        }
+        S1apMessage::MmeConfigurationUpdateAcknowledge(_) => {
+            log::info!("MME Configuration Update accepted by eNB {enb_id}");
+            Vec::new()
+        }
+        S1apMessage::MmeConfigurationUpdateFailure(msg) => {
+            log::warn!(
+                "eNB {enb_id} rejected the MME Configuration Update: cause={:?} \
+                 time_to_wait={:?}",
+                msg.cause,
+                msg.time_to_wait
+            );
+            Vec::new()
+        }
+        S1apMessage::UeContextModificationResponse(msg) => {
+            log::debug!(
+                "UE Context Modification accepted by eNB {enb_id} for mme_ue_s1ap_id={}",
+                msg.mme_ue_s1ap_id
+            );
+            Vec::new()
+        }
+        S1apMessage::UeContextModificationFailure(msg) => {
+            // TS 36.413 §8.3.4.3: the UE context is unchanged by a rejected
+            // modification, so there is nothing to roll back — but a failed MT
+            // CSFB modification means the call cannot fall back, which is worth
+            // an error rather than a debug line.
+            log::error!(
+                "eNB {enb_id} rejected the UE Context Modification for mme_ue_s1ap_id={}: \
+                 cause={:?} diagnostics={:?}",
+                msg.mme_ue_s1ap_id,
+                msg.cause,
+                msg.criticality_diagnostics
+            );
+            Vec::new()
+        }
+        S1apMessage::WriteReplaceWarningResponse(msg) => {
+            handle_write_replace_warning_response(enb_id, &msg);
+            Vec::new()
+        }
+        S1apMessage::KillResponse(msg) => {
+            handle_kill_response(enb_id, &msg);
+            Vec::new()
+        }
         // MME-originated messages arriving at the MME are a protocol error
         S1apMessage::DownlinkNasTransport(_)
         | S1apMessage::InitialContextSetupRequest(_)
@@ -246,7 +292,15 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
         | S1apMessage::HandoverPreparationFailure(_)
         | S1apMessage::PathSwitchRequestAcknowledge(_)
         | S1apMessage::PathSwitchRequestFailure(_)
-        | S1apMessage::HandoverCancelAcknowledge(_) => {
+        | S1apMessage::HandoverCancelAcknowledge(_)
+        | S1apMessage::MmeConfigurationUpdate(_)
+        | S1apMessage::EnbConfigurationUpdateAcknowledge(_)
+        | S1apMessage::EnbConfigurationUpdateFailure(_)
+        | S1apMessage::UeContextModificationRequest(_)
+        | S1apMessage::OverloadStart(_)
+        | S1apMessage::OverloadStop(_)
+        | S1apMessage::WriteReplaceWarningRequest(_)
+        | S1apMessage::KillRequest(_) => {
             log::error!("MME-originated S1AP message received from eNB {enb_id}");
             error_indication(
                 enb_id,
@@ -427,6 +481,178 @@ fn setup_failure(
         Err(e) => {
             log::error!("Failed to build S1 Setup Failure: {e}");
             Vec::new()
+        }
+    }
+}
+
+// ============================================================================
+// eNB Configuration Update (§8.7.4)
+// ============================================================================
+
+/// Handle eNB Configuration Update (TS 36.413 §8.7.4.2).
+///
+/// A conforming eNB sends this after a TAC or cell reconfiguration and expects
+/// an ACKNOWLEDGE (or FAILURE). Before this it fell through the dispatcher's
+/// `Unknown` arm to an Error Indication with `ABSTRACT_SYNTAX_ERROR_REJECT`,
+/// which is an interop break, and the MME's `supported_ta_list` for that eNB
+/// went stale.
+///
+/// Every IE is optional. An update that omits SupportedTAs leaves the stored TA
+/// list **alone** rather than clearing it: absent means unchanged, and treating
+/// it as "serves nothing" would strand every UE in those tracking areas.
+pub fn handle_enb_configuration_update(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &EnbConfigurationUpdate,
+) -> Vec<S1apSend> {
+    // An update from an eNB that never completed S1 Setup has no configuration
+    // to update (TS 36.413 §8.7.4.4).
+    if !ctx
+        .enb_find_by_id(enb_id)
+        .is_some_and(|enb| enb.state.s1_setup_success)
+    {
+        log::warn!("eNB Configuration Update from eNB {enb_id} before S1 Setup completed");
+        return config_update_failure(
+            enb_id,
+            S1apCauseGroup::Protocol,
+            protocol_cause::MESSAGE_NOT_COMPATIBLE_WITH_RECEIVER_STATE,
+            None,
+        );
+    }
+
+    let supported_tais = msg.supported_tas.as_ref().map(|tas| {
+        let mut tais = Vec::new();
+        for ta in tas {
+            for plmn in &ta.broadcast_plmns {
+                tais.push(EpsTai {
+                    plmn_id: decode_plmn_id(plmn),
+                    tac: ta.tac,
+                });
+            }
+        }
+        tais
+    });
+
+    // Same admission rule as S1 Setup: a TA list this MME does not serve is
+    // rejected rather than stored, so the two paths cannot disagree about which
+    // eNBs are servable (TS 36.413 §8.7.3.4).
+    if let Some(ref tais) = supported_tais {
+        if tais.is_empty() {
+            log::error!("eNB Configuration Update from eNB {enb_id} carries an empty TA list");
+            return config_update_failure(
+                enb_id,
+                S1apCauseGroup::Misc,
+                misc_cause::UNSPECIFIED,
+                Some(TimeToWait::V10s),
+            );
+        }
+        if ctx.num_of_served_tai > 0 && !tais.iter().any(|tai| ctx.find_served_tai(tai).is_some()) {
+            log::error!("eNB Configuration Update from eNB {enb_id}: no served TAI matches");
+            return config_update_failure(
+                enb_id,
+                S1apCauseGroup::Misc,
+                misc_cause::UNKNOWN_PLMN,
+                Some(TimeToWait::V10s),
+            );
+        }
+    }
+
+    if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&enb_id) {
+        if let Some(tais) = supported_tais {
+            log::info!(
+                "eNB Configuration Update from eNB 0x{:x}: TA list replaced ({} -> {} entries)",
+                enb.enb_id,
+                enb.supported_ta_list.len(),
+                tais.len()
+            );
+            enb.supported_ta_list = tais;
+        }
+    }
+
+    if let Some(ref name) = msg.enb_name {
+        log::info!("eNB {enb_id} reports name \"{name}\"");
+    }
+
+    match s1ap_build::build_enb_configuration_update_acknowledge() {
+        Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
+        Err(e) => {
+            log::error!("Failed to build eNB Configuration Update Acknowledge: {e}");
+            Vec::new()
+        }
+    }
+}
+
+fn config_update_failure(
+    enb_id: u64,
+    group: S1apCauseGroup,
+    value: i64,
+    ttw: Option<TimeToWait>,
+) -> Vec<S1apSend> {
+    match s1ap_build::build_enb_configuration_update_failure(group, value, ttw) {
+        Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
+        Err(e) => {
+            log::error!("Failed to build eNB Configuration Update Failure: {e}");
+            Vec::new()
+        }
+    }
+}
+
+// ============================================================================
+// PWS responses (§8.12)
+// ============================================================================
+
+/// Handle Write-Replace Warning Response (TS 36.413 §8.12.1.2).
+///
+/// The Broadcast Completed Area List is where the warning *actually* went, which
+/// is the only evidence the MME has that an ETWS/CMAS alert reached the air. An
+/// eNB that answers with no completed area accepted the message but broadcast
+/// nowhere, and that is logged as a warning rather than treated as success.
+fn handle_write_replace_warning_response(enb_id: u64, msg: &WriteReplaceWarningResponse) {
+    match &msg.broadcast_completed_area {
+        Some(area) => log::info!(
+            "Write-Replace Warning Response from eNB {enb_id}: message {:#06x}/{:#06x} \
+             broadcast in {}",
+            msg.message_identifier,
+            msg.serial_number,
+            describe_completed_area(area)
+        ),
+        None => log::warn!(
+            "eNB {enb_id} acknowledged warning {:#06x}/{:#06x} without a Broadcast Completed \
+             Area List: nothing is known to have reached the air",
+            msg.message_identifier,
+            msg.serial_number
+        ),
+    }
+}
+
+/// Handle Kill Response (TS 36.413 §8.12.2.2).
+fn handle_kill_response(enb_id: u64, msg: &KillResponse) {
+    log::info!(
+        "Kill Response from eNB {enb_id}: message {:#06x}/{:#06x} cancelled{}",
+        msg.message_identifier,
+        msg.serial_number,
+        match &msg.broadcast_cancelled_area {
+            Some(BroadcastCancelledAreaList::CellIdCancelled(cells)) =>
+                format!(" in {} cell(s)", cells.len()),
+            Some(BroadcastCancelledAreaList::TaiCancelled(tais)) =>
+                format!(" in {} tracking area(s)", tais.len()),
+            Some(BroadcastCancelledAreaList::EmergencyAreaIdCancelled(areas)) =>
+                format!(" in {} emergency area(s)", areas.len()),
+            None => String::new(),
+        }
+    );
+}
+
+fn describe_completed_area(area: &BroadcastCompletedAreaList) -> String {
+    match area {
+        BroadcastCompletedAreaList::CellIdBroadcast(cells) => format!("{} cell(s)", cells.len()),
+        BroadcastCompletedAreaList::TaiBroadcast(tais) => {
+            let cells: usize = tais.iter().map(|item| item.completed_cells.len()).sum();
+            format!("{} tracking area(s), {cells} cell(s)", tais.len())
+        }
+        BroadcastCompletedAreaList::EmergencyAreaIdBroadcast(areas) => {
+            let cells: usize = areas.iter().map(|item| item.completed_cells.len()).sum();
+            format!("{} emergency area(s), {cells} cell(s)", areas.len())
         }
     }
 }
@@ -2459,6 +2685,256 @@ mod tests {
             }
             other => panic!("expected ErrorIndication, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // eNB Configuration Update (§8.7.4) — #49
+    // ------------------------------------------------------------------
+
+    /// Register an eNB with S1 Setup complete, serving TAC 1.
+    fn setup_enb(ctx: &MmeContext) -> u64 {
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        ctx.enb_set_enb_id(enb_id, 0x1234);
+        if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&enb_id) {
+            enb.state.s1_setup_success = true;
+            enb.supported_ta_list = vec![EpsTai {
+                plmn_id: PlmnId::new("310", "410"),
+                tac: 1,
+            }];
+        }
+        enb_id
+    }
+
+    fn config_update_pdu(msg: &nextgcore_s1ap::EnbConfigurationUpdate) -> Vec<u8> {
+        builder::build_enb_configuration_update(msg).unwrap()
+    }
+
+    /// The headline interop fix: a conforming eNB that reconfigures its tracking
+    /// areas gets an ACKNOWLEDGE, and the MME's stored TA list is *replaced* by
+    /// the update's — not left at the value S1 Setup wrote.
+    #[test]
+    fn test_enb_configuration_update_replaces_the_ta_list_and_acks() {
+        let ctx = ctx_with_gummei();
+        let enb_id = setup_enb(&ctx);
+        assert_eq!(
+            ctx.enb_find_by_id(enb_id).unwrap().supported_ta_list[0].tac,
+            1,
+            "S1 Setup wrote TAC 1"
+        );
+
+        let update = nextgcore_s1ap::EnbConfigurationUpdate {
+            enb_name: Some("reconfigured".to_string()),
+            supported_tas: Some(vec![SupportedTaItem {
+                tac: 7,
+                broadcast_plmns: vec![s1ap_build::encode_plmn_id(&PlmnId::new("310", "410"))],
+            }]),
+            default_paging_drx: None,
+        };
+        let out = handle_s1ap_message(&ctx, enb_id, &config_update_pdu(&update));
+
+        assert_eq!(out.len(), 1, "an Acknowledge is due");
+        assert_eq!(out[0].enb_id, enb_id);
+        assert!(
+            matches!(
+                decode_s1ap_pdu(&out[0].pdu).unwrap(),
+                S1apMessage::EnbConfigurationUpdateAcknowledge(_)
+            ),
+            "before #49 this was answered with an Error Indication, which is an \
+             interoperability failure"
+        );
+
+        let enb = ctx.enb_find_by_id(enb_id).unwrap();
+        assert_eq!(enb.supported_ta_list.len(), 1);
+        assert_eq!(
+            enb.supported_ta_list[0].tac, 7,
+            "the TA list must be the update's, not S1 Setup's"
+        );
+    }
+
+    /// An update carrying only a new name must leave the TA list alone. Treating
+    /// an absent SupportedTAs as an empty one would strand every UE in the
+    /// tracking areas the eNB still serves.
+    #[test]
+    fn test_enb_configuration_update_without_ta_list_preserves_it() {
+        let ctx = ctx_with_gummei();
+        let enb_id = setup_enb(&ctx);
+
+        let update = nextgcore_s1ap::EnbConfigurationUpdate {
+            enb_name: Some("renamed-only".to_string()),
+            supported_tas: None,
+            default_paging_drx: Some(nextgcore_s1ap::PagingDrx::V256),
+        };
+        let out = handle_s1ap_message(&ctx, enb_id, &config_update_pdu(&update));
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            decode_s1ap_pdu(&out[0].pdu).unwrap(),
+            S1apMessage::EnbConfigurationUpdateAcknowledge(_)
+        ));
+        let enb = ctx.enb_find_by_id(enb_id).unwrap();
+        assert_eq!(
+            enb.supported_ta_list.len(),
+            1,
+            "an omitted TA list means unchanged"
+        );
+        assert_eq!(enb.supported_ta_list[0].tac, 1);
+    }
+
+    /// A TA list this MME does not serve is refused with a FAILURE, using the
+    /// same admission rule as S1 Setup so the two cannot disagree about which
+    /// eNBs are servable.
+    #[test]
+    fn test_enb_configuration_update_with_unserved_tai_fails() {
+        let mut ctx = MmeContext::new();
+        assert!(crate::config::load_config(
+            &mut ctx,
+            "../../../docker/rust/configs/epc/mme.yaml"
+        ));
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&enb_id) {
+            enb.state.s1_setup_success = true;
+        }
+
+        let update = nextgcore_s1ap::EnbConfigurationUpdate {
+            enb_name: None,
+            supported_tas: Some(vec![SupportedTaItem {
+                tac: 999,
+                broadcast_plmns: vec![s1ap_build::encode_plmn_id(&PlmnId::new("310", "410"))],
+            }]),
+            default_paging_drx: None,
+        };
+        let out = handle_s1ap_message(&ctx, enb_id, &config_update_pdu(&update));
+
+        assert_eq!(out.len(), 1);
+        match decode_s1ap_pdu(&out[0].pdu).unwrap() {
+            S1apMessage::EnbConfigurationUpdateFailure(failure) => {
+                assert_eq!(
+                    failure.cause,
+                    Cause::Misc(nextgcore_s1ap::CauseMisc::UnknownPlmn)
+                );
+                assert_eq!(failure.time_to_wait, Some(TimeToWait::V10s));
+            }
+            other => panic!("expected EnbConfigurationUpdateFailure, got {other:?}"),
+        }
+    }
+
+    /// An update from an eNB that never completed S1 Setup has no configuration
+    /// to update (TS 36.413 §8.7.4.4).
+    #[test]
+    fn test_enb_configuration_update_before_s1_setup_fails() {
+        let ctx = ctx_with_gummei();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+
+        let out = handle_s1ap_message(
+            &ctx,
+            enb_id,
+            &config_update_pdu(&nextgcore_s1ap::EnbConfigurationUpdate::default()),
+        );
+
+        assert_eq!(out.len(), 1);
+        match decode_s1ap_pdu(&out[0].pdu).unwrap() {
+            S1apMessage::EnbConfigurationUpdateFailure(failure) => {
+                assert_eq!(
+                    failure.cause,
+                    Cause::Protocol(
+                        nextgcore_s1ap::CauseProtocol::MessageNotCompatibleWithReceiverState
+                    )
+                );
+            }
+            other => panic!("expected EnbConfigurationUpdateFailure, got {other:?}"),
+        }
+    }
+
+    /// An eNB-originated UE Context Modification (an MME-only message) is a
+    /// protocol error, not a procedure to run.
+    #[test]
+    fn test_mme_originated_ue_context_modification_is_rejected() {
+        let ctx = ctx_with_gummei();
+        let (enb_id, _, _, mme_ue_s1ap_id) = add_ue(&ctx);
+
+        let bytes = builder::build_ue_context_modification_request(
+            &nextgcore_s1ap::UeContextModificationRequest {
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id: 100,
+                security_key: None,
+                subscriber_profile_id_for_rfp: None,
+                ue_ambr: None,
+                cs_fallback_indicator: Some(
+                    nextgcore_s1ap::CsFallbackIndicator::CsFallbackRequired,
+                ),
+                ue_security_capabilities: None,
+            },
+        )
+        .unwrap();
+
+        let out = handle_s1ap_message(&ctx, enb_id, &bytes);
+        assert_eq!(out.len(), 1);
+        match decode_s1ap_pdu(&out[0].pdu).unwrap() {
+            S1apMessage::ErrorIndication(ind) => {
+                assert_eq!(
+                    ind.cause,
+                    Some(Cause::Protocol(
+                        nextgcore_s1ap::CauseProtocol::MessageNotCompatibleWithReceiverState
+                    ))
+                );
+            }
+            other => panic!("expected ErrorIndication, got {other:?}"),
+        }
+    }
+
+    /// The Write-Replace Warning Response is consumed rather than falling through
+    /// to the `Unknown` arm's Error Indication, and answers nothing.
+    #[test]
+    fn test_pws_responses_are_consumed_without_a_reply() {
+        let ctx = ctx_with_gummei();
+        let enb_id = setup_enb(&ctx);
+
+        let warning_response = builder::build_write_replace_warning_response(
+            &nextgcore_s1ap::WriteReplaceWarningResponse {
+                message_identifier: 0x1100,
+                serial_number: 0x3000,
+                broadcast_completed_area: Some(
+                    nextgcore_s1ap::BroadcastCompletedAreaList::TaiBroadcast(vec![
+                        nextgcore_s1ap::TaiBroadcastItem {
+                            tai: nextgcore_s1ap::Tai {
+                                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new(
+                                    "310", "410",
+                                )),
+                                tac: 1,
+                            },
+                            completed_cells: vec![nextgcore_s1ap::EutranCgi {
+                                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new(
+                                    "310", "410",
+                                )),
+                                cell_identity: 0x42,
+                            }],
+                        },
+                    ]),
+                ),
+                criticality_diagnostics: None,
+            },
+        )
+        .unwrap();
+        assert!(handle_s1ap_message(&ctx, enb_id, &warning_response).is_empty());
+
+        let kill_response = builder::build_kill_response(&nextgcore_s1ap::KillResponse {
+            message_identifier: 0x1100,
+            serial_number: 0x3000,
+            broadcast_cancelled_area: Some(
+                nextgcore_s1ap::BroadcastCancelledAreaList::CellIdCancelled(vec![
+                    nextgcore_s1ap::CellIdCancelledItem {
+                        ecgi: nextgcore_s1ap::EutranCgi {
+                            plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+                            cell_identity: 0x42,
+                        },
+                        number_of_broadcasts: 3,
+                    },
+                ]),
+            ),
+            criticality_diagnostics: None,
+        })
+        .unwrap();
+        assert!(handle_s1ap_message(&ctx, enb_id, &kill_response).is_empty());
     }
 
     #[test]

@@ -1469,6 +1469,28 @@ pub struct MmeContext {
     /// Pool ID counter
     pub pool_id_counter: AtomicU64,
 
+    /// Attached-UE count above which the MME signals S1AP overload to every
+    /// eNB (TS 36.413 §8.7.6, TS 23.401 §4.3.7.4.1). `0` disables the check,
+    /// which is the default: mmed has no other load metric, so overload
+    /// signalling is opt-in via `mme.overload.max_ue` rather than a guess about
+    /// what this deployment can carry.
+    pub overload_max_ue: usize,
+
+    /// Whether OVERLOAD START has been signalled and not yet stopped.
+    ///
+    /// Held here rather than derived from the UE count on each tick so that
+    /// START and STOP are each sent exactly once per crossing.
+    pub overload_active: AtomicBool,
+
+    /// Warnings the MME has told eNBs to broadcast and has not yet killed,
+    /// keyed by `(message identifier, serial number)` (TS 23.041).
+    ///
+    /// Kept so a PWS RESTART INDICATION can re-send what a restarted eNB lost:
+    /// an eNB that comes back with empty PWS state would otherwise stay silent
+    /// on a live emergency alert, and the CBC has already been told the
+    /// broadcast succeeded.
+    pub active_warnings: RwLock<Vec<crate::sbc_message::SbcPwsData>>,
+
     /// Initialized flag
     pub initialized: AtomicBool,
 }
@@ -1540,6 +1562,105 @@ impl MmeContext {
         } else {
             id
         }
+    }
+}
+
+// ============================================================================
+// PWS Active Warning Tracking (TS 23.041)
+// ============================================================================
+
+impl MmeContext {
+    /// Record a warning as active, replacing any warning with the same message
+    /// identifier and serial number.
+    ///
+    /// The pair is the warning's identity in TS 23.041, and the procedure is
+    /// *Write-Replace*: a second request with the same pair supersedes the first
+    /// rather than adding a duplicate, so a re-sent alert does not accumulate.
+    pub fn pws_record_active_warning(&self, warning: &crate::sbc_message::SbcPwsData) {
+        let mut active = self.active_warnings.write().unwrap();
+        let key = (warning.message_id, warning.serial_number);
+        match active
+            .iter()
+            .position(|w| (w.message_id, w.serial_number) == key)
+        {
+            Some(index) => active[index] = warning.clone(),
+            None => active.push(warning.clone()),
+        }
+    }
+
+    /// Drop a warning from the active set, returning whether it was there.
+    ///
+    /// Called when a Kill is sent, so a later PWS restart does not resurrect a
+    /// warning the CBC has cancelled.
+    pub fn pws_forget_active_warning(&self, message_id: u16, serial_number: u16) -> bool {
+        let mut active = self.active_warnings.write().unwrap();
+        let before = active.len();
+        active.retain(|w| (w.message_id, w.serial_number) != (message_id, serial_number));
+        active.len() != before
+    }
+
+    /// Every warning currently believed to be broadcasting.
+    pub fn pws_active_warnings(&self) -> Vec<crate::sbc_message::SbcPwsData> {
+        self.active_warnings.read().unwrap().clone()
+    }
+}
+
+// ============================================================================
+// Overload Control (TS 36.413 §8.7.6, TS 23.401 §4.3.7.4.1)
+// ============================================================================
+
+/// What the overload check on a run-loop tick decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverloadTransition {
+    /// The UE count crossed above the threshold: signal OVERLOAD START.
+    Start,
+    /// The UE count fell back under the low-water mark: signal OVERLOAD STOP.
+    Stop,
+    /// No change; nothing to send.
+    Unchanged,
+}
+
+impl MmeContext {
+    /// Re-evaluate MME load and report whether an overload transition is due.
+    ///
+    /// The load metric is the number of attached UE contexts, which is the only
+    /// one mmed has. `overload_max_ue == 0` disables the check entirely.
+    ///
+    /// STOP uses a low-water mark at 90% of the threshold rather than the
+    /// threshold itself: with a single trigger point, one UE detaching and
+    /// re-attaching around the boundary would flap START/STOP at tick rate.
+    pub fn overload_reevaluate(&self) -> OverloadTransition {
+        if self.overload_max_ue == 0 {
+            return OverloadTransition::Unchanged;
+        }
+        let attached = self.mme_ue_pool.read().unwrap().len();
+        let active = self.overload_active.load(Ordering::SeqCst);
+
+        if !active && attached > self.overload_max_ue {
+            self.overload_active.store(true, Ordering::SeqCst);
+            return OverloadTransition::Start;
+        }
+        if active && attached <= self.overload_low_water_mark() {
+            self.overload_active.store(false, Ordering::SeqCst);
+            return OverloadTransition::Stop;
+        }
+        OverloadTransition::Unchanged
+    }
+
+    /// The UE count at or below which overload is lifted: 90% of the threshold,
+    /// and always at least one below it so the two marks cannot coincide.
+    ///
+    /// `saturating_mul` because the threshold comes from a config file: a typo'd
+    /// `max_ue` near `usize::MAX` would otherwise overflow on the first tick,
+    /// which is a panic in a debug build.
+    fn overload_low_water_mark(&self) -> usize {
+        let max = self.overload_max_ue;
+        (max.saturating_mul(9) / 10).min(max.saturating_sub(1))
+    }
+
+    /// Whether the MME is currently signalling overload.
+    pub fn is_overloaded(&self) -> bool {
+        self.overload_active.load(Ordering::SeqCst)
     }
 }
 
