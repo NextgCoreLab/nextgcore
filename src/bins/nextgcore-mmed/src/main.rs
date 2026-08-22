@@ -19,6 +19,7 @@ pub mod nas_dispatch;
 pub mod nas_path;
 pub mod nas_security;
 pub mod nas_timer;
+pub mod paging;
 pub mod s11_build;
 pub mod s11_handler;
 pub mod s1ap_build;

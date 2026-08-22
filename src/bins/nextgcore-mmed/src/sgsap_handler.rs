@@ -238,6 +238,56 @@ pub fn handle_location_update_reject(data: &[u8]) -> SgsapResult<LocationUpdateR
     Ok(result)
 }
 
+/// Act on an SGs Paging Request: page the UE for the CS domain (issue #47).
+///
+/// TS 29.118 §5.1.2 / TS 23.272: the VLR wants the UE for a terminating call or an
+/// SMS. The parser below has existed all along with no action attached, so the
+/// request was decoded and the call dropped.
+///
+/// Returns the number of eNBs paged; `None` when the IMSI names no UE this MME
+/// holds, which the caller answers with an SGsAP-PAGING-REJECT.
+pub fn process_paging_request(
+    ctx: &crate::context::MmeContext,
+    data: &[u8],
+) -> SgsapResult<Option<usize>> {
+    let request = handle_paging_request(data)?;
+
+    // The IMSI arrives TBCD-encoded with a leading type octet, the same shape the
+    // S6a path decodes.
+    let imsi_bcd = tbcd_to_bcd(&request.imsi);
+    let Some(mme_ue_id) = ctx.mme_ue_find_by_imsi(&imsi_bcd) else {
+        log::warn!("SGs Paging Request for IMSI[{imsi_bcd}], which this MME does not hold");
+        return Ok(None);
+    };
+
+    // The service indicator distinguishes a call from an SMS (TS 29.118 §9.4.17):
+    // 0x01 = CS call, 0x02 = SMS.
+    let paging_type =
+        if request.service_indicator == Some(crate::sgsap_build::ServiceIndicator::Sms) {
+            crate::context::PagingType::SmsService
+        } else {
+            crate::context::PagingType::CsCallService
+        };
+    log::info!("SGs paging IMSI[{imsi_bcd}] for {paging_type:?}");
+    Ok(Some(crate::paging::page_ue(ctx, mme_ue_id, paging_type)))
+}
+
+/// Decode a TBCD-encoded IMSI, skipping the leading type octet if present.
+fn tbcd_to_bcd(imsi: &[u8]) -> String {
+    let mut out = String::with_capacity(imsi.len() * 2);
+    for byte in imsi {
+        let low = byte & 0x0f;
+        let high = (byte >> 4) & 0x0f;
+        if low < 10 {
+            out.push((b'0' + low) as char);
+        }
+        if high < 10 {
+            out.push((b'0' + high) as char);
+        }
+    }
+    out
+}
+
 /// Handle Paging Request
 pub fn handle_paging_request(data: &[u8]) -> SgsapResult<PagingRequestData> {
     if data.is_empty() || data[0] != message_type::PAGING_REQUEST {
@@ -648,5 +698,70 @@ mod tests {
     fn test_sgsap_error_display() {
         let err = SgsapError::MandatoryIeMissing("IMSI".to_string());
         assert!(err.to_string().contains("IMSI"));
+    }
+
+    #[test]
+    fn test_sgs_paging_request_pages_the_ue_it_names() {
+        let ctx = crate::context::MmeContext::new();
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&enb_id) {
+            enb.state.s1_setup_success = true;
+            enb.supported_ta_list = vec![crate::context::EpsTai {
+                plmn_id: crate::context::PlmnId::new("310", "410"),
+                tac: 1,
+            }];
+        }
+        let mme_ue_id = ctx.mme_ue_add(crate::context::NEXTGCORE_INVALID_POOL_ID);
+        // IMSI 310410123456789 in TBCD.
+        ctx.mme_ue_set_imsi(mme_ue_id, "310410123456789");
+        if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+            mme_ue.tai = crate::context::EpsTai {
+                plmn_id: crate::context::PlmnId::new("310", "410"),
+                tac: 1,
+            };
+        }
+
+        // SGsAP-PAGING-REQUEST: message type, IMSI TLV, service indicator TLV.
+        let imsi_tbcd = [0x13, 0x40, 0x01, 0x21, 0x43, 0x65, 0x87, 0xf9];
+        let mut msg = vec![message_type::PAGING_REQUEST];
+        msg.push(ie_type::IMSI);
+        msg.push(imsi_tbcd.len() as u8);
+        msg.extend_from_slice(&imsi_tbcd);
+        msg.push(ie_type::SERVICE_INDICATOR);
+        msg.push(1);
+        msg.push(0x01); // CS call
+
+        let paged = process_paging_request(&ctx, &msg).expect("a valid request");
+
+        assert_eq!(paged, Some(1), "the serving eNB must be paged");
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(
+            mme_ue.paging.type_,
+            crate::context::PagingType::CsCallService
+        );
+        assert!(mme_ue.t3413.is_running());
+    }
+
+    #[test]
+    fn test_sgs_paging_request_for_an_unknown_imsi_is_reported() {
+        let ctx = crate::context::MmeContext::new();
+        ctx.init();
+        let imsi_tbcd = [0x13, 0x40, 0x01, 0x21, 0x43, 0x65, 0x87, 0xf9];
+        let mut msg = vec![message_type::PAGING_REQUEST];
+        msg.push(ie_type::IMSI);
+        msg.push(imsi_tbcd.len() as u8);
+        msg.extend_from_slice(&imsi_tbcd);
+
+        // None, not an error: the caller answers SGsAP-PAGING-REJECT.
+        assert_eq!(process_paging_request(&ctx, &msg).unwrap(), None);
+    }
+
+    #[test]
+    fn test_tbcd_to_bcd_decodes_an_imsi() {
+        assert_eq!(
+            tbcd_to_bcd(&[0x13, 0x40, 0x01, 0x21, 0x43, 0x65, 0x87, 0xf9]),
+            "310410123456789"
+        );
     }
 }
