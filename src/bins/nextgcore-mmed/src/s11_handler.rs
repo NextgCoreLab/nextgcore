@@ -564,6 +564,42 @@ pub fn handle_release_access_bearers_response(
     Ok(result)
 }
 
+/// Act on a Downlink Data Notification: page the idle UE it names (issue #47).
+///
+/// TS 23.401 §5.3.4.3: the SGW has downlink data for a UE in ECM-IDLE, so the MME
+/// pages it and answers the notification. The parser below has existed all along
+/// with no action attached, so the notification was decoded and the data dropped.
+///
+/// The UE is found by the S11 TEID in the GTP header — the local TEID the MME gave
+/// the SGW when the session was created. Returns the number of eNBs paged.
+///
+/// Nothing calls this yet in a running daemon: the S11 transport that would deliver
+/// a DDN is #51. It is wired here rather than in that issue because the trigger
+/// belongs to the paging procedure, and it is exercised by tests that hand it a
+/// notification directly.
+pub fn process_downlink_data_notification(
+    ctx: &crate::context::MmeContext,
+    data: &[u8],
+) -> S11Result<usize> {
+    let (_, _, teid, _) = parse_gtp_header(data)?;
+    let notification = handle_downlink_data_notification(data)?;
+
+    let Some(mme_ue_id) = ctx.mme_ue_find_by_s11_local_teid(teid) else {
+        log::warn!("Downlink Data Notification for unknown S11 TEID 0x{teid:08x}");
+        return Err(S11Error::ContextNotFound);
+    };
+
+    log::info!(
+        "Downlink data for idle UE {mme_ue_id} on EBI {}; paging",
+        notification.ebi
+    );
+    Ok(crate::paging::page_ue(
+        ctx,
+        mme_ue_id,
+        crate::context::PagingType::DownlinkDataNotification,
+    ))
+}
+
 /// Handle Downlink Data Notification
 pub fn handle_downlink_data_notification(data: &[u8]) -> S11Result<DownlinkDataNotificationData> {
     let (msg_type, _, _, payload) = parse_gtp_header(data)?;

@@ -39,6 +39,12 @@ pub const T3460_DURATION: Duration = Duration::from_secs(6);
 /// T3470 — IDENTITY REQUEST.
 pub const T3470_DURATION: Duration = Duration::from_secs(6);
 
+/// T3413 — PAGING.
+///
+/// TS 24.301 Table 10.2.1 leaves the value to the network; 6 s matches the other
+/// NAS retransmission timers and gives a sleeping UE a DRX cycle or two to answer.
+pub const T3413_DURATION: Duration = Duration::from_secs(6);
+
 /// Retransmissions before the procedure is aborted on the next expiry.
 pub const MAX_RETRANSMISSIONS: u32 = 4;
 
@@ -51,6 +57,8 @@ pub enum NasTimer {
     T3460,
     /// Identity request
     T3470,
+    /// Paging
+    T3413,
 }
 
 impl NasTimer {
@@ -60,6 +68,7 @@ impl NasTimer {
             NasTimer::T3450 => T3450_DURATION,
             NasTimer::T3460 => T3460_DURATION,
             NasTimer::T3470 => T3470_DURATION,
+            NasTimer::T3413 => T3413_DURATION,
         }
     }
 
@@ -68,6 +77,7 @@ impl NasTimer {
             NasTimer::T3450 => "T3450",
             NasTimer::T3460 => "T3460",
             NasTimer::T3470 => "T3470",
+            NasTimer::T3413 => "T3413",
         }
     }
 
@@ -76,11 +86,17 @@ impl NasTimer {
             NasTimer::T3450 => &mut mme_ue.t3450,
             NasTimer::T3460 => &mut mme_ue.t3460,
             NasTimer::T3470 => &mut mme_ue.t3470,
+            NasTimer::T3413 => &mut mme_ue.t3413,
         }
     }
 }
 
-const ALL_TIMERS: [NasTimer; 3] = [NasTimer::T3450, NasTimer::T3460, NasTimer::T3470];
+const ALL_TIMERS: [NasTimer; 4] = [
+    NasTimer::T3450,
+    NasTimer::T3460,
+    NasTimer::T3470,
+    NasTimer::T3413,
+];
 
 /// Retransmit or abort every NAS procedure whose timer has expired by `now`.
 ///
@@ -97,6 +113,7 @@ pub fn expire_nas_timers(ctx: &MmeContext, now: Instant) {
                         NasTimer::T3450 => &mme_ue.t3450,
                         NasTimer::T3460 => &mme_ue.t3460,
                         NasTimer::T3470 => &mme_ue.t3470,
+                        NasTimer::T3413 => &mme_ue.t3413,
                     };
                     state.is_expired(now).then_some((*id, timer))
                 })
@@ -181,6 +198,22 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
         }
     };
 
+    if abort && timer == NasTimer::T3413 {
+        // A paging procedure has no NAS signalling connection to release -- that
+        // is the point of paging. TS 23.401 §5.3.4.3: the UE did not respond, so
+        // the procedure is marked failed and whatever triggered it decides
+        // (buffer, drop, or report).
+        if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+            mme_ue.paging.failed = true;
+            mme_ue.paging.type_ = crate::context::PagingType::None;
+            log::warn!(
+                "[{}] paging gave up: the UE did not respond",
+                mme_ue.imsi_bcd
+            );
+        }
+        return;
+    }
+
     if abort {
         // TS 24.301 §5.4.2.7 / §5.4.4.6 / §5.5.1.2.7: after the last
         // retransmission the network aborts the procedure and releases the NAS
@@ -195,6 +228,13 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
 }
 
 fn retransmit(mme_ue: &MmeUe, enb_ue: &EnbUe, timer: NasTimer, pkbuf: Vec<u8>) {
+    if timer == NasTimer::T3413 {
+        // T3413 holds a complete S1AP PAGING PDU, which is NOT UE-associated and
+        // must not be wrapped in DOWNLINK NAS TRANSPORT: it goes to the eNB as it
+        // is (TS 36.413 §8.5).
+        crate::s1ap_path::s1ap_send_pdu(enb_ue.enb_id, pkbuf);
+        return;
+    }
     // The stored buffer is the complete NAS message the procedure sent, already
     // security-encoded where the procedure applied protection, so it is resent
     // verbatim inside a fresh DOWNLINK NAS TRANSPORT.
@@ -300,6 +340,46 @@ mod tests {
             crate::context::UeCtxRelAction::UeContextRemove,
             "the S1 connection must be released"
         );
+    }
+
+    #[test]
+    fn test_t3413_retransmits_the_paging_then_gives_up() {
+        let ctx = test_ctx();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 100);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+            // A complete S1AP PAGING PDU stands in as the stored message.
+            mme_ue.t3413.pkbuf = Some(vec![0x00, 0x0a, 0x40, 0x01]);
+            mme_ue.t3413.start(T3413_DURATION);
+            mme_ue.paging.type_ = crate::context::PagingType::DownlinkDataNotification;
+        }
+
+        for expected in 1..=MAX_RETRANSMISSIONS {
+            force_expiry(&ctx, mme_ue_id, NasTimer::T3413);
+            expire_nas_timers(&ctx, Instant::now());
+            assert_eq!(
+                ctx.mme_ue_find_by_id(mme_ue_id).unwrap().t3413.retry_count,
+                expected
+            );
+        }
+
+        force_expiry(&ctx, mme_ue_id, NasTimer::T3413);
+        expire_nas_timers(&ctx, Instant::now());
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(!mme_ue.t3413.is_running());
+        assert!(
+            mme_ue.paging.failed,
+            "TS 23.401 §5.3.4.3: the trigger needs to know the UE never answered"
+        );
+        assert_eq!(mme_ue.paging.type_, crate::context::PagingType::None);
+        // Paging has no NAS signalling connection, so giving up must NOT release
+        // one -- the S1 context (if any) is untouched.
+        assert!(ctx.enb_ue_find_by_id(enb_ue_id).is_some());
     }
 
     #[test]
