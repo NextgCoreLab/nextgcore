@@ -104,7 +104,10 @@ pub fn handle_write_replace_warning_request(
     Ok(WriteReplaceWarningResponse {
         message_id: sbc_pws.message_id,
         serial_number: sbc_pws.serial_number,
-        cause: None,
+        // A response with no cause tells the CBC the warning is being broadcast.
+        // It must only say that when at least one eNB actually took it
+        // (TS 29.168 §5.1.2.2).
+        cause: broadcast_cause(enbs_notified),
         unknown_tai_list,
     })
 }
@@ -180,7 +183,7 @@ pub fn handle_stop_warning_request(
     Ok(StopWarningResponse {
         message_id: sbc_pws.message_id,
         serial_number: sbc_pws.serial_number,
-        cause: None,
+        cause: broadcast_cause(enbs_notified),
         unknown_tai_list,
     })
 }
@@ -250,30 +253,46 @@ fn is_tai_served_by_any_enb(
     false
 }
 
-/// Send Write-Replace Warning Request to an eNB via S1AP
-fn send_write_replace_warning_to_enb(enb: &MmeEnb, sbc_pws: &SbcPwsData) -> Result<(), SbcCause> {
-    // In a full implementation, would:
-    // 1. Build S1AP Write-Replace Warning Request message
-    // 2. Send to eNB via SCTP
-    // For now, just log and return success (stub)
-    debug!(
-        "Would send Write-Replace Warning to eNB {:08x} for message {:#06x}",
-        enb.enb_id, sbc_pws.message_id
-    );
-    Ok(())
+/// The cause an SBc response carries given how many eNBs took the message.
+///
+/// `None` means success to the CBC, so it is only returned when at least one eNB
+/// was actually reached. Zero is reported as `WarningBroadcastNotOperational`
+/// rather than silence: a CBC that believes an alert went out will not retry it.
+fn broadcast_cause(enbs_notified: u32) -> Option<SbcCause> {
+    (enbs_notified == 0).then_some(SbcCause::WarningBroadcastNotOperational)
 }
 
-/// Send Kill Request to an eNB via S1AP
-fn send_kill_to_enb(enb: &MmeEnb, sbc_pws: &SbcPwsData) -> Result<(), SbcCause> {
-    // In a full implementation, would:
-    // 1. Build S1AP Kill Request message
-    // 2. Send to eNB via SCTP
-    // For now, just log and return success (stub)
-    debug!(
-        "Would send Kill to eNB {:08x} for message {:#06x}",
+/// Send Write-Replace Warning Request to an eNB via S1AP.
+///
+/// **Not implemented, and it says so.** The S1AP WRITE-REPLACE WARNING REQUEST
+/// message has no encoder in `nextgcore-s1ap` (part of #49), so nothing can be put
+/// on the wire. This used to log "Would send" and return `Ok(())`, which made the
+/// caller count the eNB as notified and answer the Cell Broadcast Centre with
+/// success — telling it a public warning had been broadcast when nothing left the
+/// MME. On an ETWS/CMAS path that false positive can delay an emergency alert, so
+/// it reports `WarningBroadcastNotOperational` (SBc cause 10, TS 29.168 §7.4.4)
+/// until the codec exists.
+fn send_write_replace_warning_to_enb(enb: &MmeEnb, sbc_pws: &SbcPwsData) -> Result<(), SbcCause> {
+    warn!(
+        "Cannot broadcast Write-Replace Warning to eNB {:08x} (message {:#06x}): the S1AP \
+         WRITE-REPLACE WARNING REQUEST encoder is not implemented (#49)",
         enb.enb_id, sbc_pws.message_id
     );
-    Ok(())
+    Err(SbcCause::WarningBroadcastNotOperational)
+}
+
+/// Send Kill Request to an eNB via S1AP.
+///
+/// Same as [`send_write_replace_warning_to_enb`]: no S1AP KILL REQUEST encoder
+/// exists (#49), so a stubbed success would tell the CBC a warning had been
+/// cancelled while it kept broadcasting — the more dangerous direction of the two.
+fn send_kill_to_enb(enb: &MmeEnb, sbc_pws: &SbcPwsData) -> Result<(), SbcCause> {
+    warn!(
+        "Cannot cancel the warning on eNB {:08x} (message {:#06x}): the S1AP KILL REQUEST \
+         encoder is not implemented (#49)",
+        enb.enb_id, sbc_pws.message_id
+    );
+    Err(SbcCause::WarningBroadcastNotOperational)
 }
 
 // ============================================================================
@@ -283,6 +302,35 @@ fn send_kill_to_enb(enb: &MmeEnb, sbc_pws: &SbcPwsData) -> Result<(), SbcCause> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_broadcast_cause_only_claims_success_when_an_enb_took_it() {
+        // The bug this fixes: a response with no cause is SUCCESS to the CBC.
+        assert_eq!(
+            broadcast_cause(0),
+            Some(SbcCause::WarningBroadcastNotOperational),
+            "a CBC that believes an alert went out will not retry it"
+        );
+        assert_eq!(broadcast_cause(1), None);
+        assert_eq!(broadcast_cause(42), None);
+    }
+
+    #[test]
+    fn test_pws_send_stubs_report_failure_rather_than_false_success() {
+        let enb = MmeEnb::default();
+        let pws = SbcPwsData::default();
+
+        // Until the S1AP encoders exist (#49), nothing can reach an eNB — and
+        // saying otherwise on an ETWS/CMAS path can delay an emergency alert.
+        assert_eq!(
+            send_write_replace_warning_to_enb(&enb, &pws),
+            Err(SbcCause::WarningBroadcastNotOperational)
+        );
+        assert_eq!(
+            send_kill_to_enb(&enb, &pws),
+            Err(SbcCause::WarningBroadcastNotOperational)
+        );
+    }
 
     #[test]
     fn test_tai_match_empty_list() {
