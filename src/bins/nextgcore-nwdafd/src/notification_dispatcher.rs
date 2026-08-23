@@ -414,6 +414,25 @@ pub fn build_notify_body(sub: &AnalyticsSubscription, event_notifications: Vec<V
     })
 }
 
+/// Build the termination callback body for a subscription that has stopped
+/// reporting (issue #108).
+///
+/// TS 29.520 `NnwdafEventsSubscriptionNotification` carries `termCause`; before
+/// this the NF just stopped appearing in `get_all_active_subscriptions` when its
+/// bespoke `expiryTime` passed, so a consumer could not distinguish a deliberate
+/// termination from a lost subscription and could not re-subscribe
+/// deterministically. Array-shaped like every other callback body.
+pub fn build_termination_callback_body(
+    sub: &AnalyticsSubscription,
+    cause: crate::context::TerminationCause,
+) -> Value {
+    json!([{
+        "subscriptionId": sub.subscription_id,
+        "notifCorrId":    sub.notification_correlation_id,
+        "termCause":      cause.as_str(),
+    }])
+}
+
 /// Build the Nnwdaf_EventsSubscription **callback body** (issue #108).
 ///
 /// TS 29.520 §4.2.2.2.2 declares the notify `requestBody` as
@@ -464,6 +483,48 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
     };
 
     for sub in &subscriptions {
+        // Issue #108: a subscription that has hit a stop condition gets ONE
+        // termination notification carrying termCause, then nothing. It is still
+        // in `subscriptions` precisely so this can be sent; previously it just
+        // stopped appearing and the consumer was never told.
+        if let Some(cause) = sub.termination_cause() {
+            if !sub.termination_notified {
+                let body = build_termination_callback_body(sub, cause);
+                if let Some((host, port, path)) = parse_notify_uri(&sub.notification_uri) {
+                    let client = notify_client(&host, port);
+                    match client.post_json(&path, &body).await {
+                        Ok(resp) if resp.is_success() => log::info!(
+                            "dispatch: termination notified sub={} cause={}",
+                            sub.subscription_id,
+                            cause.as_str()
+                        ),
+                        Ok(resp) => log::warn!(
+                            "dispatch: termination notify non-success status={} sub={}",
+                            resp.status,
+                            sub.subscription_id
+                        ),
+                        Err(e) => log::warn!(
+                            "dispatch: termination notify POST failed sub={}: {e}",
+                            sub.subscription_id
+                        ),
+                    }
+                } else {
+                    log::warn!(
+                        "dispatch: invalid notificationUri '{}' for terminating sub={}",
+                        sub.notification_uri,
+                        sub.subscription_id
+                    );
+                }
+                // Marked regardless of delivery outcome: retrying forever would
+                // keep a finished subscription alive indefinitely, and the
+                // consumer's own subscription has already lapsed.
+                if let Ok(guard) = ctx.read() {
+                    guard.mark_subscription_terminated(&sub.subscription_id);
+                }
+            }
+            continue;
+        }
+
         if !sub.is_due_for_notification() {
             continue;
         }
@@ -994,6 +1055,33 @@ mod tests {
             80.0,
             MatchingDirection::Crossed
         ));
+    }
+
+    /// Issue #108: the termination notification carries `termCause`, in the same
+    /// array shape as every other callback body.
+    #[test]
+    fn test_termination_body_carries_term_cause() {
+        let (ctx_arc, sub_id) = make_ctx_with_sub("http://amf.local:8080/notify", Some(60));
+        let ctx = ctx_arc.read().unwrap();
+        let sub = ctx.get_subscription(&sub_id).unwrap();
+
+        for cause in [
+            crate::context::TerminationCause::MonitoringDurationExpiry,
+            crate::context::TerminationCause::MaxNumberOfReportsReached,
+        ] {
+            let body = build_termination_callback_body(&sub, cause);
+            let arr = body.as_array().expect("array-shaped like every callback");
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0]["subscriptionId"].as_str(), Some("sub-test-001"));
+            assert_eq!(arr[0]["notifCorrId"].as_str(), Some("corr-abc123"));
+            assert_eq!(
+                arr[0]["termCause"].as_str(),
+                Some(cause.as_str()),
+                "the consumer must be told WHY reporting stopped"
+            );
+            // A termination report is not an event report.
+            assert!(arr[0].get("eventNotifications").is_none());
+        }
     }
 
     /// Issue #108: a threshold beyond `nfLoadLvlThds[0]` must still fire. Only
