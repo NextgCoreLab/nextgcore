@@ -77,6 +77,30 @@ pub enum AnalyticsId {
     DnPerformance,
     /// PDU session traffic analytics (`PDU_SESSION_TRAFFIC`, Rel-18)
     PduSessionTraffic,
+    // The nine tokens below complete the TS 29.520 `NwdafEvent` enumeration
+    // (issue #108). None has a collector in this build, so each is
+    // `is_supported() == false` and is reported per-event via
+    // `failEventReports` — but being *recognised* is what lets a subscription
+    // mixing them with NF_LOAD succeed for the part we can serve, instead of
+    // being rejected wholesale.
+    /// PFD determination analytics (`PFD_DETERMINATION`, Rel-17)
+    PfdDetermination,
+    /// End-to-end data-volume transfer time (`E2E_DATA_VOL_TRANS_TIME`, Rel-17)
+    E2eDataVolTransTime,
+    /// UE movement behaviour (`MOVEMENT_BEHAVIOUR`, Rel-18)
+    MovementBehaviour,
+    /// Location accuracy analytics (`LOC_ACCURACY`, Rel-18)
+    LocAccuracy,
+    /// Relative UE proximity (`RELATIVE_PROXIMITY`, Rel-18)
+    RelativeProximity,
+    /// Signalling storm analytics (`SIGNALLING_STORM`, Rel-18)
+    SignallingStorm,
+    /// QoS policy assistance (`QOS_POLICY_ASSIST`, Rel-18)
+    QosPolicyAssist,
+    /// Abnormal uplink/downlink traffic (`ABNORMAL_UP_TRAFFIC`, Rel-18)
+    AbnormalUpTraffic,
+    /// Traffic pattern analytics (`TRAFFIC_PATTERN`, Rel-18)
+    TrafficPattern,
 }
 
 impl AnalyticsId {
@@ -100,6 +124,15 @@ impl AnalyticsId {
         Self::WlanPerformance,
         Self::DnPerformance,
         Self::PduSessionTraffic,
+        Self::PfdDetermination,
+        Self::E2eDataVolTransTime,
+        Self::MovementBehaviour,
+        Self::LocAccuracy,
+        Self::RelativeProximity,
+        Self::SignallingStorm,
+        Self::QosPolicyAssist,
+        Self::AbnormalUpTraffic,
+        Self::TrafficPattern,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -120,6 +153,15 @@ impl AnalyticsId {
             Self::WlanPerformance => "WLAN_PERFORMANCE",
             Self::DnPerformance => "DN_PERFORMANCE",
             Self::PduSessionTraffic => "PDU_SESSION_TRAFFIC",
+            Self::PfdDetermination => "PFD_DETERMINATION",
+            Self::E2eDataVolTransTime => "E2E_DATA_VOL_TRANS_TIME",
+            Self::MovementBehaviour => "MOVEMENT_BEHAVIOUR",
+            Self::LocAccuracy => "LOC_ACCURACY",
+            Self::RelativeProximity => "RELATIVE_PROXIMITY",
+            Self::SignallingStorm => "SIGNALLING_STORM",
+            Self::QosPolicyAssist => "QOS_POLICY_ASSIST",
+            Self::AbnormalUpTraffic => "ABNORMAL_UP_TRAFFIC",
+            Self::TrafficPattern => "TRAFFIC_PATTERN",
         }
     }
 
@@ -141,6 +183,15 @@ impl AnalyticsId {
             "WLAN_PERFORMANCE" => Some(Self::WlanPerformance),
             "DN_PERFORMANCE" => Some(Self::DnPerformance),
             "PDU_SESSION_TRAFFIC" => Some(Self::PduSessionTraffic),
+            "PFD_DETERMINATION" => Some(Self::PfdDetermination),
+            "E2E_DATA_VOL_TRANS_TIME" => Some(Self::E2eDataVolTransTime),
+            "MOVEMENT_BEHAVIOUR" => Some(Self::MovementBehaviour),
+            "LOC_ACCURACY" => Some(Self::LocAccuracy),
+            "RELATIVE_PROXIMITY" => Some(Self::RelativeProximity),
+            "SIGNALLING_STORM" => Some(Self::SignallingStorm),
+            "QOS_POLICY_ASSIST" => Some(Self::QosPolicyAssist),
+            "ABNORMAL_UP_TRAFFIC" => Some(Self::AbnormalUpTraffic),
+            "TRAFFIC_PATTERN" => Some(Self::TrafficPattern),
             _ => None,
         }
     }
@@ -171,6 +222,19 @@ impl AnalyticsId {
             Self::DnPerformance => "dnPerfInfos",
             Self::SmCongestion => "smcInfos",
             Self::PduSessionTraffic => "pduSesTrafInfos",
+            // Issue #108: keys read off `EventNotification` in
+            // TS29520_Nnwdaf_EventsSubscription.yaml, not inferred from the
+            // token names — several of them are abbreviated differently from
+            // what the token would suggest (`dataVlTrnsTmInfos`, `movBehavInfos`).
+            Self::PfdDetermination => "pfdDetermInfos",
+            Self::E2eDataVolTransTime => "dataVlTrnsTmInfos",
+            Self::MovementBehaviour => "movBehavInfos",
+            Self::LocAccuracy => "locAccInfos",
+            Self::RelativeProximity => "relProxInfos",
+            Self::SignallingStorm => "signalStormInfos",
+            Self::QosPolicyAssist => "qosPolAssistInfos",
+            Self::AbnormalUpTraffic => "abnormalTrafficInfos",
+            Self::TrafficPattern => "trafficPatternInfos",
         }
     }
 }
@@ -320,6 +384,14 @@ pub struct AnalyticsSubscription {
     pub target_supi: Option<String>,
     /// Target S-NSSAI (for slice-specific analytics)
     pub target_snssai: Option<SNssai>,
+    /// Event tokens the consumer asked for that are outside the TS 29.520
+    /// `NwdafEvent` enumeration entirely (issue #108).
+    ///
+    /// Carried rather than rejected: the enumeration's yaml `anyOf` includes a
+    /// free-form string alternative expressly for forward compatibility, so a
+    /// consumer requesting a newer analytics type must still get the events it
+    /// *is* entitled to. These surface per-event in `failEventReports`.
+    pub unknown_events: Vec<String>,
     /// Notification URI for analytics reports (`notificationURI`)
     pub notification_uri: String,
     /// Subscription expiry time (Unix timestamp)
@@ -365,6 +437,7 @@ impl AnalyticsSubscription {
             events,
             target_supi: None,
             target_snssai: None,
+            unknown_events: Vec::new(),
             notification_uri,
             expiry,
             active: true,
@@ -1042,7 +1115,24 @@ mod tests {
             "WLAN_PERFORMANCE",
             "DN_PERFORMANCE",
             "PDU_SESSION_TRAFFIC",
+            // Issue #108: the remaining nine `NwdafEvent` tokens, completing the
+            // enumeration at 25. Read off
+            // TS29520_Nnwdaf_EventsSubscription.yaml, not inferred.
+            "PFD_DETERMINATION",
+            "E2E_DATA_VOL_TRANS_TIME",
+            "MOVEMENT_BEHAVIOUR",
+            "LOC_ACCURACY",
+            "RELATIVE_PROXIMITY",
+            "SIGNALLING_STORM",
+            "QOS_POLICY_ASSIST",
+            "ABNORMAL_UP_TRAFFIC",
+            "TRAFFIC_PATTERN",
         ];
+        assert_eq!(
+            tokens.len(),
+            25,
+            "TS 29.520 NwdafEvent defines exactly 25 tokens"
+        );
 
         // from_str(t).as_str() == t for every spec token.
         for t in tokens {

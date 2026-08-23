@@ -355,8 +355,11 @@ fn build_event_notifications(
 // Notify body builder (pure, testable without network)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build the `NnwdafEventsSubscriptionNotification` JSON body for one
-/// subscription (TS 29.520 `components.schemas`):
+/// Build one `NnwdafEventsSubscriptionNotification` object.
+///
+/// This is a single element of the callback body, **not** the body itself — see
+/// [`build_notify_callback_body`], which wraps it in the array TS 29.520
+/// requires.
 /// ```json
 /// {
 ///   "subscriptionId": "...",
@@ -370,6 +373,27 @@ pub fn build_notify_body(sub: &AnalyticsSubscription, event_notifications: Vec<V
         "notifCorrId":        sub.notification_correlation_id,
         "eventNotifications": event_notifications,
     })
+}
+
+/// Build the Nnwdaf_EventsSubscription **callback body** (issue #108).
+///
+/// TS 29.520 §4.2.2.2.2 declares the notify `requestBody` as
+/// `type: array, items: NnwdafEventsSubscriptionNotification, minItems: 1`
+/// (`TS29520_Nnwdaf_EventsSubscription.yaml:82-90`). This NF POSTed the bare
+/// object instead, so a conformant consumer deserialising an array rejected
+/// **every** notification the NWDAF emitted — an interop hard stop that made
+/// closed-loop automation silently never fire.
+///
+/// The ML-provision path in [`crate::ml_service::build_ml_model_prov_notif_body`]
+/// already wrapped correctly; the two paths disagreeing is what made this easy
+/// to miss. Both are now array-shaped, and a test asserts they agree.
+pub fn build_notify_callback_body(
+    sub: &AnalyticsSubscription,
+    event_notifications: Vec<Value>,
+) -> Value {
+    // minItems: 1 — one subscription's notification per POST, so exactly one
+    // element. The array is the contract, not a batching mechanism.
+    json!([build_notify_body(sub, event_notifications)])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,7 +448,7 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
             continue;
         }
 
-        let body = build_notify_body(sub, event_notifications);
+        let body = build_notify_callback_body(sub, event_notifications);
 
         // Parse the notification URI
         let (host, port, path) = match parse_notify_uri(&sub.notification_uri) {
@@ -610,6 +634,59 @@ mod tests {
                 0,
             ));
         }
+    }
+
+    /// **The #108 acceptance test.** TS 29.520 §4.2.2.2.2 declares the notify
+    /// `requestBody` as `type: array, items: NnwdafEventsSubscriptionNotification,
+    /// minItems: 1`. This NF POSTed the bare object, so every conformant consumer
+    /// rejected every notification it emitted — closed-loop automation silently
+    /// never fired. The callback body must be an array.
+    #[test]
+    fn test_notify_callback_body_is_an_array() {
+        let (ctx_arc, sub_id) = make_ctx_with_sub("http://amf.local:8080/notify", Some(60));
+        let ctx = ctx_arc.read().unwrap();
+        ingest_loads(&ctx, "AMF", "amf-array-shape", &[30, 32]);
+        let sub = ctx.get_subscription(&sub_id).unwrap();
+
+        let engine = ctx.lock_engine();
+        let event_notifications = build_event_notifications(&ctx, &engine, &sub);
+        drop(engine);
+        let body = build_notify_callback_body(&sub, event_notifications);
+
+        let arr = body
+            .as_array()
+            .expect("the callback body must be a JSON array, not an object");
+        assert_eq!(arr.len(), 1, "minItems: 1 — one notification per POST");
+        // The element is the object the old code POSTed unwrapped.
+        assert_eq!(arr[0]["subscriptionId"].as_str(), Some("sub-test-001"));
+        assert!(arr[0]["eventNotifications"].is_array());
+    }
+
+    /// The EventsSubscription and ML-provision notification paths must agree on
+    /// top-level wire shape. They disagreeing — ML-provision wrapped, events did
+    /// not — is what let the events-path defect go unnoticed.
+    #[test]
+    fn test_both_notification_paths_are_array_shaped() {
+        let (ctx_arc, sub_id) = make_ctx_with_sub("http://amf.local:8080/notify", Some(60));
+        let ctx = ctx_arc.read().unwrap();
+        let sub = ctx.get_subscription(&sub_id).unwrap();
+        let events_body = build_notify_callback_body(&sub, Vec::new());
+
+        let ml_sub = crate::context::MlProvSubscription::new(
+            "mlsub-shape".to_string(),
+            "http://anlf.local/cb".to_string(),
+            None,
+            vec![AnalyticsId::NfLoad],
+        );
+        let ml_body = crate::ml_service::build_ml_model_prov_notif_body(&ml_sub, None);
+
+        assert!(events_body.is_array(), "EventsSubscription notify");
+        assert!(ml_body.is_array(), "MLModelProvision notify");
+        assert_eq!(
+            events_body.as_array().map(Vec::len),
+            ml_body.as_array().map(Vec::len),
+            "both paths deliver exactly one notification per POST"
+        );
     }
 
     /// nwafd-04: the Notify body is an `NnwdafEventsSubscriptionNotification`:
