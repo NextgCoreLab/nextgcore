@@ -12,6 +12,21 @@ use nextgcore_sbi::server::{send_bad_request, send_not_found};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+/// Monitoring duration used when `evtReq.monDur` is absent (issue #108).
+///
+/// Keeps the pre-#108 window so a consumer that sends no `evtReq` sees unchanged
+/// behaviour — except that its subscription now terminates with a `termCause`
+/// instead of vanishing.
+const DEFAULT_MONITORING_DURATION_SECS: u64 = 3600;
+
+/// Seconds since the Unix epoch.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_secs()
+}
+
 // ── query-string + S-NSSAI parsing helpers ───────────────────────────────────
 
 /// Minimal application/x-www-form-urlencoded percent-decoder for query values.
@@ -527,10 +542,32 @@ fn parse_events_subscription(
         .map(String::from)
         .unwrap_or_else(|| format!("corr-{}", uuid::Uuid::new_v4()));
 
-    let expiry_seconds = data
-        .get("expiryTime")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3600);
+    // Issue #108: duration comes from `evtReq` → TS 29.523 `ReportingInformation`,
+    // NOT a bespoke top-level `expiryTime`. The TS 29.520 subscription resource
+    // has no `expiryTime` member at all (yaml:414-433), so the old key was
+    // non-spec: a conformant consumer could not set it, and every subscription
+    // silently died after the 3600 s default with no termCause.
+    let evt_req = data.get("evtReq");
+    // `monDur` is an absolute DateTime in TS 29.523; `monDurOrDuration` styles
+    // vary by release, so accept either an RFC-3339 instant or a duration in
+    // seconds and fall back to the previous 3600 s window when neither is given.
+    let mon_dur_secs = evt_req
+        .and_then(|r| r.get("monDur"))
+        .and_then(|v| {
+            v.as_u64().or_else(|| {
+                v.as_str().and_then(|ts| {
+                    chrono::DateTime::parse_from_rfc3339(ts)
+                        .ok()
+                        .map(|dt| dt.timestamp().max(0) as u64)
+                        .map(|abs| abs.saturating_sub(now_secs()))
+                })
+            })
+        })
+        .unwrap_or(DEFAULT_MONITORING_DURATION_SECS);
+    let max_report_nbr = evt_req
+        .and_then(|r| r.get("maxReportNbr"))
+        .and_then(|v| v.as_u64());
+    let expiry_seconds = mon_dur_secs;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -557,6 +594,7 @@ fn parse_events_subscription(
     subscription.notification_correlation_id = notif_corr_id;
     subscription.repetition_period_secs = rep_period;
     subscription.unknown_events = unknown_events;
+    subscription.max_report_nbr = max_report_nbr;
     if let Some(supi) = tgt_supi {
         subscription = subscription.with_target_supi(supi);
     }
@@ -1120,6 +1158,62 @@ mod tests {
                 event.as_str()
             );
         }
+    }
+
+    /// Issue #108: the non-spec top-level `expiryTime` is no longer honoured —
+    /// TS 29.520's subscription resource has no such member (yaml:414-433), so a
+    /// conformant consumer could never set it. Duration comes from `evtReq`.
+    #[tokio::test]
+    async fn test_duration_comes_from_evt_req_not_expiry_time() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+
+        // A bespoke expiryTime of 1 second must NOT shorten the subscription.
+        let req = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                "expiryTime": 1,
+                "eventSubscriptions": [{ "event": "NF_LOAD" }]
+            }))
+            .expect("valid JSON body");
+        assert_eq!(handle_subscription_create(&req).await.status, 201);
+        let ctx = nwdaf_self();
+        let stored = ctx
+            .read()
+            .unwrap()
+            .get_all_active_subscriptions()
+            .into_iter()
+            .next()
+            .expect("subscription stored");
+        assert!(
+            stored.expiry > now_secs() + 1000,
+            "the non-spec expiryTime must be ignored, not applied (expiry={}, now={})",
+            stored.expiry,
+            now_secs()
+        );
+        assert_eq!(stored.max_report_nbr, None, "no evtReq → unlimited reports");
+
+        // evtReq.maxReportNbr and a monDur duration ARE honoured.
+        nwdaf_context_init("nwdaf-test2".to_string(), 1024);
+        let req = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                "evtReq": { "maxReportNbr": 5, "monDur": 120 },
+                "eventSubscriptions": [{ "event": "NF_LOAD" }]
+            }))
+            .expect("valid JSON body");
+        assert_eq!(handle_subscription_create(&req).await.status, 201);
+        let stored = nwdaf_self()
+            .read()
+            .unwrap()
+            .get_all_active_subscriptions()
+            .into_iter()
+            .find(|s| s.max_report_nbr == Some(5))
+            .expect("the evtReq subscription");
+        assert!(
+            stored.expiry <= now_secs() + 121 && stored.expiry > now_secs(),
+            "monDur must set the window (expiry={})",
+            stored.expiry
+        );
     }
 
     /// Issue #108: a subscription mixing a serviceable event with an

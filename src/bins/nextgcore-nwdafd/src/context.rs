@@ -441,6 +441,38 @@ pub struct AnalyticsSubscription {
     pub repetition_period_secs: Option<u64>,
     /// Unix timestamp of the last successfully dispatched notification.
     pub last_notification_time: Option<u64>,
+    /// `evtReq.maxReportNbr` (TS 29.523 `ReportingInformation`): stop after this
+    /// many notifications. `None` = unlimited (issue #108).
+    pub max_report_nbr: Option<u64>,
+    /// Notifications successfully dispatched so far, counted against
+    /// [`Self::max_report_nbr`].
+    pub reports_sent: u64,
+    /// Set once a termination notification carrying `termCause` has been sent,
+    /// so it is emitted exactly once (issue #108).
+    pub termination_notified: bool,
+}
+
+/// TS 29.520 `TerminationCause` — why the NWDAF stopped reporting.
+///
+/// Before issue #108 a subscription simply vanished from
+/// `get_all_active_subscriptions` when its bespoke `expiryTime` passed, with no
+/// notification at all: a consumer could not tell a deliberate termination from
+/// a lost subscription, so it could not re-subscribe deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationCause {
+    /// The monitoring duration (`evtReq.monDur`) elapsed.
+    MonitoringDurationExpiry,
+    /// The requested number of reports (`evtReq.maxReportNbr`) was reached.
+    MaxNumberOfReportsReached,
+}
+
+impl TerminationCause {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MonitoringDurationExpiry => "MONITORING_DURATION_EXPIRY",
+            Self::MaxNumberOfReportsReached => "MAX_NUMBER_OF_REPORTS_REACHED",
+        }
+    }
 }
 
 impl AnalyticsSubscription {
@@ -479,6 +511,9 @@ impl AnalyticsSubscription {
             notification_correlation_id,
             repetition_period_secs: Some(60),
             last_notification_time: None,
+            max_report_nbr: None,
+            reports_sent: 0,
+            termination_notified: false,
         }
     }
 
@@ -505,6 +540,25 @@ impl AnalyticsSubscription {
         now > self.expiry
     }
 
+    /// Why this subscription should stop reporting, or `None` while it is live
+    /// (issue #108).
+    ///
+    /// Both causes are checked here rather than at the two former call sites so
+    /// `is_due_for_notification` and the dispatcher's termination pass cannot
+    /// disagree about whether a subscription is finished.
+    pub fn termination_cause(&self) -> Option<TerminationCause> {
+        if self
+            .max_report_nbr
+            .is_some_and(|max| self.reports_sent >= max)
+        {
+            return Some(TerminationCause::MaxNumberOfReportsReached);
+        }
+        if self.is_expired() {
+            return Some(TerminationCause::MonitoringDurationExpiry);
+        }
+        None
+    }
+
     /// Returns true if this subscription is due for a periodic notification.
     ///
     /// A subscription is due when:
@@ -514,7 +568,8 @@ impl AnalyticsSubscription {
     ///   If `repetition_period_secs` is `None` the subscription is treated as
     ///   a one-shot: due only on the very first dispatch.
     pub fn is_due_for_notification(&self) -> bool {
-        if !self.active || self.is_expired() {
+        // Issue #108: `maxReportNbr` is a stop condition as much as expiry is.
+        if !self.active || self.termination_cause().is_some() {
             return false;
         }
         let now = std::time::SystemTime::now()
@@ -1061,7 +1116,15 @@ impl NwdafContext {
             .read()
             .map(|subs| {
                 subs.values()
-                    .filter(|s| s.active && !s.is_expired())
+                    // Issue #108: a subscription that has just hit a stop
+                    // condition stays visible until its termCause notification
+                    // has gone out, otherwise it disappears silently — which is
+                    // the defect. `is_due_for_notification` still gates the
+                    // ordinary reports, so a terminating subscription emits its
+                    // termination and nothing else.
+                    .filter(|s| {
+                        s.active && (s.termination_cause().is_none() || !s.termination_notified)
+                    })
                     .cloned()
                     .collect()
             })
@@ -1078,6 +1141,19 @@ impl NwdafContext {
         if let Ok(mut subs) = self.analytics_subscriptions.write() {
             if let Some(sub) = subs.get_mut(subscription_id) {
                 sub.last_notification_time = Some(now);
+                // Issue #108: counted here rather than at the send site so a
+                // failed delivery does not consume one of `maxReportNbr`.
+                sub.reports_sent = sub.reports_sent.saturating_add(1);
+            }
+        }
+    }
+
+    /// Mark a subscription's termination notification as delivered, so the
+    /// `termCause` report is emitted exactly once (issue #108).
+    pub fn mark_subscription_terminated(&self, subscription_id: &str) {
+        if let Ok(mut subs) = self.analytics_subscriptions.write() {
+            if let Some(sub) = subs.get_mut(subscription_id) {
+                sub.termination_notified = true;
             }
         }
     }
@@ -1310,6 +1386,122 @@ mod tests {
 
         assert!(ctx.remove_ml_prov_subscription("mlsub-1").is_some());
         assert_eq!(ctx.ml_prov_subscription_count(), 0);
+    }
+
+    /// Issue #108: a subscription terminates for a NAMED reason, and the two
+    /// reasons are distinguishable — `maxReportNbr` reached vs monitoring
+    /// duration elapsed. Before this it just vanished with no `termCause`, so a
+    /// consumer could not tell a deliberate termination from a lost subscription.
+    #[test]
+    fn test_termination_cause_is_named_and_distinguishes_its_two_reasons() {
+        let live = |max: Option<u64>, sent: u64| {
+            let mut sub = AnalyticsSubscription::new(
+                "s1".into(),
+                AnalyticsId::NfLoad,
+                "http://x/y".into(),
+                u64::MAX, // not expired
+            );
+            sub.max_report_nbr = max;
+            sub.reports_sent = sent;
+            sub
+        };
+
+        // Live: no cause, and reporting is due.
+        let sub = live(Some(3), 1);
+        assert_eq!(sub.termination_cause(), None);
+        assert!(sub.is_due_for_notification());
+
+        // maxReportNbr reached → that cause, and no longer due.
+        let sub = live(Some(3), 3);
+        assert_eq!(
+            sub.termination_cause(),
+            Some(TerminationCause::MaxNumberOfReportsReached)
+        );
+        assert!(
+            !sub.is_due_for_notification(),
+            "maxReportNbr is a stop condition, not just a counter"
+        );
+
+        // Monitoring duration elapsed → the other cause.
+        let mut expired = live(None, 0);
+        expired.expiry = 1; // 1970
+        assert_eq!(
+            expired.termination_cause(),
+            Some(TerminationCause::MonitoringDurationExpiry)
+        );
+
+        // The two are distinct on the wire.
+        assert_eq!(
+            TerminationCause::MaxNumberOfReportsReached.as_str(),
+            "MAX_NUMBER_OF_REPORTS_REACHED"
+        );
+        assert_eq!(
+            TerminationCause::MonitoringDurationExpiry.as_str(),
+            "MONITORING_DURATION_EXPIRY"
+        );
+
+        // Unlimited reporting never terminates on count.
+        let unlimited = live(None, 10_000);
+        assert_eq!(unlimited.termination_cause(), None);
+    }
+
+    /// Issue #108: a terminating subscription must stay visible until its
+    /// termCause notification has gone out — disappearing silently is the defect.
+    #[test]
+    fn test_terminating_subscription_stays_visible_until_notified() {
+        let mut ctx = NwdafContext::new("nwdaf-test".to_string());
+        ctx.init(100);
+        let mut sub = AnalyticsSubscription::new(
+            "s-term".into(),
+            AnalyticsId::NfLoad,
+            "http://x/y".into(),
+            1, // already expired
+        );
+        sub.notification_correlation_id = "corr-term".into();
+        ctx.add_subscription(sub);
+
+        assert_eq!(
+            ctx.get_all_active_subscriptions().len(),
+            1,
+            "an expired subscription is still listed so its termCause can be sent"
+        );
+
+        ctx.mark_subscription_terminated("s-term");
+        assert!(
+            ctx.get_all_active_subscriptions().is_empty(),
+            "once notified it drops out"
+        );
+    }
+
+    /// A dispatched notification counts against `maxReportNbr` (issue #108).
+    #[test]
+    fn test_dispatched_notifications_count_against_max_report_nbr() {
+        let mut ctx = NwdafContext::new("nwdaf-test".to_string());
+        ctx.init(100);
+        let mut sub = AnalyticsSubscription::new(
+            "s-count".into(),
+            AnalyticsId::NfLoad,
+            "http://x/y".into(),
+            u64::MAX,
+        );
+        sub.max_report_nbr = Some(2);
+        sub.repetition_period_secs = None;
+        ctx.add_subscription(sub);
+
+        ctx.update_subscription_last_notification("s-count");
+        assert_eq!(ctx.get_subscription("s-count").unwrap().reports_sent, 1);
+        assert_eq!(
+            ctx.get_subscription("s-count").unwrap().termination_cause(),
+            None
+        );
+
+        ctx.update_subscription_last_notification("s-count");
+        assert_eq!(ctx.get_subscription("s-count").unwrap().reports_sent, 2);
+        assert_eq!(
+            ctx.get_subscription("s-count").unwrap().termination_cause(),
+            Some(TerminationCause::MaxNumberOfReportsReached),
+            "the second report reaches the limit"
+        );
     }
 
     /// nwafd-07: per-(subscription, event, instance) level state round-trips and
