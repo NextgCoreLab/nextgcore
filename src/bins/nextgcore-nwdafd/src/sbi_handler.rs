@@ -408,15 +408,36 @@ fn parse_events_subscription(
     };
 
     let mut events: Vec<EventSubscription> = Vec::with_capacity(event_array.len());
+    let mut unknown_events: Vec<String> = Vec::new();
     for es in event_array {
         let event_token = es.get("event").and_then(|v| v.as_str()).unwrap_or("");
         let event = match AnalyticsId::from_str(event_token) {
             Some(e) => e,
             None => {
-                return Err((
-                    format!("Invalid or missing event: {event_token}"),
-                    "INVALID_ANALYTICS_TYPE",
-                ))
+                // Issue #108: an event outside the enumeration fails on its own,
+                // not for the whole subscription. TS 29.520 §4.2.2.4.2 reports
+                // events the NWDAF cannot serve via `failEventReports`, and the
+                // `NwdafEvent` yaml has a free-form `anyOf` alternative
+                // expressly for forward compatibility — so a consumer asking for
+                // a newer analytics type must still receive the events it *is*
+                // entitled to. Rejecting the lot with 400
+                // INVALID_ANALYTICS_TYPE made that brittle.
+                //
+                // An `event` member that is absent entirely is a different
+                // thing: it is a missing mandatory IE, not an unknown value.
+                if event_token.is_empty() {
+                    return Err((
+                        "eventSubscriptions[] entry is missing the mandatory 'event' member"
+                            .to_string(),
+                        "MANDATORY_IE_MISSING",
+                    ));
+                }
+                log::info!(
+                    "subscription requests unrecognised event {event_token:?}; reporting it in \
+                     failEventReports rather than rejecting the subscription"
+                );
+                unknown_events.push(event_token.to_string());
+                continue;
             }
         };
 
@@ -434,20 +455,31 @@ fn parse_events_subscription(
         //  - SLICE_LOAD_LEVEL / NSI_LOAD_LEVEL use the scalar `loadLevelThreshold`.
         //  - NF_LOAD (and other NF-load events) use `nfLoadLvlThds[].nfLoadLevel`
         //    (ThresholdLevel, §5.1.6.2.30), falling back to `nfCpuUsage`.
-        let load_level_threshold = match event {
-            AnalyticsId::SliceLoadLevel | AnalyticsId::NsiLoadLevel => {
-                es.get("loadLevelThreshold").and_then(|v| v.as_u64())
-            }
+        // Issue #108: `nfLoadLvlThds` is a LIST of ThresholdLevel and a
+        // THRESHOLD notification fires when ANY entry is crossed; only `[0]`
+        // used to be read, so every additional threshold was inert.
+        let mut all_thresholds: Vec<u64> = match event {
+            AnalyticsId::SliceLoadLevel | AnalyticsId::NsiLoadLevel => es
+                .get("loadLevelThreshold")
+                .and_then(|v| v.as_u64())
+                .into_iter()
+                .collect(),
             _ => es
                 .get("nfLoadLvlThds")
                 .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .and_then(|t| {
-                    t.get("nfLoadLevel")
-                        .or_else(|| t.get("nfCpuUsage"))
-                        .and_then(|v| v.as_u64())
-                }),
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| {
+                            t.get("nfLoadLevel")
+                                .or_else(|| t.get("nfCpuUsage"))
+                                .and_then(|v| v.as_u64())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
+        let load_level_threshold = (!all_thresholds.is_empty()).then(|| all_thresholds.remove(0));
+        let extra_load_level_thresholds = all_thresholds;
 
         let matching_dir = es
             .get("matchingDir")
@@ -481,6 +513,7 @@ fn parse_events_subscription(
             notification_method,
             rep_period_secs,
             load_level_threshold,
+            extra_load_level_thresholds,
             matching_dir,
             snssais,
             nf_instance_ids,
@@ -523,6 +556,7 @@ fn parse_events_subscription(
     );
     subscription.notification_correlation_id = notif_corr_id;
     subscription.repetition_period_secs = rep_period;
+    subscription.unknown_events = unknown_events;
     if let Some(supi) = tgt_supi {
         subscription = subscription.with_target_supi(supi);
     }
@@ -534,11 +568,20 @@ fn parse_events_subscription(
 
 /// G2-3: build the TS 29.520 `failEventReports[]` array — one
 /// `FailureEventInfo { event, failureCode }` (both mandatory per the yaml)
-/// with `failureCode` = `UNAVAILABLE_DATA` for every subscribed event that is
-/// not in [`SUPPORTED_EVENTS`] (no collector → the necessary data to perform
-/// the service is unavailable). Empty when every event is supported.
-fn fail_event_reports(events: &[EventSubscription]) -> Vec<serde_json::Value> {
-    events
+/// per event this NWDAF cannot serve. Empty when every event is serviceable.
+///
+/// Two distinct reasons land here, both `UNAVAILABLE_DATA`:
+///
+/// - a **recognised** event with no collector in this build (not in
+///   [`SUPPORTED_EVENTS`]);
+/// - an **unrecognised** token, i.e. outside the `NwdafEvent` enumeration
+///   (issue #108). These used to fail the whole subscription with
+///   `400 INVALID_ANALYTICS_TYPE`; they are now reported per-event, so a
+///   consumer requesting a newer analytics type keeps the events it is entitled
+///   to. The token is echoed back verbatim, since that is what the consumer
+///   asked for and `FailureEventInfo.event` is a free-form-capable `NwdafEvent`.
+fn fail_event_reports(sub: &AnalyticsSubscription) -> Vec<serde_json::Value> {
+    sub.events
         .iter()
         .filter(|e| !e.event.is_supported())
         .map(|e| {
@@ -547,6 +590,12 @@ fn fail_event_reports(events: &[EventSubscription]) -> Vec<serde_json::Value> {
                 "failureCode": "UNAVAILABLE_DATA",
             })
         })
+        .chain(sub.unknown_events.iter().map(|token| {
+            serde_json::json!({
+                "event": token,
+                "failureCode": "UNAVAILABLE_DATA",
+            })
+        }))
         .collect()
 }
 
@@ -580,7 +629,7 @@ fn events_subscription_echo(sub: &AnalyticsSubscription) -> serde_json::Value {
             .collect::<Vec<_>>()),
     );
     // failEventReports has minItems 1 in the yaml: omit entirely when empty.
-    let failed = fail_event_reports(&sub.events);
+    let failed = fail_event_reports(sub);
     if !failed.is_empty() {
         obj.insert("failEventReports".to_string(), serde_json::json!(failed));
     }
@@ -1071,6 +1120,99 @@ mod tests {
                 event.as_str()
             );
         }
+    }
+
+    /// Issue #108: a subscription mixing a serviceable event with an
+    /// unrecognised token must SUCCEED, listing the unknown one in
+    /// `failEventReports` — not die with 400 INVALID_ANALYTICS_TYPE and take the
+    /// serviceable event with it. The `NwdafEvent` yaml has a free-form `anyOf`
+    /// alternative expressly so consumers can request newer analytics types.
+    #[tokio::test]
+    async fn test_unrecognised_event_fails_alone_not_the_subscription() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let req = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                "eventSubscriptions": [
+                    { "event": "NF_LOAD" },
+                    { "event": "SOME_REL20_ANALYTIC" }
+                ]
+            }))
+            .expect("valid JSON body");
+        let resp = handle_subscription_create(&req).await;
+        assert_eq!(
+            resp.status, 201,
+            "one unknown token must not reject the whole subscription"
+        );
+
+        let body = body_json(&resp);
+        // The serviceable event survived.
+        let events: Vec<&str> = body["eventSubscriptions"]
+            .as_array()
+            .expect("eventSubscriptions")
+            .iter()
+            .filter_map(|e| e["event"].as_str())
+            .collect();
+        assert_eq!(events, vec!["NF_LOAD"], "the entitled event is kept");
+
+        // The unknown one is reported per-event, echoed verbatim.
+        let failed = body["failEventReports"]
+            .as_array()
+            .expect("failEventReports must list the unknown event");
+        assert!(
+            failed.iter().any(|f| {
+                f["event"].as_str() == Some("SOME_REL20_ANALYTIC")
+                    && f["failureCode"].as_str() == Some("UNAVAILABLE_DATA")
+            }),
+            "got {failed:?}"
+        );
+    }
+
+    /// A previously-missing but spec-valid token is now recognised, so it is
+    /// carried as an event (and reported unsupported because it has no
+    /// collector) rather than rejected as an invalid analytics type.
+    #[tokio::test]
+    async fn test_previously_missing_spec_token_is_accepted() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let req = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                // One of the nine tokens #108 added; before it, this returned 400.
+                "eventSubscriptions": [{ "event": "MOVEMENT_BEHAVIOUR" }]
+            }))
+            .expect("valid JSON body");
+        let resp = handle_subscription_create(&req).await;
+        assert_eq!(resp.status, 201);
+
+        let body = body_json(&resp);
+        assert_eq!(
+            body["eventSubscriptions"][0]["event"].as_str(),
+            Some("MOVEMENT_BEHAVIOUR"),
+            "a spec token must be recognised and carried"
+        );
+        assert_eq!(
+            body["failEventReports"][0]["event"].as_str(),
+            Some("MOVEMENT_BEHAVIOUR"),
+            "recognised but with no collector → reported unsupported"
+        );
+    }
+
+    /// An `event` member absent entirely is a missing mandatory IE, which is a
+    /// different failure from an unknown value and must stay a 400.
+    #[tokio::test]
+    async fn test_missing_event_member_is_still_a_bad_request() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let req = SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+            .with_json_body(&json!({
+                "notificationURI": "http://amf.example.org/notify",
+                "eventSubscriptions": [{ "notificationMethod": "PERIODIC" }]
+            }))
+            .expect("valid JSON body");
+        let resp = handle_subscription_create(&req).await;
+        assert_eq!(
+            resp.status, 400,
+            "a missing mandatory IE is not an unknown value"
+        );
     }
 
     /// G2-3 honesty: POST subscription {NF_LOAD, UE_MOBILITY} → 201 whose body

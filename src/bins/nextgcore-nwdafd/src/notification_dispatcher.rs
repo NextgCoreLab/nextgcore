@@ -138,18 +138,40 @@ pub fn threshold_crossed(
     }
 }
 
-/// Extract the scalar level (0–100) used for THRESHOLD evaluation from a
-/// previously-computed per-event `*Infos` array. Only `NF_LOAD` exposes such a
-/// scalar today (`nfLoadLevelAverage`); other events return `None`, so a
-/// THRESHOLD subscription on them cannot be evaluated and is suppressed.
-fn extract_level(event: AnalyticsId, infos: &Value) -> Option<f64> {
+/// Extract the per-instance scalar levels (0–100) used for THRESHOLD evaluation
+/// from a previously-computed per-event `*Infos` array, paired with the instance
+/// each came from.
+///
+/// Only `NF_LOAD` exposes such a scalar today (`nfLoadLevelAverage`); other
+/// events yield an empty vector, so a THRESHOLD subscription on them cannot be
+/// evaluated and is suppressed.
+///
+/// Issue #108: this used to return only `infos.first()`, so a subscription
+/// watching an NF type with several instances was evaluated against whichever
+/// one happened to sort first and the rest could cross a threshold unnoticed.
+/// The instance id comes back with the level because the edge-detection state has
+/// to be kept per instance — see [`crate::context::NwdafContext::get_event_level`].
+fn extract_levels(event: AnalyticsId, infos: &Value) -> Vec<(String, f64)> {
+    let Some(arr) = infos.as_array() else {
+        return Vec::new();
+    };
     match event {
-        AnalyticsId::NfLoad => infos
-            .as_array()?
-            .first()?
-            .get("nfLoadLevelAverage")?
-            .as_f64(),
-        _ => None,
+        AnalyticsId::NfLoad => arr
+            .iter()
+            .filter_map(|info| {
+                let level = info.get("nfLoadLevelAverage")?.as_f64()?;
+                // An info entry without an instance id cannot have its own
+                // edge state; key it by the empty string so it still evaluates
+                // rather than being silently dropped.
+                let instance = info
+                    .get("nfInstanceId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some((instance, level))
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -323,21 +345,38 @@ fn build_event_notifications(
                 return None;
             }
 
-            // THRESHOLD gate (nwafd-07).
+            // THRESHOLD gate (nwafd-07, widened by issue #108).
+            //
+            // Every configured threshold is evaluated against every reported
+            // instance, and the notification fires if ANY (instance, threshold)
+            // pair crosses. Previously only `nfLoadLvlThds[0]` against
+            // `infos.first()` was checked, so additional thresholds and every
+            // instance after the first could cross unnoticed.
+            //
+            // Edge state is recorded for every instance regardless of whether it
+            // crossed: `threshold_crossed` is edge-triggered, so an instance
+            // whose level is not written back would re-fire on the next cycle.
             if e.notification_method == Some(NotificationMethod::Threshold) {
-                let measured = extract_level(e.event, &infos);
-                let threshold = e.load_level_threshold.map(|t| t as f64);
-                match (measured, threshold) {
-                    (Some(m), Some(th)) => {
-                        let prev = ctx.get_event_level(&sub.subscription_id, e.event);
-                        ctx.set_event_level(&sub.subscription_id, e.event, m);
-                        if !threshold_crossed(prev, m, th, e.matching_direction()) {
-                            return None;
-                        }
-                    }
+                let measured = extract_levels(e.event, &infos);
+                let thresholds = e.load_level_thresholds();
+                if measured.is_empty() || thresholds.is_empty() {
                     // No computable metric or no configured threshold → the
                     // THRESHOLD condition cannot be evaluated; suppress.
-                    _ => return None,
+                    return None;
+                }
+
+                let mut any_crossed = false;
+                for (instance, level) in &measured {
+                    let prev = ctx.get_event_level(&sub.subscription_id, e.event, instance);
+                    ctx.set_event_level(&sub.subscription_id, e.event, instance, *level);
+                    if thresholds.iter().any(|th| {
+                        threshold_crossed(prev, *level, *th as f64, e.matching_direction())
+                    }) {
+                        any_crossed = true;
+                    }
+                }
+                if !any_crossed {
+                    return None;
                 }
             }
 
@@ -355,8 +394,11 @@ fn build_event_notifications(
 // Notify body builder (pure, testable without network)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build the `NnwdafEventsSubscriptionNotification` JSON body for one
-/// subscription (TS 29.520 `components.schemas`):
+/// Build one `NnwdafEventsSubscriptionNotification` object.
+///
+/// This is a single element of the callback body, **not** the body itself — see
+/// [`build_notify_callback_body`], which wraps it in the array TS 29.520
+/// requires.
 /// ```json
 /// {
 ///   "subscriptionId": "...",
@@ -370,6 +412,27 @@ pub fn build_notify_body(sub: &AnalyticsSubscription, event_notifications: Vec<V
         "notifCorrId":        sub.notification_correlation_id,
         "eventNotifications": event_notifications,
     })
+}
+
+/// Build the Nnwdaf_EventsSubscription **callback body** (issue #108).
+///
+/// TS 29.520 §4.2.2.2.2 declares the notify `requestBody` as
+/// `type: array, items: NnwdafEventsSubscriptionNotification, minItems: 1`
+/// (`TS29520_Nnwdaf_EventsSubscription.yaml:82-90`). This NF POSTed the bare
+/// object instead, so a conformant consumer deserialising an array rejected
+/// **every** notification the NWDAF emitted — an interop hard stop that made
+/// closed-loop automation silently never fire.
+///
+/// The ML-provision path in [`crate::ml_service::build_ml_model_prov_notif_body`]
+/// already wrapped correctly; the two paths disagreeing is what made this easy
+/// to miss. Both are now array-shaped, and a test asserts they agree.
+pub fn build_notify_callback_body(
+    sub: &AnalyticsSubscription,
+    event_notifications: Vec<Value>,
+) -> Value {
+    // minItems: 1 — one subscription's notification per POST, so exactly one
+    // element. The array is the contract, not a batching mechanism.
+    json!([build_notify_body(sub, event_notifications)])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,7 +487,7 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
             continue;
         }
 
-        let body = build_notify_body(sub, event_notifications);
+        let body = build_notify_callback_body(sub, event_notifications);
 
         // Parse the notification URI
         let (host, port, path) = match parse_notify_uri(&sub.notification_uri) {
@@ -610,6 +673,59 @@ mod tests {
                 0,
             ));
         }
+    }
+
+    /// **The #108 acceptance test.** TS 29.520 §4.2.2.2.2 declares the notify
+    /// `requestBody` as `type: array, items: NnwdafEventsSubscriptionNotification,
+    /// minItems: 1`. This NF POSTed the bare object, so every conformant consumer
+    /// rejected every notification it emitted — closed-loop automation silently
+    /// never fired. The callback body must be an array.
+    #[test]
+    fn test_notify_callback_body_is_an_array() {
+        let (ctx_arc, sub_id) = make_ctx_with_sub("http://amf.local:8080/notify", Some(60));
+        let ctx = ctx_arc.read().unwrap();
+        ingest_loads(&ctx, "AMF", "amf-array-shape", &[30, 32]);
+        let sub = ctx.get_subscription(&sub_id).unwrap();
+
+        let engine = ctx.lock_engine();
+        let event_notifications = build_event_notifications(&ctx, &engine, &sub);
+        drop(engine);
+        let body = build_notify_callback_body(&sub, event_notifications);
+
+        let arr = body
+            .as_array()
+            .expect("the callback body must be a JSON array, not an object");
+        assert_eq!(arr.len(), 1, "minItems: 1 — one notification per POST");
+        // The element is the object the old code POSTed unwrapped.
+        assert_eq!(arr[0]["subscriptionId"].as_str(), Some("sub-test-001"));
+        assert!(arr[0]["eventNotifications"].is_array());
+    }
+
+    /// The EventsSubscription and ML-provision notification paths must agree on
+    /// top-level wire shape. They disagreeing — ML-provision wrapped, events did
+    /// not — is what let the events-path defect go unnoticed.
+    #[test]
+    fn test_both_notification_paths_are_array_shaped() {
+        let (ctx_arc, sub_id) = make_ctx_with_sub("http://amf.local:8080/notify", Some(60));
+        let ctx = ctx_arc.read().unwrap();
+        let sub = ctx.get_subscription(&sub_id).unwrap();
+        let events_body = build_notify_callback_body(&sub, Vec::new());
+
+        let ml_sub = crate::context::MlProvSubscription::new(
+            "mlsub-shape".to_string(),
+            "http://anlf.local/cb".to_string(),
+            None,
+            vec![AnalyticsId::NfLoad],
+        );
+        let ml_body = crate::ml_service::build_ml_model_prov_notif_body(&ml_sub, None);
+
+        assert!(events_body.is_array(), "EventsSubscription notify");
+        assert!(ml_body.is_array(), "MLModelProvision notify");
+        assert_eq!(
+            events_body.as_array().map(Vec::len),
+            ml_body.as_array().map(Vec::len),
+            "both paths deliver exactly one notification per POST"
+        );
     }
 
     /// nwafd-04: the Notify body is an `NnwdafEventsSubscriptionNotification`:
@@ -878,6 +994,87 @@ mod tests {
             80.0,
             MatchingDirection::Crossed
         ));
+    }
+
+    /// Issue #108: a threshold beyond `nfLoadLvlThds[0]` must still fire. Only
+    /// index 0 was evaluated, so every additional configured threshold was inert.
+    #[test]
+    fn test_every_configured_threshold_is_evaluated() {
+        let ctx = NwdafContext::new("nwdaf-test".to_string());
+        ingest_loads(&ctx, "AMF", "amf-multi-thr", &[55, 55]);
+
+        let mut e = EventSubscription::periodic(AnalyticsId::NfLoad);
+        e.notification_method = Some(NotificationMethod::Threshold);
+        e.matching_dir = Some("ASCENDING".to_string());
+        // Primary threshold is far above the ingested load 55, so only the
+        // SECOND entry can make this fire.
+        e.load_level_threshold = Some(90);
+        e.extra_load_level_thresholds = vec![40];
+        assert_eq!(e.load_level_thresholds(), vec![90, 40]);
+
+        let mut sub = AnalyticsSubscription::new(
+            "sub-multi-thr".into(),
+            AnalyticsId::NfLoad,
+            "http://x/y".into(),
+            u64::MAX,
+        );
+        sub.events = vec![e];
+        let engine = ctx.lock_engine();
+        assert_eq!(
+            build_event_notifications(&ctx, &engine, &sub).len(),
+            1,
+            "a crossing of nfLoadLvlThds[1] must fire, not just [0]"
+        );
+    }
+
+    /// Issue #108: with several instances reporting, a crossing on any of them
+    /// must fire — `infos.first()` meant only one instance was ever checked —
+    /// and their edge state must stay separate.
+    #[test]
+    fn test_thresholds_are_evaluated_per_instance() {
+        let ctx = NwdafContext::new("nwdaf-test".to_string());
+        // Two instances of the same NF type: one quiet, one hot.
+        ingest_loads(&ctx, "AMF", "amf-quiet", &[10, 10]);
+        ingest_loads(&ctx, "AMF", "amf-hot", &[95, 95]);
+
+        let mut e = EventSubscription::periodic(AnalyticsId::NfLoad);
+        e.notification_method = Some(NotificationMethod::Threshold);
+        e.matching_dir = Some("ASCENDING".to_string());
+        e.load_level_threshold = Some(80);
+
+        let mut sub = AnalyticsSubscription::new(
+            "sub-per-instance".into(),
+            AnalyticsId::NfLoad,
+            "http://x/y".into(),
+            u64::MAX,
+        );
+        sub.events = vec![e];
+
+        let engine = ctx.lock_engine();
+        assert_eq!(
+            build_event_notifications(&ctx, &engine, &sub).len(),
+            1,
+            "the hot instance crossing 80 must fire even if another is quiet"
+        );
+        drop(engine);
+
+        // Both instances' levels were recorded, separately.
+        assert_eq!(
+            ctx.get_event_level("sub-per-instance", AnalyticsId::NfLoad, "amf-quiet"),
+            Some(10.0)
+        );
+        assert_eq!(
+            ctx.get_event_level("sub-per-instance", AnalyticsId::NfLoad, "amf-hot"),
+            Some(95.0)
+        );
+
+        // ASCENDING is edge-triggered: with both levels now recorded and
+        // unchanged, a second evaluation must NOT re-fire.
+        let engine = ctx.lock_engine();
+        assert!(
+            build_event_notifications(&ctx, &engine, &sub).is_empty(),
+            "an unchanged level must not re-fire an ASCENDING threshold"
+        );
     }
 
     /// A THRESHOLD event is suppressed below its threshold and emitted at/above

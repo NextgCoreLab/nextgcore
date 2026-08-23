@@ -77,6 +77,30 @@ pub enum AnalyticsId {
     DnPerformance,
     /// PDU session traffic analytics (`PDU_SESSION_TRAFFIC`, Rel-18)
     PduSessionTraffic,
+    // The nine tokens below complete the TS 29.520 `NwdafEvent` enumeration
+    // (issue #108). None has a collector in this build, so each is
+    // `is_supported() == false` and is reported per-event via
+    // `failEventReports` — but being *recognised* is what lets a subscription
+    // mixing them with NF_LOAD succeed for the part we can serve, instead of
+    // being rejected wholesale.
+    /// PFD determination analytics (`PFD_DETERMINATION`, Rel-17)
+    PfdDetermination,
+    /// End-to-end data-volume transfer time (`E2E_DATA_VOL_TRANS_TIME`, Rel-17)
+    E2eDataVolTransTime,
+    /// UE movement behaviour (`MOVEMENT_BEHAVIOUR`, Rel-18)
+    MovementBehaviour,
+    /// Location accuracy analytics (`LOC_ACCURACY`, Rel-18)
+    LocAccuracy,
+    /// Relative UE proximity (`RELATIVE_PROXIMITY`, Rel-18)
+    RelativeProximity,
+    /// Signalling storm analytics (`SIGNALLING_STORM`, Rel-18)
+    SignallingStorm,
+    /// QoS policy assistance (`QOS_POLICY_ASSIST`, Rel-18)
+    QosPolicyAssist,
+    /// Abnormal uplink/downlink traffic (`ABNORMAL_UP_TRAFFIC`, Rel-18)
+    AbnormalUpTraffic,
+    /// Traffic pattern analytics (`TRAFFIC_PATTERN`, Rel-18)
+    TrafficPattern,
 }
 
 impl AnalyticsId {
@@ -100,6 +124,15 @@ impl AnalyticsId {
         Self::WlanPerformance,
         Self::DnPerformance,
         Self::PduSessionTraffic,
+        Self::PfdDetermination,
+        Self::E2eDataVolTransTime,
+        Self::MovementBehaviour,
+        Self::LocAccuracy,
+        Self::RelativeProximity,
+        Self::SignallingStorm,
+        Self::QosPolicyAssist,
+        Self::AbnormalUpTraffic,
+        Self::TrafficPattern,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -120,6 +153,15 @@ impl AnalyticsId {
             Self::WlanPerformance => "WLAN_PERFORMANCE",
             Self::DnPerformance => "DN_PERFORMANCE",
             Self::PduSessionTraffic => "PDU_SESSION_TRAFFIC",
+            Self::PfdDetermination => "PFD_DETERMINATION",
+            Self::E2eDataVolTransTime => "E2E_DATA_VOL_TRANS_TIME",
+            Self::MovementBehaviour => "MOVEMENT_BEHAVIOUR",
+            Self::LocAccuracy => "LOC_ACCURACY",
+            Self::RelativeProximity => "RELATIVE_PROXIMITY",
+            Self::SignallingStorm => "SIGNALLING_STORM",
+            Self::QosPolicyAssist => "QOS_POLICY_ASSIST",
+            Self::AbnormalUpTraffic => "ABNORMAL_UP_TRAFFIC",
+            Self::TrafficPattern => "TRAFFIC_PATTERN",
         }
     }
 
@@ -141,6 +183,15 @@ impl AnalyticsId {
             "WLAN_PERFORMANCE" => Some(Self::WlanPerformance),
             "DN_PERFORMANCE" => Some(Self::DnPerformance),
             "PDU_SESSION_TRAFFIC" => Some(Self::PduSessionTraffic),
+            "PFD_DETERMINATION" => Some(Self::PfdDetermination),
+            "E2E_DATA_VOL_TRANS_TIME" => Some(Self::E2eDataVolTransTime),
+            "MOVEMENT_BEHAVIOUR" => Some(Self::MovementBehaviour),
+            "LOC_ACCURACY" => Some(Self::LocAccuracy),
+            "RELATIVE_PROXIMITY" => Some(Self::RelativeProximity),
+            "SIGNALLING_STORM" => Some(Self::SignallingStorm),
+            "QOS_POLICY_ASSIST" => Some(Self::QosPolicyAssist),
+            "ABNORMAL_UP_TRAFFIC" => Some(Self::AbnormalUpTraffic),
+            "TRAFFIC_PATTERN" => Some(Self::TrafficPattern),
             _ => None,
         }
     }
@@ -171,6 +222,19 @@ impl AnalyticsId {
             Self::DnPerformance => "dnPerfInfos",
             Self::SmCongestion => "smcInfos",
             Self::PduSessionTraffic => "pduSesTrafInfos",
+            // Issue #108: keys read off `EventNotification` in
+            // TS29520_Nnwdaf_EventsSubscription.yaml, not inferred from the
+            // token names — several of them are abbreviated differently from
+            // what the token would suggest (`dataVlTrnsTmInfos`, `movBehavInfos`).
+            Self::PfdDetermination => "pfdDetermInfos",
+            Self::E2eDataVolTransTime => "dataVlTrnsTmInfos",
+            Self::MovementBehaviour => "movBehavInfos",
+            Self::LocAccuracy => "locAccInfos",
+            Self::RelativeProximity => "relProxInfos",
+            Self::SignallingStorm => "signalStormInfos",
+            Self::QosPolicyAssist => "qosPolAssistInfos",
+            Self::AbnormalUpTraffic => "abnormalTrafficInfos",
+            Self::TrafficPattern => "trafficPatternInfos",
         }
     }
 }
@@ -252,6 +316,15 @@ pub struct EventSubscription {
     /// Load-level threshold (`loadLevelThreshold` / `nfLoadLvlThds`), carried
     /// for the deferred THRESHOLD evaluation (nwafd-07); not yet evaluated.
     pub load_level_threshold: Option<u64>,
+    /// Additional `nfLoadLvlThds[]` entries beyond the first (issue #108).
+    ///
+    /// TS 29.520 `EventSubscription.nfLoadLvlThds` is a LIST of `ThresholdLevel`
+    /// and a THRESHOLD notification fires when any of them is crossed. Only
+    /// `[0]` used to be read. Kept as an overflow list beside the existing
+    /// scalar rather than replacing it, so the many call sites and tests that
+    /// read `load_level_threshold` for the primary threshold keep working;
+    /// [`Self::load_level_thresholds`] is the accessor evaluation should use.
+    pub extra_load_level_thresholds: Vec<u64>,
     /// `matchingDir` (ASCENDING / DESCENDING / CROSSED), carried for nwafd-07.
     pub matching_dir: Option<String>,
     /// Per-event slice filters (`snssais`).
@@ -273,6 +346,7 @@ impl EventSubscription {
             notification_method: Some(NotificationMethod::Periodic),
             rep_period_secs: None,
             load_level_threshold: None,
+            extra_load_level_thresholds: Vec::new(),
             matching_dir: None,
             snssais: Vec::new(),
             nf_instance_ids: Vec::new(),
@@ -289,6 +363,31 @@ impl EventSubscription {
             .and_then(MatchingDirection::from_wire)
             .unwrap_or(MatchingDirection::Ascending)
     }
+
+    /// Every configured load-level threshold, primary first (issue #108).
+    ///
+    /// THRESHOLD evaluation must consider all of `nfLoadLvlThds[]`, not just the
+    /// first entry, so this is the accessor the dispatcher uses.
+    pub fn load_level_thresholds(&self) -> Vec<u64> {
+        self.load_level_threshold
+            .into_iter()
+            .chain(self.extra_load_level_thresholds.iter().copied())
+            .collect()
+    }
+}
+
+/// Key for the THRESHOLD edge-detection state: one previous level per
+/// `(subscription, event, NF instance)`.
+///
+/// The instance is part of the key (issue #108) because thresholds are evaluated
+/// per reported instance. Without it, two instances of the same NF type sharing a
+/// subscription would overwrite each other's previous level and
+/// `ASCENDING`/`DESCENDING` would fire or suppress on the wrong history.
+fn event_level_key(subscription_id: &str, event: AnalyticsId, nf_instance_id: &str) -> String {
+    format!(
+        "{subscription_id}\u{1f}{}\u{1f}{nf_instance_id}",
+        event.as_str()
+    )
 }
 
 /// S-NSSAI (Single Network Slice Selection Assistance Information)
@@ -320,6 +419,14 @@ pub struct AnalyticsSubscription {
     pub target_supi: Option<String>,
     /// Target S-NSSAI (for slice-specific analytics)
     pub target_snssai: Option<SNssai>,
+    /// Event tokens the consumer asked for that are outside the TS 29.520
+    /// `NwdafEvent` enumeration entirely (issue #108).
+    ///
+    /// Carried rather than rejected: the enumeration's yaml `anyOf` includes a
+    /// free-form string alternative expressly for forward compatibility, so a
+    /// consumer requesting a newer analytics type must still get the events it
+    /// *is* entitled to. These surface per-event in `failEventReports`.
+    pub unknown_events: Vec<String>,
     /// Notification URI for analytics reports (`notificationURI`)
     pub notification_uri: String,
     /// Subscription expiry time (Unix timestamp)
@@ -365,6 +472,7 @@ impl AnalyticsSubscription {
             events,
             target_supi: None,
             target_snssai: None,
+            unknown_events: Vec::new(),
             notification_uri,
             expiry,
             active: true,
@@ -903,16 +1011,28 @@ impl NwdafContext {
             .unwrap_or(0)
     }
 
-    /// Last observed analytic level for a `(subscription, event)` pair, or
+    /// Last observed analytic level for a `(subscription, event, instance)`, or
     /// `None` if this is the first observation (nwafd-07 edge detection).
-    pub fn get_event_level(&self, subscription_id: &str, event: AnalyticsId) -> Option<f64> {
-        let key = format!("{subscription_id}\u{1f}{}", event.as_str());
+    pub fn get_event_level(
+        &self,
+        subscription_id: &str,
+        event: AnalyticsId,
+        nf_instance_id: &str,
+    ) -> Option<f64> {
+        let key = event_level_key(subscription_id, event, nf_instance_id);
         self.event_levels.read().ok()?.get(&key).copied()
     }
 
-    /// Record the latest observed analytic level for a `(subscription, event)`.
-    pub fn set_event_level(&self, subscription_id: &str, event: AnalyticsId, level: f64) {
-        let key = format!("{subscription_id}\u{1f}{}", event.as_str());
+    /// Record the latest observed analytic level for a
+    /// `(subscription, event, instance)`.
+    pub fn set_event_level(
+        &self,
+        subscription_id: &str,
+        event: AnalyticsId,
+        nf_instance_id: &str,
+        level: f64,
+    ) {
+        let key = event_level_key(subscription_id, event, nf_instance_id);
         if let Ok(mut levels) = self.event_levels.write() {
             levels.insert(key, level);
         }
@@ -1042,7 +1162,24 @@ mod tests {
             "WLAN_PERFORMANCE",
             "DN_PERFORMANCE",
             "PDU_SESSION_TRAFFIC",
+            // Issue #108: the remaining nine `NwdafEvent` tokens, completing the
+            // enumeration at 25. Read off
+            // TS29520_Nnwdaf_EventsSubscription.yaml, not inferred.
+            "PFD_DETERMINATION",
+            "E2E_DATA_VOL_TRANS_TIME",
+            "MOVEMENT_BEHAVIOUR",
+            "LOC_ACCURACY",
+            "RELATIVE_PROXIMITY",
+            "SIGNALLING_STORM",
+            "QOS_POLICY_ASSIST",
+            "ABNORMAL_UP_TRAFFIC",
+            "TRAFFIC_PATTERN",
         ];
+        assert_eq!(
+            tokens.len(),
+            25,
+            "TS 29.520 NwdafEvent defines exactly 25 tokens"
+        );
 
         // from_str(t).as_str() == t for every spec token.
         for t in tokens {
@@ -1175,20 +1312,42 @@ mod tests {
         assert_eq!(ctx.ml_prov_subscription_count(), 0);
     }
 
-    /// nwafd-07: per-(subscription, event) level state round-trips and is keyed
-    /// so different events on the same subscription do not collide.
+    /// nwafd-07: per-(subscription, event, instance) level state round-trips and
+    /// is keyed so nothing on the same subscription collides.
     #[test]
     fn test_event_level_state() {
         let ctx = NwdafContext::new("nwdaf-test".to_string());
-        assert_eq!(ctx.get_event_level("s1", AnalyticsId::NfLoad), None);
-        ctx.set_event_level("s1", AnalyticsId::NfLoad, 42.0);
-        ctx.set_event_level("s1", AnalyticsId::UeMobility, 7.0);
-        assert_eq!(ctx.get_event_level("s1", AnalyticsId::NfLoad), Some(42.0));
         assert_eq!(
-            ctx.get_event_level("s1", AnalyticsId::UeMobility),
+            ctx.get_event_level("s1", AnalyticsId::NfLoad, "amf-1"),
+            None
+        );
+        ctx.set_event_level("s1", AnalyticsId::NfLoad, "amf-1", 42.0);
+        ctx.set_event_level("s1", AnalyticsId::UeMobility, "amf-1", 7.0);
+        assert_eq!(
+            ctx.get_event_level("s1", AnalyticsId::NfLoad, "amf-1"),
+            Some(42.0)
+        );
+        assert_eq!(
+            ctx.get_event_level("s1", AnalyticsId::UeMobility, "amf-1"),
             Some(7.0)
         );
-        assert_eq!(ctx.get_event_level("s2", AnalyticsId::NfLoad), None);
+        assert_eq!(
+            ctx.get_event_level("s2", AnalyticsId::NfLoad, "amf-1"),
+            None
+        );
+
+        // Issue #108: two instances under ONE subscription+event must not share
+        // edge state, or ASCENDING/DESCENDING fires on the wrong history.
+        ctx.set_event_level("s1", AnalyticsId::NfLoad, "amf-2", 99.0);
+        assert_eq!(
+            ctx.get_event_level("s1", AnalyticsId::NfLoad, "amf-1"),
+            Some(42.0),
+            "the second instance must not overwrite the first"
+        );
+        assert_eq!(
+            ctx.get_event_level("s1", AnalyticsId::NfLoad, "amf-2"),
+            Some(99.0)
+        );
     }
 
     /// nwafd-07: `matchingDir` parses to the typed enum and defaults to
