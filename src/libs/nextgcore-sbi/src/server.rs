@@ -695,6 +695,11 @@ fn convert_response(mut sbi_response: SbiResponse) -> Response<Full<Bytes>> {
             &sbi_response.http.parts,
             &boundary,
         ))
+    } else if let Some(binary) = sbi_response.http.binary_content.clone() {
+        // A non-text body (e.g. a downloadable model artefact) goes out
+        // verbatim. Checked after `parts` so multipart still wins, and before
+        // `content` so a handler cannot accidentally send both.
+        binary
     } else {
         sbi_response
             .http
@@ -1284,6 +1289,50 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("SMF-54804518-abcd")
         );
+    }
+
+    /// `binary_content` carries a non-text body verbatim (the NWDAF's ONNX model
+    /// artefact, issue #109), and — the part that matters for every other NF —
+    /// leaving it `None` keeps the JSON path byte-identical.
+    #[tokio::test]
+    async fn test_convert_response_binary_body_is_verbatim_and_opt_in() {
+        use http_body_util::BodyExt;
+
+        async fn body_bytes(resp: Response<Full<Bytes>>) -> Vec<u8> {
+            resp.into_body()
+                .collect()
+                .await
+                .expect("collect body")
+                .to_bytes()
+                .to_vec()
+        }
+
+        // Not valid UTF-8, so this could not have gone through `content`.
+        let artefact: Vec<u8> = vec![0x08, 0x01, 0xFF, 0xFE, 0x00, 0x7F];
+        let mut resp = SbiResponse::with_status(200);
+        resp.http
+            .set_header("Content-Type", "application/octet-stream");
+        resp.http.binary_content = Some(Bytes::from(artefact.clone()));
+        let hyper = convert_response(resp);
+        assert_eq!(hyper.status(), 200);
+        assert_eq!(
+            body_bytes(hyper).await,
+            artefact,
+            "bytes must go out unchanged"
+        );
+
+        // The default: no binary content → the text body wins, exactly as before.
+        let json = SbiResponse::ok().with_body("{\"a\":1}", "application/json");
+        assert!(json.http.binary_content.is_none());
+        assert_eq!(
+            body_bytes(convert_response(json)).await,
+            b"{\"a\":1}".to_vec()
+        );
+
+        // Neither set → empty body, as before.
+        assert!(body_bytes(convert_response(SbiResponse::with_status(204)))
+            .await
+            .is_empty());
     }
 
     #[test]

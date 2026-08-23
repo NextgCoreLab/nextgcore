@@ -192,6 +192,17 @@ pub struct SbiHttpMessage {
     pub headers: HashMap<String, String>,
     /// Body content
     pub content: Option<String>,
+    /// Binary body content, for responses whose payload is not text.
+    ///
+    /// `content` is a `String`, so it cannot carry an arbitrary octet stream —
+    /// a downloadable artefact (e.g. the NWDAF's ONNX model file, TS 29.520
+    /// §4.2.2.5) would otherwise have to be base64'd into JSON or wrapped in
+    /// `multipart/related`, neither of which is what a consumer dereferencing a
+    /// file URL expects. When this is set and [`Self::parts`] is empty, the
+    /// server writes these bytes as the whole body verbatim.
+    ///
+    /// Defaults to `None`, so every existing response is byte-unchanged.
+    pub binary_content: Option<Bytes>,
     /// Multipart parts
     pub parts: Vec<SbiPart>,
 }

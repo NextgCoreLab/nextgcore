@@ -24,7 +24,12 @@ pub mod federation;
 pub mod ml_service;
 pub mod notification_dispatcher;
 pub mod nrf_collector;
-#[cfg(feature = "onnx-model")]
+pub mod onnx_export; // issue #109: export the active model as an ONNX artefact
+                     // The reader is no longer gated at the module level: #109 serves an ONNX model
+                     // built by `onnx_export`, and the reader is how we prove those bytes round-trip
+                     // and reproduce our own prediction. Reading *operator-supplied* files stays the
+                     // opt-in part — the `onnx:<path>` arm of `ml_service::load_model` is still behind
+                     // the `onnx-model` feature.
 pub mod onnx_model; // issue #26: zero-dep ONNX LinearRegressor subset backend
 mod sbi_handler;
 
@@ -200,6 +205,29 @@ async fn main() -> Result<()> {
 
     nwdaf_context_init(nf_instance_id.clone(), args.max_subscriptions);
 
+    // Issue #109: the model URL notified to MLModelProvision consumers has to
+    // resolve back to this NF, so record our own SBI base. Uses the advertised
+    // address rather than the bind address: `0.0.0.0` is what we listen on, not
+    // somewhere a consumer can fetch from.
+    {
+        let scheme = if args.tls { "https" } else { "http" };
+        let host = if args.sbi_addr == "0.0.0.0" || args.sbi_addr == "::" {
+            log::warn!(
+                "SBI bound to {} — the ML model URL will advertise 127.0.0.1; set --sbi-addr \
+                 to a reachable address for consumers to download models (issue #109)",
+                args.sbi_addr
+            );
+            "127.0.0.1"
+        } else {
+            args.sbi_addr.as_str()
+        };
+        let base = format!("{scheme}://{host}:{}", args.sbi_port);
+        let ctx = nwdaf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        guard.set_sbi_base_uri(&base);
+        log::info!("SBI base URI for model provisioning: {base}");
+    }
+
     // Issue #26: optional prediction-model selection. Default (env unset) is
     // the OLS baseline — behavior-identical to the pre-#26 inline math.
     if let Ok(model_id) = std::env::var("NWDAF_PREDICTION_MODEL") {
@@ -353,8 +381,18 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
+        // Nnwdaf_MLModelProvision model artefact (issue #109). The Subscribe/
+        // Notify half notifies an `mLFileAddr.mLModelUrl`; this is the route it
+        // resolves to, serving the active predictor as an ONNX LinearRegressor.
+        // The path segments identify the notification, not distinct models —
+        // there is one active predictor, so each URL serves the same artefact.
+        ["nnwdaf-mlmodelprovision", "v1", "models", _event, _sub_id] => match method {
+            "GET" => handle_ml_model_download().await,
+            _ => send_method_not_allowed(method, "models/{event}/{subscriptionId}"),
+        },
+
         // Nnwdaf_MLModelProvision service — TS 29.520 is a Subscribe/Notify
-        // resource on /subscriptions (there is no /models resource).
+        // resource on /subscriptions.
         ["nnwdaf-mlmodelprovision", "v1", "subscriptions"] => match method {
             "POST" => handle_ml_prov_subscription_create(&request).await,
             _ => send_method_not_allowed(method, "subscriptions"),
@@ -394,39 +432,59 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// [`SUPPORTED_EVENTS`] so consumers discover only analytics with a live
 /// collector. Additive JSON: the NRF ignores unknown NFProfile members, so
 /// registration behavior is otherwise unchanged.
+///
+/// The same honesty rule now applies to `nnwdaf-mlmodelprovision` (issue #109):
+/// it is advertised only when this NWDAF's active predictor has an exportable
+/// form, so a consumer that discovers the MTLF role can actually download a
+/// model. Advertising it unconditionally is what made it a facade — the notified
+/// URL 404'd.
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
     let event_ids: Vec<&'static str> = SUPPORTED_EVENTS.iter().map(|e| e.as_str()).collect();
+
+    let mut services = vec![
+        serde_json::json!({
+            "serviceInstanceId": format!("{}-nnwdaf-eventssubscription", nf_instance_id),
+            "serviceName": "nnwdaf-eventssubscription",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+        }),
+        serde_json::json!({
+            "serviceInstanceId": format!("{}-nnwdaf-analyticsinfo", nf_instance_id),
+            "serviceName": "nnwdaf-analyticsinfo",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+        }),
+    ];
+    if nwdaf_self()
+        .read()
+        .map(|ctx| ctx.can_provision_model())
+        .unwrap_or(false)
+    {
+        services.push(serde_json::json!({
+            "serviceInstanceId": format!("{}-nnwdaf-mlmodelprovision", nf_instance_id),
+            "serviceName": "nnwdaf-mlmodelprovision",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+        }));
+    } else {
+        log::warn!(
+            "not advertising nnwdaf-mlmodelprovision: the active prediction model has no \
+             exportable form, so no model artefact could be served (issue #109)"
+        );
+    }
+
     serde_json::json!({
         "nfInstanceId": nf_instance_id,
         "nfType": "NWDAF",
         "nfStatus": "REGISTERED",
         "ipv4Addresses": [sbi_addr],
-        "nfServices": [
-            {
-                "serviceInstanceId": format!("{}-nnwdaf-eventssubscription", nf_instance_id),
-                "serviceName": "nnwdaf-eventssubscription",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            },
-            {
-                "serviceInstanceId": format!("{}-nnwdaf-analyticsinfo", nf_instance_id),
-                "serviceName": "nnwdaf-analyticsinfo",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            },
-            {
-                "serviceInstanceId": format!("{}-nnwdaf-mlmodelprovision", nf_instance_id),
-                "serviceName": "nnwdaf-mlmodelprovision",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            }
-        ],
+        "nfServices": services,
         "nwdafInfo": { "eventIds": event_ids },
         "allowedNfTypes": ["AMF", "SMF", "PCF", "NEF", "SCP"],
         "heartBeatTimer": 10
@@ -691,14 +749,122 @@ mod tests {
         assert_eq!(resp.status, 405, "GET on the notify callback must be 405");
     }
 
-    // --- nwafd-05: Nnwdaf_MLModelProvision is Subscribe/Notify, not /models ---
+    // --- nwafd-05 / issue #109: Nnwdaf_MLModelProvision is Subscribe/Notify on
+    //     /subscriptions, plus a model-artefact route the notified
+    //     mLFileAddr.mLModelUrl resolves to ---
 
     #[tokio::test]
-    async fn test_routing_mlmodelprovision_models_gone() {
-        // The bespoke /models registry resource no longer exists → 404.
+    async fn test_routing_mlmodelprovision_bespoke_registry_still_gone() {
+        // The old bespoke /models *registry* resource stays gone: the artefact
+        // route added by #109 is a GET on /models/{event}/{subscriptionId}, not
+        // a POST-able collection.
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
         let req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/models");
         let resp = nwdaf_sbi_request_handler(req).await;
-        assert_eq!(resp.status, 404, "the /models resource must be removed");
+        assert_eq!(resp.status, 404, "the /models registry must stay removed");
+    }
+
+    /// **The #109 acceptance test.** A GET on the notified `mLModelUrl` must
+    /// return 200 with a non-empty artefact — and not merely a well-formed one:
+    /// the bytes must parse back to a model that predicts what this NWDAF
+    /// predicts. Before #109 the URL was fabricated and this route 404'd.
+    #[tokio::test]
+    async fn test_ml_model_url_serves_a_real_downloadable_artefact() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+
+        // Exactly the path a notification advertises.
+        let url = ml_service::model_url("http://x", "mlsub-1", AnalyticsId::NfLoad);
+        let path = url.strip_prefix("http://x").expect("built from the base");
+        let resp = nwdaf_sbi_request_handler(SbiRequest::get(path)).await;
+
+        assert_eq!(resp.status, 200, "the advertised model URL must be live");
+        assert_eq!(
+            resp.http.get_header("Content-Type").map(String::as_str),
+            Some(onnx_export::ONNX_CONTENT_TYPE)
+        );
+        let bytes = resp
+            .http
+            .binary_content
+            .as_ref()
+            .expect("the artefact is served as bytes, not JSON");
+        assert!(!bytes.is_empty(), "a non-empty model-file body");
+
+        // The load-bearing assertion: this really is the NWDAF's model.
+        let parsed = onnx_model::OnnxLinearRegressor::from_bytes(bytes, "onnx:served")
+            .expect("the served bytes are a valid ONNX LinearRegressor");
+        let series = [0.2, 0.35, 0.4, 0.55, 0.6];
+        let (expected, _) =
+            ml_service::InferenceModel::predict_series(&ml_service::OlsLinearModel, &series)
+                .expect("baseline predicts");
+        let (actual, _) = ml_service::InferenceModel::predict_series(&parsed, &series)
+            .expect("served model predicts");
+        assert!(
+            (expected - actual).abs() < 1e-6,
+            "the downloaded model must reproduce the NWDAF's own prediction \
+             (expected {expected}, got {actual})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ml_model_route_rejects_non_get() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/models/NF_LOAD/mlsub-1");
+        let resp = nwdaf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 405);
+    }
+
+    /// The profile advertises the MTLF service only when a model can actually be
+    /// served. Advertising it unconditionally is what made it a facade.
+    #[tokio::test]
+    async fn test_profile_advertises_mlmodelprovision_only_when_exportable() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+
+        let profile = build_nf_profile("nwdaf-test", "10.0.0.5", 7777);
+        let names: Vec<&str> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .filter_map(|s| s["serviceName"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"nnwdaf-mlmodelprovision"),
+            "the default OLS predictor is exportable, so the service is advertised: {names:?}"
+        );
+
+        // Swap in a predictor with no fixed-window linear form.
+        {
+            let ctx = nwdaf_self();
+            let guard = ctx.read().expect("ctx");
+            guard
+                .lock_engine()
+                .set_predictor(Box::new(ml_service::EwmaModel::default()));
+        }
+        let profile = build_nf_profile("nwdaf-test", "10.0.0.5", 7777);
+        let names: Vec<&str> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .filter_map(|s| s["serviceName"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"nnwdaf-mlmodelprovision"),
+            "a NWDAF that cannot serve a model must not claim the MTLF role: {names:?}"
+        );
+        // ...and the route says so rather than serving something wrong.
+        let resp = nwdaf_sbi_request_handler(SbiRequest::get(
+            "/nnwdaf-mlmodelprovision/v1/models/NF_LOAD/mlsub-1",
+        ))
+        .await;
+        assert_eq!(resp.status, 404);
+
+        // Restore the default so test order cannot leak this predictor.
+        {
+            let ctx = nwdaf_self();
+            let guard = ctx.read().expect("ctx");
+            guard
+                .lock_engine()
+                .set_predictor(Box::new(ml_service::OlsLinearModel));
+        }
     }
 
     #[tokio::test]

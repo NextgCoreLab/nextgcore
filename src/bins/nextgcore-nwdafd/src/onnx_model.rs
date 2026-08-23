@@ -199,6 +199,13 @@ impl InferenceModel for OnnxLinearRegressor {
         &self.model_id
     }
 
+    fn linear_form(&self) -> Option<(Vec<f64>, f64)> {
+        // Already a fixed-window linear model, so re-exporting it is lossless
+        // apart from the f64 -> f32 narrowing ONNX's `floats` attribute imposes,
+        // which the input file had already been through.
+        Some((self.coefficients.clone(), self.intercept))
+    }
+
     fn predict_series(&self, series: &[f64]) -> Option<(f64, f64)> {
         let n = self.coefficients.len();
         if n == 0 || series.len() < n {
@@ -509,6 +516,11 @@ mod tests {
             .contains("duplicate ModelProto.graph"));
     }
 
+    /// Gated on the feature, not on the module: #109 ungated this module so the
+    /// reader can verify what `onnx_export` writes, but loading an
+    /// *operator-supplied file* via `onnx:<path>` is still the opt-in part, and
+    /// `ml_service::load_model` refuses it without the feature.
+    #[cfg(feature = "onnx-model")]
     #[test]
     fn load_model_via_ml_service_roundtrips_a_file() {
         let bytes = model_bytes("LinearRegressor", &[-1.0, 2.0], &[0.0]);

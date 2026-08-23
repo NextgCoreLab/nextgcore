@@ -481,8 +481,15 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
 /// to its `notifUri` and, on success, mark it delivered so it is not re-sent.
 /// This reuses the same URI parsing + client plumbing as the analytics path.
 async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
-    let pending = match ctx.read() {
-        Ok(guard) => guard.get_pending_ml_prov_subscriptions(),
+    // The model URL must resolve back to this NF, and is only emitted when the
+    // active predictor is actually exportable (issue #109). Both are read once
+    // here, under the same guard as the pending list, rather than per
+    // subscription.
+    let (pending, model_base_uri) = match ctx.read() {
+        Ok(guard) => {
+            let base = guard.can_provision_model().then(|| guard.sbi_base_uri());
+            (guard.get_pending_ml_prov_subscriptions(), base)
+        }
         Err(e) => {
             log::error!("dispatch_ml_prov_notifications: failed to read context: {e}");
             return;
@@ -490,7 +497,8 @@ async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
     };
 
     for sub in &pending {
-        let body = crate::ml_service::build_ml_model_prov_notif_body(sub);
+        let body =
+            crate::ml_service::build_ml_model_prov_notif_body(sub, model_base_uri.as_deref());
 
         let (host, port, path) = match parse_notify_uri(&sub.notif_uri) {
             Some(t) => t,
