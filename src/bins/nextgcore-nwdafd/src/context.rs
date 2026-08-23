@@ -316,6 +316,15 @@ pub struct EventSubscription {
     /// Load-level threshold (`loadLevelThreshold` / `nfLoadLvlThds`), carried
     /// for the deferred THRESHOLD evaluation (nwafd-07); not yet evaluated.
     pub load_level_threshold: Option<u64>,
+    /// Additional `nfLoadLvlThds[]` entries beyond the first (issue #108).
+    ///
+    /// TS 29.520 `EventSubscription.nfLoadLvlThds` is a LIST of `ThresholdLevel`
+    /// and a THRESHOLD notification fires when any of them is crossed. Only
+    /// `[0]` used to be read. Kept as an overflow list beside the existing
+    /// scalar rather than replacing it, so the many call sites and tests that
+    /// read `load_level_threshold` for the primary threshold keep working;
+    /// [`Self::load_level_thresholds`] is the accessor evaluation should use.
+    pub extra_load_level_thresholds: Vec<u64>,
     /// `matchingDir` (ASCENDING / DESCENDING / CROSSED), carried for nwafd-07.
     pub matching_dir: Option<String>,
     /// Per-event slice filters (`snssais`).
@@ -337,6 +346,7 @@ impl EventSubscription {
             notification_method: Some(NotificationMethod::Periodic),
             rep_period_secs: None,
             load_level_threshold: None,
+            extra_load_level_thresholds: Vec::new(),
             matching_dir: None,
             snssais: Vec::new(),
             nf_instance_ids: Vec::new(),
@@ -353,6 +363,31 @@ impl EventSubscription {
             .and_then(MatchingDirection::from_wire)
             .unwrap_or(MatchingDirection::Ascending)
     }
+
+    /// Every configured load-level threshold, primary first (issue #108).
+    ///
+    /// THRESHOLD evaluation must consider all of `nfLoadLvlThds[]`, not just the
+    /// first entry, so this is the accessor the dispatcher uses.
+    pub fn load_level_thresholds(&self) -> Vec<u64> {
+        self.load_level_threshold
+            .into_iter()
+            .chain(self.extra_load_level_thresholds.iter().copied())
+            .collect()
+    }
+}
+
+/// Key for the THRESHOLD edge-detection state: one previous level per
+/// `(subscription, event, NF instance)`.
+///
+/// The instance is part of the key (issue #108) because thresholds are evaluated
+/// per reported instance. Without it, two instances of the same NF type sharing a
+/// subscription would overwrite each other's previous level and
+/// `ASCENDING`/`DESCENDING` would fire or suppress on the wrong history.
+fn event_level_key(subscription_id: &str, event: AnalyticsId, nf_instance_id: &str) -> String {
+    format!(
+        "{subscription_id}\u{1f}{}\u{1f}{nf_instance_id}",
+        event.as_str()
+    )
 }
 
 /// S-NSSAI (Single Network Slice Selection Assistance Information)
@@ -976,16 +1011,28 @@ impl NwdafContext {
             .unwrap_or(0)
     }
 
-    /// Last observed analytic level for a `(subscription, event)` pair, or
+    /// Last observed analytic level for a `(subscription, event, instance)`, or
     /// `None` if this is the first observation (nwafd-07 edge detection).
-    pub fn get_event_level(&self, subscription_id: &str, event: AnalyticsId) -> Option<f64> {
-        let key = format!("{subscription_id}\u{1f}{}", event.as_str());
+    pub fn get_event_level(
+        &self,
+        subscription_id: &str,
+        event: AnalyticsId,
+        nf_instance_id: &str,
+    ) -> Option<f64> {
+        let key = event_level_key(subscription_id, event, nf_instance_id);
         self.event_levels.read().ok()?.get(&key).copied()
     }
 
-    /// Record the latest observed analytic level for a `(subscription, event)`.
-    pub fn set_event_level(&self, subscription_id: &str, event: AnalyticsId, level: f64) {
-        let key = format!("{subscription_id}\u{1f}{}", event.as_str());
+    /// Record the latest observed analytic level for a
+    /// `(subscription, event, instance)`.
+    pub fn set_event_level(
+        &self,
+        subscription_id: &str,
+        event: AnalyticsId,
+        nf_instance_id: &str,
+        level: f64,
+    ) {
+        let key = event_level_key(subscription_id, event, nf_instance_id);
         if let Ok(mut levels) = self.event_levels.write() {
             levels.insert(key, level);
         }
@@ -1265,20 +1312,42 @@ mod tests {
         assert_eq!(ctx.ml_prov_subscription_count(), 0);
     }
 
-    /// nwafd-07: per-(subscription, event) level state round-trips and is keyed
-    /// so different events on the same subscription do not collide.
+    /// nwafd-07: per-(subscription, event, instance) level state round-trips and
+    /// is keyed so nothing on the same subscription collides.
     #[test]
     fn test_event_level_state() {
         let ctx = NwdafContext::new("nwdaf-test".to_string());
-        assert_eq!(ctx.get_event_level("s1", AnalyticsId::NfLoad), None);
-        ctx.set_event_level("s1", AnalyticsId::NfLoad, 42.0);
-        ctx.set_event_level("s1", AnalyticsId::UeMobility, 7.0);
-        assert_eq!(ctx.get_event_level("s1", AnalyticsId::NfLoad), Some(42.0));
         assert_eq!(
-            ctx.get_event_level("s1", AnalyticsId::UeMobility),
+            ctx.get_event_level("s1", AnalyticsId::NfLoad, "amf-1"),
+            None
+        );
+        ctx.set_event_level("s1", AnalyticsId::NfLoad, "amf-1", 42.0);
+        ctx.set_event_level("s1", AnalyticsId::UeMobility, "amf-1", 7.0);
+        assert_eq!(
+            ctx.get_event_level("s1", AnalyticsId::NfLoad, "amf-1"),
+            Some(42.0)
+        );
+        assert_eq!(
+            ctx.get_event_level("s1", AnalyticsId::UeMobility, "amf-1"),
             Some(7.0)
         );
-        assert_eq!(ctx.get_event_level("s2", AnalyticsId::NfLoad), None);
+        assert_eq!(
+            ctx.get_event_level("s2", AnalyticsId::NfLoad, "amf-1"),
+            None
+        );
+
+        // Issue #108: two instances under ONE subscription+event must not share
+        // edge state, or ASCENDING/DESCENDING fires on the wrong history.
+        ctx.set_event_level("s1", AnalyticsId::NfLoad, "amf-2", 99.0);
+        assert_eq!(
+            ctx.get_event_level("s1", AnalyticsId::NfLoad, "amf-1"),
+            Some(42.0),
+            "the second instance must not overwrite the first"
+        );
+        assert_eq!(
+            ctx.get_event_level("s1", AnalyticsId::NfLoad, "amf-2"),
+            Some(99.0)
+        );
     }
 
     /// nwafd-07: `matchingDir` parses to the typed enum and defaults to

@@ -455,20 +455,31 @@ fn parse_events_subscription(
         //  - SLICE_LOAD_LEVEL / NSI_LOAD_LEVEL use the scalar `loadLevelThreshold`.
         //  - NF_LOAD (and other NF-load events) use `nfLoadLvlThds[].nfLoadLevel`
         //    (ThresholdLevel, §5.1.6.2.30), falling back to `nfCpuUsage`.
-        let load_level_threshold = match event {
-            AnalyticsId::SliceLoadLevel | AnalyticsId::NsiLoadLevel => {
-                es.get("loadLevelThreshold").and_then(|v| v.as_u64())
-            }
+        // Issue #108: `nfLoadLvlThds` is a LIST of ThresholdLevel and a
+        // THRESHOLD notification fires when ANY entry is crossed; only `[0]`
+        // used to be read, so every additional threshold was inert.
+        let mut all_thresholds: Vec<u64> = match event {
+            AnalyticsId::SliceLoadLevel | AnalyticsId::NsiLoadLevel => es
+                .get("loadLevelThreshold")
+                .and_then(|v| v.as_u64())
+                .into_iter()
+                .collect(),
             _ => es
                 .get("nfLoadLvlThds")
                 .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .and_then(|t| {
-                    t.get("nfLoadLevel")
-                        .or_else(|| t.get("nfCpuUsage"))
-                        .and_then(|v| v.as_u64())
-                }),
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| {
+                            t.get("nfLoadLevel")
+                                .or_else(|| t.get("nfCpuUsage"))
+                                .and_then(|v| v.as_u64())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
+        let load_level_threshold = (!all_thresholds.is_empty()).then(|| all_thresholds.remove(0));
+        let extra_load_level_thresholds = all_thresholds;
 
         let matching_dir = es
             .get("matchingDir")
@@ -502,6 +513,7 @@ fn parse_events_subscription(
             notification_method,
             rep_period_secs,
             load_level_threshold,
+            extra_load_level_thresholds,
             matching_dir,
             snssais,
             nf_instance_ids,

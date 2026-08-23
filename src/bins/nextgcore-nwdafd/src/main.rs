@@ -441,6 +441,37 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
     let event_ids: Vec<&'static str> = SUPPORTED_EVENTS.iter().map(|e| e.as_str()).collect();
 
+    let can_provision = nwdaf_self()
+        .read()
+        .map(|ctx| ctx.can_provision_model())
+        .unwrap_or(false);
+    let services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, can_provision);
+
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "NWDAF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": services,
+        "nwdafInfo": { "eventIds": event_ids },
+        "allowedNfTypes": ["AMF", "SMF", "PCF", "NEF", "SCP"],
+        "heartBeatTimer": 10
+    })
+}
+
+/// The `nfServices[]` this NWDAF advertises.
+///
+/// `can_provision` gates `nnwdaf-mlmodelprovision` (issue #109): the MTLF role is
+/// only claimed when the active predictor can actually be exported. Taken as a
+/// parameter rather than read from the global context so both branches are
+/// testable without mutating process-wide state — swapping the global predictor
+/// in a test raced the artefact-download test in the same binary.
+fn nwdaf_services(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    can_provision: bool,
+) -> Vec<serde_json::Value> {
     let mut services = vec![
         serde_json::json!({
             "serviceInstanceId": format!("{}-nnwdaf-eventssubscription", nf_instance_id),
@@ -459,11 +490,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
             "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
         }),
     ];
-    if nwdaf_self()
-        .read()
-        .map(|ctx| ctx.can_provision_model())
-        .unwrap_or(false)
-    {
+    if can_provision {
         services.push(serde_json::json!({
             "serviceInstanceId": format!("{}-nnwdaf-mlmodelprovision", nf_instance_id),
             "serviceName": "nnwdaf-mlmodelprovision",
@@ -478,17 +505,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
              exportable form, so no model artefact could be served (issue #109)"
         );
     }
-
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "NWDAF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "nwdafInfo": { "eventIds": event_ids },
-        "allowedNfTypes": ["AMF", "SMF", "PCF", "NEF", "SCP"],
-        "heartBeatTimer": 10
-    })
+    services
 }
 
 /// Register NWDAF with NRF
@@ -814,11 +831,41 @@ mod tests {
     }
 
     /// The profile advertises the MTLF service only when a model can actually be
-    /// served. Advertising it unconditionally is what made it a facade.
+    /// served (issue #109). Both branches are asserted on the pure service
+    /// builder: an earlier version swapped the process-global predictor, which
+    /// raced `test_ml_model_url_serves_a_real_downloadable_artefact` in this same
+    /// binary — the two tests share `nwdaf_self()`.
+    #[test]
+    fn test_profile_advertises_mlmodelprovision_only_when_exportable() {
+        let names = |can_provision: bool| -> Vec<String> {
+            nwdaf_services("nwdaf-test", "10.0.0.5", 7777, can_provision)
+                .iter()
+                .filter_map(|s| s["serviceName"].as_str().map(String::from))
+                .collect()
+        };
+
+        let with = names(true);
+        assert!(
+            with.iter().any(|n| n == "nnwdaf-mlmodelprovision"),
+            "an exportable predictor means the MTLF role is real: {with:?}"
+        );
+
+        let without = names(false);
+        assert!(
+            !without.iter().any(|n| n == "nnwdaf-mlmodelprovision"),
+            "a NWDAF that cannot serve a model must not claim the MTLF role: {without:?}"
+        );
+        // Only that one service is gated; the rest are unconditional.
+        assert_eq!(without.len() + 1, with.len());
+        assert!(without.iter().any(|n| n == "nnwdaf-eventssubscription"));
+        assert!(without.iter().any(|n| n == "nnwdaf-analyticsinfo"));
+    }
+
+    /// The default build's predictor IS exportable, so a freshly initialised
+    /// NWDAF advertises the service — the integration half of the above.
     #[tokio::test]
-    async fn test_profile_advertises_mlmodelprovision_only_when_exportable() {
+    async fn test_default_build_advertises_mlmodelprovision() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
-
         let profile = build_nf_profile("nwdaf-test", "10.0.0.5", 7777);
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
@@ -826,45 +873,7 @@ mod tests {
             .iter()
             .filter_map(|s| s["serviceName"].as_str())
             .collect();
-        assert!(
-            names.contains(&"nnwdaf-mlmodelprovision"),
-            "the default OLS predictor is exportable, so the service is advertised: {names:?}"
-        );
-
-        // Swap in a predictor with no fixed-window linear form.
-        {
-            let ctx = nwdaf_self();
-            let guard = ctx.read().expect("ctx");
-            guard
-                .lock_engine()
-                .set_predictor(Box::new(ml_service::EwmaModel::default()));
-        }
-        let profile = build_nf_profile("nwdaf-test", "10.0.0.5", 7777);
-        let names: Vec<&str> = profile["nfServices"]
-            .as_array()
-            .expect("nfServices")
-            .iter()
-            .filter_map(|s| s["serviceName"].as_str())
-            .collect();
-        assert!(
-            !names.contains(&"nnwdaf-mlmodelprovision"),
-            "a NWDAF that cannot serve a model must not claim the MTLF role: {names:?}"
-        );
-        // ...and the route says so rather than serving something wrong.
-        let resp = nwdaf_sbi_request_handler(SbiRequest::get(
-            "/nnwdaf-mlmodelprovision/v1/models/NF_LOAD/mlsub-1",
-        ))
-        .await;
-        assert_eq!(resp.status, 404);
-
-        // Restore the default so test order cannot leak this predictor.
-        {
-            let ctx = nwdaf_self();
-            let guard = ctx.read().expect("ctx");
-            guard
-                .lock_engine()
-                .set_predictor(Box::new(ml_service::OlsLinearModel));
-        }
+        assert!(names.contains(&"nnwdaf-mlmodelprovision"), "{names:?}");
     }
 
     #[tokio::test]
