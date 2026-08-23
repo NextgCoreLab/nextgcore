@@ -168,6 +168,13 @@ impl AnalyticsEngine {
         self.predictor.0.model_id()
     }
 
+    /// The active prediction model, so callers can ask what it *is* rather than
+    /// only what it predicts — `Nnwdaf_MLModelProvision` needs its linear form
+    /// to export a model artefact (issue #109).
+    pub fn predictor(&self) -> &dyn crate::ml_service::InferenceModel {
+        self.predictor.0.as_ref()
+    }
+
     /// Upsert the cached NRF profile metadata for an NF instance (G2-1).
     pub fn upsert_nf_meta(&mut self, nf_instance_id: &str, meta: NfProfileMeta) {
         self.nf_meta.insert(nf_instance_id.to_string(), meta);

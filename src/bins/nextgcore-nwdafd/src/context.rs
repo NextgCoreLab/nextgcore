@@ -519,6 +519,13 @@ pub struct NwdafContext {
     nrf_status_subscription: RwLock<Option<NrfStatusSubscription>>,
     /// NRF collector configuration (G2-1), set by `main()` at startup.
     nrf_collector_config: RwLock<Option<NrfCollectorConfig>>,
+    /// This NF's own SBI base URI (e.g. `http://10.0.0.5:7777`), set by `main()`
+    /// at startup from the bound address.
+    ///
+    /// Needed because `Nnwdaf_MLModelProvision` notifies consumers of a model
+    /// URL that must resolve back to *this* NF (issue #109); the placeholder it
+    /// replaced was a hardcoded `http://nwdaf/...` that nothing served.
+    sbi_base_uri: RwLock<Option<String>>,
     /// Next internal ID generator
     next_id: AtomicUsize,
     /// Maximum subscriptions
@@ -551,6 +558,7 @@ impl NwdafContext {
             engine: Mutex::new(AnalyticsEngine::new()),
             nrf_status_subscription: RwLock::new(None),
             nrf_collector_config: RwLock::new(None),
+            sbi_base_uri: RwLock::new(None),
             next_id: AtomicUsize::new(1),
             max_subscriptions: 0,
             initialized: AtomicBool::new(false),
@@ -711,6 +719,45 @@ impl NwdafContext {
 
     /// Arm the NRF collector (G2-1): stores where to subscribe and the
     /// callback URI the NRF must POST NFStatusNotify to.
+    /// Record this NF's own SBI base URI (issue #109).
+    pub fn set_sbi_base_uri(&self, base: impl Into<String>) {
+        if let Ok(mut guard) = self.sbi_base_uri.write() {
+            *guard = Some(base.into());
+        }
+    }
+
+    /// This NF's own SBI base URI.
+    ///
+    /// Falls back to a loopback default when `main()` has not set one (unit
+    /// tests). That is a *local* address rather than a plausible-looking remote
+    /// one on purpose: a URL that only resolves on this host is obviously wrong
+    /// in a deployment, whereas the old `http://nwdaf/...` placeholder looked
+    /// routable and silently 404'd.
+    pub fn sbi_base_uri(&self) -> String {
+        self.sbi_base_uri
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| "http://127.0.0.1:7777".to_string())
+    }
+
+    /// The ONNX artefact for the active prediction model, or `None` when that
+    /// model has no fixed-window linear form and so cannot be provisioned
+    /// (issue #109).
+    ///
+    /// `None` is the signal that `nnwdaf-mlmodelprovision` must not be
+    /// advertised and no `mLModelUrl` emitted.
+    pub fn active_model_onnx(&self) -> Option<Vec<u8>> {
+        let engine = self.lock_engine();
+        crate::ml_service::active_model_onnx(engine.predictor())
+    }
+
+    /// Whether this NWDAF can currently provision a model artefact.
+    pub fn can_provision_model(&self) -> bool {
+        let engine = self.lock_engine();
+        engine.predictor().linear_form().is_some()
+    }
+
     pub fn set_nrf_collector_config(&self, config: NrfCollectorConfig) {
         if let Ok(mut slot) = self.nrf_collector_config.write() {
             *slot = Some(config);

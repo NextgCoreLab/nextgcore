@@ -825,6 +825,46 @@ pub async fn handle_ml_prov_subscription_delete(subscription_id: &str) -> SbiRes
     }
 }
 
+/// Serve the ML model artefact a `Nnwdaf_MLModelProvision` notification pointed
+/// at (issue #109, TS 29.520 §4.2.2.5).
+///
+/// Returns the active predictor serialized as an ONNX `ai.onnx.ml
+/// LinearRegressor` — bytes that reproduce this NWDAF's own prediction, not a
+/// stand-in. Before #109 the notified URL was a fabricated `http://nwdaf/...`
+/// that no route served, so a consumer following it got a 404.
+///
+/// A 404 here means this NWDAF's active predictor has no exportable
+/// fixed-window linear form (e.g. EWMA), which is also the state in which the
+/// service is not advertised and no URL is emitted — so a conformant consumer
+/// should never reach this branch.
+pub async fn handle_ml_model_download() -> SbiResponse {
+    let ctx = nwdaf_self();
+    let bytes = match ctx.read() {
+        Ok(context) => context.active_model_onnx(),
+        Err(e) => {
+            log::error!("ML model download: failed to read context: {e}");
+            None
+        }
+    };
+
+    match bytes {
+        Some(bytes) => {
+            log::debug!("Serving ONNX model artefact ({} bytes)", bytes.len());
+            let mut response = SbiResponse::with_status(200);
+            response
+                .http
+                .set_header("Content-Type", crate::onnx_export::ONNX_CONTENT_TYPE);
+            response.http.binary_content = Some(bytes.into());
+            response
+        }
+        None => send_not_found(
+            "this NWDAF's active prediction model has no exportable form, so no \
+             model artefact can be provisioned",
+            Some("MODEL_NOT_AVAILABLE"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

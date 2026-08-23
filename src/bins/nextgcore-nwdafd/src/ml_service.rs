@@ -440,18 +440,47 @@ pub fn ml_prov_subsc_json(sub: &MlProvSubscription) -> Value {
     Value::Object(obj)
 }
 
-/// Synthesize the model-file address advertised in a notification.
+/// The model-file address advertised in a notification.
 ///
-/// HONESTY NOTE: this NWDAF is a linear-regression analytics prototype, not an
-/// MTLF that trains and exports real ML model files. The URL is a stable,
-/// well-formed placeholder so a conformant consumer can parse `mLFileAddr`; no
-/// downloadable model artefact exists behind it.
-fn synthetic_model_url(sub_id: &str, event: AnalyticsId) -> String {
+/// SCOPE NOTE (issue #109): this NWDAF is a linear-regression analytics engine,
+/// not an MTLF with a training pipeline. What it *can* do honestly is export the
+/// predictor it actually runs: the URL below resolves to a live route on this NF
+/// serving an ONNX `LinearRegressor` whose output equals this NWDAF's own
+/// prediction (see [`crate::onnx_export`]). It replaced a fabricated
+/// `http://nwdaf/...` placeholder that no route served, so a consumer that
+/// dereferenced it got a 404.
+///
+/// `Nnwdaf_MLModelMonitor`, `Nnwdaf_MLModelInfo` and `/transfers` subscription
+/// continuity (`prevSub` / `consNfInfo`) remain **unimplemented** and are out of
+/// scope for #109, which tracks only the MLModelProvision artefact.
+///
+/// The `{event}`/`{sub_id}` segments identify the notification, not distinct
+/// models: there is one active predictor, so every URL serves the same artefact.
+/// They are kept because a consumer echoes back the URL it was given.
+pub fn model_url(base: &str, sub_id: &str, event: AnalyticsId) -> String {
     format!(
-        "http://nwdaf/nnwdaf-mlmodelprovision/v1/models/{}/{}",
+        "{}/nnwdaf-mlmodelprovision/v1/models/{}/{}",
+        base.trim_end_matches('/'),
         event.as_str(),
         sub_id
     )
+}
+
+/// The ONNX bytes this NWDAF serves for its active predictor, or `None` when the
+/// predictor has no fixed-window linear form and therefore cannot be provisioned.
+///
+/// `None` is what makes the advertisement honest: the caller must then neither
+/// register `nnwdaf-mlmodelprovision` in the NF profile nor emit an
+/// `mLFileAddr.mLModelUrl`.
+pub fn active_model_onnx(model: &dyn InferenceModel) -> Option<Vec<u8>> {
+    let (coefficients, intercept) = model.linear_form()?;
+    if coefficients.is_empty() {
+        return None;
+    }
+    Some(crate::onnx_export::encode_linear_regressor(
+        &coefficients,
+        intercept,
+    ))
 }
 
 /// Build the `Nnwdaf_MLModelProvision` notification callback body for a
@@ -461,7 +490,16 @@ fn synthetic_model_url(sub_id: &str, event: AnalyticsId) -> String {
 /// (minItems 1); each carries the required `subscriptionId` and `eventNotifs[]`
 /// of `MLEventNotif`, where every `MLEventNotif` satisfies the `oneOf` by
 /// supplying `mLFileAddr.mLModelUrl`.
-pub fn build_ml_model_prov_notif_body(sub: &MlProvSubscription) -> Value {
+///
+/// `model_base_uri` is `None` when this NWDAF's active predictor has no
+/// exportable form, in which case `mLFileAddr` is omitted rather than pointing
+/// at a URL that would 404 — the defect #109 fixed. A build in that state also
+/// does not advertise the service, so a conformant consumer never subscribes and
+/// never sees the truncated notification.
+pub fn build_ml_model_prov_notif_body(
+    sub: &MlProvSubscription,
+    model_base_uri: Option<&str>,
+) -> Value {
     let event_notifs: Vec<Value> = sub
         .ml_events
         .iter()
@@ -471,10 +509,12 @@ pub fn build_ml_model_prov_notif_body(sub: &MlProvSubscription) -> Value {
             if let Some(corr) = &sub.notif_corr_id {
                 notif.insert("notifCorreId".to_string(), json!(corr));
             }
-            notif.insert(
-                "mLFileAddr".to_string(),
-                json!({ "mLModelUrl": synthetic_model_url(&sub.subscription_id, *ev) }),
-            );
+            if let Some(base) = model_base_uri {
+                notif.insert(
+                    "mLFileAddr".to_string(),
+                    json!({ "mLModelUrl": model_url(base, &sub.subscription_id, *ev) }),
+                );
+            }
             Value::Object(notif)
         })
         .collect();
@@ -688,7 +728,7 @@ mod tests {
             Some("corr-9".to_string()),
             vec![AnalyticsId::NfLoad],
         );
-        let body = build_ml_model_prov_notif_body(&sub);
+        let body = build_ml_model_prov_notif_body(&sub, Some("http://10.0.0.5:7777"));
 
         let arr = body.as_array().expect("callback body is an array");
         assert_eq!(arr.len(), 1, "minItems 1 array of NwdafMLModelProvNotif");
@@ -701,13 +741,59 @@ mod tests {
         assert_eq!(evns.len(), 1);
         assert_eq!(evns[0]["event"].as_str(), Some("NF_LOAD"));
         assert_eq!(evns[0]["notifCorreId"].as_str(), Some("corr-9"));
-        assert!(
-            evns[0]["mLFileAddr"]["mLModelUrl"].as_str().is_some(),
-            "MLEventNotif must satisfy the oneOf via mLFileAddr.mLModelUrl"
+        // Issue #109: the URL must point at THIS NF's live route, not the old
+        // fabricated `http://nwdaf/...` that nothing served.
+        assert_eq!(
+            evns[0]["mLFileAddr"]["mLModelUrl"].as_str(),
+            Some("http://10.0.0.5:7777/nnwdaf-mlmodelprovision/v1/models/NF_LOAD/mlsub-9")
         );
         // No bespoke registry keys leak into the notification.
         assert!(notif.get("modelCount").is_none());
         assert!(notif.get("accuracy").is_none());
+    }
+
+    /// With no exportable model there is no URL to advertise, so `mLFileAddr` is
+    /// omitted rather than pointing somewhere that would 404 — the #109 defect.
+    #[test]
+    fn test_notif_body_omits_model_addr_when_nothing_is_exportable() {
+        let sub = MlProvSubscription::new(
+            "mlsub-10".to_string(),
+            "http://anlf.local/ml-cb".to_string(),
+            None,
+            vec![AnalyticsId::NfLoad],
+        );
+        let body = build_ml_model_prov_notif_body(&sub, None);
+        let evns = body[0]["eventNotifs"].as_array().expect("eventNotifs");
+        assert!(
+            evns[0].get("mLFileAddr").is_none(),
+            "a URL that cannot be served must not be emitted at all"
+        );
+    }
+
+    /// The two baselines differ in whether they can be provisioned at all, and
+    /// that difference is what gates the advertisement (#109).
+    #[test]
+    fn test_only_fixed_window_models_are_exportable() {
+        let (coefs, intercept) = OlsLinearModel
+            .linear_form()
+            .expect("OLS extrapolation is a fixed-window linear function");
+        assert_eq!(coefs.len(), OLS_EXPORT_WINDOW);
+        assert_eq!(intercept, 0.0);
+        // n = 5 closed form, verified against the OLS fit in onnx_export tests.
+        let expected = [-0.4, -0.1, 0.2, 0.5, 0.8];
+        for (got, want) in coefs.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-9, "got {coefs:?}");
+        }
+        assert!(active_model_onnx(&OlsLinearModel).is_some());
+
+        // EWMA's weights span the whole observed series, so no fixed-window
+        // artefact could reproduce it; exporting a truncation would ship bytes
+        // that disagree with this NWDAF's own analytics.
+        assert!(
+            EwmaModel::default().linear_form().is_none(),
+            "EWMA must report no exportable form rather than a truncated one"
+        );
+        assert!(active_model_onnx(&EwmaModel::default()).is_none());
     }
 }
 
@@ -728,7 +814,61 @@ pub trait InferenceModel: Send + Sync {
     /// Returns `(prediction clamped to 0..=1, confidence 0..=1)`, or `None`
     /// when the series is empty or shorter than the model's input window.
     fn predict_series(&self, series: &[f64]) -> Option<(f64, f64)>;
+
+    /// This model as a fixed-window linear function — `(coefficients, intercept)`
+    /// applied to the last `coefficients.len()` samples, oldest first — or `None`
+    /// when it has no such form.
+    ///
+    /// This is what `Nnwdaf_MLModelProvision` can export as an ONNX
+    /// `LinearRegressor` (issue #109). Returning `None` is a real answer, not a
+    /// gap to fill: a model whose weights depend on the whole observed series
+    /// rather than a fixed window cannot be truncated into a fixed-window
+    /// artefact without predicting differently from the NWDAF that served it,
+    /// and shipping bytes that disagree with our own analytics would be the same
+    /// class of dishonesty as the placeholder URL #109 removed. Callers must
+    /// treat `None` as "this NWDAF cannot provision a model" and neither
+    /// advertise the service nor emit an `mLModelUrl`.
+    fn linear_form(&self) -> Option<(Vec<f64>, f64)> {
+        None
+    }
 }
+
+/// Weights of the ordinary-least-squares one-step extrapolator over a window of
+/// `n` samples, oldest first.
+///
+/// [`OlsLinearModel`] stores no coefficients — it re-fits OLS on every call — but
+/// the fit over a *fixed* window width is a fixed linear function of that window,
+/// which is what makes the model exportable (issue #109). Fitting `y = a + b·x`
+/// at `x = 0..n-1` and evaluating at `x = n` gives, per sample `i`:
+///
+/// ```text
+/// w_i = 1/n + (i - x̄)·(n - x̄) / Σ(i - x̄)²        x̄ = (n - 1) / 2
+/// ```
+///
+/// For `n = 5` that is `[-0.4, -0.1, 0.2, 0.5, 0.8]`. The weights always sum to
+/// 1 (a flat series predicts itself) and map the ramp `0..n-1` to `n`.
+///
+/// Returns an empty vector for `n < 2`, which has no fit — matching
+/// `predict_series`, which reports the last sample with zero confidence there.
+pub fn ols_window_weights(n: usize) -> Vec<f64> {
+    if n < 2 {
+        return Vec::new();
+    }
+    let nf = n as f64;
+    let x_bar = (nf - 1.0) / 2.0;
+    let s_xx: f64 = (0..n).map(|i| (i as f64 - x_bar).powi(2)).sum();
+    (0..n)
+        .map(|i| 1.0 / nf + (i as f64 - x_bar) * (nf - x_bar) / s_xx)
+        .collect()
+}
+
+/// The window width [`OlsLinearModel`] settles on once it has enough history.
+///
+/// `predict_series` uses `min(series.len(), 5)`, so this is the widest — and for
+/// any series the analytics engine has been running on, the actual — window. It
+/// is the one exported, because a narrower export would disagree with the
+/// NWDAF's own prediction on exactly the series a consumer cares about.
+pub const OLS_EXPORT_WINDOW: usize = 5;
 
 /// Default baseline: ordinary-least-squares linear fit over the last ≤5
 /// samples — byte-for-byte the math `AnalyticsEngine::compute_nf_load`
@@ -777,6 +917,11 @@ impl InferenceModel for OlsLinearModel {
             (1.0 - ss_res / ss_tot).clamp(0.0, 1.0)
         };
         Some((predicted, r_squared))
+    }
+
+    fn linear_form(&self) -> Option<(Vec<f64>, f64)> {
+        // Exact, not an approximation: see `ols_window_weights`.
+        Some((ols_window_weights(OLS_EXPORT_WINDOW), 0.0))
     }
 }
 
@@ -830,6 +975,13 @@ impl InferenceModel for EwmaModel {
         let confidence = (1.0 - abs_err_sum / rest.len() as f64).clamp(0.0, 1.0);
         Some((ewma.clamp(0.0, 1.0), confidence))
     }
+
+    // `linear_form` is deliberately left at the `None` default. EWMA *is* a
+    // weighted sum, but its weights decay over the whole observed series rather
+    // than a fixed window: the prediction after k samples depends on all k. Any
+    // fixed-window export would therefore predict differently from this NWDAF,
+    // so there is no honest artefact to serve and #109's answer here is to
+    // advertise nothing.
 }
 
 /// Wrapper giving the boxed active model `Debug` + `Default` (the analytics
