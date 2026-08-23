@@ -917,11 +917,72 @@ fn emm_extended_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64
         return;
     }
 
-    log::info!(
-        "[{}] EXTENDED SERVICE REQUEST (service_type={service_type}) accepted; CSFB bearer \
-         handling is out of scope here",
-        mme_ue.imsi_bcd
-    );
+    // TS 23.272 §7.2/§7.3: the MME triggers the fallback by sending the eNB a
+    // UE CONTEXT MODIFICATION REQUEST carrying the CS Fallback Indicator. Until
+    // #49 the codec had no such message, so an accepted Extended Service Request
+    // went no further and no CS call — mobile-originated or terminated — could
+    // ever fall back.
+    match csfb_context_modification(enb_ue, service_type) {
+        None => log::info!(
+            "[{}] EXTENDED SERVICE REQUEST (service_type={service_type}) is a packet-services \
+             request, not CS fallback",
+            mme_ue.imsi_bcd
+        ),
+        Some(Ok(pdu)) => {
+            log::info!(
+                "[{}] EXTENDED SERVICE REQUEST (service_type={service_type}) accepted; sending \
+                 UE Context Modification with the CS Fallback Indicator",
+                mme_ue.imsi_bcd
+            );
+            s1ap_path::s1ap_send_pdu(enb_ue.enb_id, pdu);
+        }
+        Some(Err(e)) => log::error!(
+            "[{}] failed to build the CSFB UE Context Modification: {e}",
+            mme_ue.imsi_bcd
+        ),
+    }
+}
+
+/// The UE Context Modification a CS-fallback Extended Service Request calls for,
+/// or `None` when the request is not a CS fallback at all.
+///
+/// Composed as one function so the whole decision — service type in, encoded
+/// S1AP PDU out — is testable without a transport.
+fn csfb_context_modification(
+    enb_ue: &EnbUe,
+    service_type: u8,
+) -> Option<nextgcore_s1ap::S1apResult<Vec<u8>>> {
+    let csfb = csfb_indicator_for(service_type)?;
+    Some(s1ap_build::build_ue_context_modification_for_csfb(
+        enb_ue,
+        csfb == CsfbPriority::High,
+    ))
+}
+
+/// Which CS Fallback Indicator an Extended Service Request's service type calls
+/// for, or `None` when the request is not a CS fallback at all.
+///
+/// TS 24.301 §9.9.3.27: 0 is MO CSFB, 1 is MT CSFB, 2 is an MO CSFB **emergency
+/// call**, and 3-4 are unused values the network must read as MO CSFB. 8 and
+/// above are "packet services via S1", which is a different procedure and must
+/// not put an eNB into CS fallback. The emergency case maps to
+/// `cs-fallback-high-priority` so the eNB prioritises the redirection.
+fn csfb_indicator_for(service_type: u8) -> Option<CsfbPriority> {
+    match service_type {
+        0 | 1 | 3 | 4 => Some(CsfbPriority::Normal),
+        2 => Some(CsfbPriority::High),
+        _ => None,
+    }
+}
+
+/// The two CS Fallback Indicator values, named by what they mean here rather
+/// than by their ASN.1 spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CsfbPriority {
+    /// `cs-fallback-required`
+    Normal,
+    /// `cs-fallback-high-priority` (emergency call)
+    High,
 }
 
 fn emm_detach_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]) {
@@ -1495,6 +1556,80 @@ mod tests {
 
     const TEST_IMSI: &str = "001010123456789";
     const TEST_APN: &str = "inet";
+
+    /// TS 24.301 §9.9.3.27. The interesting cases are the two the network must
+    /// *not* treat alike: an emergency CS fallback needs priority handling, and
+    /// "packet services via S1" is not a CS fallback at all — putting an eNB
+    /// into CS fallback for it would redirect a UE that only wanted PS bearers.
+    #[test]
+    fn test_csfb_indicator_follows_the_service_type() {
+        assert_eq!(csfb_indicator_for(0), Some(CsfbPriority::Normal)); // MO CSFB
+        assert_eq!(csfb_indicator_for(1), Some(CsfbPriority::Normal)); // MT CSFB
+        assert_eq!(csfb_indicator_for(2), Some(CsfbPriority::High)); // MO emergency
+
+        // 3 and 4 are unused values the network reads as MO CS fallback.
+        assert_eq!(csfb_indicator_for(3), Some(CsfbPriority::Normal));
+        assert_eq!(csfb_indicator_for(4), Some(CsfbPriority::Normal));
+
+        // 8..=11 are "packet services via S1": a different procedure entirely.
+        for service_type in 8..=11 {
+            assert_eq!(
+                csfb_indicator_for(service_type),
+                None,
+                "service type {service_type} is not CS fallback"
+            );
+        }
+    }
+
+    /// The MT CSFB trigger, end to end from the service type: an MT CS fallback
+    /// Extended Service Request must produce a real S1AP UE CONTEXT MODIFICATION
+    /// REQUEST carrying the CS Fallback Indicator and addressed to the UE's S1
+    /// connection. Before #49 this path logged "out of scope" and sent nothing,
+    /// so MT CSFB voice could not be triggered at all.
+    #[test]
+    fn test_mt_csfb_emits_a_ue_context_modification_with_the_csfb_indicator() {
+        let enb_ue = EnbUe {
+            id: 1,
+            enb_id: 9,
+            enb_ue_s1ap_id: 100,
+            mme_ue_s1ap_id: 4242,
+            ..Default::default()
+        };
+
+        // Service type 1: mobile terminating CS fallback.
+        let pdu = csfb_context_modification(&enb_ue, 1)
+            .expect("an MT CS fallback must produce a modification")
+            .expect("it must encode");
+        match nextgcore_s1ap::decode_s1ap_pdu(&pdu).unwrap() {
+            nextgcore_s1ap::S1apMessage::UeContextModificationRequest(req) => {
+                assert_eq!(req.mme_ue_s1ap_id, 4242);
+                assert_eq!(req.enb_ue_s1ap_id, 100);
+                assert_eq!(
+                    req.cs_fallback_indicator,
+                    Some(nextgcore_s1ap::CsFallbackIndicator::CsFallbackRequired)
+                );
+            }
+            other => panic!("expected UeContextModificationRequest, got {other:?}"),
+        }
+
+        // Service type 2: an emergency call gets priority handling.
+        let pdu = csfb_context_modification(&enb_ue, 2).unwrap().unwrap();
+        match nextgcore_s1ap::decode_s1ap_pdu(&pdu).unwrap() {
+            nextgcore_s1ap::S1apMessage::UeContextModificationRequest(req) => {
+                assert_eq!(
+                    req.cs_fallback_indicator,
+                    Some(nextgcore_s1ap::CsFallbackIndicator::CsFallbackHighPriority)
+                );
+            }
+            other => panic!("expected UeContextModificationRequest, got {other:?}"),
+        }
+
+        // Service type 8: packet services via S1, so no CS fallback is triggered.
+        assert!(
+            csfb_context_modification(&enb_ue, 8).is_none(),
+            "a packet-services request must not put the eNB into CS fallback"
+        );
+    }
 
     fn test_ctx() -> MmeContext {
         let ctx = MmeContext::new();

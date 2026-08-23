@@ -1111,6 +1111,634 @@ fn ue_capability_info_indication_roundtrip() {
 }
 
 // ============================================================================
+// eNB / MME Configuration Update (§9.1.8.7-9.1.8.12)
+// ============================================================================
+
+#[test]
+fn enb_configuration_update_roundtrip() {
+    let msg = EnbConfigurationUpdate {
+        enb_name: Some("reconfigured-enb".to_string()),
+        supported_tas: Some(vec![
+            SupportedTaItem {
+                tac: 0x0007,
+                broadcast_plmns: vec![PLMN],
+            },
+            SupportedTaItem {
+                tac: 0x0008,
+                broadcast_plmns: vec![PLMN, [0x99, 0xF9, 0x99]],
+            },
+        ]),
+        default_paging_drx: Some(PagingDrx::V256),
+    };
+    let bytes = build_enb_configuration_update(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::EnbConfigurationUpdate(decoded) => {
+            assert_eq!(decoded.enb_name.as_deref(), Some("reconfigured-enb"));
+            let tas = decoded.supported_tas.expect("SupportedTAs was present");
+            assert_eq!(tas.len(), 2);
+            assert_eq!(tas[0].tac, 0x0007);
+            assert_eq!(tas[1].tac, 0x0008);
+            assert_eq!(tas[1].broadcast_plmns.len(), 2);
+            assert_eq!(decoded.default_paging_drx, Some(PagingDrx::V256));
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+/// An update that carries only a new name must decode with `supported_tas`
+/// **absent**, not empty: the two mean different things to the MME (unchanged
+/// vs. serves nothing), and conflating them erases the eNB's TA list.
+#[test]
+fn enb_configuration_update_absent_ta_list_is_not_an_empty_one() {
+    let msg = EnbConfigurationUpdate {
+        enb_name: Some("renamed-only".to_string()),
+        supported_tas: None,
+        default_paging_drx: None,
+    };
+    let bytes = build_enb_configuration_update(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::EnbConfigurationUpdate(decoded) => {
+            assert_eq!(decoded.enb_name.as_deref(), Some("renamed-only"));
+            assert!(
+                decoded.supported_tas.is_none(),
+                "an omitted SupportedTAs must stay None, never Some(vec![])"
+            );
+            assert!(decoded.default_paging_drx.is_none());
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+#[test]
+fn enb_configuration_update_acknowledge_roundtrip() {
+    let msg = EnbConfigurationUpdateAcknowledge {
+        criticality_diagnostics: Some(CriticalityDiagnostics {
+            procedure_code: Some(29),
+            triggering_message: Some(triggering_message::INITIATING_MESSAGE),
+            procedure_criticality: Some(0),
+            ies: vec![IeCriticalityDiagnostics {
+                ie_criticality: Criticality::Reject,
+                ie_id: 64,
+                type_of_error: TypeOfError::NotUnderstood,
+            }],
+        }),
+    };
+    let bytes = build_enb_configuration_update_acknowledge(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::EnbConfigurationUpdateAcknowledge(decoded) => {
+            let diag = decoded
+                .criticality_diagnostics
+                .expect("diagnostics present");
+            assert_eq!(diag.procedure_code, Some(29));
+            assert_eq!(diag.ies.len(), 1);
+            assert_eq!(diag.ies[0].ie_id, 64);
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+#[test]
+fn enb_configuration_update_failure_roundtrip() {
+    let msg = EnbConfigurationUpdateFailure {
+        cause: Cause::Misc(CauseMisc::UnknownPlmn),
+        time_to_wait: Some(TimeToWait::V20s),
+        criticality_diagnostics: None,
+    };
+    let bytes = build_enb_configuration_update_failure(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::EnbConfigurationUpdateFailure(decoded) => {
+            assert_eq!(decoded.cause, Cause::Misc(CauseMisc::UnknownPlmn));
+            assert_eq!(decoded.time_to_wait, Some(TimeToWait::V20s));
+            assert!(decoded.criticality_diagnostics.is_none());
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+#[test]
+fn mme_configuration_update_roundtrip() {
+    let msg = MmeConfigurationUpdate {
+        mme_name: Some("mme02.nextgcore".to_string()),
+        served_gummeis: Some(vec![ServedGummeiItem {
+            served_plmns: vec![PLMN],
+            served_group_ids: vec![0x0002],
+            served_mmec_codes: vec![7],
+        }]),
+        relative_mme_capacity: Some(64),
+    };
+    let bytes = build_mme_configuration_update(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::MmeConfigurationUpdate(decoded) => {
+            assert_eq!(decoded.mme_name.as_deref(), Some("mme02.nextgcore"));
+            let gummeis = decoded.served_gummeis.expect("ServedGUMMEIs present");
+            assert_eq!(gummeis.len(), 1);
+            assert_eq!(gummeis[0].served_mmec_codes, vec![7]);
+            assert_eq!(decoded.relative_mme_capacity, Some(64));
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+#[test]
+fn mme_configuration_update_acknowledge_and_failure_roundtrip() {
+    let ack_bytes =
+        build_mme_configuration_update_acknowledge(&MmeConfigurationUpdateAcknowledge::default())
+            .unwrap();
+    assert!(matches!(
+        decode_s1ap_pdu(&ack_bytes).unwrap(),
+        S1apMessage::MmeConfigurationUpdateAcknowledge(_)
+    ));
+
+    let failure_bytes = build_mme_configuration_update_failure(&MmeConfigurationUpdateFailure {
+        cause: Cause::Protocol(CauseProtocol::SemanticError),
+        time_to_wait: None,
+        criticality_diagnostics: None,
+    })
+    .unwrap();
+    match decode_s1ap_pdu(&failure_bytes).unwrap() {
+        S1apMessage::MmeConfigurationUpdateFailure(decoded) => {
+            assert_eq!(decoded.cause, Cause::Protocol(CauseProtocol::SemanticError));
+            assert!(decoded.time_to_wait.is_none());
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+// ============================================================================
+// UE Context Modification (§9.1.4.8-9.1.4.10)
+// ============================================================================
+
+#[test]
+fn ue_context_modification_request_roundtrip() {
+    let msg = UeContextModificationRequest {
+        mme_ue_s1ap_id: 0x0001_0203,
+        enb_ue_s1ap_id: 0x0004_0506,
+        security_key: Some([0x5A; 32]),
+        subscriber_profile_id_for_rfp: Some(256),
+        ue_ambr: Some(UeAmbr {
+            dl: 1_000_000_000,
+            ul: 500_000_000,
+        }),
+        cs_fallback_indicator: Some(CsFallbackIndicator::CsFallbackRequired),
+        ue_security_capabilities: Some(UeSecurityCapabilities {
+            encryption_algorithms: 0xE000,
+            integrity_algorithms: 0xE000,
+        }),
+    };
+    let bytes = build_ue_context_modification_request(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::UeContextModificationRequest(decoded) => {
+            assert_eq!(decoded.mme_ue_s1ap_id, 0x0001_0203);
+            assert_eq!(decoded.enb_ue_s1ap_id, 0x0004_0506);
+            assert_eq!(decoded.security_key, Some([0x5A; 32]));
+            // The IE is INTEGER (1..256): the upper bound must survive.
+            assert_eq!(decoded.subscriber_profile_id_for_rfp, Some(256));
+            assert_eq!(decoded.ue_ambr.map(|a| a.dl), Some(1_000_000_000));
+            assert_eq!(
+                decoded.cs_fallback_indicator,
+                Some(CsFallbackIndicator::CsFallbackRequired)
+            );
+            assert_eq!(
+                decoded
+                    .ue_security_capabilities
+                    .map(|c| c.integrity_algorithms),
+                Some(0xE000)
+            );
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+/// Only the two mandatory IDs: every optional IE must come back absent rather
+/// than defaulted, or a modification that changed nothing would look like one
+/// that zeroed the UE's AMBR.
+#[test]
+fn ue_context_modification_request_minimal_roundtrip() {
+    let msg = UeContextModificationRequest {
+        mme_ue_s1ap_id: 9,
+        enb_ue_s1ap_id: 10,
+        security_key: None,
+        subscriber_profile_id_for_rfp: None,
+        ue_ambr: None,
+        cs_fallback_indicator: None,
+        ue_security_capabilities: None,
+    };
+    let bytes = build_ue_context_modification_request(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::UeContextModificationRequest(decoded) => {
+            assert_eq!(decoded.mme_ue_s1ap_id, 9);
+            assert!(decoded.security_key.is_none());
+            assert!(decoded.subscriber_profile_id_for_rfp.is_none());
+            assert!(decoded.ue_ambr.is_none());
+            assert!(decoded.cs_fallback_indicator.is_none());
+            assert!(decoded.ue_security_capabilities.is_none());
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+/// `cs-fallback-high-priority` is an ASN.1 **extension addition**, so it is
+/// encoded as extension index 0 rather than root value 1. Asserting both
+/// variants is what distinguishes a correct extensible enumeration from one
+/// that silently encodes the high-priority case as the required case.
+#[test]
+fn cs_fallback_indicator_extension_value_roundtrips_distinctly() {
+    let mut required = None;
+    let mut high_priority = None;
+    for indicator in [
+        CsFallbackIndicator::CsFallbackRequired,
+        CsFallbackIndicator::CsFallbackHighPriority,
+    ] {
+        let bytes = build_ue_context_modification_request(&UeContextModificationRequest {
+            mme_ue_s1ap_id: 1,
+            enb_ue_s1ap_id: 2,
+            security_key: None,
+            subscriber_profile_id_for_rfp: None,
+            ue_ambr: None,
+            cs_fallback_indicator: Some(indicator),
+            ue_security_capabilities: None,
+        })
+        .unwrap();
+        match decode_s1ap_pdu(&bytes).unwrap() {
+            S1apMessage::UeContextModificationRequest(decoded) => {
+                assert_eq!(decoded.cs_fallback_indicator, Some(indicator));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+        match indicator {
+            CsFallbackIndicator::CsFallbackRequired => required = Some(bytes),
+            CsFallbackIndicator::CsFallbackHighPriority => high_priority = Some(bytes),
+        }
+    }
+    assert_ne!(
+        required.unwrap(),
+        high_priority.unwrap(),
+        "the two indicator values must differ on the wire"
+    );
+}
+
+#[test]
+fn ue_context_modification_response_and_failure_roundtrip() {
+    let bytes = build_ue_context_modification_response(&UeContextModificationResponse {
+        mme_ue_s1ap_id: 11,
+        enb_ue_s1ap_id: 12,
+        criticality_diagnostics: None,
+    })
+    .unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::UeContextModificationResponse(decoded) => {
+            assert_eq!(decoded.mme_ue_s1ap_id, 11);
+            assert_eq!(decoded.enb_ue_s1ap_id, 12);
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    let bytes = build_ue_context_modification_failure(&UeContextModificationFailure {
+        mme_ue_s1ap_id: 13,
+        enb_ue_s1ap_id: 14,
+        cause: Cause::RadioNetwork(CauseRadioNetwork::RadioResourcesNotAvailable),
+        criticality_diagnostics: None,
+    })
+    .unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::UeContextModificationFailure(decoded) => {
+            assert_eq!(decoded.mme_ue_s1ap_id, 13);
+            assert_eq!(
+                decoded.cause,
+                Cause::RadioNetwork(CauseRadioNetwork::RadioResourcesNotAvailable)
+            );
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+// ============================================================================
+// Overload Start / Stop (§9.1.8.13-9.1.8.14)
+// ============================================================================
+
+/// Every Overload Action must round-trip, including the four that are ASN.1
+/// extension additions (values 3..=6) rather than root values.
+#[test]
+fn overload_start_roundtrips_every_action_including_extensions() {
+    for action in [
+        OverloadAction::RejectNonEmergencyMoDt,
+        OverloadAction::RejectRrcCrSignalling,
+        OverloadAction::PermitEmergencySessionsAndMtOnly,
+        OverloadAction::PermitHighPrioritySessionsAndMtOnly,
+        OverloadAction::RejectDelayTolerantAccess,
+        OverloadAction::PermitHighPrioritySessionsAndExceptionReportingAndMtOnly,
+        OverloadAction::NotAcceptMoDataOrDelayTolerantAccessFromCpCiot,
+    ] {
+        let bytes = build_overload_start(&OverloadStart {
+            overload_action: action,
+        })
+        .unwrap();
+        match decode_s1ap_pdu(&bytes).unwrap() {
+            S1apMessage::OverloadStart(decoded) => {
+                assert_eq!(decoded.overload_action, action, "action {action:?}");
+            }
+            other => panic!("unexpected message for {action:?}: {other:?}"),
+        }
+    }
+}
+
+/// Overload Stop has no mandatory IE, so an empty container is conformant and
+/// must decode rather than be rejected as malformed.
+#[test]
+fn overload_stop_roundtrip() {
+    let bytes = build_overload_stop(&OverloadStop).unwrap();
+    assert!(matches!(
+        decode_s1ap_pdu(&bytes).unwrap(),
+        S1apMessage::OverloadStop(_)
+    ));
+}
+
+// ============================================================================
+// PWS: Write-Replace Warning / Kill (§9.1.13)
+// ============================================================================
+
+fn sample_etws_warning() -> WriteReplaceWarningRequest {
+    WriteReplaceWarningRequest {
+        message_identifier: 0x1100, // ETWS earthquake (TS 23.041)
+        serial_number: 0x3000,
+        warning_area: Some(WarningAreaList::TrackingAreaListForWarning(vec![
+            sample_tai(),
+        ])),
+        repetition_period: 4095,
+        number_of_broadcast_request: 65535,
+        warning_type: Some([0x00, 0x01]),
+        warning_security_info: Some([0xAB; 50]),
+        data_coding_scheme: Some(0x0F),
+        warning_message_contents: Some(b"Earthquake. Take cover.".to_vec()),
+        concurrent_warning_message_indicator: true,
+    }
+}
+
+#[test]
+fn write_replace_warning_request_roundtrip() {
+    let msg = sample_etws_warning();
+    let bytes = build_write_replace_warning_request(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::WriteReplaceWarningRequest(decoded) => {
+            assert_eq!(decoded.message_identifier, 0x1100);
+            assert_eq!(decoded.serial_number, 0x3000);
+            assert_eq!(
+                decoded.warning_area,
+                Some(WarningAreaList::TrackingAreaListForWarning(vec![
+                    sample_tai()
+                ]))
+            );
+            // Both bounds of their constrained ranges must survive.
+            assert_eq!(decoded.repetition_period, 4095);
+            assert_eq!(decoded.number_of_broadcast_request, 65535);
+            assert_eq!(decoded.warning_type, Some([0x00, 0x01]));
+            assert_eq!(decoded.warning_security_info, Some([0xAB; 50]));
+            assert_eq!(decoded.data_coding_scheme, Some(0x0F));
+            assert_eq!(
+                decoded.warning_message_contents.as_deref(),
+                Some(b"Earthquake. Take cover.".as_slice())
+            );
+            assert!(decoded.concurrent_warning_message_indicator);
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+/// A CMAS-style request with only the mandatory IEs and no warning area, which
+/// per TS 23.041 means every cell the eNB serves.
+#[test]
+fn write_replace_warning_request_minimal_roundtrip() {
+    let msg = WriteReplaceWarningRequest {
+        message_identifier: 0x1112,
+        serial_number: 0x0001,
+        warning_area: None,
+        repetition_period: 0,
+        number_of_broadcast_request: 0,
+        warning_type: None,
+        warning_security_info: None,
+        data_coding_scheme: None,
+        warning_message_contents: None,
+        concurrent_warning_message_indicator: false,
+    };
+    let bytes = build_write_replace_warning_request(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::WriteReplaceWarningRequest(decoded) => {
+            assert_eq!(decoded.message_identifier, 0x1112);
+            assert!(
+                decoded.warning_area.is_none(),
+                "no warning area means all cells, not an empty list"
+            );
+            assert_eq!(decoded.repetition_period, 0);
+            assert!(!decoded.concurrent_warning_message_indicator);
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+/// All three Warning Area List alternatives must round-trip: a CBC may target
+/// cells, tracking areas, or emergency areas.
+#[test]
+fn warning_area_list_roundtrips_every_alternative() {
+    let areas = [
+        WarningAreaList::CellIdList(vec![sample_cgi(), sample_cgi()]),
+        WarningAreaList::TrackingAreaListForWarning(vec![sample_tai()]),
+        WarningAreaList::EmergencyAreaIdList(vec![[0x01, 0x02, 0x03], [0xFF, 0xFE, 0xFD]]),
+    ];
+    for area in areas {
+        let bytes = build_kill_request(&KillRequest {
+            message_identifier: 0x1100,
+            serial_number: 1,
+            warning_area: Some(area.clone()),
+            kill_all_warning_messages: false,
+        })
+        .unwrap();
+        match decode_s1ap_pdu(&bytes).unwrap() {
+            S1apMessage::KillRequest(decoded) => {
+                assert_eq!(decoded.warning_area, Some(area.clone()), "area {area:?}");
+            }
+            other => panic!("unexpected message for {area:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn write_replace_warning_response_roundtrip() {
+    let msg = WriteReplaceWarningResponse {
+        message_identifier: 0x1100,
+        serial_number: 0x3000,
+        broadcast_completed_area: Some(BroadcastCompletedAreaList::TaiBroadcast(vec![
+            TaiBroadcastItem {
+                tai: sample_tai(),
+                completed_cells: vec![sample_cgi()],
+            },
+        ])),
+        criticality_diagnostics: None,
+    };
+    let bytes = build_write_replace_warning_response(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::WriteReplaceWarningResponse(decoded) => {
+            assert_eq!(decoded.message_identifier, 0x1100);
+            assert_eq!(
+                decoded.broadcast_completed_area,
+                msg.broadcast_completed_area
+            );
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+#[test]
+fn broadcast_completed_area_list_roundtrips_every_alternative() {
+    let areas = [
+        BroadcastCompletedAreaList::CellIdBroadcast(vec![sample_cgi()]),
+        BroadcastCompletedAreaList::TaiBroadcast(vec![TaiBroadcastItem {
+            tai: sample_tai(),
+            completed_cells: vec![sample_cgi(), sample_cgi()],
+        }]),
+        BroadcastCompletedAreaList::EmergencyAreaIdBroadcast(vec![EmergencyAreaIdBroadcastItem {
+            emergency_area_id: [0x0A, 0x0B, 0x0C],
+            completed_cells: vec![sample_cgi()],
+        }]),
+    ];
+    for area in areas {
+        let bytes = build_write_replace_warning_response(&WriteReplaceWarningResponse {
+            message_identifier: 1,
+            serial_number: 2,
+            broadcast_completed_area: Some(area.clone()),
+            criticality_diagnostics: None,
+        })
+        .unwrap();
+        match decode_s1ap_pdu(&bytes).unwrap() {
+            S1apMessage::WriteReplaceWarningResponse(decoded) => {
+                assert_eq!(
+                    decoded.broadcast_completed_area,
+                    Some(area.clone()),
+                    "area {area:?}"
+                );
+            }
+            other => panic!("unexpected message for {area:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn kill_request_roundtrip() {
+    let msg = KillRequest {
+        message_identifier: 0x1100,
+        serial_number: 0x3000,
+        warning_area: Some(WarningAreaList::CellIdList(vec![sample_cgi()])),
+        kill_all_warning_messages: true,
+    };
+    let bytes = build_kill_request(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::KillRequest(decoded) => {
+            assert_eq!(decoded.message_identifier, 0x1100);
+            assert_eq!(decoded.serial_number, 0x3000);
+            assert_eq!(decoded.warning_area, msg.warning_area);
+            assert!(decoded.kill_all_warning_messages);
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+/// The cancelled area lists differ from the completed ones by carrying
+/// `numberOfBroadcasts` per cell — how far the alert got before it was killed.
+#[test]
+fn kill_response_roundtrips_every_cancelled_alternative() {
+    let cell = || CellIdCancelledItem {
+        ecgi: sample_cgi(),
+        number_of_broadcasts: 65535,
+    };
+    let areas = [
+        BroadcastCancelledAreaList::CellIdCancelled(vec![cell()]),
+        BroadcastCancelledAreaList::TaiCancelled(vec![TaiCancelledItem {
+            tai: sample_tai(),
+            cancelled_cells: vec![cell(), cell()],
+        }]),
+        BroadcastCancelledAreaList::EmergencyAreaIdCancelled(vec![EmergencyAreaIdCancelledItem {
+            emergency_area_id: [0x11, 0x22, 0x33],
+            cancelled_cells: vec![cell()],
+        }]),
+    ];
+    for area in areas {
+        let bytes = build_kill_response(&KillResponse {
+            message_identifier: 0x1100,
+            serial_number: 7,
+            broadcast_cancelled_area: Some(area.clone()),
+            criticality_diagnostics: None,
+        })
+        .unwrap();
+        match decode_s1ap_pdu(&bytes).unwrap() {
+            S1apMessage::KillResponse(decoded) => {
+                assert_eq!(decoded.message_identifier, 0x1100);
+                assert_eq!(
+                    decoded.broadcast_cancelled_area,
+                    Some(area.clone()),
+                    "area {area:?}"
+                );
+            }
+            other => panic!("unexpected message for {area:?}: {other:?}"),
+        }
+    }
+}
+
+/// `WarningMessageContents ::= OCTET STRING (SIZE(1..9600))` — a zero-length
+/// message is not encodable, and an over-long one must be refused rather than
+/// silently truncated onto the wire.
+#[test]
+fn warning_message_contents_bounds_are_enforced() {
+    let mut msg = sample_etws_warning();
+
+    msg.warning_message_contents = Some(Vec::new());
+    assert!(
+        build_write_replace_warning_request(&msg).is_err(),
+        "an empty warning message must be refused, not encoded as SIZE(0)"
+    );
+
+    msg.warning_message_contents = Some(vec![0x41; 9601]);
+    assert!(
+        build_write_replace_warning_request(&msg).is_err(),
+        "a warning message over 9600 octets must be refused"
+    );
+
+    msg.warning_message_contents = Some(vec![0x41; 9600]);
+    assert!(
+        build_write_replace_warning_request(&msg).is_ok(),
+        "exactly 9600 octets is the upper bound and must encode"
+    );
+}
+
+/// The PWS area lists are bounded at 65535, not the 256 that bounds every E-RAB
+/// list. Encoding one with more than 256 entries and reading it back proves the
+/// list helpers are not using the E-RAB bound for their length determinant.
+#[test]
+fn warning_area_list_exceeds_the_erab_list_bound() {
+    let cells: Vec<EutranCgi> = (0..300)
+        .map(|i| EutranCgi {
+            plmn_identity: PLMN,
+            cell_identity: i,
+        })
+        .collect();
+    let bytes = build_kill_request(&KillRequest {
+        message_identifier: 0x1100,
+        serial_number: 1,
+        warning_area: Some(WarningAreaList::CellIdList(cells.clone())),
+        kill_all_warning_messages: false,
+    })
+    .unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::KillRequest(decoded) => match decoded.warning_area {
+            Some(WarningAreaList::CellIdList(decoded_cells)) => {
+                assert_eq!(decoded_cells.len(), 300);
+                assert_eq!(decoded_cells, cells);
+            }
+            other => panic!("expected a cell-id list, got {other:?}"),
+        },
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+// ============================================================================
 // Strict-reject: missing mandatory IEs
 // ============================================================================
 
@@ -1168,6 +1796,10 @@ fn strict_reject_missing_mandatory_ies() {
         ProcedureCode::PATH_SWITCH_REQUEST,
         ProcedureCode::HANDOVER_CANCEL,
         ProcedureCode::UE_CAPABILITY_INFO_INDICATION,
+        ProcedureCode::UE_CONTEXT_MODIFICATION,
+        ProcedureCode::OVERLOAD_START,
+        ProcedureCode::WRITE_REPLACE_WARNING,
+        ProcedureCode::KILL,
     ];
     for code in initiating {
         let bytes = empty_initiating(code);
@@ -1189,6 +1821,9 @@ fn strict_reject_missing_mandatory_ies() {
         ProcedureCode::HANDOVER_RESOURCE_ALLOCATION,
         ProcedureCode::PATH_SWITCH_REQUEST,
         ProcedureCode::HANDOVER_CANCEL,
+        ProcedureCode::UE_CONTEXT_MODIFICATION,
+        ProcedureCode::WRITE_REPLACE_WARNING,
+        ProcedureCode::KILL,
     ];
     for code in successful {
         let bytes = empty_successful(code);
@@ -1205,6 +1840,9 @@ fn strict_reject_missing_mandatory_ies() {
         ProcedureCode::HANDOVER_PREPARATION,
         ProcedureCode::HANDOVER_RESOURCE_ALLOCATION,
         ProcedureCode::PATH_SWITCH_REQUEST,
+        ProcedureCode::ENB_CONFIGURATION_UPDATE,
+        ProcedureCode::MME_CONFIGURATION_UPDATE,
+        ProcedureCode::UE_CONTEXT_MODIFICATION,
     ];
     for code in unsuccessful {
         let bytes = empty_unsuccessful(code);
@@ -1230,6 +1868,31 @@ fn optional_only_messages_accept_empty_container() {
     assert!(matches!(
         decode_s1ap_pdu(&error_ind).unwrap(),
         S1apMessage::ErrorIndication(_)
+    ));
+
+    // Both Configuration Updates and their Acknowledges are all-optional too
+    // (TS 36.413 §9.1.8.7-9.1.8.11), as is Overload Stop (§9.1.8.14). Rejecting
+    // an empty one of these would break a conformant peer that is only asking
+    // us to re-confirm the configuration we already hold.
+    assert!(matches!(
+        decode_s1ap_pdu(&empty_initiating(ProcedureCode::ENB_CONFIGURATION_UPDATE)).unwrap(),
+        S1apMessage::EnbConfigurationUpdate(_)
+    ));
+    assert!(matches!(
+        decode_s1ap_pdu(&empty_initiating(ProcedureCode::MME_CONFIGURATION_UPDATE)).unwrap(),
+        S1apMessage::MmeConfigurationUpdate(_)
+    ));
+    assert!(matches!(
+        decode_s1ap_pdu(&empty_successful(ProcedureCode::ENB_CONFIGURATION_UPDATE)).unwrap(),
+        S1apMessage::EnbConfigurationUpdateAcknowledge(_)
+    ));
+    assert!(matches!(
+        decode_s1ap_pdu(&empty_successful(ProcedureCode::MME_CONFIGURATION_UPDATE)).unwrap(),
+        S1apMessage::MmeConfigurationUpdateAcknowledge(_)
+    ));
+    assert!(matches!(
+        decode_s1ap_pdu(&empty_initiating(ProcedureCode::OVERLOAD_STOP)).unwrap(),
+        S1apMessage::OverloadStop(_)
     ));
 }
 
@@ -1297,13 +1960,17 @@ fn truncated_messages_return_err() {
 
 #[test]
 fn unknown_procedure_code_is_reported_not_rejected() {
-    let bytes = empty_initiating(ProcedureCode::WRITE_REPLACE_WARNING);
+    // TRACE START (§8.11.1) is a Class-2 procedure this codec does not model.
+    // This test used to use WRITE-REPLACE WARNING for the same purpose; that
+    // stopped being an unsupported code when #49 implemented it, so the stand-in
+    // moved rather than the assertion.
+    let bytes = empty_initiating(ProcedureCode::TRACE_START);
     match decode_s1ap_pdu(&bytes).unwrap() {
         S1apMessage::Unknown {
             procedure_code,
             message_type,
         } => {
-            assert_eq!(procedure_code, ProcedureCode::WRITE_REPLACE_WARNING.0);
+            assert_eq!(procedure_code, ProcedureCode::TRACE_START.0);
             assert_eq!(message_type, "InitiatingMessage");
         }
         other => panic!("unexpected message: {other:?}"),

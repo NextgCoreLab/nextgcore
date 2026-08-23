@@ -10,13 +10,17 @@
 use crate::context::{
     ECgi, EnbUe, EpsTai, IpAddr, MmeBearer, MmeContext, MmeUe, PlmnId, S1apCause, S1apCauseGroup,
 };
+use crate::sbc_message::SbcPwsData;
 use nextgcore_s1ap::{
     builder, AllocationRetentionPriority, Cause, CauseMisc, CauseNas, CauseProtocol,
-    CauseRadioNetwork, CauseTransport, CnDomain, DlNasTransport, ErabItem, ErabLevelQosParameters,
-    ErabModifyRequest, ErabReleaseCommand, ErabSetupRequest, ErabToBeModifiedItem,
-    ErabToBeSetupItem, ErrorIndication, EutranCgi, GbrQosInformation, InitialContextSetupRequest,
-    Paging, PagingDrx, S1SetupFailure, S1SetupResponse, S1apResult, STmsi, ServedGummeiItem, Tai,
-    TimeToWait, UeAmbr, UeContextReleaseCommand, UePagingId, UeS1apIds, UeSecurityCapabilities,
+    CauseRadioNetwork, CauseTransport, CnDomain, CsFallbackIndicator, DlNasTransport,
+    EnbConfigurationUpdateAcknowledge, EnbConfigurationUpdateFailure, ErabItem,
+    ErabLevelQosParameters, ErabModifyRequest, ErabReleaseCommand, ErabSetupRequest,
+    ErabToBeModifiedItem, ErabToBeSetupItem, ErrorIndication, EutranCgi, GbrQosInformation,
+    InitialContextSetupRequest, KillRequest, OverloadAction, OverloadStart, OverloadStop, Paging,
+    PagingDrx, S1SetupFailure, S1SetupResponse, S1apResult, STmsi, ServedGummeiItem, Tai,
+    TimeToWait, UeAmbr, UeContextModificationRequest, UeContextReleaseCommand, UePagingId,
+    UeS1apIds, UeSecurityCapabilities, WarningAreaList, WriteReplaceWarningRequest,
 };
 
 // ============================================================================
@@ -526,6 +530,156 @@ pub fn build_paging(
 }
 
 // ============================================================================
+// Configuration Update (§8.7.4)
+// ============================================================================
+
+/// Build eNB Configuration Update Acknowledge (TS 36.413 §9.1.8.8)
+pub fn build_enb_configuration_update_acknowledge() -> S1apResult<Vec<u8>> {
+    builder::build_enb_configuration_update_acknowledge(&EnbConfigurationUpdateAcknowledge {
+        criticality_diagnostics: None,
+    })
+}
+
+/// Build eNB Configuration Update Failure (TS 36.413 §9.1.8.9)
+pub fn build_enb_configuration_update_failure(
+    cause_group: S1apCauseGroup,
+    cause_value: i64,
+    time_to_wait: Option<TimeToWait>,
+) -> S1apResult<Vec<u8>> {
+    builder::build_enb_configuration_update_failure(&EnbConfigurationUpdateFailure {
+        cause: cause_to_s1ap(cause_group, cause_value),
+        time_to_wait,
+        criticality_diagnostics: None,
+    })
+}
+
+// ============================================================================
+// UE Context Modification (§8.3.4)
+// ============================================================================
+
+/// Build UE Context Modification Request carrying the CS Fallback Indicator
+/// (TS 36.413 §9.1.4.8, TS 23.272 §7.3).
+///
+/// This is the MT CSFB trigger: it tells the eNB to move the UE to the CS
+/// domain for an incoming circuit-switched call. Only the indicator is sent —
+/// nothing else about the UE has changed, and an unnecessary `SecurityKey` here
+/// would make the eNB rekey a UE mid-call.
+pub fn build_ue_context_modification_for_csfb(
+    enb_ue: &EnbUe,
+    high_priority: bool,
+) -> S1apResult<Vec<u8>> {
+    builder::build_ue_context_modification_request(&UeContextModificationRequest {
+        mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+        enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+        security_key: None,
+        subscriber_profile_id_for_rfp: None,
+        ue_ambr: None,
+        cs_fallback_indicator: Some(if high_priority {
+            CsFallbackIndicator::CsFallbackHighPriority
+        } else {
+            CsFallbackIndicator::CsFallbackRequired
+        }),
+        ue_security_capabilities: None,
+    })
+}
+
+// ============================================================================
+// Overload (§8.7.6)
+// ============================================================================
+
+/// Build Overload Start (TS 36.413 §9.1.8.13)
+pub fn build_overload_start(action: OverloadAction) -> S1apResult<Vec<u8>> {
+    builder::build_overload_start(&OverloadStart {
+        overload_action: action,
+    })
+}
+
+/// Build Overload Stop (TS 36.413 §9.1.8.14)
+pub fn build_overload_stop() -> S1apResult<Vec<u8>> {
+    builder::build_overload_stop(&OverloadStop)
+}
+
+// ============================================================================
+// PWS: Write-Replace Warning / Kill (§8.12)
+// ============================================================================
+
+/// Build a Write-Replace Warning Request for one eNB from the CBC's PWS data
+/// (TS 36.413 §9.1.13.1, TS 23.041).
+///
+/// `warning_tais` is the subset of the CBC's warning area this eNB actually
+/// serves. It may only be empty when the CBC named no area at all, which per
+/// TS 23.041 means every cell the eNB serves.
+pub fn build_write_replace_warning(
+    sbc_pws: &SbcPwsData,
+    warning_tais: &[EpsTai],
+) -> S1apResult<Vec<u8>> {
+    builder::build_write_replace_warning_request(&WriteReplaceWarningRequest {
+        message_identifier: sbc_pws.message_id,
+        serial_number: sbc_pws.serial_number,
+        warning_area: warning_area_from(sbc_pws, warning_tais)?,
+        // The SBc-AP fields are wider than the S1AP IEs they feed
+        // (RepetitionPeriod is INTEGER(0..4095), NumberofBroadcastRequest is
+        // INTEGER(0..65535)), so they are clamped rather than truncated: a
+        // wrapped repetition period would silently change how long an
+        // emergency alert is broadcast.
+        repetition_period: sbc_pws.repetition_period.min(PWS_MAX_REPETITION_PERIOD) as u16,
+        number_of_broadcast_request: sbc_pws.number_of_broadcast.min(u16::MAX as u32) as u16,
+        warning_type: sbc_pws.warning_type.map(|wt| wt.encode()),
+        warning_security_info: None,
+        data_coding_scheme: Some(sbc_pws.data_coding_scheme),
+        warning_message_contents: (!sbc_pws.message_contents.is_empty())
+            .then(|| sbc_pws.message_contents.clone()),
+        concurrent_warning_message_indicator: sbc_pws.concurrent_warning_message_indicator,
+    })
+}
+
+/// Build a Kill Request for one eNB (TS 36.413 §9.1.13.3).
+pub fn build_kill(sbc_pws: &SbcPwsData, warning_tais: &[EpsTai]) -> S1apResult<Vec<u8>> {
+    builder::build_kill_request(&KillRequest {
+        message_identifier: sbc_pws.message_id,
+        serial_number: sbc_pws.serial_number,
+        warning_area: warning_area_from(sbc_pws, warning_tais)?,
+        // Only this (message id, serial number) is cancelled, never every
+        // warning the eNB holds: a Stop Warning Request from the CBC names one
+        // message, so killing them all would cancel unrelated live alerts.
+        kill_all_warning_messages: false,
+    })
+}
+
+/// `RepetitionPeriod ::= INTEGER (0..4095)` (TS 36.413 §9.2.1.49)
+const PWS_MAX_REPETITION_PERIOD: u32 = 4095;
+
+/// The Warning Area List for a set of TAIs.
+///
+/// `None` means "omit the IE", which per TS 23.041 tells the eNB to broadcast in
+/// **every cell it serves**. That is only correct when the CBC itself named no
+/// area, so an empty `warning_tais` for a request that *did* name TAIs is an
+/// error rather than an omission: silently widening a targeted emergency alert to
+/// an entire eNB is worse than not sending it. `TAIListforWarning` is
+/// `SIZE(1..maxnoofTAIforWarning)` and cannot encode an empty list anyway.
+fn warning_area_from(
+    sbc_pws: &SbcPwsData,
+    warning_tais: &[EpsTai],
+) -> S1apResult<Option<WarningAreaList>> {
+    if warning_tais.is_empty() {
+        if sbc_pws.no_of_tai > 0 {
+            return Err(nextgcore_s1ap::S1apError::InvalidIeValue {
+                ie_name: "WarningAreaList",
+                reason: format!(
+                    "the CBC named {} TAI(s) but none of them match this eNB; refusing to \
+                     broadcast to every cell instead",
+                    sbc_pws.no_of_tai
+                ),
+            });
+        }
+        return Ok(None);
+    }
+    Ok(Some(WarningAreaList::TrackingAreaListForWarning(
+        warning_tais.iter().map(tai_to_s1ap).collect(),
+    )))
+}
+
+// ============================================================================
 // Error Indication (§8.7.2)
 // ============================================================================
 
@@ -884,6 +1038,87 @@ mod tests {
                     paging.ue_paging_id,
                     UePagingId::Imsi(imsi_bcd_to_tbcd("001010123456789"))
                 );
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    /// The MT CSFB trigger (TS 23.272 §7.3): a UE Context Modification carrying
+    /// only the CS Fallback Indicator. Anything else in it would ask the eNB to
+    /// change something about the UE that has not actually changed — a
+    /// `SecurityKey` here would rekey a UE mid-call.
+    #[test]
+    fn test_build_ue_context_modification_for_csfb_roundtrip() {
+        let enb_ue = test_enb_ue();
+
+        let bytes = build_ue_context_modification_for_csfb(&enb_ue, false).unwrap();
+        match decode_s1ap_pdu(&bytes).unwrap() {
+            S1apMessage::UeContextModificationRequest(req) => {
+                assert_eq!(req.mme_ue_s1ap_id, 42);
+                assert_eq!(req.enb_ue_s1ap_id, 7);
+                assert_eq!(
+                    req.cs_fallback_indicator,
+                    Some(nextgcore_s1ap::CsFallbackIndicator::CsFallbackRequired)
+                );
+                assert!(req.security_key.is_none(), "the UE must not be rekeyed");
+                assert!(req.ue_ambr.is_none());
+                assert!(req.ue_security_capabilities.is_none());
+                assert!(req.subscriber_profile_id_for_rfp.is_none());
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // An emergency CS fallback asks for priority handling instead.
+        let bytes = build_ue_context_modification_for_csfb(&enb_ue, true).unwrap();
+        match decode_s1ap_pdu(&bytes).unwrap() {
+            S1apMessage::UeContextModificationRequest(req) => {
+                assert_eq!(
+                    req.cs_fallback_indicator,
+                    Some(nextgcore_s1ap::CsFallbackIndicator::CsFallbackHighPriority)
+                );
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_overload_start_and_stop_roundtrip() {
+        let bytes = build_overload_start(OverloadAction::RejectDelayTolerantAccess).unwrap();
+        match decode_s1ap_pdu(&bytes).unwrap() {
+            S1apMessage::OverloadStart(start) => {
+                assert_eq!(
+                    start.overload_action,
+                    OverloadAction::RejectDelayTolerantAccess
+                );
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        let bytes = build_overload_stop().unwrap();
+        assert!(matches!(
+            decode_s1ap_pdu(&bytes).unwrap(),
+            S1apMessage::OverloadStop(_)
+        ));
+    }
+
+    #[test]
+    fn test_build_enb_configuration_update_ack_and_failure_roundtrip() {
+        let bytes = build_enb_configuration_update_acknowledge().unwrap();
+        assert!(matches!(
+            decode_s1ap_pdu(&bytes).unwrap(),
+            S1apMessage::EnbConfigurationUpdateAcknowledge(_)
+        ));
+
+        let bytes = build_enb_configuration_update_failure(
+            S1apCauseGroup::Misc,
+            misc_cause::UNKNOWN_PLMN,
+            Some(TimeToWait::V10s),
+        )
+        .unwrap();
+        match decode_s1ap_pdu(&bytes).unwrap() {
+            S1apMessage::EnbConfigurationUpdateFailure(failure) => {
+                assert_eq!(failure.cause, Cause::Misc(CauseMisc::UnknownPlmn));
+                assert_eq!(failure.time_to_wait, Some(TimeToWait::V10s));
             }
             other => panic!("unexpected message: {other:?}"),
         }

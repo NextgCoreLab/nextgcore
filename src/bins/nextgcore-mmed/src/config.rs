@@ -89,6 +89,16 @@ struct TimeYaml {
     t3423: Option<TimerValueYaml>,
 }
 
+/// `mme.overload`: when the MME asks eNBs to shed load (TS 36.413 §8.7.6).
+///
+/// Absent or `max_ue: 0` leaves overload signalling off, which is the default —
+/// mmed has no load metric other than the attached-UE count, so what counts as
+/// overload is a deployment decision rather than something to guess.
+#[derive(Debug, Default, Deserialize)]
+struct OverloadYaml {
+    max_ue: Option<usize>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct MmeSection {
     #[serde(rename = "freeDiameter")]
@@ -100,6 +110,7 @@ struct MmeSection {
     network_name: Option<NetworkNameYaml>,
     mme_name: Option<String>,
     time: Option<TimeYaml>,
+    overload: Option<OverloadYaml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -163,6 +174,17 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
                 ..Default::default()
             };
         }
+    }
+
+    // Overload threshold. Left at 0 (disabled) when the key is absent, so an
+    // existing deployment's behaviour is unchanged by this key existing.
+    if let Some(max_ue) = mme.overload.and_then(|overload| overload.max_ue) {
+        if max_ue == 0 {
+            log::info!("Overload signalling disabled (mme.overload.max_ue: 0)");
+        } else {
+            log::info!("Overload threshold: {max_ue} attached UEs");
+        }
+        ctx.overload_max_ue = max_ue;
     }
 
     // The Diameter identity, realm, listener and HSS peer live in this file's
@@ -398,6 +420,39 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    /// `mme.overload.max_ue` must actually be parsed, and must default to
+    /// disabled so no existing deployment starts shedding load because the key
+    /// now exists.
+    #[test]
+    fn test_overload_threshold_is_parsed_and_defaults_to_disabled() {
+        let mut ctx = MmeContext::new();
+        assert!(
+            load_config(&mut ctx, SHIPPED_CONFIG),
+            "the shipped config must parse"
+        );
+        assert_eq!(
+            ctx.overload_max_ue, 0,
+            "the shipped config declares no threshold, so overload stays off"
+        );
+
+        let path = write_temp(
+            "mme-overload.yaml",
+            "mme:\n  mme_name: test\n  overload:\n    max_ue: 5000\n",
+        );
+        let mut ctx = MmeContext::new();
+        assert!(load_config(&mut ctx, path.to_str().unwrap()));
+        assert_eq!(ctx.overload_max_ue, 5000);
+
+        // An explicit 0 is a valid way to say "off".
+        let path = write_temp(
+            "mme-overload-off.yaml",
+            "mme:\n  mme_name: test\n  overload:\n    max_ue: 0\n",
+        );
+        let mut ctx = MmeContext::new();
+        assert!(load_config(&mut ctx, path.to_str().unwrap()));
+        assert_eq!(ctx.overload_max_ue, 0);
     }
 
     #[test]
