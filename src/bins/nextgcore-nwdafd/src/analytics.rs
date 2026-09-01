@@ -55,6 +55,37 @@ impl NfLoadSample {
     }
 }
 
+/// A closed observation window in Unix seconds, inclusive at both ends.
+///
+/// Issue #171: TS 29.520 NOTE 7 on `AnalyticsData` — when the requested
+/// analytics target period (`ana-req.startTs`/`endTs`) refers to the PAST, the
+/// reported analytics are *statistics over that period*, so the samples they are
+/// computed from must come from that period and no other. Without this, a
+/// request for statistics over last Tuesday is answered with today's numbers
+/// carrying last Tuesday's `start`/`expiry` — a fabricated label on real data.
+///
+/// A *future* target period is deliberately NOT expressed as a window: a
+/// prediction is computed *from* past samples, so restricting the input to the
+/// prediction interval would leave nothing to predict from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationWindow {
+    /// Earliest sample timestamp to consider (inclusive).
+    pub start: u64,
+    /// Latest sample timestamp to consider (inclusive).
+    pub end: u64,
+}
+
+impl ObservationWindow {
+    pub fn new(start: u64, end: u64) -> Self {
+        Self { start, end }
+    }
+
+    /// Whether a sample timestamp falls inside this window.
+    pub fn contains(&self, timestamp: u64) -> bool {
+        timestamp >= self.start && timestamp <= self.end
+    }
+}
+
 /// Cached per-NF-instance profile metadata sourced from NRF
 /// NFStatusSubscribe/Notify (TS 29.510 §5.2.2.5/§5.2.2.6). This is the
 /// authoritative record of what the NRF last told us about an instance —
@@ -222,18 +253,40 @@ impl AnalyticsEngine {
     /// (linear) model files, and each model documents its own confidence
     /// semantics (TS 23.288 §6.14).
     pub fn compute_nf_load(&self, nf_instance_id: &str) -> Option<NfLoadAnalytics> {
+        self.compute_nf_load_in_window(nf_instance_id, None)
+    }
+
+    /// Compute NF load analytics from the samples inside `window` only
+    /// (issue #171).
+    ///
+    /// `None` considers every stored sample and is exactly
+    /// [`compute_nf_load`](Self::compute_nf_load). A `Some(window)` restricts the
+    /// input to samples observed inside it, so a request for statistics over a
+    /// past analytics target period is answered from *that* period's data — and
+    /// returns `None` when the window holds no sample, which is what lets the
+    /// AnalyticsInfo handler distinguish "no data for the requested period"
+    /// (`500 UNAVAILABLE_DATA`, TS 29.520 §4.3.2.2.2) from "no data at all".
+    pub fn compute_nf_load_in_window(
+        &self,
+        nf_instance_id: &str,
+        window: Option<ObservationWindow>,
+    ) -> Option<NfLoadAnalytics> {
         let samples = self.nf_samples.get(nf_instance_id)?;
-        if samples.is_empty() {
+        let windowed: Vec<&NfLoadSample> = match window {
+            Some(w) => samples.iter().filter(|s| w.contains(s.timestamp)).collect(),
+            None => samples.iter().collect(),
+        };
+        if windowed.is_empty() {
             return None;
         }
-        let mean_cpu = samples.iter().map(|s| s.cpu_usage).sum::<f64>() / samples.len() as f64;
-        let peak_cpu = samples.iter().map(|s| s.cpu_usage).fold(0.0f64, f64::max);
+        let mean_cpu = windowed.iter().map(|s| s.cpu_usage).sum::<f64>() / windowed.len() as f64;
+        let peak_cpu = windowed.iter().map(|s| s.cpu_usage).fold(0.0f64, f64::max);
 
         // Issue #26: route the prediction through the active inference model
         // (default: the OLS baseline, byte-identical to the formerly inline
         // least-squares fit). A model that declines (window too short) falls
         // back to (mean, no-confidence), preserving the pre-#26 contract.
-        let values: Vec<f64> = samples.iter().map(|s| s.cpu_usage).collect();
+        let values: Vec<f64> = windowed.iter().map(|s| s.cpu_usage).collect();
         let (predicted_load, confidence) = self
             .predictor
             .0
@@ -241,7 +294,7 @@ impl AnalyticsEngine {
             .unwrap_or((mean_cpu, 0.0));
 
         Some(NfLoadAnalytics {
-            nf_type: samples[0].nf_type.clone(),
+            nf_type: windowed[0].nf_type.clone(),
             nf_instance_id: nf_instance_id.into(),
             mean_cpu,
             peak_cpu,
@@ -368,6 +421,58 @@ mod tests {
         // The previous synthetic constant (sample-count ratio) is gone: with 5
         // of 100 samples it would have been 0.05, not ~1.0 for the clean trend.
         assert!((clean_r.confidence - 0.05).abs() > 0.1);
+    }
+
+    /// Issue #171: a past analytics target period must be answered from the
+    /// samples observed inside it, and a window holding no sample must return
+    /// `None` rather than silently widening to every sample.
+    #[test]
+    fn test_windowed_nf_load_uses_only_samples_in_the_window() {
+        let mut engine = AnalyticsEngine::new();
+        // Three samples at t = 1000, 2000, 3000 with distinct CPU values.
+        for (ts, cpu) in [(1000u64, 0.20), (2000, 0.60), (3000, 1.00)] {
+            engine.ingest_nf_load(NfLoadSample {
+                nf_type: "AMF".into(),
+                nf_instance_id: "amf-window".into(),
+                cpu_usage: cpu,
+                mem_usage: 0.0,
+                active_sessions: 0,
+                timestamp: ts,
+            });
+        }
+
+        // No window → every sample: mean of 0.2/0.6/1.0 = 0.6.
+        let all = engine.compute_nf_load("amf-window").expect("analytics");
+        assert!((all.mean_cpu - 0.6).abs() < 1e-9, "{}", all.mean_cpu);
+        assert!((all.peak_cpu - 1.0).abs() < 1e-9);
+
+        // A window covering only the first two samples → mean 0.4, peak 0.6.
+        // A whole-series computation could not produce either number.
+        let early = engine
+            .compute_nf_load_in_window("amf-window", Some(ObservationWindow::new(900, 2500)))
+            .expect("analytics inside the window");
+        assert!((early.mean_cpu - 0.4).abs() < 1e-9, "{}", early.mean_cpu);
+        assert!((early.peak_cpu - 0.6).abs() < 1e-9, "{}", early.peak_cpu);
+
+        // Inclusive at both ends.
+        let exact = engine
+            .compute_nf_load_in_window("amf-window", Some(ObservationWindow::new(1000, 1000)))
+            .expect("boundary sample is inside the window");
+        assert!((exact.mean_cpu - 0.2).abs() < 1e-9);
+
+        // A window with no sample in it → None, which is what makes
+        // `500 UNAVAILABLE_DATA` an evidence-based answer rather than a guess.
+        assert!(engine
+            .compute_nf_load_in_window("amf-window", Some(ObservationWindow::new(1, 999)))
+            .is_none());
+        assert!(engine
+            .compute_nf_load_in_window("amf-window", Some(ObservationWindow::new(3001, 4000)))
+            .is_none());
+
+        // An unknown instance is still None regardless of window.
+        assert!(engine
+            .compute_nf_load_in_window("nope", Some(ObservationWindow::new(0, u64::MAX)))
+            .is_none());
     }
 
     #[test]

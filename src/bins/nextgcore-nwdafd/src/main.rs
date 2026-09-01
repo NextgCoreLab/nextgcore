@@ -369,6 +369,14 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "analytics"),
         },
 
+        // Nnwdaf_AnalyticsInfo_ContextTransfer (`GetNwdafContext`, TS 29.520
+        // §4.3.2.3, TS29520_Nnwdaf_AnalyticsInfo.yaml:118). Issue #171: this
+        // operation was unrouted, so an advertised part of the API 404'd.
+        ["nnwdaf-analyticsinfo", "v1", "context"] => match method {
+            "GET" => handle_nwdaf_context_query(&request).await,
+            _ => send_method_not_allowed(method, "context"),
+        },
+
         // Nnwdaf_EventsSubscription service
         ["nnwdaf-eventssubscription", "v1", "subscriptions"] => match method {
             "POST" => handle_subscription_create(&request).await,
@@ -703,6 +711,37 @@ mod tests {
             resp.status, 200,
             "GET /analytics?event-id=NF_LOAD with data must be 200"
         );
+    }
+
+    /// Issue #171 acceptance: `GET /nnwdaf-analyticsinfo/v1/context`
+    /// (`GetNwdafContext`) is routed through the REAL router and no longer 404s.
+    /// A GET with no `context-ids` reaches the handler and is answered 400 by it —
+    /// which is only distinguishable from the old unrouted 404 because the route
+    /// exists. Non-GET is 405, not 404, for the same reason.
+    #[tokio::test]
+    async fn test_routing_nwdaf_context_is_routed() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+
+        let resp = nwdaf_sbi_request_handler(SbiRequest::get(
+            "/nnwdaf-analyticsinfo/v1/context?context-ids=%7B%22contextIds%22%3A%5B%7B%22subscriptionId%22%3A%22nope%22%2C%22nfAnaCtxts%22%3A%5B%22NF_LOAD%22%5D%7D%5D%7D",
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 204,
+            "GET /context with an unknown subscription must be 204 (204 proves it is routed; \
+             404 was the unrouted defect)"
+        );
+
+        let resp =
+            nwdaf_sbi_request_handler(SbiRequest::get("/nnwdaf-analyticsinfo/v1/context")).await;
+        assert_eq!(
+            resp.status, 400,
+            "GET /context without the mandatory context-ids must be 400, not 404"
+        );
+
+        let resp =
+            nwdaf_sbi_request_handler(SbiRequest::post("/nnwdaf-analyticsinfo/v1/context")).await;
+        assert_eq!(resp.status, 405, "POST /context must be 405, not 404");
     }
 
     /// G2-3 honesty (acceptance check 1, curl-style through the REAL router):

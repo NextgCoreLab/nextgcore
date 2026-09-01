@@ -40,7 +40,7 @@
 //! edge-triggered rather than re-firing every cycle. `PERIODIC` events are
 //! unaffected and always reported on their period.
 
-use crate::analytics::AnalyticsEngine;
+use crate::analytics::{AnalyticsEngine, ObservationWindow};
 use crate::context::{
     AnalyticsId, AnalyticsSubscription, EventSubscription, MatchingDirection, NotificationMethod,
     NwdafContext,
@@ -187,6 +187,14 @@ pub struct EventInfoFilter {
     pub nf_instance_ids: Vec<String>,
     /// Restrict to these NF types (`nfTypes`), when non-empty.
     pub nf_types: Vec<String>,
+    /// Restrict the computation to samples observed inside this window
+    /// (issue #171).
+    ///
+    /// Set by `Nnwdaf_AnalyticsInfo` when the consumer asked for statistics over
+    /// a PAST analytics target period (`ana-req.startTs`/`endTs`). `None` — the
+    /// `Default`, and what every subscription-driven notification uses — means
+    /// every stored sample, so the dispatcher path is unchanged.
+    pub window: Option<ObservationWindow>,
 }
 
 impl EventInfoFilter {
@@ -197,11 +205,22 @@ impl EventInfoFilter {
 
     /// Build the filter from a subscription's per-event
     /// `nfInstanceIds`/`nfTypes` (TS 29.520 `EventSubscription`).
+    ///
+    /// No observation window: a subscription reports on what is happening now,
+    /// not over a consumer-supplied past period (that is an AnalyticsInfo query
+    /// parameter, not an `EventSubscription` member).
     pub fn from_event_subscription(e: &EventSubscription) -> Self {
         Self {
             nf_instance_ids: e.nf_instance_ids.clone(),
             nf_types: e.nf_types.clone(),
+            window: None,
         }
+    }
+
+    /// Restrict this filter to samples observed inside `window` (issue #171).
+    pub fn with_window(mut self, window: ObservationWindow) -> Self {
+        self.window = Some(window);
+        self
     }
 
     fn matches(&self, nf_instance_id: &str, nf_type: &str) -> bool {
@@ -237,6 +256,12 @@ fn nf_status_json(status: &str) -> Value {
 /// `filter`. No samples → empty array — never fabricated data. The former
 /// hard-coded synthetic self-sample placeholder is gone.
 ///
+/// Issue #171: `filter.window` restricts the computation to samples observed
+/// inside a requested past analytics target period, so statistics really are the
+/// statistics of the period the consumer asked about. An instance whose samples
+/// all fall outside the window contributes nothing, exactly like one excluded by
+/// `nfInstanceIds`.
+///
 /// Emission shape per TS 29.520 `NfLoadLevelInformation`
 /// (`TS29520_Nnwdaf_EventsSubscription.yaml` `NfLoadLevelInformation`):
 /// `nfType`+`nfInstanceId` mandatory; `nfStatus` is the **object** form
@@ -260,7 +285,7 @@ pub fn compute_event_infos(
         AnalyticsId::NfLoad => {
             let mut infos: Vec<Value> = Vec::new();
             for instance_id in engine.nf_instance_ids() {
-                let Some(r) = engine.compute_nf_load(&instance_id) else {
+                let Some(r) = engine.compute_nf_load_in_window(&instance_id, filter.window) else {
                     continue;
                 };
                 if !filter.matches(&instance_id, &r.nf_type) {
@@ -1333,6 +1358,7 @@ mod tests {
             &EventInfoFilter {
                 nf_instance_ids: Vec::new(),
                 nf_types: vec!["SMF".to_string()],
+                ..Default::default()
             },
         );
         let arr = by_type.as_array().expect("array");
@@ -1346,6 +1372,7 @@ mod tests {
             &EventInfoFilter {
                 nf_instance_ids: vec!["upf-multi-01".to_string()],
                 nf_types: Vec::new(),
+                ..Default::default()
             },
         );
         let arr = by_id.as_array().expect("array");
@@ -1359,6 +1386,7 @@ mod tests {
             &EventInfoFilter {
                 nf_instance_ids: vec!["nope".to_string()],
                 nf_types: Vec::new(),
+                ..Default::default()
             },
         );
         assert_eq!(none.as_array().map(Vec::len), Some(0));

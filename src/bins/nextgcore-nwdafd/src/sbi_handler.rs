@@ -5,10 +5,11 @@
 //! - Nnwdaf_EventsSubscription: Analytics subscription management
 //! - Nnwdaf_MLModelProvision: ML model provision Subscribe/Notify (nwafd-05)
 
+use crate::analytics::ObservationWindow;
 use crate::context::*;
 use crate::notification_dispatcher::{compute_event_infos, EventInfoFilter};
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
-use nextgcore_sbi::server::{send_bad_request, send_not_found};
+use nextgcore_sbi::server::{send_bad_request, send_error, send_not_found};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -18,6 +19,16 @@ use std::sync::{Arc, RwLock};
 /// behaviour — except that its subscription now terminates with a `termCause`
 /// instead of vanishing.
 const DEFAULT_MONITORING_DURATION_SECS: u64 = 3600;
+
+/// Validity of an `AnalyticsData` report when the consumer requested no
+/// analytics target period, and the span of a target period the consumer bounded
+/// on only one side (issue #171).
+///
+/// TS 29.520 NOTE 7 on `AnalyticsData` leaves the validity period to "NWDAF
+/// internal logic" as long as it is a subset of the requested target period, so
+/// this keeps the pre-#171 one hour: a consumer that sends no `ana-req` sees
+/// byte-unchanged `start`/`expiry`.
+const DEFAULT_ANALYTICS_VALIDITY_SECS: i64 = 3600;
 
 /// Seconds since the Unix epoch.
 fn now_secs() -> u64 {
@@ -146,6 +157,20 @@ fn event_subscription_json(e: &EventSubscription) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
+/// The string members of a JSON array property, or empty when the property is
+/// absent, null or not an array of strings.
+fn json_string_array(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse the `event-filter` query parameter (TS 29.520 `EventFilter`, JSON in
 /// the query per the AnalyticsInfo yaml) into an [`EventInfoFilter`]. Only the
 /// `nfInstanceIds`/`nfTypes` members are honored (G2-1); other members are
@@ -157,21 +182,248 @@ fn parse_event_filter(raw: Option<&String>) -> Result<EventInfoFilter, String> {
     };
     let v: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| format!("event-filter is not valid EventFilter JSON: {e}"))?;
-    let string_array = |key: &str| -> Vec<String> {
-        v.get(key)
-            .and_then(|x| x.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|s| s.as_str())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    // `nfSetIds` is an alternative to `nfInstanceIds` in TS 29.520 §4.3.2.2.2
+    // that this NWDAF does not resolve (it has no NF-Set membership view), so a
+    // query naming only NF Sets is not narrowed by it. Said out loud rather than
+    // dropped silently — a caller cannot otherwise tell a honoured filter from an
+    // ignored one.
+    if !json_string_array(&v, "nfSetIds").is_empty() {
+        log::warn!(
+            "event-filter.nfSetIds is not honoured by this NWDAF: NF-Set membership is not \
+             tracked, so the query is not narrowed to those sets (TS 29.520 §4.3.2.2.2)"
+        );
+    }
     Ok(EventInfoFilter {
-        nf_instance_ids: string_array("nfInstanceIds"),
-        nf_types: string_array("nfTypes"),
+        nf_instance_ids: json_string_array(&v, "nfInstanceIds"),
+        nf_types: json_string_array(&v, "nfTypes"),
+        window: None,
     })
+}
+
+/// The `tgt-ue` query parameter of `GET /analytics`: TS 29.520
+/// `TargetUeInformation` (`TS29520_Nnwdaf_AnalyticsInfo.yaml:62-69`).
+///
+/// Only the members that decide *scope* are modelled — whether the request
+/// applies to every UE or to an identified set. `ueIpAddrs` counts as an
+/// identified set without its shape being modelled: it still names specific UEs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TargetUeInfo {
+    /// `anyUe` — the request applies to every UE (default false when omitted).
+    any_ue: bool,
+    /// `supis`
+    supis: Vec<String>,
+    /// `gpsis`
+    gpsis: Vec<String>,
+    /// `intGroupIds`
+    int_group_ids: Vec<String>,
+    /// Whether `ueIpAddrs` was present.
+    ue_ip_addrs: bool,
+}
+
+impl TargetUeInfo {
+    /// Whether this restricts the request to an identified set of UEs, as
+    /// opposed to `anyUe`.
+    fn names_specific_ues(&self) -> bool {
+        !self.supis.is_empty()
+            || !self.gpsis.is_empty()
+            || !self.int_group_ids.is_empty()
+            || self.ue_ip_addrs
+    }
+
+    /// Whether this `TargetUeInformation` identifies any target at all. A body
+    /// that sets neither `anyUe` nor any identifier scopes nothing, which is a
+    /// malformed query parameter rather than an empty filter.
+    fn identifies_a_target(&self) -> bool {
+        self.any_ue || self.names_specific_ues()
+    }
+}
+
+/// Parse the `tgt-ue` query parameter into [`TargetUeInfo`] (issue #171).
+///
+/// `Ok(None)` = the parameter was absent. Present-but-not-JSON, or a
+/// `TargetUeInformation` identifying no target, is `Err` → 400: the yaml declares
+/// this parameter as `content: application/json`, so a bare identifier string is
+/// not a conformant value, and quietly ignoring it is precisely the defect.
+fn parse_target_ue(raw: Option<&String>) -> Result<Option<TargetUeInfo>, String> {
+    let raw = match raw {
+        Some(r) if !r.is_empty() => r,
+        _ => return Ok(None),
+    };
+    let v: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| format!("tgt-ue is not valid TargetUeInformation JSON: {e}"))?;
+    let info = TargetUeInfo {
+        any_ue: v.get("anyUe").and_then(|x| x.as_bool()).unwrap_or(false),
+        supis: json_string_array(&v, "supis"),
+        gpsis: json_string_array(&v, "gpsis"),
+        int_group_ids: json_string_array(&v, "intGroupIds"),
+        ue_ip_addrs: v.get("ueIpAddrs").is_some_and(|x| !x.is_null()),
+    };
+    if !info.identifies_a_target() {
+        return Err(
+            "tgt-ue identifies no target UE: one of anyUe/supis/gpsis/intGroupIds/ueIpAddrs \
+             is required"
+                .to_string(),
+        );
+    }
+    Ok(Some(info))
+}
+
+/// The analytics target period a consumer asked for, derived from the `ana-req`
+/// query parameter (TS 29.520 `EventReportingRequirement`, issue #171).
+///
+/// Never straddles the present — see [`parse_analytics_target_period`] — so
+/// [`is_statistics`](Self::is_statistics) is a total classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnalyticsTargetPeriod {
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+}
+
+impl AnalyticsTargetPeriod {
+    /// Whether this period refers to the past, i.e. the consumer asked for
+    /// STATISTICS rather than a prediction (TS 29.520 NOTE 7 on `AnalyticsData`).
+    fn is_statistics(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.end <= now
+    }
+
+    /// The sample-selection window a statistics request must be computed over.
+    fn observation_window(&self) -> ObservationWindow {
+        ObservationWindow::new(
+            self.start.timestamp().max(0) as u64,
+            self.end.timestamp().max(0) as u64,
+        )
+    }
+}
+
+/// `t + d`, or a 400-shaped error when the result leaves the representable
+/// `DateTime` range (reachable from a consumer-supplied instant at the edge of
+/// the calendar).
+fn shifted(
+    t: chrono::DateTime<chrono::Utc>,
+    d: chrono::Duration,
+) -> Result<chrono::DateTime<chrono::Utc>, (String, &'static str)> {
+    t.checked_add_signed(d).ok_or_else(|| {
+        (
+            "the analytics target period falls outside the representable DateTime range"
+                .to_string(),
+            "INVALID_QUERY_PARAM",
+        )
+    })
+}
+
+/// Parse the `ana-req` query parameter into the requested analytics target
+/// period (issue #171).
+///
+/// `ana-req` is TS 29.520 `EventReportingRequirement`
+/// (`TS29520_Nnwdaf_AnalyticsInfo.yaml:41-48`); the target period is
+/// `startTs`/`endTs`, with `offsetPeriod` as the relative alternative (negative =
+/// statistics over the past offset period, positive = prediction over the future
+/// one). `Ok(None)` means the consumer requested no period, which keeps the
+/// pre-#171 internal default window.
+///
+/// Two deliberate shapes:
+///
+/// - **`400 BOTH_STAT_PRED_NOT_ALLOWED`** when `startTs` is in the past and
+///   `endTs` in the future (TS 29.520 §4.3.2.2.2, table 5.2.7.3-1): that asks for
+///   statistics and prediction in one request.
+/// - A period the consumer bounded on **one** side has the other bound derived
+///   and **clamped to `now`**, so a derived period never straddles the present.
+///   That keeps `BOTH_STAT_PRED_NOT_ALLOWED` tied to a period the consumer
+///   actually asked to straddle, which is how the spec words it.
+///
+/// Every malformed value fails closed with `400 INVALID_QUERY_PARAM` rather than
+/// silently falling back to the default window.
+fn parse_analytics_target_period(
+    raw: Option<&String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<AnalyticsTargetPeriod>, (String, &'static str)> {
+    let raw = match raw {
+        Some(r) if !r.is_empty() => r,
+        _ => return Ok(None),
+    };
+    let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        (
+            format!("ana-req is not valid EventReportingRequirement JSON: {e}"),
+            "INVALID_QUERY_PARAM",
+        )
+    })?;
+
+    let instant =
+        |key: &str| -> Result<Option<chrono::DateTime<chrono::Utc>>, (String, &'static str)> {
+            match v.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(x) => {
+                    let s = x.as_str().ok_or_else(|| {
+                        (
+                            format!("ana-req.{key} must be an RFC-3339 DateTime string"),
+                            "INVALID_QUERY_PARAM",
+                        )
+                    })?;
+                    let dt = chrono::DateTime::parse_from_rfc3339(s).map_err(|e| {
+                        (
+                            format!("ana-req.{key} is not a valid RFC-3339 DateTime: {e}"),
+                            "INVALID_QUERY_PARAM",
+                        )
+                    })?;
+                    Ok(Some(dt.with_timezone(&chrono::Utc)))
+                }
+            }
+        };
+
+    let start_ts = instant("startTs")?;
+    let end_ts = instant("endTs")?;
+    let default = chrono::Duration::seconds(DEFAULT_ANALYTICS_VALIDITY_SECS);
+
+    let (start, end) = match (start_ts, end_ts) {
+        (Some(s), Some(e)) => {
+            if e < s {
+                return Err((
+                    "ana-req.endTs is earlier than ana-req.startTs".to_string(),
+                    "INVALID_QUERY_PARAM",
+                ));
+            }
+            if s < now && e > now {
+                return Err((
+                    "the analytics target period starts in the past and ends in the future, \
+                     which requests both statistics and prediction"
+                        .to_string(),
+                    "BOTH_STAT_PRED_NOT_ALLOWED",
+                ));
+            }
+            (s, e)
+        }
+        (Some(s), None) if s < now => (s, now),
+        (Some(s), None) => (s, shifted(s, default)?),
+        (None, Some(e)) if e > now => (now, e),
+        (None, Some(e)) => (shifted(e, -default)?, e),
+        (None, None) => match v.get("offsetPeriod") {
+            None | Some(serde_json::Value::Null) => return Ok(None),
+            Some(x) => {
+                let offset = x.as_i64().ok_or_else(|| {
+                    (
+                        "ana-req.offsetPeriod must be an integer number of seconds".to_string(),
+                        "INVALID_QUERY_PARAM",
+                    )
+                })?;
+                if offset == 0 {
+                    return Ok(None);
+                }
+                let d = chrono::Duration::try_seconds(offset).ok_or_else(|| {
+                    (
+                        "ana-req.offsetPeriod is out of range".to_string(),
+                        "INVALID_QUERY_PARAM",
+                    )
+                })?;
+                if offset < 0 {
+                    (shifted(now, d)?, now)
+                } else {
+                    (now, shifted(now, d)?)
+                }
+            }
+        },
+    };
+
+    Ok(Some(AnalyticsTargetPeriod { start, end }))
 }
 
 /// Handle Nnwdaf_AnalyticsInfo query against an explicit context
@@ -200,6 +452,19 @@ fn parse_event_filter(raw: Option<&String>) -> Result<EventInfoFilter, String> {
 /// OLS linear-regression baseline, whose confidence is the regression R²
 /// scaled to a Uinteger; the feature-gated `onnx-model` backend loads real
 /// linear model files — TS 23.288 §6.14).
+///
+/// Issue #171: `tgt-ue` and `ana-req` are now typed, validated and acted on
+/// instead of being bound to unused locals.
+///
+/// - The reported `start`/`expiry` are a subset of the requested analytics target
+///   period (`ana-req.startTs`/`endTs`/`offsetPeriod`), per NOTE 7 on
+///   `AnalyticsData`, and default to `now`/`now + 3600 s` when none is requested.
+/// - A target period in the **past** is a request for statistics, so the samples
+///   are restricted to that period; if none falls inside it the answer is
+///   `500 UNAVAILABLE_DATA` rather than statistics from another period.
+/// - A period starting in the past and ending in the future is
+///   `400 BOTH_STAT_PRED_NOT_ALLOWED`.
+/// - `tgt-ue` scoping follows §4.3.2.2.2 for NF_LOAD (see the inline gate).
 pub async fn handle_analytics_info_query_with_ctx(
     ctx: &Arc<RwLock<NwdafContext>>,
     request: &SbiRequest,
@@ -240,6 +505,31 @@ pub async fn handle_analytics_info_query_with_ctx(
         }
     };
 
+    // ── request validation (issue #171) ──────────────────────────────────────
+    // `ana-req` and `tgt-ue` are parsed BEFORE the supported-events gate below:
+    // a malformed request is malformed whether or not the event could be served,
+    // which is the order the existing `event-id` validation already establishes.
+    // Both fail closed, like `event-filter`: answering over a window or a
+    // population the consumer did not ask for is the defect being fixed.
+    let now = chrono::Utc::now();
+    let target_period = match parse_analytics_target_period(params.get("ana-req"), now) {
+        Ok(p) => p,
+        Err((detail, cause)) => return send_bad_request(&detail, Some(cause)),
+    };
+    let target_ue = match parse_target_ue(params.get("tgt-ue")) {
+        Ok(t) => t,
+        Err(detail) => return send_bad_request(&detail, Some("INVALID_QUERY_PARAM")),
+    };
+    // `supported-features` is read and acknowledged. No optional feature of this
+    // API is implemented, so nothing is negotiated away — logged rather than
+    // silently dropped (SBI feature negotiation is issue #65).
+    if let Some(features) = params.get("supported-features") {
+        log::debug!(
+            "AnalyticsInfo supported-features={features}: this NWDAF negotiates no optional \
+             feature of TS 29.520, so the response carries no suppFeat"
+        );
+    }
+
     // G2-3 (supported-events honesty): a recognised NwdafEvent token with no
     // live collector means the requested analytics data cannot exist → 204 No
     // Content (TS 29.520 §4.3.2.2.2), NOT 400/501 and never an empty-200.
@@ -256,13 +546,53 @@ pub async fn handle_analytics_info_query_with_ctx(
         Err(detail) => return send_bad_request(&detail, Some("INVALID_QUERY_PARAM")),
     };
 
-    // tgt-ue / ana-req / supported-features are parsed and acknowledged.
-    // G2-3: the former non-spec `tgtUe` echo into AnalyticsData is removed —
-    // TS 29.520 `AnalyticsData` has no such member (audit LOW). Full filtering
-    // by these parameters is out of scope here.
-    let _tgt_ue = params.get("tgt-ue");
-    let _ana_req = params.get("ana-req");
-    let _supported_features = params.get("supported-features");
+    // tgt-ue scoping (issue #171). TS 29.520 §4.3.2.2.2 for NF_LOAD — the only
+    // event with a live collector, so the only one whose tgt-ue semantics are
+    // reachable; a future collector for a UE-scoped event needs its own arm here:
+    //
+    //  * NOTE 4 — "Only NF instances of type AMF and SMF which are serving the UE
+    //    can be determined using a SUPI in supis". Resolving a SUPI to the NF
+    //    instances *serving* it needs a UE→serving-NF view this NWDAF does not
+    //    collect, so the requested analytics data does not exist → 204. Reporting
+    //    every AMF/SMF instead would relabel a whole-network figure as that UE's.
+    //  * NOTE 5 — "If a list of the NF Instance IDs ... is provided ... the target
+    //    UE(s) of the Analytics Reporting need be ignored". So a UE-scoped tgt-ue
+    //    accompanied by event-filter.nfInstanceIds IS served. `nfSetIds` does not
+    //    trigger this exception: it is not resolved to instances (see
+    //    `parse_event_filter`), and serving every instance for an unresolved set
+    //    would be broader than the consumer asked for.
+    //
+    // `anyUe`, and an absent tgt-ue, impose no restriction. §4.3.2.2.2 says a
+    // NF_LOAD consumer *shall* provide tgt-ue, but that mandate is conditional on
+    // the `NfLoad` feature being negotiated and `supported-features` is not acted
+    // on yet (issue #65), so absence is treated as "no UE restriction" rather
+    // than rejected.
+    if target_ue
+        .as_ref()
+        .is_some_and(TargetUeInfo::names_specific_ues)
+        && filter.nf_instance_ids.is_empty()
+    {
+        log::info!(
+            "AnalyticsInfo {}: tgt-ue names specific UEs but this NWDAF holds no \
+             UE-to-serving-NF mapping and the query names no nfInstanceIds, so no analytics \
+             exist for that scope → 204 (TS 29.520 §4.3.2.2.2 NOTE 4/NOTE 5)",
+            analytics_id.as_str()
+        );
+        return SbiResponse::with_status(204);
+    }
+
+    // A PAST target period is a request for statistics, which must be computed
+    // from that period's samples (NOTE 7 on `AnalyticsData`). A FUTURE one is a
+    // prediction, computed *from* past samples, so it is deliberately not
+    // windowed — restricting the input to the prediction interval would leave
+    // nothing to predict from.
+    let statistics_window = target_period
+        .filter(|p| p.is_statistics(now))
+        .map(|p| p.observation_window());
+    let filter = match statistics_window {
+        Some(window) => filter.with_window(window),
+        None => filter,
+    };
 
     // Lock order (nf-context-lock-deadlocks): context read → engine mutex.
     let infos = match ctx.read() {
@@ -276,14 +606,43 @@ pub async fn handle_analytics_info_query_with_ctx(
         }
     };
 
-    // TS 29.520 §4.3.2.2.2: requested analytics data does not exist → 204.
     if infos.as_array().is_none_or(|a| a.is_empty()) {
+        // TS 29.520 §4.3.2.2.2: "If the statistics in the past are requested but
+        // the necessary data to perform the service is unavailable, the NWDAF
+        // shall reject the request with an HTTP 500 ... cause UNAVAILABLE_DATA."
+        // Only a PAST target period escalates: absent data with no period, or a
+        // future one, stays 204 ("the requested analytics data does not exist").
+        if let Some(window) = statistics_window {
+            log::info!(
+                "AnalyticsInfo {}: no sample inside the requested statistics window \
+                 [{}, {}] → 500 UNAVAILABLE_DATA",
+                analytics_id.as_str(),
+                window.start,
+                window.end
+            );
+            return send_error(
+                500,
+                "Internal Server Error",
+                "no data was collected inside the requested analytics target period, so the \
+                 requested statistics cannot be computed",
+                Some("UNAVAILABLE_DATA"),
+            );
+        }
         return SbiResponse::with_status(204);
     }
 
-    let now = chrono::Utc::now();
-    let start = now.to_rfc3339();
-    let expiry = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+    // The reported validity period is a subset of the requested analytics target
+    // period (NOTE 7 on `AnalyticsData`), or the internal default hour when the
+    // consumer requested none.
+    let (period_start, period_end) = match target_period {
+        Some(p) => (p.start, p.end),
+        None => (
+            now,
+            now + chrono::Duration::seconds(DEFAULT_ANALYTICS_VALIDITY_SECS),
+        ),
+    };
+    let start = period_start.to_rfc3339();
+    let expiry = period_end.to_rfc3339();
 
     // Build the AnalyticsData object with the event-specific *Infos key.
     let mut analytics_data = serde_json::Map::new();
@@ -304,6 +663,280 @@ pub async fn handle_analytics_info_query_with_ctx(
 pub async fn handle_analytics_info_query(request: &SbiRequest) -> SbiResponse {
     let ctx = nwdaf_self();
     handle_analytics_info_query_with_ctx(&ctx, request).await
+}
+
+// ── Nnwdaf_AnalyticsInfo_ContextTransfer (TS 29.520 §4.3.2.3, issue #171) ─────
+
+/// One entry of the `context-ids` query parameter: TS 29.520
+/// `AnalyticsContextIdentifier`, which requires `subscriptionId` plus at least
+/// one of `nfAnaCtxts`/`ueAnaCtxts`.
+#[derive(Debug, Clone)]
+struct RequestedAnalyticsContext {
+    /// `subscriptionId` — the analytics subscription this context belongs to.
+    subscription_id: String,
+    /// `nfAnaCtxts` — the NF-related analytics types whose context is wanted.
+    /// Empty means the consumer asked only for UE-related contexts.
+    nf_ana_ctxts: Vec<String>,
+    /// Whether `ueAnaCtxts` was present. Carried so the handler can say plainly
+    /// that no UE-related analytics context exists here, rather than answering
+    /// with NF contexts the consumer did not ask for.
+    wants_ue_contexts: bool,
+}
+
+/// Parse the mandatory `context-ids` query parameter (TS 29.520 `ContextIdList`).
+fn parse_context_id_list(
+    raw: Option<&String>,
+) -> Result<Vec<RequestedAnalyticsContext>, (String, &'static str)> {
+    let raw = match raw {
+        Some(r) if !r.is_empty() => r,
+        _ => {
+            return Err((
+                "context-ids query parameter is mandatory".to_string(),
+                "MANDATORY_QUERY_PARAM_INCORRECT",
+            ))
+        }
+    };
+    let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        (
+            format!("context-ids is not valid ContextIdList JSON: {e}"),
+            "INVALID_QUERY_PARAM",
+        )
+    })?;
+    let ids = v
+        .get("contextIds")
+        .and_then(|x| x.as_array())
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| {
+            (
+                "context-ids.contextIds is a required member with minItems 1".to_string(),
+                "INVALID_QUERY_PARAM",
+            )
+        })?;
+
+    let mut out = Vec::with_capacity(ids.len());
+    for item in ids {
+        let subscription_id = item
+            .get("subscriptionId")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                (
+                    "every AnalyticsContextIdentifier requires a subscriptionId".to_string(),
+                    "INVALID_QUERY_PARAM",
+                )
+            })?;
+        let nf_ana_ctxts = json_string_array(item, "nfAnaCtxts");
+        let wants_ue_contexts = item
+            .get("ueAnaCtxts")
+            .and_then(|x| x.as_array())
+            .is_some_and(|a| !a.is_empty());
+        if nf_ana_ctxts.is_empty() && !wants_ue_contexts {
+            return Err((
+                "every AnalyticsContextIdentifier requires nfAnaCtxts or ueAnaCtxts".to_string(),
+                "INVALID_QUERY_PARAM",
+            ));
+        }
+        out.push(RequestedAnalyticsContext {
+            subscription_id: subscription_id.to_string(),
+            nf_ana_ctxts,
+            wants_ue_contexts,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse the optional `req-context` query parameter (TS 29.520
+/// `RequestedContext`), returning the requested `ContextType` tokens.
+///
+/// `Ok(None)` = absent, which §4.3.2.3.2 leaves as "whatever is available".
+/// `contexts` is a required member with minItems 1, so present-but-empty is a
+/// 400. Unrecognised tokens are CARRIED rather than rejected: `ContextType` has a
+/// free-form `anyOf` alternative for forward compatibility, exactly like
+/// `NwdafEvent` (issue #108).
+fn parse_requested_context(
+    raw: Option<&String>,
+) -> Result<Option<Vec<String>>, (String, &'static str)> {
+    let raw = match raw {
+        Some(r) if !r.is_empty() => r,
+        _ => return Ok(None),
+    };
+    let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        (
+            format!("req-context is not valid RequestedContext JSON: {e}"),
+            "INVALID_QUERY_PARAM",
+        )
+    })?;
+    let contexts = json_string_array(&v, "contexts");
+    if contexts.is_empty() {
+        return Err((
+            "req-context.contexts is a required member with minItems 1".to_string(),
+            "INVALID_QUERY_PARAM",
+        ));
+    }
+    Ok(Some(contexts))
+}
+
+/// Format a Unix-seconds timestamp as the RFC-3339 string a TS 29.571 `DateTime`
+/// requires, or `None` when the value is not a representable instant.
+fn rfc3339_from_unix(secs: u64) -> Option<String> {
+    chrono::DateTime::from_timestamp(i64::try_from(secs).ok()?, 0).map(|dt| dt.to_rfc3339())
+}
+
+/// Handle `GET /nnwdaf-analyticsinfo/v1/context` against an explicit context.
+///
+/// The Nnwdaf_AnalyticsInfo_ContextTransfer service operation (`GetNwdafContext`,
+/// TS 29.520 §4.3.2.3, `TS29520_Nnwdaf_AnalyticsInfo.yaml:118`). Issue #171: this
+/// route did not exist, so an operation on an otherwise-advertised API surface
+/// 404'd.
+///
+/// For each requested `AnalyticsContextIdentifier` naming a **known**
+/// subscription, the `ContextData` response carries a `ContextElement` with:
+///
+/// - `contextId` — `{subscriptionId, nfAnaCtxts}`, where `nfAnaCtxts` is the
+///   intersection of the requested analytics types with the subscription's events
+///   **that have a live collector**. An event with no collector has no analytics
+///   context to transfer, so the `SUPPORTED_EVENTS` gate every other wire surface
+///   uses applies here too. An empty intersection contributes no element (and
+///   `nfAnaCtxts` has `minItems: 1`, so an empty array would be schema-invalid).
+/// - `lastOutputTime` — the subscription's last dispatched notification, when one
+///   has gone out and the consumer asked for `PENDING_ANALYTICS` and/or
+///   `HISTORICAL_ANALYTICS` (or sent no `req-context` at all).
+///
+/// Nothing matching → **204**, per "if the requested context information does not
+/// exist, the NWDAF shall respond with 204 No Content".
+///
+/// WHAT IS OMITTED, AND WHY THAT IS CONFORMANT RATHER THAN A FACADE: every other
+/// `ContextElement` member is conditional on the information being *available*.
+/// This NWDAF stores no analytics history and no aggregation state, so
+/// `pendAnalytics`, `histAnalytics`, `histData`, `aggrSubs`, `aggrNwdafIds`,
+/// `adrfId`/`adrfDataTypes`, `anaAccuInfos` and `modelAccuInfos` are absent, and
+/// the requested-but-unavailable types are named in a log line. `modelInfo` is
+/// absent for a different reason worth recording: it describes ML models the
+/// *consumer* NWDAF subscribes to for the analytics, whereas this NWDAF is the
+/// MTLF serving its own artefact (issue #109) — emitting our own model there
+/// would be the wrong direction, not merely incomplete.
+///
+/// `pendAnalytics` was considered and rejected rather than overlooked: the only
+/// code that builds `EventNotification[]` is
+/// `notification_dispatcher::build_event_notifications`, which MUTATES THRESHOLD
+/// edge-detection state via `set_event_level`. Calling it from a GET would let a
+/// read suppress a later THRESHOLD notification. Serving analytics history needs
+/// its own storage and belongs in its own issue.
+pub async fn handle_nwdaf_context_query_with_ctx(
+    ctx: &Arc<RwLock<NwdafContext>>,
+    request: &SbiRequest,
+) -> SbiResponse {
+    log::info!("NWDAF Context Transfer: {}", request.header.uri);
+
+    let params = request_query_params(request);
+    let requested_ids = match parse_context_id_list(params.get("context-ids")) {
+        Ok(ids) => ids,
+        Err((detail, cause)) => return send_bad_request(&detail, Some(cause)),
+    };
+    let requested_contexts = match parse_requested_context(params.get("req-context")) {
+        Ok(c) => c,
+        Err((detail, cause)) => return send_bad_request(&detail, Some(cause)),
+    };
+
+    // §4.3.2.3.2 reports `lastOutputTime` when the consumer indicated the pending
+    // and/or historical output-analytics context types; an absent `req-context`
+    // asks for whatever is available.
+    let wants_output_time = requested_contexts.as_ref().is_none_or(|types| {
+        types
+            .iter()
+            .any(|t| t == "PENDING_ANALYTICS" || t == "HISTORICAL_ANALYTICS")
+    });
+    if let Some(types) = &requested_contexts {
+        log::info!(
+            "NWDAF context transfer requested context types {types:?}: this NWDAF stores no \
+             analytics history, aggregation state or ADRF data, so only contextId and \
+             lastOutputTime are returned (TS 29.520 §4.3.2.3.2 makes every other \
+             ContextElement member conditional on availability)"
+        );
+    }
+
+    let guard = match ctx.read() {
+        Ok(guard) => guard,
+        Err(e) => {
+            log::error!("handle_nwdaf_context_query: failed to read context: {e}");
+            return nextgcore_sbi::server::send_internal_error("context unavailable");
+        }
+    };
+
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+    for requested in &requested_ids {
+        if requested.wants_ue_contexts {
+            log::info!(
+                "NWDAF context transfer: no UE-related analytics context exists for \
+                 subscription {} — this NWDAF has no UE-scoped analytics collector, so \
+                 ueAnaCtxts is not answered",
+                requested.subscription_id
+            );
+        }
+        let Some(sub) = guard.get_subscription(&requested.subscription_id) else {
+            log::info!(
+                "NWDAF context transfer: subscription {} is unknown — omitted from ContextData",
+                requested.subscription_id
+            );
+            continue;
+        };
+
+        // The analytics contexts that actually exist for this subscription.
+        let mut available: Vec<&'static str> = Vec::new();
+        for event in &sub.events {
+            let token = event.event.as_str();
+            if !event.event.is_supported() || available.contains(&token) {
+                continue;
+            }
+            if !requested.nf_ana_ctxts.iter().any(|r| r == token) {
+                continue;
+            }
+            available.push(token);
+        }
+        if available.is_empty() {
+            log::info!(
+                "NWDAF context transfer: subscription {} has no analytics context matching \
+                 the requested types {:?} that also has a live collector — omitted",
+                requested.subscription_id,
+                requested.nf_ana_ctxts
+            );
+            continue;
+        }
+
+        let mut context_id = serde_json::Map::new();
+        context_id.insert(
+            "subscriptionId".to_string(),
+            serde_json::json!(sub.subscription_id),
+        );
+        context_id.insert("nfAnaCtxts".to_string(), serde_json::json!(available));
+
+        let mut element = serde_json::Map::new();
+        element.insert(
+            "contextId".to_string(),
+            serde_json::Value::Object(context_id),
+        );
+        if wants_output_time {
+            if let Some(last) = sub.last_notification_time.and_then(rfc3339_from_unix) {
+                element.insert("lastOutputTime".to_string(), serde_json::json!(last));
+            }
+        }
+        elements.push(serde_json::Value::Object(element));
+    }
+    drop(guard);
+
+    if elements.is_empty() {
+        return SbiResponse::with_status(204);
+    }
+
+    SbiResponse::with_status(200)
+        .with_json_body(&serde_json::json!({ "contextElems": elements }))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// Handle `GET /nnwdaf-analyticsinfo/v1/context` against the global context.
+pub async fn handle_nwdaf_context_query(request: &SbiRequest) -> SbiResponse {
+    let ctx = nwdaf_self();
+    handle_nwdaf_context_query_with_ctx(&ctx, request).await
 }
 
 /// Issue #16 (non-normative 6G ISAC): ingest one `SensingResult` posted to
@@ -1003,8 +1636,13 @@ mod tests {
     #[tokio::test]
     async fn test_analytics_info_get_returns_analytics_data() {
         let ctx = ctx_with_loads("AMF", "amf-get-01", &[30, 40]);
-        let req =
-            SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD&tgt-ue=imsi-001");
+        // `tgt-ue` is percent-encoded `{"anyUe":true}` — a conformant
+        // TargetUeInformation (issue #171 made the bare `tgt-ue=imsi-001` this
+        // test used to send a 400, since the yaml declares the parameter as
+        // `content: application/json`).
+        let req = SbiRequest::get(
+            "/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD&tgt-ue=%7B%22anyUe%22%3Atrue%7D",
+        );
         let resp = handle_analytics_info_query_with_ctx(&ctx, &req).await;
         assert_eq!(
             resp.status, 200,
@@ -1116,6 +1754,661 @@ mod tests {
         let uri = "/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD&event-filter=not-json";
         let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(uri)).await;
         assert_eq!(resp.status, 400, "malformed event-filter must be 400");
+    }
+
+    // ── issue #171: tgt-ue, the analytics target period, and its errors ───────
+
+    /// Percent-encode a JSON value for use as a query-parameter value, so tests
+    /// drive exactly the wire shape the yaml declares (`content:
+    /// application/json`). Necessary rather than cosmetic: an RFC-3339 instant
+    /// ends in `+00:00`, and a raw `+` decodes to a space.
+    fn qp(v: &Value) -> String {
+        let mut out = String::new();
+        for b in v.to_string().bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(char::from(b))
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    /// Isolated context whose one NF instance has samples at EXPLICIT timestamps,
+    /// so a requested analytics target period can be aimed at or away from them.
+    fn ctx_with_timed_loads(instance: &str, samples: &[(u64, u8)]) -> Arc<RwLock<NwdafContext>> {
+        let mut ctx = NwdafContext::new("nwdaf-window-test".to_string());
+        ctx.init(64);
+        {
+            let mut engine = ctx.lock_engine();
+            for &(timestamp, load) in samples {
+                engine.ingest_nf_load(crate::analytics::NfLoadSample {
+                    nf_type: "AMF".to_string(),
+                    nf_instance_id: instance.to_string(),
+                    cpu_usage: f64::from(load) / 100.0,
+                    mem_usage: 0.0,
+                    active_sessions: 0,
+                    timestamp,
+                });
+            }
+        }
+        Arc::new(RwLock::new(ctx))
+    }
+
+    fn analytics_uri(query: &str) -> String {
+        format!("/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD&{query}")
+    }
+
+    /// **Acceptance criterion 1 of #171.** A requested analytics target period
+    /// changes the reported window AND the samples the statistics are computed
+    /// from — the hardcoded `now`/`now + 3600 s` is gone.
+    ///
+    /// Two samples 10 and 5 minutes old carry loads 20 and 80. A period covering
+    /// only the older one must report `nfLoadLevelAverage` 20, and a period
+    /// covering both must report 50. Neither number is producible by the
+    /// whole-series computation the handler used to do, and `start`/`expiry` must
+    /// equal what was asked for rather than `now`.
+    #[tokio::test]
+    async fn test_analytics_info_target_period_drives_window_and_statistics() {
+        let now = chrono::Utc::now();
+        let at = |mins: i64| (now - chrono::Duration::minutes(mins)).timestamp() as u64;
+        let ctx = ctx_with_timed_loads("amf-period-01", &[(at(10), 20), (at(5), 80)]);
+
+        // ── only the older sample is inside [now-12min, now-8min] ─────────────
+        let start = now - chrono::Duration::minutes(12);
+        let end = now - chrono::Duration::minutes(8);
+        let uri = analytics_uri(&format!(
+            "ana-req={}",
+            qp(&json!({ "startTs": start.to_rfc3339(), "endTs": end.to_rfc3339() }))
+        ));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(
+            resp.status, 200,
+            "a past period with data in it must be 200"
+        );
+        let body = body_json(&resp);
+        assert_eq!(
+            body["nfLoadLevelInfos"][0]["nfLoadLevelAverage"].as_u64(),
+            Some(20),
+            "statistics must come from the requested period's samples only"
+        );
+        let reported = |key: &str| -> chrono::DateTime<chrono::FixedOffset> {
+            chrono::DateTime::parse_from_rfc3339(
+                body[key]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{key} present")),
+            )
+            .expect("RFC-3339")
+        };
+        assert_eq!(
+            reported("start").timestamp(),
+            start.timestamp(),
+            "start must be the requested startTs, not now"
+        );
+        assert_eq!(
+            reported("expiry").timestamp(),
+            end.timestamp(),
+            "expiry must be the requested endTs, not now + 3600"
+        );
+
+        // ── a wider past period covers both samples → average 50 ─────────────
+        let wide_start = now - chrono::Duration::minutes(20);
+        let wide_end = now - chrono::Duration::minutes(1);
+        let uri = analytics_uri(&format!(
+            "ana-req={}",
+            qp(&json!({ "startTs": wide_start.to_rfc3339(), "endTs": wide_end.to_rfc3339() }))
+        ));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            body_json(&resp)["nfLoadLevelInfos"][0]["nfLoadLevelAverage"].as_u64(),
+            Some(50),
+            "a wider period must report the average of both samples"
+        );
+
+        // ── no ana-req → the pre-#171 default window, both samples ────────────
+        let resp =
+            handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(analytics_uri(""))).await;
+        assert_eq!(resp.status, 200);
+        let body = body_json(&resp);
+        assert_eq!(
+            body["nfLoadLevelInfos"][0]["nfLoadLevelAverage"].as_u64(),
+            Some(50)
+        );
+        let default_expiry = chrono::DateTime::parse_from_rfc3339(body["expiry"].as_str().unwrap())
+            .expect("RFC-3339")
+            .timestamp();
+        assert!(
+            (default_expiry - (now.timestamp() + 3600)).abs() <= 5,
+            "with no requested period the validity stays now + 3600 s (got {default_expiry})"
+        );
+    }
+
+    /// **Acceptance criterion 2 of #171, the `500` half.** Statistics over a past
+    /// period with no sample in it is `500 UNAVAILABLE_DATA` (TS 29.520
+    /// §4.3.2.2.2), while absent data with no period — or a FUTURE period — stays
+    /// `204`. The same context serves all three, so the difference provably comes
+    /// from the requested period and not from an empty engine.
+    #[tokio::test]
+    async fn test_analytics_info_past_period_without_data_is_500_unavailable_data() {
+        let now = chrono::Utc::now();
+        let ctx = ctx_with_timed_loads(
+            "amf-unavail-01",
+            &[((now - chrono::Duration::minutes(5)).timestamp() as u64, 40)],
+        );
+
+        // A past period that predates every sample → 500 UNAVAILABLE_DATA.
+        let start = now - chrono::Duration::days(30);
+        let end = now - chrono::Duration::days(29);
+        let uri = analytics_uri(&format!(
+            "ana-req={}",
+            qp(&json!({ "startTs": start.to_rfc3339(), "endTs": end.to_rfc3339() }))
+        ));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(
+            resp.status, 500,
+            "statistics in the past with no data must be 500, not 204 and never a 200 \
+             computed over another period"
+        );
+        assert_eq!(
+            body_json(&resp)["cause"].as_str(),
+            Some("UNAVAILABLE_DATA"),
+            "the 500 must carry the TS 29.520 table 5.2.7.3-1 cause"
+        );
+
+        // The very same engine answers 200 without a period — so the 500 above is
+        // about the requested window, not about having no data at all.
+        let resp =
+            handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(analytics_uri(""))).await;
+        assert_eq!(resp.status, 200, "the engine does hold data");
+
+        // A FUTURE period is a prediction, computed from the past samples → 200.
+        let uri = analytics_uri(&format!(
+            "ana-req={}",
+            qp(&json!({
+                "startTs": (now + chrono::Duration::minutes(5)).to_rfc3339(),
+                "endTs": (now + chrono::Duration::minutes(30)).to_rfc3339(),
+            }))
+        ));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(
+            resp.status, 200,
+            "a future period must predict from past samples, not window them away"
+        );
+
+        // A future period with NO data anywhere stays 204, not 500: the spec ties
+        // UNAVAILABLE_DATA to statistics in the past.
+        let mut empty = NwdafContext::new("nwdaf-empty-window".to_string());
+        empty.init(8);
+        let empty = Arc::new(RwLock::new(empty));
+        let resp = handle_analytics_info_query_with_ctx(&empty, &SbiRequest::get(&uri)).await;
+        assert_eq!(resp.status, 204, "a future period with no data is 204");
+    }
+
+    /// **Acceptance criterion 2 of #171, the `400` half.** A target period whose
+    /// start is in the past and end in the future asks for statistics AND
+    /// prediction → `400 BOTH_STAT_PRED_NOT_ALLOWED` (TS 29.520 §4.3.2.2.2).
+    #[tokio::test]
+    async fn test_analytics_info_straddling_period_is_400_both_stat_pred() {
+        let now = chrono::Utc::now();
+        let ctx = ctx_with_timed_loads("amf-straddle-01", &[(now.timestamp() as u64, 40)]);
+        let uri = analytics_uri(&format!(
+            "ana-req={}",
+            qp(&json!({
+                "startTs": (now - chrono::Duration::hours(1)).to_rfc3339(),
+                "endTs": (now + chrono::Duration::hours(1)).to_rfc3339(),
+            }))
+        ));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            body_json(&resp)["cause"].as_str(),
+            Some("BOTH_STAT_PRED_NOT_ALLOWED")
+        );
+    }
+
+    /// A malformed `ana-req` fails closed rather than falling back to the default
+    /// window — silently computing over an unrequested window is the defect.
+    #[tokio::test]
+    async fn test_analytics_info_malformed_ana_req_400() {
+        let ctx = ctx_with_loads("AMF", "amf-badana-01", &[50]);
+        let now = chrono::Utc::now();
+        let cases = [
+            ("not-json".to_string(), "not JSON at all"),
+            (
+                qp(&json!({ "startTs": "yesterday" })),
+                "a non-RFC-3339 startTs",
+            ),
+            (qp(&json!({ "endTs": 12345 })), "a numeric endTs"),
+            (
+                qp(&json!({
+                    "startTs": now.to_rfc3339(),
+                    "endTs": (now - chrono::Duration::hours(2)).to_rfc3339(),
+                })),
+                "endTs before startTs",
+            ),
+            (
+                qp(&json!({ "offsetPeriod": "-600" })),
+                "a non-integer offsetPeriod",
+            ),
+        ];
+        for (value, what) in cases {
+            let uri = analytics_uri(&format!("ana-req={value}"));
+            let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+            assert_eq!(resp.status, 400, "{what} must be rejected with 400");
+        }
+    }
+
+    /// `offsetPeriod` is the relative form of the target period: negative selects
+    /// statistics over the past offset window, positive a prediction over the
+    /// future one (TS 29.520 `EventReportingRequirement`).
+    #[tokio::test]
+    async fn test_analytics_info_offset_period_selects_statistics_or_prediction() {
+        let now = chrono::Utc::now();
+        let ctx = ctx_with_timed_loads(
+            "amf-offset-01",
+            &[((now - chrono::Duration::minutes(2)).timestamp() as u64, 60)],
+        );
+
+        // −600 s: statistics over [now-600, now]; the sample is inside it.
+        let uri = analytics_uri(&format!("ana-req={}", qp(&json!({ "offsetPeriod": -600 }))));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(resp.status, 200);
+        let body = body_json(&resp);
+        assert_eq!(
+            body["nfLoadLevelInfos"][0]["nfLoadLevelAverage"].as_u64(),
+            Some(60)
+        );
+        let expiry = chrono::DateTime::parse_from_rfc3339(body["expiry"].as_str().unwrap())
+            .expect("RFC-3339")
+            .timestamp();
+        assert!(
+            (expiry - now.timestamp()).abs() <= 5,
+            "a negative offset ends the window at now (got {expiry})"
+        );
+
+        // −60 s: the sample is 2 minutes old, so this past window is empty.
+        let uri = analytics_uri(&format!("ana-req={}", qp(&json!({ "offsetPeriod": -60 }))));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(
+            resp.status, 500,
+            "a negative offset naming a window with no sample is UNAVAILABLE_DATA"
+        );
+
+        // +1800 s: prediction from the past sample, validity ending now+1800.
+        let uri = analytics_uri(&format!("ana-req={}", qp(&json!({ "offsetPeriod": 1800 }))));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(resp.status, 200);
+        let expiry =
+            chrono::DateTime::parse_from_rfc3339(body_json(&resp)["expiry"].as_str().unwrap())
+                .expect("RFC-3339")
+                .timestamp();
+        assert!(
+            (expiry - (now.timestamp() + 1800)).abs() <= 5,
+            "a positive offset predicts forward to now + offset (got {expiry})"
+        );
+    }
+
+    /// A one-sided target period has its missing bound derived and clamped to
+    /// `now`, so a period the consumer did not ask to straddle never does —
+    /// which is what keeps `BOTH_STAT_PRED_NOT_ALLOWED` tied to an explicit
+    /// two-bound request.
+    #[test]
+    fn test_parse_analytics_target_period_never_straddles_now() {
+        let now = chrono::Utc::now();
+        let period = |v: Value| {
+            parse_analytics_target_period(Some(&v.to_string()), now)
+                .expect("valid ana-req")
+                .expect("a period")
+        };
+
+        // startTs in the past, no endTs → [startTs, now]: pure statistics, even
+        // though startTs + 3600 s would have landed in the future.
+        let p = period(json!({ "startTs": (now - chrono::Duration::minutes(1)).to_rfc3339() }));
+        assert_eq!(p.end.timestamp(), now.timestamp());
+        assert!(p.is_statistics(now), "a past start alone means statistics");
+
+        // startTs in the future, no endTs → [startTs, startTs + 3600]: prediction.
+        let future = now + chrono::Duration::hours(2);
+        let p = period(json!({ "startTs": future.to_rfc3339() }));
+        assert_eq!(p.start.timestamp(), future.timestamp());
+        assert_eq!(p.end.timestamp(), future.timestamp() + 3600);
+        assert!(!p.is_statistics(now));
+
+        // endTs in the future, no startTs → [now, endTs]: prediction.
+        let p = period(json!({ "endTs": (now + chrono::Duration::minutes(1)).to_rfc3339() }));
+        assert_eq!(p.start.timestamp(), now.timestamp());
+        assert!(!p.is_statistics(now));
+
+        // endTs in the past, no startTs → [endTs - 3600, endTs]: statistics.
+        let past = now - chrono::Duration::hours(2);
+        let p = period(json!({ "endTs": past.to_rfc3339() }));
+        assert_eq!(p.start.timestamp(), past.timestamp() - 3600);
+        assert!(p.is_statistics(now));
+
+        // An `ana-req` carrying no target period at all is not an error.
+        assert!(parse_analytics_target_period(
+            Some(&json!({ "accuracy": "HIGH" }).to_string()),
+            now
+        )
+        .expect("valid")
+        .is_none());
+        assert!(parse_analytics_target_period(None, now)
+            .expect("valid")
+            .is_none());
+    }
+
+    /// `tgt-ue` is a JSON `TargetUeInformation` per the yaml, so a bare
+    /// identifier string, or an object that identifies no target, fails closed.
+    #[tokio::test]
+    async fn test_analytics_info_tgt_ue_must_identify_a_target() {
+        let ctx = ctx_with_loads("AMF", "amf-tgtue-01", &[50]);
+
+        for (value, what) in [
+            ("imsi-001".to_string(), "a bare identifier string"),
+            (qp(&json!({})), "an empty TargetUeInformation"),
+            (qp(&json!({ "anyUe": false })), "anyUe explicitly false"),
+        ] {
+            let uri = analytics_uri(&format!("tgt-ue={value}"));
+            let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+            assert_eq!(resp.status, 400, "{what} must be rejected with 400");
+        }
+
+        // `anyUe: true` identifies every UE and imposes no restriction.
+        let uri = analytics_uri(&format!("tgt-ue={}", qp(&json!({ "anyUe": true }))));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(resp.status, 200, "anyUe must not narrow anything away");
+    }
+
+    /// **The `tgt-ue` behaviour of #171, including the NOTE 5 exception.**
+    ///
+    /// A `tgt-ue` naming specific UEs cannot be resolved to the AMF/SMF instances
+    /// serving them (TS 29.520 §4.3.2.2.2 NOTE 4) — this NWDAF holds no
+    /// UE-to-serving-NF view — so those analytics do not exist → 204. But NOTE 5
+    /// says the target UEs are IGNORED when the query names NF instance IDs, so
+    /// the same request plus `event-filter.nfInstanceIds` must be SERVED. A naive
+    /// "UE-scoped ⇒ 204" gate gets that second case wrong.
+    #[tokio::test]
+    async fn test_analytics_info_ue_scoped_tgt_ue_honours_note_4_and_note_5() {
+        let ctx = ctx_with_loads("AMF", "amf-scope-01", &[70]);
+        let scoped = qp(&json!({ "supis": ["imsi-001010000000001"] }));
+
+        // NOTE 4: no way to know which NF serves that SUPI → 204.
+        let uri = analytics_uri(&format!("tgt-ue={scoped}"));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(
+            resp.status, 204,
+            "a UE-scoped NF_LOAD query must not be answered with the whole network's load"
+        );
+
+        // Every other UE identifier behaves the same way.
+        for value in [
+            qp(&json!({ "gpsis": ["msisdn-15551234"] })),
+            qp(&json!({ "intGroupIds": ["group-1"] })),
+            qp(&json!({ "ueIpAddrs": { "ipv4Addrs": ["10.0.0.1"] } })),
+        ] {
+            let uri = analytics_uri(&format!("tgt-ue={value}"));
+            let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+            assert_eq!(resp.status, 204, "UE-scoped query {value} must be 204");
+        }
+
+        // NOTE 5: with nfInstanceIds present the target UEs are ignored → served.
+        let uri = analytics_uri(&format!(
+            "tgt-ue={scoped}&event-filter={}",
+            qp(&json!({ "nfInstanceIds": ["amf-scope-01"] }))
+        ));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(
+            resp.status, 200,
+            "NOTE 5: nfInstanceIds means the target UEs are ignored, not that the query fails"
+        );
+        assert_eq!(
+            body_json(&resp)["nfLoadLevelInfos"][0]["nfInstanceId"].as_str(),
+            Some("amf-scope-01")
+        );
+    }
+
+    // ── issue #171: Nnwdaf_AnalyticsInfo_ContextTransfer (GET /context) ───────
+
+    /// Isolated context holding one analytics subscription over `events`.
+    fn ctx_with_subscription(events: &[AnalyticsId]) -> (Arc<RwLock<NwdafContext>>, String) {
+        let mut inner = NwdafContext::new("nwdaf-ctxtransfer-test".to_string());
+        inner.init(64);
+        let sub_id = "sub-ctxtransfer-1".to_string();
+        let sub = AnalyticsSubscription::new_with_events(
+            sub_id.clone(),
+            events
+                .iter()
+                .copied()
+                .map(EventSubscription::periodic)
+                .collect(),
+            "http://amf.example.org/notify".to_string(),
+            u64::MAX,
+        );
+        inner.add_subscription(sub).expect("subscription stored");
+        (Arc::new(RwLock::new(inner)), sub_id)
+    }
+
+    fn context_uri(context_ids: &Value, req_context: Option<&Value>) -> String {
+        let mut uri = format!(
+            "/nnwdaf-analyticsinfo/v1/context?context-ids={}",
+            qp(context_ids)
+        );
+        if let Some(rc) = req_context {
+            uri.push_str(&format!("&req-context={}", qp(rc)));
+        }
+        uri
+    }
+
+    /// **Acceptance criterion 3 of #171.** `GET /context` is routed and answers a
+    /// known subscription with a `ContextData` naming the analytics contexts that
+    /// actually exist for it.
+    #[tokio::test]
+    async fn test_context_transfer_returns_context_data_for_a_known_subscription() {
+        let (ctx, sub_id) = ctx_with_subscription(&[AnalyticsId::NfLoad, AnalyticsId::UeMobility]);
+        let uri = context_uri(
+            &json!({ "contextIds": [{ "subscriptionId": sub_id, "nfAnaCtxts": ["NF_LOAD", "UE_MOBILITY"] }] }),
+            None,
+        );
+        let resp = handle_nwdaf_context_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+        assert_eq!(resp.status, 200, "a known subscription must be 200");
+
+        let body = body_json(&resp);
+        let elems = body["contextElems"]
+            .as_array()
+            .expect("ContextData.contextElems is required");
+        assert_eq!(elems.len(), 1);
+        assert_eq!(
+            elems[0]["contextId"]["subscriptionId"].as_str(),
+            Some(sub_id.as_str())
+        );
+        // UE_MOBILITY was requested and IS on the subscription, but it has no
+        // collector, so no analytics context exists to transfer for it.
+        assert_eq!(
+            elems[0]["contextId"]["nfAnaCtxts"],
+            json!(["NF_LOAD"]),
+            "only events with a live collector have a transferable context"
+        );
+        // Nothing this NWDAF does not store may appear.
+        for absent in [
+            "pendAnalytics",
+            "histAnalytics",
+            "histData",
+            "aggrSubs",
+            "aggrNwdafIds",
+            "adrfId",
+            "modelInfo",
+        ] {
+            assert!(
+                elems[0].get(absent).is_none(),
+                "{absent} must be omitted, not fabricated"
+            );
+        }
+    }
+
+    /// `lastOutputTime` is real state: it appears only after a notification has
+    /// actually been dispatched, and only when the consumer asked for the pending
+    /// or historical output-analytics context types (TS 29.520 §4.3.2.3.2).
+    #[tokio::test]
+    async fn test_context_transfer_last_output_time_tracks_dispatched_notifications() {
+        let (ctx, sub_id) = ctx_with_subscription(&[AnalyticsId::NfLoad]);
+        let ids =
+            json!({ "contextIds": [{ "subscriptionId": sub_id, "nfAnaCtxts": ["NF_LOAD"] }] });
+        let pending = json!({ "contexts": ["PENDING_ANALYTICS"] });
+
+        // Nothing dispatched yet → no lastOutputTime to report.
+        let resp = handle_nwdaf_context_query_with_ctx(
+            &ctx,
+            &SbiRequest::get(context_uri(&ids, Some(&pending))),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        assert!(
+            body_json(&resp)["contextElems"][0]
+                .get("lastOutputTime")
+                .is_none(),
+            "no notification has gone out, so there is no last output time"
+        );
+
+        // Record a dispatch, then it is reported as an RFC-3339 instant.
+        ctx.read()
+            .unwrap()
+            .update_subscription_last_notification(&sub_id);
+        let resp = handle_nwdaf_context_query_with_ctx(
+            &ctx,
+            &SbiRequest::get(context_uri(&ids, Some(&pending))),
+        )
+        .await;
+        let reported = body_json(&resp)["contextElems"][0]["lastOutputTime"]
+            .as_str()
+            .expect("lastOutputTime after a dispatch")
+            .to_string();
+        let parsed = chrono::DateTime::parse_from_rfc3339(&reported).expect("RFC-3339 DateTime");
+        assert!(
+            (parsed.timestamp() - chrono::Utc::now().timestamp()).abs() <= 5,
+            "lastOutputTime must be the moment of dispatch, got {reported}"
+        );
+
+        // A consumer that asked for neither output-analytics type does not get it.
+        let resp = handle_nwdaf_context_query_with_ctx(
+            &ctx,
+            &SbiRequest::get(context_uri(
+                &ids,
+                Some(&json!({ "contexts": ["AGGR_SUBS"] })),
+            )),
+        )
+        .await;
+        assert!(
+            body_json(&resp)["contextElems"][0]
+                .get("lastOutputTime")
+                .is_none(),
+            "lastOutputTime is conditional on PENDING_ANALYTICS/HISTORICAL_ANALYTICS"
+        );
+    }
+
+    /// 204 whenever no requested context information exists (TS 29.520
+    /// §4.3.2.3.2) — an unknown subscription, a type the subscription does not
+    /// carry, a subscription whose only event has no collector, or a request for
+    /// UE-related contexts, which this NWDAF has none of.
+    #[tokio::test]
+    async fn test_context_transfer_204_when_nothing_matches() {
+        let (ctx, sub_id) = ctx_with_subscription(&[AnalyticsId::NfLoad]);
+
+        let cases = [
+            (
+                json!({ "contextIds": [{ "subscriptionId": "sub-does-not-exist", "nfAnaCtxts": ["NF_LOAD"] }] }),
+                "an unknown subscription",
+            ),
+            (
+                json!({ "contextIds": [{ "subscriptionId": sub_id, "nfAnaCtxts": ["UE_MOBILITY"] }] }),
+                "a type the subscription does not carry",
+            ),
+            (
+                json!({ "contextIds": [{ "subscriptionId": sub_id, "ueAnaCtxts": [{ "supi": "imsi-1", "ueAnaTypes": ["UE_MOBILITY"] }] }] }),
+                "a request for UE-related analytics contexts",
+            ),
+        ];
+        for (ids, what) in cases {
+            let resp = handle_nwdaf_context_query_with_ctx(
+                &ctx,
+                &SbiRequest::get(context_uri(&ids, None)),
+            )
+            .await;
+            assert_eq!(resp.status, 204, "{what} must be 204");
+            assert!(
+                resp.http.content.as_deref().is_none_or(str::is_empty),
+                "204 carries no body"
+            );
+        }
+
+        // A subscription whose only event has no collector has no context either.
+        let (collectorless, id) = ctx_with_subscription(&[AnalyticsId::UeMobility]);
+        let resp = handle_nwdaf_context_query_with_ctx(
+            &collectorless,
+            &SbiRequest::get(context_uri(
+                &json!({ "contextIds": [{ "subscriptionId": id, "nfAnaCtxts": ["UE_MOBILITY"] }] }),
+                None,
+            )),
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+    }
+
+    /// `context-ids` is mandatory and must be a conformant `ContextIdList`; a
+    /// malformed `req-context` is rejected too rather than silently ignored.
+    #[tokio::test]
+    async fn test_context_transfer_rejects_missing_or_malformed_query_params() {
+        let (ctx, sub_id) = ctx_with_subscription(&[AnalyticsId::NfLoad]);
+
+        // Absent context-ids → 400 with the mandatory-parameter cause.
+        let resp = handle_nwdaf_context_query_with_ctx(
+            &ctx,
+            &SbiRequest::get("/nnwdaf-analyticsinfo/v1/context"),
+        )
+        .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            body_json(&resp)["cause"].as_str(),
+            Some("MANDATORY_QUERY_PARAM_INCORRECT")
+        );
+
+        let bad = [
+            ("context-ids=not-json".to_string(), "context-ids not JSON"),
+            (
+                format!("context-ids={}", qp(&json!({ "contextIds": [] }))),
+                "an empty contextIds array",
+            ),
+            (
+                format!(
+                    "context-ids={}",
+                    qp(&json!({ "contextIds": [{ "nfAnaCtxts": ["NF_LOAD"] }] }))
+                ),
+                "an identifier with no subscriptionId",
+            ),
+            (
+                format!(
+                    "context-ids={}",
+                    qp(&json!({ "contextIds": [{ "subscriptionId": "s" }] }))
+                ),
+                "an identifier with neither nfAnaCtxts nor ueAnaCtxts",
+            ),
+            (
+                format!(
+                    "context-ids={}&req-context={}",
+                    qp(
+                        &json!({ "contextIds": [{ "subscriptionId": sub_id, "nfAnaCtxts": ["NF_LOAD"] }] })
+                    ),
+                    qp(&json!({ "contexts": [] }))
+                ),
+                "an empty req-context.contexts",
+            ),
+        ];
+        for (query, what) in bad {
+            let uri = format!("/nnwdaf-analyticsinfo/v1/context?{query}");
+            let resp = handle_nwdaf_context_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+            assert_eq!(resp.status, 400, "{what} must be 400");
+        }
     }
 
     // ── G2-3: supported-events honesty ────────────────────────────────────────
