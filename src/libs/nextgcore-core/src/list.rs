@@ -587,6 +587,13 @@ mod proptests {
     }
 
     /// Node storage for property tests
+    ///
+    /// The `Box` is load-bearing, so `clippy::vec_box` is a false positive here:
+    /// `add_node` hands back a `NonNull` pointing INTO the stored node, and those
+    /// pointers must stay valid as more nodes are added. A `Vec<TestNodeProp>`
+    /// moves its elements when it reallocates, which would dangle every pointer
+    /// returned earlier. The heap indirection is what pins each node's address.
+    #[allow(clippy::vec_box)]
     struct NodeStorage {
         nodes: Vec<Box<TestNodeProp>>,
     }
