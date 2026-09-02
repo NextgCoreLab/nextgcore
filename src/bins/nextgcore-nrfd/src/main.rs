@@ -51,16 +51,30 @@ struct SbiOauth2Yaml {
     /// /jwks endpoints stay exempt). Default OFF so the matched simulator —
     /// whose NFs may not all attach tokens yet — is never locked out.
     require_server: Option<bool>,
-    /// nrfd-05: require the token endpoint to authenticate the requesting NF
-    /// via a Client-Credentials-Assertion (CCA) bound to the body
-    /// nfInstanceId. Default OFF (non-TLS dev / matched sim still function).
+    /// nrfd-05: require the token endpoint to authenticate the requesting NF.
+    /// Client authentication is satisfied by EITHER a signature-verified CCA
+    /// bound to the body `nfInstanceId` OR a transport-authenticated mTLS client
+    /// identity bound to it (see `require_client_cert_binding`). A request
+    /// carrying NEITHER is rejected (`invalid_client`).
     ///
-    /// I2 semantics extension: when this is ON, client authentication is
-    /// satisfied by EITHER a bound CCA (existing path) OR a transport-
-    /// authenticated mTLS client identity bound to the body `nfInstanceId`
-    /// (see `require_client_cert_binding`). A request carrying NEITHER is
-    /// rejected (`invalid_client`).
+    /// **Default ON** (issue #64 gap 1, TS 33.501 §13.3.1). Setting this to
+    /// `false` is the documented escape hatch for non-TLS dev and the matched
+    /// simulator: it makes the token endpoint mint a token for ANY registered
+    /// `nfInstanceId` a caller cares to name, so it is announced with a startup
+    /// `warn!` rather than being a silent default.
     require_client_auth: Option<bool>,
+    /// Whether to trust an `x-forwarded-client-cert` header as proof of the
+    /// requester's mTLS identity. **Default OFF** (issue #64 gap 2).
+    ///
+    /// The header is only meaningful when a TLS-terminating SBI ingress / SCP
+    /// sets it and strips any client-supplied copy at the trust boundary. Nothing
+    /// establishes that boundary by default here, so trusting the header
+    /// unconditionally would let any client that can reach the NRF assert any
+    /// identity simply by setting it — which would make
+    /// `require_client_cert_binding` security theatre. Turn this on ONLY when
+    /// every path to the NRF passes through a terminator that overwrites the
+    /// header.
+    trust_forwarded_client_cert: Option<bool>,
     /// I2 (TS 33.501 §13.3.1 / §13.4.1): mandate transport-layer (mTLS)
     /// authentication of the token requester. When ON, the token request MUST
     /// carry a mutually-authenticated TLS client identity whose NF Instance ID
@@ -74,10 +88,13 @@ struct SbiOauth2Yaml {
     /// present, independent of this flag (fail-closed on a forged binding).
     require_client_cert_binding: Option<bool>,
     /// I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA's ES256 JWS
-    /// signature (not just the claim binding). Default OFF so the matched
-    /// simulator — which today signs CCAs with a placeholder — is not locked
-    /// out; the flip to `true` is a manual host gate, taken only once every NF
-    /// signs its CCA with a real key registered under `cca_trusted_keys`.
+    /// signature (not just the claim binding).
+    ///
+    /// **Default ON** (issue #64 gap 2). An unverified CCA is not evidence of
+    /// anything: its claims are attacker-chosen, so accepting one as
+    /// authentication lets any caller assert any `nfInstanceId`. With this off,
+    /// `require_client_auth` demands evidence of identity and then accepts forged
+    /// evidence — which is why gaps 1 and 2 had to be fixed together.
     cca_verify_signature: Option<bool>,
     /// I1: the trusted per-NF ES256 public keys the NRF verifies CCA signatures
     /// against, keyed by the signing NF's `nfInstanceId`. Each entry carries an
@@ -163,13 +180,17 @@ struct NrfPolicy {
     /// nrfd-06: enforce OAuth2 on own nnrf-nfm/nnrf-disc endpoints.
     require_oauth2_server: bool,
     /// nrfd-05: enforce CCA (or, per I2, mTLS) client authentication at the
-    /// token endpoint.
+    /// token endpoint. Default ON (issue #64 gap 1).
     require_client_auth: bool,
     /// I2 (TS 33.501 §13.3.1/§13.4.1): mandate a transport-authenticated (mTLS)
     /// client identity bound to the request `nfInstanceId`.
     require_client_cert_binding: bool,
+    /// Issue #64 gap 2: whether an `x-forwarded-client-cert` header is trusted as
+    /// proof of mTLS identity. Default OFF — without a TLS terminator that
+    /// overwrites the header, any client can set it.
+    trust_forwarded_client_cert: bool,
     /// I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA ES256 JWS
-    /// signature (not just the claim binding). Default OFF.
+    /// signature (not just the claim binding). Default ON (issue #64 gap 2).
     cca_verify_signature: bool,
     /// I1: `nfInstanceId` -> trusted ES256 verifying key used to check the CCA
     /// signature. Populated from `nrf.sbi.oauth2.cca_trusted_keys`.
@@ -186,9 +207,20 @@ impl Default for NrfPolicy {
             disc_default_page_size: NRF_DISC_DEFAULT_PAGE_SIZE,
             disc_max_page_size: NRF_DISC_MAX_PAGE_SIZE,
             require_oauth2_server: false,
-            require_client_auth: false,
+            // Issue #64 gaps 1+2 (TS 33.501 §13.3.1/§13.4.1.1): the token
+            // endpoint authenticates the requester, and the only evidence it
+            // accepts is unforgeable. These two defaults are one decision: an
+            // enforced requirement that accepts an unsigned CCA is no
+            // requirement at all.
+            require_client_auth: true,
+            cca_verify_signature: true,
+            // Requiring mTLS *specifically* remains opt-in: a plaintext dev
+            // deployment cannot satisfy it, and a signed CCA is the TS 33.501
+            // §13.3.8 alternative for exactly that case.
             require_client_cert_binding: false,
-            cca_verify_signature: false,
+            // The forwarded-cert header is only as trustworthy as the terminator
+            // that sets it, and nothing here guarantees one exists.
+            trust_forwarded_client_cert: false,
             cca_trusted_keys: std::collections::HashMap::new(),
         }
     }
@@ -222,12 +254,29 @@ impl NrfPolicy {
             }
         }
         if let Some(o) = nrf.sbi.as_ref().and_then(|s| s.oauth2.as_ref()) {
-            p.require_oauth2_server = o.require_server.unwrap_or(false);
-            p.require_client_auth = o.require_client_auth.unwrap_or(false);
+            // Only an EXPLICITLY set knob overrides the default. `unwrap_or(false)`
+            // would silently undo a secure default for every config file that has
+            // an `oauth2:` section at all but omits the key -- which is most of
+            // them -- so the default would look secure in code and be off in
+            // every deployment (issue #64 gaps 1+2).
+            if let Some(v) = o.require_server {
+                p.require_oauth2_server = v;
+            }
+            if let Some(v) = o.require_client_auth {
+                p.require_client_auth = v;
+            }
             // I2 (TS 33.501 §13.3.1/§13.4.1): mTLS client-cert binding.
-            p.require_client_cert_binding = o.require_client_cert_binding.unwrap_or(false);
+            if let Some(v) = o.require_client_cert_binding {
+                p.require_client_cert_binding = v;
+            }
+            // Issue #64 gap 2: trusting the forwarded-cert header is opt-in.
+            if let Some(v) = o.trust_forwarded_client_cert {
+                p.trust_forwarded_client_cert = v;
+            }
             // I1 (TS 33.501 §13.3.8.3): CCA ES256 JWS signature verification.
-            p.cca_verify_signature = o.cca_verify_signature.unwrap_or(false);
+            if let Some(v) = o.cca_verify_signature {
+                p.cca_verify_signature = v;
+            }
             if let Some(keys) = o.cca_trusted_keys.as_ref() {
                 for entry in keys {
                     match nextgcore_sbi::oauth::parse_es256_jwk(&entry.jwk) {
@@ -248,14 +297,21 @@ impl NrfPolicy {
         p
     }
 
-    /// I2: runtime overrides for the client-authentication knobs so the manual
-    /// host-gate flip can be A/B-tested in docker WITHOUT a code edit (mirrors
-    /// the H9 NAS-security canary runtime-knob pattern). Each env var forces the
-    /// corresponding knob ON only; a knob already `true` (from yaml) is never
-    /// turned back off here, and an absent/other env value leaves it unchanged —
-    /// so the default-safe (OFF) matched-sim path is untouched unless a host
-    /// operator explicitly opts in. `NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH` and
-    /// `NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING` accept `1`/`true`.
+    /// I2: runtime overrides for the client-authentication knobs so a posture
+    /// change can be A/B-tested in docker WITHOUT a code edit (mirrors the H9
+    /// NAS-security canary runtime-knob pattern). An absent or non-truthy value
+    /// leaves the knob at whatever config resolved, so these are additive.
+    ///
+    /// Tightening (`NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH`,
+    /// `NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING`,
+    /// `NRF_SBI_OAUTH2_TRUST_FORWARDED_CLIENT_CERT`) forces the knob ON.
+    ///
+    /// `NRF_SBI_OAUTH2_ALLOW_UNAUTHENTICATED` is the one LOOSENING override
+    /// (issue #64 gap 1's documented escape hatch): it turns client
+    /// authentication off for non-TLS dev and the matched simulator. It is
+    /// applied last so it wins over the tightening knob, and the caller
+    /// announces it with a `warn!` — the insecure posture stays reachable, but
+    /// only when asked for by name.
     fn apply_env_overrides(&mut self) {
         let forced_on = |key: &str| {
             matches!(
@@ -268,6 +324,12 @@ impl NrfPolicy {
         }
         if forced_on("NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING") {
             self.require_client_cert_binding = true;
+        }
+        if forced_on("NRF_SBI_OAUTH2_TRUST_FORWARDED_CLIENT_CERT") {
+            self.trust_forwarded_client_cert = true;
+        }
+        if forced_on("NRF_SBI_OAUTH2_ALLOW_UNAUTHENTICATED") {
+            self.require_client_auth = false;
         }
     }
 }
@@ -348,14 +410,7 @@ fn nrf_token_expires_in() -> u64 {
 
 /// Generate a fresh ES256 signing key.
 fn generate_signing_key() -> p256::ecdsa::SigningKey {
-    use rand::Rng;
-    // Draw a random scalar; reject the (vanishingly rare) invalid ones.
-    loop {
-        let bytes = rand::rng().random::<[u8; 32]>();
-        if let Ok(sk) = p256::ecdsa::SigningKey::from_slice(&bytes) {
-            break sk;
-        }
-    }
+    nextgcore_sbi::oauth::generate_es256_key()
 }
 
 /// Load the signing key from `path`, or generate one and persist it there.
@@ -375,52 +430,30 @@ fn generate_signing_key() -> p256::ecdsa::SigningKey {
 ///
 /// A malformed or wrong-length file is an ERROR, never a silent regeneration:
 /// quietly minting a new key would reproduce exactly the defect this fixes.
+///
+/// The load/persist/permissions mechanics live in
+/// [`nextgcore_sbi::oauth::load_or_create_es256_key`] because every NF's CCA
+/// signing key needs the identical contract (issue #64 gaps 1+2). Keeping two
+/// copies of a security-relevant load-or-create is how one of them drifts; this
+/// wrapper adds only the NRF-specific consequence to the error text.
 fn load_or_create_signing_key(path: &std::path::Path) -> anyhow::Result<p256::ecdsa::SigningKey> {
-    use anyhow::Context as _;
-
-    if path.exists() {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read --signing-key-file {}", path.display()))?;
-        let raw = hex::decode(text.trim()).with_context(|| {
-            format!(
-                "--signing-key-file {} is not hex; refusing to regenerate, because a new \
-                 key under the same kid would invalidate every outstanding token",
-                path.display()
-            )
-        })?;
-        let key = p256::ecdsa::SigningKey::from_slice(&raw).with_context(|| {
-            format!(
-                "--signing-key-file {} does not hold a valid P-256 scalar ({} bytes)",
-                path.display(),
-                raw.len()
-            )
-        })?;
+    let existed = path.exists();
+    let key = nextgcore_sbi::oauth::load_or_create_es256_key(path).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}. This is the --signing-key-file: a new key under the same kid \
+             '{NRF_KID}' would invalidate every outstanding access token, so it is not \
+             regenerated automatically."
+        )
+    })?;
+    if existed {
         log::info!("loaded the ES256 signing key from {}", path.display());
-        return Ok(key);
+    } else {
+        log::info!(
+            "generated a new ES256 signing key and persisted it to {} (mount this so \
+             restarts and HA replicas share it)",
+            path.display()
+        );
     }
-
-    let key = generate_signing_key();
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create the directory for {}", path.display())
-            })?;
-        }
-    }
-    std::fs::write(path, hex::encode(key.to_bytes()))
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    // Owner-only: this is the key every access token in the PLMN is signed with.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to restrict permissions on {}", path.display()))?;
-    }
-    log::info!(
-        "generated a new ES256 signing key and persisted it to {} (mount this so \
-         restarts and HA replicas share it)",
-        path.display()
-    );
     Ok(key)
 }
 
@@ -706,18 +739,42 @@ async fn main() -> Result<()> {
         );
     }
     if policy.require_client_auth {
-        log::warn!("nrfd-05: token-endpoint client authentication ENABLED (CCA or mTLS)");
-    }
-    if policy.require_client_cert_binding {
+        log::info!(
+            "nrfd-05: token-endpoint client authentication required (signature-verified CCA \
+             or mTLS identity); {} trusted CCA key(s) configured",
+            policy.cca_trusted_keys.len()
+        );
+    } else {
+        // Issue #64 gap 1: this is the documented escape hatch, and it must not
+        // be quiet. With it set, the endpoint mints a valid access token for any
+        // nfInstanceId that happens to be registered.
         log::warn!(
-            "nrfd-I2: token-endpoint mTLS client-certificate binding REQUIRED \
-             (x-forwarded-client-cert URI SAN must match nfInstanceId)"
+            "nrfd-05: token-endpoint client authentication is DISABLED \
+             (nrf.sbi.oauth2.require_client_auth=false or \
+             NRF_SBI_OAUTH2_ALLOW_UNAUTHENTICATED). Any caller that knows a registered \
+             nfInstanceId can obtain an access token for it. Do not run this in production."
         );
     }
-    if policy.cca_verify_signature {
+    if policy.require_client_cert_binding {
+        log::info!(
+            "nrfd-I2: token-endpoint mTLS client-certificate binding REQUIRED \
+             (certificate URI SAN must match nfInstanceId)"
+        );
+    }
+    if policy.trust_forwarded_client_cert {
+        // Issue #64 gap 2: trusting this header is safe only behind a terminator
+        // that overwrites it. Say so where an operator will see it.
         log::warn!(
-            "nrfd-I1: CCA ES256 JWS signature verification ENABLED ({} trusted key(s))",
-            policy.cca_trusted_keys.len()
+            "nrfd-I2: the {XFCC_HEADER} header is TRUSTED as proof of mTLS identity. Every \
+             path to this NRF must pass through a TLS terminator that sets this header and \
+             strips any client-supplied copy -- otherwise any client can assert any \
+             identity by setting it."
+        );
+    }
+    if !policy.cca_verify_signature {
+        log::warn!(
+            "nrfd-I1: CCA ES256 signature verification is DISABLED. A CCA is then just \
+             attacker-chosen claims, so it proves nothing about the requester's identity."
         );
     }
     NRF_POLICY.set(policy).ok();
@@ -2228,7 +2285,25 @@ fn parse_xfcc_first_entry_uri(header: &str) -> Option<String> {
 /// terminates TLS directly (no SCP), surfacing the rustls-verified peer
 /// certificate's SAN into this header (or onto `SbiRequest`) is an additive
 /// `nextgcore-sbi` server-glue extension outside this component's boundary.
-fn extract_transport_client_nf_instance_id(request: &SbiRequest) -> Option<String> {
+///
+/// Issue #64 gap 2: the header is read ONLY when the operator has declared that
+/// a trusted terminator exists (`policy.trust_forwarded_client_cert`). It is an
+/// ordinary request header, so without that declaration any client that can
+/// reach the NRF could mint an identity by setting it — and the mTLS binding
+/// built on top of it would confirm the forgery rather than catch it.
+fn extract_transport_client_nf_instance_id(
+    request: &SbiRequest,
+    policy: &NrfPolicy,
+) -> Option<String> {
+    if !policy.trust_forwarded_client_cert {
+        if request.http.get_header(XFCC_HEADER).is_some() {
+            log::debug!(
+                "ignoring a {XFCC_HEADER} header: no trusted TLS terminator is declared \
+                 (nrf.sbi.oauth2.trust_forwarded_client_cert)"
+            );
+        }
+        return None;
+    }
     let xfcc = request.http.get_header(XFCC_HEADER)?;
     let uri = parse_xfcc_first_entry_uri(xfcc)?;
     // Strip the `urn:uuid:` scheme+NID (case-insensitive) when present; other
@@ -2268,17 +2343,92 @@ fn verify_transport_binding(
     Ok(())
 }
 
+/// The result of authenticating a token requester (issue #64 gaps 1+2).
+///
+/// `identity` is `Some` only when UNFORGEABLE evidence proved the requester is
+/// that NF Instance ID: a certificate identity from a trusted TLS terminator, or
+/// a CCA whose ES256 signature verified against a key the NRF trusts for that
+/// issuer. A CCA that was merely claim-checked does NOT count — its claims are
+/// chosen by whoever sent it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClientAuthentication {
+    /// The proven NF Instance ID, if any.
+    identity: Option<String>,
+    /// Whether the proof came from a transport (mTLS) certificate identity.
+    via_transport: bool,
+}
+
+impl ClientAuthentication {
+    fn is_authenticated(&self) -> bool {
+        self.identity.is_some()
+    }
+}
+
+/// Authenticate the requester of an access token (TS 33.501 §13.3.1, §13.3.8.3,
+/// §13.4.1.1) and return the identity that was actually PROVEN.
+///
+/// Order matters, and every failure is fail-closed:
+///
+/// 1. A certificate identity is taken only from a trusted terminator (see
+///    [`extract_transport_client_nf_instance_id`]) and, when present, MUST bind
+///    to the request `nfInstanceId` — a mismatch is rejected regardless of the
+///    policy flags, since a forged binding is never acceptable.
+/// 2. A present CCA is always claim-checked ([`verify_cca_binding`]). Its
+///    signature is then verified against the trusted key for that issuer; with
+///    no such key the request is rejected rather than downgraded.
+/// 3. The CCA contributes an identity ONLY if its signature verified. If
+///    `cca_verify_signature` is off, the assertion is still claim-checked (so a
+///    contradictory one is refused) but it authenticates nothing — which is the
+///    honest reading of "we did not check it".
+fn authenticate_token_client(
+    policy: &NrfPolicy,
+    request: &SbiRequest,
+    nf_instance_id: &str,
+    cca: &str,
+    now: u64,
+) -> Result<ClientAuthentication, (&'static str, String)> {
+    let mut auth = ClientAuthentication::default();
+
+    if let Some(cert_id) = extract_transport_client_nf_instance_id(request, policy) {
+        verify_transport_binding(&cert_id, nf_instance_id)?;
+        auth.identity = Some(cert_id);
+        auth.via_transport = true;
+    }
+
+    if !cca.is_empty() {
+        verify_cca_binding(cca, nf_instance_id, now)?;
+        if policy.cca_verify_signature {
+            // Fail-closed: an issuer with no trusted key cannot be verified, so
+            // its assertion is refused rather than accepted unverified.
+            let Some(key) = policy.cca_trusted_keys.get(nf_instance_id) else {
+                return Err((
+                    "invalid_client",
+                    format!(
+                        "no trusted ES256 key configured to verify the CCA signature of \
+                         nfInstanceId {nf_instance_id:?}"
+                    ),
+                ));
+            };
+            verify_cca_signature(cca, key)?;
+            // Signature verified: the assertion now proves the identity. When a
+            // certificate identity was also present both bind to the same
+            // nfInstanceId, so this does not overwrite it with anything different.
+            auth.identity
+                .get_or_insert_with(|| nf_instance_id.to_string());
+        }
+    }
+
+    Ok(auth)
+}
+
 /// I2: decide whether the token request satisfies the configured client-
-/// authentication policy, given whether a (already-binding-validated) CCA and a
-/// (already-binding-validated) mTLS transport identity are present.
+/// authentication policy, given the outcome of [`authenticate_token_client`].
 ///
-/// - `require_client_auth` (nrfd-05 + I2): authentication is satisfied by a
-///   bound CCA OR a bound mTLS identity; a request with NEITHER is rejected.
-/// - `require_client_cert_binding` (I2): the request MUST additionally carry a
-///   bound mTLS transport identity (mandate transport-layer authentication).
-///
-/// Both knobs default OFF (`NrfPolicy::default`), so with no config/env the
-/// function always returns `Ok(())` and the matched-sim path is unchanged.
+/// - `require_client_auth` (nrfd-05 + I2, DEFAULT ON): an identity must have
+///   been proven — by a signature-verified CCA or a certificate identity from a
+///   trusted terminator. A request that proved neither is rejected.
+/// - `require_client_cert_binding` (I2, default off): the proof must
+///   specifically be a transport (mTLS) certificate identity.
 fn enforce_client_authentication(
     policy: &NrfPolicy,
     has_cca: bool,
@@ -2295,8 +2445,10 @@ fn enforce_client_authentication(
     if policy.require_client_auth && !has_cca && !has_transport_identity {
         return Err((
             "invalid_client",
-            "client authentication required: present a Client Credentials Assertion or an \
-             mTLS client certificate (nrf.sbi.oauth2.require_client_auth)"
+            "client authentication required (TS 33.501 §13.3.1): present a Client \
+             Credentials Assertion signed with a key this NRF trusts for your \
+             nfInstanceId, or an mTLS client certificate. A self-asserted nfInstanceId \
+             is not sufficient"
                 .to_string(),
         ));
     }
@@ -2467,6 +2619,20 @@ fn parse_token_request(body: &str) -> TokenRequestParams {
 }
 
 async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
+    handle_access_token_request_with_policy(request, nrf_policy()).await
+}
+
+/// The token endpoint, against an explicit policy.
+///
+/// Split out from [`handle_access_token_request`] so a test can state the posture
+/// it is exercising instead of inheriting the process-global [`nrf_policy`]: that
+/// is a `OnceLock`, so a single test process can otherwise only ever see one
+/// policy, and the security-relevant cases here (authenticated vs not, trusted
+/// terminator vs not) each need a different one.
+async fn handle_access_token_request_with_policy(
+    request: &SbiRequest,
+    policy: &NrfPolicy,
+) -> SbiResponse {
     log::info!("OAuth2 Access Token Request");
 
     let body = match &request.http.content {
@@ -2516,59 +2682,26 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
         .expect("value expected")
         .as_secs();
 
-    let policy = nrf_policy();
+    // Issue #64 gaps 1+2 (TS 33.501 §13.3.1/§13.3.8.3/§13.4.1.1): establish WHO
+    // is asking before minting anything for them. Returns only the identity that
+    // unforgeable evidence proved — a certificate identity from a trusted TLS
+    // terminator, or a CCA whose ES256 signature verified against a key this NRF
+    // trusts for that issuer. Every binding or signature failure is fail-closed.
+    let authentication =
+        match authenticate_token_client(policy, request, &nf_instance_id, &req.cca, now) {
+            Ok(auth) => auth,
+            Err((code, desc)) => return token_error(code, &desc),
+        };
 
-    // I2 (TS 33.501 §13.3.1/§13.4.1): extract the transport-authenticated (mTLS)
-    // client NF Instance ID conveyed by the trusted TLS terminator, and — when
-    // one is present — ALWAYS verify it is bound to the request nfInstanceId.
-    // The mismatch rejection is unconditional (like the CCA binding below): a
-    // forged transport identity is refused regardless of the policy flags.
-    let transport_nf_id = extract_transport_client_nf_instance_id(request);
-    if let Some(ref cert_id) = transport_nf_id {
-        if let Err((code, desc)) = verify_transport_binding(cert_id, &nf_instance_id) {
-            return token_error(code, &desc);
-        }
-    }
-
-    // nrfd-05 + I2: enforce the client-authentication policy. Authentication is
-    // satisfied by a bound CCA OR a bound mTLS transport identity; the
-    // require_client_cert_binding knob additionally mandates the mTLS identity.
-    // Both knobs default OFF so the matched-sim path is unchanged.
-    if let Err((code, desc)) =
-        enforce_client_authentication(policy, !req.cca.is_empty(), transport_nf_id.is_some())
-    {
+    // nrfd-05 + I2: enforce the client-authentication policy against what was
+    // actually proven. `require_client_auth` defaults ON, so an unauthenticated
+    // request is rejected unless an operator explicitly opted out.
+    if let Err((code, desc)) = enforce_client_authentication(
+        policy,
+        authentication.is_authenticated(),
+        authentication.via_transport,
+    ) {
         return token_error(code, &desc);
-    }
-
-    // A present CCA is always validated for binding (TS 29.510 §6.7.5).
-    if !req.cca.is_empty() {
-        if let Err((code, desc)) = verify_cca_binding(&req.cca, &nf_instance_id, now) {
-            return token_error(code, &desc);
-        }
-        // I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA's ES256
-        // JWS signature against the requesting NF's trusted public key. This is
-        // fail-closed and default-OFF (cca_verify_signature): when enabled, an
-        // issuer with no configured trusted key is rejected, so a forged CCA —
-        // which today passes the claim-binding checks with any placeholder
-        // signature — can no longer be accepted.
-        if policy.cca_verify_signature {
-            match policy.cca_trusted_keys.get(&nf_instance_id) {
-                Some(key) => {
-                    if let Err((code, desc)) = verify_cca_signature(&req.cca, key) {
-                        return token_error(code, &desc);
-                    }
-                }
-                None => {
-                    return token_error(
-                        "invalid_client",
-                        &format!(
-                            "no trusted ES256 key configured to verify the CCA signature of \
-                             nfInstanceId {nf_instance_id:?}"
-                        ),
-                    );
-                }
-            }
-        }
     }
 
     // Verify that the requesting NF is registered: an unknown client is an
@@ -2632,12 +2765,22 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     let expires_in = nrf_token_expires_in();
 
     let header_json = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{NRF_KID}"}}"#);
+    // Issue #64 gap 2 (TS 33.501 §13.4.1.1): the token subject is the
+    // AUTHENTICATED client identity, not the value the body asserted. Both
+    // binding checks force the two equal whenever an identity was proven, so this
+    // changes nothing on the wire today — it means a later edit that loosens a
+    // binding cannot silently re-introduce a self-asserted subject, because the
+    // subject no longer comes from the request at all.
+    let subject = authentication
+        .identity
+        .as_deref()
+        .unwrap_or(&nf_instance_id);
     // nrfd-07: `iss` is the NRF NF Instance ID (TS 29.510 §6.3.5.2.4); when a
     // producer instance was pinned, `aud` is its instance-ID array and the
     // optional producer/consumer claims are populated.
     let claims_json = build_access_token_claims(
         nrf_instance_id(),
-        &nf_instance_id,
+        subject,
         &target_nf_type,
         target_instance.as_ref(),
         &consumer,
@@ -2822,6 +2965,17 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A policy with the documented client-authentication opt-out applied, for
+    /// tests whose subject is something OTHER than authentication (target
+    /// resolution, scope, claim shapes). Issue #64's own criteria are exercised
+    /// against the real default in the tests named for them.
+    fn policy_without_client_auth() -> NrfPolicy {
+        NrfPolicy {
+            require_client_auth: false,
+            ..NrfPolicy::default()
+        }
+    }
 
     #[test]
     fn test_args_default() {
@@ -3280,21 +3434,41 @@ mod tests {
                 .expect("PATCH unknown NF");
             assert_eq!(resp.status, 404);
 
-            // --- OAuth2 token: success has iss = NRF instance UUID ---
+            // --- OAuth2 token, through the REAL router and the process-global
+            // default policy: an unauthenticated request is refused (issue #64
+            // gap 1). This assertion INVERTED with the posture change — it used to
+            // expect 200 — and it is the full-stack proof that the secure default
+            // is what a deployment actually gets, not just what the struct says.
+            let token_body = json!({
+                "grant_type": "client_credentials",
+                "nfInstanceId": nf_id,
+                "nfType": "SMF",
+                "targetNfType": "UDM",
+                "scope": "nudm-sdm"
+            });
             let resp = client
-                .post_json(
-                    "/nnrf-oauth2/v1/access-token",
-                    &json!({
-                        "grant_type": "client_credentials",
-                        "nfInstanceId": nf_id,
-                        "nfType": "SMF",
-                        "targetNfType": "UDM",
-                        "scope": "nudm-sdm"
-                    }),
-                )
+                .post_json("/nnrf-oauth2/v1/access-token", &token_body)
                 .await
                 .expect("token request");
-            assert_eq!(resp.status, 200);
+            assert_eq!(
+                resp.status, 400,
+                "the default policy must refuse an unauthenticated token request: {:?}",
+                resp.http.content
+            );
+            let err: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(err["error"], "invalid_client");
+
+            // The claim shape is asserted against the handler with the documented
+            // opt-out applied, because the router reads the process-global
+            // `nrf_policy()` OnceLock, which a test cannot steer without racing
+            // every other test in this binary.
+            let mut token_req = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+            token_req.http.set_content(token_body.to_string());
+            let resp =
+                handle_access_token_request_with_policy(&token_req, &policy_without_client_auth())
+                    .await;
+            assert_eq!(resp.status, 200, "opt-out path: {:?}", resp.http.content);
             let token_resp: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
             let token = token_resp["access_token"].as_str().unwrap();
@@ -3305,6 +3479,7 @@ mod tests {
                 serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload_b64).unwrap()).unwrap();
             assert_eq!(claims["iss"], nrf_instance_id(), "iss must be NRF UUID");
             assert_ne!(claims["iss"], "NRF");
+            assert_eq!(claims["sub"], nf_id, "sub must be the requesting NF");
 
             // --- OAuth2 token: RFC 6749 §5.2 error JSON, not bare statuses ---
             let resp = client
@@ -3320,19 +3495,33 @@ mod tests {
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
             assert_eq!(err["error"], "unsupported_grant_type");
 
-            let resp = client
-                .post_json(
-                    "/nnrf-oauth2/v1/access-token",
-                    &json!({"grant_type": "client_credentials",
-                            "nfInstanceId": "11111111-2222-3333-4444-555555555555",
-                            "nfType": "SMF", "targetNfType": "UDM", "scope": "nudm-sdm"}),
-                )
-                .await
-                .expect("token unknown client");
+            // An UNREGISTERED client is invalid_client for the registry-lookup
+            // reason. Exercised with the opt-out applied so authentication does not
+            // short-circuit it first — otherwise the assertion would still pass
+            // while testing something else entirely.
+            let mut unknown_req = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+            unknown_req.http.set_content(
+                json!({"grant_type": "client_credentials",
+                       "nfInstanceId": "11111111-2222-3333-4444-555555555555",
+                       "nfType": "SMF", "targetNfType": "UDM", "scope": "nudm-sdm"})
+                .to_string(),
+            );
+            let resp = handle_access_token_request_with_policy(
+                &unknown_req,
+                &policy_without_client_auth(),
+            )
+            .await;
             assert_eq!(resp.status, 400);
             let err: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
             assert_eq!(err["error"], "invalid_client");
+            assert!(
+                err["error_description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("not registered"),
+                "must fail the registry lookup, not the authentication check: {err}"
+            );
 
             // --- Deregister -> 204, heartbeat timer disarmed, GET -> 404 ---
             assert!(
@@ -3726,12 +3915,19 @@ mod tests {
             r.http.set_content(body.to_string());
             r
         };
+        // This test's subject is target resolution and scope, not authentication,
+        // so it runs with the documented opt-out. Authentication itself is covered
+        // by the issue #64 tests further down.
+        let policy = policy_without_client_auth();
 
         // (a) Only targetNfInstanceId (no targetNfType) -> succeeds.
-        let resp = handle_access_token_request(&token_req(json!({
-            "grant_type": "client_credentials", "nfInstanceId": consumer_id,
-            "nfType": "NRFD04C", "targetNfInstanceId": producer_id, "scope": "nrfd04-svc"
-        })))
+        let resp = handle_access_token_request_with_policy(
+            &token_req(json!({
+                "grant_type": "client_credentials", "nfInstanceId": consumer_id,
+                "nfType": "NRFD04C", "targetNfInstanceId": producer_id, "scope": "nrfd04-svc"
+            })),
+            &policy,
+        )
         .await;
         assert_eq!(
             resp.status, 200,
@@ -3740,10 +3936,13 @@ mod tests {
         );
 
         // (b) Neither targetNfType nor targetNfInstanceId -> invalid_request.
-        let resp = handle_access_token_request(&token_req(json!({
-            "grant_type": "client_credentials", "nfInstanceId": consumer_id,
-            "nfType": "NRFD04C", "scope": "nrfd04-svc"
-        })))
+        let resp = handle_access_token_request_with_policy(
+            &token_req(json!({
+                "grant_type": "client_credentials", "nfInstanceId": consumer_id,
+                "nfType": "NRFD04C", "scope": "nrfd04-svc"
+            })),
+            &policy,
+        )
         .await;
         assert_eq!(resp.status, 400);
         let err: serde_json::Value =
@@ -3751,11 +3950,14 @@ mod tests {
         assert_eq!(err["error"], "invalid_request");
 
         // (c) requesterSnssaiList that no producer serves -> invalid_scope.
-        let resp = handle_access_token_request(&token_req(json!({
-            "grant_type": "client_credentials", "nfInstanceId": consumer_id,
-            "nfType": "NRFD04C", "targetNfType": "NRFD04P", "scope": "nrfd04-svc",
-            "requesterSnssaiList": [{"sst": 9}]
-        })))
+        let resp = handle_access_token_request_with_policy(
+            &token_req(json!({
+                "grant_type": "client_credentials", "nfInstanceId": consumer_id,
+                "nfType": "NRFD04C", "targetNfType": "NRFD04P", "scope": "nrfd04-svc",
+                "requesterSnssaiList": [{"sst": 9}]
+            })),
+            &policy,
+        )
         .await;
         assert_eq!(resp.status, 400);
         let err: serde_json::Value =
@@ -3961,10 +4163,18 @@ mod tests {
         assert!(policy2.cca_verify_signature);
         assert!(!policy2.cca_trusted_keys.contains_key("nf-2"));
 
-        // Defaults: signature verification OFF, empty trust store.
+        // Issue #64 gap 2: signature verification defaults ON, with an EMPTY trust
+        // store — so a CCA from an unknown issuer is rejected rather than accepted
+        // unverified. The two together are what make the default fail-closed.
         let def = NrfPolicy::default();
-        assert!(!def.cca_verify_signature);
+        assert!(def.cca_verify_signature);
         assert!(def.cca_trusted_keys.is_empty());
+
+        // An explicitly-disabled knob is honoured (the documented opt-out).
+        let off: NrfYaml =
+            serde_yaml::from_str("nrf:\n  sbi:\n    oauth2:\n      cca_verify_signature: false\n")
+                .expect("parse yaml");
+        assert!(!NrfPolicy::from_yaml(&off).cca_verify_signature);
     }
 
     // -----------------------------------------------------------------
@@ -4017,12 +4227,19 @@ mod tests {
             None
         );
 
+        // Extraction requires a declared trusted terminator (issue #64 gap 2);
+        // see `xfcc_header_is_ignored_unless_trusted` for the default posture.
+        let trusting = NrfPolicy {
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+
         // Full extraction: urn:uuid: prefix (case-insensitive) is stripped.
         let mut req = SbiRequest::post("/nnrf-oauth2/v1/access-token");
         req.http
             .set_header("x-forwarded-client-cert", "Hash=ab;URI=URN:UUID:amf-9");
         assert_eq!(
-            extract_transport_client_nf_instance_id(&req).as_deref(),
+            extract_transport_client_nf_instance_id(&req, &trusting).as_deref(),
             Some("amf-9")
         );
         // A non-URN URI SAN binds on the exact value.
@@ -4032,12 +4249,12 @@ mod tests {
             "URI=https://amf.example/nf/amf-9",
         );
         assert_eq!(
-            extract_transport_client_nf_instance_id(&req2).as_deref(),
+            extract_transport_client_nf_instance_id(&req2, &trusting).as_deref(),
             Some("https://amf.example/nf/amf-9")
         );
         // No XFCC header -> no transport identity.
         let bare = SbiRequest::post("/x");
-        assert!(extract_transport_client_nf_instance_id(&bare).is_none());
+        assert!(extract_transport_client_nf_instance_id(&bare, &trusting).is_none());
     }
 
     #[test]
@@ -4053,25 +4270,26 @@ mod tests {
 
     #[test]
     fn test_nrfd_i2_enforce_client_authentication() {
-        // Defaults OFF: no authentication required regardless of what's present.
+        // Issue #64 gap 1: the DEFAULT requires authentication. Satisfied by a
+        // verified CCA OR an mTLS identity; neither proven -> invalid_client.
         let def = NrfPolicy::default();
-        assert!(enforce_client_authentication(&def, false, false).is_ok());
+        assert!(def.require_client_auth, "the secure posture is the default");
         assert!(enforce_client_authentication(&def, true, false).is_ok());
-
-        // require_client_auth ON: satisfied by a CCA OR an mTLS identity;
-        // neither present -> invalid_client.
-        let auth = NrfPolicy {
-            require_client_auth: true,
-            ..NrfPolicy::default()
-        };
-        assert!(enforce_client_authentication(&auth, true, false).is_ok());
-        assert!(enforce_client_authentication(&auth, false, true).is_ok());
+        assert!(enforce_client_authentication(&def, false, true).is_ok());
         assert_eq!(
-            enforce_client_authentication(&auth, false, false)
+            enforce_client_authentication(&def, false, false)
                 .unwrap_err()
                 .0,
             "invalid_client"
         );
+
+        // The documented escape hatch: explicitly opting out lets an
+        // unauthenticated request through again (matched sim / non-TLS dev).
+        let opted_out = NrfPolicy {
+            require_client_auth: false,
+            ..NrfPolicy::default()
+        };
+        assert!(enforce_client_authentication(&opted_out, false, false).is_ok());
 
         // require_client_cert_binding ON: an mTLS identity is MANDATORY — a CCA
         // alone does not satisfy it.
@@ -4100,22 +4318,46 @@ mod tests {
         assert!(policy.require_client_auth);
         assert!(policy.require_client_cert_binding);
 
-        // Defaults are OFF (default-safe / matched-sim untouched).
+        // Issue #64 gaps 1+2: authentication is required by default and the CCA
+        // signature is verified by default; mandating mTLS *specifically*, and
+        // trusting a forwarded-cert header, both stay opt-in.
         let def = NrfPolicy::default();
-        assert!(!def.require_client_auth);
+        assert!(def.require_client_auth);
+        assert!(def.cca_verify_signature);
         assert!(!def.require_client_cert_binding);
+        assert!(!def.trust_forwarded_client_cert);
 
-        // Env override forces a default-OFF knob ON without a code edit; an
+        // An `oauth2:` section that does NOT mention a knob must leave its default
+        // alone. This is the whole reason `from_yaml` stopped using
+        // `unwrap_or(false)`: nrf-oauth2.yaml sets only `require: true`, so the
+        // old fold silently turned client authentication back OFF in exactly the
+        // deployment that had asked for OAuth2.
+        let partial: NrfYaml =
+            serde_yaml::from_str("nrf:\n  sbi:\n    oauth2:\n      require: true\n")
+                .expect("parse yaml");
+        let folded = NrfPolicy::from_yaml(&partial);
+        assert!(
+            folded.require_client_auth,
+            "an unmentioned knob must keep its secure default"
+        );
+        assert!(folded.cca_verify_signature);
+
+        // Env override forces an opt-in knob ON without a code edit; an
         // absent/other value leaves it unchanged. Serialized because it mutates
         // process env.
         let mut p = NrfPolicy::default();
         std::env::set_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING", "1");
         p.apply_env_overrides();
         assert!(p.require_client_cert_binding);
-        assert!(!p.require_client_auth, "unset knob stays OFF");
         std::env::remove_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING");
 
-        // An env override never turns a yaml-ON knob back off.
+        let mut t = NrfPolicy::default();
+        std::env::set_var("NRF_SBI_OAUTH2_TRUST_FORWARDED_CLIENT_CERT", "1");
+        t.apply_env_overrides();
+        assert!(t.trust_forwarded_client_cert);
+        std::env::remove_var("NRF_SBI_OAUTH2_TRUST_FORWARDED_CLIENT_CERT");
+
+        // A tightening env override never turns a knob back off with a falsy value.
         let mut on = NrfPolicy {
             require_client_auth: true,
             ..NrfPolicy::default()
@@ -4123,6 +4365,20 @@ mod tests {
         std::env::set_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH", "0");
         on.apply_env_overrides();
         assert!(on.require_client_auth);
+        std::env::remove_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH");
+
+        // The escape hatch is the ONE loosening override, and it wins over the
+        // tightening one so a host operator can always get back to a working
+        // dev posture without editing config.
+        let mut hatch = NrfPolicy::default();
+        std::env::set_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH", "1");
+        std::env::set_var("NRF_SBI_OAUTH2_ALLOW_UNAUTHENTICATED", "1");
+        hatch.apply_env_overrides();
+        assert!(
+            !hatch.require_client_auth,
+            "NRF_SBI_OAUTH2_ALLOW_UNAUTHENTICATED is applied last and wins"
+        );
+        std::env::remove_var("NRF_SBI_OAUTH2_ALLOW_UNAUTHENTICATED");
         std::env::remove_var("NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH");
     }
 
@@ -4167,20 +4423,31 @@ mod tests {
             r
         };
 
-        // (a) A forged/mismatched mTLS identity is rejected with invalid_client
-        // even though require_client_auth defaults OFF.
-        let resp =
-            handle_access_token_request(&token_req(Some("Hash=ab;URI=urn:uuid:some-other-nf")))
-                .await;
+        // A deployment that HAS declared a trusted TLS terminator, so the
+        // forwarded-cert header carries a real identity (issue #64 gap 2).
+        let policy = NrfPolicy {
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+
+        // (a) A forged/mismatched mTLS identity is rejected with invalid_client.
+        // The binding check is unconditional: a cert for one NF can never mint a
+        // token for another, whatever the policy flags say.
+        let resp = handle_access_token_request_with_policy(
+            &token_req(Some("Hash=ab;URI=urn:uuid:some-other-nf")),
+            &policy,
+        )
+        .await;
         assert_eq!(resp.status, 400, "mismatched cert must be rejected");
         let err: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(err["error"], "invalid_client");
 
         // (b) A matching mTLS identity binds cleanly -> token issued (200).
-        let resp = handle_access_token_request(&token_req(Some(&format!(
-            "Hash=ab;URI=urn:uuid:{consumer_id}"
-        ))))
+        let resp = handle_access_token_request_with_policy(
+            &token_req(Some(&format!("Hash=ab;URI=urn:uuid:{consumer_id}"))),
+            &policy,
+        )
         .await;
         assert_eq!(
             resp.status, 200,
@@ -4188,12 +4455,487 @@ mod tests {
             resp.http.content
         );
 
-        // (c) No mTLS identity, default policy -> unchanged behaviour (200).
-        let resp = handle_access_token_request(&token_req(None)).await;
-        assert_eq!(resp.status, 200, "default path unchanged");
+        // (c) No identity at all -> rejected, because authentication is now
+        // required by default (issue #64 gap 1). This assertion INVERTED with the
+        // posture change: it used to assert 200.
+        let resp = handle_access_token_request_with_policy(&token_req(None), &policy).await;
+        assert_eq!(
+            resp.status, 400,
+            "an unauthenticated request must be refused under the default policy"
+        );
+
+        // (d) The same request succeeds only when an operator explicitly opts out.
+        let opted_out = NrfPolicy {
+            require_client_auth: false,
+            ..policy
+        };
+        let resp = handle_access_token_request_with_policy(&token_req(None), &opted_out).await;
+        assert_eq!(
+            resp.status, 200,
+            "explicit opt-out restores the legacy path: {:?}",
+            resp.http.content
+        );
 
         mgr.deregister(consumer_id).ok();
         mgr.deregister(producer_id).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #64 gaps 1+2: the token endpoint authenticates the consumer, and
+    // the evidence it accepts is unforgeable
+    // (TS 33.501 §13.3.1, §13.3.8.3, §13.4.1.1)
+    // -----------------------------------------------------------------
+
+    /// Register a throwaway consumer/producer pair under NF types unique to the
+    /// caller, so no other test's registrations affect the authorization decision.
+    fn register_pair(tag: &str) -> (String, String, String, String) {
+        use serde_json::json;
+        let mgr = nf_manager();
+        let consumer_id = format!("{tag}-consumer");
+        let producer_id = format!("{tag}-producer");
+        let consumer_type = format!("{}C", tag.to_uppercase());
+        let producer_type = format!("{}P", tag.to_uppercase());
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": consumer_id, "nfType": consumer_type,
+                "nfStatus": "REGISTERED",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": producer_id, "nfType": producer_type,
+                "nfStatus": "REGISTERED",
+                "nfServices": [{"serviceInstanceId": "s0", "serviceName": "svc"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (consumer_id, producer_id, consumer_type, producer_type)
+    }
+
+    /// Build a token request for a pair from [`register_pair`], optionally
+    /// carrying a CCA and/or a forwarded-client-cert header.
+    fn auth_token_req(
+        consumer_id: &str,
+        consumer_type: &str,
+        producer_type: &str,
+        cca: Option<&str>,
+        xfcc: Option<&str>,
+    ) -> SbiRequest {
+        use serde_json::json;
+        let mut body = json!({
+            "grant_type": "client_credentials",
+            "nfInstanceId": consumer_id,
+            "nfType": consumer_type,
+            "targetNfType": producer_type,
+            "scope": "svc",
+        });
+        if let Some(c) = cca {
+            body["cca"] = json!(c);
+        }
+        let mut r = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+        r.http.set_content(body.to_string());
+        if let Some(x) = xfcc {
+            r.http.set_header("x-forwarded-client-cert", x);
+        }
+        r
+    }
+
+    fn error_of(resp: &SbiResponse) -> serde_json::Value {
+        serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap()
+    }
+
+    /// **Issue #64 acceptance criterion 1.** With DEFAULT configuration, a token
+    /// request from a consumer that presents no verifiable client identity is
+    /// rejected with `invalid_client`.
+    ///
+    /// This is the whole of gap 1: before the fix the endpoint minted a valid,
+    /// NRF-signed access token for any `nfInstanceId` that happened to be in the
+    /// registry, with no evidence at all that the caller was that NF.
+    ///
+    /// Revert-verified: restoring `require_client_auth: false` in
+    /// `NrfPolicy::default` fails this.
+    #[tokio::test]
+    async fn default_policy_rejects_unauthenticated_token_request() {
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd64a");
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, None, None),
+            &NrfPolicy::default(),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "the default policy must not mint a token for an unauthenticated caller: {:?}",
+            resp.http.content
+        );
+        assert_eq!(error_of(&resp)["error"], "invalid_client");
+
+        let mgr = nf_manager();
+        mgr.deregister(&consumer_id).ok();
+        mgr.deregister(&producer_id).ok();
+    }
+
+    /// **Issue #64 gap 2.** A claim-valid but UNSIGNED CCA does not authenticate
+    /// anything.
+    ///
+    /// This is why gaps 1 and 2 could not ship separately. `verify_cca_binding`
+    /// only checks that the assertion's own claims agree with the request body —
+    /// and both are chosen by whoever sent them. Before the fix,
+    /// `cca_verify_signature` defaulted OFF and a present `cca` field satisfied
+    /// `require_client_auth`, so turning gap 1's knob on would have demanded
+    /// evidence of identity and then accepted a forgery: an attacker mints an
+    /// assertion naming any registered NF and is authenticated as it.
+    ///
+    /// Revert-verified: making `authenticate_token_client` set `auth.identity`
+    /// for a merely claim-checked CCA, or defaulting `cca_verify_signature` back
+    /// to false, fails this.
+    #[tokio::test]
+    async fn unsigned_cca_does_not_authenticate() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd64b");
+
+        // A CCA whose CLAIMS are all correct, with a garbage signature.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+        let claims = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "sub": consumer_id, "iss": consumer_id, "aud": "NRF",
+                "iat": now, "exp": now + 60,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let forged = format!("{header}.{claims}.{}", URL_SAFE_NO_PAD.encode([0u8; 64]));
+
+        // The claim binding passes -- which is exactly the trap.
+        assert!(verify_cca_binding(&forged, &consumer_id, now).is_ok());
+
+        // The consumer DOES have a trusted key registered, so the fail-closed
+        // "no trusted key for this issuer" branch cannot be what rejects this.
+        // Only signature verification can, which is the property under test.
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(consumer_id.clone(), *key.verifying_key());
+        let policy = NrfPolicy {
+            cca_trusted_keys: trusted.clone(),
+            ..NrfPolicy::default()
+        };
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&forged), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "an unsigned CCA must not authenticate: {:?}",
+            resp.http.content
+        );
+        assert_eq!(error_of(&resp)["error"], "invalid_client");
+
+        // And with signature verification explicitly OFF -- the pre-fix default --
+        // the forged assertion must STILL not authenticate the caller. This is the
+        // combination that made gaps 1 and 2 inseparable: enforcement on, evidence
+        // unchecked, so a forgery satisfies the requirement.
+        let unchecked = NrfPolicy {
+            cca_verify_signature: false,
+            cca_trusted_keys: trusted,
+            ..NrfPolicy::default()
+        };
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&forged), None),
+            &unchecked,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "an unverified CCA must not satisfy require_client_auth: {:?}",
+            resp.http.content
+        );
+        assert_eq!(error_of(&resp)["error"], "invalid_client");
+
+        let mgr = nf_manager();
+        mgr.deregister(&consumer_id).ok();
+        mgr.deregister(&producer_id).ok();
+    }
+
+    /// **Issue #64 gap 2.** The `x-forwarded-client-cert` header confers no
+    /// identity unless the operator declared a trusted TLS terminator.
+    ///
+    /// The header is an ordinary request header. Nothing in this repo sets or
+    /// strips it (`grep -rn forwarded-client-cert docker/ deploy/ k8s/ configs/`
+    /// finds nothing) and no SCP fronts the NRF token endpoint, so trusting it
+    /// unconditionally let any client that could reach the NRF assert any
+    /// identity by setting it — and `require_client_cert_binding` would then have
+    /// confirmed the forgery instead of catching it.
+    ///
+    /// Revert-verified: removing the `trust_forwarded_client_cert` gate from
+    /// `extract_transport_client_nf_instance_id` fails this.
+    #[tokio::test]
+    async fn xfcc_header_is_ignored_unless_trusted() {
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd64c");
+        let xfcc = format!("Hash=ab;URI=urn:uuid:{consumer_id}");
+
+        // Default policy: the header is not evidence, so the request is
+        // unauthenticated and refused.
+        let req = auth_token_req(&consumer_id, &ctype, &ptype, None, Some(&xfcc));
+        assert!(
+            extract_transport_client_nf_instance_id(&req, &NrfPolicy::default()).is_none(),
+            "an untrusted forwarded-cert header must confer no identity"
+        );
+        let resp = handle_access_token_request_with_policy(&req, &NrfPolicy::default()).await;
+        assert_eq!(
+            resp.status, 400,
+            "a self-set forwarded-cert header must not authenticate: {:?}",
+            resp.http.content
+        );
+        assert_eq!(error_of(&resp)["error"], "invalid_client");
+
+        // Declare a trusted terminator and the SAME header now authenticates.
+        let trusting = NrfPolicy {
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, None, Some(&xfcc)),
+            &trusting,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "behind a declared terminator the header is the identity: {:?}",
+            resp.http.content
+        );
+
+        let mgr = nf_manager();
+        mgr.deregister(&consumer_id).ok();
+        mgr.deregister(&producer_id).ok();
+    }
+
+    /// **Issue #64 acceptance criterion 2.** A CCA whose subject does not match
+    /// the requester is rejected, and so is a mismatched certificate identity.
+    #[tokio::test]
+    async fn subject_mismatch_is_rejected() {
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd64d");
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // A CCA correctly signed by SOMEONE ELSE's key, asserting their identity,
+        // replayed on a request that claims to be our consumer.
+        let other_cca = nextgcore_sbi::oauth::mint_cca(&key, "a-different-nf", "NRF", now, 60);
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(consumer_id.clone(), *key.verifying_key());
+        let policy = NrfPolicy {
+            cca_trusted_keys: trusted,
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&other_cca), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(resp.status, 400, "CCA subject mismatch must be rejected");
+        assert_eq!(error_of(&resp)["error"], "invalid_client");
+
+        // A certificate identity for a different NF, behind a trusted terminator.
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(
+                &consumer_id,
+                &ctype,
+                &ptype,
+                None,
+                Some("Hash=ab;URI=urn:uuid:a-different-nf"),
+            ),
+            &policy,
+        )
+        .await;
+        assert_eq!(resp.status, 400, "cert identity mismatch must be rejected");
+        assert_eq!(error_of(&resp)["error"], "invalid_client");
+
+        let mgr = nf_manager();
+        mgr.deregister(&consumer_id).ok();
+        mgr.deregister(&producer_id).ok();
+    }
+
+    /// **Issue #64 gaps 1+2, the positive path.** A CCA minted by
+    /// [`nextgcore_sbi::oauth::mint_cca`] and signed with a key the NRF trusts for
+    /// that issuer authenticates the consumer, and the token's `sub` is the
+    /// AUTHENTICATED identity (TS 33.501 §13.4.1.1).
+    ///
+    /// This is the end-to-end proof that the secure default is usable rather than
+    /// merely strict: it exercises the exact assertion an `OAuth2Client` sends.
+    #[tokio::test]
+    async fn signed_cca_authenticates_and_binds_the_token_subject() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd64e");
+
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &consumer_id, "NRF", now, 60);
+
+        // The NRF trusts this issuer's public key -- the operator-provisioned half.
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(consumer_id.clone(), *key.verifying_key());
+        let policy = NrfPolicy {
+            cca_trusted_keys: trusted,
+            ..NrfPolicy::default()
+        };
+
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&cca), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "a signed CCA from a trusted key must authenticate: {:?}",
+            resp.http.content
+        );
+
+        let body: serde_json::Value = serde_json::from_str(resp.http.content.as_deref().unwrap())
+            .expect("token response is JSON");
+        let token = body["access_token"].as_str().expect("access_token");
+        let claims: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(token.split('.').nth(1).expect("payload"))
+                .expect("base64url"),
+        )
+        .expect("claims are JSON");
+        assert_eq!(
+            claims["sub"], consumer_id,
+            "the subject must be the authenticated identity"
+        );
+
+        // An assertion signed by an UNTRUSTED key is refused fail-closed, even
+        // though its claims are identical.
+        let rogue = nextgcore_sbi::oauth::generate_es256_key();
+        let rogue_cca = nextgcore_sbi::oauth::mint_cca(&rogue, &consumer_id, "NRF", now, 60);
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&rogue_cca), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "a CCA signed by an untrusted key must be refused"
+        );
+        assert_eq!(error_of(&resp)["error"], "invalid_client");
+
+        let mgr = nf_manager();
+        mgr.deregister(&consumer_id).ok();
+        mgr.deregister(&producer_id).ok();
+    }
+
+    /// Issue #64 gaps 1+2, the WIRE contract between the two crates: a CCA minted
+    /// by `nextgcore-sbi`, encoded into the form body it actually sends, must
+    /// survive nrfd's own parser and still verify.
+    ///
+    /// Worth its own test because the two halves live in different crates and
+    /// neither one alone can prove the round trip. A form body is
+    /// percent-encoded and `percent_decode` maps `+` to space; a JWT is
+    /// base64url plus `.` separators, which `url_encode` leaves untouched — but
+    /// that is a property of two functions agreeing, not something either
+    /// guarantees on its own. If it ever stops holding, every NF silently fails
+    /// authentication.
+    #[test]
+    fn a_minted_cca_survives_the_form_body_round_trip() {
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let now = 1_700_000_000u64;
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, "amf-1", "NRF", now, 60);
+
+        // Encode exactly as OAuth2Client::request_token does.
+        let mut req = nextgcore_sbi::oauth::AccessTokenRequest::new(
+            "amf-1",
+            NfType::Amf,
+            NfType::Udm,
+            "nudm-sdm",
+        );
+        req.cca = Some(cca.clone());
+        let body = req.to_form_body();
+
+        // ...and decode with the NRF's own parser.
+        let parsed = parse_token_request(&body);
+        assert_eq!(parsed.nf_instance_id, "amf-1");
+        assert_eq!(
+            parsed.cca, cca,
+            "the CCA must arrive byte-identical, or its signature cannot verify"
+        );
+        // The assertion the NRF reconstructed still passes both NRF-side checks.
+        verify_cca_binding(&parsed.cca, "amf-1", now).expect("binding holds after the round trip");
+        verify_cca_signature(&parsed.cca, key.verifying_key())
+            .expect("signature holds after the round trip");
+    }
+
+    /// Issue #64 gap 2: `authenticate_token_client` returns an identity ONLY for
+    /// proven evidence, and records HOW it was proven.
+    #[test]
+    fn authenticate_token_client_reports_only_proven_identities() {
+        let now = 1_700_000_000u64;
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, "nf-1", "NRF", now, 60);
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert("nf-1".to_string(), *key.verifying_key());
+
+        // Nothing presented -> nothing proven.
+        let bare = SbiRequest::post("/x");
+        let auth =
+            authenticate_token_client(&NrfPolicy::default(), &bare, "nf-1", "", now).unwrap();
+        assert!(!auth.is_authenticated());
+        assert!(!auth.via_transport);
+
+        // A verified CCA proves the identity, but NOT via transport -- so it
+        // cannot satisfy `require_client_cert_binding`.
+        let policy = NrfPolicy {
+            cca_trusted_keys: trusted.clone(),
+            ..NrfPolicy::default()
+        };
+        let auth = authenticate_token_client(&policy, &bare, "nf-1", &cca, now).unwrap();
+        assert_eq!(auth.identity.as_deref(), Some("nf-1"));
+        assert!(
+            !auth.via_transport,
+            "a CCA is not transport authentication; mandating mTLS must still reject it"
+        );
+        assert_eq!(
+            enforce_client_authentication(
+                &NrfPolicy {
+                    require_client_cert_binding: true,
+                    ..policy.clone()
+                },
+                auth.is_authenticated(),
+                auth.via_transport,
+            )
+            .unwrap_err()
+            .0,
+            "invalid_client"
+        );
+
+        // With signature verification explicitly off, the assertion is still
+        // claim-checked but authenticates nothing -- the honest reading of "we
+        // did not check it".
+        let unchecked = NrfPolicy {
+            cca_verify_signature: false,
+            ..NrfPolicy::default()
+        };
+        let auth = authenticate_token_client(&unchecked, &bare, "nf-1", &cca, now).unwrap();
+        assert!(
+            !auth.is_authenticated(),
+            "an unverified assertion proves nothing"
+        );
+        // ...and a contradictory one is still refused outright.
+        assert!(authenticate_token_client(&unchecked, &bare, "nf-2", &cca, now).is_err());
     }
 
     // -----------------------------------------------------------------

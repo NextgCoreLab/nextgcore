@@ -1358,6 +1358,7 @@ mod tests {
                 target_nf_type: NfType::Udm,
                 scope: "nudm-sdm".to_string(),
                 target_nf_instance_id: None,
+                cca: None,
             });
         let json = serde_json::to_string(&problem).unwrap();
         assert!(json.contains(r#""nrfId":"nrf-1""#));

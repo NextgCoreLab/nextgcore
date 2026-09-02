@@ -649,4 +649,68 @@ mod audience_binding_guards {
              exemption to this guard explaining why the NF has no NF-type aud."
         );
     }
+
+    /// Issue #64 gaps 1+2: every NF acquires its OAuth2 client through
+    /// `OAuth2Client::new`, which is where the process-wide CCA signing key is
+    /// seeded — so a deployment turns on client authentication in ONE place.
+    ///
+    /// A struct literal would bypass that seeding silently: the NF would still
+    /// compile, still request tokens, and be rejected by an NRF running its
+    /// default policy with nothing pointing at the cause. This is the same failure
+    /// shape as the `--kill` flag that was duplicated across 12 daemons and
+    /// therefore wrong in 12 places at once.
+    #[test]
+    fn every_nf_builds_its_oauth2_client_through_the_shared_constructor() {
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+        assert!(bins.is_dir(), "expected {} to exist", bins.display());
+
+        let mut constructing = Vec::new();
+        let mut bypassing = Vec::new();
+
+        for entry in std::fs::read_dir(&bins).expect("read bins/") {
+            let path = entry.expect("dir entry").path();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let src = path.join("src");
+            if !src.is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(&src).expect("read src/") {
+                let f = file.expect("file entry").path();
+                if f.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&f).unwrap_or_default();
+                if text.contains("OAuth2Client::new") {
+                    constructing.push(name.clone());
+                }
+                // A struct literal skips `new`, so it skips the key seeding.
+                if text.contains("OAuth2Client {") {
+                    bypassing.push(name.clone());
+                }
+            }
+        }
+
+        assert!(
+            !constructing.is_empty(),
+            "expected to find NFs constructing an OAuth2Client; the guard found none, so \
+             it is no longer checking anything"
+        );
+        bypassing.sort();
+        bypassing.dedup();
+        assert!(
+            bypassing.is_empty(),
+            "these NFs build an OAuth2Client by struct literal, bypassing \
+             OAuth2Client::new and therefore the process-wide CCA signing key: {bypassing:?}. \
+             They would request tokens with no client authentication and be rejected by an \
+             NRF running its default policy. Use OAuth2Client::new (plus \
+             with_cca_signing_key when a per-instance key is wanted)."
+        );
+    }
 }

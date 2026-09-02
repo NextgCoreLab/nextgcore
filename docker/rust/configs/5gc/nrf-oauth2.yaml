@@ -41,3 +41,21 @@ nrf:
           min_version: "1.2"
     oauth2:
       require: true
+      # ---------------------------------------------------------------------
+      # ESCAPE HATCH (issue #64 gap 1). Client authentication at the token
+      # endpoint now defaults ON: the NRF requires a CCA signed with a key it
+      # trusts for the requesting nfInstanceId, or an mTLS client identity.
+      #
+      # This overlay cannot satisfy that yet, and the reason is concrete: the
+      # NRF verifies a CCA against `cca_trusted_keys`, which is keyed by
+      # nfInstanceId — but no NF in docker-compose.yml pins its instance ID, so
+      # every NF generates a fresh UUID on each start and there is no stable key
+      # to pre-register. Provisioning it needs (a) pinned nfInstanceIds per NF,
+      # (b) a generated ES256 key per NF mounted at
+      # NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE, and (c) the matching public JWKs
+      # listed under cca_trusted_keys here.
+      #
+      # Until then this overlay explicitly opts out, so the insecure posture is
+      # asked for by name and announced with a startup warn! rather than being a
+      # silent default. DO NOT copy this line into a production config.
+      require_client_auth: false

@@ -8,7 +8,7 @@
 //! NF service producers.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,253 @@ fn env_flag_truthy(value: Option<&str>) -> bool {
     }
 }
 
+// ============================================================================
+// ES256 key material (issue #64) — shared by the NRF's token-signing key and
+// every NF's Client-Credentials-Assertion signing key
+// ============================================================================
+
+/// Load a hex-encoded ES256 (ECDSA P-256) private key from `path`, or generate
+/// one and persist it there.
+///
+/// The format is the raw 32-byte scalar, hex-encoded. Deliberately not
+/// PKCS#8/PEM: that needs a `p256` feature this build does not enable, and the
+/// intended operator flow is to let the process generate the file on first
+/// start and then mount it (as a Kubernetes Secret or equivalent) so restarts
+/// and replicas share it — no externally-generated key has to be parsed.
+///
+/// **A malformed or wrong-length file is an error, never a silent
+/// regeneration.** The distinction that matters is between *absent* and
+/// *invalid*: absent legitimately means "create one", invalid means a human
+/// needs to look at it. Quietly minting a replacement would invalidate every
+/// credential other parties have already verified against the old key — for the
+/// NRF's signing key that is exactly the defect issue #64 gap 4 fixed, and for
+/// an NF's CCA key it would silently stop the NRF trusting that NF.
+///
+/// The file is created `0600` on Unix: it is a private key.
+pub fn load_or_create_es256_key(path: &std::path::Path) -> SbiResult<p256::ecdsa::SigningKey> {
+    if path.exists() {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            SbiError::ClientError(format!("failed to read ES256 key {}: {e}", path.display()))
+        })?;
+        let raw = hex::decode(text.trim()).map_err(|e| {
+            SbiError::ClientError(format!(
+                "ES256 key {} is not hex ({e}); refusing to regenerate, because a new key \
+                 would invalidate every credential already issued under the old one",
+                path.display()
+            ))
+        })?;
+        let key = p256::ecdsa::SigningKey::from_slice(&raw).map_err(|e| {
+            SbiError::ClientError(format!(
+                "ES256 key {} does not hold a valid P-256 scalar ({} bytes): {e}",
+                path.display(),
+                raw.len()
+            ))
+        })?;
+        return Ok(key);
+    }
+
+    let key = generate_es256_key();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                SbiError::ClientError(format!(
+                    "failed to create the directory for {}: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
+    std::fs::write(path, hex::encode(key.to_bytes()))
+        .map_err(|e| SbiError::ClientError(format!("failed to write {}: {e}", path.display())))?;
+    // Owner-only: this is a private key.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            SbiError::ClientError(format!(
+                "failed to restrict permissions on {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(key)
+}
+
+/// Generate a fresh ES256 (ECDSA P-256) signing key.
+pub fn generate_es256_key() -> p256::ecdsa::SigningKey {
+    use rand::Rng;
+    // Draw a random scalar; reject the (vanishingly rare) invalid ones.
+    loop {
+        let bytes = rand::rng().random::<[u8; 32]>();
+        if let Ok(sk) = p256::ecdsa::SigningKey::from_slice(&bytes) {
+            break sk;
+        }
+    }
+}
+
+// ============================================================================
+// Client Credentials Assertion (CCA) — TS 33.501 §13.3.8
+// ============================================================================
+
+/// Default CCA lifetime. The assertion is presented once, immediately, on a
+/// single token request, so it is deliberately short: TS 33.501 §13.3.8.3 has
+/// the NRF validate the timestamp, and a long-lived assertion is a replayable
+/// bearer credential.
+pub const CCA_DEFAULT_LIFETIME_SECS: u64 = 60;
+
+/// Build a signed Client Credentials Assertion (TS 33.501 §13.3.8.2).
+///
+/// The CCA is how an NF proves its identity to the NRF's access-token endpoint
+/// when the NRF cannot see a mutually-authenticated client certificate — for
+/// example when an SCP terminates TLS, or on a deployment where the NRF's
+/// listener does not surface the peer certificate. Without it the endpoint has
+/// nothing to authenticate and can only trust a self-asserted `nfInstanceId`,
+/// which is issue #64 gaps 1 and 2.
+///
+/// Claims are exactly what the receiving NRF validates: `sub` and `iss` are the
+/// asserting NF's own instance ID (the assertion is self-issued), `aud` is the
+/// receiving NF's *type* (`"NRF"` for the token endpoint), plus `iat` and `exp`.
+/// The signature is ES256 over `base64url(header) "." base64url(payload)`
+/// (RFC 7515 §5.2), with the fixed 64-byte `r||s` form of RFC 7518 §3.4.
+pub fn mint_cca(
+    key: &p256::ecdsa::SigningKey,
+    nf_instance_id: &str,
+    audience: &str,
+    now: u64,
+    lifetime_secs: u64,
+) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use p256::ecdsa::{signature::Signer, Signature};
+
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+    let claims = serde_json::json!({
+        "sub": nf_instance_id,
+        "iss": nf_instance_id,
+        "aud": audience,
+        "iat": now,
+        "exp": now.saturating_add(lifetime_secs),
+    });
+    let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+    let signing_input = format!("{header}.{payload}");
+    let signature: Signature = key.sign(signing_input.as_bytes());
+    format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    )
+}
+
+/// Environment variable naming the file that holds this NF's ES256 CCA signing
+/// key. Generated on first use if absent (see [`load_or_create_es256_key`]).
+///
+/// Resolved process-wide so a deployment gains client authentication without
+/// touching any of the 16 `OAuth2Client::new` construction sites — the same
+/// reasoning as the shared `--kill` helper: a knob duplicated per daemon stays
+/// wrong in every one of them at once. Register the corresponding PUBLIC key
+/// with the NRF under `nrf.sbi.oauth2.cca_trusted_keys`, keyed by this NF's
+/// `nfInstanceId`, or the NRF cannot verify the assertion.
+pub const CCA_SIGNING_KEY_FILE_ENV: &str = "NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE";
+
+/// Process-wide CCA signing key state: whether a programmatic override is in
+/// force, and if so what it is.
+enum CcaKeyOverride {
+    /// No override — resolve [`CCA_SIGNING_KEY_FILE_ENV`].
+    Unset,
+    /// Explicitly no key: send token requests without a CCA even if the env var
+    /// is set. Used by tests that assert the unauthenticated path.
+    Disabled,
+    /// Use this key.
+    Key(Arc<p256::ecdsa::SigningKey>),
+}
+
+static CCA_KEY_OVERRIDE: std::sync::RwLock<CcaKeyOverride> =
+    std::sync::RwLock::new(CcaKeyOverride::Unset);
+
+/// Env-resolved key, computed at most once per process.
+static CCA_KEY_FROM_ENV: OnceLock<Option<Arc<p256::ecdsa::SigningKey>>> = OnceLock::new();
+
+/// Set the process-wide CCA signing key, overriding
+/// [`CCA_SIGNING_KEY_FILE_ENV`]. Every subsequently-constructed
+/// [`OAuth2Client`] signs its access-token requests with it.
+pub fn set_cca_signing_key(key: Arc<p256::ecdsa::SigningKey>) {
+    if let Ok(mut guard) = CCA_KEY_OVERRIDE.write() {
+        *guard = CcaKeyOverride::Key(key);
+    }
+}
+
+/// Force the process-wide CCA signing key OFF, so token requests carry no
+/// assertion even when [`CCA_SIGNING_KEY_FILE_ENV`] is set.
+pub fn disable_cca_signing_key() {
+    if let Ok(mut guard) = CCA_KEY_OVERRIDE.write() {
+        *guard = CcaKeyOverride::Disabled;
+    }
+}
+
+/// Clear a programmatic override, restoring env-var-driven resolution.
+pub fn reset_cca_signing_key() {
+    if let Ok(mut guard) = CCA_KEY_OVERRIDE.write() {
+        *guard = CcaKeyOverride::Unset;
+    }
+}
+
+/// Resolve this NF's CCA signing key: the programmatic override first, then
+/// [`CCA_SIGNING_KEY_FILE_ENV`], else `None` (no assertion is sent).
+///
+/// An unusable key file logs an `error!` naming the consequence and resolves to
+/// `None` rather than aborting a request path that cannot report it; the NRF
+/// then rejects the token request with `invalid_client` under its default
+/// policy, so the misconfiguration is loud in both logs. Call
+/// [`init_cca_signing_key_from_env`] at startup to fail fast instead.
+pub fn cca_signing_key_default() -> Option<Arc<p256::ecdsa::SigningKey>> {
+    if let Ok(guard) = CCA_KEY_OVERRIDE.read() {
+        match &*guard {
+            CcaKeyOverride::Disabled => return None,
+            CcaKeyOverride::Key(k) => return Some(k.clone()),
+            CcaKeyOverride::Unset => {}
+        }
+    }
+    CCA_KEY_FROM_ENV
+        .get_or_init(|| {
+            let path = std::env::var(CCA_SIGNING_KEY_FILE_ENV).ok()?;
+            let path = path.trim();
+            if path.is_empty() {
+                return None;
+            }
+            match load_or_create_es256_key(std::path::Path::new(path)) {
+                Ok(key) => {
+                    log::info!("CCA signing key loaded from {path}");
+                    Some(Arc::new(key))
+                }
+                Err(e) => {
+                    log::error!(
+                        "CCA signing key {path} is unusable: {e}. Access-token requests will \
+                         be sent WITHOUT client authentication, and an NRF running its \
+                         default policy will reject them with invalid_client."
+                    );
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+/// Resolve [`CCA_SIGNING_KEY_FILE_ENV`] eagerly so a misconfigured key file
+/// fails at startup rather than at the first token request. Returns whether a
+/// key is now configured.
+pub fn init_cca_signing_key_from_env() -> SbiResult<bool> {
+    let Ok(path) = std::env::var(CCA_SIGNING_KEY_FILE_ENV) else {
+        return Ok(false);
+    };
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Ok(false);
+    }
+    let key = load_or_create_es256_key(std::path::Path::new(&path))?;
+    set_cca_signing_key(Arc::new(key));
+    log::info!("CCA signing key loaded from {path}");
+    Ok(true)
+}
+
 /// OAuth2 access token response per RFC 6749 Section 4.4.3 and 3GPP TS 29.510.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessTokenResponse {
@@ -130,6 +377,16 @@ pub struct AccessTokenRequest {
     /// Target NF Instance ID (optional)
     #[serde(rename = "targetNfInstanceId", skip_serializing_if = "Option::is_none")]
     pub target_nf_instance_id: Option<String>,
+    /// Client Credentials Assertion (TS 33.501 §13.3.8, TS 29.510 §6.7.5): a
+    /// self-issued, ES256-signed JWT proving the requester really is
+    /// `nf_instance_id`. Absent by default; populated by [`OAuth2Client`] when a
+    /// CCA signing key is configured (see [`CCA_SIGNING_KEY_FILE_ENV`]).
+    ///
+    /// Without it the NRF has nothing to authenticate and can only trust a
+    /// self-asserted `nfInstanceId` — issue #64 gaps 1 and 2 — so an NRF running
+    /// its default policy rejects such a request with `invalid_client`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cca: Option<String>,
 }
 
 impl AccessTokenRequest {
@@ -147,12 +404,20 @@ impl AccessTokenRequest {
             target_nf_type,
             scope: scope.into(),
             target_nf_instance_id: None,
+            cca: None,
         }
     }
 
     /// Set the target NF instance ID.
     pub fn with_target_nf_instance_id(mut self, id: impl Into<String>) -> Self {
         self.target_nf_instance_id = Some(id.into());
+        self
+    }
+
+    /// Attach a Client Credentials Assertion (TS 33.501 §13.3.8). Build one with
+    /// [`mint_cca`].
+    pub fn with_cca(mut self, cca: impl Into<String>) -> Self {
+        self.cca = Some(cca.into());
         self
     }
 
@@ -167,6 +432,12 @@ impl AccessTokenRequest {
         ];
         if let Some(ref id) = self.target_nf_instance_id {
             parts.push(format!("targetNfInstanceId={}", url_encode(id)));
+        }
+        // TS 29.510 §6.7.5: the CCA travels in the token request. It is a JWT —
+        // base64url plus two `.` separators, all form-safe — but it is
+        // percent-encoded like every other value so the encoding is uniform.
+        if let Some(ref cca) = self.cca {
+            parts.push(format!("cca={}", url_encode(cca)));
         }
         parts.join("&")
     }
@@ -566,6 +837,12 @@ pub struct OAuth2Client {
     /// [`OAuth2Client::TOKEN_PATH_BESPOKE`]. Override per instance with
     /// [`OAuth2Client::with_token_path`].
     token_path: String,
+    /// ES256 key this NF signs its Client Credentials Assertion with (issue #64
+    /// gaps 1 and 2). Seeded from the process-wide
+    /// [`cca_signing_key_default`]; override per instance with
+    /// [`OAuth2Client::with_cca_signing_key`]. `None` sends token requests with
+    /// no assertion, which an NRF running its default policy rejects.
+    cca_signing_key: Option<Arc<p256::ecdsa::SigningKey>>,
 }
 
 impl OAuth2Client {
@@ -605,7 +882,52 @@ impl OAuth2Client {
             cache: TokenCache::new(),
             tls: None,
             token_path: Self::default_token_path().to_string(),
+            cca_signing_key: cca_signing_key_default(),
         }
+    }
+
+    /// Sign this client's access-token requests with `key`, overriding the
+    /// process-wide [`cca_signing_key_default`].
+    ///
+    /// The NRF verifies the assertion against the PUBLIC half, which it must
+    /// hold under `nrf.sbi.oauth2.cca_trusted_keys` keyed by this NF's
+    /// `nfInstanceId`; an issuer with no trusted key there is rejected
+    /// fail-closed.
+    pub fn with_cca_signing_key(mut self, key: Arc<p256::ecdsa::SigningKey>) -> Self {
+        self.cca_signing_key = Some(key);
+        self
+    }
+
+    /// Send access-token requests WITHOUT a Client Credentials Assertion, even
+    /// when one is configured process-wide. An NRF running its default policy
+    /// rejects such a request with `invalid_client`.
+    pub fn without_cca(mut self) -> Self {
+        self.cca_signing_key = None;
+        self
+    }
+
+    /// Whether this client can authenticate itself to the NRF token endpoint.
+    pub fn has_cca_signing_key(&self) -> bool {
+        self.cca_signing_key.is_some()
+    }
+
+    /// Mint the Client Credentials Assertion for a token request, when a signing
+    /// key is configured. `aud` is the receiving NF's type, `"NRF"` for the
+    /// access-token endpoint (TS 33.501 §13.3.8.3: the NRF checks the audience
+    /// against its own NF type).
+    fn build_cca(&self) -> Option<String> {
+        let key = self.cca_signing_key.as_ref()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Some(mint_cca(
+            key,
+            &self.nf_instance_id,
+            NfType::Nrf.to_str(),
+            now,
+            CCA_DEFAULT_LIFETIME_SECS,
+        ))
     }
 
     /// Override the access-token resource path (sbi-06). The default is the
@@ -677,8 +999,12 @@ impl OAuth2Client {
         target_nf_type: NfType,
         scope: &str,
     ) -> SbiResult<AccessTokenResponse> {
-        let request =
+        let mut request =
             AccessTokenRequest::new(&self.nf_instance_id, self.nf_type, target_nf_type, scope);
+        // Issue #64 gaps 1+2: authenticate this NF to the token endpoint. Absent
+        // a CCA (and absent a client certificate the NRF can see) the NRF has
+        // only the self-asserted nfInstanceId in the body to go on.
+        request.cca = self.build_cca();
 
         let body = request.to_form_body();
         // sbi-06/I4: the resource path is configurable; the process-wide
@@ -1082,6 +1408,183 @@ mod tests {
         // start from the shipped (env-driven) baseline.
         reset_oauth2_standard_paths_default();
         g
+    }
+
+    /// Same treatment for the process-wide CCA signing key (issue #64): tests
+    /// that flip it must not perturb one asserting the default.
+    static CCA_KEY_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_cca_key() -> std::sync::MutexGuard<'static, ()> {
+        let g = CCA_KEY_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset_cca_signing_key();
+        g
+    }
+
+    /// Issue #64 gaps 1+2: `mint_cca` must produce exactly the assertion the NRF
+    /// validates — ES256 header, `sub == iss == nfInstanceId`, `aud` = the
+    /// receiving NF type, `iat`/`exp` present — and its signature must verify
+    /// against the public half.
+    ///
+    /// If this drifts, every NF silently loses the ability to authenticate to the
+    /// token endpoint and the NRF's default policy refuses them all.
+    #[test]
+    fn mint_cca_is_verifiable_and_carries_the_claims_the_nrf_checks() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::signature::Verifier;
+
+        let key = generate_es256_key();
+        let now = 1_700_000_000u64;
+        let cca = mint_cca(&key, "amf-1", "NRF", now, CCA_DEFAULT_LIFETIME_SECS);
+
+        let parts: Vec<&str> = cca.split('.').collect();
+        assert_eq!(parts.len(), 3, "a CCA is a three-part JWS");
+
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).expect("header b64"))
+                .expect("header JSON");
+        assert_eq!(
+            header["alg"], "ES256",
+            "the NRF rejects any other alg, `none` included"
+        );
+
+        let claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).expect("payload b64"))
+                .expect("claims JSON");
+        assert_eq!(claims["sub"], "amf-1");
+        assert_eq!(claims["iss"], "amf-1", "the assertion is self-issued");
+        assert_eq!(claims["aud"], "NRF", "audience is the receiving NF's TYPE");
+        assert_eq!(claims["iat"], now);
+        assert_eq!(claims["exp"], now + CCA_DEFAULT_LIFETIME_SECS);
+
+        // The signature covers `header.payload` and verifies with the public key.
+        let sig = p256::ecdsa::Signature::from_slice(
+            &URL_SAFE_NO_PAD.decode(parts[2]).expect("signature b64"),
+        )
+        .expect("64-byte r||s");
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        key.verifying_key()
+            .verify(signing_input.as_bytes(), &sig)
+            .expect("the CCA signature must verify against the public key");
+
+        // A tampered payload must not verify — the whole point of signing it.
+        let tampered = format!("{}.{}", parts[0], URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#));
+        assert!(key
+            .verifying_key()
+            .verify(tampered.as_bytes(), &sig)
+            .is_err());
+    }
+
+    /// Issue #64 gaps 1+2: a configured signing key puts a `cca` on the wire, and
+    /// no key leaves the request unauthenticated.
+    #[test]
+    fn token_request_carries_a_cca_only_when_a_key_is_configured() {
+        let key = Arc::new(generate_es256_key());
+
+        // Per-instance key (no process-global state touched).
+        let with_key = OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf)
+            .with_cca_signing_key(key.clone());
+        assert!(with_key.has_cca_signing_key());
+        let cca = with_key.build_cca().expect("a key means an assertion");
+        let mut req = AccessTokenRequest::new("amf-1", NfType::Amf, NfType::Udm, "nudm-sdm");
+        req.cca = Some(cca);
+        let body = req.to_form_body();
+        assert!(body.contains("cca="), "the CCA must reach the wire: {body}");
+        // Still a well-formed form body alongside the mandatory parameters.
+        assert!(body.contains("grant_type=client_credentials"));
+        assert!(body.contains("nfInstanceId=amf-1"));
+
+        // No key -> no assertion, and no `cca` parameter at all (rather than an
+        // empty one, which the NRF would read as "a CCA was presented").
+        let without = OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf).without_cca();
+        assert!(!without.has_cca_signing_key());
+        assert!(without.build_cca().is_none());
+        let bare = AccessTokenRequest::new("amf-1", NfType::Amf, NfType::Udm, "nudm-sdm");
+        assert!(!bare.to_form_body().contains("cca="));
+    }
+
+    /// Issue #64: the signing key is resolved PROCESS-WIDE so a deployment gains
+    /// client authentication without editing any of the 16 `OAuth2Client::new`
+    /// construction sites — a knob duplicated per daemon stays wrong in every one
+    /// of them at once.
+    #[test]
+    fn cca_signing_key_is_resolved_process_wide() {
+        let _g = lock_cca_key();
+
+        // Baseline: no override, and (in the test environment) no env var.
+        assert!(
+            cca_signing_key_default().is_none() || std::env::var(CCA_SIGNING_KEY_FILE_ENV).is_ok(),
+            "with no override and no env var, no assertion is sent"
+        );
+
+        let key = Arc::new(generate_es256_key());
+        set_cca_signing_key(key.clone());
+        assert_eq!(
+            cca_signing_key_default().map(|k| k.to_bytes()),
+            Some(key.to_bytes()),
+            "the override is what every new client picks up"
+        );
+        // A freshly-constructed client inherits it with no per-NF wiring.
+        assert!(OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf).has_cca_signing_key());
+
+        disable_cca_signing_key();
+        assert!(
+            cca_signing_key_default().is_none(),
+            "an explicit disable beats the env var"
+        );
+
+        reset_cca_signing_key();
+    }
+
+    /// Issue #64: the shared ES256 key loader distinguishes ABSENT (create one)
+    /// from INVALID (a human must look at it). Regenerating on a malformed file
+    /// would invalidate every credential already issued under the old key — which
+    /// for the NRF's signing key is precisely the gap-4 defect.
+    #[test]
+    fn load_or_create_es256_key_fails_on_invalid_and_creates_on_absent() {
+        let dir = std::env::temp_dir().join(format!("sbi-cca-key-{}", std::process::id()));
+        let path = dir.join("nested").join("cca.key");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Absent -> created, including parent directories, and stable on reload.
+        let first = load_or_create_es256_key(&path).expect("absent means create");
+        assert!(path.exists());
+        let second = load_or_create_es256_key(&path).expect("present means load");
+        assert_eq!(
+            first.to_bytes(),
+            second.to_bytes(),
+            "reloading must yield the identical key"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "a private key must not be world-readable"
+            );
+        }
+
+        // Invalid -> error, never a silent replacement. Both shapes: unparseable,
+        // and right-encoding-wrong-length (the likelier real corruption, e.g. a
+        // truncated write or a partially-mounted secret).
+        std::fs::write(&path, "not-hex").expect("write");
+        assert!(load_or_create_es256_key(&path).is_err());
+        std::fs::write(&path, "aabbcc").expect("write");
+        assert!(load_or_create_es256_key(&path).is_err());
+        // The file is left untouched, so an operator can still recover it.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read").trim(),
+            "aabbcc",
+            "a failed load must not overwrite the file it could not parse"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -30,9 +30,7 @@ uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 base64.workspace = true
-rand.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
-hex.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
