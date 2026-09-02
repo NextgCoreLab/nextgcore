@@ -567,7 +567,10 @@ impl SbiClient {
     /// Stamp the standard outbound headers on `request` exactly once before the
     /// (possibly retried / redirected) send. Mutations are identical, and in the
     /// same order, to the pre-refactor inline code.
-    async fn prepare_request(&self, request: &mut SbiRequest) {
+    /// Returns `Err` when OAuth2 is configured for this client but a token could
+    /// not be obtained (issue #63). See the token block below for why that is not
+    /// a warning.
+    async fn prepare_request(&self, request: &mut SbiRequest) -> SbiResult<()> {
         // Automatically attach Bearer token if OAuth2 is configured
         // and the request does not already carry an Authorization header
         if let (Some(oauth2), Some(target_nf_type)) = (&self.oauth2, &self.target_nf_type) {
@@ -582,7 +585,30 @@ impl SbiClient {
                             request.http.set_header("Authorization", auth_value);
                         }
                         Err(e) => {
-                            log::warn!("OAuth2 token request failed, sending without token: {e}");
+                            // Issue #63: FAIL CLOSED. This used to log a warning
+                            // and send the request anyway, so a token endpoint
+                            // that was unreachable or misconfigured silently
+                            // stripped SBI authentication from every outbound
+                            // request -- the posture degraded to unauthenticated
+                            // with nothing but a warn-level line to show it, which
+                            // is precisely the regression an operator cannot see
+                            // (TS 33.501 13.4.1.1).
+                            //
+                            // Only reachable when OAuth2 IS configured on this
+                            // client, i.e. the deployment asked for authenticated
+                            // SBI. A client with no OAuth2 configured is untouched,
+                            // so this cannot break the default or E2E paths -- it
+                            // only stops a deployment that wanted authentication
+                            // from silently losing it.
+                            log::error!(
+                                "OAuth2 token acquisition failed; refusing to send {} {} \
+                                 unauthenticated: {e}",
+                                request.header.method,
+                                request.header.uri
+                            );
+                            return Err(SbiError::AuthenticationFailed(format!(
+                                "could not obtain an access token for scope '{scope}': {e}"
+                            )));
                         }
                     }
                 }
@@ -633,6 +659,8 @@ impl SbiClient {
             let traceparent = format!("00-{}-{}-01", hex::encode(trace_id), hex::encode(span_id),);
             request.http.set_header("traceparent", traceparent);
         }
+
+        Ok(())
     }
 
     /// sbi-05 retry wrapper. Only entered when `max_attempts > 1`. Re-runs the
@@ -693,7 +721,7 @@ impl SbiClient {
     /// by [`MAX_REDIRECTS`]. A normal (non-redirect) response takes a single
     /// `send_once` call against the pooled connection — identical to before.
     async fn send_following_redirects(&self, mut request: SbiRequest) -> SbiResult<SbiResponse> {
-        self.prepare_request(&mut request).await;
+        self.prepare_request(&mut request).await?;
 
         // First attempt uses the pooled connection (target = None).
         let mut target: Option<ConnectTarget> = None;
@@ -1671,6 +1699,71 @@ mod tests {
             count.load(Ordering::SeqCst),
             2,
             "exactly max_attempts tries"
+        );
+    }
+
+    // ── issue #63: the consumer client must not fail OPEN ──────────────────
+
+    /// **The #63 fail-open fix.** When OAuth2 is configured but a token cannot be
+    /// obtained, the request must FAIL rather than go out unauthenticated.
+    ///
+    /// The load-bearing assertion is the error KIND. Before this, token
+    /// acquisition failure logged a warning and the request proceeded, so the
+    /// caller saw whatever the target replied -- a success against a producer that
+    /// does not enforce tokens, or a connection error. Either way the token
+    /// failure was invisible. Now it surfaces as `AuthenticationFailed`, which is
+    /// distinguishable from `ConnectionError` and cannot be mistaken for the
+    /// target being down.
+    #[tokio::test]
+    async fn token_acquisition_failure_fails_the_request_not_the_authentication() {
+        // Token endpoint on a closed port: acquisition cannot succeed.
+        let oauth2 = std::sync::Arc::new(crate::oauth::OAuth2Client::new(
+            "http://127.0.0.1:1",
+            "amf-63-test",
+            NfType::Amf,
+        ));
+        // The TARGET is also unreachable, deliberately: if the fix regressed, the
+        // request would proceed and fail with ConnectionError instead, so the
+        // assertion below distinguishes "refused to send" from "sent and failed".
+        let client = SbiClient::with_host_port("127.0.0.1", 1).with_oauth2(oauth2, NfType::Udm);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.send_request(SbiRequest::get("/nudm-sdm/v1/imsi-001010000000001/am-data")),
+        )
+        .await
+        .expect("must not hang");
+
+        let err = result.expect_err("a request with no obtainable token must fail");
+        assert!(
+            matches!(err, SbiError::AuthenticationFailed(_)),
+            "the token failure must surface as AuthenticationFailed, not as a \
+             transport error or a success: got {err:?}"
+        );
+        assert_eq!(
+            err.status_code(),
+            Some(401),
+            "the surfaced error should map to 401"
+        );
+    }
+
+    /// A client with NO OAuth2 configured is untouched: it still attempts the
+    /// send. This is why the fail-closed change cannot break the default or E2E
+    /// paths -- only a deployment that asked for authenticated SBI is affected.
+    #[tokio::test]
+    async fn a_client_without_oauth2_still_attempts_the_send() {
+        let client = SbiClient::with_host_port("127.0.0.1", 1);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.send_request(SbiRequest::get("/nudm-sdm/v1/imsi-001010000000001/am-data")),
+        )
+        .await
+        .expect("must not hang");
+
+        let err = result.expect_err("the target is closed, so the send fails");
+        assert!(
+            !matches!(err, SbiError::AuthenticationFailed(_)),
+            "a client with no OAuth2 must not fail on authentication: got {err:?}"
         );
     }
 }
