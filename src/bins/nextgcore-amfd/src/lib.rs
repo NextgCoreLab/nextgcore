@@ -887,9 +887,27 @@ pub async fn run() -> Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;
     let mut sbi_server_config = nextgcore_sbi::server::SbiServerConfig::new(sbi_sock);
-    if oauth2_required(&args.config) {
+    // Issue #63: resolve the SBI security profile, PRODUCTION by default. The
+    // production profile requires OAuth2, so the outbound token client is
+    // installed too -- a producer that demands tokens must also present them.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
+    if sbi_profile.is_production() || oauth2_required(&args.config) {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config).await;
     }
+    let nrf_uri = nextgcore_sbi::context::global_context()
+        .get_nrf_uri()
+        .await
+        .unwrap_or_default();
+    sbi_server_config = nextgcore_sbi::security::apply_sbi_security_profile(
+        sbi_server_config,
+        sbi_profile,
+        nextgcore_sbi::types::NfType::Amf,
+        &nrf_uri,
+    )?;
+    // Issue #63 criterion 2: the profile decided the listener's scheme, so record
+    // it BEFORE the NF profile is built. Otherwise the AMF registers an `http://`
+    // URL for a TLS listener and every peer that discovers it fails to connect.
+    sbi_path::set_sbi_tls_active(sbi_profile.is_production());
     let sbi_server = nextgcore_sbi::server::SbiServer::new(sbi_server_config);
     sbi_server
         .start(namf_server::namf_request_handler)

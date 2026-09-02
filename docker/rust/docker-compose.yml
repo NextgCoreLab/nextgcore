@@ -18,6 +18,21 @@ x-common: &common
     # Set TLS_ENABLED=true to enable HTTPS for SBI
     TLS_ENABLED: "${TLS_ENABLED:-false}"
     SBI_SCHEME: "${SBI_SCHEME:-http}"
+    # ------------------------------------------------------------------------
+    # SBI security profile (issue #63). amfd/smfd/ausfd/udmd default to the
+    # PRODUCTION profile: mutually-authenticated TLS plus a required OAuth2
+    # access token on every SBI request. This compose file is the local
+    # development / matched-simulator E2E stack, which serves cleartext h2c and
+    # whose NFs do not all present tokens, so it opts out EXPLICITLY.
+    #
+    # Without this line those four NFs refuse to start, naming the missing
+    # certificate path -- deliberately, because a security posture that falls
+    # back to cleartext when a file is absent is not a posture.
+    #
+    # Override to run the secure stack once certs are mounted:
+    #   NEXTGCORE_SBI_PROFILE=production docker compose up -d
+    # ------------------------------------------------------------------------
+    NEXTGCORE_SBI_PROFILE: "${NEXTGCORE_SBI_PROFILE:-dev}"
 
 x-nf-healthcheck: &nf-healthcheck
   healthcheck:

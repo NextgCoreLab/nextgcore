@@ -61,6 +61,40 @@ impl Default for TlsPaths {
     }
 }
 
+impl TlsPaths {
+    /// Environment variables overriding each certificate path, so a deployment
+    /// can mount its SBI certificates wherever it likes (issue #63).
+    ///
+    /// Kubernetes Secret mounts, Docker bind mounts and distro packaging all put
+    /// these in different places, and the compiled-in `/etc/nextgcore/tls`
+    /// default cannot be right for all of them. Without an override the
+    /// production profile would be unusable anywhere it does not match — and
+    /// "unusable" in practice means an operator selects the dev profile instead,
+    /// which is the opposite of the intent.
+    pub const CERT_ENV: &'static str = "NEXTGCORE_SBI_TLS_CERT";
+    pub const KEY_ENV: &'static str = "NEXTGCORE_SBI_TLS_KEY";
+    pub const CA_ENV: &'static str = "NEXTGCORE_SBI_TLS_CA";
+
+    /// [`TlsPaths::default`] with each path overridden by its environment
+    /// variable when that variable is set and non-empty.
+    pub fn from_env() -> Self {
+        let or_env = |var: &str, fallback: String| -> String {
+            match std::env::var(var) {
+                Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+                _ => fallback,
+            }
+        };
+        let d = Self::default();
+        Self {
+            cert: or_env(Self::CERT_ENV, d.cert),
+            key: or_env(Self::KEY_ENV, d.key),
+            ca_cert: or_env(Self::CA_ENV, d.ca_cert),
+            client_cert: d.client_cert,
+            client_key: d.client_key,
+        }
+    }
+}
+
 impl Default for SbiSecurityPolicy {
     fn default() -> Self {
         Self::production()
@@ -104,6 +138,23 @@ impl SbiSecurityPolicy {
         }
     }
 
+    /// The policy for a resolved [`SbiProfile`], with certificate paths taken
+    /// from the environment ([`TlsPaths::from_env`]) so a deployment can mount
+    /// them where it likes.
+    ///
+    /// This is the **runtime** entry point that gives
+    /// [`SbiSecurityPolicy::production`] a non-test caller (issue #63 criterion
+    /// 4); before this it was defined and reachable only from unit tests, so the
+    /// intended production posture was dead code.
+    pub fn for_profile(profile: SbiProfile) -> Self {
+        let mut policy = match profile {
+            SbiProfile::Production => Self::production(),
+            SbiProfile::Dev => Self::development(),
+        };
+        policy.tls_paths = TlsPaths::from_env();
+        policy
+    }
+
     /// Check if a given configuration meets the security policy
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut violations = Vec::new();
@@ -124,6 +175,214 @@ impl SbiSecurityPolicy {
             Err(violations)
         }
     }
+}
+
+// ============================================================================
+// SBI security profile (issue #63) — one resolved posture per process
+// ============================================================================
+
+/// Which security posture an NF starts in (issue #63, TS 33.501 §13.1.0).
+///
+/// **`Production` is the default**, so an NF that is simply started serves SBI
+/// over mutually-authenticated TLS and requires an OAuth2 access token. The
+/// previous behaviour — cleartext h2c with no token verification — is still
+/// reachable, but only by asking for it by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SbiProfile {
+    /// TLS + mTLS + OAuth2 required (TS 33.501 §13.1.0, §13.4.1.1).
+    Production,
+    /// Cleartext h2c, no client-certificate verification, no token
+    /// verification. For local development and the matched-simulator E2E only.
+    Dev,
+}
+
+/// Environment variable selecting the profile, process-wide.
+///
+/// `dev`, `development`, `insecure`, `local` and `test` select
+/// [`SbiProfile::Dev`]; `production` and `prod` select
+/// [`SbiProfile::Production`]. **Anything else — including the variable being
+/// unset — is `Production`**: an unrecognised value must not silently downgrade
+/// security, which is the failure mode this issue is about.
+pub const SBI_PROFILE_ENV: &str = "NEXTGCORE_SBI_PROFILE";
+
+impl SbiProfile {
+    /// Resolve the process-wide profile from [`SBI_PROFILE_ENV`].
+    pub fn resolve() -> Self {
+        Self::from_env_value(std::env::var(SBI_PROFILE_ENV).ok().as_deref())
+    }
+
+    /// Pure resolution of an env value, unit-testable without touching the
+    /// process environment.
+    ///
+    /// An unrecognised non-empty value resolves to `Production` **and warns**:
+    /// a typo like `NEXTGCORE_SBI_PROFILE=devel` must not be read as "insecure
+    /// is fine", but it also must not pass silently, because the operator
+    /// clearly meant something.
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        let Some(raw) = value else {
+            return Self::Production;
+        };
+        let v = raw.trim();
+        if v.is_empty() {
+            return Self::Production;
+        }
+        match v.to_ascii_lowercase().as_str() {
+            "dev" | "development" | "insecure" | "local" | "test" => Self::Dev,
+            "production" | "prod" => Self::Production,
+            other => {
+                log::warn!(
+                    "{SBI_PROFILE_ENV}={other:?} is not a recognised profile; using \
+                     'production'. Accepted values: production, prod, dev, development, \
+                     insecure, local, test."
+                );
+                Self::Production
+            }
+        }
+    }
+
+    /// Whether this profile serves SBI over TLS.
+    pub fn is_production(&self) -> bool {
+        matches!(self, Self::Production)
+    }
+}
+
+/// Apply the resolved [`SbiProfile`] to an NF's SBI **server** configuration
+/// (issue #63 criteria 1-4, 7).
+///
+/// Under [`SbiProfile::Production`] this is the single place that turns
+/// [`SbiSecurityPolicy::production`] into concrete listener settings: TLS from
+/// the policy's certificate paths, `verify_client` for mTLS, `require_oauth2`
+/// with the NRF's JWKS as the verification source, and the NF's own type as the
+/// expected token audience. Under [`SbiProfile::Dev`] the config is returned
+/// **untouched**, so the cleartext h2c path is byte-for-byte what it was.
+///
+/// Centralised deliberately. The four core NFs each build their listener at a
+/// different site, and a posture expressed as four copies of the same twenty
+/// lines is a posture that will disagree with itself — the same failure shape as
+/// the `--kill` flag that was duplicated across twelve daemons and wrong in all
+/// twelve. Peripheral NFs that already hand-roll `with_tls` can migrate onto
+/// this later.
+///
+/// # Errors
+///
+/// Fails when the production profile is selected but its certificate, key or CA
+/// file is missing or unreadable. That is deliberate: it surfaces at startup,
+/// naming the path, rather than as a TLS handshake failure on the first peer
+/// connection — and it must never fall back to cleartext, because a security
+/// posture that degrades when a file is absent is not a posture.
+pub fn apply_sbi_security_profile(
+    config: crate::server::SbiServerConfig,
+    profile: SbiProfile,
+    nf_type: NfType,
+    nrf_uri: &str,
+) -> SbiResult<crate::server::SbiServerConfig> {
+    let policy = SbiSecurityPolicy::for_profile(profile);
+    apply_sbi_security_policy(config, profile, &policy, nf_type, nrf_uri)
+}
+
+/// [`apply_sbi_security_profile`] against an explicit policy.
+///
+/// Split out so the production path is testable without writing to the policy's
+/// real certificate directory: a test supplies a policy whose [`TlsPaths`] point
+/// at generated certificates in a temporary directory. Production code should
+/// call [`apply_sbi_security_profile`], which resolves the policy from the
+/// profile and the environment.
+pub fn apply_sbi_security_policy(
+    config: crate::server::SbiServerConfig,
+    profile: SbiProfile,
+    policy: &SbiSecurityPolicy,
+    nf_type: NfType,
+    nrf_uri: &str,
+) -> SbiResult<crate::server::SbiServerConfig> {
+    if profile == SbiProfile::Dev {
+        log::warn!(
+            "SBI security profile is DEV ({SBI_PROFILE_ENV}): serving cleartext h2c with \
+             no client-certificate verification and no access-token verification. \
+             Subscriber identifiers, authentication vectors and session context are \
+             readable and modifiable by anything on the path. Do not run this in \
+             production."
+        );
+        return Ok(config);
+    }
+
+    // Self-check the policy before acting on it, so a contradictory policy is a
+    // startup error rather than a surprising listener.
+    if let Err(violations) = policy.validate() {
+        return Err(SbiError::TlsError(format!(
+            "the production SBI security policy is self-contradictory: {}",
+            violations.join("; ")
+        )));
+    }
+
+    let paths = &policy.tls_paths;
+    for (label, path) in [
+        ("certificate", paths.cert.as_str()),
+        ("private key", paths.key.as_str()),
+        ("client CA certificate", paths.ca_cert.as_str()),
+    ] {
+        if !std::path::Path::new(path).is_file() {
+            return Err(SbiError::TlsError(format!(
+                "SBI production profile requires a TLS {label} at {path}, which does not \
+                 exist. Provision it, or select the dev profile explicitly with \
+                 {SBI_PROFILE_ENV}=dev (cleartext h2c, no token verification)."
+            )));
+        }
+    }
+
+    let mut config = config.with_tls(&paths.key, &paths.cert);
+    if policy.mtls_required {
+        config.verify_client = true;
+        config.verify_client_cacert = Some(paths.ca_cert.clone());
+    }
+
+    if policy.oauth2_required {
+        config.require_oauth2 = true;
+        // The verification source is the NRF's JWKS. An ALREADY-configured source
+        // wins: an NF that set a static `oauth2_jwks`, or derived a JWKS URI from
+        // its own config, has said something more specific than "use the NRF".
+        //
+        // With neither configured this stays None, and the server then rejects
+        // every request with 503 rather than serving unauthenticated (see
+        // `OAuthVerifier::from_config`) -- so an absent NRF is safe to leave to
+        // the server rather than special-casing here.
+        if config.oauth2_jwks.is_none() && config.oauth2_jwks_uri.is_none() {
+            let uri = nrf_uri.trim();
+            if !uri.is_empty() {
+                config.oauth2_jwks_uri =
+                    Some(crate::oauth::JwksCache::for_nrf(uri).jwks_uri().to_string());
+            }
+        }
+        // TS 33.501 §13.4.1.2: a token minted for another producer must not be
+        // accepted here. Again, an explicit audience already set wins.
+        if config.oauth2_expected_audience.is_none() {
+            config = config.with_expected_audience_nf_type(nf_type);
+        }
+    }
+
+    // KNOWN INCOMPLETE (issue #63, remaining half of criterion 1). This function
+    // configures the INBOUND listener. The four core NFs still build their
+    // OUTBOUND peer clients with `SbiClient::with_host_port`, which defaults to
+    // cleartext http with no client certificate -- so NF-to-NF calls between two
+    // production-profile NFs fail at the TLS layer. Said out loud here because the
+    // alternative is an operator debugging a connection error on the callee side
+    // with nothing pointing at the caller's scheme.
+    log::warn!(
+        "SBI production profile: OUTBOUND peer calls are NOT yet profile-aware. This NF's \
+         listener requires mutually-authenticated TLS, but its own calls to other NFs \
+         still use cleartext http with no client certificate, so inter-NF requests to \
+         another production-profile NF will fail to connect. Until that lands, run a \
+         uniformly dev-profile deployment or terminate TLS at a proxy."
+    );
+    log::info!(
+        "SBI security profile PRODUCTION for {}: TLS cert={} mTLS={} \
+         require_oauth2={} JWKS={}",
+        nf_type.to_str(),
+        paths.cert,
+        config.verify_client,
+        config.require_oauth2,
+        config.oauth2_jwks_uri.as_deref().unwrap_or("UNCONFIGURED"),
+    );
+    Ok(config)
 }
 
 // ============================================================================
@@ -367,6 +626,597 @@ pub enum TlsVersion {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use crate::server::SbiServerConfig;
+    use crate::types::UriScheme;
+    use std::net::SocketAddr;
+
+    fn cfg() -> SbiServerConfig {
+        SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 7777)))
+    }
+
+    /// **Issue #63.** An unrecognised or absent profile value resolves to
+    /// PRODUCTION.
+    ///
+    /// This is the load-bearing assertion of the whole posture change. The
+    /// defect being fixed is that the secure path was opt-in, so anything that
+    /// makes it opt-in again — including a typo like `NEXTGCORE_SBI_PROFILE=devel`
+    /// silently reading as "insecure is fine" — reintroduces it. Absent, empty
+    /// and garbage must all mean production.
+    #[test]
+    fn unrecognised_or_absent_profile_resolves_to_production() {
+        for value in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                SbiProfile::from_env_value(value),
+                SbiProfile::Production,
+                "absent/blank must not downgrade: {value:?}"
+            );
+        }
+        for typo in ["devel", "dv", "off", "0", "false", "no", "yes", "1", "prd"] {
+            assert_eq!(
+                SbiProfile::from_env_value(Some(typo)),
+                SbiProfile::Production,
+                "an unrecognised value must not downgrade security: {typo:?}"
+            );
+        }
+        for dev in ["dev", "DEV", " Development ", "insecure", "local", "test"] {
+            assert_eq!(
+                SbiProfile::from_env_value(Some(dev)),
+                SbiProfile::Dev,
+                "explicit opt-out must be honoured: {dev:?}"
+            );
+        }
+        for prod in ["production", "PROD", " Production "] {
+            assert_eq!(
+                SbiProfile::from_env_value(Some(prod)),
+                SbiProfile::Production
+            );
+        }
+    }
+
+    /// **Issue #63 criterion 7.** The dev profile leaves the listener exactly as
+    /// it was: cleartext h2c, no client-certificate verification, no token
+    /// verification. Existing dev/E2E flows depend on this being byte-identical.
+    #[test]
+    fn dev_profile_leaves_the_listener_untouched() {
+        let before = cfg();
+        let after = apply_sbi_security_profile(before.clone(), SbiProfile::Dev, NfType::Amf, "")
+            .expect("dev never fails");
+        assert_eq!(after.scheme, UriScheme::Http, "dev stays cleartext h2c");
+        assert!(after.cert.is_none() && after.private_key.is_none());
+        assert!(!after.verify_client);
+        assert!(!after.require_oauth2, "dev verifies no tokens");
+        assert!(after.oauth2_expected_audience.is_none());
+        // And nothing else drifted.
+        assert_eq!(after.addr, before.addr);
+        assert_eq!(after.max_request_body_size, before.max_request_body_size);
+    }
+
+    /// **Issue #63.** The production profile refuses to start when its
+    /// certificates are missing — it never falls back to cleartext.
+    ///
+    /// A posture that degrades when a file is absent is not a posture. The error
+    /// must name the missing path, because the alternative is a TLS handshake
+    /// failure on the first peer connection that looks like a peer problem.
+    #[test]
+    fn production_profile_fails_closed_on_missing_certificates() {
+        let missing = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: "/nonexistent/nextgcore-test/server.crt".to_string(),
+                key: "/nonexistent/nextgcore-test/server.key".to_string(),
+                ca_cert: "/nonexistent/nextgcore-test/ca.crt".to_string(),
+                ..TlsPaths::default()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let err = apply_sbi_security_policy(
+            cfg(),
+            SbiProfile::Production,
+            &missing,
+            NfType::Amf,
+            "http://nrf:7777",
+        )
+        .expect_err("missing certificates must fail startup, not degrade");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/nonexistent/nextgcore-test/server.crt"),
+            "the error must name the missing path: {msg}"
+        );
+        assert!(
+            msg.contains(SBI_PROFILE_ENV),
+            "and say how to opt out deliberately: {msg}"
+        );
+    }
+
+    /// **Issue #63 criteria 1-4.** With certificates present, the production
+    /// profile produces a TLS + mTLS listener that requires an OAuth2 token
+    /// bound to this NF's own audience.
+    #[test]
+    fn production_profile_configures_tls_mtls_and_oauth2() {
+        let dir = std::env::temp_dir().join(format!("sbi-profile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let cert = dir.join("server.crt");
+        let key = dir.join("server.key");
+        let ca = dir.join("ca.crt");
+        for p in [&cert, &key, &ca] {
+            std::fs::write(p, b"placeholder").expect("write");
+        }
+
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: cert.display().to_string(),
+                key: key.display().to_string(),
+                ca_cert: ca.display().to_string(),
+                ..TlsPaths::default()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let out = apply_sbi_security_policy(
+            cfg(),
+            SbiProfile::Production,
+            &policy,
+            NfType::Udm,
+            "http://nrf.example:7777",
+        )
+        .expect("present certificates");
+
+        // Criterion 1/2: TLS, and mTLS client verification.
+        assert_eq!(out.scheme, UriScheme::Https);
+        assert_eq!(
+            out.cert.as_deref(),
+            Some(cert.display().to_string().as_str())
+        );
+        assert!(out.verify_client, "the production profile mandates mTLS");
+        assert_eq!(
+            out.verify_client_cacert.as_deref(),
+            Some(ca.display().to_string().as_str())
+        );
+        // Criterion 3: tokens required, verified against the NRF's JWKS.
+        assert!(out.require_oauth2);
+        assert_eq!(
+            out.oauth2_jwks_uri.as_deref(),
+            Some("http://nrf.example:7777/nnrf-oauth2/v1/jwks")
+        );
+        // TS 33.501 §13.4.1.2: bound to THIS producer's audience.
+        assert_eq!(out.oauth2_expected_audience.as_deref(), Some("UDM"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #63 criterion 3: with `require_oauth2` on and no JWKS source, the
+    /// server must fail closed (503) rather than serve unauthenticated. The
+    /// profile deliberately leaves that to the server rather than refusing to
+    /// start, so an NRF that is merely not yet reachable does not block boot.
+    #[test]
+    fn production_profile_with_no_nrf_leaves_the_server_to_fail_closed() {
+        let dir = std::env::temp_dir().join(format!("sbi-profile-nonrf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (cert, key, ca) = (
+            dir.join("server.crt"),
+            dir.join("server.key"),
+            dir.join("ca.crt"),
+        );
+        for p in [&cert, &key, &ca] {
+            std::fs::write(p, b"placeholder").expect("write");
+        }
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: cert.display().to_string(),
+                key: key.display().to_string(),
+                ca_cert: ca.display().to_string(),
+                ..TlsPaths::default()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let out =
+            apply_sbi_security_policy(cfg(), SbiProfile::Production, &policy, NfType::Amf, "")
+                .expect("an unreachable NRF must not block startup");
+        assert!(out.require_oauth2, "tokens are still required");
+        assert!(
+            out.oauth2_jwks_uri.is_none() && out.oauth2_jwks.is_none(),
+            "no key source, so the server rejects every request with 503 rather than \
+             serving unauthenticated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #63: an explicitly-configured JWKS source or audience wins over the
+    /// profile's NRF-derived default. An NF that said something more specific
+    /// than "use the NRF" must not have it overwritten.
+    #[test]
+    fn an_explicit_jwks_source_and_audience_survive_the_profile() {
+        let dir = std::env::temp_dir().join(format!("sbi-profile-explicit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (cert, key, ca) = (
+            dir.join("server.crt"),
+            dir.join("server.key"),
+            dir.join("ca.crt"),
+        );
+        for p in [&cert, &key, &ca] {
+            std::fs::write(p, b"placeholder").expect("write");
+        }
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: cert.display().to_string(),
+                key: key.display().to_string(),
+                ca_cert: ca.display().to_string(),
+                ..TlsPaths::default()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+
+        let mut pre = cfg();
+        pre.oauth2_jwks_uri = Some("https://elsewhere/jwks".to_string());
+        pre.oauth2_expected_audience = Some("custom-aud".to_string());
+        let out = apply_sbi_security_policy(
+            pre,
+            SbiProfile::Production,
+            &policy,
+            NfType::Udm,
+            "http://nrf.example:7777",
+        )
+        .expect("present certificates");
+        assert_eq!(
+            out.oauth2_jwks_uri.as_deref(),
+            Some("https://elsewhere/jwks")
+        );
+        assert_eq!(out.oauth2_expected_audience.as_deref(), Some("custom-aud"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #63 criterion 4: `SbiSecurityPolicy::production()` now has a real
+    /// runtime caller, reached through `for_profile`, and its certificate paths
+    /// are environment-overridable so a deployment can mount them anywhere.
+    #[test]
+    fn for_profile_adopts_the_production_policy() {
+        let p = SbiSecurityPolicy::for_profile(SbiProfile::Production);
+        assert!(p.tls_required && p.mtls_required && p.oauth2_required);
+        assert!(!p.allow_insecure);
+        let d = SbiSecurityPolicy::for_profile(SbiProfile::Dev);
+        assert!(!d.tls_required && !d.mtls_required && !d.oauth2_required);
+    }
+}
+
+/// **Issue #63 criterion 6.** An SBI transaction between two NFs over mTLS with
+/// OAuth2, end to end, plus the negative case where the token endpoint is down.
+///
+/// This is the criterion the issue itself called the expensive one, and it is the
+/// only test here that exercises the production posture as a whole rather than
+/// one setting at a time: a real TLS handshake with client-certificate
+/// verification, a real token minted by a stub NRF and fetched over the wire, and
+/// a real signature check against a JWKS.
+///
+/// **Scope limit, stated rather than implied:** this drives the same
+/// `SbiServer`/`SbiClient` stack the four core NFs use, in one process, against
+/// generated certificates. It is not two containers running `nextgcore-amfd` and
+/// `nextgcore-udmd` — CI skips the Docker E2E jobs, so that variant would not run
+/// anywhere. What this proves is that the library path the NFs were just wired
+/// onto works; what it cannot prove is that each daemon's startup wiring reaches
+/// it. The per-NF wiring is covered by the `every_core_nf_applies_the_sbi_profile`
+/// source guard instead.
+#[cfg(test)]
+mod mtls_oauth2_e2e {
+    use super::*;
+    use crate::client::{SbiClient, SbiClientConfig};
+    use crate::message::{SbiRequest, SbiResponse};
+    use crate::oauth::OAuth2Client;
+    use crate::server::{SbiServer, SbiServerConfig};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    /// A CA plus a server leaf and a client leaf signed by it, written as PEM.
+    /// mTLS needs a real chain: the server verifies the client leaf against the
+    /// CA and vice versa, so self-signed leaves would not do.
+    struct Pki {
+        dir: std::path::PathBuf,
+        ca: String,
+        server_cert: String,
+        server_key: String,
+        client_cert: String,
+        client_key: String,
+    }
+
+    impl Drop for Pki {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn pki(tag: &str) -> Pki {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+        let dir = std::env::temp_dir().join(format!("sbi-e2e-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let mut ca_params = CertificateParams::new(Vec::new()).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "nextgcore-test-ca");
+        let ca_key = KeyPair::generate().expect("ca key");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed ca");
+
+        let leaf = |name: &str| -> (String, String) {
+            let mut params =
+                CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params");
+            params.distinguished_name.push(DnType::CommonName, name);
+            let key = KeyPair::generate().expect("leaf key");
+            let cert = params
+                .signed_by(&key, &ca_cert, &ca_key)
+                .expect("ca-signed leaf");
+            (cert.pem(), key.serialize_pem())
+        };
+        let (server_cert_pem, server_key_pem) = leaf("nextgcore-test-producer");
+        let (client_cert_pem, client_key_pem) = leaf("nextgcore-test-consumer");
+
+        let write = |name: &str, contents: &str| -> String {
+            let p = dir.join(name);
+            std::fs::write(&p, contents).expect("write pem");
+            p.display().to_string()
+        };
+        Pki {
+            ca: write("ca.crt", &ca_cert.pem()),
+            server_cert: write("server.crt", &server_cert_pem),
+            server_key: write("server.key", &server_key_pem),
+            client_cert: write("client.crt", &client_cert_pem),
+            client_key: write("client.key", &client_key_pem),
+            dir,
+        }
+    }
+
+    /// The RFC 7517 JWKS a producer verifies tokens against, for one ES256 key.
+    fn jwks(key: &p256::ecdsa::VerifyingKey) -> serde_json::Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let point = key.to_encoded_point(false);
+        serde_json::json!({"keys": [{
+            "kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig",
+            "kid": "test-es256",
+            "x": URL_SAFE_NO_PAD.encode(point.x().expect("x")),
+            "y": URL_SAFE_NO_PAD.encode(point.y().expect("y")),
+        }]})
+    }
+
+    /// Mint an NRF-style ES256 access token.
+    fn mint_token(key: &p256::ecdsa::SigningKey, aud: &str, scope: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT","kid":"test-es256"}"#);
+        let claims = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "iss": "nrf-test", "sub": "consumer-1", "aud": [aud],
+                "scope": scope, "iat": now, "exp": now + 300,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let signing_input = format!("{header}.{claims}");
+        let sig: Signature = key.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    }
+
+    /// A stub NRF that answers the access-token endpoint with `token`.
+    async fn start_stub_nrf(token: String) -> (SbiServer, u16) {
+        let port = crate::test_support::free_port();
+        let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
+        server
+            .start(move |_req: SbiRequest| {
+                let token = token.clone();
+                async move {
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "access_token": token,
+                            "token_type": "Bearer",
+                            "expires_in": 300,
+                            "scope": "nudm-sdm",
+                        }))
+                        .expect("token response")
+                }
+            })
+            .await
+            .expect("stub NRF starts");
+        (server, port)
+    }
+
+    /// The producer: mTLS listener that requires an OAuth2 token whose audience
+    /// is its own NF type, configured through the PRODUCTION profile.
+    async fn start_producer(pki: &Pki, jwks: serde_json::Value) -> (SbiServer, u16) {
+        let port = crate::test_support::free_port();
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: pki.server_cert.clone(),
+                key: pki.server_key.clone(),
+                ca_cert: pki.ca.clone(),
+                ..TlsPaths::default()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        // A static JWKS stands in for the NRF's live one, so the producer's
+        // verification is exercised without a second network dependency.
+        cfg.oauth2_jwks = Some(jwks);
+        let cfg = apply_sbi_security_policy(
+            cfg,
+            SbiProfile::Production,
+            &policy,
+            NfType::Udm,
+            "http://unused",
+        )
+        .expect("production profile applies");
+        assert!(cfg.verify_client && cfg.require_oauth2);
+
+        let server = SbiServer::new(cfg);
+        server
+            .start(|_req: SbiRequest| async move { SbiResponse::ok() })
+            .await
+            .expect("producer starts");
+        (server, port)
+    }
+
+    fn consumer_config(pki: &Pki, port: u16) -> SbiClientConfig {
+        let mut cfg = SbiClientConfig::new("localhost", port).with_https();
+        cfg.ca_cert = Some(pki.ca.clone());
+        cfg.client_cert = Some(pki.client_cert.clone());
+        cfg.client_key = Some(pki.client_key.clone());
+        cfg
+    }
+
+    #[tokio::test]
+    async fn sbi_transaction_over_mtls_with_oauth2_end_to_end() {
+        let pki = pki("ok");
+        let signing = crate::oauth::generate_es256_key();
+        let token = mint_token(&signing, "UDM", "nudm-sdm");
+
+        let (nrf, nrf_port) = start_stub_nrf(token).await;
+        let (producer, producer_port) = start_producer(&pki, jwks(signing.verifying_key())).await;
+
+        // The consumer authenticates at the transport with its client certificate
+        // and carries an NRF-issued token it fetched over the wire.
+        let oauth2 = Arc::new(OAuth2Client::new(
+            format!("http://127.0.0.1:{nrf_port}"),
+            "consumer-1",
+            NfType::Amf,
+        ));
+        let client =
+            SbiClient::new(consumer_config(&pki, producer_port)).with_oauth2(oauth2, NfType::Udm);
+
+        let resp = client
+            .send_request(SbiRequest::get("/nudm-sdm/v1/imsi-001010000000001/am-data"))
+            .await
+            .expect("the mTLS + OAuth2 transaction must complete");
+        assert_eq!(
+            resp.status, 200,
+            "authenticated request over mTLS must be served"
+        );
+
+        producer.stop().await.ok();
+        nrf.stop().await.ok();
+    }
+
+    /// **The negative case criterion 6 names.** With the token endpoint down, the
+    /// transaction must FAIL — not proceed unauthenticated.
+    ///
+    /// This guards PR 181's fix from the outside: before it, token-acquisition
+    /// failure logged a warning and sent the request anyway, so an operator who
+    /// had configured OAuth2 could silently lose SBI authentication. Here the
+    /// producer would then reject it 401, which looks like a token problem rather
+    /// than a client that gave up on authenticating.
+    #[tokio::test]
+    async fn transaction_fails_when_the_token_endpoint_is_unavailable() {
+        let pki = pki("notoken");
+        let signing = crate::oauth::generate_es256_key();
+        let (producer, producer_port) = start_producer(&pki, jwks(signing.verifying_key())).await;
+
+        // Port 1 on loopback: nothing listens, so token acquisition cannot succeed.
+        let oauth2 = Arc::new(OAuth2Client::new(
+            "http://127.0.0.1:1",
+            "consumer-1",
+            NfType::Amf,
+        ));
+        let client =
+            SbiClient::new(consumer_config(&pki, producer_port)).with_oauth2(oauth2, NfType::Udm);
+
+        let err = client
+            .send_request(SbiRequest::get("/nudm-sdm/v1/imsi-001010000000001/am-data"))
+            .await
+            .expect_err("an unobtainable token must fail the call, not downgrade it");
+        assert!(
+            matches!(err, SbiError::AuthenticationFailed(_)),
+            "the failure must name authentication, so it is distinguishable from a \
+             transport error and from a producer rejection: {err:?}"
+        );
+
+        producer.stop().await.ok();
+    }
+
+    /// Issue #63 criterion 3: a request carrying NO token is rejected by a
+    /// production-profile producer, even though its client certificate verified.
+    /// Transport authentication is not service authorisation.
+    #[tokio::test]
+    async fn producer_rejects_a_request_with_no_access_token() {
+        let pki = pki("notok");
+        let signing = crate::oauth::generate_es256_key();
+        let (producer, producer_port) = start_producer(&pki, jwks(signing.verifying_key())).await;
+
+        // Same mTLS identity, but no OAuth2 client -> no Authorization header.
+        let client = SbiClient::new(consumer_config(&pki, producer_port));
+        let resp = client
+            .send_request(SbiRequest::get("/nudm-sdm/v1/imsi-001010000000001/am-data"))
+            .await
+            .expect("the connection itself succeeds; the request is refused");
+        assert_eq!(
+            resp.status, 401,
+            "a tokenless request must be refused by a producer that requires OAuth2"
+        );
+
+        producer.stop().await.ok();
+    }
+
+    /// Issue #63 criterion 1: the client CERTIFICATE is genuinely required, not
+    /// merely accepted when offered.
+    ///
+    /// Without this case the rest of this module would pass just as happily
+    /// against `verify_client = false` — a TLS-only listener serves a client that
+    /// brings no certificate, so "mTLS" would be untested. A TLS client that
+    /// trusts the CA but presents no certificate of its own must be refused at
+    /// the handshake.
+    #[tokio::test]
+    async fn tls_client_without_a_certificate_is_refused() {
+        let pki = pki("noclientcert");
+        let signing = crate::oauth::generate_es256_key();
+        let (producer, producer_port) = start_producer(&pki, jwks(signing.verifying_key())).await;
+
+        // https and the right CA, but no client_cert/client_key.
+        let mut cfg = SbiClientConfig::new("localhost", producer_port).with_https();
+        cfg.ca_cert = Some(pki.ca.clone());
+        let result = SbiClient::new(cfg)
+            .send_request(SbiRequest::get("/nudm-sdm/v1/imsi-001010000000001/am-data"))
+            .await;
+        assert!(
+            result.is_err(),
+            "an mTLS listener must refuse a client that presents no certificate, but got \
+             {:?}",
+            result.map(|r| r.status)
+        );
+
+        producer.stop().await.ok();
+    }
+
+    /// Issue #63 criterion 2, second half: a cleartext h2c client cannot talk to
+    /// a production-profile listener. This is what "a plaintext connection to a
+    /// core NF producer is refused" means in practice.
+    #[tokio::test]
+    async fn cleartext_client_cannot_reach_a_tls_producer() {
+        let pki = pki("plain");
+        let signing = crate::oauth::generate_es256_key();
+        let (producer, producer_port) = start_producer(&pki, jwks(signing.verifying_key())).await;
+
+        // http:// against an https listener.
+        let plain = SbiClient::with_host_port("127.0.0.1", producer_port);
+        let result = plain
+            .send_request(SbiRequest::get("/nudm-sdm/v1/imsi-001010000000001/am-data"))
+            .await;
+        assert!(
+            result.is_err(),
+            "cleartext h2c must not be served by a TLS listener, but got {:?}",
+            result.map(|r| r.status)
+        );
+
+        producer.stop().await.ok();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -647,6 +1497,95 @@ mod audience_binding_guards {
              minted for another producer is accepted (TS 33.501 13.4.1.2). Set \
              with_expected_audience_nf_type(<own NfType>), or add a documented \
              exemption to this guard explaining why the NF has no NF-type aud."
+        );
+    }
+
+    /// **Issue #63 criterion 1.** Each of the four core NFs applies the SBI
+    /// security profile at startup.
+    ///
+    /// The library-level E2E in `mtls_oauth2_e2e` proves the mTLS + OAuth2 path
+    /// works; it cannot prove that amfd/smfd/ausfd/udmd actually reach it, because
+    /// each builds its listener at its own site and CI skips the Docker E2E that
+    /// would run the real daemons. This guard closes that gap by reading their
+    /// sources — the same shape as the audience guard above, and the reason it is
+    /// a guard rather than a comment is that a future refactor of any one of these
+    /// four startup paths could silently drop the call and leave that NF back on
+    /// cleartext h2c with no test failing.
+    #[test]
+    fn every_core_nf_applies_the_sbi_profile() {
+        const CORE_NFS: &[&str] = &[
+            "nextgcore-amfd",
+            "nextgcore-smfd",
+            "nextgcore-ausfd",
+            "nextgcore-udmd",
+        ];
+
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+
+        let mut missing = Vec::new();
+        for nf in CORE_NFS {
+            let src = bins.join(nf).join("src");
+            assert!(src.is_dir(), "expected {} to exist", src.display());
+            let mut applies = false;
+            for file in std::fs::read_dir(&src).expect("read src/") {
+                let f = file.expect("file entry").path();
+                if f.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&f).unwrap_or_default();
+                if text.contains("apply_sbi_security_profile") {
+                    applies = true;
+                }
+            }
+            if !applies {
+                missing.push(*nf);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these core NFs never apply the SBI security profile, so they serve cleartext \
+             h2c with no access-token verification regardless of {}: {missing:?}. Call \
+             nextgcore_sbi::security::apply_sbi_security_profile on the SbiServerConfig \
+             before building the SbiServer.",
+            crate::security::SBI_PROFILE_ENV
+        );
+    }
+
+    /// Issue #63 criterion 2: amfd must not hardcode the scheme it advertises.
+    ///
+    /// The AMF publishes its own endpoint in its NFProfile and in the callback
+    /// URIs it registers with peers. If those keep saying `http` while the
+    /// listener moves to TLS, peers discover an unusable URL and the failure
+    /// surfaces on THEIR side as a connection error, with nothing pointing back at
+    /// the AMF's registration. A literal `"scheme": "http"` is therefore a defect,
+    /// not a default.
+    #[test]
+    fn amfd_does_not_hardcode_its_advertised_scheme() {
+        let sbi_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins/nextgcore-amfd/src/sbi_path.rs");
+        let text = std::fs::read_to_string(&sbi_path).expect("read amfd sbi_path.rs");
+
+        assert!(
+            !text.contains(r#""scheme": "http""#),
+            "amfd advertises a hardcoded http scheme in its NFProfile; it must follow the \
+             listener via advertised_sbi_scheme()"
+        );
+        assert!(
+            !text.contains(r#"format!("http://{addr}:{port}")"#),
+            "amfd builds a hardcoded http:// base URL; it must follow the listener via \
+             advertised_sbi_scheme()"
+        );
+        assert!(
+            text.contains("fn advertised_sbi_scheme"),
+            "the scheme helper must exist for the two sites above to use"
         );
     }
 
