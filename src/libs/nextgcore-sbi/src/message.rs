@@ -569,6 +569,29 @@ impl SbiResponse {
         Ok(self)
     }
 
+    /// Set a JSON body served as `application/3gppHal+json` (issue #82).
+    ///
+    /// A handful of 3GPP resources are declared HAL-only rather than plain JSON —
+    /// e.g. the `201 UEAuthenticationCtx` of `POST /nausf-auth/v1/ue-authentications`
+    /// (`TS29509_Nausf_UEAuthentication.yaml:44-48`), whose body carries a `_links`
+    /// map the consumer must follow to continue authentication. A strict client
+    /// content-negotiating on the HAL type can reject or mis-parse such a body
+    /// served as `application/json`.
+    ///
+    /// Deliberately a SEPARATE method rather than a change to
+    /// [`with_json_body`](Self::with_json_body): plain `application/json` is right
+    /// for the overwhelming majority of SBI responses, so the HAL type is opt-in at
+    /// the call site that the spec declares it for.
+    pub fn with_hal_json_body<T: Serialize>(mut self, body: &T) -> Result<Self, serde_json::Error> {
+        let json = serde_json::to_string(body)?;
+        self.http.set_content(json);
+        self.http.set_header(
+            crate::constants::header::CONTENT_TYPE,
+            crate::constants::content_type::APPLICATION_3GPP_HAL_JSON,
+        );
+        Ok(self)
+    }
+
     /// Set raw body content
     pub fn with_body(
         mut self,
@@ -1373,5 +1396,34 @@ mod tests {
             .content
             .unwrap()
             .contains("RESOURCE_NOT_FOUND"));
+    }
+
+    /// Issue #82: `with_hal_json_body` serves `application/3gppHal+json` for the
+    /// handful of resources 3GPP declares HAL-only, and — the regression half —
+    /// `with_json_body` still defaults to plain `application/json` for everything
+    /// else. The HAL type is opt-in per call site precisely so this stays true.
+    #[test]
+    fn test_hal_json_body_is_opt_in_and_json_stays_the_default() {
+        let body = serde_json::json!({ "authType": "5G_AKA", "_links": { "5g-aka": {} } });
+
+        let hal = SbiResponse::with_status(201)
+            .with_hal_json_body(&body)
+            .expect("serializes");
+        assert_eq!(
+            hal.http.get_header("content-type").map(String::as_str),
+            Some(crate::constants::content_type::APPLICATION_3GPP_HAL_JSON)
+        );
+
+        let plain = SbiResponse::with_status(200)
+            .with_json_body(&body)
+            .expect("serializes");
+        assert_eq!(
+            plain.http.get_header("content-type").map(String::as_str),
+            Some(crate::constants::content_type::APPLICATION_JSON),
+            "with_json_body must keep its application/json default"
+        );
+
+        // Only the media type differs; the serialized body is identical.
+        assert_eq!(hal.http.content, plain.http.content);
     }
 }

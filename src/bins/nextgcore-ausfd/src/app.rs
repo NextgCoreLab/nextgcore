@@ -410,6 +410,14 @@ pub async fn ausf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             let auth_ctx_id = parts[3];
             handle_eap_session(auth_ctx_id, &request).await
         }
+        // Issue #82: TS 29.509 §5.2.2.3 Deregister. MUST precede the generic
+        // authenticate arm below, which would otherwise swallow `deregister` as
+        // an `AuthenticationInfo` body and reject it 400.
+        ("nausf-auth", "ue-authentications", "POST")
+            if parts.len() >= 4 && parts[3] == "deregister" =>
+        {
+            handle_ue_authentication_deregister(&request).await
+        }
         ("nausf-auth", "ue-authentications", "POST") => {
             // UE Authentication (5G-AKA or EAP-AKA')
             handle_ue_authentication(&request).await
@@ -439,11 +447,123 @@ pub async fn ausf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             crate::upu_protection::handle_upu_protect(supi, &request)
         }
 
+        // Issue #82: paths the Nausf_UEAuthentication API DECLARES but this AUSF
+        // does not implement (optional Rel-16/17 features):
+        //   /rg-authentications                              (yaml:381)
+        //   /prose-authentications                           (yaml:451)
+        //   /prose-authentications/{authCtxId}/prose-auth    (yaml:514)
+        // `501 Not Implemented` is the right shape for a defined-but-unimplemented
+        // resource; `405 Method Not Allowed` (the fallthrough) claims the resource
+        // exists but rejects the method, which is false and misleads a consumer
+        // into retrying with another verb.
+        ("nausf-auth", "rg-authentications", _) | ("nausf-auth", "prose-authentications", _) => {
+            log::info!("AUSF: {method} {uri} is a declared but unimplemented Nausf resource");
+            send_problem(
+                501,
+                "NOT_IMPLEMENTED",
+                &format!("{resource} is declared by TS 29.509 but not implemented by this AUSF"),
+            )
+        }
+
         _ => {
             log::warn!("Unknown AUSF request: {method} {uri}");
             send_method_not_allowed(method, uri)
         }
     }
+}
+
+/// Handle `POST /nausf-auth/v1/ue-authentications/deregister` — the TS 29.509
+/// §5.2.2.3 Deregister service operation (issue #82).
+///
+/// Before this the path had no arm, so it fell through to the generic
+/// authenticate handler, which parsed the `DeregistrationInfo` body as an
+/// `AuthenticationInfo`, found no `servingNetworkName` and answered `400`. A
+/// conformant consumer could therefore never release a security context through
+/// the standard operation.
+///
+/// WHAT THIS CLEARS, AND WHY IT DIFFERS FROM [`handle_auth_context_delete`].
+/// §5.2.2.3.1 states the purpose explicitly: the consumer (**the UDM**, not the
+/// AMF) asks the AUSF "to clear the stale security context ... so as to ensure
+/// only latest Kausf is maintained in the network". So unlike the AMF's
+/// `DELETE ue-authentications/{authCtxId}` — which deliberately KEEPS the per-SUPI
+/// SoR/UPU anchor so Nausf_SoRProtection/Nausf_UPUProtection keep working
+/// (TS 33.501 §6.14.1) — deregister must purge the anchor too. Reusing the DELETE
+/// teardown verbatim would leave the stale anchor `K_AUSF` behind and so fail the
+/// operation's entire stated purpose.
+///
+/// `404` is returned only when the AUSF holds NEITHER an authentication context
+/// nor an anchor for the SUPI, i.e. genuinely nothing to clear. An anchor with no
+/// live authentication context is a real state to clear (the AMF may already have
+/// deleted the context), so that case is a success.
+pub async fn handle_ue_authentication_deregister(request: &SbiRequest) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+
+    let info: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+
+    // `DeregistrationInfo` requires ONLY `supi`
+    // (TS29509_Nausf_UEAuthentication.yaml:796-805). Deliberately NOT routed
+    // through `validate_authentication_info`: that demands `servingNetworkName`,
+    // which this body does not carry and the spec does not ask for.
+    let supi = match info.get("supi").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return send_bad_request(
+                "supi is a mandatory IE of DeregistrationInfo",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+
+    log::info!("[{supi}] UE Authentication Deregister");
+
+    let ctx = ausf_self();
+
+    let ue_id = ctx
+        .read()
+        .ok()
+        .and_then(|context| context.ue_find_by_supi(supi).map(|ue| ue.id));
+
+    // Purge the SoR/UPU anchor: the whole point of the operation is that a stale
+    // KAUSF must not survive it.
+    let anchor_removed = ctx
+        .read()
+        .map(|context| context.anchor_remove(supi))
+        .unwrap_or(false);
+
+    let context_removed = match ue_id {
+        Some(id) => {
+            let removed = ctx.read().ok().and_then(|context| context.ue_remove(id));
+            match removed {
+                Some(mut ue) => {
+                    // Zeroize KAUSF/KSEAF/XRES* before the context is dropped.
+                    ue.zeroize();
+                    true
+                }
+                None => false,
+            }
+        }
+        None => false,
+    };
+
+    if !context_removed && !anchor_removed {
+        log::info!("[{supi}] Deregister: no security context or anchor held → 404");
+        return send_not_found(
+            "No security context for the requested SUPI",
+            Some("CONTEXT_NOT_FOUND"),
+        );
+    }
+
+    log::info!(
+        "[{supi}] Security context cleared and zeroized (auth context: {context_removed}, \
+         SoR/UPU anchor: {anchor_removed})"
+    );
+    SbiResponse::with_status(204)
 }
 
 // UE Authentication handlers
@@ -461,18 +581,22 @@ pub async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let supi_or_suci = auth_info
-        .get("supiOrSuci")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    // Issue #82: `supiOrSuci` is a mandatory IE of `AuthenticationInfo`. It used
+    // to default to the literal "unknown", which the validator then accepted as a
+    // present value — so a body with no identity reached the UDM as a query for a
+    // subscriber called "unknown" instead of being rejected. Kept as an Option so
+    // absence stays distinguishable from an empty string all the way to the
+    // validator.
+    let supi_or_suci = auth_info.get("supiOrSuci").and_then(|v| v.as_str());
     let serving_network_name = auth_info.get("servingNetworkName").and_then(|v| v.as_str());
 
     // Validate required fields
     if let Err(msg) =
-        crate::nausf_handler::validate_authentication_info(Some(supi_or_suci), serving_network_name)
+        crate::nausf_handler::validate_authentication_info(supi_or_suci, serving_network_name)
     {
         return send_bad_request(msg, Some("INVALID_REQUEST"));
     }
+    let supi_or_suci = supi_or_suci.expect("validated non-empty above");
 
     let serving_network_name = serving_network_name.expect("value expected");
 
@@ -581,9 +705,14 @@ pub async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
             let hxres_star_hex = crate::nudm_handler::bytes_to_hex(&ausf_ue.hxres_star);
             let auth_ctx_id = ausf_ue.ctx_id.clone();
 
+            // Issue #82: the 201 UEAuthenticationCtx is declared
+            // `application/3gppHal+json` ONLY
+            // (TS29509_Nausf_UEAuthentication.yaml:44-48) — it carries the
+            // `_links` map the consumer follows to confirm, so a strict HAL
+            // client may reject or mis-parse it as plain application/json.
             SbiResponse::with_status(201)
                 .with_header("Location", format!("/nausf-auth/v1/ue-authentications/{auth_ctx_id}"))
-                .with_json_body(&serde_json::json!({
+                .with_hal_json_body(&serde_json::json!({
                     "authType": "5G_AKA",
                     "5gAuthData": {
                         "rand": rand_hex,
@@ -639,12 +768,13 @@ pub async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
             }
 
             let auth_ctx_id = ausf_ue.ctx_id.clone();
+            // Issue #82: HAL media type, as for the 5G-AKA branch above.
             SbiResponse::with_status(201)
                 .with_header(
                     "Location",
                     format!("/nausf-auth/v1/ue-authentications/{auth_ctx_id}"),
                 )
-                .with_json_body(&serde_json::json!({
+                .with_hal_json_body(&serde_json::json!({
                     "authType": "EAP_AKA_PRIME",
                     "5gAuthData": eap_payload_b64,
                     "_links": {
@@ -2135,7 +2265,7 @@ mod tests {
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::lock_context();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
         tokio::time::timeout(Duration::from_secs(60), async {
@@ -2500,7 +2630,7 @@ mod tests {
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::lock_context();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
 
@@ -2745,7 +2875,7 @@ mod tests {
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::lock_context();
         let _lock = TEST_MUTEX.lock().await;
         ausf_context_init(128);
 
@@ -2793,7 +2923,7 @@ mod tests {
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::lock_context();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
 
@@ -2905,6 +3035,333 @@ mod tests {
     }
 
     // ====================================================================
+    // Issue #82: TS 29.509 §5.2.2.3 Deregister, HAL media type, and the
+    // declared-but-unimplemented resources.
+    // ====================================================================
+
+    /// **The #82 acceptance test, and the design point.** Deregister clears the
+    /// stale security context INCLUDING the per-SUPI SoR/UPU anchor, which is the
+    /// exact opposite of `handle_auth_context_delete` (whose companion test
+    /// `test_sor_upu_anchor_survives_auth_context_delete` asserts the anchor
+    /// SURVIVES).
+    ///
+    /// TS 29.509 §5.2.2.3.1 states the purpose: the consumer (the UDM) asks the
+    /// AUSF "to clear the stale security context ... so as to ensure only latest
+    /// Kausf is maintained in the network". Reusing the DELETE teardown verbatim
+    /// would leave the anchor `K_AUSF` behind and fail that purpose, so the two
+    /// operations deliberately differ and both are pinned.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
+    async fn test_deregister_clears_context_and_the_sor_upu_anchor() {
+        let _guard = crate::test_support::lock_context();
+        let _ = env_logger::try_init();
+        let _lock = TEST_MUTEX.lock().await;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            ausf_context_init(128);
+
+            let udm_port = free_port();
+            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                udm_port,
+            ))));
+            udm_server.start(mock_udm_handler).await.expect("udm start");
+            std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+            std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
+
+            let ausf_port = free_port();
+            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                ausf_port,
+            ))));
+            ausf_server
+                .start(ausf_sbi_request_handler)
+                .await
+                .expect("ausf start");
+            let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
+
+            // Fresh SUPI so no earlier test can have seeded state for it.
+            let supi = "imsi-001010000000821";
+
+            // Real 5G-AKA flow so the anchor is populated by the production hook.
+            let (href, rand) = initiate_5g_aka(&client, supi, TEST_SNN).await;
+            let (res, ck, ik, _ak, _akstar) =
+                nextgcore_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
+            let res_star =
+                nextgcore_crypt::kdf::nextgcore_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+            let resp = client
+                .put_json(
+                    &href,
+                    &serde_json::json!({
+                        "resStar": crate::nudm_handler::bytes_to_hex(&res_star)
+                    }),
+                )
+                .await
+                .expect("confirmation");
+            assert_eq!(resp.status, 200);
+
+            // Both pieces of state exist before deregistration.
+            let kausf = ausf_self()
+                .read()
+                .unwrap()
+                .anchor_lookup_kausf(supi)
+                .expect("anchor after successful primary auth");
+            assert_ne!(kausf, [0u8; 32], "anchor KAUSF must not be zero");
+            assert!(
+                ausf_self().read().unwrap().ue_find_by_supi(supi).is_some(),
+                "auth context exists before deregistration"
+            );
+
+            // ── UDM-style deregistration, through the REAL router ─────────────
+            // `DeregistrationInfo` carries ONLY `supi` — no servingNetworkName.
+            // Before #82 this fell through to the authenticate handler, which
+            // demanded one and answered 400.
+            let resp = client
+                .post_json(
+                    "/nausf-auth/v1/ue-authentications/deregister",
+                    &serde_json::json!({ "supi": supi }),
+                )
+                .await
+                .expect("deregister");
+            assert_eq!(
+                resp.status, 204,
+                "a conformant DeregistrationInfo must be 204, not the pre-#82 400"
+            );
+
+            // The authentication context is gone (and was zeroized on removal)...
+            assert!(
+                ausf_self().read().unwrap().ue_find_by_supi(supi).is_none(),
+                "deregister must remove the authentication context"
+            );
+            // ...and so is the anchor: THIS is what distinguishes deregister from
+            // DELETE, and what makes "only the latest KAUSF is maintained" true.
+            assert!(
+                ausf_self()
+                    .read()
+                    .unwrap()
+                    .anchor_lookup_kausf(supi)
+                    .is_none(),
+                "deregister must purge the stale SoR/UPU anchor KAUSF (TS 29.509 §5.2.2.3.1)"
+            );
+            // With no anchor, the SoR/UPU counter lifecycle refuses to serve.
+            assert_eq!(
+                ausf_self().read().unwrap().anchor_next_sor_counter(supi),
+                Err(crate::AnchorCounterError::NoAnchor),
+                "no anchor means SoR/UPU can no longer be protected with a stale key"
+            );
+
+            // Nothing left to clear → 404 on a repeat.
+            let resp = client
+                .post_json(
+                    "/nausf-auth/v1/ue-authentications/deregister",
+                    &serde_json::json!({ "supi": supi }),
+                )
+                .await
+                .expect("second deregister");
+            assert_eq!(resp.status, 404, "a second deregister has nothing to clear");
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// Deregister input validation (issue #82). The load-bearing case is the
+    /// LAST one: a body with `supi` and no `servingNetworkName` must NOT be run
+    /// through `validate_authentication_info`, which is what produced the 400
+    /// before the dedicated route existed.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
+    async fn test_deregister_validation_and_unknown_supi() {
+        let _guard = crate::test_support::lock_context();
+        let _lock = TEST_MUTEX.lock().await;
+        ausf_context_init(128);
+
+        let post = |body: Option<serde_json::Value>| {
+            let req = SbiRequest::post("/nausf-auth/v1/ue-authentications/deregister");
+            match body {
+                Some(v) => req.with_json_body(&v).expect("valid JSON"),
+                None => req,
+            }
+        };
+
+        // No body → 400.
+        assert_eq!(
+            ausf_sbi_request_handler(post(None)).await.status,
+            400,
+            "a missing body must be 400"
+        );
+
+        // Malformed JSON → 400.
+        assert_eq!(
+            ausf_sbi_request_handler(
+                SbiRequest::post("/nausf-auth/v1/ue-authentications/deregister")
+                    .with_body("{not json", "application/json")
+            )
+            .await
+            .status,
+            400,
+            "malformed JSON must be 400"
+        );
+
+        // `supi` absent or empty → 400 (it is the only required member).
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "supi": "" }),
+            serde_json::json!({ "supportedFeatures": "0" }),
+        ] {
+            assert_eq!(
+                ausf_sbi_request_handler(post(Some(body.clone())))
+                    .await
+                    .status,
+                400,
+                "a DeregistrationInfo without supi must be 400: {body}"
+            );
+        }
+
+        // A well-formed body for a SUPI the AUSF holds nothing for → 404, NOT the
+        // 400 the authenticate handler would have produced for the missing
+        // servingNetworkName. The status is what proves the request was parsed as
+        // a DeregistrationInfo.
+        let resp = ausf_sbi_request_handler(post(Some(
+            serde_json::json!({ "supi": "imsi-001019999999999" }),
+        )))
+        .await;
+        assert_eq!(
+            resp.status, 404,
+            "an unknown SUPI is 404 (a 400 here would mean it was parsed as \
+             AuthenticationInfo again)"
+        );
+    }
+
+    /// Issue #82: the `201 UEAuthenticationCtx` is declared
+    /// `application/3gppHal+json` ONLY (`TS29509_Nausf_UEAuthentication.yaml:44-48`)
+    /// on BOTH the 5G-AKA and EAP-AKA' branches, because it carries the `_links`
+    /// map the consumer must follow. A strict HAL client content-negotiating on
+    /// that type can reject or mis-parse a body served as `application/json`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
+    async fn test_ue_authentication_ctx_is_served_as_hal_json() {
+        let _guard = crate::test_support::lock_context();
+        let _ = env_logger::try_init();
+        let _lock = TEST_MUTEX.lock().await;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            ausf_context_init(64);
+
+            let udm_port = free_port();
+            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                udm_port,
+            ))));
+            udm_server.start(mock_udm_handler).await.expect("udm start");
+            std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+            std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
+
+            let ausf_port = free_port();
+            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                ausf_port,
+            ))));
+            ausf_server
+                .start(ausf_sbi_request_handler)
+                .await
+                .expect("ausf start");
+            let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
+
+            // SUPI_5G_AKA selects 5G-AKA at the mock UDM, SUPI_EAP selects
+            // EAP-AKA' — so both 201 branches are exercised.
+            for (identity, expected_auth_type) in
+                [(SUPI_5G_AKA, "5G_AKA"), (SUPI_EAP, "EAP_AKA_PRIME")]
+            {
+                let resp = client
+                    .post_json(
+                        "/nausf-auth/v1/ue-authentications",
+                        &serde_json::json!({
+                            "supiOrSuci": identity,
+                            "servingNetworkName": TEST_SNN
+                        }),
+                    )
+                    .await
+                    .expect("POST ue-authentications");
+                assert_eq!(resp.status, 201, "{expected_auth_type} must be 201");
+
+                assert_eq!(
+                    resp.http.get_header("Content-Type").map(String::as_str),
+                    Some(nextgcore_sbi::constants::content_type::APPLICATION_3GPP_HAL_JSON),
+                    "the {expected_auth_type} 201 UEAuthenticationCtx must be HAL, got {:?}",
+                    resp.http.get_header("Content-Type")
+                );
+
+                // Still the same body, and it really does carry the _links map
+                // that is the reason the media type is HAL.
+                let body: serde_json::Value =
+                    serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+                assert_eq!(
+                    body.get("authType").and_then(|v| v.as_str()),
+                    Some(expected_auth_type)
+                );
+                assert!(
+                    body.get("_links").is_some_and(|l| l.is_object()),
+                    "the HAL body must carry _links: {body}"
+                );
+            }
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// Issue #82: a body with no `supiOrSuci` is rejected 400 instead of being
+    /// coerced to the literal `"unknown"` and queried against the UDM.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
+    async fn test_missing_supi_or_suci_is_rejected() {
+        let _guard = crate::test_support::lock_context();
+        let _lock = TEST_MUTEX.lock().await;
+        ausf_context_init(64);
+
+        // No UDM is configured for this test on purpose: if the handler still
+        // defaulted to "unknown" it would try to reach one, so a 400 also proves
+        // no UDM query was attempted.
+        for body in [
+            serde_json::json!({ "servingNetworkName": TEST_SNN }),
+            serde_json::json!({ "supiOrSuci": "", "servingNetworkName": TEST_SNN }),
+        ] {
+            let req = SbiRequest::post("/nausf-auth/v1/ue-authentications")
+                .with_json_body(&body)
+                .expect("valid JSON");
+            let resp = ausf_sbi_request_handler(req).await;
+            assert_eq!(
+                resp.status, 400,
+                "supiOrSuci is a mandatory IE; {body} must be 400"
+            );
+        }
+    }
+
+    /// Issue #82: resources TS 29.509 DECLARES but this AUSF does not implement
+    /// answer `501 Not Implemented`, not `405 Method Not Allowed`. A 405 claims
+    /// the resource exists but rejects the verb, which is false and invites a
+    /// consumer to retry with another method.
+    #[tokio::test]
+    async fn test_declared_but_unimplemented_resources_are_501() {
+        for path in [
+            "/nausf-auth/v1/rg-authentications",
+            "/nausf-auth/v1/prose-authentications",
+            "/nausf-auth/v1/prose-authentications/ctx-1/prose-auth",
+        ] {
+            let resp = ausf_sbi_request_handler(SbiRequest::post(path)).await;
+            assert_eq!(resp.status, 501, "POST {path} must be 501");
+        }
+
+        // A genuinely unknown resource is still a fallthrough, not a 501 —
+        // 501 means "declared by the API but unimplemented here".
+        let resp =
+            ausf_sbi_request_handler(SbiRequest::post("/nausf-auth/v1/not-a-resource")).await;
+        assert_ne!(
+            resp.status, 501,
+            "an undeclared resource must not claim 501"
+        );
+    }
+
+    // ====================================================================
     // ausfd-05: serving-network-name entitlement vs consumer token PLMN
     // ====================================================================
     #[tokio::test]
@@ -2913,7 +3370,7 @@ mod tests {
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::lock_context();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
 
@@ -3059,7 +3516,7 @@ mod tests {
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.
-        let _guard = crate::test_support::CONTEXT_GUARD.lock().unwrap();
+        let _guard = crate::test_support::lock_context();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
 

@@ -61,12 +61,32 @@ pub use app::{
 /// boundaries; a dev-dependency test in a peer crate must seed the
 /// process-global AUSF context.
 pub mod test_support {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     /// Process-wide lock so strict-peer tests that touch the global AUSF
     /// context run serially (the context is process-global; parallel tests
     /// race).
+    ///
+    /// Take it via [`lock_context`], never `CONTEXT_GUARD.lock().unwrap()`.
     pub static CONTEXT_GUARD: Mutex<()> = Mutex::new(());
+
+    /// Acquire [`CONTEXT_GUARD`], recovering from poisoning.
+    ///
+    /// The guard is held across assertions, so the FIRST test to fail poisons it
+    /// and every later test that unwrapped the lock died with `PoisonError`
+    /// instead of running. That turned one genuine assertion failure into an
+    /// avalanche of unrelated ones and buried the real message — which is exactly
+    /// what makes a CI failure, or a revert-verification, unreadable.
+    ///
+    /// Poisoning carries no information here: the mutex guards `()`, so there is
+    /// no invariant a panicking test could have left broken. Every test re-seeds
+    /// the global context with `ausf_context_init` after taking the lock anyway.
+    /// So recovering is strictly better than propagating.
+    pub fn lock_context() -> MutexGuard<'static, ()> {
+        CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Initialize the process-global AUSF context for in-process strict-peer
     /// tests (wraps [`crate::context::ausf_context_init`] with test capacity).
