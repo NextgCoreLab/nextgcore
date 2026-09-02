@@ -25,8 +25,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd -r nextgcore && useradd -r -g nextgcore -s /bin/false nextgcore
 
 # Create standard directories
-RUN mkdir -p /etc/nextgcore /var/log/nextgcore /var/run/nextgcore && \
-    chown -R nextgcore:nextgcore /etc/nextgcore /var/log/nextgcore /var/run/nextgcore
+# /var/lib/nextgcore holds durable NF state snapshots (issue #66). It must exist
+# in the image AND be owned by `nextgcore`: a Docker named volume mounted onto a
+# path the image does not create is initialised root-owned, and these processes
+# run as `nextgcore`, so the first snapshot write would fail with EACCES. Creating
+# it here lets the volume inherit the right ownership.
+RUN mkdir -p /etc/nextgcore /var/log/nextgcore /var/run/nextgcore /var/lib/nextgcore && \
+    chown -R nextgcore:nextgcore /etc/nextgcore /var/log/nextgcore /var/run/nextgcore \
+        /var/lib/nextgcore
 
 ENV RUST_LOG=info
 

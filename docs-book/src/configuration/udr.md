@@ -93,7 +93,7 @@ From the clap `Args` struct in `src/bins/nextgcore-udrd/src/main.rs`:
 | `--tls` | flag | off | Enable TLS on the SBI server. |
 | `--tls-cert` | path | unset | TLS certificate file. |
 | `--tls-key` | path | unset | TLS private key file. |
-| `--state-file` | path | unset | JSON snapshot file for the non-subscriber resource trees (exposure-data, application-data, smf-registrations, subs-to-notify, policy provisioning, amf-3gpp-access). Falls back to `NEXTGCORE_UDR_STATE_FILE`; empty strings are treated as unset. When neither is set the trees are in-memory only and lost on restart. |
+| `--state-file` | path | unset (but **set in the shipped Docker compose**, see below) | JSON snapshot file for the non-subscriber resource trees (exposure-data, application-data, smf-registrations, subs-to-notify, policy provisioning, amf-3gpp-access). Falls back to `NEXTGCORE_UDR_STATE_FILE`; empty strings are treated as unset. When neither is set the trees are in-memory only and lost on restart. |
 
 ## Behavior notes
 
@@ -102,4 +102,30 @@ From the clap `Args` struct in `src/bins/nextgcore-udrd/src/main.rs`:
 - **Change notifications are fire-and-forget.** `subs-to-notify` subscriptions on the subscription-data, exposure-data, influenceData, and application-data trees trigger real HTTP POSTs to the registered callback URI with a 2 s connect / 3 s request timeout; delivery failures are logged and never retried.
 - **UE identifier handling** (TS 29.571 `VarUeId` forms per code comments): null-scheme SUCIs are converted to IMSI locally; syntactically valid but unprovisioned `nai-`/`gci-`/`gli-` identifiers get **404** `NOT_FOUND` (not 400); `extgroupid-` gets **501** `NOT_SUPPORTED`; anything else is **400** `INVALID_SUPI`.
 - **PATCH on `authentication-subscription` stores exactly what is written** — the UDR applies the `/sequenceNumber/sqn` PatchItem verbatim with no SQN side effects; SQN advancement is the UDM/ARPF's job per the TS 33.102 Annex C.3 code comment (a previous unconditional +32 SEQ increment here was a bug, WSB-6).
+
+## Durable state is on by default in Docker
+
+`docker/rust/docker-compose.yml` sets `NEXTGCORE_UDR_STATE_FILE=/var/lib/nextgcore/udr-state.json`
+and backs it with the `udr_state` named volume, so the resource trees survive both
+`docker compose restart` and `up -d` recreating the container (issue #66).
+
+The UDR is the most severe member of that issue: memory-only, a restart erases
+every subscriber's `amf-3gpp-access` and `smf-registration` at once, and consumers
+then receive authoritative-looking "not registered" answers for subscribers that
+*are* registered.
+
+Two things make enabling it safe rather than merely convenient:
+
+* a **corrupt** snapshot is refused, not overwritten — the NF logs an error, starts
+  empty, and declines to persist, so the unreadable file survives for recovery
+  (see the shared-store section in [Configuration Overview](./overview.md));
+* snapshots are written atomically, fsynced and `0600` — this file is keyed by
+  IMSI.
+
+**Kubernetes and Helm are not covered.** The `udr` manifest is a `Deployment` with
+no volume for this, so persistence there still needs a `PersistentVolumeClaim` plus
+`strategy: Recreate` (or conversion to a `StatefulSet`, as MongoDB uses). That is a
+storage-topology decision rather than a config line, so it is deliberately left
+out.
+
 - **Environment variables**: `DB_URI` (MongoDB URI; read only when the YAML has no `db_uri` line), `NEXTGCORE_UDR_STATE_FILE` (state-file path; read only when `--state-file` is absent — the flag wins), and `OTEL_EXPORTER_OTLP_ENDPOINT` (OpenTelemetry OTLP exporter endpoint, default `http://jaeger:4317`).
