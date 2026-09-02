@@ -644,9 +644,26 @@ pub async fn handle_analytics_info_query_with_ctx(
     let start = period_start.to_rfc3339();
     let expiry = period_end.to_rfc3339();
 
-    // Build the AnalyticsData object with the event-specific *Infos key.
+    // Build the AnalyticsData object with the event-specific payload member.
+    //
+    // Issue #172: the member name comes from `AnalyticsData`, NOT from the
+    // EventsSubscription `EventNotification` schema — they disagree for four
+    // tokens. `None` means `AnalyticsData` defines no member for this event
+    // (PFD_DETERMINATION, which is not even an `EventId` value), so there is no
+    // conformant body to return and the honest answer is 204 rather than a
+    // fabricated member name. Unreachable while that event has no collector, but
+    // it is the guard a future collector needs.
+    let Some(infos_key) = analytics_id.analytics_data_key() else {
+        log::info!(
+            "AnalyticsInfo {}: TS 29.520 AnalyticsData defines no member for this event (it is \
+             not an EventId value — subscribe/notify only), so no conformant response body \
+             exists → 204",
+            analytics_id.as_str()
+        );
+        return SbiResponse::with_status(204);
+    };
     let mut analytics_data = serde_json::Map::new();
-    analytics_data.insert(analytics_id.infos_key().to_string(), infos);
+    analytics_data.insert(infos_key.to_string(), infos);
     analytics_data.insert("start".to_string(), serde_json::json!(start));
     analytics_data.insert("expiry".to_string(), serde_json::json!(expiry));
     analytics_data.insert(

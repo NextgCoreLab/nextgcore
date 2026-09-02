@@ -240,8 +240,12 @@ fn nf_status_json(status: &str) -> Value {
     }
 }
 
-/// Compute the per-event `*Infos` **array** (the value stored under
-/// `event.infos_key()`) for a single analytics event.
+/// Compute the per-event `*Infos` **array** for a single analytics event.
+///
+/// Always an array, whichever surface consumes it: the per-surface member NAME
+/// comes from `AnalyticsId::notification_infos_key` / `analytics_data_key`, and
+/// the one event whose notify payload is a single object is reshaped by
+/// [`notification_payload`] at emission time (issue #172).
 ///
 /// Shared by `Nnwdaf_AnalyticsInfo` (GET → `AnalyticsData`) and the
 /// `Nnwdaf_EventsSubscription_Notify` dispatcher so both stay wire-aligned on
@@ -326,9 +330,30 @@ pub fn compute_event_infos(
     }
 }
 
+/// Shape the computed per-event `*Infos` array for the `EventNotification`
+/// surface (issue #172).
+///
+/// Almost every payload member of `EventNotification` is a `minItems: 1` array
+/// and the computed value is emitted unchanged. `SLICE_LOAD_LEVEL` is the sole
+/// exception: its member `sliceLoadLevelInfo` is a bare
+/// `SliceLoadLevelInformation` object
+/// (`TS29520_Nnwdaf_EventsSubscription.yaml:835-836`), so the first computed
+/// entry is unwrapped. Returns `None` when there is nothing to emit, which the
+/// caller turns into "do not report this event" — the same fail-closed rule the
+/// empty-array check above applies.
+fn notification_payload(event: AnalyticsId, infos: Value) -> Option<Value> {
+    if !event.notification_payload_is_single_object() {
+        return Some(infos);
+    }
+    match infos {
+        Value::Array(mut entries) if !entries.is_empty() => Some(entries.swap_remove(0)),
+        _ => None,
+    }
+}
+
 /// Build the TS 29.520 `eventNotifications[]` array for a subscription: one
 /// `EventNotification` per subscribed event, each carrying `event`,
-/// `start`/`expiry` and the event-specific `*Infos` array.
+/// `start`/`expiry` and the event-specific payload member.
 ///
 /// nwafd-07: events whose `notificationMethod` is `THRESHOLD` are only emitted
 /// when their computed analytic crosses the configured threshold in the
@@ -409,7 +434,15 @@ fn build_event_notifications(
             obj.insert("event".to_string(), json!(e.event.as_str()));
             obj.insert("start".to_string(), json!(start));
             obj.insert("expiry".to_string(), json!(expiry));
-            obj.insert(e.event.infos_key().to_string(), infos);
+            // Issue #172: the member name AND its shape come from
+            // `EventNotification`, not from the AnalyticsInfo `AnalyticsData`
+            // schema — the two disagree for four tokens. SLICE_LOAD_LEVEL's
+            // notify payload is a single object, so the computed array is
+            // unwrapped rather than emitted as-is.
+            obj.insert(
+                e.event.notification_infos_key().to_string(),
+                notification_payload(e.event, infos)?,
+            );
             Some(Value::Object(obj))
         })
         .collect()
@@ -1247,6 +1280,93 @@ mod tests {
             1,
             "PERIODIC subscription must always report when data exists"
         );
+    }
+
+    // ── issue #172: per-surface payload member names and shapes ─────────────
+
+    /// **Issue #172, the shape half.** `SLICE_LOAD_LEVEL`'s `EventNotification`
+    /// member is a bare `SliceLoadLevelInformation` object
+    /// (`TS29520_Nnwdaf_EventsSubscription.yaml:835-836`), not the `minItems: 1`
+    /// array every other payload member is — and not the array its own
+    /// `AnalyticsData` counterpart `sliceLoadLevelInfos` is either. So the
+    /// computed array is unwrapped for that one event and passed through for the
+    /// rest.
+    #[test]
+    fn test_notification_payload_unwraps_only_slice_load_level() {
+        let entry = || json!({ "loadLevelInformation": 42 });
+        let two = Value::Array(vec![entry(), json!({ "loadLevelInformation": 7 })]);
+
+        // SLICE_LOAD_LEVEL: a single OBJECT, not an array.
+        let shaped = notification_payload(AnalyticsId::SliceLoadLevel, two.clone())
+            .expect("non-empty input yields a payload");
+        assert!(
+            shaped.is_object(),
+            "sliceLoadLevelInfo is an object in EventNotification, got {shaped}"
+        );
+        assert_eq!(shaped, entry(), "the first computed entry is the payload");
+
+        // Every other event keeps the array — including NSI_LOAD_LEVEL, which
+        // used to share SLICE_LOAD_LEVEL's member and would otherwise inherit
+        // its shape.
+        for event in AnalyticsId::ALL {
+            if *event == AnalyticsId::SliceLoadLevel {
+                continue;
+            }
+            let shaped = notification_payload(*event, two.clone()).expect("payload");
+            assert!(
+                shaped.is_array(),
+                "{} must stay a minItems:1 array, got {shaped}",
+                event.as_str()
+            );
+            assert_eq!(shaped.as_array().map(Vec::len), Some(2));
+        }
+
+        // Nothing to unwrap → no payload, so the caller drops the event rather
+        // than emitting `sliceLoadLevelInfo: null`.
+        assert!(notification_payload(AnalyticsId::SliceLoadLevel, json!([])).is_none());
+        assert!(notification_payload(AnalyticsId::SliceLoadLevel, Value::Null).is_none());
+    }
+
+    /// The emitted `EventNotification` keys its payload by the notify-surface
+    /// member name, and NF_LOAD's stays the array it has always been — a
+    /// regression guard on the #172 accessor split for the one event with a
+    /// live collector.
+    #[test]
+    fn test_event_notification_uses_the_notify_surface_member() {
+        let ctx = NwdafContext::new("nwdaf-test".to_string());
+        ingest_loads(&ctx, "AMF", "amf-key-surface", &[40, 60]);
+        let sub = AnalyticsSubscription::new(
+            "sub-key-surface".into(),
+            AnalyticsId::NfLoad,
+            "http://x/y".into(),
+            u64::MAX,
+        );
+
+        let engine = ctx.lock_engine();
+        let notifications = build_event_notifications(&ctx, &engine, &sub);
+        assert_eq!(notifications.len(), 1);
+        let notification = &notifications[0];
+
+        assert_eq!(
+            AnalyticsId::NfLoad.notification_infos_key(),
+            "nfLoadLevelInfos"
+        );
+        assert!(
+            notification["nfLoadLevelInfos"].is_array(),
+            "NF_LOAD's notify payload is a minItems:1 array: {notification}"
+        );
+        // No stray member from the other surface or the pre-#172 spellings.
+        for absent in [
+            "wlanPerfInfos",
+            "smcInfos",
+            "sliceLoadLevelInfo",
+            "abnormalTraffic",
+        ] {
+            assert!(
+                notification.get(absent).is_none(),
+                "{absent} must not appear in an NF_LOAD EventNotification"
+            );
+        }
     }
 
     // ── G2-3: supported-events honesty in the dispatcher ────────────────────
