@@ -85,6 +85,35 @@ Common sub-blocks seen in the Docker configs:
 
 Precedence, where both exist: **environment variable > YAML > compiled-in default.**
 
+### Durable state snapshots
+
+Four NFs persist their long-lived runtime state as a full-store JSON snapshot,
+rewritten on every mutation and reloaded at boot: **nrfd** (NF registry),
+**nssfd** (NSSAI-availability subscriptions and data), **nsacfd** (admission
+counters) and **udrd** (the non-subscriber resource trees). Each is enabled by its
+own `--state-file` flag or `NEXTGCORE_<NF>_STATE_FILE` variable; with neither set
+the NF is purely in-memory, which is the shipped Docker/E2E default.
+
+They share one implementation (`nextgcore-core`'s `state_store`), which
+distinguishes three cases:
+
+| snapshot file | meaning | behaviour |
+|---|---|---|
+| absent | first boot, or persistence disabled | start empty, persisting enabled |
+| present, valid | normal restart | state restored, persisting enabled |
+| present, **invalid** | a human must look at it | start empty, **persisting REFUSED** |
+
+The third row is the one to know about. Previously an unreadable or malformed
+snapshot was logged as a warning and treated as "no state" — and the next mutation
+rewrote the file from the resulting empty snapshot, making the loss permanent and
+destroying the only recoverable copy. Now the NF logs an error, starts empty, and
+**refuses to write**, so the file survives for inspection. Move it aside to start
+fresh deliberately.
+
+Snapshots are written atomically (temporary file, fsync, rename, parent-directory
+fsync) and created `0600` — the UDR's contains IMSI-keyed subscriber
+registrations.
+
 ### SBI security profile (issue #63)
 
 `amf`, `smf`, `ausf` and `udm` resolve `NEXTGCORE_SBI_PROFILE` at startup. Under

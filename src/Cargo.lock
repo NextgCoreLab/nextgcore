@@ -2427,6 +2427,7 @@ dependencies = [
  "log",
  "proptest",
  "rand 0.9.2",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "uuid",

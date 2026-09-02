@@ -337,6 +337,10 @@ pub struct NsacfContext {
     eac_threshold_percent: RwLock<u8>,
     /// Optional persistence path; counters survive restarts when set
     state_file: RwLock<Option<PathBuf>>,
+    /// Issue #66: set when `load_state` could not read the snapshot. While set,
+    /// `save_state` REFUSES to write, so an unreadable file is never replaced by
+    /// the empty quota set that failing to read it produced.
+    state_unreadable: std::sync::atomic::AtomicBool,
     /// Context initialized flag
     initialized: AtomicBool,
 }
@@ -352,6 +356,7 @@ impl NsacfContext {
             max_quotas: 0,
             eac_threshold_percent: RwLock::new(80),
             state_file: RwLock::new(None),
+            state_unreadable: std::sync::atomic::AtomicBool::new(false),
             initialized: AtomicBool::new(false),
         }
     }
@@ -865,6 +870,20 @@ impl NsacfContext {
             },
             Err(_) => return,
         };
+        // Issue #66: a failed load left the quota set EMPTY, so writing now would
+        // replace the unreadable file with nothing and make the loss permanent.
+        if self
+            .state_unreadable
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            log::error!(
+                "NSACF refusing to persist to {}: its previous contents could not be read, \
+                 and overwriting them with the current (empty) state would make the loss \
+                 permanent. Move the file aside to start fresh.",
+                path.display()
+            );
+            return;
+        }
         let quotas: Vec<serde_json::Value> = match self.quota_list.read() {
             Ok(list) => list
                 .values()
@@ -914,13 +933,13 @@ impl NsacfContext {
         // handler never stalls a tokio worker on disk I/O: when a runtime is
         // active (the request-reachable path) spawn it on the blocking pool;
         // otherwise (sync tests / non-async startup) write inline.
-        let body = state.to_string();
-        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("tmp{seq}"));
+        // The shared writer (issue #66) does the serialise + temp + fsync +
+        // rename, so the per-save sequence that used to name the temp file is no
+        // longer needed -- it derives a non-colliding name itself.
+        let _ = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
         let write = move || {
-            let result = std::fs::write(&tmp, &body).and_then(|_| std::fs::rename(&tmp, &path));
-            if let Err(e) = result {
-                log::warn!("Failed to persist NSACF state to {}: {e}", path.display());
+            if let Err(e) = nextgcore_core::state_store::write_snapshot(&path, &state) {
+                log::warn!("Failed to persist NSACF state: {e}");
             }
         };
         match tokio::runtime::Handle::try_current() {
@@ -940,14 +959,20 @@ impl NsacfContext {
             },
             Err(_) => return false,
         };
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return false, // no state yet
-        };
-        let state: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
+        let state: serde_json::Value = match nextgcore_core::state_store::read_snapshot(&path) {
+            Ok(Some(v)) => v,
+            // No file yet: a first boot, not a problem.
+            Ok(None) => return false,
+            // Issue #66: unreadable or malformed. This used to return false and
+            // let the next save_state rewrite the file from the empty quota set,
+            // making the loss permanent. Mark it so save_state refuses instead.
             Err(e) => {
-                log::warn!("Corrupt NSACF state file {}: {e}", path.display());
+                log::error!(
+                    "NSACF state load failed, starting EMPTY and refusing to overwrite the \
+                     file: {e}"
+                );
+                self.state_unreadable
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 return false;
             }
         };
