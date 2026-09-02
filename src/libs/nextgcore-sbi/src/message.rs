@@ -409,6 +409,19 @@ pub struct SbiRequest {
     /// programmatically. The SEPP N32-c handler consumes this to derive the
     /// N32-f session key via `set_n32c_tls_exporter_secret`.
     pub tls_exporter_secret: Option<Vec<u8>>,
+    /// NF Instance ID from the URI SubjectAltName of the peer's **verified**
+    /// client certificate (issue #186, TS 33.310, TS 33.501 §13.4.1.1).
+    ///
+    /// `Some` only when the listener runs mTLS (`verify_client = true`), rustls
+    /// verified the client's chain, and that certificate carries a URI SAN.
+    /// `None` for plaintext connections, for TLS without client authentication,
+    /// for a certificate with no URI SAN, and for requests built
+    /// programmatically.
+    ///
+    /// This is an identity **this process** verified, so it outranks any
+    /// forwarded-certificate header, which is only as trustworthy as the
+    /// terminator that set it.
+    pub peer_cert_nf_instance_id: Option<String>,
 }
 
 impl SbiRequest {

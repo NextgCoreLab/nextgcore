@@ -51,6 +51,7 @@ pub mod multipart;
 pub mod nes; // NES idle/sleep state machine (issue #22, non-normative)
 pub mod oauth;
 pub mod overload;
+pub mod peer_cert; // NF identity from a verified TLS peer certificate (issue #186)
 #[cfg(feature = "6g-extensions")]
 pub mod pubsub;
 pub mod scp;

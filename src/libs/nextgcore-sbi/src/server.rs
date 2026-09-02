@@ -306,6 +306,10 @@ struct SbiService<H: SbiRequestHandler> {
     /// once per connection (T1.5b). Shared across all multiplexed requests on
     /// the same HTTP/2 connection and threaded into each `SbiRequest`.
     tls_exporter_secret: Option<Vec<u8>>,
+    /// Issue #186: NF Instance ID from the verified peer certificate's URI SAN,
+    /// extracted once per connection alongside the exporter secret and threaded
+    /// into every request multiplexed on it.
+    peer_cert_nf_instance_id: Option<String>,
     /// This NF's `(NfType, id)` identity for the `Server` response header
     /// (sbi-02). `None` emits no `Server` header.
     server_identity: Option<(NfType, String)>,
@@ -318,6 +322,7 @@ impl<H: SbiRequestHandler> Clone for SbiService<H> {
             oauth: self.oauth.clone(),
             max_request_body_size: self.max_request_body_size,
             tls_exporter_secret: self.tls_exporter_secret.clone(),
+            peer_cert_nf_instance_id: self.peer_cert_nf_instance_id.clone(),
             server_identity: self.server_identity.clone(),
         }
     }
@@ -333,6 +338,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let oauth = self.oauth.clone();
         let max_body = self.max_request_body_size;
         let tls_exporter_secret = self.tls_exporter_secret.clone();
+        let peer_cert_nf_instance_id = self.peer_cert_nf_instance_id.clone();
         let server_identity = self.server_identity.clone();
         let path = req.uri().path().to_string();
 
@@ -350,26 +356,29 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             // Convert hyper request to SbiRequest, enforcing the body-size cap
             // BEFORE buffering (T1.4). An oversize body is rejected with 413
             // ProblemDetails without allocating the full body.
-            let sbi_request = match convert_request(req, max_body, tls_exporter_secret).await {
-                Ok(request) => request,
-                Err(ConvertRequestError::BodyTooLarge) => {
-                    let body = serde_json::json!({
-                        "title": "Payload Too Large",
-                        "status": 413,
-                        "detail": format!(
-                            "request body exceeds the maximum of {max_body} bytes"
-                        ),
-                        "cause": "PAYLOAD_TOO_LARGE",
-                    })
-                    .to_string();
-                    let resp =
-                        SbiResponse::with_status(413).with_body(body, "application/problem+json");
-                    return Ok(convert_response_with_identity(
-                        resp,
-                        server_identity.as_ref(),
-                    ));
-                }
-            };
+            let sbi_request =
+                match convert_request(req, max_body, tls_exporter_secret, peer_cert_nf_instance_id)
+                    .await
+                {
+                    Ok(request) => request,
+                    Err(ConvertRequestError::BodyTooLarge) => {
+                        let body = serde_json::json!({
+                            "title": "Payload Too Large",
+                            "status": 413,
+                            "detail": format!(
+                                "request body exceeds the maximum of {max_body} bytes"
+                            ),
+                            "cause": "PAYLOAD_TOO_LARGE",
+                        })
+                        .to_string();
+                        let resp = SbiResponse::with_status(413)
+                            .with_body(body, "application/problem+json");
+                        return Ok(convert_response_with_identity(
+                            resp,
+                            server_identity.as_ref(),
+                        ));
+                    }
+                };
 
             // OAuth2 enforcement (opt-in). Verify the bearer token against the
             // configured key material before dispatching to the NF handler.
@@ -539,6 +548,7 @@ async fn convert_request(
     req: Request<Incoming>,
     max_body_size: usize,
     tls_exporter_secret: Option<Vec<u8>>,
+    peer_cert_nf_instance_id: Option<String>,
 ) -> Result<SbiRequest, ConvertRequestError> {
     let method = req.method().to_string();
     let uri = req.uri().path().to_string();
@@ -628,6 +638,7 @@ async fn convert_request(
         http,
         correlation_id,
         tls_exporter_secret,
+        peer_cert_nf_instance_id,
     })
 }
 
@@ -893,11 +904,33 @@ impl SbiServer {
                                                     })
                                                     .ok()
                                                 };
+                                                // ── #186: NF identity from the VERIFIED
+                                                // peer certificate ──
+                                                // rustls has already validated the
+                                                // client's chain by this point (when
+                                                // verify_client is set); the leaf's URI
+                                                // SubjectAltName carries the NF Instance
+                                                // ID (TS 33.310). Read from the same
+                                                // borrow as the exporter secret above,
+                                                // for the same reason: it must happen
+                                                // before the stream moves into TokioIo.
+                                                let peer_cert_nf_instance_id = {
+                                                    let (_, server_conn) = tls_stream.get_ref();
+                                                    server_conn
+                                                        .peer_certificates()
+                                                        .and_then(|chain| chain.first())
+                                                        .and_then(|leaf| {
+                                                            crate::peer_cert::nf_instance_id_from_der(
+                                                                leaf.as_ref(),
+                                                            )
+                                                        })
+                                                };
                                                 let service = SbiService {
                                                     handler: handler_ref,
                                                     oauth: oauth_ref,
                                                     max_request_body_size,
                                                     tls_exporter_secret,
+                                                    peer_cert_nf_instance_id,
                                                     server_identity: server_identity_ref,
                                                 };
                                                 let io = TokioIo::new(tls_stream);
@@ -922,8 +955,10 @@ impl SbiServer {
                                         handler: handler_ref,
                                         oauth: oauth_ref,
                                         max_request_body_size,
-                                        // No TLS on plaintext connections.
+                                        // No TLS on plaintext connections, so no
+                                        // exporter secret and no peer certificate.
                                         tls_exporter_secret: None,
+                                        peer_cert_nf_instance_id: None,
                                         server_identity: server_identity_ref,
                                     };
                                     let io = TokioIo::new(stream);

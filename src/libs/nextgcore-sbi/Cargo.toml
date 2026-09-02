@@ -41,6 +41,11 @@ hex.workspace = true
 # probabilistic reaction (sbi-08). Workspace-pinned; no root Cargo.toml change.
 rand.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
+# Issue #186: parse the URI SubjectAltName out of a peer's verified client
+# certificate (TS 33.310 carries the NF Instance ID there). RustCrypto, so it
+# builds on the same `der` already in the graph via p256 -- no second ASN.1 stack,
+# and no hand-rolled X.509 parsing for a security-relevant identity.
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 # http3-feature-only: HTTP/3 transport prototype (issue #15). Crate-local, not
 # workspace-pinned — no other crate may depend on these (non-normative research).
 h3 = { version = "0.0.8", optional = true }
