@@ -61,6 +61,9 @@ fn amfd_notify_request(pol_asso_id: &str, n1_payload: &[u8]) -> nextgcore_sbi::m
 /// the association Pending→Delivered (records the UPSC as installed UPSI).
 #[tokio::test]
 async fn complete_via_real_amfd_notify_delivers() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let id = seed_pending_association(0x91);
     let complete = nas_updp::ManageUePolicyComplete { pti: 0x91 }
         .encode()
@@ -82,6 +85,9 @@ async fn complete_via_real_amfd_notify_delivers() {
 /// D.6.3 per-instruction cause.
 #[tokio::test]
 async fn reject_via_real_amfd_notify_fails_with_cause() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let id = seed_pending_association(0x92);
     let reject = nas_updp::ManageUePolicyCommandReject {
         pti: 0x92,
@@ -119,6 +125,9 @@ async fn reject_via_real_amfd_notify_fails_with_cause() {
 /// Pending — Delivered is reached ONLY via a matching PTI.
 #[tokio::test]
 async fn wrong_pti_complete_is_dropped() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let id = seed_pending_association(0x93);
     let stale = nas_updp::ManageUePolicyComplete { pti: 0x9F }
         .encode()

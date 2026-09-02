@@ -19,7 +19,11 @@ global:
   # This chart mounts no SBI certificates, so it ships the explicit "dev"
   # opt-out: cleartext h2c, no client-certificate verification, no token
   # verification. Set to "production" only once those certs are provisioned and
-  # mounted at /etc/nextgcore/tls/{server.crt,server.key,ca.crt}.
+  # mounted at /etc/nextgcore/tls/{server.crt,server.key,ca.crt} -- plus the
+  # CLIENT pair those NFs present when they DIAL a peer
+  # (/etc/nextgcore/tls/{client.crt,client.key}), since under mTLS an NF is both
+  # server and client. Override any path with NEXTGCORE_SBI_TLS_CERT / _KEY / _CA
+  # / _CLIENT_CERT / _CLIENT_KEY.
   sbiProfile: dev
   logLevel: info
   max:

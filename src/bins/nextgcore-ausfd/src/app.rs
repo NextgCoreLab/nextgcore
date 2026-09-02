@@ -146,7 +146,7 @@ async fn peer_client(
 ) -> Arc<nextgcore_sbi::client::SbiClient> {
     match oauth2_client() {
         Some(oauth2) => Arc::new(
-            nextgcore_sbi::client::SbiClient::new(nextgcore_sbi::client::SbiClientConfig::new(
+            nextgcore_sbi::client::SbiClient::new(nextgcore_sbi::security::sbi_peer_client_config(
                 host, port,
             ))
             .with_oauth2(oauth2, target),
@@ -2278,6 +2278,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_http_auth_flows_5g_aka_and_eap_aka_prime() {
+        // Drives production code against a loopback PLAINTEXT peer, i.e. describes a
+        // dev-profile deployment (issue #63). Declared, not inherited from the env.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.
@@ -2643,6 +2646,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_confirmation_response_shaping() {
+        // Drives production code against a loopback PLAINTEXT peer, i.e. describes a
+        // dev-profile deployment (issue #63). Declared, not inherited from the env.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.
@@ -2936,6 +2942,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_sor_upu_anchor_survives_auth_context_delete() {
+        // Drives production code against a loopback PLAINTEXT peer, i.e. describes a
+        // dev-profile deployment (issue #63). Declared, not inherited from the env.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.
@@ -3069,6 +3078,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_deregister_clears_context_and_the_sor_upu_anchor() {
+        // Drives production code against a loopback PLAINTEXT peer, i.e. describes a
+        // dev-profile deployment (issue #63). Declared, not inherited from the env.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = crate::test_support::lock_context();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
@@ -3256,6 +3268,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_ue_authentication_ctx_is_served_as_hal_json() {
+        // Drives production code against a loopback PLAINTEXT peer, i.e. describes a
+        // dev-profile deployment (issue #63). Declared, not inherited from the env.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = crate::test_support::lock_context();
         let _ = env_logger::try_init();
         let _lock = TEST_MUTEX.lock().await;
@@ -3383,6 +3398,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_snn_entitlement_against_consumer_token() {
+        // Drives production code against a loopback PLAINTEXT peer, i.e. describes a
+        // dev-profile deployment (issue #63). Declared, not inherited from the env.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.
@@ -3529,6 +3547,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global AUSF state (current-thread test)
     async fn test_sor_upu_protection_http_end_to_end() {
+        // Drives production code against a loopback PLAINTEXT peer, i.e. describes a
+        // dev-profile deployment (issue #63). Declared, not inherited from the env.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // Serialize on ausfd's global-context/env guard: re-inits the process-
         // global AUSF context and/or sets UDM/UDR_SBI_* env vars, which races any
         // other ausfd test doing the same under parallel `cargo test`.

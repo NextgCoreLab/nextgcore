@@ -90,6 +90,9 @@ fn body_cause(resp: &nextgcore_sbi::message::SbiResponse) -> String {
 /// egress are byte-identical to pcfd's E1(f) command (no re-encoding, no drop).
 #[test]
 fn pcfd_updp_accepted_by_real_amfd_and_enqueued_verbatim() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let _serial = CONTEXT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let supi = "imsi-001010000004001";
     let ue_id = seed_ue(supi, true);
@@ -128,6 +131,9 @@ fn pcfd_updp_accepted_by_real_amfd_and_enqueued_verbatim() {
 /// non-2xx that pcfd's delivery path records as `DeliveryState::Failed`.
 #[test]
 fn pcfd_updp_to_idle_ue_rejected_504_by_real_amfd() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let _serial = CONTEXT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let supi = "imsi-001010000004002";
     let ue_id = seed_ue(supi, false);

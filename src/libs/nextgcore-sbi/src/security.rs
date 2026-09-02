@@ -74,6 +74,11 @@ impl TlsPaths {
     pub const CERT_ENV: &'static str = "NEXTGCORE_SBI_TLS_CERT";
     pub const KEY_ENV: &'static str = "NEXTGCORE_SBI_TLS_KEY";
     pub const CA_ENV: &'static str = "NEXTGCORE_SBI_TLS_CA";
+    /// The certificate this NF presents when it DIALS a peer. Under mTLS an NF is
+    /// both a server and a client, and a deployment may well mount the two roles'
+    /// material separately.
+    pub const CLIENT_CERT_ENV: &'static str = "NEXTGCORE_SBI_TLS_CLIENT_CERT";
+    pub const CLIENT_KEY_ENV: &'static str = "NEXTGCORE_SBI_TLS_CLIENT_KEY";
 
     /// [`TlsPaths::default`] with each path overridden by its environment
     /// variable when that variable is set and non-empty.
@@ -84,13 +89,19 @@ impl TlsPaths {
                 _ => fallback,
             }
         };
+        let or_env_opt = |var: &str, fallback: Option<String>| -> Option<String> {
+            match std::env::var(var) {
+                Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+                _ => fallback,
+            }
+        };
         let d = Self::default();
         Self {
             cert: or_env(Self::CERT_ENV, d.cert),
             key: or_env(Self::KEY_ENV, d.key),
             ca_cert: or_env(Self::CA_ENV, d.ca_cert),
-            client_cert: d.client_cert,
-            client_key: d.client_key,
+            client_cert: or_env_opt(Self::CLIENT_CERT_ENV, d.client_cert),
+            client_key: or_env_opt(Self::CLIENT_KEY_ENV, d.client_key),
         }
     }
 }
@@ -205,10 +216,43 @@ pub enum SbiProfile {
 /// security, which is the failure mode this issue is about.
 pub const SBI_PROFILE_ENV: &str = "NEXTGCORE_SBI_PROFILE";
 
+/// Tri-state programmatic override of the profile: `0` = consult
+/// [`SBI_PROFILE_ENV`], `1` = force [`SbiProfile::Dev`], `2` = force
+/// [`SbiProfile::Production`].
+static SBI_PROFILE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the process-wide profile, overriding [`SBI_PROFILE_ENV`].
+///
+/// Exists for tests that exercise production code paths against a loopback
+/// **plaintext** peer: such a test is describing a dev-profile deployment, and
+/// saying so explicitly is better than depending on whatever the environment
+/// happens to hold. Storing the same value from several threads is benign, so
+/// parallel tests that all want `Dev` do not need to serialise.
+pub fn set_sbi_profile_override(profile: SbiProfile) {
+    SBI_PROFILE_MODE.store(
+        match profile {
+            SbiProfile::Dev => 1,
+            SbiProfile::Production => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Clear an override set by [`set_sbi_profile_override`], restoring env-driven
+/// resolution.
+pub fn reset_sbi_profile_override() {
+    SBI_PROFILE_MODE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl SbiProfile {
-    /// Resolve the process-wide profile from [`SBI_PROFILE_ENV`].
+    /// Resolve the process-wide profile: the programmatic override
+    /// ([`set_sbi_profile_override`]) first, then [`SBI_PROFILE_ENV`].
     pub fn resolve() -> Self {
-        Self::from_env_value(std::env::var(SBI_PROFILE_ENV).ok().as_deref())
+        match SBI_PROFILE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => Self::Dev,
+            2 => Self::Production,
+            _ => Self::from_env_value(std::env::var(SBI_PROFILE_ENV).ok().as_deref()),
+        }
     }
 
     /// Pure resolution of an env value, unit-testable without touching the
@@ -314,12 +358,25 @@ pub fn apply_sbi_security_policy(
         )));
     }
 
+    // Every file the posture needs, checked at startup so a missing one names
+    // itself here rather than surfacing later as a handshake error. Under mTLS an
+    // NF is both server and client, so the client material it presents when
+    // DIALLING a peer is just as required as the server material -- omitting it
+    // from this check is how "the listener came up fine" turns into every
+    // outbound call failing.
     let paths = &policy.tls_paths;
-    for (label, path) in [
+    let mut required: Vec<(&str, &str)> = vec![
         ("certificate", paths.cert.as_str()),
         ("private key", paths.key.as_str()),
         ("client CA certificate", paths.ca_cert.as_str()),
-    ] {
+    ];
+    if let Some(cc) = paths.client_cert.as_deref() {
+        required.push(("client certificate (for outbound peer calls)", cc));
+    }
+    if let Some(ck) = paths.client_key.as_deref() {
+        required.push(("client private key (for outbound peer calls)", ck));
+    }
+    for (label, path) in required {
         if !std::path::Path::new(path).is_file() {
             return Err(SbiError::TlsError(format!(
                 "SBI production profile requires a TLS {label} at {path}, which does not \
@@ -359,20 +416,6 @@ pub fn apply_sbi_security_policy(
         }
     }
 
-    // KNOWN INCOMPLETE (issue #63, remaining half of criterion 1). This function
-    // configures the INBOUND listener. The four core NFs still build their
-    // OUTBOUND peer clients with `SbiClient::with_host_port`, which defaults to
-    // cleartext http with no client certificate -- so NF-to-NF calls between two
-    // production-profile NFs fail at the TLS layer. Said out loud here because the
-    // alternative is an operator debugging a connection error on the callee side
-    // with nothing pointing at the caller's scheme.
-    log::warn!(
-        "SBI production profile: OUTBOUND peer calls are NOT yet profile-aware. This NF's \
-         listener requires mutually-authenticated TLS, but its own calls to other NFs \
-         still use cleartext http with no client certificate, so inter-NF requests to \
-         another production-profile NF will fail to connect. Until that lands, run a \
-         uniformly dev-profile deployment or terminate TLS at a proxy."
-    );
     log::info!(
         "SBI security profile PRODUCTION for {}: TLS cert={} mTLS={} \
          require_oauth2={} JWKS={}",
@@ -383,6 +426,49 @@ pub fn apply_sbi_security_policy(
         config.oauth2_jwks_uri.as_deref().unwrap_or("UNCONFIGURED"),
     );
     Ok(config)
+}
+
+/// The client configuration for DIALLING a peer NF under the resolved profile
+/// (issue #63, the outbound half of criterion 1).
+///
+/// An NF is both a server and a client on the SBI. Configuring only the listener
+/// leaves a "secure by default" posture that cannot talk to itself: the callee
+/// requires mutually-authenticated TLS while the caller still dials cleartext
+/// http with no certificate, so every inter-NF request fails at the TLS layer —
+/// and it fails on the *callee* side, with nothing pointing at the caller's
+/// scheme.
+///
+/// Under [`SbiProfile::Production`] this returns an `https` config presenting
+/// this NF's client certificate and verifying the peer against the configured CA.
+/// Under [`SbiProfile::Dev`] it is exactly `SbiClientConfig::new`, so the
+/// cleartext path is byte-identical.
+///
+/// **Scheme comes from the profile, not from a discovered URI.** In a uniformly
+/// production deployment every peer is `https`; in a uniformly dev one every peer
+/// is `http`. A deployment that mixes the two per-NF is not supported here — it
+/// was already broken before this, since the scheme was hardcoded `http`
+/// regardless of what a peer advertised.
+pub fn sbi_client_config_for_profile(
+    host: &str,
+    port: u16,
+    profile: SbiProfile,
+) -> crate::client::SbiClientConfig {
+    let config = crate::client::SbiClientConfig::new(host, port);
+    if profile == SbiProfile::Dev {
+        return config;
+    }
+    let paths = TlsPaths::from_env();
+    let mut config = config.with_https();
+    config.ca_cert = Some(paths.ca_cert);
+    config.client_cert = paths.client_cert;
+    config.client_key = paths.client_key;
+    config
+}
+
+/// [`sbi_client_config_for_profile`] with the profile resolved from the
+/// environment.
+pub fn sbi_peer_client_config(host: &str, port: u16) -> crate::client::SbiClientConfig {
+    sbi_client_config_for_profile(host, port, SbiProfile::resolve())
 }
 
 // ============================================================================
@@ -750,6 +836,10 @@ mod profile_tests {
                 cert: cert.display().to_string(),
                 key: key.display().to_string(),
                 ca_cert: ca.display().to_string(),
+                // The production posture needs client material too (an NF dials
+                // peers as well as serving them), so these must exist.
+                client_cert: Some(cert.display().to_string()),
+                client_key: Some(key.display().to_string()),
                 ..TlsPaths::default()
             },
             ..SbiSecurityPolicy::production()
@@ -807,6 +897,10 @@ mod profile_tests {
                 cert: cert.display().to_string(),
                 key: key.display().to_string(),
                 ca_cert: ca.display().to_string(),
+                // The production posture needs client material too (an NF dials
+                // peers as well as serving them), so these must exist.
+                client_cert: Some(cert.display().to_string()),
+                client_key: Some(key.display().to_string()),
                 ..TlsPaths::default()
             },
             ..SbiSecurityPolicy::production()
@@ -843,6 +937,10 @@ mod profile_tests {
                 cert: cert.display().to_string(),
                 key: key.display().to_string(),
                 ca_cert: ca.display().to_string(),
+                // The production posture needs client material too (an NF dials
+                // peers as well as serving them), so these must exist.
+                client_cert: Some(cert.display().to_string()),
+                client_key: Some(key.display().to_string()),
                 ..TlsPaths::default()
             },
             ..SbiSecurityPolicy::production()
@@ -1039,6 +1137,8 @@ mod mtls_oauth2_e2e {
                 cert: pki.server_cert.clone(),
                 key: pki.server_key.clone(),
                 ca_cert: pki.ca.clone(),
+                client_cert: Some(pki.client_cert.clone()),
+                client_key: Some(pki.client_key.clone()),
                 ..TlsPaths::default()
             },
             ..SbiSecurityPolicy::production()
@@ -1071,6 +1171,79 @@ mod mtls_oauth2_e2e {
         cfg.client_cert = Some(pki.client_cert.clone());
         cfg.client_key = Some(pki.client_key.clone());
         cfg
+    }
+
+    /// The consumer config **as the NFs actually build it** — through
+    /// `sbi_client_config_for_profile`, with the certificate paths supplied via
+    /// the same env vars a deployment would use.
+    ///
+    /// [`consumer_config`] hand-builds the equivalent, which proves the transport
+    /// works but not that the helper the NFs call produces it. This closes that
+    /// gap: if the helper stopped setting `https`, or dropped the client
+    /// certificate, this test would fail where the hand-built one would not.
+    /// Serialised because it mutates process environment.
+    fn consumer_config_via_profile_helper(pki: &Pki, port: u16) -> SbiClientConfig {
+        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(TlsPaths::CA_ENV, &pki.ca);
+        std::env::set_var(TlsPaths::CLIENT_CERT_ENV, &pki.client_cert);
+        std::env::set_var(TlsPaths::CLIENT_KEY_ENV, &pki.client_key);
+        let cfg = sbi_client_config_for_profile("localhost", port, SbiProfile::Production);
+        std::env::remove_var(TlsPaths::CA_ENV);
+        std::env::remove_var(TlsPaths::CLIENT_CERT_ENV);
+        std::env::remove_var(TlsPaths::CLIENT_KEY_ENV);
+        cfg
+    }
+
+    /// **Issue #63, the outbound half of criterion 1.** The transaction succeeds
+    /// with the consumer built by the profile helper the NFs call — not by hand.
+    ///
+    /// Before this, the four core NFs dialled peers with `SbiClient::with_host_port`
+    /// (cleartext http, no client certificate) while their own listeners required
+    /// mutually-authenticated TLS, so a call between two production-profile NFs
+    /// failed at the TLS layer. That made the production default a configuration
+    /// that could not work.
+    #[tokio::test]
+    async fn peer_client_built_by_the_profile_helper_completes_the_transaction() {
+        let pki = pki("helper");
+        let signing = crate::oauth::generate_es256_key();
+        let token = mint_token(&signing, "UDM", "nudm-sdm");
+
+        let (nrf, nrf_port) = start_stub_nrf(token).await;
+        let (producer, producer_port) = start_producer(&pki, jwks(signing.verifying_key())).await;
+
+        let cfg = consumer_config_via_profile_helper(&pki, producer_port);
+        // The helper must have produced a TLS config carrying THIS NF's client
+        // certificate; without the certificate the mTLS listener refuses it, and
+        // without https it never gets that far.
+        assert_eq!(cfg.scheme, crate::types::UriScheme::Https);
+        assert!(cfg.client_cert.is_some() && cfg.client_key.is_some());
+
+        let oauth2 = Arc::new(OAuth2Client::new(
+            format!("http://127.0.0.1:{nrf_port}"),
+            "consumer-1",
+            NfType::Amf,
+        ));
+        let resp = SbiClient::new(cfg)
+            .with_oauth2(oauth2, NfType::Udm)
+            .send_request(SbiRequest::get("/nudm-sdm/v1/imsi-001010000000001/am-data"))
+            .await
+            .expect("the profile-built peer client must complete the transaction");
+        assert_eq!(resp.status, 200);
+
+        producer.stop().await.ok();
+        nrf.stop().await.ok();
+    }
+
+    /// Issue #63: under the dev profile the peer client is byte-identical to
+    /// today's cleartext one, so existing deployments and tests are untouched.
+    #[test]
+    fn dev_profile_peer_client_stays_cleartext() {
+        let cfg = sbi_client_config_for_profile("peer", 7777, SbiProfile::Dev);
+        assert_eq!(cfg.scheme, crate::types::UriScheme::Http);
+        assert!(cfg.ca_cert.is_none());
+        assert!(cfg.client_cert.is_none() && cfg.client_key.is_none());
+        assert_eq!(cfg.base_uri(), "http://peer:7777");
     }
 
     #[tokio::test]
@@ -1554,6 +1727,52 @@ mod audience_binding_guards {
              before building the SbiServer.",
             crate::security::SBI_PROFILE_ENV
         );
+    }
+
+    /// **Issue #63, the outbound half of criterion 1.** The files that hold the
+    /// core NFs' peer-call code must not build cleartext clients.
+    ///
+    /// `SbiClient::with_host_port` is plain http always, on purpose — tests that
+    /// start a loopback plaintext server need it. That makes it exactly the thing
+    /// a future edit could reach for in production code without noticing, putting
+    /// that NF back to dialling cleartext while its own listener demands mTLS.
+    /// These two files contain only peer-call code (their test modules use
+    /// separate helpers), so a hit here is unambiguous.
+    #[test]
+    fn core_nf_peer_call_paths_do_not_build_cleartext_clients() {
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+
+        // (file, first line of its test module) — everything before it is
+        // production peer-call code.
+        let files = [
+            ("nextgcore-amfd/src/sbi_path.rs", "mod tests {"),
+            ("nextgcore-smfd/src/policy.rs", "mod tests {"),
+        ];
+        for (rel, test_marker) in files {
+            let path = bins.join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let production = match text.find(test_marker) {
+                Some(i) => &text[..i],
+                None => &text[..],
+            };
+            assert!(
+                !production.contains("SbiClient::with_host_port"),
+                "{rel} builds a peer client with SbiClient::with_host_port, which is \
+                 cleartext http with no client certificate regardless of the SBI security \
+                 profile. Use SbiClient::for_peer (or \
+                 security::sbi_peer_client_config) so the call follows the profile."
+            );
+            assert!(
+                production.contains("for_peer") || production.contains("sbi_peer_client_config"),
+                "{rel} should reach peers through the profile-aware helper; if its peer \
+                 calls moved elsewhere, move this guard with them rather than deleting it"
+            );
+        }
     }
 
     /// Issue #63 criterion 2: amfd must not hardcode the scheme it advertises.

@@ -215,7 +215,7 @@ pub(crate) async fn peer_client(
 ) -> Arc<nextgcore_sbi::client::SbiClient> {
     match oauth2_client() {
         Some(oauth2) => Arc::new(
-            nextgcore_sbi::client::SbiClient::new(nextgcore_sbi::client::SbiClientConfig::new(
+            nextgcore_sbi::client::SbiClient::new(nextgcore_sbi::security::sbi_peer_client_config(
                 host, port,
             ))
             .with_oauth2(oauth2, target),
@@ -2396,6 +2396,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_http_generate_auth_data_flows() {
+        // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+        // dev-profile deployment (issue #63). Declared rather than inherited.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // Serialize on udmd's global-context/UDR-env guard: this test re-inits
         // the process-global UDM context and/or sets UDR_SBI_* env vars, which
         // races any other udmd test doing the same (the CI-flaky AUTS-resync).

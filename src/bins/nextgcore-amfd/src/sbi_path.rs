@@ -843,7 +843,7 @@ pub async fn call_smf_create_sm_context(
     );
 
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(smf_host, smf_port),
+        SbiClient::for_peer(smf_host, smf_port),
         nextgcore_sbi::types::NfType::Smf,
     );
 
@@ -935,7 +935,7 @@ pub async fn call_smf_update_sm_context(
     );
 
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(smf_host, smf_port),
+        SbiClient::for_peer(smf_host, smf_port),
         nextgcore_sbi::types::NfType::Smf,
     );
 
@@ -995,7 +995,7 @@ pub async fn call_smf_update_sm_context_with_n1(
     );
 
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(smf_host, smf_port),
+        SbiClient::for_peer(smf_host, smf_port),
         nextgcore_sbi::types::NfType::Smf,
     );
 
@@ -1061,7 +1061,7 @@ pub async fn call_smf_release_sm_context(
     log::info!("Calling SMF SM Context Release: ref={sm_context_ref}");
 
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(smf_host, smf_port),
+        SbiClient::for_peer(smf_host, smf_port),
         nextgcore_sbi::types::NfType::Smf,
     );
 
@@ -1131,7 +1131,7 @@ pub async fn call_ausf_authenticate_with_resync(
     );
 
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(ausf_host, ausf_port),
+        SbiClient::for_peer(ausf_host, ausf_port),
         nextgcore_sbi::types::NfType::Ausf,
     );
 
@@ -1225,7 +1225,7 @@ pub async fn call_ausf_5g_aka_confirm(
     );
 
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(ausf_host, ausf_port),
+        SbiClient::for_peer(ausf_host, ausf_port),
         nextgcore_sbi::types::NfType::Ausf,
     );
 
@@ -1461,7 +1461,7 @@ pub async fn call_udm_uecm_registration(
     amf_id_hex: &str,
 ) -> SbiResult<()> {
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(udm_host, udm_port),
+        SbiClient::for_peer(udm_host, udm_port),
         nextgcore_sbi::types::NfType::Udm,
     );
 
@@ -1515,7 +1515,7 @@ pub async fn call_udm_sdm_get_am_data(
     supi: &str,
 ) -> SbiResult<AmDataResponse> {
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(udm_host, udm_port),
+        SbiClient::for_peer(udm_host, udm_port),
         nextgcore_sbi::types::NfType::Udm,
     );
     let path = format!("/nudm-sdm/v2/{supi}/am-data");
@@ -1569,7 +1569,7 @@ pub async fn call_udm_sdm_subscribe(
     amf_instance_id: &str,
 ) -> SbiResult<String> {
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(udm_host, udm_port),
+        SbiClient::for_peer(udm_host, udm_port),
         nextgcore_sbi::types::NfType::Udm,
     );
 
@@ -1621,7 +1621,7 @@ pub async fn call_pcf_am_policy_create(
     serving_plmn_mnc: &str,
 ) -> SbiResult<String> {
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(pcf_host, pcf_port),
+        SbiClient::for_peer(pcf_host, pcf_port),
         nextgcore_sbi::types::NfType::Pcf,
     );
 
@@ -1699,7 +1699,7 @@ pub async fn call_pcf_ue_policy_create(
     guami_amf_id_hex: &str,
 ) -> SbiResult<String> {
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(pcf_host, pcf_port),
+        SbiClient::for_peer(pcf_host, pcf_port),
         nextgcore_sbi::types::NfType::Pcf,
     );
 
@@ -1757,7 +1757,7 @@ pub async fn call_pcf_ue_policy_delete(
     pol_asso_id: &str,
 ) -> SbiResult<()> {
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(pcf_host, pcf_port),
+        SbiClient::for_peer(pcf_host, pcf_port),
         nextgcore_sbi::types::NfType::Pcf,
     );
 
@@ -1809,7 +1809,7 @@ pub async fn call_nsacf_ue_admission(
     update_flag: bool,
 ) -> SbiResult<NsacfUeAdmissionResult> {
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(nsacf_host, nsacf_port),
+        SbiClient::for_peer(nsacf_host, nsacf_port),
         nextgcore_sbi::types::NfType::Nsacf,
     );
 
@@ -1882,7 +1882,7 @@ pub async fn call_udm_uecm_deregistration(
     supi: &str,
 ) -> SbiResult<()> {
     let client = crate::attach_oauth2(
-        SbiClient::with_host_port(udm_host, udm_port),
+        SbiClient::for_peer(udm_host, udm_port),
         nextgcore_sbi::types::NfType::Udm,
     );
 
@@ -1996,6 +1996,10 @@ mod tests {
 
     #[tokio::test]
     async fn nsacf_ue_admission_204_403_200_failure_list() {
+        // This test drives production code against a loopback PLAINTEXT peer, i.e.
+        // it describes a dev-profile deployment (issue #63). Declared explicitly
+        // rather than inherited from the environment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let port = nsacf_free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let server = nextgcore_sbi::server::SbiServer::new(
@@ -2401,6 +2405,10 @@ mod tests {
     /// the polAssoId out of the Location header.
     #[tokio::test]
     async fn ue_policy_create_posts_spec_body_and_parses_location() {
+        // This test drives production code against a loopback PLAINTEXT peer, i.e.
+        // it describes a dev-profile deployment (issue #63). Declared explicitly
+        // rather than inherited from the environment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, port) = start_pcf_ue_policy_stub().await;
 
         let assoc = call_pcf_ue_policy_create(
@@ -2465,6 +2473,10 @@ mod tests {
     /// §4.2.4) and maps 204 → Ok, 404 → Err.
     #[tokio::test]
     async fn ue_policy_delete_deletes_resource() {
+        // This test drives production code against a loopback PLAINTEXT peer, i.e.
+        // it describes a dev-profile deployment (issue #63). Declared explicitly
+        // rather than inherited from the environment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, port) = start_pcf_ue_policy_stub().await;
 
         call_pcf_ue_policy_delete("127.0.0.1", port, "pol-ue-42")

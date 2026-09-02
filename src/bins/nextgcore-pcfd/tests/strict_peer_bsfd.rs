@@ -94,6 +94,9 @@ fn binding_id_from_location(resp: &SbiResponse, prefix: &str) -> String {
 /// DELETE -> 204. A 400 here fails the test (the pre-fix behavior).
 #[tokio::test]
 async fn pcfd_production_binding_accepted_at_session_site() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     init_peers();
     let body = production_body("imsi-001010000000701", "10.45.0.71");
 
@@ -130,6 +133,9 @@ async fn pcfd_production_binding_accepted_at_session_site() {
 /// /pcfBindings), so there is no builder to re-key -- the mapping lives here.
 #[tokio::test]
 async fn pcfd_production_binding_accepted_at_ue_site() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     init_peers();
     let src = production_body("imsi-001010000000702", "10.45.0.72");
     let mut body = serde_json::json!({ "supi": src["supi"].clone() });
@@ -159,6 +165,9 @@ async fn pcfd_production_binding_accepted_at_ue_site() {
 /// PCF-address members under test come from the real builder) -> 201.
 #[tokio::test]
 async fn pcfd_production_binding_accepted_at_mbs_site() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     init_peers();
     let mut body = production_body("imsi-001010000000703", "10.45.0.73");
     body["mbsSessionId"] = mbs_session_id("000703");
@@ -181,6 +190,9 @@ async fn pcfd_production_binding_accepted_at_mbs_site() {
 /// If bsfd is ever loosened instead of pcfd being fixed, this fails.
 #[tokio::test]
 async fn legacy_binding_still_rejected_400_at_all_three_sites() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     init_peers();
     let body = legacy_body("imsi-001010000000704", "10.45.0.74");
 

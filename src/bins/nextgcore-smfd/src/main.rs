@@ -2823,7 +2823,7 @@ async fn send_sm_context_status_notification(
     let path = uri_path(uri);
     let body = build_sm_context_status_notification(resource_status, cause);
     let client = nextgcore_sbi::client::SbiClient::new(
-        nextgcore_sbi::client::SbiClientConfig::new(host, port)
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(std::time::Duration::from_secs(2))
             .with_request_timeout(std::time::Duration::from_secs(3)),
     );

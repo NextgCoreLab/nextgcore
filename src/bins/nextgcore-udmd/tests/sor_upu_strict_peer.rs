@@ -200,6 +200,9 @@ fn parse(body: &str) -> serde_json::Value {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn sor_upu_strict_peer_end_to_end() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let _ = env_logger::try_init();
 
     // Serialize against any other in-process consumer of the two NF contexts

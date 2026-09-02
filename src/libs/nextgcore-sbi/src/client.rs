@@ -334,6 +334,23 @@ impl SbiClient {
         Self::new(SbiClientConfig::new(host, port))
     }
 
+    /// A client for dialling a **peer NF**, honouring the process-wide SBI
+    /// security profile (issue #63): `https` with this NF's client certificate
+    /// under `production`, plain `http` under `dev`.
+    ///
+    /// This is what production code should use to reach another NF.
+    /// [`SbiClient::with_host_port`] deliberately stays profile-blind: it is
+    /// plain `http` always, which is what tests spinning up a loopback server
+    /// need. Making the general constructor profile-aware instead would have
+    /// broken every such test — `cargo test` sets no `NEXTGCORE_SBI_PROFILE`, so
+    /// it resolves to `production` and the client would try to speak TLS to a
+    /// plaintext server. `cfg!(test)` is no help either: it is false when this
+    /// crate is compiled as a dependency of the binaries, so the binaries' own
+    /// tests would still break.
+    pub fn for_peer(host: impl Into<String>, port: u16) -> Self {
+        Self::new(crate::security::sbi_peer_client_config(&host.into(), port))
+    }
+
     /// Attach an OAuth2 client for automatic Bearer token attachment.
     ///
     /// When set, the client will request a token from the NRF before each

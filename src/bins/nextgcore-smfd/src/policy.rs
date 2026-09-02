@@ -19,7 +19,7 @@
 //! warning. When a PCF *is* configured, a rejection or transport failure is a
 //! hard failure for the PDU session (no silent fallback).
 
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -221,7 +221,7 @@ impl PcfEndpoint {
         // when OAuth2 enforcement is on (Wave-6 H8 Phase A); no-op otherwise.
         crate::attach_oauth2(
             SbiClient::new(
-                SbiClientConfig::new(self.host.clone(), self.port)
+                nextgcore_sbi::security::sbi_peer_client_config(&self.host, self.port)
                     .with_connect_timeout(Duration::from_secs(2))
                     .with_request_timeout(Duration::from_secs(3)),
             ),
@@ -246,7 +246,7 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
         .await?;
     let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
     let client = SbiClient::new(
-        SbiClientConfig::new(nrf_host, nrf_port)
+        nextgcore_sbi::security::sbi_peer_client_config(&nrf_host, nrf_port)
             .with_connect_timeout(Duration::from_secs(2))
             .with_request_timeout(Duration::from_secs(3)),
     );
@@ -315,7 +315,7 @@ impl NsacfEndpoint {
         // enforcement is on (Wave-6 H8 Phase A); no-op otherwise.
         crate::attach_oauth2(
             SbiClient::new(
-                SbiClientConfig::new(self.host.clone(), self.port)
+                nextgcore_sbi::security::sbi_peer_client_config(&self.host, self.port)
                     .with_connect_timeout(Duration::from_secs(2))
                     .with_request_timeout(Duration::from_secs(3)),
             ),
@@ -342,7 +342,7 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
         .await?;
     let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
     let client = SbiClient::new(
-        SbiClientConfig::new(nrf_host, nrf_port)
+        nextgcore_sbi::security::sbi_peer_client_config(&nrf_host, nrf_port)
             .with_connect_timeout(Duration::from_secs(2))
             .with_request_timeout(Duration::from_secs(3)),
     );
@@ -1665,6 +1665,9 @@ mod tests {
 
     #[tokio::test]
     async fn sm_policy_lifecycle_http_round_trip() {
+        // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+        // dev-profile deployment (issue #63). Declared rather than inherited.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let port = free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let server = nextgcore_sbi::server::SbiServer::new(
@@ -1788,6 +1791,9 @@ mod tests {
 
     #[tokio::test]
     async fn nsac_pdu_session_admit_admitted_and_rejected() {
+        // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+        // dev-profile deployment (issue #63). Declared rather than inherited.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let port = free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let server = nextgcore_sbi::server::SbiServer::new(
