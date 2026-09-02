@@ -10,7 +10,7 @@
 //! all SBI communication between NFs SHALL use TLS with mutual authentication.
 
 use crate::error::{SbiError, SbiResult};
-use crate::oauth::{authorize_bearer, AccessTokenClaims};
+use crate::oauth::AccessTokenClaims;
 use crate::types::NfType;
 
 // ============================================================================
@@ -216,9 +216,16 @@ pub fn extract_bearer_token(auth_header: &str) -> Option<&str> {
 ///
 /// Returns Ok(Some(claims)) when authorized, Ok(None) when the policy does
 /// not require OAuth2, Err otherwise.
+/// `expected_audience` is the producer's own identity (TS 29.510 `NfType` token,
+/// e.g. `"UDR"`). Issue #64 gap 3: this used to call the audience-SKIPPING
+/// `authorize_bearer`, so a token the NRF minted for producer A verified happily at
+/// producer B — an authorisation bypass (TS 33.501 §13.4.1.2 requires the producer
+/// to verify it is the intended audience). It is a required parameter rather than an
+/// `Option` so a caller cannot omit it by accident; pass the NF's own type.
 pub fn authorize_sbi_request(
     auth_header: Option<&str>,
     required_scope: &str,
+    expected_audience: &str,
     policy: &SbiSecurityPolicy,
     jwks: &serde_json::Value,
 ) -> SbiResult<Option<AccessTokenClaims>> {
@@ -226,8 +233,9 @@ pub fn authorize_sbi_request(
         return Ok(None);
     }
 
-    // Signature + expiry verification against the NRF public key set.
-    let claims = authorize_bearer(auth_header, jwks)?;
+    // Signature + expiry verification against the NRF public key set, plus the
+    // audience binding.
+    let claims = crate::oauth::authorize_bearer_aud(auth_header, jwks, Some(expected_audience))?;
 
     // Scope enforcement (TS 29.510 §6.3.5.2.4: space-delimited service names).
     let scopes: Vec<&str> = claims.scope.split_whitespace().collect();
@@ -453,23 +461,28 @@ mod tests {
         let auth = format!("Bearer {token}");
 
         // Properly signed token with the right scope is accepted.
-        let claims = authorize_sbi_request(Some(&auth), "nsmf-pdusession", &policy, &jwks)
+        let claims = authorize_sbi_request(Some(&auth), "nsmf-pdusession", "SMF", &policy, &jwks)
             .expect("signed token authorizes")
             .expect("claims returned");
         assert_eq!(claims.iss, "nrf-instance-1");
         assert_eq!(claims.sub, "amf-instance-1");
 
         // Wrong scope is rejected even with a valid signature.
-        assert!(authorize_sbi_request(Some(&auth), "nausf-auth", &policy, &jwks).is_err());
+        assert!(authorize_sbi_request(Some(&auth), "nausf-auth", "SMF", &policy, &jwks).is_err());
 
         // A token whose signature does not verify is rejected: there is no
         // signature-skipping path anymore.
         let mut tampered = token.clone();
         tampered.replace_range(0..1, "f");
         let tampered_auth = format!("Bearer {tampered}");
-        assert!(
-            authorize_sbi_request(Some(&tampered_auth), "nsmf-pdusession", &policy, &jwks).is_err()
-        );
+        assert!(authorize_sbi_request(
+            Some(&tampered_auth),
+            "nsmf-pdusession",
+            "SMF",
+            &policy,
+            &jwks
+        )
+        .is_err());
 
         // An unsigned/garbage-signature token is rejected too.
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -482,23 +495,33 @@ mod tests {
             URL_SAFE_NO_PAD.encode([0u8; 64])
         );
         let forged_auth = format!("Bearer {forged}");
-        assert!(
-            authorize_sbi_request(Some(&forged_auth), "nsmf-pdusession", &policy, &jwks).is_err()
-        );
+        assert!(authorize_sbi_request(
+            Some(&forged_auth),
+            "nsmf-pdusession",
+            "SMF",
+            &policy,
+            &jwks
+        )
+        .is_err());
 
         // Expired token is rejected.
         let (expired, jwks2) = signed_token_and_jwks("nsmf-pdusession", 1);
         let expired_auth = format!("Bearer {expired}");
-        assert!(
-            authorize_sbi_request(Some(&expired_auth), "nsmf-pdusession", &policy, &jwks2).is_err()
-        );
+        assert!(authorize_sbi_request(
+            Some(&expired_auth),
+            "nsmf-pdusession",
+            "SMF",
+            &policy,
+            &jwks2
+        )
+        .is_err());
     }
 
     #[test]
     fn test_authorize_sbi_request_not_required() {
         let policy = SbiSecurityPolicy::development();
         let jwks = serde_json::json!({"keys": []});
-        let result = authorize_sbi_request(None, "any-scope", &policy, &jwks);
+        let result = authorize_sbi_request(None, "any-scope", "SMF", &policy, &jwks);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -507,7 +530,7 @@ mod tests {
     fn test_authorize_sbi_request_missing_header() {
         let policy = SbiSecurityPolicy::production();
         let jwks = serde_json::json!({"keys": []});
-        let result = authorize_sbi_request(None, "nsmf-pdusession", &policy, &jwks);
+        let result = authorize_sbi_request(None, "nsmf-pdusession", "SMF", &policy, &jwks);
         assert!(result.is_err());
     }
 
@@ -549,5 +572,81 @@ mod tests {
         assert!(paths.cert.contains("server.crt"));
         assert!(paths.key.contains("server.key"));
         assert!(paths.ca_cert.contains("ca.crt"));
+    }
+}
+
+#[cfg(test)]
+mod audience_binding_guards {
+    /// Issue #64 gap 3: every NF that enforces OAuth2 must also assert the token's
+    /// audience, or it accepts tokens the NRF minted for a different producer.
+    ///
+    /// This guard is the thing that would have caught the UDR: 15 daemons set
+    /// `require_oauth2 = true` and only 13 set an expected audience, and nothing
+    /// compared the two lists. Read from the daemon sources so a new NF cannot enable
+    /// enforcement without making an explicit choice about `aud`.
+    #[test]
+    fn every_oauth2_enforcing_nf_asserts_an_audience() {
+        // pind is deliberately exempt AND documents why in-source: it is not a
+        // TS 29.510 NfType, so there is no NF-type `aud` for the NRF to mint or for
+        // it to assert. Any other exemption must be argued the same way, here.
+        const DOCUMENTED_EXEMPTIONS: &[&str] = &["nextgcore-pind"];
+
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+        assert!(bins.is_dir(), "expected {} to exist", bins.display());
+
+        let mut enforcing = Vec::new();
+        let mut asserting = Vec::new();
+
+        for entry in std::fs::read_dir(&bins).expect("read bins/") {
+            let path = entry.expect("dir entry").path();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let src = path.join("src");
+            if !src.is_dir() {
+                continue;
+            }
+            let mut enforces = false;
+            let mut asserts = false;
+            for file in std::fs::read_dir(&src).expect("read src/") {
+                let f = file.expect("file entry").path();
+                if f.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&f).unwrap_or_default();
+                if text.contains("require_oauth2 = true") {
+                    enforces = true;
+                }
+                if text.contains("with_expected_audience") {
+                    asserts = true;
+                }
+            }
+            if enforces && !DOCUMENTED_EXEMPTIONS.contains(&name.as_str()) {
+                enforcing.push(name.clone());
+                if asserts {
+                    asserting.push(name);
+                }
+            }
+        }
+
+        assert!(
+            !enforcing.is_empty(),
+            "expected to find NFs enforcing OAuth2; the guard found none, so it is no \
+             longer checking anything"
+        );
+        enforcing.sort();
+        asserting.sort();
+        assert_eq!(
+            enforcing, asserting,
+            "these NFs verify OAuth2 tokens WITHOUT asserting the audience, so a token \
+             minted for another producer is accepted (TS 33.501 13.4.1.2). Set \
+             with_expected_audience_nf_type(<own NfType>), or add a documented \
+             exemption to this guard explaining why the NF has no NF-type aud."
+        );
     }
 }

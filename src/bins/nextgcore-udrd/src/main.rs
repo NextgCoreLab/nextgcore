@@ -271,6 +271,16 @@ async fn main() -> Result<()> {
         sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
             .as_deref()
             .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
+        // Issue #64 gap 3: assert the token's `aud` names the UDR.
+        //
+        // Without this `oauth2_expected_audience` stays None, the server calls
+        // `authorize_bearer_aud(.., None)` and the audience check is SKIPPED -- so a
+        // token the NRF minted for any other producer was accepted here, on the NF
+        // that holds subscriber data. TS 33.501 13.4.1.2 requires the producer to
+        // verify it is the intended audience. Every other OAuth2-enforcing NF
+        // already did this; the UDR was the one that did not.
+        sbi_server_config =
+            sbi_server_config.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udr);
         // Wave-6 H8 Phase A: install the process-wide OAuth2 client so outbound
         // SBI calls acquire and attach an NRF-issued Bearer token.
         if let Some(nrf_uri) = nrf_uri_cfg.as_deref() {
