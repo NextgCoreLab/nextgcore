@@ -148,10 +148,24 @@ services:
       TLS_CERT: /etc/nextgcore/certs/udr.crt
       TLS_KEY: /etc/nextgcore/certs/udr.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
+      # Issue #66 criterion 3: durable state ON BY DEFAULT for the UDR.
+      #
+      # The UDR is the most severe member of that issue: memory-only, a restart
+      # erases every subscriber's amf-3gpp-access and smf-registration at once,
+      # and consumers then get authoritative-looking "not registered" answers for
+      # subscribers that are registered. The mechanism already existed
+      # (--state-file / NEXTGCORE_UDR_STATE_FILE) but nothing switched it on.
+      #
+      # Backed by the udr_state named volume below so it survives `docker compose
+      # restart` AND `up -d` recreating the container. A corrupt snapshot is now
+      # refused rather than overwritten (see nextgcore-core state_store), so
+      # enabling this cannot silently destroy what it fails to read.
+      NEXTGCORE_UDR_STATE_FILE: /var/lib/nextgcore/udr-state.json
     command: ["-c", "/etc/nextgcore/udr.yaml"]
     volumes:
       - ./configs/5gc/udr.yaml:/etc/nextgcore/udr.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro
+      - udr_state:/var/lib/nextgcore
     networks:
       core:
         ipv4_address: 172.23.0.20
@@ -617,6 +631,10 @@ networks:
           gateway: 172.23.0.1
 
 volumes:
+  # Durable UDR state snapshot (issue #66). Named rather than a bind mount so it
+  # is owned by the image's `nextgcore` user -- the NF processes run non-root, and
+  # a bind mount would arrive owned by the host user.
+  udr_state:
   mongodb_data:
   prometheus_data:
   grafana_data:

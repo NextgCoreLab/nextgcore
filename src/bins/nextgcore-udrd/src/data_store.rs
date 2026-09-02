@@ -1336,6 +1336,62 @@ mod tests {
         std::env::temp_dir().join(format!("udrd-test-{tag}-{pid}-{nanos}.json"))
     }
 
+    /// **Issue #66 criterion 3.** The shipped Docker configuration must actually
+    /// enable UDR persistence, and must back it with a volume that survives the
+    /// container being recreated.
+    ///
+    /// The criterion's own test is "restart udrd in the E2E stack and assert the
+    /// registrations survive" — but CI skips the Docker E2E jobs, so that test
+    /// would never run anywhere. This reads the shipped compose file from
+    /// `cargo test` instead: it cannot prove the restart works, but it does prove
+    /// the configuration that makes it possible is present, which is the part a
+    /// future edit could silently drop.
+    ///
+    /// Same reasoning as the webui source-level guards: pin what you can where it
+    /// will actually execute, and say plainly what it does not cover.
+    #[test]
+    fn shipped_docker_config_enables_udr_persistence() {
+        let compose = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("crate is at <root>/src/bins/nextgcore-udrd")
+            .join("docker/rust/docker-compose.yml");
+        let text = std::fs::read_to_string(&compose)
+            .unwrap_or_else(|e| panic!("read {}: {e}", compose.display()));
+
+        let state_file = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("NEXTGCORE_UDR_STATE_FILE:"))
+            .map(str::trim)
+            .expect(
+                "the shipped compose must set NEXTGCORE_UDR_STATE_FILE for the UDR: without \
+                 it a restart erases every subscriber's amf-3gpp-access and smf-registration \
+                 (issue #66 criterion 3)",
+            );
+        assert!(
+            !state_file.is_empty(),
+            "an empty NEXTGCORE_UDR_STATE_FILE is treated as unset, so persistence would be \
+             off while looking configured"
+        );
+
+        // The snapshot must live on a declared volume, or it dies with the
+        // container and the flag is theatre.
+        let dir = state_file
+            .rsplit_once('/')
+            .map(|(d, _)| d)
+            .expect("the state file path must be absolute");
+        assert!(
+            text.contains(&format!(":{dir}")),
+            "{state_file} is not backed by any volume mounted at {dir}, so the snapshot \
+             would not survive the container being recreated"
+        );
+        assert!(
+            text.contains("udr_state:"),
+            "the udr_state named volume must be declared; a bind mount would arrive owned \
+             by the host user and the non-root NF could not write it"
+        );
+    }
+
     /// **Issue #66.** A corrupt state file must not be overwritten by the empty
     /// store that failing to read it produced.
     ///
