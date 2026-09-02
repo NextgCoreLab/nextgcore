@@ -40,6 +40,32 @@
 #   scp (proxy: forwards Authorization unmodified, enforces only its admin
 #   surface), sepp (N32 PRINS/TLS trust model, TS 33.501 §13.2), upf (N4/PFCP,
 #   not an SBI surface).
+#
+# ---------------------------------------------------------------------------
+# TOKEN-ENDPOINT CLIENT AUTHENTICATION (issue #64 gaps 1+2)
+#
+# The NRF now REQUIRES the token requester to authenticate: a Client
+# Credentials Assertion (TS 33.501 §13.3.8) signed with a key the NRF trusts
+# for that nfInstanceId, or an mTLS client identity. This overlay explicitly
+# opts out in configs/5gc/nrf-oauth2.yaml — see the comment there for exactly
+# what is missing.
+#
+# To run this overlay AUTHENTICATED, three things have to line up:
+#   1. Pin each NF's nfInstanceId (they are random UUIDs per start today, so
+#      there is no stable key to pre-register).
+#   2. Give each NF an ES256 CCA signing key:
+#        environment:
+#          - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/etc/nextgcore/certs/<nf>-cca.key
+#      It is generated on first start if absent (0600) and reused thereafter;
+#      a malformed file is an error, never silently replaced.
+#   3. List the matching PUBLIC keys under nrf.sbi.oauth2.cca_trusted_keys in
+#      nrf-oauth2.yaml, keyed by nfInstanceId, and drop the
+#      require_client_auth: false line.
+# Alternatively, terminate TLS at an SCP/ingress that sets
+# x-forwarded-client-cert and set nrf.sbi.oauth2.trust_forwarded_client_cert
+# — but ONLY if that terminator strips any client-supplied copy of the header,
+# because otherwise any client can assert any identity by setting it.
+# ---------------------------------------------------------------------------
 
 services:
   # -- step 1: NRF (Authorization Server; client side only, token/jwks stay open)
