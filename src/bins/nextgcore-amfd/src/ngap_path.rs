@@ -7276,6 +7276,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_uplink_ue_associated_nrppa_relays_to_lmf_callback() {
+        // This test drives production code against a loopback PLAINTEXT peer, i.e.
+        // it describes a dev-profile deployment (issue #63). Declared explicitly
+        // rather than inherited from the environment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
         use nextgcore_asn1c::ngap::pdu::build_uplink_ue_associated_nrppa_transport;
         crate::context::amf_context_init(64, 1024, 4096);
@@ -7431,6 +7435,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_uplink_non_ue_associated_nrppa_relays_to_registered_lmf() {
+        // This test drives production code against a loopback PLAINTEXT peer, i.e.
+        // it describes a dev-profile deployment (issue #63). Declared explicitly
+        // rather than inherited from the environment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use nextgcore_asn1c::ngap::ies::{NrppaPdu, RoutingId};
         use nextgcore_asn1c::ngap::pdu::build_uplink_non_ue_associated_nrppa_transport;
         crate::context::amf_context_init(64, 1024, 4096);

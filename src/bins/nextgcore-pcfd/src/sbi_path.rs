@@ -1282,6 +1282,10 @@ mod tests {
     /// stay mocked (H1 policy).
     #[tokio::test]
     async fn discover_and_send_udr_mock() {
+        // pcfd resolves peers through the shared client cache, which now honours the
+        // SBI security profile (issue #63). This test uses a loopback PLAINTEXT NRF
+        // stub, i.e. a dev-profile deployment; declared rather than inherited.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use nextgcore_sbi::message::SbiRequest as Req;
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::time::Duration;

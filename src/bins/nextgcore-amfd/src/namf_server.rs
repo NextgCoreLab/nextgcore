@@ -794,7 +794,7 @@ fn handle_event_subscription_delete(subscription_id: &str) -> SbiResponse {
 
 /// Build a notification SBI client with bounded connect/request timeouts
 fn notify_client(host: &str, port: u16) -> SbiClient {
-    let config = nextgcore_sbi::client::SbiClientConfig::new(host, port)
+    let config = nextgcore_sbi::security::sbi_peer_client_config(host, port)
         .with_connect_timeout(std::time::Duration::from_secs(NOTIFY_CONNECT_TIMEOUT_SECS))
         .with_request_timeout(std::time::Duration::from_secs(NOTIFY_REQUEST_TIMEOUT_SECS));
     SbiClient::new(config)
@@ -2529,6 +2529,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_event_notification_post_delivery() {
+        // This test drives production code against a loopback PLAINTEXT peer, i.e.
+        // it describes a dev-profile deployment (issue #63). Declared explicitly
+        // rather than inherited from the environment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         amf_context_init(64, 1024, 4096);
         let supi = "imsi-001010000060010";
         let (server, port, mut rx) = start_capture_server().await;
@@ -2807,6 +2811,10 @@ mod tests {
     /// into the relay is covered by the connected-UE test above.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_updp_to_idle_ue_504_not_fake_200() {
+        // This test drives production code against a loopback PLAINTEXT peer, i.e.
+        // it describes a dev-profile deployment (issue #63). Declared explicitly
+        // rather than inherited from the environment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _serial = updp_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
         let supi = "imsi-001010000060033";
@@ -3407,6 +3415,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_failure_callback_http_delivery() {
+        // This test drives production code against a loopback PLAINTEXT peer, i.e.
+        // it describes a dev-profile deployment (issue #63). Declared explicitly
+        // rather than inherited from the environment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // Idle UE + PDU_RES_REL_CMD + skipInd: N1 message is not transferred,
         // the response is 504 UE_NOT_REACHABLE and the failure notification
         // is POSTed to n1n2FailureTxfNotifURI.

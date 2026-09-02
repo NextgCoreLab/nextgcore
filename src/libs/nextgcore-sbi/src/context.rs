@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::client::{SbiClient, SbiClientConfig};
+use crate::client::SbiClient;
 use crate::message::{PlmnId, SNssai};
 use crate::types::{NfType, SbiServiceType, UriScheme};
 
@@ -234,7 +234,10 @@ impl SbiContext {
         }
 
         // Create new client
-        let config = SbiClientConfig::new(host, port);
+        // Issue #63: this cache hands out clients for dialling PEER NFs, so it
+        // must honour the SBI security profile. Left cleartext it would silently
+        // undo the outbound half for every NF that resolves peers through it.
+        let config = crate::security::sbi_peer_client_config(host, port);
         let client = Arc::new(SbiClient::new(config));
 
         let mut clients = self.clients.write().await;

@@ -68,6 +68,9 @@ fn provisioned_ims_doc() -> serde_json::Value {
 /// command vector (reflects the provisioned DNN "ims" / S-NSSAI SST=1).
 #[test]
 fn provisioned_via_real_udrd_store_matches_golden() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     std::env::remove_var("PCF_URSP_RULES");
     let supi = "imsi-001010000003001";
     let ds = data_store::store();
@@ -99,6 +102,9 @@ fn provisioned_via_real_udrd_store_matches_golden() {
 /// No provisioning for a SUPI → pcfd delivers the static default (E1(f)).
 #[test]
 fn no_provisioning_delivers_static_default() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     std::env::remove_var("PCF_URSP_RULES");
     let supi = "imsi-001010000003002";
     let ds = data_store::store();
@@ -118,6 +124,9 @@ fn no_provisioning_delivers_static_default() {
 /// offending component (grep-able WARN source).
 #[test]
 fn malformed_provisioning_falls_back_via_real_store() {
+    // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+    // dev-profile deployment (issue #63). Declared rather than inherited from env.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     std::env::remove_var("PCF_URSP_RULES");
     let supi = "imsi-001010000003003";
     let ds = data_store::store();

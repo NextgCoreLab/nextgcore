@@ -4435,6 +4435,9 @@ mod positioning_chain_strict_peer {
     /// returns a measurement-derived fix, driven end-to-end across BOTH real NFs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_positioning_chain_returns_200_computed_fix_via_real_amfd() {
+        // Drives REAL amfd peer-call code against a loopback PLAINTEXT stub, i.e.
+        // describes a dev-profile deployment (issue #63). Declared, not inherited.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _serial = chain_lock().lock().await;
         let supi = "imsi-001010000000701".to_string();
 
@@ -4553,6 +4556,9 @@ mod positioning_chain_strict_peer {
     /// POSITIONING_FAILED (TS 29.572 Table 6.1.7.3-1), never a fabricated fix.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_positioning_chain_corrupt_lpp_reply_maps_to_500() {
+        // Drives REAL amfd peer-call code against a loopback PLAINTEXT stub, i.e.
+        // describes a dev-profile deployment (issue #63). Declared, not inherited.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _serial = chain_lock().lock().await;
         let supi = "imsi-001010000000703".to_string();
 

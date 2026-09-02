@@ -78,7 +78,8 @@ Common sub-blocks seen in the Docker configs:
 | `AMF_NAS_SECURITY=nextgcore` | Forces the strict NAS-security path, overriding `nas.use_nextgcore_security` in YAML | amfd `lib.rs` |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Forces OAuth2 enforcement on the SBI server regardless of YAML | amfd `lib.rs` |
 | `NEXTGCORE_SBI_PROFILE` | SBI security profile for amf/smf/ausf/udm. **Defaults to `production`** (mutually-authenticated TLS + a required OAuth2 access token). `dev`/`development`/`insecure`/`local`/`test` opt out to cleartext h2c; **any other value, including a typo, stays `production`** so a mistake cannot silently downgrade security | `nextgcore-sbi` `security.rs` |
-| `NEXTGCORE_SBI_TLS_CERT` / `_KEY` / `_CA` | Override the production profile's certificate paths (defaults under `/etc/nextgcore/tls/`), so the certs can be mounted wherever the deployment puts them | `nextgcore-sbi` `security.rs` |
+| `NEXTGCORE_SBI_TLS_CERT` / `_KEY` / `_CA` | Override the production profile's **server** certificate paths (defaults under `/etc/nextgcore/tls/`), so the certs can be mounted wherever the deployment puts them | `nextgcore-sbi` `security.rs` |
+| `NEXTGCORE_SBI_TLS_CLIENT_CERT` / `_CLIENT_KEY` | Override the certificate this NF **presents when it dials a peer**. Under mTLS an NF is both server and client, and a deployment may mount the two roles' material separately | `nextgcore-sbi` `security.rs` |
 | `TLS_ENABLED`, `SBI_SCHEME` | Docker-compose knobs to enable SBI TLS | config comments |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector (default `http://jaeger:4317`; no-op if absent) | `init.rs` |
 
@@ -87,21 +88,30 @@ Precedence, where both exist: **environment variable > YAML > compiled-in defaul
 ### SBI security profile (issue #63)
 
 `amf`, `smf`, `ausf` and `udm` resolve `NEXTGCORE_SBI_PROFILE` at startup. Under
-`production` they serve SBI over mutually-authenticated TLS and require an OAuth2
-access token whose audience is their own NF type, and they **refuse to start**
-when the certificates named above are missing rather than falling back to
-cleartext.
+`production`:
+
+* their **listener** serves SBI over mutually-authenticated TLS and requires an
+  OAuth2 access token whose audience is their own NF type;
+* their **outbound peer calls** use `https`, presenting this NF's client
+  certificate and verifying the peer against the configured CA;
+* they **refuse to start** when any certificate named above is missing —
+  including the client material, since an NF that cannot dial its peers is not
+  usable — rather than falling back to cleartext.
+
+The outbound half also covers the shared peer-client cache in
+`nextgcore-sbi`'s global context, so **peripheral NFs that resolve peers through
+it follow the profile too**. Their own listeners are still configured by their
+individual `--tls` flags rather than by this profile.
 
 Every artefact this repo ships — `docker/rust/docker-compose.yml`,
 `k8s/manifests/`, and the Helm chart via `global.sbiProfile` — sets the explicit
 `dev` opt-out, because none of them mount SBI certificates. Local development and
 the matched-simulator E2E are therefore unchanged.
 
-**Known incomplete:** the profile configures the *inbound* listener. Those four
-NFs still build their *outbound* peer clients as cleartext http with no client
-certificate, so a call between two production-profile NFs fails at the TLS layer;
-the production profile logs a warning saying so at startup. Until that lands, run
-a uniformly dev-profile deployment or terminate TLS at a proxy.
+**Mixed deployments are not supported:** the scheme comes from the profile, not
+from a peer's advertised URI, so run either a uniformly `production` or a
+uniformly `dev` core. (Before this, the scheme was hardcoded `http` regardless of
+what a peer advertised, so mixed was already broken.)
 
 ## Common parameters and code defaults
 
