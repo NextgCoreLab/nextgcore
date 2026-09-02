@@ -3236,13 +3236,17 @@ dependencies = [
  "clap",
  "ctrlc",
  "env_logger",
+ "hyper-util",
  "log",
  "mongodb",
  "nextgcore-core",
  "nextgcore-dbi",
+ "rustls 0.23.36",
+ "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tower-http",
 ]
 

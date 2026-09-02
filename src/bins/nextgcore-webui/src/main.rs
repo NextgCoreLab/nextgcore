@@ -56,9 +56,109 @@ struct Args {
     #[arg(short, long, default_value_t = 3000)]
     port: u16,
 
-    /// HTTP listen address
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Listen address.
+    ///
+    /// Issue #118: defaults to LOOPBACK, not `0.0.0.0`. This is a subscriber
+    /// provisioning interface; binding every interface by default maximised the
+    /// blast radius of any other weakness. An operator that wants it reachable
+    /// must name the management address explicitly.
+    #[arg(long, default_value = "127.0.0.1")]
     listen: String,
+
+    /// File containing the bearer token required on every `/api` request
+    /// (issue #118).
+    ///
+    /// A file rather than a flag value so the secret is not visible in `ps` or
+    /// the shell history. `NEXTGCORE_WEBUI_API_TOKEN` is the alternative source.
+    /// Leading/trailing whitespace is trimmed so a trailing newline in the file
+    /// is not part of the token.
+    #[arg(long)]
+    api_token_file: Option<String>,
+
+    /// TLS certificate chain, PEM (issue #118). Required with `--tls-key`.
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// TLS private key, PEM (issue #118).
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    /// Run with NO authentication and NO TLS. Local development only.
+    ///
+    /// The insecure path is the explicit opt-in and secure is the default, never
+    /// the other way round: this interface can read and write permanent
+    /// subscriber key material.
+    #[arg(long)]
+    insecure_dev: bool,
+}
+
+/// Environment variable carrying the `/api` bearer token, as an alternative to
+/// `--api-token-file`.
+const API_TOKEN_ENV: &str = "NEXTGCORE_WEBUI_API_TOKEN";
+
+/// Minimum accepted length for the `/api` bearer token.
+///
+/// Not a strength estimate — just a floor that rejects obviously-placeholder
+/// values like `test` or `secret` that would otherwise pass for a credential.
+const MIN_API_TOKEN_LEN: usize = 16;
+
+/// Resolve the `/api` bearer token, or explain why startup must fail.
+///
+/// `Ok(None)` is returned ONLY for `--insecure-dev`. Otherwise a missing token is
+/// a hard startup failure: a provisioning API that can read and write permanent
+/// subscriber keys must not come up unauthenticated because a flag was forgotten
+/// (TS 33.117 §4.2.3.2.4).
+fn resolve_api_token(args: &Args) -> Result<Option<String>> {
+    let from_file = match &args.api_token_file {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read --api-token-file {path}"))?
+                .trim()
+                .to_string(),
+        ),
+        None => None,
+    };
+    let token = from_file.or_else(|| {
+        std::env::var(API_TOKEN_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+    });
+
+    match token {
+        Some(t) if t.len() >= MIN_API_TOKEN_LEN => Ok(Some(t)),
+        Some(t) if t.is_empty() => anyhow::bail!(
+            "the /api bearer token is empty; provide a real credential via \
+             --api-token-file or {API_TOKEN_ENV}"
+        ),
+        Some(t) => anyhow::bail!(
+            "the /api bearer token is {} characters; at least {MIN_API_TOKEN_LEN} are required",
+            t.len()
+        ),
+        None if args.insecure_dev => Ok(None),
+        None => anyhow::bail!(
+            "refusing to start: the subscriber provisioning API would be \
+             unauthenticated. Supply a bearer token via --api-token-file or \
+             {API_TOKEN_ENV}, or pass --insecure-dev for local development only."
+        ),
+    }
+}
+
+/// Compare two secrets without leaking their common prefix length through timing.
+///
+/// Hand-written rather than pulling in a new workspace dependency for six lines.
+/// The length comparison is deliberately NOT short-circuited into the loop: token
+/// length is not the secret, and folding it in would make the loop bound depend on
+/// the candidate.
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +384,74 @@ fn default_priority() -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Read-path projection (issue #118)
+// ---------------------------------------------------------------------------
+
+/// The subscriber shape this API is allowed to RETURN.
+///
+/// Issue #118: the provisioning API used to serialise [`Subscriber`] directly, so
+/// every read handed back `security.k` and `security.opc` — the permanent
+/// subscriber key and the OPc derived from the operator key — as cleartext JSON.
+/// TS 33.501 makes `K` the root of the whole 5G AKA trust chain: disclosure
+/// permanently compromises authentication for that SUPI, and there is no recovery
+/// short of re-provisioning the SIM. The 8-character truncation in the embedded
+/// dashboard HTML was cosmetic; the raw JSON carried the full values.
+///
+/// THIS IS A SEPARATE TYPE ON PURPOSE, not `#[serde(skip_serializing)]` on
+/// [`SecurityContext`]. Those fields must still serialise on the way OUT of this
+/// process to MongoDB (that is how provisioning works), so a skip attribute
+/// would have to be undone for the DB path and could be re-broken by anyone
+/// adding a field. A projection type cannot leak a field it does not have:
+/// `k`/`op`/`opc` are absent from [`SecurityView`] entirely, so re-introducing the
+/// leak requires deliberately adding them back.
+///
+/// Provisioning stays write-only for key material: create/update accept `k`/`opc`
+/// and answer with this view, never an echo of what was submitted.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubscriberView {
+    pub imsi: String,
+    pub msisdn: Vec<String>,
+    pub security: SecurityView,
+    pub ambr: Ambr,
+    pub slice: Vec<SliceConfig>,
+    pub status: i32,
+}
+
+/// The non-secret part of a subscriber's security context.
+///
+/// `amf` is an authentication-management-field constant, not a secret, and `sqn`
+/// is a replay counter the operator legitimately needs to see. `k`, `op` and
+/// `opc` have no member here at all — see [`SubscriberView`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SecurityView {
+    pub amf: String,
+    pub sqn: i64,
+    /// Whether key material is provisioned for this subscriber.
+    ///
+    /// An operator still needs to distinguish "provisioned" from "not
+    /// provisioned" after the keys stopped being echoed back; this answers that
+    /// without revealing anything about the value.
+    pub key_provisioned: bool,
+}
+
+impl From<&Subscriber> for SubscriberView {
+    fn from(sub: &Subscriber) -> Self {
+        Self {
+            imsi: sub.imsi.clone(),
+            msisdn: sub.msisdn.clone(),
+            security: SecurityView {
+                amf: sub.security.amf.clone(),
+                sqn: sub.security.sqn,
+                key_provisioned: !sub.security.k.is_empty(),
+            },
+            ambr: sub.ambr.clone(),
+            slice: sub.slice.clone(),
+            status: sub.status,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
@@ -361,24 +529,103 @@ fn validate_subscriber(sub: &Subscriber) -> Result<(), String> {
 struct AppState {
     db_uri: String,
     db_name: String,
+    /// Bearer token every `/api` request must present (issue #118).
+    ///
+    /// `None` means `--insecure-dev`: authentication is disabled. Kept as an
+    /// `Option` rather than an empty string so "no auth" cannot be reached by
+    /// accident — an empty token would otherwise match an empty header.
+    api_token: Option<String>,
 }
 
 type SharedState = Arc<AppState>;
+
+/// Require a valid bearer token on every `/api` request (issue #118).
+///
+/// Before this the `/api/subscribers*` routes carried no authentication at all,
+/// so anyone who could reach the listener could read and write subscriber
+/// records. TS 33.117 §4.2.3.2.4 requires authentication on a management
+/// interface handling sensitive data.
+///
+/// Fails closed: any missing, malformed or non-matching credential is 401 with a
+/// `WWW-Authenticate` challenge, and the body never says which of those it was —
+/// distinguishing "no such token" from "wrong token" is free information for an
+/// attacker.
+async fn require_api_token(
+    State(state): State<SharedState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(expected) = state.api_token.as_deref() else {
+        // --insecure-dev. Logged on every request, not just at startup, so an
+        // unauthenticated deployment cannot quietly become the steady state.
+        log::warn!(
+            "INSECURE: serving {} {} with authentication disabled (--insecure-dev)",
+            request.method(),
+            request.uri().path()
+        );
+        return next.run(request).await;
+    };
+
+    let presented = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
+
+    match presented {
+        Some(token) if secret_eq(token, expected) => next.run(request).await,
+        _ => {
+            log::warn!(
+                "rejected unauthenticated {} {}",
+                request.method(),
+                request.uri().path()
+            );
+            (
+                StatusCode::UNAUTHORIZED,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    "Bearer realm=\"nextgcore-webui\"",
+                )],
+                "unauthorized",
+            )
+                .into_response()
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // API handlers
 // ---------------------------------------------------------------------------
 
+/// Build the JSON response for one subscriber.
+///
+/// Issue #118: the ONLY place a single subscriber becomes a response body, so the
+/// projection through [`SubscriberView`] cannot be bypassed by editing one handler.
+/// Tested on the produced BYTES, not on the type, so reverting it is a test failure.
+fn subscriber_response(sub: &Subscriber) -> Response {
+    Json(SubscriberView::from(sub)).into_response()
+}
+
+/// Build the JSON response for a list of subscribers. See [`subscriber_response`].
+fn subscriber_list_response(subs: &[Subscriber]) -> Response {
+    let view: Vec<SubscriberView> = subs.iter().map(SubscriberView::from).collect();
+    Json(view).into_response()
+}
+
 async fn list_subscribers(State(state): State<SharedState>) -> Response {
     match db_list_subscribers(&state.db_uri, &state.db_name) {
-        Ok(subs) => Json(subs).into_response(),
+        // Issue #118: projected through SubscriberView, which has no k/op/opc
+        // member, so the long-term key cannot leave over this API.
+        Ok(subs) => subscriber_list_response(&subs),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 async fn get_subscriber(State(state): State<SharedState>, Path(imsi): Path<String>) -> Response {
     match db_get_subscriber(&state.db_uri, &state.db_name, &imsi) {
-        Ok(Some(sub)) => Json(sub).into_response(),
+        // Issue #118: key material is never returned — see SubscriberView.
+        Ok(Some(sub)) => subscriber_response(&sub),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -392,7 +639,9 @@ async fn create_subscriber(
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
     match db_create_subscriber(&state.db_uri, &state.db_name, &sub) {
-        Ok(()) => (StatusCode::CREATED, Json(sub)).into_response(),
+        // Issue #118: the 201 must not echo the submitted k/opc back either —
+        // provisioning is write-only for key material.
+        Ok(()) => (StatusCode::CREATED, subscriber_response(&sub)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -400,15 +649,42 @@ async fn create_subscriber(
 async fn update_subscriber(
     State(state): State<SharedState>,
     Path(imsi): Path<String>,
-    Json(sub): Json<Subscriber>,
+    Json(mut sub): Json<Subscriber>,
 ) -> Response {
+    // Issue #118, key-PRESERVING update. Once reads stopped echoing `k`/`opc`, no
+    // client can round-trip them — including this daemon's own dashboard, which
+    // used to prefill the edit form from the GET response. An update that omits
+    // key material therefore means "leave the keys alone", not "blank them".
+    //
+    // Without this the edit path would submit an empty `k` and either 400 (best
+    // case) or overwrite a provisioned key with nothing. Omission is now the
+    // safe operation and re-keying requires explicitly supplying a new value.
+    if sub.security.k.trim().is_empty() {
+        match db_get_subscriber(&state.db_uri, &state.db_name, &imsi) {
+            Ok(Some(existing)) => {
+                sub.security.k = existing.security.k;
+                // OP/OPc travel with K: a partial carry-over could pair a stored
+                // K with a submitted OPc from a different credential set.
+                if sub.security.opc.trim().is_empty() && sub.security.op.trim().is_empty() {
+                    sub.security.opc = existing.security.opc;
+                    sub.security.op = existing.security.op;
+                }
+            }
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    }
+
     // Update validates too: an update writes the same document shape, so
     // skipping it here would leave a hole straight to the create-path defect.
+    // Runs AFTER the carry-over so a key-preserving update still has to produce a
+    // fully valid document.
     if let Err(e) = validate_subscriber(&sub) {
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
     match db_update_subscriber(&state.db_uri, &state.db_name, &imsi, &sub) {
-        Ok(true) => Json(sub).into_response(),
+        // Issue #118: as for create — no echo of key material.
+        Ok(true) => subscriber_response(&sub),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -582,7 +858,7 @@ tbody tr:hover{background:#334155}
     <button class="btn btn-primary" onclick="openAdd()">+ Add Subscriber</button>
   </div>
   <table>
-    <thead><tr><th>IMSI</th><th>MSISDN</th><th>K</th><th>OPc</th><th>AMF</th><th>Slices</th><th>Actions</th></tr></thead>
+    <thead><tr><th>IMSI</th><th>MSISDN</th><th>Key</th><th>SQN</th><th>AMF</th><th>Slices</th><th>Actions</th></tr></thead>
     <tbody id="subTable"></tbody>
   </table>
   <div class="empty" id="emptyMsg" style="display:none">No subscribers found. Click "+ Add Subscriber" to get started.</div>
@@ -595,8 +871,8 @@ tbody tr:hover{background:#334155}
     <div class="form-group"><label>IMSI</label><input id="fImsi" class="mono" placeholder="001010000000001" maxlength="15"></div>
     <div class="form-group"><label>MSISDN (comma-separated)</label><input id="fMsisdn" placeholder="0000000001"></div>
     <div class="form-row">
-      <div class="form-group"><label>K (hex, 32 chars)</label><input id="fK" class="mono" placeholder="465B5CE8B199B49FAA5F0A2EE238A6BC" maxlength="32"></div>
-      <div class="form-group"><label>OPc (hex, 32 chars)</label><input id="fOPc" class="mono" placeholder="E8ED289DEBA952E4283B54E88E6183CA" maxlength="32"></div>
+      <div class="form-group"><label>K (hex, 32 chars)</label><input id="fK" class="mono" placeholder="blank on edit = keep stored key" maxlength="32"></div>
+      <div class="form-group"><label>OPc (hex, 32 chars)</label><input id="fOPc" class="mono" placeholder="blank on edit = keep stored OPc" maxlength="32"></div>
     </div>
     <div class="form-row">
       <div class="form-group"><label>AMF</label><input id="fAMF" class="mono" value="8000" maxlength="4"></div>
@@ -628,9 +904,25 @@ tbody tr:hover{background:#334155}
 const API='/api/subscribers';
 let allSubs=[];
 
+// Issue #118: /api requires a bearer token. Held in sessionStorage so it is gone
+// when the tab closes and never written to localStorage or the URL.
+function apiToken(){
+  let t=sessionStorage.getItem('ngcToken');
+  if(!t){t=prompt('API token for subscriber provisioning:')||'';if(t)sessionStorage.setItem('ngcToken',t)}
+  return t;
+}
+function clearToken(){sessionStorage.removeItem('ngcToken')}
+async function api(path,opts){
+  const o=opts||{};
+  o.headers=Object.assign({},o.headers||{},{'Authorization':'Bearer '+apiToken()});
+  const r=await fetch(path,o);
+  if(r.status===401){clearToken();throw new Error('Unauthorized - check the API token')}
+  return r;
+}
+
 async function load(){
   try{
-    const [subs,cnt]=await Promise.all([fetch(API).then(r=>r.json()),fetch(API+'/count').then(r=>r.json())]);
+    const [subs,cnt]=await Promise.all([api(API).then(r=>r.json()),api(API+'/count').then(r=>r.json())]);
     allSubs=subs;
     document.getElementById('totalCount').textContent=cnt.count;
     document.getElementById('countBadge').textContent=cnt.count+' subscribers';
@@ -651,8 +943,8 @@ function renderTable(subs){
   tb.innerHTML=subs.map(s=>`<tr>
     <td class="mono">${s.imsi}</td>
     <td>${(s.msisdn||[]).join(', ')}</td>
-    <td class="mono">${s.security.k.substring(0,8)}...</td>
-    <td class="mono">${(s.security.opc||'').substring(0,8)||'-'}...</td>
+    <td class="mono">${s.security.key_provisioned?'provisioned':'MISSING'}</td>
+    <td class="mono">${s.security.sqn===undefined?'-':s.security.sqn}</td>
     <td class="mono">${s.security.amf||'8000'}</td>
     <td>${(s.slice||[]).map(sl=>'SST:'+sl.sst+(sl.sd?'/SD:'+sl.sd:'')).join(', ')||'-'}</td>
     <td><button class="btn btn-primary btn-sm" onclick='openEdit("${s.imsi}")'>Edit</button>
@@ -684,7 +976,9 @@ function openEdit(imsi){
   document.getElementById('modalTitle').textContent='Edit Subscriber';
   document.getElementById('fImsi').value=s.imsi;document.getElementById('fImsi').disabled=true;
   document.getElementById('fMsisdn').value=(s.msisdn||[]).join(',');
-  document.getElementById('fK').value=s.security.k;document.getElementById('fOPc').value=s.security.opc||'';
+  // Issue #118: the API no longer returns k/opc, so these start EMPTY and an
+  // empty submission leaves the stored keys untouched (key-preserving update).
+  document.getElementById('fK').value='';document.getElementById('fOPc').value='';
   document.getElementById('fAMF').value=s.security.amf||'8000';document.getElementById('fSQN').value=s.security.sqn||'';
   const sl=(s.slice||[])[0]||{};
   document.getElementById('fSST').value=sl.sst||1;document.getElementById('fSD').value=sl.sd||'';
@@ -713,17 +1007,20 @@ async function saveSub(){
               uplink:{value:parseInt(document.getElementById('fUL').value)||1,unit:3}},
         qos:{index:9,arp:{priority_level:8,pre_emption_capability:1,pre_emption_vulnerability:1}}}]}]
   };
-  if(!sub.imsi||!sub.security.k){alert('IMSI and K are required');return}
+  if(!sub.imsi){alert('IMSI is required');return}
+  // On add, K is mandatory. On edit, leaving K blank preserves the stored key.
+  if(mode==='add'&&!sub.security.k){alert('K is required for a new subscriber');return}
   try{
-    if(mode==='add'){await fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(sub)})}
-    else{await fetch(API+'/'+sub.imsi,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(sub)})}
+    const h={'Content-Type':'application/json'};
+    if(mode==='add'){await api(API,{method:'POST',headers:h,body:JSON.stringify(sub)})}
+    else{await api(API+'/'+sub.imsi,{method:'PUT',headers:h,body:JSON.stringify(sub)})}
     closeModal();load();
   }catch(e){alert('Error: '+e.message)}
 }
 
 async function deleteSub(imsi){
   if(!confirm('Delete subscriber '+imsi+'?'))return;
-  try{await fetch(API+'/'+imsi,{method:'DELETE'});load()}catch(e){alert('Error: '+e.message)}
+  try{await api(API+'/'+imsi,{method:'DELETE'});load()}catch(e){alert('Error: '+e.message)}
 }
 
 load();
@@ -743,13 +1040,53 @@ async fn main() -> Result<()> {
 
     log::info!("Starting NextGCore WebUI on {}:{}", args.listen, args.port);
 
+    // Issue #118: resolve credentials BEFORE binding, so an unauthenticated
+    // provisioning API never reaches the point of accepting a connection.
+    let api_token = resolve_api_token(&args)?;
+    let tls = resolve_tls(&args)?;
+
     let state: SharedState = Arc::new(AppState {
         db_uri: args.db_uri,
         db_name: args.db_name,
+        api_token,
     });
 
-    let app = Router::new()
-        .route("/", get(serve_dashboard))
+    let app = build_router(state);
+
+    let addr: SocketAddr = format!("{}:{}", args.listen, args.port)
+        .parse()
+        .context("invalid listen address")?;
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("bind failed")?;
+
+    match tls {
+        Some(acceptor) => {
+            log::info!("WebUI available at https://{addr}");
+            serve_tls(listener, acceptor, app).await
+        }
+        None => {
+            log::warn!(
+                "INSECURE: serving the subscriber provisioning API over PLAINTEXT HTTP at \
+                 http://{addr} (--insecure-dev). Key material and credentials cross the \
+                 network in the clear."
+            );
+            axum::serve(listener, app).await.context("server error")
+        }
+    }
+}
+
+/// Build the provisioning router.
+///
+/// Split out of `main` so tests can drive the REAL router — including the auth
+/// layer — instead of asserting against a hand-rolled copy of it.
+///
+/// Issue #118: `require_api_token` is layered on the `/api` routes only. `/` is
+/// the dashboard shell, which carries no subscriber data and fetches everything
+/// through `/api` with the operator's token.
+fn build_router(state: SharedState) -> Router {
+    let api = Router::new()
         .route(
             "/api/subscribers",
             get(list_subscribers).post(create_subscriber),
@@ -761,21 +1098,108 @@ async fn main() -> Result<()> {
                 .put(update_subscriber)
                 .delete(delete_subscriber),
         )
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_api_token,
+        ));
 
-    let addr: SocketAddr = format!("{}:{}", args.listen, args.port)
-        .parse()
-        .context("invalid listen address")?;
+    Router::new()
+        .route("/", get(serve_dashboard))
+        .merge(api)
+        // Issue #118: credentialed, so the previous `permissive()` (which allows
+        // any origin) must not stay — a permissive CORS policy on a
+        // token-authenticated provisioning API invites a hostile page to drive it
+        // with a token the browser holds. Same-origin only; the dashboard this
+        // binary serves is same-origin by construction.
+        .layer(CorsLayer::new())
+        .with_state(state)
+}
 
-    log::info!("WebUI available at http://{addr}");
+/// Build a TLS acceptor, or `None` for `--insecure-dev`.
+///
+/// TS 33.117 §4.2.5.1: authentication material must not cross the network in
+/// cleartext. Startup fails when TLS is neither configured nor explicitly waived,
+/// and fails when only one of cert/key is given — a half-configured TLS setup
+/// silently falling back to plaintext is exactly the outcome to avoid.
+fn resolve_tls(args: &Args) -> Result<Option<tokio_rustls::TlsAcceptor>> {
+    match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => Ok(Some(build_tls_acceptor(cert, key)?)),
+        (None, None) if args.insecure_dev => Ok(None),
+        (None, None) => anyhow::bail!(
+            "refusing to start: the subscriber provisioning API would serve key material \
+             over plaintext HTTP. Supply --tls-cert and --tls-key, or pass --insecure-dev \
+             for local development only."
+        ),
+        (Some(_), None) => anyhow::bail!("--tls-cert given without --tls-key"),
+        (None, Some(_)) => anyhow::bail!("--tls-key given without --tls-cert"),
+    }
+}
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .context("bind failed")?;
-    axum::serve(listener, app).await.context("server error")?;
+/// Load a PEM certificate chain and private key into a rustls acceptor.
+fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<tokio_rustls::TlsAcceptor> {
+    let cert_pem = std::fs::read(cert_path)
+        .with_context(|| format!("failed to read --tls-cert {cert_path}"))?;
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse certificates from {cert_path}"))?;
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in {cert_path}");
+    }
 
-    Ok(())
+    let key_pem =
+        std::fs::read(key_path).with_context(|| format!("failed to read --tls-key {key_path}"))?;
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .with_context(|| format!("failed to parse a private key from {key_path}"))?
+        .with_context(|| format!("no private key found in {key_path}"))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("invalid TLS certificate/key pair")?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Serve the router over TLS.
+///
+/// Hand-rolled because `axum::serve` takes a plaintext listener; this mirrors the
+/// accept loop `nextgcore-sbi`'s server uses. A handshake failure is logged and
+/// the connection dropped — one bad client must not take the listener down.
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    app: Router,
+) -> Result<()> {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::warn!("accept failed: {e}");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let service = app.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("TLS handshake with {peer} failed: {e}");
+                    return;
+                }
+            };
+            let io = hyper_util::rt::TokioIo::new(tls_stream);
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(
+                        io,
+                        hyper_util::service::TowerToHyperService::new(service),
+                    )
+                    .await
+            {
+                log::debug!("connection from {peer} ended: {e}");
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -991,5 +1415,590 @@ mod tests {
             session: vec![],
         }];
         assert!(validate_subscriber(&sub).is_err(), "non-hex sd");
+    }
+
+    // =====================================================================
+    // Issue #118: key material must never leave over the API, and /api must
+    // be authenticated.
+    // =====================================================================
+
+    /// **The core #118 assertion.** The read projection cannot carry key
+    /// material — asserted on the VALUES, not just the field names, so a nested
+    /// or renamed leak is caught too.
+    #[test]
+    fn read_projection_never_carries_key_material() {
+        let sub = good_subscriber();
+        let k = sub.security.k.clone();
+        let opc = sub.security.opc.clone();
+
+        let json = serde_json::to_string(&SubscriberView::from(&sub)).expect("serialize view");
+
+        // The values themselves must be absent. This is the assertion that
+        // matters: field names can be renamed, the secret cannot be un-leaked.
+        assert!(
+            !json.contains(&k),
+            "the permanent key K must not appear in an API response: {json}"
+        );
+        assert!(
+            !json.contains(&opc),
+            "OPc must not appear in an API response: {json}"
+        );
+        // Field names too, so a client cannot come to depend on them.
+        for field in ["\"k\"", "\"opc\"", "\"op\""] {
+            assert!(
+                !json.contains(field),
+                "{field} must not be a member of the API response: {json}"
+            );
+        }
+
+        // What an operator legitimately still gets.
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed["imsi"], serde_json::json!(sub.imsi));
+        assert_eq!(
+            parsed["security"]["amf"],
+            serde_json::json!(sub.security.amf)
+        );
+        assert_eq!(
+            parsed["security"]["key_provisioned"],
+            serde_json::json!(true),
+            "provisioned-or-not is reported without revealing the value"
+        );
+
+        // A subscriber with no key reports so rather than lying.
+        let mut keyless = good_subscriber();
+        keyless.security.k = String::new();
+        let json = serde_json::to_string(&SubscriberView::from(&keyless)).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            parsed["security"]["key_provisioned"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// **The assertion that actually guards the API surface.** The projection
+    /// test above checks the TYPE; this checks the BYTES the handlers put on the
+    /// wire, via the single builders every read path goes through. Reverting a
+    /// handler to `Json(sub)` therefore fails a test rather than passing silently.
+    #[tokio::test]
+    async fn api_response_bytes_never_contain_key_material() {
+        let sub = good_subscriber();
+        let k = sub.security.k.clone();
+        let opc = sub.security.opc.clone();
+
+        async fn body_of(response: Response) -> String {
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("read body");
+            String::from_utf8(bytes.to_vec()).expect("utf-8 body")
+        }
+
+        for (label, body) in [
+            ("single", body_of(subscriber_response(&sub)).await),
+            (
+                "list",
+                body_of(subscriber_list_response(std::slice::from_ref(&sub))).await,
+            ),
+        ] {
+            assert!(
+                !body.contains(&k),
+                "the {label} response body must not contain K: {body}"
+            );
+            assert!(
+                !body.contains(&opc),
+                "the {label} response body must not contain OPc: {body}"
+            );
+            // ...and it is still a useful response.
+            assert!(
+                body.contains(&sub.imsi),
+                "the {label} response must still identify the subscriber"
+            );
+            assert!(
+                body.contains("key_provisioned"),
+                "the {label} response should report provisioning state"
+            );
+        }
+    }
+
+    /// The `Subscriber` model itself must KEEP serialising key material — that is
+    /// the MongoDB write path. This pins why the fix is a separate projection type
+    /// rather than `#[serde(skip_serializing)]` on `SecurityContext`, which would
+    /// have broken provisioning.
+    #[test]
+    fn the_db_model_still_serialises_key_material() {
+        let sub = good_subscriber();
+        let json = serde_json::to_string(&sub).expect("serialize model");
+        assert!(
+            json.contains(&sub.security.k),
+            "the DB write path must still carry K, or provisioning cannot work"
+        );
+    }
+
+    /// Issue #118: startup fails closed. An unauthenticated or plaintext
+    /// provisioning API must not be reachable because a flag was forgotten.
+    #[test]
+    fn startup_refuses_to_run_insecure_by_default() {
+        let base = || Args {
+            db_uri: "mongodb://localhost:27017".to_string(),
+            db_name: "nextgcore".to_string(),
+            port: 3000,
+            listen: "127.0.0.1".to_string(),
+            api_token_file: None,
+            tls_cert: None,
+            tls_key: None,
+            insecure_dev: false,
+        };
+
+        // The default listen address is loopback, not every interface.
+        let parsed = Args::parse_from(["nextgcore-webui"]);
+        assert_eq!(
+            parsed.listen, "127.0.0.1",
+            "the provisioning listener must not default to 0.0.0.0"
+        );
+        assert!(!parsed.insecure_dev, "insecure mode must be opt-in");
+
+        // No token and no --insecure-dev → refuse to start.
+        assert!(
+            resolve_api_token(&base()).is_err(),
+            "a missing API token must be a startup failure, not an open API"
+        );
+        // No TLS and no --insecure-dev → refuse to start.
+        assert!(
+            resolve_tls(&base()).is_err(),
+            "missing TLS must be a startup failure"
+        );
+
+        // --insecure-dev is the ONLY way to get there.
+        let mut dev = base();
+        dev.insecure_dev = true;
+        assert!(matches!(resolve_api_token(&dev), Ok(None)));
+        assert!(matches!(resolve_tls(&dev), Ok(None)));
+
+        // Half-configured TLS must not silently fall back to plaintext.
+        let mut half = base();
+        half.tls_cert = Some("/nonexistent/cert.pem".to_string());
+        assert!(resolve_tls(&half).is_err(), "cert without key must fail");
+        let mut half = base();
+        half.tls_key = Some("/nonexistent/key.pem".to_string());
+        assert!(resolve_tls(&half).is_err(), "key without cert must fail");
+
+        // A placeholder-length token is not a credential.
+        let dir = std::env::temp_dir();
+        let short = dir.join(format!("ngc-webui-short-{}", std::process::id()));
+        std::fs::write(&short, "secret").expect("write");
+        let mut args = base();
+        args.api_token_file = Some(short.to_string_lossy().into_owned());
+        assert!(
+            resolve_api_token(&args).is_err(),
+            "a 6-character token must be rejected"
+        );
+
+        // A real token is accepted, and a trailing newline is not part of it.
+        let good = dir.join(format!("ngc-webui-good-{}", std::process::id()));
+        std::fs::write(&good, "0123456789abcdef0123456789abcdef\n").expect("write");
+        let mut args = base();
+        args.api_token_file = Some(good.to_string_lossy().into_owned());
+        assert_eq!(
+            resolve_api_token(&args).expect("valid token").as_deref(),
+            Some("0123456789abcdef0123456789abcdef"),
+        );
+
+        let _ = std::fs::remove_file(short);
+        let _ = std::fs::remove_file(good);
+    }
+
+    /// Constant-time comparison still has to be a CORRECT comparison.
+    #[test]
+    fn secret_eq_matches_only_equal_secrets() {
+        assert!(secret_eq("0123456789abcdef", "0123456789abcdef"));
+        assert!(!secret_eq("0123456789abcdef", "0123456789abcdee"));
+        assert!(!secret_eq("0123456789abcdef", "0123456789abcde"));
+        assert!(!secret_eq("", "x"));
+        assert!(secret_eq("", ""));
+    }
+
+    // ── the auth layer, driven through the REAL router ────────────────────
+    //
+    // The 401 is produced by middleware BEFORE any handler runs, so these need
+    // no MongoDB — which is exactly why the unauthenticated case is assertable
+    // in CI while the DB-backed happy path is not.
+
+    /// Send a raw HTTP/1.1 request and return the status line. Raw TCP rather
+    /// than an HTTP client so no new dependency is added for two tests.
+    fn http_status(port: u16, request: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.write_all(request.as_bytes()).expect("write");
+        stream.flush().expect("flush");
+        let mut buf = Vec::new();
+        // Connection: close, so read_to_end terminates.
+        let _ = stream.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    async fn serve_test_router(api_token: Option<String>) -> u16 {
+        let state: SharedState = Arc::new(AppState {
+            // Port 1 so any handler that DID run cannot reach a real database,
+            // with the selection timeouts bounded: `db_*` uses the BLOCKING
+            // mongodb::sync client from inside an async handler, so an
+            // unreachable host with the 30 s default would stall the test.
+            db_uri: "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=150&connectTimeoutMS=150"
+                .to_string(),
+            db_name: "nextgcore-test".to_string(),
+            api_token,
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let app = build_router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // Let the accept loop reach the await point.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        port
+    }
+
+    /// **Acceptance criterion 1.** Every `/api/subscribers*` route rejects a
+    /// request with no valid credential — including the write verbs, which is
+    /// where an unauthenticated caller could otherwise overwrite key material.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unauthenticated_api_requests_are_rejected() {
+        let port = serve_test_router(Some(TEST_TOKEN.to_string())).await;
+
+        let cases = [
+            "GET /api/subscribers",
+            "GET /api/subscribers/count",
+            "GET /api/subscribers/001010000000001",
+            "POST /api/subscribers",
+            "PUT /api/subscribers/001010000000001",
+            "DELETE /api/subscribers/001010000000001",
+        ];
+        for case in cases {
+            let request =
+                format!("{case} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let status = http_status(port, &request);
+            assert!(
+                status.contains("401"),
+                "{case} without a token must be 401, got {status:?}"
+            );
+        }
+
+        // A wrong token is equally rejected...
+        let status = http_status(
+            port,
+            "GET /api/subscribers HTTP/1.1\r\nHost: localhost\r\n\
+             Authorization: Bearer wrong-token-wrong-token\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            status.contains("401"),
+            "a wrong token must be 401: {status:?}"
+        );
+
+        // ...as is a non-Bearer scheme carrying the right secret.
+        let status = http_status(
+            port,
+            &format!(
+                "GET /api/subscribers HTTP/1.1\r\nHost: localhost\r\n\
+                 Authorization: Basic {TEST_TOKEN}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            status.contains("401"),
+            "only the Bearer scheme is accepted: {status:?}"
+        );
+
+        // The CORRECT token passes the gate. It then fails at the unreachable
+        // database (500), which is the proof it got past authentication — the
+        // point is that it is NOT 401.
+        let status = http_status(
+            port,
+            &format!(
+                "GET /api/subscribers HTTP/1.1\r\nHost: localhost\r\n\
+                 Authorization: Bearer {TEST_TOKEN}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            !status.contains("401"),
+            "the correct token must pass the auth layer, got {status:?}"
+        );
+    }
+
+    /// The dashboard shell stays reachable without a token — it carries no
+    /// subscriber data and fetches everything through the authenticated `/api`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dashboard_shell_is_not_behind_the_api_token() {
+        let port = serve_test_router(Some(TEST_TOKEN.to_string())).await;
+        let status = http_status(
+            port,
+            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            status.contains("200"),
+            "the dashboard shell must still load, got {status:?}"
+        );
+    }
+
+    /// The embedded dashboard must not have been left reading fields the API no
+    /// longer returns, and must send the token on every call it makes.
+    #[test]
+    fn dashboard_matches_the_projected_api_shape() {
+        let html = DASHBOARD_HTML;
+
+        // It used to render `s.security.k.substring(0,8)` and prefill the edit
+        // form from `s.security.k`, both of which would now throw on an undefined
+        // field. Matched precisely: a bare `s.security.k` prefix-matches the
+        // legitimate `s.security.key_provisioned`.
+        assert!(
+            !html.contains("s.security.k.substring"),
+            "the dashboard must not render security.k -- the API no longer returns it"
+        );
+        assert!(
+            !html.contains("value=s.security.k;"),
+            "the edit form must not prefill K from the API response"
+        );
+        assert!(
+            !html.contains("s.security.opc"),
+            "the dashboard must not read security.opc"
+        );
+        assert!(
+            html.contains("key_provisioned"),
+            "the dashboard should show whether a key is provisioned"
+        );
+
+        // Every API call goes through the token-attaching helper, so none can
+        // silently regress to a bare fetch of /api.
+        assert!(
+            !html.contains("fetch(API"),
+            "API calls must go through api(), which attaches the bearer token"
+        );
+        assert!(html.contains("'Authorization':'Bearer '+apiToken()"));
+    }
+}
+
+/// Issue #118: CI-enforced guards on the **shipped artefacts outside this crate**
+/// — the legacy Node UI and the MongoDB init script.
+///
+/// WHY THESE ARE SOURCE-LEVEL ASSERTIONS. `webui/` has no test framework (no
+/// `devDependencies`, no `test` script) and the CI workflow never installs Node or
+/// runs anything under `webui/`, so a Node unit test would not be executed by any
+/// gate. `cargo test --workspace` IS the gate, so these run there.
+///
+/// For a "this credential must not exist in the shipped artefact" property that is
+/// arguably the better shape anyway: the risk is a default credential coming BACK,
+/// and grepping the artefact catches that whether or not a server can be booted in
+/// CI. What they cannot do is prove runtime behaviour — see the issue notes.
+#[cfg(test)]
+mod shipped_artefact_guards {
+    /// Repository root, from this crate's manifest directory
+    /// (`<root>/src/bins/nextgcore-webui`).
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("crate is at <root>/src/bins/nextgcore-webui")
+            .to_path_buf()
+    }
+
+    fn read(relative: &str) -> String {
+        let path = repo_root().join(relative);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    }
+
+    /// Read a JS file with comments stripped.
+    ///
+    /// These guards assert that dangerous *code* is absent, so they must not trip
+    /// over prose that names the very pattern being forbidden — the comments
+    /// explaining why `change-me` was removed necessarily contain the literal.
+    /// Stripping is deliberately naive (no string-literal awareness); a false PASS
+    /// is impossible, because stripping only ever removes text the assertions are
+    /// searching for.
+    fn read_code(relative: &str) -> String {
+        let source = read(relative);
+        let mut out = String::with_capacity(source.len());
+        let mut rest = source.as_str();
+        while let Some(start) = rest.find("/*") {
+            out.push_str(&rest[..start]);
+            match rest[start + 2..].find("*/") {
+                Some(end) => rest = &rest[start + 2 + end + 2..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        out.lines()
+            .map(strip_line_comment)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Truncate a line at its `//` comment, ignoring the `//` of a URL scheme.
+    ///
+    /// `mongodb://127.0.0.1/nextgcore` is code, not a comment — a naive
+    /// `find("//")` cut the line at the scheme separator and made the guards read
+    /// an empty DB_URI.
+    fn strip_line_comment(line: &str) -> &str {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                // `://` is a scheme separator, not a comment.
+                if i > 0 && bytes[i - 1] == b':' {
+                    i += 2;
+                    continue;
+                }
+                return &line[..i];
+            }
+            i += 1;
+        }
+        line
+    }
+
+    /// No predefined credential may ship (TS 33.117 §4.2.3.4.2.2,
+    /// TR 33.926 §5.3.6.8). The `admin`/`1423` account used to be created
+    /// unconditionally by the Mongo init script — which the shipped
+    /// docker-compose stack mounts — and again by a dev-mode auto-register.
+    #[test]
+    fn no_default_admin_credential_is_shipped() {
+        let mongo_init = read_code("docs/assets/webui/mongo-init.js");
+        // The bcrypt hash of "1423" that used to be inserted.
+        assert!(
+            !mongo_init.contains("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"),
+            "mongo-init.js must not seed a default admin password hash"
+        );
+        assert!(
+            !mongo_init.contains("db.accounts.insertOne"),
+            "mongo-init.js must not insert any account; the first admin is an \
+             explicit provisioning step"
+        );
+
+        let server = read_code("webui/server/index.js");
+        assert!(
+            !server.contains("Account.register(newAccount"),
+            "the dev-mode auto-registration of a default admin must stay removed"
+        );
+        assert!(
+            !server.contains("'1423'"),
+            "no hardcoded password may remain in the server entry point"
+        );
+    }
+
+    /// The JWT signing/verification secret must have no default. With
+    /// `|| 'change-me'` in place an attacker could sign
+    /// `{user:{roles:['admin']}}` themselves and pass the `/api/db` gate without
+    /// any account at all.
+    #[test]
+    fn the_jwt_secret_has_no_shipped_default() {
+        for file in [
+            "webui/server/routes/auth.js",
+            "webui/server/routes/index.js",
+        ] {
+            let source = read_code(file);
+            assert!(
+                !source.contains("'change-me'"),
+                "{file} must not fall back to a well-known signing secret"
+            );
+            assert!(
+                !source.contains("JWT_SECRET_KEY ||"),
+                "{file} must not default JWT_SECRET_KEY to anything"
+            );
+            assert!(
+                source.contains("loadJwtSecret()"),
+                "{file} must resolve the secret through the fail-fast loader"
+            );
+        }
+
+        // The loader itself refuses the historical default and requires a real
+        // length, and does so at require time so the server cannot start.
+        let loader = read_code("webui/server/lib/jwt-secret.js");
+        assert!(
+            loader.contains("'change-me'"),
+            "the loader must reject 'change-me' by name"
+        );
+        assert!(
+            loader.contains("throw new Error"),
+            "a bad secret must throw, not warn"
+        );
+        assert!(
+            loader.contains("MIN_LENGTH"),
+            "a length floor must be enforced"
+        );
+    }
+
+    /// Every component must agree on the database name.
+    ///
+    /// The Node UI defaulted `DB_URI` to `open5gs` -- a leftover from the upstream
+    /// project this was forked from -- while `mongo-init.js` seeds `nextgcore`. Not
+    /// merely branding: the UI was reading a database nothing populates, so
+    /// anything provisioned there was invisible to the UDR and anything seeded was
+    /// invisible to the UI. The Rust side was corrected earlier for exactly this
+    /// reason (see `NEXTGCORE_DEFAULT_DB_NAME`); the Node side was the last holdout.
+    ///
+    /// Guarded here because CI never runs Node, so nothing else would notice it
+    /// drifting back.
+    #[test]
+    fn every_component_agrees_on_the_database_name() {
+        assert_eq!(
+            super::DEFAULT_DB_NAME,
+            "nextgcore",
+            "the shared default database name"
+        );
+
+        // The Mongo init script seeds it...
+        let mongo_init = read_code("docs/assets/webui/mongo-init.js");
+        assert!(
+            mongo_init.contains("getSiblingDB('nextgcore')"),
+            "mongo-init.js must seed the nextgcore database"
+        );
+
+        // ...and both Node entry points must read the same one.
+        for file in ["webui/server/index.js", "webui/server/bin/create-admin.js"] {
+            let source = read_code(file);
+            assert!(
+                !source.contains("open5gs"),
+                "{file} must not reference the upstream open5gs database"
+            );
+            assert!(
+                source.contains("mongodb://127.0.0.1/nextgcore"),
+                "{file} must default DB_URI to the nextgcore database"
+            );
+        }
+    }
+
+    /// The session cookie must not travel in cleartext or be script-readable
+    /// (TS 33.117 §4.2.5.1). `httpOnly` used to sit on the session options object
+    /// rather than inside `cookie`, where express-session reads it, so it had no
+    /// effect; `secure` was absent entirely.
+    #[test]
+    fn the_session_cookie_is_hardened() {
+        let server = read_code("webui/server/index.js");
+        let cookie_block = server
+            .split_once("cookie: {")
+            .expect("a cookie configuration block")
+            .1
+            .split_once('}')
+            .expect("a closed cookie block")
+            .0;
+
+        for attribute in ["httpOnly: true", "sameSite:", "secure:"] {
+            assert!(
+                cookie_block.contains(attribute),
+                "the session cookie must set {attribute} -- block was: {cookie_block}"
+            );
+        }
+        // Secure must be the default, with only an explicit opt-out.
+        assert!(
+            cookie_block.contains("WEBUI_INSECURE_DEV !== '1'"),
+            "`secure` must default to true and require an explicit opt-out"
+        );
     }
 }

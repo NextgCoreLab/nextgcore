@@ -1,4 +1,14 @@
-process.env.DB_URI = process.env.DB_URI || 'mongodb://127.0.0.1/open5gs';
+// Database name is `nextgcore`, matching the single source of truth in
+// src/libs/nextgcore-dbi/src/types.rs (NEXTGCORE_DEFAULT_DB_NAME), the Rust
+// WebUI's --db-name, docs/assets/webui/mongo-init.js and the compose stack's
+// MONGO_INITDB_DATABASE.
+//
+// This said `open5gs` -- a leftover from the upstream project this was forked
+// from. Not merely branding: mongo-init.js seeds subscribers into `nextgcore`, so
+// this UI was reading a database nothing populates. Anything provisioned here was
+// invisible to the UDR, and anything seeded was invisible here. The Rust side was
+// already corrected for exactly this reason; this was the last holdout.
+process.env.DB_URI = process.env.DB_URI || 'mongodb://127.0.0.1/nextgcore';
 
 const _hostname = process.env.HOSTNAME || 'localhost';
 const port = process.env.PORT || 9999;
@@ -43,26 +53,23 @@ co(function* () {
     /* other options */
   })
 
-  if (dev) {
-    Account.count((err, count) => {
-      if (err) {
-        console.error(err);
-        throw err;
-      }
-
-      if (!count) {
-        const newAccount = new Account();
-        newAccount.username = 'admin';
-        newAccount.roles = [ 'admin' ];
-        Account.register(newAccount, '1423', err => {
-          if (err) {
-            console.error(err);
-            throw err;
-          }
-        })
-      }
-    })
-  }
+  // Issue #118: the dev-mode auto-registration of admin/1423 is REMOVED.
+  // TS 33.117 §4.2.3.4.2.2 / TR 33.926 §5.3.6.8: no predefined credential may
+  // grant privileged access. A first admin is now an explicit provisioning step:
+  //   node server/bin/create-admin.js <username>
+  // which prompts for a password rather than baking one in.
+  Account.count((err, count) => {
+    if (err) {
+      console.error(err);
+      throw err;
+    }
+    if (!count) {
+      console.warn(
+        '> No provisioning accounts exist. Create one with: ' +
+        'node server/bin/create-admin.js <username>'
+      );
+    }
+  })
 
   const server = express();
   
@@ -79,9 +86,17 @@ co(function* () {
     resave: false,
     rolling: true,
     saveUninitialized: true,
-    httpOnly: true,
     cookie: {
-      maxAge: 1000 * 60 * 60 * 24 * 7 * 2  // 2 weeks
+      maxAge: 1000 * 60 * 60 * 24 * 7 * 2,  // 2 weeks
+      // Issue #118 / TS 33.117 §4.2.5.1. `httpOnly` was set on the session
+      // OPTIONS object rather than inside `cookie`, where express-session reads
+      // it -- so it had no effect and the cookie was scriptable. `secure` was
+      // absent entirely, so the session cookie was sent over plaintext HTTP.
+      httpOnly: true,
+      sameSite: 'strict',
+      // Secure by default; only a deliberate insecure-dev run may send the
+      // session cookie over plaintext.
+      secure: process.env.WEBUI_INSECURE_DEV !== '1'
     }
   }));
 

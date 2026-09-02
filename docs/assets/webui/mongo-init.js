@@ -21,15 +21,18 @@ db.sessions.createIndex({ "dnn": 1 });
 // Create indexes for policy data
 db.policyData.createIndex({ "supi": 1 });
 
-// Create admin user for webui
+// WebUI accounts collection.
+//
+// Issue #118: this used to seed an "admin" account with the well-known password
+// 1423, unconditionally, in every deployment that mounts this script -- including
+// the shipped docker-compose stack. TS 33.117 §4.2.3.4.2.2 and TR 33.926 §5.3.6.8
+// forbid shipping a predefined credential that grants privileged access; with the
+// WebUI that account can read and write every subscriber's permanent key.
+//
+// The index is still created so the collection has its uniqueness constraint. No
+// account is seeded: create the first admin explicitly with
+//   node server/bin/create-admin.js <username>
 db.accounts.createIndex({ "username": 1 }, { unique: true });
-db.accounts.insertOne({
-    username: "admin",
-    // Default password: 1423 (hashed)
-    password: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
-    roles: ["admin"],
-    created: new Date()
-});
 
 // Insert test subscriber matching nextgsim UE config (IMSI: 999700000000001, PLMN 999-70)
 db.subscribers.insertOne({
@@ -183,5 +186,5 @@ db.subscribers.insertOne({
 });
 
 print("NextGCore MongoDB initialization completed.");
-print("Default admin user created (username: admin, password: 1423)");
+print("No admin account seeded (issue #118). Create one: node server/bin/create-admin.js <username>");
 print("Test subscriber created (IMSI: 001010123456789)");
