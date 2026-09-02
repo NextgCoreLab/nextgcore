@@ -1488,7 +1488,16 @@ pub async fn persist_binding_async(sess: BsfSess) {
     let result = tokio::task::spawn_blocking(move || bsf_db_upsert_binding(&sess)).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => log::debug!("DB persistence unavailable for {binding_id}: {e}"),
+        // Previously logged at debug level, i.e. invisible in every shipped
+        // deployment (RUST_LOG=info).
+        // The BSF still answers discovery correctly from memory, so nothing looks
+        // wrong until a restart loses this binding -- having reported success for a
+        // write that did not happen.
+        Ok(Err(e)) => log::error!(
+            "BSF binding {binding_id} was NOT persisted: {e}. It exists in memory only \
+             and will be lost on restart, even though the create was answered \
+             successfully."
+        ),
         Err(e) => log::warn!("persist_binding_async join error: {e}"),
     }
 }
@@ -1499,7 +1508,15 @@ pub async fn unpersist_binding_async(binding_id: String) {
     let result = tokio::task::spawn_blocking(move || bsf_db_delete_binding(&id)).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => log::debug!("DB persistence unavailable for delete {binding_id}: {e}"),
+        // Worse than a lost write: the row survives, so load_persisted_bindings_async
+        // REINSTALLS this binding at the next boot. The BSF then reports a PCF
+        // binding for a session that was deliberately deleted, and a consumer routes
+        // policy to a PCF that is not serving it. Reconciling that is #193's job;
+        // being loud about it is this function's.
+        Ok(Err(e)) => log::error!(
+            "BSF binding {binding_id} was deleted from memory but NOT from the database: \
+             {e}. It will be RESURRECTED on the next restart and reported as live."
+        ),
         Err(e) => log::warn!("unpersist_binding_async join error: {e}"),
     }
 }
@@ -1518,7 +1535,13 @@ pub async fn load_persisted_bindings_async() {
             };
             log::info!("Loaded {count} persisted BSF bindings from database");
         }
-        Ok(Err(e)) => log::debug!("No persisted bindings loaded (DB unavailable): {e}"),
+        // An empty BSF is not a quiet condition: it answers "no binding" -- with a
+        // 404, authoritatively -- for sessions that HAVE one, and a consumer cannot
+        // tell that apart from a session that was never bound.
+        Ok(Err(e)) => log::error!(
+            "BSF bindings could NOT be loaded from the database: {e}. Starting with ZERO \
+             bindings, so discovery will report no binding for sessions that have one."
+        ),
         Err(e) => log::warn!("load_persisted_bindings_async join error: {e}"),
     }
 }
@@ -1563,6 +1586,68 @@ pub fn get_sess_load() -> i32 {
         return context.get_sess_load();
     }
     0
+}
+
+#[cfg(test)]
+mod persistence_visibility_guards {
+    /// A BSF binding-persistence failure must never be logged below `warn`.
+    ///
+    /// All three DB-failure arms — persist, unpersist, load-at-boot — were
+    /// `log::debug!`, while every shipped deployment runs `RUST_LOG=info`
+    /// (`docker/rust/docker-compose.yml`). So each failure was **invisible in
+    /// practice**, and each has a consequence an operator would want to know
+    /// about:
+    ///
+    /// * persist fails → the create was answered successfully but the binding is
+    ///   memory-only and dies at restart;
+    /// * unpersist fails → the row survives, so the deleted binding is
+    ///   **resurrected** at the next boot and reported as live;
+    /// * load fails → the BSF starts empty and answers "no binding" —
+    ///   authoritatively, with a 404 — for sessions that have one.
+    ///
+    /// This is a source guard because the property is about the log *level*, which
+    /// has no runtime signal to assert against. Keyed to the function bodies rather
+    /// than to message text, so rewording a message does not break it.
+    ///
+    /// It greps for the macro token, so it also matches the token inside a comment —
+    /// which it did on first run, against a comment written to explain this very
+    /// fix. The comments in those functions therefore say "debug level" in prose.
+    /// Stripping comments first was the alternative and is worse: a naive stripper
+    /// cuts at the `//` in a URL, which this repo has already been bitten by.
+    #[test]
+    fn persistence_failures_are_not_logged_below_warn() {
+        let src = include_str!("context.rs");
+
+        for func in [
+            "pub async fn persist_binding_async",
+            "pub async fn unpersist_binding_async",
+            "pub async fn load_persisted_bindings_async",
+        ] {
+            let start = src
+                .find(func)
+                .unwrap_or_else(|| panic!("{func} not found; move this guard with it"));
+            // Each of these is short; the body ends at the first line that is a
+            // closing brace at column 0.
+            let rest = &src[start..];
+            let end = rest.find("\n}\n").map(|i| start + i).unwrap_or(src.len());
+            let body = &src[start..end];
+
+            assert!(
+                !body.contains("log::debug!"),
+                "{func} logs a persistence outcome at debug level. Every shipped \
+                 deployment runs RUST_LOG=info, so that failure is invisible: the BSF \
+                 keeps answering from memory and nothing surfaces until a restart loses \
+                 (or resurrects) a binding. Use warn! or error! and name the \
+                 consequence."
+            );
+            assert!(
+                body.contains("log::error!") || body.contains("log::warn!"),
+                "{func} should report its DB-failure path at warn or error; if the \
+                 failure handling moved elsewhere, move this guard with it rather than \
+                 deleting it"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
