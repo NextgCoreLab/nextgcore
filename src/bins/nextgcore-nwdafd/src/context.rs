@@ -135,6 +135,15 @@ impl AnalyticsId {
         Self::TrafficPattern,
     ];
 
+    /// The TS 29.520 **`NwdafEvent`** token for this event.
+    ///
+    /// This is the spelling used by Nnwdaf_EventsSubscription
+    /// (`eventSubscriptions[].event`), Nnwdaf_MLModelProvision
+    /// (`mLEventSubscs[].mLEvent`) and `NwdafInfo.nwdafEvents`.
+    ///
+    /// NOT the spelling for Nnwdaf_AnalyticsInfo (issue #175): that API types its
+    /// `event-id` as `EventId`, a different 24-value enumeration. Use
+    /// [`as_event_id`](Self::as_event_id) there.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::NfLoad => "NF_LOAD",
@@ -165,6 +174,12 @@ impl AnalyticsId {
         }
     }
 
+    /// Parse a TS 29.520 **`NwdafEvent`** token (the counterpart of
+    /// [`as_str`](Self::as_str)).
+    ///
+    /// Accepts all 25 `NwdafEvent` values. NOT for the Nnwdaf_AnalyticsInfo
+    /// `event-id` query parameter, which is an `EventId` — use
+    /// [`from_event_id`](Self::from_event_id) there (issue #175).
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "NF_LOAD" => Some(Self::NfLoad),
@@ -193,6 +208,60 @@ impl AnalyticsId {
             "ABNORMAL_UP_TRAFFIC" => Some(Self::AbnormalUpTraffic),
             "TRAFFIC_PATTERN" => Some(Self::TrafficPattern),
             _ => None,
+        }
+    }
+
+    /// The TS 29.520 **`EventId`** token for this event, or `None` when `EventId`
+    /// has no value for it (issue #175).
+    ///
+    /// `EventId` (`TS29520_Nnwdaf_AnalyticsInfo.yaml:939-1004`) is a DIFFERENT
+    /// enumeration from `NwdafEvent`, and the difference is not cosmetic:
+    ///
+    /// | | `NwdafEvent` (25) | `EventId` (24) |
+    /// |---|---|---|
+    /// | slice load level | `SLICE_LOAD_LEVEL` | `LOAD_LEVEL_INFORMATION` |
+    /// | PFD determination | `PFD_DETERMINATION` | *(absent)* |
+    ///
+    /// `EventId` is the type of the Nnwdaf_AnalyticsInfo `event-id` query
+    /// parameter (`yaml:35-40`) and of `NwdafInfo.eventIds` in the NRF profile
+    /// (`TS29510_Nnrf_NFManagement.yaml` `NwdafInfo`). `NwdafInfo` also carries a
+    /// separate `nwdafEvents` member typed `NwdafEvent`, which is how an event
+    /// with no `EventId` value can still be advertised — see
+    /// `main.rs::build_nf_profile`.
+    pub fn as_event_id(&self) -> Option<&'static str> {
+        Some(match self {
+            // The one token whose EventId spelling differs from its NwdafEvent
+            // spelling. Getting this wrong is what made a conformant
+            // `event-id=LOAD_LEVEL_INFORMATION` a 400 before #175.
+            Self::SliceLoadLevel => "LOAD_LEVEL_INFORMATION",
+            // Not an EventId value: PFD determination analytics are
+            // subscribe/notify-only, and `AnalyticsData` has no member for them
+            // either (see `analytics_data_key`).
+            Self::PfdDetermination => return None,
+            // Every other token is spelled identically in both enumerations.
+            other => other.as_str(),
+        })
+    }
+
+    /// Parse a TS 29.520 **`EventId`** token — the enumeration the
+    /// Nnwdaf_AnalyticsInfo `event-id` query parameter is typed as (issue #175).
+    ///
+    /// Accepts exactly `EventId`'s 24 values, so `LOAD_LEVEL_INFORMATION` is
+    /// recognised (it was rejected `400 INVALID_ANALYTICS_TYPE` before #175,
+    /// which is the spec's own token for that API) and the two `NwdafEvent`-only
+    /// spellings `SLICE_LOAD_LEVEL` / `PFD_DETERMINATION` are NOT — accepting a
+    /// token the called API does not define is the mirror-image of the same
+    /// confusion.
+    ///
+    /// The exact-inverse property (`from_event_id(as_event_id(e)) == Some(e)` for
+    /// every token with an `EventId` value, and no `EventId` value maps to two
+    /// tokens) is asserted by `test_event_id_and_nwdaf_event_are_distinct_enums`.
+    pub fn from_event_id(s: &str) -> Option<Self> {
+        match s {
+            "LOAD_LEVEL_INFORMATION" => Some(Self::SliceLoadLevel),
+            // Reject the NwdafEvent-only spellings on this surface.
+            "SLICE_LOAD_LEVEL" | "PFD_DETERMINATION" => None,
+            other => Self::from_str(other),
         }
     }
 
@@ -1375,6 +1444,122 @@ mod tests {
         // The old abbreviated tokens are rejected.
         assert_eq!(AnalyticsId::from_str("UE_COMM"), None);
         assert_eq!(AnalyticsId::from_str("SLICE_LOAD"), None);
+    }
+
+    /// **The issue #175 table test.** `EventId` and `NwdafEvent` are DIFFERENT
+    /// enumerations, and each parse/emit pair is pinned against its own yaml so
+    /// the two cannot drift back together.
+    ///
+    /// Sources: `TS29520_Nnwdaf_AnalyticsInfo.yaml:939-1004` (`EventId`, 24
+    /// values, the type of the `event-id` query parameter at `yaml:35-40`) and
+    /// `TS29520_Nnwdaf_EventsSubscription.yaml` (`NwdafEvent`, 25 values).
+    #[test]
+    fn test_event_id_and_nwdaf_event_are_distinct_enums() {
+        // The EventId enumeration, transcribed from the yaml in its own order.
+        let event_id_tokens = [
+            "LOAD_LEVEL_INFORMATION",
+            "NETWORK_PERFORMANCE",
+            "NF_LOAD",
+            "SERVICE_EXPERIENCE",
+            "UE_MOBILITY",
+            "UE_COMMUNICATION",
+            "QOS_SUSTAINABILITY",
+            "ABNORMAL_BEHAVIOUR",
+            "USER_DATA_CONGESTION",
+            "NSI_LOAD_LEVEL",
+            "SM_CONGESTION",
+            "DISPERSION",
+            "RED_TRANS_EXP",
+            "WLAN_PERFORMANCE",
+            "DN_PERFORMANCE",
+            "PDU_SESSION_TRAFFIC",
+            "E2E_DATA_VOL_TRANS_TIME",
+            "MOVEMENT_BEHAVIOUR",
+            "LOC_ACCURACY",
+            "RELATIVE_PROXIMITY",
+            "SIGNALLING_STORM",
+            "QOS_POLICY_ASSIST",
+            "TRAFFIC_PATTERN",
+            "ABNORMAL_UP_TRAFFIC",
+        ];
+        assert_eq!(event_id_tokens.len(), 24, "EventId defines 24 values");
+        assert_eq!(AnalyticsId::ALL.len(), 25, "NwdafEvent defines 25");
+
+        // Every EventId value is accepted on the AnalyticsInfo surface.
+        for t in event_id_tokens {
+            assert!(
+                AnalyticsId::from_event_id(t).is_some(),
+                "EventId value {t} must be accepted as an event-id"
+            );
+        }
+
+        // The two NwdafEvent-only spellings are REJECTED there: accepting a token
+        // the called API does not define is the mirror image of the #175 defect.
+        assert_eq!(AnalyticsId::from_event_id("SLICE_LOAD_LEVEL"), None);
+        assert_eq!(AnalyticsId::from_event_id("PFD_DETERMINATION"), None);
+        // ...while both remain valid NwdafEvent values on the notify surface.
+        assert_eq!(
+            AnalyticsId::from_str("SLICE_LOAD_LEVEL"),
+            Some(AnalyticsId::SliceLoadLevel)
+        );
+        assert_eq!(
+            AnalyticsId::from_str("PFD_DETERMINATION"),
+            Some(AnalyticsId::PfdDetermination)
+        );
+        // And LOAD_LEVEL_INFORMATION is NOT a NwdafEvent value.
+        assert_eq!(AnalyticsId::from_str("LOAD_LEVEL_INFORMATION"), None);
+
+        // The one token whose spelling differs between the enums.
+        assert_eq!(
+            AnalyticsId::from_event_id("LOAD_LEVEL_INFORMATION"),
+            Some(AnalyticsId::SliceLoadLevel),
+            "LOAD_LEVEL_INFORMATION is EventId's name for slice load level"
+        );
+        assert_eq!(
+            AnalyticsId::SliceLoadLevel.as_event_id(),
+            Some("LOAD_LEVEL_INFORMATION")
+        );
+        assert_eq!(AnalyticsId::SliceLoadLevel.as_str(), "SLICE_LOAD_LEVEL");
+
+        // PFD_DETERMINATION has no EventId spelling at all.
+        assert_eq!(AnalyticsId::PfdDetermination.as_event_id(), None);
+
+        // Exact inverse: as_event_id round-trips for every token that has one,
+        // and the 24 emitted spellings are exactly the EventId enumeration with
+        // no token sharing another's spelling.
+        let mut emitted: Vec<&str> = Vec::new();
+        for event in AnalyticsId::ALL {
+            match event.as_event_id() {
+                Some(token) => {
+                    assert_eq!(
+                        AnalyticsId::from_event_id(token),
+                        Some(*event),
+                        "as_event_id/from_event_id must be inverses for {}",
+                        event.as_str()
+                    );
+                    emitted.push(token);
+                }
+                None => assert_eq!(
+                    *event,
+                    AnalyticsId::PfdDetermination,
+                    "only PFD_DETERMINATION lacks an EventId spelling, not {}",
+                    event.as_str()
+                ),
+            }
+        }
+        emitted.sort_unstable();
+        let mut expected = event_id_tokens;
+        expected.sort_unstable();
+        assert_eq!(
+            emitted, expected,
+            "the emitted EventId spellings must be exactly the EventId enumeration"
+        );
+
+        // Every token still round-trips on the NwdafEvent surface (#108's
+        // contract is untouched by the new pair).
+        for event in AnalyticsId::ALL {
+            assert_eq!(AnalyticsId::from_str(event.as_str()), Some(*event));
+        }
     }
 
     /// **The issue #172 table test.** Every token's payload member name is
