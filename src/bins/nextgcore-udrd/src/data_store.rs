@@ -14,7 +14,7 @@
 //! second map lock — see the documented ABBA lock-order rule).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
@@ -113,6 +113,11 @@ pub struct UdrDataStore {
     next_sub_id: AtomicU64,
     /// Optional on-disk snapshot path. `None` => purely in-memory.
     state_path: Option<PathBuf>,
+    /// Issue #66: set when `load` could not read the snapshot. While set,
+    /// `persist` REFUSES to write, so an unreadable file is never replaced by the
+    /// empty state that failing to read it produced. `AtomicBool` because
+    /// `persist` takes `&self` (the store lives behind a `OnceLock`).
+    state_unreadable: std::sync::atomic::AtomicBool,
 }
 
 impl UdrDataStore {
@@ -208,9 +213,25 @@ impl UdrDataStore {
         let Some(path) = self.state_path.as_ref() else {
             return;
         };
+        // Issue #66: a failed load left this store EMPTY, so writing now would
+        // replace the unreadable file with nothing and make the loss permanent --
+        // for the UDR, every subscriber's AMF and SMF registration. Refuse, and
+        // keep saying so on every mutation rather than once at boot.
+        if self
+            .state_unreadable
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            log::error!(
+                "UDR refusing to persist to {}: its previous contents could not be read, \
+                 and overwriting them with the current (empty) state would make the loss \
+                 permanent. Move the file aside to start fresh.",
+                path.display()
+            );
+            return;
+        }
         let doc = self.snapshot();
-        if let Err(e) = write_atomic(path, &doc) {
-            log::warn!("UDR state persist to {} failed: {e}", path.display());
+        if let Err(e) = nextgcore_core::state_store::write_snapshot(path, &doc) {
+            log::warn!("UDR state persist failed: {e}");
         }
     }
 
@@ -220,22 +241,25 @@ impl UdrDataStore {
         let Some(path) = self.state_path.clone() else {
             return;
         };
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        match nextgcore_core::state_store::read_snapshot(&path) {
+            // Restored.
+            Ok(Some(doc)) => self.restore_from(&doc),
+            // No file yet: a first boot, not a problem.
+            Ok(None) => {}
+            // Issue #66: unreadable or malformed. This USED to be a `warn!` and a
+            // silent empty start, after which the first mutation rewrote the file
+            // from that empty state and the loss became permanent. Now the store
+            // is marked unreadable so `persist` refuses, leaving the file intact
+            // for inspection or recovery.
             Err(e) => {
-                log::warn!("UDR state load from {} failed: {e}", path.display());
-                return;
+                log::error!(
+                    "UDR state load failed, starting EMPTY and refusing to overwrite the \
+                     file: {e}"
+                );
+                self.state_unreadable
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
-        };
-        let doc: Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("UDR state file {} is not valid JSON: {e}", path.display());
-                return;
-            }
-        };
-        self.restore_from(&doc);
+        }
     }
 
     /// Restore in-memory maps from a snapshot document (used by `load` and by
@@ -780,22 +804,6 @@ impl UdrDataStore {
     }
 }
 
-/// Atomically write `doc` to `path` (write a temp file in the same directory,
-/// then rename over the target) so a crash mid-write can never leave a
-/// truncated snapshot. Creates parent directories as needed.
-fn write_atomic(path: &Path, doc: &Value) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let serialized = serde_json::to_vec_pretty(doc)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &serialized)?;
-    std::fs::rename(&tmp, path)
-}
-
 /// Backing cell for the global UDR data store singleton.
 static STORE: OnceLock<UdrDataStore> = OnceLock::new();
 
@@ -1326,6 +1334,46 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("udrd-test-{tag}-{pid}-{nanos}.json"))
+    }
+
+    /// **Issue #66.** A corrupt state file must not be overwritten by the empty
+    /// store that failing to read it produced.
+    ///
+    /// This is the UDR-level wiring test for the shared guard: the mechanism is
+    /// covered in `nextgcore_core::state_store`, but only a test here proves this
+    /// store actually routes through it. Before the fix, `load` logged a warning
+    /// and returned, and the very first `put_amf_3gpp` rewrote the file from the
+    /// empty snapshot -- destroying every subscriber's AMF and SMF registration
+    /// along with the operator's only chance of recovering them.
+    ///
+    /// Revert-verified: dropping the `state_unreadable` guard from `persist` fails
+    /// the "contents survive" assertion.
+    #[test]
+    fn a_corrupt_state_file_is_not_destroyed_by_the_next_write() {
+        let path = temp_state_path("corrupt");
+        // Truncated JSON -- a partial write, or a container killed mid-rename.
+        let original = r#"{"amf_3gpp": {"imsi-001010000000001": {"amfInstanceId"#;
+        std::fs::write(&path, original).expect("seed corrupt file");
+
+        let store = UdrDataStore::with_state_path(&path);
+        assert!(
+            store
+                .state_unreadable
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a corrupt snapshot must mark the store unreadable"
+        );
+        // The store is empty, as it must be -- nothing could be read.
+        assert!(store.amf_3gpp_get("imsi-001010000000001").is_none());
+
+        // A mutation now persists... and must NOT touch the file.
+        store.amf_3gpp_put("imsi-001010000000002", json!({"amfInstanceId": "amf-2"}));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            original,
+            "the unreadable file must survive so an operator can recover it"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// PUT a value, then re-open the store from the same path and confirm the

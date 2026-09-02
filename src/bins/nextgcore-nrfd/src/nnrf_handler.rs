@@ -4,7 +4,7 @@
 
 use crate::nf_sm::{nrf_nf_fsm_fini, nrf_nf_fsm_init, NfSmContext, NfState};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 /// NF Profile data structure
@@ -418,6 +418,11 @@ pub struct NfInstanceManager {
     subscriptions: RwLock<HashMap<String, SubscriptionData>>,
     /// Optional on-disk snapshot path. `None` => purely in-memory.
     state_path: Option<PathBuf>,
+    /// Issue #66: set when `load` could not read the snapshot. While set,
+    /// `persist` REFUSES to write, so an unreadable file is never replaced by the
+    /// empty state that failing to read it produced. `AtomicBool` because
+    /// `persist` takes `&self`.
+    state_unreadable: std::sync::atomic::AtomicBool,
 }
 
 impl NfInstanceManager {
@@ -428,6 +433,7 @@ impl NfInstanceManager {
             profiles: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
             state_path: None,
+            state_unreadable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -466,9 +472,24 @@ impl NfInstanceManager {
         let Some(path) = self.state_path.as_ref() else {
             return;
         };
+        // Issue #66: a failed load left this context EMPTY, so writing now would
+        // replace the unreadable file with nothing and make the loss permanent --
+        // here, the whole NF registry. Refuse, and keep saying so.
+        if self
+            .state_unreadable
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            log::error!(
+                "NRF refusing to persist to {}: its previous contents could not be read, \
+                 and overwriting them with the current (empty) state would make the loss \
+                 permanent. Move the file aside to start fresh.",
+                path.display()
+            );
+            return;
+        }
         let doc = self.snapshot();
-        if let Err(e) = write_atomic(path, &doc) {
-            log::warn!("NRF state persist to {} failed: {e}", path.display());
+        if let Err(e) = nextgcore_core::state_store::write_snapshot(path, &doc) {
+            log::warn!("NRF state persist failed: {e}");
         }
     }
 
@@ -477,22 +498,23 @@ impl NfInstanceManager {
         let Some(path) = self.state_path.clone() else {
             return;
         };
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        match nextgcore_core::state_store::read_snapshot(&path) {
+            Ok(Some(doc)) => self.restore_from(&doc),
+            // No file yet: a first boot, not a problem.
+            Ok(None) => {}
+            // Issue #66: unreadable or malformed. This USED to be a `warn!` and a
+            // silent empty start, after which the first mutation rewrote the file
+            // from that empty state and made the loss permanent. Now the context
+            // is marked unreadable so `persist` refuses and the file survives.
             Err(e) => {
-                log::warn!("NRF state load from {} failed: {e}", path.display());
-                return;
+                log::error!(
+                    "NRF state load failed, starting EMPTY and refusing to overwrite the \
+                     file: {e}"
+                );
+                self.state_unreadable
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
-        };
-        let doc: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("NRF state file {} is not valid JSON: {e}", path.display());
-                return;
-            }
-        };
-        self.restore_from(&doc);
+        }
     }
 
     /// Restore profiles (re-instantiating their FSMs) and subscriptions from a
@@ -827,21 +849,6 @@ fn subscription_from_json(v: &serde_json::Value) -> Option<SubscriptionData> {
         subscr_cond,
         validity_duration,
     })
-}
-
-/// Atomically write `doc` to `path` (temp file + rename) so a crash mid-write
-/// cannot leave a truncated snapshot. Creates parent directories as needed.
-fn write_atomic(path: &Path, doc: &serde_json::Value) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let serialized = serde_json::to_vec_pretty(doc)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &serialized)?;
-    std::fs::rename(&tmp, path)
 }
 
 impl Default for NfInstanceManager {

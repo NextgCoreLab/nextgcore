@@ -3,7 +3,7 @@
 //! Port of src/nssf/context.c - NSSF context with NSI list and Home list
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -387,6 +387,11 @@ pub struct NssfContext {
     /// Optional on-disk snapshot path for NSSAI-availability subscriptions and
     /// availability data. `None` => purely in-memory (previous behaviour).
     state_path: Option<PathBuf>,
+    /// Issue #66: set when `load` could not read the snapshot. While set,
+    /// `persist` REFUSES to write, so an unreadable file is never replaced by the
+    /// empty state that failing to read it produced. `AtomicBool` because
+    /// `persist` takes `&self`.
+    state_unreadable: std::sync::atomic::AtomicBool,
 }
 
 impl NssfContext {
@@ -406,6 +411,7 @@ impl NssfContext {
             max_num_of_nf: 0,
             initialized: AtomicBool::new(false),
             state_path: None,
+            state_unreadable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -450,9 +456,24 @@ impl NssfContext {
         let Some(path) = self.state_path.as_ref() else {
             return;
         };
+        // Issue #66: a failed load left this context EMPTY, so writing now would
+        // replace the unreadable file with nothing and make the loss permanent --
+        // here, every slice-availability subscription and per-NF availability document. Refuse, and keep saying so.
+        if self
+            .state_unreadable
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            log::error!(
+                "NSSF refusing to persist to {}: its previous contents could not be read, \
+                 and overwriting them with the current (empty) state would make the loss \
+                 permanent. Move the file aside to start fresh.",
+                path.display()
+            );
+            return;
+        }
         let doc = self.snapshot();
-        if let Err(e) = write_atomic(path, &doc) {
-            log::warn!("NSSF state persist to {} failed: {e}", path.display());
+        if let Err(e) = nextgcore_core::state_store::write_snapshot(path, &doc) {
+            log::warn!("NSSF state persist failed: {e}");
         }
     }
 
@@ -461,22 +482,23 @@ impl NssfContext {
         let Some(path) = self.state_path.clone() else {
             return;
         };
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        match nextgcore_core::state_store::read_snapshot(&path) {
+            Ok(Some(doc)) => self.restore_from(&doc),
+            // No file yet: a first boot, not a problem.
+            Ok(None) => {}
+            // Issue #66: unreadable or malformed. This USED to be a `warn!` and a
+            // silent empty start, after which the first mutation rewrote the file
+            // from that empty state and made the loss permanent. Now the context
+            // is marked unreadable so `persist` refuses and the file survives.
             Err(e) => {
-                log::warn!("NSSF state load from {} failed: {e}", path.display());
-                return;
+                log::error!(
+                    "NSSF state load failed, starting EMPTY and refusing to overwrite the \
+                     file: {e}"
+                );
+                self.state_unreadable
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
-        };
-        let doc: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("NSSF state file {} is not valid JSON: {e}", path.display());
-                return;
-            }
-        };
-        self.restore_from(&doc);
+        }
     }
 
     /// Restore subscriptions and availability data from a snapshot document.
@@ -976,21 +998,6 @@ impl Default for NssfContext {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Atomically write `doc` to `path` (temp file + rename) so a crash mid-write
-/// cannot leave a truncated snapshot. Creates parent directories as needed.
-fn write_atomic(path: &Path, doc: &serde_json::Value) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let serialized = serde_json::to_vec_pretty(doc)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &serialized)?;
-    std::fs::rename(&tmp, path)
 }
 
 /// Global NSSF context (thread-safe singleton)
