@@ -495,11 +495,17 @@ pub async fn handle_analytics_info_query_with_ctx(
         return isac_sensing_summary_with_ctx(ctx);
     }
 
-    let analytics_id = match AnalyticsId::from_str(event_token) {
+    // Issue #175: `event-id` is typed `EventId`
+    // (`TS29520_Nnwdaf_AnalyticsInfo.yaml:35-40`), NOT the `NwdafEvent` the
+    // EventsSubscription API uses. The two enumerations differ, so parsing this
+    // with `from_str` rejected `LOAD_LEVEL_INFORMATION` — the spec's own token for
+    // slice load level on THIS API — while accepting `SLICE_LOAD_LEVEL` and
+    // `PFD_DETERMINATION`, which `EventId` does not define.
+    let analytics_id = match AnalyticsId::from_event_id(event_token) {
         Some(id) => id,
         None => {
             return send_bad_request(
-                &format!("Invalid event-id: {event_token}"),
+                &format!("Invalid event-id: {event_token} is not a TS 29.520 EventId value"),
                 Some("INVALID_ANALYTICS_TYPE"),
             )
         }
@@ -1773,6 +1779,115 @@ mod tests {
         assert_eq!(resp.status, 400, "malformed event-filter must be 400");
     }
 
+    // ── issue #175: event-id is an EventId, not a NwdafEvent ─────────────────
+
+    /// **The #175 acceptance test.** `event-id` is typed `EventId`
+    /// (`TS29520_Nnwdaf_AnalyticsInfo.yaml:35-40`), so
+    /// `LOAD_LEVEL_INFORMATION` — the spec's own token for slice load level on
+    /// THIS API — must be accepted. Before #175 it was rejected
+    /// `400 INVALID_ANALYTICS_TYPE`, which is a live defect a conformant consumer
+    /// hits immediately, unlike #172's latent member names.
+    ///
+    /// It resolves to the same analytics as `SLICE_LOAD_LEVEL` does on the
+    /// subscribe surface, so with no collector for it the honest answer is 204 —
+    /// the supported-events gate, NOT a parse rejection. The distinction is the
+    /// whole point: 400 says "no such analytics type", 204 says "that analytics
+    /// type exists but has no data".
+    #[tokio::test]
+    async fn test_analytics_info_accepts_the_event_id_spelling() {
+        // NF_LOAD data exists, so a 204 can only come from the supported-events
+        // gate rather than from a globally empty engine.
+        let ctx = ctx_with_loads("AMF", "amf-eventid-01", &[50]);
+
+        let resp = handle_analytics_info_query_with_ctx(
+            &ctx,
+            &SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=LOAD_LEVEL_INFORMATION"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 204,
+            "LOAD_LEVEL_INFORMATION is an EventId value: it must reach the \
+             supported-events gate (204), not be rejected as an unknown type (400)"
+        );
+
+        // The two NwdafEvent-only spellings are NOT EventId values, so on this
+        // surface they are a genuine 400 INVALID_ANALYTICS_TYPE.
+        for token in ["SLICE_LOAD_LEVEL", "PFD_DETERMINATION"] {
+            let uri = format!("/nnwdaf-analyticsinfo/v1/analytics?event-id={token}");
+            let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
+            assert_eq!(
+                resp.status, 400,
+                "{token} is not an EventId value, so event-id={token} must be 400"
+            );
+            assert_eq!(
+                body_json(&resp)["cause"].as_str(),
+                Some("INVALID_ANALYTICS_TYPE")
+            );
+        }
+
+        // Every other EventId value keeps reaching the gate, and a token outside
+        // both enumerations is still a 400.
+        let resp = handle_analytics_info_query_with_ctx(
+            &ctx,
+            &SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "NF_LOAD is spelled the same in both enums"
+        );
+        let resp = handle_analytics_info_query_with_ctx(
+            &ctx,
+            &SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=NOT_AN_EVENT"),
+        )
+        .await;
+        assert_eq!(resp.status, 400);
+    }
+
+    /// The subscribe surface is unchanged: `eventSubscriptions[].event` really is
+    /// a `NwdafEvent`, so `SLICE_LOAD_LEVEL` belongs there and
+    /// `LOAD_LEVEL_INFORMATION` does not — the exact opposite of the GET surface.
+    #[tokio::test]
+    async fn test_subscription_event_stays_a_nwdaf_event() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+
+        let create = |token: &str| {
+            SbiRequest::post("/nnwdaf-eventssubscription/v1/subscriptions")
+                .with_json_body(&json!({
+                    "notificationURI": "http://amf.example.org/notify",
+                    "eventSubscriptions": [{ "event": token }]
+                }))
+                .expect("valid JSON body")
+        };
+
+        // SLICE_LOAD_LEVEL is a NwdafEvent → carried as a recognised event.
+        let resp = handle_subscription_create(&create("SLICE_LOAD_LEVEL")).await;
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            body_json(&resp)["eventSubscriptions"][0]["event"].as_str(),
+            Some("SLICE_LOAD_LEVEL"),
+            "the notify surface keeps the NwdafEvent spelling"
+        );
+
+        // LOAD_LEVEL_INFORMATION is NOT a NwdafEvent. Per #108 an unrecognised
+        // token is reported per-event in failEventReports rather than rejecting
+        // the subscription, so it lands there — echoed verbatim.
+        let resp = handle_subscription_create(&create("LOAD_LEVEL_INFORMATION")).await;
+        assert_eq!(resp.status, 201);
+        let body = body_json(&resp);
+        assert!(
+            body["eventSubscriptions"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "LOAD_LEVEL_INFORMATION is not a NwdafEvent, so it is not carried as one: {body}"
+        );
+        assert_eq!(
+            body["failEventReports"][0]["event"].as_str(),
+            Some("LOAD_LEVEL_INFORMATION"),
+            "it is reported unserviceable, echoed verbatim (#108)"
+        );
+    }
+
     // ── issue #171: tgt-ue, the analytics target period, and its errors ───────
 
     /// Percent-encode a JSON value for use as a query-parameter value, so tests
@@ -2452,20 +2567,24 @@ mod tests {
         );
 
         // Every recognised-but-unsupported event behaves identically.
+        //
+        // Issue #175: iterated by the event's `EventId` spelling, because that is
+        // what this API's `event-id` parameter is typed as. A token with no
+        // EventId value (PFD_DETERMINATION) is not "unsupported analytics" on this
+        // surface at all — it is an unknown analytics type, so 400 rather than
+        // 204, which `test_analytics_info_accepts_the_event_id_spelling` pins.
         for event in AnalyticsId::ALL {
             if event.is_supported() {
                 continue;
             }
-            let uri = format!(
-                "/nnwdaf-analyticsinfo/v1/analytics?event-id={}",
-                event.as_str()
-            );
+            let Some(token) = event.as_event_id() else {
+                continue;
+            };
+            let uri = format!("/nnwdaf-analyticsinfo/v1/analytics?event-id={token}");
             let resp = handle_analytics_info_query_with_ctx(&ctx, &SbiRequest::get(&uri)).await;
             assert_eq!(
-                resp.status,
-                204,
-                "GET {} must be 204 (a 200 here is empty-200 dishonesty)",
-                event.as_str()
+                resp.status, 204,
+                "GET event-id={token} must be 204 (a 200 here is empty-200 dishonesty)"
             );
         }
     }

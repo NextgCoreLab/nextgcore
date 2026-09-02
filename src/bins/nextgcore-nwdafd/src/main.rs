@@ -446,8 +446,20 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// form, so a consumer that discovers the MTLF role can actually download a
 /// model. Advertising it unconditionally is what made it a facade — the notified
 /// URL 404'd.
+///
+/// Issue #175: `NwdafInfo` has TWO event members with DIFFERENT enumerations —
+/// `eventIds` typed `EventId` (24 values, the Nnwdaf_AnalyticsInfo spelling) and
+/// `nwdafEvents` typed `NwdafEvent` (25, the Nnwdaf_EventsSubscription spelling).
+/// Both are advertised from the same [`SUPPORTED_EVENTS`], each in its own
+/// spelling, so a consumer discovering us for either API sees tokens that API
+/// actually defines. Previously `eventIds` carried `NwdafEvent` spellings, which
+/// is only invisible because NF_LOAD is spelled the same in both; a
+/// SLICE_LOAD_LEVEL or PFD_DETERMINATION collector would have advertised a token
+/// no `EventId` consumer could match. `eventIds` is omitted entirely rather than
+/// emitted empty if no supported event has an `EventId` value (it has
+/// `minItems: 1`).
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
-    let event_ids: Vec<&'static str> = SUPPORTED_EVENTS.iter().map(|e| e.as_str()).collect();
+    let nwdaf_info = nwdaf_info(SUPPORTED_EVENTS);
 
     let can_provision = nwdaf_self()
         .read()
@@ -461,10 +473,43 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
         "nfStatus": "REGISTERED",
         "ipv4Addresses": [sbi_addr],
         "nfServices": services,
-        "nwdafInfo": { "eventIds": event_ids },
+        "nwdafInfo": nwdaf_info,
         "allowedNfTypes": ["AMF", "SMF", "PCF", "NEF", "SCP"],
         "heartBeatTimer": 10
     })
+}
+
+/// Build TS 29.510 `NwdafInfo` for a set of supported analytics (issue #175).
+///
+/// `NwdafInfo` has two event members typed as two DIFFERENT TS 29.520
+/// enumerations, so each is emitted in its own spelling:
+///
+/// - `eventIds` → `EventId` (24 values, the Nnwdaf_AnalyticsInfo spelling). An
+///   event with no `EventId` value is skipped, because a consumer discovering us
+///   for that API could not name it anyway.
+/// - `nwdafEvents` → `NwdafEvent` (25 values, the Nnwdaf_EventsSubscription
+///   spelling). Covers every supported event, which is how one with no `EventId`
+///   value is still advertised.
+///
+/// Both have `minItems: 1`, so an empty member is omitted rather than emitted.
+///
+/// Taken as a parameter rather than read from [`SUPPORTED_EVENTS`] so the
+/// spelling logic is testable with events whose two spellings actually differ —
+/// same reason `nwdaf_services` takes `can_provision`. With `SUPPORTED_EVENTS`
+/// hardcoded, a test could only ever see NF_LOAD, which is spelled identically in
+/// both enumerations and therefore proves nothing about the divergence.
+fn nwdaf_info(events: &[AnalyticsId]) -> serde_json::Value {
+    let event_ids: Vec<&'static str> = events.iter().filter_map(|e| e.as_event_id()).collect();
+    let nwdaf_events: Vec<&'static str> = events.iter().map(|e| e.as_str()).collect();
+
+    let mut info = serde_json::Map::new();
+    if !event_ids.is_empty() {
+        info.insert("eventIds".to_string(), serde_json::json!(event_ids));
+    }
+    if !nwdaf_events.is_empty() {
+        info.insert("nwdafEvents".to_string(), serde_json::json!(nwdaf_events));
+    }
+    serde_json::Value::Object(info)
 }
 
 /// The `nfServices[]` this NWDAF advertises.
@@ -629,47 +674,116 @@ mod tests {
 
     // --- G2-3: NF profile advertises supported events (contract test) ---
 
-    /// G2-3 honesty contract: the registered NFProfile carries
-    /// `nwdafInfo.eventIds` (TS 29.510 `NwdafInfo`), the array equals
-    /// `SUPPORTED_EVENTS` exactly (same tokens, same order), and every token is
-    /// a recognised TS 29.520 `NwdafEvent`/`EventId` value ("NF_LOAD" is valid
-    /// in both enums). Field names pinned against
-    /// TS29510_Nnrf_NFManagement.yaml `NwdafInfo` (eventIds → EventId).
+    /// G2-3 honesty contract: the registered NFProfile advertises the supported
+    /// analytics, and — issue #175 — it does so in BOTH of `NwdafInfo`'s event
+    /// members, each in the enumeration that member is typed as:
+    /// `eventIds` → `EventId`, `nwdafEvents` → `NwdafEvent`
+    /// (`TS29510_Nnrf_NFManagement.yaml` `NwdafInfo`). Advertising `NwdafEvent`
+    /// spellings under `eventIds` is only invisible while every supported event
+    /// happens to be spelled the same in both enums.
     #[test]
     fn test_honesty_profile_advertises_supported_event_ids() {
         let profile = build_nf_profile("nwdaf-contract-test", "127.0.0.1", 7815);
 
-        let event_ids = profile
-            .get("nwdafInfo")
-            .and_then(|i| i.get("eventIds"))
-            .and_then(|v| v.as_array())
-            .expect("NFProfile must carry nwdafInfo.eventIds (TS 29.510 NwdafInfo)");
+        let member = |name: &str| -> Vec<String> {
+            profile
+                .get("nwdafInfo")
+                .and_then(|i| i.get(name))
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("NFProfile must carry nwdafInfo.{name}"))
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .unwrap_or_else(|| panic!("{name} entries are strings"))
+                        .to_string()
+                })
+                .collect()
+        };
+
+        // eventIds is the EventId spelling, in SUPPORTED_EVENTS order, skipping
+        // any event EventId does not define.
+        let event_ids = member("eventIds");
         assert!(
             !event_ids.is_empty(),
             "nwdafInfo.eventIds has minItems 1 in the yaml"
         );
-
-        let tokens: Vec<&str> = event_ids
+        let expected_ids: Vec<&str> = SUPPORTED_EVENTS
             .iter()
-            .map(|v| v.as_str().expect("eventIds entries are strings"))
+            .filter_map(|e| e.as_event_id())
             .collect();
-        let supported: Vec<&str> = SUPPORTED_EVENTS.iter().map(|e| e.as_str()).collect();
-        assert_eq!(
-            tokens, supported,
-            "advertised eventIds must equal SUPPORTED_EVENTS exactly"
-        );
-
-        // ⊆ NwdafEvent tokens: every advertised id round-trips through the
-        // recognised event enum (no bespoke tokens on the wire).
-        for t in &tokens {
+        assert_eq!(event_ids, expected_ids);
+        for t in &event_ids {
             assert!(
-                AnalyticsId::from_str(t).is_some(),
-                "advertised eventId {t} must be a recognised NwdafEvent token"
+                AnalyticsId::from_event_id(t).is_some(),
+                "advertised eventId {t} must be a TS 29.520 EventId value"
             );
         }
 
-        // Initially exactly NF_LOAD (the only live collector, G2-1).
-        assert_eq!(tokens, vec!["NF_LOAD"]);
+        // nwdafEvents is the NwdafEvent spelling, covering every supported event.
+        let nwdaf_events = member("nwdafEvents");
+        let expected_events: Vec<&str> = SUPPORTED_EVENTS.iter().map(|e| e.as_str()).collect();
+        assert_eq!(nwdaf_events, expected_events);
+        for t in &nwdaf_events {
+            assert!(
+                AnalyticsId::from_str(t).is_some(),
+                "advertised nwdafEvent {t} must be a TS 29.520 NwdafEvent value"
+            );
+        }
+        assert_eq!(
+            nwdaf_events.len(),
+            SUPPORTED_EVENTS.len(),
+            "nwdafEvents must cover every supported event, even those EventId omits"
+        );
+
+        // Initially exactly NF_LOAD (the only live collector, G2-1), which is
+        // spelled identically in both enumerations.
+        assert_eq!(event_ids, vec!["NF_LOAD"]);
+        assert_eq!(nwdaf_events, vec!["NF_LOAD"]);
+    }
+
+    /// **The load-bearing half of the #175 profile fix.** The test above can only
+    /// ever see NF_LOAD, which is spelled the same in both enumerations, so it
+    /// cannot tell `eventIds` built from `EventId` spellings apart from one built
+    /// from `NwdafEvent` spellings. This drives the pure builder with events whose
+    /// spellings DO differ.
+    #[test]
+    fn test_nwdaf_info_emits_each_member_in_its_own_enumeration() {
+        let info = nwdaf_info(&[
+            AnalyticsId::NfLoad,
+            AnalyticsId::SliceLoadLevel,
+            AnalyticsId::PfdDetermination,
+        ]);
+
+        // eventIds is EventId: SLICE_LOAD_LEVEL becomes LOAD_LEVEL_INFORMATION,
+        // and PFD_DETERMINATION is dropped because EventId has no value for it.
+        assert_eq!(
+            info["eventIds"],
+            serde_json::json!(["NF_LOAD", "LOAD_LEVEL_INFORMATION"]),
+            "eventIds must carry EventId spellings only"
+        );
+
+        // nwdafEvents is NwdafEvent: all three, in their own spelling. This is
+        // how an event with no EventId value is still advertised at all.
+        assert_eq!(
+            info["nwdafEvents"],
+            serde_json::json!(["NF_LOAD", "SLICE_LOAD_LEVEL", "PFD_DETERMINATION"]),
+            "nwdafEvents must carry NwdafEvent spellings for every supported event"
+        );
+
+        // An event with no EventId value at all → eventIds omitted, not empty
+        // (minItems 1), while nwdafEvents still advertises it.
+        let only_pfd = nwdaf_info(&[AnalyticsId::PfdDetermination]);
+        assert!(
+            only_pfd.get("eventIds").is_none(),
+            "an empty eventIds would violate minItems 1: {only_pfd}"
+        );
+        assert_eq!(
+            only_pfd["nwdafEvents"],
+            serde_json::json!(["PFD_DETERMINATION"])
+        );
+
+        // No supported events at all → both omitted.
+        assert_eq!(nwdaf_info(&[]), serde_json::json!({}));
     }
 
     // --- nwafd-02: Nnwdaf_AnalyticsInfo is GET-only at the routing layer ---
