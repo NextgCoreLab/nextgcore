@@ -16,11 +16,7 @@
 // Resolve DB_URI exactly as server/index.js does, including its default. If this
 // script and the server disagreed, the account would be created in a database the
 // server never reads and login would fail with no visible reason.
-//
-// NOTE: that shared default is `open5gs` while mongo-init.js seeds subscribers
-// into `nextgcore` -- a pre-existing Node-side mismatch, unrelated to issue #118
-// and deliberately not changed here. Set DB_URI explicitly for a real deployment.
-process.env.DB_URI = process.env.DB_URI || 'mongodb://127.0.0.1/open5gs';
+process.env.DB_URI = process.env.DB_URI || 'mongodb://127.0.0.1/nextgcore';
 
 const mongoose = require('mongoose');
 const readline = require('readline');

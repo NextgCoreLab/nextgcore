@@ -1836,12 +1836,31 @@ mod shipped_artefact_guards {
         }
         out.push_str(rest);
         out.lines()
-            .map(|line| match line.find("//") {
-                Some(i) => &line[..i],
-                None => line,
-            })
+            .map(strip_line_comment)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Truncate a line at its `//` comment, ignoring the `//` of a URL scheme.
+    ///
+    /// `mongodb://127.0.0.1/nextgcore` is code, not a comment — a naive
+    /// `find("//")` cut the line at the scheme separator and made the guards read
+    /// an empty DB_URI.
+    fn strip_line_comment(line: &str) -> &str {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                // `://` is a scheme separator, not a comment.
+                if i > 0 && bytes[i - 1] == b':' {
+                    i += 2;
+                    continue;
+                }
+                return &line[..i];
+            }
+            i += 1;
+        }
+        line
     }
 
     /// No predefined credential may ship (TS 33.117 §4.2.3.4.2.2,
@@ -1913,6 +1932,46 @@ mod shipped_artefact_guards {
             loader.contains("MIN_LENGTH"),
             "a length floor must be enforced"
         );
+    }
+
+    /// Every component must agree on the database name.
+    ///
+    /// The Node UI defaulted `DB_URI` to `open5gs` -- a leftover from the upstream
+    /// project this was forked from -- while `mongo-init.js` seeds `nextgcore`. Not
+    /// merely branding: the UI was reading a database nothing populates, so
+    /// anything provisioned there was invisible to the UDR and anything seeded was
+    /// invisible to the UI. The Rust side was corrected earlier for exactly this
+    /// reason (see `NEXTGCORE_DEFAULT_DB_NAME`); the Node side was the last holdout.
+    ///
+    /// Guarded here because CI never runs Node, so nothing else would notice it
+    /// drifting back.
+    #[test]
+    fn every_component_agrees_on_the_database_name() {
+        assert_eq!(
+            super::DEFAULT_DB_NAME,
+            "nextgcore",
+            "the shared default database name"
+        );
+
+        // The Mongo init script seeds it...
+        let mongo_init = read_code("docs/assets/webui/mongo-init.js");
+        assert!(
+            mongo_init.contains("getSiblingDB('nextgcore')"),
+            "mongo-init.js must seed the nextgcore database"
+        );
+
+        // ...and both Node entry points must read the same one.
+        for file in ["webui/server/index.js", "webui/server/bin/create-admin.js"] {
+            let source = read_code(file);
+            assert!(
+                !source.contains("open5gs"),
+                "{file} must not reference the upstream open5gs database"
+            );
+            assert!(
+                source.contains("mongodb://127.0.0.1/nextgcore"),
+                "{file} must default DB_URI to the nextgcore database"
+            );
+        }
     }
 
     /// The session cookie must not travel in cleartext or be script-readable

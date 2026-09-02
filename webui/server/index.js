@@ -1,4 +1,14 @@
-process.env.DB_URI = process.env.DB_URI || 'mongodb://127.0.0.1/open5gs';
+// Database name is `nextgcore`, matching the single source of truth in
+// src/libs/nextgcore-dbi/src/types.rs (NEXTGCORE_DEFAULT_DB_NAME), the Rust
+// WebUI's --db-name, docs/assets/webui/mongo-init.js and the compose stack's
+// MONGO_INITDB_DATABASE.
+//
+// This said `open5gs` -- a leftover from the upstream project this was forked
+// from. Not merely branding: mongo-init.js seeds subscribers into `nextgcore`, so
+// this UI was reading a database nothing populates. Anything provisioned here was
+// invisible to the UDR, and anything seeded was invisible here. The Rust side was
+// already corrected for exactly this reason; this was the last holdout.
+process.env.DB_URI = process.env.DB_URI || 'mongodb://127.0.0.1/nextgcore';
 
 const _hostname = process.env.HOSTNAME || 'localhost';
 const port = process.env.PORT || 9999;
