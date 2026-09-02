@@ -2217,11 +2217,41 @@ fn build_access_token_claims(
                 serde_json::Value::Array(snssais),
             );
         }
-        if let Some(set_id) = p.attributes.get("nfSetIdList").cloned() {
-            obj.insert("producerNsiList".to_string(), set_id);
+        // Issue #64 gap 5: both producer claims read the WRONG NFProfile member.
+        //
+        // `producerNsiList` is an array of NSI-IDs
+        // (TS29510_Nnrf_AccessToken.yaml:400-404) whose source is
+        // `NFProfile.nsiList` (TS29510_Nnrf_NFManagement.yaml:1498-1502). It was
+        // filled from `nfSetIdList`, i.e. NF SET IDs, so any consumer or producer
+        // keying slice scoping on this claim received NF Set IDs and mis-scoped.
+        //
+        // `producerNfSetId` is a SINGLE `NfSetId` (yaml:405-406) and was read from
+        // a `nfSetId` attribute that `NFProfile` does not define at all -- only
+        // `nfSetIdList` exists (yaml:1743-1747) -- so in production the claim was
+        // NEVER populated and anything gating on it silently saw nothing.
+        if let Some(nsi_list) = p
+            .attributes
+            .get("nsiList")
+            .and_then(|v| v.as_array())
+            .filter(|a| !a.is_empty())
+        {
+            obj.insert(
+                "producerNsiList".to_string(),
+                serde_json::Value::Array(nsi_list.clone()),
+            );
         }
-        if let Some(set_id) = p.attributes.get("nfSetId").cloned() {
-            obj.insert("producerNfSetId".to_string(), set_id);
+        // The claim is singular where the profile member is a list, so the first
+        // entry is the only representable one. A producer belonging to several NF
+        // Sets cannot be fully expressed in this claim -- that is a shape
+        // limitation of TS 29.510 §6.3.5.2.4, not a choice made here.
+        if let Some(set_id) = p
+            .attributes
+            .get("nfSetIdList")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .filter(|v| v.is_string())
+        {
+            obj.insert("producerNfSetId".to_string(), set_id.clone());
         }
     }
     claims
@@ -4108,7 +4138,12 @@ mod tests {
             "nfInstanceId": "p-1", "nfType": "UDM", "nfStatus": "REGISTERED",
             "plmnList": [{"mcc": "001", "mnc": "01"}],
             "sNssais": [{"sst": 1, "sd": "010203"}],
-            "nfSetId": "set-udm-1"
+            // Issue #64 gap 5: the REAL TS 29.510 NFProfile members. This fixture
+            // used to carry `"nfSetId": "set-udm-1"`, which NFProfile does not
+            // define -- it was only constructible because profile attributes are
+            // stored unvalidated, so the test passed while pinning the bug.
+            "nfSetIdList": ["set-udm-1", "set-udm-2"],
+            "nsiList": ["nsi-001", "nsi-002"]
         }))
         .unwrap();
 
@@ -4130,7 +4165,40 @@ mod tests {
         );
         assert_eq!(claims["consumerPlmnId"], json!({"mcc": "001", "mnc": "01"}));
         assert_eq!(claims["producerPlmnId"], json!({"mcc": "001", "mnc": "01"}));
+        // producerNfSetId is a SINGLE NfSetId taken from nfSetIdList.
         assert_eq!(claims["producerNfSetId"], json!("set-udm-1"));
+        // producerNsiList carries NSI-IDs from nsiList -- NOT the NF Set IDs it
+        // used to be filled with, which is the interop half of gap 5.
+        assert_eq!(claims["producerNsiList"], json!(["nsi-001", "nsi-002"]));
+        assert_ne!(
+            claims["producerNsiList"],
+            json!(["set-udm-1", "set-udm-2"]),
+            "producerNsiList must not carry NF Set IDs"
+        );
+
+        // A profile carrying ONLY the non-spec `nfSetId` yields neither claim:
+        // that member does not exist in TS 29.510, so nothing may be derived from
+        // it. This is the assertion the old fixture made impossible.
+        let bogus = NfProfile::from_json(&json!({
+            "nfInstanceId": "p-2", "nfType": "UDM", "nfStatus": "REGISTERED",
+            "nfSetId": "set-udm-9"
+        }))
+        .unwrap();
+        let bogus_claims = build_access_token_claims(
+            "nrf-iss",
+            "c-1",
+            "UDM",
+            Some(&bogus),
+            &consumer,
+            "nudm-sdm",
+            100,
+            3700,
+        );
+        assert!(
+            bogus_claims.get("producerNfSetId").is_none(),
+            "a non-spec nfSetId member must not populate the claim: {bogus_claims}"
+        );
+        assert!(bogus_claims.get("producerNsiList").is_none());
 
         // Type-scoped (no instance): aud is the bare NF type string.
         let claims2 = build_access_token_claims(
