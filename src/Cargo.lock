@@ -2769,6 +2769,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "env_logger",
+ "hex",
  "log",
  "nextgcore-app",
  "nextgcore-core",

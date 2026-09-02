@@ -329,14 +329,117 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+/// Where the ES256 signing key is persisted, when the operator configured a path
+/// (issue #64 gap 4). Set once at startup from `--signing-key-file`.
+static NRF_SIGNING_KEY_FILE: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Access-token lifetime in seconds (`expires_in`), from `--token-expires-in`.
+static NRF_TOKEN_EXPIRES_IN: OnceLock<u64> = OnceLock::new();
+
+/// Default access-token lifetime, matching the value that used to be hardcoded.
+const DEFAULT_TOKEN_EXPIRES_IN_SECS: u64 = 3600;
+
+/// The configured access-token lifetime (issue #64 gap 4).
+fn nrf_token_expires_in() -> u64 {
+    *NRF_TOKEN_EXPIRES_IN
+        .get()
+        .unwrap_or(&DEFAULT_TOKEN_EXPIRES_IN_SECS)
+}
+
+/// Generate a fresh ES256 signing key.
+fn generate_signing_key() -> p256::ecdsa::SigningKey {
+    use rand::Rng;
+    // Draw a random scalar; reject the (vanishingly rare) invalid ones.
+    loop {
+        let bytes = rand::rng().random::<[u8; 32]>();
+        if let Ok(sk) = p256::ecdsa::SigningKey::from_slice(&bytes) {
+            break sk;
+        }
+    }
+}
+
+/// Load the signing key from `path`, or generate one and persist it there.
+///
+/// Issue #64 gap 4: the key used to be generated per process under a FIXED `kid`
+/// (`nrf-es256`). So every restart, and every additional HA NRF instance, published
+/// a DIFFERENT public key under the SAME `kid` — a producer that had cached the
+/// JWKS then rejected still-valid tokens, which surfaces as sporadic 401s during
+/// rollout and failover with no obvious cause. TS 33.501 §13.4.1 assumes a stable
+/// NRF signing key.
+///
+/// Format is the raw 32-byte scalar, hex-encoded. Deliberately not PKCS#8/PEM: that
+/// needs a p256 feature this build does not enable, and the normal operator flow is
+/// to let the NRF generate the file on first start and then mount it (as a
+/// Kubernetes Secret or equivalent) so replicas and restarts share it — no
+/// externally-generated key needs to be parsed.
+///
+/// A malformed or wrong-length file is an ERROR, never a silent regeneration:
+/// quietly minting a new key would reproduce exactly the defect this fixes.
+fn load_or_create_signing_key(path: &std::path::Path) -> anyhow::Result<p256::ecdsa::SigningKey> {
+    use anyhow::Context as _;
+
+    if path.exists() {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read --signing-key-file {}", path.display()))?;
+        let raw = hex::decode(text.trim()).with_context(|| {
+            format!(
+                "--signing-key-file {} is not hex; refusing to regenerate, because a new \
+                 key under the same kid would invalidate every outstanding token",
+                path.display()
+            )
+        })?;
+        let key = p256::ecdsa::SigningKey::from_slice(&raw).with_context(|| {
+            format!(
+                "--signing-key-file {} does not hold a valid P-256 scalar ({} bytes)",
+                path.display(),
+                raw.len()
+            )
+        })?;
+        log::info!("loaded the ES256 signing key from {}", path.display());
+        return Ok(key);
+    }
+
+    let key = generate_signing_key();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create the directory for {}", path.display())
+            })?;
+        }
+    }
+    std::fs::write(path, hex::encode(key.to_bytes()))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    // Owner-only: this is the key every access token in the PLMN is signed with.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to restrict permissions on {}", path.display()))?;
+    }
+    log::info!(
+        "generated a new ES256 signing key and persisted it to {} (mount this so \
+         restarts and HA replicas share it)",
+        path.display()
+    );
+    Ok(key)
+}
+
 fn nrf_signing_key() -> &'static p256::ecdsa::SigningKey {
     NRF_SIGNING_KEY.get_or_init(|| {
-        use rand::Rng;
-        // Draw a random scalar; reject the (vanishingly rare) invalid ones.
-        loop {
-            let bytes = rand::rng().random::<[u8; 32]>();
-            if let Ok(sk) = p256::ecdsa::SigningKey::from_slice(&bytes) {
-                break sk;
+        // A configured path was already loaded (and validated) at startup; this
+        // fallback is the no-path case, which keeps the pre-#64 per-process
+        // behaviour for local runs.
+        match NRF_SIGNING_KEY_FILE.get() {
+            Some(path) => load_or_create_signing_key(path)
+                .unwrap_or_else(|e| panic!("signing key unavailable: {e:#}")),
+            None => {
+                log::warn!(
+                    "no --signing-key-file configured: generating an EPHEMERAL ES256 key. \
+                     Every restart and every additional NRF replica will publish a \
+                     different key under kid '{NRF_KID}', so previously issued tokens \
+                     will be rejected (issue #64)."
+                );
+                generate_signing_key()
             }
         }
     })
@@ -377,6 +480,18 @@ struct Args {
     /// SBI server port
     #[arg(long, default_value = "7777")]
     sbi_port: u16,
+
+    /// File holding the ES256 access-token signing key (issue #64 gap 4).
+    ///
+    /// Generated on first start if absent, then reused. Mount the same file into
+    /// every NRF replica: without it each process signs with a different key under
+    /// the same `kid`, so restarts and scale-out invalidate outstanding tokens.
+    #[arg(long)]
+    signing_key_file: Option<String>,
+
+    /// Access-token lifetime in seconds (`expires_in`).
+    #[arg(long, default_value_t = DEFAULT_TOKEN_EXPIRES_IN_SECS)]
+    token_expires_in: u64,
 
     /// Enable TLS
     #[arg(long)]
@@ -518,6 +633,22 @@ async fn main() -> Result<()> {
             log::info!("NRF registry persistence disabled (in-memory only)");
         }
     }
+
+    // Issue #64 gap 4: resolve the signing key BEFORE the server can serve a token
+    // request, so a bad key file fails startup rather than surfacing as a runtime
+    // panic on the first token.
+    if let Some(ref path) = args.signing_key_file {
+        NRF_SIGNING_KEY_FILE
+            .set(std::path::PathBuf::from(path))
+            .ok();
+        let key = load_or_create_signing_key(std::path::Path::new(path))?;
+        NRF_SIGNING_KEY.set(key).ok();
+    }
+    NRF_TOKEN_EXPIRES_IN.set(args.token_expires_in).ok();
+    log::info!(
+        "access-token lifetime: {}s (kid {NRF_KID})",
+        nrf_token_expires_in()
+    );
 
     // Store the NRF's own SBI URI so notification handlers can use it
     let scheme = if args.tls { "https" } else { "http" };
@@ -2497,7 +2628,8 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     let scope = granted_scopes.join(" ");
 
     // Issue a JWT access token signed with ES256 (ECDSA P-256).
-    let expires_in = 3600u64; // 1 hour
+    // Issue #64 gap 4: operator-configurable via --token-expires-in.
+    let expires_in = nrf_token_expires_in();
 
     let header_json = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{NRF_KID}"}}"#);
     // nrfd-07: `iss` is the NRF NF Instance ID (TS 29.510 §6.3.5.2.4); when a
@@ -4125,6 +4257,84 @@ mod tests {
     // -----------------------------------------------------------------
     // nrfd-07: producer/consumer optional claims (TS 29.510 §6.3.5.2.4)
     // -----------------------------------------------------------------
+
+    /// **Issue #64 gap 4.** The signing key must SURVIVE a restart: the whole
+    /// defect was that a per-process key under a fixed `kid` made every restart and
+    /// every HA replica publish a different public key for the same `kid`, so a
+    /// producer with a cached JWKS rejected still-valid tokens.
+    #[test]
+    fn signing_key_persists_across_loads() {
+        let dir = std::env::temp_dir().join(format!("nrfd-key-{}", std::process::id()));
+        let path = dir.join("nested").join("signing.key");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // First load creates the file (including parent directories).
+        let first = load_or_create_signing_key(&path).expect("first load creates a key");
+        assert!(path.exists(), "the key must be persisted");
+
+        // A second load returns THE SAME key -- this is the property that makes a
+        // restart or a second replica safe.
+        let second = load_or_create_signing_key(&path).expect("second load reuses it");
+        assert_eq!(
+            first.to_bytes(),
+            second.to_bytes(),
+            "reloading must yield the identical key, or tokens signed before the \
+             restart stop verifying"
+        );
+        // And so the published public key is stable too.
+        assert_eq!(
+            first.verifying_key().to_encoded_point(false).as_bytes(),
+            second.verifying_key().to_encoded_point(false).as_bytes()
+        );
+
+        // Owner-only permissions: this signs every access token in the PLMN.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "the key file must not be world-readable"
+            );
+        }
+
+        // A corrupt file is an ERROR, never a silent regeneration -- regenerating
+        // would reproduce the very defect being fixed.
+        std::fs::write(&path, "not-hex").expect("write");
+        assert!(
+            load_or_create_signing_key(&path).is_err(),
+            "a malformed key file must fail loudly"
+        );
+        // Right encoding, wrong length is also rejected.
+        std::fs::write(&path, "aabbcc").expect("write");
+        assert!(load_or_create_signing_key(&path).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #64 gap 4: `expires_in` is operator-configurable and defaults to the
+    /// previously hardcoded hour.
+    #[test]
+    fn token_lifetime_defaults_to_one_hour() {
+        // The OnceLock is process-global and other tests may not have set it; the
+        // default is what matters here.
+        assert_eq!(DEFAULT_TOKEN_EXPIRES_IN_SECS, 3600);
+        let effective = nrf_token_expires_in();
+        assert!(
+            effective > 0,
+            "a zero lifetime would mint already-expired tokens"
+        );
+        assert_eq!(
+            effective,
+            *NRF_TOKEN_EXPIRES_IN
+                .get()
+                .unwrap_or(&DEFAULT_TOKEN_EXPIRES_IN_SECS)
+        );
+    }
 
     #[test]
     fn test_nrfd_07_instance_scoped_claims() {
