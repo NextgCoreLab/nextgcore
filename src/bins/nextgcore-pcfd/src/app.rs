@@ -56,7 +56,8 @@ struct Args {
     #[arg(short = 'm', long)]
     no_color: bool,
 
-    /// Kill running instance
+    /// Kill a running instance (NOT SUPPORTED: exits with an error;
+    /// stop the NF through its supervisor)
     #[arg(short = 'k', long)]
     kill: bool,
 
@@ -265,10 +266,11 @@ pub async fn run() -> Result<()> {
 
     log::info!("NextGCore PCF v{} starting...", env!("CARGO_PKG_VERSION"));
 
-    // Handle kill flag
+    // Issue: `--kill` was advertised as "Kill running instance" and did
+    // NOTHING -- it logged an intention and returned success, so the process
+    // exited 0 while the instance kept serving. Fail loudly instead.
     if args.kill {
-        log::info!("Kill flag set - would send SIGTERM to running instance");
-        return Ok(());
+        return Err(nextgcore_core::signal::kill_unsupported().into());
     }
 
     // Set up signal handlers
