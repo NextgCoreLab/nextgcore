@@ -2295,6 +2295,16 @@ fn extract_transport_client_nf_instance_id(
     request: &SbiRequest,
     policy: &NrfPolicy,
 ) -> Option<String> {
+    // Issue #186: a certificate THIS process verified outranks a header, and needs
+    // no trust declaration -- rustls validated the chain during the handshake, so
+    // there is no terminator to trust. This is the direct-mTLS path that used to
+    // yield nothing, which is why require_client_cert_binding could only reject.
+    if let Some(id) = request.peer_cert_nf_instance_id.as_deref() {
+        let id = id.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
     if !policy.trust_forwarded_client_cert {
         if request.http.get_header(XFCC_HEADER).is_some() {
             log::debug!(

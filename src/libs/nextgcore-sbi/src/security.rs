@@ -1024,7 +1024,17 @@ mod mtls_oauth2_e2e {
         }
     }
 
+    /// [`pki`] with a URI SubjectAltName on the CLIENT leaf, so the server can
+    /// recover an NF Instance ID from it (issue #186, TS 33.310).
+    fn pki_with_uri_san(tag: &str, client_uri: &str) -> Pki {
+        pki_inner(tag, Some(client_uri))
+    }
+
     fn pki(tag: &str) -> Pki {
+        pki_inner(tag, None)
+    }
+
+    fn pki_inner(tag: &str, client_uri: Option<&str>) -> Pki {
         use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 
         let dir = std::env::temp_dir().join(format!("sbi-e2e-{}-{tag}", std::process::id()));
@@ -1038,18 +1048,23 @@ mod mtls_oauth2_e2e {
         let ca_key = KeyPair::generate().expect("ca key");
         let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed ca");
 
-        let leaf = |name: &str| -> (String, String) {
+        let leaf = |name: &str, uri: Option<&str>| -> (String, String) {
             let mut params =
                 CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params");
             params.distinguished_name.push(DnType::CommonName, name);
+            if let Some(u) = uri {
+                params
+                    .subject_alt_names
+                    .push(rcgen::SanType::URI(u.try_into().expect("ia5 uri")));
+            }
             let key = KeyPair::generate().expect("leaf key");
             let cert = params
                 .signed_by(&key, &ca_cert, &ca_key)
                 .expect("ca-signed leaf");
             (cert.pem(), key.serialize_pem())
         };
-        let (server_cert_pem, server_key_pem) = leaf("nextgcore-test-producer");
-        let (client_cert_pem, client_key_pem) = leaf("nextgcore-test-consumer");
+        let (server_cert_pem, server_key_pem) = leaf("nextgcore-test-producer", None);
+        let (client_cert_pem, client_key_pem) = leaf("nextgcore-test-consumer", client_uri);
 
         let write = |name: &str, contents: &str| -> String {
             let p = dir.join(name);
@@ -1335,6 +1350,116 @@ mod mtls_oauth2_e2e {
         );
 
         producer.stop().await.ok();
+    }
+
+    /// **Issue #186.** A DIRECT mTLS connection now yields the peer's NF identity,
+    /// with no forwarded-certificate header and no trusted terminator involved.
+    ///
+    /// This is what was missing: rustls verified the client's chain, and the
+    /// verified certificate was then discarded, so an NF that terminated TLS
+    /// itself learned nothing about who connected. The consequence was concrete —
+    /// `require_client_cert_binding` could only ever *reject* on a direct
+    /// connection, so a deployment that had done the hard part (per-NF
+    /// certificates, mutual TLS everywhere) still could not use it.
+    ///
+    /// Revert-verified: dropping the `peer_certificates()` extraction at the
+    /// accept site makes the identity `None` and fails this.
+    #[tokio::test]
+    async fn direct_mtls_surfaces_the_peer_nf_instance_id() {
+        let pki = pki_with_uri_san("peercert", "urn:uuid:consumer-42");
+        let signing = crate::oauth::generate_es256_key();
+
+        let port = crate::test_support::free_port();
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: pki.server_cert.clone(),
+                key: pki.server_key.clone(),
+                ca_cert: pki.ca.clone(),
+                client_cert: Some(pki.client_cert.clone()),
+                client_key: Some(pki.client_key.clone()),
+                ..TlsPaths::default()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        cfg.oauth2_jwks = Some(jwks(signing.verifying_key()));
+        let cfg = apply_sbi_security_policy(
+            cfg,
+            SbiProfile::Production,
+            &policy,
+            NfType::Udm,
+            "http://unused",
+        )
+        .expect("production profile applies");
+
+        // The handler reports back what identity the server saw.
+        let server = SbiServer::new(cfg);
+        server
+            .start(|req: SbiRequest| async move {
+                let seen = req.peer_cert_nf_instance_id.clone().unwrap_or_default();
+                SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({"peer": seen}))
+                    .expect("body")
+            })
+            .await
+            .expect("producer starts");
+
+        let token = mint_token(&signing, "UDM", "nudm-sdm");
+        let mut client_cfg = SbiClientConfig::new("localhost", port).with_https();
+        client_cfg.ca_cert = Some(pki.ca.clone());
+        client_cfg.client_cert = Some(pki.client_cert.clone());
+        client_cfg.client_key = Some(pki.client_key.clone());
+        let mut req = SbiRequest::get("/nudm-sdm/v1/imsi-001010000000001/am-data");
+        req.http
+            .set_header("authorization", &format!("Bearer {token}"));
+        let resp = SbiClient::new(client_cfg)
+            .send_request(req)
+            .await
+            .expect("mTLS request completes");
+        assert_eq!(resp.status, 200, "body: {:?}", resp.http.content);
+
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).expect("json");
+        assert_eq!(
+            body["peer"], "consumer-42",
+            "the server must see the client NF Instance ID from its verified certificate, \
+             with the urn:uuid: prefix stripped"
+        );
+
+        server.stop().await.ok();
+    }
+
+    /// Issue #186: a plaintext connection carries no peer certificate, so the
+    /// identity is `None` rather than anything a caller could act on.
+    #[tokio::test]
+    async fn a_plaintext_connection_surfaces_no_peer_identity() {
+        let port = crate::test_support::free_port();
+        let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
+        server
+            .start(|req: SbiRequest| async move {
+                let present = req.peer_cert_nf_instance_id.is_some();
+                SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({"present": present}))
+                    .expect("body")
+            })
+            .await
+            .expect("starts");
+
+        let resp = SbiClient::with_host_port("127.0.0.1", port)
+            .send_request(SbiRequest::get("/ntest/v1/x"))
+            .await
+            .expect("plaintext request completes");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).expect("json");
+        assert_eq!(
+            body["present"], false,
+            "a plaintext peer presents no certificate and therefore no identity"
+        );
+
+        server.stop().await.ok();
     }
 
     /// Issue #63 criterion 1: the client CERTIFICATE is genuinely required, not
