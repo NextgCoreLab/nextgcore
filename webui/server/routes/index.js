@@ -4,7 +4,11 @@ const db = require('./db')
 
 const router = express.Router();
 
-const secret = process.env.JWT_SECRET_KEY || 'change-me';
+// Issue #118: same fail-fast secret as the signing side (routes/auth.js). A token
+// signed with the old `change-me` default no longer verifies, because that value
+// can never be the secret.
+const { loadJwtSecret } = require('../lib/jwt-secret');
+const secret = loadJwtSecret();
 const passport = require('passport');
 const JWTstrategy = require('passport-jwt').Strategy;
 const ExtractJWT = require('passport-jwt').ExtractJwt;

@@ -24,6 +24,12 @@ tower-http.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 mongodb.workspace = true
+# Issue #118: TLS on the provisioning listener and the hyper glue axum::serve
+# does not provide for a TLS-wrapped stream.
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+hyper-util.workspace = true
 
 [lints]
 workspace = true

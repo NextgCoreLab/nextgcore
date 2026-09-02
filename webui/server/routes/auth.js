@@ -4,7 +4,10 @@ const router = express.Router();
 const passport = require('passport');
 
 const jwt = require('jsonwebtoken');
-const secret = process.env.JWT_SECRET_KEY || 'change-me';
+// Issue #118: no `|| 'change-me'` fallback -- a known signing secret makes admin
+// tokens forgeable. Throws at require time if unset/placeholder/too short.
+const { loadJwtSecret } = require('../lib/jwt-secret');
+const secret = loadJwtSecret();
 
 router.get('/csrf', (req, res) => {
   return res.json({csrfToken: res.locals._csrf});
