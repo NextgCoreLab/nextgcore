@@ -102,6 +102,13 @@ spec:
               mountPath: /shared
             {{- end }}
           env:
+            - name: NEXTGCORE_SBI_PROFILE
+              # Issue #63: this NF defaults to the PRODUCTION SBI profile
+              # (mutually-authenticated TLS + a required OAuth2 access token) and
+              # REFUSES TO START without the certificates it names. The chart
+              # mounts none by default, so it opts out explicitly. Set
+              # global.sbiProfile=production once certs are provisioned.
+              value: {{ .Values.global.sbiProfile | default "dev" | quote }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
             - name: RUST_BACKTRACE

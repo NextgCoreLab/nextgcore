@@ -11,6 +11,16 @@ global:
   sbi:
     scheme: http
     port: 7777
+  # SBI security profile for amf/smf/ausf/udm (issue #63). Those four default in
+  # CODE to "production": mutually-authenticated TLS plus a required OAuth2
+  # access token, and they REFUSE TO START without the certificates named by
+  # SbiSecurityPolicy::production() rather than falling back to cleartext.
+  #
+  # This chart mounts no SBI certificates, so it ships the explicit "dev"
+  # opt-out: cleartext h2c, no client-certificate verification, no token
+  # verification. Set to "production" only once those certs are provisioned and
+  # mounted at /etc/nextgcore/tls/{server.crt,server.key,ca.crt}.
+  sbiProfile: dev
   logLevel: info
   max:
     ue: 1024

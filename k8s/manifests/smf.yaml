@@ -49,6 +49,13 @@ spec:
         - name: rewrite-advertise-addr
           image: busybox:1.36
           env:
+            - name: NEXTGCORE_SBI_PROFILE
+              # Issue #63: this NF defaults to the PRODUCTION SBI profile
+              # (mutually-authenticated TLS + a required OAuth2 access token) and
+              # REFUSES TO START without the certificates it names. These base
+              # manifests mount none, so they opt out explicitly. Remove this to
+              # run the secure posture once certs are mounted.
+              value: "dev"
             - name: POD_IP
               valueFrom:
                 fieldRef:

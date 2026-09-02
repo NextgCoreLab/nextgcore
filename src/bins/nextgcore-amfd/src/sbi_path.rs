@@ -362,7 +362,8 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
             "serviceInstanceId": format!("{nf_instance_id}-namf-comm"),
             "serviceName": "namf-comm",
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
+            // Issue #63 criterion 2: follows the listener, never hardcoded.
+            "scheme": advertised_sbi_scheme(),
             "nfServiceStatus": "REGISTERED",
             "ipEndPoints": [{
                 "ipv4Address": sbi_addr,
@@ -1406,7 +1407,36 @@ pub fn advertised_sbi_base() -> String {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
-    format!("http://{addr}:{port}")
+    format!("{}://{addr}:{port}", advertised_sbi_scheme())
+}
+
+/// Whether the SBI listener this AMF started is TLS-protected (issue #63).
+///
+/// Set once from the resolved [`nextgcore_sbi::security::SbiProfile`] before the
+/// NF profile is built. It defaults to `false` so a unit test that never starts a
+/// listener keeps describing a cleartext one.
+static SBI_TLS_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether the started SBI listener is TLS-protected. Called by `run()`
+/// immediately after the security profile is applied.
+pub fn set_sbi_tls_active(active: bool) {
+    SBI_TLS_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The URI scheme the AMF advertises for its own SBI endpoint.
+///
+/// Issue #63 criterion 2: this MUST follow the listener. The AMF used to hardcode
+/// `http` in both its NFProfile service entry and its callback base URL, so under
+/// TLS it would have published an `http://` URL for an `https` listener and every
+/// peer that discovered it — or POSTed to a registered callback — would fail to
+/// connect. That failure presents as a peer-side connection error with nothing
+/// pointing back at the AMF's own registration.
+pub fn advertised_sbi_scheme() -> &'static str {
+    if SBI_TLS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        "https"
+    } else {
+        "http"
+    }
 }
 
 /// The absolute Nudm_UECM `deregCallbackUri` the AMF registers for `supi`
