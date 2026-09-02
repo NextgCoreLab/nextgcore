@@ -202,13 +202,36 @@ impl AnalyticsId {
         SUPPORTED_EVENTS.contains(self)
     }
 
-    /// The per-event `*Infos` array key used in `AnalyticsData`
-    /// (Nnwdaf_AnalyticsInfo) and `EventNotification`
-    /// (Nnwdaf_EventsSubscription_Notify) bodies, per TS 29.520.
-    pub fn infos_key(&self) -> &'static str {
+    /// The per-event payload member name in a TS 29.520 `EventNotification`
+    /// body, i.e. what `Nnwdaf_EventsSubscription_Notify` emits.
+    ///
+    /// Read off `components.schemas.EventNotification` in
+    /// `TS29520_Nnwdaf_EventsSubscription.yaml` (yaml:802-966), never inferred
+    /// from the token name — several are abbreviated differently from what the
+    /// token suggests (`dataVlTrnsTmInfos`, `movBehavInfos`, `abnorBehavrs`).
+    ///
+    /// THIS IS NOT INTERCHANGEABLE WITH [`analytics_data_key`](Self::analytics_data_key)
+    /// (issue #172). The two service APIs name the same analytics differently, so
+    /// one shared accessor cannot be right for both — which is exactly how the
+    /// pre-#172 `infos_key()` was wrong on one surface or the other for seven
+    /// tokens. See `analytics_data_key` for the divergence table.
+    ///
+    /// Every one of the 25 `NwdafEvent` tokens maps to a distinct member here,
+    /// and those 25 are exactly the payload members of `EventNotification`
+    /// (its other 11 members are envelope fields: `event`, `start`, `expiry`,
+    /// `timeStampGen`, `failNotifyCode`, `rvWaitTime`, `anaMetaInfo`,
+    /// `accuInfo`, `cancelAccuInd`, `pauseInd`, `resumeInd`). The bijection is
+    /// asserted by `test_infos_keys_match_the_spec_for_every_token`.
+    pub fn notification_infos_key(&self) -> &'static str {
         match self {
             Self::NfLoad => "nfLoadLevelInfos",
-            Self::SliceLoadLevel | Self::NsiLoadLevel => "sliceLoadLevelInfos",
+            // Issue #172: NSI_LOAD_LEVEL has its OWN member; it used to share
+            // SLICE_LOAD_LEVEL's, so a consumer would have looked for
+            // `nsiLoadLevelInfos` and found nothing.
+            Self::NsiLoadLevel => "nsiLoadLevelInfos",
+            // Issue #172: singular, and an OBJECT not an array — see
+            // `notification_payload_is_single_object`.
+            Self::SliceLoadLevel => "sliceLoadLevelInfo",
             Self::NetworkPerformance => "nwPerfs",
             Self::UeMobility => "ueMobs",
             Self::UeCommunication => "ueComms",
@@ -218,14 +241,12 @@ impl AnalyticsId {
             Self::UserDataCongestion => "userDataCongInfos",
             Self::Dispersion => "disperInfos",
             Self::RedTransExp => "redTransInfos",
-            Self::WlanPerformance => "wlanPerfInfos",
+            // Issue #172: was `wlanPerfInfos`, which the yaml does not define.
+            Self::WlanPerformance => "wlanInfos",
             Self::DnPerformance => "dnPerfInfos",
-            Self::SmCongestion => "smcInfos",
+            // Issue #172: was `smcInfos`, which the yaml does not define.
+            Self::SmCongestion => "smccExps",
             Self::PduSessionTraffic => "pduSesTrafInfos",
-            // Issue #108: keys read off `EventNotification` in
-            // TS29520_Nnwdaf_EventsSubscription.yaml, not inferred from the
-            // token names — several of them are abbreviated differently from
-            // what the token would suggest (`dataVlTrnsTmInfos`, `movBehavInfos`).
             Self::PfdDetermination => "pfdDetermInfos",
             Self::E2eDataVolTransTime => "dataVlTrnsTmInfos",
             Self::MovementBehaviour => "movBehavInfos",
@@ -236,6 +257,79 @@ impl AnalyticsId {
             Self::AbnormalUpTraffic => "abnormalTrafficInfos",
             Self::TrafficPattern => "trafficPatternInfos",
         }
+    }
+
+    /// The per-event payload member name in a TS 29.520 `AnalyticsData` body,
+    /// i.e. what an `Nnwdaf_AnalyticsInfo` GET returns — or `None` when
+    /// `AnalyticsData` defines no member for this event.
+    ///
+    /// Read off `components.schemas.AnalyticsData` in
+    /// `TS29520_Nnwdaf_AnalyticsInfo.yaml` (yaml:212-361).
+    ///
+    /// WHY THIS IS A SEPARATE ACCESSOR (issue #172). The two service APIs do not
+    /// agree, so the single shared `infos_key()` this replaced was necessarily
+    /// wrong on one surface or the other:
+    ///
+    /// | token | `EventNotification` | `AnalyticsData` |
+    /// |---|---|---|
+    /// | `SLICE_LOAD_LEVEL` | `sliceLoadLevelInfo` (object) | `sliceLoadLevelInfos` (array) |
+    /// | `QOS_POLICY_ASSIST` | `qosPolAssistInfos` | `qosPlyAsstInfos` |
+    /// | `ABNORMAL_UP_TRAFFIC` | `abnormalTrafficInfos` | `abnormalTraffic` |
+    /// | `PFD_DETERMINATION` | `pfdDetermInfos` | *(no member)* |
+    ///
+    /// `PFD_DETERMINATION` is `None` because it is not even an `EventId` value:
+    /// the AnalyticsInfo API's enum has 24 tokens where `NwdafEvent` has 25, so
+    /// PFD determination analytics are subscribe/notify-only. A GET for it must
+    /// fail closed rather than invent a member name (see `sbi_handler`).
+    ///
+    /// The 24 `Some` values are exactly the payload members of `AnalyticsData`
+    /// (its other 7 are envelope fields: `start`, `expiry`, `timeStampGen`,
+    /// `anaMetaInfo`, `accuInfo`, `cancelAccuInd`, `suppFeat`).
+    pub fn analytics_data_key(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::NfLoad => "nfLoadLevelInfos",
+            Self::NsiLoadLevel => "nsiLoadLevelInfos",
+            // An ARRAY here, unlike the notify surface's singular object.
+            Self::SliceLoadLevel => "sliceLoadLevelInfos",
+            Self::NetworkPerformance => "nwPerfs",
+            Self::UeMobility => "ueMobs",
+            Self::UeCommunication => "ueComms",
+            Self::QosSustainability => "qosSustainInfos",
+            Self::AbnormalBehaviour => "abnorBehavrs",
+            Self::ServiceExperience => "svcExps",
+            Self::UserDataCongestion => "userDataCongInfos",
+            Self::Dispersion => "disperInfos",
+            Self::RedTransExp => "redTransInfos",
+            Self::WlanPerformance => "wlanInfos",
+            Self::DnPerformance => "dnPerfInfos",
+            Self::SmCongestion => "smccExps",
+            Self::PduSessionTraffic => "pduSesTrafInfos",
+            Self::E2eDataVolTransTime => "dataVlTrnsTmInfos",
+            Self::MovementBehaviour => "movBehavInfos",
+            Self::LocAccuracy => "locAccInfos",
+            Self::RelativeProximity => "relProxInfos",
+            Self::SignallingStorm => "signalStormInfos",
+            // Differs from the notify surface's `qosPolAssistInfos`.
+            Self::QosPolicyAssist => "qosPlyAsstInfos",
+            // Differs from the notify surface's `abnormalTrafficInfos`.
+            Self::AbnormalUpTraffic => "abnormalTraffic",
+            Self::TrafficPattern => "trafficPatternInfos",
+            // Not an `EventId` value: no AnalyticsData member exists.
+            Self::PfdDetermination => return None,
+        })
+    }
+
+    /// Whether this event's `EventNotification` payload is a SINGLE object
+    /// rather than an array (issue #172).
+    ///
+    /// True only for `SLICE_LOAD_LEVEL`, whose notify member
+    /// `sliceLoadLevelInfo` is a bare `SliceLoadLevelInformation`
+    /// (`TS29520_Nnwdaf_EventsSubscription.yaml:835-836`) while every other
+    /// payload member — including its own `AnalyticsData` counterpart
+    /// `sliceLoadLevelInfos` — is a `minItems: 1` array. This is a *shape*
+    /// difference, not just a name, so it cannot be handled by the key alone.
+    pub fn notification_payload_is_single_object(&self) -> bool {
+        matches!(self, Self::SliceLoadLevel)
     }
 }
 
@@ -1281,6 +1375,177 @@ mod tests {
         // The old abbreviated tokens are rejected.
         assert_eq!(AnalyticsId::from_str("UE_COMM"), None);
         assert_eq!(AnalyticsId::from_str("SLICE_LOAD"), None);
+    }
+
+    /// **The issue #172 table test.** Every token's payload member name is
+    /// pinned against BOTH TS 29.520 schemas, transcribed from the yaml rather
+    /// than inferred, so the next added collector cannot inherit a wrong key.
+    ///
+    /// The table below is the whole point: the two service APIs name the same
+    /// analytics differently for four tokens, which is why one shared
+    /// `infos_key()` was necessarily wrong on one surface or the other. Sources:
+    /// `TS29520_Nnwdaf_EventsSubscription.yaml:802-966` (`EventNotification`) and
+    /// `TS29520_Nnwdaf_AnalyticsInfo.yaml:212-361` (`AnalyticsData`).
+    #[test]
+    fn test_infos_keys_match_the_spec_for_every_token() {
+        // (token, EventNotification member, AnalyticsData member or None)
+        let spec: &[(AnalyticsId, &str, Option<&str>)] = &[
+            (
+                AnalyticsId::NfLoad,
+                "nfLoadLevelInfos",
+                Some("nfLoadLevelInfos"),
+            ),
+            (AnalyticsId::NetworkPerformance, "nwPerfs", Some("nwPerfs")),
+            (AnalyticsId::UeMobility, "ueMobs", Some("ueMobs")),
+            (AnalyticsId::UeCommunication, "ueComms", Some("ueComms")),
+            (
+                AnalyticsId::AbnormalBehaviour,
+                "abnorBehavrs",
+                Some("abnorBehavrs"),
+            ),
+            (AnalyticsId::ServiceExperience, "svcExps", Some("svcExps")),
+            (
+                AnalyticsId::QosSustainability,
+                "qosSustainInfos",
+                Some("qosSustainInfos"),
+            ),
+            // ── the four #172 divergences ─────────────────────────────────────
+            // Shape differs too: singular OBJECT on notify, array in AnalyticsData.
+            (
+                AnalyticsId::SliceLoadLevel,
+                "sliceLoadLevelInfo",
+                Some("sliceLoadLevelInfos"),
+            ),
+            // Was sharing SLICE_LOAD_LEVEL's member; it has its own on both.
+            (
+                AnalyticsId::NsiLoadLevel,
+                "nsiLoadLevelInfos",
+                Some("nsiLoadLevelInfos"),
+            ),
+            // Was `wlanPerfInfos`, which neither schema defines.
+            (AnalyticsId::WlanPerformance, "wlanInfos", Some("wlanInfos")),
+            // Was `smcInfos`, which neither schema defines.
+            (AnalyticsId::SmCongestion, "smccExps", Some("smccExps")),
+            // ── divergences #172 did not list, found by diffing both schemas ──
+            (
+                AnalyticsId::QosPolicyAssist,
+                "qosPolAssistInfos",
+                Some("qosPlyAsstInfos"),
+            ),
+            (
+                AnalyticsId::AbnormalUpTraffic,
+                "abnormalTrafficInfos",
+                Some("abnormalTraffic"),
+            ),
+            // Not an `EventId` value at all → no AnalyticsData member exists.
+            (AnalyticsId::PfdDetermination, "pfdDetermInfos", None),
+            // ── the rest, identical on both surfaces ──────────────────────────
+            (
+                AnalyticsId::UserDataCongestion,
+                "userDataCongInfos",
+                Some("userDataCongInfos"),
+            ),
+            (AnalyticsId::Dispersion, "disperInfos", Some("disperInfos")),
+            (
+                AnalyticsId::RedTransExp,
+                "redTransInfos",
+                Some("redTransInfos"),
+            ),
+            (
+                AnalyticsId::DnPerformance,
+                "dnPerfInfos",
+                Some("dnPerfInfos"),
+            ),
+            (
+                AnalyticsId::PduSessionTraffic,
+                "pduSesTrafInfos",
+                Some("pduSesTrafInfos"),
+            ),
+            (
+                AnalyticsId::E2eDataVolTransTime,
+                "dataVlTrnsTmInfos",
+                Some("dataVlTrnsTmInfos"),
+            ),
+            (
+                AnalyticsId::MovementBehaviour,
+                "movBehavInfos",
+                Some("movBehavInfos"),
+            ),
+            (AnalyticsId::LocAccuracy, "locAccInfos", Some("locAccInfos")),
+            (
+                AnalyticsId::RelativeProximity,
+                "relProxInfos",
+                Some("relProxInfos"),
+            ),
+            (
+                AnalyticsId::SignallingStorm,
+                "signalStormInfos",
+                Some("signalStormInfos"),
+            ),
+            (
+                AnalyticsId::TrafficPattern,
+                "trafficPatternInfos",
+                Some("trafficPatternInfos"),
+            ),
+        ];
+
+        assert_eq!(
+            spec.len(),
+            AnalyticsId::ALL.len(),
+            "the spec table must cover every recognised NwdafEvent token"
+        );
+
+        for (event, notify_key, data_key) in spec {
+            assert_eq!(
+                event.notification_infos_key(),
+                *notify_key,
+                "{} EventNotification member",
+                event.as_str()
+            );
+            assert_eq!(
+                event.analytics_data_key(),
+                *data_key,
+                "{} AnalyticsData member",
+                event.as_str()
+            );
+        }
+
+        // Bijection: 25 distinct EventNotification members (its other 11
+        // properties are envelope fields), and 24 distinct AnalyticsData ones —
+        // no token may silently share another's member, which is the defect that
+        // hid NSI_LOAD_LEVEL behind SLICE_LOAD_LEVEL.
+        let notify: std::collections::BTreeSet<&str> = AnalyticsId::ALL
+            .iter()
+            .map(|e| e.notification_infos_key())
+            .collect();
+        assert_eq!(notify.len(), 25, "every token needs its OWN notify member");
+        let data: std::collections::BTreeSet<&str> = AnalyticsId::ALL
+            .iter()
+            .filter_map(|e| e.analytics_data_key())
+            .collect();
+        assert_eq!(
+            data.len(),
+            24,
+            "24 AnalyticsData members: every token but PFD_DETERMINATION, none shared"
+        );
+
+        // Only SLICE_LOAD_LEVEL's notify payload is a single object.
+        for event in AnalyticsId::ALL {
+            assert_eq!(
+                event.notification_payload_is_single_object(),
+                *event == AnalyticsId::SliceLoadLevel,
+                "{} payload shape",
+                event.as_str()
+            );
+        }
+
+        // The pre-#172 spellings are gone from both surfaces.
+        for wrong in ["wlanPerfInfos", "smcInfos"] {
+            assert!(
+                !notify.contains(wrong) && !data.contains(wrong),
+                "{wrong} is not defined by either schema"
+            );
+        }
     }
 
     /// G2-3 honesty: `SUPPORTED_EVENTS` is non-empty, a strict subset of the
