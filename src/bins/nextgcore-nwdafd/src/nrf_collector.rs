@@ -483,6 +483,7 @@ mod tests {
             &EventInfoFilter {
                 nf_instance_ids: vec![instance.to_string()],
                 nf_types: Vec::new(),
+                ..Default::default()
             },
         );
         infos.as_array().cloned().unwrap_or_default()
