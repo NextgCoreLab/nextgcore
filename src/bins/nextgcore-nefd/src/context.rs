@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 /// Southbound 5GC event producer a northbound monitoring subscription was
 /// translated to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SouthboundProducer {
     /// AMF Namf_EventExposure (TS 29.518).
     Amf,
@@ -38,7 +38,7 @@ impl SouthboundProducer {
 /// northbound AF subscription. Kept so producer notifications can be
 /// correlated back to the AF and so the producer-side subscription can be
 /// torn down when the AF deletes its northbound subscription.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SouthboundRef {
     pub producer: SouthboundProducer,
     /// Producer-assigned subscription ID.
@@ -48,7 +48,7 @@ pub struct SouthboundRef {
 }
 
 /// A northbound TS 29.122 Monitoring Event subscription stored by the NEF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NefMonitoringSubscription {
     /// NEF-assigned subscription ID. Doubles as the northbound resource ID
     /// and the southbound notify-correlation identifier (it is embedded in
@@ -85,7 +85,7 @@ impl NefMonitoringSubscription {
 }
 
 /// A TS 29.122 §5.10 Device Triggering transaction stored by the NEF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NefTriggerTransaction {
     /// NEF-assigned transaction ID.
     pub id: String,
@@ -164,6 +164,15 @@ pub struct NefContext {
     max_transactions: usize,
     /// Context initialized flag
     initialized: AtomicBool,
+    /// Durable snapshot of the two maps above (issue #66/#192). Disabled unless
+    /// a state file is configured, in which case the memory-only behaviour is
+    /// byte-identical to before.
+    ///
+    /// `StateStore` rather than the `read_snapshot`/`write_snapshot` free
+    /// functions: it enforces "never overwrite a snapshot you could not read"
+    /// internally, and a new adopter has no reason to take that obligation on
+    /// manually.
+    state: nextgcore_core::state_store::StateStore,
 }
 
 impl NefContext {
@@ -171,6 +180,7 @@ impl NefContext {
         Self {
             subscriptions: RwLock::new(HashMap::new()),
             transactions: RwLock::new(HashMap::new()),
+            state: nextgcore_core::state_store::StateStore::disabled(),
             amf_uri: None,
             udm_uri: None,
             notify_base: None,
@@ -242,20 +252,114 @@ impl NefContext {
     }
 
     /// Insert a monitoring subscription, enforcing the capacity cap.
+    // -- durable state (issue #66/#192) ---------------------------------------
+
+    /// Point this context at a snapshot file and restore any prior state.
+    ///
+    /// Called once at startup. A snapshot that cannot be read is an **error**:
+    /// the caller should refuse to start rather than come up empty and then
+    /// overwrite it. `StateStore` also refuses that write itself, so the file
+    /// survives either way.
+    pub fn set_state_file(
+        &mut self,
+        path: std::path::PathBuf,
+    ) -> Result<usize, nextgcore_core::state_store::StateStoreError> {
+        use nextgcore_core::state_store::{Loaded, StateStore};
+        self.state = StateStore::new(Some(path));
+        match self.state.load()? {
+            Loaded::Snapshot(doc) => Ok(self.restore_from(&doc)),
+            // First boot: nothing to restore, and persisting is enabled.
+            Loaded::Absent => Ok(0),
+        }
+    }
+
+    /// Serialize the two northbound maps to one snapshot document.
+    fn snapshot(&self) -> serde_json::Value {
+        let subs: Vec<NefMonitoringSubscription> = self
+            .subscriptions
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        let txns: Vec<NefTriggerTransaction> = self
+            .transactions
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        serde_json::json!({
+            "version": 1,
+            "subscriptions": subs,
+            "transactions": txns,
+        })
+    }
+
+    /// Restore both maps from a snapshot document, returning how many records
+    /// were installed. An individual malformed record is skipped rather than
+    /// costing the whole file -- the file itself was already validated as JSON by
+    /// the store, so a bad record here means a schema change, not corruption.
+    fn restore_from(&self, doc: &serde_json::Value) -> usize {
+        let mut restored = 0usize;
+        if let Some(arr) = doc.get("subscriptions").and_then(|v| v.as_array()) {
+            if let Ok(mut subs) = self.subscriptions.write() {
+                for v in arr {
+                    match serde_json::from_value::<NefMonitoringSubscription>(v.clone()) {
+                        Ok(sub) => {
+                            subs.insert(sub.id.clone(), sub);
+                            restored += 1;
+                        }
+                        Err(e) => log::warn!("skipping unreadable NEF subscription record: {e}"),
+                    }
+                }
+            }
+        }
+        if let Some(arr) = doc.get("transactions").and_then(|v| v.as_array()) {
+            if let Ok(mut txns) = self.transactions.write() {
+                for v in arr {
+                    match serde_json::from_value::<NefTriggerTransaction>(v.clone()) {
+                        Ok(txn) => {
+                            txns.insert(txn.id.clone(), txn);
+                            restored += 1;
+                        }
+                        Err(e) => log::warn!("skipping unreadable NEF transaction record: {e}"),
+                    }
+                }
+            }
+        }
+        restored
+    }
+
+    /// Snapshot to disk after a mutation. A no-op when no state file is
+    /// configured, and refused (loudly) when the previous load failed.
+    fn persist(&self) {
+        if !self.state.is_enabled() {
+            return;
+        }
+        let doc = self.snapshot();
+        if let Err(e) = self.state.persist(&doc) {
+            // The AF's subscription exists in memory but not on disk: the create
+            // was answered successfully and will not survive a restart.
+            log::error!("NEF state was NOT persisted: {e}");
+        }
+    }
+
     pub fn subscription_insert(
         &self,
         sub: NefMonitoringSubscription,
     ) -> Result<(), NefContextError> {
-        let mut subs = self
-            .subscriptions
-            .write()
-            .map_err(|_| NefContextError::LockPoisoned)?;
-        if subs.len() >= self.max_subscriptions {
-            return Err(NefContextError::MaxSubscriptionsReached);
+        {
+            let mut subs = self
+                .subscriptions
+                .write()
+                .map_err(|_| NefContextError::LockPoisoned)?;
+            if subs.len() >= self.max_subscriptions {
+                return Err(NefContextError::MaxSubscriptionsReached);
+            }
+            let id = sub.id.clone();
+            subs.insert(id.clone(), sub);
+            log::debug!("NEF monitoring subscription inserted (id={id})");
         }
-        let id = sub.id.clone();
-        subs.insert(id.clone(), sub);
-        log::debug!("NEF monitoring subscription inserted (id={id})");
+        // The guard MUST be dropped first: persist -> snapshot takes a read lock
+        // on this same map, and std RwLock is not reentrant (issue #66/#192).
+        self.persist();
         Ok(())
     }
 
@@ -267,8 +371,16 @@ impl NefContext {
 
     /// Remove a monitoring subscription by NEF subscription ID.
     pub fn subscription_remove(&self, id: &str) -> Option<NefMonitoringSubscription> {
-        let mut subs = self.subscriptions.write().ok()?;
-        subs.remove(id)
+        let removed = {
+            let mut subs = self.subscriptions.write().ok()?;
+            subs.remove(id)
+        };
+        // Persist the removal too, or a restart resurrects a subscription the AF
+        // deleted -- and the NEF would keep forwarding notifications for it.
+        if removed.is_some() {
+            self.persist();
+        }
+        removed
     }
 
     /// Number of stored monitoring subscriptions (NRF `/load` gauge source).
@@ -278,16 +390,20 @@ impl NefContext {
 
     /// Insert a device triggering transaction, enforcing the capacity cap.
     pub fn transaction_insert(&self, txn: NefTriggerTransaction) -> Result<(), NefContextError> {
-        let mut txns = self
-            .transactions
-            .write()
-            .map_err(|_| NefContextError::LockPoisoned)?;
-        if txns.len() >= self.max_transactions {
-            return Err(NefContextError::MaxTransactionsReached);
+        {
+            let mut txns = self
+                .transactions
+                .write()
+                .map_err(|_| NefContextError::LockPoisoned)?;
+            if txns.len() >= self.max_transactions {
+                return Err(NefContextError::MaxTransactionsReached);
+            }
+            let id = txn.id.clone();
+            txns.insert(id.clone(), txn);
+            log::debug!("NEF device triggering transaction inserted (id={id})");
         }
-        let id = txn.id.clone();
-        txns.insert(id.clone(), txn);
-        log::debug!("NEF device triggering transaction inserted (id={id})");
+        // Guard dropped first -- see subscription_insert.
+        self.persist();
         Ok(())
     }
 
@@ -335,6 +451,164 @@ pub fn nef_context_final() {
 
 #[cfg(test)]
 mod tests {
+
+    /// Unique snapshot path per test so parallel runs cannot collide.
+    fn temp_state_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "nefd-state-{tag}-{}-{nanos}.json",
+            std::process::id()
+        ))
+    }
+
+    /// **Issue #192.** A monitoring subscription and a triggering transaction
+    /// survive a restart through the configured snapshot file.
+    ///
+    /// The failure this prevents: an AF's subscription resource 404s after a NEF
+    /// restart and its notifications simply stop, with no termination signal the
+    /// AF could act on. NEF consumers are typically external AFs, so the dangling
+    /// state is visible outside the operator's network.
+    #[test]
+    fn subscriptions_and_transactions_survive_a_restart() {
+        let path = temp_state_path("restart");
+        let _ = std::fs::remove_file(&path);
+
+        let sub_id;
+        let txn_id;
+        {
+            let mut ctx = NefContext::new();
+            ctx.init(16, 16);
+            ctx.set_state_file(path.clone())
+                .expect("first boot is empty");
+
+            let mut sub = NefMonitoringSubscription::new(
+                "af-1",
+                "LOCATION_REPORTING",
+                "https://af.example/notify",
+                r#"{"monitoringType":"LOCATION_REPORTING"}"#,
+            );
+            sub.southbound = Some(SouthboundRef {
+                producer: SouthboundProducer::Amf,
+                subscription_id: "amf-sub-7".to_string(),
+                delete_path: "/namf-evts/v1/subscriptions/amf-sub-7".to_string(),
+            });
+            sub_id = sub.id.clone();
+            ctx.subscription_insert(sub).expect("insert");
+
+            let txn = NefTriggerTransaction {
+                id: "txn-1".to_string(),
+                scs_as_id: "af-1".to_string(),
+                delivery_result: "TRIGGERED".to_string(),
+                raw: r#"{"validityPeriod":"x"}"#.to_string(),
+            };
+            txn_id = txn.id.clone();
+            ctx.transaction_insert(txn).expect("insert txn");
+        }
+
+        // Fresh context, same file: the simulated restart.
+        let mut restarted = NefContext::new();
+        restarted.init(16, 16);
+        let restored = restarted
+            .set_state_file(path.clone())
+            .expect("valid snapshot");
+        assert_eq!(restored, 2, "both records must be restored");
+
+        let sub = restarted
+            .subscription_find(&sub_id)
+            .expect("the subscription must survive the restart");
+        assert_eq!(sub.notification_destination, "https://af.example/notify");
+        // The southbound reference matters most: without it the NEF cannot tear
+        // down the producer-side subscription when the AF deletes its own.
+        let sb = sub.southbound.expect("southbound ref must survive");
+        assert_eq!(sb.producer, SouthboundProducer::Amf);
+        assert_eq!(sb.subscription_id, "amf-sub-7");
+        assert_eq!(
+            restarted
+                .transaction_find(&txn_id)
+                .map(|t| t.delivery_result),
+            Some("TRIGGERED".to_string())
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Issue #192.** A deleted subscription must NOT come back after a restart.
+    ///
+    /// Persisting inserts but not removals is the subtler half of the bug: the
+    /// resource would be resurrected and the NEF would resume forwarding
+    /// notifications for a subscription the AF had explicitly deleted. bsfd had
+    /// exactly this shape on its DB-delete path.
+    #[test]
+    fn a_deleted_subscription_is_not_resurrected_by_a_restart() {
+        let path = temp_state_path("delete");
+        let _ = std::fs::remove_file(&path);
+
+        let sub_id;
+        {
+            let mut ctx = NefContext::new();
+            ctx.init(16, 16);
+            ctx.set_state_file(path.clone()).expect("first boot");
+            let sub = NefMonitoringSubscription::new("af-1", "T", "https://af/n", "{}");
+            sub_id = sub.id.clone();
+            ctx.subscription_insert(sub).expect("insert");
+            assert!(ctx.subscription_remove(&sub_id).is_some(), "removed");
+        }
+
+        let mut restarted = NefContext::new();
+        restarted.init(16, 16);
+        restarted.set_state_file(path.clone()).expect("valid");
+        assert!(
+            restarted.subscription_find(&sub_id).is_none(),
+            "a deleted subscription must not be resurrected -- the NEF would resume \
+             forwarding notifications for it"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Issue #192**, memory-only default preserved: with no state file
+    /// configured the behaviour is byte-identical to before.
+    #[test]
+    fn without_a_state_file_nothing_is_persisted() {
+        let mut ctx = NefContext::new();
+        ctx.init(16, 16);
+        let sub = NefMonitoringSubscription::new("af-1", "T", "https://af/n", "{}");
+        ctx.subscription_insert(sub).expect("insert still works");
+        assert_eq!(ctx.subscription_count(), 1, "memory behaviour unchanged");
+        // There is no file to assert about, which IS the property: persist()
+        // returns early on a disabled store.
+    }
+
+    /// **Issue #192 / #66.** An unreadable snapshot is an ERROR at startup, not a
+    /// silent empty boot -- and the file is left intact for recovery.
+    #[test]
+    fn a_corrupt_snapshot_fails_startup_and_survives() {
+        let path = temp_state_path("corrupt");
+        let original = r#"{"subscriptions": [{"id": "trunc"#;
+        std::fs::write(&path, original).expect("seed");
+
+        let mut ctx = NefContext::new();
+        ctx.init(16, 16);
+        let err = ctx
+            .set_state_file(path.clone())
+            .expect_err("a corrupt snapshot must fail rather than boot empty");
+        assert!(err.to_string().contains("not valid JSON"), "got {err}");
+
+        // A mutation must not overwrite the file the store could not read.
+        let sub = NefMonitoringSubscription::new("af-1", "T", "https://af/n", "{}");
+        ctx.subscription_insert(sub)
+            .expect("memory insert still works");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            original,
+            "the unreadable snapshot must survive for recovery"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
     use super::*;
 
     // These tests use local `NefContext` instances (not the process-global
