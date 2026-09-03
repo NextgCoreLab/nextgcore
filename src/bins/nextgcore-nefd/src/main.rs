@@ -76,6 +76,16 @@ struct Args {
     #[arg(short = 'c', long, default_value = "/etc/nextgcore/nef.yaml")]
     config: String,
 
+    /// JSON snapshot file for northbound monitoring subscriptions and device
+    /// triggering transactions (issue #66/#192).
+    ///
+    /// Falls back to `NEXTGCORE_NEF_STATE_FILE`; an empty value is treated as
+    /// unset. With neither set the NEF is memory-only, which is the shipped
+    /// default and byte-identical to previous behaviour. An unreadable snapshot
+    /// FAILS STARTUP rather than coming up empty and overwriting it.
+    #[arg(long)]
+    state_file: Option<String>,
+
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
@@ -166,6 +176,34 @@ async fn main() -> Result<()> {
     log::info!("Network Exposure Function (TS 23.501 6.2.5; TS 29.122 northbound)");
 
     nef_context_init(args.max_subscriptions, args.max_transactions);
+
+    // Issue #66/#192: restore durable state BEFORE the SBI server can accept a
+    // subscription, so a restored record is never shadowed by a fresh one.
+    // Precedence matches the other NFs: the flag wins over the env var, and an
+    // empty value is treated as unset rather than as a path.
+    let state_file = args
+        .state_file
+        .clone()
+        .or_else(|| std::env::var("NEXTGCORE_NEF_STATE_FILE").ok())
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    if let Some(path) = state_file {
+        let ctx = context::nef_self();
+        let mut guard = ctx
+            .write()
+            .map_err(|_| anyhow::anyhow!("NEF context lock poisoned"))?;
+        // Fail STARTUP on an unreadable snapshot. Coming up empty would answer
+        // "no such subscription" for AF subscriptions that exist, and the store
+        // would then refuse every later write to protect the file -- so the NF
+        // would be running in a state that is neither durable nor honest.
+        let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
+        log::info!("NEF durable state: {path} ({restored} record(s) restored)");
+    } else {
+        log::info!(
+            "NEF durable state disabled (no --state-file / NEXTGCORE_NEF_STATE_FILE): \
+             subscriptions and transactions are memory-only and lost on restart"
+        );
+    }
 
     let nf_instance_id = args
         .nf_instance_id

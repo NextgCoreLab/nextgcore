@@ -87,12 +87,20 @@ Precedence, where both exist: **environment variable > YAML > compiled-in defaul
 
 ### Durable state snapshots
 
-Four NFs persist their long-lived runtime state as a full-store JSON snapshot,
+Five NFs persist their long-lived runtime state as a full-store JSON snapshot,
 rewritten on every mutation and reloaded at boot: **nrfd** (NF registry),
 **nssfd** (NSSAI-availability subscriptions and data), **nsacfd** (admission
-counters) and **udrd** (the non-subscriber resource trees). Each is enabled by its
+counters), **udrd** (the non-subscriber resource trees) and **nefd** (TS 29.122
+monitoring subscriptions and device-triggering transactions). Each is enabled by its
 own `--state-file` flag or `NEXTGCORE_<NF>_STATE_FILE` variable; with neither set
-the NF is purely in-memory, which is the shipped Docker/E2E default.
+the NF is purely in-memory — the shipped Docker/E2E default for all but udrd, which
+is on by default (see [UDR](./udr.md)).
+
+`nefd` differs from the older four in one respect worth knowing: an unreadable
+snapshot **fails its startup** rather than only refusing to persist. It adopts the
+`StateStore` type directly, so the caller sees the load error and declines to serve;
+the other four predate that type and keep their own flag, refusing the write but
+coming up empty.
 
 They share one implementation (`nextgcore-core`'s `state_store`), which
 distinguishes three cases:

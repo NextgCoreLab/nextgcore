@@ -2764,6 +2764,7 @@ dependencies = [
  "nextgcore-metrics",
  "nextgcore-sbi",
  "proptest",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
