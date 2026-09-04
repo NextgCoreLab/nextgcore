@@ -653,7 +653,19 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
     }
 
     // nwafd-05: deliver pending Nnwdaf_MLModelProvision callbacks.
-    dispatch_ml_prov_notifications(ctx).await;
+    dispatch_ml_prov_notifications(ctx.clone()).await;
+
+    // Issue #66/#192: write the tick's bookkeeping ONCE.
+    //
+    // `update_subscription_last_notification`, `mark_subscription_terminated`,
+    // `mark_ml_prov_notified` and `set_event_level` are all called per
+    // subscription above and only mark the context dirty; a snapshot rewrite per
+    // call would rewrite the whole store (with two fsyncs) up to
+    // `max_subscriptions` times per tick. A no-op when nothing changed, and when
+    // no state file is configured.
+    if let Ok(guard) = ctx.read() {
+        guard.flush_state_if_dirty();
+    }
 }
 
 /// Deliver the one-shot "model available" `Nnwdaf_MLModelProvision` callbacks.

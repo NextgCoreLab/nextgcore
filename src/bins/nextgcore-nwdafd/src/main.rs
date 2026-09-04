@@ -83,6 +83,17 @@ struct Args {
     #[arg(long, default_value = "1024")]
     max_subscriptions: usize,
 
+    /// JSON snapshot file for analytics and ML-provision subscriptions plus
+    /// THRESHOLD edge state (issue #66/#192).
+    ///
+    /// Falls back to `NEXTGCORE_NWDAF_STATE_FILE`; an empty value is treated as
+    /// unset. With neither set the NWDAF is memory-only, which is the shipped
+    /// default and byte-identical to previous behaviour. An unreadable snapshot,
+    /// or one written by a newer build, FAILS STARTUP rather than coming up empty
+    /// and overwriting it.
+    #[arg(long)]
+    state_file: Option<String>,
+
     /// NRF URI for registration
     #[arg(long, default_value = "http://127.0.0.1:7777")]
     nrf_uri: String,
@@ -90,6 +101,24 @@ struct Args {
     /// NF instance ID
     #[arg(long)]
     nf_instance_id: Option<String>,
+}
+
+/// Resolve the durable-state path from the flag and the environment variable
+/// (issue #66/#192).
+///
+/// The precedence the other NFs use, and the one the configuration docs state:
+/// **the flag wins over the variable, and an empty or whitespace-only value is
+/// treated as unset rather than as a path.** That last part matters in container
+/// deployments, where an unset variable routinely arrives as `""` — taking it
+/// literally would try to snapshot to a file with no name and log a write error
+/// on every mutation.
+///
+/// Split out of `main` so the precedence is testable without a process
+/// environment.
+fn resolve_state_file(flag: Option<String>, env: Option<String>) -> Option<String> {
+    flag.or(env)
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
 }
 
 fn init_logging(level: &str) {
@@ -204,6 +233,34 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("nwdaf-{}", uuid::Uuid::new_v4()));
 
     nwdaf_context_init(nf_instance_id.clone(), args.max_subscriptions);
+
+    // Issue #66/#192: restore durable state AFTER the context knows its capacity
+    // cap and BEFORE the SBI server can accept a subscription, so a restored
+    // record is never shadowed by a fresh one. Precedence matches the other NFs:
+    // the flag wins over the env var, and an empty value is treated as unset
+    // rather than as a path.
+    let state_file = resolve_state_file(
+        args.state_file.clone(),
+        std::env::var("NEXTGCORE_NWDAF_STATE_FILE").ok(),
+    );
+    if let Some(path) = state_file {
+        let ctx = nwdaf_self();
+        let mut guard = ctx
+            .write()
+            .map_err(|_| anyhow::anyhow!("NWDAF context lock poisoned"))?;
+        // Fail STARTUP on a snapshot that cannot be read or is from a newer
+        // build. Coming up empty would answer "no such subscription" for
+        // subscriptions that exist and silently stop analytics for them, and the
+        // store would then refuse every later write to protect the file -- so the
+        // NF would be running in a state that is neither durable nor honest.
+        let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
+        log::info!("NWDAF durable state: {path} ({restored} record(s) restored)");
+    } else {
+        log::info!(
+            "NWDAF durable state disabled (no --state-file / NEXTGCORE_NWDAF_STATE_FILE): \
+             analytics and ML-provision subscriptions are memory-only and lost on restart"
+        );
+    }
 
     // Issue #109: the model URL notified to MLModelProvision consumers has to
     // resolve back to this NF, so record our own SBI base. Uses the advertised
@@ -654,6 +711,44 @@ mod tests {
         assert_eq!(args.config, "/etc/nextgcore/nwdaf.yaml");
         assert_eq!(args.sbi_port, 7815);
         assert_eq!(args.max_subscriptions, 1024);
+        assert_eq!(
+            args.state_file, None,
+            "memory-only is the shipped default (issue #66/#192)"
+        );
+    }
+
+    /// The documented `--state-file` precedence (issue #66/#192): the flag wins,
+    /// and an empty value is unset rather than a path.
+    #[test]
+    fn state_file_precedence_is_flag_then_env_and_empty_means_unset() {
+        let s = |v: &str| Some(v.to_string());
+
+        assert_eq!(resolve_state_file(None, None), None, "neither set");
+        assert_eq!(resolve_state_file(s("/f.json"), None), s("/f.json"));
+        assert_eq!(resolve_state_file(None, s("/e.json")), s("/e.json"));
+        assert_eq!(
+            resolve_state_file(s("/f.json"), s("/e.json")),
+            s("/f.json"),
+            "the flag wins over the environment variable"
+        );
+
+        // An unset variable routinely arrives as "" in container deployments;
+        // taking it literally would snapshot to a nameless file and log a write
+        // error on every mutation.
+        assert_eq!(resolve_state_file(None, s("")), None);
+        assert_eq!(resolve_state_file(None, s("   ")), None);
+        assert_eq!(resolve_state_file(s(""), None), None);
+        assert_eq!(
+            resolve_state_file(s(""), s("/e.json")),
+            None,
+            "an explicitly empty flag still wins -- it is an explicit opt-out, \
+             not a fallthrough to the environment"
+        );
+        assert_eq!(
+            resolve_state_file(s(" /f.json "), None),
+            s("/f.json"),
+            "surrounding whitespace is trimmed"
+        );
     }
 
     // --- SbiContext dependency-injection pilot (DANGER-ZONES #1) ---
