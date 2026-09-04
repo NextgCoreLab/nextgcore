@@ -21,12 +21,20 @@ tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Northbound OAuth2 knob parsing and bearer-claim decoding (issue #110). Both
+# are already workspace dependencies used by sibling NFs, so no new crate enters
+# the tree.
+serde_yaml.workspace = true
+base64.workspace = true
 uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Issue #110: the strict-peer northbound OAuth2 test signs an ES256 token
+# against a served JWKS, so the real listener verification path runs.
+p256 = { workspace = true, features = ["ecdsa"] }
 
 [lints]
 workspace = true

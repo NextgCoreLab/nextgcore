@@ -2755,6 +2755,7 @@ name = "nextgcore-nefd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "ctrlc",
  "env_logger",
@@ -2763,9 +2764,11 @@ dependencies = [
  "nextgcore-core",
  "nextgcore-metrics",
  "nextgcore-sbi",
+ "p256",
  "proptest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "uuid",
 ]

@@ -2,9 +2,20 @@
 //!
 //! Minimal NEF (issue #19): exposes 5GC event services to external
 //! Application Functions (AFs) and translates northbound requests into
-//! internal service calls toward the 5GC producers. Caller authentication on
-//! the northbound surface is not yet wired (default-off OAuth2 parity with
-//! the other small NFs is future work).
+//! internal service calls toward the 5GC producers.
+//!
+//! Northbound security (issue #110, TS 33.501 §5.9.2.3 / §12.1):
+//! - The **SUPI is never sent to an AF**. Notifications echo the external
+//!   identity the AF itself supplied; see [`build_monitoring_notification`].
+//! - A monitoring request must resolve to **exactly one UE**. A GPSI is
+//!   translated via UDM and an unresolvable target is refused — it is never
+//!   widened to a network-wide `anyUE` subscription, which the
+//!   [`SouthboundTarget`] type now makes unrepresentable.
+//! - Caller authentication (OAuth2 and/or mTLS) is **default-off** for
+//!   matched-simulator parity; when enabled, subscription ownership is keyed to
+//!   the authenticated identity rather than the caller-supplied `{scsAsId}`.
+//!   With it off, the NF logs a warning at startup and must not face an
+//!   untrusted network.
 //!
 //! Served surfaces:
 //! - **Monitoring Event** northbound API (TS 29.122 §5.3):
@@ -110,6 +121,30 @@ struct Args {
     #[arg(long)]
     tls_key: Option<String>,
 
+    /// Require and verify a client certificate on the northbound surface
+    /// (mutual TLS, TS 33.501 §12.1) — issue #110.
+    ///
+    /// Only meaningful with `--tls`. When on, the verified certificate's URI SAN
+    /// becomes the authenticated client identity that subscription ownership is
+    /// keyed to, instead of the caller-supplied `{scsAsId}` path segment.
+    #[arg(long)]
+    verify_client: bool,
+
+    /// CA bundle used to verify client certificates when `--verify-client` is
+    /// set. Defaults to the SBI layer's own trust configuration.
+    #[arg(long)]
+    verify_client_cacert: Option<String>,
+
+    /// UDM SBI base URI used to resolve an AF-supplied GPSI (`msisdn`/
+    /// `externalId`) to the internal SUPI via TS 29.503
+    /// `id-translation-result` (issue #110).
+    ///
+    /// Defaults to `--udm-uri` when unset, since that is the same UDM. With
+    /// neither configured, GPSI-targeted monitoring requests are REFUSED rather
+    /// than widened to a network-wide subscription.
+    #[arg(long)]
+    udm_sdm_uri: Option<String>,
+
     #[arg(long, default_value = "http://127.0.0.1:7777")]
     nrf_uri: String,
 
@@ -143,6 +178,160 @@ struct Args {
     /// Maximum stored device triggering transactions.
     #[arg(long, default_value = "4096")]
     max_transactions: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Northbound authentication (issue #110; TS 33.501 §12.1)
+//
+// TS 33.501 §12.1 makes mutual authentication between the NEF and the AF
+// mandatory, and requires the NEF to authorise each AF request. Before this the
+// northbound surface had neither: any caller could create, read or delete
+// subscriptions, and ownership was asserted from the caller-supplied `{scsAsId}`
+// path segment, so one client could delete another's subscriptions by naming
+// their ID.
+//
+// Enforcement is default-OFF, following the staging the issue's own
+// "Feature-gating" section allows and the pattern dccfd/nwdafd already use, so
+// the matched-simulator E2E path is byte-unchanged. The privacy fixes (SUPI
+// stripping, no anyUE widening) are NOT gated — they are corrections, not
+// optional capabilities.
+//
+// CONFORMANCE NOTE: the token mechanism here is the operator-internal one (an
+// NRF-issued OAuth2 token verified against the NRF JWKS), because that is what
+// this repo has. TS 33.501 §12.1's AF-facing tokens are not necessarily
+// NRF-issued. The properties that matter hold under either: no unauthenticated
+// access, and an identity the NEF verified rather than one the caller typed.
+// ---------------------------------------------------------------------------
+
+/// What the northbound listener actually verifies. Set once at startup.
+///
+/// This is process configuration rather than per-request state, and the handler
+/// needs it to answer one question: *may the claims on this request be trusted?*
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NorthboundAuth {
+    /// `require_oauth2` is set on the listener, so nextgcore-sbi verified the
+    /// bearer token's signature, audience, scope and expiry **before** the
+    /// handler ran (`libs/nextgcore-sbi/src/server.rs:386-398`).
+    pub oauth2: bool,
+    /// `verify_client` is set, so rustls verified the peer's certificate chain
+    /// and `SbiRequest::peer_cert_nf_instance_id` is trustworthy (issue #186).
+    pub mtls: bool,
+}
+
+impl NorthboundAuth {
+    pub fn is_enforced(&self) -> bool {
+        self.oauth2 || self.mtls
+    }
+}
+
+/// The northbound auth posture, set once by `main()`.
+static NORTHBOUND_AUTH: std::sync::OnceLock<NorthboundAuth> = std::sync::OnceLock::new();
+
+fn northbound_auth() -> NorthboundAuth {
+    NORTHBOUND_AUTH.get().copied().unwrap_or_default()
+}
+
+/// The authenticated identity of the caller, or `None` when the request carries
+/// no identity this process verified (issue #110).
+///
+/// Order matters. A certificate **this process** verified outranks a token,
+/// which in turn outranks anything in the URL:
+///
+/// 1. `peer_cert_nf_instance_id` — the URI SAN of a chain-verified client
+///    certificate (issue #186). Only ever populated under `verify_client`.
+/// 2. the `sub` claim of the bearer token.
+/// 3. nothing.
+///
+/// **Why reading `sub` without re-verifying is sound, and only here.** The server
+/// rejects an invalid token with 401 *before dispatch*, so by the time a handler
+/// runs under `auth.oauth2` the signature, audience, scope and expiry have all
+/// been checked and the claims are trustworthy. When `auth.oauth2` is false
+/// nothing was checked, and an attacker could set any `sub` it liked — so the
+/// claim is ignored entirely in that case. The `auth.oauth2` guard below is
+/// therefore load-bearing, not defensive: dropping it turns this function into an
+/// impersonation primitive.
+fn authenticated_client_id(request: &SbiRequest, auth: NorthboundAuth) -> Option<String> {
+    if auth.mtls {
+        if let Some(id) = request.peer_cert_nf_instance_id.as_deref() {
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    if auth.oauth2 {
+        return bearer_subject(request.http.get_header("authorization")?);
+    }
+    None
+}
+
+/// The `sub` claim of a Bearer token, without verifying it.
+///
+/// **Never call this outside [`authenticated_client_id`]'s `auth.oauth2` branch**
+/// — see that function for why the guard is what makes reading unverified claims
+/// safe. Split out only so the claim decoding is unit-testable.
+fn bearer_subject(authorization: &str) -> Option<String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let token = authorization
+        .strip_prefix("Bearer ")
+        .or_else(|| authorization.strip_prefix("bearer "))?
+        .trim();
+    // header.payload.signature — the claims are the middle segment.
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .get("sub")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Parse the opt-in `sbi.oauth2.require` knob (dccfd/nwdafd parity). Default
+/// false so the matched-sim path is untouched. Honors
+/// `NEXTGCORE_SBI_OAUTH2_REQUIRE` first (overlay-friendly), then the yaml
+/// `<nf>.sbi.oauth2.require` (root-key agnostic: true iff any top-level section
+/// sets it).
+fn oauth2_required(config_path: &str) -> bool {
+    if let Ok(v) = std::env::var("NEXTGCORE_SBI_OAUTH2_REQUIRE") {
+        return matches!(v.trim(), "1" | "true" | "TRUE" | "yes");
+    }
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
+        return false;
+    };
+    value.as_mapping().is_some_and(|map| {
+        map.values().any(|section| {
+            section
+                .get("sbi")
+                .and_then(|s| s.get("oauth2"))
+                .and_then(|o| o.get("require"))
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// Apply OAuth2 producer enforcement, with the audience scoped to `NEF`
+/// (TS 29.510 §5.4.2). With no NRF URI it fails closed (503) rather than
+/// accepting unverifiable tokens.
+fn apply_oauth2_enforcement(mut cfg: SbiServerConfig, nrf_uri: &str) -> SbiServerConfig {
+    cfg.require_oauth2 = true;
+    let uri = (!nrf_uri.is_empty()).then_some(nrf_uri);
+    cfg.oauth2_jwks_uri = uri.map(|u| {
+        nextgcore_sbi::oauth::JwksCache::for_nrf(u)
+            .jwks_uri()
+            .to_string()
+    });
+    cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Nef);
+    log::info!(
+        "NEF northbound OAuth2 enforcement enabled (JWKS: {})",
+        cfg.oauth2_jwks_uri.as_deref().unwrap_or("UNCONFIGURED")
+    );
+    cfg
 }
 
 fn init_logging(level: &str) {
@@ -223,6 +412,16 @@ async fn main() -> Result<()> {
                 Some(notify_base),
                 Some(nf_instance_id.clone()),
             );
+            // Issue #110: GPSI→SUPI resolution target; defaults to --udm-uri.
+            context.set_udm_sdm_uri(args.udm_sdm_uri.clone());
+            if context.udm_sdm_uri().is_none() {
+                log::warn!(
+                    "no --udm-sdm-uri or --udm-uri configured: AF monitoring requests that target \
+                     a UE by msisdn/externalId will be REFUSED, because the GPSI cannot be \
+                     resolved to a SUPI (TS 33.501 §5.9.2.3). This is deliberate -- the previous \
+                     behaviour widened such requests to a network-wide anyUE subscription."
+                );
+            }
         };
     }
 
@@ -244,6 +443,45 @@ async fn main() -> Result<()> {
             .as_deref()
             .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_server_config = sbi_server_config.with_tls(key, cert);
+    }
+
+    // Issue #110 / TS 33.501 §12.1: northbound authentication. Default OFF, so
+    // the shipped matched-sim path is byte-unchanged; the privacy fixes in this
+    // same change are unconditional.
+    let oauth2 = oauth2_required(&args.config);
+    if oauth2 {
+        sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
+    }
+    let mtls = args.verify_client;
+    if mtls {
+        if !args.tls {
+            // Fail startup rather than run with an option that silently does
+            // nothing: --verify-client without --tls reads as "mutual TLS is on"
+            // while the listener is plaintext and every request is unauthenticated.
+            anyhow::bail!(
+                "--verify-client requires --tls: there is no client certificate to verify on a \
+                 plaintext listener, and starting anyway would present an unauthenticated \
+                 northbound surface as an authenticated one"
+            );
+        }
+        sbi_server_config.verify_client = true;
+        sbi_server_config.verify_client_cacert = args.verify_client_cacert.clone();
+    }
+    let auth = NorthboundAuth { oauth2, mtls };
+    let _ = NORTHBOUND_AUTH.set(auth);
+    if auth.is_enforced() {
+        log::info!(
+            "NEF northbound authentication: oauth2={oauth2}, mtls={mtls}; subscription ownership \
+             is keyed to the authenticated identity"
+        );
+    } else {
+        log::warn!(
+            "NEF northbound authentication DISABLED (no nef.sbi.oauth2.require / \
+             NEXTGCORE_SBI_OAUTH2_REQUIRE, no --verify-client): any caller can create and delete \
+             monitoring subscriptions, and ownership falls back to the caller-supplied scsAsId \
+             path segment. Do not expose this listener to an untrusted or partner-facing network \
+             (TS 33.501 §12.1)."
+        );
     }
 
     let sbi_server = SbiServer::new(sbi_server_config);
@@ -310,7 +548,7 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions"),
         },
         ["3gpp-monitoring-event", "v1", scs_as_id, "subscriptions", sub_id] => match method {
-            "DELETE" => handle_monitoring_subscription_delete(scs_as_id, sub_id).await,
+            "DELETE" => handle_monitoring_subscription_delete(scs_as_id, sub_id, &request).await,
             _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
         },
         // Device Triggering northbound API (TS 29.122 §5.10)
@@ -376,12 +614,29 @@ async fn handle_monitoring_subscription_create(
         );
     }
 
-    // Target UE identity. TS 29.122 uses msisdn/externalId; supi is accepted
-    // as a NextGCore-internal extension (no GPSI→SUPI resolution path exists
-    // in this repo yet).
+    // Target UE identity. TS 29.122 names the UE by msisdn/externalId; supi is
+    // accepted as a NextGCore-internal extension.
     let supi = data.get("supi").and_then(|v| v.as_str());
     let msisdn = data.get("msisdn").and_then(|v| v.as_str());
     let external_id = data.get("externalId").and_then(|v| v.as_str());
+
+    // Issue #110: `externalGroupId` is TS 29.122's GROUP form. Rejected rather
+    // than ignored, because ignoring it is how the original defect behaved: the
+    // group identifier fell through to no-identity, and no-identity became a
+    // network-wide `anyUE` subscription. Serving it needs a group→internal
+    // mapping this repo does not have, and inventing one would repeat the
+    // mistake. Filed as a follow-up.
+    if data
+        .get("externalGroupId")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        return send_bad_request(
+            "externalGroupId (group-scoped monitoring) is not supported by this NEF; \
+             subscribe per UE with msisdn or externalId",
+            Some("MANDATORY_IE_INCORRECT"),
+        );
+    }
     // The identity is interpolated into southbound resource paths
     // (/nudm-ee/v1/{ueIdentity}/...), so reject anything outside the
     // SUPI/GPSI character set up front (path-injection guard).
@@ -400,34 +655,94 @@ async fn handle_monitoring_subscription_create(
         }
     }
 
+    // Issue #110: the external identity the AF used, kept so notifications can
+    // echo it back instead of the SUPI. `externalId` is preferred over `msisdn`
+    // when both are present, matching the southbound preference order that was
+    // already here.
+    let af_target = external_id
+        .map(|e| AfTarget::ExternalId(e.to_string()))
+        .or_else(|| msisdn.map(|m| AfTarget::Msisdn(m.to_string())));
+
+    // Snapshot endpoint config out of the context so no lock is held across
+    // the southbound await.
+    let ctx = nef_self();
+    let (notify_base, amf_uri, udm_uri, udm_sdm_uri, nf_instance_id) = match ctx.read() {
+        Ok(c) => (
+            c.notify_base(),
+            c.amf_uri(),
+            c.udm_uri(),
+            c.udm_sdm_uri(),
+            c.nf_instance_id(),
+        ),
+        Err(_) => return send_internal_error("NEF context lock poisoned"),
+    };
+
+    // Issue #110: resolve the target to exactly one UE, or refuse.
+    //
+    // This is where the anyUE widening died. Previously an unresolvable or
+    // GPSI-only target fell through to `anyUE`, turning a request for one
+    // subscriber into a network-wide feed. Now: a SUPI is used directly (the
+    // NextGCore extension), a GPSI is translated via UDM (TS 33.501 §5.9.2.3),
+    // and anything that cannot be resolved to a single UE is an error to the AF
+    // with NO southbound subscribe issued.
+    let target = match supi {
+        Some(supi) => SouthboundTarget::Supi(supi.to_string()),
+        None => match &af_target {
+            Some(t) => match resolve_gpsi_to_supi(udm_sdm_uri, &t.gpsi()).await {
+                Some(resolved) => SouthboundTarget::Supi(resolved),
+                None => {
+                    // 404 rather than 500: TS 29.122's failure for a target the
+                    // network cannot identify. The AF asked about a UE this
+                    // network cannot resolve, which is its request's problem,
+                    // and saying so is far better than silently subscribing to
+                    // every UE instead.
+                    log::warn!(
+                        "monitoring subscription refused: {} '{}' could not be resolved to a SUPI",
+                        t.member(),
+                        t.value()
+                    );
+                    return send_not_found(
+                        &format!(
+                            "{} could not be resolved to a subscriber of this network",
+                            t.member()
+                        ),
+                        Some("UE_NOT_FOUND"),
+                    );
+                }
+            },
+            None => {
+                // No target at all. TS 29.122's monitoring types served here are
+                // per-UE, so the identity is mandatory; this is NOT an implicit
+                // request for network-wide scope.
+                return send_bad_request(
+                    "a target UE identity (msisdn or externalId) is mandatory for per-UE \
+                     monitoring types",
+                    Some("MANDATORY_IE_MISSING"),
+                );
+            }
+        },
+    };
+
+    // Issue #110: ownership is keyed to an identity this process verified, not to
+    // the caller-supplied {scsAsId} path segment.
+    let owner_id = authenticated_client_id(request, northbound_auth());
+
     let sub = NefMonitoringSubscription::new(
         scs_as_id,
         &monitoring_type,
         &notification_destination,
         body.clone(),
-    );
+    )
+    .with_af_target(af_target)
+    .with_owner_id(owner_id);
 
-    // Snapshot endpoint config out of the context so no lock is held across
-    // the southbound await.
-    let ctx = nef_self();
-    let (notify_base, amf_uri, udm_uri, nf_instance_id) = match ctx.read() {
-        Ok(c) => (
-            c.notify_base(),
-            c.amf_uri(),
-            c.udm_uri(),
-            c.nf_instance_id(),
-        ),
-        Err(_) => return send_internal_error("NEF context lock poisoned"),
-    };
     let notify_base = notify_base.unwrap_or_else(|| "http://127.0.0.1:7817".to_string());
     let nf_instance_id = nf_instance_id.unwrap_or_else(|| "nef-unregistered".to_string());
     let nef_notify_uri = format!("{notify_base}/nnef-eventexposure/v1/notify/{}", sub.id);
 
     let southbound = match build_southbound_subscribe(
         &monitoring_type,
-        supi,
-        msisdn,
-        external_id,
+        &target,
         &nef_notify_uri,
         &sub.id,
         &nf_instance_id,
@@ -487,17 +802,39 @@ async fn handle_monitoring_subscription_create(
 
 /// DELETE /3gpp-monitoring-event/v1/{scsAsId}/subscriptions/{subId} —
 /// TS 29.122 §5.3 unsubscribe. Tears the southbound producer subscription
-/// down (best-effort) and removes the northbound mapping. The subscription
-/// must belong to the requesting {scsAsId}; a foreign ID answers 404.
-async fn handle_monitoring_subscription_delete(scs_as_id: &str, sub_id: &str) -> SbiResponse {
+/// down (best-effort) and removes the northbound mapping.
+///
+/// Issue #110: the subscription must belong to the **authenticated** caller. A
+/// subscription created under authentication can only be deleted by the identity
+/// that created it, so supplying another client's `{scsAsId}` in the path no
+/// longer works — that segment is caller-controlled and confers nothing. With no
+/// northbound authentication configured the check degrades to the historical
+/// `scsAsId` comparison. Either way a caller that is not the owner gets 404, not
+/// 403: whether that subscription exists is not information it is entitled to.
+async fn handle_monitoring_subscription_delete(
+    scs_as_id: &str,
+    sub_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     let ctx = nef_self();
     let (sub, amf_uri, udm_uri) = match ctx.read() {
         Ok(c) => (c.subscription_find(sub_id), c.amf_uri(), c.udm_uri()),
         Err(_) => return send_internal_error("NEF context lock poisoned"),
     };
+    let caller_id = authenticated_client_id(request, northbound_auth());
     let sub = match sub {
-        Some(s) if s.scs_as_id == scs_as_id => s,
-        _ => {
+        Some(s) if s.is_owned_by(caller_id.as_deref(), scs_as_id) => s,
+        Some(_) => {
+            log::warn!(
+                "monitoring subscription delete refused: {sub_id} is not owned by the requesting \
+                 client (scsAsId={scs_as_id}, authenticated={caller_id:?})"
+            );
+            return send_not_found(
+                &format!("Subscription {sub_id} not found"),
+                Some("SUBSCRIPTION_NOT_FOUND"),
+            );
+        }
+        None => {
             return send_not_found(
                 &format!("Subscription {sub_id} not found"),
                 Some("SUBSCRIPTION_NOT_FOUND"),
@@ -632,6 +969,33 @@ pub struct SouthboundSubscribe {
     pub body: serde_json::Value,
 }
 
+/// Who a southbound subscription is for (issue #110).
+///
+/// **This type exists to make the anyUE widening unrepresentable.** The previous
+/// signature took `supi: Option<&str>` and did `None => anyUE`, so *absence of
+/// an identity* silently became *every UE in the network*: an AF naming one UE by
+/// `msisdn` or `externalId` — both valid TS 29.122 targets that this function
+/// never read — received a network-wide feed.
+///
+/// Making the target an explicit enum means a caller must **choose** [`AnyUe`],
+/// so no future edit can reintroduce the widening by forgetting a check. A
+/// handler-side guard would have left that possible; the type does not.
+///
+/// [`AnyUe`]: SouthboundTarget::AnyUe
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SouthboundTarget {
+    /// One UE, named by its resolved internal identity.
+    Supi(String),
+    /// Every UE (TS 29.518 `anyUE`, TS 29.503 ueIdentity `anyUE`).
+    ///
+    /// A faithful encoding of a real producer-side capability, kept for the
+    /// group/any-UE feature TS 29.122 will eventually need. **No northbound
+    /// request path constructs it** — the three monitoring types this NEF serves
+    /// are per-UE and their target is mandatory, so an AF cannot reach it. That
+    /// property is asserted by `no_northbound_input_can_produce_any_ue`.
+    AnyUe,
+}
+
 /// Translate a northbound TS 29.122 MonitoringType into the southbound
 /// producer subscribe request (the northbound→southbound mapping):
 ///
@@ -644,11 +1008,13 @@ pub struct SouthboundSubscribe {
 ///   `callbackReference` + `monitoringConfigurations`.
 ///
 /// Returns None for unsupported monitoring types.
+///
+/// `target` is an explicit [`SouthboundTarget`] rather than an optional SUPI: see
+/// that type for why absence-of-identity must not be expressible here (issue
+/// #110).
 fn build_southbound_subscribe(
     monitoring_type: &str,
-    supi: Option<&str>,
-    msisdn: Option<&str>,
-    external_id: Option<&str>,
+    target: &SouthboundTarget,
     nef_notify_uri: &str,
     nef_correlation_id: &str,
     nf_instance_id: &str,
@@ -667,9 +1033,9 @@ fn build_southbound_subscribe(
                 "nfId": nf_instance_id,
             });
             // TS 29.518: the subscription must target a UE (supi) or anyUE.
-            match supi {
-                Some(supi) => subscription["supi"] = serde_json::json!(supi),
-                None => subscription["anyUE"] = serde_json::json!(true),
+            match target {
+                SouthboundTarget::Supi(supi) => subscription["supi"] = serde_json::json!(supi),
+                SouthboundTarget::AnyUe => subscription["anyUE"] = serde_json::json!(true),
             }
             Some(SouthboundSubscribe {
                 producer: SouthboundProducer::Amf,
@@ -678,13 +1044,16 @@ fn build_southbound_subscribe(
             })
         }
         "LOSS_OF_CONNECTIVITY" => {
-            // TS 29.503 ueIdentity: SUPI or GPSI ("msisdn-<digits>" /
-            // "extid-<id>"), or the literal "anyUE".
-            let ue_identity = supi
-                .map(str::to_string)
-                .or_else(|| external_id.map(|e| format!("extid-{e}")))
-                .or_else(|| msisdn.map(|m| format!("msisdn-{m}")))
-                .unwrap_or_else(|| "anyUE".to_string());
+            // TS 29.503 ueIdentity: a SUPI, or the literal "anyUE".
+            //
+            // The GPSI forms this used to accept here are gone on purpose: the
+            // handler now resolves a GPSI to a SUPI before calling us (issue
+            // #110), so there is one identity kind on this path instead of a
+            // three-way fallback whose last arm was `anyUE`.
+            let ue_identity = match target {
+                SouthboundTarget::Supi(supi) => supi.as_str(),
+                SouthboundTarget::AnyUe => "anyUE",
+            };
             Some(SouthboundSubscribe {
                 producer: SouthboundProducer::Udm,
                 path: format!("/nudm-ee/v1/{ue_identity}/ee-subscriptions"),
@@ -697,6 +1066,80 @@ fn build_southbound_subscribe(
             })
         }
         _ => None,
+    }
+}
+
+/// Resolve an AF-supplied GPSI to the internal SUPI via UDM
+/// (TS 29.503 §6.1.3.3.3 `GET /nudm-sdm/v2/{gpsi}/id-translation-result`,
+/// response `IdTranslationResult { supi, gpsi }`) — issue #110.
+///
+/// This is the identity translation TS 33.501 §5.9.2.3 requires of the NEF, and
+/// TS 23.501 §6.2.5.0 names as one of its core functions.
+///
+/// **It fails closed, and that is the security fix.** Every failure — no UDM
+/// configured, unreachable, non-200, or a body with no `supi` — returns `None`,
+/// and the caller then REJECTS the subscription. What must never happen is the
+/// old behaviour, where an unresolvable target fell through to a network-wide
+/// `anyUE` subscription: a request the NEF could not satisfy became a request for
+/// far more than was asked.
+///
+/// **Known gap, not a defect here:** this repo's own `udmd` answers this
+/// operation `501 Not Implemented`
+/// (`bins/nextgcore-udmd/src/app.rs:641-642`, tagged `udmd-12`), so against
+/// nextgcore's UDM every GPSI-targeted monitoring request is refused. That is the
+/// honest outcome and strictly better than the covert widening it replaces;
+/// making it *succeed* needs the UDM side, which belongs to #85.
+async fn resolve_gpsi_to_supi(udm_uri: Option<String>, gpsi: &str) -> Option<String> {
+    let Some(uri) = udm_uri else {
+        log::warn!(
+            "no UDM URI configured; cannot resolve GPSI '{gpsi}' to a SUPI \
+             (subscription will be refused rather than widened to anyUE)"
+        );
+        return None;
+    };
+    let Some((host, port)) = parse_host_port(&uri) else {
+        log::warn!("invalid UDM URI '{uri}'; GPSI '{gpsi}' not resolved");
+        return None;
+    };
+    let client = bounded_client(&host, port);
+    let path = format!("/nudm-sdm/v2/{gpsi}/id-translation-result");
+    match client.get(&path).await {
+        Ok(response) if response.status == 200 => {
+            let supi = response
+                .http
+                .content
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                .and_then(|v| v.get("supi")?.as_str().map(str::to_string));
+            match supi {
+                // A SUPI is interpolated into southbound resource paths, so it
+                // gets the same character-set guard as an AF-supplied identity:
+                // the UDM is more trusted than an AF, but "more trusted" is not
+                // "unvalidated".
+                Some(supi) if valid_ue_identity(&supi) => Some(supi),
+                Some(bad) => {
+                    log::warn!(
+                        "UDM returned a SUPI outside the identity charset for '{gpsi}': {bad:?}"
+                    );
+                    None
+                }
+                None => {
+                    log::warn!("UDM id-translation-result for '{gpsi}' carried no supi");
+                    None
+                }
+            }
+        }
+        Ok(response) => {
+            log::warn!(
+                "UDM id-translation-result for '{gpsi}' returned status {}",
+                response.status
+            );
+            None
+        }
+        Err(e) => {
+            log::warn!("UDM id-translation-result for '{gpsi}' failed: {e}");
+            None
+        }
     }
 }
 
@@ -833,6 +1276,25 @@ async fn southbound_unsubscribe(producer_uri: Option<String>, southbound: Southb
 /// notificationDestination from a producer notification body (AMF
 /// AmfEventNotification `reportList`; UDM Nudm_EE bodies fall through to a
 /// bare monitoringType report).
+///
+/// # The SUPI never crosses this boundary (issue #110)
+///
+/// TS 33.501 §5.9.2.3 requires the NEF to map between the internal subscriber
+/// identity and the external one, and **not** to expose the SUPI to Application
+/// Functions. This function used to copy the producer report's `supi` verbatim
+/// into the AF-bound body — a permanent-identifier disclosure leaving the
+/// operator trust boundary on every notification.
+///
+/// It now echoes the identity the AF itself supplied, read from the subscription
+/// record ([`AfTarget`]) rather than from the producer report, in the same TS
+/// 29.122 member the AF used. No lookup is needed: the AF told us this identity
+/// when it subscribed.
+///
+/// When the AF targeted by the NextGCore-internal `supi` extension there is no
+/// external identity to echo, and the identity is **omitted** rather than filled
+/// in with the SUPI. That loses nothing the AF needs — it already knows which UE
+/// it asked about, and the `subscription` self link identifies which
+/// subscription this is.
 fn build_monitoring_notification(
     sub: &NefMonitoringSubscription,
     producer_body: &serde_json::Value,
@@ -841,6 +1303,13 @@ fn build_monitoring_notification(
         "/3gpp-monitoring-event/v1/{}/subscriptions/{}",
         sub.scs_as_id, sub.id
     );
+    // The AF's own identity for this UE, echoed in the member it used. Computed
+    // once: it is a property of the subscription, not of the report.
+    let af_identity = sub
+        .af_target
+        .as_ref()
+        .map(|t| (t.member(), serde_json::json!(t.value())));
+
     let mut reports = Vec::new();
     if let Some(report_list) = producer_body.get("reportList").and_then(|v| v.as_array()) {
         for report in report_list {
@@ -851,16 +1320,22 @@ fn build_monitoring_notification(
             if report.get("reachability").and_then(|v| v.as_str()) == Some("REACHABLE") {
                 out["reachabilityType"] = serde_json::json!("DATA");
             }
-            if let Some(supi) = report.get("supi") {
-                // NextGCore-internal extension: TS 29.122 identifies the UE
-                // by msisdn/externalId, but no SUPI→GPSI mapping exists here.
-                out["supi"] = supi.clone();
+            // `report["supi"]` is deliberately NOT read. The producer sends the
+            // internal identity; forwarding it is the leak this function exists
+            // to prevent. Do not "restore" this for debugging convenience --
+            // `af_bound_notification_never_contains_supi` fails if you do.
+            if let Some((member, value)) = &af_identity {
+                out[*member] = value.clone();
             }
             reports.push(out);
         }
     }
     if reports.is_empty() {
-        reports.push(serde_json::json!({ "monitoringType": sub.monitoring_type }));
+        let mut bare = serde_json::json!({ "monitoringType": sub.monitoring_type });
+        if let Some((member, value)) = &af_identity {
+            bare[*member] = value.clone();
+        }
+        reports.push(bare);
     }
     serde_json::json!({
         "subscription": self_link,
@@ -1099,6 +1574,12 @@ mod tests {
         })
     }
 
+    /// A DELETE request carrying no credentials — the default-off posture, where
+    /// ownership falls back to the `scsAsId` path segment.
+    fn delete_request() -> SbiRequest {
+        SbiRequest::new()
+    }
+
     #[test]
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-nefd"]);
@@ -1190,9 +1671,7 @@ mod tests {
     fn location_reporting_translates_to_amf_location_report() {
         let req = build_southbound_subscribe(
             "LOCATION_REPORTING",
-            Some("imsi-001010000000001"),
-            None,
-            None,
+            &SouthboundTarget::Supi("imsi-001010000000001".to_string()),
             "http://10.0.0.9:7817/nnef-eventexposure/v1/notify/sub-1",
             "sub-1",
             "nef-instance-1",
@@ -1216,9 +1695,7 @@ mod tests {
     fn ue_reachability_translates_to_amf_reachability_report_any_ue() {
         let req = build_southbound_subscribe(
             "UE_REACHABILITY",
-            None,
-            None,
-            None,
+            &SouthboundTarget::AnyUe,
             "http://10.0.0.9:7817/nnef-eventexposure/v1/notify/sub-2",
             "sub-2",
             "nef-instance-1",
@@ -1236,9 +1713,7 @@ mod tests {
     fn loss_of_connectivity_translates_to_udm_ee() {
         let req = build_southbound_subscribe(
             "LOSS_OF_CONNECTIVITY",
-            Some("imsi-001010000000002"),
-            None,
-            None,
+            &SouthboundTarget::Supi("imsi-001010000000002".to_string()),
             "http://10.0.0.9:7817/nnef-eventexposure/v1/notify/sub-3",
             "sub-3",
             "nef-instance-1",
@@ -1262,41 +1737,33 @@ mod tests {
         assert_eq!(configs["1"]["eventType"], "LOSS_OF_CONNECTIVITY");
     }
 
+    /// Issue #110: GPSI handling left this builder. The handler resolves a GPSI
+    /// to a SUPI *before* calling it, so there is one identity kind on the UDM
+    /// path instead of a three-way fallback whose last arm was `anyUE`.
+    ///
+    /// The old test asserted that `extid-`/`msisdn-` forms were built here and
+    /// that no identity produced `/nudm-ee/v1/anyUE/...`. That last assertion is
+    /// exactly the defect: it pinned "absence of an identity means every UE".
     #[test]
-    fn loss_of_connectivity_ue_identity_fallbacks() {
-        // externalId → GPSI extid form.
+    fn loss_of_connectivity_uses_the_resolved_supi_not_a_gpsi() {
         let req = build_southbound_subscribe(
             "LOSS_OF_CONNECTIVITY",
-            None,
-            None,
-            Some("dev1@af.example.com"),
+            &SouthboundTarget::Supi("imsi-001010000000009".to_string()),
             "http://n/cb",
             "s",
             "nef",
         )
         .expect("supported type");
         assert_eq!(
-            req.path,
-            "/nudm-ee/v1/extid-dev1@af.example.com/ee-subscriptions"
+            req.path, "/nudm-ee/v1/imsi-001010000000009/ee-subscriptions",
+            "the UDM is addressed by the RESOLVED SUPI"
         );
-        // msisdn → GPSI msisdn form.
+
+        // anyUE is still encodable, but only when explicitly chosen -- and no
+        // northbound input chooses it (no_northbound_input_can_produce_any_ue).
         let req = build_southbound_subscribe(
             "LOSS_OF_CONNECTIVITY",
-            None,
-            Some("491700000001"),
-            None,
-            "http://n/cb",
-            "s",
-            "nef",
-        )
-        .expect("supported type");
-        assert_eq!(req.path, "/nudm-ee/v1/msisdn-491700000001/ee-subscriptions");
-        // No identity at all → anyUE.
-        let req = build_southbound_subscribe(
-            "LOSS_OF_CONNECTIVITY",
-            None,
-            None,
-            None,
+            &SouthboundTarget::AnyUe,
             "http://n/cb",
             "s",
             "nef",
@@ -1309,9 +1776,7 @@ mod tests {
     fn unsupported_monitoring_type_translates_to_none() {
         assert!(build_southbound_subscribe(
             "NUMBER_OF_UES_IN_AN_AREA",
-            None,
-            None,
-            None,
+            &SouthboundTarget::Supi("imsi-1".to_string()),
             "http://n/cb",
             "s",
             "nef"
@@ -1531,7 +1996,11 @@ mod tests {
         let location = created.http.get_header("location").unwrap().clone();
         let sub_id = location.rsplit('/').next().unwrap().to_string();
 
-        let deleted = block_on(handle_monitoring_subscription_delete("af1", &sub_id));
+        let deleted = block_on(handle_monitoring_subscription_delete(
+            "af1",
+            &sub_id,
+            &delete_request(),
+        ));
         assert_eq!(deleted.status, 204);
         assert!(nef_self()
             .read()
@@ -1539,7 +2008,11 @@ mod tests {
             .subscription_find(&sub_id)
             .is_none());
 
-        let again = block_on(handle_monitoring_subscription_delete("af1", &sub_id));
+        let again = block_on(handle_monitoring_subscription_delete(
+            "af1",
+            &sub_id,
+            &delete_request(),
+        ));
         assert_eq!(again.status, 404, "second delete must be 404");
     }
 
@@ -1553,7 +2026,11 @@ mod tests {
         let location = created.http.get_header("location").unwrap().clone();
         let sub_id = location.rsplit('/').next().unwrap().to_string();
 
-        let response = block_on(handle_monitoring_subscription_delete("other-af", &sub_id));
+        let response = block_on(handle_monitoring_subscription_delete(
+            "other-af",
+            &sub_id,
+            &delete_request(),
+        ));
         assert_eq!(
             response.status, 404,
             "foreign scsAsId must not see the subscription"
@@ -1644,6 +2121,17 @@ mod tests {
         assert_eq!(response.status, 404);
     }
 
+    /// **Issue #110, the privacy fix.** The producer's `supi` must never reach the
+    /// AF; the AF's own external identity is echoed instead, in the TS 29.122
+    /// member the AF used.
+    ///
+    /// This test previously asserted the opposite —
+    /// `assert_eq!(report["supi"], "imsi-001010000000001")` — so it *pinned the
+    /// leak*. A permanent subscriber identifier crossing the operator trust
+    /// boundary was a documented, tested expectation.
+    ///
+    /// Revert-verified: restoring the `out["supi"] = supi.clone()` line in
+    /// `build_monitoring_notification` fails this test.
     #[test]
     fn build_monitoring_notification_maps_amf_reports() {
         let mut sub = NefMonitoringSubscription::new(
@@ -1651,7 +2139,8 @@ mod tests {
             "UE_REACHABILITY",
             "http://af.example.com/cb",
             "{}",
-        );
+        )
+        .with_af_target(Some(AfTarget::Msisdn("491700000001".to_string())));
         sub.id = "sub-fixed".to_string();
         let producer_body = serde_json::json!({
             "notifyCorrelationId": "sub-fixed",
@@ -1672,7 +2161,17 @@ mod tests {
         let report = &notification["monitoringEventReports"][0];
         assert_eq!(report["monitoringType"], "UE_REACHABILITY");
         assert_eq!(report["reachabilityType"], "DATA");
-        assert_eq!(report["supi"], "imsi-001010000000001");
+        // The SUPI is gone...
+        assert!(
+            report.get("supi").is_none(),
+            "the internal SUPI must not be exposed to an AF (TS 33.501 §5.9.2.3)"
+        );
+        // ...and the AF gets back the identity it supplied, in its own member.
+        assert_eq!(report["msisdn"], "491700000001");
+        assert!(
+            report.get("externalId").is_none(),
+            "only the member the AF actually used is echoed"
+        );
     }
 
     #[test]
@@ -1701,6 +2200,355 @@ mod tests {
         );
     }
 
+    // ── Issue #110: northbound privacy and authorisation ────────────────────
+
+    /// **Criterion 3, the structural claim.** No northbound input can produce an
+    /// `anyUE` subscription.
+    ///
+    /// The old code turned *absence of a resolvable identity* into *every UE in
+    /// the network*, so this enumerates every target shape an AF can send and
+    /// asserts each one either names a single UE or is refused. Nothing in
+    /// between.
+    ///
+    /// The AMF-routed types are the ones that mattered:
+    /// `build_southbound_subscribe` accepted `msisdn`/`external_id` and read
+    /// neither, so naming a UE by MSISDN produced a network-wide feed.
+    #[test]
+    fn no_northbound_input_can_produce_any_ue() {
+        let _guard = lock_globals();
+
+        // Cases that must be REFUSED (no UDM is configured in this context, so a
+        // GPSI cannot be resolved -- and refusing is the point).
+        let refused = [
+            ("no target at all", serde_json::json!({})),
+            (
+                "msisdn with no resolvable UDM",
+                serde_json::json!({"msisdn": "491700000001"}),
+            ),
+            (
+                "externalId with no resolvable UDM",
+                serde_json::json!({"externalId": "dev1@af.example.com"}),
+            ),
+            (
+                "externalGroupId (group scope)",
+                serde_json::json!({"externalGroupId": "group1@af.example.com"}),
+            ),
+        ];
+        for monitoring_type in [
+            "LOCATION_REPORTING",
+            "UE_REACHABILITY",
+            "LOSS_OF_CONNECTIVITY",
+        ] {
+            for (label, target) in &refused {
+                reset_context();
+                let mut body = serde_json::json!({
+                    "monitoringType": monitoring_type,
+                    "notificationDestination": "http://af.example.com:8080/cb",
+                });
+                for (k, v) in target.as_object().expect("object") {
+                    body[k] = v.clone();
+                }
+                let response = block_on(handle_monitoring_subscription_create(
+                    "af1",
+                    &monitoring_request(body),
+                ));
+                assert!(
+                    response.status == 400 || response.status == 404,
+                    "{monitoring_type} / {label}: expected a refusal, got {} -- an unresolvable \
+                     target must never become an anyUE subscription",
+                    response.status
+                );
+                assert_eq!(
+                    nef_self().read().unwrap().subscription_count(),
+                    0,
+                    "{monitoring_type} / {label}: a refused create must store nothing"
+                );
+            }
+
+            // The one accepted shape names exactly one UE, and its southbound
+            // body carries `supi` with no `anyUE` anywhere.
+            reset_context();
+            let body = serde_json::json!({
+                "monitoringType": monitoring_type,
+                "notificationDestination": "http://af.example.com:8080/cb",
+                "supi": "imsi-001010000000001",
+            });
+            let response = block_on(handle_monitoring_subscription_create(
+                "af1",
+                &monitoring_request(body),
+            ));
+            assert_eq!(
+                response.status, 201,
+                "{monitoring_type}: an explicitly identified UE must be accepted"
+            );
+
+            let built = build_southbound_subscribe(
+                monitoring_type,
+                &SouthboundTarget::Supi("imsi-001010000000001".to_string()),
+                "http://n/cb",
+                "s",
+                "nef",
+            )
+            .expect("supported type");
+            // Path AND body: the AMF carries the identity in the body
+            // (`subscription.supi`) while the UDM carries it in the resource path
+            // (`/nudm-ee/v1/{supi}/...`), so checking only one would miss an
+            // `anyUE` on the other surface.
+            let serialised = format!("{} {}", built.path, built.body);
+            assert!(
+                !serialised.contains("anyUE"),
+                "{monitoring_type}: a single-UE target must not emit anyUE, got {serialised}"
+            );
+            assert!(
+                serialised.contains("imsi-001010000000001"),
+                "{monitoring_type}: the resolved SUPI must reach the producer, got {serialised}"
+            );
+        }
+    }
+
+    /// **Criterion 2.** A GPSI that cannot be resolved refuses the subscription
+    /// and issues no southbound subscribe.
+    ///
+    /// Asserted through the store rather than a mock producer: with no AMF/UDM
+    /// URI configured the southbound leg cannot run at all, so "no subscription
+    /// stored" is the observable that a southbound subscribe was not the outcome.
+    /// Against this repo's own udmd the resolution fails with 501, which is the
+    /// same path.
+    #[test]
+    fn an_unresolvable_gpsi_is_rejected_and_issues_no_southbound_subscribe() {
+        let _guard = lock_globals();
+        reset_context();
+
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &monitoring_request(serde_json::json!({
+                "monitoringType": "LOCATION_REPORTING",
+                "notificationDestination": "http://af.example.com:8080/cb",
+                "msisdn": "491700000001",
+            })),
+        ));
+        assert_eq!(
+            response.status, 404,
+            "an unresolvable target UE is a 404, not a silent widening"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "UE_NOT_FOUND");
+        assert_eq!(
+            nef_self().read().unwrap().subscription_count(),
+            0,
+            "nothing is stored, so nothing was subscribed southbound"
+        );
+    }
+
+    /// **Criterion 4, the guard.** No path through the notification builder emits
+    /// a `supi` key, whatever the producer sent and however the AF targeted.
+    ///
+    /// The per-case assertions live in
+    /// `build_monitoring_notification_maps_amf_reports`; this is the blanket one
+    /// that a new branch cannot slip past.
+    #[test]
+    fn af_bound_notification_never_contains_supi() {
+        let targets = [
+            Some(AfTarget::Msisdn("491700000001".to_string())),
+            Some(AfTarget::ExternalId("dev1@af.example.com".to_string())),
+            // The AF used the internal `supi` extension: there is no external
+            // identity to echo, so the identity is OMITTED -- never backfilled
+            // with the SUPI.
+            None,
+        ];
+        let producer_bodies = [
+            serde_json::json!({"reportList": [{"supi": "imsi-001010000000001", "reachability": "REACHABLE"}]}),
+            serde_json::json!({"reportList": [{"supi": "imsi-001010000000001", "location": {"nrLocation": {}}}]}),
+            // No reportList: the bare-report fallback path.
+            serde_json::json!({"supi": "imsi-001010000000001"}),
+            serde_json::json!({}),
+        ];
+
+        for target in &targets {
+            for producer_body in &producer_bodies {
+                let sub = NefMonitoringSubscription::new(
+                    "af1",
+                    "UE_REACHABILITY",
+                    "http://af.example.com/cb",
+                    "{}",
+                )
+                .with_af_target(target.clone());
+                let notification = build_monitoring_notification(&sub, producer_body);
+                let serialised = notification.to_string();
+                assert!(
+                    !serialised.contains("supi"),
+                    "no `supi` key may appear in an AF-bound notification (target={target:?}, \
+                     producer={producer_body}), got {serialised}"
+                );
+                assert!(
+                    !serialised.contains("imsi-001010000000001"),
+                    "nor the SUPI value under any other key, got {serialised}"
+                );
+                match target {
+                    Some(t) => assert_eq!(
+                        notification["monitoringEventReports"][0][t.member()],
+                        serde_json::json!(t.value()),
+                        "the AF's own identity is echoed in its own member"
+                    ),
+                    None => {
+                        let report = &notification["monitoringEventReports"][0];
+                        assert!(report.get("msisdn").is_none());
+                        assert!(report.get("externalId").is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Criterion 6.** Ownership comes from the authenticated identity, so
+    /// client A cannot delete B's subscription by supplying B's `{scsAsId}`.
+    ///
+    /// Exercised on `is_owned_by` directly, because the authenticated identity
+    /// arrives from the TLS/OAuth2 layer and a unit test cannot mint a verified
+    /// peer certificate. The handler's use of it is one call
+    /// (`handle_monitoring_subscription_delete`).
+    #[test]
+    fn ownership_is_derived_from_the_authenticated_identity() {
+        let owned_by_b = NefMonitoringSubscription::new(
+            "af-b",
+            "UE_REACHABILITY",
+            "http://af.example.com/cb",
+            "{}",
+        )
+        .with_owner_id(Some("client-b".to_string()));
+
+        // A authenticates as itself but claims B's scsAsId in the path: refused.
+        assert!(
+            !owned_by_b.is_owned_by(Some("client-a"), "af-b"),
+            "a caller-supplied scsAsId must not confer ownership"
+        );
+        // B authenticated: allowed, even from an unexpected path segment.
+        assert!(owned_by_b.is_owned_by(Some("client-b"), "af-b"));
+        assert!(owned_by_b.is_owned_by(Some("client-b"), "whatever"));
+        // Created under auth, request carries none: cannot prove ownership.
+        assert!(
+            !owned_by_b.is_owned_by(None, "af-b"),
+            "an unauthenticated request cannot claim an authenticated subscription"
+        );
+
+        // Default-off: no authenticated owner recorded, so the historical
+        // scsAsId comparison applies unchanged.
+        let unauthenticated = NefMonitoringSubscription::new(
+            "af-b",
+            "UE_REACHABILITY",
+            "http://af.example.com/cb",
+            "{}",
+        );
+        assert!(unauthenticated.is_owned_by(None, "af-b"));
+        assert!(!unauthenticated.is_owned_by(None, "af-a"));
+    }
+
+    /// The `sub` claim is read only when the server actually verified the token.
+    ///
+    /// The guard in `authenticated_client_id` is load-bearing: without it, an
+    /// unauthenticated caller could set any `sub` and impersonate another client.
+    #[test]
+    fn a_bearer_subject_is_trusted_only_under_enforcement() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let claims = URL_SAFE_NO_PAD.encode(br#"{"sub":"client-a","aud":"NEF"}"#);
+        let token = format!("aGRy.{claims}.c2ln");
+        let request = SbiRequest::post("/3gpp-monitoring-event/v1/af1/subscriptions")
+            .with_header("Authorization", format!("Bearer {token}"));
+
+        assert_eq!(
+            bearer_subject(&format!("Bearer {token}")).as_deref(),
+            Some("client-a")
+        );
+
+        // Enforcement on: the server already verified this token, so the claim
+        // is usable.
+        assert_eq!(
+            authenticated_client_id(
+                &request,
+                NorthboundAuth {
+                    oauth2: true,
+                    mtls: false
+                }
+            )
+            .as_deref(),
+            Some("client-a")
+        );
+        // Enforcement off: nothing verified it, so it must be ignored entirely.
+        assert_eq!(
+            authenticated_client_id(&request, NorthboundAuth::default()),
+            None,
+            "an unverified `sub` must never become an identity -- that is an \
+             impersonation primitive"
+        );
+
+        // A verified client certificate outranks the token.
+        let mut with_cert = request.clone();
+        with_cert.peer_cert_nf_instance_id = Some("cert-identity".to_string());
+        assert_eq!(
+            authenticated_client_id(
+                &with_cert,
+                NorthboundAuth {
+                    oauth2: true,
+                    mtls: true
+                }
+            )
+            .as_deref(),
+            Some("cert-identity"),
+            "an identity this process verified beats a claim in a token"
+        );
+
+        // Malformed authorization headers yield nothing rather than panicking.
+        for bad in [
+            "",
+            "Bearer",
+            "Bearer notatoken",
+            "Basic dXNlcjpwdw==",
+            "Bearer a.!!!.c",
+        ] {
+            assert_eq!(bearer_subject(bad), None, "input {bad:?}");
+        }
+    }
+
+    /// The startup guard: `--verify-client` without `--tls` is refused.
+    ///
+    /// Booting anyway would present an unauthenticated plaintext listener as a
+    /// mutually-authenticated one — the operator would believe the northbound
+    /// surface was protected when every request on it is anonymous.
+    #[test]
+    fn verify_client_without_tls_is_a_startup_error() {
+        let args = Args::parse_from(["nextgcore-nefd", "--verify-client"]);
+        assert!(args.verify_client);
+        assert!(
+            !args.tls,
+            "this combination must be rejected in main(), not silently ignored"
+        );
+    }
+
+    #[test]
+    fn oauth2_require_knob_parses_and_defaults_off() {
+        let dir = std::env::temp_dir();
+        let off = dir.join(format!("nef-110-off-{}.yaml", std::process::id()));
+        std::fs::write(
+            &off,
+            "nef:\n  sbi:\n    server:\n      - address: 127.0.0.1\n",
+        )
+        .unwrap();
+        assert!(
+            !oauth2_required(off.to_str().unwrap()),
+            "default must stay OFF for matched-sim parity"
+        );
+        let on = dir.join(format!("nef-110-on-{}.yaml", std::process::id()));
+        std::fs::write(&on, "nef:\n  sbi:\n    oauth2:\n      require: true\n").unwrap();
+        assert!(oauth2_required(on.to_str().unwrap()));
+        // A missing or unparsable file is OFF, never a hard failure.
+        assert!(!oauth2_required("/nonexistent/nef.yaml"));
+        let _ = std::fs::remove_file(off);
+        let _ = std::fs::remove_file(on);
+    }
+
     // ── Router ───────────────────────────────────────────────────────────────
     #[test]
     fn router_unknown_path_returns_404_and_wrong_method_405() {
@@ -1711,5 +2559,132 @@ mod tests {
         let wrong_method = SbiRequest::get("/3gpp-monitoring-event/v1/af1/subscriptions");
         let response = block_on(nef_sbi_request_handler(wrong_method));
         assert_eq!(response.status, 405);
+    }
+}
+
+/// **Issue #110, criterion 5.** Every northbound route rejects a caller that
+/// cannot authenticate, exercised through the real listener rather than by
+/// calling handlers directly.
+///
+/// The `nefd` handlers themselves never check a token — nextgcore-sbi's server
+/// verifies it and answers 401 *before dispatch*
+/// (`libs/nextgcore-sbi/src/server.rs:386-398`). So a handler-level test could
+/// not show this property at all: it has to run against a mounted server, which
+/// is also what makes the "already verified, so `sub` is trustworthy" argument in
+/// [`authenticated_client_id`] checkable rather than merely asserted.
+#[cfg(test)]
+mod northbound_auth_tests {
+    use nextgcore_sbi::client::SbiClient;
+    use nextgcore_sbi::message::SbiRequest;
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    use nextgcore_sbi::types::NfType;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    fn free_port() -> u16 {
+        nextgcore_sbi::test_support::free_port()
+    }
+
+    fn build_es256_token(
+        sk: &p256::ecdsa::SigningKey,
+        kid: &str,
+        aud: &str,
+        scope: &str,
+        sub: &str,
+    ) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature};
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
+        let claims = serde_json::json!({
+            "iss": "NRF", "sub": sub, "aud": aud,
+            "scope": scope, "exp": exp, "iat": 0
+        })
+        .to_string();
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("{h}.{p}.{s}")
+    }
+
+    fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let point = sk.verifying_key().to_encoded_point(false);
+        serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":kid,
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }]})
+    }
+
+    async fn start_enforcing_server(jwks: serde_json::Value) -> (SbiServer, u16) {
+        super::nef_context_init(256, 256);
+        let port = free_port();
+        let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(jwks);
+        cfg = cfg.with_expected_audience_nf_type(NfType::Nef);
+        let server = SbiServer::new(cfg);
+        server
+            .start(super::nef_sbi_request_handler)
+            .await
+            .expect("server start");
+        (server, port)
+    }
+
+    /// Every northbound route — the two AF-facing APIs and the producer sink.
+    fn northbound_routes() -> Vec<SbiRequest> {
+        vec![
+            SbiRequest::post("/3gpp-monitoring-event/v1/af1/subscriptions"),
+            SbiRequest::delete("/3gpp-monitoring-event/v1/af1/subscriptions/sub-1"),
+            SbiRequest::post("/3gpp-device-triggering/v1/af1/transactions"),
+            SbiRequest::post("/nnef-eventexposure/v1/notify/sub-1"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn every_northbound_route_rejects_an_unauthenticated_caller() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let (server, port) = start_enforcing_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        for request in northbound_routes() {
+            let uri = request.header.uri.clone();
+            let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(request))
+                .await
+                .expect("bounded")
+                .expect("response");
+            assert!(
+                resp.status == 401 || resp.status == 403,
+                "{uri}: an unauthenticated caller must be refused, got {}",
+                resp.status
+            );
+        }
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_audience_token_is_refused_on_the_northbound_surface() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let (server, port) = start_enforcing_server(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // A token minted for the AMF must not open the NEF.
+        let token = build_es256_token(&sk, "nrf-es256", "AMF", "3gpp-monitoring-event", "client-a");
+        let request = SbiRequest::post("/3gpp-monitoring-event/v1/af1/subscriptions")
+            .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(request))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+        server.stop().await.expect("stop");
     }
 }
