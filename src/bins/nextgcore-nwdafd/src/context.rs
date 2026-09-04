@@ -2,6 +2,12 @@
 //!
 //! Network Data Analytics Function context (TS 23.288)
 //! Manages analytics subscriptions, ML models, and data collection
+//!
+//! The two consumer-facing subscription maps and the THRESHOLD edge state are
+//! durable when a state file is configured (issue #66/#192); everything else —
+//! the sample window, the NRF collector's own subscription — is rebuilt at boot.
+//! See [`NwdafContext::set_state_file`] for the format and its compatibility
+//! rules.
 
 use crate::analytics::AnalyticsEngine;
 use std::collections::HashMap;
@@ -402,6 +408,46 @@ impl AnalyticsId {
     }
 }
 
+// ── durable representation (issue #66/#192) ─────────────────────────────────
+//
+// `AnalyticsId` reaches the durable snapshot through `EventSubscription.event`
+// and `MlProvSubscription.ml_events`, so THIS CODEC IS A COMPATIBILITY SURFACE,
+// not boilerplate: `StateStore` refuses to overwrite a snapshot it cannot parse
+// (#190), so changing the representation between builds makes nwdafd FAIL
+// STARTUP after an upgrade rather than reset quietly.
+//
+// Two decisions, both deliberate:
+//
+// 1. The token is the **TS 29.520 spelling** (`NF_LOAD`), never the Rust variant
+//    name (`NfLoad`). The spec text is the stable contract; the Rust identifier
+//    is ours to rename, and renaming one has no business invalidating an
+//    operator's snapshot.
+//
+// 2. It DELEGATES to `as_str`/`from_str` instead of carrying 25
+//    `#[serde(rename = "…")]` attributes. Attributes would be a second copy of
+//    the token table with nothing to catch it drifting from the wire codec —
+//    `test_analytics_id_token_round_trip` only exercises `as_str`/`from_str`.
+//    Delegating makes the on-disk token definitionally the wire token, so the
+//    existing yaml-pinned test guards the snapshot too.
+//
+// `as_str` (`NwdafEvent`) rather than `as_event_id` (`EventId`): the latter is
+// partial — `PFD_DETERMINATION` has no `EventId` spelling and so could not be
+// encoded at all — and both persisted sites are typed `NwdafEvent` upstream.
+impl serde::Serialize for AnalyticsId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AnalyticsId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let token = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_str(&token).ok_or_else(|| {
+            serde::de::Error::custom(format!("{token:?} is not a TS 29.520 NwdafEvent token"))
+        })
+    }
+}
+
 /// TS 29.520 `NotificationMethod` — how the consumer is notified for an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationMethod {
@@ -430,6 +476,26 @@ impl NotificationMethod {
             Self::Periodic => "PERIODIC",
             Self::Threshold => "THRESHOLD",
         }
+    }
+}
+
+/// Durable representation: the TS 29.520 token, emitted by the same codec the
+/// wire uses. Same reasoning as [`AnalyticsId`]'s impl above — see that comment
+/// before changing either.
+impl serde::Serialize for NotificationMethod {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for NotificationMethod {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let token = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_wire(&token).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "{token:?} is not a TS 29.520 NotificationMethod token"
+            ))
+        })
     }
 }
 
@@ -467,17 +533,25 @@ impl MatchingDirection {
 
 /// One entry of TS 29.520 `NnwdafEventsSubscription.eventSubscriptions[]`
 /// (`EventSubscription`).
-#[derive(Debug, Clone)]
+///
+/// PERSISTED (issue #66/#192). When adding a field, give it `#[serde(default)]`
+/// unless a record without it is genuinely unusable: `restore_from` skips
+/// malformed records individually, so a newly-required member silently drops
+/// EVERY subscription written by the previous build.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EventSubscription {
     /// The analytics event (`event`, NwdafEvent).
     pub event: AnalyticsId,
     /// `notificationMethod` (PERIODIC / THRESHOLD); `None` = unspecified.
+    #[serde(default)]
     pub notification_method: Option<NotificationMethod>,
     /// Reporting period in seconds, from `extraReportReq.repPeriod`
     /// (`EventReportingRequirement`).
+    #[serde(default)]
     pub rep_period_secs: Option<u64>,
     /// Load-level threshold (`loadLevelThreshold` / `nfLoadLvlThds`), carried
     /// for the deferred THRESHOLD evaluation (nwafd-07); not yet evaluated.
+    #[serde(default)]
     pub load_level_threshold: Option<u64>,
     /// Additional `nfLoadLvlThds[]` entries beyond the first (issue #108).
     ///
@@ -487,16 +561,24 @@ pub struct EventSubscription {
     /// scalar rather than replacing it, so the many call sites and tests that
     /// read `load_level_threshold` for the primary threshold keep working;
     /// [`Self::load_level_thresholds`] is the accessor evaluation should use.
+    #[serde(default)]
     pub extra_load_level_thresholds: Vec<u64>,
     /// `matchingDir` (ASCENDING / DESCENDING / CROSSED), carried for nwafd-07.
+    ///
+    /// Persisted as the received string, which is why [`MatchingDirection`] is
+    /// NOT part of the durable tree and needs no codec of its own.
+    #[serde(default)]
     pub matching_dir: Option<String>,
     /// Per-event slice filters (`snssais`).
+    #[serde(default)]
     pub snssais: Vec<SNssai>,
     /// Per-event NF-instance filter (`nfInstanceIds`, TS 29.520
     /// `EventSubscription`); empty = no filter (G2-1).
+    #[serde(default)]
     pub nf_instance_ids: Vec<String>,
     /// Per-event NF-type filter (`nfTypes`, TS 29.520 `EventSubscription`);
     /// empty = no filter (G2-1).
+    #[serde(default)]
     pub nf_types: Vec<String>,
 }
 
@@ -554,11 +636,17 @@ fn event_level_key(subscription_id: &str, event: AnalyticsId, nf_instance_id: &s
 }
 
 /// S-NSSAI (Single Network Slice Selection Assistance Information)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// PERSISTED (issue #66/#192). The field names are already the TS 29.571
+/// spelling, so the derive emits `{"sst": .., "sd": ..}` with no renames. `sd`
+/// stays a `u32` rather than the wire's hex string: a snapshot is not a wire
+/// surface, and the integer is lossless.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SNssai {
     /// Slice/Service Type (SST)
     pub sst: u8,
     /// Slice Differentiator (SD) - optional 24-bit value
+    #[serde(default)]
     pub sd: Option<u32>,
 }
 
@@ -572,15 +660,24 @@ impl Default for SNssai {
 ///
 /// A single subscription record may carry multiple events via
 /// [`events`](Self::events), matching the spec `eventSubscriptions[]` array.
-#[derive(Debug, Clone)]
+///
+/// PERSISTED (issue #66/#192) — see [`EventSubscription`] for the rule on
+/// adding a field. `subscription_id`, `notification_uri`, `expiry`, `active` and
+/// `notification_correlation_id` are deliberately NOT defaulted: a record
+/// missing any of them cannot serve the consumer that created it (the
+/// correlation ID is echoed in every Notify body), so skipping it is the honest
+/// outcome.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AnalyticsSubscription {
     /// Unique subscription ID
     pub subscription_id: String,
     /// Per-event subscriptions (`eventSubscriptions[]`, minItems 1).
     pub events: Vec<EventSubscription>,
     /// Target SUPI (for UE-specific analytics)
+    #[serde(default)]
     pub target_supi: Option<String>,
     /// Target S-NSSAI (for slice-specific analytics)
+    #[serde(default)]
     pub target_snssai: Option<SNssai>,
     /// Event tokens the consumer asked for that are outside the TS 29.520
     /// `NwdafEvent` enumeration entirely (issue #108).
@@ -589,6 +686,7 @@ pub struct AnalyticsSubscription {
     /// free-form string alternative expressly for forward compatibility, so a
     /// consumer requesting a newer analytics type must still get the events it
     /// *is* entitled to. These surface per-event in `failEventReports`.
+    #[serde(default)]
     pub unknown_events: Vec<String>,
     /// Notification URI for analytics reports (`notificationURI`)
     pub notification_uri: String,
@@ -603,15 +701,19 @@ pub struct AnalyticsSubscription {
     /// time since `last_notification_time` is less than this value.
     pub repetition_period_secs: Option<u64>,
     /// Unix timestamp of the last successfully dispatched notification.
+    #[serde(default)]
     pub last_notification_time: Option<u64>,
     /// `evtReq.maxReportNbr` (TS 29.523 `ReportingInformation`): stop after this
     /// many notifications. `None` = unlimited (issue #108).
+    #[serde(default)]
     pub max_report_nbr: Option<u64>,
     /// Notifications successfully dispatched so far, counted against
     /// [`Self::max_report_nbr`].
+    #[serde(default)]
     pub reports_sent: u64,
     /// Set once a termination notification carrying `termCause` has been sent,
     /// so it is emitted exactly once (issue #108).
+    #[serde(default)]
     pub termination_notified: bool,
 }
 
@@ -753,17 +855,24 @@ impl AnalyticsSubscription {
 /// spec Subscribe/Notify resource. A consumer (e.g. an AnLF) subscribes for ML
 /// model availability for one or more `NwdafEvent`s; the NWDAF delivers an
 /// `NwdafMLModelProvNotif` callback carrying the model file address(es).
-#[derive(Debug, Clone)]
+///
+/// PERSISTED (issue #66/#192) — see [`EventSubscription`] for the rule on adding
+/// a field. `notified` is persisted because it is what makes the callback
+/// one-shot: losing it re-POSTs "model available" to every consumer after every
+/// restart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MlProvSubscription {
     /// Unique subscription ID (`{subscriptionId}` in the resource URI).
     pub subscription_id: String,
     /// Consumer callback URI (`notifUri`, mandatory).
     pub notif_uri: String,
     /// Notification correlation ID (`notifCorreId`, optional — spec casing).
+    #[serde(default)]
     pub notif_corr_id: Option<String>,
     /// Subscribed ML events (`mLEventSubscs[].mLEvent`, minItems 1).
     pub ml_events: Vec<AnalyticsId>,
     /// Whether the (one-shot, "model available") callback has been dispatched.
+    #[serde(default)]
     pub notified: bool,
 }
 
@@ -819,6 +928,32 @@ pub struct DataSource {
     pub enabled: bool,
 }
 
+/// Why durable state could not be loaded (issue #66/#192).
+#[derive(Debug, thiserror::Error)]
+pub enum NwdafStateError {
+    /// The snapshot file itself could not be read or parsed.
+    #[error(transparent)]
+    Store(#[from] nextgcore_core::state_store::StateStoreError),
+    /// The snapshot was written by a newer build.
+    ///
+    /// Refused rather than partially restored: restoring only the members this
+    /// build recognises and then persisting would rewrite a newer-format file in
+    /// the older format, destroying the parts it could not read. That is the same
+    /// data-loss shape [`nextgcore_core::state_store`] exists to prevent, reached
+    /// by downgrade instead of by corruption.
+    #[error(
+        "state file {path} was written by a newer nwdafd (snapshot version {found}; this build \
+         understands {supported}). Refusing to restore or overwrite it — persisting in the older \
+         format would discard what this build cannot read. Run the newer build, or move the file \
+         aside to start fresh."
+    )]
+    UnsupportedVersion {
+        path: std::path::PathBuf,
+        found: u64,
+        supported: u64,
+    },
+}
+
 /// NWDAF Context - main context structure
 pub struct NwdafContext {
     /// NF instance ID
@@ -858,6 +993,19 @@ pub struct NwdafContext {
     max_subscriptions: usize,
     /// Context initialized flag
     initialized: AtomicBool,
+    /// Durable snapshot of the two subscription maps plus the THRESHOLD edge
+    /// state (issue #66/#192). Disabled unless a state file is configured, in
+    /// which case the memory-only behaviour is byte-identical to before.
+    ///
+    /// `StateStore` rather than the `read_snapshot`/`write_snapshot` free
+    /// functions: it enforces "never overwrite a snapshot you could not read"
+    /// internally, and a new adopter has no reason to take that obligation on
+    /// manually.
+    state: nextgcore_core::state_store::StateStore,
+    /// Set by the mutators whose persist is DEFERRED to the end of the
+    /// dispatcher tick (see [`NwdafContext::flush_state_if_dirty`]); cleared by
+    /// any write of the snapshot.
+    dirty: AtomicBool,
     /// Bounded ISAC sensing-result store (issue #16, non-normative 6G).
     /// LOCK ORDER (nf-context-lock-deadlocks): outer context RwLock (read)
     /// FIRST, then only this lock — never while holding another interior lock.
@@ -888,6 +1036,8 @@ impl NwdafContext {
             next_id: AtomicUsize::new(1),
             max_subscriptions: 0,
             initialized: AtomicBool::new(false),
+            state: nextgcore_core::state_store::StateStore::disabled(),
+            dirty: AtomicBool::new(false),
             #[cfg(feature = "sensing")]
             sensing_results: RwLock::new(VecDeque::new()),
             #[cfg(feature = "sensing")]
@@ -976,6 +1126,14 @@ impl NwdafContext {
         if !self.initialized.load(Ordering::SeqCst) {
             return;
         }
+        // Issue #66/#192: DISABLE the store before clearing anything. `fini`
+        // empties every map, and the notification dispatcher is a detached task
+        // that can tick during shutdown — so a persist reached afterwards would
+        // write an empty snapshot over a good one and lose every subscription.
+        // Disabling makes `persist` a no-op, which is the only ordering that
+        // cannot lose data regardless of what runs next.
+        self.state = nextgcore_core::state_store::StateStore::disabled();
+        self.dirty.store(false, Ordering::SeqCst);
         #[cfg(feature = "sensing")]
         {
             let mut buf = self
@@ -1094,31 +1252,280 @@ impl NwdafContext {
         self.initialized.load(Ordering::SeqCst)
     }
 
-    /// Add an analytics subscription
-    pub fn add_subscription(&self, subscription: AnalyticsSubscription) -> Option<String> {
-        let mut subs = self.analytics_subscriptions.write().ok()?;
+    // ── durable state (issue #66/#192) ───────────────────────────────────────
 
-        if subs.len() >= self.max_subscriptions {
-            log::error!(
-                "Maximum analytics subscriptions [{}] reached",
-                self.max_subscriptions
-            );
-            return None;
+    /// Snapshot document version.
+    ///
+    /// Bump ONLY for a change no `#[serde(default)]` can absorb — a renamed or
+    /// re-typed member. A bump makes every older snapshot unreadable to this
+    /// build, so adding a defaulted field is almost always the better move.
+    pub const SNAPSHOT_VERSION: u64 = 1;
+
+    /// Point this context at a snapshot file and restore any prior state,
+    /// returning how many records were installed.
+    ///
+    /// Call once at startup, **after** [`init`](Self::init) (the capacity cap
+    /// must be known) and **before** the SBI server can accept a subscription,
+    /// so a restored record is never shadowed by a fresh one.
+    ///
+    /// A snapshot that cannot be read is an **error**: the caller should refuse
+    /// to start rather than come up empty and answer "no such subscription" for
+    /// subscriptions that exist. `StateStore` additionally refuses to overwrite
+    /// such a file, so it survives for recovery either way.
+    ///
+    /// # The snapshot is a compatibility surface
+    ///
+    /// ```json
+    /// {
+    ///   "version": 1,
+    ///   "analyticsSubscriptions": [ { "subscription_id": "…",
+    ///                                 "events": [ { "event": "NF_LOAD",
+    ///                                               "notification_method": "PERIODIC" } ] } ],
+    ///   "mlProvSubscriptions":    [ { "ml_events": ["NF_LOAD"] } ],
+    ///   "eventLevels":            { "sub-1\u001fNF_LOAD\u001famf-1": 42.0 }
+    /// }
+    /// ```
+    ///
+    /// Enums are written as their TS 29.520 tokens by the same codec the wire
+    /// uses — see the comment on `impl Serialize for AnalyticsId`. Records are
+    /// sorted by ID so two writes of equal state produce equal bytes.
+    ///
+    /// `eventLevels` keys are [`event_level_key`]'s three-part key, whose
+    /// separators are unit separators, so on disk they appear escaped
+    /// (`"sub-1\u001fNF_LOAD\u001famf-1"`).
+    pub fn set_state_file(&mut self, path: std::path::PathBuf) -> Result<usize, NwdafStateError> {
+        use nextgcore_core::state_store::{Loaded, StateStore};
+        self.state = StateStore::new(Some(path.clone()));
+        match self.state.load()? {
+            Loaded::Snapshot(doc) => {
+                let restored = self.restore_from(&doc, &path);
+                if restored.is_err() {
+                    // Belt and braces: the store is NOT poisoned here (the load
+                    // itself succeeded), so a caller that logs this error and
+                    // carries on would otherwise be free to overwrite a snapshot
+                    // this build cannot fully read. Disable persisting instead.
+                    self.state = StateStore::disabled();
+                }
+                restored
+            }
+            // First boot: nothing to restore, and persisting is enabled.
+            Loaded::Absent => Ok(0),
+        }
+    }
+
+    /// Serialize the durable maps to one snapshot document.
+    ///
+    /// Takes read locks on all three maps, which is why every caller must have
+    /// dropped its write guard first: `std::sync::RwLock` is not reentrant.
+    fn snapshot(&self) -> serde_json::Value {
+        let mut subs: Vec<AnalyticsSubscription> = self
+            .analytics_subscriptions
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        subs.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+
+        let mut ml_subs: Vec<MlProvSubscription> = self
+            .ml_prov_subscriptions
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        ml_subs.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+
+        // BTreeMap for a stable key order. The levels come from JSON numbers
+        // (`extract_levels` reads them with `as_f64`), so they are always finite
+        // and cannot serialise as the `null` that a NaN would become.
+        let levels: std::collections::BTreeMap<String, f64> = self
+            .event_levels
+            .read()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
+
+        serde_json::json!({
+            "version": Self::SNAPSHOT_VERSION,
+            "analyticsSubscriptions": subs,
+            "mlProvSubscriptions": ml_subs,
+            "eventLevels": levels,
+        })
+    }
+
+    /// Restore the durable maps from a snapshot document.
+    ///
+    /// An individual malformed record is skipped rather than costing the whole
+    /// file — the file was already validated as JSON by the store, so a bad
+    /// record means a schema change, not corruption. A *newer* document version
+    /// is refused outright; see [`NwdafStateError::UnsupportedVersion`].
+    ///
+    /// The capacity cap is deliberately NOT applied here. Dropping a restored
+    /// subscription would leave a consumer holding a resource URI that 404s
+    /// while our own snapshot says it exists; being temporarily over the cap
+    /// (which then refuses new subscriptions until enough are deleted) is the
+    /// honest failure.
+    fn restore_from(
+        &self,
+        doc: &serde_json::Value,
+        path: &std::path::Path,
+    ) -> Result<usize, NwdafStateError> {
+        // An absent version cannot be from the future, so treat it as this
+        // build's — that keeps a hand-written snapshot usable.
+        let found = doc
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(Self::SNAPSHOT_VERSION);
+        if found > Self::SNAPSHOT_VERSION {
+            return Err(NwdafStateError::UnsupportedVersion {
+                path: path.to_path_buf(),
+                found,
+                supported: Self::SNAPSHOT_VERSION,
+            });
         }
 
-        let sub_id = subscription.subscription_id.clone();
-        subs.insert(sub_id.clone(), subscription);
+        let mut restored = 0usize;
+        if let Some(arr) = doc.get("analyticsSubscriptions").and_then(|v| v.as_array()) {
+            if let Ok(mut subs) = self.analytics_subscriptions.write() {
+                for v in arr {
+                    match serde_json::from_value::<AnalyticsSubscription>(v.clone()) {
+                        Ok(sub) => {
+                            subs.insert(sub.subscription_id.clone(), sub);
+                            restored += 1;
+                        }
+                        Err(e) => {
+                            log::warn!("skipping unreadable NWDAF analytics subscription: {e}")
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(arr) = doc.get("mlProvSubscriptions").and_then(|v| v.as_array()) {
+            if let Ok(mut subs) = self.ml_prov_subscriptions.write() {
+                for v in arr {
+                    match serde_json::from_value::<MlProvSubscription>(v.clone()) {
+                        Ok(sub) => {
+                            subs.insert(sub.subscription_id.clone(), sub);
+                            restored += 1;
+                        }
+                        Err(e) => log::warn!("skipping unreadable NWDAF ML-prov subscription: {e}"),
+                    }
+                }
+            }
+        }
+        // THRESHOLD edge state. Restored so a level already past its threshold
+        // does not read as a fresh crossing after a restart: `threshold_crossed`
+        // fires on `previous == None`, so losing this re-alarms every THRESHOLD
+        // subscription whose instance is currently above the threshold.
+        if let Some(map) = doc.get("eventLevels").and_then(|v| v.as_object()) {
+            if let Ok(mut levels) = self.event_levels.write() {
+                for (k, v) in map {
+                    match v.as_f64() {
+                        Some(level) => {
+                            levels.insert(k.clone(), level);
+                        }
+                        None => log::warn!("skipping unreadable NWDAF event level for key {k}"),
+                    }
+                }
+            }
+        }
+        Ok(restored)
+    }
 
-        log::info!("Analytics subscription added: {sub_id}");
+    /// Write the snapshot now. A no-op when no state file is configured, and
+    /// refused (loudly) when the previous load failed.
+    ///
+    /// Used by the consumer-facing CRUD paths: the 201/204 has already been
+    /// answered, so the record must be durable before the response is acted on.
+    /// A full-store write also makes any deferred mutation durable, so it clears
+    /// the dirty flag.
+    fn persist(&self) {
+        if !self.state.is_enabled() {
+            return;
+        }
+        let doc = self.snapshot();
+        self.dirty.store(false, Ordering::SeqCst);
+        if let Err(e) = self.state.persist(&doc) {
+            // The consumer's subscription exists in memory but not on disk: the
+            // request was answered successfully and will not survive a restart.
+            // Error, not warn — this is the promise being quietly broken.
+            log::error!("NWDAF state was NOT persisted: {e}");
+        }
+    }
+
+    /// Note that durable state changed, to be written by the next
+    /// [`flush_state_if_dirty`](Self::flush_state_if_dirty).
+    ///
+    /// Used by the per-tick bookkeeping mutators instead of [`persist`](Self::persist)
+    /// — see `flush_state_if_dirty` for why.
+    fn mark_dirty(&self) {
+        if self.state.is_enabled() {
+            self.dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Write the snapshot if a deferred mutation is pending. Called once at the
+    /// end of each notification-dispatcher tick.
+    ///
+    /// WHY THESE ARE DEFERRED. `update_subscription_last_notification`,
+    /// `mark_subscription_terminated`, `mark_ml_prov_notified` and
+    /// `set_event_level` are called *per subscription per tick*, and
+    /// `StateStore::persist` rewrites the entire store with two `fsync`s. At the
+    /// shipped `--max-subscriptions 1024` a synchronous persist per call would
+    /// rewrite a ~500 KB file up to 1024 times per 30 s tick — half a gigabyte
+    /// of writes to record counter bumps.
+    ///
+    /// The window this opens is one tick wide and so is its worst case: a crash
+    /// inside it can repeat one notification, or let a subscription exceed
+    /// `maxReportNbr` by that tick's reports. It CANNOT resurrect a deleted
+    /// subscription — that path persists synchronously. And because the
+    /// dispatcher ticks unconditionally, a future call site that forgets to
+    /// flush is still covered by the next tick.
+    pub fn flush_state_if_dirty(&self) {
+        if self.dirty.swap(false, Ordering::SeqCst) {
+            if let Err(e) = self.state.persist(&self.snapshot()) {
+                log::error!("NWDAF state was NOT persisted: {e}");
+            }
+        }
+    }
+
+    /// Whether durable state is configured (introspection/tests).
+    pub fn state_is_enabled(&self) -> bool {
+        self.state.is_enabled()
+    }
+
+    /// Add an analytics subscription
+    pub fn add_subscription(&self, subscription: AnalyticsSubscription) -> Option<String> {
+        let sub_id = {
+            let mut subs = self.analytics_subscriptions.write().ok()?;
+
+            if subs.len() >= self.max_subscriptions {
+                log::error!(
+                    "Maximum analytics subscriptions [{}] reached",
+                    self.max_subscriptions
+                );
+                return None;
+            }
+
+            let sub_id = subscription.subscription_id.clone();
+            subs.insert(sub_id.clone(), subscription);
+
+            log::info!("Analytics subscription added: {sub_id}");
+            sub_id
+        };
+        // The guard MUST be dropped first: persist -> snapshot takes a read lock
+        // on this same map, and std RwLock is not reentrant (issue #66/#192).
+        self.persist();
         Some(sub_id)
     }
 
     /// Remove an analytics subscription
     pub fn remove_subscription(&self, subscription_id: &str) -> Option<AnalyticsSubscription> {
-        let mut subs = self.analytics_subscriptions.write().ok()?;
-        let removed = subs.remove(subscription_id);
+        let removed = {
+            let mut subs = self.analytics_subscriptions.write().ok()?;
+            subs.remove(subscription_id)
+        };
+        // Persist the removal too, or a restart resurrects a subscription the
+        // consumer deleted and the NWDAF resumes POSTing analytics for it.
         if removed.is_some() {
             log::info!("Analytics subscription removed: {subscription_id}");
+            self.persist();
         }
         removed
     }
@@ -1126,15 +1533,23 @@ impl NwdafContext {
     /// Replace an existing analytics subscription (PUT). Returns false if the
     /// subscription does not exist (so the handler can answer 404).
     pub fn update_subscription(&self, subscription: AnalyticsSubscription) -> bool {
-        if let Ok(mut subs) = self.analytics_subscriptions.write() {
-            if let std::collections::hash_map::Entry::Occupied(mut e) =
-                subs.entry(subscription.subscription_id.clone())
-            {
-                e.insert(subscription);
-                return true;
+        let replaced = {
+            let Ok(mut subs) = self.analytics_subscriptions.write() else {
+                return false;
+            };
+            match subs.entry(subscription.subscription_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.insert(subscription);
+                    true
+                }
+                std::collections::hash_map::Entry::Vacant(_) => false,
             }
+        };
+        // Guard dropped first -- see add_subscription.
+        if replaced {
+            self.persist();
         }
-        false
+        replaced
     }
 
     /// Get analytics subscription by ID
@@ -1161,17 +1576,22 @@ impl NwdafContext {
 
     /// Add an Nnwdaf_MLModelProvision subscription (nwafd-05).
     pub fn add_ml_prov_subscription(&self, sub: MlProvSubscription) -> Option<String> {
-        let mut subs = self.ml_prov_subscriptions.write().ok()?;
-        if subs.len() >= self.max_subscriptions {
-            log::error!(
-                "Maximum ML-provision subscriptions [{}] reached",
-                self.max_subscriptions
-            );
-            return None;
-        }
-        let id = sub.subscription_id.clone();
-        subs.insert(id.clone(), sub);
-        log::info!("ML-provision subscription added: {id}");
+        let id = {
+            let mut subs = self.ml_prov_subscriptions.write().ok()?;
+            if subs.len() >= self.max_subscriptions {
+                log::error!(
+                    "Maximum ML-provision subscriptions [{}] reached",
+                    self.max_subscriptions
+                );
+                return None;
+            }
+            let id = sub.subscription_id.clone();
+            subs.insert(id.clone(), sub);
+            log::info!("ML-provision subscription added: {id}");
+            id
+        };
+        // Guard dropped first -- see add_subscription.
+        self.persist();
         Some(id)
     }
 
@@ -1187,21 +1607,37 @@ impl NwdafContext {
     /// Replace an existing ML-provision subscription (PUT). Returns false if the
     /// subscription does not exist (so the handler can answer 404).
     pub fn update_ml_prov_subscription(&self, sub: MlProvSubscription) -> bool {
-        if let Ok(mut subs) = self.ml_prov_subscriptions.write() {
-            if let std::collections::hash_map::Entry::Occupied(mut e) =
-                subs.entry(sub.subscription_id.clone())
-            {
-                e.insert(sub);
-                return true;
+        let replaced = {
+            let Ok(mut subs) = self.ml_prov_subscriptions.write() else {
+                return false;
+            };
+            match subs.entry(sub.subscription_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.insert(sub);
+                    true
+                }
+                std::collections::hash_map::Entry::Vacant(_) => false,
             }
+        };
+        // Guard dropped first -- see add_subscription.
+        if replaced {
+            self.persist();
         }
-        false
+        replaced
     }
 
     /// Remove an ML-provision subscription (DELETE).
     pub fn remove_ml_prov_subscription(&self, subscription_id: &str) -> Option<MlProvSubscription> {
-        let mut subs = self.ml_prov_subscriptions.write().ok()?;
-        subs.remove(subscription_id)
+        let removed = {
+            let mut subs = self.ml_prov_subscriptions.write().ok()?;
+            subs.remove(subscription_id)
+        };
+        // Removals are persisted too -- otherwise the one-shot "model available"
+        // callback is re-sent after a restart to a consumer that unsubscribed.
+        if removed.is_some() {
+            self.persist();
+        }
+        removed
     }
 
     /// All ML-provision subscriptions that have not yet had their (one-shot)
@@ -1214,11 +1650,24 @@ impl NwdafContext {
     }
 
     /// Mark an ML-provision subscription's callback as delivered.
+    ///
+    /// Durable, but written by the dispatcher's end-of-tick flush rather than
+    /// here — see [`flush_state_if_dirty`](Self::flush_state_if_dirty).
     pub fn mark_ml_prov_notified(&self, subscription_id: &str) {
-        if let Ok(mut subs) = self.ml_prov_subscriptions.write() {
-            if let Some(sub) = subs.get_mut(subscription_id) {
-                sub.notified = true;
+        let changed = {
+            match self.ml_prov_subscriptions.write() {
+                Ok(mut subs) => match subs.get_mut(subscription_id) {
+                    Some(sub) => {
+                        sub.notified = true;
+                        true
+                    }
+                    None => false,
+                },
+                Err(_) => false,
             }
+        };
+        if changed {
+            self.mark_dirty();
         }
     }
 
@@ -1243,6 +1692,13 @@ impl NwdafContext {
 
     /// Record the latest observed analytic level for a
     /// `(subscription, event, instance)`.
+    /// Durable, but written by the dispatcher's end-of-tick flush rather than
+    /// here. Besides the write-amplification reason given on
+    /// [`flush_state_if_dirty`](Self::flush_state_if_dirty), this one is called
+    /// from `build_event_notifications` while the engine mutex is held, and
+    /// `persist` -> `snapshot` takes read locks on both subscription maps —
+    /// persisting here would introduce an engine-mutex-then-map order against the
+    /// documented context-read-then-engine one.
     pub fn set_event_level(
         &self,
         subscription_id: &str,
@@ -1251,8 +1707,12 @@ impl NwdafContext {
         level: f64,
     ) {
         let key = event_level_key(subscription_id, event, nf_instance_id);
-        if let Ok(mut levels) = self.event_levels.write() {
-            levels.insert(key, level);
+        let changed = match self.event_levels.write() {
+            Ok(mut levels) => levels.insert(key, level) != Some(level),
+            Err(_) => false,
+        };
+        if changed {
+            self.mark_dirty();
         }
     }
 
@@ -1296,28 +1756,53 @@ impl NwdafContext {
 
     /// Record that a notification was just dispatched for a subscription.
     /// Updates `last_notification_time` to the current Unix timestamp.
+    ///
+    /// Durable, but written by the dispatcher's end-of-tick flush rather than
+    /// here — see [`flush_state_if_dirty`](Self::flush_state_if_dirty). Losing
+    /// this in a crash costs at most a repeated report; `reports_sent` is what
+    /// makes `maxReportNbr` hold across a restart.
     pub fn update_subscription_last_notification(&self, subscription_id: &str) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or(std::time::Duration::ZERO)
             .as_secs();
-        if let Ok(mut subs) = self.analytics_subscriptions.write() {
-            if let Some(sub) = subs.get_mut(subscription_id) {
-                sub.last_notification_time = Some(now);
-                // Issue #108: counted here rather than at the send site so a
-                // failed delivery does not consume one of `maxReportNbr`.
-                sub.reports_sent = sub.reports_sent.saturating_add(1);
-            }
+        let changed = match self.analytics_subscriptions.write() {
+            Ok(mut subs) => match subs.get_mut(subscription_id) {
+                Some(sub) => {
+                    sub.last_notification_time = Some(now);
+                    // Issue #108: counted here rather than at the send site so a
+                    // failed delivery does not consume one of `maxReportNbr`.
+                    sub.reports_sent = sub.reports_sent.saturating_add(1);
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        };
+        if changed {
+            self.mark_dirty();
         }
     }
 
     /// Mark a subscription's termination notification as delivered, so the
     /// `termCause` report is emitted exactly once (issue #108).
+    ///
+    /// Durable, but written by the dispatcher's end-of-tick flush rather than
+    /// here — see [`flush_state_if_dirty`](Self::flush_state_if_dirty). This is
+    /// the flag that keeps "exactly once" true across a restart.
     pub fn mark_subscription_terminated(&self, subscription_id: &str) {
-        if let Ok(mut subs) = self.analytics_subscriptions.write() {
-            if let Some(sub) = subs.get_mut(subscription_id) {
-                sub.termination_notified = true;
-            }
+        let changed = match self.analytics_subscriptions.write() {
+            Ok(mut subs) => match subs.get_mut(subscription_id) {
+                Some(sub) => {
+                    sub.termination_notified = true;
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        };
+        if changed {
+            self.mark_dirty();
         }
     }
 
@@ -2004,6 +2489,668 @@ mod tests {
         assert_eq!(e.matching_direction(), MatchingDirection::Crossed);
         e.matching_dir = Some("bogus".to_string());
         assert_eq!(e.matching_direction(), MatchingDirection::Ascending);
+    }
+
+    // ── durable state (issue #66/#192) ───────────────────────────────────────
+
+    /// Unique snapshot path per test so parallel runs cannot collide.
+    fn temp_state_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "nextgcore-nwdaf-state-{}-{tag}-{nanos}.json",
+            std::process::id()
+        ))
+    }
+
+    /// A context with a state file already armed.
+    fn ctx_with_state(path: &std::path::Path) -> NwdafContext {
+        let mut ctx = NwdafContext::new("nwdaf-test".to_string());
+        ctx.init(100);
+        ctx.set_state_file(path.to_path_buf())
+            .expect("arming a fresh state file must succeed");
+        ctx
+    }
+
+    /// A subscription with every nested member populated, so a round-trip
+    /// exercises the whole persisted tree rather than just the top level.
+    fn rich_subscription(id: &str) -> AnalyticsSubscription {
+        let mut sub = AnalyticsSubscription::new_with_events(
+            id.to_string(),
+            vec![
+                EventSubscription {
+                    event: AnalyticsId::NfLoad,
+                    notification_method: Some(NotificationMethod::Threshold),
+                    rep_period_secs: Some(30),
+                    load_level_threshold: Some(80),
+                    extra_load_level_thresholds: vec![90, 95],
+                    matching_dir: Some("DESCENDING".to_string()),
+                    snssais: vec![SNssai {
+                        sst: 2,
+                        sd: Some(0x0a_bc_de),
+                    }],
+                    nf_instance_ids: vec!["amf-1".to_string()],
+                    nf_types: vec!["AMF".to_string()],
+                },
+                EventSubscription::periodic(AnalyticsId::SliceLoadLevel),
+            ],
+            "http://consumer.local/notify".to_string(),
+            u64::MAX,
+        );
+        sub.target_supi = Some("imsi-001010000000001".to_string());
+        sub.target_snssai = Some(SNssai { sst: 1, sd: None });
+        sub.unknown_events = vec!["SOME_REL_19_EVENT".to_string()];
+        sub.max_report_nbr = Some(7);
+        sub.reports_sent = 3;
+        sub
+    }
+
+    /// **Issue #192, the acceptance criterion.** Both subscription maps and the
+    /// THRESHOLD edge state survive a simulated restart through the same state
+    /// file, with the nested tree intact.
+    ///
+    /// The nested assertions are the point: a top-level-only check would pass
+    /// even if `events[].event` had silently become `null`, and it is the events
+    /// that decide what the restored subscription actually reports.
+    #[test]
+    fn subscriptions_survive_a_restart() {
+        let path = temp_state_path("restart");
+
+        {
+            let ctx = ctx_with_state(&path);
+            ctx.add_subscription(rich_subscription("sub-1"))
+                .expect("stored");
+            ctx.add_ml_prov_subscription(MlProvSubscription::new(
+                "mlsub-1".to_string(),
+                "http://anlf.local/ml-notify".to_string(),
+                Some("corr-ml".to_string()),
+                vec![AnalyticsId::NfLoad, AnalyticsId::UeMobility],
+            ))
+            .expect("stored");
+            // Pin that the two CREATES reached disk by themselves. Without this,
+            // the flush below would cover for them: it rewrites the whole store,
+            // so the restore assertions would pass even with no persist on the
+            // create paths at all.
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("snapshot exists"))
+                    .expect("valid JSON");
+            assert_eq!(doc["analyticsSubscriptions"][0]["subscription_id"], "sub-1");
+            assert_eq!(doc["mlProvSubscriptions"][0]["subscription_id"], "mlsub-1");
+
+            ctx.set_event_level("sub-1", AnalyticsId::NfLoad, "amf-1", 42.5);
+            ctx.flush_state_if_dirty();
+        }
+
+        // A brand-new context, as after a process restart.
+        let restored = ctx_with_state(&path);
+
+        let sub = restored
+            .get_subscription("sub-1")
+            .expect("the subscription must come back");
+        assert_eq!(sub.notification_uri, "http://consumer.local/notify");
+        assert_eq!(sub.target_supi.as_deref(), Some("imsi-001010000000001"));
+        assert_eq!(sub.target_snssai, Some(SNssai { sst: 1, sd: None }));
+        assert_eq!(sub.unknown_events, vec!["SOME_REL_19_EVENT".to_string()]);
+        assert_eq!(sub.max_report_nbr, Some(7));
+        assert_eq!(
+            sub.reports_sent, 3,
+            "reports_sent is what makes maxReportNbr hold across a restart"
+        );
+
+        assert_eq!(sub.events.len(), 2, "both eventSubscriptions[] entries");
+        let e = &sub.events[0];
+        assert_eq!(e.event, AnalyticsId::NfLoad);
+        assert_eq!(e.notification_method, Some(NotificationMethod::Threshold));
+        assert_eq!(e.rep_period_secs, Some(30));
+        assert_eq!(e.load_level_threshold, Some(80));
+        assert_eq!(e.extra_load_level_thresholds, vec![90, 95]);
+        assert_eq!(e.matching_direction(), MatchingDirection::Descending);
+        assert_eq!(
+            e.snssais,
+            vec![SNssai {
+                sst: 2,
+                sd: Some(0x0a_bc_de)
+            }]
+        );
+        assert_eq!(e.nf_instance_ids, vec!["amf-1".to_string()]);
+        assert_eq!(e.nf_types, vec!["AMF".to_string()]);
+        assert_eq!(sub.events[1].event, AnalyticsId::SliceLoadLevel);
+
+        let ml = restored
+            .get_ml_prov_subscription("mlsub-1")
+            .expect("the ML-provision subscription must come back");
+        assert_eq!(ml.notif_uri, "http://anlf.local/ml-notify");
+        assert_eq!(ml.notif_corr_id.as_deref(), Some("corr-ml"));
+        assert_eq!(
+            ml.ml_events,
+            vec![AnalyticsId::NfLoad, AnalyticsId::UeMobility]
+        );
+
+        assert_eq!(
+            restored.get_event_level("sub-1", AnalyticsId::NfLoad, "amf-1"),
+            Some(42.5),
+            "THRESHOLD edge state must survive too"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The removal half.** Persisting inserts but not removals resurrects a
+    /// resource the consumer explicitly deleted, and the NWDAF resumes POSTing
+    /// analytics for it — which reads as correct operation rather than as an
+    /// outage, so nothing investigates it.
+    ///
+    /// Revert-verified: dropping the `persist()` from `remove_subscription` fails
+    /// the "gone from disk" assertion below, and likewise for
+    /// `remove_ml_prov_subscription`.
+    ///
+    /// Each removal is checked ON DISK immediately, not only after the restart.
+    /// Checking only at the end let the two removals cover for each other — the
+    /// ML removal's `persist` rewrites the whole store, which by then no longer
+    /// holds the deleted analytics subscription either, so the test passed with
+    /// the analytics `persist` deleted. That is a green test proving nothing.
+    #[test]
+    fn a_deleted_subscription_is_not_resurrected_by_a_restart() {
+        let path = temp_state_path("removal");
+
+        /// The IDs currently in the snapshot, per map.
+        fn on_disk(path: &std::path::Path) -> (Vec<String>, Vec<String>) {
+            let raw = std::fs::read_to_string(path).expect("snapshot exists");
+            let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+            let ids = |key: &str| -> Vec<String> {
+                doc[key]
+                    .as_array()
+                    .expect("an array")
+                    .iter()
+                    .map(|v| v["subscription_id"].as_str().expect("an id").to_string())
+                    .collect()
+            };
+            (ids("analyticsSubscriptions"), ids("mlProvSubscriptions"))
+        }
+
+        {
+            let ctx = ctx_with_state(&path);
+            ctx.add_subscription(rich_subscription("keep")).expect("in");
+            ctx.add_subscription(rich_subscription("drop")).expect("in");
+            ctx.add_ml_prov_subscription(MlProvSubscription::new(
+                "ml-keep".to_string(),
+                "http://a/1".to_string(),
+                None,
+                vec![AnalyticsId::NfLoad],
+            ))
+            .expect("in");
+            ctx.add_ml_prov_subscription(MlProvSubscription::new(
+                "ml-drop".to_string(),
+                "http://a/2".to_string(),
+                None,
+                vec![AnalyticsId::NfLoad],
+            ))
+            .expect("in");
+            assert_eq!(
+                on_disk(&path),
+                (
+                    vec!["drop".to_string(), "keep".to_string()],
+                    vec!["ml-drop".to_string(), "ml-keep".to_string()]
+                ),
+                "all four creates persisted synchronously, sorted by id"
+            );
+
+            assert!(ctx.remove_subscription("drop").is_some());
+            assert_eq!(
+                on_disk(&path).0,
+                vec!["keep".to_string()],
+                "the analytics removal must reach disk on its own, with no later \
+                 write covering for it"
+            );
+
+            assert!(ctx.remove_ml_prov_subscription("ml-drop").is_some());
+            assert_eq!(
+                on_disk(&path).1,
+                vec!["ml-keep".to_string()],
+                "and likewise the ML-provision removal"
+            );
+        }
+
+        let restored = ctx_with_state(&path);
+        assert!(restored.get_subscription("keep").is_some());
+        assert!(
+            restored.get_subscription("drop").is_none(),
+            "a deleted analytics subscription must not come back"
+        );
+        assert!(restored.get_ml_prov_subscription("ml-keep").is_some());
+        assert!(
+            restored.get_ml_prov_subscription("ml-drop").is_none(),
+            "a deleted ML-provision subscription must not come back"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The representation decision, pinned.** The on-disk token is the TS
+    /// 29.520 spelling, not the Rust variant name.
+    ///
+    /// This is the assertion that fails if someone swaps the hand-written codec
+    /// for `#[derive(Serialize)]` — which would write `"NfLoad"` and make every
+    /// existing snapshot unreadable. Because the store refuses to overwrite a
+    /// snapshot it cannot parse, that mistake surfaces as nwdafd FAILING STARTUP
+    /// after an upgrade, at the operator's site rather than here.
+    #[test]
+    fn the_on_disk_enum_representation_is_the_ts_29520_token() {
+        let path = temp_state_path("tokens");
+        {
+            let ctx = ctx_with_state(&path);
+            ctx.add_subscription(rich_subscription("sub-1"))
+                .expect("stored");
+        }
+
+        let raw = std::fs::read_to_string(&path).expect("the snapshot was written");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+        let event = &doc["analyticsSubscriptions"][0]["events"][0];
+        assert_eq!(
+            event["event"], "NF_LOAD",
+            "the NwdafEvent token, never the Rust variant name `NfLoad`"
+        );
+        assert_eq!(
+            event["notification_method"], "THRESHOLD",
+            "the NotificationMethod token, never `Threshold`"
+        );
+        assert_eq!(
+            doc["analyticsSubscriptions"][0]["events"][1]["event"], "SLICE_LOAD_LEVEL",
+            "the NwdafEvent spelling, not AnalyticsInfo's LOAD_LEVEL_INFORMATION"
+        );
+        assert_eq!(doc["version"], 1, "the document carries its version");
+        // The Rust identifiers must appear nowhere in the file.
+        for rust_name in ["NfLoad", "Threshold", "SliceLoadLevel", "Periodic"] {
+            assert!(
+                !raw.contains(rust_name),
+                "{rust_name} is a Rust identifier and must not reach the snapshot"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The only test that can catch a representation change.** Every other
+    /// test here writes and reads with the same build, so it passes whatever the
+    /// format is. This one restores a snapshot literal committed in the source,
+    /// which is what an operator's file looks like after an upgrade.
+    ///
+    /// If this fails, the format changed: either restore compatibility, or bump
+    /// `SNAPSHOT_VERSION` and accept that older snapshots stop loading.
+    #[test]
+    fn a_committed_fixture_snapshot_still_loads() {
+        // Written by the build at commit bd90166 + this change. Do NOT regenerate
+        // it to make a failure go away -- that is the failure.
+        const FIXTURE: &str = r#"{
+          "version": 1,
+          "analyticsSubscriptions": [
+            {
+              "subscription_id": "fixture-sub",
+              "events": [
+                {
+                  "event": "NF_LOAD",
+                  "notification_method": "THRESHOLD",
+                  "rep_period_secs": 30,
+                  "load_level_threshold": 80,
+                  "extra_load_level_thresholds": [90, 95],
+                  "matching_dir": "DESCENDING",
+                  "snssais": [{"sst": 2, "sd": 703710}],
+                  "nf_instance_ids": ["amf-1"],
+                  "nf_types": ["AMF"]
+                }
+              ],
+              "target_supi": "imsi-001010000000001",
+              "target_snssai": {"sst": 1, "sd": null},
+              "unknown_events": ["SOME_REL_19_EVENT"],
+              "notification_uri": "http://consumer.local/notify",
+              "expiry": 18446744073709551615,
+              "active": true,
+              "notification_correlation_id": "corr-fixture",
+              "repetition_period_secs": 60,
+              "last_notification_time": 1756900000,
+              "max_report_nbr": 7,
+              "reports_sent": 3,
+              "termination_notified": false
+            }
+          ],
+          "mlProvSubscriptions": [
+            {
+              "subscription_id": "fixture-mlsub",
+              "notif_uri": "http://anlf.local/ml-notify",
+              "notif_corr_id": "corr-ml",
+              "ml_events": ["NF_LOAD", "UE_MOBILITY"],
+              "notified": true
+            }
+          ],
+          "eventLevels": {"fixture-sub\u001fNF_LOAD\u001famf-1": 42.5}
+        }"#;
+
+        let path = temp_state_path("fixture");
+        std::fs::write(&path, FIXTURE).expect("write fixture");
+
+        let ctx = ctx_with_state(&path);
+
+        let sub = ctx
+            .get_subscription("fixture-sub")
+            .expect("the committed fixture must still restore");
+        assert_eq!(sub.events[0].event, AnalyticsId::NfLoad);
+        assert_eq!(
+            sub.events[0].notification_method,
+            Some(NotificationMethod::Threshold)
+        );
+        assert_eq!(
+            sub.events[0].matching_direction(),
+            MatchingDirection::Descending
+        );
+        assert_eq!(
+            sub.events[0].snssais,
+            vec![SNssai {
+                sst: 2,
+                sd: Some(703_710)
+            }]
+        );
+        assert_eq!(sub.notification_correlation_id, "corr-fixture");
+        assert_eq!(sub.reports_sent, 3);
+        assert_eq!(sub.last_notification_time, Some(1_756_900_000));
+
+        let ml = ctx
+            .get_ml_prov_subscription("fixture-mlsub")
+            .expect("the ML-provision record must restore too");
+        assert_eq!(
+            ml.ml_events,
+            vec![AnalyticsId::NfLoad, AnalyticsId::UeMobility]
+        );
+        assert!(ml.notified, "the one-shot flag must survive");
+
+        assert_eq!(
+            ctx.get_event_level("fixture-sub", AnalyticsId::NfLoad, "amf-1"),
+            Some(42.5)
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The realistic future break is an ADDED field, not a renamed token: an old
+    /// snapshot read by a new binary fails `missing field` per record, and
+    /// records are skipped individually, so every subscription would vanish with
+    /// only a warn each. The `#[serde(default)]`s prevent that; this pins them.
+    #[test]
+    fn an_older_snapshot_missing_optional_members_still_loads() {
+        // Only the members a record cannot do without.
+        const MINIMAL: &str = r#"{
+          "version": 1,
+          "analyticsSubscriptions": [
+            {
+              "subscription_id": "minimal-sub",
+              "events": [{"event": "NF_LOAD"}],
+              "notification_uri": "http://consumer.local/notify",
+              "expiry": 18446744073709551615,
+              "active": true,
+              "notification_correlation_id": "corr-min",
+              "repetition_period_secs": 60
+            }
+          ],
+          "mlProvSubscriptions": [
+            {
+              "subscription_id": "minimal-ml",
+              "notif_uri": "http://anlf.local/n",
+              "ml_events": ["NF_LOAD"]
+            }
+          ]
+        }"#;
+
+        let path = temp_state_path("minimal");
+        std::fs::write(&path, MINIMAL).expect("write");
+
+        let ctx = ctx_with_state(&path);
+
+        let sub = ctx
+            .get_subscription("minimal-sub")
+            .expect("a record with only its required members must still load");
+        assert_eq!(sub.events[0].event, AnalyticsId::NfLoad);
+        assert_eq!(sub.events[0].notification_method, None);
+        assert!(sub.events[0].snssais.is_empty());
+        assert_eq!(sub.reports_sent, 0);
+        assert!(!sub.termination_notified);
+        assert!(sub.unknown_events.is_empty());
+
+        let ml = ctx
+            .get_ml_prov_subscription("minimal-ml")
+            .expect("likewise for ML-provision");
+        assert!(!ml.notified);
+        assert_eq!(ml.notif_corr_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A snapshot from a NEWER build is refused rather than partially restored.
+    ///
+    /// Restoring what this build recognises and then persisting would rewrite the
+    /// newer file in the older format, discarding whatever it could not read —
+    /// the same data-loss shape #190 exists to prevent, reached by downgrade
+    /// instead of by corruption. So: startup fails, the file is untouched, and
+    /// persisting is disabled even if the caller ignores the error.
+    #[test]
+    fn a_newer_snapshot_version_is_refused() {
+        let path = temp_state_path("newer");
+        let original = r#"{"version": 999, "analyticsSubscriptions": [], "somethingNew": 1}"#;
+        std::fs::write(&path, original).expect("write");
+
+        let mut ctx = NwdafContext::new("nwdaf-test".to_string());
+        ctx.init(100);
+        let err = ctx
+            .set_state_file(path.clone())
+            .expect_err("a newer snapshot must not be restored");
+        assert!(
+            matches!(
+                err,
+                NwdafStateError::UnsupportedVersion {
+                    found: 999,
+                    supported: 1,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+
+        // Even a caller that logs and carries on cannot destroy the file.
+        assert!(
+            !ctx.state_is_enabled(),
+            "persisting must be disabled after a refused load"
+        );
+        ctx.add_subscription(rich_subscription("later"))
+            .expect("in");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            original,
+            "the newer snapshot must survive untouched"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An unreadable snapshot is an error at startup, not a silent empty boot,
+    /// and the file survives for recovery (issue #66/#190).
+    #[test]
+    fn a_corrupt_snapshot_fails_startup_and_survives() {
+        let path = temp_state_path("corrupt");
+        // Truncated JSON: the realistic corruption (a partial write, a container
+        // killed mid-rename).
+        let original = r#"{"version": 1, "analyticsSubscriptions": [{"subscription_i"#;
+        std::fs::write(&path, original).expect("write");
+
+        let mut ctx = NwdafContext::new("nwdaf-test".to_string());
+        ctx.init(100);
+        let err = ctx
+            .set_state_file(path.clone())
+            .expect_err("a corrupt snapshot must fail rather than boot empty");
+        assert!(matches!(err, NwdafStateError::Store(_)), "got {err:?}");
+        assert_eq!(ctx.subscription_count(), 0);
+
+        // The store poisons itself, so a later mutation cannot overwrite the file.
+        ctx.add_subscription(rich_subscription("later"))
+            .expect("in");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            original,
+            "the unreadable snapshot must survive for recovery"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The shipped default: no state file means no file operations at all, and
+    /// behaviour is byte-identical to before #192.
+    #[test]
+    fn without_a_state_file_nothing_is_persisted() {
+        let mut ctx = NwdafContext::new("nwdaf-test".to_string());
+        ctx.init(100);
+        assert!(!ctx.state_is_enabled());
+
+        ctx.add_subscription(rich_subscription("sub-1"))
+            .expect("in");
+        ctx.set_event_level("sub-1", AnalyticsId::NfLoad, "amf-1", 1.0);
+        ctx.update_subscription_last_notification("sub-1");
+        ctx.mark_subscription_terminated("sub-1");
+        // A no-op rather than a panic or a write: there is no path to write to,
+        // which IS the property.
+        ctx.flush_state_if_dirty();
+        assert!(ctx.remove_subscription("sub-1").is_some());
+        assert_eq!(ctx.subscription_count(), 0);
+    }
+
+    /// The `event_levels` half, asserted through the consumer-visible effect
+    /// rather than through storage.
+    ///
+    /// `threshold_crossed` fires whenever the previous level is `None`, so an
+    /// instance sitting above its threshold re-alarms after every restart if the
+    /// edge state is lost — a duplicate alarm that reads as a real new crossing.
+    #[test]
+    fn a_threshold_does_not_refire_after_a_restart() {
+        use crate::notification_dispatcher::threshold_crossed;
+
+        let path = temp_state_path("threshold");
+        let threshold = 80.0;
+        let current = 92.0; // already above, and it already fired before the restart
+
+        {
+            let ctx = ctx_with_state(&path);
+            ctx.add_subscription(rich_subscription("sub-1"))
+                .expect("in");
+            // The crossing that fired: no history, level above the threshold.
+            assert!(threshold_crossed(
+                None,
+                current,
+                threshold,
+                MatchingDirection::Ascending
+            ));
+            ctx.set_event_level("sub-1", AnalyticsId::NfLoad, "amf-1", current);
+            ctx.flush_state_if_dirty();
+        }
+
+        let restored = ctx_with_state(&path);
+        let prev = restored.get_event_level("sub-1", AnalyticsId::NfLoad, "amf-1");
+        assert_eq!(prev, Some(current), "the edge state must be restored");
+        assert!(
+            !threshold_crossed(prev, current, threshold, MatchingDirection::Ascending),
+            "a level that was already above its threshold must not re-alarm after a restart"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The dispatcher's bookkeeping is deferred to one write per tick, and the
+    /// flush is what makes it durable.
+    ///
+    /// Both halves are asserted: before the flush the file still holds the old
+    /// counter (so the deferral is real, not an accident), and after it the
+    /// counter survives a restart — which is what keeps `maxReportNbr` honest.
+    #[test]
+    fn deferred_bookkeeping_is_written_by_the_tick_flush() {
+        let path = temp_state_path("deferred");
+
+        let ctx = ctx_with_state(&path);
+        ctx.add_subscription(rich_subscription("sub-1"))
+            .expect("in");
+        let on_disk = |label: &str| -> u64 {
+            let raw = std::fs::read_to_string(&path).expect("snapshot exists");
+            let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+            doc["analyticsSubscriptions"][0]["reports_sent"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{label}: reports_sent is a number"))
+        };
+        assert_eq!(
+            on_disk("after create"),
+            3,
+            "the create persisted synchronously"
+        );
+
+        ctx.update_subscription_last_notification("sub-1");
+        assert_eq!(
+            ctx.get_subscription("sub-1").expect("present").reports_sent,
+            4,
+            "in memory immediately"
+        );
+        assert_eq!(
+            on_disk("before flush"),
+            3,
+            "deferred: a per-subscription persist here would rewrite the whole \
+             store once per subscription per tick"
+        );
+
+        ctx.flush_state_if_dirty();
+        assert_eq!(on_disk("after flush"), 4, "the tick flush wrote it");
+
+        // And a second flush with nothing pending is a no-op.
+        ctx.flush_state_if_dirty();
+        assert_eq!(on_disk("after idle flush"), 4);
+
+        drop(ctx);
+        let restored = ctx_with_state(&path);
+        assert_eq!(
+            restored
+                .get_subscription("sub-1")
+                .expect("present")
+                .reports_sent,
+            4
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The shutdown trap.** `fini()` clears every map, and the notification
+    /// dispatcher is a detached task that can tick during shutdown — so a persist
+    /// reached after `fini` would write an empty snapshot over a good one and
+    /// lose every subscription.
+    ///
+    /// Revert-verified: removing the `StateStore::disabled()` from `fini` fails
+    /// this test.
+    #[test]
+    fn fini_cannot_overwrite_a_good_snapshot_with_an_empty_one() {
+        let path = temp_state_path("fini");
+
+        let mut ctx = ctx_with_state(&path);
+        ctx.add_subscription(rich_subscription("sub-1"))
+            .expect("in");
+        let good = std::fs::read_to_string(&path).expect("snapshot written");
+
+        ctx.fini();
+        assert_eq!(ctx.subscription_count(), 0, "fini clears the maps");
+        // Anything the dispatcher might still reach after fini must not write.
+        ctx.flush_state_if_dirty();
+        ctx.set_event_level("sub-1", AnalyticsId::NfLoad, "amf-1", 1.0);
+        ctx.flush_state_if_dirty();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            good,
+            "an emptied context must never be written over a good snapshot"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

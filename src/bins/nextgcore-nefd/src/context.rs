@@ -6,9 +6,10 @@
 //! Namf_EventExposure per TS 29.518, UDM Nudm_EE per TS 29.503), plus Device
 //! Triggering transactions (TS 29.122 §5.10).
 //!
-//! All state is in-memory (`RwLock<HashMap<..>>`); persistence is out of
-//! scope for the minimal NEF (issue #19), matching the other small NFs
-//! (pind, nsacfd).
+//! Both maps are in-memory (`RwLock<HashMap<..>>`) and, when a state file is
+//! configured, durable across a restart — see [`NefContext::set_state_file`]
+//! (issue #66/#192). With no state file the behaviour is memory-only, which is
+//! the shipped default.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -251,7 +252,6 @@ impl NefContext {
         self.nf_instance_id.clone()
     }
 
-    /// Insert a monitoring subscription, enforcing the capacity cap.
     // -- durable state (issue #66/#192) ---------------------------------------
 
     /// Point this context at a snapshot file and restore any prior state.
@@ -341,6 +341,7 @@ impl NefContext {
         }
     }
 
+    /// Insert a monitoring subscription, enforcing the capacity cap.
     pub fn subscription_insert(
         &self,
         sub: NefMonitoringSubscription,
