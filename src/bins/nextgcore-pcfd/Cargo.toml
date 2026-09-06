@@ -46,6 +46,9 @@ anyhow.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
 serde_json.workspace = true
+# Durable-state load errors (issue #66/#192); already a workspace dep via
+# nextgcore-core's state_store, so no new crate enters the tree.
+thiserror.workspace = true
 uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
