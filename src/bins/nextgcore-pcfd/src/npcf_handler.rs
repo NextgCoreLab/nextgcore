@@ -170,6 +170,32 @@ impl FlowStatus {
     }
 }
 
+/// Durable representation (issue #66/#192): the TS 29.512 token, emitted by the
+/// SAME codec the wire uses.
+///
+/// Delegates to [`FlowStatus::as_wire`] / [`FlowStatus::from_wire`] rather than
+/// carrying `#[serde(rename)]` attributes, because those would be a second copy
+/// of a token table that already exists here -- and nothing would catch the two
+/// drifting apart. Contrast `AccessType` in `context.rs`, which has no existing
+/// codec and so gets renames as its only table.
+///
+/// Note `from_wire` is lenient (an unknown token becomes `Enabled`, its TS 29.514
+/// default). That is right for the wire, where a peer may send a newer value, and
+/// it is also right here: a snapshot member this build does not recognise should
+/// not cost the whole PCC rule.
+impl serde::Serialize for FlowStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_wire())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FlowStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let token = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::from_wire(&token))
+    }
+}
+
 /// Media Sub Component
 #[derive(Debug, Clone, Default)]
 pub struct MediaSubComponent {
@@ -193,7 +219,7 @@ pub enum FlowUsage {
 
 /// A single flow-information entry inside a PCC rule
 /// (TS 29.512 §5.6.2.9 FlowInformation).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FlowInfo {
     /// IPFilterRule packet filter (TS 29.514 flowDescription).
     pub flow_description: String,
@@ -205,7 +231,7 @@ pub struct FlowInfo {
 
 /// QoS decision derived from an AF media component
 /// (TS 29.512 §5.6.2.8 QosData). Always emits the mandatory `qosId` (pcfd-01).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QosData {
     pub qos_id: String,
     pub five_qi: u8,
@@ -245,7 +271,7 @@ impl QosData {
 /// (TS 29.512 §5.6.2.6 PccRule). Carries flow filters, a QoS reference and the
 /// AF-requested flow status. Named `AfPccRule` to distinguish it from the
 /// subscription-sourced `nudr_handler::PccRule`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AfPccRule {
     pub pcc_rule_id: String,
     pub precedence: u32,

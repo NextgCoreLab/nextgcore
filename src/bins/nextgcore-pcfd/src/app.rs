@@ -44,6 +44,17 @@ struct Args {
     #[arg(short = 'c', long, default_value = "/etc/nextgcore/pcf.yaml")]
     config: String,
 
+    /// JSON snapshot file for AM/SM policy associations, PDU sessions and AF
+    /// application sessions (issue #66/#192).
+    ///
+    /// Falls back to `NEXTGCORE_PCF_STATE_FILE`; an empty value is treated as
+    /// unset. With neither set the PCF is memory-only, which is the shipped
+    /// default and byte-identical to previous behaviour. An unreadable snapshot,
+    /// or one written by a newer build, FAILS STARTUP rather than coming up empty
+    /// and overwriting it.
+    #[arg(long)]
+    state_file: Option<String>,
+
     /// Log file path
     #[arg(short = 'l', long)]
     log_file: Option<String>,
@@ -284,6 +295,34 @@ pub async fn run() -> Result<()> {
         args.max_ue,
         args.max_sess
     );
+
+    // Issue #66/#192: restore durable state AFTER the context knows its capacity
+    // caps and BEFORE the SBI server can accept a request, so a restored
+    // association is never shadowed by a fresh one. Precedence matches the other
+    // NFs: the flag wins over the env var, and an empty value is treated as unset.
+    let state_file = args
+        .state_file
+        .clone()
+        .or_else(|| std::env::var("NEXTGCORE_PCF_STATE_FILE").ok())
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    if let Some(path) = state_file {
+        let ctx = crate::context::pcf_self();
+        let mut guard = ctx
+            .write()
+            .map_err(|_| anyhow::anyhow!("PCF context lock poisoned"))?;
+        // Fail STARTUP on a snapshot that cannot be read or is from a newer build.
+        // Coming up empty would answer "no such association" for associations that
+        // exist -- so the AMF and SMF could neither update nor tear them down --
+        // and the store would then refuse every later write to protect the file.
+        let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
+        log::info!("PCF durable state: {path} ({restored} record(s) restored)");
+    } else {
+        log::info!(
+            "PCF durable state disabled (no --state-file / NEXTGCORE_PCF_STATE_FILE): \
+             policy associations and app sessions are memory-only and lost on restart"
+        );
+    }
 
     // Initialize PCF state machine
     let mut pcf_sm = PcfSmContext::new();

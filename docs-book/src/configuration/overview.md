@@ -87,25 +87,26 @@ Precedence, where both exist: **environment variable > YAML > compiled-in defaul
 
 ### Durable state snapshots
 
-Six NFs persist their long-lived runtime state as a full-store JSON snapshot,
+Seven NFs persist their long-lived runtime state as a full-store JSON snapshot,
 rewritten on every mutation and reloaded at boot: **nrfd** (NF registry),
 **nssfd** (NSSAI-availability subscriptions and data), **nsacfd** (admission
 counters), **udrd** (the non-subscriber resource trees), **nefd** (TS 29.122
 monitoring subscriptions and device-triggering transactions) and **nwdafd**
 (TS 29.520 analytics and ML-provision subscriptions — see
-[NWDAF](./nwdaf.md)). Each is enabled by its
+[NWDAF](./nwdaf.md)) and **pcfd** (AM/SM policy associations, PDU sessions and AF
+application sessions — see [PCF](./pcf.md)). Each is enabled by its
 own `--state-file` flag or `NEXTGCORE_<NF>_STATE_FILE` variable; with neither set
 the NF is purely in-memory — the shipped Docker/E2E default for all but udrd, which
 is on by default (see [UDR](./udr.md)).
 
-`nefd` and `nwdafd` differ from the older four in one respect worth knowing: an
-unreadable snapshot **fails their startup** rather than only refusing to persist.
+`nefd`, `nwdafd` and `pcfd` differ from the older four in one respect worth
+knowing: an unreadable snapshot **fails their startup** rather than only refusing to persist.
 They adopt the `StateStore` type directly, so the caller sees the load error and
 declines to serve; the other four predate that type and keep their own flag,
 refusing the write but coming up empty.
 
-`nwdafd` goes one step further and versions its snapshot document, refusing one
-written by a *newer* build. Restoring only the members an older build recognises and
+`nwdafd` and `pcfd` go one step further and version their snapshot document,
+refusing one written by a *newer* build. Restoring only the members an older build recognises and
 then rewriting the file would discard the rest — the same data loss the table below
 guards against, reached by downgrade instead of by corruption.
 
