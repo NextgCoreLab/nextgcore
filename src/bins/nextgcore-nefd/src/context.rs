@@ -48,7 +48,55 @@ pub struct SouthboundRef {
     pub delete_path: String,
 }
 
+/// The external identity the AF used to name its target UE (TS 29.122
+/// `MonitoringEventSubscription`).
+///
+/// Kept so notifications can echo the identity **the AF already knows** instead
+/// of the internal SUPI (issue #110). Which member the AF used matters, not just
+/// its value: a TS 29.122 `MonitoringEventReport` names the UE with the same
+/// member the request did, so echoing `msisdn` for an `externalId` request would
+/// be a different (wrong) answer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AfTarget {
+    /// `msisdn` — an MSISDN in TS 23.003 international format, no leading `+`.
+    Msisdn(String),
+    /// `externalId` — a GPSI of the form `<local>@<domain>`.
+    ExternalId(String),
+}
+
+impl AfTarget {
+    /// The TS 29.122 member name this identity was supplied in, and must be
+    /// echoed in.
+    pub fn member(&self) -> &'static str {
+        match self {
+            Self::Msisdn(_) => "msisdn",
+            Self::ExternalId(_) => "externalId",
+        }
+    }
+
+    /// The identity value as the AF supplied it.
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Msisdn(v) | Self::ExternalId(v) => v,
+        }
+    }
+
+    /// The TS 29.503 GPSI form used to address the UDM
+    /// (`msisdn-<digits>` / `extid-<id>`).
+    pub fn gpsi(&self) -> String {
+        match self {
+            Self::Msisdn(v) => format!("msisdn-{v}"),
+            Self::ExternalId(v) => format!("extid-{v}"),
+        }
+    }
+}
+
 /// A northbound TS 29.122 Monitoring Event subscription stored by the NEF.
+///
+/// PERSISTED (issue #66/#192). When adding a field, give it `#[serde(default)]`
+/// unless a record without it is unusable: `restore_from` skips malformed
+/// records individually, so a newly-required member silently drops every
+/// subscription written by the previous build.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NefMonitoringSubscription {
     /// NEF-assigned subscription ID. Doubles as the northbound resource ID
@@ -63,6 +111,24 @@ pub struct NefMonitoringSubscription {
     pub notification_destination: String,
     /// Southbound producer subscription, when one was established.
     pub southbound: Option<SouthboundRef>,
+    /// The external identity the AF used to name its target UE, when it used
+    /// one (issue #110).
+    ///
+    /// `None` means the AF targeted by the NextGCore-internal `supi` extension,
+    /// in which case notifications carry **no** UE identity at all rather than
+    /// the SUPI — see `build_monitoring_notification`.
+    #[serde(default)]
+    pub af_target: Option<AfTarget>,
+    /// The authenticated identity of the client that created this subscription
+    /// (issue #110): the verified mTLS peer certificate's NF instance ID, or the
+    /// `sub` claim of a verified OAuth2 token.
+    ///
+    /// `None` when the subscription was created on a listener with no
+    /// northbound authentication configured — the shipped default. Ownership
+    /// then falls back to the `scsAsId` path segment, which is exactly today's
+    /// behaviour, so the default-off path is unchanged.
+    #[serde(default)]
+    pub owner_id: Option<String>,
     /// Raw MonitoringEventSubscription JSON as received.
     pub raw: String,
 }
@@ -80,7 +146,40 @@ impl NefMonitoringSubscription {
             monitoring_type: monitoring_type.into(),
             notification_destination: notification_destination.into(),
             southbound: None,
+            af_target: None,
+            owner_id: None,
             raw: raw.into(),
+        }
+    }
+
+    /// Record the external identity the AF used (issue #110).
+    pub fn with_af_target(mut self, target: Option<AfTarget>) -> Self {
+        self.af_target = target;
+        self
+    }
+
+    /// Record the authenticated creator (issue #110).
+    pub fn with_owner_id(mut self, owner_id: Option<String>) -> Self {
+        self.owner_id = owner_id;
+        self
+    }
+
+    /// Whether `caller` is entitled to act on this subscription (issue #110).
+    ///
+    /// When the subscription has an authenticated owner, ONLY that identity
+    /// matches — the `scsAsId` path segment is caller-supplied and so cannot
+    /// confer ownership. Without an authenticated owner (no northbound auth
+    /// configured) the check degrades to the historical `scsAsId` comparison,
+    /// which is a routing-level check rather than a security one, and is
+    /// documented as such.
+    pub fn is_owned_by(&self, caller_id: Option<&str>, scs_as_id: &str) -> bool {
+        match (&self.owner_id, caller_id) {
+            (Some(owner), Some(caller)) => owner == caller,
+            // Created under authentication, but this request carries none: the
+            // caller cannot prove it is the owner, so it is not.
+            (Some(_), None) => false,
+            // No authenticated owner recorded. `scsAsId` is all there is.
+            (None, _) => self.scs_as_id == scs_as_id,
         }
     }
 }
@@ -153,6 +252,13 @@ pub struct NefContext {
     amf_uri: Option<String>,
     /// UDM SBI base URI for southbound Nudm_EE. None = southbound deferred.
     udm_uri: Option<String>,
+    /// UDM SBI base URI for Nudm_SDM `id-translation-result`, the GPSI→SUPI
+    /// resolution TS 33.501 §5.9.2.3 requires of the NEF (issue #110).
+    ///
+    /// Separate from [`udm_uri`](Self::udm_uri) only so a deployment can point
+    /// identity translation at a different UDM front end; it defaults to the
+    /// same value. `None` means GPSI-targeted requests are refused.
+    udm_sdm_uri: Option<String>,
     /// Externally routable base URI of this NEF's SBI server, used as the
     /// prefix of the callback URI handed to producers.
     notify_base: Option<String>,
@@ -184,6 +290,7 @@ impl NefContext {
             state: nextgcore_core::state_store::StateStore::disabled(),
             amf_uri: None,
             udm_uri: None,
+            udm_sdm_uri: None,
             notify_base: None,
             nf_instance_id: None,
             max_subscriptions: 0,
@@ -236,12 +343,23 @@ impl NefContext {
         self.nf_instance_id = nf_instance_id;
     }
 
+    /// Point GPSI→SUPI resolution at a UDM (issue #110). Defaults to
+    /// [`udm_uri`](Self::udm_uri) when `None` is passed, since it is the same UDM.
+    pub fn set_udm_sdm_uri(&mut self, udm_sdm_uri: Option<String>) {
+        self.udm_sdm_uri = udm_sdm_uri.or_else(|| self.udm_uri.clone());
+    }
+
     pub fn amf_uri(&self) -> Option<String> {
         self.amf_uri.clone()
     }
 
     pub fn udm_uri(&self) -> Option<String> {
         self.udm_uri.clone()
+    }
+
+    /// The UDM used for GPSI→SUPI resolution (issue #110).
+    pub fn udm_sdm_uri(&self) -> Option<String> {
+        self.udm_sdm_uri.clone()
     }
 
     pub fn notify_base(&self) -> Option<String> {

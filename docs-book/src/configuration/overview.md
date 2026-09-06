@@ -157,6 +157,51 @@ from a peer's advertised URI, so run either a uniformly `production` or a
 uniformly `dev` core. (Before this, the scheme was hardcoded `http` regardless of
 what a peer advertised, so mixed was already broken.)
 
+### NEF northbound exposure (issue #110)
+
+`nefd` is the only NF whose consumers are **outside** the operator — third-party
+Application Functions over the TS 29.122 T8 APIs — so its northbound surface has
+rules the internal SBI ones do not.
+
+**Always on, not configurable:**
+
+* **The SUPI is never sent to an AF** (TS 33.501 §5.9.2.3). Monitoring
+  notifications echo the external identity the AF itself supplied (`msisdn` or
+  `externalId`), in the same member it used. An AF that targeted a UE by the
+  NextGCore-internal `supi` extension gets **no** UE identity in its
+  notifications rather than the SUPI.
+* **A monitoring request must resolve to exactly one UE.** A GPSI is translated
+  to a SUPI via UDM (TS 29.503 `id-translation-result`), and a target that
+  cannot be resolved is refused with `404 UE_NOT_FOUND`. It is never promoted to
+  a network-wide `anyUE` subscription — which is what previously happened to any
+  request naming its UE by `msisdn` or `externalId`.
+* `externalGroupId` (group-scoped monitoring) is refused rather than ignored, for
+  the same reason: an ignored group identifier used to fall through to
+  network-wide scope.
+
+**Caller authentication is opt-in and off by default**, so the matched-simulator
+E2E path is unchanged:
+
+| knob | effect |
+|---|---|
+| `nef.sbi.oauth2.require: true` / `NEXTGCORE_SBI_OAUTH2_REQUIRE=1` | require an OAuth2 token with audience `NEF` on every northbound route |
+| `--verify-client` (needs `--tls`) | require and verify a client certificate; its URI SAN becomes the caller's identity |
+| `--verify-client-cacert` | CA bundle for the above |
+| `--udm-sdm-uri` | UDM used for GPSI→SUPI resolution; defaults to `--udm-uri` |
+
+With authentication enabled, **subscription ownership is keyed to the
+authenticated identity** rather than to the `{scsAsId}` path segment, so one
+client can no longer delete another's subscriptions by naming their ID. With it
+disabled the NF logs a startup warning and ownership falls back to that path
+segment, which is a routing check and not a security one — do not expose such a
+listener to an untrusted or partner-facing network.
+
+Two limits worth knowing. `--verify-client` without `--tls` **fails startup**
+rather than running a plaintext listener that reports itself as mutually
+authenticated. And this repo's own `udmd` answers `id-translation-result` with
+`501 Not Implemented`, so against nextgcore's UDM every `msisdn`/`externalId`
+request is refused; making it succeed needs the UDM side (issue #85).
+
 ## Common parameters and code defaults
 
 | Parameter | Default (from code) | Where defined |
