@@ -493,7 +493,18 @@ impl SbiRequest {
         self
     }
 
-    /// Add a query parameter
+    /// Add a query parameter.
+    ///
+    /// **The value is RAW.** `SbiClient` percent-encodes both key and value when
+    /// it assembles the URI (issue #101), so a caller must NOT pre-encode --
+    /// doing so double-encodes (`{` -> `%7B` -> `%257B`) and the peer decodes it
+    /// once, back to `%7B`.
+    ///
+    /// This contract is asymmetric with hand-built URI strings: a caller that
+    /// formats a path itself and passes it to `SbiClient::get` bypasses the
+    /// client's encoder and MUST encode with
+    /// [`crate::uri_encode::encode_query_value`] (pcfd's nudr-dr queries do
+    /// exactly that).
     pub fn with_param(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.http.set_param(key, value);
         self

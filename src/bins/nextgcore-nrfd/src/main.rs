@@ -3346,11 +3346,13 @@ mod tests {
             req.http.set_param("requester-nf-type", "AMF");
             req.http.set_param("service-names", "nsmf-pdusession");
             req.http.set_param("dnn", "internet");
-            // [{"sst":1,"sd":"010203"}] percent-encoded
-            req.http.set_param(
-                "snssais",
-                "%5B%7B%22sst%22%3A1%2C%22sd%22%3A%22010203%22%7D%5D",
-            );
+            // Issue #101: the RAW JSON. This used to be hand-percent-encoded
+            // here, compensating for a client that did not encode -- so the test
+            // exercised a path no real consumer takes. The client encodes now, and
+            // nrfd's `percent_decode` reverses it, so this asserts the real
+            // round trip.
+            req.http
+                .set_param("snssais", r#"[{"sst":1,"sd":"010203"}]"#);
             let resp = client.send_request(req).await.expect("discover");
             assert_eq!(resp.status, 200);
             let result: serde_json::Value =

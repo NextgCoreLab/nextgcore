@@ -59,6 +59,7 @@ pub mod security;
 pub mod test_support; // Shared test helpers (NOT cfg(test): other crates' tests use it)
 pub mod tls;
 pub mod types; // Event-driven pub-sub (B6.1)
+pub mod uri_encode; // Percent-encoding for URI queries and form bodies (issue #101)
 
 pub mod client;
 pub mod server;
