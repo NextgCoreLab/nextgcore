@@ -3419,6 +3419,61 @@ impl NgapServer {
                     .map(|s| s.amf_ue.redcap_indication)
                     .unwrap_or(false);
 
+                // Issue #73: convey the UE and serving-network identity on N11
+                // (TS 29.502 6.1.6.2.2). Previously none of this was sent, so the
+                // SMF fabricated `imsi-unknown` and every subscriber looked
+                // identical to policy, charging and NSAC.
+                let identity = {
+                    let ctx = crate::context::amf_self();
+                    let guard = ctx.read().ok();
+                    let state = self.ue_auth_state.get(&amf_ue_ngap_id);
+                    // The serving PLMN: prefer the TAI the UE is actually in,
+                    // then the AMF's own served GUAMI. Never a literal.
+                    let serving_plmn = state
+                        .map(|s| &s.amf_ue.nr_tai.plmn_id)
+                        .map(|p| (p.mcc(), p.mnc()))
+                        .or_else(|| {
+                            guard
+                                .as_ref()
+                                .and_then(|c| c.served_guami.first())
+                                .map(|g| (g.plmn_id.mcc(), g.plmn_id.mnc()))
+                        });
+                    let guami = guard
+                        .as_ref()
+                        .and_then(|c| c.served_guami.first())
+                        .map(|g| {
+                            serde_json::json!({
+                                "plmnId": { "mcc": g.plmn_id.mcc(), "mnc": g.plmn_id.mnc() },
+                                "amfId": format!(
+                                    "{:02x}{:03x}{:02x}",
+                                    g.amf_id.region, g.amf_id.set, g.amf_id.pointer
+                                ),
+                            })
+                        });
+                    // TS 29.571 UserLocation: the serving NR TAI.
+                    let ue_location = state.map(|s| &s.amf_ue.nr_tai).map(|tai| {
+                        serde_json::json!({
+                            "nrLocation": {
+                                "tai": {
+                                    "plmnId": {
+                                        "mcc": tai.plmn_id.mcc(),
+                                        "mnc": tai.plmn_id.mnc(),
+                                    },
+                                    "tac": format!("{:06x}", tai.tac),
+                                }
+                            }
+                        })
+                    });
+                    crate::sbi_path::SmContextIdentity {
+                        supi: state.and_then(|s| s.amf_ue.supi.clone()),
+                        pei: state.and_then(|s| s.amf_ue.pei.clone()),
+                        guami,
+                        serving_plmn,
+                        serving_nf_id: None,
+                        ue_location,
+                    }
+                };
+
                 match crate::sbi_path::call_smf_create_sm_context(
                     &smf_host,
                     smf_port,
@@ -3428,6 +3483,7 @@ impl NgapServer {
                     dnn,
                     sm_pdu,
                     redcap_indication,
+                    &identity,
                 )
                 .await
                 {

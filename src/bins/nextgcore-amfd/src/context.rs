@@ -98,6 +98,29 @@ impl PlmnId {
             mnc3: mnc_bytes.get(2).copied().unwrap_or(0xf),
         }
     }
+
+    /// The MCC as its three decimal digits (TS 29.571 `Mcc`, `\d{3}`).
+    ///
+    /// Issue #73: the inverse of [`PlmnId::new`] was missing, which is part of why
+    /// the N11 `servingNetwork` was hardcoded to `001/01` -- there was no way to
+    /// render a real PLMN back to the wire form.
+    pub fn mcc(&self) -> String {
+        format!("{}{}{}", self.mcc1, self.mcc2, self.mcc3)
+    }
+
+    /// The MNC as its two or three decimal digits (TS 29.571 `Mnc`,
+    /// `\d{2,3}`).
+    ///
+    /// `mnc3 == 0xf` is the TS 24.008 filler marking a TWO-digit MNC, so it is
+    /// dropped rather than rendered -- emitting `15` for a 2-digit MNC would
+    /// silently claim a different network.
+    pub fn mnc(&self) -> String {
+        if self.mnc3 == 0xf {
+            format!("{}{}", self.mnc1, self.mnc2)
+        } else {
+            format!("{}{}{}", self.mnc1, self.mnc2, self.mnc3)
+        }
+    }
 }
 
 /// AMF ID (Region + Set + Pointer)

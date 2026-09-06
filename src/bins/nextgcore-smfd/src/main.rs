@@ -1868,15 +1868,26 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         return problem_400("MANDATORY_IE_MISSING", "sNssai.sst is required");
     };
     let snssai_sd = req_body["sNssai"]["sd"].as_str().map(str::to_string);
-    // supi is conditional-mandatory (non-emergency registration); the current
-    // AMF does not send it yet, so warn instead of rejecting.
-    let supi = match req_body["supi"].as_str() {
-        Some(s) => s.to_string(),
-        None => {
-            log::warn!("SmContextCreateData without supi (lenient: AMF support pending)");
-            "imsi-unknown".to_string()
-        }
+    // Issue #73: `supi` is conditional-mandatory for a non-emergency session
+    // (TS 29.502 §6.1.6.2.2), and it is now REJECTED when absent.
+    //
+    // This used to warn and substitute `"imsi-unknown"`, with the comment "lenient:
+    // AMF support pending". The AMF now sends the real SUPI, and the fabrication
+    // was never merely cosmetic: the phantom identity flowed into NSAC counters,
+    // policy association and session lookup, so every subscriber in the network
+    // collapsed onto ONE identity. Charging and slice admission were computed over
+    // a subscriber that does not exist -- and because it looked like a working
+    // session, nothing surfaced the loss.
+    //
+    // Rejecting is the honest failure: a session the SMF cannot attribute is a
+    // session it cannot charge, police or admit.
+    let Some(supi) = req_body["supi"].as_str().filter(|s| !s.is_empty()) else {
+        return problem_400(
+            "MANDATORY_IE_MISSING",
+            "supi is required for a non-emergency SmContextCreateData (TS 29.502 6.1.6.2.2)",
+        );
     };
+    let supi = supi.to_string();
     let an_type = req_body["anType"].as_str().unwrap_or_else(|| {
         log::warn!("SmContextCreateData without anType — assuming 3GPP_ACCESS");
         "3GPP_ACCESS"
@@ -3642,6 +3653,56 @@ mod tests {
         let n1 = resolve_binary_ref(&request, &req_body["n1SmMsg"]).unwrap();
         assert_eq!(n1, N1_ESTABLISHMENT_REQUEST.to_vec());
         assert!(policy::parse_establishment_request(&n1).is_some());
+    }
+
+    // ------------------------- issue #73 --------------------------------
+
+    /// **Issue #73, criterion 3.** A non-emergency `CreateSMContext` with no
+    /// `supi` is REJECTED, not served with a fabricated subscriber.
+    ///
+    /// This used to warn and substitute `"imsi-unknown"`, and the phantom identity
+    /// then flowed into NSAC counters, policy association and session lookup — so
+    /// every subscriber in the network collapsed onto ONE identity. Charging and
+    /// slice admission were computed over a subscriber that does not exist, and
+    /// because the session still came up, nothing surfaced the loss.
+    ///
+    /// Asserted on BEHAVIOUR (the 400 and its cause), not by grepping the source
+    /// for `imsi-unknown`: the explanation of this fix contains that literal, and
+    /// a source-grepping guard would match its own justification.
+    #[tokio::test]
+    async fn create_sm_context_without_supi_is_rejected() {
+        smf_context_init(64, 256, 512);
+        let body = serde_json::json!({
+            "pduSessionId": 5,
+            "sNssai": { "sst": 1, "sd": "010203" },
+            "dnn": "internet",
+            "n1SmMsg": { "contentId": "n1SmMsg" },
+        });
+        let mut request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts");
+        request.http.content = Some(body.to_string());
+
+        let resp = handle_sm_context_create(&request).await;
+        assert_eq!(
+            resp.status, 400,
+            "a session the SMF cannot attribute must be refused"
+        );
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "MANDATORY_IE_MISSING");
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("supi"),
+            "the rejection must name the missing IE, got {problem}"
+        );
+
+        // An empty string is not an identity either.
+        let mut empty = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts");
+        let mut with_empty = body.clone();
+        with_empty["supi"] = serde_json::json!("");
+        empty.http.content = Some(with_empty.to_string());
+        assert_eq!(handle_sm_context_create(&empty).await.status, 400);
     }
 
     // ----------------------------- smfd-06 ------------------------------
