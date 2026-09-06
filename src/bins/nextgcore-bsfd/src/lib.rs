@@ -2584,23 +2584,6 @@ mod tests {
         server.stop().await.expect("stop");
     }
 
-    /// Percent-encode a JSON query-parameter value the way a conformant
-    /// consumer must: TS 29.521 declares `mbs-session-id` as
-    /// `content: application/json`, and raw `{`/`}`/`"` are not legal URI
-    /// characters, so the JSON has to be escaped before it goes on the wire.
-    fn pct_encode_query(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() * 3);
-        for b in s.bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    out.push(b as char)
-                }
-                _ => out.push_str(&format!("%{b:02X}")),
-            }
-        }
-        out
-    }
-
     fn problem(resp: &SbiResponse) -> serde_json::Value {
         serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap()
     }
@@ -3671,8 +3654,7 @@ mod tests {
             "tmgi": {"plmnId": {"mnc": "01", "mcc": "001"}, "mbsServiceId": "AABBCC"}
         });
         let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
-        req.http
-            .set_param("mbs-session-id", &pct_encode_query(&upper.to_string()));
+        req.http.set_param("mbs-session-id", upper.to_string());
         let resp = client
             .send_request(req)
             .await
@@ -3729,8 +3711,7 @@ mod tests {
             "tmgi": {"mbsServiceId": "975002", "plmnId": {"mcc": "001", "mnc": "01"}}
         });
         let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
-        req.http
-            .set_param("mbs-session-id", &pct_encode_query(&id.to_string()));
+        req.http.set_param("mbs-session-id", id.to_string());
         let resp = client.send_request(req).await.expect("mbs discover empty");
         assert_eq!(resp.status, 200);
         let body: serde_json::Value =
@@ -3748,8 +3729,7 @@ mod tests {
             .expect("POST mbs");
         assert_eq!(resp.status, 201);
         let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
-        req.http
-            .set_param("mbs-session-id", &pct_encode_query(&id.to_string()));
+        req.http.set_param("mbs-session-id", id.to_string());
         let resp = client.send_request(req).await.expect("mbs discover one");
         assert_eq!(resp.status, 200);
         let body: serde_json::Value =
@@ -4003,8 +3983,7 @@ mod tests {
 
         // Discovery by mbsSessionId → 200 single result.
         let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
-        req.http
-            .set_param("mbs-session-id", &pct_encode_query(&mbs_id_obj.to_string()));
+        req.http.set_param("mbs-session-id", mbs_id_obj.to_string());
         let resp = client.send_request(req).await.expect("discover mbs");
         assert_eq!(resp.status, 200);
 
@@ -4019,10 +3998,8 @@ mod tests {
 
         // Unknown mbsSessionId → 204.
         let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
-        req.http.set_param(
-            "mbs-session-id",
-            &pct_encode_query(&mbs_id_other.to_string()),
-        );
+        req.http
+            .set_param("mbs-session-id", mbs_id_other.to_string());
         let resp = client.send_request(req).await.expect("discover mbs miss");
         // 200 with an empty array, not 204 (see the UE site above).
         assert_eq!(resp.status, 200);

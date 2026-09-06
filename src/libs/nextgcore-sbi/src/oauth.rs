@@ -1163,24 +1163,15 @@ async fn http2_connect(
     }
 }
 
-/// Minimal percent-encoding for form values.
+/// Percent-encoding for `application/x-www-form-urlencoded` values.
+///
+/// Issue #101: was a local copy. It now delegates to the shared encoder, which
+/// keeps the form encoding (space -> `+`) DISTINCT from the RFC 3986 query
+/// encoding (space -> `%20`) rather than merging them -- the two are not
+/// interchangeable, and this is the form-body surface. See
+/// [`crate::uri_encode`].
 fn url_encode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => result.push(c),
-            ' ' => result.push('+'),
-            _ => {
-                let mut buf = [0u8; 4];
-                let encoded = c.encode_utf8(&mut buf);
-                for &b in encoded.as_bytes() {
-                    result.push('%');
-                    result.push_str(&format!("{b:02X}"));
-                }
-            }
-        }
-    }
-    result
+    crate::uri_encode::encode_form_value(s)
 }
 
 // ============================================================================

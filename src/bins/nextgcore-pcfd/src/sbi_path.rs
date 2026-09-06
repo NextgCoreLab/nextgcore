@@ -530,18 +530,15 @@ pub struct DiscoveredEndpoint {
     pub scheme: String,
 }
 
-/// Minimal RFC 3986 percent-encoding for a query-string value (no external dep).
+/// RFC 3986 percent-encoding for a query-string value.
+///
+/// Issue #101: was a local copy. It now delegates to nextgcore-sbi's shared
+/// encoder, which is byte-identical in behaviour (same unreserved set, space ->
+/// `%20`). These call sites build the URI **string** by hand rather than through
+/// `SbiRequest::with_param`, so the client's central encoding does not reach them
+/// and they must still encode here -- see `with_param`'s contract note.
 fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
+    nextgcore_sbi::uri_encode::encode_query_value(s)
 }
 
 /// Parse the first matching service endpoint from an NRF SearchResult body.

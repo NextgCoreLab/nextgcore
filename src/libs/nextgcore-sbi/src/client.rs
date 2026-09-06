@@ -803,7 +803,22 @@ impl SbiClient {
                 .http
                 .params
                 .iter()
-                .map(|(k, v)| format!("{k}={v}"))
+                // Issue #101: percent-encode BOTH key and value. Joining them raw
+                // meant any structured SBI query factor -- an S-NSSAI list, a
+                // GUAMI, a TAI, a PLMN list -- contained `[`, `{`, `"` or `:`,
+                // which made the `Uri::parse` below reject the whole URI. The SCP's
+                // delegated discovery therefore died with 502 before the request
+                // ever left the process (TS 29.500 6.10.3.2).
+                //
+                // Encoded here, in the one place every SBI query passes through,
+                // rather than at each call site -- a caller cannot forget.
+                .map(|(k, v)| {
+                    format!(
+                        "{}={}",
+                        crate::uri_encode::encode_query_value(k),
+                        crate::uri_encode::encode_query_value(v)
+                    )
+                })
                 .collect();
             format!("{}?{}", uri_str, params.join("&"))
         };
