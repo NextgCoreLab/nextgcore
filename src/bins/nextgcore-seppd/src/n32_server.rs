@@ -152,6 +152,10 @@ async fn n32_request_handler(request: HttpRequest) -> HttpResponse {
             handle_exchange_params(&body, tls_secret.as_deref(), &cid)
         }
         ("POST", "/n32c-handshake/v1/n32f-error") => handle_n32f_error_report(&body),
+        // Issue #99: N32-f context termination (TS 29.573 5.2.4). Mandatory, and
+        // previously absent -- a peer's terminate request fell through to the 404
+        // below, so terminated contexts and their keys persisted indefinitely.
+        ("POST", "/n32c-handshake/v1/n32f-terminate") => handle_n32f_terminate(&body),
         ("POST", "/n32f-forward/v1/n32f-process") => handle_n32f_process(&body).await,
         _ => send_error(
             404,
@@ -442,26 +446,51 @@ async fn handle_n32f_process(body: &str) -> HttpResponse {
                 if let Some(resp) = enforce_tls_mode_peer(sender_sepp.as_deref()) {
                     return resp;
                 }
-                let headers = msg
-                    .header
-                    .iter()
-                    .map(|h| (h.name.clone(), h.value.clone()))
-                    .collect();
-                let rec = ReconstructedRequestJson {
+                // Issue #99: FORWARD to the target NF. This used to build a
+                // `ReconstructedRequestJson` and return it as a 200 body -- the
+                // reconstructed request was reflected to the SENDING SEPP instead
+                // of being delivered, so in TLS security mode no roaming service
+                // request ever traversed the SEPP-to-NF hop and nothing was ever
+                // fulfilled (TS 29.573 5.3.3.1, TS 29.500 6.1.4.3.4,
+                // TS 33.501 5.9.3: the SEPP is a proxy here, not an endpoint).
+                let rec = prins::ReconstructedRequest {
                     method: msg.request_line.method,
                     url: msg.request_line.url,
-                    headers,
-                    body: msg.payload,
-                    message_id: None,
+                    headers: msg
+                        .header
+                        .iter()
+                        .map(|h| (h.name.clone(), h.value.clone()))
+                        .collect(),
+                    // The TLS envelope carries the payload as text; the
+                    // forwarder wants bytes.
+                    body: msg.payload.map(String::into_bytes),
+                    // The TLS envelope carries no messageId; it is a PRINS
+                    // correlation field. Empty rather than fabricated.
+                    message_id: String::new(),
                 };
                 log::info!(
-                    "N32-f TLS-mode message accepted: {} {}",
+                    "N32-f TLS-mode message accepted, forwarding to target NF: {} {}",
                     rec.method,
                     rec.url
                 );
-                HttpResponse::ok()
-                    .with_json_body(&rec)
-                    .unwrap_or_else(|_| HttpResponse::internal_error())
+                let (status, resp_headers, resp_body) = forward_to_target_nf(&rec).await;
+                // Relay the NF's REAL response verbatim. Deliberately NOT via
+                // `forward_and_protect_response`, which the PRINS branch uses:
+                // that wraps the response in an N32fReformattedRspMsg and
+                // JOSE-protects it, which a peer that negotiated TLS cannot
+                // deserialise. In TLS mode the transport IS the protection
+                // (TS 33.501 5.9.3), so the two modes share the forwarding step
+                // and diverge on the response step.
+                let mut out = HttpResponse::with_status(status);
+                for (k, v) in resp_headers {
+                    out.http.set_header(k, v);
+                }
+                if let Some(body) = resp_body {
+                    if let Ok(text) = String::from_utf8(body) {
+                        out.http.set_content(text);
+                    }
+                }
+                out
             }
             Err(e) => send_error(400, "Bad Request", &e, Some("MANDATORY_IE_INCORRECT")),
         }
@@ -473,6 +502,95 @@ async fn handle_n32f_process(body: &str) -> HttpResponse {
             Some("MANDATORY_IE_INCORRECT"),
         )
     }
+}
+
+/// `POST /n32c-handshake/v1/n32f-terminate` — N32-f context termination
+/// (TS 29.573 §5.2.4, response body `N32fContextInfo` per §6.1.5.2).
+///
+/// Deletes the addressed N32-f context **and its keys**: the key hierarchy lives
+/// inside `SeppNode::n32f_security`, so clearing that `Option` is the deletion.
+/// `handshake_state` is reset too, so a later N32-f message cannot ride a context
+/// whose keys are gone.
+///
+/// Deliberately NOT `node_remove`. TS 29.573 §5.2.4 terminates an
+/// `n32fContextId`, not the peer: the peer's N32-c API root and negotiated
+/// capabilities are provisioning state that must survive an N32-f teardown, or a
+/// re-handshake could not find its own peer configuration. Terminating a context
+/// is routine; de-provisioning a peer is not.
+///
+/// An unknown `n32fContextId` is 404 rather than a silent success — the peer
+/// asked us to destroy keys, and letting it believe we did when we never held
+/// them is exactly the wrong answer for a border function.
+fn handle_n32f_terminate(body: &str) -> HttpResponse {
+    let json: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return send_error(
+                400,
+                "Bad Request",
+                &format!("Malformed N32fContextInfo: {e}"),
+                Some("MANDATORY_IE_INCORRECT"),
+            )
+        }
+    };
+    let Some(context_id) = json
+        .get("n32fContextId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return send_error(
+            400,
+            "Bad Request",
+            "n32fContextId is mandatory",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
+
+    let ctx = sepp_self();
+    let found = {
+        // Guard scoped so it drops before node_update takes the write lock.
+        let context = match ctx.read() {
+            Ok(c) => c,
+            Err(_) => {
+                return send_error(
+                    500,
+                    "Internal Server Error",
+                    "SEPP context lock poisoned",
+                    None,
+                )
+            }
+        };
+        context.node_find_by_n32f_context_id(context_id)
+    };
+    let Some(mut node) = found else {
+        return send_error(
+            404,
+            "Not Found",
+            &format!("Unknown n32fContextId {context_id}"),
+            Some("CONTEXT_NOT_FOUND"),
+        );
+    };
+
+    // The keys are in here. Dropping it is the key deletion.
+    node.n32f_security = None;
+    node.handshake_state = crate::handshake_sm::HandshakeState::Initial;
+    let updated = match ctx.read() {
+        Ok(context) => context.node_update(&node),
+        Err(_) => false,
+    };
+    if !updated {
+        return send_error(
+            500,
+            "Internal Server Error",
+            "failed to update SEPP node while terminating the N32-f context",
+            None,
+        );
+    }
+    log::info!("N32-f context {context_id} terminated: context and keys deleted");
+
+    HttpResponse::ok()
+        .with_json_body(&serde_json::json!({ "n32fContextId": context_id }))
+        .unwrap_or_else(|_| HttpResponse::internal_error())
 }
 
 /// Enforce that a TLS-mode N32-f message comes from a known peer SEPP whose
@@ -617,7 +735,13 @@ async fn handle_prins_message(msg: &N32fReformattedMessage) -> HttpResponse {
             log::error!("N32-f PRINS verification failed: {e}");
 
             // Produce the n32f-error report towards the sending SEPP
-            let info = e.to_error_info();
+            // Issue #99: name the context the failure relates to, so a peer
+            // holding several can tell which one broke.
+            let info = e.to_error_info(
+                node.n32f_security
+                    .as_ref()
+                    .map(|sec| sec.local_context_id.as_str()),
+            );
             if let Some(api_root) = node.peer_api_root.clone() {
                 let report = info.clone();
                 tokio::spawn(async move {
@@ -1357,6 +1481,159 @@ mod tests {
             c.node_update(&node);
         }
         assert!(enforce_tls_mode_peer(Some("sepp-tls-ok.example.com")).is_none());
+    }
+
+    // ── issue #99: N32-f forwarding and context termination ─────────────────
+
+    /// Register a TLS-mode peer with an N32-f security context, and return its
+    /// locally-allocated context id.
+    fn tls_peer_with_context(receiver: &str, context_id: &str) -> u64 {
+        ensure_ctx_initialized();
+        let ctx = sepp_self();
+        let c = ctx.read().unwrap();
+        let mut node = c.node_add(receiver).unwrap();
+        node.negotiated_security_scheme = SecurityCapability::Tls;
+        node.handshake_state = crate::handshake_sm::HandshakeState::Established;
+        node.n32f_security = Some(crate::context::N32fSecurityInfo {
+            local_context_id: context_id.to_string(),
+            peer_context_id: format!("peer-{context_id}"),
+            key_material: crate::n32c_handler::derive_n32f_key_material(&[7u8; 64], context_id),
+            role: crate::n32c_handler::N32fRole::Initiator,
+            kid: context_id.to_string(),
+            jwe_cipher_suite: "A256GCM".to_string(),
+            jws_cipher_suite: "ES256".to_string(),
+            enc_profiles: Vec::new(),
+        });
+        let id = node.id;
+        c.node_update(&node);
+        id
+    }
+
+    /// **Criterion 2, the regression guard.** The TLS-mode handler must not
+    /// return the reconstructed request.
+    ///
+    /// It used to answer `200` with the request echoed back via
+    /// `with_json_body(&rec)`, so in TLS security mode roaming SBI traffic never
+    /// reached the target NF and no service request was ever fulfilled. With no
+    /// resolvable target here the forward attempt fails, which is the honest
+    /// outcome -- and crucially NOT a 200 carrying the request.
+    #[tokio::test]
+    async fn tls_mode_does_not_echo_the_reconstructed_request() {
+        tls_peer_with_context("sepp-echo-guard.example.com", "ctx-echo-guard");
+        // Built with the real sender-side builder, not hand-written JSON: an
+        // envelope missing a field (`protocol`) is rejected at 400 before the TLS
+        // branch runs, which would make this assertion vacuous.
+        let msg = crate::n32c_build::build_n32f_tls_message(
+            "GET",
+            "/nnrf-disc/v1/nf-instances",
+            &[(
+                "3gpp-sbi-sender-sepp".to_string(),
+                "sepp-echo-guard.example.com".to_string(),
+            )],
+            None,
+        );
+        let resp = handle_n32f_process(&serde_json::to_string(&msg).unwrap()).await;
+        // Must have reached the TLS branch: a parse/authorisation rejection would
+        // make the assertions below pass for the wrong reason.
+        let body = resp.http.content.clone().unwrap_or_default();
+
+        // POSITIVE evidence that the forward was ATTEMPTED, not merely that the
+        // echo is gone. Without a `3gpp-Sbi-Target-apiRoot` header and with a
+        // relative URL there is no target to resolve, so `forward_to_target_nf`
+        // answers with its own problem response -- and that string is only
+        // reachable from inside the forwarding path.
+        //
+        // Asserting this rather than just `status != 200` matters: an earlier
+        // version of this test hand-wrote the envelope, which failed to parse at
+        // 400 before the TLS branch ran, so every assertion passed for the wrong
+        // reason. A vacuous guard is worse than none.
+        assert!(
+            body.contains("target NF apiRoot could not be resolved"),
+            "the TLS branch must reach forward_to_target_nf, got {resp:?}"
+        );
+        assert_ne!(
+            resp.status, 200,
+            "a 200 here means the request was echoed rather than forwarded"
+        );
+        assert!(
+            !body.contains("requestLine") && !body.contains("/nnrf-disc/v1/nf-instances"),
+            "the response must not be the inbound reconstructed request, got {body}"
+        );
+    }
+
+    /// **Criterion 3.** `n32f-terminate` returns `N32fContextInfo`, and deletes
+    /// the context AND its keys -- the key hierarchy lives inside
+    /// `n32f_security`, so clearing it is the deletion.
+    ///
+    /// Also asserts the follow-on property: a later N32-f message on the
+    /// terminated context is rejected, so a peer cannot ride a context whose keys
+    /// are gone.
+    #[tokio::test]
+    async fn n32f_terminate_returns_context_info_and_deletes_the_keys() {
+        let node_id = tls_peer_with_context("sepp-term.example.com", "ctx-to-terminate");
+
+        let resp = handle_n32f_terminate(
+            &serde_json::json!({ "n32fContextId": "ctx-to-terminate" }).to_string(),
+        );
+        assert_eq!(resp.status, 200, "TS 29.573 5.2.4 mandates 200");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["n32fContextId"], "ctx-to-terminate",
+            "the response body is an N32fContextInfo naming the terminated context"
+        );
+
+        // The context and its keys are gone...
+        {
+            let ctx = sepp_self();
+            let c = ctx.read().unwrap();
+            let node = c.node_find(node_id).expect("the PEER must survive");
+            assert!(
+                node.n32f_security.is_none(),
+                "the N32-f context and its key material must be deleted"
+            );
+            assert_eq!(
+                node.handshake_state,
+                crate::handshake_sm::HandshakeState::Initial,
+                "the handshake must be reset so the dead context cannot be ridden"
+            );
+        }
+        // ...and the peer itself is NOT removed: its provisioning survives an
+        // N32-f teardown (see handle_n32f_terminate's docs).
+        assert!(
+            c_node_exists(node_id),
+            "terminating a context must not de-provision the peer"
+        );
+        // A later message on that context id no longer resolves.
+        assert!(
+            {
+                let ctx = sepp_self();
+                let c = ctx.read().unwrap();
+                c.node_find_by_n32f_context_id("ctx-to-terminate").is_none()
+            },
+            "the terminated context must no longer resolve"
+        );
+    }
+
+    fn c_node_exists(id: u64) -> bool {
+        let ctx = sepp_self();
+        let c = ctx.read().unwrap();
+        c.node_find(id).is_some()
+    }
+
+    /// An unknown context is 404, not a silent success: the peer asked us to
+    /// destroy keys, and claiming we did when we never held them is the wrong
+    /// answer for a border function.
+    #[test]
+    fn n32f_terminate_unknown_context_is_404() {
+        ensure_ctx_initialized();
+        let resp = handle_n32f_terminate(
+            &serde_json::json!({ "n32fContextId": "ctx-never-existed" }).to_string(),
+        );
+        assert_eq!(resp.status, 404);
+        // And a missing mandatory IE is 400, not 404.
+        let resp = handle_n32f_terminate("{}");
+        assert_eq!(resp.status, 400);
     }
 
     #[test]

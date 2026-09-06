@@ -324,10 +324,30 @@ async fn two_sepp_n32_handshake_and_forwarding() {
         )
         .await
         .expect("TLS-mode N32-f forward");
-        assert_eq!(status, 200);
-        let rec: ReconstructedJson = serde_json::from_str(&rsp_body).unwrap();
-        assert_eq!(rec.method, "GET");
-        assert_eq!(rec.url, "/nnrf-disc/v1/nf-instances");
+        // Issue #99, criterion 2: the receiving SEPP must FORWARD to the target
+        // NF, not echo the reconstructed request back to us.
+        //
+        // This block used to assert the echo -- `rec.method == "GET"` and
+        // `rec.url == "/nnrf-disc/v1/nf-instances"` -- i.e. it pinned the defect
+        // as the expected behaviour. In TLS security mode roaming SBI traffic
+        // therefore never traversed the SEPP-to-NF hop and no service request was
+        // ever fulfilled, while this test stayed green.
+        //
+        // No target NF is reachable here and the URL is relative with no
+        // `3gpp-Sbi-Target-apiRoot`, so the SEPP cannot resolve a target and
+        // answers 400. That is the honest outcome of an ATTEMPTED forward, and it
+        // is what distinguishes forwarding from echoing.
+        assert_ne!(
+            status, 200,
+            "a TLS-mode N32-f message with no resolvable target must not succeed; \
+             a 200 here means the request was echoed rather than forwarded"
+        );
+        assert!(
+            serde_json::from_str::<ReconstructedJson>(&rsp_body)
+                .map(|rec| rec.url != "/nnrf-disc/v1/nf-instances")
+                .unwrap_or(true),
+            "the response must not be the inbound reconstructed request, got {rsp_body}"
+        );
 
         // ------------------------------------------------------------------
         // Phase 5: capability mismatch -> negotiation failure

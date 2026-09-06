@@ -619,19 +619,57 @@ pub enum N32fErrorType {
 }
 
 /// N32fErrorInfo body POSTed to {apiRoot}/n32c-handshake/v1/n32f-error
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct N32fErrorInfo {
     /// messageId of the failed N32-f message
     pub n32f_message_id: String,
     /// What failed
     pub n32f_error_type: N32fErrorType,
-    /// FQDNs of failed modification entries (when applicable)
+    /// Per-IPX modification failures (TS 29.573 §6.1.5.4).
+    ///
+    /// Issue #99: was `Vec<String>`. A conformant peer SEPP deserialises this as
+    /// an array of `FailedModificationInfo` OBJECTS, so a list of bare strings
+    /// could not be parsed at all -- and this report is emitted exactly when the
+    /// N32 link is already failing, so the malformed shape destroyed
+    /// diagnosability at the worst moment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub failed_modification_list: Vec<String>,
-    /// Additional diagnostics
+    pub failed_modification_list: Vec<FailedModificationInfo>,
+    /// Reconstruction diagnostics (TS 29.573 §6.1.5.4). Was `Vec<String>`; see
+    /// above.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub error_details_list: Vec<String>,
+    pub error_details_list: Vec<N32fErrorDetail>,
+    /// The N32-f context the failure relates to. Issue #99: absent before, so a
+    /// peer holding several contexts could not tell which one failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n32f_context_id: Option<String>,
+}
+
+/// One IPX's modification failure (TS 29.573 §6.1.5.4 `FailedModificationInfo`,
+/// `TS29573_N32_Handshake.yaml:503-533`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedModificationInfo {
+    /// Identity of the IPX whose modification could not be applied.
+    pub ipx_id: String,
+    /// Why it failed.
+    pub n32f_error_type: N32fErrorType,
+}
+
+/// One reconstruction diagnostic (TS 29.573 §6.1.5.4 `N32fErrorDetail`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct N32fErrorDetail {
+    /// The JSON attribute that could not be reconstructed.
+    ///
+    /// Optional and left unset by the current error path, which does not track
+    /// which attribute failed. Omitted rather than fabricated -- an invented
+    /// attribute name in a diagnostic report is worse than a missing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribute: Option<String>,
+    /// Human-readable reason the message could not be reconstructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_reconstruct_fail_reason: Option<String>,
 }
 
 /// Error raised while unprotecting an N32-f message; carries everything
@@ -658,13 +696,30 @@ impl N32fUnprotectError {
         }
     }
 
-    /// Convert into the on-the-wire N32fErrorInfo
-    pub fn to_error_info(&self) -> N32fErrorInfo {
+    /// Convert into the on-the-wire `N32fErrorInfo`.
+    ///
+    /// `n32f_context_id` is passed in rather than stored on the error: the error
+    /// is raised deep in unprotection, which does not know the context, while the
+    /// caller emitting the report always does (issue #99, criterion 4).
+    pub fn to_error_info(&self, n32f_context_id: Option<&str>) -> N32fErrorInfo {
         N32fErrorInfo {
             n32f_message_id: self.message_id.clone().unwrap_or_else(|| "unknown".into()),
             n32f_error_type: self.error_type,
-            failed_modification_list: self.failed_modifications.clone(),
-            error_details_list: vec![self.detail.clone()],
+            // Issue #99: the stored strings are IPX identifiers, so each becomes
+            // a FailedModificationInfo carrying this report's error type.
+            failed_modification_list: self
+                .failed_modifications
+                .iter()
+                .map(|ipx_id| FailedModificationInfo {
+                    ipx_id: ipx_id.clone(),
+                    n32f_error_type: self.error_type,
+                })
+                .collect(),
+            error_details_list: vec![N32fErrorDetail {
+                attribute: None,
+                msg_reconstruct_fail_reason: Some(self.detail.clone()),
+            }],
+            n32f_context_id: n32f_context_id.map(str::to_string),
         }
     }
 }
@@ -2029,6 +2084,59 @@ mod tests {
         assert_eq!(rec.body.unwrap(), raw);
     }
 
+    /// **Issue #99, criterion 4.** `N32fErrorInfo` must match TS 29.573 §6.1.5.4:
+    /// `failedModificationList` is an array of `FailedModificationInfo` OBJECTS,
+    /// `errorDetailsList` an array of `N32fErrorDetail` objects, and
+    /// `n32fContextId` is carried.
+    ///
+    /// Both lists were `Vec<String>` before, so a conformant peer SEPP could not
+    /// deserialise the report at all -- and this is emitted precisely when the N32
+    /// link is already failing, so the malformed shape destroyed diagnosability at
+    /// the worst possible moment.
+    #[test]
+    fn n32f_error_info_round_trips_the_spec_shape() {
+        let err = N32fUnprotectError {
+            error_type: N32fErrorType::IntegrityCheckFailed,
+            message_id: Some("msg-7".into()),
+            detail: "aad mismatch".into(),
+            failed_modifications: vec!["ipx-a.example.com".into(), "ipx-b.example.com".into()],
+        };
+        let info = err.to_error_info(Some("ctx-42"));
+        let json = serde_json::to_value(&info).expect("serialise");
+
+        // camelCase members, per the yaml.
+        assert_eq!(json["n32fMessageId"], "msg-7");
+        assert_eq!(json["n32fContextId"], "ctx-42");
+
+        // failedModificationList: OBJECTS, not strings.
+        let mods = json["failedModificationList"].as_array().expect("array");
+        assert_eq!(mods.len(), 2);
+        assert!(
+            mods[0].is_object(),
+            "FailedModificationInfo must be an object, got {}",
+            mods[0]
+        );
+        assert_eq!(mods[0]["ipxId"], "ipx-a.example.com");
+        assert!(
+            mods[0].get("n32fErrorType").is_some(),
+            "each entry carries its own n32fErrorType"
+        );
+
+        // errorDetailsList: objects with msgReconstructFailReason.
+        let details = json["errorDetailsList"].as_array().expect("array");
+        assert_eq!(details.len(), 1);
+        assert!(details[0].is_object(), "N32fErrorDetail must be an object");
+        assert_eq!(details[0]["msgReconstructFailReason"], "aad mismatch");
+        assert!(
+            details[0].get("attribute").is_none(),
+            "attribute is omitted, not fabricated, when the failing attribute is unknown"
+        );
+
+        // Round trip: a peer's deserialise of our bytes yields the same value.
+        let back: N32fErrorInfo = serde_json::from_value(json).expect("deserialise");
+        assert_eq!(back, info);
+    }
+
     #[test]
     fn error_info_serialization_is_spec_shaped() {
         let err = N32fUnprotectError {
@@ -2037,7 +2145,7 @@ mod tests {
             detail: "tag mismatch".to_string(),
             failed_modifications: vec![],
         };
-        let info = err.to_error_info();
+        let info = err.to_error_info(Some("ctx-under-test"));
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["n32fMessageId"], "abc123");
         assert_eq!(json["n32fErrorType"], "DECIPHERING_FAILED");
