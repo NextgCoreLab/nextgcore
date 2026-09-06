@@ -792,6 +792,34 @@ fn extract_binary_ref(
 /// RefToBinaryData pointer, and the UE's PDU Session Establishment Request
 /// travels as a 5gnas binary part (TS 29.502 §6.1.2.2.2). The `SbiClient`
 /// serializes the attached part into the multipart/related body.
+/// The UE and serving-network identity the AMF must convey on N11
+/// (TS 29.502 §6.1.6.2.2 `SmContextCreateData`) — issue #73.
+///
+/// Before this, `build_create_sm_context_request` emitted none of it, so `smfd`
+/// fabricated `imsi-unknown` for every PDU session and every subscriber presented
+/// identically to policy, charging and NSAC. `servingNetwork` was hardcoded
+/// `001/01`, misrepresenting the serving network to SMF/PCF/CHF and breaking
+/// roaming decisions.
+///
+/// Grouped into a struct rather than added as six more positional parameters:
+/// `call_smf_create_sm_context` already took eight, and a positional `Option<String>`
+/// soup is how a caller silently passes `pei` where `gpsi` belongs.
+#[derive(Debug, Clone, Default)]
+pub struct SmContextIdentity {
+    /// `supi` — conditional-mandatory for every non-emergency session.
+    pub supi: Option<String>,
+    /// `pei` — the UE's equipment identity (`imei-`/`imeisv-`).
+    pub pei: Option<String>,
+    /// `guami` — the serving AMF's GUAMI.
+    pub guami: Option<serde_json::Value>,
+    /// `servingNetwork` — the REAL serving PLMN, as (mcc, mnc).
+    pub serving_plmn: Option<(String, String)>,
+    /// `servingNfId` — this AMF's NF instance ID.
+    pub serving_nf_id: Option<String>,
+    /// `ueLocation` — TS 29.571 `UserLocation`, built from the serving TAI.
+    pub ue_location: Option<serde_json::Value>,
+}
+
 fn build_create_sm_context_request(
     pdu_session_id: u8,
     sst: u8,
@@ -799,8 +827,9 @@ fn build_create_sm_context_request(
     dnn: &str,
     n1_sm_msg_from_ue: &[u8],
     redcap_indication: bool,
+    identity: &SmContextIdentity,
 ) -> SbiRequest {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "pduSessionId": pdu_session_id,
         "sNssai": {
             "sst": sst,
@@ -809,11 +838,41 @@ fn build_create_sm_context_request(
         "dnn": dnn,
         "n1SmMsg": { "contentId": "n1SmMsg" },
         "redcapIndication": redcap_indication,
-        "servingNetwork": {
-            "mcc": "001",
-            "mnc": "01"
-        }
     });
+    let obj = body.as_object_mut().expect("json! built an object");
+
+    // Issue #73: the serving PLMN comes from the GUAMI/TAI, not a literal. When
+    // it is genuinely unknown the member is OMITTED rather than filled with a
+    // placeholder -- a wrong serving network is worse than an absent one, because
+    // the SMF cannot tell the difference between "001/01" the test PLMN and
+    // "001/01" meaning "the AMF did not know".
+    if let Some((mcc, mnc)) = &identity.serving_plmn {
+        obj.insert(
+            "servingNetwork".to_string(),
+            serde_json::json!({ "mcc": mcc, "mnc": mnc }),
+        );
+    }
+    // Each identity member is emitted only when the AMF actually holds it. The
+    // SMF now rejects a non-emergency create with no `supi` (issue #73), so an
+    // absent SUPI surfaces as a refused session rather than a phantom subscriber.
+    if let Some(supi) = &identity.supi {
+        obj.insert("supi".to_string(), serde_json::json!(supi));
+    }
+    if let Some(pei) = &identity.pei {
+        obj.insert("pei".to_string(), serde_json::json!(pei));
+    }
+    if let Some(guami) = &identity.guami {
+        obj.insert("guami".to_string(), guami.clone());
+    }
+    if let Some(nf_id) = &identity.serving_nf_id {
+        obj.insert("servingNfId".to_string(), serde_json::json!(nf_id));
+    }
+    if let Some(loc) = &identity.ue_location {
+        obj.insert("ueLocation".to_string(), loc.clone());
+    }
+    // `gpsi` is deliberately absent: amfd's UE context has no GPSI field at all
+    // (it never retrieves one from UDM), so there is nothing to convey. Emitting
+    // a derived or blank GPSI would be a fabrication. Tracked as a follow-up.
     SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
         .with_part(SbiPart::with_content(
@@ -836,6 +895,7 @@ pub async fn call_smf_create_sm_context(
     dnn: &str,
     n1_sm_msg_from_ue: &[u8],
     redcap_indication: bool,
+    identity: &SmContextIdentity,
 ) -> SbiResult<SmContextCreateResponse> {
     log::info!(
         "Calling SMF SM Context Create: {smf_host}:{smf_port}, PSI={pdu_session_id}, SST={sst}, \
@@ -858,6 +918,7 @@ pub async fn call_smf_create_sm_context(
         dnn,
         n1_sm_msg_from_ue,
         redcap_indication,
+        identity,
     );
 
     let response = client
@@ -2134,13 +2195,121 @@ mod tests {
         0x2E, 0x05, 0x02, 0xC1, 0xFF, 0xFF, 0x93, 0xA2, 0x28, 0x01, 0x00, 0x55, 0x00, 0x10,
     ];
 
+    /// A populated identity, as the AMF now builds it from the UE context.
+    fn test_identity() -> SmContextIdentity {
+        SmContextIdentity {
+            supi: Some("imsi-262011234567890".to_string()),
+            pei: Some("imeisv-1234567890123456".to_string()),
+            guami: Some(serde_json::json!({
+                "plmnId": { "mcc": "262", "mnc": "01" },
+                "amfId": "01000a",
+            })),
+            serving_plmn: Some(("262".to_string(), "01".to_string())),
+            serving_nf_id: Some("amf-instance-1".to_string()),
+            ue_location: Some(serde_json::json!({
+                "nrLocation": {
+                    "tai": { "plmnId": { "mcc": "262", "mnc": "01" }, "tac": "000001" }
+                }
+            })),
+        }
+    }
+
+    fn n11_body(identity: &SmContextIdentity) -> serde_json::Value {
+        let request = build_create_sm_context_request(
+            5,
+            1,
+            None,
+            "internet",
+            &UE_N1_REQUEST,
+            false,
+            identity,
+        );
+        serde_json::from_str(request.http.content.as_deref().unwrap()).unwrap()
+    }
+
+    /// **Issue #73, criterion 1.** The N11 body carries the real subscriber
+    /// identity.
+    ///
+    /// None of these members were emitted before, so `smfd` fabricated
+    /// `imsi-unknown` and every subscriber in the network collapsed onto one
+    /// phantom identity for policy, charging and NSAC.
+    #[test]
+    fn n11_create_carries_the_real_subscriber_identity() {
+        let body = n11_body(&test_identity());
+
+        assert_eq!(body["supi"].as_str(), Some("imsi-262011234567890"));
+        // TS 29.571 `Supi` pattern: a real identifier, not a placeholder.
+        let supi = body["supi"].as_str().unwrap();
+        assert!(
+            supi.starts_with("imsi-") && supi["imsi-".len()..].chars().all(|c| c.is_ascii_digit()),
+            "supi must match the TS 29.571 Supi pattern, got {supi}"
+        );
+        assert_ne!(supi, "imsi-unknown", "the phantom identity must be gone");
+
+        assert_eq!(body["pei"].as_str(), Some("imeisv-1234567890123456"));
+        assert_eq!(body["servingNfId"].as_str(), Some("amf-instance-1"));
+        assert_eq!(body["guami"]["plmnId"]["mcc"].as_str(), Some("262"));
+        assert_eq!(
+            body["ueLocation"]["nrLocation"]["tai"]["tac"].as_str(),
+            Some("000001")
+        );
+    }
+
+    /// **Criterion 2.** `servingNetwork` reflects the real serving PLMN, not the
+    /// hardcoded `001/01` every SM context used to claim.
+    #[test]
+    fn n11_serving_network_is_the_real_plmn() {
+        let body = n11_body(&test_identity());
+        assert_eq!(body["servingNetwork"]["mcc"].as_str(), Some("262"));
+        assert_eq!(body["servingNetwork"]["mnc"].as_str(), Some("01"));
+        assert_ne!(
+            body["servingNetwork"]["mcc"].as_str(),
+            Some("001"),
+            "the hardcoded test PLMN must not be reported for a real network"
+        );
+    }
+
+    /// An identity the AMF does not hold is OMITTED, never placeheld.
+    ///
+    /// This matters more than it looks: a `servingNetwork` of `001/01` is
+    /// indistinguishable from a real 001/01 test network, so a placeholder would
+    /// have the SMF confidently route on a PLMN the AMF never knew. Absent is
+    /// checkable; wrong is not.
+    #[test]
+    fn n11_omits_identity_the_amf_does_not_have() {
+        let body = n11_body(&SmContextIdentity::default());
+        for absent in [
+            "supi",
+            "pei",
+            "guami",
+            "servingNfId",
+            "ueLocation",
+            "servingNetwork",
+        ] {
+            assert!(
+                body.get(absent).is_none(),
+                "{absent} must be omitted when unknown, got {body}"
+            );
+        }
+        // The unconditional members are still there.
+        assert_eq!(body["pduSessionId"].as_u64(), Some(5));
+        assert_eq!(body["dnn"].as_str(), Some("internet"));
+    }
+
     /// amfd's CreateSmContext request is multipart/related: the JSON root holds
     /// the SmContextCreateData with the N1 as a RefToBinaryData pointer, and the
     /// UE's N1 travels in a 5gnas binary part with the exact UE bytes.
     #[test]
     fn amfd_create_request_is_multipart_with_n1_part() {
-        let request =
-            build_create_sm_context_request(5, 1, None, "internet", &UE_N1_REQUEST, false);
+        let request = build_create_sm_context_request(
+            5,
+            1,
+            None,
+            "internet",
+            &UE_N1_REQUEST,
+            false,
+            &SmContextIdentity::default(),
+        );
 
         // Serialize the request's parts exactly as the SBI client would, then
         // decode it back to prove the wire shape the SMF receives.
