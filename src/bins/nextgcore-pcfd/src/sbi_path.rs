@@ -300,6 +300,72 @@ pub async fn send_notification_post(
     Ok(resp.status)
 }
 
+/// How many times one notification endpoint is attempted before the delivery
+/// moves on to an alternate (TS 29.500 §6.10 requires retransmission; it does not
+/// fix a count, and an unbounded retry would pin a task on a dead consumer).
+const NOTIFY_ATTEMPTS_PER_ENDPOINT: u32 = 3;
+
+/// Backoff before attempt N (0-indexed): 0ms, 100ms, 400ms. Short because a
+/// policy notification is only useful while the association still exists.
+fn notify_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(match attempt {
+        0 => 0,
+        1 => 100,
+        _ => 400,
+    })
+}
+
+/// Deliver a notification to `uri`, retrying, then to each alternate endpoint in
+/// turn. Returns true once some endpoint accepts it.
+///
+/// A 4xx is NOT retried: the consumer understood the request and rejected it, so
+/// resending the same bytes cannot help — only transport failures and 5xx are
+/// worth another attempt (TS 29.500 §6.10).
+async fn deliver_notification(
+    uri: &str,
+    alternates: &[String],
+    suffix: &str,
+    body: &serde_json::Value,
+    what: &str,
+) -> bool {
+    for (endpoint_idx, endpoint) in std::iter::once(uri)
+        .chain(alternates.iter().map(String::as_str))
+        .enumerate()
+    {
+        for attempt in 0..NOTIFY_ATTEMPTS_PER_ENDPOINT {
+            let backoff = notify_backoff(attempt);
+            if !backoff.is_zero() {
+                tokio::time::sleep(backoff).await;
+            }
+            match send_notification_post(endpoint, suffix, body).await {
+                Ok(status) if (200..300).contains(&status) => {
+                    log::info!(
+                        "{what} notification delivered ({status}) to {endpoint}{suffix} \
+                         (endpoint {endpoint_idx}, attempt {attempt})"
+                    );
+                    return true;
+                }
+                Ok(status) if (400..500).contains(&status) => {
+                    log::warn!(
+                        "{what} notification rejected ({status}) by {endpoint}{suffix}; not retrying"
+                    );
+                    break;
+                }
+                Ok(status) => log::warn!(
+                    "{what} notification got {status} from {endpoint}{suffix} (attempt {attempt})"
+                ),
+                Err(e) => {
+                    log::warn!(
+                        "{what} notification to {endpoint}{suffix} failed: {e} (attempt {attempt})"
+                    )
+                }
+            }
+        }
+    }
+    log::warn!("{what} notification undelivered after every endpoint and retry");
+    false
+}
+
 /// Spawn an async notification POST (fire-and-forget for sync call sites).
 fn spawn_notification(
     uri: String,
@@ -307,18 +373,22 @@ fn spawn_notification(
     body: serde_json::Value,
     what: &'static str,
 ) -> bool {
+    spawn_notification_with_alternates(uri, Vec::new(), suffix, body, what)
+}
+
+/// Spawn an async notification POST that retries and falls back to the
+/// consumer's alternate notification endpoints (TS 29.500 §6.10).
+fn spawn_notification_with_alternates(
+    uri: String,
+    alternates: Vec<String>,
+    suffix: &'static str,
+    body: serde_json::Value,
+    what: &'static str,
+) -> bool {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn(async move {
-                match send_notification_post(&uri, suffix, &body).await {
-                    Ok(status) if (200..300).contains(&status) => {
-                        log::info!("{what} notification delivered ({status}) to {uri}{suffix}");
-                    }
-                    Ok(status) => {
-                        log::warn!("{what} notification rejected ({status}) by {uri}{suffix}");
-                    }
-                    Err(e) => log::warn!("{what} notification failed: {e}"),
-                }
+                deliver_notification(&uri, &alternates, suffix, &body, what).await;
             });
             true
         }
@@ -329,31 +399,79 @@ fn spawn_notification(
     }
 }
 
+/// Await a notification delivery instead of spawning it, so a caller that needs
+/// to know the outcome (or a test that needs determinism) can have it.
+pub async fn send_notification_reliably(
+    uri: &str,
+    alternates: &[String],
+    suffix: &str,
+    body: &serde_json::Value,
+    what: &str,
+) -> bool {
+    deliver_notification(uri, alternates, suffix, body, what).await
+}
+
 /// Send AM policy control update notify to the AMF over HTTP
 /// (TS 29.507 §4.2.3: POST {notificationUri}/update with PolicyUpdate).
 pub fn pcf_sbi_send_am_policy_control_notify(pcf_ue_am_id: u64) -> bool {
     // Copy out what we need, then drop the guards (lock-order rule).
     let info = crate::context::pcf_self().read().ok().and_then(|ctx| {
         ctx.ue_am_find_by_id(pcf_ue_am_id).and_then(|ue| {
-            ue.notification_uri
-                .clone()
-                .map(|uri| (uri, ue.association_id))
+            ue.notification_uri.clone().map(|uri| {
+                (
+                    uri,
+                    ue.alt_notif_uris.clone(),
+                    ue.association_id.clone(),
+                    ue.triggers.clone(),
+                    ue.am_policy.clone(),
+                )
+            })
         })
     });
-    let Some((uri, association_id)) = info else {
+    let Some((uri, alternates, association_id, triggers, am_policy)) = info else {
         log::warn!("[ue_am_id={pcf_ue_am_id}] AM policy notify: no notification URI stored");
         return false;
     };
-
-    let body = serde_json::json!({
-        "resourceUri": format!("/npcf-am-policy-control/v1/policies/{association_id}"),
-        "triggers": [],
-    });
-    spawn_notification(uri, "/update", body, "AM policy update")
+    let body = build_am_policy_update(&association_id, &triggers, am_policy.as_ref());
+    // TS 29.507 §4.2.4.2: POST the PolicyUpdate to {notificationUri}/update, and
+    // do it reliably — retried, then to the consumer's alternate endpoints
+    // (TS 29.500 §6.10). Before #89 this was a single fire-and-forget POST that
+    // hardcoded `triggers: []`, and nothing called it at all.
+    spawn_notification_with_alternates(uri, alternates, "/update", body, "AM policy")
 }
 
-/// Send SM policy control create response
-/// Port of pcf_sbi_send_smpolicycontrol_create_response() from sbi-path.c
+/// Build a TS 29.507 `PolicyUpdate` for an AM policy association.
+///
+/// `resourceUri` names the association the update applies to, which is what lets
+/// a consumer that holds several correlate the notification. `triggers` is
+/// `nullable` with `minItems: 1` in the schema, so an EMPTY list is omitted
+/// rather than sent as `[]` — an empty array is not a valid value there, and
+/// sending one is how the old notify body claimed "no triggers" while meaning
+/// "we never populated this". The provisioned policy members are merged in as
+/// they are, so an absent one stays absent instead of becoming null.
+pub fn build_am_policy_update(
+    association_id: &str,
+    triggers: &[String],
+    am_policy: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "resourceUri".to_string(),
+        serde_json::json!(format!(
+            "/npcf-am-policy-control/v1/policies/{association_id}"
+        )),
+    );
+    if !triggers.is_empty() {
+        body.insert("triggers".to_string(), serde_json::json!(triggers));
+    }
+    if let Some(policy) = am_policy.and_then(|p| p.as_object()) {
+        for (k, v) in policy {
+            body.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::Value::Object(body)
+}
+
 pub fn pcf_sbi_send_smpolicycontrol_create_response(sess_id: u64, stream_id: u64) -> bool {
     log::debug!(
         "[sess_id={sess_id}, stream_id={stream_id}] Sending SM policy control create response"
@@ -809,6 +927,54 @@ pub async fn pcf_udr_ue_policy_set(supi: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// Discover a UDR and GET the UE's AM subscription data
+/// (TS 29.505: `GET /nudr-dr/v2/subscription-data/{supi}/provisioned-data/am-data`).
+///
+/// This is where the access-and-mobility policy a `PolicyAssociation` must carry
+/// comes from — `subscribedUeAmbr`, and `rfspIndex` / `serviceAreaRestriction`
+/// when the operator has provisioned them. Returns `Ok(None)` on 404 or when no
+/// UDR is reachable; the caller then provisions what it can and omits the rest
+/// rather than emitting nulls (#89).
+pub async fn pcf_udr_get_am_subscription_data(
+    supi: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
+        return Ok(None);
+    };
+    let client = client_for(&ep, NfType::Udr);
+    let path = format!(
+        "/nudr-dr/v2/subscription-data/{}/provisioned-data/am-data",
+        percent_encode(supi),
+    );
+    let resp = client
+        .get(&path)
+        .await
+        .map_err(|e| format!("nudr-dr am-data GET failed: {e}"))?;
+    match resp.status {
+        200 => {
+            let body = resp.http.content.ok_or("empty am-data body")?;
+            let json =
+                serde_json::from_str(&body).map_err(|e| format!("invalid am-data body: {e}"))?;
+            Ok(Some(json))
+        }
+        404 => {
+            log::warn!("nudr-dr returned 404 for am-data SUPI {supi}");
+            Ok(None)
+        }
+        other => Err(format!("nudr-dr am-data GET returned status {other}")),
+    }
+}
+
+/// Bounded live-path AM subscription-data read. `None` on 404 / unreachable /
+/// timeout, so a stuck UDR cannot hold up an AM policy association.
+pub async fn pcf_udr_am_subscription_data(supi: &str) -> Option<serde_json::Value> {
+    let fut = pcf_udr_get_am_subscription_data(supi);
+    match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
+        Ok(Ok(Some(v))) => Some(v),
+        _ => None,
+    }
+}
+
 /// Register a PCF binding with a discovered BSF
 /// (TS 29.521 Nbsf_Management: `POST /nbsf-management/v1/pcfBindings`).
 /// Returns the binding id (from the Location header, else the response
@@ -846,6 +1012,37 @@ pub async fn pcf_register_bsf_binding(
         }
         other => Err(format!("nbsf-management register returned status {other}")),
     }
+}
+
+/// Update a PCF binding at the BSF
+/// (`PATCH /nbsf-management/v1/pcfBindings/{bindingId}`, Nbsf_Management_Update,
+/// TS 29.521 §4.2.3).
+///
+/// The one Nbsf operation this PCF was missing (#89): a UE that changes IP keeps
+/// a binding advertising the old address, so an AF-influenced lookup through the
+/// BSF resolves a binding that no longer matches the session. `Ok(true)` on
+/// 200/204.
+pub async fn pcf_update_bsf_binding(
+    binding_id: &str,
+    patch: &serde_json::Value,
+) -> Result<bool, String> {
+    let Some(ep) = pcf_discover_endpoint("BSF", "nbsf-management").await? else {
+        return Ok(false);
+    };
+    let client = client_for(&ep, NfType::Bsf);
+    let path = format!("/nbsf-management/v1/pcfBindings/{binding_id}");
+    // TS 29.521 §5.2: the PcfBindingPatch is a merge patch, so the content type
+    // is `application/merge-patch+json` -- our own bsfd tolerates
+    // `application/json` but a strict BSF answers 415 for it.
+    let body = serde_json::to_string(patch)
+        .map_err(|e| format!("failed to serialize PcfBindingPatch: {e}"))?;
+    let request = nextgcore_sbi::message::SbiRequest::patch(&path)
+        .with_body(body, "application/merge-patch+json");
+    let resp = client
+        .send_request(request)
+        .await
+        .map_err(|e| format!("nbsf-management update failed: {e}"))?;
+    Ok(resp.status == 200 || resp.status == 204)
 }
 
 /// Deregister a PCF binding with a discovered BSF
@@ -1144,6 +1341,52 @@ pub fn pcf_sess_register_bsf_binding(sess_id: u64) {
     }
 }
 
+/// Reflect a session's new UE IP address to the BSF (best-effort, spawned).
+///
+/// Called when an SM policy update carries an address that differs from the one
+/// the binding was registered with. Silently does nothing when the session has no
+/// binding id — there is nothing to update, and registering one here would race
+/// the create path's own registration.
+pub fn pcf_sess_update_bsf_binding(sess_id: u64) {
+    let snap = crate::context::pcf_self().read().ok().and_then(|ctx| {
+        let sess = ctx.sess_find_by_id(sess_id)?;
+        let binding_id = sess.binding.id.clone()?;
+        Some((
+            binding_id,
+            sess.ipv4addr_string.clone(),
+            sess.ipv6prefix_string.clone(),
+        ))
+    });
+    let Some((binding_id, ipv4, ipv6)) = snap else {
+        log::debug!("[sess_id={sess_id}] BSF binding update: no binding registered");
+        return;
+    };
+    // PcfBindingPatch carries only the members that changed.
+    let mut patch = serde_json::Map::new();
+    if let Some(ip) = ipv4 {
+        patch.insert("ipv4Addr".to_string(), serde_json::json!(ip));
+    }
+    if let Some(prefix) = ipv6 {
+        patch.insert("ipv6Prefix".to_string(), serde_json::json!(prefix));
+    }
+    if patch.is_empty() {
+        return;
+    }
+    let patch = serde_json::Value::Object(patch);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                match pcf_update_bsf_binding(&binding_id, &patch).await {
+                    Ok(true) => log::info!("PCF binding {binding_id} updated at BSF"),
+                    Ok(false) => log::debug!("No BSF reachable; binding {binding_id} not updated"),
+                    Err(e) => log::warn!("BSF binding update failed: {e}"),
+                }
+            });
+        }
+        Err(_) => log::warn!("BSF binding update skipped: no async runtime"),
+    }
+}
+
 /// Deregister a session's BSF binding (best-effort, spawned).
 pub fn pcf_sess_deregister_bsf_binding(binding_id: String) {
     if binding_id.is_empty() {
@@ -1318,7 +1561,14 @@ mod tests {
     /// see `tests/strict_peer_bsfd.rs`. Only the NRF-discovery bootstrap may
     /// stay mocked (H1 policy).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI (current-thread test)
     async fn discover_and_send_udr_mock() {
+        // The NRF URI is PROCESS-GLOBAL, so a test that sets it races any other
+        // test that does -- serialize on the crate-wide guard rather than adding
+        // a private lock the other side would not know about (#89).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // pcfd resolves peers through the shared client cache, which now honours the
         // SBI security profile (issue #63). This test uses a loopback PLAINTEXT NRF
         // stub, i.e. a dev-profile deployment; declared rather than inherited.

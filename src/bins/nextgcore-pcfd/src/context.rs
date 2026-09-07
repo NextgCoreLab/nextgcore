@@ -130,6 +130,26 @@ pub struct PcfUeAm {
     pub is_redcap: bool,
     /// SNPN NID (Rel-17)
     pub snpn_nid: Option<String>,
+    /// #89: the policy-control request triggers this association subscribes to
+    /// (TS 29.507 `RequestTrigger`). Applied from the consumer's
+    /// `PolicyAssociationRequest`/`UpdateRequest` and echoed on every
+    /// representation, so a GET reports what the PCF actually watches.
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    /// #89: the provisioned access-and-mobility policy for this association —
+    /// `servAreaRes`, `rfsp`, `ueAmbr` as the wire members. Stored as the
+    /// rendered JSON because it IS the response body's policy half; splitting it
+    /// into typed fields would mean re-deriving the same object in three
+    /// handlers. Absent members are simply not in the map, which is how the
+    /// response avoids emitting schema-invalid nulls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub am_policy: Option<serde_json::Value>,
+    /// #89: the consumer's alternate notification endpoints
+    /// (`altNotifIpv4Addrs` / `altNotifFqdns`, TS 29.507), tried in order when
+    /// the primary `notification_uri` will not accept a notification
+    /// (TS 29.500 §6.10).
+    #[serde(default)]
+    pub alt_notif_uris: Vec<String>,
 }
 
 /// UE Route Selection Policy rule (TS 24.526)
@@ -208,6 +228,9 @@ impl PcfUeAm {
             ursp_rules: Vec::new(),
             is_redcap: false,
             snpn_nid: None,
+            triggers: Vec::new(),
+            am_policy: None,
+            alt_notif_uris: Vec::new(),
         }
     }
 
