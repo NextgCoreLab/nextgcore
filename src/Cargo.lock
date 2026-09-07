@@ -3130,6 +3130,7 @@ dependencies = [
  "env_logger",
  "log",
  "nextgcore-app",
+ "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-diameter",
  "nextgcore-gtp",

@@ -40,6 +40,9 @@ pub mod gsm_cause {
     /// Used when the NSACF declines a PDU-session admission for the S-NSSAI
     /// (slice PDU-session quota exhausted: NSACF 403, or 200 acuFailureList).
     pub const INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE: u8 = 67;
+    /// #68 Not supported SSC mode (TS 24.501 §9.11.4.2). Paired with the Allowed
+    /// SSC mode IE so the UE knows what to request instead.
+    pub const NOT_SUPPORTED_SSC_MODE: u8 = 68;
 }
 
 /// PDU session type values (TS 24.501 §9.11.4.11)
@@ -980,6 +983,10 @@ pub fn build_establishment_accept(
     sd: Option<u32>,
     dnn: &str,
     cause_5gsm: Option<u8>,
+    // `dns_servers`: DNS servers for the ePCO IE (TS 24.501 §6.6.1); empty omits
+    // the IE. `mtu`: IPv4 link MTU for the same IE; `None` omits it.
+    dns_servers: &[std::net::Ipv4Addr],
+    mtu: Option<u16>,
 ) -> Vec<u8> {
     use crate::gsm_build::{
         encode_qos_flow_descriptions, encode_qos_rules, pf_component_type, pf_direction,
@@ -1096,13 +1103,59 @@ pub fn build_establishment_accept(
         msg.extend_from_slice(&qos_desc_bytes);
     }
 
+    // Extended Protocol Configuration Options (IEI 0x7B, TLV-E) carrying the
+    // configured DNS server(s) and link MTU (TS 24.501 §6.6.1, §9.11.4.6).
+    //
+    // The live accept emitted no ePCO at all, so a UE received **no DNS
+    // configuration** — while `smf.dns` has been present in the shipped docker
+    // config all along and `SmfContext.dns` was declared and never read. The
+    // working encoder existed too, reachable only from the `SmfSess`-based
+    // builder that nothing on the live path calls.
+    if !dns_servers.is_empty() || mtu.is_some() {
+        let epco = crate::gsm_build::build_epco(dns_servers, mtu);
+        if !epco.is_empty() {
+            msg.push(0x7B);
+            // TLV-E: two-octet length (TS 24.007 §11.2.5).
+            msg.extend_from_slice(&(epco.len() as u16).to_be_bytes());
+            msg.extend_from_slice(&epco);
+        }
+    }
+
     // DNN (IEI 0x25)
-    let dnn_bytes = dnn.as_bytes();
+    let dnn_labels = encode_dnn_labels(dnn);
     msg.push(0x25);
-    msg.push((dnn_bytes.len() + 1) as u8);
-    msg.push(dnn_bytes.len() as u8);
-    msg.extend_from_slice(dnn_bytes);
+    msg.push(dnn_labels.len() as u8);
+    msg.extend_from_slice(&dnn_labels);
     msg
+}
+
+/// Encode a DNN into the labelled-name form used on the wire: each dot-separated
+/// label prefixed by its own length octet (TS 24.501 §9.11.2.1B, TS 23.003 §9.1).
+///
+/// This used to emit one label whose length octet was the length of the WHOLE
+/// string, dots included. A single-label DNN (`internet`) encodes identically
+/// either way, which is why the bug survived: it only corrupts the multi-label
+/// operator and roaming names (`internet.mnc001.mcc001.gprs`), where a UE reads
+/// the first length octet, walks past the end of the intended first label, and
+/// misparses the rest.
+///
+/// Deliberately the same construction as `n4_build::add_apn_dnn`, which already
+/// did this correctly for the N4 APN/DNN IE — the two must agree, since they name
+/// the same DNN to the UPF and to the UE.
+pub(crate) fn encode_dnn_labels(dnn: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(dnn.len() + 4);
+    for label in dnn.split('.') {
+        // An empty label (leading, trailing or doubled dot) would encode a zero
+        // length octet, which terminates the name early. Skipped rather than
+        // emitted, so a sloppily configured DNN degrades to the labels it does
+        // have instead of truncating at the first empty one.
+        if label.is_empty() {
+            continue;
+        }
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out
 }
 
 /// Encode a GPRS timer 3 octet (TS 24.008 §10.5.7.4a) for `minutes` with the
@@ -1245,6 +1298,8 @@ mod tests {
             None,
             "internet",
             None,
+            &[],
+            None,
         );
         // SM header (TS 24.501 §9.3 / Table 8.3.2.1.1 octets 1-4)
         assert_eq!(msg[0], 0x2E); // EPD: 5GSM
@@ -1334,6 +1389,8 @@ mod tests {
             None,
             "internet",
             None,
+            &[],
+            None,
         );
         // header | octet-5 | QoS rules LV-E | Session-AMBR LV | PDU address.
         const PINNED_PREFIX: [u8; 30] = [
@@ -1376,6 +1433,8 @@ mod tests {
             Some(0x010203),
             "xr",
             None,
+            &[],
+            None,
         );
         // S-NSSAI present with SST + 3-byte SD.
         let snssai_at = msg
@@ -1417,6 +1476,8 @@ mod tests {
             None,
             "internet",
             None,
+            &[],
+            None,
         );
         // octet-5: SSC mode 1 | IPv4v6 (0x13)
         assert_eq!(msg[4], (1 << 4) | pdu_session_type::IPV4V6);
@@ -1451,6 +1512,8 @@ mod tests {
             None,
             "internet",
             Some(gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED),
+            &[],
+            None,
         );
         // Header(4)+octet5(1)+QoS-LV-E(11)+Session-AMBR(7) = 23 bytes; the 5GSM
         // cause TV occupies indices 23..25, then the PDU address IE (0x29).
