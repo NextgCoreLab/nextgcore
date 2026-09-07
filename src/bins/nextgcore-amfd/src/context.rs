@@ -1983,6 +1983,14 @@ pub struct AmfUeMemento {
     pub kgnb: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
     /// Next hop key
     pub nh: [u8; NEXTGCORE_SHA256_DIGEST_SIZE],
+    /// Next Hop Chaining Count.
+    ///
+    /// `nh` and `nhcc` are ONE VALUE: the NCC names the position of that NH in
+    /// the chain, and the target gNB derives KgNB* from the pair. Saving `nh`
+    /// without `nhcc` (as this memento did) rolls the key back while leaving the
+    /// counter advanced, so the AMF then conveys an NCC that does not describe
+    /// the NH beside it and the target derives a key the UE cannot match.
+    pub nhcc: u8,
     /// Selected encryption algorithm
     pub selected_enc_algorithm: u8,
     /// Selected integrity algorithm
@@ -2608,6 +2616,42 @@ pub struct AmfSessRef {
 }
 
 impl AmfUe {
+    /// Seed the {NH, NCC} forward-security chain from KgNB when the AS security
+    /// context is established (TS 33.501 Annex A.10, Section 6.9.2.3.3).
+    ///
+    /// KgNB, derived straight from KAMF, is the pair with **NCC = 0**. The
+    /// initial NH is `KDF(KAMF, KgNB)` and is the pair with **NCC = 1**. Call
+    /// this immediately after storing `kgnb`.
+    ///
+    /// Skipping this step is the defect behind nextgcore #70: `nh` is
+    /// zero-initialised and the only derivation chained it from ITSELF, so a UE
+    /// that had never performed an Xn handover shipped 32 ZERO BYTES with
+    /// NCC = 0 to the target gNB, and one that had chained from a zero seed.
+    /// Either way the target derives an AS root key the source gNB — and anyone
+    /// who logged KgNB — can reproduce, which is precisely the forward security
+    /// the NH chain exists to provide.
+    pub fn init_next_hop_chain(&mut self) {
+        self.nh = nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&self.kamf, &self.kgnb);
+        self.nhcc = 1;
+    }
+
+    /// Advance the {NH, NCC} chain one step and return the pair to convey to the
+    /// target gNB (TS 33.501 Section 6.9.2.3.3).
+    ///
+    /// `NH_next = KDF(KAMF, NH_current)` and `NCC_next = (NCC + 1) mod 8`. Both
+    /// the N2 (HandoverRequest) and Xn (PathSwitchRequestAcknowledge) paths go
+    /// through here, so the two cannot derive keys differently — they did
+    /// before: N2 copied the stored pair without advancing it at all, while Xn
+    /// advanced correctly from the wrong seed.
+    ///
+    /// Returns `(ncc, nh)` in the order the NGAP `SecurityContext` fields are
+    /// written, so a caller cannot transpose them.
+    pub fn advance_next_hop(&mut self) -> (u8, [u8; NEXTGCORE_SHA256_DIGEST_SIZE]) {
+        self.nh = nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&self.kamf, &self.nh);
+        self.nhcc = self.nhcc.wrapping_add(1) & 0x07;
+        (self.nhcc, self.nh)
+    }
+
     /// Create a new AMF UE context
     pub fn new(id: u64, ran_ue_id: u64) -> Self {
         Self {
@@ -2796,6 +2840,7 @@ impl AmfUe {
         self.memento.ul_count_established = self.ul_count_established;
         self.memento.kgnb = self.kgnb;
         self.memento.nh = self.nh;
+        self.memento.nhcc = self.nhcc;
         self.memento.selected_enc_algorithm = self.selected_enc_algorithm;
         self.memento.selected_int_algorithm = self.selected_int_algorithm;
     }
@@ -2818,6 +2863,7 @@ impl AmfUe {
         self.ul_count_established = self.memento.ul_count_established;
         self.kgnb = self.memento.kgnb;
         self.nh = self.memento.nh;
+        self.nhcc = self.memento.nhcc;
         self.selected_enc_algorithm = self.memento.selected_enc_algorithm;
         self.selected_int_algorithm = self.memento.selected_int_algorithm;
     }
@@ -3415,6 +3461,169 @@ mod tests {
         assert_eq!(plmn.mnc1, 0);
         assert_eq!(plmn.mnc2, 1);
         assert_eq!(plmn.mnc3, 0xf);
+    }
+
+    /// A UE with an established AS security context: KAMF and KgNB set, chain
+    /// seeded, no handover yet performed.
+    fn ue_with_as_context() -> AmfUe {
+        let mut ue = AmfUe::new(1, 1);
+        ue.kamf = [0x11; NEXTGCORE_SHA256_DIGEST_SIZE];
+        ue.kgnb = [0x22; NEXTGCORE_SHA256_DIGEST_SIZE];
+        ue.init_next_hop_chain();
+        ue
+    }
+
+    /// nextgcore #70, the dominant defect: before this, `nh` was zero-initialised
+    /// and the only derivation chained it from ITSELF, so a UE that had performed
+    /// no prior handover shipped 32 ZERO BYTES with NCC=0 to the target gNB.
+    #[test]
+    fn next_hop_chain_is_seeded_from_kgnb_never_from_zero() {
+        let mut ue = AmfUe::new(1, 1);
+        // The pre-fix starting state.
+        assert_eq!(ue.nh, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE]);
+        assert_eq!(ue.nhcc, 0);
+
+        ue.kamf = [0x11; NEXTGCORE_SHA256_DIGEST_SIZE];
+        ue.kgnb = [0x22; NEXTGCORE_SHA256_DIGEST_SIZE];
+        ue.init_next_hop_chain();
+
+        // Annex A.10: the initial NH is KDF(KAMF, KgNB) and is the NCC=1 pair.
+        assert_eq!(ue.nhcc, 1);
+        assert_ne!(ue.nh, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE]);
+        assert_eq!(
+            ue.nh,
+            nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&ue.kamf, &ue.kgnb),
+            "the initial NH must be bound to KgNB"
+        );
+        // It must NOT be the degenerate self-chained value the defect produced.
+        assert_ne!(
+            ue.nh,
+            nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(
+                &ue.kamf,
+                &[0u8; NEXTGCORE_SHA256_DIGEST_SIZE]
+            ),
+            "the NH must not be derived from a zero seed"
+        );
+    }
+
+    /// The pair a first handover conveys: NH non-zero, NCC = previous + 1.
+    #[test]
+    fn first_handover_conveys_a_non_zero_nh_and_an_incremented_ncc() {
+        let mut ue = ue_with_as_context();
+        let ncc_before = ue.nhcc;
+
+        let (ncc, nh) = ue.advance_next_hop();
+
+        assert_ne!(nh, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE]);
+        assert_eq!(ncc, ncc_before + 1);
+        // The conveyed NH is one the SOURCE gNB has never held — that is the
+        // forward-security property the chain exists for.
+        assert_ne!(nh, ue.kgnb);
+        // And the returned pair is the stored pair, so the AMF's view and the
+        // target's agree.
+        assert_eq!((ncc, nh), (ue.nhcc, ue.nh));
+    }
+
+    /// The N2 and Xn paths now share one helper, so equal inputs must give
+    /// identical key derivation. Before, N2 copied the stored pair without
+    /// advancing it while Xn advanced from a zero seed.
+    #[test]
+    fn n2_and_xn_derive_identically_for_equal_inputs() {
+        let mut n2 = ue_with_as_context();
+        let mut xn = ue_with_as_context();
+
+        for _ in 0..3 {
+            assert_eq!(
+                n2.advance_next_hop(),
+                xn.advance_next_hop(),
+                "the two mobility paths must not diverge"
+            );
+        }
+    }
+
+    /// NCC is a 3-bit field, so the chain wraps mod 8 while the NH keeps
+    /// advancing — the counter repeating must not mean the key repeats.
+    #[test]
+    fn ncc_wraps_mod_8_while_the_nh_keeps_advancing() {
+        let mut ue = ue_with_as_context();
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            let (ncc, nh) = ue.advance_next_hop();
+            assert!(ncc < 8, "NCC must stay within 3 bits, got {ncc}");
+            seen.push(nh);
+        }
+        // Back to the starting NCC after eight steps...
+        assert_eq!(ue.nhcc, 1);
+        // ...but no NH repeated.
+        for (i, a) in seen.iter().enumerate() {
+            for b in seen.iter().skip(i + 1) {
+                assert_ne!(a, b, "an NH repeated within one NCC cycle");
+            }
+        }
+    }
+
+    /// `nh` and `nhcc` are one value. The memento saved the key without the
+    /// counter, so a restore rolled the key back while leaving the counter
+    /// advanced and the AMF then conveyed a pair that did not describe itself.
+    #[test]
+    fn memento_restores_the_nh_and_ncc_together() {
+        let mut ue = ue_with_as_context();
+        ue.save_memento();
+        let saved = (ue.nhcc, ue.nh);
+
+        ue.advance_next_hop();
+        ue.advance_next_hop();
+        assert_ne!((ue.nhcc, ue.nh), saved, "the chain moved");
+
+        ue.restore_memento();
+        assert_eq!(
+            (ue.nhcc, ue.nh),
+            saved,
+            "a restore must recover the NH and its NCC as a pair"
+        );
+    }
+
+    /// Both mobility paths must route through the shared chain helper, and the
+    /// chain must be seeded where the AS context is established.
+    ///
+    /// The unit tests above cover the DERIVATION; nothing covers the WIRING,
+    /// because amfd has no harness that drives `handle_handover_required` or
+    /// `handle_path_switch_request` (both are async NGAP handlers needing live
+    /// associations). Reverting the N2 site to copy the stored pair therefore
+    /// compiled and passed every test — which is what this guard exists to
+    /// catch.
+    ///
+    /// It lives in `context.rs` and reads `ngap_path.rs` deliberately: a guard
+    /// that greps the file it lives in matches its own needle, including inside
+    /// the comment explaining it. Keeping the two apart makes that impossible
+    /// rather than merely avoided. Do not move this test into `ngap_path.rs`.
+    #[test]
+    fn both_mobility_paths_route_through_the_shared_next_hop_helper() {
+        let src = include_str!("ngap_path.rs");
+
+        // Positive: the N2 HandoverRequest site and the Xn
+        // PathSwitchRequestAcknowledge site, and nothing else.
+        assert_eq!(
+            src.matches("advance_next_hop()").count(),
+            2,
+            "expected exactly the N2 and Xn mobility sites to advance the chain; \
+             a new site must either use the helper or this count must be raised \
+             deliberately"
+        );
+        // Positive: the chain is seeded once, where KgNB is derived.
+        assert_eq!(
+            src.matches("init_next_hop_chain()").count(),
+            1,
+            "the forward-security chain must be seeded exactly once, at \
+             AS-security-context establishment"
+        );
+        // Negative, and the reason the positives above are not enough on their
+        // own: the defective form conveyed the stored pair unchanged.
+        assert!(
+            !src.contains("next_hop_chaining_count: state.amf_ue.nhcc"),
+            "a mobility path is conveying the stored NCC verbatim instead of \
+             advancing the chain (nextgcore #70)"
+        );
     }
 
     #[test]
