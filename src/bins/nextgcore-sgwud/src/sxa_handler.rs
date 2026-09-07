@@ -145,7 +145,12 @@ pub struct Gbr {
 #[derive(Debug, Clone, Default)]
 pub struct CreateBarRequest {
     pub bar_id: u8,
+    /// Downlink Data Notification Delay in 50 ms units (TS 29.244 Section 8.2.28)
     pub downlink_data_notification_delay: Option<u8>,
+    /// DL Buffering Duration (TS 29.244 Section 8.2.47)
+    pub dl_buffering_duration: Option<u8>,
+    /// DL Buffering Suggested Packet Count (TS 29.244 Section 8.2.48)
+    pub dl_buffering_suggested_packet_count: Option<u16>,
 }
 
 // ============================================================================
@@ -223,6 +228,19 @@ pub struct UpdateQerRequest {
 pub struct SessionReportResponse {
     /// Cause value
     pub cause: Option<u8>,
+    /// Update BAR (TS 29.244 Table 7.5.9.2-1): the CP function's extended
+    /// buffering instruction, previously parsed away and ignored.
+    pub update_bar: Option<UpdateBarRequest>,
+}
+
+/// Update BAR carried in a Session Report Response or Session Modification
+/// (TS 29.244 Table 7.5.9.2-1 / Section 7.5.4.11).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateBarRequest {
+    pub bar_id: u8,
+    pub downlink_data_notification_delay: Option<u8>,
+    pub dl_buffering_duration: Option<u8>,
+    pub dl_buffering_suggested_packet_count: Option<u16>,
 }
 
 // ============================================================================
@@ -493,6 +511,33 @@ pub fn handle_session_report_response(
         return HandlerResult::Error(cause);
     }
 
+    // TS 29.244 Table 7.5.9.2-1: the response may carry an Update BAR telling
+    // the UP function how long to keep buffering and how much. This was parsed
+    // away before, so extended-buffering instructions had no effect at all.
+    if let (Some(sess), Some(update)) = (sess, rsp.update_bar.as_ref()) {
+        let ctx = sgwu_self();
+        if ctx.bar_update(
+            sess.id,
+            update.bar_id,
+            update.downlink_data_notification_delay,
+            update.dl_buffering_duration,
+            update.dl_buffering_suggested_packet_count,
+        ) {
+            log::debug!(
+                "Update BAR {} applied: ddn_delay={:?} dl_duration={:?} suggested_count={:?}",
+                update.bar_id,
+                update.downlink_data_notification_delay,
+                update.dl_buffering_duration,
+                update.dl_buffering_suggested_packet_count
+            );
+        } else {
+            log::warn!(
+                "Update BAR {} in Session Report Response matches no installed BAR",
+                update.bar_id
+            );
+        }
+    }
+
     log::debug!("Session Report Response accepted");
     HandlerResult::Ok
 }
@@ -627,6 +672,8 @@ fn process_create_bar(sess: &SgwuSess, req: &CreateBarRequest) -> Result<(), u8>
         sess_id: sess.id,
         bar_id: req.bar_id,
         downlink_data_notification_delay: req.downlink_data_notification_delay,
+        dl_buffering_duration: req.dl_buffering_duration,
+        dl_buffering_suggested_packet_count: req.dl_buffering_suggested_packet_count,
     }) {
         return Err(pfcp_cause::SYSTEM_FAILURE);
     }
@@ -891,7 +938,10 @@ mod tests {
     #[test]
     fn test_handle_session_report_response_no_cause() {
         let sess = create_test_sess();
-        let rsp = SessionReportResponse { cause: None };
+        let rsp = SessionReportResponse {
+            cause: None,
+            update_bar: None,
+        };
         let result = handle_session_report_response(Some(&sess), 1, &rsp);
         matches!(
             result,
@@ -904,6 +954,7 @@ mod tests {
         let sess = create_test_sess();
         let rsp = SessionReportResponse {
             cause: Some(pfcp_cause::REQUEST_ACCEPTED),
+            update_bar: None,
         };
         let result = handle_session_report_response(Some(&sess), 1, &rsp);
         assert!(matches!(result, HandlerResult::Ok));

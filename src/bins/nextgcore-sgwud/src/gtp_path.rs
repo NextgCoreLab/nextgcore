@@ -7,10 +7,11 @@
 //! IE and Error Indication carries Tunnel Endpoint Identifier Data I +
 //! GTP-U Peer Address as proper IEs (TS 29.281 Section 7.3.1).
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -331,8 +332,17 @@ fn handle_error_indication(msg: &Gtp1Message, peer: SocketAddr) -> GtpuRecvResul
     );
 
     let ctx = sgwu_self();
-    let Some(far) = ctx.far_find_by_ohc_teid(parsed.teid) else {
-        log::warn!("Error Indication TEID 0x{:x} matches no FAR", parsed.teid);
+    // TS 29.281 Section 7.3.1: the TEID and the GTP-U peer address TOGETHER
+    // identify the bearer. Matching on the TEID alone attributes the report to
+    // whichever session happens to hold that TEID first, so a collision with
+    // another peer names — and may tear down — an unrelated bearer.
+    let Some(far) = ctx.far_find_by_ohc_teid_peer(parsed.teid, peer.ip()) else {
+        log::warn!(
+            "Error Indication TEID 0x{:x} from {} matches no FAR for that peer; dropping \
+             rather than attributing it to another peer's session (TS 29.281 Section 7.3.1)",
+            parsed.teid,
+            peer.ip()
+        );
         return GtpuRecvResult::Handled;
     };
     let Some(sess) = ctx.sess_find_by_id(far.sess_id) else {
@@ -365,7 +375,14 @@ fn handle_end_marker(server: &GtpuServer, msg: &Gtp1Message, peer: SocketAddr) -
 
     let ctx = sgwu_self();
     let Some(pdr) = ctx.pdr_find_by_teid(teid) else {
-        return send_error_indication(server, teid, peer);
+        // TS 29.281 Section 7.3.2.1: "If an End Marker message is received with
+        // a TEID for which there is no context, then the receiver shall ignore
+        // this message." An Error Indication here is not merely non-conformant:
+        // End Markers arrive precisely during a handover path switch, so the
+        // race this hits is the normal case, and the peer may read the
+        // indication as loss of bearer context.
+        log::debug!("End Marker TEID 0x{teid:x} from {peer} matches no PDR; ignoring per spec");
+        return GtpuRecvResult::Handled;
     };
     let far = pdr.far_id.and_then(|fid| ctx.far_find(pdr.sess_id, fid));
     if let Some(far) = far {
@@ -407,6 +424,77 @@ fn handle_gpdu(server: &GtpuServer, msg: &Gtp1Message, peer: SocketAddr) -> Gtpu
     apply_far(server, &pdr, payload)
 }
 
+/// Whether QER enforcement is switched on.
+///
+/// Off by default: enforcing a gate or an MBR changes forwarding behaviour, so a
+/// mis-provisioned QER would drop traffic that flows today. nextgcore #60
+/// requires the behaviour-changing half to be gated. `SGWU_QER_ENFORCEMENT=1`
+/// enables it.
+fn qer_enforcement_enabled() -> bool {
+    matches!(
+        std::env::var("SGWU_QER_ENFORCEMENT")
+            .unwrap_or_default()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+/// Per-(session, QER, direction) token buckets for MBR policing.
+static MBR_BUCKETS: std::sync::OnceLock<std::sync::Mutex<HashMap<(u64, u32, bool), MbrBucket>>> =
+    std::sync::OnceLock::new();
+
+/// A token bucket sized to one second of the provisioned MBR.
+struct MbrBucket {
+    /// Tokens in BITS, so the MBR (bits per second) needs no unit conversion.
+    tokens: f64,
+    last: Instant,
+}
+
+/// Whether `len` bytes fit within the QER's MBR (TS 29.244 Section 5.2.5.1).
+///
+/// A token bucket refilled at the MBR and capped at one second's worth: that cap
+/// is the burst tolerance, and without it an idle bearer would accumulate
+/// unlimited credit and then blast far above its MBR.
+///
+/// Returns true (forward) when the bucket cannot be locked — a poisoned lock
+/// must not become a traffic black hole.
+fn mbr_allows(sess_id: u64, qer_id: u32, uplink: bool, mbr_bps: u64, len: usize) -> bool {
+    let buckets = MBR_BUCKETS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let Ok(mut buckets) = buckets.lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    let bits = (len as f64) * 8.0;
+    let capacity = mbr_bps as f64;
+
+    let bucket = buckets
+        .entry((sess_id, qer_id, uplink))
+        .or_insert(MbrBucket {
+            tokens: capacity,
+            last: now,
+        });
+    let elapsed = now.duration_since(bucket.last).as_secs_f64();
+    bucket.last = now;
+    bucket.tokens = (bucket.tokens + elapsed * capacity).min(capacity);
+
+    if bucket.tokens >= bits {
+        bucket.tokens -= bits;
+        true
+    } else {
+        false
+    }
+}
+
+/// Drop any MBR state held for a session (called when the session goes away, so
+/// buckets do not accumulate for dead sessions).
+pub fn mbr_forget_session(sess_id: u64) {
+    if let Some(buckets) = MBR_BUCKETS.get() {
+        if let Ok(mut buckets) = buckets.lock() {
+            buckets.retain(|(sid, _, _), _| *sid != sess_id);
+        }
+    }
+}
+
 /// Apply the FAR linked to a PDR to a received payload
 fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResult {
     let ctx = sgwu_self();
@@ -424,11 +512,45 @@ fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResu
         return GtpuRecvResult::Dropped("FAR action DROP".to_string());
     }
 
+    // QER enforcement (TS 29.244 Section 5.2.5.1). Before this, a CLOSED gate
+    // still forwarded and an MBR was never policed, so QoS provisioned by the
+    // SGW-C was silently inert.
+    //
+    // Gated off by default: enforcement changes forwarding behaviour, and a
+    // mis-provisioned QER would black-hole traffic that flows today. Enable with
+    // SGWU_QER_ENFORCEMENT=1.
+    if qer_enforcement_enabled() {
+        if let Some(qer) = pdr.qer_id.and_then(|qid| ctx.qer_find(pdr.sess_id, qid)) {
+            // Direction from the PDI: ACCESS-sourced traffic is uplink.
+            let uplink = pdr.source_interface == crate::sxa_handler::pfcp_interface::ACCESS;
+            if qer.gate_is_closed(uplink) {
+                log::debug!(
+                    "DROP per QER {} closed gate ({} direction)",
+                    qer.qer_id,
+                    if uplink { "UL" } else { "DL" }
+                );
+                return GtpuRecvResult::Dropped("QER gate CLOSED".to_string());
+            }
+            let mbr = qer.mbr_bps(uplink);
+            if mbr > 0 && !mbr_allows(pdr.sess_id, qer.qer_id, uplink, mbr, payload.len()) {
+                log::debug!("DROP per QER {} MBR {mbr} bps exceeded", qer.qer_id);
+                return GtpuRecvResult::Dropped("QER MBR exceeded".to_string());
+            }
+        }
+    }
+
     if far.apply_action & apply_action::BUFF != 0 {
+        let bar = ctx.bar_find_for_sess(pdr.sess_id);
+        // TS 29.244 Section 8.2.48: honour the CP function's suggested packet
+        // count when it gave one; the previous hardcoded 64 ignored it.
+        let capacity = crate::context::buffer_capacity(
+            bar.as_ref()
+                .and_then(|b| b.dl_buffering_suggested_packet_count),
+        );
         let count = ctx
-            .far_buffer_packet(pdr.sess_id, far_id, payload.to_vec())
+            .far_buffer_packet(pdr.sess_id, far_id, payload.to_vec(), capacity)
             .unwrap_or(0);
-        log::debug!("BUFF per FAR {far_id} (buffered={count})");
+        log::debug!("BUFF per FAR {far_id} (buffered={count}/{capacity})");
         // First buffered packet triggers a Downlink Data Report unless the
         // SGW-C suppressed notification (NOCP)
         if count == 1 && far.apply_action & apply_action::NOCP == 0 {
@@ -438,7 +560,36 @@ fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResu
                     pdr_id: Some(pdr.pdr_id),
                     ..Default::default()
                 };
-                if let Err(e) = pfcp_path::send_session_report_request(&sess, &report) {
+                // TS 29.244 Section 5.9 / TS 23.401 Section 5.3.4.2: the CP
+                // function may ask the UP function to DELAY the notification so
+                // several downlink packets can accumulate before the MME is
+                // paged. Sending immediately, as before, ignores that request.
+                if let Some(delay) = bar.as_ref().and_then(|b| b.ddn_delay()) {
+                    let sess_for_delay = sess.clone();
+                    let report_for_delay = report.clone();
+                    // Detached: the receive loop must not stall for the delay,
+                    // or every buffered packet behind it waits too.
+                    std::thread::Builder::new()
+                        .name("sgwu-ddn-delay".into())
+                        .spawn(move || {
+                            std::thread::sleep(delay);
+                            if let Err(e) = pfcp_path::send_session_report_request(
+                                &sess_for_delay,
+                                &report_for_delay,
+                            ) {
+                                log::error!("Delayed Session Report (DLDR) failed: {e}");
+                            }
+                        })
+                        .map(|_| log::debug!("DLDR delayed by {delay:?} per BAR"))
+                        .unwrap_or_else(|e| {
+                            // A thread we cannot spawn must not silently swallow
+                            // the notification: send it undelayed instead.
+                            log::error!("Cannot spawn DDN delay thread ({e}); reporting now");
+                            if let Err(e) = pfcp_path::send_session_report_request(&sess, &report) {
+                                log::error!("Session Report (DLDR) failed: {e}");
+                            }
+                        });
+                } else if let Err(e) = pfcp_path::send_session_report_request(&sess, &report) {
                     log::error!("Session Report (DLDR) failed: {e}");
                 }
                 return GtpuRecvResult::SessionReport(report);
@@ -793,5 +944,144 @@ mod tests {
         let result = handle_gtpu_packet(&server, &[0x00], "127.0.0.1:9999".parse().unwrap());
         assert!(matches!(result, GtpuRecvResult::Dropped(_)));
         server.close();
+    }
+
+    // ================================================================
+    // nextgcore #60: End Marker, Error Indication peer match, QER gate
+    // ================================================================
+
+    /// TS 29.281 Section 7.3.2.1: "If an End Marker message is received with a
+    /// TEID for which there is no context, then the receiver shall ignore this
+    /// message." It used to answer with an Error Indication, which a peer may
+    /// read as loss of bearer context — during a handover path switch, i.e.
+    /// exactly when End Markers arrive.
+    #[test]
+    fn unknown_teid_end_marker_is_ignored_not_error_indicated() {
+        let server = test_server(GTPV1_U_UDP_PORT);
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+
+        // A TEID no PDR was ever installed for.
+        let end_marker = Gtp1Message::end_marker(0x0BAD_F00D);
+        sock.send_to(&end_marker.encode(), server.local_addr())
+            .unwrap();
+
+        let mut buf = [0u8; 4096];
+        assert!(
+            sock.recv_from(&mut buf).is_err(),
+            "an unknown-TEID End Marker must draw no reply at all"
+        );
+        server.close();
+    }
+
+    /// A G-PDU for an unknown TEID, by contrast, SHOULD still draw an Error
+    /// Indication (TS 29.281 Section 7.3.1). Asserting this keeps the End Marker
+    /// fix from being over-applied into "never send an Error Indication".
+    #[test]
+    fn unknown_teid_gpdu_still_gets_an_error_indication() {
+        let server = test_server(GTPV1_U_UDP_PORT);
+        let sock = client();
+
+        let gpdu = Gtp1Message::gpdu(0x0DEA_D000, Bytes::from_static(b"payload"));
+        sock.send_to(&gpdu.encode(), server.local_addr()).unwrap();
+
+        let reply = recv_msg(&sock);
+        assert_eq!(
+            reply.header.message_type,
+            Gtp1uMessageType::ErrorIndication as u8,
+            "a G-PDU for an unknown TEID is still an error"
+        );
+        server.close();
+    }
+
+    /// QER enforcement: a CLOSED gate must drop rather than forward. Driven
+    /// through apply_far so the enforcement is exercised where forwarding is
+    /// decided, not only in the gate decoder.
+    #[test]
+    fn closed_qer_gate_drops_when_enforcement_is_enabled() {
+        let ctx = sgwu_self();
+        let server = test_server(GTPV1_U_UDP_PORT);
+
+        let f_seid = FSeid::with_ipv4(0x6000, Ipv4Addr::new(10, 0, 0, 1));
+        let sess = ctx.sess_add(&f_seid).unwrap();
+        ctx.far_install(SgwuFar {
+            sess_id: sess.id,
+            far_id: 1,
+            apply_action: apply_action::FORW,
+            outer_header_creation: Some((0x999, Some(Ipv4Addr::new(127, 0, 0, 1)), None)),
+            ..Default::default()
+        });
+        // UL gate CLOSED (bits 1-2 = 1), source interface ACCESS = uplink.
+        ctx.qer_install(crate::context::SgwuQer {
+            sess_id: sess.id,
+            qer_id: 5,
+            gate_status: Some(0x01),
+            ..Default::default()
+        });
+        let pdr = SgwuPdr {
+            sess_id: sess.id,
+            pdr_id: 1,
+            source_interface: crate::sxa_handler::pfcp_interface::ACCESS,
+            local_teid: 0x6001,
+            far_id: Some(1),
+            qer_id: Some(5),
+            ..Default::default()
+        };
+        ctx.pdr_install(pdr.clone());
+
+        // Enforcement off (the shipped default): the packet still forwards, so
+        // this change cannot alter behaviour until an operator opts in.
+        std::env::remove_var("SGWU_QER_ENFORCEMENT");
+        assert!(
+            matches!(apply_far(&server, &pdr, b"data"), GtpuRecvResult::Forwarded),
+            "with enforcement off the closed gate must NOT take effect"
+        );
+
+        // Enforcement on: the closed gate drops.
+        std::env::set_var("SGWU_QER_ENFORCEMENT", "1");
+        let result = apply_far(&server, &pdr, b"data");
+        std::env::remove_var("SGWU_QER_ENFORCEMENT");
+        assert!(
+            matches!(&result, GtpuRecvResult::Dropped(reason) if reason.contains("gate")),
+            "a CLOSED gate must drop, got {result:?}"
+        );
+
+        ctx.sess_remove(sess.id);
+        server.close();
+    }
+
+    /// The MBR token bucket: the first packet fits within one second of credit,
+    /// and a packet far larger than the whole per-second allowance cannot.
+    #[test]
+    fn mbr_bucket_admits_within_rate_and_rejects_beyond_it() {
+        // 8000 bits per second = 1000 bytes/s of credit.
+        assert!(
+            mbr_allows(9001, 1, true, 8000, 100),
+            "100 bytes must fit in a 1000 byte/s bucket"
+        );
+        // A single packet larger than the entire per-second capacity can never
+        // fit, however long we wait.
+        assert!(
+            !mbr_allows(9002, 1, true, 8000, 5000),
+            "5000 bytes cannot fit a 1000 byte/s bucket"
+        );
+        // Directions are policed independently.
+        assert!(mbr_allows(9003, 1, true, 8000, 900));
+        assert!(mbr_allows(9003, 1, false, 8000, 900));
+
+        mbr_forget_session(9001);
+        mbr_forget_session(9002);
+        mbr_forget_session(9003);
+    }
+
+    #[test]
+    fn mbr_forget_session_drops_only_that_sessions_buckets() {
+        assert!(mbr_allows(9101, 1, true, 8000, 10));
+        assert!(mbr_allows(9102, 1, true, 8000, 10));
+        mbr_forget_session(9101);
+        // Still functional for the other session (and for a fresh 9101).
+        assert!(mbr_allows(9102, 1, true, 8000, 10));
+        mbr_forget_session(9102);
     }
 }

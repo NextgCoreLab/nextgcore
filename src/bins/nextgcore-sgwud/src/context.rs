@@ -183,6 +183,25 @@ pub mod apply_action {
 /// Maximum packets buffered per FAR while the action is BUFF
 pub const MAX_BUFFERED_PACKETS: usize = 64;
 
+/// Buffer cap for a FAR, honouring a BAR's DL Buffering Suggested Packet Count
+/// when the CP function provided one (TS 29.244 §8.2.48) and otherwise the
+/// local default, which `SGWU_MAX_BUFFERED_PACKETS` can override.
+///
+/// The hardcoded 64 was the only limit before; a CP function asking for deeper
+/// extended buffering had no way to get it.
+pub fn buffer_capacity(suggested: Option<u16>) -> usize {
+    if let Some(count) = suggested {
+        if count > 0 {
+            return count as usize;
+        }
+    }
+    std::env::var("SGWU_MAX_BUFFERED_PACKETS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MAX_BUFFERED_PACKETS)
+}
+
 /// Packet Detection Rule installed by the SGW-C (TS 29.244 Section 7.5.2.2)
 #[derive(Debug, Clone, Default)]
 pub struct SgwuPdr {
@@ -215,7 +234,10 @@ pub struct SgwuFar {
     pub buffered: Vec<Vec<u8>>,
 }
 
-/// QoS Enforcement Rule (stored; rate enforcement is a follow-up)
+/// QoS Enforcement Rule (TS 29.244 §5.2.5.1, §8.2.7).
+///
+/// `gate_status` packs both directions: bits 1-2 are the UL gate and bits 3-4
+/// the DL gate, each `0` = OPEN and `1` = CLOSED.
 #[derive(Debug, Clone, Default)]
 pub struct SgwuQer {
     pub sess_id: u64,
@@ -225,12 +247,67 @@ pub struct SgwuQer {
     pub mbr_dl: u64,
 }
 
-/// Buffering Action Rule
+/// Gate status values (TS 29.244 §8.2.7).
+pub mod gate_status {
+    pub const OPEN: u8 = 0;
+    pub const CLOSED: u8 = 1;
+}
+
+impl SgwuQer {
+    /// Whether the gate for a direction is CLOSED, so traffic must be dropped.
+    ///
+    /// An absent Gate Status IE means OPEN: TS 29.244 §8.2.7 makes the closed
+    /// state something the CP must ASK for, so defaulting to closed on an absent
+    /// IE would black-hole every session whose QER omits it.
+    pub fn gate_is_closed(&self, uplink: bool) -> bool {
+        let Some(status) = self.gate_status else {
+            return false;
+        };
+        let gate = if uplink {
+            status & 0x03
+        } else {
+            (status >> 2) & 0x03
+        };
+        gate == gate_status::CLOSED
+    }
+
+    /// MBR for a direction, in bits per second. `0` means "not provisioned",
+    /// which TS 29.244 treats as unlimited rather than as a zero-rate cap.
+    pub fn mbr_bps(&self, uplink: bool) -> u64 {
+        if uplink {
+            self.mbr_ul
+        } else {
+            self.mbr_dl
+        }
+    }
+}
+
+/// Buffering Action Rule (TS 29.244 §5.9, Table 7.5.9.2-1).
 #[derive(Debug, Clone, Default)]
 pub struct SgwuBar {
     pub sess_id: u64,
     pub bar_id: u8,
+    /// Downlink Data Notification Delay in **50 ms units** (TS 29.244 §8.2.28).
     pub downlink_data_notification_delay: Option<u8>,
+    /// DL Buffering Duration from an Update BAR (TS 29.244 §8.2.47), in the
+    /// encoded form: bits 1-5 the value, bits 6-8 the unit.
+    pub dl_buffering_duration: Option<u8>,
+    /// DL Buffering Suggested Packet Count from an Update BAR
+    /// (TS 29.244 §8.2.48): the cap the CP function suggests for this session,
+    /// overriding the local default.
+    pub dl_buffering_suggested_packet_count: Option<u16>,
+}
+
+impl SgwuBar {
+    /// The Downlink Data Notification delay as a duration
+    /// (TS 29.244 §8.2.28: 50 ms units). `None` when no delay was provisioned or
+    /// the provisioned delay is zero.
+    pub fn ddn_delay(&self) -> Option<std::time::Duration> {
+        match self.downlink_data_notification_delay {
+            Some(0) | None => None,
+            Some(units) => Some(std::time::Duration::from_millis(units as u64 * 50)),
+        }
+    }
 }
 
 // ============================================================================
@@ -597,13 +674,50 @@ impl SgwuContext {
     }
 
     /// Find the FAR whose Outer Header Creation TEID matches (used to map a
-    /// received Error Indication back to a session)
+    /// received Error Indication back to a session).
+    ///
+    /// **Prefer [`SgwuContext::far_find_by_ohc_teid_peer`].** TS 29.281 §7.3.1:
+    /// "The TEID and GTP-U peer Address together uniquely identify the related
+    /// ... EPS bearer in the receiving node." A TEID alone does not, so this
+    /// returns the first of possibly several matches and can name the wrong
+    /// session. Kept for callers that genuinely have no peer address.
     pub fn far_find_by_ohc_teid(&self, teid: u32) -> Option<SgwuFar> {
         self.far_list
             .read()
             .ok()?
             .values()
             .find(|far| matches!(far.outer_header_creation, Some((t, _, _)) if t == teid))
+            .cloned()
+    }
+
+    /// Find the FAR whose Outer Header Creation TEID **and** peer address both
+    /// match (TS 29.281 §7.3.1).
+    ///
+    /// Returns `None` when the TEID matches but the peer does not: that is a
+    /// TEID collision with another peer, and reporting it would attribute an
+    /// Error Indication to an unrelated bearer — potentially tearing it down.
+    /// Dropping is the safe direction, because a genuinely lost bearer will be
+    /// re-reported by the peer.
+    ///
+    /// Both address families are compared against the corresponding slot of
+    /// [`SgwuFar::outer_header_creation`], so a v4 Error Indication cannot match
+    /// a FAR that only holds a v6 peer or vice versa.
+    pub fn far_find_by_ohc_teid_peer(
+        &self,
+        teid: u32,
+        peer_ip: std::net::IpAddr,
+    ) -> Option<SgwuFar> {
+        self.far_list
+            .read()
+            .ok()?
+            .values()
+            .find(|far| match far.outer_header_creation {
+                Some((t, v4, v6)) if t == teid => match peer_ip {
+                    std::net::IpAddr::V4(want) => v4 == Some(want),
+                    std::net::IpAddr::V6(want) => v6 == Some(want),
+                },
+                _ => false,
+            })
             .cloned()
     }
 
@@ -626,11 +740,19 @@ impl SgwuContext {
     /// Buffer a packet on a FAR whose action is BUFF.
     /// Returns Some(buffered_count) on success; the count lets the caller
     /// send a Downlink Data Report only for the first buffered packet.
-    pub fn far_buffer_packet(&self, sess_id: u64, far_id: u32, packet: Vec<u8>) -> Option<usize> {
+    /// Buffer a packet against a FAR, bounded by `capacity` (see
+    /// [`buffer_capacity`], which folds in a BAR's suggested packet count).
+    pub fn far_buffer_packet(
+        &self,
+        sess_id: u64,
+        far_id: u32,
+        packet: Vec<u8>,
+        capacity: usize,
+    ) -> Option<usize> {
         let mut fars = self.far_list.write().ok()?;
         let far = fars.get_mut(&(sess_id, far_id))?;
-        if far.buffered.len() >= MAX_BUFFERED_PACKETS {
-            log::warn!("FAR {far_id}: buffer full, dropping packet");
+        if far.buffered.len() >= capacity {
+            log::warn!("FAR {far_id}: buffer full at {capacity} packets, dropping packet");
             return Some(far.buffered.len());
         }
         far.buffered.push(packet);
@@ -680,6 +802,53 @@ impl SgwuContext {
     }
 
     /// Remove a BAR
+    /// Find a BAR by session and id.
+    pub fn bar_find(&self, sess_id: u64, bar_id: u8) -> Option<SgwuBar> {
+        self.bar_list.read().ok()?.get(&(sess_id, bar_id)).cloned()
+    }
+
+    /// The BAR installed for a session, if any. Sessions carry at most one BAR
+    /// (TS 29.244 Section 7.5.2.6), so the buffering path can find it without
+    /// knowing its id.
+    pub fn bar_find_for_sess(&self, sess_id: u64) -> Option<SgwuBar> {
+        self.bar_list
+            .read()
+            .ok()?
+            .values()
+            .find(|bar| bar.sess_id == sess_id)
+            .cloned()
+    }
+
+    /// Apply an Update BAR: overwrite only the members the CP function supplied,
+    /// leaving the rest of the rule intact (TS 29.244 Table 7.5.9.2-1 is a
+    /// partial update, not a replacement). Returns false when no BAR is
+    /// installed for that session and id.
+    pub fn bar_update(
+        &self,
+        sess_id: u64,
+        bar_id: u8,
+        ddn_delay: Option<u8>,
+        dl_buffering_duration: Option<u8>,
+        dl_buffering_suggested_packet_count: Option<u16>,
+    ) -> bool {
+        let Ok(mut bars) = self.bar_list.write() else {
+            return false;
+        };
+        let Some(bar) = bars.get_mut(&(sess_id, bar_id)) else {
+            return false;
+        };
+        if ddn_delay.is_some() {
+            bar.downlink_data_notification_delay = ddn_delay;
+        }
+        if dl_buffering_duration.is_some() {
+            bar.dl_buffering_duration = dl_buffering_duration;
+        }
+        if dl_buffering_suggested_packet_count.is_some() {
+            bar.dl_buffering_suggested_packet_count = dl_buffering_suggested_packet_count;
+        }
+        true
+    }
+
     pub fn bar_remove(&self, sess_id: u64, bar_id: u8) -> Option<SgwuBar> {
         self.bar_list.write().ok()?.remove(&(sess_id, bar_id))
     }
@@ -891,5 +1060,206 @@ mod tests {
         assert!(pfcp.urr_ids.is_empty());
         assert!(pfcp.qer_ids.is_empty());
         assert!(pfcp.bar_ids.is_empty());
+    }
+
+    // ================================================================
+    // nextgcore #60: peer-matched Error Indication, QER gate, BAR
+    // ================================================================
+
+    /// TS 29.281 Section 7.3.1: the TEID and the GTP-U peer address TOGETHER
+    /// identify the bearer. Two sessions holding the SAME outbound TEID toward
+    /// DIFFERENT peers is exactly the collision that made the TEID-only lookup
+    /// name the wrong session.
+    #[test]
+    fn far_lookup_requires_both_teid_and_peer() {
+        let ctx = SgwuContext::new();
+        let peer_a = Ipv4Addr::new(10, 60, 0, 1);
+        let peer_b = Ipv4Addr::new(10, 60, 0, 2);
+
+        ctx.far_install(SgwuFar {
+            sess_id: 1,
+            far_id: 1,
+            outer_header_creation: Some((0xABCD, Some(peer_a), None)),
+            ..Default::default()
+        });
+        ctx.far_install(SgwuFar {
+            sess_id: 2,
+            far_id: 1,
+            outer_header_creation: Some((0xABCD, Some(peer_b), None)),
+            ..Default::default()
+        });
+
+        // Each peer resolves to ITS OWN session.
+        let from_a = ctx
+            .far_find_by_ohc_teid_peer(0xABCD, std::net::IpAddr::V4(peer_a))
+            .expect("peer A matches");
+        let from_b = ctx
+            .far_find_by_ohc_teid_peer(0xABCD, std::net::IpAddr::V4(peer_b))
+            .expect("peer B matches");
+        assert_ne!(
+            from_a.sess_id, from_b.sess_id,
+            "the collision must resolve to two different sessions"
+        );
+        assert_eq!(from_a.sess_id, 1);
+        assert_eq!(from_b.sess_id, 2);
+
+        // A third peer holding the same TEID matches NOTHING rather than being
+        // attributed to whichever session was stored first.
+        assert!(ctx
+            .far_find_by_ohc_teid_peer(0xABCD, std::net::IpAddr::V4(Ipv4Addr::new(10, 60, 0, 9)))
+            .is_none());
+        // Address families do not cross-match.
+        assert!(ctx
+            .far_find_by_ohc_teid_peer(
+                0xABCD,
+                std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+            )
+            .is_none());
+    }
+
+    /// TS 29.244 Section 8.2.7: bits 1-2 are the UL gate, bits 3-4 the DL gate,
+    /// 0 OPEN and 1 CLOSED. An absent IE must read as OPEN, or every session
+    /// whose QER omits it would be black-holed.
+    #[test]
+    fn qer_gate_status_decodes_per_direction() {
+        let open = SgwuQer::default();
+        assert!(!open.gate_is_closed(true));
+        assert!(!open.gate_is_closed(false));
+
+        let ul_closed = SgwuQer {
+            gate_status: Some(0x01),
+            ..Default::default()
+        };
+        assert!(ul_closed.gate_is_closed(true), "UL gate closed");
+        assert!(!ul_closed.gate_is_closed(false), "DL gate still open");
+
+        let dl_closed = SgwuQer {
+            gate_status: Some(0x04),
+            ..Default::default()
+        };
+        assert!(!dl_closed.gate_is_closed(true), "UL gate still open");
+        assert!(dl_closed.gate_is_closed(false), "DL gate closed");
+
+        let both = SgwuQer {
+            gate_status: Some(0x05),
+            ..Default::default()
+        };
+        assert!(both.gate_is_closed(true) && both.gate_is_closed(false));
+
+        // An explicitly-OPEN IE is open, not merely "not closed by accident".
+        let explicit_open = SgwuQer {
+            gate_status: Some(0x00),
+            ..Default::default()
+        };
+        assert!(!explicit_open.gate_is_closed(true));
+    }
+
+    #[test]
+    fn qer_mbr_zero_means_unlimited_not_zero_rate() {
+        let q = SgwuQer {
+            mbr_ul: 0,
+            mbr_dl: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            q.mbr_bps(true),
+            0,
+            "0 signals not-provisioned to the caller"
+        );
+        assert_eq!(q.mbr_bps(false), 1_000_000);
+    }
+
+    /// TS 29.244 Section 8.2.28: the DDN delay is in 50 ms units, and 0 or
+    /// absent means no delay.
+    #[test]
+    fn bar_ddn_delay_is_fifty_millisecond_units() {
+        let mut bar = SgwuBar::default();
+        assert_eq!(bar.ddn_delay(), None, "absent means no delay");
+
+        bar.downlink_data_notification_delay = Some(0);
+        assert_eq!(
+            bar.ddn_delay(),
+            None,
+            "zero means no delay, not zero-length"
+        );
+
+        bar.downlink_data_notification_delay = Some(1);
+        assert_eq!(bar.ddn_delay(), Some(std::time::Duration::from_millis(50)));
+
+        bar.downlink_data_notification_delay = Some(20);
+        assert_eq!(
+            bar.ddn_delay(),
+            Some(std::time::Duration::from_millis(1000)),
+            "20 units is one second, not 20 ms"
+        );
+    }
+
+    /// TS 29.244 Section 8.2.48: a suggested packet count from the CP function
+    /// overrides the local default. The hardcoded 64 ignored it entirely.
+    #[test]
+    fn buffer_capacity_honours_the_suggested_packet_count() {
+        assert_eq!(buffer_capacity(Some(200)), 200);
+        // Zero is not a request for a zero-length buffer.
+        assert_eq!(buffer_capacity(Some(0)), MAX_BUFFERED_PACKETS);
+        assert_eq!(buffer_capacity(None), MAX_BUFFERED_PACKETS);
+    }
+
+    /// An Update BAR is a PARTIAL update (TS 29.244 Table 7.5.9.2-1): members
+    /// the CP function omitted must survive it.
+    #[test]
+    fn bar_update_only_overwrites_supplied_members() {
+        let ctx = SgwuContext::new();
+        assert!(ctx.bar_install(SgwuBar {
+            sess_id: 7,
+            bar_id: 1,
+            downlink_data_notification_delay: Some(4),
+            dl_buffering_duration: Some(9),
+            dl_buffering_suggested_packet_count: Some(50),
+        }));
+
+        // Supply only the suggested count.
+        assert!(ctx.bar_update(7, 1, None, None, Some(120)));
+        let bar = ctx.bar_find(7, 1).expect("bar present");
+        assert_eq!(bar.dl_buffering_suggested_packet_count, Some(120));
+        assert_eq!(bar.downlink_data_notification_delay, Some(4), "preserved");
+        assert_eq!(bar.dl_buffering_duration, Some(9), "preserved");
+
+        // An update for a BAR that is not installed is reported, not silently
+        // dropped.
+        assert!(!ctx.bar_update(7, 9, Some(1), None, None));
+    }
+
+    #[test]
+    fn bar_find_for_sess_locates_the_sessions_bar() {
+        let ctx = SgwuContext::new();
+        assert!(ctx.bar_install(SgwuBar {
+            sess_id: 11,
+            bar_id: 3,
+            downlink_data_notification_delay: Some(2),
+            ..Default::default()
+        }));
+        let found = ctx.bar_find_for_sess(11).expect("found by session alone");
+        assert_eq!(found.bar_id, 3);
+        assert!(ctx.bar_find_for_sess(12).is_none());
+    }
+
+    /// The buffer cap must actually bound the buffer.
+    #[test]
+    fn far_buffer_packet_respects_the_supplied_capacity() {
+        let ctx = SgwuContext::new();
+        ctx.far_install(SgwuFar {
+            sess_id: 21,
+            far_id: 1,
+            ..Default::default()
+        });
+        for _ in 0..5 {
+            ctx.far_buffer_packet(21, 1, vec![0u8; 4], 3);
+        }
+        let far = ctx.far_find(21, 1).expect("far present");
+        assert_eq!(
+            far.buffered.len(),
+            3,
+            "buffer bounded by the capacity given"
+        );
     }
 }
