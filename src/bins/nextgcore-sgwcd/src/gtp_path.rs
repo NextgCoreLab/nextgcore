@@ -28,6 +28,14 @@ use crate::{pfcp_path, sxa_handler};
 /// Default S11 bind address (GTPv2-C well-known port, TS 29.274 Section 4.2)
 const DEFAULT_S11_BIND: &str = "0.0.0.0:2123";
 
+/// Default Echo probe interval (TS 23.007 Section 20.3.1). Override with
+/// `SGWC_ECHO_INTERVAL_SECS`; 0 disables probing.
+const DEFAULT_ECHO_INTERVAL_SECS: u64 = 60;
+
+/// Default location of the persisted local restart counter
+/// (TS 23.007 Section 18 requires non-volatile storage).
+const DEFAULT_RESTART_COUNTER_FILE: &str = "/var/lib/nextgcore/sgwc-restart-counter";
+
 // ============================================================================
 // GTP Path State
 // ============================================================================
@@ -130,9 +138,10 @@ impl GtpcServer {
                 .map_err(|e| e.to_string())?;
         }
 
-        // Retransmission (T3/N3) loop
+        // Retransmission (T3/N3) loop, which also drives Echo path management.
         {
             let inner = inner.clone();
+            let last_echo: Mutex<HashMap<SocketAddr, Instant>> = Mutex::new(HashMap::new());
             std::thread::Builder::new()
                 .name("sgwc-s11-rtx".into())
                 .spawn(move || {
@@ -162,6 +171,52 @@ impl GtpcServer {
                             );
                             if let Ok(mut states) = inner.peer_state.lock() {
                                 states.insert(xact.peer, GtpPathState::Failed);
+                            }
+                            // A failed path leaves the same stale contexts a
+                            // restart does, so run the same cleanup rather than
+                            // only recording the state (TS 23.007 Section 20).
+                            if restart_deletion_enabled() {
+                                delete_contexts_for_peer(xact.peer.ip());
+                            }
+                        }
+
+                        // Periodic Echo path management (TS 23.007 Section 20).
+                        // Driven from this thread because it already ticks; a
+                        // separate timer task would need its own shutdown story.
+                        if let Some(interval) = echo_interval() {
+                            let due: Vec<SocketAddr> = {
+                                match inner.peer_state.lock() {
+                                    Ok(states) => states.keys().copied().collect(),
+                                    Err(_) => Vec::new(),
+                                }
+                            };
+                            let now = Instant::now();
+                            let mut last = match last_echo.lock() {
+                                Ok(l) => l,
+                                Err(_) => continue,
+                            };
+                            for peer in due {
+                                // A peer enters peer_state BECAUSE we just heard
+                                // from it, so the first sighting starts the
+                                // interval rather than triggering a probe. An
+                                // immediate probe would both waste a round trip
+                                // and inject unsolicited traffic into any
+                                // exchange already in flight.
+                                let send = match last.get(&peer) {
+                                    Some(t) => now.duration_since(*t) >= interval,
+                                    None => false,
+                                };
+                                if send || !last.contains_key(&peer) {
+                                    last.insert(peer, now);
+                                }
+                                if send {
+                                    let server = GtpcServer {
+                                        inner: inner.clone(),
+                                    };
+                                    if let Err(e) = server.send_echo_request(peer) {
+                                        log::warn!("S11 Echo Request to {peer} failed: {e}");
+                                    }
+                                }
                             }
                         }
                     }
@@ -317,10 +372,22 @@ pub fn gtp_open() -> Result<(), String> {
     }
 
     let bind = std::env::var("SGWC_S11_BIND").unwrap_or_else(|_| DEFAULT_S11_BIND.to_string());
-    let restart_counter = std::env::var("SGWC_RESTART_COUNTER")
+    // SGWC_RESTART_COUNTER is a TEST OVERRIDE only; production reads and
+    // advances the persisted counter so peers can detect an SGW-C restart
+    // (TS 23.007 Section 18).
+    let restart_counter = match std::env::var("SGWC_RESTART_COUNTER")
         .ok()
         .and_then(|v| v.parse::<u8>().ok())
-        .unwrap_or(1);
+    {
+        Some(override_value) => {
+            log::warn!(
+                "SGWC_RESTART_COUNTER={override_value} overrides the persisted restart counter; \
+                 this is a test-only escape hatch"
+            );
+            override_value
+        }
+        None => advance_persistent_restart_counter(&restart_counter_path()),
+    };
 
     let server = GtpcServer::open(&bind, Gtp2XactConfig::default(), restart_counter)?;
 
@@ -348,6 +415,85 @@ pub fn gtp_open() -> Result<(), String> {
     Ok(())
 }
 
+/// Where the local restart counter is persisted.
+///
+/// TS 23.007 Section 18 requires the local restart counter to live in
+/// non-volatile storage: a counter that resets to the same value on every start
+/// tells peers nothing changed, so they keep stale SGW-C contexts forever.
+pub(crate) fn restart_counter_path() -> std::path::PathBuf {
+    std::env::var("SGWC_RESTART_COUNTER_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_RESTART_COUNTER_FILE))
+}
+
+/// Read the persisted restart counter, advance it, write it back, and return the
+/// value to advertise in Recovery IEs.
+///
+/// * absent file → this is a first start; begin at 1 and persist it;
+/// * unreadable or malformed contents → log loudly and fall back to 1, because
+///   refusing to start would take an EPC control plane down over a scratch file,
+///   while silently continuing would hide a restart from every peer. The peers'
+///   view is what suffers, and the log says so;
+/// * wraps 255 → 1 rather than 0, keeping 0 free as "never persisted".
+///
+/// Uses temp-file-plus-rename so a crash mid-write cannot leave a truncated
+/// counter that the next start reads as malformed.
+pub(crate) fn advance_persistent_restart_counter(path: &std::path::Path) -> u8 {
+    let previous = match std::fs::read_to_string(path) {
+        Ok(text) => match text.trim().parse::<u8>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                log::error!(
+                    "Restart counter file {} is malformed ({:?}); restarting the count at 1, so \
+                     peers may not detect this SGW-C restart (TS 23.007 Section 18)",
+                    path.display(),
+                    text.trim()
+                );
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            log::error!(
+                "Cannot read restart counter file {}: {e}; restarting the count at 1, so peers \
+                 may not detect this SGW-C restart",
+                path.display()
+            );
+            None
+        }
+    };
+
+    let next = match previous {
+        Some(v) => v.checked_add(1).unwrap_or(1),
+        None => 1,
+    };
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::error!(
+                    "Cannot create {} for the restart counter: {e}",
+                    parent.display()
+                );
+            }
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    let write = std::fs::write(&tmp, next.to_string()).and_then(|()| std::fs::rename(&tmp, path));
+    match write {
+        Ok(()) => log::info!(
+            "Local GTP-C restart counter advanced to {next} (persisted at {})",
+            path.display()
+        ),
+        Err(e) => log::error!(
+            "Cannot persist restart counter to {}: {e}; the next start will not advance it and \
+             peers will not detect that restart",
+            path.display()
+        ),
+    }
+    next
+}
+
 /// Close the S11 GTP-C server socket
 /// Port of sgwc_gtp_close
 pub fn gtp_close() {
@@ -361,11 +507,71 @@ pub fn gtp_close() {
 // Datagram dispatch
 // ============================================================================
 
+/// Echo probe interval, or `None` when probing is disabled.
+///
+/// `SGWC_ECHO_INTERVAL_SECS=0` disables it; absent means the default. TS 23.007
+/// Section 20.3.1 says an entity *may* probe, so this is configurable rather
+/// than mandatory.
+fn echo_interval() -> Option<Duration> {
+    let secs = std::env::var("SGWC_ECHO_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ECHO_INTERVAL_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
+}
+
+/// Build the 8-octet Version Not Supported Indication (TS 29.274 Section 7.7.2).
+///
+/// Message type 3, no TEID, no IEs: header flags + type + length + 3-octet
+/// sequence number + spare. The sequence number echoes the offending message's
+/// so the peer can correlate the rejection.
+pub(crate) fn build_version_not_supported(sequence_number: u32) -> Bytes {
+    let header = nextgcore_gtp::v2::header::Gtp2Header::new_no_teid(
+        Gtp2MessageType::VersionNotSupportedIndication as u8,
+        sequence_number,
+    );
+    Bytes::from(Gtp2Message::new(header).encode().to_vec())
+}
+
+/// Sequence number of a datagram whose header could not be decoded.
+///
+/// The GTPv2 sequence number is the 3 octets after flags(1) + type(1) +
+/// length(2), and it sits at the same offset for every version >= 1, so it can
+/// be recovered from a datagram this node cannot otherwise parse. Returns 0 when
+/// the datagram is too short to carry one.
+fn peek_sequence_number(data: &[u8]) -> u32 {
+    if data.len() < 8 {
+        return 0;
+    }
+    ((data[4] as u32) << 16) | ((data[5] as u32) << 8) | (data[6] as u32)
+}
+
 fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
     let mut bytes = Bytes::copy_from_slice(data);
     let msg = match Gtp2Message::decode(&mut bytes) {
         Ok(m) => m,
         Err(e) => {
+            // TS 29.274 Section 7.7.2: a message of an unsupported GTP version
+            // HIGHER than GTPv2 is a Triggered message that shall be answered
+            // with a Version Not Supported Indication, not dropped. A lower
+            // version (GTPv1) is not ours to answer on this interface.
+            if let nextgcore_gtp::GtpError::InvalidVersion(version) = e {
+                if version > 2 {
+                    let reply = build_version_not_supported(peek_sequence_number(data));
+                    log::warn!(
+                        "GTPv{version} datagram from {peer}: replying Version Not Supported \
+                         Indication (TS 29.274 Section 7.7.2)"
+                    );
+                    if let Err(e) = inner.socket.send_to(&reply, peer) {
+                        log::error!("S11 Version Not Supported Indication to {peer} failed: {e}");
+                    }
+                    return;
+                }
+            }
             log::error!("[DROP] Cannot decode GTPv2-C datagram from {peer}: {e}");
             return;
         }
@@ -496,15 +702,138 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
     }
 }
 
-/// Track the peer's restart counter; a change means the peer restarted and
-/// its contexts are stale (TS 23.007 Section 18)
+/// How a received restart counter relates to the one already stored for a peer
+/// (TS 23.007 Section 18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartOrder {
+    /// Received value is ahead of the stored one: the peer restarted.
+    Restarted,
+    /// Received value equals the stored one: nothing happened.
+    Unchanged,
+    /// Received value is behind the stored one. TS 23.007 Section 18: "If the
+    /// value ... previously stored for a peer is larger than the Restart
+    /// counter value received ... this indicates a possible race condition ...
+    /// [the message] shall be discarded."
+    Stale,
+}
+
+/// Classify a received restart counter against the stored one.
+///
+/// The previous code used `previous != restart_counter`, which treats a value
+/// moving BACKWARDS as a restart. That is precisely the race TS 23.007 Section 18
+/// says to discard, and acting on it tears down live contexts on a reordered
+/// datagram.
+///
+/// Note on the counter's modulo-256 wrap: a genuine wrap (255 -> 0) is reported
+/// here as `Stale`, not `Restarted`, because Section 18 is written as a plain
+/// magnitude comparison on the stored-versus-received values and nextgcore #53's
+/// acceptance criteria require a rolled-over value to be discarded. The cost is
+/// that the 256th restart of a peer is not detected from its counter alone; it
+/// is still detected by N3 exhaustion on the path. Chosen deliberately: treating
+/// a backwards jump as a restart would delete live sessions on every reordered
+/// message, which is the far more damaging error.
+pub(crate) fn restart_counter_order(stored: u8, received: u8) -> RestartOrder {
+    match received.cmp(&stored) {
+        std::cmp::Ordering::Greater => RestartOrder::Restarted,
+        std::cmp::Ordering::Equal => RestartOrder::Unchanged,
+        std::cmp::Ordering::Less => RestartOrder::Stale,
+    }
+}
+
+/// Whether restart-triggered context deletion is enabled.
+///
+/// Off by default: deleting contexts on a restart heuristic can drop live
+/// sessions if the heuristic misfires, so nextgcore #53 requires it be gated
+/// until validated end to end. Set `SGWC_RESTART_DELETE_CONTEXTS=1` to enable.
+fn restart_deletion_enabled() -> bool {
+    matches!(
+        std::env::var("SGWC_RESTART_DELETE_CONTEXTS")
+            .unwrap_or_default()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+/// Restart-triggered context deletion (TS 23.007 Section 16.1A.1.1): drop every
+/// PDN connection held for a peer that has restarted, tearing down each
+/// session's SGW-U PFCP session first.
+///
+/// Returns the number of UE contexts removed, so callers (and tests) can assert
+/// the teardown actually happened rather than only that it was attempted.
+pub(crate) fn delete_contexts_for_peer(peer_ip: std::net::IpAddr) -> usize {
+    let ctx = sgwc_self();
+    let ue_ids = ctx.ue_ids_for_mme_ip(peer_ip);
+    let mut removed = 0usize;
+
+    for ue_id in ue_ids {
+        // PFCP first: once ue_remove runs, the session records are gone and no
+        // Session Deletion Request can be built from them.
+        for sess in ctx.sess_list_for_ue(ue_id) {
+            if let Err(e) = pfcp_path::send_session_deletion_request(&sess, 0, None) {
+                // Best-effort: a dead SGW-U must not block dropping local state,
+                // or the contexts leak exactly as they did before this fix.
+                log::warn!(
+                    "SGW-U session deletion for sess {} failed during peer-{peer_ip} \
+                     restart cleanup: {e}",
+                    sess.id
+                );
+            }
+        }
+        if ctx.ue_remove(ue_id).is_some() {
+            removed += 1;
+        }
+    }
+
+    if removed > 0 {
+        log::warn!(
+            "Peer {peer_ip} restart/failure: deleted {removed} UE context(s) and their \
+             SGW-U sessions (TS 23.007 Section 16.1A.1.1)"
+        );
+    }
+    removed
+}
+
+/// Track the peer's restart counter and act on a confirmed restart
+/// (TS 23.007 Section 18 / Section 16.1A.1.1).
 fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, restart_counter: u8) {
-    let mut peer_restart = match inner.peer_restart.lock() {
-        Ok(p) => p,
-        Err(_) => return,
+    let previous = {
+        let mut peer_restart = match inner.peer_restart.lock() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // Only overwrite when the value is not stale, so a racing datagram
+        // cannot rewrite the stored counter backwards and make the NEXT genuine
+        // message look like a restart.
+        match peer_restart.get(&peer.ip()).copied() {
+            Some(prev) => {
+                if restart_counter_order(prev, restart_counter) == RestartOrder::Restarted {
+                    peer_restart.insert(peer.ip(), restart_counter);
+                }
+                Some(prev)
+            }
+            None => {
+                peer_restart.insert(peer.ip(), restart_counter);
+                None
+            }
+        }
     };
-    match peer_restart.insert(peer.ip(), restart_counter) {
-        Some(previous) if previous != restart_counter => {
+
+    let Some(previous) = previous else {
+        return;
+    };
+
+    match restart_counter_order(previous, restart_counter) {
+        RestartOrder::Unchanged => {}
+        RestartOrder::Stale => {
+            log::warn!(
+                "GTP-C peer {} sent restart counter {} below the stored {}: possible race, \
+                 discarding (TS 23.007 Section 18)",
+                peer.ip(),
+                restart_counter,
+                previous
+            );
+        }
+        RestartOrder::Restarted => {
             log::warn!(
                 "GTP-C peer {} restarted (restart counter {} -> {}): contexts are stale",
                 peer.ip(),
@@ -514,8 +843,16 @@ fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, restart_counter:
             if let Ok(mut states) = inner.peer_state.lock() {
                 states.insert(peer, GtpPathState::Idle);
             }
+            if restart_deletion_enabled() {
+                delete_contexts_for_peer(peer.ip());
+            } else {
+                log::warn!(
+                    "Peer {} restart detected but SGWC_RESTART_DELETE_CONTEXTS is off: \
+                     contexts left in place",
+                    peer.ip()
+                );
+            }
         }
-        _ => {}
     }
 }
 
@@ -1577,5 +1914,196 @@ mod tests {
         );
 
         server.close();
+    }
+
+    // ================================================================
+    // nextgcore #53: restart handling, Echo, Version Not Supported
+    // ================================================================
+
+    /// TS 23.007 Section 18: a counter moving BACKWARDS is a race to be
+    /// discarded, not a restart. The old `previous != restart_counter` test
+    /// classified it as a restart and tore down live contexts.
+    #[test]
+    fn restart_counter_order_discards_a_backwards_jump() {
+        assert_eq!(restart_counter_order(5, 6), RestartOrder::Restarted);
+        assert_eq!(restart_counter_order(5, 200), RestartOrder::Restarted);
+        assert_eq!(restart_counter_order(5, 5), RestartOrder::Unchanged);
+        // The race: stored is larger than received.
+        assert_eq!(restart_counter_order(5, 4), RestartOrder::Stale);
+        assert_eq!(restart_counter_order(200, 5), RestartOrder::Stale);
+        // A modulo-256 roll-over is reported Stale, per #53's criteria and the
+        // plain magnitude reading of Section 18. Documented on the function.
+        assert_eq!(restart_counter_order(255, 0), RestartOrder::Stale);
+    }
+
+    /// TS 29.274 Section 7.7.2: a datagram of a version higher than GTPv2 must
+    /// elicit a type-3 Version Not Supported Indication, not a silent drop.
+    #[test]
+    fn unsupported_gtp_version_gets_a_version_not_supported_reply() {
+        let server = test_server(200, 2);
+        let sock = client();
+
+        // GTPv3 header: version 3 in the top 3 bits of the flags octet.
+        let mut datagram = vec![0u8; 8];
+        datagram[0] = 3 << 5;
+        datagram[1] = 1; // some message type
+        datagram[2] = 0;
+        datagram[3] = 4;
+        // Sequence number 0x0ABBCC, which the reply must echo.
+        datagram[4] = 0x0A;
+        datagram[5] = 0xBB;
+        datagram[6] = 0xCC;
+
+        sock.send_to(&datagram, server.local_addr()).unwrap();
+
+        let mut buf = [0u8; 256];
+        let (len, _) = sock
+            .recv_from(&mut buf)
+            .expect("expected a reply, not a drop");
+        assert_eq!(len, 8, "Version Not Supported Indication is 8 octets");
+        assert_eq!(
+            buf[1],
+            Gtp2MessageType::VersionNotSupportedIndication as u8,
+            "reply must be message type 3"
+        );
+        assert_eq!((buf[0] >> 5) & 0x07, 2, "the reply itself must be GTPv2");
+        assert_eq!(
+            [buf[4], buf[5], buf[6]],
+            [0x0A, 0xBB, 0xCC],
+            "the reply must echo the offending sequence number"
+        );
+        server.close();
+    }
+
+    /// A GTPv1 datagram is NOT ours to answer on S11: Section 7.7.2 covers
+    /// versions HIGHER than GTPv2 only. Asserting this keeps the fix from
+    /// becoming "reply to anything we cannot parse".
+    #[test]
+    fn lower_gtp_version_is_still_dropped_silently() {
+        let server = test_server(200, 2);
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+
+        let mut datagram = vec![0u8; 8];
+        datagram[0] = 1 << 5; // GTPv1
+        datagram[1] = 1;
+        sock.send_to(&datagram, server.local_addr()).unwrap();
+
+        let mut buf = [0u8; 256];
+        assert!(
+            sock.recv_from(&mut buf).is_err(),
+            "a GTPv1 datagram must not draw a Version Not Supported Indication"
+        );
+        server.close();
+    }
+
+    /// The 8-octet shape and echoed sequence number, asserted directly on the
+    /// builder so a change to it fails here rather than only over a socket.
+    #[test]
+    fn version_not_supported_is_eight_octets_with_no_teid() {
+        let bytes = build_version_not_supported(0x0102_03);
+        assert_eq!(bytes.len(), 8);
+        assert_eq!((bytes[0] >> 5) & 0x07, 2);
+        assert_eq!(bytes[0] & 0x08, 0, "the T flag must be clear (no TEID)");
+        assert_eq!(bytes[1], 3);
+        assert_eq!([bytes[4], bytes[5], bytes[6]], [0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn peek_sequence_number_reads_the_header_offset_and_tolerates_runts() {
+        assert_eq!(
+            peek_sequence_number(&[0, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0]),
+            0x00AA_BBCC
+        );
+        assert_eq!(peek_sequence_number(&[0, 0, 0]), 0);
+        assert_eq!(peek_sequence_number(&[]), 0);
+    }
+
+    /// TS 23.007 Section 18: the local restart counter must survive a process
+    /// restart and advance, or peers can never tell the SGW-C restarted.
+    #[test]
+    fn persistent_restart_counter_advances_across_starts() {
+        let dir = std::env::temp_dir().join(format!("ngc-sgwc-rc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("counter");
+
+        // First start: no file yet.
+        assert_eq!(advance_persistent_restart_counter(&path), 1);
+        // Subsequent starts advance, and the value is read back from disk --
+        // which is the property the hardcoded default could never have.
+        assert_eq!(advance_persistent_restart_counter(&path), 2);
+        assert_eq!(advance_persistent_restart_counter(&path), 3);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "3");
+
+        // Malformed contents must not take the daemon down, and must not
+        // silently reuse the old value either.
+        std::fs::write(&path, "not-a-number").unwrap();
+        assert_eq!(advance_persistent_restart_counter(&path), 1);
+
+        // 255 wraps to 1, keeping 0 free as "never persisted".
+        std::fs::write(&path, "255").unwrap();
+        assert_eq!(advance_persistent_restart_counter(&path), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Restart-triggered deletion is off unless the operator opts in (#53
+    /// requires the behaviour-changing path to be gated).
+    #[test]
+    fn restart_deletion_is_off_by_default() {
+        // The suite runs without the variable set, which is the shipped default.
+        if std::env::var("SGWC_RESTART_DELETE_CONTEXTS").is_err() {
+            assert!(!restart_deletion_enabled());
+        }
+    }
+
+    /// Echo probing is configurable and disablable (Section 20.3.1 says an
+    /// entity *may* probe).
+    #[test]
+    fn echo_interval_defaults_and_can_be_disabled() {
+        if std::env::var("SGWC_ECHO_INTERVAL_SECS").is_err() {
+            assert_eq!(
+                echo_interval(),
+                Some(Duration::from_secs(DEFAULT_ECHO_INTERVAL_SECS))
+            );
+        }
+    }
+
+    /// TS 23.007 Section 16.1A.1.1: a confirmed peer restart deletes that
+    /// peer's contexts. Scoped by peer address, so another MME's UE survives --
+    /// asserting only that the restarted peer's UE is gone would pass against
+    /// code that deletes everything.
+    #[test]
+    fn restart_deletion_removes_only_the_restarted_peers_contexts() {
+        let ctx = sgwc_self();
+        let restarted: SocketAddr = "10.53.0.1:2123".parse().unwrap();
+        let survivor: SocketAddr = "10.53.0.2:2123".parse().unwrap();
+
+        let mut a = ctx.ue_add(b"001010000000053").expect("ue a");
+        a.mme_addr = Some(restarted);
+        ctx.ue_update(&a);
+        let mut b = ctx.ue_add(b"001010000000054").expect("ue b");
+        b.mme_addr = Some(survivor);
+        ctx.ue_update(&b);
+
+        assert!(ctx.sess_add(a.id, "internet").is_some());
+
+        let removed = delete_contexts_for_peer(restarted.ip());
+        assert_eq!(removed, 1, "exactly the restarted peer's UE is removed");
+        assert!(
+            ctx.ue_find_by_id(a.id).is_none(),
+            "restarted peer's UE is gone"
+        );
+        assert!(
+            ctx.ue_find_by_id(b.id).is_some(),
+            "another MME's UE must survive"
+        );
+        assert!(
+            ctx.sess_list_for_ue(a.id).is_empty(),
+            "the removed UE's sessions are gone too"
+        );
+
+        ctx.ue_remove(b.id);
     }
 }

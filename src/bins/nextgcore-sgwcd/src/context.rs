@@ -582,6 +582,40 @@ impl SgwcContext {
         None
     }
 
+    /// IDs of every UE whose serving MME is at `ip` (TS 23.007 Section 16.1A.1.1
+    /// restart-triggered deletion needs the peer's contexts, and the peer is
+    /// identified by address because a restarted MME keeps its address and
+    /// loses its state).
+    ///
+    /// Compares the IP only: an MME that restarts may bind a different source
+    /// port, so matching the full socket address would find nothing.
+    pub fn ue_ids_for_mme_ip(&self, ip: std::net::IpAddr) -> Vec<u64> {
+        match self.sgwc_ue_list.read() {
+            Ok(list) => list
+                .values()
+                .filter(|ue| ue.mme_addr.map(|a| a.ip()) == Some(ip))
+                .map(|ue| ue.id)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Every session belonging to a UE, cloned.
+    ///
+    /// Needed because the SGW-U PFCP sessions must be torn down BEFORE
+    /// [`SgwcContext::ue_remove`] drops the local records — once the UE is gone
+    /// there is nothing left to build a Session Deletion Request from.
+    pub fn sess_list_for_ue(&self, sgwc_ue_id: u64) -> Vec<SgwcSess> {
+        match self.sess_list.read() {
+            Ok(list) => list
+                .values()
+                .filter(|s| s.sgwc_ue_id == sgwc_ue_id)
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Remove all UEs
     pub fn ue_remove_all(&self) {
         let ids: Vec<u64> = {
