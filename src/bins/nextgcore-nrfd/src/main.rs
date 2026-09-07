@@ -660,6 +660,12 @@ async fn main() -> Result<()> {
         Some(path) => {
             nextgcore_nrfd::init_nf_manager(Some(std::path::PathBuf::from(path)));
             log::info!("NRF registry persistence enabled: {path}");
+            // Restoring the registry without re-arming its timers leaves every
+            // restored NF unsupervised and every restored subscription immortal:
+            // the no-heartbeat timer is armed only inside register/update and the
+            // validity timer only inside subscription create, so nothing ever
+            // expires a record that came off disk (TS 29.510 Section 6.1.3).
+            rearm_restored_timers();
         }
         None => {
             nextgcore_nrfd::init_nf_manager(None);
@@ -1661,6 +1667,99 @@ fn epoch_to_rfc3339(secs: u64) -> String {
     format!("{year:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
+/// Re-arm supervision timers for records restored from the state file.
+///
+/// Restored NFs get a no-heartbeat timer so a stale registration is eventually
+/// suspended and deregistered; restored subscriptions get a validity timer so an
+/// expired subscription is cleaned up. Without this, a restart converts every
+/// persisted record into one that never expires.
+///
+/// A restored NF is given a FULL supervision interval rather than the remainder
+/// of its original one: how long it has already been silent is not persisted, and
+/// granting a fresh interval risks keeping a dead NF one interval too long, while
+/// guessing short would deregister a healthy NF that simply restarted alongside
+/// the NRF. Erring toward keeping it is the recoverable direction — the next
+/// missed heartbeat still suspends it.
+fn rearm_restored_timers() {
+    let manager = nf_manager();
+    let timer_mgr = timer_manager();
+
+    let mut nf_count = 0usize;
+    for profile in manager.list() {
+        let hb = profile.heartbeat_timer.unwrap_or(10) as u64;
+        arm_heartbeat_timer(&profile.nf_instance_id, Duration::from_secs(hb * 2));
+        nf_count += 1;
+    }
+
+    let mut sub_count = 0usize;
+    for id in manager.subscription_ids() {
+        if let Some(sub) = manager.find_subscription(&id) {
+            timer_mgr.start_timer(
+                nextgcore_nrfd::NrfTimerId::SubscriptionValidity,
+                Duration::from_secs(sub.validity_duration),
+                id.clone(),
+            );
+            sub_count += 1;
+        }
+    }
+
+    if nf_count > 0 || sub_count > 0 {
+        log::info!(
+            "Re-armed timers for {nf_count} restored NF instance(s) and \
+             {sub_count} restored subscription(s)"
+        );
+    }
+}
+
+/// Parse an RFC 3339 UTC date-time into seconds since the epoch, the inverse of
+/// [`epoch_to_rfc3339`].
+///
+/// Deliberately strict: only the `YYYY-MM-DDThh:mm:ss` form this NRF emits, with
+/// an optional fractional part and a `Z`/`+00:00` offset. A non-UTC offset is
+/// REJECTED rather than silently read as UTC, because misreading an offset
+/// shifts a subscription's expiry by hours.
+fn rfc3339_to_epoch(text: &str) -> Option<u64> {
+    let t = text.trim();
+    let (date, rest) = t.split_once('T').or_else(|| t.split_once(' '))?;
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // Strip the zone, accepting only UTC.
+    let time = rest
+        .strip_suffix('Z')
+        .or_else(|| rest.strip_suffix('z'))
+        .or_else(|| rest.strip_suffix("+00:00"))
+        .or_else(|| rest.strip_suffix("+0000"))?;
+    // Drop any fractional seconds.
+    let time = time.split('.').next()?;
+
+    let mut tparts = time.split(':');
+    let hour: u64 = tparts.next()?.parse().ok()?;
+    let minute: u64 = tparts.next()?.parse().ok()?;
+    let second: u64 = tparts.next().unwrap_or("0").parse().ok()?;
+    if tparts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    // days_from_civil, the inverse of the civil_from_days above.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    if days < 0 {
+        return None;
+    }
+    Some(days as u64 * 86400 + hour * 3600 + minute * 60 + second)
+}
+
 /// Handle Subscription Delete request
 async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
     log::info!("Subscription Delete: {subscription_id}");
@@ -1678,9 +1777,119 @@ async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
 }
 
 /// Handle Subscription Update request
-async fn handle_subscription_update(subscription_id: &str, _request: &SbiRequest) -> SbiResponse {
+async fn handle_subscription_update(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("Subscription Update: {subscription_id}");
+
+    let manager = nf_manager();
+    // An unknown id must be 404, not a bodyless 200 that tells the consumer its
+    // extension succeeded (TS 29.510 Section 5.2.2.5.6).
+    let Some(existing) = manager.find_subscription(subscription_id) else {
+        return send_not_found(
+            &format!("Subscription {subscription_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        );
+    };
+
+    let body = request.http.content.as_deref().unwrap_or("");
+    let patch: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Malformed subscription patch: {e}"),
+                Some("INVALID_MSG_FORMAT"),
+            )
+        }
+    };
+
+    // TS 29.510 Section 5.2.2.5.6: the patch may carry validityTime, and it is
+    // the ONLY replaceable attribute of a subscription. Accept both the JSON
+    // Patch array form and a merge-patch object, since the resource accepts
+    // application/json-patch+json.
+    let proposed = extract_patch_validity_time(&patch);
+
+    let Some(validity_time) = proposed else {
+        // Nothing we can act on. Report it rather than returning a 200 that
+        // implies the (absent) change was applied.
+        return send_bad_request(
+            "Subscription patch carries no replaceable attribute (expected validityTime)",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // validityTime is a DateTime string per the spec, not a duration. Convert to
+    // a duration from now; a time already in the past is a client error rather
+    // than an instant expiry we silently apply.
+    let Some(absolute) = rfc3339_to_epoch(&validity_time) else {
+        return send_bad_request(
+            &format!("validityTime {validity_time:?} is not an RFC 3339 date-time"),
+            Some("INVALID_MSG_FORMAT"),
+        );
+    };
+    if absolute <= now {
+        return send_bad_request(
+            &format!("validityTime {validity_time:?} is in the past"),
+            Some("INVALID_MSG_FORMAT"),
+        );
+    }
+    let validity_duration = absolute - now;
+
+    if !manager.set_subscription_validity(subscription_id, validity_duration) {
+        return send_error(
+            500,
+            "Internal Server Error",
+            "Failed to store the updated subscription validity",
+            Some("SYSTEM_FAILURE"),
+        );
+    }
+
+    // Re-arm the validity timer, which is the whole point of the PATCH: without
+    // this the subscription still expires at the ORIGINAL time and the
+    // consumer's extension is silently ineffective.
+    let timer_mgr = timer_manager();
+    timer_mgr.start_timer(
+        nextgcore_nrfd::NrfTimerId::SubscriptionValidity,
+        Duration::from_secs(validity_duration),
+        subscription_id.to_string(),
+    );
+    log::info!(
+        "Subscription {subscription_id} validity extended to {validity_time} \
+         ({validity_duration}s); timer re-armed"
+    );
+
+    let mut updated = existing;
+    updated.validity_duration = validity_duration;
     SbiResponse::with_status(200)
+        .with_json_body(&subscription_response_json(&updated, &validity_time))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// Pull `validityTime` out of either patch form the resource accepts: a JSON
+/// Patch array of operations, or a merge-patch object.
+fn extract_patch_validity_time(patch: &serde_json::Value) -> Option<String> {
+    if let Some(ops) = patch.as_array() {
+        // JSON Patch: the last replace/add wins, matching how a sequence of
+        // operations applies.
+        return ops
+            .iter()
+            .rfind(|op| {
+                matches!(
+                    op.get("op").and_then(|v| v.as_str()),
+                    Some("replace") | Some("add")
+                ) && op.get("path").and_then(|v| v.as_str()) == Some("/validityTime")
+            })
+            .and_then(|op| op.get("value"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+    }
+    patch
+        .get("validityTime")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Handle NF Discovery request (TS 29.510 §6.2.3.2.3.1 SearchNFInstances)
@@ -2937,6 +3146,29 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
                                 "NF instance {nf_instance_id} missed heartbeat, marking SUSPENDED"
                             );
                             manager.suspend(nf_instance_id);
+
+                            // TS 29.510 Section 5.2.2.6: the REGISTERED ->
+                            // SUSPENDED transition is a profile change and must
+                            // be notified. Without this, subscribers only learn
+                            // of the failure when the NF is fully deregistered a
+                            // grace period later, and keep selecting a producer
+                            // the NRF already knows is not answering.
+                            if let Some(suspended) = manager.get(nf_instance_id) {
+                                let server_uri = nrf_self_uri().to_string();
+                                tokio::spawn(async move {
+                                    if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
+                                        NotificationEventType::NfProfileChanged,
+                                        &suspended,
+                                        &server_uri,
+                                    )
+                                    .await
+                                    {
+                                        log::error!(
+                                            "Failed to send NF_PROFILE_CHANGED on suspend: {e}"
+                                        );
+                                    }
+                                });
+                            }
 
                             // Start a grace period timer for auto-deregistration
                             // Use same interval as heartbeat for the grace period
@@ -5253,5 +5485,176 @@ mod tests {
 
         // validityPeriod default reflects policy (config-driven, nrfd-10).
         assert_eq!(nrf_policy().disc_validity_period, NRF_DISC_VALIDITY_PERIOD);
+    }
+
+    // ================================================================
+    // nextgcore #68: subscription PATCH, validityTime parsing
+    // ================================================================
+
+    /// TS 29.510: validityTime is a DateTime STRING, not an integer duration.
+    /// Round-tripping through the emitter proves the two agree, which is what
+    /// makes the PATCH handler's duration arithmetic trustworthy.
+    #[test]
+    fn rfc3339_round_trips_with_the_emitter() {
+        for secs in [0u64, 1, 1_000_000_000, 1_700_000_000, 2_000_000_000] {
+            let text = epoch_to_rfc3339(secs);
+            assert_eq!(
+                rfc3339_to_epoch(&text),
+                Some(secs),
+                "{text} must parse back to {secs}"
+            );
+        }
+    }
+
+    /// A non-UTC offset is REJECTED rather than read as UTC: misreading an offset
+    /// shifts a subscription's expiry by hours.
+    #[test]
+    fn rfc3339_rejects_non_utc_and_malformed_input() {
+        assert!(
+            rfc3339_to_epoch("2026-09-07T12:00:00+02:00").is_none(),
+            "offset"
+        );
+        assert!(
+            rfc3339_to_epoch("2026-09-07T12:00:00-05:00").is_none(),
+            "offset"
+        );
+        assert!(rfc3339_to_epoch("not-a-date").is_none());
+        assert!(rfc3339_to_epoch("").is_none());
+        assert!(rfc3339_to_epoch("2026-09-07").is_none(), "no time part");
+        assert!(
+            rfc3339_to_epoch("2026-13-07T12:00:00Z").is_none(),
+            "month 13"
+        );
+        assert!(
+            rfc3339_to_epoch("2026-09-07T25:00:00Z").is_none(),
+            "hour 25"
+        );
+        // Explicit UTC spellings and fractional seconds are accepted.
+        assert!(rfc3339_to_epoch("2026-09-07T12:00:00Z").is_some());
+        assert!(rfc3339_to_epoch("2026-09-07T12:00:00+00:00").is_some());
+        assert!(rfc3339_to_epoch("2026-09-07T12:00:00.500Z").is_some());
+    }
+
+    /// The patch resource accepts both a JSON Patch array and a merge-patch
+    /// object; validityTime must be found in either.
+    #[test]
+    fn patch_validity_time_is_extracted_from_both_patch_forms() {
+        let merge = serde_json::json!({"validityTime": "2026-09-08T00:00:00Z"});
+        assert_eq!(
+            extract_patch_validity_time(&merge).as_deref(),
+            Some("2026-09-08T00:00:00Z")
+        );
+
+        let json_patch = serde_json::json!([
+            {"op": "replace", "path": "/validityTime", "value": "2026-09-09T00:00:00Z"}
+        ]);
+        assert_eq!(
+            extract_patch_validity_time(&json_patch).as_deref(),
+            Some("2026-09-09T00:00:00Z")
+        );
+
+        // `add` is accepted as well as `replace`.
+        let added = serde_json::json!([
+            {"op": "add", "path": "/validityTime", "value": "2026-09-10T00:00:00Z"}
+        ]);
+        assert_eq!(
+            extract_patch_validity_time(&added).as_deref(),
+            Some("2026-09-10T00:00:00Z")
+        );
+
+        // A sequence of operations applies in order, so the LAST one wins.
+        let sequence = serde_json::json!([
+            {"op": "replace", "path": "/validityTime", "value": "2026-09-11T00:00:00Z"},
+            {"op": "replace", "path": "/validityTime", "value": "2026-09-12T00:00:00Z"}
+        ]);
+        assert_eq!(
+            extract_patch_validity_time(&sequence).as_deref(),
+            Some("2026-09-12T00:00:00Z"),
+            "the last operation must win"
+        );
+
+        // Operations on other paths are ignored rather than mistaken for it.
+        let other = serde_json::json!([
+            {"op": "replace", "path": "/notificationUri", "value": "http://x"}
+        ]);
+        assert!(extract_patch_validity_time(&other).is_none());
+        assert!(extract_patch_validity_time(&serde_json::json!({})).is_none());
+    }
+
+    /// The PATCH must actually replace the stored validity, not return a
+    /// bodyless 200 while the subscription keeps its original expiry.
+    #[tokio::test]
+    async fn subscription_patch_replaces_validity_and_404s_for_unknown_id() {
+        nextgcore_nrfd::init_nf_manager(None);
+        let manager = nf_manager();
+
+        let sub = nextgcore_nrfd::SubscriptionData {
+            id: "sub-68".to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: None,
+            notification_uri: "http://consumer/notify".to_string(),
+            subscr_cond: None,
+            validity_duration: 60,
+        };
+        assert!(manager.add_subscription(sub));
+
+        // An unknown id is 404, not a silent 200.
+        let missing = handle_subscription_update("no-such-sub", &SbiRequest::default()).await;
+        assert_eq!(missing.status, 404, "unknown subscription must be 404");
+
+        // A patch with nothing replaceable is a client error, not a 200.
+        let empty_req = SbiRequest::default().with_body("{}", "application/json");
+        let empty = handle_subscription_update("sub-68", &empty_req).await;
+        assert_eq!(empty.status, 400);
+
+        // A malformed body is a 400.
+        let bad_req = SbiRequest::default().with_body("{not json", "application/json");
+        assert_eq!(
+            handle_subscription_update("sub-68", &bad_req).await.status,
+            400
+        );
+
+        // A validityTime in the PAST is refused rather than applied as an
+        // instant expiry.
+        let past_req = SbiRequest::default().with_body(
+            r#"{"validityTime":"1971-01-01T00:00:00Z"}"#,
+            "application/json",
+        );
+        assert_eq!(
+            handle_subscription_update("sub-68", &past_req).await.status,
+            400,
+            "a past validityTime must be refused"
+        );
+        assert_eq!(
+            manager
+                .find_subscription("sub-68")
+                .unwrap()
+                .validity_duration,
+            60,
+            "a refused patch must leave the stored validity untouched"
+        );
+
+        // A valid extension replaces the stored duration.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let future = epoch_to_rfc3339(now + 3600);
+        let ok_req = SbiRequest::default().with_body(
+            &format!(r#"{{"validityTime":"{future}"}}"#),
+            "application/json",
+        );
+        let ok = handle_subscription_update("sub-68", &ok_req).await;
+        assert_eq!(ok.status, 200);
+        let stored = manager
+            .find_subscription("sub-68")
+            .unwrap()
+            .validity_duration;
+        assert!(
+            (3595..=3600).contains(&stored),
+            "stored validity must reflect the patch, got {stored}"
+        );
+
+        manager.remove_subscription("sub-68");
     }
 }

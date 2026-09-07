@@ -745,6 +745,37 @@ impl NfInstanceManager {
         subscriptions.get(id).cloned()
     }
 
+    /// Replace a subscription's validity duration, returning false when no such
+    /// subscription exists (so the caller can answer 404 rather than a silent
+    /// 200 -- TS 29.510 §5.2.2.5.6).
+    pub fn set_subscription_validity(&self, id: &str, validity_duration: u64) -> bool {
+        let updated = {
+            match self.subscriptions.write() {
+                Ok(mut subscriptions) => match subscriptions.get_mut(id) {
+                    Some(sub) => {
+                        sub.validity_duration = validity_duration;
+                        true
+                    }
+                    None => false,
+                },
+                Err(_) => false,
+            }
+        };
+        if updated {
+            self.persist();
+        }
+        updated
+    }
+
+    /// Every subscription id currently held, for re-arming validity timers after
+    /// a state restore.
+    pub fn subscription_ids(&self) -> Vec<String> {
+        match self.subscriptions.read() {
+            Ok(subscriptions) => subscriptions.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Remove a subscription
     pub fn remove_subscription(&self, id: &str) -> bool {
         let removed = {
