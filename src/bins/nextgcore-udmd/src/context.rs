@@ -575,6 +575,37 @@ pub struct UdmContext {
     /// Wave-6 F-05: operator-provisioned UE-Parameters-Update list. `None`
     /// (the default) keeps the byte-identical am-data passthrough.
     upu_config: RwLock<Option<UpuConfig>>,
+    /// #85: the NRF-registration knobs that were hardcoded in the profile
+    /// builder. Sourced from `udm.sbi.nrf_profile` in the YAML.
+    nf_profile: RwLock<NfProfileConfig>,
+}
+
+/// Operator-configurable parts of the UDM's NFProfile (TS 29.510 §6.1.6.2.2).
+///
+/// `heart_beat_timer` and `allowed_nf_types` were literals in the profile
+/// builder (#85): the heartbeat is a deployment-timing decision, and the
+/// allow-list is an access-control decision — an operator adding an NF type that
+/// must reach the UDM had to edit Rust to do it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NfProfileConfig {
+    /// Seconds between NF heartbeats, advertised to the NRF.
+    pub heart_beat_timer: u32,
+    /// NF types allowed to consume this UDM's services.
+    pub allowed_nf_types: Vec<String>,
+}
+
+impl Default for NfProfileConfig {
+    fn default() -> Self {
+        // The historical literals, so an unconfigured deployment registers
+        // exactly as it did before #85.
+        Self {
+            heart_beat_timer: 10,
+            allowed_nf_types: ["AMF", "SMF", "AUSF", "PCF", "SCP"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
 }
 
 impl UdmContext {
@@ -600,6 +631,8 @@ impl UdmContext {
             sor_steering: RwLock::new(None),
             // Default None: no UPU config → byte-identical am-data passthrough.
             upu_config: RwLock::new(None),
+            // Defaults reproduce the pre-#85 hardcoded profile exactly.
+            nf_profile: RwLock::new(NfProfileConfig::default()),
         }
     }
 
@@ -651,6 +684,23 @@ impl UdmContext {
     /// Returns `true` when the null-scheme SUCI is accepted.
     pub fn get_allow_null_scheme(&self) -> bool {
         self.allow_null_scheme.load(Ordering::SeqCst)
+    }
+
+    // #85: NRF-registration profile knobs -----------------------------------
+
+    /// Replace the operator-configurable NFProfile knobs.
+    pub fn set_nf_profile_config(&self, config: NfProfileConfig) {
+        if let Ok(mut guard) = self.nf_profile.write() {
+            *guard = config;
+        }
+    }
+
+    /// The NFProfile knobs to advertise (defaults when unconfigured).
+    pub fn nf_profile_config(&self) -> NfProfileConfig {
+        self.nf_profile
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     // Wave-6 F-04: SoR steering configuration + expected-XMAC store -----------

@@ -1061,13 +1061,47 @@ pub fn send_not_found(detail: &str, cause: Option<&str>) -> SbiResponse {
     send_error(404, "Not Found", detail, cause)
 }
 
-/// Send a 405 Method Not Allowed error response
+/// Send a 405 Method Not Allowed error response.
+///
+/// Carries no `Allow` header because it does not know the resource's method
+/// set. Prefer [`send_method_not_allowed_with_allow`] on any route that does:
+/// RFC 9110 §15.5.6 makes `Allow` mandatory on a 405, and TS 29.500 §5.2.7.1
+/// requires it of an SBI producer.
 pub fn send_method_not_allowed(method: &str, resource: &str) -> SbiResponse {
     send_error(
         405,
         "Method Not Allowed",
         &format!("Method {method} not allowed for resource {resource}"),
         Some("METHOD_NOT_ALLOWED"),
+    )
+}
+
+/// Send a 405 Method Not Allowed carrying the mandatory `Allow` header.
+///
+/// `allowed` is the set of methods the addressed resource *does* support, and is
+/// rendered as the comma-separated `Allow` header RFC 9110 §15.5.6 requires (and
+/// TS 29.500 §5.2.7.1 restates for SBI). A 405 without it tells the consumer
+/// only that it guessed wrong, not what to do instead.
+pub fn send_method_not_allowed_with_allow(
+    method: &str,
+    resource: &str,
+    allowed: &[&str],
+) -> SbiResponse {
+    send_method_not_allowed(method, resource).with_header("Allow", allowed.join(", "))
+}
+
+/// Send a `404 Not Found` with cause `RESOURCE_URI_NOT_FOUND` (TS 29.500
+/// §5.2.7.1): the URI does not name a resource this producer serves.
+///
+/// Distinct from a 405, which says the resource exists but not for that method,
+/// and from a resource-specific 404 such as `CONTEXT_NOT_FOUND`, which says the
+/// resource exists but holds nothing for this UE.
+pub fn send_resource_uri_not_found(uri: &str) -> SbiResponse {
+    send_error(
+        404,
+        "Not Found",
+        &format!("No resource at {uri}"),
+        Some("RESOURCE_URI_NOT_FOUND"),
     )
 }
 
@@ -1102,6 +1136,51 @@ mod tests {
 
         assert_eq!(config.addr.port(), 8080);
         assert_eq!(config.interface, Some("sbi".to_string()));
+    }
+
+    /// The `cause` of a ProblemDetails body, if present.
+    fn problem_cause(resp: &SbiResponse) -> Option<String> {
+        let body = resp.http.content.as_deref()?;
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        v.get("cause")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// TS 29.500 §5.2.7.1 / RFC 9110 §15.5.6: a 405 must say which methods the
+    /// resource does support, or the consumer learns only that it guessed wrong.
+    #[test]
+    fn method_not_allowed_with_allow_lists_the_supported_methods() {
+        let resp = send_method_not_allowed_with_allow(
+            "DELETE",
+            "/nudm-uecm/v1/x/registrations",
+            &["PUT", "PATCH", "GET"],
+        );
+        assert_eq!(resp.status, 405);
+        assert_eq!(problem_cause(&resp).as_deref(), Some("METHOD_NOT_ALLOWED"));
+        // set_header lowercases keys (HTTP/2 convention).
+        assert_eq!(
+            resp.http.headers.get("allow").map(String::as_str),
+            Some("PUT, PATCH, GET"),
+            "the Allow header is mandatory on a 405"
+        );
+    }
+
+    /// An unknown URI is `404 RESOURCE_URI_NOT_FOUND`, not a 405: a consumer
+    /// branching on the cause must be able to tell "no such resource" from
+    /// "wrong method for this resource".
+    #[test]
+    fn resource_uri_not_found_is_404_with_the_spec_cause() {
+        let resp = send_resource_uri_not_found("/nudm-sdm/v2/imsi-1/not-a-resource");
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            problem_cause(&resp).as_deref(),
+            Some("RESOURCE_URI_NOT_FOUND")
+        );
+        assert!(
+            resp.http.headers.get("allow").is_none(),
+            "a 404 must not claim a method set for a resource that does not exist"
+        );
     }
 
     // --- T6.4: correlation-id extraction and generation ---

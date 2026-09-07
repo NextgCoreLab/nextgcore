@@ -67,14 +67,17 @@ pub mod test_support {
 
 // Re-export SBI path functions
 pub use sbi_path::{
-    udm_ausf_send_sor_protect, udm_ausf_send_upu_protect, udm_nrf_deregister, udm_nrf_discover,
-    udm_nrf_heartbeat, udm_nrf_register, udm_nudr_dr_send_auth_status_delete,
-    udm_nudr_dr_send_auth_status_put, udm_nudr_dr_send_auth_subscription_get,
-    udm_nudr_dr_send_auth_subscription_patch, udm_nudr_dr_send_context_delete,
-    udm_nudr_dr_send_context_get, udm_nudr_dr_send_context_patch, udm_nudr_dr_send_context_put,
-    udm_nudr_dr_send_provisioned_data_get, udm_nudr_dr_send_provisioned_data_get_with_params,
-    udm_sbi_close, udm_sbi_discover_and_send_nudr_dr, udm_sbi_is_running, udm_sbi_open,
-    udm_sbi_send_dereg_notification, udm_sbi_send_request, SbiServer, SbiServerConfig, SbiXact,
+    udm_amf_send_mt_ue_context_info, udm_ausf_send_sor_protect, udm_ausf_send_upu_protect,
+    udm_nrf_deregister, udm_nrf_discover, udm_nrf_heartbeat, udm_nrf_register,
+    udm_nudr_dr_send_auth_status_delete, udm_nudr_dr_send_auth_status_put,
+    udm_nudr_dr_send_auth_subscription_get, udm_nudr_dr_send_auth_subscription_patch,
+    udm_nudr_dr_send_context_delete, udm_nudr_dr_send_context_get, udm_nudr_dr_send_context_patch,
+    udm_nudr_dr_send_context_put, udm_nudr_dr_send_provisioned_data_get,
+    udm_nudr_dr_send_provisioned_data_get_with_params, udm_nudr_dr_send_subscription_data_delete,
+    udm_nudr_dr_send_subscription_data_get, udm_nudr_dr_send_subscription_data_patch,
+    udm_nudr_dr_send_subscription_data_put, udm_sbi_close, udm_sbi_discover_and_send_nudr_dr,
+    udm_sbi_is_running, udm_sbi_open, udm_sbi_send_dereg_notification, udm_sbi_send_request,
+    SbiServer, SbiServerConfig, SbiXact,
 };
 
 // Wave-6 F-04: expose the am-data SoR injection entry point for strict-peer
