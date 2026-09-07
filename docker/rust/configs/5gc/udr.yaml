@@ -29,3 +29,15 @@ udr:
       key: /etc/nextgcore/certs/udr.key
       ca: /etc/nextgcore/certs/ca.crt
       min_version: "1.2"
+  # Nudr_GroupIDmap assignments (TS 29.504 6.2, nextgcore #87).
+  # NF-group assignment is an operator decision made by SUPI range; there is no
+  # Nudr verb that provisions it, and deriving a group id from the SUPI would
+  # invent a topology. Longest matching prefix wins; an empty prefix is a
+  # catch-all. Omit the block entirely and GET /nf-group-ids answers 404
+  # DATA_NOT_FOUND rather than a made-up mapping.
+  group_id_map:
+    - supi_prefix: "imsi-00101"
+      nf_group_ids:
+        UDM: udm-group-1
+        AUSF: ausf-group-1
+        UDR: udr-group-1

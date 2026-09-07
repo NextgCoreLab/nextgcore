@@ -33,6 +33,10 @@ pub enum SubKind {
     AppInfluence,
     /// TS 29.519 `/application-data/subs-to-notify` (ApplicationDataChangeNotif)
     AppData,
+    /// TS 29.519 `/policy-data/subs-to-notify` (PolicyDataChangeNotification)
+    PolicyData,
+    /// TS 29.504 `/nf-group-ids/subscriptions` (NF-group-id mapping changes)
+    GroupIdMap,
 }
 
 impl SubKind {
@@ -43,6 +47,8 @@ impl SubKind {
             SubKind::ExposureData => "ExposureData",
             SubKind::AppInfluence => "AppInfluence",
             SubKind::AppData => "AppData",
+            SubKind::PolicyData => "PolicyData",
+            SubKind::GroupIdMap => "GroupIdMap",
         }
     }
 
@@ -52,6 +58,8 @@ impl SubKind {
             "ExposureData" => Some(SubKind::ExposureData),
             "AppInfluence" => Some(SubKind::AppInfluence),
             "AppData" => Some(SubKind::AppData),
+            "PolicyData" => Some(SubKind::PolicyData),
+            "GroupIdMap" => Some(SubKind::GroupIdMap),
             _ => None,
         }
     }
@@ -111,6 +119,17 @@ pub struct UdrDataStore {
     subs: RwLock<HashMap<String, StoredSub>>,
     /// Subscription id allocator
     next_sub_id: AtomicU64,
+    /// #87: generic `(collection, key) -> document` store for the TS 29.505 /
+    /// 29.519 resources that are plain CRUD documents — `amf-non-3gpp-access`,
+    /// `smsf-*`, `ip-sm-gw`, `pp-data`, the policy documents beyond am/sm/ue,
+    /// and the application-data sets.
+    ///
+    /// One map rather than fifteen typed ones: they differ only in their
+    /// resource name, and a typed field per resource would mean a new snapshot
+    /// key, a new `restore_from` arm and three near-identical accessors each. The
+    /// pre-existing typed maps are left alone so the on-disk snapshot keys they
+    /// own do not move.
+    docs: RwLock<HashMap<(String, String), Value>>,
     /// Optional on-disk snapshot path. `None` => purely in-memory.
     state_path: Option<PathBuf>,
     /// Issue #66: set when `load` could not read the snapshot. While set,
@@ -171,6 +190,14 @@ impl UdrDataStore {
             .iter()
             .map(|((supi, psi), v)| (format!("{supi}\u{1f}{psi}"), v.clone()))
             .collect();
+        // Same \u{1f} key flattening as the tuple-keyed maps above.
+        let docs: HashMap<String, Value> = self
+            .docs
+            .read()
+            .expect("lock")
+            .iter()
+            .map(|((collection, key), v)| (format!("{collection}\u{1f}{key}"), v.clone()))
+            .collect();
         let policy_am: HashMap<String, Value> = self.policy_am.read().expect("lock").clone();
         let policy_sm: HashMap<String, Value> = self.policy_sm.read().expect("lock").clone();
         let policy_ue: HashMap<String, Value> = self.policy_ue.read().expect("lock").clone();
@@ -197,6 +224,7 @@ impl UdrDataStore {
             "pfds": pfds,
             "influence": influence,
             "smf_registrations": smf_registrations,
+            "docs": docs,
             "policy_am": policy_am,
             "policy_sm": policy_sm,
             "policy_ue": policy_ue,
@@ -301,6 +329,17 @@ impl UdrDataStore {
             }
         }
         {
+            let mut docs = self.docs.write().expect("lock");
+            docs.clear();
+            if let Some(m) = doc.get("docs").and_then(Value::as_object) {
+                for (k, v) in m {
+                    if let Some((collection, key)) = k.split_once('\u{1f}') {
+                        docs.insert((collection.to_string(), key.to_string()), v.clone());
+                    }
+                }
+            }
+        }
+        {
             let mut au = self.auth_status.write().expect("lock");
             au.clear();
             let mut max_seq = 0u64;
@@ -357,6 +396,76 @@ impl UdrDataStore {
         if let Some(n) = doc.get("next_sub_id").and_then(Value::as_u64) {
             self.next_sub_id.store(n, Ordering::SeqCst);
         }
+    }
+
+    // -- generic resource documents (#87) ----------------------------------
+
+    /// Store `doc` under `(collection, key)`; returns true when newly created.
+    pub fn doc_put(&self, collection: &str, key: &str, doc: Value) -> bool {
+        let created = {
+            let mut map = self.docs.write().expect("lock");
+            map.insert((collection.to_string(), key.to_string()), doc)
+                .is_none()
+        };
+        self.persist();
+        created
+    }
+
+    /// Read the document at `(collection, key)`.
+    pub fn doc_get(&self, collection: &str, key: &str) -> Option<Value> {
+        self.docs
+            .read()
+            .expect("lock")
+            .get(&(collection.to_string(), key.to_string()))
+            .cloned()
+    }
+
+    /// Remove the document at `(collection, key)`, returning it when present.
+    pub fn doc_remove(&self, collection: &str, key: &str) -> Option<Value> {
+        let removed = {
+            let mut map = self.docs.write().expect("lock");
+            map.remove(&(collection.to_string(), key.to_string()))
+        };
+        if removed.is_some() {
+            self.persist();
+        }
+        removed
+    }
+
+    /// Every `(key, document)` in `collection`, ordered by key so a collection
+    /// GET is deterministic rather than hash-ordered.
+    pub fn doc_list(&self, collection: &str) -> Vec<(String, Value)> {
+        let mut out: Vec<(String, Value)> = self
+            .docs
+            .read()
+            .expect("lock")
+            .iter()
+            .filter(|((c, _), _)| c == collection)
+            .map(|((_, k), v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Remove every document in `collection` whose key starts with `prefix`.
+    /// Used to purge a UE's per-AF or per-id documents in one step.
+    pub fn doc_remove_prefix(&self, collection: &str, prefix: &str) -> usize {
+        let removed = {
+            let mut map = self.docs.write().expect("lock");
+            let keys: Vec<(String, String)> = map
+                .keys()
+                .filter(|(c, k)| c == collection && k.starts_with(prefix))
+                .cloned()
+                .collect();
+            for k in &keys {
+                map.remove(k);
+            }
+            keys.len()
+        };
+        if removed > 0 {
+            self.persist();
+        }
+        removed
     }
 
     // -- amf-3gpp-access ---------------------------------------------------
@@ -1047,6 +1156,46 @@ pub fn notify_influence_data_change(res_uri: &str, data: Option<&Value>) {
             sub.notify_uri.clone(),
             Value::Array(vec![Value::Object(item)]),
         );
+    }
+}
+
+/// TS 29.519 `PolicyDataChangeNotification` to `/policy-data/subs-to-notify`
+/// subscribers whose `monitoredResourceUris` cover the changed resource (#87).
+///
+/// Distinct from [`notify_subscription_data_change`]: that one serves
+/// `/subscription-data/subs-to-notify` subscribers with a `DataChangeNotify`,
+/// and a PCF that subscribed to policy changes is not on that list. The payload
+/// carries the changed document inline, because TS 29.519's notification is
+/// defined to let a consumer refresh without a second GET.
+pub fn notify_policy_data_change(ue_id: &str, changed_path: &str, doc: Option<&Value>) {
+    let subs = store().subs_matching(SubKind::PolicyData, |s| {
+        s.body
+            .get("monitoredResourceUris")
+            .and_then(Value::as_array)
+            .is_some_and(|uris| {
+                uris.iter()
+                    .filter_map(Value::as_str)
+                    .any(|u| uri_covers(u, changed_path))
+            })
+    });
+    for sub in subs {
+        let mut payload = serde_json::Map::new();
+        // `ueId` is the correlator the consumer keys on; the report id is the
+        // changed resource so a subscriber watching several can tell them apart.
+        payload.insert("ueId".to_string(), Value::String(ue_id.to_string()));
+        payload.insert(
+            "reportId".to_string(),
+            Value::String(changed_path.to_string()),
+        );
+        if let Some(d) = doc {
+            payload.insert("policyDataSubset".to_string(), d.clone());
+        } else {
+            payload.insert(
+                "delResources".to_string(),
+                serde_json::json!([changed_path]),
+            );
+        }
+        post_notification(sub.notify_uri.clone(), Value::Object(payload));
     }
 }
 

@@ -379,6 +379,14 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
     let supi_id =
         nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
+    // #87: the identity mirror answers only when a test has provisioned one, so
+    // enabling the store for the authentication tests leaves every other
+    // handler's view of the subscriber DB unchanged.
+    #[cfg(any(test, feature = "test-helpers"))]
+    if crate::test_store::identities_active() {
+        return crate::test_store::subscription_data(supi);
+    }
+
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };
 
