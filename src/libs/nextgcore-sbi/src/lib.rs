@@ -106,9 +106,10 @@ pub use security::{
 };
 pub use server::{
     send_bad_request, send_error, send_forbidden, send_gateway_timeout, send_internal_error,
-    send_method_not_allowed, send_not_found, send_service_unavailable, send_unauthorized,
-    SbiRequestHandler, SbiServer, SbiServerConfig, StreamId, DEFAULT_MAX_CONCURRENT_STREAMS,
-    DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE, DEFAULT_MAX_REQUEST_BODY_SIZE,
+    send_method_not_allowed, send_method_not_allowed_with_allow, send_not_found,
+    send_resource_uri_not_found, send_service_unavailable, send_unauthorized, SbiRequestHandler,
+    SbiServer, SbiServerConfig, StreamId, DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_FRAME_SIZE,
+    DEFAULT_MAX_HEADER_LIST_SIZE, DEFAULT_MAX_REQUEST_BODY_SIZE,
 };
 pub use tls::{
     export_keying_material, export_n32_master_key, export_n32f_session_key, N32F_EXPORTER_KEY_LEN,

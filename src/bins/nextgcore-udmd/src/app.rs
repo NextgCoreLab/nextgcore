@@ -15,8 +15,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as NextgcoreSbiServerConfig,
+    send_bad_request, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -101,10 +100,22 @@ struct SbiServerYaml {
     port: Option<u16>,
 }
 
+/// #85: the operator-configurable parts of the NRF NFProfile, which used to be
+/// literals in the profile builder.
+#[derive(Debug, Default, Deserialize)]
+struct NfProfileYaml {
+    /// Seconds between NF heartbeats (TS 29.510 `heartBeatTimer`).
+    heartbeat_timer: Option<u32>,
+    /// NF types allowed to consume this UDM (TS 29.510 `allowedNfTypes`).
+    allowed_nf_types: Option<Vec<String>>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct SbiYaml {
     server: Option<Vec<SbiServerYaml>>,
     client: Option<SbiClientYaml>,
+    /// #85: `udm.sbi.nrf_profile.{heartbeat_timer,allowed_nf_types}`.
+    nrf_profile: Option<NfProfileYaml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -360,6 +371,29 @@ pub async fn run() -> Result<()> {
                                     }
                                 }
                             }
+                            // #85: NFProfile knobs from config. An absent block
+                            // or member keeps the historical default, so an
+                            // unconfigured deployment registers unchanged.
+                            if let Some(profile) = sbi.nrf_profile {
+                                let mut config = crate::context::NfProfileConfig::default();
+                                if let Some(timer) = profile.heartbeat_timer {
+                                    config.heart_beat_timer = timer;
+                                }
+                                if let Some(types) =
+                                    profile.allowed_nf_types.filter(|t| !t.is_empty())
+                                {
+                                    config.allowed_nf_types = types;
+                                }
+                                let ctx = udm_self();
+                                if let Ok(context) = ctx.read() {
+                                    log::info!(
+                                        "NFProfile configured (heartBeatTimer={}, allowedNfTypes={:?})",
+                                        config.heart_beat_timer,
+                                        config.allowed_nf_types
+                                    );
+                                    context.set_nf_profile_config(config);
+                                };
+                            }
                         }
                         // udmd-11: null-scheme SUCI gating (default: true).
                         if let Some(allow) = udm.allow_null_scheme {
@@ -572,6 +606,49 @@ pub async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     udm_sbi_route(request).await
 }
 
+/// Every Nudm service name TS 29.503 §5 defines, in the order of the spec.
+///
+/// The UDM answers on all ten: SDM, UECM, UEAU, EE, PP and MT are served, and
+/// NIDDAuthorisation, RSDS, SSAU and UEID answer `501` on their defined
+/// operations. A service name that is not in this list is not a Nudm service, so
+/// its URI names no resource here and the answer is `404`
+/// `RESOURCE_URI_NOT_FOUND` — never `405`, which would claim the service exists
+/// and only the method was wrong (#85).
+pub(crate) const NUDM_SERVICE_NAMES: [&str; 10] = [
+    "nudm-sdm",
+    "nudm-uecm",
+    "nudm-ueau",
+    "nudm-ee",
+    "nudm-pp",
+    "nudm-mt",
+    "nudm-niddau",
+    "nudm-rsds",
+    "nudm-ssau",
+    "nudm-ueid",
+];
+
+/// Answer a request that matched no dispatch arm.
+///
+/// `allowed` is `Some(methods)` when the URI *does* name a resource this UDM
+/// serves — the request only used the wrong method, so the answer is `405` with
+/// the mandatory `Allow` header (RFC 9110 §15.5.6, TS 29.500 §5.2.7.1). It is
+/// `None` when the URI names nothing, which is `404 RESOURCE_URI_NOT_FOUND`.
+///
+/// Collapsing both into `405 METHOD_NOT_ALLOWED`, as the router did before #85,
+/// tells a consumer that every mistyped path is a supported resource.
+fn unmatched(allowed: Option<&[&str]>, method: &str, uri: &str) -> SbiResponse {
+    match allowed {
+        Some(methods) => {
+            log::debug!("UDM: {method} not allowed for {uri} (allow: {methods:?})");
+            nextgcore_sbi::server::send_method_not_allowed_with_allow(method, uri, methods)
+        }
+        None => {
+            log::warn!("UDM: no resource at {uri}");
+            nextgcore_sbi::server::send_resource_uri_not_found(uri)
+        }
+    }
+}
+
 /// Route an inbound SBI request to the UDM service handlers.
 async fn udm_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
@@ -590,107 +667,811 @@ async fn udm_sbi_route(request: SbiRequest) -> SbiResponse {
     // - /nudm-sdm/v2/{supi}/am-data          (Nudm_SDM is v2, TS 29.503 6.1.1)
     // - /nudm-sdm/v2/{supi}/smf-select-data
     // - /nudm-sdm/v2/{supi}/sm-data
+    // - /nudm-sdm/v2/{ueId}/id-translation-result
     // - /nudm-ueau/v1/{supi}/security-information/generate-auth-data
+    // - /nudm-pp/v1/{ueId}/pp-data
+    // - /nudm-mt/v1/{supi}
 
     if parts.len() < 3 {
-        return send_not_found("Invalid path", None);
+        return unmatched(None, method, uri);
     }
 
     let service = parts[0];
     let _version = parts[1];
 
     match service {
-        // UE Context Management Service (nudm-uecm)
-        "nudm-uecm" if parts.len() >= 4 => {
-            let supi = parts[2];
-            let resource = parts.get(3).unwrap_or(&"");
+        "nudm-uecm" => route_nudm_uecm(&parts, method, &request, uri).await,
+        "nudm-sdm" => route_nudm_sdm(&parts, method, &request, uri).await,
+        "nudm-ueau" => route_nudm_ueau(&parts, method, &request, uri).await,
+        "nudm-ee" => route_nudm_ee(&parts, method, &request, uri).await,
+        "nudm-pp" => route_nudm_pp(&parts, method, &request, uri).await,
+        "nudm-mt" => route_nudm_mt(&parts, method, &request, uri).await,
+        // Defined by TS 29.503 but not implemented here: the operation is
+        // recognised and answered 501, so a consumer can tell "this UDM does not
+        // do that yet" from "that is not a Nudm operation".
+        "nudm-niddau" | "nudm-rsds" | "nudm-ssau" | "nudm-ueid" => {
+            route_nudm_unimplemented(service, &parts, method, uri)
+        }
+        _ => unmatched(None, method, uri),
+    }
+}
 
-            match (*resource, method) {
-                ("registrations", _) => {
-                    route_uecm_registrations(supi, &parts, method, &request, uri).await
-                }
-                // udmd-12: UE context in SMF data (GET only, TS 29.503 §6.3.x).
-                ("ue-context-in-smf-data", "GET") => {
-                    send_not_implemented("ue-context-in-smf-data is not yet implemented")
-                }
-                // udmd-12: SUPI-to-GPSI/external-id translation (TS 29.503 §6.4.x).
-                ("id-translation-result", "GET") => {
-                    send_not_implemented("id-translation-result is not yet implemented")
-                }
-                _ => send_method_not_allowed(method, uri),
+/// Methods the `nudm-uecm` resource at `parts` supports, or `None` when the path
+/// names no UECM resource this UDM serves.
+fn uecm_allowed_methods(parts: &[&str]) -> Option<&'static [&'static str]> {
+    if parts.get(3).copied()? != "registrations" {
+        return None;
+    }
+    let sub = parts.get(4).copied().unwrap_or("");
+    let tail = parts.get(5).copied().unwrap_or("");
+    if parts.len() > 6 {
+        return None;
+    }
+    match sub {
+        "amf-3gpp-access" | "amf-non-3gpp-access" => match tail {
+            "" => Some(&["PUT", "PATCH", "GET"]),
+            "dereg-amf" | "pei-update" | "roaming-info-update" => Some(&["POST"]),
+            _ => None,
+        },
+        "smsf-3gpp-access" | "smsf-non-3gpp-access" if tail.is_empty() => {
+            Some(&["PUT", "GET", "DELETE"])
+        }
+        "smf-registrations" => {
+            if tail.is_empty() {
+                Some(&["GET"])
+            } else {
+                Some(&["PUT", "GET", "DELETE"])
             }
         }
+        "ip-sm-gw" if tail.is_empty() => Some(&["PUT", "GET", "DELETE"]),
+        "location" if tail.is_empty() => Some(&["GET"]),
+        "send-routing-info-sm" if tail.is_empty() => Some(&["POST"]),
+        _ => None,
+    }
+}
 
-        // Subscriber Data Management Service (nudm-sdm)
-        "nudm-sdm" if parts.len() >= 4 => {
-            let supi = parts[2];
-            let resource = parts.get(3).unwrap_or(&"");
+/// UE Context Management Service (nudm-uecm, TS 29.503 §5.3).
+async fn route_nudm_uecm(
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+    uri: &str,
+) -> SbiResponse {
+    let supi = parts.get(2).copied().unwrap_or("");
+    if parts.get(3).copied() == Some("registrations") && !supi.is_empty() {
+        return route_uecm_registrations(supi, parts, method, request, uri).await;
+    }
+    unmatched(uecm_allowed_methods(parts), method, uri)
+}
 
-            match (*resource, method) {
-                ("am-data", "GET") => handle_get_am_data(supi, &request).await,
-                // udmd#1: SoR / UPU acknowledgement (TS 29.503 5.2.2.6, PUT).
-                ("am-data", "PUT") if parts.len() >= 5 && parts[4] == "sor-ack" => {
-                    handle_sor_ack(supi, &request).await
-                }
-                ("am-data", "PUT") if parts.len() >= 5 && parts[4] == "upu-ack" => {
-                    handle_upu_ack(supi, &request).await
-                }
-                ("smf-select-data", "GET") => handle_get_smf_select_data(supi, &request).await,
-                ("sm-data", "GET") => handle_get_sm_data(supi, &request).await,
-                ("nssai", "GET") => handle_get_nssai(supi, &request).await,
-                ("sdm-subscriptions", "POST") => handle_sdm_subscribe(supi, &request).await,
-                ("sdm-subscriptions", "DELETE") if parts.len() >= 5 => {
-                    let subscription_id = parts[4];
-                    handle_sdm_unsubscribe(supi, subscription_id).await
-                }
-                // udmd-12: SDM subscription modification PATCH is not implemented.
-                ("sdm-subscriptions", "PATCH") if parts.len() >= 5 => {
-                    send_not_implemented("sdm-subscriptions PATCH is not yet implemented")
-                }
-                _ => send_method_not_allowed(method, uri),
+/// Methods the `nudm-sdm` resource at `parts` supports, or `None` when the path
+/// names no SDM resource this UDM serves.
+///
+/// The many SDM data sets this UDM does not serve (`trace-data`, `sms-data`,
+/// `lcs-*`, `v2x-data`, ...) are deliberately absent: they are #226's to add as
+/// real resources, and until then their URIs name nothing here.
+fn sdm_allowed_methods(parts: &[&str]) -> Option<&'static [&'static str]> {
+    let resource = parts.get(3).copied()?;
+    let tail = parts.get(4).copied().unwrap_or("");
+    if parts.len() > 5 {
+        return None;
+    }
+    match resource {
+        "am-data" => match tail {
+            "" => Some(&["GET"]),
+            "sor-ack" | "upu-ack" => Some(&["PUT"]),
+            _ => None,
+        },
+        "smf-select-data"
+        | "sm-data"
+        | "nssai"
+        | "ue-context-in-smf-data"
+        | "id-translation-result"
+            if tail.is_empty() =>
+        {
+            Some(&["GET"])
+        }
+        "sdm-subscriptions" => {
+            if tail.is_empty() {
+                Some(&["POST"])
+            } else {
+                Some(&["DELETE", "PATCH"])
             }
         }
+        _ => None,
+    }
+}
 
-        // UE Authentication Service (nudm-ueau)
-        "nudm-ueau" if parts.len() >= 4 => {
-            let supi = parts[2];
-            let resource = parts.get(3).unwrap_or(&"");
-            let action = parts.get(4).copied().unwrap_or("");
+/// Subscriber Data Management Service (nudm-sdm, TS 29.503 §5.2).
+async fn route_nudm_sdm(
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+    uri: &str,
+) -> SbiResponse {
+    let supi = parts.get(2).copied().unwrap_or("");
+    let resource = parts.get(3).copied().unwrap_or("");
+    let tail = parts.get(4).copied().unwrap_or("");
 
-            match (*resource, action, method) {
-                ("security-information", "generate-auth-data", "POST") => {
-                    handle_generate_auth_data(supi, &request).await
+    match (resource, tail, method) {
+        ("am-data", "", "GET") => handle_get_am_data(supi, request).await,
+        // udmd#1: SoR / UPU acknowledgement (TS 29.503 5.2.2.6, PUT).
+        ("am-data", "sor-ack", "PUT") => handle_sor_ack(supi, request).await,
+        ("am-data", "upu-ack", "PUT") => handle_upu_ack(supi, request).await,
+        ("smf-select-data", "", "GET") => handle_get_smf_select_data(supi, request).await,
+        ("sm-data", "", "GET") => handle_get_sm_data(supi, request).await,
+        ("nssai", "", "GET") => handle_get_nssai(supi, request).await,
+        ("sdm-subscriptions", "", "POST") => handle_sdm_subscribe(supi, request).await,
+        ("sdm-subscriptions", subscription_id, "DELETE") if !subscription_id.is_empty() => {
+            handle_sdm_unsubscribe(supi, subscription_id).await
+        }
+        // udmd-12: SDM subscription modification PATCH is not implemented.
+        ("sdm-subscriptions", subscription_id, "PATCH") if !subscription_id.is_empty() => {
+            send_not_implemented("sdm-subscriptions PATCH is not yet implemented")
+        }
+        // GetSupiOrGpsi (TS 29.503 §5.2.2.2.14 / §6.1.3.16). This is a Nudm_SDM
+        // operation, not a UECM one — it was routed under nudm-uecm before #85,
+        // where a conformant consumer would never have looked for it.
+        ("id-translation-result", "", "GET") => handle_id_translation_result(supi, request).await,
+        // udmd-12: UE context in SMF data (an SDM data set, TS 29.503 §5.2.2.2.6).
+        ("ue-context-in-smf-data", "", "GET") => {
+            send_not_implemented("ue-context-in-smf-data is not yet implemented")
+        }
+        _ => unmatched(sdm_allowed_methods(parts), method, uri),
+    }
+}
+
+/// Methods the `nudm-ueau` resource at `parts` supports.
+fn ueau_allowed_methods(parts: &[&str]) -> Option<&'static [&'static str]> {
+    let resource = parts.get(3).copied()?;
+    let tail = parts.get(4).copied().unwrap_or("");
+    if parts.len() > 5 {
+        return None;
+    }
+    match (resource, tail) {
+        ("security-information", "generate-auth-data") => Some(&["POST"]),
+        ("auth-events", "") => Some(&["POST"]),
+        // DeleteAuth addresses an individual auth-event resource.
+        ("auth-events", _) => Some(&["PUT"]),
+        _ => None,
+    }
+}
+
+/// UE Authentication Service (nudm-ueau, TS 29.503 §5.4).
+async fn route_nudm_ueau(
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+    uri: &str,
+) -> SbiResponse {
+    let supi = parts.get(2).copied().unwrap_or("");
+    let resource = parts.get(3).copied().unwrap_or("");
+    let action = parts.get(4).copied().unwrap_or("");
+
+    match (resource, action, method) {
+        ("security-information", "generate-auth-data", "POST") => {
+            handle_generate_auth_data(supi, request).await
+        }
+        ("auth-events", "", "POST") => handle_auth_event(supi, request).await,
+        // DeleteAuth: PUT /{supi}/auth-events/{authEventId}
+        // (TS 29.503 §5.4.2.3.3). The identifier is mandatory in the
+        // path, so a bare `PUT .../auth-events` is not this operation.
+        ("auth-events", auth_event_id, "PUT") if !auth_event_id.is_empty() => {
+            handle_delete_auth(supi, auth_event_id, request).await
+        }
+        _ => unmatched(ueau_allowed_methods(parts), method, uri),
+    }
+}
+
+/// Methods the `nudm-ee` resource at `parts` supports.
+fn ee_allowed_methods(parts: &[&str]) -> Option<&'static [&'static str]> {
+    if parts.get(3).copied()? != "ee-subscriptions" || parts.len() > 5 {
+        return None;
+    }
+    if parts.get(4).copied().unwrap_or("").is_empty() {
+        Some(&["POST"])
+    } else {
+        Some(&["DELETE", "PATCH"])
+    }
+}
+
+/// Event Exposure Service (nudm-ee) - udmd#0, TS 29.503 5.5/6.4
+async fn route_nudm_ee(
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+    uri: &str,
+) -> SbiResponse {
+    let ue_identity = parts.get(2).copied().unwrap_or("");
+    let resource = parts.get(3).copied().unwrap_or("");
+    let subscription_id = parts.get(4).copied().unwrap_or("");
+
+    match (resource, subscription_id, method) {
+        ("ee-subscriptions", "", "POST") => handle_ee_subscribe(ue_identity, request).await,
+        ("ee-subscriptions", id, "DELETE") if !id.is_empty() => {
+            handle_ee_unsubscribe(ue_identity, id).await
+        }
+        ("ee-subscriptions", id, "PATCH") if !id.is_empty() => {
+            handle_ee_modify(ue_identity, id, request).await
+        }
+        _ => unmatched(ee_allowed_methods(parts), method, uri),
+    }
+}
+
+/// Methods the `nudm-pp` resource at `parts` supports (TS 29.503 §5.6).
+fn pp_allowed_methods(parts: &[&str]) -> Option<&'static [&'static str]> {
+    // The group resources are not UE-scoped: /nudm-pp/v1/5g-vn-groups/{id}.
+    match parts.get(2).copied()? {
+        "5g-vn-groups" | "mbs-group-membership" => {
+            return if parts.len() == 4 {
+                Some(&["PUT", "PATCH", "GET", "DELETE"])
+            } else {
+                None
+            };
+        }
+        _ => {}
+    }
+    let resource = parts.get(3).copied()?;
+    let tail = parts.get(4).copied().unwrap_or("");
+    if parts.len() > 5 {
+        return None;
+    }
+    match (resource, tail) {
+        ("pp-data", "") => Some(&["GET", "PATCH"]),
+        ("pp-data-store", af_instance_id) if !af_instance_id.is_empty() => {
+            Some(&["PUT", "GET", "DELETE"])
+        }
+        _ => None,
+    }
+}
+
+/// Parameter Provision Service (nudm-pp, TS 29.503 §5.6).
+async fn route_nudm_pp(
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+    uri: &str,
+) -> SbiResponse {
+    let ue_id = parts.get(2).copied().unwrap_or("");
+    let resource = parts.get(3).copied().unwrap_or("");
+    let tail = parts.get(4).copied().unwrap_or("");
+
+    // 5G VN group and MBS group membership management need a group store this
+    // UDM does not have; the operations are recognised and refused as such.
+    if matches!(ue_id, "5g-vn-groups" | "mbs-group-membership") {
+        return match (parts.len(), method) {
+            (4, "PUT" | "PATCH" | "GET" | "DELETE") => {
+                send_not_implemented(&format!("{ue_id} management is not yet implemented"))
+            }
+            _ => unmatched(pp_allowed_methods(parts), method, uri),
+        };
+    }
+
+    match (resource, tail, method) {
+        ("pp-data", "", "GET") => handle_get_pp_data(ue_id).await,
+        ("pp-data", "", "PATCH") => handle_update_pp_data(ue_id, request).await,
+        ("pp-data-store", af_id, "PUT") if !af_id.is_empty() => {
+            handle_create_pp_data_entry(ue_id, af_id, request).await
+        }
+        ("pp-data-store", af_id, "GET") if !af_id.is_empty() => {
+            handle_get_pp_data_entry(ue_id, af_id).await
+        }
+        ("pp-data-store", af_id, "DELETE") if !af_id.is_empty() => {
+            handle_delete_pp_data_entry(ue_id, af_id).await
+        }
+        _ => unmatched(pp_allowed_methods(parts), method, uri),
+    }
+}
+
+/// Methods the `nudm-mt` resource at `parts` supports (TS 29.503 §5.10).
+fn mt_allowed_methods(parts: &[&str]) -> Option<&'static [&'static str]> {
+    match parts.len() {
+        // /nudm-mt/v1/{supi}
+        3 => Some(&["GET"]),
+        // /nudm-mt/v1/{supi}/loc-info/provide-loc-info
+        5 if parts[3] == "loc-info" && parts[4] == "provide-loc-info" => Some(&["POST"]),
+        _ => None,
+    }
+}
+
+/// MT Service (nudm-mt, TS 29.503 §5.10).
+async fn route_nudm_mt(
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+    uri: &str,
+) -> SbiResponse {
+    let supi = parts.get(2).copied().unwrap_or("");
+    match (parts.len(), method) {
+        (3, "GET") if !supi.is_empty() => handle_query_ue_info(supi, request).await,
+        (5, "POST") if parts[3] == "loc-info" && parts[4] == "provide-loc-info" => {
+            // ProvideLocationInfo proxies Namf_Location ProvideLocationInfo
+            // (TS 29.518 §5.5.2.3), which no AMF in this tree serves — amfd
+            // implements provide-pos-info only. Refusing is honest; answering
+            // from the UDM's own data would invent a location.
+            send_not_implemented(
+                "provide-loc-info requires Namf_Location ProvideLocationInfo, \
+                 which the serving AMF does not implement",
+            )
+        }
+        _ => unmatched(mt_allowed_methods(parts), method, uri),
+    }
+}
+
+/// The operations of the four Nudm services TS 29.503 defines and this UDM does
+/// not implement, so a recognised operation can answer `501` while an
+/// unrecognised path still answers `404`.
+fn unimplemented_service_methods(service: &str, parts: &[&str]) -> Option<&'static [&'static str]> {
+    let post: &'static [&'static str] = &["POST"];
+    match service {
+        // POST /nudm-niddau/v1/{ueIdentity}/authorize
+        "nudm-niddau" if parts.len() == 4 && parts[3] == "authorize" => Some(post),
+        // POST /nudm-rsds/v1/{ueIdentity}/sm-delivery-status
+        "nudm-rsds" if parts.len() == 4 && parts[3] == "sm-delivery-status" => Some(post),
+        // POST /nudm-ssau/v1/{ueIdentity}/{serviceType}/{authorize,remove}
+        "nudm-ssau" if parts.len() == 5 && matches!(parts[4], "authorize" | "remove") => Some(post),
+        // POST /nudm-ueid/v1/deconceal
+        "nudm-ueid" if parts.len() == 3 && parts[2] == "deconceal" => Some(post),
+        _ => None,
+    }
+}
+
+/// Answer a defined-but-unimplemented Nudm service.
+///
+/// `nudm-ueid` Deconceal is the notable one: the SIDF machinery it needs already
+/// exists in this UDM (`deconceal_suci`), so it is a small change — but it
+/// returns a SUPI for a SUCI to whoever asks, and this repo's SBI OAuth2
+/// enforcement is off by default (#187). Serving it before that posture is
+/// authenticated would turn the UDM into an unauthenticated SUPI oracle, so it
+/// stays a 501 until #187 lands.
+fn route_nudm_unimplemented(service: &str, parts: &[&str], method: &str, uri: &str) -> SbiResponse {
+    match unimplemented_service_methods(service, parts) {
+        Some(allowed) if allowed.contains(&method) => {
+            send_not_implemented(&format!("{service} is not yet implemented"))
+        }
+        allowed => unmatched(allowed, method, uri),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Nudm_SDM GetSupiOrGpsi (#85, TS 29.503 §5.2.2.2.14)
+// ---------------------------------------------------------------------------
+
+/// `GET /nudm-sdm/v2/{ueId}/id-translation-result` — translate between a UE's
+/// SUPI and its GPSI, returning an `IdTranslationResult`.
+///
+/// Both directions are served from the UDR, which is where subscriber identities
+/// live:
+///
+/// * The **identity-data** resource (TS 29.505 §5.2.19) answers either
+///   direction, because it is keyed by *any* UE identifier and returns both
+///   lists. It is the only source that can resolve a **GPSI to a SUPI**, which is
+///   the direction a NEF needs to target a UE named by `msisdn-`/`extid-`
+///   (nextgcore #110 refuses such a subscription today precisely because this
+///   operation was unrouted).
+/// * When identity-data is absent, the **SUPI to GPSI** direction falls back to
+///   the `gpsis` member of the UE's `am-data` (TS 29.505 AM subscription data),
+///   which this UDM can already read.
+///
+/// `supi` is mandatory in `IdTranslationResult`, so a translation that cannot
+/// establish one is a `404` rather than a partial answer.
+pub async fn handle_id_translation_result(ue_id: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("Id Translation Result: ueId={ue_id}");
+    let requested_gpsi_type = request.http.params.get("requested-gpsi-type").cloned();
+    let asked_for_gpsi = ue_id.starts_with("imsi-") || ue_id.starts_with("nai-");
+
+    // 1. identity-data: the only resource that resolves a GPSI to a SUPI.
+    match crate::udm_nudr_dr_send_subscription_data_get(ue_id, "identity-data").await {
+        Ok(resp) if resp.is_success() => {
+            let doc: serde_json::Value = match resp
+                .http
+                .content
+                .as_deref()
+                .and_then(|b| serde_json::from_str(b).ok())
+            {
+                Some(v) => v,
+                None => {
+                    log::error!("[{ue_id}] UDR identity-data returned unparseable body");
+                    return nextgcore_sbi::server::send_service_unavailable("UDR response invalid");
                 }
-                ("auth-events", _, "POST") => handle_auth_event(supi, &request).await,
-                // DeleteAuth: PUT /{supi}/auth-events/{authEventId}
-                // (TS 29.503 §5.4.2.3.3). The identifier is mandatory in the
-                // path, so a bare `PUT .../auth-events` is not this operation.
-                ("auth-events", auth_event_id, "PUT") if !auth_event_id.is_empty() => {
-                    handle_delete_auth(supi, auth_event_id, &request).await
-                }
-                _ => send_method_not_allowed(method, uri),
+            };
+            let list = |key: &str| -> Vec<String> {
+                doc.get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let supis = list("supiList");
+            let gpsis = list("gpsiList");
+            return match build_id_translation_result(supis, gpsis, requested_gpsi_type.as_deref()) {
+                Some(result) => SbiResponse::with_status(200)
+                    .with_json_body(&result)
+                    .unwrap_or_else(|_| {
+                        nextgcore_sbi::server::send_internal_error("serialize failed")
+                    }),
+                None => send_problem(
+                    404,
+                    "USER_NOT_FOUND",
+                    "identity-data holds no SUPI for this identifier",
+                ),
+            };
+        }
+        Ok(resp) if resp.status == 404 => {
+            log::debug!("[{ue_id}] UDR has no identity-data; trying am-data gpsis");
+        }
+        Ok(resp) => {
+            log::error!("[{ue_id}] UDR identity-data GET returned {}", resp.status);
+            return nextgcore_sbi::server::send_service_unavailable("UDR identity-data failed");
+        }
+        Err(e) => {
+            log::warn!("[{ue_id}] UDR identity-data GET failed: {e}");
+            return nextgcore_sbi::server::send_service_unavailable("UDR unavailable");
+        }
+    }
+
+    // 2. SUPI -> GPSI fallback via am-data. A GPSI-keyed request cannot use it:
+    //    am-data is addressed BY the UE identifier, so reading it back would
+    //    prove nothing about which SUPI the GPSI belongs to.
+    if !asked_for_gpsi {
+        return send_problem(
+            404,
+            "USER_NOT_FOUND",
+            "no identity-data for this GPSI (UDR identity-data resource required)",
+        );
+    }
+    match crate::udm_nudr_dr_send_provisioned_data_get(ue_id, "am-data", 0, 0).await {
+        Ok(resp) if resp.is_success() => {
+            let doc: serde_json::Value = resp
+                .http
+                .content
+                .as_deref()
+                .and_then(|b| serde_json::from_str(b).ok())
+                .unwrap_or(serde_json::Value::Null);
+            let gpsis: Vec<String> = doc
+                .get("gpsis")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match build_id_translation_result(
+                vec![ue_id.to_string()],
+                gpsis,
+                requested_gpsi_type.as_deref(),
+            ) {
+                Some(result) => SbiResponse::with_status(200)
+                    .with_json_body(&result)
+                    .unwrap_or_else(|_| {
+                        nextgcore_sbi::server::send_internal_error("serialize failed")
+                    }),
+                None => send_problem(404, "USER_NOT_FOUND", "no identity translation available"),
             }
         }
+        Ok(resp) if resp.status == 404 => {
+            send_problem(404, "USER_NOT_FOUND", "No subscription data for this UE")
+        }
+        Ok(resp) => {
+            log::error!("[{ue_id}] UDR am-data GET returned {}", resp.status);
+            nextgcore_sbi::server::send_service_unavailable("UDR query failed")
+        }
+        Err(e) => {
+            log::warn!("[{ue_id}] UDR am-data GET failed: {e}");
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
+}
 
-        // Event Exposure Service (nudm-ee) - udmd#0, TS 29.503 5.5/6.4
-        "nudm-ee" if parts.len() >= 4 => {
-            let ue_identity = parts[2];
-            let resource = parts.get(3).unwrap_or(&"");
-            match (*resource, method) {
-                ("ee-subscriptions", "POST") => handle_ee_subscribe(ue_identity, &request).await,
-                ("ee-subscriptions", "DELETE") if parts.len() >= 5 => {
-                    handle_ee_unsubscribe(ue_identity, parts[4]).await
-                }
-                ("ee-subscriptions", "PATCH") if parts.len() >= 5 => {
-                    handle_ee_modify(ue_identity, parts[4], &request).await
-                }
-                _ => send_method_not_allowed(method, uri),
+/// Assemble an `IdTranslationResult` (TS 29.503 §6.1.6.2.x) from the identity
+/// lists the UDR holds.
+///
+/// `supi` is the schema's only required member, so `None` here means the caller
+/// must answer 404 rather than emit a result with no SUPI in it. The first entry
+/// of each list is the primary identity; the rest go to `additionalSupis` /
+/// `additionalGpsis`, which is what those members are for — dropping them would
+/// hide the other identities of a multi-GPSI subscriber.
+///
+/// `requested_gpsi_type` (`MSISDN` or `EXT_ID`) filters the GPSIs, so a consumer
+/// that asked for an external identifier is not handed an MSISDN.
+pub(crate) fn build_id_translation_result(
+    supis: Vec<String>,
+    gpsis: Vec<String>,
+    requested_gpsi_type: Option<&str>,
+) -> Option<serde_json::Value> {
+    let prefix = match requested_gpsi_type {
+        Some("MSISDN") => Some("msisdn-"),
+        Some("EXT_ID") => Some("extid-"),
+        _ => None,
+    };
+    let gpsis: Vec<String> = match prefix {
+        Some(p) => gpsis.into_iter().filter(|g| g.starts_with(p)).collect(),
+        None => gpsis,
+    };
+    let supi = supis.first()?.clone();
+    let mut result = serde_json::json!({ "supi": supi });
+    let obj = result.as_object_mut()?;
+    if let Some(gpsi) = gpsis.first() {
+        obj.insert("gpsi".to_string(), serde_json::json!(gpsi));
+    }
+    if supis.len() > 1 {
+        obj.insert("additionalSupis".to_string(), serde_json::json!(supis[1..]));
+    }
+    if gpsis.len() > 1 {
+        obj.insert("additionalGpsis".to_string(), serde_json::json!(gpsis[1..]));
+    }
+    Some(result)
+}
+
+// ---------------------------------------------------------------------------
+// Nudm_PP — Parameter Provision (#85, TS 29.503 §5.6)
+// ---------------------------------------------------------------------------
+
+/// The UDR `subscription-data` resource holding an AF's provisioned parameters.
+fn pp_data_store_resource(af_instance_id: &str) -> String {
+    format!("pp-data-store/{af_instance_id}")
+}
+
+/// Map a UDR read of a provisioning resource onto the Nudm_PP response.
+fn pp_read_response(
+    ue_id: &str,
+    resource: &str,
+    result: Result<SbiResponse, String>,
+) -> SbiResponse {
+    match result {
+        Ok(resp) if resp.is_success() => {
+            let body = resp.http.content.unwrap_or_else(|| "{}".to_string());
+            SbiResponse::with_status(200).with_body(body, "application/json")
+        }
+        Ok(resp) if resp.status == 404 => send_problem(
+            404,
+            "DATA_NOT_FOUND",
+            &format!("No {resource} provisioned for this UE"),
+        ),
+        Ok(resp) => {
+            log::error!("[{ue_id}] UDR {resource} GET returned {}", resp.status);
+            nextgcore_sbi::server::send_service_unavailable("UDR query failed")
+        }
+        Err(e) => {
+            log::warn!("[{ue_id}] UDR {resource} GET failed: {e}");
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
+}
+
+/// `GET /nudm-pp/v1/{ueId}/pp-data` — Nudm_PP GetPPData (TS 29.503 §5.6.2.3).
+pub async fn handle_get_pp_data(ue_id: &str) -> SbiResponse {
+    log::info!("Get PP Data: ueId={ue_id}");
+    pp_read_response(
+        ue_id,
+        "pp-data",
+        crate::udm_nudr_dr_send_subscription_data_get(ue_id, "pp-data").await,
+    )
+}
+
+/// `PATCH /nudm-pp/v1/{ueId}/pp-data` — Nudm_PP Update (TS 29.503 §5.6.2.2).
+///
+/// The provisioned parameters belong in the UDR, not in UDM memory: an AF
+/// provisions them once and every later subscription read must see them, so a
+/// UDM-local copy would be lost on restart and invisible to a second UDM.
+pub async fn handle_update_pp_data(ue_id: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("Update PP Data: ueId={ue_id}");
+    let patch = match parse_request_json(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    // A `PpData` merge document or a `PatchItem[]` array are both legal here
+    // (TS 29.503 §6.6.6.x); anything else cannot be applied.
+    if !patch.is_object() && !patch.is_array() {
+        return send_bad_request(
+            "PpData patch must be an object or a PatchItem array",
+            Some("INVALID_MSG_FORMAT"),
+        );
+    }
+    match crate::udm_nudr_dr_send_subscription_data_patch(ue_id, "pp-data", &patch).await {
+        Ok(resp) if resp.is_success() => SbiResponse::with_status(204),
+        Ok(resp) if resp.status == 404 => send_problem(
+            404,
+            "USER_NOT_FOUND",
+            "No subscription data to provision for this UE",
+        ),
+        Ok(resp) => {
+            log::error!("[{ue_id}] UDR pp-data PATCH returned {}", resp.status);
+            nextgcore_sbi::server::send_service_unavailable("UDR provisioning failed")
+        }
+        Err(e) => {
+            log::warn!("[{ue_id}] UDR pp-data PATCH failed: {e}");
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
+}
+
+/// `PUT /nudm-pp/v1/{ueId}/pp-data-store/{afInstanceId}` — Create PP Data Entry.
+pub async fn handle_create_pp_data_entry(
+    ue_id: &str,
+    af_instance_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    log::info!("Create PP Data Entry: ueId={ue_id} af={af_instance_id}");
+    let body = match parse_request_json(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    if !body.is_object() {
+        return send_bad_request(
+            "PpDataEntry must be a JSON object",
+            Some("INVALID_MSG_FORMAT"),
+        );
+    }
+    let resource = pp_data_store_resource(af_instance_id);
+    match crate::udm_nudr_dr_send_subscription_data_put(ue_id, &resource, &body).await {
+        Ok(resp) if resp.is_success() => {
+            // 201 on create, 204 on replace: the UDR distinguishes them and the
+            // consumer needs the Location of a resource it just created.
+            if resp.status == 201 {
+                SbiResponse::with_status(201).with_header(
+                    "Location",
+                    format!("/nudm-pp/v1/{ue_id}/pp-data-store/{af_instance_id}"),
+                )
+            } else {
+                SbiResponse::with_status(204)
             }
         }
+        Ok(resp) => {
+            log::error!("[{ue_id}] UDR {resource} PUT returned {}", resp.status);
+            nextgcore_sbi::server::send_service_unavailable("UDR provisioning failed")
+        }
+        Err(e) => {
+            log::warn!("[{ue_id}] UDR {resource} PUT failed: {e}");
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
+}
 
+/// `GET /nudm-pp/v1/{ueId}/pp-data-store/{afInstanceId}` — Get PP Data Entry.
+pub async fn handle_get_pp_data_entry(ue_id: &str, af_instance_id: &str) -> SbiResponse {
+    let resource = pp_data_store_resource(af_instance_id);
+    pp_read_response(
+        ue_id,
+        &resource,
+        crate::udm_nudr_dr_send_subscription_data_get(ue_id, &resource).await,
+    )
+}
+
+/// `DELETE /nudm-pp/v1/{ueId}/pp-data-store/{afInstanceId}` — Delete PP Data
+/// Entry.
+pub async fn handle_delete_pp_data_entry(ue_id: &str, af_instance_id: &str) -> SbiResponse {
+    log::info!("Delete PP Data Entry: ueId={ue_id} af={af_instance_id}");
+    let resource = pp_data_store_resource(af_instance_id);
+    match crate::udm_nudr_dr_send_subscription_data_delete(ue_id, &resource).await {
+        Ok(resp) if resp.is_success() => SbiResponse::with_status(204),
+        Ok(resp) if resp.status == 404 => send_problem(
+            404,
+            "DATA_NOT_FOUND",
+            "No provisioned entry for this AF instance",
+        ),
+        Ok(resp) => {
+            log::error!("[{ue_id}] UDR {resource} DELETE returned {}", resp.status);
+            nextgcore_sbi::server::send_service_unavailable("UDR provisioning failed")
+        }
+        Err(e) => {
+            log::warn!("[{ue_id}] UDR {resource} DELETE failed: {e}");
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Nudm_MT — QueryUeInfo (#85, TS 29.503 §5.10.2.2)
+// ---------------------------------------------------------------------------
+
+/// The `UeInfo` attributes this UDM can actually retrieve.
+///
+/// `tadsInfo` is the AMF's `UeContextInfo`, fetched with Namf_MT
+/// ProvideDomainSelectionInfo. `userState` and `5gSrvccInfo` are NOT served:
+/// `userState` is the AMF's CM/RM state, reported through Namf_EventExposure
+/// rather than Namf_MT, and `5gSrvccInfo` is SRVCC subscription data no
+/// provisioning path in this core populates. Deriving either from the presence
+/// of a registration record would be a guess presented as a fact.
+const MT_SUPPORTED_FIELDS: [&str; 1] = ["tadsInfo"];
+
+/// `GET /nudm-mt/v1/{supi}?fields=...` — Nudm_MT QueryUeInfo.
+///
+/// The UDM is a proxy here: it resolves the UE's serving AMF from the stored
+/// UECM registration and asks that AMF, because the requested information is the
+/// AMF's, not the UDM's.
+pub async fn handle_query_ue_info(supi: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("Query UE Info: SUPI={supi}");
+
+    // `fields` is a REQUIRED query parameter (TS 29.503 §6.10.3.1): without it
+    // the request does not say what to retrieve.
+    let fields_raw = match request.http.params.get("fields") {
+        Some(v) if !v.trim().is_empty() => v.clone(),
         _ => {
-            log::warn!("Unknown UDM request: {method} {uri}");
-            send_method_not_allowed(method, uri)
+            return send_problem(
+                400,
+                "MANDATORY_IE_MISSING",
+                "QueryUeInfo requires the 'fields' query parameter",
+            )
+        }
+    };
+    let fields: Vec<&str> = fields_raw
+        .split(',')
+        .map(|f| f.trim())
+        .filter(|f| !f.is_empty())
+        .collect();
+    let unsupported: Vec<&str> = fields
+        .iter()
+        .copied()
+        .filter(|f| !MT_SUPPORTED_FIELDS.contains(f))
+        .collect();
+    if !unsupported.is_empty() {
+        // Naming the fields is the point: a bare 501 leaves the consumer unable
+        // to retry with the subset that does work.
+        return send_not_implemented(&format!(
+            "QueryUeInfo cannot retrieve {} (supported: {})",
+            unsupported.join(", "),
+            MT_SUPPORTED_FIELDS.join(", ")
+        ));
+    }
+
+    // The serving AMF comes from the UE's 3GPP-access registration; a UE with no
+    // registration has no AMF to ask.
+    let amf_instance_id = match crate::uecm::process_amf_registration_get(
+        supi,
+        &crate::uecm::UdrClient::Live,
+        crate::uecm::UecmAccess::ThreeGpp,
+    )
+    .await
+    {
+        resp if resp.status == 200 => resp
+            .http
+            .content
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+            .and_then(|v| {
+                v.get("amfInstanceId")
+                    .and_then(|i| i.as_str())
+                    .map(String::from)
+            }),
+        resp if resp.status == 404 => {
+            return send_problem(
+                404,
+                "CONTEXT_NOT_FOUND",
+                "The UE is not registered, so no AMF can be queried",
+            )
+        }
+        resp => return resp,
+    };
+
+    match crate::udm_amf_send_mt_ue_context_info(amf_instance_id.as_deref(), supi, "TADS").await {
+        Ok(resp) if resp.is_success() => {
+            let tads: serde_json::Value = resp
+                .http
+                .content
+                .as_deref()
+                .and_then(|b| serde_json::from_str(b).ok())
+                .unwrap_or(serde_json::Value::Null);
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({ "tadsInfo": tads }))
+                .unwrap_or_else(|_| nextgcore_sbi::server::send_internal_error("serialize failed"))
+        }
+        Ok(resp) if resp.status == 404 => send_problem(
+            404,
+            "CONTEXT_NOT_FOUND",
+            "The serving AMF holds no context for this UE",
+        ),
+        Ok(resp) => {
+            log::error!("[{supi}] Namf_MT returned {}", resp.status);
+            nextgcore_sbi::server::send_service_unavailable("Serving AMF query failed")
+        }
+        Err(e) => {
+            log::warn!("[{supi}] Namf_MT request failed: {e}");
+            nextgcore_sbi::server::send_service_unavailable("Serving AMF unreachable")
         }
     }
 }
@@ -741,7 +1522,7 @@ async fn route_uecm_registrations(
         // POST .../{amf-resource}/dereg-amf — TS 29.503 §5.3.2.4.2 DeregAMF.
         if tail == "dereg-amf" {
             if method != "POST" {
-                return send_method_not_allowed(method, uri);
+                return unmatched(uecm_allowed_methods(parts), method, uri);
             }
             return handle_dereg_amf(supi, request).await;
         }
@@ -753,7 +1534,7 @@ async fn route_uecm_registrations(
             "PUT" => handle_amf_registration(supi, request, access).await,
             "PATCH" => handle_amf_registration_update(supi, request, access).await,
             "GET" => handle_amf_registration_get(supi, access).await,
-            _ => send_method_not_allowed(method, uri),
+            _ => unmatched(uecm_allowed_methods(parts), method, uri),
         };
     }
 
@@ -763,7 +1544,7 @@ async fn route_uecm_registrations(
             "PUT" => handle_smsf_registration(supi, request, access).await,
             "GET" => handle_smsf_registration_get(supi, access).await,
             "DELETE" => handle_smsf_deregistration(supi, access).await,
-            _ => send_method_not_allowed(method, uri),
+            _ => unmatched(uecm_allowed_methods(parts), method, uri),
         };
     }
 
@@ -774,17 +1555,22 @@ async fn route_uecm_registrations(
             ("GET", false) => handle_smf_registration_get(supi, tail).await,
             ("PUT", false) => handle_smf_registration(supi, tail, request).await,
             ("DELETE", false) => handle_smf_deregistration(supi, tail).await,
-            _ => send_method_not_allowed(method, uri),
+            _ => unmatched(uecm_allowed_methods(parts), method, uri),
         },
         "ip-sm-gw" => match method {
             "PUT" => handle_ip_sm_gw_registration(supi, request).await,
             "GET" => handle_ip_sm_gw_registration_get(supi).await,
             "DELETE" => handle_ip_sm_gw_deregistration(supi).await,
-            _ => send_method_not_allowed(method, uri),
+            _ => unmatched(uecm_allowed_methods(parts), method, uri),
         },
         // GET .../registrations/location -> LocationInfo (TS 29.503 §5.3.2.5).
         "location" if method == "GET" => handle_location_info_get(supi).await,
-        _ => send_method_not_allowed(method, uri),
+        // POST .../registrations/send-routing-info-sm needs the SMS routing
+        // information the UDM does not hold (TS 29.503 §5.3.2.7).
+        "send-routing-info-sm" if method == "POST" => {
+            send_not_implemented("send-routing-info-sm is not yet implemented")
+        }
+        _ => unmatched(uecm_allowed_methods(parts), method, uri),
     }
 }
 
@@ -2467,49 +3253,19 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 /// (registration skipped, matching the historical behavior).
 /// Build the UDM's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
 ///
-/// Split out of `register_with_nrf_id` so the advertised API versions can be
-/// asserted without standing up an NRF. The version per service is normative
-/// and easy to get wrong: **Nudm_SDM is v2** (TS 29.503 §6.1.1, "The
-/// `<apiVersion>` shall be v2") while Nudm_UECM and Nudm_UEAU are v1.
+/// Delegates to [`crate::sbi_path::build_udm_nf_profile`], which is the single
+/// source of truth for the advertised service list: #85 removed the second,
+/// divergent builder that lived here (it advertised `nudm-sdm` at one version
+/// while `sbi_path.rs` used another, and neither advertised `nudm-ee`). Kept as a
+/// wrapper because the operator knobs come from the process-global context,
+/// which the callers here already have and the library builder should not reach
+/// into.
 fn build_udm_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "UDM",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-nudm-sdm"),
-                "serviceName": "nudm-sdm",
-                // TS 29.503 §6.1.1: "The <apiVersion> shall be v2" for
-                // Nudm_SDM. The other Nudm services stay at v1. Advertising v1
-                // here made discovery hand consumers a URI a strict producer
-                // would 404.
-                "versions": [{"apiVersionInUri": "v2", "apiFullVersion": "2.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            },
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-nudm-uecm"),
-                "serviceName": "nudm-uecm",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            },
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-nudm-ueau"),
-                "serviceName": "nudm-ueau",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            }
-        ],
-        "allowedNfTypes": ["AMF", "SMF", "AUSF", "PCF", "SCP"],
-        "heartBeatTimer": 10
-    })
+    let config = udm_self()
+        .read()
+        .map(|ctx| ctx.nf_profile_config())
+        .unwrap_or_default();
+    crate::sbi_path::build_udm_nf_profile(nf_instance_id, sbi_addr, sbi_port, &config)
 }
 
 pub(crate) async fn register_with_nrf_id(
@@ -4100,15 +4856,16 @@ mod tests {
     /// the full Nudr resource path.
     type CtxStore = Arc<std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>;
 
-    /// Mock UDR implementing the `context-data` resources of TS 29.505 §5.2.2
-    /// generically: GET / PUT / PATCH / DELETE on any resource, plus the
-    /// `smf-registrations` collection GET that answers with a bare array (the
-    /// shape the real udrd returns, which the UDM has to wrap).
+    /// Mock UDR implementing the TS 29.505 `subscription-data` resources
+    /// generically: GET / PUT / PATCH / DELETE on any resource under
+    /// `/nudr-dr/v2/subscription-data/{ueId}/...`, plus the `smf-registrations`
+    /// collection GET that answers with a bare array (the shape the real udrd
+    /// returns, which the UDM has to wrap).
     async fn mock_udr_context_data(store: CtxStore, request: SbiRequest) -> SbiResponse {
         let method = request.header.method.clone();
         let uri = request.header.uri.clone();
         let path = uri.split('?').next().unwrap_or(&uri).to_string();
-        if !path.contains("/context-data/") {
+        if !path.starts_with("/nudr-dr/v2/subscription-data/") {
             return SbiResponse::with_status(404);
         }
         let body = || -> Option<serde_json::Value> {
@@ -4701,6 +5458,509 @@ mod tests {
         udr_server.stop().await.expect("stop udr");
         ausf_a_server.stop().await.expect("stop ausf-a");
         ausf_b_server.stop().await.expect("stop ausf-b");
+    }
+
+    // ========================================================================
+    // #85: the Nudm service surface — error semantics, the ten services, and a
+    // single NF profile.
+    // ========================================================================
+
+    /// Build a request with an arbitrary method, for the method-not-allowed
+    /// assertions (the typed constructors only cover the verbs a handler uses).
+    fn request_with_method(method: &str, uri: &str) -> SbiRequest {
+        SbiRequest {
+            header: nextgcore_sbi::message::SbiHeader::with_method_uri(method, uri),
+            http: nextgcore_sbi::message::SbiHttpMessage::new(),
+            ..SbiRequest::default()
+        }
+    }
+
+    /// TS 29.500 §5.2.7.1: an unknown URI is `404 RESOURCE_URI_NOT_FOUND`, and a
+    /// known resource addressed with the wrong method is `405` **with** `Allow`.
+    /// Before #85 both were `405 METHOD_NOT_ALLOWED` with no `Allow`, so every
+    /// mistyped path looked like a supported resource.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn test_http_nudm_error_semantics() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = env_logger::try_init();
+        udm_context_init(64, 64);
+        let (udm_server, client) = start_real_udm().await;
+
+        // --- 404 RESOURCE_URI_NOT_FOUND ------------------------------------
+        for uri in [
+            // Unknown resource under a known service.
+            "/nudm-sdm/v2/imsi-001010000000001/not-a-resource",
+            "/nudm-uecm/v1/imsi-001010000000001/registrations/not-a-resource",
+            "/nudm-ueau/v1/imsi-001010000000001/not-a-resource",
+            "/nudm-ee/v1/imsi-001010000000001/not-a-resource",
+            // Entirely unknown service.
+            "/nudm-nonsense/v1/imsi-001010000000001/am-data",
+            // Too short to name anything.
+            "/nudm-sdm/v2",
+        ] {
+            let resp = client.get(uri).await.expect("GET");
+            assert_eq!(resp.status, 404, "{uri} must be 404, not 405");
+            assert_eq!(
+                json_body(&resp)["cause"],
+                "RESOURCE_URI_NOT_FOUND",
+                "{uri} cause"
+            );
+            assert!(
+                !resp.http.headers.contains_key("allow"),
+                "{uri}: a 404 must not advertise a method set"
+            );
+        }
+
+        // --- 405 + Allow ---------------------------------------------------
+        // Each of these resources exists; only the method is wrong.
+        for (method, uri, expect_allow) in [
+            (
+                "DELETE",
+                "/nudm-uecm/v1/imsi-001010000000001/registrations/amf-3gpp-access",
+                "PUT, PATCH, GET",
+            ),
+            ("POST", "/nudm-sdm/v2/imsi-001010000000001/am-data", "GET"),
+            (
+                "GET",
+                "/nudm-sdm/v2/imsi-001010000000001/sdm-subscriptions",
+                "POST",
+            ),
+            (
+                "DELETE",
+                "/nudm-ueau/v1/imsi-001010000000001/auth-events",
+                "POST",
+            ),
+            (
+                "GET",
+                "/nudm-ee/v1/imsi-001010000000001/ee-subscriptions/sub-1",
+                "DELETE, PATCH",
+            ),
+            (
+                "DELETE",
+                "/nudm-pp/v1/imsi-001010000000001/pp-data",
+                "GET, PATCH",
+            ),
+            ("POST", "/nudm-mt/v1/imsi-001010000000001", "GET"),
+            ("GET", "/nudm-ueid/v1/deconceal", "POST"),
+        ] {
+            let req = request_with_method(method, uri);
+            let resp = client.send_request(req).await.expect("send");
+            assert_eq!(resp.status, 405, "{method} {uri} must be 405");
+            assert_eq!(
+                json_body(&resp)["cause"],
+                "METHOD_NOT_ALLOWED",
+                "{method} {uri} cause"
+            );
+            assert_eq!(
+                resp.http.headers.get("allow").map(String::as_str),
+                Some(expect_allow),
+                "{method} {uri}: Allow header is mandatory on a 405"
+            );
+        }
+
+        // --- 501 for the four defined-but-unimplemented services -----------
+        for (method, uri) in [
+            ("POST", "/nudm-niddau/v1/imsi-001010000000001/authorize"),
+            (
+                "POST",
+                "/nudm-rsds/v1/imsi-001010000000001/sm-delivery-status",
+            ),
+            ("POST", "/nudm-ssau/v1/imsi-001010000000001/PROSE/authorize"),
+            ("POST", "/nudm-ueid/v1/deconceal"),
+        ] {
+            let req = request_with_method(method, uri)
+                .with_json_body(&serde_json::json!({}))
+                .expect("json");
+            let resp = client.send_request(req).await.expect("send");
+            assert_eq!(
+                resp.status, 501,
+                "{uri} is a defined Nudm operation, so 501 not 405/404"
+            );
+            assert_eq!(json_body(&resp)["cause"], "NOT_IMPLEMENTED", "{uri} cause");
+        }
+        // ...but an undefined path under those services is still a 404.
+        let resp = client
+            .get("/nudm-ueid/v1/not-deconceal")
+            .await
+            .expect("GET");
+        assert_eq!(resp.status, 404);
+        assert_eq!(json_body(&resp)["cause"], "RESOURCE_URI_NOT_FOUND");
+
+        udm_server.stop().await.expect("stop udm");
+    }
+
+    /// One profile builder, one advertised surface: `nudm-ee` is present (it was
+    /// routed but undiscoverable), `nudm-sdm` is at v2, and the operator knobs
+    /// come from configuration.
+    #[test]
+    fn test_nrf_profile_is_single_sourced_and_configurable() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            context.set_nf_profile_config(crate::context::NfProfileConfig::default());
+        }
+
+        let profile = build_udm_nf_profile("udm-1", "10.45.0.10", 7777);
+        let names: Vec<String> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .map(|s| s["serviceName"].as_str().unwrap_or_default().to_string())
+            .collect();
+        for expected in [
+            "nudm-sdm",
+            "nudm-uecm",
+            "nudm-ueau",
+            "nudm-ee",
+            "nudm-pp",
+            "nudm-mt",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "{expected} must be advertised or no consumer can discover it: {names:?}"
+            );
+        }
+        assert_eq!(advertised_version(&profile, "nudm-sdm"), "v2");
+        assert_eq!(advertised_version(&profile, "nudm-ee"), "v1");
+        // Defaults reproduce the pre-#85 literals exactly.
+        assert_eq!(profile["heartBeatTimer"], 10);
+        assert_eq!(
+            profile["allowedNfTypes"],
+            serde_json::json!(["AMF", "SMF", "AUSF", "PCF", "SCP"])
+        );
+
+        // Configured knobs reach the wire.
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            context.set_nf_profile_config(crate::context::NfProfileConfig {
+                heart_beat_timer: 42,
+                allowed_nf_types: vec!["NEF".to_string()],
+            });
+        }
+        let profile = build_udm_nf_profile("udm-1", "10.45.0.10", 7777);
+        assert_eq!(profile["heartBeatTimer"], 42);
+        assert_eq!(profile["allowedNfTypes"], serde_json::json!(["NEF"]));
+
+        // The service table is the ONE source: the typed self-instance built by
+        // sbi_path and this JSON profile enumerate the same services in the same
+        // order, so the two registration paths cannot advertise different
+        // surfaces (the #85 v1-vs-v2 divergence).
+        let table: Vec<String> = crate::sbi_path::UDM_ADVERTISED_SERVICES
+            .iter()
+            .map(|(name, _, _)| name.to_string())
+            .collect();
+        assert_eq!(names, table);
+
+        // Restore the default so later tests see an unconfigured profile.
+        let ctx = udm_self();
+        if let Ok(context) = ctx.read() {
+            context.set_nf_profile_config(crate::context::NfProfileConfig::default());
+        };
+    }
+
+    /// `IdTranslationResult` assembly: `supi` is the only required member, the
+    /// first identity of each list is primary, and `requested-gpsi-type` filters.
+    #[test]
+    fn test_build_id_translation_result_shapes() {
+        // No SUPI -> no result at all (the caller must 404).
+        assert!(build_id_translation_result(vec![], vec!["msisdn-1".into()], None).is_none());
+
+        let r = build_id_translation_result(
+            vec!["imsi-1".into(), "imsi-2".into()],
+            vec!["msisdn-1".into(), "extid-a@example.org".into()],
+            None,
+        )
+        .expect("result");
+        assert_eq!(r["supi"], "imsi-1");
+        assert_eq!(r["gpsi"], "msisdn-1");
+        assert_eq!(r["additionalSupis"], serde_json::json!(["imsi-2"]));
+        assert_eq!(
+            r["additionalGpsis"],
+            serde_json::json!(["extid-a@example.org"])
+        );
+
+        // requested-gpsi-type=EXT_ID must not hand back an MSISDN.
+        let r = build_id_translation_result(
+            vec!["imsi-1".into()],
+            vec!["msisdn-1".into(), "extid-a@example.org".into()],
+            Some("EXT_ID"),
+        )
+        .expect("result");
+        assert_eq!(r["gpsi"], "extid-a@example.org");
+        assert!(r.get("additionalGpsis").is_none());
+    }
+
+    /// #85 + the id-translation backlog item: `id-translation-result` is a
+    /// **Nudm_SDM** operation (it was routed under nudm-uecm, where a conformant
+    /// consumer would never look), and both directions are served from the UDR.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn test_http_id_translation_result_both_directions() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = env_logger::try_init();
+        udm_context_init(64, 64);
+        let (udr_server, store) = start_mock_udr_context_data().await;
+        let (udm_server, client) = start_real_udm().await;
+
+        let supi = "imsi-001010000000850";
+        let gpsi = "msisdn-491721075423";
+        store.lock().expect("store").insert(
+            format!("/nudr-dr/v2/subscription-data/{gpsi}/identity-data"),
+            serde_json::json!({ "supiList": [supi], "gpsiList": [gpsi] }),
+        );
+
+        // GPSI -> SUPI: the direction a NEF needs to target a UE by msisdn.
+        let resp = client
+            .get(&format!("/nudm-sdm/v2/{gpsi}/id-translation-result"))
+            .await
+            .expect("GET");
+        assert_eq!(
+            resp.status, 200,
+            "GPSI->SUPI translation must be routed under nudm-sdm: {:?}",
+            resp.http.content
+        );
+        let body = json_body(&resp);
+        assert_eq!(body["supi"], supi);
+        assert_eq!(body["gpsi"], gpsi);
+
+        // The old (wrong) location must NOT answer it.
+        let resp = client
+            .get(&format!("/nudm-uecm/v1/{gpsi}/id-translation-result"))
+            .await
+            .expect("GET");
+        assert_eq!(
+            resp.status, 404,
+            "id-translation-result is not a UECM resource"
+        );
+        assert_eq!(json_body(&resp)["cause"], "RESOURCE_URI_NOT_FOUND");
+
+        // SUPI -> GPSI without identity-data: the am-data `gpsis` fallback.
+        store.lock().expect("store").insert(
+            format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/am-data"),
+            serde_json::json!({ "gpsis": [gpsi] }),
+        );
+        let resp = client
+            .get(&format!("/nudm-sdm/v2/{supi}/id-translation-result"))
+            .await
+            .expect("GET");
+        assert_eq!(resp.status, 200, "SUPI->GPSI falls back to am-data");
+        let body = json_body(&resp);
+        assert_eq!(body["supi"], supi);
+        assert_eq!(body["gpsi"], gpsi);
+
+        // An unknown GPSI has no identity-data and cannot fall back, so 404 —
+        // never a fabricated SUPI.
+        let resp = client
+            .get("/nudm-sdm/v2/msisdn-000000000000/id-translation-result")
+            .await
+            .expect("GET");
+        assert_eq!(resp.status, 404);
+        assert_eq!(json_body(&resp)["cause"], "USER_NOT_FOUND");
+
+        udm_server.stop().await.expect("stop udm");
+        udr_server.stop().await.expect("stop udr");
+    }
+
+    /// Nudm_PP round-trips through the UDR, and Nudm_MT QueryUeInfo is proved
+    /// against amfd's **real** Namf_MT producer rather than a mock: the
+    /// information the operation returns is the AMF's, so a mock would only pin
+    /// this UDM's idea of the AMF's response shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn test_http_nudm_pp_and_mt_are_served() {
+        use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+        use nextgcore_sbi::types::{NfType, SbiServiceType};
+
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = env_logger::try_init();
+        udm_context_init(64, 64);
+        let (udr_server, store) = start_mock_udr_context_data().await;
+        let (udm_server, client) = start_real_udm().await;
+
+        let supi = "imsi-001010000000851";
+        let af = "af-1";
+
+        // --- Nudm_PP ------------------------------------------------------
+        // Provision an AF entry, read it back, then delete it.
+        let entry = serde_json::json!({
+            "communicationCharacteristics": { "ppSubsRegTimer": { "subsRegTimer": 3600 } }
+        });
+        let resp = client
+            .put_json(&format!("/nudm-pp/v1/{supi}/pp-data-store/{af}"), &entry)
+            .await
+            .expect("PP entry PUT");
+        assert_eq!(resp.status, 201, "PP data entry created");
+        let resp = client
+            .get(&format!("/nudm-pp/v1/{supi}/pp-data-store/{af}"))
+            .await
+            .expect("PP entry GET");
+        assert_eq!(resp.status, 200);
+        assert_eq!(json_body(&resp), entry);
+
+        // PATCH pp-data provisions the UE-level parameters.
+        store.lock().expect("store").insert(
+            format!("/nudr-dr/v2/subscription-data/{supi}/pp-data"),
+            serde_json::json!({}),
+        );
+        let resp = client
+            .patch_json(
+                &format!("/nudm-pp/v1/{supi}/pp-data"),
+                &serde_json::json!({ "expectedUeBehaviourParameters": { "stationaryIndication": "STATIONARY" } }),
+            )
+            .await
+            .expect("pp-data PATCH");
+        assert_eq!(resp.status, 204, "Nudm_PP Update must be routed");
+        let resp = client
+            .get(&format!("/nudm-pp/v1/{supi}/pp-data"))
+            .await
+            .expect("pp-data GET");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            json_body(&resp)["expectedUeBehaviourParameters"]["stationaryIndication"],
+            "STATIONARY",
+            "the provisioned parameters must be readable back from the UDR"
+        );
+
+        let resp = client
+            .delete(&format!("/nudm-pp/v1/{supi}/pp-data-store/{af}"))
+            .await
+            .expect("PP entry DELETE");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .get(&format!("/nudm-pp/v1/{supi}/pp-data-store/{af}"))
+            .await
+            .expect("PP entry GET after delete");
+        assert_eq!(resp.status, 404);
+
+        // 5G VN group management is recognised and refused as unimplemented.
+        let resp = client
+            .get("/nudm-pp/v1/5g-vn-groups/extgroupid-1")
+            .await
+            .expect("VN group GET");
+        assert_eq!(resp.status, 501);
+
+        // --- Nudm_MT (strict peer: udmd -> amfd's REAL Namf_MT) ------------
+        // `fields` is mandatory.
+        let resp = client
+            .get(&format!("/nudm-mt/v1/{supi}"))
+            .await
+            .expect("QueryUeInfo without fields");
+        assert_eq!(resp.status, 400, "QueryUeInfo requires 'fields'");
+        assert_eq!(json_body(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        // A field this UDM cannot retrieve is named, not silently omitted.
+        let resp = client
+            .get(&format!("/nudm-mt/v1/{supi}?fields=userState"))
+            .await
+            .expect("QueryUeInfo unsupported field");
+        assert_eq!(resp.status, 501);
+        assert!(
+            json_body(&resp)["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("userState"),
+            "the 501 must name the field so the consumer can retry"
+        );
+
+        // An unregistered UE has no AMF to ask.
+        let resp = client
+            .get(&format!("/nudm-mt/v1/{supi}?fields=tadsInfo"))
+            .await
+            .expect("QueryUeInfo unregistered");
+        assert_eq!(resp.status, 404);
+        assert_eq!(json_body(&resp)["cause"], "CONTEXT_NOT_FOUND");
+
+        // Stand up amfd's REAL Namf handler and register it as the serving AMF.
+        let amf_instance_id = "amf-for-mt-test";
+        let amf_port = free_port();
+        let amf_addr = SocketAddr::from(([127, 0, 0, 1], amf_port));
+        let amf_server = SbiServer::new(NextgcoreSbiServerConfig::new(amf_addr));
+        amf_server
+            .start(nextgcore_amfd::namf_request_handler)
+            .await
+            .expect("amfd Namf server starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(amf_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut instance = NfInstance::new(amf_instance_id, NfType::Amf);
+        instance.ipv4_addresses.push("127.0.0.1".to_string());
+        let mut svc = NfService::new("namf-mt", SbiServiceType::NamfMt);
+        svc.versions = vec!["v1".to_string()];
+        svc.port = amf_port;
+        instance.add_service(svc);
+        global_context().add_nf_instance(instance).await;
+
+        // Seed amfd's UE context so its real handler resolves the SUPI.
+        nextgcore_amfd::test_support::init_context();
+        {
+            let ctx = nextgcore_amfd::context::amf_self();
+            let guard = ctx.read().expect("amf ctx");
+            let ran = guard.ran_ue_add(900_500, 60_200).expect("ran_ue_add");
+            let ue = guard.amf_ue_add(ran.id).expect("amf_ue_add");
+            guard.amf_ue_set_supi(ue.id, supi);
+            let mut ue = ue;
+            ue.supi = Some(supi.to_string());
+            guard.amf_ue_update(&ue);
+        }
+        // Register the UE in the UDM's UECM store so the serving AMF is known.
+        store.lock().expect("store").insert(
+            format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access"),
+            serde_json::json!({
+                "amfInstanceId": amf_instance_id,
+                "deregCallbackUri": "http://amf.example.org:7777/namf-callback/v1/x/dereg-notify",
+                "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
+                "ratType": "NR"
+            }),
+        );
+
+        let resp = client
+            .get(&format!("/nudm-mt/v1/{supi}?fields=tadsInfo"))
+            .await
+            .expect("QueryUeInfo");
+        assert_eq!(
+            resp.status, 200,
+            "QueryUeInfo must proxy to the serving AMF: {:?}",
+            resp.http.content
+        );
+        let body = json_body(&resp);
+        assert_eq!(
+            body["tadsInfo"]["accessType"], "3GPP_ACCESS",
+            "the UeContextInfo amfd's REAL Namf_MT producer returned must be \
+             carried through verbatim: {body}"
+        );
+
+        // provide-loc-info is recognised and refused: no AMF here serves
+        // Namf_Location ProvideLocationInfo.
+        let resp = client
+            .post_json(
+                &format!("/nudm-mt/v1/{supi}/loc-info/provide-loc-info"),
+                &serde_json::json!({ "req5gsLoc": true }),
+            )
+            .await
+            .expect("provide-loc-info");
+        assert_eq!(resp.status, 501);
+
+        udm_server.stop().await.expect("stop udm");
+        udr_server.stop().await.expect("stop udr");
+        amf_server.stop().await.expect("stop amf");
     }
 }
 

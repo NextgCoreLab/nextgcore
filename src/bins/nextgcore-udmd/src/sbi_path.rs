@@ -4,6 +4,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::context::{udm_self, NfProfileConfig};
 use nextgcore_sbi::context::{global_context, NfInstance, NfService};
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::types::{NfType, SbiServiceType};
@@ -38,6 +39,67 @@ impl Default for SbiServerConfig {
 /// SBI server state
 static SBI_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// The Nudm services this UDM serves, with the API version each is defined at
+/// and its `SbiServiceType`.
+///
+/// ONE list, consumed by both the typed self-instance built in [`udm_sbi_open`]
+/// and the JSON NFProfile built by [`build_udm_nf_profile`]. Before #85 those
+/// were two hand-written lists that disagreed: one advertised `nudm-sdm` at
+/// `v1` and the other at `v2`, neither advertised the routed `nudm-ee` at all,
+/// and which profile the NRF saw depended on the registration path taken.
+///
+/// The version per service is normative and easy to get wrong: TS 29.503 §6.1.1
+/// says "The `<apiVersion>` shall be v2" for **Nudm_SDM** only; every other
+/// Nudm service is v1.
+pub const UDM_ADVERTISED_SERVICES: [(&str, &str, SbiServiceType); 6] = [
+    ("nudm-sdm", "v2", SbiServiceType::NudmSdm),
+    ("nudm-uecm", "v1", SbiServiceType::NudmUecm),
+    ("nudm-ueau", "v1", SbiServiceType::NudmUeau),
+    ("nudm-ee", "v1", SbiServiceType::NudmEe),
+    ("nudm-pp", "v1", SbiServiceType::NudmPp),
+    ("nudm-mt", "v1", SbiServiceType::NudmMt),
+];
+
+/// Build the UDM's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
+///
+/// The single source of truth for what this UDM advertises: the service list
+/// comes from [`UDM_ADVERTISED_SERVICES`] and the operator knobs
+/// (`heartBeatTimer`, `allowedNfTypes`) from [`NfProfileConfig`], so no caller
+/// can advertise a different surface than another.
+pub fn build_udm_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    config: &NfProfileConfig,
+) -> serde_json::Value {
+    let services: Vec<serde_json::Value> = UDM_ADVERTISED_SERVICES
+        .iter()
+        .map(|(name, version, _)| {
+            serde_json::json!({
+                "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+                "serviceName": name,
+                "versions": [{
+                    "apiVersionInUri": version,
+                    // apiFullVersion must agree with the URI version, not lag it.
+                    "apiFullVersion": format!("{}.0.0", version.trim_start_matches('v')),
+                }],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "UDM",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": services,
+        "allowedNfTypes": config.allowed_nf_types,
+        "heartBeatTimer": config.heart_beat_timer,
+    })
+}
+
 /// Open SBI server and register with NRF
 ///
 /// Port of udm_sbi_open()
@@ -51,21 +113,18 @@ pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     let mut nf_instance = NfInstance::new(&nf_instance_id, NfType::Udm);
     nf_instance.ipv4_addresses.push(config.addr.clone());
 
-    // Register NUDM services: nudm-ueau, nudm-uecm, nudm-sdm
-    let mut ueau_service = NfService::new("nudm-ueau", SbiServiceType::NudmUeau);
-    ueau_service.versions = vec!["v1".to_string()];
-    ueau_service.port = config.port;
-    nf_instance.add_service(ueau_service);
-
-    let mut uecm_service = NfService::new("nudm-uecm", SbiServiceType::NudmUecm);
-    uecm_service.versions = vec!["v1".to_string()];
-    uecm_service.port = config.port;
-    nf_instance.add_service(uecm_service);
-
-    let mut sdm_service = NfService::new("nudm-sdm", SbiServiceType::NudmSdm);
-    sdm_service.versions = vec!["v2".to_string()];
-    sdm_service.port = config.port;
-    nf_instance.add_service(sdm_service);
+    // Register every Nudm service this UDM serves, from the shared table so the
+    // self instance and the NRF profile cannot disagree (#85).
+    for (name, version, service_type) in UDM_ADVERTISED_SERVICES {
+        let mut service = NfService::new(name, service_type);
+        service.versions = vec![version.to_string()];
+        service.port = config.port;
+        nf_instance.add_service(service);
+    }
+    nf_instance.heartbeat_interval = udm_self()
+        .read()
+        .map(|ctx| ctx.nf_profile_config().heart_beat_timer)
+        .unwrap_or(10);
 
     // Store self NF instance in global SBI context
     // Use spawn to avoid blocking the runtime (block_on panics inside async)
@@ -94,23 +153,24 @@ pub async fn udm_nrf_register(nrf_host: &str, nrf_port: u16) -> Result<(), Strin
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
 
-    // Build NF profile JSON for registration
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": self_instance.id,
-        "nfType": "UDM",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": self_instance.ipv4_addresses,
-        "nfServices": self_instance.services.iter().map(|s| {
-            serde_json::json!({
-                "serviceName": s.name,
-                "versions": s.versions.iter().map(|v| {
-                    serde_json::json!({"apiVersionInUri": v, "apiFullVersion": format!("{}.0.0", v)})
-                }).collect::<Vec<_>>(),
-                "scheme": "http",
-            })
-        }).collect::<Vec<_>>(),
-        "heartBeatTimer": self_instance.heartbeat_interval,
-    });
+    // Build NF profile JSON for registration through the SHARED builder (#85):
+    // this path used to render the self instance by hand, producing a profile
+    // that differed from the one `app::register_with_nrf_id` sent.
+    let sbi_addr = self_instance
+        .ipv4_addresses
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    let sbi_port = self_instance
+        .services
+        .first()
+        .map(|s| s.port)
+        .unwrap_or(7777);
+    let profile_config = udm_self()
+        .read()
+        .map(|ctx| ctx.nf_profile_config())
+        .unwrap_or_default();
+    let nf_profile = build_udm_nf_profile(&self_instance.id, &sbi_addr, sbi_port, &profile_config);
 
     let request = SbiRequest::put(&path)
         .with_json_body(&nf_profile)
@@ -548,6 +608,118 @@ pub async fn udm_nudr_dr_send_auth_status_put(
         .with_json_body(body)
         .map_err(|e| format!("Failed to serialize auth status body: {e}"))?;
     udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+// ---------------------------------------------------------------------------
+// Generic subscription-data resources (Nudr_DataRepository, TS 29.505) — #85
+// ---------------------------------------------------------------------------
+
+/// Build the UDR `subscription-data` URI for a resource under a UE identifier.
+///
+/// `resource` is the path under `subscription-data/{ueId}/`, e.g.
+/// `identity-data`, `pp-data` or `pp-data-store/{afInstanceId}`.
+fn subscription_data_path(ue_id: &str, resource: &str) -> String {
+    format!("/nudr-dr/v2/subscription-data/{ue_id}/{resource}")
+}
+
+/// GET a UDR `subscription-data` resource (#85: identity-data, pp-data, ...).
+pub async fn udm_nudr_dr_send_subscription_data_get(
+    ue_id: &str,
+    resource: &str,
+) -> Result<SbiResponse, String> {
+    let path = subscription_data_path(ue_id, resource);
+    udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::get(&path)).await
+}
+
+/// PUT a UDR `subscription-data` resource (#85: pp-data-store entries).
+pub async fn udm_nudr_dr_send_subscription_data_put(
+    ue_id: &str,
+    resource: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = subscription_data_path(ue_id, resource);
+    let request = SbiRequest::put(&path)
+        .with_json_body(body)
+        .map_err(|e| format!("Failed to serialize {resource}: {e}"))?;
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+/// PATCH a UDR `subscription-data` resource (#85: pp-data provisioning).
+pub async fn udm_nudr_dr_send_subscription_data_patch(
+    ue_id: &str,
+    resource: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = subscription_data_path(ue_id, resource);
+    let request = SbiRequest::patch(&path)
+        .with_json_body(body)
+        .map_err(|e| format!("Failed to serialize {resource} patch: {e}"))?;
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+/// DELETE a UDR `subscription-data` resource (#85: pp-data-store entries).
+pub async fn udm_nudr_dr_send_subscription_data_delete(
+    ue_id: &str,
+    resource: &str,
+) -> Result<SbiResponse, String> {
+    let path = subscription_data_path(ue_id, resource);
+    udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::delete(&path)).await
+}
+
+// ---------------------------------------------------------------------------
+// Namf_MT client (#85 Nudm_MT QueryUeInfo, TS 29.518 §5.4.2.3)
+// ---------------------------------------------------------------------------
+
+/// `GET /namf-mt/v1/ue-contexts/{supi}?info-class=...` on the UE's serving AMF —
+/// Namf_MT_ProvideDomainSelectionInfo (TS 29.518 §5.4.2.3).
+///
+/// Nudm_MT `QueryUeInfo` is a proxy operation: the UE information the consumer
+/// asks for (T-ADS) lives in the AMF, not the UDM (TS 29.503 §5.10.2.2). AMF
+/// selection therefore prefers the `amfInstanceId` recorded in the UE's UECM
+/// registration — the AMF that is actually serving this UE — and falls back to a
+/// cached AMF instance, then to the `AMF_SBI_ADDR`/`AMF_SBI_PORT` env vars
+/// (mirrors the AUSF helpers above). Asking an arbitrary AMF would answer with
+/// another AMF's view of a UE it does not serve.
+pub async fn udm_amf_send_mt_ue_context_info(
+    amf_instance_id: Option<&str>,
+    supi: &str,
+    info_class: &str,
+) -> Result<SbiResponse, String> {
+    let path = format!("/namf-mt/v1/ue-contexts/{supi}");
+    let build_request = || SbiRequest::get(&path).with_param("info-class", info_class);
+
+    if let Some(id) = amf_instance_id {
+        if global_context().get_nf_instance(id).await.is_some() {
+            return udm_sbi_send_request(id, build_request()).await;
+        }
+    }
+
+    let sbi_ctx = global_context();
+    let amf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Amf).await;
+    if let Some(amf) = amf_instances.first() {
+        let host = amf
+            .ipv4_addresses
+            .first()
+            .ok_or("AMF instance has no IPv4 address")?;
+        let port = amf.services.first().map(|s| s.port).unwrap_or(80);
+        let client = sbi_ctx.get_client(host, port).await;
+        return client
+            .send_request(build_request())
+            .await
+            .map_err(|e| format!("Namf_MT request to AMF failed: {e}"));
+    }
+
+    let host = std::env::var("AMF_SBI_ADDR")
+        .map_err(|_| "No AMF instance discovered and AMF_SBI_ADDR not set".to_string())?;
+    let port: u16 = std::env::var("AMF_SBI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    let client = sbi_ctx.get_client(&host, port).await;
+    client
+        .send_request(build_request())
+        .await
+        .map_err(|e| format!("Namf_MT request to AMF failed: {e}"))
 }
 
 /// DELETE the UDR authentication-status resource for a SUPI (#84 `DeleteAuth`).

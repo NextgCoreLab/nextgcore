@@ -26,6 +26,14 @@ udm:
     client:
       nrf:
         - uri: http://172.23.0.10:7777
+    # NRF NFProfile knobs (TS 29.510 6.1.6.2.2). Both were hardcoded in the
+    # profile builder before nextgcore #85: the heartbeat is a deployment-timing
+    # decision and allowed_nf_types is access control, so an operator adding an
+    # NF type that must reach the UDM had to edit Rust. The values below are the
+    # historical defaults; omit the block entirely to keep them.
+    nrf_profile:
+      heartbeat_timer: 10
+      allowed_nf_types: [AMF, SMF, AUSF, PCF, SCP]
     # TLS configuration (G36: SBI TLS)
     # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
     tls:
