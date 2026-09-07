@@ -369,6 +369,22 @@ pub async fn process_amf_registration(supi: &str, body: &Value, client: &UdrClie
     // Local cache (UDR is the system of record).
     cache_amf_registration(supi, body);
 
+    // #83: the UE's AMF context data set just changed, so SDM subscribers
+    // monitoring it get a ModificationNotification and EE subscribers get a
+    // MonitoringReport. Awaited rather than spawned so the notification is
+    // ordered after the UDR write it reports: a subscriber that reacts by reading
+    // the data set must not find the state the notification is about missing.
+    // Delivery failures are logged inside and never fail this operation.
+    crate::notify::notify_ue_context_change(
+        supi,
+        if is_update {
+            crate::notify::UeContextEvent::AmfContextUpdated
+        } else {
+            crate::notify::UeContextEvent::AmfRegistered
+        },
+    )
+    .await;
+
     // udmd-06: 201 on create, 200 on update.
     let status = if is_update { 200 } else { 201 };
     let mut resp = SbiResponse::with_status(status)
@@ -484,6 +500,15 @@ pub async fn process_smf_registration(
         return resp;
     }
 
+    // #83: the UE's SMF context data set just changed, so SDM subscribers
+    // monitoring it get a ModificationNotification and EE subscribers get a
+    // MonitoringReport. Awaited rather than spawned so the notification is
+    // ordered after the UDR write it reports: a subscriber that reacts by reading
+    // the data set must not find the state the notification is about missing.
+    // Delivery failures are logged inside and never fail this operation.
+    crate::notify::notify_ue_context_change(supi, crate::notify::UeContextEvent::SmfRegistered)
+        .await;
+
     // udmd-06: 201 on create, 200 on update.
     let status = if is_update { 200 } else { 201 };
     let mut resp = SbiResponse::with_status(status)
@@ -518,6 +543,15 @@ pub async fn process_amf_deregistration(supi: &str, client: &UdrClient) -> SbiRe
         }
     }
 
+    // #83: the UE's AMF context data set just changed, so SDM subscribers
+    // monitoring it get a ModificationNotification and EE subscribers get a
+    // MonitoringReport. Awaited rather than spawned so the notification is
+    // ordered after the UDR write it reports: a subscriber that reacts by reading
+    // the data set must not find the state the notification is about missing.
+    // Delivery failures are logged inside and never fail this operation.
+    crate::notify::notify_ue_context_change(supi, crate::notify::UeContextEvent::AmfDeregistered)
+        .await;
+
     SbiResponse::with_status(204)
 }
 
@@ -532,6 +566,11 @@ pub async fn process_smf_deregistration(
     if let Err(e) = client.context_delete(supi, &relative).await {
         log::warn!("[{supi}] UDR SMF context DELETE failed: {e} (degraded)");
     }
+
+    // #83: the SMF context data set changed; see the AMF sites above.
+    crate::notify::notify_ue_context_change(supi, crate::notify::UeContextEvent::SmfDeregistered)
+        .await;
+
     SbiResponse::with_status(204)
 }
 
@@ -1517,5 +1556,128 @@ mod tests {
             1,
             "the (failed) dereg notification was attempted exactly once"
         );
+    }
+
+    /// #83 WIRING: a real `process_amf_registration` must produce the SDM and EE
+    /// notifications, not just the standalone producer.
+    ///
+    /// Written because revert-verification exposed the gap: removing the
+    /// `notify_ue_context_change` call from this function left every notify test
+    /// green, since they all called the producer directly. That is the recorded
+    /// lesson that a tested helper leaves the wiring untested — the helper was
+    /// covered nine ways and the one line that invokes it was not covered at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn amf_registration_notifies_sdm_and_ee_subscribers() {
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::Mutex as StdMutex;
+
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Declared, not inherited: loopback plaintext stub (see notify.rs).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        std::env::remove_var("UDM_NOTIFY_DISABLE");
+        crate::context::udm_context_init(1024, 4096);
+
+        let supi = "imsi-001010000000883";
+        let seen: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let addr = nextgcore_sbi::test_support::ephemeral_addr();
+        let server = SbiServer::new(SbiServerConfig::new(addr));
+        server
+            .start(move |req: SReq| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    if let Some(b) = req.http.content.as_deref() {
+                        if let Ok(v) = serde_json::from_str::<Value>(b) {
+                            sink.lock().expect("sink").push(v);
+                        }
+                    }
+                    SResp::with_status(204)
+                }
+            })
+            .await
+            .expect("stub callback starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let uri = format!("http://127.0.0.1:{}/cb", addr.port());
+
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            // Clear anything a previous test left for this SUPI.
+            for sub in context.sdm_subscriptions_for_supi(supi) {
+                context.sdm_subscription_remove(&sub.id);
+            }
+            for sub in context.ee_subscriptions_for_supi(supi) {
+                context.ee_subscription_remove(&sub.id);
+            }
+            context.sdm_subscription_insert(crate::context::UdmSdmSubscription::for_supi(
+                supi,
+                Some("nf-1".to_string()),
+                Some(uri.clone()),
+                vec![format!("/nudm-sdm/v2/{supi}/ue-context-in-amf-data")],
+            ));
+            context.ee_subscription_insert(crate::context::UdmEeSubscription::for_ue(
+                supi,
+                uri.clone(),
+                "{}",
+            ));
+        }
+
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock.clone());
+        let resp = process_amf_registration(supi, &valid_amf_body(), &client).await;
+        assert_eq!(
+            resp.status, 201,
+            "the registration itself must still succeed"
+        );
+
+        // Both notifications must have gone out as a consequence of the
+        // registration, with no extra call from the test.
+        let bodies = {
+            let mut out = Vec::new();
+            for _ in 0..100 {
+                out = seen.lock().expect("sink").clone();
+                if out.len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            out
+        };
+        assert_eq!(
+            bodies.len(),
+            2,
+            "an AMF registration must notify both the SDM and the EE subscriber: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|b| b["notifyItems"][0]["resourceId"]
+                == format!("/nudm-sdm/v2/{supi}/ue-context-in-amf-data")),
+            "no SDM ModificationNotification among {bodies:?}"
+        );
+        assert!(
+            bodies
+                .iter()
+                .any(|b| b["reportList"][0]["eventType"] == "UE_REACHABILITY_FOR_DATA"),
+            "no EE MonitoringReport among {bodies:?}"
+        );
+
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            for sub in context.sdm_subscriptions_for_supi(supi) {
+                context.sdm_subscription_remove(&sub.id);
+            }
+            for sub in context.ee_subscriptions_for_supi(supi) {
+                context.ee_subscription_remove(&sub.id);
+            }
+        }
     }
 }

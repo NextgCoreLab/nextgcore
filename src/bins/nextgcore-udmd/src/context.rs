@@ -1226,6 +1226,51 @@ impl UdmContext {
         ee_list.remove(id)
     }
 
+    /// Every SDM subscription monitoring `supi` (#83).
+    ///
+    /// Cloned out rather than handed out behind the lock, because the caller then
+    /// makes outbound HTTP calls: holding a `RwLock` across an `.await` is how the
+    /// notification path would deadlock the subscribe path.
+    pub fn sdm_subscriptions_for_supi(&self, supi: &str) -> Vec<UdmSdmSubscription> {
+        match self.sdm_subscription_list.read() {
+            Ok(list) => list.values().filter(|s| s.supi == supi).cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Every EE subscription whose scope covers `supi` (#83).
+    ///
+    /// A subscription's `ue_identity` is a SUPI, a GPSI, an external group id or
+    /// the literal `anyUE` (TS 29.503 §5.5.2.2). Only the exact-SUPI and `anyUE`
+    /// forms are matched here: resolving a GPSI or a group id needs the
+    /// identifier translation this UDM does not implement (tracked on #85), and
+    /// matching them by guesswork would deliver another UE's events.
+    pub fn ee_subscriptions_for_supi(&self, supi: &str) -> Vec<UdmEeSubscription> {
+        match self.ee_subscription_list.read() {
+            Ok(list) => list
+                .values()
+                .filter(|s| s.ue_identity == supi || s.ue_identity == "anyUE")
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Replace a stored EE subscription, returning false when it is not there.
+    pub fn ee_subscription_update(&self, sub: UdmEeSubscription) -> bool {
+        let mut list = match self.ee_subscription_list.write() {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        match list.get_mut(&sub.id) {
+            Some(existing) => {
+                *existing = sub;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Update SDM subscription in the context
     pub fn sdm_subscription_update(&self, subscription: &UdmSdmSubscription) -> bool {
         let mut sdm_list = self.sdm_subscription_list.write().unwrap();

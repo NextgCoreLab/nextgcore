@@ -13,6 +13,7 @@ pub mod context;
 pub mod event;
 #[cfg(feature = "nes")]
 pub mod nes_driver; // issue #22 Network Energy Saving runtime (off by default)
+pub mod notify; // #83 Nudm_SDM Data Change Notification / Nudm_EE Event Occurrence
 pub mod nudm_handler;
 pub mod nudr_handler;
 pub mod sbi_path;

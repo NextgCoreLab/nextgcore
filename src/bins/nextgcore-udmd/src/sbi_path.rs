@@ -595,13 +595,27 @@ pub async fn udm_sbi_send_dereg_notification(
     callback_uri: &str,
     body: &serde_json::Value,
 ) -> Result<SbiResponse, String> {
+    udm_sbi_send_callback_notification(callback_uri, body).await
+}
+
+/// POST a notification body to an absolute `callbackReference` supplied by a
+/// consumer.
+///
+/// Shared by the UECM dereg notification and by the SDM / EE producers (#83):
+/// all three are "POST this JSON to the absolute URI the consumer gave us", and
+/// having one implementation means a fix to the URI parsing or the client reaches
+/// every notification the UDM sends.
+pub async fn udm_sbi_send_callback_notification(
+    callback_uri: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
     let (host, port, path) = parse_callback_uri(callback_uri)
-        .ok_or_else(|| format!("deregCallbackUri is not an absolute URI: {callback_uri}"))?;
+        .ok_or_else(|| format!("callback reference is not an absolute URI: {callback_uri}"))?;
     let client = global_context().get_client(&host, port).await;
     client
         .post_json(&path, body)
         .await
-        .map_err(|e| format!("Dereg notification POST to {callback_uri} failed: {e}"))
+        .map_err(|e| format!("Notification POST to {callback_uri} failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------
