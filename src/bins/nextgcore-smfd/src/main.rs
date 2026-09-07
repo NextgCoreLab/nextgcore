@@ -215,6 +215,16 @@ struct SbiSection {
 #[derive(Debug, Default, Deserialize)]
 struct SmfSection {
     sbi: Option<SbiSection>,
+    /// DNS servers signalled to the UE in the establishment accept's ePCO IE.
+    ///
+    /// The shipped `docker/rust/configs/5gc/smf.yaml` has declared these (and
+    /// `mtu`) all along; nothing parsed them, so the UE received no DNS
+    /// configuration at all. IPv6 entries are accepted in the list and skipped
+    /// here — the ePCO container this SMF emits is the IPv4 DNS one, and
+    /// silently dropping a v6 address is better than failing to parse the file.
+    dns: Option<Vec<String>>,
+    /// IPv4 link MTU signalled in the same IE.
+    mtu: Option<u16>,
 }
 
 /// Root YAML document
@@ -232,6 +242,10 @@ struct SmfConfig {
     max_bearer: usize,
     /// NRF URI parsed from `smf.sbi.client.nrf[0].uri` (if present).
     nrf_uri: Option<String>,
+    /// IPv4 DNS servers for the establishment accept's ePCO IE.
+    dns_servers: Vec<std::net::Ipv4Addr>,
+    /// IPv4 link MTU for the same IE.
+    mtu: Option<u16>,
 }
 
 impl Default for SmfConfig {
@@ -243,6 +257,8 @@ impl Default for SmfConfig {
             max_sess: 4096,
             max_bearer: 8192,
             nrf_uri: None,
+            dns_servers: Vec::new(),
+            mtu: None,
         }
     }
 }
@@ -288,9 +304,41 @@ fn load_config(path: &str) -> SmfConfig {
                 }
             }
         }
+        if let Some(dns) = smf.dns {
+            // Only the IPv4 entries are usable by the ePCO container this SMF
+            // emits; a v6 address in the list is skipped with a note rather than
+            // treated as a config error.
+            for entry in dns {
+                match entry.parse::<std::net::Ipv4Addr>() {
+                    Ok(addr) => config.dns_servers.push(addr),
+                    Err(_) => log::debug!(
+                        "smf.dns entry {entry:?} is not an IPv4 address; not signalled in ePCO"
+                    ),
+                }
+            }
+        }
+        config.mtu = smf.mtu;
     }
 
     config
+}
+
+/// DNS servers and link MTU resolved from config, for the ePCO IE the
+/// establishment accept carries (TS 24.501 §6.6.1).
+///
+/// A process-global because the accept is built deep inside the SBI handler
+/// chain, which threads no config; the same shape `NRF_URI` and the other
+/// startup-resolved values already use in this binary.
+static EPCO_CONFIG: std::sync::OnceLock<(Vec<std::net::Ipv4Addr>, Option<u16>)> =
+    std::sync::OnceLock::new();
+
+/// The configured ePCO inputs, or `(&[], None)` before startup has resolved them
+/// (in which case no ePCO IE is emitted — the previous behaviour).
+fn epco_config() -> (&'static [std::net::Ipv4Addr], Option<u16>) {
+    match EPCO_CONFIG.get() {
+        Some((dns, mtu)) => (dns.as_slice(), *mtu),
+        None => (&[], None),
+    }
 }
 
 #[tokio::main]
@@ -337,6 +385,20 @@ async fn main() -> Result<()> {
         config.sbi_addr,
         config.sbi_port
     );
+    // Publish the ePCO inputs before any SBI handler can build an accept.
+    if config.dns_servers.is_empty() && config.mtu.is_none() {
+        log::warn!(
+            "No smf.dns / smf.mtu configured: the PDU Session Establishment Accept \
+             will carry no ePCO IE, so UEs receive no DNS configuration"
+        );
+    } else {
+        log::info!(
+            "ePCO: signalling {} DNS server(s), mtu={:?}",
+            config.dns_servers.len(),
+            config.mtu
+        );
+    }
+    let _ = EPCO_CONFIG.set((config.dns_servers.clone(), config.mtu));
 
     // Seed NRF URI into SBI context for NF registration (parsed once in load_config).
     if let Some(ref uri) = config.nrf_uri {
@@ -589,8 +651,14 @@ async fn main() -> Result<()> {
             break;
         }
 
-        // Process timer expirations and state machine updates
-        // In a full implementation, this would check the timer manager
+        // 5GSM procedure timers (T3591/T3592): retransmit the modification or
+        // release command the UE has not answered, and abandon the procedure once
+        // the retransmissions are exhausted (TS 24.501 §6.3.2.2, §6.3.3).
+        run_gsm_timer_tick().await;
+
+        // PFCP timers and the wider state machine are still driven by their own
+        // tasks (pfcp_assoc_handle above and the per-transaction retransmission
+        // inside pfcp_path); this tick owns only the 5GSM procedure timers.
     }
 
     pfcp_assoc_handle.abort();
@@ -1536,6 +1604,17 @@ async fn pfcp_session_delete(smf_n4_seid: u64, upf_seid: u64) -> Result<()> {
 // =============================================================================
 
 /// Build a ProblemDetails 400 response (TS 29.500 §5.2.7).
+/// A 404 ProblemDetails, for an operation naming an SM context that does not
+/// exist (TS 29.502 `CONTEXT_NOT_FOUND`).
+fn problem_404(cause: &str, detail: &str) -> SbiResponse {
+    let body = serde_json::json!({
+        "status": 404,
+        "cause": cause,
+        "detail": detail,
+    });
+    SbiResponse::with_status(404).with_body(body.to_string(), "application/problem+json")
+}
+
 fn problem_400(cause: &str, detail: &str) -> SbiResponse {
     let body = serde_json::json!({
         "status": 400,
@@ -1777,6 +1856,61 @@ fn sm_context_create_error(
         ))
 }
 
+/// The SSC modes this SMF actually implements, as the Allowed SSC mode bitmap
+/// (bit 1 = mode 1, bit 2 = mode 2, bit 3 = mode 3 — TS 24.501 §9.11.4.16).
+///
+/// Mode 1 only, and that is a statement about capability rather than a policy
+/// choice: SSC modes 2 and 3 require PSA relocation (tear down and re-anchor, or
+/// run two anchors in parallel), and this SMF has no such machinery. Echoing the
+/// UE's requested mode — the previous behaviour — told the UE it had been granted
+/// a session continuity the network cannot deliver, which is worse than a
+/// refusal it can act on.
+const ALLOWED_SSC_MODE_BITMAP: u8 = 0b001;
+
+/// Authorise the UE's requested SSC mode against [`ALLOWED_SSC_MODE_BITMAP`].
+///
+/// `Ok(mode)` is the mode to grant; `Err(bitmap)` means refuse with 5GSM cause
+/// #68 and this bitmap in the Allowed SSC mode IE. A requested mode of 0 means
+/// the UE did not ask (the IE is optional), so the SMF picks its default.
+fn authorize_ssc_mode(requested: u8) -> Result<u8, u8> {
+    if requested == 0 {
+        // No preference expressed: grant the lowest mode this SMF supports.
+        return Ok(ALLOWED_SSC_MODE_BITMAP.trailing_zeros() as u8 + 1);
+    }
+    if !(1..=3).contains(&requested) {
+        return Err(ALLOWED_SSC_MODE_BITMAP);
+    }
+    if ALLOWED_SSC_MODE_BITMAP & (1 << (requested - 1)) != 0 {
+        Ok(requested)
+    } else {
+        Err(ALLOWED_SSC_MODE_BITMAP)
+    }
+}
+
+/// An establishment reject carrying the Allowed SSC mode IE alongside the cause
+/// (TS 24.501 §8.3.3.1), so the UE learns which mode to request instead.
+fn sm_context_create_ssc_error(psi: u8, pti: u8, allowed_ssc_bitmap: u8) -> SbiResponse {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
+    let n1 = policy::build_establishment_reject_ext(
+        psi,
+        pti,
+        policy::gsm_cause::NOT_SUPPORTED_SSC_MODE,
+        Some(allowed_ssc_bitmap),
+    );
+    let body = serde_json::json!({
+        "error": { "status": 403, "cause": "SSC_MODE_NOT_SUPPORTED" },
+        "n1SmMsg": { "contentId": "n1SmMsg" },
+    });
+    SbiResponse::with_status(403)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(&n1),
+        ))
+}
+
 /// Dispatch an Npcf_SMPolicyControl client response into a session's GSM FSM
 /// (drives Wait5gcSmPolicyAssociation → WaitPfcpEstablishment / N1N2Reject5gc).
 fn fsm_dispatch_policy_response(fsm: &mut gsm_sm::GsmFsm, status: u16) {
@@ -1974,7 +2108,17 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             );
         }
     };
-    let selected_ssc = if requested_ssc == 0 { 1 } else { requested_ssc };
+    // Authorise the requested SSC mode instead of echoing it (TS 23.502 §4.3.5).
+    let selected_ssc = match authorize_ssc_mode(requested_ssc) {
+        Ok(mode) => mode,
+        Err(allowed) => {
+            log::warn!(
+                "Requested SSC mode {requested_ssc} is not supported (allowed bitmap \
+                 {allowed:#05b}) — rejecting with 5GSM cause #68"
+            );
+            return sm_context_create_ssc_error(pdu_session_id, pti, allowed);
+        }
+    };
 
     // ---- Allocate session resources ----
     let ctx = smf_self();
@@ -2358,6 +2502,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // 5GSM cause #50 "PDU session type IPv4 only allowed".
     let est_5gsm_cause = (requested_type != selected_type)
         .then_some(policy::gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED);
+    let (epco_dns, epco_mtu) = epco_config();
     let n1_sm_msg = policy::build_establishment_accept(
         pdu_session_id,
         pti,
@@ -2373,6 +2518,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         snssai_sd_u32,
         &dnn,
         est_5gsm_cause,
+        epco_dns,
+        epco_mtu,
     );
 
     // ---- N2 SM Information: real-APER PDUSessionResourceSetupRequestTransfer ----
@@ -2540,6 +2687,23 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
     };
 
     let n2_sm_info_type = req_body["n2SmInfoType"].as_str().unwrap_or("");
+
+    // TS 29.502 §5.2.2.3.1: the request may carry `n1SmMsg`, `n2SmInfo` /
+    // `n2SmInfoType`, or a UP connection-state change, and the SMF must process
+    // whichever is present. This handler branched **only** on `n2SmInfoType`, so
+    // a UE-originated 5GSM message arriving with no N2 payload fell into the
+    // `upCnxState` branch and was never decoded: the UE got
+    // `{"upCnxState":"ACTIVATED"}` back and the release or modification procedure
+    // never ran.
+    //
+    // The N1 container is handled first, and only when there is no N2 payload to
+    // process: a request carrying both is an N2 procedure that happens to relay a
+    // NAS message, and those are already handled by the arms below.
+    if n2_sm_info_type.is_empty() {
+        if let Some(n1) = resolve_binary_ref(request, &req_body["n1SmMsg"]) {
+            return handle_n1_sm_message(sm_context_ref, &n1).await;
+        }
+    }
 
     match n2_sm_info_type {
         // gNB accepted the PDU session resources (initial setup) — or the UE
@@ -2785,6 +2949,493 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             problem_400("N2_SM_ERROR", &format!("unsupported n2SmInfoType {other}"))
         }
     }
+}
+
+// =============================================================================
+// UE-initiated N1 5GSM procedures on /modify (TS 24.501 §6.4.1.3, §6.4.3.3)
+// =============================================================================
+
+/// A 5GSM procedure timer armed against one SM context (TS 24.501 §6.3.2.2,
+/// §6.3.3): the command that was sent, so it can be retransmitted verbatim, plus
+/// how many attempts have been made.
+#[derive(Debug, Clone)]
+struct GsmProcedureTimer {
+    timer_id: timer::SmfTimerId,
+    /// The exact 5GSM command that was sent. Retransmission must resend the same
+    /// bytes — rebuilding it could pick up state that changed in the meantime and
+    /// send the UE a different message under the same procedure.
+    command: Vec<u8>,
+    /// SUPI and PSI, needed to address the retransmission through the AMF.
+    supi: String,
+    psi: u8,
+    /// The AMF callback authority to reach (from `smContextStatusUri`).
+    amf_uri: Option<String>,
+    attempts: u32,
+    deadline: std::time::Instant,
+}
+
+/// Armed 5GSM procedure timers, keyed by SM context reference.
+///
+/// One per context: TS 24.501 runs at most one network-requested 5GSM procedure
+/// per PDU session at a time, so a second armed timer for the same context would
+/// mean the SMF had started a procedure it should have queued.
+static GSM_PROCEDURE_TIMERS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, GsmProcedureTimer>>,
+> = std::sync::OnceLock::new();
+
+fn gsm_procedure_timers(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, GsmProcedureTimer>> {
+    GSM_PROCEDURE_TIMERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Arm T3591 / T3592 for `sm_context_ref` after sending `command`.
+fn arm_gsm_timer(
+    sm_context_ref: &str,
+    timer_id: timer::SmfTimerId,
+    command: &[u8],
+    supi: &str,
+    psi: u8,
+    amf_uri: Option<&str>,
+) {
+    let configs = timer::SmfTimerConfigs::default();
+    let duration = configs
+        .get(timer_id)
+        .map(|c| c.duration)
+        .unwrap_or_else(|| std::time::Duration::from_secs(16));
+    let entry = GsmProcedureTimer {
+        timer_id,
+        command: command.to_vec(),
+        supi: supi.to_string(),
+        psi,
+        amf_uri: amf_uri.map(str::to_string),
+        attempts: 0,
+        deadline: std::time::Instant::now() + duration,
+    };
+    if let Ok(mut timers) = gsm_procedure_timers().lock() {
+        if let Some(prev) = timers.insert(sm_context_ref.to_string(), entry) {
+            log::warn!(
+                "{} armed for ref={sm_context_ref} while {} was still running; \
+                 the previous procedure was abandoned",
+                timer_id.name(),
+                prev.timer_id.name()
+            );
+        }
+        log::info!(
+            "{} armed for ref={sm_context_ref} ({}s)",
+            timer_id.name(),
+            duration.as_secs()
+        );
+    }
+}
+
+/// Stop the armed timer for `sm_context_ref` when it matches `timer_id`.
+///
+/// Returns whether a matching timer was actually stopped, which is what lets a
+/// COMPLETE be distinguished from a duplicate or an unsolicited one.
+fn cancel_gsm_timer(sm_context_ref: &str, timer_id: timer::SmfTimerId) -> bool {
+    let Ok(mut timers) = gsm_procedure_timers().lock() else {
+        return false;
+    };
+    match timers.get(sm_context_ref) {
+        Some(entry) if entry.timer_id == timer_id => {
+            timers.remove(sm_context_ref);
+            log::info!("{} stopped for ref={sm_context_ref}", timer_id.name());
+            true
+        }
+        Some(entry) => {
+            log::warn!(
+                "ref={sm_context_ref} has {} armed, not {}; not stopping it",
+                entry.timer_id.name(),
+                timer_id.name()
+            );
+            false
+        }
+        None => {
+            log::debug!(
+                "No {} armed for ref={sm_context_ref} (duplicate or unsolicited COMPLETE)",
+                timer_id.name()
+            );
+            false
+        }
+    }
+}
+
+/// One expiry decision for an armed 5GSM timer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GsmTimerExpiry {
+    /// Resend the command; the timer has been re-armed for the next attempt.
+    Retransmit { attempt: u32 },
+    /// Retransmissions are exhausted; the timer has been dropped and the
+    /// procedure must be abandoned.
+    Exhausted,
+}
+
+/// Collect the timers due at `now`, advancing or dropping each.
+///
+/// Pure over the timer map so the retransmission decision is testable without
+/// waiting 16 seconds or driving the main loop: the caller does the sending.
+fn expire_gsm_timers(now: std::time::Instant) -> Vec<(String, GsmProcedureTimer, GsmTimerExpiry)> {
+    let Ok(mut timers) = gsm_procedure_timers().lock() else {
+        return Vec::new();
+    };
+    let configs = timer::SmfTimerConfigs::default();
+    let mut due = Vec::new();
+    let mut exhausted = Vec::new();
+    for (reference, entry) in timers.iter_mut() {
+        if entry.deadline > now {
+            continue;
+        }
+        let config = configs.get(entry.timer_id);
+        let max_count = config.map(|c| c.max_count).unwrap_or(4);
+        let duration = config
+            .map(|c| c.duration)
+            .unwrap_or_else(|| std::time::Duration::from_secs(16));
+        if entry.attempts < max_count {
+            entry.attempts += 1;
+            entry.deadline = now + duration;
+            due.push((
+                reference.clone(),
+                entry.clone(),
+                GsmTimerExpiry::Retransmit {
+                    attempt: entry.attempts,
+                },
+            ));
+        } else {
+            due.push((reference.clone(), entry.clone(), GsmTimerExpiry::Exhausted));
+            exhausted.push(reference.clone());
+        }
+    }
+    for reference in exhausted {
+        timers.remove(&reference);
+    }
+    due
+}
+
+/// Drive 5GSM timer expiry: retransmit what is due, abandon what is exhausted.
+///
+/// Called from the main loop tick.
+async fn run_gsm_timer_tick() {
+    for (sm_context_ref, entry, expiry) in expire_gsm_timers(std::time::Instant::now()) {
+        match expiry {
+            GsmTimerExpiry::Retransmit { attempt } => {
+                log::warn!(
+                    "{} expired for ref={sm_context_ref}; retransmitting the 5GSM \
+                     command (attempt {attempt})",
+                    entry.timer_id.name()
+                );
+                send_n1_n2_message_transfer(
+                    entry.amf_uri.as_deref(),
+                    &entry.supi,
+                    entry.psi,
+                    &entry.command,
+                )
+                .await;
+            }
+            GsmTimerExpiry::Exhausted => {
+                // TS 24.501 §6.3.2.2/§6.3.3: on the final expiry the network
+                // abandons the procedure. The UP resources were already released
+                // when the command was sent, so there is nothing to roll back —
+                // this is a log and a state settle, not a retry loop.
+                log::error!(
+                    "{} exhausted for ref={sm_context_ref}: the UE never answered \
+                     the 5GSM command; abandoning the procedure",
+                    entry.timer_id.name()
+                );
+            }
+        }
+    }
+}
+
+/// Send a 5GSM message to the UE via the AMF (Namf_Communication
+/// N1N2MessageTransfer, TS 29.518 §5.2.2.3.1).
+///
+/// The AMF authority comes from the `smContextStatusUri` it supplied at SM
+/// context create — the SMF has no other address for it, and an AMF that supplied
+/// no callback URI cannot be reached, so the transfer is skipped with a warning
+/// rather than guessed at.
+async fn send_n1_n2_message_transfer(amf_uri: Option<&str>, supi: &str, psi: u8, n1: &[u8]) {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::{SbiPart, SbiRequest as SReq};
+
+    let Some(uri) = amf_uri else {
+        log::warn!(
+            "No AMF callback URI for SUPI {supi} PSI {psi}: cannot transfer the \
+             5GSM message to the UE"
+        );
+        return;
+    };
+    let Some((host, port)) = policy::split_host_port(uri) else {
+        log::warn!("AMF URI '{uri}' is not a valid URI — skipping N1N2MessageTransfer");
+        return;
+    };
+
+    let path = format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages");
+    let body = serde_json::json!({
+        "n1MessageContainer": {
+            "n1MessageClass": "SM",
+            "n1MessageContent": { "contentId": "n1SmMsg" }
+        },
+        "pduSessionId": psi,
+    });
+    let request = SReq::post(&path)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(n1),
+        ));
+    let client = nextgcore_sbi::client::SbiClient::new(
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3)),
+    );
+    match client.send_request(request).await {
+        Ok(resp) => log::info!(
+            "N1N2MessageTransfer (SUPI {supi}, PSI {psi}, {} bytes) → {host}:{port}: status={}",
+            n1.len(),
+            resp.status
+        ),
+        Err(e) => log::warn!("N1N2MessageTransfer to {host}:{port} failed: {e}"),
+    }
+}
+
+/// The 5GSM message the UE sent, dispatched from the `n1SmMsg` container on
+/// `/modify`.
+///
+/// Returned rather than acted on inline so the decision is testable without an
+/// SBI request, a PCF or a UPF: `handle_n1_sm_message` maps bytes to intent, and
+/// the caller carries out the intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum N1SmIntent {
+    /// UE-requested release (TS 24.501 §6.4.3.3): answer with RELEASE COMMAND,
+    /// release the user plane, arm T3592.
+    ReleaseRequested { psi: u8, pti: u8, cause: Option<u8> },
+    /// UE-requested modification (§6.4.1.3): answer with MODIFICATION COMMAND,
+    /// arm T3591.
+    ModificationRequested { psi: u8, pti: u8 },
+    /// The UE completed a network-requested modification: stop T3591.
+    ModificationComplete,
+    /// The UE completed a network-requested release: stop T3592, drop the context.
+    ReleaseComplete,
+    /// 5GSM STATUS (§6.5): the UE reports an error condition.
+    Status { cause: Option<u8> },
+    /// A 5GSM message this SMF does not act on at this point in the session.
+    Unhandled { message_type: u8 },
+}
+
+/// Classify the 5GSM message in an `n1SmMsg` container.
+///
+/// `None` when the buffer is not a 5GSM message at all (wrong EPD or too short),
+/// which is a malformed request rather than an unhandled procedure.
+fn classify_n1_sm_message(n1: &[u8]) -> Option<N1SmIntent> {
+    let hdr = policy::parse_n1_sm_header(n1)?;
+    // The 5GSM cause, when present, is the octet after the header for the
+    // messages that carry it as a mandatory IE (TS 24.501 §8.3.x).
+    let cause = n1.get(4).copied();
+    Some(match hdr.message_type {
+        gsm_build::message_type::PDU_SESSION_RELEASE_REQUEST => N1SmIntent::ReleaseRequested {
+            psi: hdr.psi,
+            pti: hdr.pti,
+            cause,
+        },
+        gsm_build::message_type::PDU_SESSION_MODIFICATION_REQUEST => {
+            N1SmIntent::ModificationRequested {
+                psi: hdr.psi,
+                pti: hdr.pti,
+            }
+        }
+        gsm_build::message_type::PDU_SESSION_MODIFICATION_COMPLETE => {
+            N1SmIntent::ModificationComplete
+        }
+        gsm_build::message_type::PDU_SESSION_RELEASE_COMPLETE => N1SmIntent::ReleaseComplete,
+        gsm_build::message_type::GSM_STATUS => N1SmIntent::Status { cause },
+        other => N1SmIntent::Unhandled {
+            message_type: other,
+        },
+    })
+}
+
+/// Handle a `/modify` request whose payload is a UE-originated 5GSM message.
+///
+/// This is the gap the issue reports: the `/modify` handler branched only on
+/// `n2SmInfoType`, so a request carrying **only** an N1 container fell into the
+/// `upCnxState` branch and the 5GSM message was never decoded. A UE that released
+/// or modified a PDU session got a `{"upCnxState":"ACTIVATED"}` reply and the
+/// network never ran the procedure: the SMF context, the PFCP session and the
+/// gNB's N2 resources stayed allocated indefinitely.
+async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
+    let Some(intent) = classify_n1_sm_message(n1) else {
+        return problem_400(
+            "N1_SM_ERROR",
+            "n1SmMsg is not a 5GSM message (EPD is not 0x2E, or it is too short)",
+        );
+    };
+
+    let binding = lookup_policy_binding(sm_context_ref);
+    let Some(binding) = binding else {
+        log::warn!("N1 5GSM message for unknown SM context ref={sm_context_ref}");
+        return problem_404("CONTEXT_NOT_FOUND", "no such SM context");
+    };
+    let amf_uri = binding.sm_context_status_uri.clone();
+
+    match intent {
+        N1SmIntent::ReleaseRequested { psi, pti, cause } => {
+            log::info!(
+                "UE-requested PDU session release for ref={sm_context_ref} \
+                 (PSI={psi}, PTI={pti}, cause={cause:?})"
+            );
+            // Release the user plane first: the UE has asked to go away, so the
+            // UPF forwarding state and the IP are released before the command is
+            // acknowledged. The context itself lives until RELEASE COMPLETE so
+            // T3592 has something to key on.
+            release_user_plane(sm_context_ref).await;
+
+            let n1_cmd = policy::build_release_command(
+                psi,
+                pti,
+                cause.unwrap_or(policy::gsm_cause::REQUEST_REJECTED_UNSPECIFIED),
+            );
+            let n2_cmd = build_release_command_transfer();
+            arm_gsm_timer(
+                sm_context_ref,
+                timer::SmfTimerId::T3592,
+                &n1_cmd,
+                &binding.supi,
+                psi,
+                amf_uri.as_deref(),
+            );
+            sbi_response_with_n1_n2(
+                200,
+                serde_json::json!({ "n2SmInfoType": "PDU_RES_REL_CMD" }),
+                &n1_cmd,
+                &n2_cmd,
+            )
+        }
+
+        N1SmIntent::ModificationRequested { psi, pti } => {
+            log::info!(
+                "UE-requested PDU session modification for ref={sm_context_ref} \
+                 (PSI={psi}, PTI={pti})"
+            );
+            let n1_cmd = policy::build_modification_command(
+                psi,
+                pti,
+                binding.ambr_dl_bps,
+                binding.ambr_ul_bps,
+            );
+            arm_gsm_timer(
+                sm_context_ref,
+                timer::SmfTimerId::T3591,
+                &n1_cmd,
+                &binding.supi,
+                psi,
+                amf_uri.as_deref(),
+            );
+            let body = serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } });
+            sbi_response_with_n1(200, body, &n1_cmd)
+        }
+
+        N1SmIntent::ModificationComplete => {
+            cancel_gsm_timer(sm_context_ref, timer::SmfTimerId::T3591);
+            SbiResponse::with_status(204)
+        }
+
+        N1SmIntent::ReleaseComplete => {
+            cancel_gsm_timer(sm_context_ref, timer::SmfTimerId::T3592);
+            // The release procedure is finished: drop the context and tell the
+            // AMF, which is what the SMF-initiated release path also does.
+            let removed = smf_self().read().ok().and_then(|ctx| {
+                ctx.policy_bindings
+                    .write()
+                    .ok()
+                    .and_then(|mut b| b.remove(sm_context_ref))
+            });
+            if let Ok(context) = smf_self().read() {
+                if let Some(sess) = context.sess_find_by_sm_context_ref(sm_context_ref) {
+                    context.sess_remove(sess.id);
+                }
+            }
+            let status_uri = removed.and_then(|b| b.sm_context_status_uri);
+            send_sm_context_status_notification(status_uri.as_deref(), "RELEASED", None).await;
+            SbiResponse::with_status(204)
+        }
+
+        N1SmIntent::Status { cause } => {
+            log::warn!("5GSM STATUS from UE for ref={sm_context_ref}: cause={cause:?}");
+            SbiResponse::with_status(204)
+        }
+
+        N1SmIntent::Unhandled { message_type } => {
+            log::warn!(
+                "5GSM message type {message_type:#04x} in n1SmMsg for ref={sm_context_ref} \
+                 is not handled on /modify"
+            );
+            problem_400(
+                "N1_SM_ERROR",
+                &format!("unhandled 5GSM message type {message_type:#04x}"),
+            )
+        }
+    }
+}
+
+/// Release the user-plane resources for an SM context without removing the
+/// context itself: PFCP session deletion plus the PCF policy association.
+///
+/// Shared by the UE-initiated release path and reachable independently of the
+/// full `/release` handler, which additionally drops the context.
+async fn release_user_plane(sm_context_ref: &str) {
+    if let Some(binding) = lookup_policy_binding(sm_context_ref) {
+        if let Some(ref pol_id) = binding.sm_policy_id {
+            match policy::resolve_pcf_endpoint().await {
+                Some(pcf) => match policy::sm_policy_delete(&pcf, pol_id).await {
+                    Ok(()) => log::info!("SM policy association {pol_id} deleted at PCF"),
+                    Err(e) => log::warn!("SM policy delete failed: {e} (continuing release)"),
+                },
+                None => log::warn!("PCF unresolved — skipping SM policy delete"),
+            }
+        }
+    }
+    if let Some(seid) = lookup_upf_seid(sm_context_ref) {
+        match pfcp_session_delete(smf_n4_seid_for(sm_context_ref), seid).await {
+            Ok(()) => {
+                log::info!("PFCP session deleted for ref={sm_context_ref} on UE-requested release")
+            }
+            Err(e) => log::warn!("PFCP Session Deletion failed for ref={sm_context_ref}: {e}"),
+        }
+    }
+}
+
+/// The N2 `PDUSessionResourceReleaseCommandTransfer` (TS 38.413 §9.3.4.4) the AMF
+/// relays to the gNB so the radio and N3 resources are released too.
+fn build_release_command_transfer() -> Vec<u8> {
+    use nextgcore_ngap::transfer::PduSessionResourceReleaseCommandTransfer;
+    let transfer = PduSessionResourceReleaseCommandTransfer {
+        cause: nextgcore_ngap::types::Cause::Nas(
+            nextgcore_asn1c::ngap::cause::CauseNas::NormalRelease,
+        ),
+    };
+    transfer.encode().unwrap_or_else(|e| {
+        log::error!("Failed to encode PDUSessionResourceReleaseCommandTransfer: {e}");
+        Vec::new()
+    })
+}
+
+/// A 200 response carrying only an N1 SM message part.
+fn sbi_response_with_n1(
+    status: u16,
+    mut json_root: serde_json::Value,
+    n1_sm_msg: &[u8],
+) -> SbiResponse {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
+    json_root["n1SmMsg"] = serde_json::json!({ "contentId": "n1SmMsg" });
+    SbiResponse::with_status(status)
+        .with_body(json_root.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(n1_sm_msg),
+        ))
 }
 
 /// Build the SmContextStatusNotification body (TS 29.502 §6.1.6.2.8): a
@@ -3497,6 +4148,8 @@ mod tests {
             None,
             "internet",
             None,
+            &[],
+            None,
         );
         let n2 = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
 
@@ -3792,6 +4445,560 @@ mod tests {
         );
         assert_eq!(uri_path("/already/a/path"), "/already/a/path");
         assert_eq!(uri_path("https://amf:443"), "/");
+    }
+
+    // ==================================================================
+    // #77: UE-initiated N1 5GSM procedures, ePCO, SSC, DNN labels.
+    // ==================================================================
+
+    /// Seed a policy binding so the N1 handlers have a session to act on.
+    fn seed_binding(sm_context_ref: &str, psi: u8) {
+        smf_context_init(64, 256, 512);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                bindings.insert(
+                    sm_context_ref.to_string(),
+                    context::PolicyBinding {
+                        sm_policy_id: None,
+                        supi: "imsi-001010000000001".to_string(),
+                        psi,
+                        pti: 2,
+                        pdu_session_type: policy::pdu_session_type::IPV4,
+                        ssc_mode: 1,
+                        ue_ip: [10, 45, 0, 2],
+                        dnn: "internet".to_string(),
+                        qfi: 1,
+                        five_qi: 9,
+                        ambr_ul_bps: 100_000_000,
+                        ambr_dl_bps: 100_000_000,
+                        // No AMF callback URI: nothing to notify, and no
+                        // N1N2MessageTransfer is attempted.
+                        sm_context_status_uri: None,
+                        fsm: gsm_sm::GsmFsm::new(0),
+                    },
+                );
+            }
+        }
+    }
+
+    fn n1(psi: u8, pti: u8, message_type: u8, tail: &[u8]) -> Vec<u8> {
+        let mut m = vec![0x2E, psi, pti, message_type];
+        m.extend_from_slice(tail);
+        m
+    }
+
+    // ---- criteria 1 + 3: the 5GSM message is classified and dispatched ----
+
+    #[test]
+    fn n1_sm_messages_are_classified_by_their_5gsm_type() {
+        use gsm_build::message_type as mt;
+
+        assert_eq!(
+            classify_n1_sm_message(&n1(5, 2, mt::PDU_SESSION_RELEASE_REQUEST, &[36])),
+            Some(N1SmIntent::ReleaseRequested {
+                psi: 5,
+                pti: 2,
+                cause: Some(36)
+            })
+        );
+        assert_eq!(
+            classify_n1_sm_message(&n1(5, 2, mt::PDU_SESSION_MODIFICATION_REQUEST, &[])),
+            Some(N1SmIntent::ModificationRequested { psi: 5, pti: 2 })
+        );
+        assert_eq!(
+            classify_n1_sm_message(&n1(5, 2, mt::PDU_SESSION_MODIFICATION_COMPLETE, &[])),
+            Some(N1SmIntent::ModificationComplete)
+        );
+        assert_eq!(
+            classify_n1_sm_message(&n1(5, 2, mt::PDU_SESSION_RELEASE_COMPLETE, &[])),
+            Some(N1SmIntent::ReleaseComplete)
+        );
+        assert_eq!(
+            classify_n1_sm_message(&n1(5, 2, mt::GSM_STATUS, &[95])),
+            Some(N1SmIntent::Status { cause: Some(95) })
+        );
+        // A 5GSM message this SMF does not act on here is distinguished from a
+        // malformed one: the first is a 400 naming the type, the second a 400
+        // naming the container.
+        assert_eq!(
+            classify_n1_sm_message(&n1(5, 2, mt::PDU_SESSION_ESTABLISHMENT_ACCEPT, &[])),
+            Some(N1SmIntent::Unhandled {
+                message_type: mt::PDU_SESSION_ESTABLISHMENT_ACCEPT
+            })
+        );
+        // Not 5GSM at all (5GMM EPD 0x7E), and too short.
+        assert_eq!(classify_n1_sm_message(&[0x7E, 0x00, 0x41, 0x09]), None);
+        assert_eq!(classify_n1_sm_message(&[0x2E, 0x05]), None);
+    }
+
+    /// The whole point of the issue: a `/modify` body carrying ONLY an N1
+    /// container must run the 5GSM procedure, not fall through to `upCnxState`.
+    #[tokio::test]
+    async fn modify_with_only_an_n1_container_runs_the_release_procedure() {
+        let reference = "n77-release";
+        seed_binding(reference, 5);
+
+        let release_request = n1(
+            5,
+            2,
+            gsm_build::message_type::PDU_SESSION_RELEASE_REQUEST,
+            &[36],
+        );
+        let body = serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } });
+        let mut request = SbiRequest::post(format!(
+            "/nsmf-pdusession/v1/sm-contexts/{reference}/modify"
+        ));
+        request.http.content = Some(body.to_string());
+        request
+            .http
+            .parts
+            .push(nextgcore_sbi::message::SbiPart::with_content(
+                "n1SmMsg",
+                nextgcore_sbi::constants::content_type::APPLICATION_5GNAS,
+                bytes::Bytes::copy_from_slice(&release_request),
+            ));
+
+        // Routed through the real /modify handler, because the defect was in its
+        // dispatch: the N1 container was never reached.
+        let resp = handle_sm_context_update(reference, &request).await;
+        assert_eq!(resp.status, 200);
+
+        let root: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON");
+        assert_eq!(
+            root["n2SmInfoType"], "PDU_RES_REL_CMD",
+            "the release must also tell the AMF to release the gNB's N2 resources; \
+             got {root}"
+        );
+        assert_ne!(
+            root["upCnxState"], "ACTIVATED",
+            "the old handler answered a release request with an activation \
+             confirmation and ran no procedure at all"
+        );
+
+        // The N1 part is a PDU SESSION RELEASE COMMAND echoing the UE's PSI/PTI.
+        let n1_part = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("n1SmMsg part");
+        assert_eq!(n1_part.data[0], 0x2E, "5GSM EPD");
+        assert_eq!(n1_part.data[1], 5, "PSI echoed");
+        assert_eq!(n1_part.data[2], 2, "PTI echoed");
+        assert_eq!(
+            n1_part.data[3],
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND
+        );
+
+        // The N2 part decodes as a real release-command transfer.
+        let n2_part = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .expect("n2SmInfo part");
+        assert!(
+            nextgcore_ngap::transfer::PduSessionResourceReleaseCommandTransfer::decode(
+                &n2_part.data
+            )
+            .is_ok(),
+            "the N2 transfer must be decodable APER, not placeholder bytes"
+        );
+
+        // T3592 is now supervising the command, and RELEASE COMPLETE stops it.
+        assert!(
+            gsm_procedure_timers()
+                .lock()
+                .expect("timers")
+                .contains_key(reference),
+            "sending a RELEASE COMMAND must arm T3592"
+        );
+        assert!(cancel_gsm_timer(reference, timer::SmfTimerId::T3592));
+        assert!(!gsm_procedure_timers()
+            .lock()
+            .expect("timers")
+            .contains_key(reference));
+    }
+
+    #[tokio::test]
+    async fn modification_request_arms_t3591_and_complete_stops_it() {
+        let reference = "n77-modify";
+        seed_binding(reference, 7);
+
+        let resp = handle_n1_sm_message(
+            reference,
+            &n1(
+                7,
+                3,
+                gsm_build::message_type::PDU_SESSION_MODIFICATION_REQUEST,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let n1_part = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("n1SmMsg part");
+        assert_eq!(
+            n1_part.data[3],
+            gsm_build::message_type::PDU_SESSION_MODIFICATION_COMMAND
+        );
+        {
+            let timers = gsm_procedure_timers().lock().expect("timers");
+            assert_eq!(
+                timers.get(reference).map(|t| t.timer_id),
+                Some(timer::SmfTimerId::T3591)
+            );
+        }
+
+        // MODIFICATION COMPLETE settles the procedure with 204 and stops T3591.
+        let resp = handle_n1_sm_message(
+            reference,
+            &n1(
+                7,
+                3,
+                gsm_build::message_type::PDU_SESSION_MODIFICATION_COMPLETE,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+        assert!(
+            !gsm_procedure_timers()
+                .lock()
+                .expect("timers")
+                .contains_key(reference),
+            "MODIFICATION COMPLETE must stop T3591, or the SMF retransmits a \
+             command the UE already answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn n1_message_for_an_unknown_context_is_404_and_a_malformed_one_400() {
+        smf_context_init(64, 256, 512);
+        let resp = handle_n1_sm_message(
+            "n77-absent",
+            &n1(
+                1,
+                0,
+                gsm_build::message_type::PDU_SESSION_RELEASE_REQUEST,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 404);
+
+        let reference = "n77-malformed";
+        seed_binding(reference, 1);
+        // Not a 5GSM container at all: refused as malformed rather than silently
+        // ignored, which is what the old handler did to every N1 message.
+        let resp = handle_n1_sm_message(reference, &[0x7E, 0x00, 0x41, 0x09]).await;
+        assert_eq!(resp.status, 400);
+    }
+
+    // ---- criterion 4: T3591/T3592 retransmit and exhaust ----
+
+    #[test]
+    fn gsm_timers_retransmit_then_exhaust() {
+        let reference = "n77-timer";
+        // Clear any residue from another test using the same key.
+        gsm_procedure_timers()
+            .lock()
+            .expect("timers")
+            .remove(reference);
+
+        let command = n1(
+            9,
+            1,
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND,
+            &[36],
+        );
+        arm_gsm_timer(
+            reference,
+            timer::SmfTimerId::T3592,
+            &command,
+            "imsi-001010000000001",
+            9,
+            None,
+        );
+
+        // Nothing is due before the deadline.
+        assert!(expire_gsm_timers(std::time::Instant::now()).is_empty());
+
+        // TS 24.501 Table 10.3.2: 4 retransmissions, then the procedure is
+        // abandoned. Driven by advancing the clock rather than by sleeping 16 s
+        // per attempt.
+        let mut far_future = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        for attempt in 1..=4u32 {
+            let due = expire_gsm_timers(far_future);
+            let mine: Vec<_> = due.iter().filter(|(r, _, _)| r == reference).collect();
+            assert_eq!(mine.len(), 1, "attempt {attempt}: {due:?}");
+            assert_eq!(mine[0].2, GsmTimerExpiry::Retransmit { attempt });
+            assert_eq!(
+                mine[0].1.command, command,
+                "the retransmission must resend the SAME command bytes"
+            );
+            far_future += std::time::Duration::from_secs(3600);
+        }
+
+        let due = expire_gsm_timers(far_future);
+        let mine: Vec<_> = due.iter().filter(|(r, _, _)| r == reference).collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].2, GsmTimerExpiry::Exhausted);
+        assert!(
+            !gsm_procedure_timers()
+                .lock()
+                .expect("timers")
+                .contains_key(reference),
+            "an exhausted timer must be dropped, not left to fire forever"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_wrong_timer_id_does_not_stop_the_armed_one() {
+        let reference = "n77-timer-mismatch";
+        gsm_procedure_timers()
+            .lock()
+            .expect("timers")
+            .remove(reference);
+        arm_gsm_timer(
+            reference,
+            timer::SmfTimerId::T3592,
+            &[0x2E, 1, 0, 0xD3],
+            "imsi-001010000000001",
+            1,
+            None,
+        );
+        // A MODIFICATION COMPLETE must not stop a release timer: the two
+        // procedures are distinct, and cancelling the wrong one would leave the
+        // release unsupervised.
+        assert!(!cancel_gsm_timer(reference, timer::SmfTimerId::T3591));
+        assert!(gsm_procedure_timers()
+            .lock()
+            .expect("timers")
+            .contains_key(reference));
+        assert!(cancel_gsm_timer(reference, timer::SmfTimerId::T3592));
+        // A second cancel is a no-op, not a panic (duplicate COMPLETE).
+        assert!(!cancel_gsm_timer(reference, timer::SmfTimerId::T3592));
+    }
+
+    #[test]
+    fn gsm_timer_configs_match_ts_24_501_table_10_3_2() {
+        let configs = timer::SmfTimerConfigs::default();
+        for id in [timer::SmfTimerId::T3591, timer::SmfTimerId::T3592] {
+            let c = configs.get(id).expect("configured");
+            assert_eq!(c.duration, std::time::Duration::from_secs(16), "{id:?}");
+            assert_eq!(c.max_count, 4, "{id:?}");
+            assert!(id.is_gsm_timer());
+            assert!(!id.is_pfcp_timer(), "{id:?} is a NAS timer, not a PFCP one");
+        }
+    }
+
+    // ---- criterion 6: the SSC mode is authorised, not echoed ----
+
+    #[test]
+    fn ssc_mode_is_authorised_against_what_the_smf_implements() {
+        // Mode 1 is implemented.
+        assert_eq!(authorize_ssc_mode(1), Ok(1));
+        // Absent (0) means no preference: the SMF picks its lowest supported.
+        assert_eq!(authorize_ssc_mode(0), Ok(1));
+        // Modes 2 and 3 need PSA relocation, which this SMF does not implement.
+        // Echoing them — the old behaviour — promised continuity it cannot deliver.
+        assert_eq!(authorize_ssc_mode(2), Err(ALLOWED_SSC_MODE_BITMAP));
+        assert_eq!(authorize_ssc_mode(3), Err(ALLOWED_SSC_MODE_BITMAP));
+        // Out-of-range values are refused rather than passed through.
+        assert_eq!(authorize_ssc_mode(4), Err(ALLOWED_SSC_MODE_BITMAP));
+        assert_eq!(authorize_ssc_mode(7), Err(ALLOWED_SSC_MODE_BITMAP));
+    }
+
+    #[test]
+    fn ssc_reject_carries_cause_68_and_the_allowed_ssc_mode_ie() {
+        let resp = sm_context_create_ssc_error(5, 2, ALLOWED_SSC_MODE_BITMAP);
+        assert_eq!(resp.status, 403);
+        let n1_part = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("n1SmMsg part");
+        assert_eq!(n1_part.data[0], 0x2E);
+        assert_eq!(
+            n1_part.data[3],
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REJECT
+        );
+        assert_eq!(
+            n1_part.data[4],
+            policy::gsm_cause::NOT_SUPPORTED_SSC_MODE,
+            "5GSM cause #68"
+        );
+        // Allowed SSC mode is a type-1 IE: IEI nibble 0xF, bitmap in the low nibble.
+        let last = *n1_part.data.last().expect("non-empty");
+        assert_eq!(last >> 4, 0x0F);
+        assert_eq!(last & 0x07, ALLOWED_SSC_MODE_BITMAP);
+    }
+
+    // ---- criteria 5 + 7: the accept carries ePCO DNS and a labelled DNN ----
+
+    #[test]
+    fn establishment_accept_carries_the_configured_dns_in_an_epco_ie() {
+        let dns = [
+            std::net::Ipv4Addr::new(8, 8, 8, 8),
+            std::net::Ipv4Addr::new(8, 8, 4, 4),
+        ];
+        let accept = policy::build_establishment_accept(
+            5,
+            2,
+            policy::pdu_session_type::IPV4,
+            1,
+            1,
+            9,
+            100_000_000,
+            100_000_000,
+            [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            None,
+            "internet",
+            None,
+            &dns,
+            Some(1400),
+        );
+
+        // The ePCO IE (0x7B) must be present with a two-octet TLV-E length.
+        let epco_at = accept
+            .windows(1)
+            .position(|w| w == [0x7B])
+            .expect("ePCO IE present in the accept");
+        let len = u16::from_be_bytes([accept[epco_at + 1], accept[epco_at + 2]]) as usize;
+        let epco = &accept[epco_at + 3..epco_at + 3 + len];
+        assert_eq!(epco[0], 0x80, "ePCO configuration protocol");
+
+        // Both DNS addresses appear as 0x000D containers, and the MTU as 0x0010.
+        for addr in dns {
+            let needle = [
+                0x00,
+                0x0D,
+                4,
+                addr.octets()[0],
+                addr.octets()[1],
+                addr.octets()[2],
+                addr.octets()[3],
+            ];
+            assert!(
+                epco.windows(needle.len()).any(|w| w == needle),
+                "DNS {addr} must be signalled in the ePCO: {epco:02x?}"
+            );
+        }
+        assert!(
+            epco.windows(5).any(|w| w == [0x00, 0x10, 2, 0x05, 0x78]),
+            "the 1400-byte link MTU must be signalled: {epco:02x?}"
+        );
+
+        // With nothing configured, no ePCO IE is emitted — the previous behaviour,
+        // so a deployment that configures no DNS is unchanged.
+        let bare = policy::build_establishment_accept(
+            5,
+            2,
+            policy::pdu_session_type::IPV4,
+            1,
+            1,
+            9,
+            100_000_000,
+            100_000_000,
+            [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            None,
+            "internet",
+            None,
+            &[],
+            None,
+        );
+        assert!(
+            !bare.contains(&0x7B),
+            "no DNS and no MTU configured must emit no ePCO IE"
+        );
+    }
+
+    #[test]
+    fn a_multi_label_dnn_is_encoded_as_length_prefixed_labels() {
+        // The bug: one label whose length octet covered the whole string, dots
+        // included. Single-label DNNs encode identically either way, which is why
+        // it survived.
+        assert_eq!(
+            policy::encode_dnn_labels("internet"),
+            vec![8, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't']
+        );
+
+        let labelled = policy::encode_dnn_labels("internet.mnc001.mcc001.gprs");
+        assert_eq!(labelled[0], 8, "first label length");
+        assert_eq!(&labelled[1..9], b"internet");
+        assert_eq!(labelled[9], 6, "mnc001");
+        assert_eq!(&labelled[10..16], b"mnc001");
+        assert_eq!(labelled[16], 6, "mcc001");
+        assert_eq!(labelled[23], 4, "gprs");
+        assert!(
+            !labelled.contains(&b'.'),
+            "no dot may survive into the encoded name: {labelled:02x?}"
+        );
+
+        // Must agree byte-for-byte with the N4 APN/DNN encoder, which already did
+        // this correctly — the two name the same DNN to the UPF and to the UE.
+        let mut n4 = nextgcore_smfd_n4_dnn("internet.mnc001.mcc001.gprs");
+        assert_eq!(labelled, n4, "the N1 and N4 DNN encodings must agree");
+        n4 = nextgcore_smfd_n4_dnn("internet");
+        assert_eq!(policy::encode_dnn_labels("internet"), n4);
+
+        // Empty labels (leading/trailing/doubled dots) are skipped rather than
+        // encoded as a zero length octet, which would terminate the name early.
+        assert_eq!(
+            policy::encode_dnn_labels(".internet..gprs."),
+            policy::encode_dnn_labels("internet.gprs")
+        );
+        assert!(policy::encode_dnn_labels("").is_empty());
+    }
+
+    /// The N4 APN/DNN encoding, extracted from a built PFCP IE so the comparison
+    /// above is against what `add_apn_dnn` actually emits rather than a
+    /// re-implementation of it.
+    fn nextgcore_smfd_n4_dnn(dnn: &str) -> Vec<u8> {
+        let mut builder = n4_build::PfcpMessageBuilder::new();
+        builder.add_apn_dnn(dnn);
+        let ie = builder.build();
+        // TLV: 2-octet type, 2-octet length, then the value.
+        let len = u16::from_be_bytes([ie[2], ie[3]]) as usize;
+        ie[4..4 + len].to_vec()
+    }
+
+    #[test]
+    fn smf_yaml_dns_and_mtu_are_parsed() {
+        // The shipped docker config has declared these all along; nothing read
+        // them, so the UE received no DNS configuration.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("n77-smf-{}.yaml", std::process::id()));
+        std::fs::write(
+            &path,
+            "smf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: 7777\n\
+             \x20 dns:\n    - 8.8.8.8\n    - 2001:4860:4860::8888\n    - 8.8.4.4\n  mtu: 1400\n",
+        )
+        .expect("write config");
+        let config = load_config(path.to_str().expect("path"));
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            config.dns_servers,
+            vec![
+                std::net::Ipv4Addr::new(8, 8, 8, 8),
+                std::net::Ipv4Addr::new(8, 8, 4, 4)
+            ],
+            "the IPv4 entries are taken in order; the IPv6 one is skipped rather \
+             than failing the whole parse"
+        );
+        assert_eq!(config.mtu, Some(1400));
     }
 }
 

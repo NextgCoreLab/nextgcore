@@ -25,6 +25,10 @@ compute-aware-upf = []
 nextgcore-core = { workspace = true }
 nextgcore-nas = { workspace = true }
 nextgcore-ngap = { workspace = true }
+# For the NGAP `Cause` CHOICE carried in the N2 release-command transfer
+# (already a transitive dependency via nextgcore-ngap; peers such as amfd depend
+# on it directly for the same reason).
+nextgcore-asn1c = { workspace = true }
 nextgcore-pfcp = { workspace = true }
 nextgcore-gtp = { workspace = true }
 nextgcore-sbi = { workspace = true }

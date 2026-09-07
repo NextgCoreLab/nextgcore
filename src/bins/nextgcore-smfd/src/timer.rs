@@ -23,6 +23,14 @@ pub enum SmfTimerId {
     PfcpNoEstablishmentResponse,
     /// PFCP no deletion response timer
     PfcpNoDeletionResponse,
+    /// T3591 — network-requested PDU session modification (TS 24.501 §6.3.2.2).
+    /// Armed when a PDU SESSION MODIFICATION COMMAND is sent, stopped on
+    /// MODIFICATION COMPLETE (or COMMAND REJECT), retransmitted on expiry.
+    T3591,
+    /// T3592 — network-requested PDU session release (TS 24.501 §6.3.3).
+    /// Armed when a PDU SESSION RELEASE COMMAND is sent, stopped on RELEASE
+    /// COMPLETE, retransmitted on expiry.
+    T3592,
 }
 
 impl SmfTimerId {
@@ -33,6 +41,26 @@ impl SmfTimerId {
             Self::PfcpNoHeartbeat => "SMF_TIMER_PFCP_NO_HEARTBEAT",
             Self::PfcpNoEstablishmentResponse => "SMF_TIMER_PFCP_NO_ESTABLISHMENT_RESPONSE",
             Self::PfcpNoDeletionResponse => "SMF_TIMER_PFCP_NO_DELETION_RESPONSE",
+            Self::T3591 => "SMF_TIMER_T3591",
+            Self::T3592 => "SMF_TIMER_T3592",
+        }
+    }
+
+    /// Is this a 5GSM procedure timer (TS 24.501 Table 10.3.2)?
+    ///
+    /// Distinguished from the PFCP timers because the two families have different
+    /// owners: a PFCP timer supervises an N4 transaction, a 5GSM timer supervises
+    /// a NAS procedure with the UE and its retransmission goes out over N1/N2.
+    pub fn is_gsm_timer(&self) -> bool {
+        matches!(self, Self::T3591 | Self::T3592)
+    }
+
+    /// Default duration and retransmission count (TS 24.501 Table 10.3.2: both
+    /// T3591 and T3592 are 16 s with 4 further attempts).
+    pub fn gsm_timer_config(&self) -> Option<TimerConfig> {
+        match self {
+            Self::T3591 | Self::T3592 => Some(TimerConfig::new(4, 16)),
+            _ => None,
         }
     }
 
@@ -104,6 +132,10 @@ pub struct SmfTimerConfigs {
     pub pfcp_no_establishment_response: TimerConfig,
     /// PFCP no deletion response configuration
     pub pfcp_no_deletion_response: TimerConfig,
+    /// T3591 — network-requested PDU session modification (TS 24.501 §6.3.2.2)
+    pub t3591: TimerConfig,
+    /// T3592 — network-requested PDU session release (TS 24.501 §6.3.3)
+    pub t3592: TimerConfig,
 }
 
 impl Default for SmfTimerConfigs {
@@ -120,6 +152,9 @@ impl Default for SmfTimerConfigs {
             pfcp_no_establishment_response: TimerConfig::new(3, 3),
             // PFCP no deletion response: T1=3s, N1=3
             pfcp_no_deletion_response: TimerConfig::new(3, 3),
+            // 5GSM procedure timers (TS 24.501 Table 10.3.2): 16 s, 4 retries.
+            t3591: TimerConfig::new(4, 16),
+            t3592: TimerConfig::new(4, 16),
         }
     }
 }
@@ -132,6 +167,8 @@ impl SmfTimerConfigs {
             SmfTimerId::PfcpNoHeartbeat => Some(&self.pfcp_no_heartbeat),
             SmfTimerId::PfcpNoEstablishmentResponse => Some(&self.pfcp_no_establishment_response),
             SmfTimerId::PfcpNoDeletionResponse => Some(&self.pfcp_no_deletion_response),
+            SmfTimerId::T3591 => Some(&self.t3591),
+            SmfTimerId::T3592 => Some(&self.t3592),
         }
     }
 }

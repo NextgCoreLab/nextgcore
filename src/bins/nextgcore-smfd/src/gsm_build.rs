@@ -781,9 +781,11 @@ pub fn build_pdu_session_establishment_accept(
     let qos_desc_bytes = encode_qos_flow_descriptions(&[default_desc]);
     builder.write_tlv_e(0x79, &qos_desc_bytes);
 
-    // DNN (optional, IEI = 0x25)
+    // DNN (optional, IEI = 0x25). Labelled-name form, same encoder the live
+    // accept path uses — a single label with dots inline is malformed for any
+    // multi-label DNN (TS 24.501 §9.11.2.1B).
     if let Some(ref dnn) = sess.session_name {
-        builder.write_tlv(0x25, dnn.as_bytes());
+        builder.write_tlv(0x25, &crate::policy::encode_dnn_labels(dnn));
     }
 
     Some(builder.build())
@@ -989,16 +991,18 @@ pub fn build_pdu_session_establishment_accept_extended(
         }
     }
 
-    // DNN (optional, IEI = 0x25)
+    // DNN (optional, IEI = 0x25). Labelled-name form, same encoder the live
+    // accept path uses — a single label with dots inline is malformed for any
+    // multi-label DNN (TS 24.501 §9.11.2.1B).
     if let Some(ref dnn) = sess.session_name {
-        builder.write_tlv(0x25, dnn.as_bytes());
+        builder.write_tlv(0x25, &crate::policy::encode_dnn_labels(dnn));
     }
 
     Some(builder.build())
 }
 
 /// Build Extended Protocol Configuration Options (ePCO) for establishment accept
-fn build_epco(dns_servers: &[std::net::Ipv4Addr], mtu: Option<u16>) -> Vec<u8> {
+pub(crate) fn build_epco(dns_servers: &[std::net::Ipv4Addr], mtu: Option<u16>) -> Vec<u8> {
     let mut buffer = BytesMut::with_capacity(64);
 
     // Configuration protocol byte (0x80 = PPP with extensions)
