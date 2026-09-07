@@ -1142,6 +1142,67 @@ pub fn build_pdu_session_resource_notify(msg: &PduSessionResourceNotify) -> Ngap
 }
 
 // ============================================================================
+// RAN Status Transfer Procedures (Sections 8.4.7 / 8.4.8)
+// ============================================================================
+
+/// Build the IE container shared by Uplink and Downlink RAN Status Transfer.
+///
+/// The two messages carry the identical three mandatory IEs, all `reject`
+/// criticality, so the container is built once.
+fn ran_status_transfer_container(msg: &RanStatusTransfer) -> NgapResult<ProtocolIeContainer> {
+    if msg.container.is_empty() {
+        return Err(crate::error::NgapError::EncodingError(
+            "RANStatusTransfer-TransparentContainer is mandatory and must not be empty".to_string(),
+        ));
+    }
+
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory, reject)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory, reject)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: RANStatusTransfer-TransparentContainer (mandatory, reject) — relayed
+    // verbatim; see `RanStatusTransfer::container`.
+    ie::encode_verbatim_ie(
+        &mut container,
+        ie::IE_ID_RAN_STATUS_TRANSFER_TRANSPARENT_CONTAINER,
+        Criticality::Reject,
+        &msg.container,
+    )?;
+
+    Ok(container)
+}
+
+/// Build an UPLINK RAN STATUS TRANSFER PDU (TS 38.413 Section 8.4.7).
+///
+/// gNB -> AMF in production; provided so a test (or a simulated source gNB) can
+/// produce a conformant PDU for the AMF's relay path to consume.
+pub fn build_uplink_ran_status_transfer(msg: &RanStatusTransfer) -> NgapResult<Vec<u8>> {
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::UPLINK_RAN_STATUS_TRANSFER,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(ran_status_transfer_container(msg)?),
+    });
+    encode_pdu(&pdu)
+}
+
+/// Build a DOWNLINK RAN STATUS TRANSFER PDU (TS 38.413 Section 8.4.8).
+///
+/// AMF -> target gNB: the relayed PDCP status the target needs to resume the
+/// DRBs without loss.
+pub fn build_downlink_ran_status_transfer(msg: &RanStatusTransfer) -> NgapResult<Vec<u8>> {
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::DOWNLINK_RAN_STATUS_TRANSFER,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(ran_status_transfer_container(msg)?),
+    });
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
 // PDU Session Resource Modify Indication Procedure (Section 8.2.4)
 // ============================================================================
 

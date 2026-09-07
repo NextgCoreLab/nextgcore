@@ -1105,6 +1105,35 @@ pub struct PduSessionResourceNotifyItem {
     pub transfer: Vec<u8>,
 }
 
+/// RAN Status Transfer, both directions (TS 38.413 Sections 8.4.7 / 8.4.8).
+///
+/// `UplinkRANStatusTransferIEs` and `DownlinkRANStatusTransferIEs` are the
+/// **same three mandatory IEs** — AMF-UE-NGAP-ID, RAN-UE-NGAP-ID and the
+/// RANStatusTransfer-TransparentContainer — so one type serves both. That is not
+/// a shortcut: the AMF's whole job in this procedure is to hand the source gNB's
+/// container to the target unchanged, and a single type makes the relay
+/// impossible to get wrong by re-encoding.
+#[derive(Debug, Clone)]
+pub struct RanStatusTransfer {
+    /// AMF UE NGAP ID (AMF-scoped, so identical on both legs)
+    pub amf_ue_ngap_id: u64,
+    /// RAN UE NGAP ID — the *source* gNB's on the uplink leg, the *target* gNB's
+    /// on the downlink leg
+    pub ran_ue_ngap_id: u32,
+    /// RANStatusTransfer-TransparentContainer as the **APER-encoded IE value
+    /// bytes exactly as received**, not a decoded structure.
+    ///
+    /// It holds the per-DRB PDCP sequence-number and HFN status the target needs
+    /// for lossless handover (TS 38.413 Section 9.3.1.31). Unlike the handover
+    /// transparent containers, this one is an ASN.1 `SEQUENCE`, not an `OCTET
+    /// STRING` — so it is kept as the raw IE value and re-emitted byte-for-byte
+    /// rather than decoded and re-encoded. The AMF is a relay here: a
+    /// decode/re-encode round trip would give it a way to corrupt state it has no
+    /// stake in, and buys nothing, since the IE value encoding is identical in
+    /// both directions.
+    pub container: Vec<u8>,
+}
+
 /// PDU Session Resource Modify Indication - sent by gNB to AMF (TS 38.413 Section 8.2.4)
 #[derive(Debug, Clone)]
 pub struct PduSessionResourceModifyIndication {

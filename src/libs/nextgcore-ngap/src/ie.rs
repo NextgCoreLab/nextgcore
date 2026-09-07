@@ -357,6 +357,37 @@ pub fn decode_raw_octet_ie(field: &ProtocolIeField) -> NgapResult<Vec<u8>> {
     Ok(decoder.decode_octet_string(None, None)?)
 }
 
+/// `id-RANStatusTransfer-TransparentContainer` (TS 38.413: `ProtocolIE-ID ::=
+/// 84`, criticality `reject`).
+pub const IE_ID_RAN_STATUS_TRANSFER_TRANSPARENT_CONTAINER: u16 = 84;
+
+/// Push an IE whose value is **already APER-encoded**, verbatim.
+///
+/// For an IE the local node relays rather than originates. Copying the encoded
+/// value is not a shortcut around writing a codec: it is the only way to
+/// guarantee the relayed IE is bit-identical to the one received, which is what
+/// a transparent container means. A decode/re-encode round trip through a partial
+/// model would silently drop any extension the peer sent and that this build does
+/// not know about.
+pub fn encode_verbatim_ie(
+    container: &mut ProtocolIeContainer,
+    ie_id: u16,
+    criticality: Criticality,
+    encoded_value: &[u8],
+) -> NgapResult<()> {
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(ie_id),
+        criticality,
+        value: encoded_value.to_vec(),
+    });
+    Ok(())
+}
+
+/// The APER-encoded value bytes of an IE field, for relaying it verbatim.
+pub fn decode_verbatim_ie(field: &ProtocolIeField) -> Vec<u8> {
+    field.value.clone()
+}
+
 /// Encode a GUAMI to raw bytes for an IE
 pub fn encode_guami_ie(container: &mut ProtocolIeContainer, guami: &Guami) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();

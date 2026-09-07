@@ -1055,4 +1055,105 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 3];
         assert!(parser::decode_ngap_pdu(truncated).is_err());
     }
+
+    // ========================================================================
+    // RAN Status Transfer (TS 38.413 Sections 8.4.7 / 8.4.8)
+    // ========================================================================
+
+    /// A synthetic RANStatusTransfer-TransparentContainer. Its content is
+    /// deliberately opaque here: the point of the procedure is that the AMF
+    /// relays these bytes without understanding them.
+    fn sample_status_container() -> Vec<u8> {
+        vec![0x00, 0x01, 0xde, 0xad, 0xbe, 0xef, 0x42, 0x00, 0x7f]
+    }
+
+    #[test]
+    fn test_ran_status_transfer_roundtrip_both_directions() {
+        let msg = types::RanStatusTransfer {
+            amf_ue_ngap_id: 0x0102_0304,
+            ran_ue_ngap_id: 0x0a0b_0c0d,
+            container: sample_status_container(),
+        };
+
+        // Uplink leg (source gNB -> AMF).
+        let uplink = builder::build_uplink_ran_status_transfer(&msg).unwrap();
+        let decoded = match parser::decode_ngap_pdu(&uplink).unwrap() {
+            NgapMessage::UplinkRanStatusTransfer(t) => t,
+            other => panic!("Expected UplinkRanStatusTransfer, got {other:?}"),
+        };
+        assert_eq!(decoded.amf_ue_ngap_id, msg.amf_ue_ngap_id);
+        assert_eq!(decoded.ran_ue_ngap_id, msg.ran_ue_ngap_id);
+        assert_eq!(
+            decoded.container, msg.container,
+            "the transparent container must survive the round trip byte-for-byte; \
+             a relay that mutates it corrupts the target's PDCP state"
+        );
+
+        // Downlink leg (AMF -> target gNB), built from what the uplink decoded to
+        // — which is exactly what the AMF's relay does.
+        let downlink = builder::build_downlink_ran_status_transfer(&decoded).unwrap();
+        let relayed = match parser::decode_ngap_pdu(&downlink).unwrap() {
+            NgapMessage::DownlinkRanStatusTransfer(t) => t,
+            other => panic!("Expected DownlinkRanStatusTransfer, got {other:?}"),
+        };
+        assert_eq!(relayed.amf_ue_ngap_id, msg.amf_ue_ngap_id);
+        assert_eq!(relayed.ran_ue_ngap_id, msg.ran_ue_ngap_id);
+        assert_eq!(relayed.container, msg.container);
+
+        // The two directions are DIFFERENT procedures and must not be
+        // interchangeable on the wire, or a relayed status transfer would come
+        // back to the AMF instead of reaching the gNB.
+        assert_ne!(
+            uplink[1], downlink[1],
+            "uplink (49) and downlink (7) must carry different procedure codes"
+        );
+        assert_eq!(uplink[1], 49, "id-UplinkRANStatusTransfer");
+        assert_eq!(downlink[1], 7, "id-DownlinkRANStatusTransfer");
+    }
+
+    #[test]
+    fn test_ran_status_transfer_rejects_a_missing_mandatory_ie() {
+        // An empty container is refused at build time: all three IEs are
+        // mandatory, and emitting a status transfer with no PDCP status would
+        // point the target at a bearer it knows nothing about.
+        let empty = types::RanStatusTransfer {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            container: Vec::new(),
+        };
+        assert!(builder::build_uplink_ran_status_transfer(&empty).is_err());
+        assert!(builder::build_downlink_ran_status_transfer(&empty).is_err());
+
+        // A PDU relabelled as a RAN status transfer while carrying another
+        // procedure's IEs is refused.
+        //
+        // NOTE on what this does and does NOT pin: it is refused by the
+        // unknown-IE handling (the NAS-PDU and UserLocationInformation IEs are
+        // `reject` criticality and are not members of the RAN-status IE set), not
+        // by the missing-container check in `parse_ran_status_transfer`. That
+        // check is genuinely not independently assertable: every container
+        // constructible through this crate's public builders either carries the
+        // transparent container or carries foreign IEs that trip unknown-IE
+        // rejection first. Defence in depth, recorded rather than papered over.
+        let ies_only_uplink = builder::build_uplink_nas_transport(&types::UplinkNasTransport {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            nas_pdu: vec![0x7e, 0x00],
+            user_location_info: types::UserLocationInformation::Nr {
+                nr_cgi_plmn: [0x00, 0xf1, 0x10],
+                nr_cell_identity: 1,
+                tai_plmn: [0x00, 0xf1, 0x10],
+                tai_tac: [0x00, 0x00, 0x01],
+            },
+        })
+        .unwrap();
+        // Re-label it as procedure 49 so the RAN-status parser sees a container
+        // that carries the UE ids but no transparent container.
+        let mut mislabelled = ies_only_uplink.clone();
+        mislabelled[1] = 49;
+        assert!(
+            parser::decode_ngap_pdu(&mislabelled).is_err(),
+            "a RAN status transfer without its transparent container must not decode"
+        );
+    }
 }
