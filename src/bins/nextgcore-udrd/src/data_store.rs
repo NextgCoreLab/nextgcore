@@ -833,6 +833,21 @@ pub fn init_store(state_path: Option<PathBuf>) -> bool {
 // Helpers: URI handling, RFC 7396 merge-patch, notification dispatch
 // ---------------------------------------------------------------------------
 
+/// Strip the TS 29.571 `Pei` type prefix, returning the bare equipment-identity
+/// digits.
+///
+/// A `Pei` is `imei-<15 digits>` OR `imeisv-<16 digits>` -- both forms are
+/// valid and the AMF emits whichever the UE actually reported. Stripping only
+/// `imeisv-` leaves an `imei-` value stored with its prefix intact, so the
+/// persisted identity becomes the literal `"imei-35..."` rather than digits.
+/// Order matters: `imeisv-` must be tried first, since `imei` is a prefix of it
+/// only up to the `s`, and an unprefixed value is passed through unchanged.
+pub fn imeisv_from_pei(pei: &str) -> &str {
+    pei.strip_prefix("imeisv-")
+        .or_else(|| pei.strip_prefix("imei-"))
+        .unwrap_or(pei)
+}
+
 /// RFC 7396 JSON merge-patch applied in place.
 pub fn merge_patch(target: &mut Value, patch: &Value) {
     if let Value::Object(patch_obj) = patch {
@@ -1541,5 +1556,33 @@ mod tests {
             t.policy_ue_get("imsi-1"),
             Some(json!({"subscPolicySections": {}}))
         );
+    }
+
+    /// A `Pei` is `imei-<15>` OR `imeisv-<16>`. Stripping only `imeisv-`
+    /// persisted the literal `"imei-35..."` as the equipment identity once the
+    /// AMF started emitting the correct prefix for a 15-digit IMEI (#73
+    /// criterion 4).
+    #[test]
+    fn imeisv_from_pei_strips_either_pei_prefix() {
+        assert_eq!(
+            imeisv_from_pei("imeisv-1234567890123456"),
+            "1234567890123456"
+        );
+        assert_eq!(imeisv_from_pei("imei-123456789012345"), "123456789012345");
+        // Already-bare digits and unknown forms pass through unchanged.
+        assert_eq!(imeisv_from_pei("123456789012345"), "123456789012345");
+        assert_eq!(imeisv_from_pei(""), "");
+        // No output ever retains a prefix.
+        for pei in [
+            "imeisv-1234567890123456",
+            "imei-123456789012345",
+            "123456789012345",
+        ] {
+            let out = imeisv_from_pei(pei);
+            assert!(
+                out.bytes().all(|b| b.is_ascii_digit()),
+                "{pei} -> {out} kept a non-digit"
+            );
+        }
     }
 }

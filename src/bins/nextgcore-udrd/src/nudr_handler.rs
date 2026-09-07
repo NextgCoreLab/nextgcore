@@ -261,12 +261,9 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                                 {
                                     if let Some(pei) = reg_data.get("pei").and_then(|v| v.as_str())
                                     {
-                                        // PEI format: "imeisv-XXXXXXXXXXXXXXXX"
-                                        let imeisv = if pei.starts_with("imeisv-") {
-                                            &pei[7..]
-                                        } else {
-                                            pei
-                                        };
+                                        // Pei is imei-<15> OR imeisv-<16>;
+                                        // strip whichever prefix is present.
+                                        let imeisv = crate::data_store::imeisv_from_pei(pei);
                                         if let Err(e) =
                                             nextgcore_dbi::subscription::nextgcore_dbi_update_imeisv(
                                                 supi, imeisv,
