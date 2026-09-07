@@ -2009,10 +2009,29 @@ impl NgapServer {
 
         // SUPI (from AUSF) and key hierarchy:
         // KSEAF -> KAMF (A.7) -> KNASint/KNASenc (A.8)
-        let supi = confirm
-            .supi
-            .clone()
-            .unwrap_or_else(|| supi_from_suci(&state.suci));
+        //
+        // Fail-closed SUPI resolution (TS 33.501 Section 6.1.3): when the AUSF
+        // omits the SUPI we may only fall back to the SUCI if that SUCI is
+        // null-scheme, i.e. actually carries the MSIN in cleartext. For an
+        // ECIES-protected SUCI there is no SUPI to recover here, and deriving
+        // KAMF under a fabricated identity would key the whole NAS security
+        // context to the wrong subscriber. Reject the registration instead --
+        // same reasoning as the NIA selection below.
+        let Some(supi) = confirm.supi.clone().or_else(|| supi_from_suci(&state.suci)) else {
+            log::error!(
+                "UE {amf_ue_ngap_id}: AUSF returned no SUPI and the SUCI is not null-scheme, \
+                 so no SUPI can be recovered; rejecting registration rather than deriving \
+                 KAMF under a fabricated identity (TS 33.501 Section 6.1.3 fail-closed)"
+            );
+            let reject =
+                gmm_build::build_registration_reject(GmmCause::SecurityModeRejectedUnspecified);
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                .await?;
+            return Ok(());
+        };
         state.amf_ue.supi = Some(supi.clone());
 
         let abba_len = state.amf_ue.abba_len as usize;
@@ -2258,10 +2277,22 @@ impl NgapServer {
                 }
             }
             t if t == mobile_identity_type::IMEISV || t == mobile_identity_type::IMEI => {
-                let pei = decode_bcd_digits(&content[1..]);
-                log::info!("Identity Response: PEI {pei}");
-                state.amf_ue.pei = Some(format!("imeisv-{pei}"));
-                state.amf_ue.imeisv = Some(pei);
+                match decode_pei(content) {
+                    Some((pei, digits)) => {
+                        log::info!("Identity Response: PEI {pei}");
+                        state.amf_ue.pei = Some(pei);
+                        state.amf_ue.imeisv = Some(digits);
+                    }
+                    None => {
+                        // Record no PEI rather than one that breaks the
+                        // TS 29.571 `Pei` pattern downstream.
+                        log::error!(
+                            "Identity Response: malformed IMEI/IMEISV (type {id_type}, {} octets); \
+                             no PEI recorded",
+                            content.len()
+                        );
+                    }
+                }
                 if state.pei_requested {
                     state.pei_requested = false;
                     self.complete_registration(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
@@ -2404,10 +2435,20 @@ impl NgapServer {
                     if len > 0 && pos + 3 + len <= nas.len() {
                         let content = &nas[pos + 3..pos + 3 + len];
                         if content[0] & 0x07 == mobile_identity_type::IMEISV {
-                            let imeisv = decode_bcd_digits(&content[1..]);
-                            log::info!("IMEISV from Security Mode Complete: {imeisv}");
-                            state.amf_ue.imeisv = Some(imeisv.clone());
-                            state.amf_ue.pei = Some(format!("imeisv-{imeisv}"));
+                            match decode_pei(content) {
+                                Some((pei, digits)) => {
+                                    log::info!("IMEISV from Security Mode Complete: {digits}");
+                                    state.amf_ue.imeisv = Some(digits);
+                                    state.amf_ue.pei = Some(pei);
+                                }
+                                None => {
+                                    log::error!(
+                                        "Security Mode Complete: malformed IMEISV ({} octets); \
+                                         no PEI recorded",
+                                        content.len()
+                                    );
+                                }
+                            }
                         }
                     }
                     break;
@@ -2453,11 +2494,29 @@ impl NgapServer {
             return Ok(());
         };
 
-        let supi = state
+        // The authentication path always sets `supi`; this fallback only fires
+        // if registration completed without it. Same fail-closed rule as there:
+        // never register a UECM context or fetch subscription data under a SUPI
+        // derived from a protected SUCI (TS 33.501 Section 6.1.3).
+        let Some(supi) = state
             .amf_ue
             .supi
             .clone()
-            .unwrap_or_else(|| supi_from_suci(&state.suci));
+            .or_else(|| supi_from_suci(&state.suci))
+        else {
+            log::error!(
+                "UE {amf_ue_ngap_id}: no SUPI available and the SUCI is not null-scheme; \
+                 rejecting registration rather than registering a fabricated subscriber"
+            );
+            let reject =
+                gmm_build::build_registration_reject(GmmCause::SecurityModeRejectedUnspecified);
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                .await?;
+            return Ok(());
+        };
 
         let (serving_mcc, serving_mnc) = plmn_mcc_mnc_strings(&state.amf_ue.nr_tai.plmn_id);
 
@@ -5980,15 +6039,109 @@ fn encode_hex_lower(data: &[u8]) -> String {
     s
 }
 
-/// Derive a SUPI string from a null-scheme SUCI
-/// ("suci-0-mcc-mnc-routing-0-0-msin" -> "imsi-mccmncmsin")
-fn supi_from_suci(suci: &str) -> String {
-    let parts: Vec<&str> = suci.split('-').collect();
-    if parts.len() >= 8 && parts[0] == "suci" {
-        format!("imsi-{}{}{}", parts[2], parts[3], parts[7])
-    } else {
-        suci.to_string()
+/// Derive a SUPI string from a **null-scheme** SUCI
+/// ("suci-0-mcc-mnc-routing-0-hnkey-msin" -> "imsi-mccmncmsin"), or pass an
+/// already-plain `imsi-` SUPI through.
+///
+/// Returns `None` for anything from which a real SUPI cannot be recovered
+/// without the home network private key. That is the whole point of the
+/// function: only a null-scheme (scheme id 0) SUCI exposes the MSIN in
+/// cleartext (TS 23.003 Section 2.2A / Section 6.2.2). For an ECIES-protected
+/// SUCI the scheme output is ciphertext, so concatenating it would yield a
+/// FABRICATED SUPI -- and callers feed this value into `nextgcore_kdf_kamf`
+/// and UECM registration, so a fabricated identity silently derives the wrong
+/// keys and registers the wrong subscriber (TS 33.501 Section 6.1.3: the SUPI
+/// is recovered only after de-concealment).
+///
+/// The scheme id is checked FIRST and is the load-bearing gate: an all-digit
+/// check alone is not sufficient, because a hex-encoded ciphertext can be
+/// all decimal digits by chance.
+///
+/// Mirrors `supi_from_suci` in nextgcore-udmd's context.rs, which already
+/// returned `Option` for exactly this reason.
+fn supi_from_suci(suci: &str) -> Option<String> {
+    if let Some(rest) = suci.strip_prefix("imsi-") {
+        // Already de-concealed by the AUSF/UDM.
+        return if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            Some(suci.to_string())
+        } else {
+            None
+        };
     }
+
+    let parts: Vec<&str> = suci.split('-').collect();
+    if parts.len() < 8 || parts[0] != "suci" {
+        return None;
+    }
+    // parts: suci-<supi type>-<mcc>-<mnc>-<routing>-<scheme>-<hnkey>-<output>
+    if parts[1] != "0" {
+        // Only the IMSI SUPI type yields an imsi- SUPI.
+        return None;
+    }
+    let Ok(scheme) = parts[5].parse::<u8>() else {
+        return None;
+    };
+    if scheme != SUCI_PROTECTION_SCHEME_NULL {
+        log::error!(
+            "SUCI protection scheme {scheme} is not the null scheme: the scheme output is \
+             ciphertext, so no SUPI can be derived without de-concealment"
+        );
+        return None;
+    }
+    let msin = parts[7];
+    if msin.is_empty() || !msin.bytes().all(|b| b.is_ascii_digit()) {
+        log::error!("null-scheme SUCI carries a non-digit MSIN; refusing to derive a SUPI");
+        return None;
+    }
+    if parts[2].is_empty() || parts[3].is_empty() {
+        return None;
+    }
+    Some(format!("imsi-{}{}{}", parts[2], parts[3], msin))
+}
+
+/// Decode a PEI (IMEI or IMEISV) from the content of a 5GS mobile identity IE
+/// (TS 24.501 Section 9.11.3.4) and format it per the TS 29.571 `Pei` pattern.
+///
+/// The identity digits do NOT start at `content[1]`. Octet 4 of the IE -- which
+/// is `content[0]` here -- carries the type of identity in bits 1-3, the
+/// odd/even indicator in bit 4, and **identity digit 1 in bits 5-8**. Slicing
+/// from `content[1]` therefore drops the first digit and yields a value one
+/// digit short, which is the defect this helper exists to prevent.
+///
+/// Returns `(pei, digits)`, where `pei` is `imei-<15 digits>` or
+/// `imeisv-<16 digits>` -- the prefix is chosen from the type-of-identity
+/// field, never assumed -- and `digits` is the bare identity.
+///
+/// Returns `None` when the content is too short, the type is neither IMEI nor
+/// IMEISV, digit 1 is not a decimal digit, or the recovered digit count does
+/// not match the type. A malformed identity yields NO PEI rather than one that
+/// violates the `Pei` pattern: absent is checkable by a peer, wrong is not.
+///
+/// Both the Identity Response and the Security Mode Complete paths route
+/// through here so the two cannot diverge again.
+fn decode_pei(content: &[u8]) -> Option<(String, String)> {
+    if content.len() < 2 {
+        return None;
+    }
+    let (prefix, expected_digits) = match content[0] & 0x07 {
+        t if t == mobile_identity_type::IMEI => ("imei", 15),
+        t if t == mobile_identity_type::IMEISV => ("imeisv", 16),
+        _ => return None,
+    };
+
+    // Identity digit 1 shares octet 4 with the type-of-identity field.
+    let digit1 = (content[0] >> 4) & 0x0f;
+    if digit1 > 9 {
+        return None;
+    }
+    let mut digits = String::with_capacity(expected_digits);
+    digits.push((b'0' + digit1) as char);
+    digits.push_str(&decode_bcd_digits(&content[1..]));
+
+    if digits.len() != expected_digits {
+        return None;
+    }
+    Some((format!("{prefix}-{digits}"), digits))
 }
 
 /// Decode (nibble-swapped) BCD digits, skipping 0xF fillers
@@ -6634,14 +6787,132 @@ mod tests {
     #[test]
     fn test_supi_from_suci() {
         assert_eq!(
-            supi_from_suci("suci-0-999-70-0-0-0-0000000001"),
-            "imsi-999700000000001"
+            supi_from_suci("suci-0-999-70-0-0-0-0000000001").as_deref(),
+            Some("imsi-999700000000001")
         );
-        // Non-SUCI strings pass through
+        // Already-de-concealed SUPIs pass through
         assert_eq!(
-            supi_from_suci("imsi-001010000000001"),
-            "imsi-001010000000001"
+            supi_from_suci("imsi-001010000000001").as_deref(),
+            Some("imsi-001010000000001")
         );
+    }
+
+    /// A protected (ECIES) SUCI carries ciphertext, not the MSIN, so no SUPI
+    /// can be derived from it -- and the derived value would otherwise seed
+    /// `nextgcore_kdf_kamf` and UECM registration (#73 criterion 5).
+    ///
+    /// The scheme id is the load-bearing gate, which is why the profile-A and
+    /// profile-B cases below use an ALL-DIGIT scheme output: a digits-only
+    /// check would pass them, and only reading the scheme id rejects them.
+    #[test]
+    fn supi_from_suci_refuses_a_protected_suci() {
+        // ECIES profile A (scheme 1) with a scheme output that is all digits.
+        assert_eq!(
+            supi_from_suci("suci-0-999-70-0-1-1-0123456789012345678901234567890123456789"),
+            None
+        );
+        // ECIES profile B (scheme 2), likewise all digits.
+        assert_eq!(supi_from_suci("suci-0-999-70-0-2-1-9876543210"), None);
+        // An unknown or future scheme is refused rather than treated as null.
+        assert_eq!(supi_from_suci("suci-0-999-70-0-7-1-1234567890"), None);
+        // A non-numeric scheme id is not silently read as the null scheme.
+        assert_eq!(supi_from_suci("suci-0-999-70-0-x-1-1234567890"), None);
+
+        // The null scheme with the SAME shape is still accepted, so the
+        // rejections above are attributable to the scheme id and nothing else.
+        assert_eq!(
+            supi_from_suci("suci-0-999-70-0-0-1-9876543210").as_deref(),
+            Some("imsi-999709876543210")
+        );
+    }
+
+    #[test]
+    fn supi_from_suci_refuses_malformed_input() {
+        // Hex ciphertext that is not all digits (the common case).
+        assert_eq!(supi_from_suci("suci-0-999-70-0-0-0-deadbeef"), None);
+        // Empty MSIN.
+        assert_eq!(supi_from_suci("suci-0-999-70-0-0-0-"), None);
+        // Too few fields.
+        assert_eq!(supi_from_suci("suci-0-999-70-0-0"), None);
+        // Non-IMSI SUPI type (network-specific identifier).
+        assert_eq!(supi_from_suci("suci-1-999-70-0-0-0-1234567890"), None);
+        // Neither a SUCI nor an imsi- SUPI.
+        assert_eq!(supi_from_suci("nai-user@example.com"), None);
+        // An imsi- SUPI whose digits are not digits.
+        assert_eq!(supi_from_suci("imsi-unknown"), None);
+        assert_eq!(supi_from_suci("imsi-"), None);
+    }
+
+    /// Identity digit 1 lives in the HIGH NIBBLE of octet 4, alongside the
+    /// type-of-identity field, so the digits do not start at `content[1]`
+    /// (TS 24.501 Section 9.11.3.4). Decoding from `content[1..]` drops digit 1
+    /// and yields a value one digit short (#73 criterion 4).
+    ///
+    /// These vectors assert the FULL digit string, so reverting the fix makes
+    /// them fail on both the count and the value -- not merely on a prefix.
+    #[test]
+    fn decode_pei_recovers_digit_one_and_selects_the_prefix_by_type() {
+        // IMEISV 1234567890123456: 16 digits, so digit 1 in octet 4's high
+        // nibble plus 15 digits over 8 octets, the last high nibble a filler.
+        //   octet 4 = digit1(1) << 4 | even/odd(0) | type(IMEISV=5) = 0x15
+        let imeisv = [0x15, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0xf6];
+        let (pei, digits) = decode_pei(&imeisv).expect("IMEISV decodes");
+        assert_eq!(digits, "1234567890123456");
+        assert_eq!(pei, "imeisv-1234567890123456");
+
+        // IMEI 123456789012345: 15 digits, digit 1 plus 14 over 7 octets.
+        //   octet 4 = digit1(1) << 4 | odd(1) << 3 | type(IMEI=3) = 0x1b
+        let imei = [0x1b, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54];
+        let (pei, digits) = decode_pei(&imei).expect("IMEI decodes");
+        assert_eq!(digits, "123456789012345");
+        assert_eq!(pei, "imei-123456789012345");
+    }
+
+    /// Both emitted forms must satisfy the TS 29.571 `Pei` pattern
+    /// (`imei-[0-9]{15}` / `imeisv-[0-9]{16}`), which is what the old
+    /// unconditional `imeisv-` prefix violated for a 15-digit IMEI.
+    #[test]
+    fn decode_pei_output_matches_the_pei_pattern() {
+        for (content, prefix, len) in [
+            (
+                vec![0x15, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0xf6],
+                "imeisv-",
+                16,
+            ),
+            (
+                vec![0x1b, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54],
+                "imei-",
+                15,
+            ),
+        ] {
+            let (pei, _) = decode_pei(&content).expect("decodes");
+            let digits = pei.strip_prefix(prefix).expect("expected prefix");
+            assert_eq!(digits.len(), len, "{pei} has the wrong digit count");
+            assert!(
+                digits.bytes().all(|b| b.is_ascii_digit()),
+                "{pei} is not all digits"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_pei_refuses_malformed_identities() {
+        // Right type, wrong digit count (an IMEI's octets labelled IMEISV):
+        // emitting this would break the `Pei` pattern.
+        assert_eq!(
+            decode_pei(&[0x15, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54]),
+            None
+        );
+        // Digit 1 is a 0xF filler, not a digit.
+        assert_eq!(
+            decode_pei(&[0xf5, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0xf6]),
+            None
+        );
+        // Not an equipment identity at all (SUCI type).
+        assert_eq!(decode_pei(&[0x11, 0x32, 0x54]), None);
+        // Too short to carry a type plus any digits.
+        assert_eq!(decode_pei(&[0x15]), None);
+        assert_eq!(decode_pei(&[]), None);
     }
 
     #[test]

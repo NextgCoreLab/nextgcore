@@ -901,7 +901,7 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
             // Persist the PEI (IMEISV) claim off-thread (last live
             // blocking Mongo call moved to the spawn_blocking wrapper).
             if let Some(pei) = reg_data.get("pei").and_then(|v| v.as_str()) {
-                let imeisv = pei.strip_prefix("imeisv-").unwrap_or(pei).to_string();
+                let imeisv = data_store::imeisv_from_pei(pei).to_string();
                 if let Err(e) = nextgcore_dbi::subscription::nextgcore_dbi_update_imeisv_async(
                     supi.to_string(),
                     imeisv,
