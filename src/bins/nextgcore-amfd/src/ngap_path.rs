@@ -2873,6 +2873,11 @@ impl NgapServer {
             access_type_distinguisher,
         );
         state.amf_ue.kgnb = kgnb;
+        // Seed the {NH, NCC} forward-security chain from KgNB (TS 33.501 Annex
+        // A.10): KgNB is the NCC=0 pair, NH = KDF(KAMF, KgNB) is NCC=1. Without
+        // this the chain starts from a zero NH and every handover hands the
+        // target a key the source can reproduce (#70).
+        state.amf_ue.init_next_hop_chain();
 
         let tmsi = state.amf_ue.next_guti.tmsi;
         let allowed_nssai = state.amf_ue.allowed_nssai.clone();
@@ -4522,7 +4527,9 @@ impl NgapServer {
         // future work; we emit the HandoverRequest with the source container so
         // the target can begin admission.
         let target_assoc = target_assoc.expect("checked is_some");
-        let Some(state) = self.ue_auth_state.get(&required.amf_ue_ngap_id) else {
+        // Mutable: advancing the {NH, NCC} chain for the target gNB mutates the
+        // stored pair (TS 33.501 Section 6.9.2.3.3).
+        let Some(state) = self.ue_auth_state.get_mut(&required.amf_ue_ngap_id) else {
             log::warn!(
                 "HandoverRequired for unknown UE {}; rejecting",
                 required.amf_ue_ngap_id
@@ -4555,6 +4562,12 @@ impl NgapServer {
             }
         };
 
+        // Advance the forward-security chain for the target gNB (TS 33.501
+        // Section 6.9.2.3.3). This MUST NOT copy the stored pair: the target
+        // needs an NH the source gNB has never held, which is the whole point
+        // of the chain. Shared with the Xn path so the two cannot diverge.
+        let (ho_ncc, ho_nh) = state.amf_ue.advance_next_hop();
+
         let ho_request = nextgcore_ngap::types::HandoverRequest {
             amf_ue_ngap_id: required.amf_ue_ngap_id,
             handover_type: required.handover_type,
@@ -4565,8 +4578,8 @@ impl NgapServer {
             },
             ue_security_capabilities: ue_caps_to_ngap(&state.amf_ue.ue_security_capability),
             security_context: nextgcore_ngap::types::SecurityContext {
-                next_hop_chaining_count: state.amf_ue.nhcc,
-                next_hop: state.amf_ue.nh,
+                next_hop_chaining_count: ho_ncc,
+                next_hop: ho_nh,
             },
             pdu_session_list: required
                 .pdu_session_list
@@ -4906,10 +4919,10 @@ impl NgapServer {
                 .ue_auth_state
                 .get_mut(&amf_ue_ngap_id)
                 .expect("checked");
-            let new_nh =
-                nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&state.amf_ue.kamf, &state.amf_ue.nh);
-            state.amf_ue.nh = new_nh;
-            state.amf_ue.nhcc = state.amf_ue.nhcc.wrapping_add(1) & 0x07;
+            // Shared with the N2 path (see AmfUe::advance_next_hop) so the two
+            // cannot derive keys differently. The chain is seeded from KgNB at
+            // AS-context establishment, so this no longer chains from zeros.
+            let (_ncc, _nh) = state.amf_ue.advance_next_hop();
             // Move the UE's serving RAN association and RAN-UE-NGAP-ID to the
             // target gNB; this is the N3 tunnel/RAN identity update.
             state.ran_ue_ngap_id = req.ran_ue_ngap_id;

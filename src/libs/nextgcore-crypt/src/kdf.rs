@@ -32,6 +32,7 @@ const FC_FOR_KSEAF_DERIVATION: u8 = 0x6C;
 const FC_FOR_KAMF_DERIVATION: u8 = 0x6D;
 const FC_FOR_KGNB_KN3IWF_DERIVATION: u8 = 0x6E;
 const FC_FOR_NH_GNB_DERIVATION: u8 = 0x6F;
+const FC_FOR_KAMF_PRIME_DERIVATION: u8 = 0x72;
 const FC_FOR_SOR_MAC_IAUSF_DERIVATION: u8 = 0x77;
 const FC_FOR_SOR_MAC_IUE_DERIVATION: u8 = 0x78;
 const FC_FOR_UPU_MAC_IAUSF_DERIVATION: u8 = 0x7B;
@@ -299,6 +300,58 @@ pub fn nextgcore_kdf_nh_gnb(
 
     nextgcore_kdf_common(kamf, FC_FOR_NH_GNB_DERIVATION, &params)
 }
+
+/// TS 33.501 Annex A.13: KAMF' derivation for 5GS mobility (FC 0x72)
+///
+/// Re-keys KAMF when the UE moves, so the new AMF (or the same AMF after a
+/// mobility event) holds a key the previous one cannot compute — horizontal
+/// re-keying at N2/Xn handover and vertical re-keying at idle-mode mobility.
+///
+/// The derived key is `KDF(KAMF, S)` per TS 33.220 B.2.0 with
+///
+/// ```text
+/// S = FC(0x72) || P0(direction) || L0(0x0001) || P1(NAS COUNT, 4 octets BE) || L1(0x0004)
+/// ```
+///
+/// * `direction` — [`KAMF_PRIME_DIRECTION_UPLINK`] (0x00) when the derivation is
+///   bound to the **uplink** NAS COUNT, as at idle-mode mobility, and
+///   [`KAMF_PRIME_DIRECTION_DOWNLINK`] (0x01) when bound to the **downlink**
+///   NAS COUNT, as at connected-mode handover. The direction is what keeps the
+///   two derivations distinct even when the COUNT values coincide.
+/// * `nas_count` — the NAS COUNT for that direction, big-endian, matching how
+///   [`nextgcore_kdf_kgnb_and_kn3iwf`] encodes its COUNT (note the EPS-era
+///   helpers in this file deliberately use NATIVE byte order to stay
+///   bit-compatible with the C original; the 5G derivations do not).
+///
+/// # Verification ceiling
+///
+/// **No published 3GPP test vector was available when this was written**, and
+/// none exists in this tree. The unit tests therefore pin THIS construction —
+/// that the two directions differ, that the COUNT is load-bearing, and that the
+/// output is stable — rather than agreement with a 3GPP vector. The `S` layout
+/// is spelled out above precisely so a reviewer holding Annex A.13 can check it
+/// by eye rather than by reading the code. Treat interop against a real peer AMF
+/// as the outstanding validation.
+pub fn nextgcore_kdf_kamf_prime(
+    kamf: &[u8; SHA256_DIGEST_SIZE],
+    direction: u8,
+    nas_count: u32,
+) -> [u8; SHA256_DIGEST_SIZE] {
+    let count_be = nas_count.to_be_bytes();
+
+    let mut params = [KdfParam::default(), KdfParam::default()];
+    params[0].buf = Some(vec![direction]);
+    params[0].len = 1;
+    params[1].buf = Some(count_be.to_vec());
+    params[1].len = 4;
+
+    nextgcore_kdf_common(kamf, FC_FOR_KAMF_PRIME_DERIVATION, &params)
+}
+
+/// KAMF' bound to the uplink NAS COUNT (idle-mode mobility).
+pub const KAMF_PRIME_DIRECTION_UPLINK: u8 = 0x00;
+/// KAMF' bound to the downlink NAS COUNT (connected-mode handover).
+pub const KAMF_PRIME_DIRECTION_DOWNLINK: u8 = 0x01;
 
 /// TS 33.501 Annex A.17: SoR-MAC-I_AUSF generation function
 ///
@@ -1054,5 +1107,87 @@ mod tests {
         let (c3, _) =
             nextgcore_kdf_ck_ik_prime(&ck, &ik, "5G:mnc002.mcc002.3gppnetwork.org", &sqn_xor_ak);
         assert_ne!(c1, c3);
+    }
+
+    /// nextgcore #70 criterion 3: FC 0x72 KAMF' derivation.
+    ///
+    /// No published 3GPP vector was available, so these pin the CONSTRUCTION,
+    /// not agreement with a 3GPP vector — see the doc comment on
+    /// `nextgcore_kdf_kamf_prime`. What they do establish is that every input is
+    /// load-bearing, which is what catches a parameter dropped or transposed.
+    #[test]
+    fn kamf_prime_uses_every_input() {
+        let kamf = [0x33u8; SHA256_DIGEST_SIZE];
+        let other_kamf = [0x44u8; SHA256_DIGEST_SIZE];
+
+        let base = nextgcore_kdf_kamf_prime(&kamf, KAMF_PRIME_DIRECTION_UPLINK, 7);
+
+        // Deterministic for equal inputs.
+        assert_eq!(
+            base,
+            nextgcore_kdf_kamf_prime(&kamf, KAMF_PRIME_DIRECTION_UPLINK, 7)
+        );
+        // The direction distinguishes horizontal (handover) from vertical (idle)
+        // re-keying even when the COUNT coincides -- if P0 were dropped these
+        // would collide.
+        assert_ne!(
+            base,
+            nextgcore_kdf_kamf_prime(&kamf, KAMF_PRIME_DIRECTION_DOWNLINK, 7)
+        );
+        // The COUNT is load-bearing.
+        assert_ne!(
+            base,
+            nextgcore_kdf_kamf_prime(&kamf, KAMF_PRIME_DIRECTION_UPLINK, 8)
+        );
+        // The key is load-bearing.
+        assert_ne!(
+            base,
+            nextgcore_kdf_kamf_prime(&other_kamf, KAMF_PRIME_DIRECTION_UPLINK, 7)
+        );
+        // A re-key must not be the identity: the point is that the previous
+        // holder of KAMF cannot compute KAMF'.
+        assert_ne!(base, kamf);
+        assert_ne!(base, [0u8; SHA256_DIGEST_SIZE]);
+    }
+
+    /// Golden vectors pinning the exact `S` construction, including the COUNT's
+    /// big-endian encoding.
+    ///
+    /// These are a snapshot of OUR construction, generated from the
+    /// implementation and pasted (not typed), not a 3GPP vector — see the
+    /// function's doc comment. That still makes them load-bearing: any change to
+    /// the FC, the parameter order, a parameter length, or the COUNT's byte
+    /// order changes these bytes and fails this test.
+    ///
+    /// A first attempt asserted only that two different COUNTs produce different
+    /// outputs. That passed identically with `to_ne_bytes()`, because two
+    /// distinct COUNTs differ under either byte order — a negative assertion
+    /// satisfied by the very defect it was meant to catch. Hence the positive
+    /// form here.
+    #[test]
+    fn kamf_prime_matches_its_golden_vectors() {
+        fn hex(bytes: &[u8; SHA256_DIGEST_SIZE]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let kamf = [0x55u8; SHA256_DIGEST_SIZE];
+
+        assert_eq!(
+            hex(&nextgcore_kdf_kamf_prime(
+                &kamf,
+                KAMF_PRIME_DIRECTION_UPLINK,
+                1
+            )),
+            "b792e19a7ac57570820338756bd70b221b16e33f1d3e2d5f020a7e279961b952",
+            "uplink/COUNT=1 vector changed: the S construction moved"
+        );
+        assert_eq!(
+            hex(&nextgcore_kdf_kamf_prime(
+                &kamf,
+                KAMF_PRIME_DIRECTION_DOWNLINK,
+                1
+            )),
+            "3e3a6dae19cc9f91d5d9171a66749df5c71e77effdcc27d2c73fd98b567d1ded",
+            "downlink/COUNT=1 vector changed: the S construction moved"
+        );
     }
 }
