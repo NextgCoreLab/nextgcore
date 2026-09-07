@@ -117,9 +117,27 @@ struct SbiYaml {
     oauth2: Option<SbiOauth2Yaml>,
 }
 
+/// One `udr.group_id_map` entry: the NF-group ids assigned to the subscribers
+/// whose SUPI starts with `supi_prefix` (#87, TS 29.504 §6.2).
+///
+/// Group assignment is an operator decision made by SUPI range — there is no
+/// Nudr verb that provisions it, and deriving a group id from the SUPI would
+/// invent a topology this core does not have.
+#[derive(Debug, Default, Deserialize, Clone)]
+struct GroupIdMapYaml {
+    /// SUPI prefix this entry covers, e.g. `imsi-00101`. An empty prefix matches
+    /// every subscriber (single-group deployment).
+    #[serde(default)]
+    supi_prefix: String,
+    /// NF type (`UDM`, `AUSF`, ...) -> NF-group id.
+    nf_group_ids: std::collections::HashMap<String, String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct UdrSection {
     sbi: Option<SbiYaml>,
+    /// #87: `udr.group_id_map` — the Nudr_GroupIDmap assignments.
+    group_id_map: Option<Vec<GroupIdMapYaml>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -129,6 +147,157 @@ struct UdrYaml {
 
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// #87: the configured Nudr_GroupIDmap assignments, longest-prefix first.
+static GROUP_ID_MAP: std::sync::RwLock<Vec<GroupIdMapYaml>> = std::sync::RwLock::new(Vec::new());
+
+/// Install the group-id-map configuration (longest prefix wins, so a specific
+/// range overrides a catch-all rather than depending on file order).
+fn set_group_id_map(mut entries: Vec<GroupIdMapYaml>) {
+    entries.sort_by_key(|e| std::cmp::Reverse(e.supi_prefix.len()));
+    if let Ok(mut guard) = GROUP_ID_MAP.write() {
+        *guard = entries;
+    }
+}
+
+/// The NF-group ids assigned to `subscriber_id`, or `None` when no entry covers
+/// it. Filtered to `nf_types` when non-empty.
+fn group_ids_for(subscriber_id: &str, nf_types: &[String]) -> Option<serde_json::Value> {
+    let guard = GROUP_ID_MAP.read().ok()?;
+    let entry = guard
+        .iter()
+        .find(|e| subscriber_id.starts_with(&e.supi_prefix))?;
+    let mut out = serde_json::Map::new();
+    for (nf_type, group_id) in &entry.nf_group_ids {
+        if !nf_types.is_empty() && !nf_types.iter().any(|t| t.eq_ignore_ascii_case(nf_type)) {
+            continue;
+        }
+        out.insert(nf_type.to_ascii_uppercase(), serde_json::json!(group_id));
+    }
+    // minProperties: 1 — a map with nothing in it answers nothing.
+    if out.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Object(out))
+}
+
+/// `Nudr_GroupIDmap` (TS 29.504 §6.2), served at
+/// `/nudr-group-id-map/v1/...`. The service was unrouted, so the router's
+/// unknown-service 404 was the only answer a consumer ever got.
+fn handle_group_id_map(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
+    let ds = data_store::store();
+    match (parts.get(2).copied().unwrap_or(""), parts.get(3).copied()) {
+        // GET /nf-group-ids?nf-type=UDM,AUSF&subscriberId=imsi-...
+        ("nf-group-ids", None) => {
+            if method != "GET" {
+                return send_method_not_allowed(method, "nf-group-ids");
+            }
+            let Some(subscriber_id) = request.http.params.get("subscriberId") else {
+                return missing_mandatory("subscriberId");
+            };
+            let subscriber_id = pct_decode(subscriber_id);
+            let nf_types: Vec<String> = request
+                .http
+                .params
+                .get("nf-type")
+                .map(|raw| {
+                    pct_decode(raw)
+                        .split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if nf_types.is_empty() {
+                return missing_mandatory("nf-type");
+            }
+            match group_ids_for(&subscriber_id, &nf_types) {
+                Some(map) => {
+                    SbiResponse::with_status(200).with_body(map.to_string(), "application/json")
+                }
+                None => send_not_found(
+                    "No NF group ids assigned for this subscriber",
+                    Some("DATA_NOT_FOUND"),
+                ),
+            }
+        }
+        ("nf-group-ids", Some("subscriptions")) => {
+            let subs_id = parts.get(4).copied().unwrap_or("");
+            match (subs_id.is_empty(), method) {
+                (true, "POST") => {
+                    let body = match parse_json_body(request) {
+                        Ok(v) => v,
+                        Err(resp) => return *resp,
+                    };
+                    let Some(uri) = body
+                        .get("callbackReference")
+                        .or_else(|| body.get("notificationUri"))
+                        .and_then(|v| v.as_str())
+                    else {
+                        return missing_mandatory("callbackReference");
+                    };
+                    let sub = ds.sub_create(SubKind::GroupIdMap, uri, body.clone());
+                    SbiResponse::with_status(201)
+                        .with_header(
+                            "Location",
+                            format!(
+                                "/nudr-group-id-map/v1/nf-group-ids/subscriptions/{}",
+                                sub.id
+                            ),
+                        )
+                        .with_body(body.to_string(), "application/json")
+                }
+                (false, "GET") => match ds.sub_get(subs_id) {
+                    Some(sub) if sub.kind == SubKind::GroupIdMap => SbiResponse::with_status(200)
+                        .with_body(sub.body.to_string(), "application/json"),
+                    _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
+                },
+                (false, "PUT") => {
+                    let body = match parse_json_body(request) {
+                        Ok(v) => v,
+                        Err(resp) => return *resp,
+                    };
+                    let Some(uri) = body
+                        .get("callbackReference")
+                        .or_else(|| body.get("notificationUri"))
+                        .and_then(|v| v.as_str())
+                    else {
+                        return missing_mandatory("callbackReference");
+                    };
+                    if ds.sub_replace(subs_id, SubKind::GroupIdMap, uri, body.clone()) {
+                        SbiResponse::with_status(200)
+                            .with_body(body.to_string(), "application/json")
+                    } else {
+                        send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                    }
+                }
+                (false, "DELETE") => {
+                    if ds.sub_remove(subs_id).is_some() {
+                        SbiResponse::with_status(204)
+                    } else {
+                        send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                    }
+                }
+                _ => send_method_not_allowed(method, "nf-group-ids/subscriptions"),
+            }
+        }
+        // GET /routing-ids: routing-id assignment is a separate data model this
+        // core does not hold, so it is recognised and refused rather than
+        // answered with a fabricated mapping.
+        ("routing-ids", None) => {
+            if method != "GET" {
+                return send_method_not_allowed(method, "routing-ids");
+            }
+            send_error(
+                501,
+                "Not Implemented",
+                "routing-ids assignment is not provisioned in this UDR",
+                Some("NOT_IMPLEMENTED"),
+            )
+        }
+        _ => send_not_found("Unknown nudr-group-id-map resource", None),
+    }
+}
 
 /// Process-wide OAuth2 client for automatic Bearer-token acquisition on
 /// outbound SBI calls (Wave-6 H8 Phase A). Installed only when the existing
@@ -216,7 +385,15 @@ async fn main() -> Result<()> {
     let mut require_oauth2 = false;
     if let Ok(content) = std::fs::read_to_string(&args.config) {
         if let Ok(yaml) = serde_yaml::from_str::<UdrYaml>(&content) {
-            if let Some(sbi) = yaml.udr.and_then(|udr| udr.sbi) {
+            let udr_section = yaml.udr;
+            // #87: Nudr_GroupIDmap assignments. Absent config leaves the map
+            // empty, so `GET /nf-group-ids` answers 404 DATA_NOT_FOUND rather
+            // than inventing a group id.
+            if let Some(entries) = udr_section.as_ref().and_then(|u| u.group_id_map.clone()) {
+                log::info!("Nudr_GroupIDmap: {} assignment range(s)", entries.len());
+                set_group_id_map(entries);
+            }
+            if let Some(sbi) = udr_section.and_then(|udr| udr.sbi) {
                 // Override the advertised/bind SBI address with the routable
                 // address from config so the NRF NFProfile advertises a
                 // reachable endpoint (not 0.0.0.0).
@@ -384,6 +561,11 @@ async fn udr_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let service = parts[0];
     let _version = parts[1];
 
+    // #87: Nudr_GroupIDmap is a distinct service, not a nudr-dr resource.
+    if service == "nudr-group-id-map" {
+        return handle_group_id_map(&parts, method, &request);
+    }
+
     if service != "nudr-dr" {
         log::warn!("Unknown service: {service}");
         return send_not_found(&format!("Unknown service: {service}"), None);
@@ -465,6 +647,14 @@ async fn handle_subscription_data(
         None => return send_bad_request("Missing SUPI", Some("MISSING_SUPI")),
     };
 
+    // identity-data is defined for ANY VarUeId, SUPI or GPSI (TS 29.505
+    // §5.2.19 "Retrieve identity data by SUPI or GPSI") -- resolving a GPSI is
+    // the whole point of the resource -- so it is dispatched before the
+    // SUPI-shaped validation below, which would reject `msisdn-`/`extid-`.
+    if parts.get(4).copied() == Some("identity-data") {
+        return handle_identity_data(supi_or_suci, method, request).await;
+    }
+
     // Convert SUCI to IMSI if needed
     // SUCI format: suci-{type}-{mcc}-{mnc}-{routing}-{scheme}-{msin}
     // For null scheme (0), IMSI = MCC + MNC + MSIN
@@ -525,6 +715,13 @@ async fn handle_subscription_data(
         "authentication-data" => handle_auth_data(supi, parts, method, request).await,
         "provisioned-data" => handle_provisioned_data(supi, parts, 5, method, request).await,
         "context-data" => handle_context_data(supi, parts, method, request).await,
+        // #87: the Parameter Provision documents the UDM's Nudm_PP producer
+        // reads and writes (TS 29.505 §5.2.13).
+        "pp-data" => handle_pp_data(supi, method, request),
+        "pp-data-store" => {
+            let af_instance_id = parts.get(5).copied().unwrap_or("");
+            handle_pp_data_store(supi, af_instance_id, method, request)
+        }
         _ => {
             // Check if parts[4] is a PLMN ID and parts[5] = "provisioned-data"
             // (PLMN-scoped layout per TS 29.504:
@@ -546,6 +743,204 @@ async fn handle_subscription_data(
                 send_not_found("Unknown sub-resource", None)
             }
         }
+    }
+}
+
+/// `GET /subscription-data/{ueId}/identity-data` — TS 29.505 §5.2.19.
+///
+/// Answers in BOTH directions from the one subscriber record, because that is
+/// what the resource is for: `{ueId}` may be a SUPI or a GPSI, and the response
+/// carries `supiList` and `gpsiList` regardless. The subscriber DB query is
+/// `{<idType>: <idValue>}` over a single document, so an `msisdn-` identifier
+/// resolves the same subscriber as its `imsi-` — which is what lets a NEF
+/// translate a GPSI it was given by an AF into the SUPI every other 5GC
+/// interface needs.
+async fn handle_identity_data(ue_id: &str, method: &str, request: &SbiRequest) -> SbiResponse {
+    if method != "GET" {
+        return send_method_not_allowed(method, "identity-data");
+    }
+    let _ = request;
+    log::info!("[{ue_id}] GET identity-data");
+    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(ue_id.to_string())
+        .await
+    {
+        Ok(data) => {
+            let doc = build_identity_data(&data);
+            // supiList is what a consumer translating a GPSI needs; a record
+            // with no SUPI cannot answer the question that was asked.
+            if doc
+                .get("supiList")
+                .and_then(|v| v.as_array())
+                .is_none_or(|a| a.is_empty())
+            {
+                return send_not_found(
+                    "No SUPI stored for this identifier",
+                    Some("DATA_NOT_FOUND"),
+                );
+            }
+            SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+        }
+        Err(e) => {
+            log::debug!("[{ue_id}] identity-data lookup failed: {e:?}");
+            send_not_found("Subscriber not found", Some("DATA_NOT_FOUND"))
+        }
+    }
+}
+
+/// Build a TS 29.505 `IdentityData` from a subscriber record.
+///
+/// `supiList` carries the record's IMSI in `imsi-` form and `gpsiList` its
+/// MSISDNs in `msisdn-` form — the same GPSI spelling `am-data` uses, so a
+/// consumer sees one identity vocabulary across both resources. Both members
+/// have `minItems: 1`, so an empty list is omitted rather than emitted empty.
+fn build_identity_data(
+    data: &nextgcore_dbi::types::NextgcoreSubscriptionData,
+) -> serde_json::Value {
+    let mut doc = serde_json::Map::new();
+    if let Some(imsi) = data.imsi.as_deref() {
+        doc.insert(
+            "supiList".to_string(),
+            serde_json::json!([format!("imsi-{imsi}")]),
+        );
+    }
+    if data.num_of_msisdn > 0 {
+        let gpsis: Vec<serde_json::Value> = data
+            .msisdn
+            .iter()
+            .map(|m| serde_json::Value::String(format!("msisdn-{}", m.bcd)))
+            .collect();
+        doc.insert("gpsiList".to_string(), serde_json::Value::Array(gpsis));
+    }
+    serde_json::Value::Object(doc)
+}
+
+/// `GET`/`PATCH /subscription-data/{ueId}/pp-data` — TS 29.505 §5.2.13.
+///
+/// The UE-level Parameter Provision document. A `PUT` is accepted as well as
+/// PATCH so an operator (or the webui) can provision the document in one step;
+/// TS 29.505 defines GET and PATCH, and PATCH on an absent document would
+/// otherwise have no way to ever start.
+fn handle_pp_data(supi: &str, method: &str, request: &SbiRequest) -> SbiResponse {
+    let ds = data_store::store();
+    let path = format!("/nudr-dr/v2/subscription-data/{supi}/pp-data");
+    match method {
+        "GET" => match ds.doc_get("pp-data", supi) {
+            Some(doc) => {
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found("No pp-data provisioned", Some("DATA_NOT_FOUND")),
+        },
+        "PUT" => {
+            let doc = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            let created = ds.doc_put("pp-data", supi, doc.clone());
+            notify_subscription_data_change(supi, &path, Some(&doc));
+            if created {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(doc.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(204)
+            }
+        }
+        "PATCH" => {
+            let patch = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            // An absent document starts empty rather than 404ing: PATCH is the
+            // provisioning verb TS 29.503 §5.6.2.2 gives an AF, and refusing the
+            // first provision would leave it with no way to create one.
+            let mut doc = ds
+                .doc_get("pp-data", supi)
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(resp) = apply_patch_document(&mut doc, &patch) {
+                return resp;
+            }
+            ds.doc_put("pp-data", supi, doc.clone());
+            notify_subscription_data_change(supi, &path, Some(&doc));
+            SbiResponse::with_status(204)
+        }
+        "DELETE" => {
+            if ds.doc_remove("pp-data", supi).is_some() {
+                notify_subscription_data_change(supi, &path, None);
+            }
+            SbiResponse::with_status(204)
+        }
+        _ => send_method_not_allowed(method, "pp-data"),
+    }
+}
+
+/// `PUT`/`GET`/`DELETE /subscription-data/{ueId}/pp-data-store/{afInstanceId}` —
+/// TS 29.505 §5.2.13, the per-AF Parameter Provision entry. The collection GET
+/// returns every AF's entry for the UE.
+fn handle_pp_data_store(
+    supi: &str,
+    af_instance_id: &str,
+    method: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let ds = data_store::store();
+    let prefix = format!("{supi}\u{1f}");
+    let key = format!("{prefix}{af_instance_id}");
+    let path = format!("/nudr-dr/v2/subscription-data/{supi}/pp-data-store/{af_instance_id}");
+    match (af_instance_id.is_empty(), method) {
+        (true, "GET") => {
+            let list: Vec<serde_json::Value> = ds
+                .doc_list("pp-data-store")
+                .into_iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .map(|(_, v)| v)
+                .collect();
+            SbiResponse::with_status(200).with_body(
+                serde_json::Value::Array(list).to_string(),
+                "application/json",
+            )
+        }
+        (false, "GET") => match ds.doc_get("pp-data-store", &key) {
+            Some(doc) => {
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found("No pp-data entry for this AF", Some("DATA_NOT_FOUND")),
+        },
+        (false, "PUT") => {
+            let doc = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            let created = ds.doc_put("pp-data-store", &key, doc.clone());
+            notify_subscription_data_change(supi, &path, Some(&doc));
+            if created {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(doc.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(204)
+            }
+        }
+        (false, "DELETE") => {
+            if ds.doc_remove("pp-data-store", &key).is_some() {
+                notify_subscription_data_change(supi, &path, None);
+                SbiResponse::with_status(204)
+            } else {
+                send_not_found("No pp-data entry for this AF", Some("DATA_NOT_FOUND"))
+            }
+        }
+        _ => send_method_not_allowed(method, "pp-data-store"),
     }
 }
 
@@ -832,9 +1227,11 @@ async fn handle_auth_data(
 /// Handle context-data requests
 /// Path: /nudr-dr/v2/subscription-data/{supi}/context-data/{resource}
 ///
-/// Implements:
-/// - GET/PUT/PATCH/DELETE amf-3gpp-access: AMF 3GPP access registration context
-/// - GET/PUT/DELETE smf-registrations/{pdu-session-id}: SMF registration context
+/// Implements (TS 29.505 §5.2.4):
+/// - GET/PUT/PATCH/DELETE amf-3gpp-access, amf-non-3gpp-access
+/// - GET/PUT/PATCH/DELETE smsf-3gpp-access, smsf-non-3gpp-access, ip-sm-gw
+/// - GET/PUT/PATCH/DELETE smf-registrations/{pdu-session-id} + collection
+/// - CRUD on sdm-subscriptions/{subsId} and ee-subscriptions/{subsId}
 async fn handle_context_data(
     supi: &str,
     parts: &[&str],
@@ -847,14 +1244,29 @@ async fn handle_context_data(
         6
     };
     let resource = parts.get(resource_idx).copied().unwrap_or("");
+    let tail = parts.get(resource_idx + 1).copied().unwrap_or("");
 
     log::info!("[{supi}] {method} context-data/{resource}");
 
     match resource {
-        "amf-3gpp-access" => handle_amf_3gpp_access(supi, method, request).await,
-        "smf-registrations" => {
-            let pdu_session_id = parts.get(resource_idx + 1).copied().unwrap_or("");
-            handle_smf_registrations(supi, method, request, pdu_session_id)
+        "amf-3gpp-access" => {
+            handle_amf_access(supi, AmfAccessSlot::ThreeGpp, method, request).await
+        }
+        // #87 gap 1: this resource returned 404, so non-3GPP AMF registration
+        // state could not be stored or read at all -- the store the udmd
+        // producer added in #84 writes to.
+        "amf-non-3gpp-access" => {
+            handle_amf_access(supi, AmfAccessSlot::Non3Gpp, method, request).await
+        }
+        "smf-registrations" => handle_smf_registrations(supi, method, request, tail),
+        // Simple per-UE context documents: one store slot each, same CRUD.
+        "smsf-3gpp-access" | "smsf-non-3gpp-access" | "ip-sm-gw" => {
+            handle_ue_context_document(supi, resource, method, request)
+        }
+        // Per-UE subscription collections (TS 29.505 §5.2.4): the UDM's own
+        // SDM / EE subscriptions, stored so they survive a UDM restart.
+        "sdm-subscriptions" | "ee-subscriptions" => {
+            handle_ue_context_collection(supi, resource, tail, method, request)
         }
         _ => {
             log::warn!("[{supi}] Unknown context-data resource: {resource}");
@@ -863,23 +1275,321 @@ async fn handle_context_data(
     }
 }
 
-/// Path of the amf-3gpp-access resource for a SUPI (notification resourceId).
-fn amf_3gpp_access_path(supi: &str) -> String {
-    format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access")
+/// Which AMF access-registration document a context-data request addresses.
+///
+/// The 3GPP slot keeps its dedicated store map (and therefore its snapshot key)
+/// while the non-3GPP one lives in the generic document store — the two accesses
+/// are distinct resources (TS 29.505 §5.2.4) and a write to one must be
+/// invisible to a read of the other, which is exactly the defect #84 fixed on
+/// the UDM side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmfAccessSlot {
+    ThreeGpp,
+    Non3Gpp,
 }
 
-/// Handle AMF 3GPP access registration context (TS 29.505).
+impl AmfAccessSlot {
+    fn resource(self) -> &'static str {
+        match self {
+            Self::ThreeGpp => "amf-3gpp-access",
+            Self::Non3Gpp => "amf-non-3gpp-access",
+        }
+    }
+
+    fn get(self, supi: &str) -> Option<serde_json::Value> {
+        let ds = data_store::store();
+        match self {
+            Self::ThreeGpp => ds.amf_3gpp_get(supi),
+            Self::Non3Gpp => ds.doc_get(self.resource(), supi),
+        }
+    }
+
+    /// Store the document; returns true when newly created.
+    fn put(self, supi: &str, doc: serde_json::Value) -> bool {
+        let ds = data_store::store();
+        match self {
+            Self::ThreeGpp => ds.amf_3gpp_put(supi, doc),
+            Self::Non3Gpp => ds.doc_put(self.resource(), supi, doc),
+        }
+    }
+
+    fn remove(self, supi: &str) -> Option<serde_json::Value> {
+        let ds = data_store::store();
+        match self {
+            Self::ThreeGpp => ds.amf_3gpp_remove(supi),
+            Self::Non3Gpp => ds.doc_remove(self.resource(), supi),
+        }
+    }
+
+    fn path(self, supi: &str) -> String {
+        context_data_path(supi, self.resource())
+    }
+}
+
+/// The resource URI of a per-UE context-data document (notification resourceId).
+fn context_data_path(supi: &str, resource: &str) -> String {
+    format!("/nudr-dr/v2/subscription-data/{supi}/context-data/{resource}")
+}
+
+/// CRUD for a single-document per-UE context resource (`smsf-*`, `ip-sm-gw`).
 ///
-/// Stores and returns the full Amf3GppAccessRegistration document: the
-/// shape PUT here by udmd (forwarding the amfd Nudm registration) is
-/// preserved verbatim and echoed on GET.
-async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) -> SbiResponse {
-    let udr_ctx = nextgcore_udrd::context::udr_self();
+/// PATCH is a merge onto the stored document and 404s when there is nothing to
+/// patch: applying a patch to an absent resource would invent a registration
+/// from a partial update.
+fn handle_ue_context_document(
+    supi: &str,
+    resource: &str,
+    method: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     let ds = data_store::store();
+    let path = context_data_path(supi, resource);
     match method {
-        "GET" => match ds.amf_3gpp_get(supi) {
+        "GET" => match ds.doc_get(resource, supi) {
             Some(doc) => {
-                log::debug!("[{supi}] GET amf-3gpp-access - registration found");
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found(
+                &format!("{resource} context not found"),
+                Some("CONTEXT_NOT_FOUND"),
+            ),
+        },
+        "PUT" => {
+            let doc = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            let created = ds.doc_put(resource, supi, doc.clone());
+            notify_subscription_data_change(supi, &path, Some(&doc));
+            if created {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(doc.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(204)
+            }
+        }
+        "PATCH" => {
+            let Some(mut doc) = ds.doc_get(resource, supi) else {
+                return send_not_found(
+                    &format!("{resource} context not found"),
+                    Some("CONTEXT_NOT_FOUND"),
+                );
+            };
+            let patch = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            if let Some(resp) = apply_patch_document(&mut doc, &patch) {
+                return resp;
+            }
+            ds.doc_put(resource, supi, doc.clone());
+            notify_subscription_data_change(supi, &path, Some(&doc));
+            SbiResponse::with_status(204)
+        }
+        "DELETE" => {
+            if ds.doc_remove(resource, supi).is_some() {
+                notify_subscription_data_change(supi, &path, None);
+            }
+            SbiResponse::with_status(204)
+        }
+        _ => send_method_not_allowed(method, &format!("context-data/{resource}")),
+    }
+}
+
+/// CRUD for a per-UE context-data COLLECTION (`sdm-subscriptions`,
+/// `ee-subscriptions`), whose members are addressed by a subscription id.
+///
+/// Documents are keyed `{supi}\u{1f}{subsId}` inside the collection so one UE's
+/// members list without scanning another's.
+fn handle_ue_context_collection(
+    supi: &str,
+    resource: &str,
+    subs_id: &str,
+    method: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let ds = data_store::store();
+    let prefix = format!("{supi}\u{1f}");
+    let key = format!("{prefix}{subs_id}");
+    match (subs_id.is_empty(), method) {
+        // Collection GET: this UE's members, ordered by id.
+        (true, "GET") => {
+            let list: Vec<serde_json::Value> = ds
+                .doc_list(resource)
+                .into_iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .map(|(_, v)| v)
+                .collect();
+            SbiResponse::with_status(200).with_body(
+                serde_json::Value::Array(list).to_string(),
+                "application/json",
+            )
+        }
+        // Collection DELETE removes every member for this UE (UE purge).
+        (true, "DELETE") => {
+            ds.doc_remove_prefix(resource, &prefix);
+            SbiResponse::with_status(204)
+        }
+        (false, "GET") => match ds.doc_get(resource, &key) {
+            Some(doc) => {
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
+        },
+        (false, "PUT") => {
+            let doc = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            let path =
+                format!("/nudr-dr/v2/subscription-data/{supi}/context-data/{resource}/{subs_id}");
+            let created = ds.doc_put(resource, &key, doc.clone());
+            if created {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(doc.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(204)
+            }
+        }
+        (false, "PATCH") => {
+            let Some(mut doc) = ds.doc_get(resource, &key) else {
+                return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
+            };
+            let patch = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            if let Some(resp) = apply_patch_document(&mut doc, &patch) {
+                return resp;
+            }
+            ds.doc_put(resource, &key, doc.clone());
+            SbiResponse::with_status(204)
+        }
+        (false, "DELETE") => {
+            if ds.doc_remove(resource, &key).is_some() {
+                SbiResponse::with_status(204)
+            } else {
+                send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+            }
+        }
+        _ => send_method_not_allowed(method, &format!("context-data/{resource}")),
+    }
+}
+
+/// Apply a TS 29.571 patch document to `doc` in place, returning `Some(response)`
+/// when the patch itself is malformed.
+///
+/// Accepts both forms the Nudr resources define: a `PatchItem[]`
+/// (`application/json-patch+json`) and a merge-patch object. `remove`/`replace`
+/// on an absent member is an error rather than a silent no-op — a consumer
+/// patching a path that is not there has a wrong idea of the stored document,
+/// and a 204 would confirm it.
+fn apply_patch_document(
+    doc: &mut serde_json::Value,
+    patch: &serde_json::Value,
+) -> Option<SbiResponse> {
+    if let Some(items) = patch.as_array() {
+        for item in items {
+            let op = item.get("op").and_then(|v| v.as_str()).unwrap_or("");
+            let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let key = path.trim_start_matches('/');
+            if key.is_empty() || key.contains('/') {
+                return Some(send_bad_request(
+                    &format!("Only top-level attributes are patchable: {path}"),
+                    Some("INVALID_MSG_FORMAT"),
+                ));
+            }
+            let Some(obj) = doc.as_object_mut() else {
+                return Some(send_bad_request(
+                    "Stored document is not an object",
+                    Some("INVALID_MSG_FORMAT"),
+                ));
+            };
+            match op {
+                "add" => {
+                    let Some(value) = item.get("value") else {
+                        return Some(missing_mandatory("value"));
+                    };
+                    obj.insert(key.to_string(), value.clone());
+                }
+                "replace" => {
+                    let Some(value) = item.get("value") else {
+                        return Some(missing_mandatory("value"));
+                    };
+                    if !obj.contains_key(key) {
+                        return Some(send_bad_request(
+                            &format!("Cannot replace absent attribute: {key}"),
+                            Some("INVALID_MSG_FORMAT"),
+                        ));
+                    }
+                    obj.insert(key.to_string(), value.clone());
+                }
+                "remove" => {
+                    if obj.remove(key).is_none() {
+                        return Some(send_bad_request(
+                            &format!("Cannot remove absent attribute: {key}"),
+                            Some("INVALID_MSG_FORMAT"),
+                        ));
+                    }
+                }
+                other => {
+                    return Some(send_bad_request(
+                        &format!("Unsupported patch op: {other}"),
+                        Some("INVALID_MSG_FORMAT"),
+                    ))
+                }
+            }
+        }
+        None
+    } else if patch.is_object() {
+        merge_patch(doc, patch);
+        None
+    } else {
+        Some(send_bad_request(
+            "Invalid patch document",
+            Some("INVALID_MSG_FORMAT"),
+        ))
+    }
+}
+
+/// Path of the amf-3gpp-access resource for a SUPI (notification resourceId).
+fn amf_3gpp_access_path(supi: &str) -> String {
+    context_data_path(supi, "amf-3gpp-access")
+}
+
+/// Handle an AMF access registration context for `slot` (TS 29.505 §5.2.4).
+///
+/// Stores and returns the full `Amf3GppAccessRegistration` /
+/// `AmfNon3GppAccessRegistration` document: the shape PUT here by udmd
+/// (forwarding the amfd Nudm registration) is preserved verbatim and echoed on
+/// GET. The two accesses are separate documents, so a non-3GPP registration
+/// cannot be read back as, or overwrite, the 3GPP one.
+async fn handle_amf_access(
+    supi: &str,
+    slot: AmfAccessSlot,
+    method: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let udr_ctx = nextgcore_udrd::context::udr_self();
+    let resource = slot.resource();
+    match method {
+        "GET" => match slot.get(supi) {
+            Some(doc) => {
+                log::debug!("[{supi}] GET {resource} - registration found");
                 SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
             }
             None => send_not_found(
@@ -892,11 +1602,15 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
                 Ok(v) => v,
                 Err(resp) => return *resp,
             };
-            // Mandatory attributes per TS 29.503 Amf3GppAccessRegistration
+            // Mandatory attributes per TS 29.503 Amf3GppAccessRegistration.
+            // The non-3GPP schema additionally requires imsVoPs.
             for attr in ["amfInstanceId", "deregCallbackUri", "guami", "ratType"] {
                 if reg_data.get(attr).is_none() {
                     return missing_mandatory(attr);
                 }
+            }
+            if slot == AmfAccessSlot::Non3Gpp && reg_data.get("imsVoPs").is_none() {
+                return missing_mandatory("imsVoPs");
             }
             // Persist the PEI (IMEISV) claim off-thread (last live
             // blocking Mongo call moved to the spawn_blocking wrapper).
@@ -914,8 +1628,8 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
             if let Ok(mut ctx) = udr_ctx.write() {
                 ctx.ue_find_or_add(supi);
             }
-            let created = ds.amf_3gpp_put(supi, reg_data.clone());
-            let path = amf_3gpp_access_path(supi);
+            let created = slot.put(supi, reg_data.clone());
+            let path = slot.path(supi);
             notify_subscription_data_change(supi, &path, Some(&reg_data));
             if created {
                 SbiResponse::with_status(201)
@@ -926,7 +1640,7 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
             }
         }
         "PATCH" => {
-            let Some(mut doc) = ds.amf_3gpp_get(supi) else {
+            let Some(mut doc) = slot.get(supi) else {
                 return send_not_found(
                     "AMF registration context not found",
                     Some("CONTEXT_NOT_FOUND"),
@@ -972,21 +1686,29 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
             } else {
                 return send_bad_request("Invalid patch document", Some("INVALID_MSG_FORMAT"));
             }
-            ds.amf_3gpp_put(supi, doc.clone());
-            notify_subscription_data_change(supi, &amf_3gpp_access_path(supi), Some(&doc));
+            slot.put(supi, doc.clone());
+            notify_subscription_data_change(supi, &slot.path(supi), Some(&doc));
             SbiResponse::with_status(204)
         }
         "DELETE" => {
-            let existed = ds.amf_3gpp_remove(supi).is_some();
-            if let Ok(mut ctx) = udr_ctx.write() {
-                ctx.ue_remove(supi);
+            let existed = slot.remove(supi).is_some();
+            // The UE tracking entry is shared by both accesses, so it is only
+            // dropped once NEITHER access holds a registration -- removing it on
+            // a single-access deregistration would forget a UE that is still
+            // registered over the other access.
+            if AmfAccessSlot::ThreeGpp.get(supi).is_none()
+                && AmfAccessSlot::Non3Gpp.get(supi).is_none()
+            {
+                if let Ok(mut ctx) = udr_ctx.write() {
+                    ctx.ue_remove(supi);
+                }
             }
             if existed {
-                notify_subscription_data_change(supi, &amf_3gpp_access_path(supi), None);
+                notify_subscription_data_change(supi, &slot.path(supi), None);
             }
             SbiResponse::with_status(204)
         }
-        _ => send_method_not_allowed(method, "context-data/amf-3gpp-access"),
+        _ => send_method_not_allowed(method, &format!("context-data/{resource}")),
     }
 }
 
@@ -1096,13 +1818,58 @@ fn handle_smf_registrations(
                 ctx.sess_find_or_add(supi, psi, dnn.as_deref());
             }
             // Store the actual registered document (created vs. replaced).
-            let created = ds.smf_registration_put(supi, pdu_session_id, doc);
-            // TS 29.505: 201 Created for a new registration, 204 for replace.
+            let created = ds.smf_registration_put(supi, pdu_session_id, doc.clone());
+            let path = format!(
+                "/nudr-dr/v2/subscription-data/{supi}/context-data/smf-registrations/{pdu_session_id}"
+            );
+            notify_subscription_data_change(supi, &path, Some(&doc));
+            // TS 29.505 §5.2.4: 201 Created carries the created SmfRegistration
+            // representation AND a required Location header (#87) -- a bare 201
+            // leaves the consumer without the URI of the resource it just made,
+            // and without confirmation of what was stored.
             if created {
                 SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(doc.to_string(), "application/json")
             } else {
                 SbiResponse::with_status(204)
             }
+        }
+        "PATCH" => {
+            if pdu_session_id.is_empty() {
+                return send_bad_request("Missing pduSessionId", Some("MANDATORY_IE_MISSING"));
+            }
+            // TS 29.505 §5.2.4 defines PATCH on the individual registration;
+            // it answered 405 before #87.
+            let Some(mut doc) = ds.smf_registration_get(supi, pdu_session_id) else {
+                return send_not_found("SMF registration not found", Some("CONTEXT_NOT_FOUND"));
+            };
+            let patch = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            if let Some(resp) = apply_patch_document(&mut doc, &patch) {
+                return resp;
+            }
+            // The pduSessionId identifies the resource, so a patch must not be
+            // able to move the document to another key.
+            if doc
+                .get("pduSessionId")
+                .and_then(|v| v.as_u64())
+                .map(|p| p.to_string())
+                != Some(pdu_session_id.to_string())
+            {
+                return send_bad_request(
+                    "pduSessionId is not patchable",
+                    Some("INVALID_MSG_FORMAT"),
+                );
+            }
+            ds.smf_registration_put(supi, pdu_session_id, doc.clone());
+            let path = format!(
+                "/nudr-dr/v2/subscription-data/{supi}/context-data/smf-registrations/{pdu_session_id}"
+            );
+            notify_subscription_data_change(supi, &path, Some(&doc));
+            SbiResponse::with_status(204)
         }
         "DELETE" => {
             if !pdu_session_id.is_empty() {
@@ -1415,197 +2182,609 @@ async fn handle_provisioned_data(
 /// - GET/PUT policy-data/ues/{supi}/sm-data: SM policy data
 /// - GET policy-data/ues/{supi}/ue-policy-set: UE policy set
 async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
-    // /nudr-dr/v2/policy-data/ues/{supi}/{resource}
-    let sub_resource = parts.get(3).copied().unwrap_or("");
+    // TS 29.519 §5.2 resource tree:
+    //   /policy-data/ues/{ueId}/{am-data,sm-data[/{usageMonId}],ue-policy-set}
+    //   /policy-data/subs-to-notify[/{subsId}]
+    //   /policy-data/plmns/{plmnId}/ue-policy-set
+    //   /policy-data/sponsor-connectivity-data/{sponsorId}
+    //   /policy-data/bdt-data[/{bdtReferenceId}]
+    match parts.get(3).copied().unwrap_or("") {
+        "ues" => handle_policy_ue_data(parts, method, request).await,
+        "subs-to-notify" => handle_policy_subs_to_notify(parts, method, request),
+        "plmns" => handle_policy_plmn_data(parts, method, request),
+        "sponsor-connectivity-data" => handle_policy_sponsor_data(parts, method, request),
+        "bdt-data" => handle_policy_bdt_data(parts, method, request),
+        other => send_not_found(&format!("Unknown policy sub-resource: {other}"), None),
+    }
+}
 
-    if sub_resource != "ues" {
-        return send_not_found(
-            &format!("Unknown policy sub-resource: {sub_resource}"),
-            None,
+/// The resource URI of a per-UE policy document (notification resourceId).
+fn policy_ue_path(supi: &str, resource: &str) -> String {
+    format!("/nudr-dr/v2/policy-data/ues/{supi}/{resource}")
+}
+
+/// Store a provisioned policy document and emit both change notifications.
+///
+/// Both, because the two subscription trees have different audiences: a
+/// `/subscription-data/subs-to-notify` subscriber (typically the UDM) gets the
+/// `DataChangeNotify`, a `/policy-data/subs-to-notify` subscriber (the PCF) gets
+/// the `PolicyDataChangeNotification`. Emitting only the first is why a PCF
+/// could subscribe and never hear anything.
+fn notify_policy_change(supi: &str, path: &str, doc: Option<&serde_json::Value>) {
+    notify_subscription_data_change(supi, path, doc);
+    nextgcore_udrd::data_store::notify_policy_data_change(supi, path, doc);
+}
+
+/// Read a provisioned policy document by resource name.
+fn policy_doc_get(supi: &str, resource: &str) -> Option<serde_json::Value> {
+    let ds = nextgcore_udrd::data_store::store();
+    match resource {
+        "am-data" => ds.policy_am_get(supi),
+        "sm-data" => ds.policy_sm_get(supi),
+        "ue-policy-set" => ds.policy_ue_get(supi),
+        _ => None,
+    }
+}
+
+/// Write a provisioned policy document by resource name; true when created.
+fn policy_doc_put(supi: &str, resource: &str, doc: serde_json::Value) -> bool {
+    let ds = nextgcore_udrd::data_store::store();
+    match resource {
+        "am-data" => ds.policy_am_put(supi, doc),
+        "sm-data" => ds.policy_sm_put(supi, doc),
+        "ue-policy-set" => ds.policy_ue_put(supi, doc),
+        _ => false,
+    }
+}
+
+/// PUT a provisioned per-UE policy document (`am-data`, `sm-data`,
+/// `ue-policy-set`).
+fn policy_put(supi: &str, resource: &str, request: &SbiRequest) -> SbiResponse {
+    let body = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    if !body.is_object() {
+        return send_bad_request("Body must be a JSON object", Some("INVALID_MSG_FORMAT"));
+    }
+    let created = policy_doc_put(supi, resource, body.clone());
+    let path = policy_ue_path(supi, resource);
+    notify_policy_change(supi, &path, Some(&body));
+    if created {
+        SbiResponse::with_status(201)
+            .with_header("Location", path)
+            .with_body(body.to_string(), "application/json")
+    } else {
+        SbiResponse::with_status(204)
+    }
+}
+
+/// PATCH a provisioned per-UE policy document (TS 29.519 §5.2: `am-data` :143,
+/// `sm-data` :333, `ue-policy-set` :484 — all `405` before #87).
+///
+/// An absent document starts empty rather than 404ing: PATCH is how a PCF
+/// provisions a delta, and refusing the first one would mean a document could
+/// only ever be created by a full PUT the consumer may not have.
+fn policy_patch(supi: &str, resource: &str, request: &SbiRequest) -> SbiResponse {
+    let patch = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let mut doc = policy_doc_get(supi, resource).unwrap_or_else(|| serde_json::json!({}));
+    if let Some(resp) = apply_patch_document(&mut doc, &patch) {
+        return resp;
+    }
+    policy_doc_put(supi, resource, doc.clone());
+    let path = policy_ue_path(supi, resource);
+    notify_policy_change(supi, &path, Some(&doc));
+    SbiResponse::with_status(204)
+}
+
+/// Does `entry`'s `snssai` object match the requested one?
+///
+/// Compared field-wise on `sst`/`sd` rather than by map key, because the key
+/// spelling is a UDR-side convention (`"01-000001"`) while the consumer sends a
+/// JSON `Snssai` — matching on the key would make the filter depend on how this
+/// UDR happens to format it.
+fn snssai_entry_matches(entry: &serde_json::Value, want: &serde_json::Value) -> bool {
+    let have = entry.get("snssai").unwrap_or(entry);
+    let sst_eq =
+        have.get("sst").and_then(|v| v.as_u64()) == want.get("sst").and_then(|v| v.as_u64());
+    let norm_sd = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_str())
+            .map(|s| s.trim_start_matches('0').to_ascii_lowercase())
+    };
+    sst_eq && norm_sd(have.get("sd")) == norm_sd(want.get("sd"))
+}
+
+/// Narrow an `SmPolicyData` to the requested `snssai` / `dnn` (TS 29.519 §5.2).
+///
+/// Returns `None` when the filter selects nothing — the subscriber has no policy
+/// for that slice or DNN, which is a `404` rather than an empty document a PCF
+/// would install as "no policy applies".
+fn filter_sm_policy_data(
+    doc: &serde_json::Value,
+    snssai: Option<&serde_json::Value>,
+    dnn: Option<&str>,
+) -> Option<serde_json::Value> {
+    let Some(want) = snssai else {
+        // No filter: the whole document, as before #87.
+        return Some(doc.clone());
+    };
+    let entries = doc.get("smPolicySnssaiData").and_then(|v| v.as_object())?;
+    let mut kept = serde_json::Map::new();
+    for (key, entry) in entries {
+        if !snssai_entry_matches(entry, want) {
+            continue;
+        }
+        let mut entry = entry.clone();
+        if let Some(dnn) = dnn {
+            let dnn_entries = entry
+                .get("smPolicyDnnData")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let Some(hit) = dnn_entries.get(dnn) else {
+                // The slice matches but the DNN does not: selecting nothing.
+                continue;
+            };
+            let mut only = serde_json::Map::new();
+            only.insert(dnn.to_string(), hit.clone());
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert(
+                    "smPolicyDnnData".to_string(),
+                    serde_json::Value::Object(only),
+                );
+            }
+        }
+        kept.insert(key.clone(), entry);
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    let mut out = doc.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "smPolicySnssaiData".to_string(),
+            serde_json::Value::Object(kept),
         );
     }
+    Some(out)
+}
 
+/// `/policy-data/ues/{ueId}/...` (TS 29.519 §5.2).
+async fn handle_policy_ue_data(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
     let supi = match parts.get(4) {
         Some(s) => *s,
         None => return send_bad_request("Missing SUPI", Some("MISSING_SUPI")),
     };
 
     let resource = parts.get(5).copied().unwrap_or("");
+    let tail = parts.get(6).copied().unwrap_or("");
 
     match resource {
-        "am-data" => {
-            match method {
-                "GET" => {
-                    log::debug!("[{supi}] GET policy am-data");
-                    // udrd-05: return stored AmPolicyData when provisioned (udrd-04);
-                    // fall back to `{}` per TS 29.519 (no default AM policy data).
-                    let ds = nextgcore_udrd::data_store::store();
-                    let body = ds
-                        .policy_am_get(supi)
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    let body = apply_fields_param(body, request);
-                    SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
-                }
-                "PUT" => {
-                    log::debug!("[{supi}] PUT policy am-data");
-                    let body = match parse_json_body(request) {
-                        Ok(v) => v,
-                        Err(resp) => return *resp,
-                    };
-                    if !body.is_object() {
-                        return send_bad_request(
-                            "Body must be a JSON object",
-                            Some("INVALID_MSG_FORMAT"),
-                        );
-                    }
-                    let ds = nextgcore_udrd::data_store::store();
-                    let created = ds.policy_am_put(supi, body.clone());
-                    let path = format!("/nudr-dr/v2/policy-data/ues/{supi}/am-data");
-                    notify_subscription_data_change(supi, &path, Some(&body));
-                    if created {
-                        SbiResponse::with_status(201)
-                            .with_header("Location", path)
-                            .with_body(body.to_string(), "application/json")
-                    } else {
-                        SbiResponse::with_status(204)
-                    }
-                }
-                _ => send_method_not_allowed(method, "policy-data/ues/am-data"),
+        "am-data" => match method {
+            "GET" => {
+                log::debug!("[{supi}] GET policy am-data");
+                // udrd-05: return stored AmPolicyData when provisioned (udrd-04);
+                // fall back to `{}` per TS 29.519 (no default AM policy data).
+                let body = policy_doc_get(supi, "am-data").unwrap_or_else(|| serde_json::json!({}));
+                let body = apply_fields_param(body, request);
+                SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
             }
+            "PUT" => policy_put(supi, "am-data", request),
+            "PATCH" => policy_patch(supi, "am-data", request),
+            _ => send_method_not_allowed(method, "policy-data/ues/am-data"),
+        },
+        "sm-data" if !tail.is_empty() => {
+            // /sm-data/{usageMonId} — the UsageMonData document (TS 29.519 :550).
+            handle_policy_usage_mon(supi, tail, method, request)
         }
-        "sm-data" => {
-            match method {
-                "GET" => {
-                    log::debug!("[{supi}] GET policy sm-data");
-                    let ds = nextgcore_udrd::data_store::store();
-                    // udrd-05: prefer stored SmPolicyData when provisioned (udrd-04);
-                    // fall back to the derived default from subscription data.
-                    if let Some(stored) = ds.policy_sm_get(supi) {
-                        let stored = apply_fields_param(stored, request);
-                        return SbiResponse::with_status(200)
-                            .with_body(stored.to_string(), "application/json");
-                    }
-                    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(
-                        supi.to_string(),
-                    )
-                    .await
-                    {
-                        Ok(data) => {
-                            let sm_policy_snssai_data = build_sm_policy_data(&data);
-                            let response =
-                                serde_json::json!({"smPolicySnssaiData": sm_policy_snssai_data});
-                            let response = apply_fields_param(response, request);
-                            SbiResponse::with_status(200)
-                                .with_body(response.to_string(), "application/json")
-                        }
-                        Err(_) => send_not_found("Subscriber not found", None),
-                    }
-                }
-                "PUT" => {
-                    log::debug!("[{supi}] PUT policy sm-data");
-                    let body = match parse_json_body(request) {
-                        Ok(v) => v,
-                        Err(resp) => return *resp,
-                    };
-                    if !body.is_object() {
-                        return send_bad_request(
-                            "Body must be a JSON object",
-                            Some("INVALID_MSG_FORMAT"),
-                        );
-                    }
-                    // udrd-04: persist the provisioned SmPolicyData.
-                    let ds = nextgcore_udrd::data_store::store();
-                    let created = ds.policy_sm_put(supi, body.clone());
-                    let path = format!("/nudr-dr/v2/policy-data/ues/{supi}/sm-data");
-                    notify_subscription_data_change(supi, &path, Some(&body));
-                    if created {
-                        SbiResponse::with_status(201)
-                            .with_header("Location", path)
-                            .with_body(body.to_string(), "application/json")
-                    } else {
-                        SbiResponse::with_status(204)
-                    }
-                }
-                _ => send_method_not_allowed(method, "policy-data/ues/sm-data"),
-            }
-        }
-        "ue-policy-set" => {
-            match method {
-                "GET" => {
-                    log::debug!("[{supi}] GET ue-policy-set");
-                    let ds = nextgcore_udrd::data_store::store();
-                    // udrd-05: prefer stored UePolicySet when provisioned (udrd-04);
-                    // fall back to a minimal derived default built from subscription slices.
-                    if let Some(stored) = ds.policy_ue_get(supi) {
-                        let stored = apply_fields_param(stored, request);
-                        return SbiResponse::with_status(200)
-                            .with_body(stored.to_string(), "application/json");
-                    }
-                    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(
-                        supi.to_string(),
-                    )
-                    .await
-                    {
-                        Ok(data) => {
-                            // Build a minimal UePolicySet with subscribed S-NSSAIs
-                            let mut subscribed_ue_pol_sections = serde_json::Map::new();
-                            for slice in &data.slice {
-                                let snssai_key = if slice.s_nssai.has_sd() {
-                                    format!("{:02x}-{:06x}", slice.s_nssai.sst, slice.s_nssai.sd.v)
-                                } else {
-                                    format!("{:02x}", slice.s_nssai.sst)
-                                };
-                                subscribed_ue_pol_sections.insert(
-                                    snssai_key,
-                                    serde_json::json!({
-                                        "upsi": [],
-                                        "allowedRouteSelDescs": {}
-                                    }),
-                                );
-                            }
-                            let response = serde_json::json!({
-                                "subscPolicySections": subscribed_ue_pol_sections
-                            });
-                            let response = apply_fields_param(response, request);
-                            SbiResponse::with_status(200)
-                                .with_body(response.to_string(), "application/json")
-                        }
-                        Err(_) => {
-                            // Return empty UePolicySet as default (TS 29.519)
-                            SbiResponse::with_status(200)
-                                .with_body("{}".to_string(), "application/json")
+        "sm-data" => match method {
+            "GET" => {
+                log::debug!("[{supi}] GET policy sm-data");
+                // TS 29.519 §5.2: `snssai` (a JSON Snssai) and `dnn` narrow the
+                // document. Both are optional in the in-tree OpenAPI, so an
+                // absent filter still returns everything; a filter that selects
+                // nothing is a 404, not an empty SmPolicyData (#87).
+                let snssai = request
+                    .http
+                    .params
+                    .get("snssai")
+                    .map(|raw| pct_decode(raw))
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+                let dnn = request.http.params.get("dnn").map(|d| pct_decode(d));
+                let stored = match policy_doc_get(supi, "sm-data") {
+                    Some(stored) => Some(stored),
+                    None => {
+                        // Fall back to the default derived from subscription data.
+                        match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(
+                            supi.to_string(),
+                        )
+                        .await
+                        {
+                            Ok(data) => Some(serde_json::json!({
+                                "smPolicySnssaiData": build_sm_policy_data(&data)
+                            })),
+                            Err(_) => None,
                         }
                     }
-                }
-                "PUT" => {
-                    log::debug!("[{supi}] PUT ue-policy-set");
-                    let body = match parse_json_body(request) {
-                        Ok(v) => v,
-                        Err(resp) => return *resp,
-                    };
-                    if !body.is_object() {
-                        return send_bad_request(
-                            "Body must be a JSON object",
-                            Some("INVALID_MSG_FORMAT"),
-                        );
+                };
+                let Some(stored) = stored else {
+                    return send_not_found("Subscriber not found", None);
+                };
+                match filter_sm_policy_data(&stored, snssai.as_ref(), dnn.as_deref()) {
+                    Some(doc) => {
+                        let doc = apply_fields_param(doc, request);
+                        SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
                     }
-                    // udrd-04: persist the provisioned UePolicySet.
-                    let ds = nextgcore_udrd::data_store::store();
-                    let created = ds.policy_ue_put(supi, body.clone());
-                    let path = format!("/nudr-dr/v2/policy-data/ues/{supi}/ue-policy-set");
-                    notify_subscription_data_change(supi, &path, Some(&body));
-                    if created {
-                        SbiResponse::with_status(201)
-                            .with_header("Location", path)
-                            .with_body(body.to_string(), "application/json")
-                    } else {
-                        SbiResponse::with_status(204)
-                    }
+                    None => send_not_found(
+                        "No SM policy data for the requested S-NSSAI/DNN",
+                        Some("DATA_NOT_FOUND"),
+                    ),
                 }
-                _ => send_method_not_allowed(method, "policy-data/ues/ue-policy-set"),
             }
-        }
+            "PUT" => policy_put(supi, "sm-data", request),
+            "PATCH" => policy_patch(supi, "sm-data", request),
+            _ => send_method_not_allowed(method, "policy-data/ues/sm-data"),
+        },
+        "ue-policy-set" => match method {
+            "GET" => {
+                log::debug!("[{supi}] GET ue-policy-set");
+                // udrd-05: prefer stored UePolicySet when provisioned (udrd-04);
+                // fall back to a minimal derived default built from subscription slices.
+                if let Some(stored) = policy_doc_get(supi, "ue-policy-set") {
+                    let stored = apply_fields_param(stored, request);
+                    return SbiResponse::with_status(200)
+                        .with_body(stored.to_string(), "application/json");
+                }
+                match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(
+                    supi.to_string(),
+                )
+                .await
+                {
+                    Ok(data) => {
+                        // Build a minimal UePolicySet with subscribed S-NSSAIs
+                        let mut subscribed_ue_pol_sections = serde_json::Map::new();
+                        for slice in &data.slice {
+                            let snssai_key = if slice.s_nssai.has_sd() {
+                                format!("{:02x}-{:06x}", slice.s_nssai.sst, slice.s_nssai.sd.v)
+                            } else {
+                                format!("{:02x}", slice.s_nssai.sst)
+                            };
+                            subscribed_ue_pol_sections.insert(
+                                snssai_key,
+                                serde_json::json!({
+                                    "upsi": [],
+                                    "allowedRouteSelDescs": {}
+                                }),
+                            );
+                        }
+                        let response = serde_json::json!({
+                            "subscPolicySections": subscribed_ue_pol_sections
+                        });
+                        let response = apply_fields_param(response, request);
+                        SbiResponse::with_status(200)
+                            .with_body(response.to_string(), "application/json")
+                    }
+                    Err(_) => {
+                        // Return empty UePolicySet as default (TS 29.519)
+                        SbiResponse::with_status(200)
+                            .with_body("{}".to_string(), "application/json")
+                    }
+                }
+            }
+            "PUT" => policy_put(supi, "ue-policy-set", request),
+            "PATCH" => policy_patch(supi, "ue-policy-set", request),
+            _ => send_method_not_allowed(method, "policy-data/ues/ue-policy-set"),
+        },
         _ => send_not_found(&format!("Unknown policy resource: {resource}"), None),
+    }
+}
+
+/// `/policy-data/ues/{ueId}/sm-data/{usageMonId}` — the UsageMonData document
+/// (TS 29.519 §5.2). Keyed `{supi}\u{1f}{usageMonId}` so one UE's monitoring
+/// documents are independent of another's.
+fn handle_policy_usage_mon(
+    supi: &str,
+    usage_mon_id: &str,
+    method: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let ds = nextgcore_udrd::data_store::store();
+    let key = format!("{supi}\u{1f}{usage_mon_id}");
+    let path = format!("/nudr-dr/v2/policy-data/ues/{supi}/sm-data/{usage_mon_id}");
+    match method {
+        "GET" => match ds.doc_get("policy-usage-mon", &key) {
+            Some(doc) => {
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found("No usage monitoring data", Some("DATA_NOT_FOUND")),
+        },
+        "PUT" => {
+            let body = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            let created = ds.doc_put("policy-usage-mon", &key, body.clone());
+            notify_policy_change(supi, &path, Some(&body));
+            if created {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(body.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(204)
+            }
+        }
+        "DELETE" => {
+            if ds.doc_remove("policy-usage-mon", &key).is_some() {
+                notify_policy_change(supi, &path, None);
+            }
+            SbiResponse::with_status(204)
+        }
+        _ => send_method_not_allowed(method, "policy-data/ues/sm-data/{usageMonId}"),
+    }
+}
+
+/// `/policy-data/subs-to-notify[/{subsId}]` — TS 29.519 §5.2 (:1077, :1250).
+///
+/// The subscription tree a PCF uses to hear about policy-data changes. It was
+/// entirely absent, so a conformant PCF's subscribe attempt 404'd.
+fn handle_policy_subs_to_notify(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
+    let ds = nextgcore_udrd::data_store::store();
+    let subs_id = parts.get(4).copied().unwrap_or("");
+    match (subs_id.is_empty(), method) {
+        (true, "POST") => {
+            let body = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            // PolicyDataSubscription: notificationUri + monitoredResourceUris.
+            let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
+                return missing_mandatory("notificationUri");
+            };
+            if body
+                .get("monitoredResourceUris")
+                .and_then(|v| v.as_array())
+                .is_none_or(|a| a.is_empty())
+            {
+                return missing_mandatory("monitoredResourceUris");
+            }
+            let sub = ds.sub_create(SubKind::PolicyData, uri, body.clone());
+            SbiResponse::with_status(201)
+                .with_header(
+                    "Location",
+                    format!("/nudr-dr/v2/policy-data/subs-to-notify/{}", sub.id),
+                )
+                .with_body(body.to_string(), "application/json")
+        }
+        (false, "GET") => match ds.sub_get(subs_id) {
+            Some(sub) if sub.kind == SubKind::PolicyData => {
+                SbiResponse::with_status(200).with_body(sub.body.to_string(), "application/json")
+            }
+            _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
+        },
+        (false, "PUT") => {
+            let body = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
+                return missing_mandatory("notificationUri");
+            };
+            if ds.sub_replace(subs_id, SubKind::PolicyData, uri, body.clone()) {
+                SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
+            } else {
+                send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+            }
+        }
+        (false, "DELETE") => {
+            if ds.sub_remove(subs_id).is_some() {
+                SbiResponse::with_status(204)
+            } else {
+                send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+            }
+        }
+        _ => send_method_not_allowed(method, "policy-data/subs-to-notify"),
+    }
+}
+
+/// `/policy-data/plmns/{plmnId}/ue-policy-set` — TS 29.519 §5.2 (:1651): the
+/// PLMN-wide UE policy set, as opposed to a per-UE one.
+fn handle_policy_plmn_data(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
+    let plmn_id = parts.get(4).copied().unwrap_or("");
+    if parts.get(5).copied() != Some("ue-policy-set") {
+        return send_not_found("Unknown policy plmns resource", None);
+    }
+    if !is_valid_plmn_id(plmn_id) {
+        return send_error(
+            400,
+            "Bad Request",
+            &format!("Invalid plmnId: {plmn_id}"),
+            Some("MANDATORY_IE_INCORRECT"),
+        );
+    }
+    let ds = nextgcore_udrd::data_store::store();
+    let path = format!("/nudr-dr/v2/policy-data/plmns/{plmn_id}/ue-policy-set");
+    match method {
+        "GET" => match ds.doc_get("policy-plmn-ue-policy-set", plmn_id) {
+            Some(doc) => {
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found("No PLMN UE policy set", Some("DATA_NOT_FOUND")),
+        },
+        "PUT" => {
+            let body = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            let created = ds.doc_put("policy-plmn-ue-policy-set", plmn_id, body.clone());
+            if created {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(body.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(204)
+            }
+        }
+        "PATCH" => {
+            let patch = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            let mut doc = ds
+                .doc_get("policy-plmn-ue-policy-set", plmn_id)
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(resp) = apply_patch_document(&mut doc, &patch) {
+                return resp;
+            }
+            ds.doc_put("policy-plmn-ue-policy-set", plmn_id, doc);
+            SbiResponse::with_status(204)
+        }
+        _ => send_method_not_allowed(method, "policy-data/plmns/ue-policy-set"),
+    }
+}
+
+/// `/policy-data/sponsor-connectivity-data/{sponsorId}` — TS 29.519 §5.2 (:738).
+fn handle_policy_sponsor_data(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
+    let sponsor_id = parts.get(4).copied().unwrap_or("");
+    if sponsor_id.is_empty() {
+        return send_not_found("Missing sponsorId", None);
+    }
+    let ds = nextgcore_udrd::data_store::store();
+    let path = format!("/nudr-dr/v2/policy-data/sponsor-connectivity-data/{sponsor_id}");
+    match method {
+        "GET" => match ds.doc_get("policy-sponsor-data", sponsor_id) {
+            Some(doc) => {
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found("No sponsor connectivity data", Some("DATA_NOT_FOUND")),
+        },
+        "PUT" => {
+            let body = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            // SponsorConnectivityData requires aspIds (TS 29.519 §5.6.2.x).
+            if body
+                .get("aspIds")
+                .and_then(|v| v.as_array())
+                .is_none_or(|a| a.is_empty())
+            {
+                return missing_mandatory("aspIds");
+            }
+            let created = ds.doc_put("policy-sponsor-data", sponsor_id, body.clone());
+            if created {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(body.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(204)
+            }
+        }
+        _ => send_method_not_allowed(method, "policy-data/sponsor-connectivity-data"),
+    }
+}
+
+/// `/policy-data/bdt-data[/{bdtReferenceId}]` — TS 29.519 §5.2 (:799, :864).
+fn handle_policy_bdt_data(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
+    let ds = nextgcore_udrd::data_store::store();
+    let bdt_ref = parts.get(4).copied().unwrap_or("");
+    match (bdt_ref.is_empty(), method) {
+        (true, "GET") => {
+            let list: Vec<serde_json::Value> = ds
+                .doc_list("policy-bdt-data")
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect();
+            SbiResponse::with_status(200).with_body(
+                serde_json::Value::Array(list).to_string(),
+                "application/json",
+            )
+        }
+        (false, "GET") => match ds.doc_get("policy-bdt-data", bdt_ref) {
+            Some(doc) => {
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found("No BDT data", Some("DATA_NOT_FOUND")),
+        },
+        (false, "PUT") => {
+            let body = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            // BdtData requires aspId, transPolicy and bdtRefId; the path segment
+            // is authoritative for the last, so a body that disagrees is refused
+            // rather than silently stored under the URI's id.
+            for attr in ["aspId", "transPolicy"] {
+                if body.get(attr).is_none() {
+                    return missing_mandatory(attr);
+                }
+            }
+            if let Some(body_ref) = body.get("bdtRefId").and_then(|v| v.as_str()) {
+                if body_ref != bdt_ref {
+                    return send_bad_request(
+                        "bdtRefId in body does not match URI",
+                        Some("INVALID_MSG_FORMAT"),
+                    );
+                }
+            }
+            let path = format!("/nudr-dr/v2/policy-data/bdt-data/{bdt_ref}");
+            let created = ds.doc_put("policy-bdt-data", bdt_ref, body.clone());
+            if created {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(body.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(204)
+            }
+        }
+        (false, "PATCH") => {
+            let Some(mut doc) = ds.doc_get("policy-bdt-data", bdt_ref) else {
+                return send_not_found("No BDT data", Some("DATA_NOT_FOUND"));
+            };
+            let patch = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            if let Some(resp) = apply_patch_document(&mut doc, &patch) {
+                return resp;
+            }
+            ds.doc_put("policy-bdt-data", bdt_ref, doc.clone());
+            SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+        }
+        (false, "DELETE") => {
+            if ds.doc_remove("policy-bdt-data", bdt_ref).is_some() {
+                SbiResponse::with_status(204)
+            } else {
+                send_not_found("No BDT data", Some("DATA_NOT_FOUND"))
+            }
+        }
+        _ => send_method_not_allowed(method, "policy-data/bdt-data"),
     }
 }
 
@@ -2231,7 +3410,118 @@ async fn handle_application_data(
             }
             _ => send_method_not_allowed(method, "application-data/subs-to-notify"),
         },
+        // --- the datasets that fell through to 404 before #87 --------------
+        // TS 29.519 §5.6 names them exactly as spelled here; the issue's
+        // informal "af-qos-data" / "eas-deployment-data" do not appear in the
+        // OpenAPI, and routing an invented path would advertise a surface no
+        // conformant consumer asks for.
+        Some(
+            collection @ ("bdtPolicyData" | "iptvConfigData" | "serviceParamData"
+            | "am-influence-data" | "af-qos-data-sets" | "eas-deploy-data"),
+        ) => handle_application_dataset(collection, parts.get(4).copied(), method, request),
         _ => send_not_found("Unknown application-data resource", None),
+    }
+}
+
+/// Mandatory members of an application-data document, by dataset
+/// (TS 29.519 §5.6.2). Datasets whose schema marks nothing required return an
+/// empty slice rather than a made-up requirement.
+fn application_dataset_required(collection: &str) -> &'static [&'static str] {
+    match collection {
+        // BdtPolicyData
+        "bdtPolicyData" => &["bdtRefId"],
+        // IptvConfigData
+        "iptvConfigData" => &["afAppId", "multiAccCtrls"],
+        _ => &[],
+    }
+}
+
+/// CRUD for one application-data dataset (TS 29.519 §5.6).
+///
+/// All six share the same document shape — a collection of AF-provisioned
+/// documents addressed by an id — so they share one handler; only the mandatory
+/// members differ, and those come from [`application_dataset_required`]. The
+/// collection GET returns every document, which is what an NEF or PCF reading
+/// the dataset expects.
+fn handle_application_dataset(
+    collection: &str,
+    doc_id: Option<&str>,
+    method: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let ds = data_store::store();
+    let store_key = format!("app-{collection}");
+    match (doc_id, method) {
+        (None, "GET") => {
+            let list: Vec<serde_json::Value> = ds
+                .doc_list(&store_key)
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect();
+            SbiResponse::with_status(200).with_body(
+                serde_json::Value::Array(list).to_string(),
+                "application/json",
+            )
+        }
+        (Some(id), "GET") => match ds.doc_get(&store_key, id) {
+            Some(doc) => {
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+            }
+            None => send_not_found(&format!("{collection} not found"), Some("DATA_NOT_FOUND")),
+        },
+        (Some(id), "PUT") => {
+            let body = match parse_json_body(request) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    return send_bad_request(
+                        "Body must be a JSON object",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+                Err(resp) => return *resp,
+            };
+            for attr in application_dataset_required(collection) {
+                if body.get(*attr).is_none() {
+                    return missing_mandatory(attr);
+                }
+            }
+            let path = format!("/nudr-dr/v2/application-data/{collection}/{id}");
+            let created = ds.doc_put(&store_key, id, body.clone());
+            notify_application_data_change(&path, id, false);
+            if created {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(body.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
+            }
+        }
+        (Some(id), "PATCH") => {
+            let Some(mut doc) = ds.doc_get(&store_key, id) else {
+                return send_not_found(&format!("{collection} not found"), Some("DATA_NOT_FOUND"));
+            };
+            let patch = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            if let Some(resp) = apply_patch_document(&mut doc, &patch) {
+                return resp;
+            }
+            let path = format!("/nudr-dr/v2/application-data/{collection}/{id}");
+            ds.doc_put(&store_key, id, doc.clone());
+            notify_application_data_change(&path, id, false);
+            SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+        }
+        (Some(id), "DELETE") => {
+            if ds.doc_remove(&store_key, id).is_some() {
+                let path = format!("/nudr-dr/v2/application-data/{collection}/{id}");
+                notify_application_data_change(&path, id, true);
+                SbiResponse::with_status(204)
+            } else {
+                send_not_found(&format!("{collection} not found"), Some("DATA_NOT_FOUND"))
+            }
+        }
+        _ => send_method_not_allowed(method, &format!("application-data/{collection}")),
     }
 }
 
@@ -4486,5 +5776,776 @@ udr:
         );
 
         udr.stop().await.expect("udr stops");
+    }
+
+    // ========================================================================
+    // #87: the TS 29.505 / 29.519 / 29.504 resources that answered 404 or 405.
+    // ========================================================================
+
+    fn json_of(resp: &SbiResponse) -> serde_json::Value {
+        serde_json::from_str(resp.http.content.as_deref().unwrap_or("null"))
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    fn amf_reg(instance: &str, non_3gpp: bool) -> serde_json::Value {
+        let mut doc = json!({
+            "amfInstanceId": instance,
+            "deregCallbackUri": format!("http://{instance}/dereg"),
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
+            "ratType": if non_3gpp { "VIRTUAL" } else { "NR" }
+        });
+        if non_3gpp {
+            doc["imsVoPs"] = json!("HOMOGENEOUS_NON_SUPPORT");
+        }
+        doc
+    }
+
+    /// #87 gap 1: `amf-non-3gpp-access` is its own resource. It returned 404, so
+    /// non-3GPP registration state could not be stored at all — and the UDM
+    /// producer added in #84 writes exactly here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_amf_non_3gpp_access_round_trip() {
+        let (udr, client, _listener, _cb_port, _rx) = start_udr_and_listener().await;
+        let supi = "imsi-001019900008701";
+        let three = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access");
+        let non3 = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-non-3gpp-access");
+
+        // Register over 3GPP first, so the assertions below can prove the two
+        // resources are independent rather than aliases.
+        let resp = client
+            .put_json(&three, &amf_reg("amf-3gpp", false))
+            .await
+            .expect("PUT 3gpp");
+        assert_eq!(resp.status, 201);
+
+        // The non-3GPP schema additionally requires imsVoPs.
+        let resp = client
+            .put_json(&non3, &amf_reg("amf-n3", false))
+            .await
+            .expect("PUT non-3gpp without imsVoPs");
+        assert_eq!(resp.status, 400);
+        assert_eq!(json_of(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        let doc = amf_reg("amf-n3", true);
+        let resp = client.put_json(&non3, &doc).await.expect("PUT non-3gpp");
+        assert_eq!(
+            resp.status, 201,
+            "amf-non-3gpp-access must be stored, not 404: {:?}",
+            resp.http.content
+        );
+        assert_eq!(
+            resp.http.get_header("Location").map(String::as_str),
+            Some(non3.as_str())
+        );
+
+        let resp = client.get(&non3).await.expect("GET non-3gpp");
+        assert_eq!(resp.status, 200);
+        assert_eq!(json_of(&resp), doc, "round-trip equality");
+
+        // The 3GPP registration is untouched by the non-3GPP one.
+        let resp = client.get(&three).await.expect("GET 3gpp");
+        assert_eq!(resp.status, 200);
+        assert_eq!(json_of(&resp)["amfInstanceId"], "amf-3gpp");
+
+        // PATCH and DELETE address only the addressed access.
+        let resp = client
+            .patch_json(&non3, &json!({"pei": "imeisv-1234567890123456"}))
+            .await
+            .expect("PATCH non-3gpp");
+        assert_eq!(resp.status, 204);
+        let resp = client.get(&non3).await.expect("GET after PATCH");
+        assert_eq!(json_of(&resp)["pei"], "imeisv-1234567890123456");
+
+        let resp = client.delete(&non3).await.expect("DELETE non-3gpp");
+        assert_eq!(resp.status, 204);
+        let resp = client.get(&non3).await.expect("GET after DELETE");
+        assert_eq!(resp.status, 404);
+        let resp = client
+            .get(&three)
+            .await
+            .expect("GET 3gpp after non-3gpp delete");
+        assert_eq!(
+            resp.status, 200,
+            "deleting the non-3GPP registration must not delete the 3GPP one"
+        );
+
+        udr.stop().await.expect("stop");
+    }
+
+    /// #87 gap 1: the `smf-registrations` PUT owes a `Location` header and the
+    /// created representation, and PATCH must not be a 405.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_smf_registration_put_location_body_and_patch() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        let supi = "imsi-001019900008702";
+        let path = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/smf-registrations/5");
+        let doc = json!({
+            "smfInstanceId": "smf-1",
+            "pduSessionId": 5,
+            "singleNssai": { "sst": 1, "sd": "000001" },
+            "dnn": "internet",
+            "plmnId": { "mcc": "001", "mnc": "01" }
+        });
+
+        let resp = client.put_json(&path, &doc).await.expect("PUT");
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            resp.http.get_header("Location").map(String::as_str),
+            Some(path.as_str()),
+            "TS 29.505 requires Location on the 201"
+        );
+        assert_eq!(
+            json_of(&resp)["smfInstanceId"],
+            "smf-1",
+            "the 201 must carry the created SmfRegistration"
+        );
+
+        // PATCH was a flat 405.
+        let resp = client
+            .patch_json(
+                &path,
+                &json!([{"op": "replace", "path": "/dnn", "value": "ims"}]),
+            )
+            .await
+            .expect("PATCH");
+        assert_eq!(
+            resp.status, 204,
+            "PATCH must be accepted: {:?}",
+            resp.http.content
+        );
+        let resp = client.get(&path).await.expect("GET after PATCH");
+        assert_eq!(json_of(&resp)["dnn"], "ims");
+
+        // The id in the URI owns the resource: a patch cannot move it.
+        let resp = client
+            .patch_json(
+                &path,
+                &json!([{"op": "replace", "path": "/pduSessionId", "value": 9}]),
+            )
+            .await
+            .expect("PATCH psi");
+        assert_eq!(resp.status, 400, "pduSessionId is not patchable");
+
+        udr.stop().await.expect("stop");
+    }
+
+    /// #87 gap 2: the remaining per-UE context documents and collections.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_context_data_smsf_ipsmgw_and_subscription_collections() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        let supi = "imsi-001019900008703";
+        let ctx = |r: &str| format!("/nudr-dr/v2/subscription-data/{supi}/context-data/{r}");
+
+        for (resource, doc) in [
+            (
+                "smsf-3gpp-access",
+                json!({"smsfInstanceId": "smsf-1", "plmnId": {"mcc": "001", "mnc": "01"}}),
+            ),
+            (
+                "smsf-non-3gpp-access",
+                json!({"smsfInstanceId": "smsf-2", "plmnId": {"mcc": "001", "mnc": "01"}}),
+            ),
+            ("ip-sm-gw", json!({"ipsmgwFqdn": "ipsmgw.example.org"})),
+        ] {
+            let path = ctx(resource);
+            let resp = client.get(&path).await.expect("GET before");
+            assert_eq!(resp.status, 404, "{resource} unprovisioned");
+            let resp = client.put_json(&path, &doc).await.expect("PUT");
+            assert_eq!(resp.status, 201, "{resource} PUT: {:?}", resp.http.content);
+            let resp = client.get(&path).await.expect("GET after");
+            assert_eq!(resp.status, 200);
+            assert_eq!(json_of(&resp), doc, "{resource} round-trip");
+            let resp = client.delete(&path).await.expect("DELETE");
+            assert_eq!(resp.status, 204);
+        }
+
+        // sdm-subscriptions / ee-subscriptions collections.
+        for resource in ["sdm-subscriptions", "ee-subscriptions"] {
+            let member = format!("{}/sub-1", ctx(resource));
+            let doc = json!({"nfInstanceId": "nf-1", "callbackReference": "http://nf/cb"});
+            let resp = client.put_json(&member, &doc).await.expect("PUT member");
+            assert_eq!(resp.status, 201, "{resource} member PUT");
+            let resp = client.get(&ctx(resource)).await.expect("GET collection");
+            assert_eq!(resp.status, 200);
+            assert_eq!(
+                json_of(&resp),
+                json!([doc]),
+                "{resource} collection lists this UE's members"
+            );
+            let resp = client.delete(&member).await.expect("DELETE member");
+            assert_eq!(resp.status, 204);
+            let resp = client.get(&member).await.expect("GET after delete");
+            assert_eq!(resp.status, 404);
+        }
+
+        udr.stop().await.expect("stop");
+    }
+
+    /// #85's producers need these: the Parameter Provision documents and the
+    /// identity translation the UDM reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_pp_data_and_identity_data() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        let supi = "imsi-001019900008704";
+
+        // pp-data: PATCH provisions (an absent document starts empty), GET reads.
+        let pp = format!("/nudr-dr/v2/subscription-data/{supi}/pp-data");
+        let resp = client.get(&pp).await.expect("GET pp-data");
+        assert_eq!(resp.status, 404, "nothing provisioned yet");
+        let resp = client
+            .patch_json(
+                &pp,
+                &json!({"expectedUeBehaviourParameters": {"stationaryIndication": "STATIONARY"}}),
+            )
+            .await
+            .expect("PATCH pp-data");
+        assert_eq!(
+            resp.status, 204,
+            "PATCH provisions: {:?}",
+            resp.http.content
+        );
+        let resp = client.get(&pp).await.expect("GET pp-data after");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            json_of(&resp)["expectedUeBehaviourParameters"]["stationaryIndication"],
+            "STATIONARY"
+        );
+
+        // pp-data-store: one document per AF instance.
+        let entry = format!("/nudr-dr/v2/subscription-data/{supi}/pp-data-store/af-1");
+        let doc =
+            json!({"communicationCharacteristics": {"ppSubsRegTimer": {"subsRegTimer": 3600}}});
+        let resp = client.put_json(&entry, &doc).await.expect("PUT entry");
+        assert_eq!(resp.status, 201);
+        let resp = client.get(&entry).await.expect("GET entry");
+        assert_eq!(json_of(&resp), doc);
+        let resp = client
+            .get(&format!(
+                "/nudr-dr/v2/subscription-data/{supi}/pp-data-store"
+            ))
+            .await
+            .expect("GET entries");
+        assert_eq!(json_of(&resp), json!([doc]));
+
+        // identity-data, BOTH directions, against the subscriber-identity mirror
+        // (no MongoDB): the GPSI -> SUPI direction is what a NEF needs and what
+        // the UDM's id-translation-result reads.
+        //
+        // The DbiTestStore guard is mandatory rather than a nicety: the mirror is
+        // process-global and its `disable()` is a kill switch, so provisioning it
+        // without the lock races every other test that has it enabled -- which is
+        // exactly the flake this comment replaced.
+        let _dbi = DbiTestStore::enable().await;
+        let gpsi_digits = "491721075400";
+        nextgcore_dbi::test_store::provision_subscriber(supi, &[gpsi_digits]);
+        for id in [supi.to_string(), format!("msisdn-{gpsi_digits}")] {
+            let resp = client
+                .get(&format!("/nudr-dr/v2/subscription-data/{id}/identity-data"))
+                .await
+                .expect("GET identity-data");
+            assert_eq!(
+                resp.status, 200,
+                "identity-data must resolve {id}: {:?}",
+                resp.http.content
+            );
+            let doc = json_of(&resp);
+            assert_eq!(doc["supiList"], json!([supi]), "supiList for {id}");
+            assert_eq!(
+                doc["gpsiList"],
+                json!([format!("msisdn-{gpsi_digits}")]),
+                "gpsiList for {id}"
+            );
+        }
+        // An identifier no subscriber holds is a 404, never a guessed SUPI.
+        let resp = client
+            .get("/nudr-dr/v2/subscription-data/msisdn-000000000000/identity-data")
+            .await
+            .expect("GET unknown identity-data");
+        assert_eq!(resp.status, 404);
+
+        udr.stop().await.expect("stop");
+    }
+
+    /// #87 gap 3: policy-data PATCH, the snssai/dnn filter, the documents that
+    /// were absent, and a subs-to-notify round trip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_policy_data_patch_filter_and_notify() {
+        let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
+        let supi = "imsi-001019900008705";
+        let ues = |r: &str| format!("/nudr-dr/v2/policy-data/ues/{supi}/{r}");
+
+        // --- subs-to-notify: the tree a PCF subscribes on (was absent) -------
+        let cb_uri = format!("http://127.0.0.1:{cb_port}/cb/policy-change");
+        let resp = client
+            .post_json(
+                "/nudr-dr/v2/policy-data/subs-to-notify",
+                &json!({"notificationUri": cb_uri, "monitoredResourceUris": [ues("am-data")]}),
+            )
+            .await
+            .expect("POST policy sub");
+        assert_eq!(resp.status, 201, "policy subs-to-notify must exist");
+        let sub_loc = resp.http.get_header("Location").expect("Location").clone();
+        assert!(sub_loc.contains("/policy-data/subs-to-notify/"));
+        // Mandatory members are enforced.
+        let resp = client
+            .post_json(
+                "/nudr-dr/v2/policy-data/subs-to-notify",
+                &json!({"notificationUri": cb_uri}),
+            )
+            .await
+            .expect("POST bad sub");
+        assert_eq!(resp.status, 400);
+
+        // --- PATCH on am-data (was 405) + the notification -------------------
+        let resp = client
+            .patch_json(&ues("am-data"), &json!({"praInfos": {}}))
+            .await
+            .expect("PATCH am-data");
+        assert_eq!(resp.status, 204, "am-data PATCH must be accepted");
+        let (path, body) = recv_notification(&mut rx).await;
+        assert!(path.contains("/cb/policy-change"), "notified at {path}");
+        assert_eq!(body["ueId"], supi);
+        assert_eq!(
+            body["reportId"],
+            ues("am-data"),
+            "the notification names the changed resource: {body}"
+        );
+
+        // --- ue-policy-set PATCH (was 405) -----------------------------------
+        let resp = client
+            .patch_json(&ues("ue-policy-set"), &json!({"subscPolicySections": {}}))
+            .await
+            .expect("PATCH ue-policy-set");
+        assert_eq!(resp.status, 204);
+
+        // --- sm-data: PATCH, then the snssai/dnn filter ----------------------
+        let sm_doc = json!({
+            "smPolicySnssaiData": {
+                "01-000001": {
+                    "snssai": {"sst": 1, "sd": "000001"},
+                    "smPolicyDnnData": {
+                        "internet": {"dnn": "internet"},
+                        "ims": {"dnn": "ims"}
+                    }
+                },
+                "02": {
+                    "snssai": {"sst": 2},
+                    "smPolicyDnnData": {"iot": {"dnn": "iot"}}
+                }
+            }
+        });
+        let resp = client
+            .put_json(&ues("sm-data"), &sm_doc)
+            .await
+            .expect("PUT sm-data");
+        assert_eq!(resp.status, 201);
+
+        // Unfiltered: the whole document (unchanged behaviour).
+        let resp = client.get(&ues("sm-data")).await.expect("GET sm-data");
+        assert_eq!(json_of(&resp), sm_doc);
+
+        // Filtered by snssai: only that slice. The two provisioned slices differ,
+        // so returning the whole document would fail this.
+        // The JSON Snssai is percent-encoded, as a query value carrying `{`/`"`
+        // must be (RFC 3986 §3.4) -- the UDR pct-decodes it.
+        let resp = client
+            .get(&format!("{}?snssai=%7B%22sst%22%3A2%7D", ues("sm-data")))
+            .await
+            .expect("GET sm-data sst=2");
+        assert_eq!(resp.status, 200);
+        let doc = json_of(&resp);
+        assert_eq!(
+            doc["smPolicySnssaiData"].as_object().map(|o| o.len()),
+            Some(1),
+            "exactly the requested slice: {doc}"
+        );
+        assert!(doc["smPolicySnssaiData"]["02"].is_object());
+
+        // Filtered by snssai + dnn: only that DNN within that slice.
+        let resp = client
+            .get(&format!(
+                "{}?snssai=%7B%22sst%22%3A1%2C%22sd%22%3A%22000001%22%7D&dnn=ims",
+                ues("sm-data")
+            ))
+            .await
+            .expect("GET sm-data filtered");
+        assert_eq!(resp.status, 200);
+        let doc = json_of(&resp);
+        let dnns = doc["smPolicySnssaiData"]["01-000001"]["smPolicyDnnData"]
+            .as_object()
+            .expect("smPolicyDnnData")
+            .clone();
+        assert_eq!(dnns.len(), 1, "only the requested DNN: {doc}");
+        assert!(dnns.contains_key("ims"));
+
+        // A filter that selects nothing is a 404, not an empty SmPolicyData a
+        // PCF would install as "no policy applies".
+        let resp = client
+            .get(&format!("{}?snssai=%7B%22sst%22%3A9%7D", ues("sm-data")))
+            .await
+            .expect("GET sm-data sst=9");
+        assert_eq!(resp.status, 404);
+
+        // --- the documents that had no route at all --------------------------
+        let usage_mon = format!("{}/um-1", ues("sm-data"));
+        let resp = client
+            .put_json(
+                &usage_mon,
+                &json!({"limitId": "um-1", "umLevel": "SESSION_LEVEL"}),
+            )
+            .await
+            .expect("PUT usageMonId");
+        assert_eq!(resp.status, 201, "sm-data/{{usageMonId}} must be routed");
+        let resp = client.get(&usage_mon).await.expect("GET usageMonId");
+        assert_eq!(json_of(&resp)["limitId"], "um-1");
+
+        let plmn = "/nudr-dr/v2/policy-data/plmns/00101/ue-policy-set";
+        let resp = client
+            .put_json(plmn, &json!({"upsis": ["upsi-1"]}))
+            .await
+            .expect("PUT plmn ue-policy-set");
+        assert_eq!(resp.status, 201);
+        let resp = client.get(plmn).await.expect("GET plmn ue-policy-set");
+        assert_eq!(json_of(&resp)["upsis"], json!(["upsi-1"]));
+        let resp = client
+            .get("/nudr-dr/v2/policy-data/plmns/nope/ue-policy-set")
+            .await
+            .expect("GET bad plmn");
+        assert_eq!(resp.status, 400, "a malformed plmnId is refused");
+
+        let sponsor = "/nudr-dr/v2/policy-data/sponsor-connectivity-data/sponsor-1";
+        let resp = client
+            .put_json(sponsor, &json!({"aspIds": ["asp-1"]}))
+            .await
+            .expect("PUT sponsor");
+        assert_eq!(resp.status, 201);
+        let resp = client.get(sponsor).await.expect("GET sponsor");
+        assert_eq!(json_of(&resp)["aspIds"], json!(["asp-1"]));
+        let resp = client
+            .put_json(sponsor, &json!({}))
+            .await
+            .expect("PUT sponsor without aspIds");
+        assert_eq!(resp.status, 400);
+
+        let bdt = "/nudr-dr/v2/policy-data/bdt-data/bdt-1";
+        let resp = client
+            .put_json(
+                bdt,
+                &json!({"bdtRefId": "bdt-1", "aspId": "asp-1", "transPolicy": {"ratingGroup": 1}}),
+            )
+            .await
+            .expect("PUT bdt-data");
+        assert_eq!(resp.status, 201);
+        // The URI owns the id.
+        let resp = client
+            .put_json(
+                bdt,
+                &json!({"bdtRefId": "other", "aspId": "asp-1", "transPolicy": {"ratingGroup": 1}}),
+            )
+            .await
+            .expect("PUT bdt-data mismatched id");
+        assert_eq!(resp.status, 400);
+        let resp = client
+            .get("/nudr-dr/v2/policy-data/bdt-data")
+            .await
+            .expect("GET bdt-data collection");
+        assert_eq!(resp.status, 200);
+        assert_eq!(json_of(&resp).as_array().map(|a| a.len()), Some(1));
+
+        // Clean up the subscription so it cannot notify later tests.
+        let sub_id = sub_loc.rsplit('/').next().expect("sub id");
+        let resp = client
+            .delete(&format!("/nudr-dr/v2/policy-data/subs-to-notify/{sub_id}"))
+            .await
+            .expect("DELETE sub");
+        assert_eq!(resp.status, 204);
+
+        drop(listener);
+        udr.stop().await.expect("stop");
+    }
+
+    /// The `200 {}` vs `404` question the issue asks to settle explicitly: KEPT
+    /// as `200 {}` for `am-data` and `ue-policy-set`, because those documents'
+    /// members are all optional, so "this subscriber has no AM policy data" is a
+    /// representable answer — while a `404` would also be the answer for "no such
+    /// subscriber", collapsing two facts a PCF may want to distinguish. `sm-data`
+    /// keeps its `404` for an unknown subscriber, since it has a derived default
+    /// and absence there means the subscriber itself is missing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_unprovisioned_policy_documents_keep_200_empty() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        let supi = "imsi-001019900008706";
+        for resource in ["am-data", "ue-policy-set"] {
+            let resp = client
+                .get(&format!("/nudr-dr/v2/policy-data/ues/{supi}/{resource}"))
+                .await
+                .expect("GET");
+            assert_eq!(
+                resp.status, 200,
+                "{resource} on an unprovisioned subscriber"
+            );
+            assert_eq!(json_of(&resp), json!({}), "{resource} empty document");
+        }
+        let resp = client
+            .get(&format!("/nudr-dr/v2/policy-data/ues/{supi}/sm-data"))
+            .await
+            .expect("GET sm-data");
+        assert_eq!(
+            resp.status, 404,
+            "sm-data has a derived default, so absence means no subscriber"
+        );
+        udr.stop().await.expect("stop");
+    }
+
+    /// #87 gap 4: the five application-data datasets that answered
+    /// "Unknown application-data resource".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_application_data_remaining_datasets() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        // Spec spellings (TS 29.519 §5.6): the issue's informal "af-qos-data" /
+        // "eas-deployment-data" do not appear in the OpenAPI.
+        let datasets: [(&str, &str, serde_json::Value); 6] = [
+            (
+                "bdtPolicyData",
+                "bdt-1",
+                json!({"bdtRefId": "bdt-1", "aspId": "asp-1"}),
+            ),
+            (
+                "iptvConfigData",
+                "cfg-1",
+                json!({"afAppId": "app-1", "multiAccCtrls": {}, "supi": "imsi-1"}),
+            ),
+            ("serviceParamData", "svc-1", json!({"afAppId": "app-1"})),
+            ("am-influence-data", "ami-1", json!({"afAppId": "app-1"})),
+            ("af-qos-data-sets", "qos-1", json!({"afQosDataId": "qos-1"})),
+            ("eas-deploy-data", "eas-1", json!({"dnn": "internet"})),
+        ];
+        for (collection, id, doc) in datasets {
+            let path = format!("/nudr-dr/v2/application-data/{collection}/{id}");
+            let resp = client.get(&path).await.expect("GET before");
+            assert_eq!(
+                resp.status, 404,
+                "{collection} unprovisioned is DATA_NOT_FOUND, not an unknown resource"
+            );
+            assert_eq!(json_of(&resp)["cause"], "DATA_NOT_FOUND", "{collection}");
+
+            let resp = client.put_json(&path, &doc).await.expect("PUT");
+            assert_eq!(
+                resp.status, 201,
+                "{collection} PUT: {:?}",
+                resp.http.content
+            );
+            let resp = client.get(&path).await.expect("GET after");
+            assert_eq!(resp.status, 200);
+            assert_eq!(json_of(&resp), doc, "{collection} round-trip");
+
+            let resp = client
+                .get(&format!("/nudr-dr/v2/application-data/{collection}"))
+                .await
+                .expect("GET collection");
+            assert_eq!(resp.status, 200);
+            assert_eq!(
+                json_of(&resp),
+                json!([doc]),
+                "{collection} collection lists it"
+            );
+            let resp = client.delete(&path).await.expect("DELETE");
+            assert_eq!(resp.status, 204);
+        }
+        // Mandatory members are enforced where the schema names them.
+        let resp = client
+            .put_json(
+                "/nudr-dr/v2/application-data/iptvConfigData/cfg-2",
+                &json!({"afAppId": "app-1"}),
+            )
+            .await
+            .expect("PUT iptv without multiAccCtrls");
+        assert_eq!(resp.status, 400);
+        udr.stop().await.expect("stop");
+    }
+
+    /// #87 gap 5: `Nudr_GroupIDmap` was not routed at all, so the router's
+    /// unknown-service 404 was the only answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_group_id_map_service() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        set_group_id_map(vec![
+            GroupIdMapYaml {
+                supi_prefix: String::new(),
+                nf_group_ids: [("UDM".to_string(), "udm-grp-default".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            GroupIdMapYaml {
+                supi_prefix: "imsi-00101".to_string(),
+                nf_group_ids: [
+                    ("UDM".to_string(), "udm-grp-1".to_string()),
+                    ("AUSF".to_string(), "ausf-grp-1".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ]);
+
+        // subscriberId is mandatory, as is nf-type.
+        let resp = client
+            .get("/nudr-group-id-map/v1/nf-group-ids?nf-type=UDM")
+            .await
+            .expect("GET without subscriberId");
+        assert_eq!(resp.status, 400);
+        let resp = client
+            .get("/nudr-group-id-map/v1/nf-group-ids?subscriberId=imsi-001010000000001")
+            .await
+            .expect("GET without nf-type");
+        assert_eq!(resp.status, 400);
+
+        // The longest matching prefix wins over the catch-all.
+        let resp = client
+            .get("/nudr-group-id-map/v1/nf-group-ids?nf-type=UDM,AUSF&subscriberId=imsi-001010000000001")
+            .await
+            .expect("GET nf-group-ids");
+        assert_eq!(
+            resp.status, 200,
+            "the service must be reachable: {:?}",
+            resp.http.content
+        );
+        assert_eq!(
+            json_of(&resp),
+            json!({"UDM": "udm-grp-1", "AUSF": "ausf-grp-1"})
+        );
+
+        // nf-type filters the map.
+        let resp = client
+            .get(
+                "/nudr-group-id-map/v1/nf-group-ids?nf-type=AUSF&subscriberId=imsi-001010000000001",
+            )
+            .await
+            .expect("GET filtered");
+        assert_eq!(json_of(&resp), json!({"AUSF": "ausf-grp-1"}));
+
+        // A subscriber outside every range, with no catch-all, is a 404.
+        set_group_id_map(vec![GroupIdMapYaml {
+            supi_prefix: "imsi-99999".to_string(),
+            nf_group_ids: [("UDM".to_string(), "udm-grp-x".to_string())]
+                .into_iter()
+                .collect(),
+        }]);
+        let resp = client
+            .get("/nudr-group-id-map/v1/nf-group-ids?nf-type=UDM&subscriberId=imsi-001010000000001")
+            .await
+            .expect("GET unmatched");
+        assert_eq!(resp.status, 404);
+
+        // Subscriptions CRUD.
+        let resp = client
+            .post_json(
+                "/nudr-group-id-map/v1/nf-group-ids/subscriptions",
+                &json!({"callbackReference": "http://nf/cb", "nfTypes": ["UDM"]}),
+            )
+            .await
+            .expect("POST sub");
+        assert_eq!(resp.status, 201);
+        let loc = resp.http.get_header("Location").expect("Location").clone();
+        let sub_id = loc.rsplit('/').next().expect("sub id").to_string();
+        let resp = client
+            .get(&format!(
+                "/nudr-group-id-map/v1/nf-group-ids/subscriptions/{sub_id}"
+            ))
+            .await
+            .expect("GET sub");
+        assert_eq!(resp.status, 200);
+        let resp = client
+            .delete(&format!(
+                "/nudr-group-id-map/v1/nf-group-ids/subscriptions/{sub_id}"
+            ))
+            .await
+            .expect("DELETE sub");
+        assert_eq!(resp.status, 204);
+
+        // routing-ids is recognised and refused rather than 404'd.
+        let resp = client
+            .get("/nudr-group-id-map/v1/routing-ids?subscriberId=imsi-001010000000001")
+            .await
+            .expect("GET routing-ids");
+        assert_eq!(resp.status, 501);
+
+        set_group_id_map(Vec::new());
+        udr.stop().await.expect("stop");
+    }
+
+    #[test]
+    fn test_udr_yaml_group_id_map() {
+        let yaml = r#"
+udr:
+  group_id_map:
+    - supi_prefix: "imsi-00101"
+      nf_group_ids:
+        UDM: udm-grp-1
+        AUSF: ausf-grp-1
+"#;
+        let parsed: UdrYaml = serde_yaml::from_str(yaml).unwrap();
+        let entries = parsed.udr.unwrap().group_id_map.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].supi_prefix, "imsi-00101");
+        assert_eq!(
+            entries[0].nf_group_ids.get("UDM").map(String::as_str),
+            Some("udm-grp-1")
+        );
+    }
+
+    /// `build_identity_data` maps a subscriber record to TS 29.505 `IdentityData`.
+    #[test]
+    fn test_build_identity_data_shapes() {
+        let mut data = nextgcore_dbi::types::NextgcoreSubscriptionData::new();
+        // No IMSI: nothing to answer with, and the handler turns that into a 404.
+        assert_eq!(build_identity_data(&data), json!({}));
+
+        data.imsi = Some("001010000000001".to_string());
+        let mut msisdn = nextgcore_dbi::types::NextgcoreMsisdn::default();
+        msisdn.bcd = "491721075400".to_string();
+        data.msisdn.push(msisdn);
+        data.num_of_msisdn = 1;
+        assert_eq!(
+            build_identity_data(&data),
+            json!({
+                "supiList": ["imsi-001010000000001"],
+                "gpsiList": ["msisdn-491721075400"]
+            }),
+            "both lists use the same identity spelling as am-data's gpsis"
+        );
+    }
+
+    /// The snssai/dnn filter, unit-level: matching is field-wise on sst/sd, so it
+    /// does not depend on how this UDR spells the map key.
+    #[test]
+    fn test_filter_sm_policy_data_matches_on_snssai_fields() {
+        let doc = json!({
+            "smPolicySnssaiData": {
+                "MY-OWN-KEY": {
+                    "snssai": {"sst": 1, "sd": "000001"},
+                    "smPolicyDnnData": {"internet": {"dnn": "internet"}}
+                }
+            }
+        });
+        // Key spelling is irrelevant; sst+sd decide.
+        let hit = filter_sm_policy_data(&doc, Some(&json!({"sst": 1, "sd": "000001"})), None)
+            .expect("match");
+        assert_eq!(
+            hit["smPolicySnssaiData"].as_object().map(|o| o.len()),
+            Some(1)
+        );
+        // sd is compared without leading-zero padding differences.
+        assert!(
+            filter_sm_policy_data(&doc, Some(&json!({"sst": 1, "sd": "0000001"})), None).is_some()
+        );
+        // A different slice selects nothing.
+        assert!(filter_sm_policy_data(&doc, Some(&json!({"sst": 2})), None).is_none());
+        // Right slice, wrong DNN: nothing.
+        assert!(
+            filter_sm_policy_data(&doc, Some(&json!({"sst": 1, "sd": "000001"})), Some("ims"))
+                .is_none()
+        );
+        // No filter: unchanged.
+        assert_eq!(filter_sm_policy_data(&doc, None, None), Some(doc));
     }
 }

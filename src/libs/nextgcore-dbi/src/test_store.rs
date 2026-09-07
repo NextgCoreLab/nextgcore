@@ -27,6 +27,12 @@ use crate::types::{nextgcore_ascii_to_hex, NEXTGCORE_MAX_SQN};
 /// `None` = store disabled (production Mongo path is used).
 static STORE: Mutex<Option<HashMap<String, NextgcoreDbiAuthInfo>>> = Mutex::new(None);
 
+/// Subscriber identity mirror: SUPI -> the subscriber's GPSIs, as MSISDN BCD
+/// digits. Separate from [`STORE`] because the identity documents and the
+/// authentication documents are provisioned independently, exactly as they are
+/// in Mongo (`subscriber.msisdn` vs `subscriber.security`).
+static IDENTITIES: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
+
 /// Enable the in-memory store. Idempotent: an already-enabled store keeps its
 /// contents so parallel tests (using distinct SUPIs) do not clobber each other.
 pub fn enable() {
@@ -39,6 +45,21 @@ pub fn enable() {
 /// Disable the store (subsequent calls hit the real MongoDB path again).
 pub fn disable() {
     *STORE.lock().unwrap() = None;
+    *IDENTITIES.lock().unwrap() = None;
+}
+
+/// Provision a subscriber's identities (SUPI + its MSISDN GPSIs), so a handler
+/// that resolves identities — `identity-data`, `am-data`'s `gpsis` — can be
+/// exercised without MongoDB. `msisdns` are BCD digit strings, i.e. the value
+/// inside a `msisdn-<digits>` GPSI. Enables the store if it is not already on.
+pub fn provision_subscriber(supi: &str, msisdns: &[&str]) {
+    enable();
+    let mut guard = IDENTITIES.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(
+        supi.to_string(),
+        msisdns.iter().map(|m| m.to_string()).collect(),
+    );
 }
 
 /// Whether the store is currently enabled.
@@ -56,6 +77,46 @@ pub fn stored_sqn(supi: &str) -> Option<u64> {
         .as_ref()
         .and_then(|m| m.get(supi))
         .map(|a| a.sqn)
+}
+
+/// Mirror of `nextgcore_dbi_subscription_data`'s identity lookup.
+///
+/// Faithful to the Mongo query, which is `{ <idType>: <idValue> }` over a single
+/// subscriber document — so a `msisdn-` identifier resolves the SAME subscriber
+/// as its `imsi-`. That reverse direction is what makes the UDR's
+/// `identity-data` resource able to answer GPSI-to-SUPI at all.
+pub(crate) fn subscription_data(id: &str) -> DbiResult<crate::types::NextgcoreSubscriptionData> {
+    let guard = IDENTITIES.lock().unwrap();
+    let map = guard
+        .as_ref()
+        .ok_or_else(|| DbiError::SubscriberNotFound(id.to_string()))?;
+    let value = crate::types::nextgcore_id_get_value(id)
+        .ok_or_else(|| DbiError::InvalidSupi(id.to_string()))?;
+    let hit = map
+        .iter()
+        .find(|(supi, msisdns)| {
+            crate::types::nextgcore_id_get_value(supi).as_deref() == Some(value.as_str())
+                || msisdns.iter().any(|m| m == &value)
+        })
+        .map(|(supi, msisdns)| (supi.clone(), msisdns.clone()))
+        .ok_or_else(|| DbiError::SubscriberNotFound(id.to_string()))?;
+
+    let mut data = crate::types::NextgcoreSubscriptionData::new();
+    data.imsi = crate::types::nextgcore_id_get_value(&hit.0);
+    for bcd in &hit.1 {
+        let mut msisdn = crate::types::NextgcoreMsisdn::default();
+        msisdn.bcd = bcd.clone();
+        data.msisdn.push(msisdn);
+    }
+    data.num_of_msisdn = data.msisdn.len();
+    Ok(data)
+}
+
+/// Whether any subscriber identity has been provisioned. Used to decide whether
+/// the identity mirror should answer at all, so enabling the store for the
+/// authentication tests does not change what the identity handlers see.
+pub(crate) fn identities_active() -> bool {
+    IDENTITIES.lock().unwrap().is_some()
 }
 
 /// Mirror of `nextgcore_dbi_auth_info` against the in-memory store.
