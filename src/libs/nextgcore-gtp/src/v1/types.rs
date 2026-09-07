@@ -298,6 +298,26 @@ impl PduSessionContainer {
         })
     }
 
+    /// Create a DL PDU SESSION INFORMATION frame carrying the QoS markings the
+    /// UPF was provisioned with (TS 38.415 §5.5.2).
+    ///
+    /// `rqi` triggers reflective QoS at the UE (TS 23.501 §5.7.5); `ppi` selects
+    /// a paging policy. Separate from [`Self::dl`] because the great majority of
+    /// downlink packets carry neither and should not pay for an options struct —
+    /// and because a caller that has markings to set is making a deliberate
+    /// choice, not defaulting.
+    pub fn dl_with_marking(qfi: u8, rqi: bool, ppi: Option<u8>) -> Self {
+        Self::Dl(DlPduSessionInformation {
+            qfi: qfi & 0x3F,
+            rqi,
+            // The PPI is 3 bits on the wire (values 0-7, TS 38.415 §5.5.3.7); a
+            // provisioned value wider than that is masked rather than dropped,
+            // so a mis-provisioned QER still yields a well-formed header.
+            ppi: ppi.map(|p| p & 0x07),
+            ..Default::default()
+        })
+    }
+
     /// Create a minimal UL PDU SESSION INFORMATION frame with the given QFI
     pub fn ul(qfi: u8) -> Self {
         Self::Ul(UlPduSessionInformation {

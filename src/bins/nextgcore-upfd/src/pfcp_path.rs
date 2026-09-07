@@ -179,7 +179,6 @@ pub struct PfcpPathContext {
     pub local_node_id: NodeId,
     pub local_addr: Option<SocketAddr>,
     pub recovery_time_stamp: u32,
-    pub peer_nodes: HashMap<String, PfcpNode>,
     pub next_sequence: u32,
     pub transactions: HashMap<u32, PfcpXact>,
 }
@@ -191,7 +190,6 @@ impl PfcpPathContext {
             local_node_id: NodeId::Ipv4(Ipv4Addr::UNSPECIFIED),
             local_addr: None,
             recovery_time_stamp: 0,
-            peer_nodes: HashMap::new(),
             next_sequence: 1,
             transactions: HashMap::new(),
         }
@@ -364,7 +362,6 @@ pub fn pfcp_open(ctx: &mut PfcpPathContext, local_addr: SocketAddr) -> Result<()
 /// Close PFCP path (cleanup)
 /// Port of upf_pfcp_close
 pub fn pfcp_close(ctx: &mut PfcpPathContext) {
-    ctx.peer_nodes.clear();
     ctx.transactions.clear();
     ctx.local_addr = None;
     log::info!("PFCP path closed");
@@ -2351,7 +2348,6 @@ mod tests {
     fn test_pfcp_path_context_new() {
         let ctx = PfcpPathContext::new();
         assert_eq!(ctx.next_sequence, 1);
-        assert!(ctx.peer_nodes.is_empty());
         assert!(ctx.transactions.is_empty());
     }
 
@@ -2410,7 +2406,6 @@ mod tests {
 
         assert!(ctx.local_addr.is_none());
         assert!(ctx.transactions.is_empty());
-        assert!(ctx.peer_nodes.is_empty());
     }
 
     #[test]

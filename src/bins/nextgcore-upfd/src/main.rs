@@ -636,6 +636,11 @@ async fn run_async_event_loop(
                 // defects are why it is gone rather than repaired: the state it
                 // needed already exists on the server, next to the socket that
                 // sends and receives the heartbeats.
+                //
+                // `peer_nodes` itself is now deleted too (#81): leaving an
+                // unpopulated per-peer registry behind reads as a peer table the
+                // UPF maintains, and the next person to add heartbeat state would
+                // reasonably put it there -- back into the map with no readers.
 
                 // Process pending PFCP transactions (check for timeouts)
                 let stale_seqs: Vec<u32> = pfcp_ctx
@@ -816,6 +821,11 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         let mut dp_qers = std::collections::HashMap::new();
                         for q in &qers {
                             let mut qer = DataPlaneQer::new(q.qer_id);
+                            // Reflective QoS / paging policy the SMF asked for.
+                            // Parsed since #81; previously decoded nowhere, so a
+                            // QER requesting them had no effect on the wire.
+                            qer.rqi = q.rqi;
+                            qer.ppi = q.ppi;
                             qer.ul_gate_open = q.ul_gate == 0;
                             qer.dl_gate_open = q.dl_gate == 0;
                             qer.set_mbr(q.ul_mbr, q.dl_mbr);
@@ -929,6 +939,11 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                     let mut dp_qers = session.qers.write().unwrap();
                     for q in &updated_qers {
                         let mut qer = DataPlaneQer::new(q.qer_id);
+                        // Reflective QoS / paging policy the SMF asked for.
+                        // Parsed since #81; previously decoded nowhere, so a
+                        // QER requesting them had no effect on the wire.
+                        qer.rqi = q.rqi;
+                        qer.ppi = q.ppi;
                         qer.ul_gate_open = q.ul_gate == 0;
                         qer.dl_gate_open = q.dl_gate == 0;
                         qer.set_mbr(q.ul_mbr, q.dl_mbr);
