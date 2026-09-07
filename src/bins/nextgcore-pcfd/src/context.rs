@@ -997,6 +997,16 @@ pub struct PcfApp {
     pub notif_uri: Option<String>,
     /// Parent session ID
     pub sess_id: u64,
+    /// The AF's `EventsSubscReqData` for this app session, as received
+    /// (TS 29.514 §4.2.6). `None` until the AF PUTs the `events-subscription`
+    /// sub-resource. Stored verbatim rather than parsed into fields because the
+    /// PCF only needs to know WHICH events were subscribed and where to send
+    /// them; re-serialising a parsed copy would drop members a future trigger
+    /// may need.
+    ///
+    /// `serde(default)` so a snapshot written before #88 still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_subsc: Option<serde_json::Value>,
 }
 
 impl PcfApp {
@@ -1006,8 +1016,63 @@ impl PcfApp {
             app_session_id: Uuid::new_v4().to_string(),
             notif_uri: None,
             sess_id,
+            events_subsc: None,
         }
     }
+
+    /// Whether the AF subscribed to `event` (TS 29.514 `AfEvent`) on this app
+    /// session.
+    pub fn subscribed_to(&self, event: &str) -> bool {
+        self.events_subsc
+            .as_ref()
+            .and_then(|s| s.get("events"))
+            .and_then(|e| e.as_array())
+            .is_some_and(|list| {
+                list.iter()
+                    .filter_map(|e| e.get("event").and_then(|v| v.as_str()))
+                    .any(|e| e == event)
+            })
+    }
+
+    /// Where an `EventsNotification` for this app session goes: the
+    /// subscription's own `notifUri` when it carried one, else the app session's
+    /// (TS 29.514 §4.2.6 — the AF may point events at a different endpoint from
+    /// the session's).
+    pub fn events_notif_uri(&self) -> Option<String> {
+        self.events_subsc
+            .as_ref()
+            .and_then(|s| s.get("notifUri"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| self.notif_uri.clone())
+    }
+}
+
+/// Does the `/len`-bit prefix of `prefix` cover `addr`?
+///
+/// Compares whole bytes then the partial byte under a mask, so a prefix length
+/// that is not a multiple of 8 is honoured rather than rounded — rounding up
+/// would reject a legitimate address, and rounding down would bind an AF request
+/// to a neighbouring UE's session.
+fn ipv6_prefix_contains(prefix: &[u8; 16], len: u8, addr: &[u8; 16]) -> bool {
+    let len = len.min(128) as usize;
+    let full_bytes = len / 8;
+    if prefix[..full_bytes] != addr[..full_bytes] {
+        return false;
+    }
+    let rem = len % 8;
+    if rem == 0 {
+        return true;
+    }
+    let mask = 0xFFu8 << (8 - rem);
+    (prefix[full_bytes] & mask) == (addr[full_bytes] & mask)
+}
+
+/// Test-visible wrapper over [`ipv6_prefix_contains`], so the masking rule can
+/// be pinned directly rather than only through a session lookup.
+#[cfg(test)]
+pub fn ipv6_prefix_contains_for_test(prefix: &[u8; 16], len: u8, addr: &[u8; 16]) -> bool {
+    ipv6_prefix_contains(prefix, len, addr)
 }
 
 /// PCF Context - main context structure for PCF
@@ -1720,6 +1785,27 @@ impl PcfContext {
                 .and_then(|&id| sess_list.get(&id).cloned());
         }
         None
+    }
+
+    /// Find the session whose IPv6 prefix CONTAINS `ue_ipv6` (TS 29.514
+    /// `AppSessionContextReqData.ueIpv6` is a full address, while a session is
+    /// allocated a prefix).
+    ///
+    /// A scan rather than a hash lookup: `ipv6prefix_hash` is keyed by the exact
+    /// prefix string, which cannot answer a containment question — an AF sending
+    /// `2001:db8::1` would miss a session holding `2001:db8::/64`. Sessions per
+    /// PCF are bounded by `max_num_of_sess`, so the scan is bounded too.
+    pub fn sess_find_by_ipv6_ue_addr(&self, ue_ipv6: &str) -> Option<PcfSess> {
+        let addr: std::net::Ipv6Addr = ue_ipv6.parse().ok()?;
+        let octets = addr.octets();
+        let sess_list = self.sess_list.read().ok()?;
+        sess_list
+            .values()
+            .find(|sess| match sess.ipv6prefix {
+                Some((len, prefix)) => ipv6_prefix_contains(&prefix, len, &octets),
+                None => false,
+            })
+            .cloned()
     }
 
     pub fn sess_find_by_ipv6addr(&self, ipv6prefix_string: &str) -> Option<PcfSess> {

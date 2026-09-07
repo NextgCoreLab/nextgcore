@@ -470,6 +470,46 @@ pub fn pcf_sbi_send_policyauthorization_terminate_notify(app_id: u64) -> bool {
     spawn_notification(uri, "/terminate", body, "AF terminate")
 }
 
+/// POST an `EventsNotification` to the AF for `app_id` (TS 29.514 §4.2.6:
+/// `POST {notifUri}/notify`).
+///
+/// `events` are the `AfEvent` values that fired. The notification is delivered to
+/// the events subscription's own `notifUri` when it carried one, else the app
+/// session's — the AF may point events at a different endpoint from the session.
+/// Returns false when the AF subscribed to none of `events`, which is not a
+/// failure: an unsubscribed event must not be pushed.
+pub fn pcf_sbi_send_policyauthorization_events_notify(app_id: u64, events: &[&str]) -> bool {
+    let info = crate::context::pcf_self().read().ok().and_then(|ctx| {
+        ctx.app_find_by_id(app_id).and_then(|app| {
+            let matched: Vec<String> = events
+                .iter()
+                .filter(|e| app.subscribed_to(e))
+                .map(|e| e.to_string())
+                .collect();
+            if matched.is_empty() {
+                return None;
+            }
+            app.events_notif_uri()
+                .map(|uri| (uri, app.app_session_id.clone(), matched))
+        })
+    });
+    let Some((uri, app_session_id, matched)) = info else {
+        log::debug!("[app_id={app_id}] AF events notify: no matching subscription");
+        return false;
+    };
+    // TS 29.514 EventsNotification requires evSubsUri + evNotifs.
+    let body = serde_json::json!({
+        "evSubsUri": format!(
+            "/npcf-policyauthorization/v1/app-sessions/{app_session_id}/events-subscription"
+        ),
+        "evNotifs": matched
+            .iter()
+            .map(|e| serde_json::json!({ "event": e }))
+            .collect::<Vec<_>>(),
+    });
+    spawn_notification(uri, "/notify", body, "AF events")
+}
+
 /// Discover and send request to UDR for UE AM
 /// Port of pcf_ue_am_sbi_discover_and_send() from sbi-path.c
 pub fn pcf_ue_am_sbi_discover_and_send(
