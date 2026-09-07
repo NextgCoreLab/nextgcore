@@ -148,6 +148,10 @@ pub mod pfcp_ie {
     pub const QER_ID: u16 = 109;
     pub const PDN_TYPE: u16 = 113;
     pub const QFI: u16 = 124;
+    /// Reflective QoS Indicator (TS 29.244 §8.2.88)
+    pub const RQI: u16 = 123;
+    /// Paging Policy Indicator (TS 29.244 §8.2.116)
+    pub const PAGING_POLICY_INDICATOR: u16 = 158;
     pub const FRAMED_ROUTE: u16 = 153;
     pub const FRAMED_IPV6_ROUTE: u16 = 155;
     pub const APN_DNN: u16 = 159;
@@ -1534,6 +1538,24 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
         }
     }
 
+    // RQI (TS 29.244 §8.2.88, IE type 123): octet 5 bit 1, rest spare. Parsed so
+    // the SMF can actually turn reflective QoS on — it was decoded nowhere, so a
+    // QER asking for it was silently ignored and the downlink header always went
+    // out with RQI clear.
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::RQI) {
+        if !ie.value.is_empty() {
+            qer.rqi = ie.value[0] & 0x01 != 0;
+        }
+    }
+
+    // Paging Policy Indicator (TS 29.244 §8.2.116, IE type 158): octet 5 bits
+    // 1-3 carry a value 0-7, the rest is spare.
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PAGING_POLICY_INDICATOR) {
+        if !ie.value.is_empty() {
+            qer.ppi = Some(ie.value[0] & 0x07);
+        }
+    }
+
     Ok(qer)
 }
 
@@ -1548,6 +1570,11 @@ pub struct ParsedCreateQer {
     pub ul_gbr: u64,
     pub dl_gbr: u64,
     pub qfi: Option<u8>,
+    /// Reflective QoS Indicator (TS 29.244 §8.2.88): set on downlink packets
+    /// matching this QER so the UE derives its uplink rule (TS 23.501 §5.7.5).
+    pub rqi: bool,
+    /// Paging Policy Indicator (TS 29.244 §8.2.116), 0-7 when provisioned.
+    pub ppi: Option<u8>,
 }
 
 /// Parse Create URR IE
@@ -2475,5 +2502,62 @@ mod tests {
             Some(7),
             "parsed choose_id must be Some(7)"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #81 criterion 1: the QER's RQI and PPI are parsed, not dropped.
+    // ------------------------------------------------------------------
+
+    /// Frame a PFCP IE: 2-octet type, 2-octet length, value.
+    fn ie(ie_type: u16, value: &[u8]) -> Vec<u8> {
+        let mut out = ie_type.to_be_bytes().to_vec();
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn qer_ies(extra: &[Vec<u8>]) -> Vec<u8> {
+        let mut buf = ie(pfcp_ie::QER_ID, &7u32.to_be_bytes());
+        // Gate Status: UL and DL both OPEN.
+        buf.extend_from_slice(&ie(25, &[0x00]));
+        buf.extend_from_slice(&ie(pfcp_ie::QFI, &[9]));
+        for e in extra {
+            buf.extend_from_slice(e);
+        }
+        buf
+    }
+
+    #[test]
+    fn create_qer_parses_the_rqi_and_ppi_flags() {
+        // RQI is IE 123, octet 5 bit 1 (TS 29.244 §8.2.88); PPI is IE 158,
+        // octet 5 bits 1-3 (§8.2.116).
+        let qer =
+            parse_create_qer(&qer_ies(&[ie(123, &[0x01]), ie(158, &[0x05])])).expect("QER parses");
+        assert_eq!(qer.qer_id, 7);
+        assert_eq!(qer.qfi, Some(9));
+        assert!(qer.rqi, "RQI=1 must be parsed, not dropped at the QFI");
+        assert_eq!(qer.ppi, Some(5));
+
+        // The spare bits above RQI must not be read as the flag.
+        let spare_only = parse_create_qer(&qer_ies(&[ie(123, &[0xFE])])).expect("QER parses");
+        assert!(
+            !spare_only.rqi,
+            "only bit 1 of the RQI IE is the flag; the spare bits are not"
+        );
+
+        // A PPI value wider than 3 bits is masked to the wire range, not dropped.
+        let wide_ppi = parse_create_qer(&qer_ies(&[ie(158, &[0xFF])])).expect("QER parses");
+        assert_eq!(wide_ppi.ppi, Some(0x07));
+
+        // Absent IEs leave both off: this is the regression guard for every QER
+        // that does not ask for reflective QoS.
+        let bare = parse_create_qer(&qer_ies(&[])).expect("QER parses");
+        assert!(!bare.rqi);
+        assert_eq!(bare.ppi, None);
+
+        // RQI=0 explicitly signalled is still off (TS 29.244 §5.7.5: the SMF sets
+        // the bit to 0 to turn reflective QoS off for the flow).
+        let explicit_off = parse_create_qer(&qer_ies(&[ie(123, &[0x00])])).expect("QER parses");
+        assert!(!explicit_off.rqi);
     }
 }

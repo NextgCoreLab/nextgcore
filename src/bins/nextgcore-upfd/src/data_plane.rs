@@ -453,10 +453,26 @@ pub fn build_gtpu_header_with_seq(
 /// layout (E flag, length units, padding, next-type chaining) is shared
 /// with the rest of the stack.
 pub fn build_gtpu_header_with_qfi(teid: u32, payload_len: u16, qfi: u8) -> Vec<u8> {
+    build_gtpu_header_with_marking(teid, payload_len, qfi, false, None)
+}
+
+/// Build a downlink G-PDU header whose PDU Session Container carries the QoS
+/// markings the QER provisioned (TS 38.415 §5.5.2).
+///
+/// `build_gtpu_header_with_qfi` is the unmarked case and delegates here, so there
+/// is exactly one place that lays out the header.
+pub fn build_gtpu_header_with_marking(
+    teid: u32,
+    payload_len: u16,
+    qfi: u8,
+    rqi: bool,
+    ppi: Option<u8>,
+) -> Vec<u8> {
     use bytes::BytesMut;
     use nextgcore_gtp::v1::types::{ExtensionHeaderType, Gtp1ExtHeader, PduSessionContainer};
 
-    let ext = Gtp1ExtHeader::pdu_session_container(&PduSessionContainer::dl(qfi));
+    let ext =
+        Gtp1ExtHeader::pdu_session_container(&PduSessionContainer::dl_with_marking(qfi, rqi, ppi));
     let ext_len = ext.encoded_len();
 
     let mut header = Vec::with_capacity(12 + ext_len);
@@ -484,9 +500,26 @@ pub fn build_gtpu_header_with_qfi(teid: u32, payload_len: u16, qfi: u8) -> Vec<u
 /// the PDU Session Container extension header is added so the gNB can map
 /// the packet to the correct QoS flow (TS 38.415).
 pub fn encapsulate_dl_gpdu(inner_ip: &[u8], teid: u32, qfi: Option<u8>) -> Vec<u8> {
+    encapsulate_dl_gpdu_marked(inner_ip, teid, qfi, false, None)
+}
+
+/// Encapsulate a downlink packet, applying the QER's reflective-QoS and
+/// paging-policy markings to the PDU Session Container.
+///
+/// The markings were parsed from the QER and then dropped: every downlink G-PDU
+/// went out through `PduSessionContainer::dl`, which hardcodes `rqi = false` and
+/// `ppi = None`, so reflective QoS and paging-policy differentiation were
+/// silently inert no matter what the SMF asked for.
+pub fn encapsulate_dl_gpdu_marked(
+    inner_ip: &[u8],
+    teid: u32,
+    qfi: Option<u8>,
+    rqi: bool,
+    ppi: Option<u8>,
+) -> Vec<u8> {
     match qfi {
         Some(q) => {
-            let header = build_gtpu_header_with_qfi(teid, inner_ip.len() as u16, q);
+            let header = build_gtpu_header_with_marking(teid, inner_ip.len() as u16, q, rqi, ppi);
             let mut pkt = Vec::with_capacity(header.len() + inner_ip.len());
             pkt.extend_from_slice(&header);
             pkt.extend_from_slice(inner_ip);
@@ -936,6 +969,11 @@ pub struct DataPlaneQer {
     /// Guaranteed Bit Rate downlink (kbps, 0 = none)
     pub dl_gbr: u64,
     pub qfi: Option<u8>,
+    /// Reflective QoS Indicator provisioned by the SMF (TS 29.244 §8.2.88).
+    /// Written onto every downlink PDU Session Information header for this QER.
+    pub rqi: bool,
+    /// Paging Policy Indicator provisioned by the SMF (TS 29.244 §8.2.116).
+    pub ppi: Option<u8>,
     /// DSCP value for outer GTP-U IP header (computed from QFI)
     pub dscp: u8,
     /// True when this QER carries an XR delay-critical GBR 5QI (82-85,
@@ -958,6 +996,8 @@ impl Clone for DataPlaneQer {
         qer.ul_gate_open = self.ul_gate_open;
         qer.dl_gate_open = self.dl_gate_open;
         qer.qfi = self.qfi;
+        qer.rqi = self.rqi;
+        qer.ppi = self.ppi;
         qer.dscp = self.dscp;
         qer.is_xr = self.is_xr;
         qer.set_mbr(self.ul_mbr, self.dl_mbr);
@@ -977,6 +1017,10 @@ impl DataPlaneQer {
             ul_gbr: 0,
             dl_gbr: 0,
             qfi: None,
+            // Off unless the SMF provisions them: reflective QoS and a paging
+            // policy are opt-in per QER (TS 29.244 §8.2.88, §8.2.116).
+            rqi: false,
+            ppi: None,
             dscp: 0,
             is_xr: false,
             ul_mbr_bucket: std::sync::Mutex::new(None),
@@ -2335,6 +2379,10 @@ impl DataPlane {
 
         let mut dscp_to_apply: Option<u8> = None;
         let mut qfi_to_apply: Option<u8> = None;
+        // Reflective QoS / paging-policy markings for the PDU Session Container,
+        // taken from the matched QER (TS 38.415 §5.5.2).
+        let mut rqi_to_apply = false;
+        let mut ppi_to_apply: Option<u8> = None;
         let dl_pkt_tuple = if ip_version == IP_VERSION_4 {
             PacketTuple::from_ipv4_packet(pkt)
         } else {
@@ -2380,6 +2428,8 @@ impl DataPlane {
                     dscp_to_apply = Some(qer.dscp);
                 }
                 qfi_to_apply = qer.qfi;
+                rqi_to_apply = qer.rqi;
+                ppi_to_apply = qer.ppi;
             }
         }
         if qfi_to_apply.is_none() {
@@ -2464,7 +2514,8 @@ impl DataPlane {
         // Build GTP-U encapsulated packet, carrying the QFI in a PDU Session
         // Container extension header on N3 (TS 38.415 / TS 29.281 5.2.2.7). The
         // inner IP packet is forwarded byte-for-byte intact.
-        let gtpu_pkt = encapsulate_dl_gpdu(pkt, dl_teid, qfi_to_apply);
+        let gtpu_pkt =
+            encapsulate_dl_gpdu_marked(pkt, dl_teid, qfi_to_apply, rqi_to_apply, ppi_to_apply);
 
         // Send to gNB
         match gtpu.send_to(&gtpu_pkt, gnb_addr).await {
@@ -2524,10 +2575,29 @@ impl DataPlane {
             .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
             .unwrap_or(session.gnb_addr);
         let qfi = session.qfi;
+        // Buffered packets are flushed against the SESSION's QFI rather than a
+        // per-packet PDR/QER match (pre-existing behaviour of this path), so the
+        // markings are taken from the QER that owns that same QFI — same flow,
+        // same reflective-QoS and paging-policy treatment. Without this the
+        // packets that woke the UE would be the only ones stripped of their
+        // markings, which is precisely when a paging policy matters.
+        let (rqi, ppi) = match qfi {
+            Some(q) => session
+                .qers
+                .read()
+                .ok()
+                .and_then(|qers| {
+                    qers.values()
+                        .find(|qer| qer.qfi == Some(q))
+                        .map(|qer| (qer.rqi, qer.ppi))
+                })
+                .unwrap_or((false, None)),
+            None => (false, None),
+        };
         let mut sent = 0usize;
         for pkt in pkts {
             let len = pkt.len() as u64;
-            let gtpu_pkt = encapsulate_dl_gpdu(&pkt, teid, qfi);
+            let gtpu_pkt = encapsulate_dl_gpdu_marked(&pkt, teid, qfi, rqi, ppi);
             match gtpu.send_to(&gtpu_pkt, addr).await {
                 Ok(_) => {
                     sent += 1;
@@ -4785,5 +4855,254 @@ mod tests {
             header.teid, 0,
             "non-zero TEID must trigger Error Indication path"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #81 criteria 2 + 3: RQI/PPI reach the downlink PDU Session Container.
+    // ------------------------------------------------------------------
+
+    /// Locate the PDU Session Container content inside a downlink G-PDU built by
+    /// `build_gtpu_header_with_marking`.
+    ///
+    /// Returns `(octet0, octet1, rest)` of the container frame. Parsed out of the
+    /// real header rather than asserted against a hand-written byte string, so the
+    /// test still means something if the header layout changes.
+    fn dl_container_of(gpdu: &[u8]) -> (u8, u8, Vec<u8>) {
+        // 0: flags, 1: msg type, 2-3: length, 4-7: TEID, 8-9: seq, 10: npdu,
+        // 11: next-ext-type, 12: ext length (in 4-octet units), 13..: content.
+        assert_eq!(gpdu[0] & 0x04, 0x04, "E flag must be set");
+        assert_eq!(
+            gpdu[11],
+            nextgcore_gtp::v1::types::ExtensionHeaderType::PduSessionContainer as u8
+        );
+        let ext_units = gpdu[12] as usize;
+        let ext_total = ext_units * 4;
+        // content = ext bytes minus the length octet and the trailing next-ext octet
+        let content = &gpdu[13..12 + ext_total - 1];
+        (content[0], content[1], content[2..].to_vec())
+    }
+
+    #[test]
+    fn downlink_container_carries_the_rqi_bit_and_ppi_field() {
+        // TS 38.415 §5.5.2: octet 1 of DL PDU SESSION INFORMATION is
+        // PPP(bit 8) | RQI(bit 7) | QFI(bits 1-6); the PPI octet follows when PPP
+        // is set, as PPI(bits 6-8) | spare.
+        let marked = build_gtpu_header_with_marking(0xAABBCCDD, 100, 9, true, Some(5));
+        let (octet0, octet1, rest) = dl_container_of(&marked);
+        assert_eq!(octet0 >> 4, 0, "PDU Type 0 = DL PDU SESSION INFORMATION");
+        assert_eq!(octet1 & 0x3F, 9, "QFI");
+        assert_eq!(octet1 & 0x40, 0x40, "RQI bit set");
+        assert_eq!(octet1 & 0x80, 0x80, "PPP bit set because a PPI is present");
+        assert_eq!(rest[0] >> 5, 5, "PPI value in bits 6-8");
+
+        // RQI without PPI: the PPP bit stays clear and no PPI octet is added.
+        let rqi_only = build_gtpu_header_with_marking(1, 10, 9, true, None);
+        let (_, octet1, rest) = dl_container_of(&rqi_only);
+        assert_eq!(octet1 & 0x40, 0x40, "RQI set");
+        assert_eq!(octet1 & 0x80, 0, "PPP clear when there is no PPI");
+        assert!(
+            rest.is_empty(),
+            "no PPI octet may be emitted when PPP is clear: {rest:02x?}"
+        );
+
+        // Regression guard, exactly as the criterion asks: a session whose QER
+        // sets neither leaves both clear. This is what every downlink packet used
+        // to look like regardless of what the SMF provisioned.
+        let unmarked = build_gtpu_header_with_qfi(0xAABBCCDD, 100, 9);
+        let (_, octet1, rest) = dl_container_of(&unmarked);
+        assert_eq!(octet1 & 0x3F, 9, "QFI still carried");
+        assert_eq!(octet1 & 0x40, 0, "RQI must stay clear");
+        assert_eq!(octet1 & 0x80, 0, "PPP must stay clear");
+        assert!(rest.is_empty());
+    }
+
+    /// The whole chain the criterion names: PFCP QER bytes → `parse_create_qer` →
+    /// `DataPlaneQer` (including through a `Clone`) → the encapsulated downlink
+    /// G-PDU's container.
+    #[test]
+    fn qer_markings_travel_from_pfcp_to_the_downlink_header() {
+        fn ie(ie_type: u16, value: &[u8]) -> Vec<u8> {
+            let mut out = ie_type.to_be_bytes().to_vec();
+            out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            out.extend_from_slice(value);
+            out
+        }
+        let mut ies = ie(crate::n4_build::pfcp_ie::QER_ID, &3u32.to_be_bytes());
+        ies.extend_from_slice(&ie(25, &[0x00]));
+        ies.extend_from_slice(&ie(crate::n4_build::pfcp_ie::QFI, &[6]));
+        ies.extend_from_slice(&ie(123, &[0x01])); // RQI
+        ies.extend_from_slice(&ie(158, &[0x03])); // PPI = 3
+
+        let parsed = crate::n4_build::parse_create_qer(&ies).expect("QER parses");
+
+        // The install step upfd's main.rs performs.
+        let mut qer = DataPlaneQer::new(parsed.qer_id);
+        qer.qfi = parsed.qfi;
+        qer.rqi = parsed.rqi;
+        qer.ppi = parsed.ppi;
+
+        // Clone must carry them: the data plane clones QERs, and a Clone that
+        // dropped the markings would disable reflective QoS wherever a copy is
+        // taken while the original still looked correct.
+        let cloned = qer.clone();
+        assert!(cloned.rqi);
+        assert_eq!(cloned.ppi, Some(3));
+        assert_eq!(cloned.qfi, Some(6));
+
+        let inner = [
+            0x45u8, 0x00, 0x00, 0x14, 0, 0, 0, 0, 64, 17, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+        ];
+        let gpdu = encapsulate_dl_gpdu_marked(&inner, 0x1234, cloned.qfi, cloned.rqi, cloned.ppi);
+        let (_, octet1, rest) = dl_container_of(&gpdu);
+        assert_eq!(octet1 & 0x3F, 6);
+        assert_eq!(octet1 & 0x40, 0x40, "RQI must reach the wire");
+        assert_eq!(rest[0] >> 5, 3, "PPI must reach the wire");
+        // The inner packet is still forwarded byte-for-byte.
+        assert!(gpdu.ends_with(&inner));
+
+        // And the unmarked path through the same encapsulator is unchanged.
+        let plain = encapsulate_dl_gpdu(&inner, 0x1234, Some(6));
+        let (_, octet1, rest) = dl_container_of(&plain);
+        assert_eq!(
+            octet1 & 0xC0,
+            0,
+            "no markings without a QER asking for them"
+        );
+        assert!(rest.is_empty());
+    }
+
+    /// The WIRING, not just the helpers: drive a real downlink packet through
+    /// `handle_downlink_packet` with a QER carrying RQI/PPI and read the markings
+    /// off the G-PDU the gNB actually receives.
+    ///
+    /// Without this, every assertion above could pass while the forwarding site
+    /// still called the unmarked encapsulator — which is exactly the defect, since
+    /// the QER was parsed and then dropped on the way to the wire.
+    #[tokio::test]
+    async fn dl_forwarding_applies_the_qer_markings_to_the_sent_gpdu() {
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 11);
+        let gnb_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gnb_addr = gnb_sock.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dp = DataPlane::new(shutdown);
+        let upf_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dp = DataPlane {
+            gtpu_socket: Some(Arc::new(upf_sock)),
+            ..dp
+        };
+        dp.add_session_from_pfcp(
+            0x81,
+            0x1081,
+            ue_ip,
+            0x100,
+            0x200,
+            gnb_addr,
+            Some(1),
+            Some(9),
+        );
+
+        let session = dp.sessions.find_by_seid(0x81).unwrap();
+        let mut qer = DataPlaneQer::new(11);
+        qer.set_qfi(9);
+        qer.rqi = true;
+        qer.ppi = Some(4);
+        session.qers.write().unwrap().insert(11, qer);
+        if let Some(far) = session.fars.write().unwrap().get_mut(&2) {
+            far.ohc_addr = None;
+        }
+        {
+            let mut pdrs = session.pdrs.write().unwrap();
+            for p in pdrs.iter_mut() {
+                if p.source_interface == SRC_INTF_CORE {
+                    p.qer_id = Some(11);
+                }
+            }
+        }
+
+        let mut inner = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
+        finalize_ipv4(&mut inner);
+        let gtpu = dp.gtpu_socket.as_ref().unwrap().clone();
+        dp.handle_downlink_packet(&inner, &gtpu).await;
+
+        let mut buf = [0u8; 2048];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gnb_sock.recv_from(&mut buf),
+        )
+        .await
+        .expect("DL G-PDU must arrive")
+        .unwrap();
+
+        let (_, octet1, rest) = dl_container_of(&buf[..len]);
+        assert_eq!(octet1 & 0x3F, 9, "QFI");
+        assert_eq!(
+            octet1 & 0x40,
+            0x40,
+            "the forwarding path must apply the QER's RQI, not just the helper"
+        );
+        assert_eq!(octet1 & 0x80, 0x80, "PPP set for the PPI");
+        assert_eq!(rest[0] >> 5, 4, "PPI value");
+    }
+
+    /// The same path with a QER that asks for neither leaves both clear — so the
+    /// test above is pinning the markings rather than a header that always sets
+    /// them.
+    #[tokio::test]
+    async fn dl_forwarding_leaves_the_markings_clear_without_a_qer_asking() {
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 12);
+        let gnb_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gnb_addr = gnb_sock.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dp = DataPlane::new(shutdown);
+        let upf_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dp = DataPlane {
+            gtpu_socket: Some(Arc::new(upf_sock)),
+            ..dp
+        };
+        dp.add_session_from_pfcp(
+            0x82,
+            0x1082,
+            ue_ip,
+            0x100,
+            0x200,
+            gnb_addr,
+            Some(1),
+            Some(9),
+        );
+
+        let session = dp.sessions.find_by_seid(0x82).unwrap();
+        let mut qer = DataPlaneQer::new(12);
+        qer.set_qfi(9);
+        session.qers.write().unwrap().insert(12, qer);
+        if let Some(far) = session.fars.write().unwrap().get_mut(&2) {
+            far.ohc_addr = None;
+        }
+        {
+            let mut pdrs = session.pdrs.write().unwrap();
+            for p in pdrs.iter_mut() {
+                if p.source_interface == SRC_INTF_CORE {
+                    p.qer_id = Some(12);
+                }
+            }
+        }
+
+        let mut inner = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
+        finalize_ipv4(&mut inner);
+        let gtpu = dp.gtpu_socket.as_ref().unwrap().clone();
+        dp.handle_downlink_packet(&inner, &gtpu).await;
+
+        let mut buf = [0u8; 2048];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gnb_sock.recv_from(&mut buf),
+        )
+        .await
+        .expect("DL G-PDU must arrive")
+        .unwrap();
+
+        let (_, octet1, rest) = dl_container_of(&buf[..len]);
+        assert_eq!(octet1 & 0x3F, 9, "QFI still carried");
+        assert_eq!(octet1 & 0xC0, 0, "RQI and PPP must both stay clear");
+        assert!(rest.is_empty(), "no PPI octet: {rest:02x?}");
     }
 }
