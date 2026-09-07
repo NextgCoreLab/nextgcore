@@ -1262,6 +1262,8 @@ mod g21_strict_peer_tests {
             notification_uri: format!("http://127.0.0.1:{port}/nnwdaf-nfstatus-notify/v1/notify"),
             subscr_cond: None, // all NFs
             validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
         });
 
         let client = SbiClient::with_host_port("127.0.0.1", port);

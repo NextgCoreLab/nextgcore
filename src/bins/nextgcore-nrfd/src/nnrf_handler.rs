@@ -370,17 +370,363 @@ pub struct SubscriptionData {
     pub subscr_cond: Option<SubscrCond>,
     /// Validity duration (seconds)
     pub validity_duration: u64,
+    /// `reqNotifEvents` (TS 29.510 §5.2.2.5.2): the event types the subscriber
+    /// asked for, as the wire strings (`NF_REGISTERED`, `NF_DEREGISTERED`,
+    /// `NF_PROFILE_CHANGED`). `None` => the subscriber did not restrict the
+    /// event set, so every event is delivered.
+    pub req_notif_events: Option<Vec<String>>,
+    /// `notifCondition` (TS 29.510 §5.2.2.5.2): which NFProfile attributes the
+    /// subscriber wants `NF_PROFILE_CHANGED` for. `None` => no restriction.
+    pub notif_condition: Option<NotifCondition>,
 }
 
-/// Subscription condition
+/// `NotifCondition` (TS 29.510 §5.2.2.5.2 / `NotifCondition` schema): the list
+/// of NFProfile attributes whose change does — or does not — warrant an
+/// `NF_PROFILE_CHANGED` notification.
+///
+/// The schema is `not: required: [monitoredAttributes, unmonitoredAttributes]`,
+/// i.e. the two forms are mutually exclusive; a body carrying both is refused at
+/// parse time rather than silently resolved in one direction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotifCondition {
+    /// Only a change to one of these attributes is notified.
+    pub monitored_attributes: Option<Vec<String>>,
+    /// A change to one of these attributes is *not* notified.
+    pub unmonitored_attributes: Option<Vec<String>>,
+}
+
+impl NotifCondition {
+    /// Parse a `NotifCondition` object. `None` when the object carries both
+    /// `monitoredAttributes` and `unmonitoredAttributes` (the schema's `not`
+    /// clause) or neither, so the caller can answer 400 rather than guess.
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let list = |k: &str| -> Option<Vec<String>> {
+            let arr = v.get(k)?.as_array()?;
+            if arr.is_empty() {
+                return None; // minItems: 1
+            }
+            Some(
+                arr.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(String::from)
+                    .collect(),
+            )
+        };
+        let monitored = list("monitoredAttributes");
+        let unmonitored = list("unmonitoredAttributes");
+        match (&monitored, &unmonitored) {
+            (Some(_), Some(_)) | (None, None) => None,
+            _ => Some(Self {
+                monitored_attributes: monitored,
+                unmonitored_attributes: unmonitored,
+            }),
+        }
+    }
+
+    /// Serialize back to the wire/snapshot shape.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        if let Some(ref a) = self.monitored_attributes {
+            map.insert("monitoredAttributes".into(), a.clone().into());
+        }
+        if let Some(ref a) = self.unmonitored_attributes {
+            map.insert("unmonitoredAttributes".into(), a.clone().into());
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// Does a change to `attribute` (a top-level NFProfile attribute name)
+    /// warrant a notification under this condition?
+    ///
+    /// `monitoredAttributes` is an allowlist, `unmonitoredAttributes` a
+    /// denylist; exactly one of the two is populated (see [`Self::from_json`]).
+    pub fn notifies_attribute(&self, attribute: &str) -> bool {
+        if let Some(ref monitored) = self.monitored_attributes {
+            return monitored.iter().any(|a| a == attribute);
+        }
+        if let Some(ref unmonitored) = self.unmonitored_attributes {
+            return !unmonitored.iter().any(|a| a == attribute);
+        }
+        true
+    }
+}
+
+/// The `SubscrCond` discriminator a subscription's condition was recognised as.
+///
+/// TS 29.510 §5.2.2.5.2 makes `SubscrCond` a `oneOf` over 17 condition schemas.
+/// Modelling the tag separately from the payload — rather than flattening a few
+/// fields into one struct — is what stops an unmodelled variant from parsing to
+/// "no criteria" and therefore matching every NF (the match-all defect this
+/// replaces). Same shape as the recorded decision to keep a received JSON object
+/// verbatim and match on a canonical key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscrCondKind {
+    /// `NfInstanceIdCond`
+    NfInstanceId,
+    /// `NfInstanceIdListCond`
+    NfInstanceIdList,
+    /// `NfTypeCond`
+    NfType,
+    /// `ServiceNameCond`
+    ServiceName,
+    /// `ServiceNameListCond` (`conditionType: SERVICE_NAME_LIST_COND`)
+    ServiceNameList,
+    /// `AmfCond`
+    Amf,
+    /// `GuamiListCond`
+    GuamiList,
+    /// `NetworkSliceCond`
+    NetworkSlice,
+    /// `NfGroupCond`
+    NfGroup,
+    /// `NfGroupListCond` (`conditionType: NF_GROUP_LIST_COND`)
+    NfGroupList,
+    /// `NfSetCond`
+    NfSet,
+    /// `NfServiceSetCond`
+    NfServiceSet,
+    /// `UpfCond` (`conditionType: UPF_COND`)
+    Upf,
+    /// `ScpDomainCond`
+    ScpDomain,
+    /// `NwdafCond` (`conditionType: NWDAF_COND`)
+    Nwdaf,
+    /// `NefCond` (`conditionType: NEF_COND`)
+    Nef,
+    /// `DccfCond` (`conditionType: DCCF_COND`)
+    Dccf,
+}
+
+impl SubscrCondKind {
+    /// The NF type a `conditionType`-tagged condition implicitly restricts to,
+    /// or `None` when the condition is not NF-type-specific.
+    ///
+    /// `UPF_COND`/`NWDAF_COND`/`NEF_COND`/`DCCF_COND` name the produced NF type
+    /// in the condition itself (TS 29.510 §5.2.2.5.2), so a UPF condition must
+    /// never match, say, an AMF whose profile happens to carry no criteria.
+    pub fn implied_nf_type(&self) -> Option<&'static str> {
+        match self {
+            SubscrCondKind::Upf => Some("UPF"),
+            SubscrCondKind::Nwdaf => Some("NWDAF"),
+            SubscrCondKind::Nef => Some("NEF"),
+            SubscrCondKind::Dccf => Some("DCCF"),
+            _ => None,
+        }
+    }
+
+    /// The `*Info` container in an NFProfile that carries this condition's
+    /// serving-area criteria, if any.
+    pub fn info_container(&self) -> Option<&'static str> {
+        match self {
+            SubscrCondKind::Upf => Some("upfInfo"),
+            SubscrCondKind::Nwdaf => Some("nwdafInfo"),
+            SubscrCondKind::Nef => Some("nefInfo"),
+            SubscrCondKind::Dccf => Some("dccfInfo"),
+            _ => None,
+        }
+    }
+}
+
+/// Subscription condition: the recognised discriminator plus the condition
+/// object exactly as received.
+///
+/// Keeping `raw` verbatim means a criterion this NRF does not yet evaluate is
+/// still persisted and still visible in the subscription resource, instead of
+/// being silently dropped on parse.
 #[derive(Debug, Clone)]
 pub struct SubscrCond {
-    /// NF type condition
-    pub nf_type: Option<String>,
-    /// Service name condition
-    pub service_name: Option<String>,
-    /// NF instance ID condition
-    pub nf_instance_id: Option<String>,
+    /// Which `oneOf` variant this condition was recognised as.
+    pub kind: SubscrCondKind,
+    /// The `subscrCond` object exactly as received.
+    pub raw: serde_json::Value,
+}
+
+/// A `subscrCond` that parsed to a known variant but whose criteria this NRF
+/// cannot evaluate against an NFProfile.
+///
+/// Returned so the caller can answer 400 naming the criterion, rather than
+/// accept a subscription it would then either over-serve (notify for every NF)
+/// or under-serve (notify for none). Both silent options are worse than a
+/// refusal the consumer can see; see the recorded principle that an NF should
+/// advertise only what it can actually serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedCriterion {
+    /// The `subscrCond` member that cannot be evaluated.
+    pub criterion: &'static str,
+    /// Why it cannot be evaluated, for the ProblemDetails detail string.
+    pub reason: &'static str,
+}
+
+impl SubscrCond {
+    /// Recognise a `subscrCond` object as one of the TS 29.510 §5.2.2.5.2
+    /// `oneOf` variants.
+    ///
+    /// `None` means no discriminator matched — an unknown or malformed
+    /// condition, which the caller answers 400 for. That is the whole point of
+    /// this function: the previous model parsed *any* object into a struct whose
+    /// three fields were all `None`, and an all-`None` condition matched every
+    /// NF in the registry.
+    ///
+    /// `conditionType` is checked first because it is the explicit
+    /// discriminator; the untagged variants are then distinguished by their
+    /// required members, in an order that respects the schemas' `not` clauses
+    /// (`NfTypeCond` forbids `nfGroupId`, so `NfGroupCond` is tried first).
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let has = |k: &str| v.get(k).is_some_and(|x| !x.is_null());
+        let non_empty_array = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_array())
+                .is_some_and(|a| !a.is_empty())
+        };
+
+        let kind = if let Some(ct) = v.get("conditionType").and_then(|x| x.as_str()) {
+            match ct {
+                "SERVICE_NAME_LIST_COND" if non_empty_array("serviceNameList") => {
+                    SubscrCondKind::ServiceNameList
+                }
+                "NF_GROUP_LIST_COND" if non_empty_array("nfGroupIdList") && has("nfType") => {
+                    SubscrCondKind::NfGroupList
+                }
+                "UPF_COND" => SubscrCondKind::Upf,
+                "NWDAF_COND" => SubscrCondKind::Nwdaf,
+                "NEF_COND" => SubscrCondKind::Nef,
+                "DCCF_COND" => SubscrCondKind::Dccf,
+                // A conditionType we do not know, or one whose mandatory
+                // members are missing, is malformed rather than match-all.
+                _ => return None,
+            }
+        } else if has("nfInstanceId") {
+            SubscrCondKind::NfInstanceId
+        } else if non_empty_array("nfInstanceIdList") {
+            SubscrCondKind::NfInstanceIdList
+        } else if has("nfGroupId") && has("nfType") {
+            SubscrCondKind::NfGroup
+        } else if has("nfType") {
+            SubscrCondKind::NfType
+        } else if has("serviceName") {
+            SubscrCondKind::ServiceName
+        } else if has("nfServiceSetId") {
+            SubscrCondKind::NfServiceSet
+        } else if has("nfSetId") {
+            SubscrCondKind::NfSet
+        } else if non_empty_array("guamiList") {
+            SubscrCondKind::GuamiList
+        } else if non_empty_array("snssaiList") {
+            SubscrCondKind::NetworkSlice
+        } else if has("amfSetId") || has("amfRegionId") {
+            SubscrCondKind::Amf
+        } else if non_empty_array("scpDomains") {
+            SubscrCondKind::ScpDomain
+        } else {
+            return None;
+        };
+
+        Some(Self {
+            kind,
+            raw: v.clone(),
+        })
+    }
+
+    /// The criterion this NRF cannot evaluate against an NFProfile, if any.
+    ///
+    /// Two cases, both grounded in the TS 29.510 NFProfile schema rather than in
+    /// implementation convenience:
+    ///
+    /// * `UpfCond.taiList` — `UpfInfo` (§6.1.6.2.13) carries `smfServingArea`,
+    ///   `sNssaiUpfInfoList` and `interfaceUpfInfoList`, but **no TAI list**, so
+    ///   there is nothing in a UPF's profile to compare a TAI against. The
+    ///   condition's own description mentions a TAI list; the profile schema
+    ///   does not provide one. Another instance of the recorded pattern where
+    ///   the 29.5xx schemas disagree with their prose.
+    /// * `NefCond` AF/identifier-range criteria — these match against
+    ///   `NefInfo.afEeData`, `gpsiRanges` and `externalGroupIdentifiersRanges`,
+    ///   which are nested range structures rather than directly comparable
+    ///   values.
+    pub fn unsupported_criterion(&self) -> Option<UnsupportedCriterion> {
+        let present = |k: &str| self.raw.get(k).is_some_and(|x| !x.is_null());
+        match self.kind {
+            SubscrCondKind::Upf if present("taiList") => Some(UnsupportedCriterion {
+                criterion: "taiList",
+                reason: "TS 29.510 UpfInfo carries no TAI list, so a UPF profile holds \
+                         nothing to match a TAI against; use smfServingArea instead",
+            }),
+            SubscrCondKind::Nef => {
+                for k in [
+                    "afEvents",
+                    "afInstanceId",
+                    "applicationIds",
+                    "externalIdentifiers",
+                    "externalGroupIdentifiers",
+                    "domainNames",
+                ] {
+                    if present(k) {
+                        return Some(UnsupportedCriterion {
+                            criterion: match k {
+                                "afEvents" => "afEvents",
+                                "afInstanceId" => "afInstanceId",
+                                "applicationIds" => "applicationIds",
+                                "externalIdentifiers" => "externalIdentifiers",
+                                "externalGroupIdentifiers" => "externalGroupIdentifiers",
+                                _ => "domainNames",
+                            },
+                            reason: "matching this criterion needs NefInfo afEeData / \
+                                     gpsiRanges / externalGroupIdentifiersRanges, which are \
+                                     nested range structures this NRF does not evaluate; \
+                                     use snssaiList or taiList",
+                        });
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Convenience constructor for an `NfTypeCond`.
+    pub fn nf_type(nf_type: &str) -> Self {
+        Self {
+            kind: SubscrCondKind::NfType,
+            raw: serde_json::json!({ "nfType": nf_type }),
+        }
+    }
+
+    /// Convenience constructor for a `ServiceNameCond`.
+    pub fn service_name(service_name: &str) -> Self {
+        Self {
+            kind: SubscrCondKind::ServiceName,
+            raw: serde_json::json!({ "serviceName": service_name }),
+        }
+    }
+
+    /// Convenience constructor for an `NfInstanceIdCond`.
+    pub fn nf_instance_id(nf_instance_id: &str) -> Self {
+        Self {
+            kind: SubscrCondKind::NfInstanceId,
+            raw: serde_json::json!({ "nfInstanceId": nf_instance_id }),
+        }
+    }
+
+    /// Read a string member of the condition.
+    pub fn str_at(&self, key: &str) -> Option<&str> {
+        self.raw.get(key).and_then(|v| v.as_str())
+    }
+
+    /// Read an array-of-strings member of the condition.
+    pub fn str_list_at(&self, key: &str) -> Option<Vec<&str>> {
+        Some(
+            self.raw
+                .get(key)?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect(),
+        )
+    }
+
+    /// Read an array-of-objects member of the condition.
+    pub fn obj_list_at(&self, key: &str) -> Option<&Vec<serde_json::Value>> {
+        self.raw.get(key)?.as_array()
+    }
 }
 
 /// Search result for NF discovery
@@ -836,18 +1182,18 @@ fn subscription_to_json(sub: &SubscriptionData) -> serde_json::Value {
     if let Some(ref iid) = sub.req_nf_instance_id {
         map.insert("reqNfInstanceId".into(), iid.clone().into());
     }
+    // The condition is snapshotted verbatim; the discriminator is re-derived on
+    // load by the same `from_json` the wire path uses, so a restored
+    // subscription cannot end up recognised differently from the one that was
+    // accepted.
     if let Some(ref cond) = sub.subscr_cond {
-        let mut c = serde_json::Map::new();
-        if let Some(ref v) = cond.nf_type {
-            c.insert("nfType".into(), v.clone().into());
-        }
-        if let Some(ref v) = cond.service_name {
-            c.insert("serviceName".into(), v.clone().into());
-        }
-        if let Some(ref v) = cond.nf_instance_id {
-            c.insert("nfInstanceId".into(), v.clone().into());
-        }
-        map.insert("subscrCond".into(), serde_json::Value::Object(c));
+        map.insert("subscrCond".into(), cond.raw.clone());
+    }
+    if let Some(ref events) = sub.req_notif_events {
+        map.insert("reqNotifEvents".into(), events.clone().into());
+    }
+    if let Some(ref cond) = sub.notif_condition {
+        map.insert("notifCondition".into(), cond.to_json());
     }
     obj
 }
@@ -861,17 +1207,34 @@ fn subscription_from_json(v: &serde_json::Value) -> Option<SubscriptionData> {
         .and_then(|d| d.as_u64())
         .unwrap_or(0);
     let str_at = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
-    let subscr_cond = v.get("subscrCond").map(|c| SubscrCond {
-        nf_type: c.get("nfType").and_then(|x| x.as_str()).map(String::from),
-        service_name: c
-            .get("serviceName")
-            .and_then(|x| x.as_str())
-            .map(String::from),
-        nf_instance_id: c
-            .get("nfInstanceId")
-            .and_then(|x| x.as_str())
-            .map(String::from),
-    });
+    // A persisted condition that no longer recognises (e.g. written by an older
+    // build) is dropped to `None` rather than kept as an unrecognised object,
+    // because `None` means "all NFs" and is at least a defined behaviour. Logged
+    // so the narrowing is visible instead of silent.
+    let subscr_cond = match v.get("subscrCond") {
+        Some(c) => match SubscrCond::from_json(c) {
+            Some(cond) => Some(cond),
+            None => {
+                log::warn!(
+                    "Restored subscription {id} carries an unrecognised subscrCond {c}; \
+                     treating it as unconditional"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let req_notif_events = v
+        .get("reqNotifEvents")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|a: &Vec<String>| !a.is_empty());
+    let notif_condition = v.get("notifCondition").and_then(NotifCondition::from_json);
     Some(SubscriptionData {
         id,
         req_nf_type: str_at("reqNfType"),
@@ -879,6 +1242,8 @@ fn subscription_from_json(v: &serde_json::Value) -> Option<SubscriptionData> {
         notification_uri,
         subscr_cond,
         validity_duration,
+        req_notif_events,
+        notif_condition,
     })
 }
 
@@ -1780,12 +2145,10 @@ mod tests {
             req_nf_type: Some("AMF".to_string()),
             req_nf_instance_id: None,
             notification_uri: "http://example.com/notify".to_string(),
-            subscr_cond: Some(SubscrCond {
-                nf_type: Some("SMF".to_string()),
-                service_name: None,
-                nf_instance_id: None,
-            }),
+            subscr_cond: Some(SubscrCond::nf_type("SMF")),
             validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
         };
 
         assert!(manager.add_subscription(subscription));
@@ -1903,6 +2266,8 @@ mod tests {
             notification_uri: "".to_string(),
             subscr_cond: None,
             validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
         };
 
         let result = nrf_nnrf_handle_nf_status_subscribe(subscription);
@@ -2513,12 +2878,10 @@ mod tests {
                 req_nf_type: Some("AMF".to_string()),
                 req_nf_instance_id: Some("amf-1".to_string()),
                 notification_uri: "http://amf:8080/cb".to_string(),
-                subscr_cond: Some(SubscrCond {
-                    nf_type: Some("SMF".to_string()),
-                    service_name: Some("nsmf-pdusession".to_string()),
-                    nf_instance_id: None,
-                }),
+                subscr_cond: Some(SubscrCond::nf_type("SMF")),
                 validity_duration: 3600,
+                req_notif_events: None,
+                notif_condition: None,
             }));
         }
 
@@ -2550,12 +2913,12 @@ mod tests {
                 .expect("subscription retained across restart");
             assert_eq!(sub.notification_uri, "http://amf:8080/cb");
             assert_eq!(sub.req_nf_type.as_deref(), Some("AMF"));
-            assert_eq!(
-                sub.subscr_cond
-                    .as_ref()
-                    .and_then(|c| c.service_name.as_deref()),
-                Some("nsmf-pdusession")
-            );
+            // The condition survives the snapshot verbatim AND is recognised as
+            // the same variant it was accepted as; a restored subscription must
+            // not silently widen (an unrecognised condition would mean "all NFs").
+            let cond = sub.subscr_cond.as_ref().expect("condition retained");
+            assert_eq!(cond.kind, SubscrCondKind::NfType);
+            assert_eq!(cond.str_at("nfType"), Some("SMF"));
             assert_eq!(sub.validity_duration, 3600);
         }
 
