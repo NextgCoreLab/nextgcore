@@ -93,7 +93,28 @@ impl GtpuServer {
                         inner: inner.clone(),
                     };
                     let mut buf = [0u8; 9000];
+                    let mut last_probe = Instant::now();
                     while inner.running.load(Ordering::SeqCst) {
+                        // GTP-U path management (TS 23.007 Section 20.3.1): probe
+                        // each peer we forward to and count unanswered Echoes.
+                        // Driven from the receive loop, whose 100 ms read timeout
+                        // gives it a cadence without a second thread to shut down.
+                        if let Some(interval) = gtpu_echo_interval() {
+                            if last_probe.elapsed() >= interval {
+                                last_probe = Instant::now();
+                                for ip in gtpu_peer_addresses() {
+                                    // Count the PREVIOUS round's probe as missed
+                                    // before sending the next: a response since
+                                    // then has already cleared it.
+                                    note_echo_unanswered(ip);
+                                    let dest = SocketAddr::new(ip, inner.peer_port);
+                                    let echo = Gtp1Message::echo_request(0, 0).encode();
+                                    if let Err(e) = inner.socket.send_to(&echo, dest) {
+                                        log::warn!("GTP-U Echo Request to {dest} failed: {e}");
+                                    }
+                                }
+                            }
+                        }
                         match inner.socket.recv_from(&mut buf) {
                             Ok((len, peer)) => {
                                 handle_gtpu_packet(&server, &buf[..len], peer);
@@ -279,6 +300,10 @@ pub fn handle_gtpu_packet(server: &GtpuServer, data: &[u8], peer: SocketAddr) ->
     match msg_type {
         t if t == Gtp1cMessageType::EchoRequest as u8 => handle_echo_request(server, &msg, peer),
         t if t == Gtp1cMessageType::EchoResponse as u8 => {
+            // TS 23.007 Section 20.3.1: an Echo Response confirms the path, so it
+            // clears the unanswered counter. Discarding it, as before, meant no
+            // probe could ever be resolved and the path state never recovered.
+            note_echo_answered(peer.ip());
             // TS 29.281 Section 8.2: the Recovery value in GTP-U shall be
             // ignored by the receiver; the response just confirms the path.
             log::debug!("[RECV] GTP-U Echo Response from {peer}");
@@ -291,6 +316,139 @@ pub fn handle_gtpu_packet(server: &GtpuServer, data: &[u8], peer: SocketAddr) ->
             log::error!("[DROP] Invalid GTP-U message type [{other}] from {peer}");
             GtpuRecvResult::Dropped(format!("unknown type {other}"))
         }
+    }
+}
+
+// ============================================================================
+// GTP-U path management (TS 23.007 Section 20.3)
+// ============================================================================
+
+/// Default Echo probe interval toward each known GTP-U peer. `0` disables
+/// probing. TS 23.007 Section 20.3.1 requires path-failure detection via Echo;
+/// the cadence is a deployment choice.
+const DEFAULT_GTPU_ECHO_INTERVAL_SECS: u64 = 60;
+
+/// Default unanswered Echo Requests before the path is declared down
+/// (N3-REQUESTS, TS 23.007 Section 20.3.1).
+const DEFAULT_N3_REQUESTS: u32 = 3;
+
+/// Per-peer GTP-U path state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GtpuPathState {
+    /// Consecutive Echo Requests sent with no Echo Response.
+    pub unanswered: u32,
+    /// True once `unanswered` has exceeded N3-REQUESTS.
+    pub failed: bool,
+}
+
+/// GTP-U path table keyed by peer IP.
+static GTPU_PATHS: OnceLock<std::sync::Mutex<HashMap<IpAddr, GtpuPathState>>> = OnceLock::new();
+
+fn gtpu_paths() -> &'static std::sync::Mutex<HashMap<IpAddr, GtpuPathState>> {
+    GTPU_PATHS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Echo probe interval, or `None` when probing is disabled
+/// (`SGWU_GTPU_ECHO_INTERVAL_SECS=0`).
+fn gtpu_echo_interval() -> Option<Duration> {
+    let secs = std::env::var("SGWU_GTPU_ECHO_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_GTPU_ECHO_INTERVAL_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// N3-REQUESTS: unanswered Echoes tolerated before the path is down.
+fn n3_requests() -> u32 {
+    std::env::var("SGWU_GTPU_N3_REQUESTS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_N3_REQUESTS)
+}
+
+/// Peers this SGW-U currently forwards to, from the installed FARs' Outer Header
+/// Creation. These are the paths TS 23.007 Section 20.3.1 says to probe: the ones
+/// we are "in contact with".
+pub fn gtpu_peer_addresses() -> Vec<IpAddr> {
+    let mut peers: Vec<IpAddr> = sgwu_self()
+        .far_ohc_peers()
+        .into_iter()
+        .map(IpAddr::V4)
+        .collect();
+    peers.sort();
+    peers.dedup();
+    peers
+}
+
+/// Record that an Echo Request went unanswered, returning the new state.
+///
+/// The path is declared down once the counter EXCEEDS N3-REQUESTS, matching
+/// Section 20.3.1's "down if the counter exceeds N3-REQUESTS" rather than
+/// "reaches", which would fail a path one probe early.
+pub fn note_echo_unanswered(peer: IpAddr) -> GtpuPathState {
+    let limit = n3_requests();
+    let Ok(mut paths) = gtpu_paths().lock() else {
+        return GtpuPathState::default();
+    };
+    let state = paths.entry(peer).or_default();
+    state.unanswered = state.unanswered.saturating_add(1);
+    if state.unanswered > limit && !state.failed {
+        state.failed = true;
+        log::error!(
+            "GTP-U path to {peer} is DOWN: {} unanswered Echo Requests exceeds \
+             N3-REQUESTS={limit} (TS 23.007 Section 20.3.1)",
+            state.unanswered
+        );
+    }
+    state.clone()
+}
+
+/// Record an Echo Response, clearing the path's failure state.
+pub fn note_echo_answered(peer: IpAddr) -> GtpuPathState {
+    let Ok(mut paths) = gtpu_paths().lock() else {
+        return GtpuPathState::default();
+    };
+    let state = paths.entry(peer).or_default();
+    if state.failed {
+        log::warn!(
+            "GTP-U path to {peer} RECOVERED after {} misses",
+            state.unanswered
+        );
+    }
+    state.unanswered = 0;
+    state.failed = false;
+    state.clone()
+}
+
+/// Current path state for a peer.
+pub fn gtpu_path_state(peer: IpAddr) -> GtpuPathState {
+    gtpu_paths()
+        .lock()
+        .ok()
+        .and_then(|p| p.get(&peer).cloned())
+        .unwrap_or_default()
+}
+
+/// Peers whose path is currently down.
+pub fn failed_gtpu_paths() -> Vec<IpAddr> {
+    let Ok(paths) = gtpu_paths().lock() else {
+        return Vec::new();
+    };
+    let mut failed: Vec<IpAddr> = paths
+        .iter()
+        .filter(|(_, s)| s.failed)
+        .map(|(ip, _)| *ip)
+        .collect();
+    failed.sort();
+    failed
+}
+
+/// Forget a peer's path state (used when no FAR references it any more, so the
+/// table does not grow without bound).
+pub fn forget_gtpu_path(peer: IpAddr) {
+    if let Ok(mut paths) = gtpu_paths().lock() {
+        paths.remove(&peer);
     }
 }
 
@@ -1083,5 +1241,124 @@ mod tests {
         // Still functional for the other session (and for a fresh 9101).
         assert!(mbr_allows(9102, 1, true, 8000, 10));
         mbr_forget_session(9102);
+    }
+
+    // ================================================================
+    // nextgcore #61: GTP-U path management (TS 23.007 Section 20.3)
+    // ================================================================
+
+    /// Section 20.3.1: "The path shall be considered to be down if the counter
+    /// EXCEEDS N3-REQUESTS." Exceeds, not reaches — failing at N3 would declare
+    /// a path down one probe early.
+    #[test]
+    fn path_fails_only_after_exceeding_n3_requests() {
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 1));
+        forget_gtpu_path(peer);
+        std::env::set_var("SGWU_GTPU_N3_REQUESTS", "3");
+
+        for expected in 1..=3 {
+            let state = note_echo_unanswered(peer);
+            assert_eq!(state.unanswered, expected);
+            assert!(
+                !state.failed,
+                "{expected} unanswered must not yet be a failure with N3=3"
+            );
+        }
+        // The fourth EXCEEDS N3.
+        let state = note_echo_unanswered(peer);
+        assert_eq!(state.unanswered, 4);
+        assert!(state.failed, "exceeding N3-REQUESTS declares the path down");
+        assert_eq!(failed_gtpu_paths(), vec![peer]);
+
+        std::env::remove_var("SGWU_GTPU_N3_REQUESTS");
+        forget_gtpu_path(peer);
+    }
+
+    /// An Echo Response confirms the path and clears the counter. The old code
+    /// discarded Echo Responses entirely, so nothing could ever recover.
+    #[test]
+    fn echo_response_clears_the_path_failure() {
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 2));
+        forget_gtpu_path(peer);
+        std::env::set_var("SGWU_GTPU_N3_REQUESTS", "1");
+
+        note_echo_unanswered(peer);
+        note_echo_unanswered(peer);
+        assert!(
+            gtpu_path_state(peer).failed,
+            "path down after exceeding N3=1"
+        );
+
+        let state = note_echo_answered(peer);
+        assert_eq!(state.unanswered, 0);
+        assert!(!state.failed, "a response must clear the failure");
+        assert!(failed_gtpu_paths().is_empty());
+
+        std::env::remove_var("SGWU_GTPU_N3_REQUESTS");
+        forget_gtpu_path(peer);
+    }
+
+    /// Paths are tracked per peer: one dead eNB must not mark another down.
+    #[test]
+    fn path_state_is_per_peer() {
+        let dead = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 3));
+        let alive = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 4));
+        forget_gtpu_path(dead);
+        forget_gtpu_path(alive);
+        std::env::set_var("SGWU_GTPU_N3_REQUESTS", "1");
+
+        note_echo_unanswered(dead);
+        note_echo_unanswered(dead);
+        note_echo_answered(alive);
+
+        assert!(gtpu_path_state(dead).failed);
+        assert!(!gtpu_path_state(alive).failed);
+        assert_eq!(failed_gtpu_paths(), vec![dead]);
+
+        std::env::remove_var("SGWU_GTPU_N3_REQUESTS");
+        forget_gtpu_path(dead);
+        forget_gtpu_path(alive);
+    }
+
+    /// Probing is configurable and disablable (the cadence is a deployment
+    /// choice; Section 20.3.1 mandates the detection, not the interval).
+    #[test]
+    fn echo_interval_is_configurable_and_disablable() {
+        std::env::set_var("SGWU_GTPU_ECHO_INTERVAL_SECS", "0");
+        assert_eq!(gtpu_echo_interval(), None, "0 disables probing");
+        std::env::set_var("SGWU_GTPU_ECHO_INTERVAL_SECS", "5");
+        assert_eq!(gtpu_echo_interval(), Some(Duration::from_secs(5)));
+        std::env::remove_var("SGWU_GTPU_ECHO_INTERVAL_SECS");
+    }
+
+    /// The peers probed are exactly those the installed FARs forward to
+    /// (Section 20.3.1: the peers we are "in contact with"), deduplicated so a
+    /// busy eNB is probed once rather than per bearer.
+    #[test]
+    fn probe_targets_come_from_installed_far_peers_deduplicated() {
+        let ctx = sgwu_self();
+        let f_seid = FSeid::with_ipv4(0x6100, Ipv4Addr::new(10, 0, 0, 1));
+        let sess = ctx.sess_add(&f_seid).unwrap();
+        let enb = Ipv4Addr::new(10, 61, 9, 1);
+
+        // Two FARs toward the SAME peer, plus one toward another.
+        for (far_id, ip) in [(1u32, enb), (2, enb), (3, Ipv4Addr::new(10, 61, 9, 2))] {
+            ctx.far_install(SgwuFar {
+                sess_id: sess.id,
+                far_id,
+                outer_header_creation: Some((0x100 + far_id, Some(ip), None)),
+                ..Default::default()
+            });
+        }
+
+        let peers = gtpu_peer_addresses();
+        assert!(peers.contains(&IpAddr::V4(enb)));
+        assert_eq!(
+            peers.iter().filter(|p| **p == IpAddr::V4(enb)).count(),
+            1,
+            "a peer with several FARs must be probed once, not per bearer"
+        );
+
+        ctx.sess_remove(sess.id);
     }
 }

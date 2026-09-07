@@ -493,7 +493,34 @@ pub struct PfcpServer {
     /// for T1/N1 retransmission (TS 29.244 §7.2.2.3). Currently used for
     /// Session Report Requests (Downlink Data / Error Indication Reports).
     pending_reports: tokio::sync::Mutex<HashMap<u32, PendingReport>>,
+    /// Heartbeat state: outstanding request sequence numbers and how many
+    /// heartbeat rounds in a row went unanswered (TS 23.007 §19A).
+    ///
+    /// Without this the heartbeat was fire-and-forget, so a silently dead
+    /// SMF/SGW-C was never detected: the association and every session stayed
+    /// in place indefinitely while traffic blackholed.
+    heartbeat: tokio::sync::Mutex<HeartbeatState>,
 }
+
+/// Outstanding-heartbeat bookkeeping for peer-failure detection.
+#[derive(Debug, Default)]
+pub struct HeartbeatState {
+    /// Sequence numbers sent and not yet answered.
+    pub outstanding: std::collections::HashSet<u32>,
+    /// Consecutive heartbeat rounds with no response at all.
+    ///
+    /// Counting ROUNDS rather than elapsed time is the point: the previous
+    /// fallback sweep fired on `last_check.elapsed() > timeout`, which signals
+    /// on liveness of the timer rather than on missed responses, so it would
+    /// have declared failure against a perfectly healthy peer.
+    pub consecutive_misses: u32,
+}
+
+/// Consecutive unanswered heartbeat rounds before the peer is declared down
+/// (TS 23.007 §19A). Three rounds at the ~10 s heartbeat cadence is ~30 s of
+/// silence, which tolerates a transient loss without holding dead state for
+/// minutes.
+pub const HEARTBEAT_MAX_MISSES: u32 = 3;
 
 /// PFCP session information stored in server
 #[derive(Debug, Clone)]
@@ -541,6 +568,7 @@ impl PfcpServer {
             association: tokio::sync::RwLock::new(None),
             data_plane: std::sync::RwLock::new(None),
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
+            heartbeat: tokio::sync::Mutex::new(HeartbeatState::default()),
         })
     }
 
@@ -675,8 +703,10 @@ impl PfcpServer {
                     .await?;
             }
             pfcp_type::HEARTBEAT_RESPONSE => {
-                // Response to a UPF-initiated heartbeat: check the peer's
-                // recovery timestamp for restart detection
+                // Response to a UPF-initiated heartbeat: clear the outstanding
+                // request so silence is distinguishable from liveness, then
+                // check the peer's recovery timestamp for restart detection.
+                self.note_heartbeat_response(header.sequence_number).await;
                 if let Some(rts) = parse_recovery_time_stamp(payload) {
                     self.check_peer_recovery(src_addr, rts).await;
                 }
@@ -910,6 +940,8 @@ impl PfcpServer {
         let message = self.build_response(pfcp_type::HEARTBEAT_REQUEST, 0, seq, &payload, false);
         match self.socket.send_to(&message, peer).await {
             Ok(_) => {
+                // Track it: an untracked heartbeat can never reveal silence.
+                self.heartbeat.lock().await.outstanding.insert(seq);
                 log::debug!("Sent Heartbeat Request to {peer} (seq={seq})");
                 Some(peer)
             }
@@ -918,6 +950,69 @@ impl PfcpServer {
                 None
             }
         }
+    }
+
+    /// Clear the outstanding heartbeat for `seq` and reset the miss counter.
+    ///
+    /// Any heartbeat response resets the counter, not just the matching one: a
+    /// response proves the peer is alive regardless of which round it answers,
+    /// and an out-of-order or duplicated response must not leave a peer marked
+    /// as missing.
+    async fn note_heartbeat_response(&self, seq: u32) {
+        let mut hb = self.heartbeat.lock().await;
+        hb.outstanding.remove(&seq);
+        if hb.consecutive_misses > 0 {
+            log::debug!(
+                "Heartbeat response received; clearing {} missed round(s)",
+                hb.consecutive_misses
+            );
+        }
+        hb.consecutive_misses = 0;
+    }
+
+    /// Close one heartbeat round: if nothing was answered, count a miss and
+    /// declare the peer down once [`HEARTBEAT_MAX_MISSES`] rounds have gone
+    /// unanswered (TS 23.007 §19A).
+    ///
+    /// Returns the number of consecutive misses after this round, so the caller
+    /// and tests can observe the progression rather than only its end state.
+    pub async fn close_heartbeat_round(&self) -> u32 {
+        let (misses, had_outstanding) = {
+            let mut hb = self.heartbeat.lock().await;
+            if hb.outstanding.is_empty() {
+                // Everything sent has been answered.
+                hb.consecutive_misses = 0;
+                (0, false)
+            } else {
+                hb.consecutive_misses += 1;
+                // Drop the stale sequence numbers: the next round issues its own,
+                // and keeping them would grow the set without bound.
+                hb.outstanding.clear();
+                (hb.consecutive_misses, true)
+            }
+        };
+
+        if had_outstanding && misses >= HEARTBEAT_MAX_MISSES {
+            let peer = self.association.read().await.as_ref().map(|a| a.peer_addr);
+            if let Some(peer) = peer {
+                log::error!(
+                    "PFCP peer {peer} missed {misses} consecutive heartbeat rounds;                      declaring it down (TS 23.007 Section 19A)"
+                );
+                self.declare_peer_failure(peer, "heartbeat timeout").await;
+                self.heartbeat.lock().await.consecutive_misses = 0;
+            }
+        }
+        misses
+    }
+
+    /// Current consecutive-miss count (test and diagnostic accessor).
+    pub async fn heartbeat_misses(&self) -> u32 {
+        self.heartbeat.lock().await.consecutive_misses
+    }
+
+    /// Whether any heartbeat is outstanding (test and diagnostic accessor).
+    pub async fn heartbeat_outstanding(&self) -> usize {
+        self.heartbeat.lock().await.outstanding.len()
     }
 
     /// Handle Session Establishment Request
@@ -2576,6 +2671,91 @@ mod tests {
             .await
             .is_err(),
             "no send on the give-up pass"
+        );
+    }
+
+    // ================================================================
+    // nextgcore #61: PFCP heartbeat peer-failure detection (TS 23.007 19A)
+    // ================================================================
+
+    /// A heartbeat that is sent but not TRACKED can never reveal peer silence.
+    /// Before this, `send_heartbeat_request` recorded nothing, so a dead CP
+    /// function kept its association and every session indefinitely.
+    #[tokio::test]
+    async fn heartbeat_rounds_count_misses_and_reset_on_any_response() {
+        let (server, _smf, _addr, _rx) = spawn_test_server().await;
+
+        // No association: nothing is outstanding, so no round can miss.
+        assert_eq!(server.heartbeat_outstanding().await, 0);
+        assert_eq!(server.close_heartbeat_round().await, 0);
+
+        // Simulate three sent-but-unanswered rounds by seeding the outstanding
+        // set directly, which is what send_heartbeat_request now does.
+        for round in 1..=3u32 {
+            server.heartbeat.lock().await.outstanding.insert(round);
+            let misses = server.close_heartbeat_round().await;
+            assert_eq!(misses, round, "round {round} must count as a miss");
+        }
+
+        // Any response resets the counter, even one answering an older round:
+        // a response proves liveness whichever round it belongs to.
+        server.heartbeat.lock().await.outstanding.insert(99);
+        server.note_heartbeat_response(99).await;
+        assert_eq!(
+            server.heartbeat_misses().await,
+            0,
+            "a response clears misses"
+        );
+        assert_eq!(server.heartbeat_outstanding().await, 0);
+    }
+
+    /// An answered round must not count as a miss.
+    #[tokio::test]
+    async fn answered_round_is_not_a_miss() {
+        let (server, _smf, _addr, _rx) = spawn_test_server().await;
+        server.heartbeat.lock().await.outstanding.insert(7);
+        server.note_heartbeat_response(7).await;
+        assert_eq!(
+            server.close_heartbeat_round().await,
+            0,
+            "a round whose response arrived is not a miss"
+        );
+    }
+
+    /// The outstanding set must not grow without bound: each closed round drops
+    /// its stale sequence numbers, since the next round issues its own.
+    #[tokio::test]
+    async fn closing_a_round_drops_stale_outstanding_sequences() {
+        let (server, _smf, _addr, _rx) = spawn_test_server().await;
+        for seq in 1..=5u32 {
+            server.heartbeat.lock().await.outstanding.insert(seq);
+        }
+        assert_eq!(server.heartbeat_outstanding().await, 5);
+        server.close_heartbeat_round().await;
+        assert_eq!(
+            server.heartbeat_outstanding().await,
+            0,
+            "stale sequences are cleared, not accumulated"
+        );
+    }
+
+    /// An out-of-order or duplicated response must not leave the peer marked as
+    /// missing, and must not panic on an unknown sequence number.
+    #[tokio::test]
+    async fn unknown_or_duplicate_heartbeat_response_is_harmless() {
+        let (server, _smf, _addr, _rx) = spawn_test_server().await;
+        server.note_heartbeat_response(4242).await;
+        server.note_heartbeat_response(4242).await;
+        assert_eq!(server.heartbeat_misses().await, 0);
+        assert_eq!(server.heartbeat_outstanding().await, 0);
+    }
+
+    /// The miss threshold is what turns silence into a declared failure.
+    #[test]
+    fn heartbeat_miss_threshold_is_three_rounds() {
+        assert_eq!(
+            HEARTBEAT_MAX_MISSES, 3,
+            "three rounds at the ~10s cadence is ~30s of silence"
         );
     }
 }

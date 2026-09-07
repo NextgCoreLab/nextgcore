@@ -673,6 +673,26 @@ impl SgwuContext {
         self.far_list.read().ok()?.get(&(sess_id, far_id)).cloned()
     }
 
+    /// Every distinct GTP-U peer this SGW-U forwards to, from the installed
+    /// FARs' Outer Header Creation. These are the paths TS 23.007 Section 20.3.1
+    /// says to probe with Echo Requests — the peers we are "in contact with".
+    pub fn far_ohc_peers(&self) -> Vec<Ipv4Addr> {
+        let Ok(fars) = self.far_list.read() else {
+            return Vec::new();
+        };
+        let mut peers: Vec<Ipv4Addr> = fars
+            .values()
+            .filter_map(|far| {
+                far.outer_header_creation
+                    .as_ref()
+                    .and_then(|(_, v4, _)| *v4)
+            })
+            .collect();
+        peers.sort();
+        peers.dedup();
+        peers
+    }
+
     /// Find the FAR whose Outer Header Creation TEID matches (used to map a
     /// received Error Indication back to a session).
     ///
