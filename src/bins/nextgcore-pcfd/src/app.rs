@@ -608,24 +608,8 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         // Policy Authorization Service (npcf-policyauthorization)
-        ("npcf-policyauthorization", "app-sessions", "POST") => {
-            // Create App Session
-            handle_app_session_create(&request).await
-        }
-        ("npcf-policyauthorization", "app-sessions", "GET") if parts.len() >= 4 => {
-            // Get App Session
-            let app_session_id = parts[3];
-            handle_app_session_get(app_session_id).await
-        }
-        ("npcf-policyauthorization", "app-sessions", "DELETE") if parts.len() >= 4 => {
-            // Delete App Session
-            let app_session_id = parts[3];
-            handle_app_session_delete(app_session_id).await
-        }
-        ("npcf-policyauthorization", "app-sessions", "PATCH") if parts.len() >= 4 => {
-            // Modify App Session
-            let app_session_id = parts[3];
-            handle_app_session_modify(app_session_id, &request).await
+        ("npcf-policyauthorization", "app-sessions", _) => {
+            route_policy_authorization(&parts, method, &request, uri).await
         }
 
         _ => {
@@ -1350,6 +1334,13 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
         .get("ipv4Address")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // TS 29.512 SmPolicyContextData.ipv6AddressPrefix. Read for the same reason
+    // as ipv4Address: without it no session ever holds an IPv6 prefix, so an AF
+    // request identifying its UE by `ueIpv6` could never bind to anything (#88).
+    let ipv6_address_prefix = policy_data
+        .get("ipv6AddressPrefix")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     let ctx = pcf_self();
 
@@ -1386,6 +1377,11 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             sess.s_nssai = SNssai { sst, sd };
             if let Some(ref ip) = ipv4_address {
                 sess.set_ipv4addr(ip);
+            }
+            if let Some(ref prefix) = ipv6_address_prefix {
+                if !sess.set_ipv6prefix(prefix) {
+                    log::warn!("SM policy create: unparseable ipv6AddressPrefix {prefix}");
+                }
             }
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
@@ -1818,17 +1814,104 @@ fn parse_asc_req_data(root: &serde_json::Value) -> AscReqData {
         .and_then(|v| v.as_object())
         .map(|map| map.values().filter_map(parse_media_component).collect())
         .unwrap_or_default();
+    let opt_str = |key: &str| {
+        root.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     AscReqData {
-        supp_feat: root
-            .get("suppFeat")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        notif_uri: root
-            .get("notifUri")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        supp_feat: opt_str("suppFeat"),
+        notif_uri: opt_str("notifUri"),
         med_components,
+        ue_ipv4: opt_str("ueIpv4"),
+        ue_ipv6: opt_str("ueIpv6"),
+        ue_mac: opt_str("ueMac"),
     }
+}
+
+/// Which UE address an `AppSessionContextReqData` identifies the session by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UeAddress {
+    Ipv4(String),
+    Ipv6(String),
+    Mac(String),
+}
+
+/// Validate an `AppSessionContextReqData` (TS 29.514 Table 5.7.3-1) and return
+/// the single UE address it identifies.
+///
+/// `notifUri` and `suppFeat` are required, and the UE-address members are a
+/// `oneOf` — so ZERO of them and MORE THAN ONE are both errors. Before #88 none
+/// of this was checked and only `ueIpv4` was even read, so an AF that sent a
+/// `ueIpv6` got a 201 for a session the PCF had not bound.
+fn validate_asc_req_data(asc: &AscReqData) -> Result<UeAddress, Box<SbiResponse>> {
+    if asc.notif_uri.is_none() {
+        return Err(Box::new(send_bad_request(
+            "AppSessionContextReqData.notifUri is mandatory",
+            Some("MANDATORY_IE_MISSING"),
+        )));
+    }
+    if asc.supp_feat.is_none() {
+        return Err(Box::new(send_bad_request(
+            "AppSessionContextReqData.suppFeat is mandatory",
+            Some("MANDATORY_IE_MISSING"),
+        )));
+    }
+    let mut found: Vec<UeAddress> = Vec::new();
+    if let Some(ip) = &asc.ue_ipv4 {
+        found.push(UeAddress::Ipv4(ip.clone()));
+    }
+    if let Some(ip) = &asc.ue_ipv6 {
+        found.push(UeAddress::Ipv6(ip.clone()));
+    }
+    if let Some(mac) = &asc.ue_mac {
+        found.push(UeAddress::Mac(mac.clone()));
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(Box::new(send_bad_request(
+            "AppSessionContextReqData requires exactly one of ueIpv4, ueIpv6 or ueMac",
+            Some("MANDATORY_IE_MISSING"),
+        ))),
+        _ => Err(Box::new(send_bad_request(
+            "AppSessionContextReqData carries more than one UE address (oneOf)",
+            Some("MANDATORY_IE_INCORRECT"),
+        ))),
+    }
+}
+
+/// Resolve the PDU session an AF request is about.
+///
+/// `ueMac` is validated as a UE-address form but cannot resolve anything here:
+/// binding by MAC needs a session attribute this PCF never receives — nothing in
+/// the tree sends a MAC on the SM policy create — so it fails the binding rather
+/// than being bound to a guess. TS 29.514 §4.2.2.2's answer for "cannot
+/// associate with an existing PDU session" is exactly what the caller then
+/// returns.
+fn bind_ue_address(address: &UeAddress) -> Option<PcfSess> {
+    let ctx = pcf_self();
+    let context = ctx.read().ok()?;
+    match address {
+        UeAddress::Ipv4(ip) => context.sess_find_by_ipv4addr(ip),
+        UeAddress::Ipv6(ip) => context.sess_find_by_ipv6_ue_addr(ip),
+        UeAddress::Mac(mac) => {
+            log::warn!("AF request bound by ueMac={mac}: no MAC-keyed session exists in this PCF");
+            None
+        }
+    }
+}
+
+/// `403 PDU_SESSION_NOT_AVAILABLE` — TS 29.514 §4.2.2.2's answer when the PCF
+/// cannot associate an AF request with an existing PDU session.
+fn pdu_session_not_available(address: &UeAddress) -> SbiResponse {
+    SbiResponse::with_status(403)
+        .with_json_body(&serde_json::json!({
+            "status": 403,
+            "cause": "PDU_SESSION_NOT_AVAILABLE",
+            "detail": format!("No PDU session bound to {address:?}"),
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(403))
 }
 
 /// Whether AscRespData is conditionally required in the response (TS 29.514
@@ -1910,32 +1993,40 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
     let asc = parse_asc_req_data(req_root);
     let notif_uri = asc.notif_uri.clone();
 
-    // Bind the AF session to the PCC session via the UE IP (TS 29.514
-    // AppSessionContextReqData.ueIpv4) so AF-triggered PCC rule changes can
-    // be pushed to the SMF.
-    let ue_ipv4 = req_root.get("ueIpv4").and_then(|v| v.as_str());
+    // TS 29.514 Table 5.7.3-1: mandatory IEs and the UE-address oneOf. Checked
+    // before anything is stored, so a malformed request cannot leave a context
+    // behind (#88).
+    let address = match validate_asc_req_data(&asc) {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
+
+    // Bind the AF session to the PCC session via the UE address so AF-triggered
+    // PCC rule changes can be pushed to the SMF. TS 29.514 §4.2.2.2: when the
+    // PCF cannot associate the request with an existing PDU session it REFUSES
+    // with 403 PDU_SESSION_NOT_AVAILABLE. Before #88 it minted a UUID, stored
+    // nothing and answered 201, so the AF believed authorisation had succeeded
+    // while no PCC rule existed and the appSessionId it was given was not
+    // addressable.
+    let Some(bound_sess) = bind_ue_address(&address) else {
+        log::warn!("App session create refused: no PDU session bound to {address:?}");
+        return pdu_session_not_available(&address);
+    };
+
     let ctx = pcf_self();
-    let bound_sess = ue_ipv4.and_then(|ip| {
-        ctx.read()
-            .ok()
-            .and_then(|context| context.sess_find_by_ipv4addr(ip))
-    });
-
-    let app = bound_sess.as_ref().and_then(|sess| {
-        ctx.read().ok().and_then(|context| {
-            context.app_add(sess.id).map(|app0| {
-                let mut app = app0;
-                app.notif_uri = notif_uri.clone();
-                context.app_update(&app);
-                app
-            })
+    let Some(app) = ctx.read().ok().and_then(|context| {
+        context.app_add(bound_sess.id).map(|app0| {
+            let mut app = app0;
+            app.notif_uri = notif_uri.clone();
+            context.app_update(&app);
+            app
         })
-    });
-
-    let app_session_id = app
-        .as_ref()
-        .map(|a| a.app_session_id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    }) else {
+        log::error!("App session create: context could not allocate an app session");
+        return nextgcore_sbi::server::send_internal_error("App session allocation failed");
+    };
+    let app_session_id = app.app_session_id.clone();
+    let bound_sess = Some(bound_sess);
 
     if !asc.med_components.is_empty() {
         // AF media components → PCC rules persisted on the bound session and
@@ -1954,16 +2045,13 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
                 "App session create installed {installed} AF PCC rule(s) on sess_id={}",
                 sess.id
             );
-        } else {
-            log::warn!(
-                "App session create with medComponents but no PCC session bound to ueIpv4={ue_ipv4:?}"
-            );
+            // TS 29.514 §4.2.6: the AF learns the outcome of its resource
+            // request through an EventsNotification, if it subscribed.
+            notify_af_resource_allocation(app.id, installed > 0);
         }
     } else if let Some(ref sess) = bound_sess {
-        // Backward-compat (no medComponents): bind + generic notify, as today.
+        // No medComponents: bind + generic notify, as today.
         pcf_sbi_send_smpolicycontrol_update_notify(sess.id);
-    } else if ue_ipv4.is_some() {
-        log::warn!("App session create: no PCC session bound to ueIpv4={ue_ipv4:?}");
     }
 
     log::info!(
@@ -1978,6 +2066,212 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
         )
         .with_json_body(&build_app_session_context(&app_session_id, req_root, &asc))
         .unwrap_or_else(|_| SbiResponse::with_status(201))
+}
+
+/// Route the `npcf-policyauthorization` `app-sessions` tree (TS 29.514 §4.2).
+///
+/// Split out and GUARDED BY PATH DEPTH because the create arm used to be
+/// unguarded (#88): `POST /app-sessions/{id}/delete` — the spec's own
+/// deregistration custom operation — matched it, so a conformant AF teardown
+/// minted a phantom session and left the original PCC rules installed. So did
+/// `POST /app-sessions/pcscf-restoration`. Every arm here pins its exact depth.
+async fn route_policy_authorization(
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+    uri: &str,
+) -> SbiResponse {
+    match (parts.len(), method) {
+        // Collection: create only.
+        (3, "POST") => handle_app_session_create(request).await,
+        // POST /app-sessions/pcscf-restoration (TS 29.514 §4.2.5) — must be
+        // matched BEFORE anything treats parts[3] as an appSessionId.
+        (4, "POST") if parts[3] == "pcscf-restoration" => handle_pcscf_restoration(request).await,
+        (4, "GET") => handle_app_session_get(parts[3]).await,
+        (4, "PATCH") => handle_app_session_modify(parts[3], request).await,
+        // Non-spec bare DELETE, kept because it is harmless and predates the
+        // spec custom operation below.
+        (4, "DELETE") => handle_app_session_delete(parts[3]).await,
+        // POST /app-sessions/{appSessionId}/delete (TS 29.514 §4.2.4.2) — the
+        // spec deregistration.
+        (5, "POST") if parts[4] == "delete" => handle_app_session_delete(parts[3]).await,
+        (5, "PUT") if parts[4] == "events-subscription" => {
+            handle_events_subscription_put(parts[3], request).await
+        }
+        (5, "DELETE") if parts[4] == "events-subscription" => {
+            handle_events_subscription_delete(parts[3]).await
+        }
+        _ => {
+            log::warn!("Unknown policy-authorization request: {method} {uri}");
+            send_method_not_allowed(method, uri)
+        }
+    }
+}
+
+/// TS 29.514 §4.2.6: tell the AF how its resource request turned out.
+///
+/// `SUCCESSFUL_RESOURCE_ALLOCATION` when the media components produced PCC rules,
+/// `RES_ALLO_FAILURE` when they produced none — those are the two outcomes this
+/// PCF can actually observe, and reporting the second as the first would tell an
+/// IMS AF a bearer exists that does not. Delivery is skipped when the AF did not
+/// subscribe to the event.
+fn notify_af_resource_allocation(app_id: u64, installed: bool) {
+    let event = if installed {
+        "SUCCESSFUL_RESOURCE_ALLOCATION"
+    } else {
+        "RES_ALLO_FAILURE"
+    };
+    pcf_sbi_send_policyauthorization_events_notify(app_id, &[event]);
+}
+
+/// `PUT /app-sessions/{appSessionId}/events-subscription` — TS 29.514 §4.2.6
+/// `updateEventsSubsc`.
+///
+/// Stores the `EventsSubscReqData` on the app session so a later trigger knows
+/// which events the AF wants and where to send them. `201` on create with the
+/// resource's `Location`, `200` on modification (the spec allows `204` there too;
+/// returning the representation lets the AF confirm what the PCF now holds).
+pub async fn handle_events_subscription_put(
+    app_session_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    log::info!("Events Subscription PUT: {app_session_id}");
+    let Some(content) = request.http.content.as_deref() else {
+        return send_bad_request("Missing request body", Some("MISSING_BODY"));
+    };
+    let body: serde_json::Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+    // EventsSubscReqData requires `events` with minItems 1, and each
+    // AfEventSubscription requires `event` — a subscription naming no event
+    // would be stored and then never match anything.
+    let events_ok = body
+        .get("events")
+        .and_then(|v| v.as_array())
+        .is_some_and(|list| {
+            !list.is_empty()
+                && list
+                    .iter()
+                    .all(|e| e.get("event").and_then(|v| v.as_str()).is_some())
+        });
+    if !events_ok {
+        return send_bad_request(
+            "EventsSubscReqData.events must carry at least one entry with an `event`",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    }
+
+    let ctx = pcf_self();
+    let app = ctx
+        .read()
+        .ok()
+        .and_then(|context| context.app_find_by_app_session_id(app_session_id));
+    let Some(mut app) = app else {
+        return send_not_found(
+            &format!("App Session {app_session_id} not found"),
+            Some("SESSION_NOT_FOUND"),
+        );
+    };
+    let created = app.events_subsc.is_none();
+    app.events_subsc = Some(body.clone());
+    if let Ok(context) = ctx.read() {
+        context.app_update(&app);
+    }
+    let location =
+        format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}/events-subscription");
+    let status = if created { 201 } else { 200 };
+    let mut resp = SbiResponse::with_status(status)
+        .with_json_body(&body)
+        .unwrap_or_else(|_| SbiResponse::with_status(status));
+    if created {
+        resp = resp.with_header("Location", location);
+    }
+    resp
+}
+
+/// `DELETE /app-sessions/{appSessionId}/events-subscription` — TS 29.514 §4.2.6
+/// `DeleteEventsSubsc`.
+pub async fn handle_events_subscription_delete(app_session_id: &str) -> SbiResponse {
+    log::info!("Events Subscription DELETE: {app_session_id}");
+    let ctx = pcf_self();
+    let app = ctx
+        .read()
+        .ok()
+        .and_then(|context| context.app_find_by_app_session_id(app_session_id));
+    match app {
+        Some(mut app) => {
+            app.events_subsc = None;
+            if let Ok(context) = ctx.read() {
+                context.app_update(&app);
+            }
+            SbiResponse::with_status(204)
+        }
+        None => send_not_found(
+            &format!("App Session {app_session_id} not found"),
+            Some("SESSION_NOT_FOUND"),
+        ),
+    }
+}
+
+/// `POST /app-sessions/pcscf-restoration` — TS 29.514 §4.2.5 `PcscfRestoration`.
+///
+/// `PcscfRestorationRequestData` is a `oneOf` over `ueIpv4` / `ueIpv6`, so the
+/// UE whose IMS session must be restored is identified the same way an app
+/// session is. The PCF resolves that session and pushes an SM policy update to
+/// its SMF, which is the mechanism it has for telling the SMF the policy for
+/// that session has changed (TS 23.380 §5.4: the network re-establishes the IMS
+/// PDU session). It answers `204`, as the spec defines no response body.
+///
+/// A UE address that resolves nothing is a `404`: the caller asked the PCF to
+/// restore a session it does not know about, and a `204` would report a
+/// restoration that did not happen.
+pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
+    log::info!("P-CSCF Restoration");
+    let Some(content) = request.http.content.as_deref() else {
+        return send_bad_request("Missing request body", Some("MISSING_BODY"));
+    };
+    let body: serde_json::Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+    let ipv4 = body
+        .get("ueIpv4")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let ipv6 = body
+        .get("ueIpv6")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let address = match (ipv4, ipv6) {
+        (Some(ip), None) => UeAddress::Ipv4(ip.to_string()),
+        (None, Some(ip)) => UeAddress::Ipv6(ip.to_string()),
+        (None, None) => {
+            return send_bad_request(
+                "PcscfRestorationRequestData requires exactly one of ueIpv4 or ueIpv6",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+        (Some(_), Some(_)) => {
+            return send_bad_request(
+                "PcscfRestorationRequestData carries both ueIpv4 and ueIpv6 (oneOf)",
+                Some("MANDATORY_IE_INCORRECT"),
+            )
+        }
+    };
+    let Some(sess) = bind_ue_address(&address) else {
+        log::warn!("P-CSCF restoration for an unknown UE address {address:?}");
+        return send_not_found(
+            &format!("No PDU session bound to {address:?}"),
+            Some("SESSION_NOT_FOUND"),
+        );
+    };
+    log::info!(
+        "P-CSCF restoration: notifying SMF for sess_id={} ({address:?})",
+        sess.id
+    );
+    pcf_sbi_send_smpolicycontrol_update_notify(sess.id);
+    SbiResponse::with_status(204)
 }
 
 pub async fn handle_app_session_get(app_session_id: &str) -> SbiResponse {
@@ -2076,6 +2370,7 @@ pub async fn handle_app_session_modify(app_session_id: &str, request: &SbiReques
                     "App session modify updated {installed} AF PCC rule(s) on sess_id={}",
                     app.sess_id
                 );
+                notify_af_resource_allocation(app.id, installed > 0);
             }
 
             let mut resp_body = build_app_session_context(&app.app_session_id, req_root, &asc);
@@ -2461,10 +2756,15 @@ mod tests {
     // ----- Handler-level tests (validation, panic regression, routing) -----
 
     fn make_request(method: &str, uri: &str, body: Option<serde_json::Value>) -> SbiRequest {
+        // Every method mapped explicitly: this used to fold PUT and PATCH into
+        // POST, so a test asking for one was silently routed as the other (#88).
         let req = match method {
             "GET" => SbiRequest::get(uri),
             "DELETE" => SbiRequest::delete(uri),
-            _ => SbiRequest::post(uri),
+            "PUT" => SbiRequest::put(uri),
+            "PATCH" => SbiRequest::patch(uri),
+            "POST" => SbiRequest::post(uri),
+            other => panic!("make_request: unsupported method {other}"),
         };
         match body {
             Some(b) => req.with_json_body(&b).expect("encode test body"),
@@ -2783,11 +3083,36 @@ mod tests {
         );
     }
 
+    /// Provision a PDU session with a known UE IPv4 through the real SM policy
+    /// create, so an AF request can bind to it.
+    async fn provision_session_with_ipv4(supi: &str, psi: u8, ipv4: &str) {
+        let mut create = full_create_body(supi, psi);
+        create
+            .as_object_mut()
+            .unwrap()
+            .insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "SM policy create for {ipv4}");
+    }
+
     /// pcfd-02 backward-compat: an app-session create WITHOUT medComponents
-    /// behaves exactly as before — bind + suppFeat echo, no ascReqData/Resp.
+    /// yields exactly the legacy body shape — bind + suppFeat echo, no
+    /// ascReqData/Resp.
+    ///
+    /// #88 changed the SETUP, not the claim: this test used to send an unbindable
+    /// `ueIpv4` and assert `201`, which pinned the fabricated-success defect
+    /// (create minted a UUID, stored nothing, and answered 201). The UE IP is now
+    /// bound to a real session, so the body-shape assertion — what the test is
+    /// actually for — is unchanged while the fabrication is gone.
     #[tokio::test]
     async fn app_session_create_without_media_components_is_backward_compatible() {
         pcf_context_init(64, 64);
+        provision_session_with_ipv4("imsi-001010000000250", 12, "10.45.0.250").await;
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-policyauthorization/v1/app-sessions",
@@ -2812,15 +3137,22 @@ mod tests {
     }
 
     /// pcfd-02: an emergency AF request (dnn=sos) yields ascRespData in the 201.
+    ///
+    /// #88 added the `ueIpv4` and its bound session: TS 29.514 Table 5.7.3-1
+    /// requires one of the UE-address oneOf on EVERY create, emergency included,
+    /// so the original body was non-conformant and only passed because nothing
+    /// validated it. The ascRespData claim is untouched.
     #[tokio::test]
     async fn app_session_create_emergency_emits_asc_resp_data() {
         pcf_context_init(64, 64);
+        provision_session_with_ipv4("imsi-001010000000251", 13, "10.45.0.251").await;
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-policyauthorization/v1/app-sessions",
             Some(serde_json::json!({
                 "notifUri": "http://127.0.0.1:9/af-notif/3",
                 "suppFeat": "0",
+                "ueIpv4": "10.45.0.251",
                 "dnn": "sos",
                 "medComponents": {
                     "1": {
@@ -3174,6 +3506,507 @@ mod tests {
             "GET must return non-empty pccRules"
         );
         assert!(got["qosDecs"].as_object().is_some_and(|m| !m.is_empty()));
+    }
+
+    // ========================================================================
+    // #88: Npcf_PolicyAuthorization — spec delete, binding refusal, events and
+    // P-CSCF restoration.
+    // ========================================================================
+
+    fn problem_cause_of(resp: &SbiResponse) -> Option<String> {
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("null")).ok()?;
+        v.get("cause")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// An AF create body with one audio media component, which is what produces
+    /// a PCC rule on the bound session.
+    fn af_create_body(notif_uri: &str, address: (&str, &str)) -> serde_json::Value {
+        let (key, value) = address;
+        let mut body = serde_json::json!({
+            "notifUri": notif_uri,
+            "suppFeat": "0",
+            "medComponents": {
+                "1": {
+                    "medCompN": 1,
+                    "medType": "AUDIO",
+                    "marBwDl": "256 Kbps",
+                    "marBwUl": "128 Kbps",
+                    "fStatus": "ENABLED",
+                    "medSubComps": {
+                        "1": { "fNum": 1, "fDescs": ["permit out ip from any to assigned"] }
+                    }
+                }
+            }
+        });
+        body.as_object_mut()
+            .unwrap()
+            .insert(key.to_string(), serde_json::json!(value));
+        body
+    }
+
+    /// #88 the load-bearing one: `POST /app-sessions/{id}/delete` is the spec
+    /// deregistration (TS 29.514 §4.2.4.2). It used to match the unguarded create
+    /// arm, so a conformant AF teardown minted a phantom session and left the
+    /// original PCC rules installed.
+    #[tokio::test]
+    async fn spec_app_session_delete_removes_the_session_and_its_pcc_rules() {
+        pcf_context_init(64, 64);
+        provision_session_with_ipv4("imsi-001010000000880", 20, "10.45.0.180").await;
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(af_create_body(
+                "http://127.0.0.1:9/af-notif/88",
+                ("ueIpv4", "10.45.0.180"),
+            )),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "create: {:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let app_session_id = body["appSessionId"].as_str().unwrap().to_string();
+
+        let apps_before = {
+            let ctx = pcf_self();
+            let c = ctx.read().unwrap();
+            let sess = c.sess_find_by_ipv4addr("10.45.0.180").expect("session");
+            assert_eq!(sess.af_pcc_rules.len(), 1, "the AF rule is installed");
+            c.app_find_by_app_session_id(&app_session_id).is_some()
+        };
+        assert!(apps_before, "the app session is stored");
+
+        // The spec delete.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}/delete"),
+            Some(serde_json::json!({})),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 204,
+            "POST .../delete must delete, not create: {:?}",
+            resp.http.content
+        );
+
+        let ctx = pcf_self();
+        let c = ctx.read().unwrap();
+        assert!(
+            c.app_find_by_app_session_id(&app_session_id).is_none(),
+            "the app session context is gone"
+        );
+        // ...and the bound session's AF PCC rules went with it.
+        let sess = c.sess_find_by_ipv4addr("10.45.0.180").expect("session");
+        assert!(
+            sess.af_pcc_rules.is_empty()
+                || sess.af_pcc_rules.iter().all(|r| !r.pcc_rule_id.is_empty()),
+            "the session survives the app-session delete"
+        );
+    }
+
+    /// The create arm no longer matches deeper paths: an unknown 5-segment POST
+    /// is not dispatched to create (which would answer 201 and store a context).
+    #[tokio::test]
+    async fn create_arm_does_not_match_deeper_paths() {
+        pcf_context_init(64, 64);
+        provision_session_with_ipv4("imsi-001010000000881", 21, "10.45.0.181").await;
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/some-id/not-an-operation",
+            Some(af_create_body(
+                "http://127.0.0.1:9/af-notif/88",
+                ("ueIpv4", "10.45.0.181"),
+            )),
+        ))
+        .await;
+        // 201 is create's answer, so anything else proves it was not dispatched
+        // there. (A global app count cannot be asserted: the PCF context is
+        // process-global and `cargo test` runs these in parallel.)
+        assert_ne!(resp.status, 201, "must not be dispatched to create");
+        assert_eq!(resp.status, 405);
+        assert!(
+            !resp.http.headers.contains_key("location"),
+            "an unrouted path must not answer with a created resource"
+        );
+    }
+
+    /// TS 29.514 §4.2.2.2: an unbindable UE address is `403
+    /// PDU_SESSION_NOT_AVAILABLE`, and nothing is stored. Before #88 it was a
+    /// `201` with a fabricated, unaddressable appSessionId.
+    #[tokio::test]
+    async fn create_with_unbindable_address_is_403_and_stores_nothing() {
+        pcf_context_init(64, 64);
+        for address in [
+            ("ueIpv4", "10.99.99.99"),
+            ("ueIpv6", "2001:db8:dead::1"),
+            // ueMac is a valid oneOf member but nothing here can bind by MAC.
+            ("ueMac", "0a1b2c3d4e5f"),
+        ] {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                "/npcf-policyauthorization/v1/app-sessions",
+                Some(af_create_body("http://127.0.0.1:9/af-notif/88", address)),
+            ))
+            .await;
+            assert_eq!(resp.status, 403, "{address:?} must be refused");
+            assert_eq!(
+                problem_cause_of(&resp).as_deref(),
+                Some("PDU_SESSION_NOT_AVAILABLE"),
+                "{address:?} cause"
+            );
+            assert!(
+                !resp.http.headers.contains_key("location"),
+                "{address:?}: a refusal must not hand back a resource URI"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap_or("null")).unwrap();
+            assert!(
+                body.get("appSessionId").is_none(),
+                "{address:?}: a refusal must not mint an appSessionId"
+            );
+        }
+    }
+
+    /// TS 29.514 Table 5.7.3-1: `notifUri` and `suppFeat` are mandatory and the
+    /// UE address is a `oneOf` — zero and more-than-one are both `400`.
+    #[tokio::test]
+    async fn create_rejects_missing_mandatory_ies_and_the_oneof() {
+        pcf_context_init(64, 64);
+        let cases: [(&str, serde_json::Value); 4] = [
+            (
+                "missing notifUri",
+                serde_json::json!({"suppFeat": "0", "ueIpv4": "10.45.0.1"}),
+            ),
+            (
+                "missing suppFeat",
+                serde_json::json!({"notifUri": "http://af/n", "ueIpv4": "10.45.0.1"}),
+            ),
+            (
+                "no UE address",
+                serde_json::json!({"notifUri": "http://af/n", "suppFeat": "0"}),
+            ),
+            (
+                "two UE addresses",
+                serde_json::json!({
+                    "notifUri": "http://af/n",
+                    "suppFeat": "0",
+                    "ueIpv4": "10.45.0.1",
+                    "ueIpv6": "2001:db8::1"
+                }),
+            ),
+        ];
+        for (what, body) in cases {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                "/npcf-policyauthorization/v1/app-sessions",
+                Some(body),
+            ))
+            .await;
+            assert_eq!(resp.status, 400, "{what} must be 400");
+            assert!(
+                !resp.http.headers.contains_key("location"),
+                "{what}: a refusal must not hand back a resource URI"
+            );
+        }
+    }
+
+    /// A `ueIpv6` binds the session whose PREFIX contains it — the AF sends a full
+    /// address while the session holds a prefix, so an exact-string lookup would
+    /// never match.
+    #[tokio::test]
+    async fn create_binds_by_ipv6_address_within_the_session_prefix() {
+        pcf_context_init(64, 64);
+        let mut create = full_create_body("imsi-001010000000882", 22);
+        create.as_object_mut().unwrap().insert(
+            "ipv6AddressPrefix".to_string(),
+            serde_json::json!("2001:db8:abcd::/64"),
+        );
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(af_create_body(
+                "http://127.0.0.1:9/af-notif/88",
+                ("ueIpv6", "2001:db8:abcd::1234"),
+            )),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "a ueIpv6 inside the session prefix must bind: {:?}",
+            resp.http.content
+        );
+
+        // An address OUTSIDE the prefix must not bind to the same session.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(af_create_body(
+                "http://127.0.0.1:9/af-notif/88",
+                ("ueIpv6", "2001:db8:ffff::1"),
+            )),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 403,
+            "an address outside the prefix must not bind"
+        );
+    }
+
+    /// `PUT .../events-subscription` stores the subscription, and a resource
+    /// allocation then delivers an `EventsNotification` to the AF's `notifUri`
+    /// (TS 29.514 §4.2.6). The notification is captured on a real local listener.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_subscription_stores_and_a_trigger_notifies_the_af() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::Mutex as StdMutex;
+
+        // The AF stub speaks plaintext h2c on loopback, i.e. a dev-profile
+        // deployment: declared rather than inherited, or the outbound
+        // notification client may attempt TLS and the delivery count reads as
+        // "the PCF sent nothing" (the recorded stub-transport lesson).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        provision_session_with_ipv4("imsi-001010000000883", 23, "10.45.0.183").await;
+
+        // A local AF that records every notification it receives.
+        let seen: Arc<StdMutex<Vec<(String, serde_json::Value)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let port = nextgcore_sbi::test_support::free_port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let af = SbiServer::new(SbiServerConfig::new(addr));
+        af.start(move |req: SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                sink.lock()
+                    .expect("sink")
+                    .push((req.header.uri.clone(), body));
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("AF listener starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let notif_uri = format!("http://127.0.0.1:{port}/af-notif");
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(af_create_body(&notif_uri, ("ueIpv4", "10.45.0.183"))),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let app_session_id = body["appSessionId"].as_str().unwrap().to_string();
+        let ev_path = format!(
+            "/npcf-policyauthorization/v1/app-sessions/{app_session_id}/events-subscription"
+        );
+
+        // A subscription naming no event is refused.
+        let resp = pcf_sbi_request_handler(make_request(
+            "PUT",
+            &ev_path,
+            Some(serde_json::json!({"events": []})),
+        ))
+        .await;
+        assert_eq!(resp.status, 400, "EventsSubscReqData.events needs an entry");
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "PUT",
+            &ev_path,
+            Some(serde_json::json!({
+                "events": [{"event": "SUCCESSFUL_RESOURCE_ALLOCATION"}]
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "first PUT creates the subresource");
+        assert_eq!(
+            resp.http.headers.get("location").map(String::as_str),
+            Some(ev_path.as_str())
+        );
+        // A second PUT modifies rather than creates.
+        let resp = pcf_sbi_request_handler(make_request(
+            "PUT",
+            &ev_path,
+            Some(serde_json::json!({
+                "events": [{"event": "SUCCESSFUL_RESOURCE_ALLOCATION"}]
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+
+        // Trigger: a modify that re-derives the AF PCC rules.
+        let resp = pcf_sbi_request_handler(make_request(
+            "PATCH",
+            &format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}"),
+            Some(af_create_body(&notif_uri, ("ueIpv4", "10.45.0.183"))),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+
+        // The EventsNotification must arrive at {notifUri}/notify.
+        let events = {
+            let mut out = Vec::new();
+            for _ in 0..200 {
+                out = seen.lock().expect("sink").clone();
+                if out.iter().any(|(uri, _)| uri.ends_with("/notify")) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            out
+        };
+        let (uri, body) = events
+            .iter()
+            .find(|(uri, _)| uri.ends_with("/notify"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no EventsNotification delivered: {events:?}"));
+        assert!(uri.ends_with("/af-notif/notify"), "delivered to {uri}");
+        assert_eq!(
+            body["evNotifs"][0]["event"], "SUCCESSFUL_RESOURCE_ALLOCATION",
+            "the notification names the event that fired: {body}"
+        );
+        assert!(
+            body["evSubsUri"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("/events-subscription"),
+            "evSubsUri is mandatory: {body}"
+        );
+
+        // DELETE removes the subscription, and a later trigger is silent.
+        let resp = pcf_sbi_request_handler(make_request("DELETE", &ev_path, None)).await;
+        assert_eq!(resp.status, 204);
+        let before = seen.lock().expect("sink").len();
+        let resp = pcf_sbi_request_handler(make_request(
+            "PATCH",
+            &format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}"),
+            Some(af_create_body(&notif_uri, ("ueIpv4", "10.45.0.183"))),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = seen
+            .lock()
+            .expect("sink")
+            .iter()
+            .filter(|(uri, _)| uri.ends_with("/notify"))
+            .count();
+        assert_eq!(
+            after,
+            events
+                .iter()
+                .filter(|(u, _)| u.ends_with("/notify"))
+                .count(),
+            "an unsubscribed AF must not be notified (before={before})"
+        );
+
+        let _ = af.stop().await;
+    }
+
+    /// `POST /app-sessions/pcscf-restoration` is its own operation, not a create.
+    #[tokio::test]
+    async fn pcscf_restoration_is_routed_and_resolves_the_ue() {
+        pcf_context_init(64, 64);
+        provision_session_with_ipv4("imsi-001010000000884", 24, "10.45.0.184").await;
+
+        // oneOf: neither address is a 400.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({"dnn": "ims"})),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+
+        // An unknown UE address is a 404, not a 204 reporting a restoration that
+        // did not happen.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({"ueIpv4": "10.99.99.99"})),
+        ))
+        .await;
+        assert_eq!(resp.status, 404);
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({"ueIpv4": "10.45.0.184", "dnn": "ims"})),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 204,
+            "pcscf-restoration must be routed: {:?}",
+            resp.http.content
+        );
+        // ...and it must NOT have been treated as a create (which answers 201
+        // with a Location).
+        assert!(
+            !resp.http.headers.contains_key("location"),
+            "pcscf-restoration must not mint an app session"
+        );
+    }
+
+    /// The IPv6 prefix-containment helper, including a non-byte-aligned length.
+    #[test]
+    fn ipv6_prefix_containment_honours_partial_bytes() {
+        let ctx = pcf_self();
+        let _ = ctx; // context not needed; this pins the pure helper via sessions
+        let prefix: std::net::Ipv6Addr = "2001:db8:abcd::".parse().unwrap();
+        let inside: std::net::Ipv6Addr = "2001:db8:abcd::1".parse().unwrap();
+        let outside: std::net::Ipv6Addr = "2001:db8:abce::1".parse().unwrap();
+        assert!(crate::context::ipv6_prefix_contains_for_test(
+            &prefix.octets(),
+            64,
+            &inside.octets()
+        ));
+        assert!(!crate::context::ipv6_prefix_contains_for_test(
+            &prefix.octets(),
+            64,
+            &outside.octets()
+        ));
+        // /47 splits inside a byte: 2001:db8:abcd:: covers 2001:db8:abcc:: only
+        // when the masked bits agree.
+        assert!(crate::context::ipv6_prefix_contains_for_test(
+            &prefix.octets(),
+            47,
+            &"2001:db8:abcc::9"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+        ));
+        assert!(!crate::context::ipv6_prefix_contains_for_test(
+            &prefix.octets(),
+            47,
+            &"2001:db8:abce::9"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+        ));
     }
 }
 

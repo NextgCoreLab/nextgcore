@@ -70,6 +70,13 @@ pub struct AscReqData {
     pub supp_feat: Option<String>,
     pub notif_uri: Option<String>,
     pub med_components: Vec<MediaComponent>,
+    /// TS 29.514 `AppSessionContextReqData` UE-address identifiers. The schema is
+    /// a `oneOf` over these three, so exactly one must be present — carried as
+    /// three options rather than an enum so the parser can report "zero or more
+    /// than one" rather than silently picking the first (#88).
+    pub ue_ipv4: Option<String>,
+    pub ue_ipv6: Option<String>,
+    pub ue_mac: Option<String>,
 }
 
 /// Media Component
@@ -940,6 +947,7 @@ mod tests {
                 }],
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let rules = media_components_to_pcc(&req, &sess);
@@ -1002,6 +1010,7 @@ mod tests {
                 }],
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let rules = media_components_to_pcc(&req, &sess);
         let rule = &rules[0];
@@ -1033,6 +1042,7 @@ mod tests {
                 }],
                 ..Default::default()
             }],
+            ..Default::default()
         };
         sess.af_pcc_rules = media_components_to_pcc(&req, &sess);
 
