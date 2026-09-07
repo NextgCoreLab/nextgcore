@@ -314,7 +314,16 @@ async fn main() -> Result<()> {
                 break;
             }
             if pfcp_for_hb.is_associated().await {
-                pfcp_for_hb.send_heartbeat_request().await;
+                // Close the PREVIOUS round first: whatever was sent last tick
+                // has had a full interval to be answered, so anything still
+                // outstanding is a miss. Three consecutive misses declare the
+                // peer down (TS 23.007 Section 19A). Without this the heartbeat
+                // was fire-and-forget and a silently dead CP function was never
+                // detected.
+                pfcp_for_hb.close_heartbeat_round().await;
+                if pfcp_for_hb.is_associated().await {
+                    pfcp_for_hb.send_heartbeat_request().await;
+                }
             }
         }
     });
@@ -600,8 +609,6 @@ async fn run_async_event_loop(
     // Heartbeat tracking
     let mut heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
     let mut stats_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-    let mut last_heartbeat_check = std::time::Instant::now();
-    let heartbeat_timeout = std::time::Duration::from_secs(60);
 
     loop {
         tokio::select! {
@@ -617,21 +624,18 @@ async fn run_async_event_loop(
                     upf_sm.dispatch(&entry_event);
                 }
 
-                // Check for PFCP heartbeat timeout on associated peers
-                if last_heartbeat_check.elapsed() > heartbeat_timeout {
-                    for (_, node) in pfcp_ctx.peer_nodes.iter() {
-                        if node.associated {
-                            let addr_bytes = match node.addr.ip() {
-                                std::net::IpAddr::V4(ip) => u32::from_be_bytes(ip.octets()) as u64,
-                                std::net::IpAddr::V6(_) => 0,
-                            };
-                            log::warn!("PFCP heartbeat timeout for peer {}", node.addr);
-                            let no_hb_event = UpfEvent::n4_no_heartbeat(addr_bytes);
-                            upf_sm.dispatch(&no_hb_event);
-                        }
-                    }
-                    last_heartbeat_check = std::time::Instant::now();
-                }
+                // Peer-failure detection lives in PfcpServer::close_heartbeat_round
+                // (TS 23.007 Section 19A), which counts consecutive UNANSWERED
+                // heartbeat rounds and declares the peer down.
+                //
+                // The sweep that used to sit here iterated `pfcp_ctx.peer_nodes`,
+                // a map nothing in the crate ever inserted into, and guarded on
+                // `last_heartbeat_check.elapsed() > heartbeat_timeout` -- elapsed
+                // time, not missed responses -- so even with the map populated it
+                // would have signalled failure against a healthy peer. Both
+                // defects are why it is gone rather than repaired: the state it
+                // needed already exists on the server, next to the socket that
+                // sends and receives the heartbeats.
 
                 // Process pending PFCP transactions (check for timeouts)
                 let stale_seqs: Vec<u32> = pfcp_ctx
