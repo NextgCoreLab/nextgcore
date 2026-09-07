@@ -129,10 +129,24 @@ pub struct UdmUe {
     pub serving_network_name: Option<String>,
     /// AUSF instance ID
     pub ausf_instance_id: Option<String>,
-    /// AMF instance ID
+    /// AMF instance ID serving the UE over **3GPP** access
     pub amf_instance_id: Option<String>,
-    /// Deregistration callback URI
+    /// Deregistration callback URI of the **3GPP**-access serving AMF
     pub dereg_callback_uri: Option<String>,
+    /// AMF instance ID serving the UE over **non-3GPP** access (#84).
+    ///
+    /// Separate from [`Self::amf_instance_id`] because `amf-3gpp-access` and
+    /// `amf-non-3gpp-access` are distinct UECM resources (TS 29.503 §6.2.3): a
+    /// UE may be registered over both at once, and a non-3GPP registration must
+    /// not evict the 3GPP one from this cache.
+    pub non_3gpp_amf_instance_id: Option<String>,
+    /// Deregistration callback URI of the **non-3GPP**-access serving AMF (#84).
+    pub non_3gpp_dereg_callback_uri: Option<String>,
+    /// Identifier of the `AuthEvent` resource created by the last ConfirmAuth
+    /// (TS 29.503 §5.4.2.3.2). Pinned so `DeleteAuth`
+    /// (`PUT /{supi}/auth-events/{authEventId}`, §5.4.2.3.3) can be matched
+    /// against the identifier the UDM actually handed out in `Location`.
+    pub auth_event_id: Option<String>,
     /// K key (16 bytes)
     pub k: [u8; NEXTGCORE_KEY_LEN],
     /// OPc key (16 bytes)
@@ -196,6 +210,9 @@ impl UdmUe {
             ausf_instance_id: None,
             amf_instance_id: None,
             dereg_callback_uri: None,
+            non_3gpp_amf_instance_id: None,
+            non_3gpp_dereg_callback_uri: None,
+            auth_event_id: None,
             k: [0u8; NEXTGCORE_KEY_LEN],
             opc: [0u8; NEXTGCORE_KEY_LEN],
             amf: [0u8; NEXTGCORE_AMF_LEN],

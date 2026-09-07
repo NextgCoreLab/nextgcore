@@ -5,12 +5,8 @@
 
 use crate::context::{
     udm_self, Amf3GppAccessRegistration, AuthEvent, AuthType, Guami, PlmnId, RatType,
-    SmfRegistration, UdmSdmSubscription, NEXTGCORE_RAND_LEN, NEXTGCORE_SQN_LEN,
+    SmfRegistration, UdmSdmSubscription,
 };
-use crate::nudr_handler::UdmSbiState;
-
-use nextgcore_crypt::kdf;
-use nextgcore_crypt::milenage::NEXTGCORE_AUTS_LEN;
 
 /// HTTP status codes
 pub mod http_status {
@@ -88,21 +84,6 @@ impl HandlerResult {
     }
 }
 
-/// Authentication info request data
-#[derive(Debug, Clone, Default)]
-pub struct AuthenticationInfoRequest {
-    pub serving_network_name: Option<String>,
-    pub ausf_instance_id: Option<String>,
-    pub resynchronization_info: Option<ResynchronizationInfo>,
-}
-
-/// Resynchronization info for re-sync procedure
-#[derive(Debug, Clone, Default)]
-pub struct ResynchronizationInfo {
-    pub rand: Option<String>,
-    pub auts: Option<String>,
-}
-
 /// AMF 3GPP Access Registration request
 #[derive(Debug, Clone, Default)]
 pub struct Amf3GppAccessRegistrationRequest {
@@ -162,148 +143,14 @@ pub struct AuthEventRequest {
     pub auth_removal_ind: Option<bool>,
 }
 
-/// Handle NUDM UEAU get request (security-information)
-/// Port of udm_nudm_ueau_handle_get()
-pub fn udm_nudm_ueau_handle_get(
-    udm_ue_id: u64,
-    _stream_id: u64,
-    request: &AuthenticationInfoRequest,
-) -> (HandlerResult, Option<UdmSbiState>) {
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-
-    let mut udm_ue = match context.ue_find_by_id(udm_ue_id) {
-        Some(ue) => ue,
-        None => {
-            log::error!("UDM UE not found [{udm_ue_id}]");
-            return (HandlerResult::bad_request("UDM UE not found"), None);
-        }
-    };
-    drop(context);
-
-    log::debug!("[{}] Handle NUDM UEAU get request", udm_ue.suci);
-
-    // Validate AuthenticationInfoRequest
-    let serving_network_name = match &request.serving_network_name {
-        Some(name) if !name.is_empty() => name.clone(),
-        _ => {
-            log::error!("[{}] No servingNetworkName", udm_ue.suci);
-            return (HandlerResult::bad_request("No servingNetworkName"), None);
-        }
-    };
-
-    let ausf_instance_id = match &request.ausf_instance_id {
-        Some(id) if !id.is_empty() => id.clone(),
-        _ => {
-            log::error!("[{}] No ausfInstanceId", udm_ue.suci);
-            return (HandlerResult::bad_request("No ausfInstanceId"), None);
-        }
-    };
-
-    // Store serving network name and AUSF instance ID
-    udm_ue.serving_network_name = Some(serving_network_name);
-    udm_ue.ausf_instance_id = Some(ausf_instance_id);
-
-    // Update UE in context
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-    context.ue_update(&udm_ue);
-    drop(context);
-
-    // Check for resynchronization info
-    if let Some(ref resync_info) = request.resynchronization_info {
-        // Handle resynchronization procedure
-        let rand_str = match &resync_info.rand {
-            Some(r) if !r.is_empty() => r,
-            _ => {
-                log::error!("[{}] No RAND", udm_ue.suci);
-                return (HandlerResult::bad_request("No RAND"), None);
-            }
-        };
-
-        let auts_str = match &resync_info.auts {
-            Some(a) if !a.is_empty() => a,
-            _ => {
-                log::error!("[{}] No AUTS", udm_ue.suci);
-                return (HandlerResult::bad_request("No AUTS"), None);
-            }
-        };
-
-        // Convert hex strings to bytes
-        let rand_bytes = hex_to_bytes(rand_str);
-        let auts_bytes = hex_to_bytes(auts_str);
-
-        if rand_bytes.len() != NEXTGCORE_RAND_LEN {
-            log::error!("[{}] Invalid RAND length", udm_ue.suci);
-            return (HandlerResult::bad_request("Invalid RAND"), None);
-        }
-
-        // Compare RAND with stored value
-        if rand_bytes != udm_ue.rand {
-            log::error!("[{}] Invalid RAND", udm_ue.suci);
-            return (HandlerResult::bad_request("Invalid RAND"), None);
-        }
-
-        if auts_bytes.len() != NEXTGCORE_AUTS_LEN {
-            log::error!("[{}] Invalid AUTS length", udm_ue.suci);
-            return (HandlerResult::bad_request("Invalid AUTS"), None);
-        }
-
-        // Extract concealed SQN_MS from AUTS (first 6 bytes)
-        let mut conc_sqn_ms = [0u8; NEXTGCORE_SQN_LEN];
-        conc_sqn_ms.copy_from_slice(&auts_bytes[..NEXTGCORE_SQN_LEN]);
-
-        // Use nextgcore_auc_sqn() to derive SQN_MS and MAC-S from AUTS
-        // This verifies the AUTS by recomputing MAC-S with f1* and comparing
-        let rand_arr: &[u8; NEXTGCORE_RAND_LEN] = match rand_bytes.as_slice().try_into() {
-            Ok(arr) => arr,
-            Err(_) => {
-                log::error!("[{}] RAND array conversion failed", udm_ue.suci);
-                return (HandlerResult::bad_request("RAND conversion failed"), None);
-            }
-        };
-        let (sqn_ms, mac_s) =
-            match kdf::nextgcore_auc_sqn(&udm_ue.opc, &udm_ue.k, rand_arr, &conc_sqn_ms) {
-                Ok(result) => result,
-                Err(e) => {
-                    log::error!("[{}] SQN extraction failed: {:?}", udm_ue.suci, e);
-                    return (HandlerResult::bad_request("SQN extraction failed"), None);
-                }
-            };
-
-        // Verify MAC-S matches the MAC-S in AUTS (bytes 6..14)
-        if mac_s != auts_bytes[NEXTGCORE_SQN_LEN..NEXTGCORE_AUTS_LEN] {
-            log::error!("[{}] AUTS MAC-S verification failed", udm_ue.suci);
-            return (HandlerResult::bad_request("AUTS verification failed"), None);
-        }
-
-        // Set new SQN = SQN_MS + 1 (prevents replay)
-        let sqn_ms_val = buffer_to_u64(&sqn_ms);
-        let new_sqn = (sqn_ms_val + 1) & 0xFFFFFFFFFFFF;
-        let mut new_sqn_bytes = [0u8; NEXTGCORE_SQN_LEN];
-        u64_to_buffer(new_sqn, &mut new_sqn_bytes);
-
-        // Update UE with new SQN
-        let ctx = udm_self();
-        let context = ctx.read().unwrap();
-        if let Some(mut ue) = context.ue_find_by_id(udm_ue_id) {
-            ue.sqn = new_sqn_bytes;
-            context.ue_update(&ue);
-        }
-        drop(context);
-
-        log::debug!(
-            "[{}] SQN resynchronization completed (new SQN=0x{:012x})",
-            udm_ue.suci,
-            new_sqn
-        );
-    }
-
-    // Send request to UDR for authentication subscription
-    // Return state to indicate we need to query UDR
-    (HandlerResult::ok(), Some(UdmSbiState::NoState))
-}
-
+/// The dead `udm_nudm_ueau_handle_get` used to live here: a C-port handler that
+/// validated `servingNetworkName` / `ausfInstanceId`, stored them on the UE and
+/// ran AUTS resynchronisation, with NO caller anywhere in the tree. It was the
+/// only code that persisted `ausf_instance_id`, so `sor.rs` and `upu.rs` always
+/// read `None` and picked an arbitrary AUSF (#84 gap 4). The live path in
+/// `app.rs::handle_generate_auth_data` now stores it, and the dead copy is gone
+/// rather than kept as a second, unreachable implementation of the same
+/// procedure.
 /// Handle NUDM UEAU result confirmation inform (auth-events)
 /// Port of udm_nudm_ueau_handle_result_confirmation_inform()
 pub fn udm_nudm_ueau_handle_result_confirmation_inform(

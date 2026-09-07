@@ -73,6 +73,78 @@ fn require_obj<'a>(v: &'a Value, key: &str, label: &str) -> Result<&'a Value, Pr
     }
 }
 
+/// Which AMF access-registration resource a UECM request addresses.
+///
+/// `amf-3gpp-access` and `amf-non-3gpp-access` are **distinct** resources with
+/// distinct operations (TS 29.503 §6.2.3, §5.3.2.4.2), and a UE may be
+/// registered over both at once. The access is therefore threaded through every
+/// step that names a resource — the UDR `context-data` path, the local cache
+/// slot, the `Location` header and the `DeregistrationData.accessType` — as an
+/// explicit parameter rather than defaulted, because the defect this type fixes
+/// (#84) was a non-3GPP registration silently reusing the 3GPP helper and
+/// tearing the UE's 3GPP registration down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UecmAccess {
+    /// 3GPP access (`amf-3gpp-access`, `smsf-3gpp-access`).
+    ThreeGpp,
+    /// Non-3GPP access (`amf-non-3gpp-access`, `smsf-non-3gpp-access`) — the
+    /// N3IWF / TNGF / W-AGF cases of TS 23.501 §4.2.8.
+    Non3Gpp,
+}
+
+impl UecmAccess {
+    /// The AMF-registration resource name, both as the UECM sub-resource and as
+    /// the UDR `context-data` resource (TS 29.505 §5.2.2).
+    pub fn amf_resource(self) -> &'static str {
+        match self {
+            Self::ThreeGpp => "amf-3gpp-access",
+            Self::Non3Gpp => "amf-non-3gpp-access",
+        }
+    }
+
+    /// The SMSF-registration resource name for this access.
+    pub fn smsf_resource(self) -> &'static str {
+        match self {
+            Self::ThreeGpp => "smsf-3gpp-access",
+            Self::Non3Gpp => "smsf-non-3gpp-access",
+        }
+    }
+
+    /// The TS 29.571 `AccessType` enum value for this access. Carried on the
+    /// `DeregistrationData` the old AMF keys its network-initiated
+    /// deregistration on, so it must name the access that actually changed.
+    pub fn access_type(self) -> &'static str {
+        match self {
+            Self::ThreeGpp => "3GPP_ACCESS",
+            Self::Non3Gpp => "NON_3GPP_ACCESS",
+        }
+    }
+
+    /// The `Location` URI of the AMF-registration resource for `supi`.
+    pub fn amf_location(self, supi: &str) -> String {
+        format!("/nudm-uecm/v1/{supi}/registrations/{}", self.amf_resource())
+    }
+
+    /// Resolve a UECM path segment to its access, or `None` when the segment
+    /// names neither AMF-registration resource.
+    pub fn from_amf_resource(segment: &str) -> Option<Self> {
+        match segment {
+            "amf-3gpp-access" => Some(Self::ThreeGpp),
+            "amf-non-3gpp-access" => Some(Self::Non3Gpp),
+            _ => None,
+        }
+    }
+
+    /// Resolve a UECM path segment to its access for the SMSF resources.
+    pub fn from_smsf_resource(segment: &str) -> Option<Self> {
+        match segment {
+            "smsf-3gpp-access" => Some(Self::ThreeGpp),
+            "smsf-non-3gpp-access" => Some(Self::Non3Gpp),
+            _ => None,
+        }
+    }
+}
+
 /// Validate the mandatory IEs of an `Amf3GppAccessRegistration`
 /// (TS 29.503 §6.2.6): `amfInstanceId`, `deregCallbackUri`,
 /// `guami{amfId, plmnId{mcc, mnc}}`, `ratType`.
@@ -93,6 +165,81 @@ pub fn validate_amf_3gpp_registration(body: &Value) -> Result<(), ProblemDetails
     require_str(plmn, "mcc", "Amf3GppAccessRegistration.guami.plmnId.mcc")?;
     require_str(plmn, "mnc", "Amf3GppAccessRegistration.guami.plmnId.mnc")?;
     require_str(body, "ratType", "Amf3GppAccessRegistration.ratType")?;
+    Ok(())
+}
+
+/// Validate the mandatory IEs of an `AmfNon3GppAccessRegistration`
+/// (TS 29.503 §6.2.6.2.x): the `Amf3GppAccessRegistration` set **plus**
+/// `imsVoPs`, which the non-3GPP schema additionally marks required.
+pub fn validate_amf_non_3gpp_registration(body: &Value) -> Result<(), ProblemDetails> {
+    require_str(
+        body,
+        "amfInstanceId",
+        "AmfNon3GppAccessRegistration.amfInstanceId",
+    )?;
+    require_str(
+        body,
+        "deregCallbackUri",
+        "AmfNon3GppAccessRegistration.deregCallbackUri",
+    )?;
+    let guami = require_obj(body, "guami", "AmfNon3GppAccessRegistration.guami")?;
+    require_str(guami, "amfId", "AmfNon3GppAccessRegistration.guami.amfId")?;
+    let plmn = require_obj(guami, "plmnId", "AmfNon3GppAccessRegistration.guami.plmnId")?;
+    require_str(plmn, "mcc", "AmfNon3GppAccessRegistration.guami.plmnId.mcc")?;
+    require_str(plmn, "mnc", "AmfNon3GppAccessRegistration.guami.plmnId.mnc")?;
+    require_str(body, "ratType", "AmfNon3GppAccessRegistration.ratType")?;
+    require_str(body, "imsVoPs", "AmfNon3GppAccessRegistration.imsVoPs")?;
+    Ok(())
+}
+
+/// Validate an AMF access registration for `access`.
+pub fn validate_amf_registration(body: &Value, access: UecmAccess) -> Result<(), ProblemDetails> {
+    match access {
+        UecmAccess::ThreeGpp => validate_amf_3gpp_registration(body),
+        UecmAccess::Non3Gpp => validate_amf_non_3gpp_registration(body),
+    }
+}
+
+/// Validate the mandatory IEs of an `SmsfRegistration` (TS 29.503 §6.2.6.2.9):
+/// `smsfInstanceId` and `plmnId{mcc, mnc}`.
+pub fn validate_smsf_registration(body: &Value) -> Result<(), ProblemDetails> {
+    require_str(body, "smsfInstanceId", "SmsfRegistration.smsfInstanceId")?;
+    let plmn = require_obj(body, "plmnId", "SmsfRegistration.plmnId")?;
+    require_str(plmn, "mcc", "SmsfRegistration.plmnId.mcc")?;
+    require_str(plmn, "mnc", "SmsfRegistration.plmnId.mnc")?;
+    Ok(())
+}
+
+/// The `IpSmGwRegistration` address members (TS 29.503 §6.2.6.2.16). The schema
+/// is an `anyOf` over "at least one of these is present", so the check is
+/// presence-of-any rather than a fixed required list.
+const IP_SM_GW_ADDRESS_IES: [&str; 5] = [
+    "ipSmGwMapAddress",
+    "ipSmGwDiameterAddress",
+    "ipsmgwIpv4",
+    "ipsmgwIpv6",
+    "ipsmgwFqdn",
+];
+
+/// Validate an `IpSmGwRegistration`: at least one address member must be
+/// present, else the registration names no IP-SM-GW to route to.
+pub fn validate_ip_sm_gw_registration(body: &Value) -> Result<(), ProblemDetails> {
+    if !body.is_object() {
+        return Err(ProblemDetails::mandatory_ie_missing(
+            "IpSmGwRegistration must be a JSON object",
+        ));
+    }
+    let has_address = IP_SM_GW_ADDRESS_IES.iter().any(|ie| match body.get(*ie) {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    });
+    if !has_address {
+        return Err(ProblemDetails::mandatory_ie_missing(format!(
+            "IpSmGwRegistration requires one of: {}",
+            IP_SM_GW_ADDRESS_IES.join(", ")
+        )));
+    }
     Ok(())
 }
 
@@ -131,62 +278,61 @@ pub enum UdrClient {
 }
 
 impl UdrClient {
-    async fn amf_context_get(&self, supi: &str) -> Result<SbiResponse, String> {
+    /// GET a `context-data` resource. `resource` is the path under
+    /// `context-data/`, e.g. `amf-non-3gpp-access` or `smf-registrations/5`.
+    ///
+    /// One generic accessor per verb rather than one pair per resource: the #84
+    /// overwrite existed because `amf_context_put` hardcoded
+    /// `amf-3gpp-access`, and a hardcoded resource cannot be got wrong twice if
+    /// there is nowhere left to hardcode it.
+    async fn context_get(&self, supi: &str, resource: &str) -> Result<SbiResponse, String> {
         match self {
-            UdrClient::Live => crate::sbi_path::udm_nudr_dr_send_amf_context_get(supi).await,
+            UdrClient::Live => crate::sbi_path::udm_nudr_dr_send_context_get(supi, resource).await,
             #[cfg(test)]
-            UdrClient::Mock(m) => Ok(m.amf_context_get(supi)),
+            UdrClient::Mock(m) => Ok(m.context_get(supi, resource)),
         }
     }
 
-    async fn amf_context_put(&self, supi: &str, body: &Value) -> Result<SbiResponse, String> {
-        match self {
-            UdrClient::Live => crate::sbi_path::udm_nudr_dr_send_amf_context_put(supi, body).await,
-            #[cfg(test)]
-            UdrClient::Mock(m) => Ok(m.amf_context_put(supi, body)),
-        }
-    }
-
-    async fn smf_context_put(
+    /// PUT a `context-data` resource.
+    async fn context_put(
         &self,
         supi: &str,
-        psi: &str,
+        resource: &str,
         body: &Value,
     ) -> Result<SbiResponse, String> {
         match self {
             UdrClient::Live => {
-                crate::sbi_path::udm_nudr_dr_send_smf_context_put(supi, psi, body).await
+                crate::sbi_path::udm_nudr_dr_send_context_put(supi, resource, body).await
             }
             #[cfg(test)]
-            UdrClient::Mock(m) => Ok(m.smf_context_put(supi, psi, body)),
+            UdrClient::Mock(m) => Ok(m.context_put(supi, resource, body)),
         }
     }
 
-    async fn context_delete(&self, supi: &str, relative_path: &str) -> Result<SbiResponse, String> {
+    /// PATCH a `context-data` resource.
+    async fn context_patch(
+        &self,
+        supi: &str,
+        resource: &str,
+        body: &Value,
+    ) -> Result<SbiResponse, String> {
         match self {
             UdrClient::Live => {
-                crate::sbi_path::udm_nudr_dr_send_context_delete(supi, relative_path).await
+                crate::sbi_path::udm_nudr_dr_send_context_patch(supi, resource, body).await
             }
             #[cfg(test)]
-            UdrClient::Mock(m) => Ok(m.context_delete(supi, relative_path)),
+            UdrClient::Mock(m) => Ok(m.context_patch(supi, resource, body)),
         }
     }
 
-    async fn amf_context_patch(&self, supi: &str, body: &Value) -> Result<SbiResponse, String> {
+    /// DELETE a `context-data` resource.
+    async fn context_delete(&self, supi: &str, resource: &str) -> Result<SbiResponse, String> {
         match self {
             UdrClient::Live => {
-                crate::sbi_path::udm_nudr_dr_send_amf_context_patch(supi, body).await
+                crate::sbi_path::udm_nudr_dr_send_context_delete(supi, resource).await
             }
             #[cfg(test)]
-            UdrClient::Mock(m) => Ok(m.amf_context_patch(supi, body)),
-        }
-    }
-
-    async fn smf_context_get(&self, supi: &str, psi: &str) -> Result<SbiResponse, String> {
-        match self {
-            UdrClient::Live => crate::sbi_path::udm_nudr_dr_send_smf_context_get(supi, psi).await,
-            #[cfg(test)]
-            UdrClient::Mock(m) => Ok(m.smf_context_get(supi, psi)),
+            UdrClient::Mock(m) => Ok(m.context_delete(supi, resource)),
         }
     }
 
@@ -209,9 +355,14 @@ impl UdrClient {
 // Live UECM handlers (validate -> persist -> notify)
 // ---------------------------------------------------------------------------
 
-/// Read the prior AMF registration: UDR first (udmd-02), then the local cache.
-async fn read_prior_amf_registration(supi: &str, client: &UdrClient) -> Option<Value> {
-    if let Ok(resp) = client.amf_context_get(supi).await {
+/// Read the prior AMF registration for `access`: UDR first (udmd-02), then the
+/// local cache.
+async fn read_prior_amf_registration(
+    supi: &str,
+    client: &UdrClient,
+    access: UecmAccess,
+) -> Option<Value> {
+    if let Ok(resp) = client.context_get(supi, access.amf_resource()).await {
         if resp.is_success() {
             if let Some(v) = resp
                 .http
@@ -223,42 +374,63 @@ async fn read_prior_amf_registration(supi: &str, client: &UdrClient) -> Option<V
             }
         }
     }
-    cached_prior_amf_registration(supi)
+    cached_prior_amf_registration(supi, access)
 }
 
 /// Local-cache fallback for the prior AMF registration (amfInstanceId +
 /// deregCallbackUri), used when UDR has no stored context-data.
-fn cached_prior_amf_registration(supi: &str) -> Option<Value> {
+///
+/// Reads the cache slot for `access`: a UE registered over both accesses has two
+/// serving AMFs, and answering the non-3GPP question with the 3GPP AMF would
+/// send that AMF a deregistration for a registration it never lost.
+fn cached_prior_amf_registration(supi: &str, access: UecmAccess) -> Option<Value> {
     let ctx = udm_self();
     let context = ctx.read().ok()?;
     let ue = context.ue_find_by_supi(supi)?;
-    let amf_id = ue.amf_instance_id.clone()?;
+    let (amf_id, callback) = match access {
+        UecmAccess::ThreeGpp => (ue.amf_instance_id.clone()?, ue.dereg_callback_uri),
+        UecmAccess::Non3Gpp => (
+            ue.non_3gpp_amf_instance_id.clone()?,
+            ue.non_3gpp_dereg_callback_uri,
+        ),
+    };
     Some(json!({
         "amfInstanceId": amf_id,
-        "deregCallbackUri": ue.dereg_callback_uri,
+        "deregCallbackUri": callback,
     }))
 }
 
 /// Cache the serving-AMF identity locally so udmd-02 still works when UDR does
-/// not persist context-data.
-fn cache_amf_registration(supi: &str, body: &Value) {
+/// not persist context-data. `None` clears the slot (deregistration).
+fn cache_amf_registration(supi: &str, body: Option<&Value>, access: UecmAccess) {
     let ctx = udm_self();
     let context = match ctx.read() {
         Ok(c) => c,
         Err(_) => return,
     };
+    // A clear (`body == None`) never creates a UE: it would be created only to
+    // be removed again by the deregistration that asked for the clear.
     let ue = context
         .ue_find_by_supi(supi)
-        .or_else(|| context.ue_add(supi));
+        .or_else(|| body.and_then(|_| context.ue_add(supi)));
     if let Some(mut ue) = ue {
-        ue.amf_instance_id = body
-            .get("amfInstanceId")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        ue.dereg_callback_uri = body
-            .get("deregCallbackUri")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let field = |key: &str| {
+            body.and_then(|b| b.get(key))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
+        let amf_instance_id = field("amfInstanceId");
+        let dereg_callback_uri = field("deregCallbackUri");
+        match access {
+            UecmAccess::ThreeGpp => {
+                ue.amf_instance_id = amf_instance_id;
+                ue.dereg_callback_uri = dereg_callback_uri;
+            }
+            UecmAccess::Non3Gpp => {
+                ue.non_3gpp_amf_instance_id = amf_instance_id;
+                ue.non_3gpp_dereg_callback_uri = dereg_callback_uri;
+            }
+        }
         context.ue_update(&ue);
     }
 }
@@ -266,17 +438,26 @@ fn cache_amf_registration(supi: &str, body: &Value) {
 /// Build the Nudm_UECM `DeregistrationData` notification body (TS 29.503
 /// §5.3.2.3.2): `deregReason` + `accessType`. Both members are mandatory — the
 /// old AMF's dereg-notify handler keys its network-initiated deregistration on
-/// `accessType` (WSB-4), so it must be present on the wire. The old AMF's
-/// registration was superseded by a fresh UE initial registration in the new
-/// AMF over 3GPP access. Exposed so peer NF crates (amfd) can drive the exact
-/// wire body through their real handler in strict-peer tests.
-pub fn build_dereg_notification_body() -> Value {
-    json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" })
+/// `accessType` (WSB-4), so it must be present on the wire, and it must name the
+/// access whose registration was actually superseded: a 3GPP-access value on a
+/// non-3GPP re-registration makes the old AMF tear down a 3GPP registration
+/// that is still live (#84). The old AMF's registration was superseded by a
+/// fresh UE initial registration in the new AMF over that access. Exposed so
+/// peer NF crates (amfd) can drive the exact wire body through their real
+/// handler in strict-peer tests.
+pub fn build_dereg_notification_body(access: UecmAccess) -> Value {
+    json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": access.access_type() })
 }
 
 /// udmd-02: notify the old AMF if the serving AMF changed; suppress when the new
 /// amfInstanceId equals the old one.
-async fn notify_old_amf_if_changed(supi: &str, prior: &Value, new: &Value, client: &UdrClient) {
+async fn notify_old_amf_if_changed(
+    supi: &str,
+    prior: &Value,
+    new: &Value,
+    client: &UdrClient,
+    access: UecmAccess,
+) {
     let old_id = prior.get("amfInstanceId").and_then(|v| v.as_str());
     let new_id = new.get("amfInstanceId").and_then(|v| v.as_str());
     let old_uri = prior.get("deregCallbackUri").and_then(|v| v.as_str());
@@ -288,7 +469,7 @@ async fn notify_old_amf_if_changed(supi: &str, prior: &Value, new: &Value, clien
         // Suppression rule (TS 29.503 §5.3.2.2.2): same serving AMF, no notify.
         return;
     }
-    let dereg = build_dereg_notification_body();
+    let dereg = build_dereg_notification_body(access);
     match client.send_dereg_notification(old_uri, &dereg).await {
         Ok(resp) => log::info!(
             "[{supi}] Deregistration notification to old AMF {old_uri} -> {}",
@@ -339,16 +520,32 @@ fn guami_matches(a: &Value, b: &Value) -> bool {
             == b.pointer("/plmnId/mnc").and_then(|x| x.as_str())
 }
 
-/// Process an AMF 3GPP-access registration PUT (udmd-03/01/02/06).
-pub async fn process_amf_registration(supi: &str, body: &Value, client: &UdrClient) -> SbiResponse {
+/// Process an AMF access registration PUT for `access`
+/// (udmd-03/01/02/06; TS 29.503 §5.3.2.2.2 `3GppRegistration` /
+/// §5.3.2.4.2 `Non3GppRegistration`).
+///
+/// `access` selects the resource end to end — validation schema, UDR
+/// `context-data` resource, cache slot, `Location` and the
+/// `DeregistrationData.accessType` — so a non-3GPP registration cannot touch the
+/// 3GPP one (#84).
+pub async fn process_amf_registration(
+    supi: &str,
+    body: &Value,
+    client: &UdrClient,
+    access: UecmAccess,
+) -> SbiResponse {
     // udmd-03: reject payloads missing any mandatory IE.
-    if let Err(problem) = validate_amf_3gpp_registration(body) {
-        log::warn!("[{supi}] AMF registration rejected: {}", problem.detail);
+    if let Err(problem) = validate_amf_registration(body, access) {
+        log::warn!(
+            "[{supi}] AMF {} registration rejected: {}",
+            access.amf_resource(),
+            problem.detail
+        );
         return problem.into_response();
     }
 
     // udmd-02: read the prior registration before overwriting.
-    let prior = read_prior_amf_registration(supi, client).await;
+    let prior = read_prior_amf_registration(supi, client, access).await;
     // udmd-06: remember whether a prior registration existed for status-code choice.
     let is_update = prior.is_some();
 
@@ -356,18 +553,18 @@ pub async fn process_amf_registration(supi: &str, body: &Value, client: &UdrClie
     if let Some(resp) = udr_write_outcome(
         supi,
         "AMF context PUT",
-        client.amf_context_put(supi, body).await,
+        client.context_put(supi, access.amf_resource(), body).await,
     ) {
         return resp;
     }
 
     // udmd-02: notify the old AMF if the serving AMF changed.
     if let Some(prior) = prior {
-        notify_old_amf_if_changed(supi, &prior, body, client).await;
+        notify_old_amf_if_changed(supi, &prior, body, client, access).await;
     }
 
     // Local cache (UDR is the system of record).
-    cache_amf_registration(supi, body);
+    cache_amf_registration(supi, Some(body), access);
 
     // #83: the UE's AMF context data set just changed, so SDM subscribers
     // monitoring it get a ModificationNotification and EE subscribers get a
@@ -396,58 +593,117 @@ pub async fn process_amf_registration(supi: &str, body: &Value, client: &UdrClie
         }))
         .unwrap_or_else(|_| SbiResponse::with_status(status));
     if status == 201 {
-        resp = resp.with_header(
-            "Location",
-            format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"),
-        );
+        resp = resp.with_header("Location", access.amf_location(supi));
     }
     resp
 }
 
-/// Process a PATCH to the AMF 3GPP-access registration (udmd-05).
+/// Read a `context-data` resource and parse it, mapping the UDR outcome to the
+/// UECM read semantics: `Ok(Some(doc))` when stored, `Ok(None)` when UDR says
+/// 404, `Err(response)` when UDR could not answer.
+///
+/// Shared by every UECM GET so a UDR fault is never reported to the consumer as
+/// "not registered" — the distinction the read handlers below depend on.
+async fn read_context_resource(
+    supi: &str,
+    client: &UdrClient,
+    resource: &str,
+) -> Result<Option<Value>, SbiResponse> {
+    match client.context_get(supi, resource).await {
+        Ok(resp) if resp.is_success() => match resp
+            .http
+            .content
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<Value>(b).ok())
+        {
+            Some(v) => Ok(Some(v)),
+            None => {
+                log::error!("[{supi}] UDR {resource} GET returned unparseable body");
+                Err(nextgcore_sbi::server::send_service_unavailable(
+                    "UDR response invalid",
+                ))
+            }
+        },
+        Ok(resp) if resp.status == 404 => Ok(None),
+        Ok(resp) => {
+            log::error!("[{supi}] UDR {resource} GET returned {}", resp.status);
+            Err(nextgcore_sbi::server::send_service_unavailable(
+                "UDR context GET failed",
+            ))
+        }
+        Err(e) => {
+            log::warn!("[{supi}] UDR {resource} GET failed: {e}");
+            Err(nextgcore_sbi::server::send_service_unavailable(
+                "UDR unavailable",
+            ))
+        }
+    }
+}
+
+/// A `404 CONTEXT_NOT_FOUND` for an addressed-but-unregistered UECM resource.
+fn context_not_found(resource: &str) -> SbiResponse {
+    ProblemDetails {
+        status: 404,
+        cause: "CONTEXT_NOT_FOUND".to_string(),
+        detail: format!("No {resource} registration stored for this UE"),
+    }
+    .into_response()
+}
+
+/// Process a GET of an AMF access registration (TS 29.503 §5.3.2.5
+/// `Get3GppRegistration` / `GetNon3GppRegistration`): read-through to the UDR
+/// `context-data` resource for `access`.
+pub async fn process_amf_registration_get(
+    supi: &str,
+    client: &UdrClient,
+    access: UecmAccess,
+) -> SbiResponse {
+    match read_context_resource(supi, client, access.amf_resource()).await {
+        Ok(Some(doc)) => SbiResponse::with_status(200)
+            .with_json_body(&doc)
+            .unwrap_or_else(|_| nextgcore_sbi::server::send_internal_error("serialize failed")),
+        Ok(None) => context_not_found(access.amf_resource()),
+        Err(resp) => resp,
+    }
+}
+
+/// Process a PATCH to an AMF access registration (udmd-05; TS 29.503
+/// §5.3.2.4.2 `UpdateAmfRegistration` / `UpdateNon3GppRegistration`).
 ///
 /// Validates that the GUAMI in the PATCH body matches the stored registration
 /// (ownership check, TS 29.503 §5.3.2.4); applies the update to UDR on match.
+/// A `purgeFlag` of `true` is a **deregistration**, not a field update: TS 29.503
+/// §5.3.2.4.2 defines it as the AMF telling the UDM the UE's context is gone, so
+/// leaving the registration in place after acknowledging it (as this handler did
+/// before #84) makes the UDM keep answering with a serving AMF that has already
+/// released the UE.
 pub async fn process_amf_registration_update(
     supi: &str,
     body: &Value,
     client: &UdrClient,
+    access: UecmAccess,
 ) -> SbiResponse {
     // Read the stored registration.
-    let stored = match client.amf_context_get(supi).await {
-        Ok(resp) if resp.is_success() => {
-            match resp
-                .http
-                .content
-                .as_deref()
-                .and_then(|b| serde_json::from_str::<Value>(b).ok())
-            {
-                Some(v) => v,
-                None => {
-                    log::error!("[{supi}] UDR AMF context GET returned unparseable body");
-                    return nextgcore_sbi::server::send_service_unavailable("UDR response invalid");
-                }
-            }
-        }
-        Ok(resp) if resp.status == 404 => {
+    let stored = match read_context_resource(supi, client, access.amf_resource()).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
             return ProblemDetails {
                 status: 404,
-                cause: "NOT_FOUND".to_string(),
+                cause: "CONTEXT_NOT_FOUND".to_string(),
                 detail: "No AMF registration found for this SUPI".to_string(),
             }
             .into_response();
         }
-        Ok(resp) => {
-            log::error!("[{supi}] UDR AMF context GET returned {}", resp.status);
-            return nextgcore_sbi::server::send_service_unavailable("UDR context GET failed");
-        }
-        Err(e) => {
-            log::warn!("[{supi}] UDR AMF context GET failed: {e} (no prior stored)");
-            return nextgcore_sbi::server::send_service_unavailable("UDR unavailable");
-        }
+        Err(resp) => return resp,
     };
 
     // GUAMI ownership check (TS 29.503 §5.3.2.4).
+    //
+    // Checked only when the PATCH carries a GUAMI. The IE is required by the
+    // `Amf3GppAccessRegistrationModification` schema, but the repo's own AMF
+    // sends a bare `{"purgeFlag": true}` on deregistration, and refusing that
+    // would turn a working deregistration into a 400 — so an absent GUAMI is
+    // accepted and only a *disagreeing* one is refused.
     if let (Some(stored_guami), Some(req_guami)) = (stored.get("guami"), body.get("guami")) {
         if !guami_matches(stored_guami, req_guami) {
             log::warn!("[{supi}] PATCH rejected: GUAMI mismatch");
@@ -460,16 +716,53 @@ pub async fn process_amf_registration_update(
         }
     }
 
+    // purgeFlag == true is a deregistration (TS 29.503 §5.3.2.4.2), so the
+    // resource is removed rather than patched.
+    if body.get("purgeFlag").and_then(|v| v.as_bool()) == Some(true) {
+        log::info!(
+            "[{supi}] UECM PATCH carries purgeFlag -> deregistering {}",
+            access.amf_resource()
+        );
+        return process_amf_deregistration(supi, client, access).await;
+    }
+
     // Apply the PATCH to UDR.
     if let Some(err_resp) = udr_write_outcome(
         supi,
         "AMF context PATCH",
-        client.amf_context_patch(supi, body).await,
+        client
+            .context_patch(supi, access.amf_resource(), body)
+            .await,
     ) {
         return err_resp;
     }
 
     SbiResponse::with_status(204)
+}
+
+/// Process a `POST .../registrations/amf-3gpp-access/dereg-amf` (TS 29.503
+/// §5.3.2.4.2 `DeregAMF`), the spec-defined AMF deregistration.
+///
+/// The body is an `AmfDeregInfo`, whose only member — `deregReason` — is
+/// mandatory. It is validated rather than ignored because the reason is the
+/// only thing distinguishing this from an accidental POST, and a 204 for a
+/// bodyless request would report a deregistration the consumer did not describe.
+pub async fn process_dereg_amf(supi: &str, body: &Value, client: &UdrClient) -> SbiResponse {
+    if let Err(problem) = require_str(body, "deregReason", "AmfDeregInfo.deregReason") {
+        log::warn!("[{supi}] dereg-amf rejected: {}", problem.detail);
+        return problem.into_response();
+    }
+    let reason = body
+        .get("deregReason")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    log::info!("[{supi}] UECM dereg-amf (deregReason={reason})");
+    process_amf_deregistration(supi, client, UecmAccess::ThreeGpp).await
+}
+
+/// The UDR `context-data` resource for one PDU session's SMF registration.
+fn smf_registration_resource(pdu_session_id: &str) -> String {
+    format!("smf-registrations/{pdu_session_id}")
 }
 
 /// Process an SMF registration PUT (udmd-03/01/06).
@@ -485,9 +778,11 @@ pub async fn process_smf_registration(
         return problem.into_response();
     }
 
+    let resource = smf_registration_resource(pdu_session_id);
+
     // udmd-06: check whether a prior registration exists.
     let is_update = matches!(
-        client.smf_context_get(supi, pdu_session_id).await,
+        client.context_get(supi, &resource).await,
         Ok(resp) if resp.is_success()
     );
 
@@ -495,7 +790,7 @@ pub async fn process_smf_registration(
     if let Some(resp) = udr_write_outcome(
         supi,
         "SMF context PUT",
-        client.smf_context_put(supi, pdu_session_id, body).await,
+        client.context_put(supi, &resource, body).await,
     ) {
         return resp;
     }
@@ -528,18 +823,31 @@ pub async fn process_smf_registration(
     resp
 }
 
-/// Process an AMF deregistration DELETE (udmd-01): purge UDR context-data, then
-/// return 204.
-pub async fn process_amf_deregistration(supi: &str, client: &UdrClient) -> SbiResponse {
-    if let Err(e) = client.context_delete(supi, "amf-3gpp-access").await {
+/// Process an AMF deregistration for `access` (udmd-01): purge the UDR
+/// context-data resource for that access, then return 204.
+///
+/// The local UE context is only dropped once **neither** access holds a
+/// registration: a UE deregistering from non-3GPP access while still registered
+/// over 3GPP must keep its cached 3GPP serving AMF, or the next 3GPP
+/// re-registration cannot find an old AMF to notify.
+pub async fn process_amf_deregistration(
+    supi: &str,
+    client: &UdrClient,
+    access: UecmAccess,
+) -> SbiResponse {
+    if let Err(e) = client.context_delete(supi, access.amf_resource()).await {
         log::warn!("[{supi}] UDR AMF context DELETE failed: {e} (degraded)");
     }
 
-    // Local cache cleanup (mirror legacy behavior).
+    // Local cache cleanup: clear this access's slot, and drop the UE entirely
+    // only when the other access is not registered either.
+    cache_amf_registration(supi, None, access);
     let ctx = udm_self();
     if let Ok(context) = ctx.read() {
         if let Some(ue) = context.ue_find_by_supi(supi) {
-            context.ue_remove(ue.id);
+            if ue.amf_instance_id.is_none() && ue.non_3gpp_amf_instance_id.is_none() {
+                context.ue_remove(ue.id);
+            }
         }
     }
 
@@ -562,7 +870,7 @@ pub async fn process_smf_deregistration(
     pdu_session_id: &str,
     client: &UdrClient,
 ) -> SbiResponse {
-    let relative = format!("smf-registrations/{pdu_session_id}");
+    let relative = smf_registration_resource(pdu_session_id);
     if let Err(e) = client.context_delete(supi, &relative).await {
         log::warn!("[{supi}] UDR SMF context DELETE failed: {e} (degraded)");
     }
@@ -574,37 +882,299 @@ pub async fn process_smf_deregistration(
     SbiResponse::with_status(204)
 }
 
+/// Process a GET of one PDU session's SMF registration (TS 29.503 §5.3.2.5).
+pub async fn process_smf_registration_get(
+    supi: &str,
+    pdu_session_id: &str,
+    client: &UdrClient,
+) -> SbiResponse {
+    let resource = smf_registration_resource(pdu_session_id);
+    match read_context_resource(supi, client, &resource).await {
+        Ok(Some(doc)) => SbiResponse::with_status(200)
+            .with_json_body(&doc)
+            .unwrap_or_else(|_| nextgcore_sbi::server::send_internal_error("serialize failed")),
+        Ok(None) => context_not_found(&resource),
+        Err(resp) => resp,
+    }
+}
+
+/// Process a GET of the SMF-registration **collection** (TS 29.503 §5.3.2.5
+/// `GetSmfRegistration`), returning an `SmfRegistrationInfo`.
+///
+/// The UDR collection resource answers with a bare JSON array (TS 29.505), while
+/// the UECM operation is defined to return the `SmfRegistrationInfo` object with
+/// its `smfRegistrationList` member — so the wrap happens here rather than
+/// forwarding the UDR shape and hoping the consumer is lenient. An empty list is
+/// a 404: `smfRegistrationList` has `minItems: 1`, so "registered for nothing"
+/// is not a representable answer.
+pub async fn process_smf_registrations_get(supi: &str, client: &UdrClient) -> SbiResponse {
+    let doc = match read_context_resource(supi, client, "smf-registrations").await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => return context_not_found("smf-registrations"),
+        Err(resp) => return resp,
+    };
+    // Accept both the UDR array form and an already-wrapped object, so a UDR
+    // that grows the object form later does not double-wrap.
+    let list = match &doc {
+        Value::Array(items) => items.clone(),
+        Value::Object(_) => match doc.get("smfRegistrationList").and_then(|v| v.as_array()) {
+            Some(items) => items.clone(),
+            // A single SmfRegistration document: treat as a one-element list.
+            None => vec![doc.clone()],
+        },
+        _ => {
+            log::error!("[{supi}] UDR smf-registrations returned neither array nor object");
+            return nextgcore_sbi::server::send_service_unavailable("UDR response invalid");
+        }
+    };
+    if list.is_empty() {
+        return context_not_found("smf-registrations");
+    }
+    SbiResponse::with_status(200)
+        .with_json_body(&json!({ "smfRegistrationList": list }))
+        .unwrap_or_else(|_| nextgcore_sbi::server::send_internal_error("serialize failed"))
+}
+
+/// Process a GET of the UE's location information (TS 29.503 §5.3.2.5
+/// `GetLocationInfo`), returning a `LocationInfo`.
+///
+/// Composed from the stored AMF registrations rather than read from a UDR
+/// resource of its own, because that is what the IE holds: `LocationInfo` is a
+/// list of `RegistrationLocationInfo`, each naming the serving AMF and the
+/// access types it serves. One AMF serving both accesses therefore yields ONE
+/// entry with two `accessTypeList` members — not two entries — which is also
+/// what keeps the list inside its `maxItems: 2` bound.
+pub async fn process_location_info_get(supi: &str, client: &UdrClient) -> SbiResponse {
+    let three_gpp = read_context_resource(supi, client, UecmAccess::ThreeGpp.amf_resource()).await;
+    let non_3gpp = read_context_resource(supi, client, UecmAccess::Non3Gpp.amf_resource()).await;
+    // A UDR fault on either read is reported as such: answering with a partial
+    // location would claim the UE is registered over one access only.
+    let three_gpp = match three_gpp {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let non_3gpp = match non_3gpp {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let mut entries: Vec<Value> = Vec::new();
+    for (reg, access) in [
+        (three_gpp, UecmAccess::ThreeGpp),
+        (non_3gpp, UecmAccess::Non3Gpp),
+    ] {
+        let Some(reg) = reg else { continue };
+        let Some(amf_instance_id) = reg.get("amfInstanceId").and_then(|v| v.as_str()) else {
+            log::warn!(
+                "[{supi}] stored {} registration has no amfInstanceId — omitted from LocationInfo",
+                access.amf_resource()
+            );
+            continue;
+        };
+        // Same AMF on both accesses -> one entry carrying both access types.
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|e| e.get("amfInstanceId").and_then(|v| v.as_str()) == Some(amf_instance_id))
+        {
+            if let Some(list) = existing
+                .get_mut("accessTypeList")
+                .and_then(|v| v.as_array_mut())
+            {
+                list.push(json!(access.access_type()));
+            }
+            continue;
+        }
+        let mut entry = json!({
+            "amfInstanceId": amf_instance_id,
+            "accessTypeList": [access.access_type()],
+        });
+        if let (Some(obj), Some(guami)) = (entry.as_object_mut(), reg.get("guami")) {
+            obj.insert("guami".to_string(), guami.clone());
+            if let Some(plmn) = guami.get("plmnId") {
+                obj.insert("plmnId".to_string(), plmn.clone());
+            }
+        }
+        entries.push(entry);
+    }
+
+    if entries.is_empty() {
+        return context_not_found("location");
+    }
+    let mut info = json!({ "registrationLocationInfoList": entries, "supi": supi });
+    if let (Some(obj), Some(gpsi)) = (info.as_object_mut(), cached_gpsi(supi)) {
+        obj.insert("gpsi".to_string(), json!(gpsi));
+    }
+    SbiResponse::with_status(200)
+        .with_json_body(&info)
+        .unwrap_or_else(|_| nextgcore_sbi::server::send_internal_error("serialize failed"))
+}
+
+/// The UE's GPSI, if the UDM happens to hold one.
+///
+/// Always `None` today: the UDM never learns a GPSI, which is its own tracked
+/// defect (#205 on the AMF side, #85 for the UDM's identifier translation). The
+/// hook exists so `LocationInfo.gpsi` is populated the moment a GPSI is
+/// available rather than fabricating one from the SUPI, which would be a
+/// different subscriber identity.
+fn cached_gpsi(_supi: &str) -> Option<String> {
+    None
+}
+
+/// Process an SMSF registration PUT for `access` (TS 29.503 §5.3.2.x
+/// `3GppSmsfRegistration` / `Non3GppSmsfRegistration`).
+pub async fn process_smsf_registration(
+    supi: &str,
+    body: &Value,
+    client: &UdrClient,
+    access: UecmAccess,
+) -> SbiResponse {
+    if let Err(problem) = validate_smsf_registration(body) {
+        log::warn!("[{supi}] SMSF registration rejected: {}", problem.detail);
+        return problem.into_response();
+    }
+    let resource = access.smsf_resource();
+    let is_update = matches!(
+        client.context_get(supi, resource).await,
+        Ok(resp) if resp.is_success()
+    );
+    if let Some(resp) = udr_write_outcome(
+        supi,
+        "SMSF context PUT",
+        client.context_put(supi, resource, body).await,
+    ) {
+        return resp;
+    }
+    let status = if is_update { 200 } else { 201 };
+    let mut resp = SbiResponse::with_status(status)
+        .with_json_body(body)
+        .unwrap_or_else(|_| SbiResponse::with_status(status));
+    if status == 201 {
+        resp = resp.with_header(
+            "Location",
+            format!("/nudm-uecm/v1/{supi}/registrations/{resource}"),
+        );
+    }
+    resp
+}
+
+/// Process an SMSF registration GET for `access` (TS 29.503
+/// `Get3GppSmsfRegistration` / `GetNon3GppSmsfRegistration`).
+pub async fn process_smsf_registration_get(
+    supi: &str,
+    client: &UdrClient,
+    access: UecmAccess,
+) -> SbiResponse {
+    match read_context_resource(supi, client, access.smsf_resource()).await {
+        Ok(Some(doc)) => SbiResponse::with_status(200)
+            .with_json_body(&doc)
+            .unwrap_or_else(|_| nextgcore_sbi::server::send_internal_error("serialize failed")),
+        Ok(None) => context_not_found(access.smsf_resource()),
+        Err(resp) => resp,
+    }
+}
+
+/// Process an SMSF deregistration DELETE for `access`
+/// (`3GppSmsfDeregistration` / `Non3GppSmsfDeregistration`).
+pub async fn process_smsf_deregistration(
+    supi: &str,
+    client: &UdrClient,
+    access: UecmAccess,
+) -> SbiResponse {
+    if let Err(e) = client.context_delete(supi, access.smsf_resource()).await {
+        log::warn!("[{supi}] UDR SMSF context DELETE failed: {e} (degraded)");
+    }
+    SbiResponse::with_status(204)
+}
+
+/// The UDR `context-data` resource holding the IP-SM-GW registration.
+const IP_SM_GW_RESOURCE: &str = "ip-sm-gw";
+
+/// Process an IP-SM-GW registration PUT (TS 29.503 `IpSmGwRegistration`).
+pub async fn process_ip_sm_gw_registration(
+    supi: &str,
+    body: &Value,
+    client: &UdrClient,
+) -> SbiResponse {
+    if let Err(problem) = validate_ip_sm_gw_registration(body) {
+        log::warn!(
+            "[{supi}] IP-SM-GW registration rejected: {}",
+            problem.detail
+        );
+        return problem.into_response();
+    }
+    let is_update = matches!(
+        client.context_get(supi, IP_SM_GW_RESOURCE).await,
+        Ok(resp) if resp.is_success()
+    );
+    if let Some(resp) = udr_write_outcome(
+        supi,
+        "IP-SM-GW context PUT",
+        client.context_put(supi, IP_SM_GW_RESOURCE, body).await,
+    ) {
+        return resp;
+    }
+    let status = if is_update { 200 } else { 201 };
+    let mut resp = SbiResponse::with_status(status)
+        .with_json_body(body)
+        .unwrap_or_else(|_| SbiResponse::with_status(status));
+    if status == 201 {
+        resp = resp.with_header(
+            "Location",
+            format!("/nudm-uecm/v1/{supi}/registrations/{IP_SM_GW_RESOURCE}"),
+        );
+    }
+    resp
+}
+
+/// Process an IP-SM-GW registration GET (`GetIpSmGwRegistration`).
+pub async fn process_ip_sm_gw_registration_get(supi: &str, client: &UdrClient) -> SbiResponse {
+    match read_context_resource(supi, client, IP_SM_GW_RESOURCE).await {
+        Ok(Some(doc)) => SbiResponse::with_status(200)
+            .with_json_body(&doc)
+            .unwrap_or_else(|_| nextgcore_sbi::server::send_internal_error("serialize failed")),
+        Ok(None) => context_not_found(IP_SM_GW_RESOURCE),
+        Err(resp) => resp,
+    }
+}
+
+/// Process an IP-SM-GW deregistration DELETE (`IpSmGwDeregistration`).
+pub async fn process_ip_sm_gw_deregistration(supi: &str, client: &UdrClient) -> SbiResponse {
+    if let Err(e) = client.context_delete(supi, IP_SM_GW_RESOURCE).await {
+        log::warn!("[{supi}] UDR IP-SM-GW context DELETE failed: {e} (degraded)");
+    }
+    SbiResponse::with_status(204)
+}
+
 // ---------------------------------------------------------------------------
 // Test double (mock UDR)
 // ---------------------------------------------------------------------------
 
-/// A recorded outgoing UDR/AMF operation (test-only).
+/// A recorded outgoing UDR / old-AMF operation (test-only).
+///
+/// `resource` is the `context-data` resource the call addressed
+/// (`amf-3gpp-access`, `amf-non-3gpp-access`, `smf-registrations/5`, ...), so a
+/// test can pin *which* resource a handler touched — the assertion the #84
+/// overwrite defect needed and did not have.
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum UdrCall {
-    AmfGet {
+    CtxGet {
         supi: String,
+        resource: String,
     },
-    AmfPut {
+    CtxPut {
         supi: String,
+        resource: String,
         body: Value,
     },
-    AmfPatch {
+    CtxPatch {
         supi: String,
+        resource: String,
         body: Value,
     },
-    SmfGet {
+    CtxDelete {
         supi: String,
-        psi: String,
-    },
-    SmfPut {
-        supi: String,
-        psi: String,
-        body: Value,
-    },
-    Delete {
-        supi: String,
-        path: String,
+        resource: String,
     },
     DeregNotify {
         callback_uri: String,
@@ -612,16 +1182,20 @@ pub enum UdrCall {
     },
 }
 
-/// Stateful mock UDR: `amf_context_get` returns the last value stored by
-/// `amf_context_put` (or a seeded prior), so re-registration scenarios behave
-/// like a real repository.
+/// Stateful mock UDR: `context_get` returns the last value stored by
+/// `context_put` for the SAME resource (or a seeded prior), so re-registration
+/// scenarios behave like a real repository and a write to one resource is
+/// invisible to a read of another.
 #[cfg(test)]
 pub struct MockUdr {
-    stored_amf: std::sync::Mutex<Option<Value>>,
-    stored_smf: std::sync::Mutex<std::collections::HashMap<String, Value>>,
+    stored: std::sync::Mutex<std::collections::HashMap<String, Value>>,
     put_status: u16,
     patch_status: u16,
     dereg_status: u16,
+    /// When set, every `context_get` answers with this status instead of
+    /// consulting `stored` — the UDR-fault case a read handler must not confuse
+    /// with "no such registration".
+    get_status: Option<u16>,
     calls: std::sync::Mutex<Vec<UdrCall>>,
 }
 
@@ -629,19 +1203,33 @@ pub struct MockUdr {
 impl MockUdr {
     fn new() -> Self {
         Self {
-            stored_amf: std::sync::Mutex::new(None),
-            stored_smf: std::sync::Mutex::new(std::collections::HashMap::new()),
+            stored: std::sync::Mutex::new(std::collections::HashMap::new()),
             put_status: 201,
             patch_status: 204,
             dereg_status: 204,
+            get_status: None,
             calls: std::sync::Mutex::new(Vec::new()),
         }
     }
 
+    /// Make every `context_get` fail with `status`.
+    fn with_get_status(mut self, status: u16) -> Self {
+        self.get_status = Some(status);
+        self
+    }
+
+    /// Seed a stored `amf-3gpp-access` registration.
     fn with_prior(prior: Value) -> Self {
-        let m = Self::new();
-        *m.stored_amf.lock().unwrap() = Some(prior);
-        m
+        Self::new().with_stored(UecmAccess::ThreeGpp.amf_resource(), prior)
+    }
+
+    /// Seed an arbitrary stored `context-data` resource.
+    fn with_stored(self, resource: &str, doc: Value) -> Self {
+        self.stored
+            .lock()
+            .unwrap()
+            .insert(resource.to_string(), doc);
+        self
     }
 
     /// Override the status the mocked old-AMF dereg-notify callback returns
@@ -653,11 +1241,20 @@ impl MockUdr {
         self
     }
 
-    fn amf_context_get(&self, supi: &str) -> SbiResponse {
-        self.calls.lock().unwrap().push(UdrCall::AmfGet {
+    /// The document currently stored under `resource`, if any.
+    fn stored_doc(&self, resource: &str) -> Option<Value> {
+        self.stored.lock().unwrap().get(resource).cloned()
+    }
+
+    fn context_get(&self, supi: &str, resource: &str) -> SbiResponse {
+        self.calls.lock().unwrap().push(UdrCall::CtxGet {
             supi: supi.to_string(),
+            resource: resource.to_string(),
         });
-        match self.stored_amf.lock().unwrap().clone() {
+        if let Some(status) = self.get_status {
+            return SbiResponse::with_status(status);
+        }
+        match self.stored_doc(resource) {
             Some(v) => SbiResponse::with_status(200)
                 .with_json_body(&v)
                 .unwrap_or_else(|_| SbiResponse::with_status(200)),
@@ -665,53 +1262,34 @@ impl MockUdr {
         }
     }
 
-    fn amf_context_put(&self, supi: &str, body: &Value) -> SbiResponse {
-        self.calls.lock().unwrap().push(UdrCall::AmfPut {
+    fn context_put(&self, supi: &str, resource: &str, body: &Value) -> SbiResponse {
+        self.calls.lock().unwrap().push(UdrCall::CtxPut {
             supi: supi.to_string(),
+            resource: resource.to_string(),
             body: body.clone(),
         });
-        *self.stored_amf.lock().unwrap() = Some(body.clone());
+        self.stored
+            .lock()
+            .unwrap()
+            .insert(resource.to_string(), body.clone());
         SbiResponse::with_status(self.put_status)
     }
 
-    fn amf_context_patch(&self, supi: &str, body: &Value) -> SbiResponse {
-        self.calls.lock().unwrap().push(UdrCall::AmfPatch {
+    fn context_patch(&self, supi: &str, resource: &str, body: &Value) -> SbiResponse {
+        self.calls.lock().unwrap().push(UdrCall::CtxPatch {
             supi: supi.to_string(),
+            resource: resource.to_string(),
             body: body.clone(),
         });
         SbiResponse::with_status(self.patch_status)
     }
 
-    fn smf_context_get(&self, supi: &str, psi: &str) -> SbiResponse {
-        self.calls.lock().unwrap().push(UdrCall::SmfGet {
+    fn context_delete(&self, supi: &str, resource: &str) -> SbiResponse {
+        self.calls.lock().unwrap().push(UdrCall::CtxDelete {
             supi: supi.to_string(),
-            psi: psi.to_string(),
+            resource: resource.to_string(),
         });
-        let key = format!("{supi}:{psi}");
-        match self.stored_smf.lock().unwrap().get(&key).cloned() {
-            Some(v) => SbiResponse::with_status(200)
-                .with_json_body(&v)
-                .unwrap_or_else(|_| SbiResponse::with_status(200)),
-            None => SbiResponse::with_status(404),
-        }
-    }
-
-    fn smf_context_put(&self, supi: &str, psi: &str, body: &Value) -> SbiResponse {
-        self.calls.lock().unwrap().push(UdrCall::SmfPut {
-            supi: supi.to_string(),
-            psi: psi.to_string(),
-            body: body.clone(),
-        });
-        let key = format!("{supi}:{psi}");
-        self.stored_smf.lock().unwrap().insert(key, body.clone());
-        SbiResponse::with_status(self.put_status)
-    }
-
-    fn context_delete(&self, supi: &str, path: &str) -> SbiResponse {
-        self.calls.lock().unwrap().push(UdrCall::Delete {
-            supi: supi.to_string(),
-            path: path.to_string(),
-        });
+        self.stored.lock().unwrap().remove(resource);
         SbiResponse::with_status(204)
     }
 
@@ -793,7 +1371,13 @@ mod tests {
             let body = remove_path(valid_amf_body(), path);
             let mock = Arc::new(MockUdr::new());
             let client = UdrClient::Mock(mock.clone());
-            let resp = process_amf_registration("imsi-001010000000301", &body, &client).await;
+            let resp = process_amf_registration(
+                "imsi-001010000000301",
+                &body,
+                &client,
+                UecmAccess::ThreeGpp,
+            )
+            .await;
             assert_eq!(resp.status, 400, "missing {path:?} should be 400");
             assert_eq!(
                 problem_cause(&resp).as_deref(),
@@ -802,10 +1386,10 @@ mod tests {
             );
             // Validation must short-circuit before any UDR write.
             assert!(
-                !mock
-                    .calls()
-                    .iter()
-                    .any(|c| matches!(c, UdrCall::AmfPut { .. })),
+                !mock.calls().iter().any(|c| matches!(
+                    c,
+                    UdrCall::CtxPut { resource, .. } if resource == "amf-3gpp-access"
+                )),
                 "missing {path:?} must not persist to UDR"
             );
         }
@@ -845,8 +1429,13 @@ mod tests {
         crate::context::udm_context_init(1024, 4096);
         let mock = Arc::new(MockUdr::new());
         let client = UdrClient::Mock(mock.clone());
-        let resp =
-            process_amf_registration("imsi-001010000000303", &valid_amf_body(), &client).await;
+        let resp = process_amf_registration(
+            "imsi-001010000000303",
+            &valid_amf_body(),
+            &client,
+            UecmAccess::ThreeGpp,
+        )
+        .await;
         assert_eq!(resp.status, 201);
     }
 
@@ -867,11 +1456,15 @@ mod tests {
         let mock = Arc::new(MockUdr::new());
         let client = UdrClient::Mock(mock.clone());
 
-        let resp = process_amf_registration(supi, &body, &client).await;
+        let resp = process_amf_registration(supi, &body, &client, UecmAccess::ThreeGpp).await;
         assert_eq!(resp.status, 201);
 
         let put = mock.calls().into_iter().find_map(|c| match c {
-            UdrCall::AmfPut { supi, body } => Some((supi, body)),
+            UdrCall::CtxPut {
+                supi,
+                resource,
+                body,
+            } if resource == "amf-3gpp-access" => Some((supi, body)),
             _ => None,
         });
         let (put_supi, put_body) = put.expect("an AMF context PUT was issued to UDR");
@@ -890,12 +1483,16 @@ mod tests {
         assert_eq!(resp.status, 201);
 
         let put = mock.calls().into_iter().find_map(|c| match c {
-            UdrCall::SmfPut { supi, psi, body } => Some((supi, psi, body)),
+            UdrCall::CtxPut {
+                supi,
+                resource,
+                body,
+            } if resource.starts_with("smf-registrations/") => Some((supi, resource, body)),
             _ => None,
         });
-        let (put_supi, psi, put_body) = put.expect("an SMF context PUT was issued to UDR");
+        let (put_supi, resource, put_body) = put.expect("an SMF context PUT was issued to UDR");
         assert_eq!(put_supi, supi);
-        assert_eq!(psi, "5");
+        assert_eq!(resource, "smf-registrations/5");
         assert_eq!(put_body, body);
     }
 
@@ -913,8 +1510,13 @@ mod tests {
         mock.put_status = 500;
         let mock = Arc::new(mock);
         let client = UdrClient::Mock(mock.clone());
-        let resp =
-            process_amf_registration("imsi-001010000000312", &valid_amf_body(), &client).await;
+        let resp = process_amf_registration(
+            "imsi-001010000000312",
+            &valid_amf_body(),
+            &client,
+            UecmAccess::ThreeGpp,
+        )
+        .await;
         assert_eq!(resp.status, 503, "UDR 5xx maps to 503");
     }
 
@@ -931,12 +1533,12 @@ mod tests {
         let supi = "imsi-001010000000313";
         let mock = Arc::new(MockUdr::new());
         let client = UdrClient::Mock(mock.clone());
-        let resp = process_amf_deregistration(supi, &client).await;
+        let resp = process_amf_deregistration(supi, &client, UecmAccess::ThreeGpp).await;
         assert_eq!(resp.status, 204);
         assert!(
             mock.calls().iter().any(|c| matches!(
                 c,
-                UdrCall::Delete { path, .. } if path == "amf-3gpp-access"
+                UdrCall::CtxDelete { resource, .. } if resource == "amf-3gpp-access"
             )),
             "deregistration issues a UDR context-data DELETE"
         );
@@ -959,7 +1561,13 @@ mod tests {
             "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "deadff" },
             "purgeFlag": true
         });
-        let resp = process_amf_registration_update("imsi-udmd05-0001", &wrong_guami, &client).await;
+        let resp = process_amf_registration_update(
+            "imsi-udmd05-0001",
+            &wrong_guami,
+            &client,
+            UecmAccess::ThreeGpp,
+        )
+        .await;
         assert_eq!(resp.status, 403, "wrong GUAMI must be 403");
         assert_eq!(
             problem_cause(&resp).as_deref(),
@@ -971,8 +1579,8 @@ mod tests {
             !mock
                 .calls()
                 .iter()
-                .any(|c| matches!(c, UdrCall::AmfPatch { .. })),
-            "UDR PATCH must not be issued when GUAMI mismatches"
+                .any(|c| matches!(c, UdrCall::CtxPatch { .. } | UdrCall::CtxDelete { .. })),
+            "neither a UDR PATCH nor a DELETE may be issued when GUAMI mismatches"
         );
     }
 
@@ -987,16 +1595,25 @@ mod tests {
         let mock = Arc::new(MockUdr::with_prior(stored));
         let client = UdrClient::Mock(mock.clone());
 
+        // A genuine field modification, NOT a purge: `purgeFlag: true` is a
+        // deregistration (TS 29.503 §5.3.2.4.2) and is covered by its own test
+        // below, so using it here would test the wrong branch of this handler.
         let patch = json!({
             "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
-            "purgeFlag": true
+            "pei": "imeisv-1234567890123456"
         });
-        let resp = process_amf_registration_update("imsi-udmd05-0002", &patch, &client).await;
+        let resp = process_amf_registration_update(
+            "imsi-udmd05-0002",
+            &patch,
+            &client,
+            UecmAccess::ThreeGpp,
+        )
+        .await;
         assert_eq!(resp.status, 204, "matching GUAMI must be 204");
         assert!(
             mock.calls()
                 .iter()
-                .any(|c| matches!(c, UdrCall::AmfPatch { .. })),
+                .any(|c| matches!(c, UdrCall::CtxPatch { .. })),
             "UDR PATCH must be issued when GUAMI matches"
         );
     }
@@ -1008,7 +1625,13 @@ mod tests {
         let client = UdrClient::Mock(mock);
         let patch =
             json!({ "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" } });
-        let resp = process_amf_registration_update("imsi-udmd05-0003", &patch, &client).await;
+        let resp = process_amf_registration_update(
+            "imsi-udmd05-0003",
+            &patch,
+            &client,
+            UecmAccess::ThreeGpp,
+        )
+        .await;
         assert_eq!(resp.status, 404);
     }
 
@@ -1029,7 +1652,8 @@ mod tests {
         let client = UdrClient::Mock(mock.clone());
 
         // First PUT → no prior → 201 + Location
-        let resp = process_amf_registration(supi, &valid_amf_body(), &client).await;
+        let resp =
+            process_amf_registration(supi, &valid_amf_body(), &client, UecmAccess::ThreeGpp).await;
         assert_eq!(resp.status, 201, "first PUT must be 201");
         // set_header lowercases all header keys (HTTP/2 convention).
         let loc = resp
@@ -1044,7 +1668,8 @@ mod tests {
         );
 
         // Second PUT → prior exists → 200
-        let resp = process_amf_registration(supi, &valid_amf_body(), &client).await;
+        let resp =
+            process_amf_registration(supi, &valid_amf_body(), &client, UecmAccess::ThreeGpp).await;
         assert_eq!(resp.status, 200, "second PUT must be 200");
     }
 
@@ -1095,7 +1720,7 @@ mod tests {
         body_b["amfInstanceId"] = json!("amf-b-0002");
         body_b["deregCallbackUri"] =
             json!("http://amf-b.example.org:7777/namf-callback/v1/imsi-x/dereg-notify");
-        let resp = process_amf_registration(supi, &body_b, &client).await;
+        let resp = process_amf_registration(supi, &body_b, &client, UecmAccess::ThreeGpp).await;
         assert_eq!(
             resp.status, 200,
             "re-registration over existing AMF-A must be 200 (update)"
@@ -1122,7 +1747,7 @@ mod tests {
 
         // Re-register with the SAME AMF-B id -> suppressed, no new notification.
         // Still an update (prior = AMF-B now stored) → 200.
-        let resp = process_amf_registration(supi, &body_b, &client).await;
+        let resp = process_amf_registration(supi, &body_b, &client, UecmAccess::ThreeGpp).await;
         assert_eq!(
             resp.status, 200,
             "same-AMF re-registration still updates the resource → 200"
@@ -1171,7 +1796,7 @@ mod tests {
         body_b["amfInstanceId"] = json!("amf-b-0002");
         body_b["deregCallbackUri"] =
             json!("http://amf-b.example.org:7777/namf-callback/v1/imsi-x/dereg-notify");
-        let _ = process_amf_registration(supi, &body_b, &client).await;
+        let _ = process_amf_registration(supi, &body_b, &client, UecmAccess::ThreeGpp).await;
 
         mock.calls()
             .into_iter()
@@ -1419,7 +2044,7 @@ mod tests {
         });
         assert_eq!(
             from_amfd_struct,
-            build_dereg_notification_body(),
+            build_dereg_notification_body(UecmAccess::ThreeGpp),
             "amfd's DeregistrationData wire form must be field/value-identical to \
              udmd's emitted body (TS 29.503 §5.3.2.3.2 cross-decode pin)"
         );
@@ -1433,7 +2058,7 @@ mod tests {
         let ue_id = seed_amf_ue(supi, 60_103);
         let path = format!("/namf-callback/v1/{supi}/dereg-notify");
         let req = SbiRequest::post(path)
-            .with_json_body(&build_dereg_notification_body())
+            .with_json_body(&build_dereg_notification_body(UecmAccess::ThreeGpp))
             .expect("json");
         let resp = nextgcore_amfd::namf_request_handler(req).await;
         assert_eq!(resp.status, 204, "amfd decodes udmd's body -> 204");
@@ -1546,7 +2171,7 @@ mod tests {
         body_b["amfInstanceId"] = json!("amf-b-0002");
         body_b["deregCallbackUri"] =
             json!("http://amf-b.example.org:7777/namf-callback/v1/imsi-x/dereg-notify");
-        let resp = process_amf_registration(supi, &body_b, &client).await;
+        let resp = process_amf_registration(supi, &body_b, &client, UecmAccess::ThreeGpp).await;
         assert_eq!(
             resp.status, 200,
             "a failing dereg notification must NOT wedge re-registration"
@@ -1633,7 +2258,8 @@ mod tests {
 
         let mock = Arc::new(MockUdr::new());
         let client = UdrClient::Mock(mock.clone());
-        let resp = process_amf_registration(supi, &valid_amf_body(), &client).await;
+        let resp =
+            process_amf_registration(supi, &valid_amf_body(), &client, UecmAccess::ThreeGpp).await;
         assert_eq!(
             resp.status, 201,
             "the registration itself must still succeed"
@@ -1679,5 +2305,594 @@ mod tests {
                 context.ee_subscription_remove(&sub.id);
             }
         }
+    }
+
+    // ----- #84: the two AMF access registrations are separate resources ------
+
+    /// A valid `AmfNon3GppAccessRegistration` (the 3GPP set plus `imsVoPs`).
+    fn valid_non_3gpp_body() -> Value {
+        let mut b = valid_amf_body();
+        b["amfInstanceId"] = json!("amf-n3-0001");
+        b["deregCallbackUri"] =
+            json!("http://amf-n3.example.org:7777/namf-callback/v1/imsi-x/dereg-notify");
+        b["ratType"] = json!("VIRTUAL");
+        b["imsVoPs"] = json!("HOMOGENEOUS_SUPPORT");
+        b
+    }
+
+    /// #84 gap 1, the load-bearing one: registering over non-3GPP access must
+    /// not read, rewrite or delete the `amf-3gpp-access` record, and must not
+    /// tell the 3GPP AMF anything at all.
+    ///
+    /// Revert check: hardcoding `UecmAccess::ThreeGpp` inside
+    /// `process_amf_registration` (the pre-#84 behaviour, where
+    /// `handle_amf_non3gpp_registration` called the 3GPP helper) fails the
+    /// stored-3GPP-record assertion with AMF-N3's id.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn non_3gpp_registration_leaves_the_3gpp_record_intact() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-001010000000840";
+
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock.clone());
+
+        let three_gpp = valid_amf_body();
+        let resp = process_amf_registration(supi, &three_gpp, &client, UecmAccess::ThreeGpp).await;
+        assert_eq!(resp.status, 201, "3GPP registration creates the resource");
+
+        let non_3gpp = valid_non_3gpp_body();
+        let resp = process_amf_registration(supi, &non_3gpp, &client, UecmAccess::Non3Gpp).await;
+        assert_eq!(
+            resp.status, 201,
+            "the non-3GPP resource does not exist yet, so this is a CREATE — a 200 \
+             would mean it found the 3GPP registration"
+        );
+        assert_eq!(
+            resp.http.headers.get("location").map(String::as_str),
+            Some(format!("/nudm-uecm/v1/{supi}/registrations/amf-non-3gpp-access").as_str()),
+            "Location must name the non-3GPP resource"
+        );
+
+        // The 3GPP record is byte-identical to what was registered.
+        assert_eq!(
+            mock.stored_doc("amf-3gpp-access").as_ref(),
+            Some(&three_gpp),
+            "the non-3GPP registration overwrote the 3GPP record"
+        );
+        assert_eq!(
+            mock.stored_doc("amf-non-3gpp-access").as_ref(),
+            Some(&non_3gpp),
+            "the non-3GPP registration must be stored under its own resource"
+        );
+
+        // Nothing addressed at the 3GPP resource after its own PUT, and the
+        // 3GPP AMF was never told its registration ended.
+        let calls = mock.calls();
+        let three_gpp_writes = calls
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    UdrCall::CtxPut { resource, .. }
+                        | UdrCall::CtxPatch { resource, .. }
+                        | UdrCall::CtxDelete { resource, .. }
+                        if resource == "amf-3gpp-access"
+                )
+            })
+            .count();
+        assert_eq!(
+            three_gpp_writes, 1,
+            "exactly one write to amf-3gpp-access (its own registration): {calls:?}"
+        );
+        assert_eq!(
+            deregister_count(&calls),
+            0,
+            "a non-3GPP registration must not deregister the 3GPP AMF"
+        );
+
+        // Both cache slots are populated independently.
+        let ctx = udm_self();
+        let context = ctx.read().expect("context");
+        let ue = context.ue_find_by_supi(supi).expect("UE cached");
+        assert_eq!(ue.amf_instance_id.as_deref(), Some("amf-a-0001"));
+        assert_eq!(ue.non_3gpp_amf_instance_id.as_deref(), Some("amf-n3-0001"));
+    }
+
+    /// #84 gap 1/2: a non-3GPP re-registration notifies the OLD NON-3GPP AMF,
+    /// with `accessType: NON_3GPP_ACCESS`, and leaves the 3GPP AMF alone.
+    ///
+    /// Revert check: `build_dereg_notification_body` with `accessType` pinned to
+    /// `3GPP_ACCESS` fails the accessType assertion — and that value is what
+    /// makes amfd tear a live 3GPP registration down (see the strict-peer twin
+    /// `test_dereg_notify_strict_peer_non_3gpp_no_enqueue`).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn non_3gpp_reregistration_notifies_the_non_3gpp_amf() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-001010000000841";
+
+        let n3_old_uri = "http://amf-n3-old.example.org:7777/namf-callback/v1/imsi-x/dereg-notify";
+        let mock = Arc::new(
+            MockUdr::new()
+                .with_stored(
+                    "amf-3gpp-access",
+                    json!({
+                        "amfInstanceId": "amf-3gpp-live",
+                        "deregCallbackUri": "http://amf-3gpp.example.org:7777/namf-callback/v1/imsi-x/dereg-notify",
+                        "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
+                        "ratType": "NR"
+                    }),
+                )
+                .with_stored(
+                    "amf-non-3gpp-access",
+                    json!({
+                        "amfInstanceId": "amf-n3-old",
+                        "deregCallbackUri": n3_old_uri,
+                        "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe01" },
+                        "ratType": "VIRTUAL",
+                        "imsVoPs": "HOMOGENEOUS_SUPPORT"
+                    }),
+                ),
+        );
+        let client = UdrClient::Mock(mock.clone());
+
+        let resp =
+            process_amf_registration(supi, &valid_non_3gpp_body(), &client, UecmAccess::Non3Gpp)
+                .await;
+        assert_eq!(resp.status, 200, "the non-3GPP resource existed -> update");
+
+        let calls = mock.calls();
+        assert_eq!(
+            deregister_count(&calls),
+            1,
+            "exactly one dereg notification"
+        );
+        let (uri, body) = calls
+            .iter()
+            .find_map(|c| match c {
+                UdrCall::DeregNotify { callback_uri, body } => {
+                    Some((callback_uri.clone(), body.clone()))
+                }
+                _ => None,
+            })
+            .expect("a dereg notification was sent");
+        assert_eq!(uri, n3_old_uri, "the OLD NON-3GPP AMF is the one notified");
+        assert_eq!(
+            body.get("accessType").and_then(|v| v.as_str()),
+            Some("NON_3GPP_ACCESS"),
+            "DeregistrationData must name the access that actually changed"
+        );
+        assert_eq!(
+            mock.stored_doc("amf-3gpp-access")
+                .and_then(|d| d["amfInstanceId"].as_str().map(String::from))
+                .as_deref(),
+            Some("amf-3gpp-live"),
+            "the 3GPP registration is untouched"
+        );
+    }
+
+    /// The non-3GPP schema additionally requires `imsVoPs`
+    /// (TS 29.503 `AmfNon3GppAccessRegistration`), so a body that would be a
+    /// valid 3GPP registration is refused here — and refused before any write.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn non_3gpp_registration_requires_ims_vo_ps() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::udm_context_init(1024, 4096);
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock.clone());
+        let resp = process_amf_registration(
+            "imsi-001010000000842",
+            &valid_amf_body(),
+            &client,
+            UecmAccess::Non3Gpp,
+        )
+        .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            problem_cause(&resp).as_deref(),
+            Some("MANDATORY_IE_MISSING")
+        );
+        assert!(
+            mock.calls()
+                .iter()
+                .all(|c| !matches!(c, UdrCall::CtxPut { .. })),
+            "a rejected registration must not write to UDR"
+        );
+        // The same body IS valid for 3GPP access, so the refusal is about the
+        // non-3GPP schema and not about the body being malformed in general.
+        let resp = process_amf_registration(
+            "imsi-001010000000842",
+            &valid_amf_body(),
+            &client,
+            UecmAccess::ThreeGpp,
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+    }
+
+    // ----- #84 gap 2: the UECM read operations -------------------------------
+
+    #[tokio::test]
+    async fn get_amf_registration_returns_the_stored_record_per_access() {
+        for access in [UecmAccess::ThreeGpp, UecmAccess::Non3Gpp] {
+            let stored = json!({ "amfInstanceId": format!("amf-for-{}", access.amf_resource()) });
+            let mock = Arc::new(MockUdr::new().with_stored(access.amf_resource(), stored.clone()));
+            let client = UdrClient::Mock(mock.clone());
+
+            let resp = process_amf_registration_get("imsi-1", &client, access).await;
+            assert_eq!(resp.status, 200, "{} GET", access.amf_resource());
+            let body: Value =
+                serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+            assert_eq!(body, stored, "the stored record is returned verbatim");
+
+            // The OTHER access is not registered, so its GET is a 404 — the read
+            // must not fall through to the resource that happens to exist.
+            let other = match access {
+                UecmAccess::ThreeGpp => UecmAccess::Non3Gpp,
+                UecmAccess::Non3Gpp => UecmAccess::ThreeGpp,
+            };
+            let resp = process_amf_registration_get("imsi-1", &client, other).await;
+            assert_eq!(resp.status, 404, "{} GET", other.amf_resource());
+            assert_eq!(
+                problem_cause(&resp).as_deref(),
+                Some("CONTEXT_NOT_FOUND"),
+                "TS 29.503 Table 6.2.7.3-1"
+            );
+        }
+    }
+
+    /// A UDR fault on a UECM GET must NOT be reported as "not registered": a 404
+    /// would tell a consumer the UE has no serving AMF when the truth is that
+    /// the UDM could not find out — and a `(H)GMLC` acting on that answer stops
+    /// looking for the UE.
+    #[tokio::test]
+    async fn a_udr_fault_on_a_uecm_get_is_503_not_404() {
+        let mock = Arc::new(MockUdr::new().with_get_status(500));
+        let client = UdrClient::Mock(mock);
+        for resp in [
+            process_amf_registration_get("imsi-1", &client, UecmAccess::ThreeGpp).await,
+            process_amf_registration_get("imsi-1", &client, UecmAccess::Non3Gpp).await,
+            process_smf_registrations_get("imsi-1", &client).await,
+            process_smf_registration_get("imsi-1", "5", &client).await,
+            process_location_info_get("imsi-1", &client).await,
+            process_smsf_registration_get("imsi-1", &client, UecmAccess::ThreeGpp).await,
+            process_ip_sm_gw_registration_get("imsi-1", &client).await,
+        ] {
+            assert_eq!(
+                resp.status, 503,
+                "a UDR 5xx must surface as 503, never as an empty-but-successful read"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_smf_registrations_wraps_the_udr_array_as_smf_registration_info() {
+        let reg = valid_smf_body();
+        let mock = Arc::new(MockUdr::new().with_stored("smf-registrations", json!([reg.clone()])));
+        let client = UdrClient::Mock(mock);
+
+        let resp = process_smf_registrations_get("imsi-1", &client).await;
+        assert_eq!(resp.status, 200);
+        let body: Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+        assert_eq!(
+            body["smfRegistrationList"],
+            json!([reg]),
+            "TS 29.503 SmfRegistrationInfo wraps the list the UDR returns bare"
+        );
+
+        // minItems: 1 — an empty collection is not a representable answer.
+        let mock = Arc::new(MockUdr::new().with_stored("smf-registrations", json!([])));
+        let client = UdrClient::Mock(mock);
+        let resp = process_smf_registrations_get("imsi-1", &client).await;
+        assert_eq!(resp.status, 404, "an empty smfRegistrationList is a 404");
+    }
+
+    #[tokio::test]
+    async fn get_individual_smf_registration_addresses_the_pdu_session() {
+        let reg = valid_smf_body();
+        let mock = Arc::new(MockUdr::new().with_stored("smf-registrations/5", json!(reg.clone())));
+        let client = UdrClient::Mock(mock.clone());
+
+        let resp = process_smf_registration_get("imsi-1", "5", &client).await;
+        assert_eq!(resp.status, 200);
+        let body: Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+        assert_eq!(body, reg);
+
+        let resp = process_smf_registration_get("imsi-1", "6", &client).await;
+        assert_eq!(resp.status, 404, "another PDU session is not this one");
+    }
+
+    /// `GetLocationInfo` is composed from the AMF registrations: one entry per
+    /// serving AMF, with every access that AMF serves in its `accessTypeList`.
+    #[tokio::test]
+    async fn get_location_info_composes_one_entry_per_serving_amf() {
+        let guami = json!({ "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" });
+
+        // Two different AMFs -> two entries, one access type each.
+        let mock = Arc::new(
+            MockUdr::new()
+                .with_stored(
+                    "amf-3gpp-access",
+                    json!({ "amfInstanceId": "amf-a", "guami": guami }),
+                )
+                .with_stored("amf-non-3gpp-access", json!({ "amfInstanceId": "amf-b" })),
+        );
+        let client = UdrClient::Mock(mock);
+        let resp = process_location_info_get("imsi-1", &client).await;
+        assert_eq!(resp.status, 200);
+        let body: Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+        let list = body["registrationLocationInfoList"]
+            .as_array()
+            .expect("list")
+            .clone();
+        assert_eq!(list.len(), 2, "two serving AMFs -> two entries: {list:?}");
+        assert_eq!(list[0]["amfInstanceId"], "amf-a");
+        assert_eq!(list[0]["accessTypeList"], json!(["3GPP_ACCESS"]));
+        assert_eq!(list[0]["guami"], guami, "the GUAMI is carried when stored");
+        assert_eq!(list[1]["amfInstanceId"], "amf-b");
+        assert_eq!(list[1]["accessTypeList"], json!(["NON_3GPP_ACCESS"]));
+        assert_eq!(body["supi"], "imsi-1");
+        assert!(
+            body.get("gpsi").is_none(),
+            "no GPSI is known, so none is fabricated"
+        );
+
+        // ONE AMF serving both accesses -> ONE entry with both access types,
+        // which is also what keeps the list inside maxItems: 2.
+        let mock = Arc::new(
+            MockUdr::new()
+                .with_stored("amf-3gpp-access", json!({ "amfInstanceId": "amf-both" }))
+                .with_stored(
+                    "amf-non-3gpp-access",
+                    json!({ "amfInstanceId": "amf-both" }),
+                ),
+        );
+        let client = UdrClient::Mock(mock);
+        let resp = process_location_info_get("imsi-1", &client).await;
+        let body: Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+        let list = body["registrationLocationInfoList"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "one AMF -> one entry: {list:?}");
+        assert_eq!(
+            list[0]["accessTypeList"],
+            json!(["3GPP_ACCESS", "NON_3GPP_ACCESS"])
+        );
+
+        // No registration at all -> 404 (TS 29.503 §5.3.2.5.9 step 2b).
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock);
+        let resp = process_location_info_get("imsi-1", &client).await;
+        assert_eq!(resp.status, 404);
+    }
+
+    #[tokio::test]
+    async fn smsf_registration_round_trips_per_access() {
+        for access in [UecmAccess::ThreeGpp, UecmAccess::Non3Gpp] {
+            let mock = Arc::new(MockUdr::new());
+            let client = UdrClient::Mock(mock.clone());
+
+            // Mandatory IEs first: smsfInstanceId + plmnId.
+            let resp = process_smsf_registration(
+                "imsi-1",
+                &json!({ "smsfInstanceId": "smsf-1" }),
+                &client,
+                access,
+            )
+            .await;
+            assert_eq!(resp.status, 400, "plmnId is mandatory");
+
+            let body = json!({
+                "smsfInstanceId": "smsf-1",
+                "plmnId": { "mcc": "001", "mnc": "01" }
+            });
+            let resp = process_smsf_registration("imsi-1", &body, &client, access).await;
+            assert_eq!(resp.status, 201, "{}", access.smsf_resource());
+            assert_eq!(
+                resp.http.headers.get("location").map(String::as_str),
+                Some(
+                    format!(
+                        "/nudm-uecm/v1/imsi-1/registrations/{}",
+                        access.smsf_resource()
+                    )
+                    .as_str()
+                )
+            );
+
+            let resp = process_smsf_registration_get("imsi-1", &client, access).await;
+            assert_eq!(resp.status, 200, "the SMSF registration reads back");
+            let got: Value =
+                serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+            assert_eq!(got, body);
+
+            let resp = process_smsf_deregistration("imsi-1", &client, access).await;
+            assert_eq!(resp.status, 204);
+            let resp = process_smsf_registration_get("imsi-1", &client, access).await;
+            assert_eq!(resp.status, 404, "deregistration removed it");
+        }
+    }
+
+    #[tokio::test]
+    async fn ip_sm_gw_registration_round_trips_and_requires_an_address() {
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock.clone());
+
+        // anyOf: a registration naming no IP-SM-GW address routes nowhere.
+        let resp =
+            process_ip_sm_gw_registration("imsi-1", &json!({ "unriIndicator": true }), &client)
+                .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            problem_cause(&resp).as_deref(),
+            Some("MANDATORY_IE_MISSING")
+        );
+
+        for address in [
+            json!({ "ipsmgwFqdn": "ipsmgw.example.org" }),
+            json!({ "ipsmgwIpv4": "10.0.0.9" }),
+            json!({ "ipSmGwMapAddress": "491721075423" }),
+        ] {
+            let mock = Arc::new(MockUdr::new());
+            let client = UdrClient::Mock(mock.clone());
+            let resp = process_ip_sm_gw_registration("imsi-1", &address, &client).await;
+            assert_eq!(resp.status, 201, "{address} must be accepted");
+            let resp = process_ip_sm_gw_registration_get("imsi-1", &client).await;
+            assert_eq!(resp.status, 200);
+            let got: Value =
+                serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+            assert_eq!(got, address);
+        }
+
+        let resp = process_ip_sm_gw_deregistration("imsi-1", &client).await;
+        assert_eq!(resp.status, 204);
+    }
+
+    // ----- #84 gap 3: spec deregistration -----------------------------------
+
+    /// `POST .../amf-3gpp-access/dereg-amf` is the spec deregistration: it needs
+    /// an `AmfDeregInfo.deregReason` and it removes the registration.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn dereg_amf_requires_a_reason_and_deletes_the_registration() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-001010000000843";
+        let mock = Arc::new(MockUdr::with_prior(valid_amf_body()));
+        let client = UdrClient::Mock(mock.clone());
+
+        // No deregReason -> 400, and nothing deleted.
+        let resp = process_dereg_amf(supi, &json!({}), &client).await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            problem_cause(&resp).as_deref(),
+            Some("MANDATORY_IE_MISSING")
+        );
+        assert!(
+            mock.stored_doc("amf-3gpp-access").is_some(),
+            "a rejected dereg-amf must not delete the registration"
+        );
+
+        let resp = process_dereg_amf(
+            supi,
+            &json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN" }),
+            &client,
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+        assert!(
+            mock.stored_doc("amf-3gpp-access").is_none(),
+            "dereg-amf removes the UDR context-data resource"
+        );
+    }
+
+    /// `purgeFlag: true` on the update PATCH is a deregistration
+    /// (TS 29.503 §5.3.2.4.2) — the shape this repo's own AMF sends. Before #84
+    /// it was acknowledged with 204 and patched into the stored document, so the
+    /// UDM kept answering with a serving AMF that had released the UE.
+    ///
+    /// Revert check: dropping the `purgeFlag` branch makes the stored record
+    /// survive and this test fails on the `is_none()` assertion.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn purge_flag_patch_deregisters_rather_than_patching() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-001010000000844";
+        let mock = Arc::new(MockUdr::with_prior(valid_amf_body()));
+        let client = UdrClient::Mock(mock.clone());
+
+        // Exactly what nextgcore's AMF sends: a bare purge, no GUAMI.
+        let resp = process_amf_registration_update(
+            supi,
+            &json!({ "purgeFlag": true }),
+            &client,
+            UecmAccess::ThreeGpp,
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+        assert!(
+            mock.stored_doc("amf-3gpp-access").is_none(),
+            "purgeFlag must deregister the UE, not patch the flag into the record"
+        );
+        assert!(
+            mock.calls().iter().any(|c| matches!(
+                c,
+                UdrCall::CtxDelete { resource, .. } if resource == "amf-3gpp-access"
+            )),
+            "the purge issues a UDR context-data DELETE"
+        );
+        // A purge on one access leaves the other alone.
+        assert!(
+            !mock.calls().iter().any(|c| matches!(
+                c,
+                UdrCall::CtxDelete { resource, .. } if resource == "amf-non-3gpp-access"
+            )),
+            "a 3GPP purge must not delete the non-3GPP registration"
+        );
+    }
+
+    /// Deregistering one access keeps the other access's cached serving AMF, so
+    /// the next re-registration on the surviving access still has an old AMF to
+    /// notify.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn deregistering_one_access_keeps_the_other_cached() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-001010000000845";
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock.clone());
+
+        let _ =
+            process_amf_registration(supi, &valid_amf_body(), &client, UecmAccess::ThreeGpp).await;
+        let _ =
+            process_amf_registration(supi, &valid_non_3gpp_body(), &client, UecmAccess::Non3Gpp)
+                .await;
+
+        let resp = process_amf_deregistration(supi, &client, UecmAccess::Non3Gpp).await;
+        assert_eq!(resp.status, 204);
+
+        let ctx = udm_self();
+        let context = ctx.read().expect("context");
+        let ue = context
+            .ue_find_by_supi(supi)
+            .expect("the UE survives a single-access deregistration");
+        assert_eq!(
+            ue.amf_instance_id.as_deref(),
+            Some("amf-a-0001"),
+            "the 3GPP serving AMF is still cached"
+        );
+        assert!(
+            ue.non_3gpp_amf_instance_id.is_none(),
+            "the deregistered access's slot is cleared"
+        );
+        drop(context);
+
+        // Deregistering the remaining access drops the UE entirely.
+        let resp = process_amf_deregistration(supi, &client, UecmAccess::ThreeGpp).await;
+        assert_eq!(resp.status, 204);
+        let context = ctx.read().expect("context");
+        assert!(
+            context.ue_find_by_supi(supi).is_none(),
+            "with neither access registered the UE context is dropped"
+        );
     }
 }

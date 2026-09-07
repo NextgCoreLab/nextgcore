@@ -606,32 +606,8 @@ async fn udm_sbi_route(request: SbiRequest) -> SbiResponse {
             let resource = parts.get(3).unwrap_or(&"");
 
             match (*resource, method) {
-                ("registrations", "PUT") if parts.len() >= 5 && parts[4] == "amf-3gpp-access" => {
-                    handle_amf_registration(supi, &request).await
-                }
-                ("registrations", "PATCH") if parts.len() >= 5 && parts[4] == "amf-3gpp-access" => {
-                    handle_amf_registration_update(supi, &request).await
-                }
-                ("registrations", "DELETE")
-                    if parts.len() >= 5 && parts[4] == "amf-3gpp-access" =>
-                {
-                    handle_amf_deregistration(supi).await
-                }
-                // udmd-12: AMF non-3GPP access registration (TS 29.503 §5.3.3).
-                ("registrations", "PUT")
-                    if parts.len() >= 5 && parts[4] == "amf-non-3gpp-access" =>
-                {
-                    handle_amf_non3gpp_registration(supi, &request).await
-                }
-                ("registrations", "PUT") if parts.len() >= 6 && parts[4] == "smf-registrations" => {
-                    let pdu_session_id = parts[5];
-                    handle_smf_registration(supi, pdu_session_id, &request).await
-                }
-                ("registrations", "DELETE")
-                    if parts.len() >= 6 && parts[4] == "smf-registrations" =>
-                {
-                    let pdu_session_id = parts[5];
-                    handle_smf_deregistration(supi, pdu_session_id).await
+                ("registrations", _) => {
+                    route_uecm_registrations(supi, &parts, method, &request, uri).await
                 }
                 // udmd-12: UE context in SMF data (GET only, TS 29.503 §6.3.x).
                 ("ue-context-in-smf-data", "GET") => {
@@ -686,6 +662,12 @@ async fn udm_sbi_route(request: SbiRequest) -> SbiResponse {
                     handle_generate_auth_data(supi, &request).await
                 }
                 ("auth-events", _, "POST") => handle_auth_event(supi, &request).await,
+                // DeleteAuth: PUT /{supi}/auth-events/{authEventId}
+                // (TS 29.503 §5.4.2.3.3). The identifier is mandatory in the
+                // path, so a bare `PUT .../auth-events` is not this operation.
+                ("auth-events", auth_event_id, "PUT") if !auth_event_id.is_empty() => {
+                    handle_delete_auth(supi, auth_event_id, &request).await
+                }
                 _ => send_method_not_allowed(method, uri),
             }
         }
@@ -715,69 +697,237 @@ async fn udm_sbi_route(request: SbiRequest) -> SbiResponse {
 
 // UE Context Management handlers
 
-pub async fn handle_amf_registration(supi: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("AMF Registration: SUPI={supi}");
-
+/// Parse a request body as JSON, or return the ProblemDetails response.
+fn parse_request_json(request: &SbiRequest) -> Result<serde_json::Value, Box<SbiResponse>> {
     let body = match &request.http.content {
         Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+        None => {
+            return Err(Box::new(send_bad_request(
+                "Missing request body",
+                Some("MISSING_BODY"),
+            )))
+        }
     };
+    serde_json::from_str(body).map_err(|e| {
+        Box::new(send_bad_request(
+            &format!("Invalid JSON: {e}"),
+            Some("INVALID_JSON"),
+        ))
+    })
+}
 
-    let reg_data: serde_json::Value = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+/// Route the `nudm-uecm` `.../registrations[/...]` resource tree
+/// (TS 29.503 §6.2.3).
+///
+/// Split out of [`udm_sbi_route`] because the tree is two segments deep with
+/// six sibling resources, and each of `amf-3gpp-access` and
+/// `amf-non-3gpp-access` carries PUT/PATCH/GET plus a custom operation. The
+/// access is resolved ONCE here, from the path, and handed to the UECM
+/// processors — the router is the only place that knows a resource name.
+async fn route_uecm_registrations(
+    supi: &str,
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+    uri: &str,
+) -> SbiResponse {
+    use crate::uecm::UecmAccess;
+
+    let sub = parts.get(4).copied().unwrap_or("");
+    let tail = parts.get(5).copied().unwrap_or("");
+
+    // amf-3gpp-access / amf-non-3gpp-access (+ the dereg-amf custom operation).
+    if let Some(access) = UecmAccess::from_amf_resource(sub) {
+        // POST .../{amf-resource}/dereg-amf — TS 29.503 §5.3.2.4.2 DeregAMF.
+        if tail == "dereg-amf" {
+            if method != "POST" {
+                return send_method_not_allowed(method, uri);
+            }
+            return handle_dereg_amf(supi, request).await;
+        }
+        if !tail.is_empty() {
+            // pei-update / roaming-info-update and friends are not implemented.
+            return send_not_implemented(&format!("{sub}/{tail} is not yet implemented"));
+        }
+        return match method {
+            "PUT" => handle_amf_registration(supi, request, access).await,
+            "PATCH" => handle_amf_registration_update(supi, request, access).await,
+            "GET" => handle_amf_registration_get(supi, access).await,
+            _ => send_method_not_allowed(method, uri),
+        };
+    }
+
+    // smsf-3gpp-access / smsf-non-3gpp-access.
+    if let Some(access) = UecmAccess::from_smsf_resource(sub) {
+        return match method {
+            "PUT" => handle_smsf_registration(supi, request, access).await,
+            "GET" => handle_smsf_registration_get(supi, access).await,
+            "DELETE" => handle_smsf_deregistration(supi, access).await,
+            _ => send_method_not_allowed(method, uri),
+        };
+    }
+
+    match sub {
+        "smf-registrations" => match (method, tail.is_empty()) {
+            // Collection GET -> SmfRegistrationInfo (TS 29.503 §5.3.2.5).
+            ("GET", true) => handle_smf_registrations_get(supi).await,
+            ("GET", false) => handle_smf_registration_get(supi, tail).await,
+            ("PUT", false) => handle_smf_registration(supi, tail, request).await,
+            ("DELETE", false) => handle_smf_deregistration(supi, tail).await,
+            _ => send_method_not_allowed(method, uri),
+        },
+        "ip-sm-gw" => match method {
+            "PUT" => handle_ip_sm_gw_registration(supi, request).await,
+            "GET" => handle_ip_sm_gw_registration_get(supi).await,
+            "DELETE" => handle_ip_sm_gw_deregistration(supi).await,
+            _ => send_method_not_allowed(method, uri),
+        },
+        // GET .../registrations/location -> LocationInfo (TS 29.503 §5.3.2.5).
+        "location" if method == "GET" => handle_location_info_get(supi).await,
+        _ => send_method_not_allowed(method, uri),
+    }
+}
+
+pub async fn handle_amf_registration(
+    supi: &str,
+    request: &SbiRequest,
+    access: crate::uecm::UecmAccess,
+) -> SbiResponse {
+    log::info!("AMF Registration ({}): SUPI={supi}", access.amf_resource());
+
+    let reg_data = match parse_request_json(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
     };
 
     // udmd-03 (validate) -> udmd-01 (persist to UDR) -> udmd-02 (notify old AMF).
-    crate::uecm::process_amf_registration(supi, &reg_data, &crate::uecm::UdrClient::Live).await
-}
-
-pub async fn handle_amf_registration_update(supi: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("AMF Registration Update: SUPI={supi}");
-
-    let body = match &request.http.content {
-        Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
-    };
-
-    let update_data: serde_json::Value = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
-    };
-
-    // udmd-05: GUAMI ownership check + UDR PATCH.
-    crate::uecm::process_amf_registration_update(supi, &update_data, &crate::uecm::UdrClient::Live)
+    crate::uecm::process_amf_registration(supi, &reg_data, &crate::uecm::UdrClient::Live, access)
         .await
 }
 
-pub async fn handle_amf_deregistration(supi: &str) -> SbiResponse {
-    log::info!("AMF Deregistration: SUPI={supi}");
+pub async fn handle_amf_registration_update(
+    supi: &str,
+    request: &SbiRequest,
+    access: crate::uecm::UecmAccess,
+) -> SbiResponse {
+    log::info!(
+        "AMF Registration Update ({}): SUPI={supi}",
+        access.amf_resource()
+    );
 
-    // udmd-01: DELETE the UDR context-data before returning 204.
-    crate::uecm::process_amf_deregistration(supi, &crate::uecm::UdrClient::Live).await
+    let update_data = match parse_request_json(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+
+    // udmd-05: GUAMI ownership check + UDR PATCH (or purge on purgeFlag).
+    crate::uecm::process_amf_registration_update(
+        supi,
+        &update_data,
+        &crate::uecm::UdrClient::Live,
+        access,
+    )
+    .await
 }
 
-/// udmd-12: AMF non-3GPP-access registration (PUT).
-///
-/// TS 29.503 §5.3.3 defines this for N3IWF/TNGF use cases.  We accept the
-/// request and persist via the same AMF context PUT path (same Nudr resource),
-/// returning 201/200 exactly like the 3GPP-access variant.
-pub async fn handle_amf_non3gpp_registration(supi: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("AMF Non-3GPP Registration: SUPI={supi}");
+/// `GET .../registrations/{amf-resource}` — TS 29.503 §5.3.2.5
+/// `Get3GppRegistration` / `GetNon3GppRegistration`.
+pub async fn handle_amf_registration_get(
+    supi: &str,
+    access: crate::uecm::UecmAccess,
+) -> SbiResponse {
+    log::info!(
+        "AMF Registration Get ({}): SUPI={supi}",
+        access.amf_resource()
+    );
+    crate::uecm::process_amf_registration_get(supi, &crate::uecm::UdrClient::Live, access).await
+}
 
-    let body = match &request.http.content {
-        Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+/// `POST .../registrations/amf-3gpp-access/dereg-amf` — TS 29.503 §5.3.2.4.2.
+pub async fn handle_dereg_amf(supi: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("AMF Deregistration (dereg-amf): SUPI={supi}");
+    let info = match parse_request_json(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
     };
+    crate::uecm::process_dereg_amf(supi, &info, &crate::uecm::UdrClient::Live).await
+}
 
-    let reg_data: serde_json::Value = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+/// `PUT .../registrations/{smsf-resource}` — SMSF registration.
+pub async fn handle_smsf_registration(
+    supi: &str,
+    request: &SbiRequest,
+    access: crate::uecm::UecmAccess,
+) -> SbiResponse {
+    log::info!(
+        "SMSF Registration ({}): SUPI={supi}",
+        access.smsf_resource()
+    );
+    let reg_data = match parse_request_json(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
     };
+    crate::uecm::process_smsf_registration(supi, &reg_data, &crate::uecm::UdrClient::Live, access)
+        .await
+}
 
-    // Reuse the same UECM registration path — UDR resource key is different
-    // (/amf-non-3gpp-access) but the validation and persistence logic is the same.
-    crate::uecm::process_amf_registration(supi, &reg_data, &crate::uecm::UdrClient::Live).await
+/// `GET .../registrations/{smsf-resource}`.
+pub async fn handle_smsf_registration_get(
+    supi: &str,
+    access: crate::uecm::UecmAccess,
+) -> SbiResponse {
+    crate::uecm::process_smsf_registration_get(supi, &crate::uecm::UdrClient::Live, access).await
+}
+
+/// `DELETE .../registrations/{smsf-resource}`.
+pub async fn handle_smsf_deregistration(
+    supi: &str,
+    access: crate::uecm::UecmAccess,
+) -> SbiResponse {
+    log::info!(
+        "SMSF Deregistration ({}): SUPI={supi}",
+        access.smsf_resource()
+    );
+    crate::uecm::process_smsf_deregistration(supi, &crate::uecm::UdrClient::Live, access).await
+}
+
+/// `PUT .../registrations/ip-sm-gw` — IP-SM-GW registration.
+pub async fn handle_ip_sm_gw_registration(supi: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("IP-SM-GW Registration: SUPI={supi}");
+    let reg_data = match parse_request_json(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    crate::uecm::process_ip_sm_gw_registration(supi, &reg_data, &crate::uecm::UdrClient::Live).await
+}
+
+/// `GET .../registrations/ip-sm-gw`.
+pub async fn handle_ip_sm_gw_registration_get(supi: &str) -> SbiResponse {
+    crate::uecm::process_ip_sm_gw_registration_get(supi, &crate::uecm::UdrClient::Live).await
+}
+
+/// `DELETE .../registrations/ip-sm-gw`.
+pub async fn handle_ip_sm_gw_deregistration(supi: &str) -> SbiResponse {
+    log::info!("IP-SM-GW Deregistration: SUPI={supi}");
+    crate::uecm::process_ip_sm_gw_deregistration(supi, &crate::uecm::UdrClient::Live).await
+}
+
+/// `GET .../registrations/location` — TS 29.503 §5.3.2.5 `GetLocationInfo`.
+pub async fn handle_location_info_get(supi: &str) -> SbiResponse {
+    log::info!("UECM Location Info Get: SUPI={supi}");
+    crate::uecm::process_location_info_get(supi, &crate::uecm::UdrClient::Live).await
+}
+
+/// `GET .../registrations/smf-registrations` — the collection form.
+pub async fn handle_smf_registrations_get(supi: &str) -> SbiResponse {
+    log::info!("SMF Registrations Get (collection): SUPI={supi}");
+    crate::uecm::process_smf_registrations_get(supi, &crate::uecm::UdrClient::Live).await
+}
+
+/// `GET .../registrations/smf-registrations/{pduSessionId}`.
+pub async fn handle_smf_registration_get(supi: &str, pdu_session_id: &str) -> SbiResponse {
+    crate::uecm::process_smf_registration_get(supi, pdu_session_id, &crate::uecm::UdrClient::Live)
+        .await
 }
 
 pub async fn handle_smf_registration(
@@ -787,14 +937,9 @@ pub async fn handle_smf_registration(
 ) -> SbiResponse {
     log::info!("SMF Registration: SUPI={supi}, PDU Session={pdu_session_id}");
 
-    let body = match &request.http.content {
-        Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
-    };
-
-    let reg_data: serde_json::Value = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    let reg_data = match parse_request_json(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
     };
 
     // udmd-03 (validate) -> udmd-01 (persist to UDR).
@@ -1672,18 +1817,16 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
             )
         }
     };
-    if auth_info
-        .get("ausfInstanceId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.is_empty())
-        .unwrap_or(true)
-    {
-        return send_problem(
-            400,
-            "MANDATORY_IE_MISSING",
-            "AuthenticationInfoRequest.ausfInstanceId is missing",
-        );
-    }
+    let ausf_instance_id = match auth_info.get("ausfInstanceId").and_then(|v| v.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return send_problem(
+                400,
+                "MANDATORY_IE_MISSING",
+                "AuthenticationInfoRequest.ausfInstanceId is missing",
+            )
+        }
+    };
 
     // TS 33.501 §6.1.2: verify the serving network name is well-formed before
     // generating any authentication material (anti-bidding-down: a malformed
@@ -1813,6 +1956,12 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
 
     ue.serving_network_name = Some(serving_network_name.to_string());
     ue.supi = Some(supi.clone());
+    // TS 33.501 §6.14.2.1 / §6.15.2.1: SoR and UPU protection must be computed
+    // by the AUSF that holds this UE's K_AUSF, i.e. the one that authenticated
+    // it. That is the AUSF named here, so record it now — before #84 the IE was
+    // validated and then dropped, leaving sor.rs / upu.rs to pick an arbitrary
+    // AUSF and produce a MAC the UE cannot verify.
+    ue.ausf_instance_id = Some(ausf_instance_id.to_string());
 
     let k_bytes = crate::nudm_handler::hex_to_bytes(k_hex);
     let opc_bytes = crate::nudm_handler::hex_to_bytes(opc_hex);
@@ -1932,19 +2081,20 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
         Ok(r) if r.is_success() || r.status == 204 => {
             log::debug!("[{supi}] SQN advanced to 0x{new_sqn_hex}");
         }
-        Ok(r) if r.status >= 500 => {
+        Ok(r) => {
+            // ANY failed advance withholds the AV, not only a 5xx (#84).
+            //
+            // The stored SQN is re-read from UDR on every call, so an
+            // unpersisted advance means the NEXT authentication computes an AV
+            // from the SAME SQN — the reuse TS 33.102 §6.3.2 exists to prevent,
+            // and a replay window for anyone holding the earlier AV. A 404 is
+            // the likeliest such status and the least alarming-looking, which
+            // is exactly why it was the one being tolerated.
             log::error!(
-                "[{supi}] UDR SQN PATCH returned {}: refusing to issue AV",
+                "[{supi}] UDR SQN PATCH returned {}: refusing to issue AV (SQN not advanced)",
                 r.status
             );
             return nextgcore_sbi::server::send_service_unavailable("UDR SQN update failed");
-        }
-        Ok(r) => {
-            // Non-5xx (e.g. 404): UDR may not have auth-subscription resource; degrade.
-            log::warn!(
-                "[{supi}] UDR SQN PATCH returned {} (degraded — AV issued anyway)",
-                r.status
-            );
         }
         Err(e) => {
             // Transport failure: refuse to issue AV to prevent SQN replay.
@@ -2051,11 +2201,18 @@ pub async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse 
 
     log::info!("Auth Event: success={success}");
 
+    // The identifier of the AuthEvent resource this operation creates. Minted
+    // before the context write so the SAME value is both stored and returned in
+    // `Location`: DeleteAuth (TS 29.503 §5.4.2.3.3) addresses the UE by it, and
+    // a value that was only ever put in a header can never be matched again.
+    let event_id = uuid::Uuid::new_v4().to_string();
+
     // Record the auth event in the local UE context.
     {
         let ctx = udm_self();
         if let Ok(context) = ctx.read() {
             if let Some(mut ue) = context.ue_find_by_supi(supi) {
+                ue.auth_event_id = Some(event_id.clone());
                 ue.set_auth_event(crate::AuthEvent {
                     nf_instance_id: auth_event
                         .get("nfInstanceId")
@@ -2095,8 +2252,6 @@ pub async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse 
         }
     }
 
-    // Build a stable auth-event resource URI for the Location header.
-    let event_id = uuid::Uuid::new_v4().to_string();
     SbiResponse::with_status(201)
         .with_header(
             "Location",
@@ -2110,6 +2265,108 @@ pub async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse 
             "servingNetworkName": auth_event.get("servingNetworkName"),
         }))
         .unwrap_or_else(|_| SbiResponse::with_status(201))
+}
+
+/// `PUT /nudm-ueau/v1/{supi}/auth-events/{authEventId}` — TS 29.503 §5.4.2.3.3
+/// `DeleteAuth`: the AUSF revokes the authentication result the UDM stored on
+/// `ConfirmAuth`.
+///
+/// `authEventId` must be the identifier the UDM handed out in the `ConfirmAuth`
+/// `Location` header. A mismatch is a **404**, not a silent success: the AUSF is
+/// addressing a resource this UDM does not hold, and answering 204 would tell it
+/// an authentication result was revoked while the real one stayed.
+pub async fn handle_delete_auth(
+    supi: &str,
+    auth_event_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    log::info!("Delete Auth: SUPI={supi} authEventId={auth_event_id}");
+
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+    let auth_event: serde_json::Value = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+    // The request body is a mandatory AuthEvent, so it is validated to the same
+    // standard as ConfirmAuth's rather than accepted unread.
+    for attr in [
+        "nfInstanceId",
+        "timeStamp",
+        "authType",
+        "servingNetworkName",
+    ] {
+        if auth_event
+            .get(attr)
+            .and_then(|v| v.as_str())
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+        {
+            return send_problem(
+                400,
+                "MANDATORY_IE_MISSING",
+                &format!("AuthEvent.{attr} is missing"),
+            );
+        }
+    }
+    if auth_event
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .is_none()
+    {
+        return send_problem(400, "MANDATORY_IE_MISSING", "AuthEvent.success is missing");
+    }
+
+    // Match the addressed resource against the identifier ConfirmAuth issued.
+    let mut stored_id: Option<String> = None;
+    {
+        let ctx = udm_self();
+        if let Ok(context) = ctx.read() {
+            stored_id = context
+                .ue_find_by_supi(supi)
+                .and_then(|ue| ue.auth_event_id.clone());
+        };
+    }
+    if stored_id.as_deref() != Some(auth_event_id) {
+        log::warn!("[{supi}] DeleteAuth for unknown authEventId {auth_event_id} — 404");
+        return send_problem(
+            404,
+            "CONTEXT_NOT_FOUND",
+            "No authentication event with this authEventId",
+        );
+    }
+
+    // Drop the local authentication result and the pinned identifier, so a
+    // replayed DeleteAuth for the same id now finds nothing (single-use).
+    {
+        let ctx = udm_self();
+        if let Ok(context) = ctx.read() {
+            if let Some(mut ue) = context.ue_find_by_supi(supi) {
+                ue.clear_auth_event();
+                ue.auth_event_id = None;
+                context.ue_update(&ue);
+            }
+        };
+    }
+
+    // The authentication status lives in the UDR (TS 29.505 §6.3.3), so the
+    // revocation has to reach it too. Best-effort, matching the ConfirmAuth
+    // write it undoes: a UDR without the resource must not make the AUSF
+    // believe the local revocation above did not happen.
+    match crate::udm_nudr_dr_send_auth_status_delete(supi).await {
+        Ok(r) if r.is_success() => {
+            log::debug!("[{supi}] Auth status deleted in UDR ({})", r.status);
+        }
+        Ok(r) => log::warn!(
+            "[{supi}] UDR auth-status DELETE returned {} (degraded)",
+            r.status
+        ),
+        Err(e) => log::warn!("[{supi}] UDR auth-status DELETE failed: {e} (degraded)"),
+    }
+
+    SbiResponse::with_status(204)
 }
 
 /// Initialize logging based on command line arguments
@@ -3828,6 +4085,622 @@ mod tests {
             &serde_json::json!([{ "op": "replace", "path": "/new", "value": 1 }])
         )
         .is_err());
+    }
+
+    // ========================================================================
+    // #84: the Nudm_UECM registration surface over the WIRE
+    //
+    // These drive the REAL router (`udm_sbi_request_handler`) over HTTP against
+    // a mock UDR that stores `context-data` resources, because the criteria are
+    // routing claims: "returns the stored resource rather than 405". A
+    // handler-level test cannot fail when a route arm is missing.
+    // ========================================================================
+
+    /// Shared in-memory `context-data` store for the mock UDR below, keyed by
+    /// the full Nudr resource path.
+    type CtxStore = Arc<std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>;
+
+    /// Mock UDR implementing the `context-data` resources of TS 29.505 §5.2.2
+    /// generically: GET / PUT / PATCH / DELETE on any resource, plus the
+    /// `smf-registrations` collection GET that answers with a bare array (the
+    /// shape the real udrd returns, which the UDM has to wrap).
+    async fn mock_udr_context_data(store: CtxStore, request: SbiRequest) -> SbiResponse {
+        let method = request.header.method.clone();
+        let uri = request.header.uri.clone();
+        let path = uri.split('?').next().unwrap_or(&uri).to_string();
+        if !path.contains("/context-data/") {
+            return SbiResponse::with_status(404);
+        }
+        let body = || -> Option<serde_json::Value> {
+            request
+                .http
+                .content
+                .as_deref()
+                .and_then(|b| serde_json::from_str(b).ok())
+        };
+        let mut map = store.lock().expect("ctx store");
+        match method.as_str() {
+            "GET" => {
+                if path.ends_with("/smf-registrations") {
+                    let prefix = format!("{path}/");
+                    let list: Vec<serde_json::Value> = map
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix))
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    if list.is_empty() {
+                        return SbiResponse::with_status(404);
+                    }
+                    return SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::Value::Array(list))
+                        .unwrap_or_else(|_| SbiResponse::with_status(500));
+                }
+                match map.get(&path) {
+                    Some(doc) => SbiResponse::with_status(200)
+                        .with_json_body(doc)
+                        .unwrap_or_else(|_| SbiResponse::with_status(500)),
+                    None => SbiResponse::with_status(404),
+                }
+            }
+            "PUT" => match body() {
+                Some(doc) => {
+                    let created = map.insert(path, doc).is_none();
+                    SbiResponse::with_status(if created { 201 } else { 204 })
+                }
+                None => SbiResponse::with_status(400),
+            },
+            "PATCH" => {
+                let Some(patch) = body() else {
+                    return SbiResponse::with_status(400);
+                };
+                let Some(doc) = map.get_mut(&path) else {
+                    return SbiResponse::with_status(404);
+                };
+                if let (Some(target), Some(items)) = (doc.as_object_mut(), patch.as_object()) {
+                    for (k, v) in items {
+                        target.insert(k.clone(), v.clone());
+                    }
+                }
+                SbiResponse::with_status(204)
+            }
+            "DELETE" => {
+                map.remove(&path);
+                SbiResponse::with_status(204)
+            }
+            _ => SbiResponse::with_status(405),
+        }
+    }
+
+    /// Start the mock UDR and point udmd's UDR client at it. Returns the server
+    /// (the CALLER must keep it alive: dropping it closes the listener) and the
+    /// backing store.
+    async fn start_mock_udr_context_data() -> (SbiServer, CtxStore) {
+        let store: CtxStore = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let port = free_port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        let handler_store = Arc::clone(&store);
+        server
+            .start(move |req: SbiRequest| {
+                let store = Arc::clone(&handler_store);
+                async move { mock_udr_context_data(store, req).await }
+            })
+            .await
+            .expect("mock UDR starts");
+        // SbiServer::start spawns its accept loop, so returning from it does not
+        // mean the port accepts yet (the recorded stub-listener lesson).
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDR_SBI_PORT", port.to_string());
+        (server, store)
+    }
+
+    /// Start the real UDM SBI server and return it with a client for it.
+    async fn start_real_udm() -> (SbiServer, nextgcore_sbi::client::SbiClient) {
+        let port = free_port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        server
+            .start(udm_sbi_request_handler)
+            .await
+            .expect("udm starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (
+            server,
+            nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", port),
+        )
+    }
+
+    fn json_body(resp: &SbiResponse) -> serde_json::Value {
+        serde_json::from_str(resp.http.content.as_deref().unwrap_or("null"))
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    fn amf_reg_body(instance: &str, rat: &str) -> serde_json::Value {
+        serde_json::json!({
+            "amfInstanceId": instance,
+            "deregCallbackUri":
+                format!("http://{instance}.example.org:7777/namf-callback/v1/imsi-x/dereg-notify"),
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
+            "ratType": rat,
+            "imsVoPs": "HOMOGENEOUS_NON_SUPPORT"
+        })
+    }
+
+    /// The whole #84 UECM surface, driven through the real router:
+    /// dual-access registration without overwrite (criterion 1), every mandatory
+    /// GET answering 2xx instead of 405 (criterion 3), and both spec
+    /// deregistrations (criterion 4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn test_http_uecm_registration_surface() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = env_logger::try_init();
+        udm_context_init(64, 64);
+        std::env::remove_var("UDM_NOTIFY_DISABLE");
+
+        let (udr_server, store) = start_mock_udr_context_data().await;
+        let (udm_server, client) = start_real_udm().await;
+
+        let supi = "imsi-001010000000846";
+        let reg = |r: &str| format!("/nudm-uecm/v1/{supi}/registrations/{r}");
+        let udr_key = |r: &str| format!("/nudr-dr/v2/subscription-data/{supi}/context-data/{r}");
+
+        // --- criterion 1: dual-access registration, no overwrite ------------
+        let three_gpp = amf_reg_body("amf-3gpp", "NR");
+        let resp = client
+            .put_json(&reg("amf-3gpp-access"), &three_gpp)
+            .await
+            .expect("3gpp PUT");
+        assert_eq!(resp.status, 201, "3GPP registration created");
+
+        let non_3gpp = amf_reg_body("amf-n3gpp", "VIRTUAL");
+        let resp = client
+            .put_json(&reg("amf-non-3gpp-access"), &non_3gpp)
+            .await
+            .expect("non-3gpp PUT");
+        assert_eq!(
+            resp.status, 201,
+            "the non-3GPP resource is created, not found: a 200 would mean the \
+             handler read the 3GPP registration"
+        );
+        assert_eq!(
+            resp.http.headers.get("location").map(String::as_str),
+            Some(reg("amf-non-3gpp-access").as_str())
+        );
+        {
+            let map = store.lock().expect("store");
+            assert_eq!(
+                map.get(&udr_key("amf-3gpp-access")),
+                Some(&three_gpp),
+                "the 3GPP UDR record must be untouched by the non-3GPP registration"
+            );
+            assert_eq!(
+                map.get(&udr_key("amf-non-3gpp-access")),
+                Some(&non_3gpp),
+                "the non-3GPP registration lives in its own UDR resource"
+            );
+        }
+
+        // --- criterion 3: the mandatory GETs are ROUTED (not 405) ----------
+        for (resource, expect_instance) in [
+            ("amf-3gpp-access", "amf-3gpp"),
+            ("amf-non-3gpp-access", "amf-n3gpp"),
+        ] {
+            let resp = client.get(&reg(resource)).await.expect("GET");
+            assert_eq!(resp.status, 200, "GET {resource} must be routed");
+            assert_eq!(
+                json_body(&resp)["amfInstanceId"],
+                expect_instance,
+                "GET {resource} returned the wrong access's registration"
+            );
+        }
+
+        // SMF registration + the collection and individual GETs.
+        let smf = serde_json::json!({
+            "smfInstanceId": "smf-1",
+            "pduSessionId": 5,
+            "singleNssai": { "sst": 1, "sd": "000001" },
+            "dnn": "internet",
+            "plmnId": { "mcc": "001", "mnc": "01" }
+        });
+        let resp = client
+            .put_json(&reg("smf-registrations/5"), &smf)
+            .await
+            .expect("smf PUT");
+        assert_eq!(resp.status, 201);
+        let resp = client
+            .get(&reg("smf-registrations"))
+            .await
+            .expect("smf collection GET");
+        assert_eq!(resp.status, 200, "GetSmfRegistration must be routed");
+        assert_eq!(
+            json_body(&resp)["smfRegistrationList"][0]["smfInstanceId"],
+            "smf-1",
+            "the collection is wrapped as SmfRegistrationInfo"
+        );
+        let resp = client
+            .get(&reg("smf-registrations/5"))
+            .await
+            .expect("smf individual GET");
+        assert_eq!(resp.status, 200);
+        assert_eq!(json_body(&resp)["smfInstanceId"], "smf-1");
+
+        // Location information, composed from both AMF registrations.
+        let resp = client.get(&reg("location")).await.expect("location GET");
+        assert_eq!(resp.status, 200, "GetLocationInfo must be routed");
+        let loc = json_body(&resp);
+        let entries = loc["registrationLocationInfoList"]
+            .as_array()
+            .expect("registrationLocationInfoList")
+            .clone();
+        assert_eq!(entries.len(), 2, "one entry per serving AMF: {entries:?}");
+        assert_eq!(loc["supi"], supi);
+
+        // SMSF and IP-SM-GW registrations round-trip.
+        let smsf = serde_json::json!({
+            "smsfInstanceId": "smsf-1",
+            "plmnId": { "mcc": "001", "mnc": "01" }
+        });
+        let resp = client
+            .put_json(&reg("smsf-3gpp-access"), &smsf)
+            .await
+            .expect("smsf PUT");
+        assert_eq!(resp.status, 201);
+        let resp = client
+            .get(&reg("smsf-3gpp-access"))
+            .await
+            .expect("smsf GET");
+        assert_eq!(resp.status, 200, "Get3GppSmsfRegistration must be routed");
+        assert_eq!(json_body(&resp)["smsfInstanceId"], "smsf-1");
+
+        let ipsmgw = serde_json::json!({ "ipsmgwFqdn": "ipsmgw.example.org" });
+        let resp = client
+            .put_json(&reg("ip-sm-gw"), &ipsmgw)
+            .await
+            .expect("ip-sm-gw PUT");
+        assert_eq!(resp.status, 201);
+        let resp = client.get(&reg("ip-sm-gw")).await.expect("ip-sm-gw GET");
+        assert_eq!(resp.status, 200, "GetIpSmGwRegistration must be routed");
+        assert_eq!(json_body(&resp)["ipsmgwFqdn"], "ipsmgw.example.org");
+
+        // --- criterion 4: the two spec deregistrations ---------------------
+        // POST .../amf-3gpp-access/dereg-amf, not DELETE on the resource.
+        let resp = client
+            .post_json(
+                &reg("amf-3gpp-access/dereg-amf"),
+                &serde_json::json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN" }),
+            )
+            .await
+            .expect("dereg-amf POST");
+        assert_eq!(resp.status, 204, "dereg-amf must be routed");
+        let resp = client
+            .get(&reg("amf-3gpp-access"))
+            .await
+            .expect("GET after dereg");
+        assert_eq!(resp.status, 404, "the 3GPP registration is gone");
+        let resp = client
+            .get(&reg("amf-non-3gpp-access"))
+            .await
+            .expect("GET non-3gpp after 3gpp dereg");
+        assert_eq!(
+            resp.status, 200,
+            "deregistering 3GPP access must leave the non-3GPP registration"
+        );
+
+        // purgeFlag on the update PATCH deregisters (the shape amfd sends).
+        let resp = client
+            .patch_json(
+                &reg("amf-non-3gpp-access"),
+                &serde_json::json!({ "purgeFlag": true }),
+            )
+            .await
+            .expect("purge PATCH");
+        assert_eq!(resp.status, 204, "PATCH amf-non-3gpp-access must be routed");
+        let resp = client
+            .get(&reg("amf-non-3gpp-access"))
+            .await
+            .expect("GET after purge");
+        assert_eq!(resp.status, 404, "purgeFlag deregistered the UE");
+
+        udm_server.stop().await.expect("stop udm");
+        udr_server.stop().await.expect("stop udr");
+    }
+
+    // ========================================================================
+    // #84: UEAU — the authenticating AUSF is pinned, DeleteAuth is routed, and
+    // a failed SQN advance withholds the AV.
+    // ========================================================================
+
+    /// Mock UDR for the UEAU flow: serves authentication-subscription GET,
+    /// answers the SQN PATCH with a caller-controlled status, and counts
+    /// authentication-status writes/deletes.
+    #[derive(Default)]
+    struct UeauUdrState {
+        patch_status: std::sync::atomic::AtomicU16,
+        status_deletes: std::sync::atomic::AtomicUsize,
+    }
+
+    async fn mock_udr_ueau(state: Arc<UeauUdrState>, request: SbiRequest) -> SbiResponse {
+        let method = request.header.method.clone();
+        let uri = request.header.uri.clone();
+        let path = uri.split('?').next().unwrap_or(&uri).to_string();
+        if path.contains("authentication-status") {
+            if method == "DELETE" {
+                state
+                    .status_deletes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            return SbiResponse::with_status(204);
+        }
+        if !path.contains("authentication-subscription") {
+            return SbiResponse::with_status(404);
+        }
+        if method == "PATCH" {
+            return SbiResponse::with_status(
+                state.patch_status.load(std::sync::atomic::Ordering::SeqCst),
+            );
+        }
+        SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "authenticationMethod": "5G_AKA",
+                "encPermanentKey": TEST_K_HEX,
+                "encOpcKey": TEST_OPC_HEX,
+                "authenticationManagementField": "8000",
+                "sequenceNumber": { "sqn": "000000000021", "sqnScheme": "NON_TIME_BASED" }
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(500))
+    }
+
+    /// A stub AUSF that counts the Nausf_SoRProtection / UPUProtection requests
+    /// it receives. Registered in the shared SBI context under `instance_id` so
+    /// udmd's AUSF selection can resolve it.
+    async fn start_stub_ausf(
+        instance_id: &str,
+    ) -> (SbiServer, Arc<std::sync::atomic::AtomicUsize>) {
+        use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+        use nextgcore_sbi::types::{NfType, SbiServiceType};
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let port = free_port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        server
+            .start(move |_req: SbiRequest| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // 204 with no SorSecurityInfo: the injector then withholds
+                    // (fail-closed). WHICH AUSF was asked is the whole question
+                    // here, so a successful protection is not needed.
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("stub AUSF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut instance = NfInstance::new(instance_id, NfType::Ausf);
+        instance.ipv4_addresses.push("127.0.0.1".to_string());
+        let mut svc = NfService::new("nausf-sorprotection", SbiServiceType::NausfAuth);
+        svc.versions = vec!["v1".to_string()];
+        svc.port = port;
+        instance.add_service(svc);
+        global_context().add_nf_instance(instance).await;
+        (server, hits)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn test_http_ueau_ausf_pinning_delete_auth_and_sqn_withholding() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = env_logger::try_init();
+        udm_context_init(64, 64);
+
+        let state = Arc::new(UeauUdrState::default());
+        state
+            .patch_status
+            .store(204, std::sync::atomic::Ordering::SeqCst);
+        let udr_port = free_port();
+        let udr_addr = SocketAddr::from(([127, 0, 0, 1], udr_port));
+        let udr_server = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        let handler_state = Arc::clone(&state);
+        udr_server
+            .start(move |req: SbiRequest| {
+                let state = Arc::clone(&handler_state);
+                async move { mock_udr_ueau(state, req).await }
+            })
+            .await
+            .expect("mock UDR starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(udr_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDR_SBI_PORT", udr_port.to_string());
+
+        let (udm_server, client) = start_real_udm().await;
+        let supi = "imsi-001010000000001";
+        let gen_path = format!("/nudm-ueau/v1/{supi}/security-information/generate-auth-data");
+
+        // --- criterion 5a: the request's ausfInstanceId is PERSISTED ---------
+        // Two AUSFs exist; "ausf-a" is registered first, so it is what the
+        // "any cached AUSF" fallback would pick.
+        let (ausf_a_server, ausf_a_hits) = start_stub_ausf("ausf-a").await;
+        let (ausf_b_server, ausf_b_hits) = start_stub_ausf("ausf-b").await;
+
+        let resp = client
+            .post_json(
+                &gen_path,
+                &serde_json::json!({
+                    "servingNetworkName": TEST_SNN,
+                    "ausfInstanceId": "ausf-b"
+                }),
+            )
+            .await
+            .expect("generate-auth-data");
+        assert_eq!(
+            resp.status, 200,
+            "the AV is issued: {:?}",
+            resp.http.content
+        );
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            let ue = context.ue_find_by_supi(supi).expect("UE created");
+            assert_eq!(
+                ue.ausf_instance_id.as_deref(),
+                Some("ausf-b"),
+                "the authenticating AUSF must be recorded on the live path \
+                 (TS 33.501 §6.14.2.1: it holds K_AUSF)"
+            );
+        }
+
+        // --- criterion 5b: SoR and UPU select the RECORDED AUSF -------------
+        let am_data_sor = serde_json::json!({
+            "sorInfo": { "steeringContainer": [{ "plmnId": { "mcc": "001", "mnc": "01" } }],
+                         "ackInd": false }
+        })
+        .to_string();
+        let _ = crate::sor::maybe_inject_sor_info(supi, am_data_sor).await;
+        let am_data_upu = serde_json::json!({
+            "upuInfo": { "upuDataList": [{ "secPacket": "00" }], "upuAckInd": false }
+        })
+        .to_string();
+        let _ = crate::upu::maybe_inject_upu_info(supi, am_data_upu).await;
+
+        assert_eq!(
+            ausf_b_hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both SoR and UPU protection must go to the AUSF that authenticated \
+             the UE, so the MAC is computed with the K_AUSF the UE holds"
+        );
+        assert_eq!(
+            ausf_a_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the arbitrary-first-instance fallback must not fire when the \
+             authenticating AUSF is known"
+        );
+
+        // --- criterion 6: DeleteAuth round-trips the ConfirmAuth id ----------
+        let auth_event = serde_json::json!({
+            "nfInstanceId": "ausf-b",
+            "success": true,
+            "timeStamp": "2026-01-01T00:00:00Z",
+            "authType": "5G_AKA",
+            "servingNetworkName": TEST_SNN
+        });
+        let resp = client
+            .post_json(&format!("/nudm-ueau/v1/{supi}/auth-events"), &auth_event)
+            .await
+            .expect("ConfirmAuth");
+        assert_eq!(resp.status, 201);
+        let location = resp
+            .http
+            .headers
+            .get("location")
+            .cloned()
+            .expect("ConfirmAuth Location");
+        let event_id = location
+            .rsplit('/')
+            .next()
+            .expect("authEventId segment")
+            .to_string();
+        assert!(!event_id.is_empty());
+
+        // An id this UDM never issued is a 404, not a silent success.
+        let resp = client
+            .put_json(
+                &format!("/nudm-ueau/v1/{supi}/auth-events/not-the-issued-id"),
+                &auth_event,
+            )
+            .await
+            .expect("DeleteAuth wrong id");
+        assert_eq!(resp.status, 404, "an unknown authEventId must not 204");
+
+        let before = state
+            .status_deletes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let resp = client
+            .put_json(
+                &format!("/nudm-ueau/v1/{supi}/auth-events/{event_id}"),
+                &auth_event,
+            )
+            .await
+            .expect("DeleteAuth");
+        assert_eq!(
+            resp.status, 204,
+            "DeleteAuth on the issued id must be routed and accepted"
+        );
+        assert_eq!(
+            state
+                .status_deletes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "the revocation must reach the UDR authentication-status resource"
+        );
+        // Single-use: the pinned id is consumed.
+        let resp = client
+            .put_json(
+                &format!("/nudm-ueau/v1/{supi}/auth-events/{event_id}"),
+                &auth_event,
+            )
+            .await
+            .expect("DeleteAuth replay");
+        assert_eq!(resp.status, 404, "a replayed DeleteAuth finds nothing");
+
+        // --- criterion 7: a failed SQN advance withholds the AV -------------
+        state
+            .patch_status
+            .store(404, std::sync::atomic::Ordering::SeqCst);
+        let resp = client
+            .post_json(
+                &gen_path,
+                &serde_json::json!({
+                    "servingNetworkName": TEST_SNN,
+                    "ausfInstanceId": "ausf-b"
+                }),
+            )
+            .await
+            .expect("generate-auth-data with failing SQN PATCH");
+        assert_eq!(
+            resp.status, 503,
+            "a 404 on the SQN advance must withhold the AV: the stored SQN is \
+             re-read every call, so issuing would reuse it (TS 33.102 §6.3.2)"
+        );
+        let body = json_body(&resp);
+        assert!(
+            body.get("authenticationVector").is_none(),
+            "no authentication vector may be returned: {body}"
+        );
+
+        udm_server.stop().await.expect("stop udm");
+        udr_server.stop().await.expect("stop udr");
+        ausf_a_server.stop().await.expect("stop ausf-a");
+        ausf_b_server.stop().await.expect("stop ausf-b");
     }
 }
 
