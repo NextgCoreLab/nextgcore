@@ -1052,6 +1052,31 @@ pub async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiRespon
         })
         .unwrap_or_default();
 
+    // #83: nfInstanceId, callbackReference and monitoredResourceUris are
+    // mandatory in SdmSubscription (TS 29.503 §6.1.6.2.x). This handler used to
+    // accept a body missing all three and answer 201 — so a consumer with a bug
+    // in its subscribe request got a subscription id back, monitored nothing,
+    // and had no way to tell. `nudm_handler.rs` already had these very checks;
+    // nothing routed to them.
+    //
+    // An EMPTY monitoredResourceUris is refused as well as an absent one: the
+    // spec's minItems is 1, and an empty list is the shape a consumer produces
+    // when its own resource list came out empty — which is a bug to surface, not
+    // a whole-UE subscription to infer.
+    for (value_is_present, ie) in [
+        (nf_instance_id.is_some(), "nfInstanceId"),
+        (callback_reference.is_some(), "callbackReference"),
+        (!monitored_resource_uris.is_empty(), "monitoredResourceUris"),
+    ] {
+        if !value_is_present {
+            log::warn!("SDM Subscribe for {supi} is missing {ie}; refusing");
+            return send_bad_request(
+                &format!("SdmSubscription is missing mandatory {ie}"),
+                Some("MANDATORY_IE_MISSING"),
+            );
+        }
+    }
+
     // udmd-07: persist the subscription in the UDM context.
     let sub = UdmSdmSubscription::for_supi(
         supi,
@@ -1185,26 +1210,141 @@ pub async fn handle_ee_unsubscribe(ue_identity: &str, subscription_id: &str) -> 
     SbiResponse::with_status(204)
 }
 
-/// udmd#0: Nudm_EE UpdateEeSubscription (TS 29.503 5.5.2.4).
-/// JSON-Patch application deferred; 204 on existing sub / 404 otherwise (yaml 363).
+/// Nudm_EE UpdateEeSubscription (TS 29.503 §5.5.2.4.2).
+///
+/// #83: this used to answer 204 and discard the patch, so a consumer could
+/// "modify" `monitoringConfigurations` forever while the stored subscription
+/// never changed — subscription lifecycle management that reports success and
+/// diverges from state.
 pub async fn handle_ee_modify(
     ue_identity: &str,
     subscription_id: &str,
-    _request: &SbiRequest,
+    request: &SbiRequest,
 ) -> SbiResponse {
     log::info!("EE Modify: ueIdentity={ue_identity}, subscriptionId={subscription_id}");
-    let exists = {
+
+    let Some(mut sub) = ({
         let ctx = udm_self();
         let guard = ctx.read().ok();
         guard
             .as_ref()
             .and_then(|c| c.ee_subscription_find_by_id(subscription_id))
-            .is_some()
+    }) else {
+        return send_problem(404, "NOT_FOUND", "Subscription not found");
     };
-    if !exists {
+
+    let Some(body) = request.http.content.as_deref() else {
+        return send_bad_request("Missing request body", Some("MISSING_BODY"));
+    };
+    let patch: serde_json::Value = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+
+    let mut stored: serde_json::Value = match serde_json::from_str(&sub.raw) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("Stored EeSubscription {subscription_id} is not valid JSON: {e}");
+            return send_problem(500, "INTERNAL_ERROR", "stored subscription is corrupt");
+        }
+    };
+
+    if let Err(detail) = apply_ee_patch(&mut stored, &patch) {
+        return send_bad_request(&detail, Some("INVALID_MSG_FORMAT"));
+    }
+
+    // The callbackReference is cached alongside the raw body, so a patch that
+    // changes it must update both or the next notification goes to the old URI.
+    if let Some(cb) = stored.get("callbackReference").and_then(|v| v.as_str()) {
+        sub.callback_reference = cb.to_string();
+    }
+    sub.raw = stored.to_string();
+
+    let updated = {
+        let ctx = udm_self();
+        let guard = ctx.read().ok();
+        guard
+            .as_ref()
+            .is_some_and(|c| c.ee_subscription_update(sub))
+    };
+    if !updated {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     }
     SbiResponse::with_status(204)
+}
+
+/// Apply an `EeSubscription` patch in place.
+///
+/// TS 29.503 §5.5.2.4.2 uses a JSON `PatchItem` array (RFC 6902-shaped, as the
+/// rest of this codebase's SBI PATCH endpoints do). A merge-patch object is also
+/// accepted, because lenient peers send one and refusing it buys nothing.
+///
+/// `remove` and `replace` on an absent member are errors rather than silent
+/// no-ops: a consumer patching a path that is not there has a wrong idea of the
+/// stored subscription, and answering 204 would confirm it.
+fn apply_ee_patch(stored: &mut serde_json::Value, patch: &serde_json::Value) -> Result<(), String> {
+    let Some(ops) = patch.as_array() else {
+        // Merge patch (RFC 7396): top-level members replace their counterparts.
+        let Some(members) = patch.as_object() else {
+            return Err("patch must be a PatchItem array or a merge-patch object".to_string());
+        };
+        let Some(target) = stored.as_object_mut() else {
+            return Err("stored subscription is not a JSON object".to_string());
+        };
+        for (key, value) in members {
+            if value.is_null() {
+                target.remove(key);
+            } else {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        return Ok(());
+    };
+
+    if ops.is_empty() {
+        return Err("patch carries no operations".to_string());
+    }
+    for op in ops {
+        let op_name = op
+            .get("op")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "PatchItem is missing op".to_string())?;
+        let path = op
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "PatchItem is missing path".to_string())?;
+        // Only top-level members of EeSubscription are addressable here; that is
+        // what the spec's patch targets (monitoringConfigurations,
+        // callbackReference, reportingOptions, ...). A deeper pointer is refused
+        // rather than half-applied.
+        let member = path.strip_prefix('/').unwrap_or(path);
+        if member.is_empty() || member.contains('/') {
+            return Err(format!(
+                "path {path:?} must address a top-level EeSubscription member"
+            ));
+        }
+        let target = stored
+            .as_object_mut()
+            .ok_or_else(|| "stored subscription is not a JSON object".to_string())?;
+        match op_name {
+            "add" | "replace" => {
+                let value = op
+                    .get("value")
+                    .ok_or_else(|| format!("{op_name} on {path:?} has no value"))?;
+                if op_name == "replace" && !target.contains_key(member) {
+                    return Err(format!("cannot replace absent member {path:?}"));
+                }
+                target.insert(member.to_string(), value.clone());
+            }
+            "remove" => {
+                if target.remove(member).is_none() {
+                    return Err(format!("cannot remove absent member {path:?}"));
+                }
+            }
+            other => return Err(format!("unsupported patch op {other:?}")),
+        }
+    }
+    Ok(())
 }
 
 /// udmd#1: Nudm_Sdm SoRAckInfo (TS 29.503 5.2.2.6, PUT /am-data/sor-ack).
@@ -3469,6 +3609,225 @@ mod tests {
         let ue2 = udm_self().read().unwrap().ue_find_by_supi(supi2).unwrap();
         assert!(ue2.upu_ack.is_none());
         assert!(ue2.expected_upu_xmac_iue.is_some());
+    }
+
+    // ==================================================================
+    // #83: SDM Subscribe validates its mandatory IEs; EE Modify applies
+    // the patch it used to discard.
+    // ==================================================================
+
+    fn sdm_subscribe_request(body: serde_json::Value) -> SbiRequest {
+        let mut req = SbiRequest::post("/nudm-sdm/v2/imsi-001010000000001/sdm-subscriptions");
+        req.http.content = Some(body.to_string());
+        req
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize process-global UDM state (context, UDM_NOTIFY_DISABLE, SBI profile)
+    async fn sdm_subscribe_refuses_a_subscription_missing_a_mandatory_ie() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+        let supi = "imsi-001010000000001";
+
+        let full = serde_json::json!({
+            "nfInstanceId": "nf-1",
+            "callbackReference": "http://consumer.example.com/cb",
+            "monitoredResourceUris": ["/nudm-sdm/v2/imsi-001010000000001/am-data"],
+        });
+
+        // Each mandatory IE removed in turn must be a 400 with a
+        // MANDATORY_IE_MISSING cause naming it. This handler used to answer 201
+        // for a body missing all three, so a consumer with a broken subscribe
+        // request got a subscription id back and monitored nothing.
+        for ie in ["nfInstanceId", "callbackReference", "monitoredResourceUris"] {
+            let mut body = full.clone();
+            body.as_object_mut().expect("object").remove(ie);
+            let resp = handle_sdm_subscribe(supi, &sdm_subscribe_request(body)).await;
+            assert_eq!(
+                resp.status, 400,
+                "a subscription missing {ie} must be refused"
+            );
+            let problem: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON");
+            assert_eq!(problem["cause"], "MANDATORY_IE_MISSING", "for {ie}");
+            assert!(
+                problem["detail"].as_str().expect("detail").contains(ie),
+                "the refusal must name the missing IE: {problem}"
+            );
+        }
+
+        // An EMPTY monitoredResourceUris is refused too: minItems is 1, and an
+        // empty list is what a consumer produces when its own resource list came
+        // out empty — a bug to surface, not a whole-UE subscription to infer.
+        let mut empty = full.clone();
+        empty["monitoredResourceUris"] = serde_json::json!([]);
+        let resp = handle_sdm_subscribe(supi, &sdm_subscribe_request(empty)).await;
+        assert_eq!(resp.status, 400);
+
+        // A complete body is still accepted, with the v2 Location.
+        let resp = handle_sdm_subscribe(supi, &sdm_subscribe_request(full)).await;
+        assert_eq!(resp.status, 201);
+        let location = resp
+            .http
+            .get_header("location")
+            .expect("Location header")
+            .clone();
+        assert!(
+            location.contains("/nudm-sdm/v2/"),
+            "Nudm_SDM is v2; a v1 Location hands out an undefined path: {location}"
+        );
+
+        // Clean up so the notify tests are not perturbed by this subscription.
+        clear_sdm_subscriptions_for(supi);
+    }
+
+    /// Drop every SDM subscription for `supi`.
+    ///
+    /// A plain fn rather than inline in the async test: the read guard must not be
+    /// held across the test's remaining awaits, and keeping the borrow inside one
+    /// synchronous frame is the simplest way to guarantee that.
+    fn clear_sdm_subscriptions_for(supi: &str) {
+        let ctx = udm_self();
+        let Ok(context) = ctx.read() else { return };
+        for sub in context.sdm_subscriptions_for_supi(supi) {
+            context.sdm_subscription_remove(&sub.id);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize process-global UDM state (context, UDM_NOTIFY_DISABLE, SBI profile)
+    async fn ee_modify_applies_the_patch_and_the_change_is_readable_back() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+        let ue = "imsi-001010000000083";
+
+        let original = serde_json::json!({
+            "callbackReference": "http://consumer.example.com/ee",
+            "monitoringConfigurations": { "1": { "eventType": "LOSS_OF_CONNECTIVITY" } },
+        });
+        let sub = crate::context::UdmEeSubscription::for_ue(
+            ue,
+            "http://consumer.example.com/ee",
+            original.to_string(),
+        );
+        let sub_id = sub.id.clone();
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            context.ee_subscription_insert(sub);
+        }
+
+        // PatchItem array form.
+        let patch = serde_json::json!([{
+            "op": "replace",
+            "path": "/monitoringConfigurations",
+            "value": { "2": { "eventType": "UE_REACHABILITY_FOR_DATA" } },
+        }]);
+        let mut req = SbiRequest::patch(format!("/nudm-ee/v1/{ue}/ee-subscriptions/{sub_id}"));
+        req.http.content = Some(patch.to_string());
+        let resp = handle_ee_modify(ue, &sub_id, &req).await;
+        assert_eq!(resp.status, 204);
+
+        // Read back: the stored subscription must actually have changed. This is
+        // the assertion the old handler could never satisfy — it returned 204 and
+        // discarded the patch, so lifecycle management reported success while
+        // diverging from state.
+        let stored = {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            context.ee_subscription_find_by_id(&sub_id).expect("stored")
+        };
+        let raw: serde_json::Value = serde_json::from_str(&stored.raw).expect("stored JSON");
+        assert_eq!(
+            raw["monitoringConfigurations"]["2"]["eventType"],
+            "UE_REACHABILITY_FOR_DATA"
+        );
+        assert!(
+            raw["monitoringConfigurations"].get("1").is_none(),
+            "replace must replace the member, not merge into it: {raw}"
+        );
+
+        // A patch that changes the callbackReference updates the cached copy too,
+        // or the next notification goes to the old URI.
+        let repoint = serde_json::json!([{
+            "op": "replace",
+            "path": "/callbackReference",
+            "value": "http://elsewhere.example.com/ee",
+        }]);
+        let mut req = SbiRequest::patch(format!("/nudm-ee/v1/{ue}/ee-subscriptions/{sub_id}"));
+        req.http.content = Some(repoint.to_string());
+        assert_eq!(handle_ee_modify(ue, &sub_id, &req).await.status, 204);
+        let stored = {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            context.ee_subscription_find_by_id(&sub_id).expect("stored")
+        };
+        assert_eq!(stored.callback_reference, "http://elsewhere.example.com/ee");
+
+        // An unknown subscription is still 404, and a malformed patch is a 400
+        // rather than a silent success.
+        let mut req = SbiRequest::patch("/nudm-ee/v1/x/ee-subscriptions/absent");
+        req.http.content = Some("[]".to_string());
+        assert_eq!(handle_ee_modify(ue, "absent", &req).await.status, 404);
+
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!([{ "op": "replace", "path": "/notThere", "value": 1 }]),
+            serde_json::json!([{ "op": "remove", "path": "/notThere" }]),
+            serde_json::json!([{ "op": "bogus", "path": "/callbackReference", "value": 1 }]),
+            serde_json::json!([{ "op": "replace", "path": "/a/b", "value": 1 }]),
+            serde_json::json!(42),
+        ] {
+            let mut req = SbiRequest::patch(format!("/nudm-ee/v1/{ue}/ee-subscriptions/{sub_id}"));
+            req.http.content = Some(bad.to_string());
+            assert_eq!(
+                handle_ee_modify(ue, &sub_id, &req).await.status,
+                400,
+                "patch {bad} must be refused"
+            );
+        }
+
+        clear_ee_subscription(&sub_id);
+    }
+
+    /// Drop one EE subscription by id (see `clear_sdm_subscriptions_for`).
+    fn clear_ee_subscription(id: &str) {
+        let ctx = udm_self();
+        let Ok(context) = ctx.read() else { return };
+        context.ee_subscription_remove(id);
+    }
+
+    #[test]
+    fn ee_patch_accepts_the_merge_patch_form_and_refuses_nonsense() {
+        let mut stored = serde_json::json!({ "callbackReference": "a", "keepMe": 1 });
+        // Merge patch (RFC 7396): members replace, an explicit null removes.
+        apply_ee_patch(
+            &mut stored,
+            &serde_json::json!({ "callbackReference": "b", "keepMe": null, "added": 2 }),
+        )
+        .expect("merge patch applies");
+        assert_eq!(stored["callbackReference"], "b");
+        assert!(stored.get("keepMe").is_none());
+        assert_eq!(stored["added"], 2);
+
+        // `add` creates a member that was not there; `replace` on the same
+        // absent member does not.
+        let mut fresh = serde_json::json!({});
+        apply_ee_patch(
+            &mut fresh,
+            &serde_json::json!([{ "op": "add", "path": "/new", "value": 1 }]),
+        )
+        .expect("add applies");
+        assert_eq!(fresh["new"], 1);
+        assert!(apply_ee_patch(
+            &mut serde_json::json!({}),
+            &serde_json::json!([{ "op": "replace", "path": "/new", "value": 1 }])
+        )
+        .is_err());
     }
 }
 
