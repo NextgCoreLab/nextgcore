@@ -31,7 +31,7 @@ use nextgcore_sbi::constants::{custom_header, discovery_header};
 use nextgcore_sbi::message::{
     ProblemDetails, SbiHttpMessage, SbiRequest, SbiResponse, UriComponents,
 };
-use nextgcore_sbi::oauth::OAuth2Client;
+use nextgcore_sbi::oauth::{OAuth2Client, TokenConsumer};
 use nextgcore_sbi::types::{NfType, UriScheme};
 use nextgcore_sbi::SbiError;
 
@@ -133,6 +133,22 @@ pub struct ScpProxyConfig {
     pub circuit_failure_threshold: u32,
     /// Time a tripped circuit stays Open before admitting a probe.
     pub circuit_open_timeout: Duration,
+    /// Assert the requesting consumer's identity in a delegated (Model D) token
+    /// request **even when the consumer supplied no CCA of its own**
+    /// (nextgcore #101 criterion 2).
+    ///
+    /// Default `false`, and that default is not timidity. After #64 the NRF's
+    /// token endpoint authenticates the requester by a CCA keyed to
+    /// `nfInstanceId`; the SCP can only sign with its OWN key, so naming the
+    /// consumer in the body while signing as ourselves produces a request a
+    /// conformant NRF rejects. Asserting the consumer's identity is therefore
+    /// only safe when the consumer attests it (its own CCA — the conformant
+    /// Model D case, TS 33.501 §13.4.1.3.2) or when the operator declares the
+    /// NRF does not require client authentication, which is what this flag is.
+    ///
+    /// Set it only for such an NRF: with it on and no consumer CCA, the token
+    /// request carries an unattested identity.
+    pub trust_requester_identity: bool,
 }
 
 impl Default for ScpProxyConfig {
@@ -148,6 +164,7 @@ impl Default for ScpProxyConfig {
             cache_ttl: DEFAULT_CACHE_TTL,
             circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
             circuit_open_timeout: DEFAULT_CIRCUIT_OPEN_TIMEOUT,
+            trust_requester_identity: false,
         }
     }
 }
@@ -228,6 +245,25 @@ fn normalize_binding(value: &str) -> String {
         .filter(|c| !c.is_whitespace())
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+/// Everything the SCP needs to mint a delegated (Model D) access token for the
+/// NF Service Consumer that sent the request (TS 33.501 §13.4.1.3.2).
+#[derive(Debug, Clone)]
+struct DelegatedAuth {
+    /// NF type of the discovered producer — the token's `targetNfType`.
+    target_nf_type: NfType,
+    /// Whose token this is. Either the consumer (when its identity can be
+    /// attested) or the SCP itself; see [`ScpProxy::delegated_auth`].
+    consumer: TokenConsumer,
+    /// The scope the consumer explicitly asked for in `3gpp-Sbi-Access-Scope`,
+    /// if any. When absent the scope is derived from the request URI's service
+    /// name, as before.
+    requested_scope: Option<String>,
+    /// True when `consumer` is the requester rather than the SCP. Only used for
+    /// logging, so an operator can tell an SCP-attested token from a
+    /// consumer-attested one.
+    consumer_attested: bool,
 }
 
 /// Remove any `Authorization` header (case-insensitive) from a forwardable
@@ -911,6 +947,116 @@ impl ScpProxy {
         Some(client)
     }
 
+    /// Resolve whose identity a delegated token request should assert
+    /// (nextgcore #101 criterion 2, TS 33.501 §13.4.1.3.2).
+    ///
+    /// The governing rule is **never assert an identity you cannot attest**.
+    /// Sending the consumer's `nfInstanceId` unconditionally would break the
+    /// delegated path outright against our own NRF: after #64 that token
+    /// endpoint requires a CCA keyed to the `nfInstanceId` in the body, and the
+    /// SCP can only sign with its own key. Consumer identity and an
+    /// SCP-signed CCA are therefore mutually exclusive, which is why a bare
+    /// feature flag would just turn delegated discovery off.
+    ///
+    /// So, in order:
+    ///
+    /// 1. the consumer conveyed its own CCA in `3gpp-Sbi-Client-Credentials`
+    ///    → assert the consumer's identity and forward that CCA, which the NRF
+    ///    verifies against the consumer's registered key. This is the
+    ///    conformant Model D case;
+    /// 2. no consumer CCA, but the operator set `trust_requester_identity` for
+    ///    an NRF that does not require client authentication → assert the
+    ///    consumer's identity with no assertion attached;
+    /// 3. otherwise → keep the SCP's own identity and log, so the token is
+    ///    honestly SCP-attested rather than a forgery of the consumer's.
+    ///
+    /// Note the asymmetry with discovery: `requester-nf-type` is mandatory for
+    /// delegated discovery (rejected with 400 in [`ScpProxy::discover`]) but
+    /// `requester-nf-instance-id` is optional, so a consumer can be typed
+    /// without being named. An unnamed consumer cannot be asserted at all, and
+    /// falls to case 3 regardless of the other inputs.
+    fn delegated_auth(&self, request: &SbiRequest, target_nf_type: NfType) -> DelegatedAuth {
+        let requested_scope = request
+            .http
+            .get_header(custom_header::ACCESS_SCOPE)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let scp_consumer = || {
+            self.oauth2
+                .as_ref()
+                .map(|o| o.self_consumer())
+                .unwrap_or_else(|| {
+                    TokenConsumer::new(
+                        self.config
+                            .nf_instance_id
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_SCP_NF_INSTANCE_ID.to_string()),
+                        NfType::Scp,
+                    )
+                })
+        };
+
+        // The consumer must be both named and typed before it can be asserted.
+        let requester = request
+            .http
+            .get_header(discovery_header::REQUESTER_NF_INSTANCE_ID)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .and_then(|id| {
+                request
+                    .http
+                    .get_header(discovery_header::REQUESTER_NF_TYPE)
+                    .and_then(|t| nf_type_from_str(t))
+                    .map(|nf_type| (id.to_string(), nf_type))
+            });
+
+        let consumer_cca = request
+            .http
+            .get_header(custom_header::CLIENT_CREDENTIALS)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        match requester {
+            Some((id, nf_type)) => match consumer_cca {
+                // Case 1: attested by the consumer itself.
+                Some(cca) => DelegatedAuth {
+                    target_nf_type,
+                    consumer: TokenConsumer::new(id, nf_type).with_cca(cca),
+                    requested_scope,
+                    consumer_attested: true,
+                },
+                // Case 2: attested by operator declaration.
+                None if self.config.trust_requester_identity => DelegatedAuth {
+                    target_nf_type,
+                    consumer: TokenConsumer::new(id, nf_type),
+                    requested_scope,
+                    consumer_attested: true,
+                },
+                // Case 3: not attestable — stay honest about who we are.
+                None => {
+                    log::debug!(
+                        "SCP Model D: consumer {id} sent no 3gpp-Sbi-Client-Credentials and \
+                         trust_requester_identity is off; requesting an SCP-attested token \
+                         instead of asserting an identity we cannot attest"
+                    );
+                    DelegatedAuth {
+                        target_nf_type,
+                        consumer: scp_consumer(),
+                        requested_scope,
+                        consumer_attested: false,
+                    }
+                }
+            },
+            None => DelegatedAuth {
+                target_nf_type,
+                consumer: scp_consumer(),
+                requested_scope,
+                consumer_attested: false,
+            },
+        }
+    }
+
     /// Decide how to route an incoming request (TS 29.500 §6.10.2):
     /// Target-apiRoot wins; otherwise a Routing-Binding that matches a cached
     /// Binding; otherwise delegated discovery when Discovery headers are
@@ -1115,7 +1261,7 @@ impl ScpProxy {
         target: &ApiRoot,
         producer_id: Option<&str>,
         group_id: Option<&str>,
-        delegated_nf_type: Option<NfType>,
+        delegated: Option<DelegatedAuth>,
     ) -> SbiResponse {
         // scpd-#102: consult this producer's circuit breaker before forwarding.
         // An Open circuit short-circuits to 503 without contacting the producer,
@@ -1161,42 +1307,86 @@ impl ScpProxy {
 
         // Model D: if the SCP can mint a delegated token, drop whatever
         // Authorization the consumer sent (it was scoped to the consumer, not
-        // to this producer) so L1 attaches a fresh, correctly scoped Bearer
-        // token. If no OAuth2 client is configured, fall back to forwarding the
-        // request as-is (Authorization, if any, passes through).
-        let (client, delegated) =
-            match delegated_nf_type.and_then(|nf| self.oauth_client_for(target, nf)) {
-                Some(oauth_client) => {
-                    strip_authorization(&mut fwd.http.headers);
-                    (oauth_client, true)
-                }
-                None => (self.client_for(target), false),
-            };
+        // to this producer) so the delegated Bearer token replaces it. If no
+        // OAuth2 client is configured, fall back to forwarding the request
+        // as-is (Authorization, if any, passes through).
+        let (client, delegated) = match delegated
+            .as_ref()
+            .and_then(|d| self.oauth_client_for(target, d.target_nf_type))
+        {
+            Some(oauth_client) => {
+                strip_authorization(&mut fwd.http.headers);
+                (oauth_client, delegated)
+            }
+            None => (self.client_for(target), None),
+        };
+
+        // The consumer's CCA authenticates it to the NRF's token endpoint; it is
+        // not a producer-facing credential and must not travel onward
+        // (TS 29.500 §5.2.3.2: it is consumed by the token request we make on
+        // the consumer's behalf, below).
+        fwd.http
+            .headers
+            .retain(|k, _| !k.eq_ignore_ascii_case(custom_header::CLIENT_CREDENTIALS));
 
         // scpd: on the Model D delegated path the SCP must obtain a valid OAuth2
         // access token for the producer *before* forwarding (TS 33.501 §13). If
         // the token cannot be acquired — the NRF rejects the Access Token Request
         // or is unreachable — surface the mandated 400 MISSING_ACCESS_TOKEN_INFO /
         // 403 ACCESS_TOKEN_DENIED ProblemDetails instead of silently forwarding
-        // tokenless (TS 29.500 §6.10.11.2.2 / §6.10.11.2.2A). Acquiring here
-        // primes the token cache, so L1's attach step reuses it (no double NRF
-        // round-trip). A no-scope request (no service name) needs no token.
-        if delegated {
-            if let (Some(oauth2), Some(nf)) = (self.oauth2.as_ref(), delegated_nf_type) {
-                let scope = UriComponents::parse(&request.header.uri)
+        // tokenless (TS 29.500 §6.10.11.2.2 / §6.10.11.2.2A).
+        //
+        // #101 criterion 2: the token is minted for the CONSUMER, so this path
+        // attaches the Bearer header ITSELF rather than leaving it to L1.
+        // `SbiClient::with_oauth2` has no per-request hook — it would re-derive
+        // the token from the SCP's own identity — but it only attaches when the
+        // request carries no `Authorization`, so setting the header here makes
+        // its attach step a no-op by construction rather than by ordering luck.
+        //
+        // A no-scope request (no service name and no Access-Scope) needs no token.
+        let token_scope = delegated.as_ref().map(|d| {
+            d.requested_scope.clone().unwrap_or_else(|| {
+                UriComponents::parse(&request.header.uri)
                     .api_name
-                    .unwrap_or_default();
-                if !scope.is_empty() {
-                    if let Err(e) = oauth2.get_token(nf, &scope).await {
+                    .unwrap_or_default()
+            })
+        });
+
+        // scpd-07: keep a pristine (pre-token) copy for a single refresh-and-
+        // retry on a delegated 401/403 Bearer challenge. Cloned BEFORE the
+        // Bearer header is set, so the retry cannot replay the token the
+        // producer just refused.
+        let retry_fwd = if delegated.is_some() {
+            Some(fwd.clone())
+        } else {
+            None
+        };
+
+        if let (Some(oauth2), Some(d), Some(scope)) = (
+            self.oauth2.as_ref(),
+            delegated.as_ref(),
+            token_scope.as_ref(),
+        ) {
+            if !scope.is_empty() {
+                match oauth2
+                    .get_token_on_behalf_of(&d.consumer, d.target_nf_type, scope)
+                    .await
+                {
+                    Ok(token) => {
+                        fwd.http
+                            .set_header("Authorization", format!("Bearer {token}"));
+                        if !d.consumer_attested {
+                            log::debug!(
+                                "SCP Model D: forwarding an SCP-attested token for scope {scope}"
+                            );
+                        }
+                    }
+                    Err(e) => {
                         return self.stamp_server(token_acquisition_failure_response(&e));
                     }
                 }
             }
         }
-
-        // scpd-07: keep a pristine (pre-token) copy for a single refresh-and-
-        // retry on a delegated 401/403 Bearer challenge.
-        let retry_fwd = if delegated { Some(fwd.clone()) } else { None };
 
         let mut upstream = match client.send_request(fwd).await {
             Ok(response) => response,
@@ -1212,12 +1402,34 @@ impl ScpProxy {
         // 401/403 + a Bearer `WWW-Authenticate`, the cached token was refused —
         // invalidate it, mint a fresh one, and retry exactly once
         // (TS 29.500 §6.10.11.2.3). If it still fails, the response is relayed.
-        if delegated
+        if delegated.is_some()
             && matches!(upstream.status, 401 | 403)
             && www_authenticate_is_bearer(&upstream)
         {
-            if let (Some(oauth2), Some(retry)) = (self.oauth2.as_ref(), retry_fwd) {
-                oauth2.clear_cache().await;
+            if let (Some(oauth2), Some(d), Some(scope), Some(mut retry)) = (
+                self.oauth2.as_ref(),
+                delegated.as_ref(),
+                token_scope.as_ref(),
+                retry_fwd,
+            ) {
+                // #101 criterion 4: evict only THIS consumer's token. The
+                // producer refused a token minted for this consumer, which says
+                // nothing about any other consumer's — and clearing the whole
+                // cache would make one consumer's 401 re-mint the entire
+                // fleet's tokens.
+                oauth2
+                    .invalidate_token(&d.consumer, d.target_nf_type, scope)
+                    .await;
+                if !scope.is_empty() {
+                    if let Ok(token) = oauth2
+                        .get_token_on_behalf_of(&d.consumer, d.target_nf_type, scope)
+                        .await
+                    {
+                        retry
+                            .http
+                            .set_header("Authorization", format!("Bearer {token}"));
+                    }
+                }
                 if let Ok(retried) = client.send_request(retry).await {
                     upstream = retried;
                 }
@@ -1303,10 +1515,13 @@ impl ScpProxy {
                 Ok(producer) => {
                     // The producer NF type comes from the delegated-discovery
                     // header; used to scope the OAuth2 token the SCP attaches.
-                    let delegated_nf_type = request
+                    // #101 criterion 2: the token is minted for the requesting
+                    // consumer when its identity can be attested.
+                    let delegated_auth = request
                         .http
                         .get_header(discovery_header::TARGET_NF_TYPE)
-                        .and_then(|s| nf_type_from_str(s));
+                        .and_then(|s| nf_type_from_str(s))
+                        .map(|nf| self.delegated_auth(&request, nf));
                     let producer_id =
                         build_producer_id(&producer.nf_instance_id, producer.nf_set_id.as_deref());
                     log::debug!(
@@ -1321,7 +1536,7 @@ impl ScpProxy {
                         &producer.target,
                         producer_id.as_deref(),
                         producer.nf_group_id.as_deref(),
-                        delegated_nf_type,
+                        delegated_auth,
                     )
                     .await
                 }
@@ -2151,6 +2366,361 @@ mod tests {
         );
         // The SCP actually went to the NRF's token endpoint.
         assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    // ------------------------------------------------------------------
+    // #101 criteria 2-4: delegated token identity, scope and per-consumer cache
+    // ------------------------------------------------------------------
+
+    /// A mock NRF that RECORDS each token-request body rather than asserting on
+    /// it, so each test states its own expectation about the identity the SCP
+    /// asserted.
+    async fn start_recording_nrf(
+        port: u16,
+        producer_port: u16,
+        token: &'static str,
+        token_bodies: Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
+        server
+            .start(move |request: SbiRequest| {
+                let token_bodies = token_bodies.clone();
+                async move {
+                    if request.header.uri == "/nnrf-oauth2/v1/access-token" {
+                        let body = request.http.content.clone().unwrap_or_default();
+                        token_bodies.lock().await.push(body);
+                        let resp = format!(
+                            r#"{{"access_token":"{token}","token_type":"Bearer","expires_in":3600}}"#
+                        );
+                        return SbiResponse::ok().with_body(resp, "application/json");
+                    }
+                    assert_eq!(request.header.uri, "/nnrf-disc/v1/nf-instances");
+                    let search_result = serde_json::json!({
+                        "validityPeriod": 3600,
+                        "nfInstances": [{
+                            "nfInstanceId": "udm-instance-1",
+                            "nfType": "UDM",
+                            "nfStatus": "REGISTERED",
+                            "ipv4Addresses": ["127.0.0.1"],
+                            "priority": 1,
+                            "capacity": 100,
+                            "load": 0,
+                            "nfServices": [{
+                                "serviceInstanceId": "nudm-uecm-1",
+                                "serviceName": "nudm-uecm",
+                                "ipEndPoints": [{"ipv4Address": "127.0.0.1", "port": producer_port}]
+                            }]
+                        }]
+                    });
+                    SbiResponse::ok().with_body(search_result.to_string(), "application/json")
+                }
+            })
+            .await
+            .expect("nrf start");
+        server
+    }
+
+    /// A producer that echoes the Authorization it received AND whether the
+    /// consumer's CCA header leaked through to it.
+    async fn start_header_echo_producer(port: u16) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
+        server
+            .start(|request: SbiRequest| async move {
+                let echoed = serde_json::json!({
+                    "authorization": request
+                        .http
+                        .get_header("Authorization")
+                        .cloned()
+                        .unwrap_or_default(),
+                    "cca_leaked": request
+                        .http
+                        .get_header(custom_header::CLIENT_CREDENTIALS)
+                        .is_some(),
+                });
+                SbiResponse::ok().with_body(echoed.to_string(), "application/json")
+            })
+            .await
+            .expect("producer start");
+        server
+    }
+
+    /// A Model D request from consumer `amf-instance-7`, optionally attesting
+    /// itself with its own CCA and optionally naming an explicit access scope.
+    fn model_d_request(cca: Option<&str>, access_scope: Option<&str>) -> SbiRequest {
+        let mut request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_body(r#"{"amf":"reg"}"#, "application/json")
+            .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+            .with_header(discovery_header::REQUESTER_NF_TYPE, "AMF")
+            .with_header(discovery_header::REQUESTER_NF_INSTANCE_ID, "amf-instance-7")
+            .with_header(discovery_header::SERVICE_NAMES, "nudm-uecm");
+        if let Some(cca) = cca {
+            request = request.with_header(custom_header::CLIENT_CREDENTIALS, cca);
+        }
+        if let Some(scope) = access_scope {
+            request = request.with_header(custom_header::ACCESS_SCOPE, scope);
+        }
+        request
+    }
+
+    /// A CCA-shaped value. Only its opacity matters here: the SCP must forward
+    /// it verbatim to the NRF, not interpret it.
+    const CONSUMER_CCA: &str = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbWYtaW5zdGFuY2UtNyJ9.c2lnbmF0dXJl";
+
+    /// #101 criterion 2: when the consumer attests itself with its own CCA, the
+    /// delegated token request must name the CONSUMER — not `nextgcore-scp` /
+    /// `NfType::Scp` — and must forward that CCA so the NRF can verify it
+    /// against the consumer's registered key (TS 33.501 §13.4.1.3.2).
+    #[tokio::test]
+    async fn delegated_token_asserts_the_consumer_identity_when_the_consumer_attests_it() {
+        let (producer_port, nrf_port, scp_port) =
+            (ephemeral_port(), ephemeral_port(), ephemeral_port());
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let producer = start_header_echo_producer(producer_port).await;
+        let nrf =
+            start_recording_nrf(nrf_port, producer_port, "consumer-token", bodies.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                nf_instance_id: Some("scp-instance-1".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let response = fast_client(scp_port)
+            .send_request(model_d_request(Some(CONSUMER_CCA), None))
+            .await
+            .expect("model D roundtrip");
+        assert_eq!(response.status, 200);
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 1, "exactly one token request");
+        let body = &bodies[0];
+        assert!(
+            body.contains("nfInstanceId=amf-instance-7"),
+            "token must be minted for the consumer, got: {body}"
+        );
+        assert!(
+            body.contains("nfType=AMF"),
+            "token nfType must be the consumer's, got: {body}"
+        );
+        assert!(
+            !body.contains("scp-instance-1") && !body.contains("nfType=SCP"),
+            "the SCP must not name itself once the consumer is attested, got: {body}"
+        );
+        // The consumer's assertion is forwarded verbatim (percent-encoded).
+        assert!(
+            body.contains("cca=eyJhbGciOiJFUzI1NiJ9"),
+            "the consumer's CCA must be forwarded, got: {body}"
+        );
+
+        // The CCA authenticates to the NRF only; it must not reach the producer.
+        let echoed: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(echoed["authorization"], "Bearer consumer-token");
+        assert_eq!(
+            echoed["cca_leaked"], false,
+            "3gpp-Sbi-Client-Credentials must not be relayed to the producer"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// The other half of the rule, and the reason a blind feature flag would be
+    /// wrong: with no consumer CCA the SCP cannot attest the consumer's
+    /// identity, so it must name ITSELF rather than assert an identity it
+    /// cannot prove. Naming the consumer here would be rejected by our own NRF
+    /// after #64, because the CCA we can sign has `sub` = the SCP.
+    #[tokio::test]
+    async fn delegated_token_stays_scp_attested_without_a_consumer_cca() {
+        let (producer_port, nrf_port, scp_port) =
+            (ephemeral_port(), ephemeral_port(), ephemeral_port());
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let producer = start_header_echo_producer(producer_port).await;
+        let nrf = start_recording_nrf(nrf_port, producer_port, "scp-token", bodies.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                nf_instance_id: Some("scp-instance-1".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let response = fast_client(scp_port)
+            .send_request(model_d_request(None, None))
+            .await
+            .expect("model D roundtrip");
+        assert_eq!(response.status, 200);
+
+        let bodies = bodies.lock().await;
+        let body = &bodies[0];
+        assert!(
+            body.contains("nfInstanceId=scp-instance-1") && body.contains("nfType=SCP"),
+            "an unattestable consumer must leave the token SCP-attested, got: {body}"
+        );
+        assert!(
+            !body.contains("amf-instance-7"),
+            "the consumer's identity must not be asserted unattested, got: {body}"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// The operator escape hatch for an NRF that does not require client
+    /// authentication: assert the consumer's identity with no assertion.
+    #[tokio::test]
+    async fn trust_requester_identity_asserts_the_consumer_without_a_cca() {
+        let (producer_port, nrf_port, scp_port) =
+            (ephemeral_port(), ephemeral_port(), ephemeral_port());
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let producer = start_header_echo_producer(producer_port).await;
+        let nrf = start_recording_nrf(nrf_port, producer_port, "tok", bodies.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                nf_instance_id: Some("scp-instance-1".into()),
+                trust_requester_identity: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let response = fast_client(scp_port)
+            .send_request(model_d_request(None, None))
+            .await
+            .expect("model D roundtrip");
+        assert_eq!(response.status, 200);
+
+        let bodies = bodies.lock().await;
+        let body = &bodies[0];
+        assert!(
+            body.contains("nfInstanceId=amf-instance-7") && body.contains("nfType=AMF"),
+            "the declared-trust path must assert the consumer, got: {body}"
+        );
+        assert!(
+            !body.contains("cca="),
+            "no assertion exists to send, so none must be fabricated, got: {body}"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// #101 criterion 3: `3gpp-Sbi-Access-Scope` names the scope the consumer
+    /// needs, and it must win over the scope derived from the request URI's
+    /// service name. Here the URI says `nudm-uecm` and the header says
+    /// `nudm-sdm`, so only reading the header can produce the right token.
+    #[tokio::test]
+    async fn access_scope_header_sets_the_delegated_token_scope() {
+        let (producer_port, nrf_port, scp_port) =
+            (ephemeral_port(), ephemeral_port(), ephemeral_port());
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let producer = start_header_echo_producer(producer_port).await;
+        let nrf = start_recording_nrf(nrf_port, producer_port, "tok", bodies.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                nf_instance_id: Some("scp-instance-1".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let response = fast_client(scp_port)
+            .send_request(model_d_request(Some(CONSUMER_CCA), Some("nudm-sdm")))
+            .await
+            .expect("model D roundtrip");
+        assert_eq!(response.status, 200);
+
+        let bodies = bodies.lock().await;
+        let body = &bodies[0];
+        assert!(
+            body.contains("scope=nudm-sdm"),
+            "Access-Scope must set the token scope, got: {body}"
+        );
+        assert!(
+            !body.contains("scope=nudm-uecm"),
+            "the URI-derived scope must not win over an explicit Access-Scope, got: {body}"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// #101 criterion 4, end to end: two different consumers of the SAME
+    /// (target, scope) must each cause their OWN token request. Before the
+    /// cache key gained its consumer component the second consumer silently
+    /// reused the first's token — one consumer receiving another's
+    /// authorisation at the producer.
+    #[tokio::test]
+    async fn two_consumers_of_one_target_scope_each_get_their_own_token() {
+        let (producer_port, nrf_port, scp_port) =
+            (ephemeral_port(), ephemeral_port(), ephemeral_port());
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let producer = start_header_echo_producer(producer_port).await;
+        let nrf = start_recording_nrf(nrf_port, producer_port, "tok", bodies.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                nf_instance_id: Some("scp-instance-1".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let client = fast_client(scp_port);
+        // Consumer A, attested.
+        let first = model_d_request(Some(CONSUMER_CCA), None);
+        assert_eq!(client.send_request(first).await.expect("A").status, 200);
+        // Consumer B: same target and scope, different identity and assertion.
+        let second = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_body(r#"{"smf":"reg"}"#, "application/json")
+            .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+            .with_header(discovery_header::REQUESTER_NF_TYPE, "SMF")
+            .with_header(discovery_header::REQUESTER_NF_INSTANCE_ID, "smf-instance-9")
+            .with_header(discovery_header::SERVICE_NAMES, "nudm-uecm")
+            .with_header(
+                custom_header::CLIENT_CREDENTIALS,
+                "eyJhbGciOiJFUzI1NiJ9.c21m.c2ln",
+            );
+        assert_eq!(client.send_request(second).await.expect("B").status, 200);
+
+        let bodies = bodies.lock().await;
+        assert_eq!(
+            bodies.len(),
+            2,
+            "each consumer must trigger its own token request, got: {bodies:?}"
+        );
+        assert!(bodies
+            .iter()
+            .any(|b| b.contains("nfInstanceId=amf-instance-7")));
+        assert!(bodies
+            .iter()
+            .any(|b| b.contains("nfInstanceId=smf-instance-9")));
 
         scp.stop().await.expect("scp stop");
         nrf.stop().await.expect("nrf stop");

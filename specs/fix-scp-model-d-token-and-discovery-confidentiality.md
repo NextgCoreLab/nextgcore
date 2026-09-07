@@ -3,9 +3,10 @@
 Verified against `main` @ `8c15bb6`. The issue's cites are from `76ea248`; all four were
 re-verified and all four still hold, at new line numbers.
 
-`Refs #101`, **not Closes** — see "Scope actually shipped" below. This ships criterion 1,
-the discovery-encoding hard breaker. Criteria 2–4 and defects 3–7 remain open on #101, with
-the design for 2–4 recorded here so it need not be re-derived.
+**Two passes.** Pass 1 (`Refs #101`) shipped criterion 1, the discovery-encoding hard breaker;
+it is documented below. Pass 2 (`Closes #101`) ships criteria 2, 3 and 4 — the delegated token
+identity, scope and per-consumer cache — and files defects 3–7 as #207–#211. See "Pass 2" at
+the end.
 
 ## Verified against current main
 
@@ -176,3 +177,118 @@ is the peer whose rejection motivated the issue. CI skips Docker E2E.
 * **#101 remains open** for criteria 2-4, with the design in Decisions 2 and 3 above. The
   open count deliberately does not move.
 * Defects 3-7 still to be filed as separate issues per the issue's own instruction.
+
+---
+
+# Pass 2 (`Closes #101`): criteria 2, 3 and 4
+
+Verified against `main` @ `562b4a1`. Decisions 2 and 3 above were implemented as written; two of
+their stated premises turned out to be wrong, and both corrections are recorded here rather than
+left for the next reader to trip over.
+
+## Correction 1: the blast radius was 2 direct callers, not ~15
+
+Decision 3 justified adding a method by "`OAuth2Client::get_token` is used by ~15 NFs". The real
+count is **2** direct callers outside `oauth.rs` (`scpd/proxy.rs` and `sbi/client.rs`); 13 crates
+reach it *indirectly* through `SbiClient::with_oauth2`. The decision still stands — a new method
+keeps the non-delegated path unchanged **by construction** rather than by review, which is worth
+more than the call-count argument it was justified with — but the number was wrong.
+
+## Correction 2: `forward()` was already acquiring the token, so this was not a restructure
+
+Pass 1 recorded the blocker as: `with_oauth2` "attaches the token automatically and has no
+per-request hook, so a consumer-scoped token requires the delegated path to acquire and attach
+the token itself, bypassing that integration. That is a restructure of `forward()`."
+
+`forward()` **already** acquired the token itself, to prime the cache so L1's attach step would
+not make a second NRF round-trip. And L1 attaches only when the request carries no
+`Authorization` (`client.rs:596`). So the seam already existed: `forward()` sets the
+`Authorization` header from the consumer-scoped token, and L1's attach becomes a no-op **by
+construction** rather than by ordering luck. No restructure — roughly thirty lines.
+
+This is worth noting as a pattern: the blocker recorded at the end of a long session was a
+plausible reading of the code that one more look disconfirmed. It cost a session's hesitation.
+
+## What shipped
+
+**Criterion 2 — identity, per Decision 2's three-way rule.** `TokenConsumer { nf_instance_id,
+nf_type, cca }` names who a token is for. `request_token_on_behalf_of` chooses the CCA by **who
+the body names**, which is the load-bearing detail: the consumer's own CCA when it supplied one;
+our key when the body names us; and **no assertion** when the body names a third party who gave
+us nothing — because `build_cca` mints `sub` = `self.nf_instance_id`, so signing there would emit
+a CCA whose subject contradicts the body. That is worse than sending none: it is a verifiable
+proof of the wrong claim.
+
+`ScpProxy::delegated_auth` resolves the three cases and logs case 3, so an operator can tell an
+SCP-attested token from a consumer-attested one. `trust_requester_identity` (default off) is the
+operator declaration for an NRF that does not require client authentication.
+
+One asymmetry found while implementing: `requester-nf-type` is mandatory for delegated discovery
+but `requester-nf-instance-id` is **optional**, so a consumer can be typed without being named. An
+unnamed consumer cannot be asserted at all and falls to case 3 regardless of any CCA.
+
+**Criterion 3 — scope and CCA.** `3gpp-Sbi-Access-Scope` now sets the token scope, winning over
+the URI-derived service name. Both constants already existed in `constants.rs` with **zero**
+readers — `CLIENT_CREDENTIALS` and `ACCESS_SCOPE` — the same dead-constant shape as
+`3gpp-Sbi-Callback` (now #210). The consumer's CCA is stripped from the forwarded request: it
+authenticates to the NRF's token endpoint and is not a producer-facing credential.
+
+**Criterion 4 — cache.** `CacheKey` becomes `(consumer, target_nf_type, scope)`. For an ordinary
+NF the consumer is always itself, so the key gains a constant component and caching is
+behaviour-identical. `invalidate` replaces the retry path's `clear_cache`, because one consumer's
+401 should not re-mint the whole fleet's tokens.
+
+## Verification
+
+Seven new tests. Workspace **5735 passed / 0 failed** (was 5728), `cargo test --workspace` exit 0,
+checked for `^error` rather than only a `test result:` line. `cargo fmt --all --check` clean;
+`cargo clippy --workspace` (the CI gate) exit 0.
+
+**Revert-verified**, one at a time. Revert A reproduces the original defect body verbatim:
+
+| revert | test that fails | observed wrong value |
+|---|---|---|
+| token names the SCP again | `delegated_token_asserts_the_consumer_identity_when_the_consumer_attests_it` | `nfInstanceId=scp-instance-1&nfType=SCP` |
+| treat a missing CCA as trusted | `delegated_token_stays_scp_attested_without_a_consumer_cca` | consumer asserted unattested |
+| mint our own CCA for a third party | (same as A) | consumer's CCA absent |
+| ignore `Access-Scope` | `access_scope_header_sets_the_delegated_token_scope` | `scope=nudm-uecm` |
+| consumer-agnostic cache key | `two_consumers_of_one_target_scope_each_get_their_own_token` (+ the `oauth` unit test) | 1 token request for 2 consumers |
+| relay the CCA onward | (same as A) | `cca_leaked: true` |
+| let L1 attach instead | (same as A) | a second, SCP-identity token request |
+
+The scope test is built so that only reading the header can pass it: the URI says `nudm-uecm`
+and the header says `nudm-sdm`. The protected-identity tests likewise assert on the **absence**
+of `scp-instance-1` *and* the presence of the consumer, so a change that emits both cannot pass.
+
+**Not verified:**
+
+* No conformant external NRF was involved. The token request body is asserted against a mock NRF
+  that records it — the same ceiling pass 1 recorded, and the reason #101 needed an external NRF
+  to surface at all. In particular **case 1 has never been exercised against an NRF that actually
+  verifies a consumer CCA**: the mock accepts any body, so what is proven is that the SCP *sends*
+  the consumer's identity and assertion, not that a real NRF accepts them.
+* `build_cca` returns `None` unless a signing key is configured, and the tests configure none, so
+  the "our key, our identity" arm is covered only by the third-party-identity path.
+* Docker E2E remains skipped by CI.
+* GitNexus impact analysis, mandated by this repo's CLAUDE.md, was **not run** — no GitNexus MCP
+  server was connected. Caller analysis was grep-based: 2 direct `get_token` callers, 13
+  `with_oauth2` crates, `TokenCache` only re-exported and never used outside `oauth.rs`.
+
+## Defects 3-7, now filed
+
+* **#207** — producer `NFService` selected without matching service name or API version; no `INVALID_API`.
+* **#208** — relay drops `nfSetId`/`nfGroupId` on a cache hit, overwrites `Producer-Id`, no `Target-apiRoot`/`Location` absolutisation.
+* **#209** — no alternate-producer reselection; connection-refused returns 502 not 504.
+* **#210** — `3gpp-Sbi-Callback` never inspected.
+* **#211** — NRF-unreachable / NRF-error / empty-`SearchResult` all collapse to 502, and an unreachable NRF reports `TARGET_NF_NOT_REACHABLE`.
+
+Count arithmetic, honestly: closing #101 while filing five follow-ups moves the open count the
+**wrong way**. Pass 1 predicted 61 → 65; the actual backlog is larger now, so quote both numbers
+when reporting rather than the issues-closed figure alone.
+
+## Definition of done (pass 2)
+
+- [x] Delegated token request carries the consumer's identity when attestable
+- [x] `3gpp-Sbi-Access-Scope` populated; consumer CCA forwarded to the NRF and stripped from the producer request
+- [x] `TokenCache` keyed by consumer; invalidation scoped to one consumer
+- [x] Defects 3-7 filed as #207-#211

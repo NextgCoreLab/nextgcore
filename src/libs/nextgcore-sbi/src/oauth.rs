@@ -473,13 +473,60 @@ impl CachedToken {
     }
 }
 
-/// Cache key for tokens: (target_nf_type_str, scope).
-type CacheKey = (String, String);
+/// The NF on whose behalf an access token is requested.
+///
+/// For an ordinary NF this is always itself, and [`OAuth2Client::get_token`]
+/// supplies it implicitly. It is a distinct concept only on the SCP's Model D
+/// delegated path (TS 33.501 §13.4.1.3.2), where the SCP requests a token *for
+/// the NF Service Consumer that sent the request* — so the token's subject and
+/// `nfType` must be the consumer's, not the SCP's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenConsumer {
+    /// `nfInstanceId` asserted in the token request.
+    pub nf_instance_id: String,
+    /// `nfType` asserted in the token request.
+    pub nf_type: NfType,
+    /// The consumer's OWN Client Credentials Assertion, when it supplied one
+    /// (conveyed to the SCP in `3gpp-Sbi-Client-Credentials`).
+    ///
+    /// This field is what makes asserting somebody else's identity legitimate:
+    /// the NRF verifies the assertion against the **consumer's** registered
+    /// key, so the `nfInstanceId` in the body is attested by the party it names.
+    /// Signing that body with our own key instead would produce a CCA whose
+    /// `sub` disagrees with the body, which a conformant NRF rejects — see
+    /// [`OAuth2Client::request_token_on_behalf_of`].
+    pub cca: Option<String>,
+}
+
+impl TokenConsumer {
+    /// A consumer identified by instance id and type, with no assertion.
+    pub fn new(nf_instance_id: impl Into<String>, nf_type: NfType) -> Self {
+        Self {
+            nf_instance_id: nf_instance_id.into(),
+            nf_type,
+            cca: None,
+        }
+    }
+
+    /// Attach the consumer's own CCA (TS 29.500 `3gpp-Sbi-Client-Credentials`).
+    pub fn with_cca(mut self, cca: impl Into<String>) -> Self {
+        self.cca = Some(cca.into());
+        self
+    }
+}
+
+/// Cache key for tokens: (consumer_nf_instance_id, target_nf_type_str, scope).
+///
+/// The consumer component exists so a token minted for one consumer is never
+/// replayed for another (nextgcore #101 criterion 4). For an ordinary NF the
+/// consumer is always itself, so the key gains a constant component and caching
+/// behaves exactly as it did before — a behaviour-preserving generalisation.
+type CacheKey = (String, String, String);
 
 /// OAuth2 token cache with automatic expiry.
 ///
-/// Caches access tokens keyed by `(target_nf_type, scope)` so repeated
-/// requests to the same service reuse the token until it expires.
+/// Caches access tokens keyed by `(consumer, target_nf_type, scope)` so
+/// repeated requests to the same service reuse the token until it expires.
 pub struct TokenCache {
     tokens: RwLock<HashMap<CacheKey, CachedToken>>,
 }
@@ -491,9 +538,22 @@ impl TokenCache {
         }
     }
 
+    fn key(consumer_id: &str, target_nf_type: NfType, scope: &str) -> CacheKey {
+        (
+            consumer_id.to_string(),
+            target_nf_type.to_str().to_string(),
+            scope.to_string(),
+        )
+    }
+
     /// Retrieve a non-expired cached token for the given key.
-    pub async fn get(&self, target_nf_type: NfType, scope: &str) -> Option<AccessTokenResponse> {
-        let key = (target_nf_type.to_str().to_string(), scope.to_string());
+    pub async fn get(
+        &self,
+        consumer_id: &str,
+        target_nf_type: NfType,
+        scope: &str,
+    ) -> Option<AccessTokenResponse> {
+        let key = Self::key(consumer_id, target_nf_type, scope);
         let tokens = self.tokens.read().await;
         tokens.get(&key).and_then(|cached| {
             if cached.is_expired() {
@@ -505,14 +565,30 @@ impl TokenCache {
     }
 
     /// Store a token in the cache.
-    pub async fn put(&self, target_nf_type: NfType, scope: &str, response: AccessTokenResponse) {
-        let key = (target_nf_type.to_str().to_string(), scope.to_string());
+    pub async fn put(
+        &self,
+        consumer_id: &str,
+        target_nf_type: NfType,
+        scope: &str,
+        response: AccessTokenResponse,
+    ) {
+        let key = Self::key(consumer_id, target_nf_type, scope);
         let cached = CachedToken {
             response,
             obtained_at: Instant::now(),
         };
         let mut tokens = self.tokens.write().await;
         tokens.insert(key, cached);
+    }
+
+    /// Drop one consumer's token for one target/scope, leaving every other
+    /// consumer's tokens intact. Used when a producer refuses a token: the
+    /// refusal concerns that consumer, so evicting the whole cache would make
+    /// one consumer's rejection re-mint tokens for all of them.
+    pub async fn invalidate(&self, consumer_id: &str, target_nf_type: NfType, scope: &str) {
+        let key = Self::key(consumer_id, target_nf_type, scope);
+        let mut tokens = self.tokens.write().await;
+        tokens.remove(&key);
     }
 
     /// Remove expired entries from the cache.
@@ -978,19 +1054,65 @@ impl OAuth2Client {
     /// Returns a cached token if available and not expired, otherwise
     /// requests a new one from the NRF.
     pub async fn get_token(&self, target_nf_type: NfType, scope: &str) -> SbiResult<String> {
+        self.get_token_on_behalf_of(&self.self_consumer(), target_nf_type, scope)
+            .await
+    }
+
+    /// This client's own identity as a token consumer.
+    pub fn self_consumer(&self) -> TokenConsumer {
+        TokenConsumer::new(&self.nf_instance_id, self.nf_type)
+    }
+
+    /// Get a valid access token **for another NF**, as the SCP does on the
+    /// Model D delegated path (TS 33.501 §13.4.1.3.2).
+    ///
+    /// A separate method rather than a widened [`OAuth2Client::get_token`]: 13
+    /// NFs reach `get_token` indirectly through
+    /// [`crate::client::SbiClient::with_oauth2`], and this keeps the
+    /// non-delegated path unchanged by construction rather than by review.
+    ///
+    /// The token is cached per consumer, so one consumer's token is never
+    /// replayed for another.
+    pub async fn get_token_on_behalf_of(
+        &self,
+        consumer: &TokenConsumer,
+        target_nf_type: NfType,
+        scope: &str,
+    ) -> SbiResult<String> {
         // Check cache first
-        if let Some(cached) = self.cache.get(target_nf_type, scope).await {
+        if let Some(cached) = self
+            .cache
+            .get(&consumer.nf_instance_id, target_nf_type, scope)
+            .await
+        {
             return Ok(cached.access_token);
         }
 
         // Request new token from NRF
-        let response = self.request_token(target_nf_type, scope).await?;
+        let response = self
+            .request_token_on_behalf_of(consumer, target_nf_type, scope)
+            .await?;
         let token = response.access_token.clone();
 
         // Cache it
-        self.cache.put(target_nf_type, scope, response).await;
+        self.cache
+            .put(&consumer.nf_instance_id, target_nf_type, scope, response)
+            .await;
 
         Ok(token)
+    }
+
+    /// Drop one consumer's cached token for a target/scope. See
+    /// [`TokenCache::invalidate`].
+    pub async fn invalidate_token(
+        &self,
+        consumer: &TokenConsumer,
+        target_nf_type: NfType,
+        scope: &str,
+    ) {
+        self.cache
+            .invalidate(&consumer.nf_instance_id, target_nf_type, scope)
+            .await;
     }
 
     /// Request a new access token from the NRF.
@@ -999,12 +1121,45 @@ impl OAuth2Client {
         target_nf_type: NfType,
         scope: &str,
     ) -> SbiResult<AccessTokenResponse> {
-        let mut request =
-            AccessTokenRequest::new(&self.nf_instance_id, self.nf_type, target_nf_type, scope);
+        self.request_token_on_behalf_of(&self.self_consumer(), target_nf_type, scope)
+            .await
+    }
+
+    /// Request a new access token from the NRF naming `consumer` as the
+    /// requesting NF.
+    ///
+    /// **Never assert an identity you cannot attest.** The CCA is chosen by who
+    /// the body names, not by what key happens to be loaded:
+    ///
+    /// * the consumer supplied its own CCA → forward it, because the NRF can
+    ///   verify it against that consumer's registered key (TS 33.501
+    ///   §13.4.1.3.2 conveys the consumer's CCA in Model D);
+    /// * the body names *us* → sign with our own key, as before;
+    /// * the body names a third party and they gave us no assertion → send
+    ///   **no** assertion. [`OAuth2Client::build_cca`] mints `sub` =
+    ///   `self.nf_instance_id`, so signing here would emit a CCA whose subject
+    ///   contradicts the `nfInstanceId` in the body — worse than sending none,
+    ///   because it presents a verifiable proof of the wrong claim.
+    pub async fn request_token_on_behalf_of(
+        &self,
+        consumer: &TokenConsumer,
+        target_nf_type: NfType,
+        scope: &str,
+    ) -> SbiResult<AccessTokenResponse> {
+        let mut request = AccessTokenRequest::new(
+            &consumer.nf_instance_id,
+            consumer.nf_type,
+            target_nf_type,
+            scope,
+        );
         // Issue #64 gaps 1+2: authenticate this NF to the token endpoint. Absent
         // a CCA (and absent a client certificate the NRF can see) the NRF has
         // only the self-asserted nfInstanceId in the body to go on.
-        request.cca = self.build_cca();
+        request.cca = match consumer.cca.clone() {
+            Some(consumer_cca) => Some(consumer_cca),
+            None if consumer.nf_instance_id == self.nf_instance_id => self.build_cca(),
+            None => None,
+        };
 
         let body = request.to_form_body();
         // sbi-06/I4: the resource path is configurable; the process-wide
@@ -1670,48 +1825,139 @@ mod tests {
         assert!(decode_jwt_parts("a.b").is_err());
     }
 
+    /// A token response with the given access token, for cache tests.
+    fn token_response(access_token: &str, scope: Option<&str>) -> AccessTokenResponse {
+        AccessTokenResponse {
+            access_token: access_token.to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: Some(3600),
+            scope: scope.map(str::to_string),
+        }
+    }
+
     #[tokio::test]
     async fn test_token_cache_basic() {
         let cache = TokenCache::new();
+        let consumer = "amf-1";
 
         // Nothing cached yet
-        assert!(cache.get(NfType::Smf, "nsmf-pdusession").await.is_none());
+        assert!(cache
+            .get(consumer, NfType::Smf, "nsmf-pdusession")
+            .await
+            .is_none());
 
         // Store a token
-        let response = AccessTokenResponse {
-            access_token: "cached-token".to_string(),
-            token_type: "Bearer".to_string(),
-            expires_in: Some(3600),
-            scope: Some("nsmf-pdusession".to_string()),
-        };
+        let response = token_response("cached-token", Some("nsmf-pdusession"));
         cache
-            .put(NfType::Smf, "nsmf-pdusession", response.clone())
+            .put(consumer, NfType::Smf, "nsmf-pdusession", response.clone())
             .await;
 
         // Should be retrievable
-        let cached = cache.get(NfType::Smf, "nsmf-pdusession").await;
+        let cached = cache.get(consumer, NfType::Smf, "nsmf-pdusession").await;
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().access_token, "cached-token");
 
-        // Different key should miss
-        assert!(cache.get(NfType::Amf, "nsmf-pdusession").await.is_none());
-        assert!(cache.get(NfType::Smf, "other-scope").await.is_none());
+        // Different key should miss — on any of the three components
+        assert!(cache
+            .get(consumer, NfType::Amf, "nsmf-pdusession")
+            .await
+            .is_none());
+        assert!(cache
+            .get(consumer, NfType::Smf, "other-scope")
+            .await
+            .is_none());
+        assert!(cache
+            .get("smf-9", NfType::Smf, "nsmf-pdusession")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
     async fn test_token_cache_clear() {
         let cache = TokenCache::new();
-        let response = AccessTokenResponse {
-            access_token: "token".to_string(),
-            token_type: "Bearer".to_string(),
-            expires_in: Some(3600),
-            scope: None,
-        };
-        cache.put(NfType::Smf, "scope", response).await;
-        assert!(cache.get(NfType::Smf, "scope").await.is_some());
+        cache
+            .put("amf-1", NfType::Smf, "scope", token_response("token", None))
+            .await;
+        assert!(cache.get("amf-1", NfType::Smf, "scope").await.is_some());
 
         cache.clear().await;
-        assert!(cache.get(NfType::Smf, "scope").await.is_none());
+        assert!(cache.get("amf-1", NfType::Smf, "scope").await.is_none());
+    }
+
+    /// nextgcore #101 criterion 4: two distinct consumers of the SAME
+    /// (target, scope) must hold two distinct tokens, not share one. Before the
+    /// key gained its consumer component, the second `get` here returned the
+    /// FIRST consumer's token — which is how one consumer received another's
+    /// authorisation scope at the producer.
+    #[tokio::test]
+    async fn two_consumers_of_one_target_scope_do_not_share_a_token() {
+        let cache = TokenCache::new();
+        let (target, scope) = (NfType::Udm, "nudm-sdm");
+
+        cache
+            .put(
+                "amf-1",
+                target,
+                scope,
+                token_response("token-for-amf", None),
+            )
+            .await;
+        cache
+            .put(
+                "smf-2",
+                target,
+                scope,
+                token_response("token-for-smf", None),
+            )
+            .await;
+
+        assert_eq!(
+            cache
+                .get("amf-1", target, scope)
+                .await
+                .unwrap()
+                .access_token,
+            "token-for-amf"
+        );
+        assert_eq!(
+            cache
+                .get("smf-2", target, scope)
+                .await
+                .unwrap()
+                .access_token,
+            "token-for-smf"
+        );
+
+        // A third consumer gets nothing rather than inheriting either token.
+        assert!(cache.get("pcf-3", target, scope).await.is_none());
+    }
+
+    /// Invalidating one consumer's token must leave every other consumer's
+    /// intact: a producer refusing one consumer's token says nothing about the
+    /// others, and evicting all of them would re-mint the whole fleet's tokens
+    /// on a single 401.
+    #[tokio::test]
+    async fn invalidate_is_scoped_to_one_consumer() {
+        let cache = TokenCache::new();
+        let (target, scope) = (NfType::Udm, "nudm-sdm");
+        cache
+            .put("amf-1", target, scope, token_response("a", None))
+            .await;
+        cache
+            .put("smf-2", target, scope, token_response("b", None))
+            .await;
+
+        cache.invalidate("amf-1", target, scope).await;
+
+        assert!(cache.get("amf-1", target, scope).await.is_none());
+        assert_eq!(
+            cache
+                .get("smf-2", target, scope)
+                .await
+                .unwrap()
+                .access_token,
+            "b"
+        );
     }
 
     #[test]
