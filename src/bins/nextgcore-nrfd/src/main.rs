@@ -947,6 +947,16 @@ async fn nrf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         return rejection;
     }
 
+    // Nnrf_Bootstrapping (TS 29.510 §5.5) is served at `{apiRoot}/bootstrapping`
+    // with NO service/version prefix, so it must be matched before the
+    // three-segment guard below — which is exactly why it used to 404.
+    if parts.first() == Some(&"bootstrapping") && parts.len() == 1 {
+        return match method {
+            "GET" => handle_bootstrapping(&request),
+            _ => send_method_not_allowed(method, uri),
+        };
+    }
+
     // Route based on service and resource
     // Expected paths:
     // - /nnrf-nfm/v1/nf-instances/{nfInstanceId}
@@ -1026,6 +1036,19 @@ async fn nrf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     }
 }
 
+/// The `NotificationEventType` a `PUT /nf-instances/{id}` must be notified as.
+///
+/// TS 29.510 §5.2.2.3.1A / §5.2.2.3.2: a first registration is `NF_REGISTERED`;
+/// a complete replacement of a profile that already exists is
+/// `NF_PROFILE_CHANGED`.
+fn registration_notification_event(is_new: bool) -> NotificationEventType {
+    if is_new {
+        NotificationEventType::NfRegistered
+    } else {
+        NotificationEventType::NfProfileChanged
+    }
+}
+
 /// Handle NF Register request
 async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("NF Register: {nf_instance_id}");
@@ -1100,18 +1123,26 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
                 "Heartbeat timer started for NF {nf_instance_id} ({expiry_secs} seconds, 2x {hb}s interval)"
             );
 
-            // Send NF status notifications to all matching subscribers
+            // Send NF status notifications to all matching subscribers.
+            //
+            // TS 29.510 §5.2.2.3.1A: a PUT that COMPLETELY REPLACES an existing
+            // profile is a change, not an appearance, and must be notified as
+            // NF_PROFILE_CHANGED. Emitting NF_REGISTERED for a replacement tells
+            // every subscriber a producer just appeared that has in fact been
+            // registered all along — which is what a consumer's
+            // "new NF available" handling keys on.
+            let event = registration_notification_event(is_new);
             let notify_profile = nf_profile.clone();
             let server_uri = nrf_self_uri().to_string();
             tokio::spawn(async move {
                 if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
-                    NotificationEventType::NfRegistered,
+                    event,
                     &notify_profile,
                     &server_uri,
                 )
                 .await
                 {
-                    log::error!("Failed to send NF_REGISTERED notifications: {e}");
+                    log::error!("Failed to send {} notifications: {e}", event.as_str());
                 }
             });
 
@@ -1478,26 +1509,247 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
+/// The `3gppHal+json` media type the NF-instance collection is served as
+/// (TS 29.510 §6.1.3.2.3.1).
+const HAL_JSON_CONTENT_TYPE: &str = "application/3gppHal+json";
+
 /// Handle NF List Retrieval request
-async fn handle_nf_list_retrieval(_request: &SbiRequest) -> SbiResponse {
+///
+/// TS 29.510 §6.1.3.2.3.1: `GET /nf-instances` returns a `UriList` in
+/// `application/3gppHal+json`, whose `_links` members are `LinksValueSchema`
+/// values — i.e. `{ "href": ... }` objects, or arrays of them — and it applies
+/// the `nf-type`, `limit` and `page` query parameters.
+///
+/// Three things were wrong and all three were invisible to a lenient client:
+/// the media type was plain `application/json`; `_links` carried bare strings
+/// under a mis-spelled `items` member (the schema names it `item`); and the
+/// query parameters were ignored outright — the request was bound as `_request`
+/// — so a consumer paging through a large registry silently received the whole
+/// list on every page.
+async fn handle_nf_list_retrieval(request: &SbiRequest) -> SbiResponse {
     log::debug!("NF List Retrieval");
+
+    let params = query_params(&request.header.uri);
+    let param = |name: &str| {
+        params
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+
+    // `nf-type` filters the collection; an unparseable `limit`/`page` is a 400
+    // rather than a silently-ignored parameter, since ignoring it returns a page
+    // the consumer did not ask for and cannot detect.
+    let nf_type_filter = param("nf-type");
+    let limit = match param("limit") {
+        Some(text) => match text.parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                return send_bad_request(
+                    &format!("limit {text:?} must be a positive integer"),
+                    Some("MANDATORY_IE_INCORRECT"),
+                )
+            }
+        },
+        None => None,
+    };
+    let page = match param("page") {
+        Some(text) => match text.parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                return send_bad_request(
+                    &format!("page {text:?} must be a positive integer (pages are 1-based)"),
+                    Some("MANDATORY_IE_INCORRECT"),
+                )
+            }
+        },
+        None => None,
+    };
+    if page.is_some() && limit.is_none() {
+        return send_bad_request(
+            "page requires limit: a page number is meaningless without a page size",
+            Some("MANDATORY_IE_INCORRECT"),
+        );
+    }
 
     let manager = nf_manager();
 
-    let instances: Vec<String> = manager
+    // Ordered by instance id so paging is stable: without a total order, two
+    // requests for page 2 can return different, overlapping sets from the same
+    // registry because the underlying map iterates arbitrarily.
+    let mut matched: Vec<String> = manager
         .list()
         .iter()
+        .filter(|p| nf_type_filter.is_none_or(|want| p.nf_type == want))
         .map(|p| p.nf_instance_id.clone())
         .collect();
+    matched.sort_unstable();
+
+    // `totalItemCount` counts everything the filter matched, not the page, so a
+    // consumer can tell how many pages remain.
+    let total_item_count = matched.len();
+
+    let page_items: Vec<String> = match (limit, page) {
+        (Some(limit), Some(page)) => matched
+            .into_iter()
+            .skip((page - 1) * limit)
+            .take(limit)
+            .collect(),
+        (Some(limit), None) => matched.into_iter().take(limit).collect(),
+        _ => matched,
+    };
+
+    let self_href = match (limit, page) {
+        (Some(limit), Some(page)) => {
+            format!("/nnrf-nfm/v1/nf-instances?limit={limit}&page={page}")
+        }
+        (Some(limit), None) => format!("/nnrf-nfm/v1/nf-instances?limit={limit}"),
+        _ => "/nnrf-nfm/v1/nf-instances".to_string(),
+    };
+
+    let body = serde_json::json!({
+        "_links": {
+            "self": { "href": self_href },
+            "item": page_items
+                .iter()
+                .map(|id| serde_json::json!({
+                    "href": format!("/nnrf-nfm/v1/nf-instances/{id}")
+                }))
+                .collect::<Vec<_>>(),
+        },
+        "totalItemCount": total_item_count,
+    });
 
     SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({
-            "_links": {
-                "self": "/nnrf-nfm/v1/nf-instances",
-                "items": instances.iter().map(|id| format!("/nnrf-nfm/v1/nf-instances/{id}")).collect::<Vec<_>>()
-            }
-        }))
+        .with_json_body(&body)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
+        .with_header("Content-Type", HAL_JSON_CONTENT_TYPE)
+}
+
+/// How long a `BootstrappingInfo` response may be cached, in seconds.
+///
+/// The document only changes when the NRF's own service surface or OAuth2
+/// posture changes, so a short cache is safe and keeps a fleet of consumers from
+/// re-fetching it on every start; the `ETag` lets a consumer revalidate cheaply.
+const BOOTSTRAPPING_MAX_AGE_SECS: u32 = 60;
+
+/// Handle `GET /bootstrapping` (TS 29.510 §5.5, `Nnrf_Bootstrapping`).
+///
+/// This service is how a consumer that knows only the NRF's authority learns
+/// where the NRF's services live and whether they need OAuth2 — before it holds
+/// a token. It was unrouted: the path has a single segment, so it never even
+/// reached the service match and fell out at the `parts.len() < 3` guard as a
+/// 404, leaving a consumer with no conformant way to discover the endpoints.
+///
+/// The service is optional per §5.5. It is nonetheless served unconditionally
+/// rather than behind a build feature or an off-by-default switch: it is
+/// read-only, it publishes only what an unauthenticated peer must be able to
+/// read for bootstrapping to mean anything, and a gate that defaults closed
+/// would leave the gap open for every deployment that did not know to flip it.
+/// `/bootstrapping` is outside `oauth2_protected_path`, so server-side OAuth2
+/// enforcement does not gate it even when enabled — which is required, since a
+/// consumer reads this document precisely to find the token endpoint.
+fn handle_bootstrapping(request: &SbiRequest) -> SbiResponse {
+    log::debug!("Bootstrapping Info Request");
+
+    let api_root = nrf_self_uri();
+    let policy = nrf_policy();
+
+    // Relation names are the registered types of TS 29.510 Table 6.4.6.3.3.1-1;
+    // hrefs are absolute, as that clause requires.
+    let body = serde_json::json!({
+        "status": "OPERATIVE",
+        "_links": {
+            "self": { "href": format!("{api_root}/bootstrapping") },
+            "manage": { "href": format!("{api_root}/nnrf-nfm/v1/nf-instances") },
+            "subscribe": { "href": format!("{api_root}/nnrf-nfm/v1/subscriptions") },
+            "discover": { "href": format!("{api_root}/nnrf-disc/v1/nf-instances") },
+            "authorize": { "href": format!("{api_root}/nnrf-oauth2/v1/access-token") },
+            "retrieve-key": { "href": format!("{api_root}/nnrf-oauth2/v1/jwks") },
+        },
+        // Keyed by NRF service name per §6.1.6.3.11. Reports the posture this
+        // NRF actually enforces (`require_oauth2_server`), so the answer cannot
+        // drift from behaviour the way a hardcoded value would.
+        "oauth2Required": {
+            "nnrf-nfm": policy.require_oauth2_server,
+            "nnrf-disc": policy.require_oauth2_server,
+        },
+        "nrfInstanceId": nrf_instance_id(),
+    });
+
+    let etag = format!("\"{:016x}\"", fnv1a64(&body.to_string()));
+
+    // RFC 9110 §13.1.2: a matching If-None-Match is answered 304 with no body.
+    // The Bootstrapping yaml lists If-None-Match as a parameter but does not
+    // enumerate a 304 response; the parameter has no other purpose, so the
+    // conditional is honoured rather than accepted and ignored.
+    if let Some(inm) = request.http.get_header("if-none-match") {
+        if if_none_match_matches(inm, &etag) {
+            return SbiResponse::with_status(304)
+                .with_header("ETag", &etag)
+                .with_header(
+                    "Cache-Control",
+                    format!("max-age={BOOTSTRAPPING_MAX_AGE_SECS}"),
+                );
+        }
+    }
+
+    SbiResponse::with_status(200)
+        .with_json_body(&body)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+        .with_header("Content-Type", HAL_JSON_CONTENT_TYPE)
+        .with_header("ETag", &etag)
+        .with_header(
+            "Cache-Control",
+            format!("max-age={BOOTSTRAPPING_MAX_AGE_SECS}"),
+        )
+}
+
+/// Does an `If-None-Match` header field match `etag`?
+///
+/// Handles the `*` form and a comma-separated list, and compares weak and strong
+/// forms of the same tag as equal (RFC 9110 §13.1.2 uses the weak comparison
+/// function for `If-None-Match`).
+fn if_none_match_matches(header: &str, etag: &str) -> bool {
+    let strip = |t: &str| t.trim().trim_start_matches("W/").to_string();
+    let want = strip(etag);
+    header
+        .split(',')
+        .any(|candidate| candidate.trim() == "*" || strip(candidate) == want)
+}
+
+/// FNV-1a (64-bit) over a string, for deriving a strong `ETag` from a response
+/// body without adding a hashing dependency.
+///
+/// Deliberately not `DefaultHasher`: that is documented as unstable across Rust
+/// releases, which would silently invalidate every cached bootstrapping document
+/// on a toolchain bump.
+fn fnv1a64(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Split a request URI's query string into decoded `(key, value)` pairs.
+///
+/// Percent-decoding is applied to both halves so an encoded `nf-type` still
+/// compares equal; `+` is left alone because these are path-style query values,
+/// not form encoding.
+fn query_params(uri: &str) -> Vec<(String, String)> {
+    let Some(query) = uri.split_once('?').map(|(_, q)| q) else {
+        return Vec::new();
+    };
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (percent_decode(k), percent_decode(v)),
+            None => (percent_decode(pair), String::new()),
+        })
+        .collect()
 }
 
 /// Handle Subscription Create request
@@ -1531,32 +1783,131 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
     // Generate subscription ID
     let subscription_id = uuid::Uuid::new_v4().to_string();
 
-    // Parse subscription condition
-    let subscr_cond =
-        subscription
-            .get("subscrCond")
-            .map(|cond| nextgcore_nrfd::nnrf_handler::SubscrCond {
-                nf_type: cond
-                    .get("nfType")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                service_name: cond
-                    .get("serviceName")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                nf_instance_id: cond
-                    .get("nfInstanceId")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-            });
+    // Parse the subscription condition (TS 29.510 §5.2.2.5.2 `SubscrCond`, a
+    // `oneOf` over 17 condition schemas).
+    //
+    // An unrecognised condition is a 400, NOT an unconditional subscription.
+    // This is the crux of the fix: the previous parse read three fields out of
+    // whatever object arrived, so a conformant `NfSetCond` or `AmfCond` produced
+    // a condition with no criteria at all — and a criteria-less condition
+    // matched every NF in the registry, flooding the subscriber with
+    // notifications it never asked for.
+    let subscr_cond = match subscription.get("subscrCond") {
+        Some(cond) => match nextgcore_nrfd::nnrf_handler::SubscrCond::from_json(cond) {
+            Some(parsed) => {
+                // A recognised variant whose criteria this NRF cannot evaluate
+                // is refused too. Accepting it would leave only bad options:
+                // notify for every NF, or for none — both silent, and both worse
+                // than a refusal the consumer can act on.
+                if let Some(unsupported) = parsed.unsupported_criterion() {
+                    return send_bad_request(
+                        &format!(
+                            "subscrCond criterion {:?} is not supported: {}",
+                            unsupported.criterion, unsupported.reason
+                        ),
+                        Some("SUBSCR_COND_NOT_SUPPORTED"),
+                    );
+                }
+                Some(parsed)
+            }
+            None => {
+                return send_bad_request(
+                    &format!(
+                        "subscrCond {cond} matches no TS 29.510 SubscrCond variant; \
+                         omit subscrCond to subscribe to every NF"
+                    ),
+                    Some("MANDATORY_IE_INCORRECT"),
+                )
+            }
+        },
+        None => None,
+    };
 
-    // Parse validity duration. The consumer MAY propose `validityTime`; the NRF
-    // negotiates the validity it will enforce and returns it as an absolute
-    // timestamp (below). Default = preconfigured 24h.
-    let validity_duration = subscription
-        .get("validityTime")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(NRF_SUBSCRIPTION_DEFAULT_VALIDITY);
+    // `reqNotifEvents` (TS 29.510 §5.2.2.5.2): the event types the subscriber
+    // wants. Previously dropped on parse, so a subscriber asking only for
+    // NF_DEREGISTERED still received every registration and profile change.
+    let req_notif_events = match subscription.get("reqNotifEvents") {
+        Some(v) => {
+            let Some(arr) = v.as_array() else {
+                return send_bad_request(
+                    "reqNotifEvents must be an array of NotificationEventType",
+                    Some("MANDATORY_IE_INCORRECT"),
+                );
+            };
+            if arr.is_empty() {
+                return send_bad_request(
+                    "reqNotifEvents must carry at least one NotificationEventType (minItems: 1)",
+                    Some("MANDATORY_IE_INCORRECT"),
+                );
+            }
+            let events: Vec<String> = arr
+                .iter()
+                .filter_map(|e| e.as_str())
+                .map(String::from)
+                .collect();
+            if events.len() != arr.len() {
+                return send_bad_request(
+                    "reqNotifEvents must contain only strings",
+                    Some("MANDATORY_IE_INCORRECT"),
+                );
+            }
+            Some(events)
+        }
+        None => None,
+    };
+
+    // `notifCondition` (TS 29.510 §5.2.2.5.2). The schema's `not` clause makes
+    // monitoredAttributes and unmonitoredAttributes mutually exclusive, so a
+    // body carrying both is refused rather than silently resolved one way.
+    let notif_condition = match subscription.get("notifCondition") {
+        Some(v) => match nextgcore_nrfd::nnrf_handler::NotifCondition::from_json(v) {
+            Some(c) => Some(c),
+            None => {
+                return send_bad_request(
+                    "notifCondition must carry exactly one of monitoredAttributes or \
+                     unmonitoredAttributes, each with at least one entry",
+                    Some("MANDATORY_IE_INCORRECT"),
+                )
+            }
+        },
+        None => None,
+    };
+
+    // Parse the proposed validity. `validityTime` is a DateTime string (TS 29.571
+    // `DateTime`), not an integer duration — reading it with `as_u64` meant every
+    // conformant proposal silently fell through to the default. The consumer MAY
+    // propose; the NRF negotiates the validity it will enforce and returns it as
+    // an absolute timestamp (below). Default = preconfigured 24h.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let validity_duration = match subscription.get("validityTime") {
+        None | Some(serde_json::Value::Null) => NRF_SUBSCRIPTION_DEFAULT_VALIDITY,
+        Some(v) => {
+            let Some(text) = v.as_str() else {
+                return send_bad_request(
+                    "validityTime is a DateTime string (TS 29.571), not a number",
+                    Some("MANDATORY_IE_INCORRECT"),
+                );
+            };
+            let Some(absolute) = rfc3339_to_epoch(text) else {
+                return send_bad_request(
+                    &format!("validityTime {text:?} is not an RFC 3339 date-time"),
+                    Some("MANDATORY_IE_INCORRECT"),
+                );
+            };
+            if absolute <= now {
+                return send_bad_request(
+                    &format!("validityTime {text:?} is in the past"),
+                    Some("MANDATORY_IE_INCORRECT"),
+                );
+            }
+            // The proposal is honoured only up to the NRF's own maximum, so a
+            // consumer cannot pin a subscription open indefinitely.
+            (absolute - now).min(NRF_SUBSCRIPTION_DEFAULT_VALIDITY)
+        }
+    };
 
     // Build subscription data
     let subscription_data = nextgcore_nrfd::SubscriptionData {
@@ -1572,15 +1923,13 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         notification_uri,
         subscr_cond,
         validity_duration,
+        req_notif_events,
+        notif_condition,
     };
 
     // nrfd-08: the NRF-assigned validityTime is an absolute RFC 3339 timestamp
     // (now + the armed validity duration) so the body matches the armed timer,
     // not the consumer's (possibly absent) proposal.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let validity_time = epoch_to_rfc3339(now + validity_duration);
 
     // nrfd-08: return the full stored SubscriptionData (all fields), built
@@ -1630,18 +1979,18 @@ fn subscription_response_json(
     if let Some(ref id) = sub.req_nf_instance_id {
         map.insert("reqNfInstanceId".to_string(), id.clone().into());
     }
+    // Echoed exactly as received. Rebuilding it from parsed fields is what used
+    // to drop every member the old three-field model did not know about, so a
+    // consumer reading back its own subscription saw a condition narrower than
+    // the one it sent.
     if let Some(ref cond) = sub.subscr_cond {
-        let mut c = serde_json::Map::new();
-        if let Some(ref v) = cond.nf_type {
-            c.insert("nfType".to_string(), v.clone().into());
-        }
-        if let Some(ref v) = cond.service_name {
-            c.insert("serviceName".to_string(), v.clone().into());
-        }
-        if let Some(ref v) = cond.nf_instance_id {
-            c.insert("nfInstanceId".to_string(), v.clone().into());
-        }
-        map.insert("subscrCond".to_string(), serde_json::Value::Object(c));
+        map.insert("subscrCond".to_string(), cond.raw.clone());
+    }
+    if let Some(ref events) = sub.req_notif_events {
+        map.insert("reqNotifEvents".to_string(), events.clone().into());
+    }
+    if let Some(ref cond) = sub.notif_condition {
+        map.insert("notifCondition".to_string(), cond.to_json());
     }
     obj
 }
@@ -3946,12 +4295,10 @@ mod tests {
             req_nf_type: Some("AMF".to_string()),
             req_nf_instance_id: None,
             notification_uri: "http://amf.example.com/nrfd02/notify".to_string(),
-            subscr_cond: Some(SubscrCond {
-                nf_type: Some("SMF".to_string()),
-                service_name: None,
-                nf_instance_id: None,
-            }),
+            subscr_cond: Some(SubscrCond::nf_type("SMF")),
             validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
         };
 
         // Simulate a PATCH replacing /load.
@@ -4042,12 +4389,10 @@ mod tests {
             req_nf_type: Some("SMF".to_string()),
             req_nf_instance_id: None,
             notification_uri: "http://smf.example.com/nrfd02/notify".to_string(),
-            subscr_cond: Some(SubscrCond {
-                nf_type: Some("AMF".to_string()),
-                service_name: None,
-                nf_instance_id: None,
-            }),
+            subscr_cond: Some(SubscrCond::nf_type("AMF")),
             validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
         };
 
         let request = nrf_nnrf_nfm_build_nf_profile_changed_notify(
@@ -5423,12 +5768,10 @@ mod tests {
             req_nf_type: Some("AMF".to_string()),
             req_nf_instance_id: Some("amf-1".to_string()),
             notification_uri: "http://amf/cb".to_string(),
-            subscr_cond: Some(SubscrCond {
-                nf_type: Some("SMF".to_string()),
-                service_name: None,
-                nf_instance_id: None,
-            }),
+            subscr_cond: Some(SubscrCond::nf_type("SMF")),
             validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
         };
         let body = subscription_response_json(&sub, "2023-11-14T22:13:20Z");
         assert_eq!(body["subscriptionId"], "sub-08");
@@ -5595,6 +5938,8 @@ mod tests {
             notification_uri: "http://consumer/notify".to_string(),
             subscr_cond: None,
             validity_duration: 60,
+            req_notif_events: None,
+            notif_condition: None,
         };
         assert!(manager.add_subscription(sub));
 
@@ -5641,7 +5986,7 @@ mod tests {
             .as_secs();
         let future = epoch_to_rfc3339(now + 3600);
         let ok_req = SbiRequest::default().with_body(
-            &format!(r#"{{"validityTime":"{future}"}}"#),
+            format!(r#"{{"validityTime":"{future}"}}"#),
             "application/json",
         );
         let ok = handle_subscription_update("sub-68", &ok_req).await;
@@ -5656,5 +6001,643 @@ mod tests {
         );
 
         manager.remove_subscription("sub-68");
+    }
+
+    // ==================================================================
+    // #68 criterion 9: a complete PUT replacement is NF_PROFILE_CHANGED,
+    // not NF_REGISTERED.
+    // ==================================================================
+
+    #[test]
+    fn registration_event_distinguishes_first_registration_from_replacement() {
+        assert_eq!(
+            registration_notification_event(true).as_str(),
+            "NF_REGISTERED"
+        );
+        assert_eq!(
+            registration_notification_event(false).as_str(),
+            "NF_PROFILE_CHANGED",
+            "TS 29.510 Section 5.2.2.3.1A: a complete replacement is a change, \
+             not an appearance"
+        );
+    }
+
+    /// The wiring, not just the mapping: drive two real `PUT`s through
+    /// `handle_nf_register` with a real subscriber listening, and read the events
+    /// off the wire.
+    ///
+    /// Testing `registration_notification_event` alone would leave the part that
+    /// was actually wrong untested — the handler passing `is_new` at all. The
+    /// notification is delivered by a `tokio::spawn`ed HTTP/2 call, so the only
+    /// way to observe it is to be the subscriber.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_replacement_notifies_profile_changed_over_the_wire() {
+        use serde_json::json;
+        use std::sync::Mutex as StdMutex;
+
+        // A deliberately unique nfType: `nf_manager()` is process-global and
+        // other tests in this binary register into it, so the subscription is
+        // scoped to a type only this test uses. Same reason the recorded
+        // process-global-state learning gives for keying on a unique id.
+        const TEST_NF_TYPE: &str = "NRFD68-PUT-EVENT";
+        let nf_id = "nrfd68-put-event-nf";
+
+        let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+
+        let addr = nextgcore_sbi::test_support::ephemeral_addr();
+        let subscriber = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        subscriber
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    if let Some(body) = req.http.content.clone() {
+                        sink.lock().expect("sink lock").push(body);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("subscriber server starts");
+
+        let manager = nf_manager();
+        let sub_id = "nrfd68-put-event-sub";
+        manager.add_subscription(nextgcore_nrfd::SubscriptionData {
+            id: sub_id.to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: None,
+            notification_uri: format!("http://127.0.0.1:{}/callback", addr.port()),
+            subscr_cond: Some(nextgcore_nrfd::nnrf_handler::SubscrCond::nf_type(
+                TEST_NF_TYPE,
+            )),
+            validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
+        });
+
+        /// Wait until `want` notifications have arrived, or time out.
+        async fn wait_for(sink: &Arc<StdMutex<Vec<String>>>, want: usize) -> Vec<String> {
+            for _ in 0..100 {
+                {
+                    let got = sink.lock().expect("sink lock");
+                    if got.len() >= want {
+                        return got.clone();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            sink.lock().expect("sink lock").clone()
+        }
+
+        let profile = json!({
+            "nfInstanceId": nf_id,
+            "nfType": TEST_NF_TYPE,
+            "nfStatus": "REGISTERED",
+            "capacity": 10,
+        });
+        let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
+        req.http.set_content(profile.to_string());
+
+        // --- First PUT: a new instance -> 201 and NF_REGISTERED -------------
+        let first = handle_nf_register(nf_id, &req).await;
+        assert_eq!(first.status, 201, "first registration is 201 Created");
+        let after_first = wait_for(&received, 1).await;
+        assert_eq!(
+            after_first.len(),
+            1,
+            "the subscriber must receive exactly one notification, got {after_first:?}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&after_first[0]).expect("notification is JSON");
+        assert_eq!(body["event"], "NF_REGISTERED");
+
+        // --- Second PUT: a complete replacement -> 200 and NF_PROFILE_CHANGED
+        let mut replacement_body = profile.clone();
+        replacement_body["capacity"] = json!(90);
+        let mut replacement = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
+        replacement.http.set_content(replacement_body.to_string());
+
+        let second = handle_nf_register(nf_id, &replacement).await;
+        assert_eq!(second.status, 200, "a replacement is 200 OK");
+        let after_second = wait_for(&received, 2).await;
+        assert_eq!(after_second.len(), 2, "got {after_second:?}");
+        let body: serde_json::Value =
+            serde_json::from_str(&after_second[1]).expect("notification is JSON");
+        assert_eq!(
+            body["event"], "NF_PROFILE_CHANGED",
+            "a complete replacement must NOT be announced as a new registration"
+        );
+        // The notification carries the replaced profile, so a subscriber can act
+        // on the change without a follow-up GET.
+        assert_eq!(body["nfProfile"]["capacity"], 90);
+
+        manager.remove_subscription(sub_id);
+        manager.deregister(nf_id).ok();
+        disarm_heartbeat_timer(nf_id);
+    }
+
+    // ==================================================================
+    // #68 criterion 6: GET /nf-instances is a HAL UriList and honours
+    // nf-type / limit / page.
+    // ==================================================================
+
+    #[tokio::test]
+    async fn nf_list_is_a_hal_urilist_with_link_objects() {
+        use serde_json::json;
+
+        // Unique nfType again: the registry is process-global.
+        const TEST_NF_TYPE: &str = "NRFD68-HAL-LIST";
+        let ids = [
+            "nrfd68-hal-c",
+            "nrfd68-hal-a",
+            "nrfd68-hal-b",
+            "nrfd68-hal-d",
+        ];
+        let manager = nf_manager();
+        for id in ids {
+            manager
+                .register(
+                    nextgcore_nrfd::nnrf_handler::NfProfile::from_json(&json!({
+                        "nfInstanceId": id,
+                        "nfType": TEST_NF_TYPE,
+                        "nfStatus": "REGISTERED",
+                    }))
+                    .expect("valid profile"),
+                )
+                .expect("register");
+        }
+
+        let get = |uri: &str| {
+            let req = SbiRequest::get(uri);
+            async move { handle_nf_list_retrieval(&req).await }
+        };
+        let body_of = |resp: &SbiResponse| -> serde_json::Value {
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON")
+        };
+
+        // --- Media type and link-object shape ------------------------------
+        let resp = get(&format!("/nnrf-nfm/v1/nf-instances?nf-type={TEST_NF_TYPE}")).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.http.get_header("content-type").map(String::as_str),
+            Some(HAL_JSON_CONTENT_TYPE),
+            "TS 29.510 Section 6.1.3.2.3.1 serves the collection as 3gppHal+json"
+        );
+        let body = body_of(&resp);
+        assert!(
+            body["_links"]["self"]["href"].is_string(),
+            "_links values are LinksValueSchema objects carrying href, not bare \
+             strings: {body}"
+        );
+        let items = body["_links"]["item"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the schema names the member `item`, not `items`: {body}"));
+        assert_eq!(items.len(), 4, "nf-type must filter to just our four");
+        for item in items {
+            assert!(
+                item["href"].is_string(),
+                "each item is a Link object: {item}"
+            );
+        }
+        assert_eq!(body["totalItemCount"], 4);
+
+        // --- nf-type genuinely filters -------------------------------------
+        let others = get("/nnrf-nfm/v1/nf-instances?nf-type=NRFD68-ABSENT-TYPE").await;
+        let body = body_of(&others);
+        assert_eq!(body["_links"]["item"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(body["totalItemCount"], 0);
+
+        // --- limit + page page through a stable, sorted order ---------------
+        let page1 = body_of(
+            &get(&format!(
+                "/nnrf-nfm/v1/nf-instances?nf-type={TEST_NF_TYPE}&limit=2&page=1"
+            ))
+            .await,
+        );
+        let page2 = body_of(
+            &get(&format!(
+                "/nnrf-nfm/v1/nf-instances?nf-type={TEST_NF_TYPE}&limit=2&page=2"
+            ))
+            .await,
+        );
+        let hrefs = |b: &serde_json::Value| -> Vec<String> {
+            b["_links"]["item"]
+                .as_array()
+                .expect("item array")
+                .iter()
+                .map(|i| i["href"].as_str().expect("href").to_string())
+                .collect()
+        };
+        let (h1, h2) = (hrefs(&page1), hrefs(&page2));
+        assert_eq!(h1.len(), 2, "limit must cap the page: {h1:?}");
+        assert_eq!(h2.len(), 2, "{h2:?}");
+        assert!(
+            h1.iter().all(|h| !h2.contains(h)),
+            "pages must not overlap: {h1:?} vs {h2:?}"
+        );
+        // Sorted order, so page 2 is deterministic rather than whatever the
+        // underlying map happened to yield.
+        assert!(h1[0].ends_with("nrfd68-hal-a"), "{h1:?}");
+        assert!(h1[1].ends_with("nrfd68-hal-b"), "{h1:?}");
+        assert!(h2[0].ends_with("nrfd68-hal-c"), "{h2:?}");
+        assert!(h2[1].ends_with("nrfd68-hal-d"), "{h2:?}");
+        // totalItemCount counts the whole filtered set, not the page, so a
+        // consumer can tell there is a page 2 at all.
+        assert_eq!(page1["totalItemCount"], 4);
+        // The self link echoes the paging actually applied.
+        assert_eq!(
+            page2["_links"]["self"]["href"],
+            "/nnrf-nfm/v1/nf-instances?limit=2&page=2"
+        );
+
+        // A page past the end is an empty page, not an error.
+        let page9 = body_of(
+            &get(&format!(
+                "/nnrf-nfm/v1/nf-instances?nf-type={TEST_NF_TYPE}&limit=2&page=9"
+            ))
+            .await,
+        );
+        assert_eq!(page9["_links"]["item"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(page9["totalItemCount"], 4);
+
+        // --- Unusable paging parameters are refused, not ignored ------------
+        // Ignoring them returns a page the consumer did not ask for and cannot
+        // detect, which is how the old handler behaved for every request.
+        for uri in [
+            "/nnrf-nfm/v1/nf-instances?limit=0",
+            "/nnrf-nfm/v1/nf-instances?limit=abc",
+            "/nnrf-nfm/v1/nf-instances?limit=2&page=0",
+            "/nnrf-nfm/v1/nf-instances?page=2",
+        ] {
+            let resp = get(uri).await;
+            assert_eq!(resp.status, 400, "{uri} must be refused");
+        }
+
+        for id in ids {
+            manager.deregister(id).ok();
+        }
+    }
+
+    #[test]
+    fn query_params_are_split_and_percent_decoded() {
+        assert!(query_params("/nnrf-nfm/v1/nf-instances").is_empty());
+        assert_eq!(
+            query_params("/x?nf-type=AMF&limit=2"),
+            vec![
+                ("nf-type".to_string(), "AMF".to_string()),
+                ("limit".to_string(), "2".to_string()),
+            ]
+        );
+        // A percent-encoded value must compare equal to its decoded form.
+        assert_eq!(
+            query_params("/x?nf-type=5G%5FEIR"),
+            vec![("nf-type".to_string(), "5G_EIR".to_string())]
+        );
+        // A valueless parameter and a stray separator must not panic or produce
+        // a phantom entry.
+        assert_eq!(
+            query_params("/x?flag&&limit=1"),
+            vec![
+                ("flag".to_string(), String::new()),
+                ("limit".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    // ==================================================================
+    // #68 criterion 7: GET /bootstrapping.
+    // ==================================================================
+
+    #[tokio::test]
+    async fn bootstrapping_returns_hal_bootstrapping_info() {
+        // Routed through the real dispatcher, because the bug was in the router:
+        // /bootstrapping has one path segment and used to fall out at the
+        // three-segment guard as a 404.
+        let resp = nrf_sbi_request_handler(SbiRequest::get("/bootstrapping")).await;
+        assert_eq!(
+            resp.status, 200,
+            "GET /bootstrapping must be routed, not 404'd by the path guard"
+        );
+        assert_eq!(
+            resp.http.get_header("content-type").map(String::as_str),
+            Some(HAL_JSON_CONTENT_TYPE)
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON");
+        assert_eq!(body["status"], "OPERATIVE");
+        assert_eq!(body["nrfInstanceId"], nrf_instance_id());
+
+        // The registered relation types of TS 29.510 Table 6.4.6.3.3.1-1, each an
+        // object carrying an ABSOLUTE href.
+        let api_root = nrf_self_uri();
+        for relation in [
+            "self",
+            "manage",
+            "subscribe",
+            "discover",
+            "authorize",
+            "retrieve-key",
+        ] {
+            let href = body["_links"][relation]["href"]
+                .as_str()
+                .unwrap_or_else(|| panic!("relation {relation} missing an href: {body}"));
+            assert!(
+                href.starts_with(api_root),
+                "relation {relation} href {href} must be absolute (apiRoot {api_root})"
+            );
+        }
+        assert_eq!(
+            body["_links"]["self"]["href"],
+            format!("{api_root}/bootstrapping")
+        );
+        assert_eq!(
+            body["_links"]["authorize"]["href"],
+            format!("{api_root}/nnrf-oauth2/v1/access-token")
+        );
+
+        // oauth2Required must report the posture actually enforced, keyed by NRF
+        // service name; a hardcoded value could drift from behaviour.
+        let expected = nrf_policy().require_oauth2_server;
+        assert_eq!(body["oauth2Required"]["nnrf-nfm"], expected);
+        assert_eq!(body["oauth2Required"]["nnrf-disc"], expected);
+
+        // Bootstrapping must stay reachable without a token even when
+        // server-side OAuth2 is on — a consumer reads this document to FIND the
+        // token endpoint.
+        assert!(
+            !oauth2_protected_path("/bootstrapping"),
+            "an OAuth2-gated bootstrapping resource is unusable by definition"
+        );
+
+        // A non-GET on the resource is 405, not 404.
+        let post = nrf_sbi_request_handler(SbiRequest::post("/bootstrapping")).await;
+        assert_eq!(post.status, 405);
+    }
+
+    #[tokio::test]
+    async fn bootstrapping_revalidates_with_an_etag() {
+        let first = nrf_sbi_request_handler(SbiRequest::get("/bootstrapping")).await;
+        let etag = first.http.get_header("etag").expect("ETag present").clone();
+        assert!(
+            first.http.get_header("cache-control").is_some(),
+            "Cache-Control is required alongside the ETag"
+        );
+
+        // The document is stable, so a second request yields the same tag.
+        let second = nrf_sbi_request_handler(SbiRequest::get("/bootstrapping")).await;
+        assert_eq!(second.http.get_header("etag"), Some(&etag));
+
+        // A matching If-None-Match is answered 304 with no body.
+        let conditional =
+            SbiRequest::get("/bootstrapping").with_header("If-None-Match", etag.as_str());
+        let resp = nrf_sbi_request_handler(conditional).await;
+        assert_eq!(resp.status, 304);
+        assert!(resp.http.content.is_none() || resp.http.content.as_deref() == Some(""));
+
+        // A non-matching tag still returns the document.
+        let stale =
+            SbiRequest::get("/bootstrapping").with_header("If-None-Match", "\"0000000000000000\"");
+        assert_eq!(nrf_sbi_request_handler(stale).await.status, 200);
+
+        // `*` matches any existing representation (RFC 9110 Section 13.1.2).
+        let star = SbiRequest::get("/bootstrapping").with_header("If-None-Match", "*");
+        assert_eq!(nrf_sbi_request_handler(star).await.status, 304);
+    }
+
+    #[test]
+    fn if_none_match_compares_weak_and_strong_forms_and_lists() {
+        assert!(if_none_match_matches("\"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("W/\"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("\"xyz\", \"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("*", "\"abc\""));
+        assert!(!if_none_match_matches("\"xyz\"", "\"abc\""));
+        assert!(!if_none_match_matches("", "\"abc\""));
+    }
+
+    #[test]
+    fn fnv1a64_is_deterministic_and_content_sensitive() {
+        // Determinism across runs is the point: an ETag derived from a hash that
+        // changes between builds silently invalidates every cached document.
+        assert_eq!(fnv1a64("bootstrapping"), fnv1a64("bootstrapping"));
+        assert_eq!(fnv1a64(""), 0xcbf2_9ce4_8422_2325);
+        assert_ne!(fnv1a64("a"), fnv1a64("b"));
+        // A one-character difference deep in a long string must still change it.
+        assert_ne!(
+            fnv1a64("http://nrf:7777/nnrf-nfm/v1/nf-instances"),
+            fnv1a64("http://nrf:7778/nnrf-nfm/v1/nf-instances")
+        );
+    }
+
+    // ==================================================================
+    // #68 criterion 4/5 at the handler boundary: subscribe refuses a
+    // condition it cannot honour, and parses validityTime as a DateTime.
+    // ==================================================================
+
+    async fn subscribe(body: serde_json::Value) -> SbiResponse {
+        let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        req.http.set_content(body.to_string());
+        handle_subscription_create(&req).await
+    }
+
+    fn problem_of(resp: &SbiResponse) -> serde_json::Value {
+        serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON")
+    }
+
+    #[tokio::test]
+    async fn subscribe_refuses_a_condition_it_cannot_honour() {
+        use serde_json::json;
+
+        // An unrecognised condition is a 400. Accepting it is the match-all
+        // defect: the old parse produced a criteria-less condition that matched
+        // every NF in the registry.
+        for cond in [
+            json!({}),
+            json!({"conditionType": "NOT_A_REAL_COND"}),
+            json!({"somethingElse": "x"}),
+            // A tagged condition missing its own mandatory member is malformed,
+            // not match-all.
+            json!({"conditionType": "SERVICE_NAME_LIST_COND"}),
+            json!({"conditionType": "NF_GROUP_LIST_COND", "nfGroupIdList": ["g"]}),
+        ] {
+            let resp = subscribe(json!({
+                "nfStatusNotificationUri": "http://consumer.example.com/cb",
+                "subscrCond": cond,
+            }))
+            .await;
+            assert_eq!(resp.status, 400, "subscrCond {cond} must be refused");
+            assert_eq!(problem_of(&resp)["cause"], "MANDATORY_IE_INCORRECT");
+        }
+
+        // A recognised variant whose criterion this NRF cannot evaluate is also
+        // refused, and says which criterion and why.
+        let resp = subscribe(json!({
+            "nfStatusNotificationUri": "http://consumer.example.com/cb",
+            "subscrCond": {
+                "conditionType": "UPF_COND",
+                "taiList": [{"plmnId": {"mcc": "001", "mnc": "01"}, "tac": "0001"}],
+            },
+        }))
+        .await;
+        assert_eq!(resp.status, 400);
+        let problem = problem_of(&resp);
+        assert_eq!(problem["cause"], "SUBSCR_COND_NOT_SUPPORTED");
+        assert!(
+            problem["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("taiList"),
+            "the refusal must name the criterion: {problem}"
+        );
+
+        // And an omitted condition is still accepted as "every NF" — refusing
+        // that would break the existing NF-status feeds.
+        let resp = subscribe(json!({
+            "nfStatusNotificationUri": "http://consumer.example.com/cb",
+        }))
+        .await;
+        assert_eq!(resp.status, 201);
+        let id = problem_of(&resp)["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string();
+        assert!(nf_manager()
+            .find_subscription(&id)
+            .expect("stored")
+            .subscr_cond
+            .is_none());
+        nf_manager().remove_subscription(&id);
+    }
+
+    #[tokio::test]
+    async fn subscribe_parses_validity_time_as_a_datetime_and_echoes_the_full_body() {
+        use serde_json::json;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+
+        // A conformant DateTime proposal is honoured. Read with `as_u64` — the
+        // old behaviour — this silently fell through to the 24h default, so the
+        // consumer's request had no effect it could observe.
+        let resp = subscribe(json!({
+            "nfStatusNotificationUri": "http://consumer.example.com/cb",
+            "validityTime": epoch_to_rfc3339(now + 600),
+            "reqNotifEvents": ["NF_DEREGISTERED", "NF_PROFILE_CHANGED"],
+            "notifCondition": {"monitoredAttributes": ["load"]},
+            "subscrCond": {"nfSetId": "set-68"},
+        }))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body = problem_of(&resp);
+        let id = body["subscriptionId"].as_str().expect("id").to_string();
+
+        let stored = nf_manager().find_subscription(&id).expect("stored");
+        assert!(
+            (595..=600).contains(&stored.validity_duration),
+            "the proposed DateTime must set the enforced validity, got {}",
+            stored.validity_duration
+        );
+        assert_ne!(
+            stored.validity_duration, NRF_SUBSCRIPTION_DEFAULT_VALIDITY,
+            "falling back to the default means the proposal was ignored"
+        );
+
+        // reqNotifEvents / notifCondition are retained, not dropped on parse...
+        assert_eq!(
+            stored.req_notif_events.as_deref(),
+            Some(
+                &[
+                    "NF_DEREGISTERED".to_string(),
+                    "NF_PROFILE_CHANGED".to_string()
+                ][..]
+            )
+        );
+        assert_eq!(
+            stored
+                .notif_condition
+                .as_ref()
+                .and_then(|c| c.monitored_attributes.clone()),
+            Some(vec!["load".to_string()])
+        );
+        // ... and are echoed back, along with the condition VERBATIM: rebuilding
+        // it from parsed fields is what used to drop every member the old
+        // three-field model did not know about.
+        assert_eq!(body["reqNotifEvents"][0], "NF_DEREGISTERED");
+        assert_eq!(body["notifCondition"]["monitoredAttributes"][0], "load");
+        assert_eq!(body["subscrCond"]["nfSetId"], "set-68");
+        nf_manager().remove_subscription(&id);
+
+        // An absent validityTime still gets the NRF default.
+        let resp = subscribe(json!({
+            "nfStatusNotificationUri": "http://consumer.example.com/cb",
+        }))
+        .await;
+        let id = problem_of(&resp)["subscriptionId"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        assert_eq!(
+            nf_manager()
+                .find_subscription(&id)
+                .expect("stored")
+                .validity_duration,
+            NRF_SUBSCRIPTION_DEFAULT_VALIDITY
+        );
+        nf_manager().remove_subscription(&id);
+
+        // A proposal beyond the NRF's maximum is clamped, not honoured, so a
+        // consumer cannot pin a subscription open indefinitely.
+        let resp = subscribe(json!({
+            "nfStatusNotificationUri": "http://consumer.example.com/cb",
+            "validityTime": epoch_to_rfc3339(now + NRF_SUBSCRIPTION_DEFAULT_VALIDITY * 10),
+        }))
+        .await;
+        let id = problem_of(&resp)["subscriptionId"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        assert_eq!(
+            nf_manager()
+                .find_subscription(&id)
+                .expect("stored")
+                .validity_duration,
+            NRF_SUBSCRIPTION_DEFAULT_VALIDITY
+        );
+        nf_manager().remove_subscription(&id);
+
+        // Non-conformant validityTime forms are refused rather than coerced.
+        for bad in [
+            json!(3600),
+            json!("not-a-timestamp"),
+            json!(epoch_to_rfc3339(now.saturating_sub(600))),
+        ] {
+            let resp = subscribe(json!({
+                "nfStatusNotificationUri": "http://consumer.example.com/cb",
+                "validityTime": bad,
+            }))
+            .await;
+            assert_eq!(resp.status, 400, "validityTime {bad} must be refused");
+        }
+
+        // Malformed reqNotifEvents / notifCondition are refused too. Both forms
+        // of notifCondition at once violates the schema's `not` clause, and
+        // silently picking one would apply a filter the consumer did not ask for.
+        for bad in [
+            json!({"reqNotifEvents": "NF_REGISTERED"}),
+            json!({"reqNotifEvents": []}),
+            json!({"reqNotifEvents": [1, 2]}),
+            json!({"notifCondition": {}}),
+            json!({"notifCondition": {"monitoredAttributes": ["load"],
+                                      "unmonitoredAttributes": ["capacity"]}}),
+        ] {
+            let mut body = json!({"nfStatusNotificationUri": "http://consumer.example.com/cb"});
+            for (k, v) in bad.as_object().expect("object") {
+                body[k] = v.clone();
+            }
+            let resp = subscribe(body.clone()).await;
+            assert_eq!(resp.status, 400, "{body} must be refused");
+        }
     }
 }

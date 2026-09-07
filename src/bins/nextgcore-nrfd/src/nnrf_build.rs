@@ -284,6 +284,8 @@ mod tests {
             notification_uri: "http://smf.example.com/notify".to_string(),
             subscr_cond: None,
             validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
         }
     }
 
