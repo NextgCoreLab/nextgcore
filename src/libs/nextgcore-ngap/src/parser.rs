@@ -62,6 +62,10 @@ pub enum NgapMessage {
     PathSwitchRequest(PathSwitchRequest),
     PathSwitchRequestAcknowledge(PathSwitchRequestAcknowledge),
     PathSwitchRequestFailure(PathSwitchRequestFailure),
+    /// UPLINK RAN STATUS TRANSFER (gNB -> AMF, TS 38.413 Section 8.4.7)
+    UplinkRanStatusTransfer(RanStatusTransfer),
+    /// DOWNLINK RAN STATUS TRANSFER (AMF -> gNB, TS 38.413 Section 8.4.8)
+    DownlinkRanStatusTransfer(RanStatusTransfer),
     /// Unknown/unsupported message
     Unknown {
         procedure_code: u8,
@@ -169,6 +173,12 @@ fn decode_initiating_message(msg: InitiatingMessage) -> NgapResult<NgapMessage> 
                 }
                 ProcedureCode::NAS_NON_DELIVERY_INDICATION => Ok(
                     NgapMessage::NasNonDeliveryIndication(parse_nas_non_delivery_indication(ies)?),
+                ),
+                ProcedureCode::UPLINK_RAN_STATUS_TRANSFER => Ok(
+                    NgapMessage::UplinkRanStatusTransfer(parse_ran_status_transfer(ies)?),
+                ),
+                ProcedureCode::DOWNLINK_RAN_STATUS_TRANSFER => Ok(
+                    NgapMessage::DownlinkRanStatusTransfer(parse_ran_status_transfer(ies)?),
                 ),
                 ProcedureCode::HANDOVER_PREPARATION => {
                     Ok(NgapMessage::HandoverRequired(parse_handover_required(ies)?))
@@ -1330,6 +1340,50 @@ fn parse_error_indication(container: ProtocolIeContainer) -> NgapResult<ErrorInd
 // ============================================================================
 // RAN/AMF Configuration Update parsers
 // ============================================================================
+
+/// Parse the IE container shared by UPLINK and DOWNLINK RAN STATUS TRANSFER
+/// (TS 38.413 Sections 8.4.7 / 8.4.8).
+///
+/// All three IEs are mandatory, so a container missing any of them is a decode
+/// error rather than a partially-populated message: relaying a status transfer
+/// with a defaulted UE id or an absent container would point the target gNB's
+/// PDCP state at the wrong bearer, which is worse than refusing the PDU.
+fn parse_ran_status_transfer(container: ProtocolIeContainer) -> NgapResult<RanStatusTransfer> {
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut transparent_container = None;
+
+    for field in &container.ies {
+        match field.id.0 {
+            id if id == ProtocolIeId::AMF_UE_NGAP_ID.0 => {
+                amf_ue_ngap_id = Some(ie::decode_amf_ue_ngap_id(field)?);
+            }
+            id if id == ProtocolIeId::RAN_UE_NGAP_ID.0 => {
+                ran_ue_ngap_id = Some(ie::decode_ran_ue_ngap_id(field)?);
+            }
+            ie::IE_ID_RAN_STATUS_TRANSFER_TRANSPARENT_CONTAINER => {
+                // Kept as the raw encoded value; see `RanStatusTransfer::container`.
+                transparent_container = Some(ie::decode_verbatim_ie(field));
+            }
+            _ => ie::handle_unknown_ie(field)?,
+        }
+    }
+
+    Ok(RanStatusTransfer {
+        amf_ue_ngap_id: amf_ue_ngap_id.ok_or(crate::error::NgapError::MissingMandatoryIe {
+            ie_name: "AMF-UE-NGAP-ID",
+            ie_id: ProtocolIeId::AMF_UE_NGAP_ID.0,
+        })?,
+        ran_ue_ngap_id: ran_ue_ngap_id.ok_or(crate::error::NgapError::MissingMandatoryIe {
+            ie_name: "RAN-UE-NGAP-ID",
+            ie_id: ProtocolIeId::RAN_UE_NGAP_ID.0,
+        })?,
+        container: transparent_container.ok_or(crate::error::NgapError::MissingMandatoryIe {
+            ie_name: "RANStatusTransfer-TransparentContainer",
+            ie_id: ie::IE_ID_RAN_STATUS_TRANSFER_TRANSPARENT_CONTAINER,
+        })?,
+    })
+}
 
 fn parse_ran_configuration_update(
     container: ProtocolIeContainer,

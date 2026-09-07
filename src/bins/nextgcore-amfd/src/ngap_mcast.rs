@@ -8,6 +8,20 @@
 //!
 //! The AMF acts as the NGAP anchor for MBS, relaying MB-SMF instructions
 //! to gNBs over the N2 interface.
+//!
+//! # Not yet dispatched
+//!
+//! Nothing calls into this module: `lib.rs` declares it and the NGAP dispatch in
+//! `ngap_path.rs` has no arm for procedures 71-74. Its procedure codes were
+//! nevertheless wrong (see [`mbs_procedure_code`]) and are now correct, because a
+//! latent builder that emits the wrong procedure code is a trap for whoever wires
+//! it up.
+//!
+//! It is deliberately **not deleted**, unlike the unreachable duplicate handlers
+//! removed from `ngap_handler.rs`: those had live reimplementations elsewhere, so
+//! deleting them lost nothing, whereas this is the only MBS N2 code in the AMF and
+//! `nextgcore-mbsmfd` exists as its peer. Whether the AMF should carry MBS N2 at
+//! all is a product decision, not a cleanup.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -63,12 +77,27 @@ impl McastMessageBuilder {
     }
 }
 
-/// NGAP procedure codes for MBS (TS 38.413 Section 9.2.9)
+/// NGAP procedure codes for MBS.
+///
+/// The values are from the TS 38.413 `ProcedureCode` assignments:
+/// `id-MulticastSessionActivation ::= 71`, `...Deactivation ::= 72`,
+/// `...Update ::= 73`, `id-MulticastGroupPaging ::= 74`.
+///
+/// These were previously 68/69/70/71 — off by three, which is not a harmless
+/// numbering slip: **68 is `id-BroadcastSessionSetup`**, so every builder in this
+/// module labelled its PDU as a different elementary procedure than the one it
+/// carried, and the value used for Group Paging (71) is in fact Multicast Session
+/// Activation. A gNB decoding any of them would have dispatched the wrong
+/// procedure or rejected the PDU outright.
 pub mod mbs_procedure_code {
-    pub const MULTICAST_SESSION_ACTIVATION: u16 = 68;
-    pub const MULTICAST_SESSION_DEACTIVATION: u16 = 69;
-    pub const MULTICAST_SESSION_UPDATE: u16 = 70;
-    pub const MULTICAST_GROUP_PAGING: u16 = 71;
+    /// `id-MulticastSessionActivation` (TS 38.413)
+    pub const MULTICAST_SESSION_ACTIVATION: u16 = 71;
+    /// `id-MulticastSessionDeactivation`
+    pub const MULTICAST_SESSION_DEACTIVATION: u16 = 72;
+    /// `id-MulticastSessionUpdate`
+    pub const MULTICAST_SESSION_UPDATE: u16 = 73;
+    /// `id-MulticastGroupPaging`
+    pub const MULTICAST_GROUP_PAGING: u16 = 74;
 }
 
 /// TMGI (Temporary Mobile Group Identity) for MBS sessions
