@@ -14,7 +14,7 @@
 
 use nextgcore_pcfd::sbi_path::{
     build_pcf_binding_body, build_pcf_binding_body_with, pcf_deregister_bsf_binding,
-    pcf_register_bsf_binding, pcf_self_info_set, PcfSelfInfo,
+    pcf_register_bsf_binding, pcf_self_info_set, pcf_update_bsf_binding, PcfSelfInfo,
 };
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use std::sync::Once;
@@ -231,10 +231,17 @@ async fn legacy_binding_still_rejected_400_at_all_three_sites() {
 /// NRF-discovery bootstrap is mocked (H1 policy: mocks are allowed solely
 /// for third-party endpoints the test does not target).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI
 async fn pcfd_client_registers_binding_with_real_bsfd_over_http() {
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
     use std::time::Duration;
 
+    // The NRF URI is process-global and both wire tests in this binary set it,
+    // so they must not overlap: the loser discovers a stopped NRF and its next
+    // call fails with connection-refused (#89).
+    let _guard = nextgcore_pcfd::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     init_peers();
 
     fn ephemeral_addr() -> std::net::SocketAddr {
@@ -299,6 +306,278 @@ async fn pcfd_client_registers_binding_with_real_bsfd_over_http() {
     tokio::time::timeout(Duration::from_secs(15), run)
         .await
         .expect("strict-peer wire round trip timed out");
+
+    bsf_server.stop().await.ok();
+    nrf_server.stop().await.ok();
+}
+
+/// #89: `Nbsf_Management_Update` (`PATCH /pcfBindings/{bindingId}`) against
+/// bsfd's REAL handler.
+///
+/// The operation did not exist in pcfd, so a UE that changed IP left the BSF
+/// advertising a binding that no longer matched the session. Driven against the
+/// real bsfd rather than a mock for the reason recorded at the top of this file:
+/// a lenient BSF mock is what hid the missing-pcfIpEndPoints defect for months,
+/// and this PATCH has its own strictness — bsfd requires a merge-patch content
+/// type, which a mock would have accepted either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI
+async fn pcfd_updates_binding_ip_at_real_bsfd_over_http() {
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    use std::time::Duration;
+
+    // See the twin above: the process-global NRF URI must not be shared with a
+    // concurrently-running wire test.
+    let _guard = nextgcore_pcfd::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    init_peers();
+
+    fn ephemeral_addr() -> std::net::SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let addr = probe.local_addr().expect("probe addr");
+        drop(probe);
+        addr
+    }
+
+    let bsf_addr = ephemeral_addr();
+    let bsf_server = SbiServer::new(SbiServerConfig::new(bsf_addr));
+    bsf_server
+        .start(nextgcore_bsfd::bsf_sbi_request_handler)
+        .await
+        .expect("start real bsfd");
+
+    let bsf_port = bsf_addr.port();
+    let nrf_addr = ephemeral_addr();
+    let nrf_server = SbiServer::new(SbiServerConfig::new(nrf_addr));
+    let nrf_handler = move |req: SbiRequest| async move {
+        let path = req.header.uri.split('?').next().unwrap_or("");
+        if path == "/nnrf-disc/v1/nf-instances" {
+            let body = serde_json::json!({
+                "nfInstances": [{
+                    "nfInstanceId": "bsf-real",
+                    "nfType": "BSF",
+                    "ipv4Addresses": ["127.0.0.1"],
+                    "nfServices": [{
+                        "serviceName": "nbsf-management",
+                        "scheme": "http",
+                        "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": bsf_port }]
+                    }]
+                }]
+            });
+            return SbiResponse::with_status(200)
+                .with_json_body(&body)
+                .unwrap_or_else(|_| SbiResponse::with_status(500));
+        }
+        SbiResponse::with_status(404)
+    };
+    nrf_server.start(nrf_handler).await.expect("start mock NRF");
+    nextgcore_sbi::context::global_context()
+        .set_nrf_uri(format!("http://127.0.0.1:{}", nrf_addr.port()))
+        .await;
+
+    let run = async {
+        let body = production_body("imsi-001010000000789", "10.45.0.89");
+        let binding_id = pcf_register_bsf_binding(&body)
+            .await
+            .expect("bsf register ok")
+            .expect("real bsfd must 201-accept the production binding");
+
+        // The UE re-IPs: PATCH the binding at the real BSF.
+        let patch = serde_json::json!({ "ipv4Addr": "10.45.0.99" });
+        assert!(
+            pcf_update_bsf_binding(&binding_id, &patch)
+                .await
+                .expect("bsf update ok"),
+            "real bsfd must accept the Nbsf_Management_Update"
+        );
+
+        // ...and the stored binding now carries the new address, read back
+        // through bsfd's own GET.
+        let resp = nextgcore_bsfd::bsf_sbi_request_handler(SbiRequest::get(format!(
+            "/nbsf-management/v1/pcfBindings/{binding_id}"
+        )))
+        .await;
+        assert_eq!(resp.status, 200, "GET the patched binding");
+        let stored: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("null")).unwrap();
+        assert_eq!(
+            stored["ipv4Addr"], "10.45.0.99",
+            "the BSF must hold the UE's new address: {stored}"
+        );
+
+        assert!(pcf_deregister_bsf_binding(&binding_id)
+            .await
+            .expect("bsf delete ok"));
+    };
+    tokio::time::timeout(Duration::from_secs(15), run)
+        .await
+        .expect("strict-peer binding update timed out");
+
+    bsf_server.stop().await.ok();
+    nrf_server.stop().await.ok();
+}
+
+/// #89 WIRING: the SM policy UPDATE handler must itself reach the BSF when the
+/// UE's address changes — not merely have a client function that could.
+///
+/// Written because revert-verification exposed the gap: deleting the
+/// `pcf_sess_update_bsf_binding` call from `handle_sm_policy_update_notify` left
+/// every test green, since the strict-peer test above calls the client directly.
+/// That is the recorded "a tested helper leaves the wiring untested" lesson, so
+/// this drives the REAL SM-policy create and update handlers and then reads the
+/// binding back out of the REAL bsfd.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+async fn sm_policy_update_wires_the_bsf_binding_update() {
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    use std::time::Duration;
+
+    let _guard = nextgcore_pcfd::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    init_peers();
+    nextgcore_pcfd::test_support::init_context();
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+    fn ephemeral_addr() -> std::net::SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let addr = probe.local_addr().expect("probe addr");
+        drop(probe);
+        addr
+    }
+
+    let bsf_addr = ephemeral_addr();
+    let bsf_server = SbiServer::new(SbiServerConfig::new(bsf_addr));
+    bsf_server
+        .start(nextgcore_bsfd::bsf_sbi_request_handler)
+        .await
+        .expect("start real bsfd");
+    let bsf_port = bsf_addr.port();
+
+    let nrf_addr = ephemeral_addr();
+    let nrf_server = SbiServer::new(SbiServerConfig::new(nrf_addr));
+    let nrf_handler = move |req: SbiRequest| async move {
+        let path = req.header.uri.split('?').next().unwrap_or("");
+        if path == "/nnrf-disc/v1/nf-instances" {
+            // Advertise the real BSF for every discovery query; the UDR legs of
+            // the SM-policy path then fail closed to their config defaults,
+            // which is what this test wants (it is about the BSF).
+            let body = serde_json::json!({
+                "nfInstances": [{
+                    "nfInstanceId": "bsf-real",
+                    "nfType": "BSF",
+                    "ipv4Addresses": ["127.0.0.1"],
+                    "nfServices": [{
+                        "serviceName": "nbsf-management",
+                        "scheme": "http",
+                        "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": bsf_port }]
+                    }]
+                }]
+            });
+            return SbiResponse::with_status(200)
+                .with_json_body(&body)
+                .unwrap_or_else(|_| SbiResponse::with_status(500));
+        }
+        SbiResponse::with_status(404)
+    };
+    nrf_server.start(nrf_handler).await.expect("start mock NRF");
+    nextgcore_sbi::context::global_context()
+        .set_nrf_uri(format!("http://127.0.0.1:{}", nrf_addr.port()))
+        .await;
+
+    let run = async {
+        // Create an SM policy through the REAL handler; its BSF registration is
+        // spawned, so poll bsfd until the binding exists.
+        let create = serde_json::json!({
+            "supi": "imsi-001010000000899",
+            "pduSessionId": 41,
+            "pduSessionType": "IPV4",
+            "dnn": "internet",
+            "notificationUri": "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/89",
+            "ipv4Address": "10.45.0.89",
+            "sliceInfo": { "sst": 1 },
+            "servingNetwork": { "mcc": "001", "mnc": "01" },
+            "suppFeat": "0"
+        });
+        let resp = nextgcore_pcfd::pcf_sbi_request_handler(
+            SbiRequest::post("/npcf-smpolicycontrol/v1/sm-policies")
+                .with_json_body(&create)
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "SM policy create: {:?}",
+            resp.http.content
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let sm_policy_id = body["smPolicyId"].as_str().expect("smPolicyId").to_string();
+
+        // Wait for the spawned binding registration to land in the PCF context.
+        let mut binding_id = String::new();
+        for _ in 0..200 {
+            if let Some(id) = nextgcore_pcfd::context::pcf_self()
+                .read()
+                .ok()
+                .and_then(|ctx| ctx.sess_find_by_sm_policy_id(&sm_policy_id))
+                .and_then(|s| s.binding.id.clone())
+            {
+                binding_id = id;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !binding_id.is_empty(),
+            "the create path must register a BSF binding for this test to mean anything"
+        );
+
+        // The UE re-IPs, reported on the SM policy update.
+        let resp = nextgcore_pcfd::pcf_sbi_request_handler(
+            SbiRequest::post(format!(
+                "/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/update"
+            ))
+            .with_json_body(&serde_json::json!({ "ipv4Address": "10.45.0.98" }))
+            .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "SM policy update: {:?}",
+            resp.http.content
+        );
+
+        // The REAL bsfd must now hold the new address, put there by the handler's
+        // own Nbsf_Management_Update.
+        let mut stored_ip = String::new();
+        for _ in 0..200 {
+            let resp = nextgcore_bsfd::bsf_sbi_request_handler(SbiRequest::get(format!(
+                "/nbsf-management/v1/pcfBindings/{binding_id}"
+            )))
+            .await;
+            if resp.status == 200 {
+                let doc: serde_json::Value =
+                    serde_json::from_str(resp.http.content.as_deref().unwrap_or("null")).unwrap();
+                if let Some(ip) = doc.get("ipv4Addr").and_then(|v| v.as_str()) {
+                    stored_ip = ip.to_string();
+                    if stored_ip == "10.45.0.98" {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            stored_ip, "10.45.0.98",
+            "the SM policy update must reach the BSF (TS 29.513 §6); the binding \
+             still advertises the old address"
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("SM-policy-update BSF wiring timed out");
 
     bsf_server.stop().await.ok();
     nrf_server.stop().await.ok();

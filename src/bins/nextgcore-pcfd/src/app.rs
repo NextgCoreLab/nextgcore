@@ -656,6 +656,168 @@ fn negotiate_features(consumer_hex: Option<&str>, supported: u64) -> String {
 
 // AM Policy Control handlers
 
+/// Provision the access-and-mobility policy for an association from the UDR's AM
+/// subscription data (TS 29.507 §4.2.2.2).
+///
+/// Returns the wire members of the policy — `ueAmbr`, and `rfsp` /`servAreaRes`
+/// when the operator provisioned them — as a map with **absent members simply
+/// absent**. Before #89 the create emitted `"servAreaRes": null` and
+/// `"rfsp": null`, which no `ServiceAreaRestriction` / `RfspIndex` schema accepts,
+/// so a strict AMF's validator rejected the body.
+///
+/// The UDR is the source; the local subscriber DB is the fallback for `ueAmbr`
+/// only, which is all it holds. `rfsp` is range-checked (1..=256) because a value
+/// outside it is not an `RfspIndex` and forwarding it would push the rejection
+/// onto the AMF.
+async fn provision_am_policy(supi: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut policy = serde_json::Map::new();
+
+    if let Some(am_data) = sbi_path::pcf_udr_am_subscription_data(supi).await {
+        if let Some(ambr) = am_data.get("subscribedUeAmbr") {
+            policy.insert("ueAmbr".to_string(), ambr.clone());
+        }
+        match am_data.get("rfspIndex").and_then(|v| v.as_u64()) {
+            Some(rfsp) if (1..=256).contains(&rfsp) => {
+                policy.insert("rfsp".to_string(), serde_json::json!(rfsp));
+            }
+            Some(rfsp) => log::warn!("[{supi}] UDR rfspIndex {rfsp} is outside 1..=256; omitted"),
+            None => {}
+        }
+        // ServiceAreaRestriction: restrictionType and areas are both-or-neither
+        // (TS 29.571), so a half-populated one is dropped rather than forwarded.
+        if let Some(sar) = am_data.get("serviceAreaRestriction") {
+            let has_type = sar.get("restrictionType").is_some();
+            let has_areas = sar.get("areas").is_some();
+            if has_type == has_areas {
+                policy.insert("servAreaRes".to_string(), sar.clone());
+            } else {
+                log::warn!(
+                    "[{supi}] UDR serviceAreaRestriction has restrictionType xor areas; omitted"
+                );
+            }
+        }
+    }
+
+    // ueAmbr fallback: the local subscriber DB, which is where the pre-#89 code
+    // read it from and all it can supply.
+    if !policy.contains_key("ueAmbr") {
+        if let Some(sd) = nudr_handler::query_subscription_data_pub(supi) {
+            policy.insert(
+                "ueAmbr".to_string(),
+                serde_json::json!({
+                    "uplink": format_bitrate(sd.ambr_uplink),
+                    "downlink": format_bitrate(sd.ambr_downlink),
+                }),
+            );
+        }
+    }
+    policy
+}
+
+/// The `RequestTrigger`s a consumer asked this association to watch, plus the
+/// ones the PCF adds because the subscription disagrees with the request.
+///
+/// `UE_AMBR_CH` is added when the requested `ueAmbr` differs from the provisioned
+/// one, which is the condition TS 29.507 defines it for — it was the only trigger
+/// the pre-#89 code computed, and it is kept.
+fn am_policy_triggers(
+    requested: &serde_json::Value,
+    policy: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let mut triggers: Vec<String> = requested
+        .get("triggers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let (Some(req_ambr), Some(prov_ambr)) = (requested.get("ueAmbr"), policy.get("ueAmbr")) {
+        let member = |v: &serde_json::Value, k: &str| {
+            v.get(k).and_then(|x| x.as_str()).unwrap_or("0").to_string()
+        };
+        let ambr_differs = member(req_ambr, "uplink") != member(prov_ambr, "uplink")
+            || member(req_ambr, "downlink") != member(prov_ambr, "downlink");
+        if ambr_differs && !triggers.iter().any(|t| t == "UE_AMBR_CH") {
+            triggers.push("UE_AMBR_CH".to_string());
+        }
+    }
+    triggers
+}
+
+/// The alternate notification endpoints a consumer supplied
+/// (`altNotifIpv4Addrs` / `altNotifFqdns`, TS 29.507), rendered as URIs that
+/// share the primary's scheme and path so a retry hits the same resource on a
+/// different host.
+fn alternate_notification_uris(requested: &serde_json::Value, primary: &str) -> Vec<String> {
+    let (scheme, rest) = match primary.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => ("http", primary),
+    };
+    let path = rest.find('/').map(|i| &rest[i..]).unwrap_or("");
+    let mut out = Vec::new();
+    for key in ["altNotifIpv4Addrs", "altNotifIpv6Addrs", "altNotifFqdns"] {
+        if let Some(list) = requested.get(key).and_then(|v| v.as_array()) {
+            for host in list.iter().filter_map(|v| v.as_str()) {
+                // An IPv6 literal needs brackets in an authority.
+                let authority = if key == "altNotifIpv6Addrs" {
+                    format!("[{host}]")
+                } else {
+                    host.to_string()
+                };
+                out.push(format!("{scheme}://{authority}{path}"));
+            }
+        }
+    }
+    out
+}
+
+/// Parse a TS 23.003 §2.10.1 `AmfId` (6 hex digits: 8-bit region, 10-bit set,
+/// 6-bit pointer). `None` when it is not 6 hex digits, so a malformed value is
+/// ignored instead of silently becoming region 0 / set 0 / pointer 0.
+fn parse_amf_id_hex(amf_id: &str) -> Option<crate::context::AmfId> {
+    if amf_id.len() != 6 || !amf_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(amf_id, 16).ok()?;
+    Some(crate::context::AmfId {
+        region: ((value >> 16) & 0xFF) as u8,
+        set: ((value >> 6) & 0x03FF) as u16,
+        pointer: (value & 0x3F) as u8,
+    })
+}
+
+/// Render a `PolicyAssociation` (TS 29.507 §5.6.2.4) for an association.
+///
+/// One builder for create and GET, so the two representations of the same
+/// resource cannot disagree — the GET used to answer `{polAssoId, supi,
+/// triggers: []}`, omitting the mandatory negotiated `suppFeat` and every
+/// provisioned policy member.
+fn build_policy_association(
+    association_id: &str,
+    supi: &str,
+    triggers: &[String],
+    am_policy: Option<&serde_json::Value>,
+    supp_feat: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert("polAssoId".to_string(), serde_json::json!(association_id));
+    body.insert("supi".to_string(), serde_json::json!(supi));
+    // TS 29.507 §5.8: suppFeat is mandatory in PolicyAssociation and is the
+    // negotiated (consumer ∩ producer) value (pcfd-05).
+    body.insert("suppFeat".to_string(), serde_json::json!(supp_feat));
+    if !triggers.is_empty() {
+        body.insert("triggers".to_string(), serde_json::json!(triggers));
+    }
+    if let Some(policy) = am_policy.and_then(|p| p.as_object()) {
+        for (k, v) in policy {
+            body.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::Value::Object(body)
+}
+
 pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
     log::info!("AM Policy Create");
 
@@ -694,63 +856,43 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
 
     match ue_am {
         Some(ue_am) => {
+            // Provision the access-and-mobility policy and the triggers before
+            // storing, so the association carries them from the moment it exists.
+            let policy = provision_am_policy(supi).await;
+            let triggers = am_policy_triggers(&policy_data, &policy);
+            let am_policy = if policy.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(policy))
+            };
+            let alt_notif_uris = alternate_notification_uris(&policy_data, notification_uri);
+
             // Persist the notification URI so later AM policy update notifies
             // (pcf_sbi_send_am_policy_control_notify) can reach the AMF.
             {
                 let mut updated = ue_am.clone();
                 updated.notification_uri = Some(notification_uri.to_string());
+                updated.alt_notif_uris = alt_notif_uris;
+                updated.triggers = triggers.clone();
+                updated.am_policy = am_policy.clone();
                 if let Ok(context) = ctx.read() {
                     context.ue_am_update(&updated);
                 }
             }
             log::info!(
-                "AM Policy created for SUPI {} (id={})",
+                "AM Policy created for SUPI {} (id={}, triggers={:?})",
                 supi,
-                ue_am.association_id
+                ue_am.association_id,
+                triggers
             );
 
-            // Query subscription data for UE-AMBR
-            let sub_data = nudr_handler::query_subscription_data_pub(supi);
-            let (triggers, ue_ambr) = if let Some(ref sd) = sub_data {
-                let mut triggers = Vec::new();
-                // Check if subscribed UE-AMBR differs from requested
-                if let Some(req_ambr) = policy_data.get("ueAmbr") {
-                    let req_up = req_ambr
-                        .get("uplink")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0");
-                    let req_down = req_ambr
-                        .get("downlink")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0");
-                    if req_up != format_bitrate(sd.ambr_uplink)
-                        || req_down != format_bitrate(sd.ambr_downlink)
-                    {
-                        triggers.push("UE_AMBR_CH");
-                    }
-                }
-                let ambr = serde_json::json!({
-                    "uplink": format_bitrate(sd.ambr_uplink),
-                    "downlink": format_bitrate(sd.ambr_downlink),
-                });
-                (triggers, Some(ambr))
-            } else {
-                (vec![], None)
-            };
-
-            let mut resp = serde_json::json!({
-                "polAssoId": ue_am.association_id,
-                "supi": supi,
-                "triggers": triggers,
-                "servAreaRes": null,
-                "rfsp": null,
-                // TS 29.507 §5.8: suppFeat is mandatory in PolicyAssociation and
-                // is the negotiated (consumer ∩ producer) value (pcfd-05).
-                "suppFeat": negotiate_features(Some(supp_feat), PCF_AM_POLICY_SUPPORTED_FEATURES),
-            });
-            if let Some(ambr) = ue_ambr {
-                resp["ueAmbr"] = ambr;
-            }
+            let resp = build_policy_association(
+                &ue_am.association_id,
+                supi,
+                &triggers,
+                am_policy.as_ref(),
+                &negotiate_features(Some(supp_feat), PCF_AM_POLICY_SUPPORTED_FEATURES),
+            );
 
             SbiResponse::with_status(201)
                 .with_header(
@@ -779,11 +921,16 @@ pub async fn handle_am_policy_get(pol_asso_id: &str) -> SbiResponse {
 
     match ue_am {
         Some(ue_am) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "polAssoId": ue_am.association_id,
-                "supi": ue_am.supi,
-                "triggers": [],
-            }))
+            .with_json_body(&build_policy_association(
+                &ue_am.association_id,
+                &ue_am.supi,
+                &ue_am.triggers,
+                ue_am.am_policy.as_ref(),
+                // The association's negotiated value is fixed at create; the
+                // producer set is a constant, so re-negotiating the stored
+                // consumer features would give the same answer.
+                &negotiate_features(None, PCF_AM_POLICY_SUPPORTED_FEATURES),
+            ))
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(
             &format!("AM Policy {pol_asso_id} not found"),
@@ -828,7 +975,7 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
 
-    let _update_data: serde_json::Value = match serde_json::from_str(body) {
+    let update_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
@@ -840,19 +987,94 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         None
     };
 
-    match ue_am {
-        Some(ue_am) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "polAssoId": ue_am.association_id,
-                "supi": ue_am.supi,
-                "triggers": [],
-            }))
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        None => send_not_found(
+    let Some(ue_am) = ue_am else {
+        return send_not_found(
             &format!("AM Policy {pol_asso_id} not found"),
             Some("POLICY_NOT_FOUND"),
-        ),
+        );
+    };
+
+    // TS 29.507 §4.2.3.1: apply the PolicyAssociationUpdateRequest, then
+    // re-evaluate. Before #89 the body was deserialised into `_update_data` and
+    // never read, so a consumer could move its notification endpoint, change its
+    // GUAMI or ask for different triggers and the PCF would keep using the old
+    // ones while answering 200.
+    let mut updated = ue_am.clone();
+    let mut changed = Vec::new();
+
+    if let Some(uri) = update_data.get("notificationUri").and_then(|v| v.as_str()) {
+        if updated.notification_uri.as_deref() != Some(uri) {
+            updated.notification_uri = Some(uri.to_string());
+            changed.push("notificationUri");
+        }
+        updated.alt_notif_uris = alternate_notification_uris(&update_data, uri);
     }
+    if let Some(guami) = update_data.get("guami") {
+        let mcc = guami.pointer("/plmnId/mcc").and_then(|v| v.as_str());
+        let mnc = guami.pointer("/plmnId/mnc").and_then(|v| v.as_str());
+        let amf_id = guami.get("amfId").and_then(|v| v.as_str());
+        if let (Some(mcc), Some(mnc)) = (mcc, mnc) {
+            updated.guami.plmn_id.mcc = mcc.to_string();
+            updated.guami.plmn_id.mnc = mnc.to_string();
+            // amfId is 6 hex digits = region(2) || set(3) || pointer(1)
+            // (TS 23.003 §2.10.1). Parsed rather than stored as a string because
+            // that is the shape the context holds; a malformed one leaves the
+            // stored GUAMI's AMF id alone rather than zeroing it.
+            if let Some(parsed) = amf_id.and_then(parse_amf_id_hex) {
+                updated.guami.amf_id = parsed;
+            }
+            changed.push("guami");
+        }
+    }
+    if let Some(requested) = update_data.get("triggers").and_then(|v| v.as_array()) {
+        let requested: Vec<String> = requested
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect();
+        if requested != updated.triggers {
+            updated.triggers = requested;
+            changed.push("triggers");
+        }
+    }
+
+    // Re-evaluate the provisioned policy: an update is the point at which the
+    // subscription is consulted again, which is what makes servAreaRes / rfsp /
+    // ueAmbr able to change after the association is created.
+    let policy = provision_am_policy(&updated.supi).await;
+    let am_policy = if policy.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(policy))
+    };
+    if am_policy != updated.am_policy {
+        updated.am_policy = am_policy.clone();
+        changed.push("policy");
+    }
+
+    if let Ok(context) = ctx.read() {
+        context.ue_am_update(&updated);
+    }
+    log::info!(
+        "AM Policy {pol_asso_id} updated (changed: {changed:?}, triggers={:?})",
+        updated.triggers
+    );
+
+    // TS 29.507 §4.2.4.2: a policy change is pushed to the AMF as well as
+    // returned. The notify helper had NO caller before #89, so a change never
+    // reached the consumer that did not ask for it.
+    if !changed.is_empty() {
+        pcf_sbi_send_am_policy_control_notify(updated.id);
+    }
+
+    // The 200 response schema is PolicyUpdate, not PolicyAssociation: it carries
+    // resourceUri and the changed policy.
+    SbiResponse::with_status(200)
+        .with_json_body(&sbi_path::build_am_policy_update(
+            &updated.association_id,
+            &updated.triggers,
+            updated.am_policy.as_ref(),
+        ))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
 // UE Policy Control handlers (npcf-ue-policy-control, TS 29.525)
@@ -1528,16 +1750,53 @@ pub async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
                     }
                 });
             let decision = build_sm_policy_decision(&sess.sm_policy_id, &session_data);
+            // TS 29.512 §5.3: the Individual SM Policy resource is an
+            // `SmPolicyControl`, whose two REQUIRED members are `context`
+            // (SmPolicyContextData, carrying the SUPI) and `policy`
+            // (SmPolicyDecision). Before #89 this answered a flat
+            // SmPolicyDecision-shaped object with no context at all, so a strict
+            // SMF could not parse it and never learned whose session it was.
+            let supi = ctx
+                .read()
+                .ok()
+                .and_then(|context| context.ue_sm_find_by_id(sess.pcf_ue_sm_id))
+                .map(|ue| ue.supi)
+                .unwrap_or_default();
+            let mut context_data = serde_json::Map::new();
+            context_data.insert("supi".to_string(), serde_json::json!(supi));
+            context_data.insert("pduSessionId".to_string(), serde_json::json!(sess.psi));
+            context_data.insert("dnn".to_string(), serde_json::json!(dnn));
+            context_data.insert(
+                "sliceInfo".to_string(),
+                match sess.s_nssai.sd {
+                    Some(sd) => serde_json::json!({
+                        "sst": sess.s_nssai.sst,
+                        "sd": format!("{sd:06x}"),
+                    }),
+                    None => serde_json::json!({ "sst": sess.s_nssai.sst }),
+                },
+            );
+            if let Some(ref ip) = sess.ipv4addr_string {
+                context_data.insert("ipv4Address".to_string(), serde_json::json!(ip));
+            }
+            if let Some(ref prefix) = sess.ipv6prefix_string {
+                context_data.insert("ipv6AddressPrefix".to_string(), serde_json::json!(prefix));
+            }
+            if let Some(ref uri) = sess.notification_uri {
+                context_data.insert("notificationUri".to_string(), serde_json::json!(uri));
+            }
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
-                    "smPolicyId": sess.sm_policy_id,
-                    "pduSessionId": sess.psi,
-                    "sessRules": decision.sess_rules,
-                    "pccRules": decision.pcc_rules,
-                    "qosDecs": decision.qos_decs,
-                    "chgDecs": decision.chg_decs,
-                    "traffContDecs": decision.traff_cont_decs,
-                    "policyCtrlReqTriggers": decision.triggers,
+                    "context": serde_json::Value::Object(context_data),
+                    "policy": {
+                        "smPolicyId": sess.sm_policy_id,
+                        "sessRules": decision.sess_rules,
+                        "pccRules": decision.pcc_rules,
+                        "qosDecs": decision.qos_decs,
+                        "chgDecs": decision.chg_decs,
+                        "traffContDecs": decision.traff_cont_decs,
+                        "policyCtrlReqTriggers": decision.triggers,
+                    },
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
@@ -1620,6 +1879,40 @@ pub async fn handle_sm_policy_update_notify(
                 triggers,
                 sess.psi
             );
+
+            // TS 29.513 §6: the BSF binding advertises this session's UE IP, so a
+            // change has to reach it (Nbsf_Management_Update) or an AF-influenced
+            // lookup resolves a binding that no longer matches the session. Only
+            // register/deregister existed before #89.
+            let new_ipv4 = update_data
+                .get("ipv4Address")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let new_ipv6 = update_data
+                .get("ipv6AddressPrefix")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let ipv4_changed =
+                new_ipv4.is_some_and(|ip| sess.ipv4addr_string.as_deref() != Some(ip));
+            let ipv6_changed =
+                new_ipv6.is_some_and(|p| sess.ipv6prefix_string.as_deref() != Some(p));
+            if ipv4_changed || ipv6_changed {
+                let mut latest = sess.clone();
+                if let Some(ip) = new_ipv4.filter(|_| ipv4_changed) {
+                    latest.set_ipv4addr(ip);
+                }
+                if let Some(prefix) = new_ipv6.filter(|_| ipv6_changed) {
+                    latest.set_ipv6prefix(prefix);
+                }
+                if let Ok(context) = ctx.read() {
+                    context.sess_update(&latest);
+                }
+                log::info!(
+                    "SM Policy Update: UE address changed (ipv4={new_ipv4:?}, ipv6={new_ipv6:?}); \
+                     updating the BSF binding"
+                );
+                sbi_path::pcf_sess_update_bsf_binding(latest.id);
+            }
 
             // Process PCC rule reports from SMF (rule status changes)
             let mut rule_reports = Vec::new();
@@ -3474,6 +3767,11 @@ mod tests {
 
     /// pcfd-11: GET on an individual SM policy returns the stored
     /// SmPolicyDecision (non-empty rule maps), not empty placeholders.
+    ///
+    /// #89 moved the decision under the `policy` member: TS 29.512 §5.3 makes the
+    /// resource an `SmPolicyControl{context, policy}`, so the flat body this test
+    /// used to read was the wrong envelope. The claim — non-empty rule maps — is
+    /// unchanged.
     #[tokio::test]
     async fn sm_policy_get_returns_stored_decision() {
         pcf_context_init(64, 64);
@@ -3498,14 +3796,523 @@ mod tests {
         let got: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert!(
-            got["sessRules"].as_object().is_some_and(|m| !m.is_empty()),
+            got["policy"]["sessRules"]
+                .as_object()
+                .is_some_and(|m| !m.is_empty()),
             "GET must return non-empty sessRules"
         );
         assert!(
-            got["pccRules"].as_object().is_some_and(|m| !m.is_empty()),
+            got["policy"]["pccRules"]
+                .as_object()
+                .is_some_and(|m| !m.is_empty()),
             "GET must return non-empty pccRules"
         );
-        assert!(got["qosDecs"].as_object().is_some_and(|m| !m.is_empty()));
+        assert!(got["policy"]["qosDecs"]
+            .as_object()
+            .is_some_and(|m| !m.is_empty()));
+    }
+
+    // ========================================================================
+    // #89: AM/SM policy control — provisioned policy, PolicyUpdate, reliable
+    // notification, the SmPolicyControl envelope.
+    // ========================================================================
+
+    /// Start a mock NRF+UDR on one port: the NRF SearchResult points back at
+    /// itself, and the UDR leg serves the AM subscription data an association's
+    /// policy is provisioned from.
+    async fn start_mock_nrf_udr_am_data(
+        am_data: serde_json::Value,
+    ) -> nextgcore_sbi::server::SbiServer {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let port = nextgcore_sbi::test_support::free_port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let handler = move |req: SbiRequest| {
+            let am_data = am_data.clone();
+            async move {
+                let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                if path == "/nnrf-disc/v1/nf-instances" {
+                    return SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "nfInstances": [{
+                                "nfInstanceId": "udr-mock",
+                                "nfType": "UDR",
+                                "ipv4Addresses": ["127.0.0.1"],
+                                "nfServices": [{
+                                    "serviceName": "nudr-dr",
+                                    "scheme": "http",
+                                    "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
+                                }]
+                            }]
+                        }))
+                        .unwrap_or_else(|_| SbiResponse::with_status(500));
+                }
+                if path.ends_with("/provisioned-data/am-data") {
+                    return SbiResponse::with_status(200)
+                        .with_json_body(&am_data)
+                        .unwrap_or_else(|_| SbiResponse::with_status(500));
+                }
+                SbiResponse::with_status(404)
+            }
+        };
+        server.start(handler).await.expect("mock NRF/UDR starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        nextgcore_sbi::context::global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{port}"))
+            .await;
+        server
+    }
+
+    /// AM policy Create and GET both carry the negotiated `suppFeat` and the
+    /// policy provisioned from UDR am-data, and NEVER an explicit null.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_create_and_get_provision_policy_without_nulls() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let udr = start_mock_nrf_udr_am_data(serde_json::json!({
+            "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+            "rfspIndex": 7,
+            "serviceAreaRestriction": {
+                "restrictionType": "ALLOWED_AREAS",
+                "areas": [{ "tacs": ["000001"] }]
+            }
+        }))
+        .await;
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000890",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/89",
+                "suppFeat": "0",
+                "triggers": ["LOC_CH"]
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "create: {:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_id = body["polAssoId"].as_str().unwrap().to_string();
+
+        assert_eq!(body["rfsp"], 7, "rfsp provisioned from UDR am-data: {body}");
+        assert_eq!(body["servAreaRes"]["restrictionType"], "ALLOWED_AREAS");
+        assert_eq!(body["ueAmbr"]["uplink"], "1 Gbps");
+        assert_eq!(body["suppFeat"], "0");
+        assert_eq!(body["triggers"], serde_json::json!(["LOC_CH"]));
+
+        // The GET representation must agree with the create one -- it used to
+        // answer {polAssoId, supi, triggers: []} with no suppFeat at all.
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_id}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got["suppFeat"], "0", "suppFeat is mandatory on GET: {got}");
+        assert_eq!(got["rfsp"], 7);
+        assert_eq!(got["servAreaRes"]["restrictionType"], "ALLOWED_AREAS");
+        assert_eq!(got["ueAmbr"]["uplink"], "1 Gbps");
+        assert_eq!(got["triggers"], serde_json::json!(["LOC_CH"]));
+
+        udr.stop().await.ok();
+    }
+
+    /// With nothing provisioned, `servAreaRes` / `rfsp` are ABSENT rather than
+    /// `null` — the shape a strict AMF's schema validator rejects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_omits_unprovisioned_members_instead_of_nulls() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        // am-data with no rfspIndex and a HALF-populated serviceAreaRestriction
+        // (restrictionType without areas), which TS 29.571 forbids.
+        let udr = start_mock_nrf_udr_am_data(serde_json::json!({
+            "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+            "serviceAreaRestriction": { "restrictionType": "ALLOWED_AREAS" }
+        }))
+        .await;
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000891",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/89",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        for member in ["servAreaRes", "rfsp"] {
+            assert!(
+                body.get(member).is_none(),
+                "{member} must be ABSENT, not null: {body}"
+            );
+        }
+        // An out-of-range rfspIndex is dropped rather than forwarded.
+        assert!(body.get("rfsp").is_none());
+        udr.stop().await.ok();
+    }
+
+    /// AM policy Update applies the request, answers a `PolicyUpdate` carrying
+    /// `resourceUri`, and pushes the change to the AMF's `{notificationUri}/update`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_update_applies_request_and_notifies_the_amf() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::Mutex as StdMutex;
+
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let udr = start_mock_nrf_udr_am_data(serde_json::json!({
+            "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+            "rfspIndex": 3
+        }))
+        .await;
+
+        // A mock AMF that records the notifications it receives.
+        let seen: Arc<StdMutex<Vec<(String, serde_json::Value)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let amf_port = nextgcore_sbi::test_support::free_port();
+        let amf_addr = SocketAddr::from(([127, 0, 0, 1], amf_port));
+        let amf = SbiServer::new(SbiServerConfig::new(amf_addr));
+        amf.start(move |req: SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                sink.lock()
+                    .expect("sink")
+                    .push((req.header.uri.clone(), body));
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("mock AMF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(amf_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let notif_uri = format!("http://127.0.0.1:{amf_port}/namf-callback/v1/am-policy");
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000892",
+                "notificationUri": notif_uri,
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_id = body["polAssoId"].as_str().unwrap().to_string();
+
+        // The update asks for new triggers and a new GUAMI.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_id}/update"),
+            Some(serde_json::json!({
+                "notificationUri": notif_uri,
+                "triggers": ["LOC_CH", "PRA_CH"],
+                "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200, "update: {:?}", resp.http.content);
+        let update: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        // TS 29.507: the 200 body is a PolicyUpdate, which carries resourceUri --
+        // the pre-#89 body was a PolicyAssociation-like {polAssoId, supi,
+        // triggers: []} with no resourceUri at all.
+        assert_eq!(
+            update["resourceUri"],
+            format!("/npcf-am-policy-control/v1/policies/{pol_id}"),
+            "PolicyUpdate.resourceUri: {update}"
+        );
+        assert_eq!(
+            update["triggers"],
+            serde_json::json!(["LOC_CH", "PRA_CH"]),
+            "the requested triggers must be applied and reflected: {update}"
+        );
+        assert!(
+            update.get("polAssoId").is_none(),
+            "a PolicyUpdate is not a PolicyAssociation: {update}"
+        );
+
+        // ...and the stored association reflects the request, so a later GET
+        // agrees with it.
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_id}"),
+            None,
+        ))
+        .await;
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got["triggers"], serde_json::json!(["LOC_CH", "PRA_CH"]));
+
+        // The change was pushed to the AMF at {notificationUri}/update.
+        let notifs = {
+            let mut out = Vec::new();
+            for _ in 0..200 {
+                out = seen.lock().expect("sink").clone();
+                if out.iter().any(|(uri, _)| uri.ends_with("/update")) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            out
+        };
+        let (uri, body) = notifs
+            .iter()
+            .find(|(uri, _)| uri.ends_with("/update"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no AM policy notification delivered: {notifs:?}"));
+        assert!(uri.ends_with("/am-policy/update"), "delivered to {uri}");
+        assert_eq!(
+            body["resourceUri"],
+            format!("/npcf-am-policy-control/v1/policies/{pol_id}")
+        );
+        assert_eq!(
+            body["triggers"],
+            serde_json::json!(["LOC_CH", "PRA_CH"]),
+            "the notification must carry the real triggers, not [] : {body}"
+        );
+
+        amf.stop().await.ok();
+        udr.stop().await.ok();
+    }
+
+    /// TS 29.500 §6.10: a notification is retried, and falls back to the
+    /// consumer's alternate endpoint. The primary fails twice then the alternate
+    /// accepts, so only a retry-and-fallback delivery succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notification_retries_then_falls_back_to_an_alternate_endpoint() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        // Primary: always 500, so every attempt against it fails.
+        let primary_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&primary_hits);
+        let primary_port = nextgcore_sbi::test_support::free_port();
+        let primary_addr = SocketAddr::from(([127, 0, 0, 1], primary_port));
+        let primary = SbiServer::new(SbiServerConfig::new(primary_addr));
+        primary
+            .start(move |_req: SbiRequest| {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::SeqCst);
+                    SbiResponse::with_status(500)
+                }
+            })
+            .await
+            .expect("primary starts");
+
+        // Alternate: accepts.
+        let alt_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&alt_hits);
+        let alt_port = nextgcore_sbi::test_support::free_port();
+        let alt_addr = SocketAddr::from(([127, 0, 0, 1], alt_port));
+        let alternate = SbiServer::new(SbiServerConfig::new(alt_addr));
+        alternate
+            .start(move |_req: SbiRequest| {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::SeqCst);
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("alternate starts");
+        for addr in [primary_addr, alt_addr] {
+            for _ in 0..200 {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        let delivered = sbi_path::send_notification_reliably(
+            &format!("http://127.0.0.1:{primary_port}/cb"),
+            &[format!("http://127.0.0.1:{alt_port}/cb")],
+            "/update",
+            &serde_json::json!({ "resourceUri": "/x" }),
+            "test",
+        )
+        .await;
+        assert!(
+            delivered,
+            "delivery must succeed via the alternate endpoint"
+        );
+        assert_eq!(
+            primary_hits.load(AtomicOrdering::SeqCst),
+            3,
+            "the primary must be RETRIED, not attempted once"
+        );
+        assert_eq!(alt_hits.load(AtomicOrdering::SeqCst), 1);
+
+        // A 4xx is a decision, not a transient fault: it must NOT be retried.
+        let rejecting_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&rejecting_hits);
+        let rej_port = nextgcore_sbi::test_support::free_port();
+        let rej_addr = SocketAddr::from(([127, 0, 0, 1], rej_port));
+        let rejecting = SbiServer::new(SbiServerConfig::new(rej_addr));
+        rejecting
+            .start(move |_req: SbiRequest| {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::SeqCst);
+                    SbiResponse::with_status(400)
+                }
+            })
+            .await
+            .expect("rejecting starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(rej_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let delivered = sbi_path::send_notification_reliably(
+            &format!("http://127.0.0.1:{rej_port}/cb"),
+            &[],
+            "/update",
+            &serde_json::json!({}),
+            "test",
+        )
+        .await;
+        assert!(!delivered);
+        assert_eq!(
+            rejecting_hits.load(AtomicOrdering::SeqCst),
+            1,
+            "a 4xx must not be retried"
+        );
+
+        primary.stop().await.ok();
+        alternate.stop().await.ok();
+        rejecting.stop().await.ok();
+    }
+
+    /// The alternate-endpoint URIs are derived from the consumer's
+    /// `altNotif*` lists, keeping the primary's scheme and path.
+    #[test]
+    fn alternate_notification_uris_keep_scheme_and_path() {
+        let req = serde_json::json!({
+            "altNotifIpv4Addrs": ["10.0.0.1", "10.0.0.2"],
+            "altNotifIpv6Addrs": ["2001:db8::1"],
+            "altNotifFqdns": ["amf2.example.org"]
+        });
+        let uris = alternate_notification_uris(&req, "https://amf1.example.org:8443/cb/am-policy");
+        assert_eq!(
+            uris,
+            vec![
+                "https://10.0.0.1/cb/am-policy".to_string(),
+                "https://10.0.0.2/cb/am-policy".to_string(),
+                "https://[2001:db8::1]/cb/am-policy".to_string(),
+                "https://amf2.example.org/cb/am-policy".to_string(),
+            ]
+        );
+        // No alternates configured -> nothing to fall back to.
+        assert!(alternate_notification_uris(&serde_json::json!({}), "http://a/cb").is_empty());
+    }
+
+    /// TS 23.003 §2.10.1 `AmfId` bit layout, and a malformed value ignored.
+    #[test]
+    fn amf_id_hex_parses_region_set_pointer() {
+        let id = parse_amf_id_hex("cafe00").expect("6 hex digits");
+        assert_eq!(id.region, 0xca);
+        assert_eq!(id.set, (0xfe00 >> 6) & 0x03FF);
+        assert_eq!(id.pointer, 0x00);
+        assert!(
+            parse_amf_id_hex("cafe0").is_none(),
+            "5 digits is not an AmfId"
+        );
+        assert!(
+            parse_amf_id_hex("zzzzzz").is_none(),
+            "non-hex is not an AmfId"
+        );
+    }
+
+    /// TS 29.512 §5.3: the Individual SM Policy resource is an
+    /// `SmPolicyControl{context, policy}`, and `context.supi` is the session's
+    /// real SUPI — the flat body it used to return had no context at all.
+    #[tokio::test]
+    async fn sm_policy_get_returns_the_sm_policy_control_envelope() {
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000893";
+        let mut create = full_create_body(supi, 30);
+        create
+            .as_object_mut()
+            .unwrap()
+            .insert("ipv4Address".to_string(), serde_json::json!("10.45.0.193"));
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_id = body["smPolicyId"].as_str().unwrap().to_string();
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_id}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            got.get("context").is_some() && got.get("policy").is_some(),
+            "both SmPolicyControl members are required: {got}"
+        );
+        assert_eq!(
+            got["context"]["supi"], supi,
+            "context.supi must be the session's real SUPI: {got}"
+        );
+        assert_eq!(got["context"]["pduSessionId"], 30);
+        assert_eq!(got["context"]["ipv4Address"], "10.45.0.193");
+        assert_eq!(got["policy"]["smPolicyId"], pol_id);
+        // ...and the decision is no longer at the top level.
+        assert!(
+            got.get("sessRules").is_none(),
+            "the decision belongs under `policy`: {got}"
+        );
     }
 
     // ========================================================================

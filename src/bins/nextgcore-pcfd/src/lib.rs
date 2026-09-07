@@ -43,7 +43,8 @@ pub mod ue_policy; // Rel-16: URSP rule provisioning (TS 23.503)
 // the PCF self identity it reads) and the shared SM policy decision builder.
 pub use sbi_path::{
     build_pcf_binding_body, build_pcf_binding_body_with, pcf_deregister_bsf_binding,
-    pcf_register_bsf_binding, pcf_self_info, pcf_self_info_set, PcfSelfInfo,
+    pcf_register_bsf_binding, pcf_self_info, pcf_self_info_set, pcf_sess_update_bsf_binding,
+    pcf_update_bsf_binding, PcfSelfInfo,
 };
 pub use sm_policy_build::{build_sm_policy_decision, SmPolicyDecisionParts};
 
