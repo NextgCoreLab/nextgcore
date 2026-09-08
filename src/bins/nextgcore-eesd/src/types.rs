@@ -496,14 +496,19 @@ pub fn parse_rfc3339_to_epoch(s: &str) -> Option<i64> {
     Some(days * 86400 + hour * 3600 + minute * 60 + second - offset_secs)
 }
 
-/// Format Unix epoch seconds as an RFC 3339 UTC timestamp (`...Z`).
-pub fn epoch_to_rfc3339(epoch: i64) -> String {
-    let days = epoch.div_euclid(86400);
-    let secs = epoch.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
+// The RFC 3339 migration: eesd's `epoch_to_rfc3339(i64)` used to live here. It is
+// now `nextgcore_sbi::datetime::epoch_to_rfc3339_signed`, re-exported below under
+// the old name so every call site reads unchanged.
+//
+// This copy was the ONE of the six that was not interchangeable with the others:
+// it takes an `i64` and splits it with `div_euclid`/`rem_euclid`, so a pre-epoch
+// instant formats correctly instead of wrapping through `u64` into a year around
+// 584 billion. That is why the shared module gained a signed entry point rather
+// than eesd being narrowed to the `u64` one -- narrowing would have been a silent
+// behaviour regression at a wire field, which is exactly what having six copies is
+// supposed to stop. The `u64` entry point stays the common case, so no other
+// caller changes.
+pub use nextgcore_sbi::datetime::epoch_to_rfc3339_signed as epoch_to_rfc3339;
 
 #[cfg(test)]
 mod tests {

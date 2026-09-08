@@ -19,22 +19,59 @@
 //! Hand-rolled rather than pulling in a date/time crate, matching what the
 //! existing copies already do.
 
+/// Howard Hinnant's `civil_from_days`: days since 1970-01-01 -> (year, month, day)
+/// in the proleptic Gregorian calendar.
+///
+/// Extracted so the `u64` and `i64` entry points below share one calendar
+/// conversion. The two differ only in how they split an epoch into days and
+/// seconds-of-day, which is where the signedness actually matters.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 /// Format `secs` since the Unix epoch as an RFC 3339 UTC timestamp
 /// (TS 29.571 `DateTime`).
 pub fn epoch_to_rfc3339(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Format a **signed** epoch as an RFC 3339 UTC timestamp, for the call sites that
+/// hold an `i64`.
+///
+/// Not a convenience wrapper over [`epoch_to_rfc3339`]: a negative epoch cast to
+/// `u64` becomes an enormous positive number and formats as a year far in the
+/// future, so the split into days and seconds-of-day must be Euclidean.
+/// `(-1).div_euclid(86400) == -1` and `(-1).rem_euclid(86400) == 86399`, giving
+/// `1969-12-31T23:59:59Z`; `-1 / 86400 == 0` with a remainder of `-1` would not.
+///
+/// This is `eesd`'s implementation, promoted here during the RFC 3339 migration —
+/// it was the only one of the six copies that handled a pre-epoch instant, and
+/// keeping the `u64` entry point as the common case rather than widening it means
+/// no existing caller changes.
+pub fn epoch_to_rfc3339_signed(epoch: i64) -> String {
+    let days = epoch.div_euclid(86_400);
+    let rem = epoch.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         y,
@@ -119,6 +156,29 @@ mod tests {
             assert_eq!(epoch_to_rfc3339(secs), text, "format {secs}");
             assert_eq!(rfc3339_to_epoch(text), Some(secs), "parse {text}");
         }
+    }
+
+    /// The signed entry point agrees with the `u64` one wherever both are defined,
+    /// and handles the pre-epoch instants the `u64` one cannot represent.
+    ///
+    /// The negative cases are the whole reason it exists: `-1` as a `u64` is
+    /// 18446744073709551615, which formats as a year around 584 billion. Getting
+    /// `1969-12-31T23:59:59Z` instead is what `div_euclid`/`rem_euclid` buy.
+    #[test]
+    fn signed_epochs_agree_with_unsigned_and_handle_pre_epoch_instants() {
+        for secs in [0u64, 946_684_800, 1_583_020_800, 1_709_164_800] {
+            assert_eq!(
+                epoch_to_rfc3339_signed(secs as i64),
+                epoch_to_rfc3339(secs),
+                "signed and unsigned must agree at {secs}"
+            );
+        }
+        assert_eq!(epoch_to_rfc3339_signed(-1), "1969-12-31T23:59:59Z");
+        assert_eq!(epoch_to_rfc3339_signed(-86_400), "1969-12-31T00:00:00Z");
+        assert_eq!(epoch_to_rfc3339_signed(-86_401), "1969-12-30T23:59:59Z");
+        // A truncating (non-Euclidean) split would give 1970-01-01T00:00:00Z here,
+        // i.e. it would silently round a pre-epoch instant up to the epoch.
+        assert_ne!(epoch_to_rfc3339_signed(-1), "1970-01-01T00:00:00Z");
     }
 
     #[test]
