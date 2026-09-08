@@ -113,6 +113,32 @@ pub fn scp_sbi_is_running() -> bool {
 // NF Instance Selection & Request Routing
 // ============================================================================
 
+/// One `nfServices` entry of an NF profile, reduced to what endpoint selection
+/// needs (TS 29.510 §6.1.6.2.x).
+///
+/// An NF may register several services with **different** schemes, `apiPrefix`
+/// values and ports — a UDM registering `nudm-sdm`, `nudm-uecm` and `nudm-ueau`
+/// is the ordinary case. TS 29.510 §6.2.6.2 selects the endpoint from the
+/// service matching the requested service name and the API version in the URI,
+/// so those three fields must be kept *per service* rather than collapsed to
+/// the profile's first entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NfServiceEndpoint {
+    /// `serviceName`, e.g. `nudm-sdm`.
+    pub service_name: String,
+    /// `versions[].apiVersionInUri` values, e.g. `["v1"]`. **Empty means the
+    /// profile declared none**, which is treated as "serves any version" rather
+    /// than "serves no version": a great many profiles omit `versions`, and
+    /// refusing them would turn a missing optional field into an outage.
+    pub versions: Vec<String>,
+    /// `scheme` (`https` → TLS), defaulting to `Http` when absent.
+    pub scheme: UriScheme,
+    /// Port from this service's `ipEndPoints` (TCP entry preferred).
+    pub port: u16,
+    /// `apiPrefix` for this service (empty when absent).
+    pub prefix: String,
+}
+
 /// NF instance candidate for load-balanced routing
 #[derive(Debug, Clone)]
 pub struct NfInstanceCandidate {
@@ -131,6 +157,39 @@ pub struct NfInstanceCandidate {
     /// Optional deployment-specific API prefix from `nfServices[].apiPrefix`
     /// (TS 29.501 §4.4.1 / TS 29.500 §6.10.2.5).
     pub prefix: String,
+    /// Every `nfServices` entry of the profile, so the endpoint can be taken
+    /// from the *matching* service (TS 29.510 §6.2.6.2) instead of the first.
+    /// The `scheme`/`port`/`prefix` fields above remain the profile-level
+    /// fallback used when the profile declares no services at all.
+    pub services: Vec<NfServiceEndpoint>,
+}
+
+/// Why no producer endpoint could be selected for a requested service and API
+/// version (TS 29.510 §6.2.6.2). The variants are kept distinct because the
+/// SCP owes the consumer three *different* answers: nothing to choose from,
+/// nobody offers the service, and the service exists in another version only —
+/// the last of which is `INVALID_API` rather than a discovery failure
+/// (TS 29.500 Table 5.2.7.2-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointSelectionError {
+    /// The candidate list is empty, or holds nothing selectable.
+    NoCandidate,
+    /// Candidates exist but none registers the requested `serviceName`.
+    ServiceNotOffered,
+    /// The requested `serviceName` is registered, but no candidate declares the
+    /// requested API major version for it.
+    UnsupportedApiVersion,
+}
+
+/// A producer endpoint resolved from the *matching* `NFService` of the selected
+/// candidate. `scheme`/`port`/`prefix` are the matched service's, not the
+/// profile's first service's.
+#[derive(Debug, Clone)]
+pub struct SelectedEndpoint<'a> {
+    pub candidate: &'a NfInstanceCandidate,
+    pub scheme: UriScheme,
+    pub port: u16,
+    pub prefix: String,
 }
 
 /// Select the best NF instance from a list of candidates using weighted round-robin.
@@ -143,19 +202,23 @@ pub struct NfInstanceCandidate {
 /// 2. Group by priority (lower = better)
 /// 3. Among same-priority, pick by available capacity (capacity - load)
 pub fn select_nf_instance(candidates: &[NfInstanceCandidate]) -> Option<&NfInstanceCandidate> {
-    if candidates.is_empty() {
+    select_best(candidates.iter().collect())
+}
+
+/// The health / priority / capacity ordering of [`select_nf_instance`], factored
+/// out so it can be applied *within* a service-and-version-matched subset
+/// (TS 29.510 §6.2.6.2) rather than only over a whole SearchResult. Behaviour is
+/// unchanged for the whole-list caller.
+fn select_best(pool: Vec<&NfInstanceCandidate>) -> Option<&NfInstanceCandidate> {
+    if pool.is_empty() {
         return None;
     }
 
     // Filter to healthy instances only
-    let healthy: Vec<&NfInstanceCandidate> = candidates.iter().filter(|c| c.healthy).collect();
+    let healthy: Vec<&NfInstanceCandidate> = pool.iter().copied().filter(|c| c.healthy).collect();
 
     // Fall back to all candidates if none are marked healthy
-    let pool = if healthy.is_empty() {
-        candidates.iter().collect()
-    } else {
-        healthy
-    };
+    let pool = if healthy.is_empty() { pool } else { healthy };
 
     // Group by priority (lower is better)
     let min_priority = pool.iter().map(|c| c.priority).min().unwrap_or(0);
@@ -171,6 +234,115 @@ pub fn select_nf_instance(candidates: &[NfInstanceCandidate]) -> Option<&NfInsta
         .iter()
         .max_by_key(|c| c.capacity.saturating_sub(c.load) as u32)
         .map(|c| **c)
+}
+
+/// True when `service` is the service the consumer asked for. A `None` request
+/// service name matches everything (the caller could not determine one).
+fn service_name_matches(service: &NfServiceEndpoint, requested: Option<&str>) -> bool {
+    match requested {
+        None => true,
+        Some(name) => service.service_name.eq_ignore_ascii_case(name),
+    }
+}
+
+/// True when `service` serves the requested API major version. A service that
+/// declares **no** `versions` matches any version: the field is optional in
+/// TS 29.510 and most profiles in this tree omit it, so treating "unstated" as
+/// "unsupported" would reject conformant producers. A `None` requested version
+/// likewise matches everything.
+fn service_version_matches(service: &NfServiceEndpoint, requested: Option<&str>) -> bool {
+    match requested {
+        None => true,
+        Some(version) => {
+            service.versions.is_empty()
+                || service
+                    .versions
+                    .iter()
+                    .any(|v| v.eq_ignore_ascii_case(version))
+        }
+    }
+}
+
+/// Select a producer endpoint by matching the requested **service name** and
+/// **API major version**, per TS 29.510 §6.2.6.2.
+///
+/// This is the selection TS 29.510 actually defines: an `NFService` is chosen by
+/// service name and by the API version in the URI, and the endpoint (scheme,
+/// `apiPrefix`, port) comes from *that* service. Taking the endpoint from
+/// `nfServices[0]` instead mis-addresses every multi-service producer — a UDM
+/// serving `nudm-uecm` on 8080 and `nudm-sdm` on 8443 resolves both to whichever
+/// entry the NRF happened to list first, and the failure then surfaces as a
+/// producer 404 that looks like a producer bug.
+///
+/// The existing priority / capacity / load ordering is applied **within** the
+/// matching set, so a single-service producer selects exactly as before.
+///
+/// A candidate whose profile declares no `nfServices` at all keeps the
+/// profile-level `scheme`/`port`/`prefix` and matches any request: there is no
+/// service list to contradict the request, and the alternative is refusing to
+/// route to a producer the NRF returned.
+pub fn select_nf_service_endpoint<'a>(
+    candidates: &'a [NfInstanceCandidate],
+    service_name: Option<&str>,
+    api_version: Option<&str>,
+) -> Result<SelectedEndpoint<'a>, EndpointSelectionError> {
+    if candidates.is_empty() {
+        return Err(EndpointSelectionError::NoCandidate);
+    }
+
+    // Stage 1: candidates that offer the requested service at all. Kept separate
+    // from the version stage so "offered in another version" is distinguishable
+    // from "not offered", which are different answers to the consumer.
+    let offers_service: Vec<&NfInstanceCandidate> = candidates
+        .iter()
+        .filter(|c| {
+            c.services.is_empty()
+                || c.services
+                    .iter()
+                    .any(|s| service_name_matches(s, service_name))
+        })
+        .collect();
+    if offers_service.is_empty() {
+        return Err(EndpointSelectionError::ServiceNotOffered);
+    }
+
+    // Stage 2: of those, the ones serving the requested API major version.
+    let serves_version: Vec<&NfInstanceCandidate> = offers_service
+        .iter()
+        .copied()
+        .filter(|c| {
+            c.services.is_empty()
+                || c.services.iter().any(|s| {
+                    service_name_matches(s, service_name) && service_version_matches(s, api_version)
+                })
+        })
+        .collect();
+    if serves_version.is_empty() {
+        return Err(EndpointSelectionError::UnsupportedApiVersion);
+    }
+
+    let candidate = select_best(serves_version).ok_or(EndpointSelectionError::NoCandidate)?;
+
+    // Endpoint from the MATCHING service; the profile-level fields are only the
+    // fallback for a profile with no service list.
+    let matched = candidate
+        .services
+        .iter()
+        .find(|s| service_name_matches(s, service_name) && service_version_matches(s, api_version));
+    Ok(match matched {
+        Some(service) => SelectedEndpoint {
+            candidate,
+            scheme: service.scheme,
+            port: service.port,
+            prefix: service.prefix.clone(),
+        },
+        None => SelectedEndpoint {
+            candidate,
+            scheme: candidate.scheme,
+            port: candidate.port,
+            prefix: candidate.prefix.clone(),
+        },
+    })
 }
 
 /// Round-robin index for distributing requests across equal-weight instances.
@@ -383,6 +555,13 @@ pub fn discovery_cache() -> &'static DiscoveryCache {
 ///   (case-insensitive), falling back to `ipEndPoints[0]` if none specifies
 ///   a transport.
 /// - **prefix**: from `nfServices[0].apiPrefix` (empty string when absent).
+///
+/// In addition **every** `nfServices` entry is retained in
+/// [`NfInstanceCandidate::services`] with its own scheme / port / `apiPrefix` and
+/// `versions[].apiVersionInUri`, so [`select_nf_service_endpoint`] can address
+/// the service the consumer actually asked for (TS 29.510 §6.2.6.2). The
+/// `nfServices[0]`-derived fields above are kept as the profile-level fallback
+/// for a profile that registers no services.
 pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
     let value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -436,46 +615,32 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
             // Service-level fields: scheme, port, and apiPrefix come from
             // nfServices[0].  Port is taken from the first ipEndPoints entry
             // whose transport is TCP (case-insensitive); falls back to [0].
-            let first_service = inst
-                .get("nfServices")
-                .and_then(|v| v.as_array())
-                .and_then(|s| s.first());
+            let service_array = inst.get("nfServices").and_then(|v| v.as_array());
+            let first_service = service_array.and_then(|s| s.first());
 
-            let scheme = first_service
-                .and_then(|svc| svc.get("scheme"))
-                .and_then(|v| v.as_str())
-                .map(|s| {
-                    if s.eq_ignore_ascii_case("https") {
-                        UriScheme::Https
-                    } else {
-                        UriScheme::Http
-                    }
-                })
-                .unwrap_or(UriScheme::Http);
+            let scheme = service_scheme(first_service);
+            let prefix = service_prefix(first_service);
+            let port = service_port(first_service);
 
-            let prefix = first_service
-                .and_then(|svc| svc.get("apiPrefix"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let port = first_service
-                .and_then(|svc| svc.get("ipEndPoints"))
-                .and_then(|v| v.as_array())
-                .and_then(|eps| {
-                    // Prefer an endpoint explicitly marked as TCP.
-                    eps.iter()
-                        .find(|ep| {
-                            ep.get("transport")
-                                .and_then(|t| t.as_str())
-                                .map(|t| t.eq_ignore_ascii_case("TCP"))
-                                .unwrap_or(false)
+            // Every registered service, with ITS OWN endpoint, so the SCP can
+            // address the requested one (TS 29.510 §6.2.6.2).
+            let services: Vec<NfServiceEndpoint> = service_array
+                .map(|arr| {
+                    arr.iter()
+                        .map(|svc| NfServiceEndpoint {
+                            service_name: svc
+                                .get("serviceName")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            versions: service_versions(svc),
+                            scheme: service_scheme(Some(svc)),
+                            port: service_port(Some(svc)),
+                            prefix: service_prefix(Some(svc)),
                         })
-                        .or_else(|| eps.first())
+                        .collect()
                 })
-                .and_then(|ep| ep.get("port"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(7777) as u16;
+                .unwrap_or_default();
 
             let priority = inst.get("priority").and_then(|v| v.as_u64()).unwrap_or(50) as u16;
             let capacity = inst.get("capacity").and_then(|v| v.as_u64()).unwrap_or(100) as u16;
@@ -492,11 +657,77 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
                 healthy: nf_status == "REGISTERED",
                 scheme,
                 prefix,
+                services,
             });
         }
     }
 
     candidates
+}
+
+/// `nfServices[].scheme` → [`UriScheme`]; `Http` when absent or unrecognised
+/// (backward-compat default, TS 29.510 §6.1.6.2.x).
+fn service_scheme(service: Option<&serde_json::Value>) -> UriScheme {
+    service
+        .and_then(|svc| svc.get("scheme"))
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            if s.eq_ignore_ascii_case("https") {
+                UriScheme::Https
+            } else {
+                UriScheme::Http
+            }
+        })
+        .unwrap_or(UriScheme::Http)
+}
+
+/// `nfServices[].apiPrefix`, empty string when absent (TS 29.501 §4.4.1).
+fn service_prefix(service: Option<&serde_json::Value>) -> String {
+    service
+        .and_then(|svc| svc.get("apiPrefix"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Port from `nfServices[].ipEndPoints`, preferring an entry explicitly marked
+/// `transport: TCP` and falling back to the first entry, then to 7777.
+fn service_port(service: Option<&serde_json::Value>) -> u16 {
+    service
+        .and_then(|svc| svc.get("ipEndPoints"))
+        .and_then(|v| v.as_array())
+        .and_then(|eps| {
+            // Prefer an endpoint explicitly marked as TCP.
+            eps.iter()
+                .find(|ep| {
+                    ep.get("transport")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.eq_ignore_ascii_case("TCP"))
+                        .unwrap_or(false)
+                })
+                .or_else(|| eps.first())
+        })
+        .and_then(|ep| ep.get("port"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(7777) as u16
+}
+
+/// `nfServices[].versions[].apiVersionInUri` values (TS 29.510 §6.1.6.2.12).
+/// Entries without an `apiVersionInUri` are skipped rather than guessed at from
+/// `apiFullVersion`; a profile whose whole `versions` array yields nothing is
+/// therefore indistinguishable from one that declared none, which
+/// [`service_version_matches`] treats as "serves any version".
+fn service_versions(service: &serde_json::Value) -> Vec<String> {
+    service
+        .get("versions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.get("apiVersionInUri").and_then(|x| x.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -575,6 +806,7 @@ mod tests {
             healthy: true,
             scheme: UriScheme::Http,
             prefix: String::new(),
+            services: Vec::new(),
         }];
         let selected = select_nf_instance(&candidates);
         assert!(selected.is_some());
@@ -595,6 +827,7 @@ mod tests {
                 healthy: true,
                 scheme: UriScheme::Http,
                 prefix: String::new(),
+                services: Vec::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-high".to_string(),
@@ -607,6 +840,7 @@ mod tests {
                 healthy: true,
                 scheme: UriScheme::Http,
                 prefix: String::new(),
+                services: Vec::new(),
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -627,6 +861,7 @@ mod tests {
                 healthy: true,
                 scheme: UriScheme::Http,
                 prefix: String::new(),
+                services: Vec::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-idle".to_string(),
@@ -639,6 +874,7 @@ mod tests {
                 healthy: true,
                 scheme: UriScheme::Http,
                 prefix: String::new(),
+                services: Vec::new(),
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -659,6 +895,7 @@ mod tests {
                 healthy: false,
                 scheme: UriScheme::Http,
                 prefix: String::new(),
+                services: Vec::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-healthy".to_string(),
@@ -671,6 +908,7 @@ mod tests {
                 healthy: true,
                 scheme: UriScheme::Http,
                 prefix: String::new(),
+                services: Vec::new(),
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -691,6 +929,7 @@ mod tests {
                 healthy: true,
                 scheme: UriScheme::Http,
                 prefix: String::new(),
+                services: Vec::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-b".to_string(),
@@ -703,6 +942,7 @@ mod tests {
                 healthy: true,
                 scheme: UriScheme::Http,
                 prefix: String::new(),
+                services: Vec::new(),
             },
         ];
         // Call twice to see round-robin switching
@@ -735,6 +975,7 @@ mod tests {
             healthy: true,
             scheme: UriScheme::Http,
             prefix: String::new(),
+            services: Vec::new(),
         }];
 
         cache.put(
@@ -898,6 +1139,7 @@ mod tests {
             healthy: true,
             scheme: UriScheme::Http,
             prefix: String::new(),
+            services: Vec::new(),
         }]
     }
 
@@ -958,5 +1200,246 @@ mod tests {
         let body = serde_json::to_vec(&json).unwrap();
         let candidates = parse_search_result(&body);
         assert_eq!(candidates[0].host, "ausf.5gc.example.org");
+    }
+
+    // ------------------------------------------------------------------
+    // scpd-#207: endpoint selection matches serviceName AND API version
+    // (TS 29.510 §6.2.6.2)
+    // ------------------------------------------------------------------
+
+    /// A UDM registering two services on different ports / prefixes / schemes —
+    /// the ordinary shape TS 29.510 §6.2.6.2 exists for.
+    ///
+    /// Both services declare the SAME `v1`, deliberately: with different versions
+    /// the version filter alone would resolve the endpoint and
+    /// `test_select_endpoint_uses_the_requested_services_endpoint` would pass with
+    /// service-name matching disabled. It was written that way first and the
+    /// revert caught it. The name is now the only discriminator.
+    fn multi_service_udm() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "udm-multi",
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": ["10.0.0.9"],
+                "priority": 1,
+                "capacity": 100,
+                "load": 0,
+                "nfServices": [
+                    {
+                        "serviceName": "nudm-uecm",
+                        "apiPrefix": "/uecm",
+                        "versions": [{"apiVersionInUri": "v1"}],
+                        "ipEndPoints": [{"transport": "TCP", "port": 8080}]
+                    },
+                    {
+                        "serviceName": "nudm-sdm",
+                        "scheme": "https",
+                        "apiPrefix": "/sdm",
+                        "versions": [{"apiVersionInUri": "v1"}],
+                        "ipEndPoints": [{"transport": "TCP", "port": 8443}]
+                    }
+                ]
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// scpd-#207: `parse_search_result` retains EVERY service with its own
+    /// endpoint, not just `nfServices[0]`.
+    #[test]
+    fn test_parse_search_result_retains_every_service_endpoint() {
+        let candidates = parse_search_result(&multi_service_udm());
+        assert_eq!(candidates.len(), 1);
+        let services = &candidates[0].services;
+        assert_eq!(services.len(), 2, "both services retained");
+        assert_eq!(services[0].service_name, "nudm-uecm");
+        assert_eq!(services[0].port, 8080);
+        assert_eq!(services[0].prefix, "/uecm");
+        assert_eq!(services[0].scheme, UriScheme::Http);
+        assert_eq!(services[0].versions, vec!["v1".to_string()]);
+        assert_eq!(services[1].service_name, "nudm-sdm");
+        assert_eq!(services[1].port, 8443);
+        assert_eq!(services[1].prefix, "/sdm");
+        assert_eq!(services[1].scheme, UriScheme::Https);
+        assert_eq!(services[1].versions, vec!["v1".to_string()]);
+        // The profile-level fallback fields still mirror nfServices[0].
+        assert_eq!(candidates[0].port, 8080);
+        assert_eq!(candidates[0].prefix, "/uecm");
+    }
+
+    /// scpd-#207 acceptance: with a two-service producer on differing ports and
+    /// prefixes, the REQUESTED service's endpoint is used — for both services, so
+    /// the test cannot pass by always returning the first (or the last) entry.
+    #[test]
+    fn test_select_endpoint_uses_the_requested_services_endpoint() {
+        let candidates = parse_search_result(&multi_service_udm());
+
+        let uecm = select_nf_service_endpoint(&candidates, Some("nudm-uecm"), Some("v1"))
+            .expect("uecm selected");
+        assert_eq!(uecm.candidate.nf_instance_id, "udm-multi");
+        assert_eq!(uecm.port, 8080);
+        assert_eq!(uecm.prefix, "/uecm");
+        assert_eq!(uecm.scheme, UriScheme::Http);
+
+        let sdm = select_nf_service_endpoint(&candidates, Some("nudm-sdm"), Some("v1"))
+            .expect("sdm selected");
+        assert_eq!(sdm.port, 8443, "the second service's port, not the first's");
+        assert_eq!(sdm.prefix, "/sdm");
+        assert_eq!(sdm.scheme, UriScheme::Https);
+    }
+
+    /// scpd-#207 acceptance: an API version the producer does not declare for the
+    /// requested service is `UnsupportedApiVersion` — distinct from
+    /// `ServiceNotOffered`, because the two owe the consumer different answers.
+    #[test]
+    fn test_select_endpoint_distinguishes_version_from_service_mismatch() {
+        let candidates = parse_search_result(&multi_service_udm());
+
+        // nudm-uecm exists, but only at v1.
+        assert_eq!(
+            select_nf_service_endpoint(&candidates, Some("nudm-uecm"), Some("v2")).unwrap_err(),
+            EndpointSelectionError::UnsupportedApiVersion
+        );
+        // nudm-ueau is not registered at all.
+        assert_eq!(
+            select_nf_service_endpoint(&candidates, Some("nudm-ueau"), Some("v1")).unwrap_err(),
+            EndpointSelectionError::ServiceNotOffered
+        );
+        // An empty SearchResult is neither.
+        assert_eq!(
+            select_nf_service_endpoint(&[], Some("nudm-uecm"), Some("v1")).unwrap_err(),
+            EndpointSelectionError::NoCandidate
+        );
+    }
+
+    /// scpd-#207: a profile that declares NO `versions` serves any version, and a
+    /// profile with no `nfServices` at all keeps its profile-level endpoint. Both
+    /// are the backward-compatibility cases: refusing them would turn a missing
+    /// optional field into an outage.
+    #[test]
+    fn test_select_endpoint_is_lenient_where_the_profile_is_silent() {
+        let versionless = serde_json::to_vec(&serde_json::json!({
+            "nfInstances": [{
+                "nfInstanceId": "udm-versionless",
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": ["10.0.0.10"],
+                "nfServices": [{
+                    "serviceName": "nudm-uecm",
+                    "ipEndPoints": [{"port": 7777}]
+                }]
+            }]
+        }))
+        .unwrap();
+        let candidates = parse_search_result(&versionless);
+        for version in ["v1", "v2", "v9"] {
+            let selected =
+                select_nf_service_endpoint(&candidates, Some("nudm-uecm"), Some(version))
+                    .unwrap_or_else(|e| panic!("versionless profile must serve {version}: {e:?}"));
+            assert_eq!(selected.port, 7777);
+        }
+
+        let serviceless = serde_json::to_vec(&serde_json::json!({
+            "nfInstances": [{
+                "nfInstanceId": "udm-serviceless",
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": ["10.0.0.11"]
+            }]
+        }))
+        .unwrap();
+        let candidates = parse_search_result(&serviceless);
+        let selected = select_nf_service_endpoint(&candidates, Some("nudm-uecm"), Some("v1"))
+            .expect("a profile with no service list is still routable");
+        assert_eq!(selected.port, 7777, "profile-level fallback port");
+        assert_eq!(selected.scheme, UriScheme::Http);
+    }
+
+    /// scpd-#207: the priority / capacity ordering is applied WITHIN the matching
+    /// set. The best-priority instance here does not offer the requested service,
+    /// so the worse-priority one that does must win — a test that only ever had
+    /// matching candidates could not tell the filter from the ordering.
+    #[test]
+    fn test_select_endpoint_orders_within_the_matching_set_only() {
+        let mixed = serde_json::to_vec(&serde_json::json!({
+            "nfInstances": [
+                {
+                    "nfInstanceId": "udm-sdm-only",
+                    "nfType": "UDM",
+                    "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["10.0.0.12"],
+                    "priority": 1,
+                    "nfServices": [{
+                        "serviceName": "nudm-sdm",
+                        "ipEndPoints": [{"port": 1111}]
+                    }]
+                },
+                {
+                    "nfInstanceId": "udm-uecm-only",
+                    "nfType": "UDM",
+                    "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["10.0.0.13"],
+                    "priority": 90,
+                    "nfServices": [{
+                        "serviceName": "nudm-uecm",
+                        "ipEndPoints": [{"port": 2222}]
+                    }]
+                }
+            ]
+        }))
+        .unwrap();
+        let candidates = parse_search_result(&mixed);
+        // Whole-list selection still prefers priority 1 (unchanged behaviour).
+        assert_eq!(
+            select_nf_instance(&candidates)
+                .expect("selected")
+                .nf_instance_id,
+            "udm-sdm-only"
+        );
+        // Service-matched selection must skip it: it does not serve nudm-uecm.
+        let selected = select_nf_service_endpoint(&candidates, Some("nudm-uecm"), Some("v1"))
+            .expect("the matching instance is selected despite worse priority");
+        assert_eq!(selected.candidate.nf_instance_id, "udm-uecm-only");
+        assert_eq!(selected.port, 2222);
+    }
+
+    /// scpd-#207: an unhealthy instance is still skipped inside the matching set,
+    /// so the version/name filter does not defeat the health filter.
+    #[test]
+    fn test_select_endpoint_still_skips_unhealthy_within_the_match() {
+        let mixed = serde_json::to_vec(&serde_json::json!({
+            "nfInstances": [
+                {
+                    "nfInstanceId": "udm-down",
+                    "nfType": "UDM",
+                    "nfStatus": "SUSPENDED",
+                    "ipv4Addresses": ["10.0.0.14"],
+                    "priority": 1,
+                    "nfServices": [{
+                        "serviceName": "nudm-uecm",
+                        "ipEndPoints": [{"port": 3333}]
+                    }]
+                },
+                {
+                    "nfInstanceId": "udm-up",
+                    "nfType": "UDM",
+                    "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["10.0.0.15"],
+                    "priority": 50,
+                    "nfServices": [{
+                        "serviceName": "nudm-uecm",
+                        "ipEndPoints": [{"port": 4444}]
+                    }]
+                }
+            ]
+        }))
+        .unwrap();
+        let candidates = parse_search_result(&mixed);
+        let selected = select_nf_service_endpoint(&candidates, Some("nudm-uecm"), Some("v1"))
+            .expect("healthy");
+        assert_eq!(selected.candidate.nf_instance_id, "udm-up");
+        assert_eq!(selected.port, 4444);
     }
 }

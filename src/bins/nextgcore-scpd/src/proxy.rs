@@ -37,7 +37,9 @@ use nextgcore_sbi::SbiError;
 
 use crate::cache::BoundedCache;
 use crate::circuit_breaker::CircuitBreaker;
-use crate::sbi_path::{parse_search_result, select_nf_instance, DiscoveryCache};
+use crate::sbi_path::{
+    parse_search_result, select_nf_service_endpoint, DiscoveryCache, EndpointSelectionError,
+};
 
 /// Default upstream connect timeout (bounded per TS 29.500 §6.11 guidance).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -573,6 +575,69 @@ fn upstream_error_response(target: &str, err: &SbiError) -> SbiResponse {
             "Bad Gateway",
             &format!("Failed to forward request to {target}: {other}"),
             "TARGET_NF_NOT_REACHABLE",
+        ),
+    }
+}
+
+/// The service name and API major version the request is *for*, used to select
+/// the producer's matching `NFService` endpoint (TS 29.510 §6.2.6.2).
+///
+/// **The request URI is authoritative**, because it is what the producer will be
+/// asked for: `/nudm-uecm/v1/registrations` names service `nudm-uecm` at version
+/// `v1`. `3gpp-Sbi-Discovery-service-names` is only a fallback for a URI with no
+/// `{apiName}/{apiVersion}` pair, and only when it names exactly **one** service
+/// — a list leaves the endpoint ambiguous, and picking an element of it would
+/// reinstate the arbitrary choice this selection exists to remove.
+fn requested_service_and_version(request: &SbiRequest) -> (Option<String>, Option<String>) {
+    let parsed = UriComponents::parse(&request.header.uri);
+    let single_named_service = || {
+        request
+            .http
+            .get_header(discovery_header::SERVICE_NAMES)
+            .and_then(|value| {
+                let mut names = value.split(',').map(str::trim).filter(|s| !s.is_empty());
+                let first = names.next()?;
+                names.next().is_none().then(|| first.to_string())
+            })
+    };
+    let service = parsed.api_name.clone().or_else(single_named_service);
+    (service, parsed.api_version)
+}
+
+/// Map an endpoint-selection failure to the answer the consumer is owed
+/// (TS 29.510 §6.2.6.2, TS 29.500 Table 5.2.7.2-1).
+///
+/// The version case is `400 INVALID_API` and not a discovery failure: the NRF
+/// did its job and returned the producer, and it is the consumer's requested API
+/// version that cannot be served — retrying will not help, so telling it
+/// `NF_DISCOVERY_FAILURE` would send it looking in the wrong place.
+fn endpoint_selection_error_response(
+    err: EndpointSelectionError,
+    service: Option<&str>,
+    version: Option<&str>,
+) -> SbiResponse {
+    let service = service.unwrap_or("(unnamed)");
+    match err {
+        EndpointSelectionError::UnsupportedApiVersion => problem_response(
+            400,
+            "Bad Request",
+            &format!(
+                "No discovered producer serves service {service} at API version {}",
+                version.unwrap_or("(unnamed)")
+            ),
+            "INVALID_API",
+        ),
+        EndpointSelectionError::ServiceNotOffered => problem_response(
+            502,
+            "Bad Gateway",
+            &format!("NRF discovery returned no NF instance offering service {service}"),
+            "NF_DISCOVERY_FAILURE",
+        ),
+        EndpointSelectionError::NoCandidate => problem_response(
+            502,
+            "Bad Gateway",
+            "NRF discovery returned no usable NF instance",
+            "NF_DISCOVERY_FAILURE",
         ),
     }
 }
@@ -1129,23 +1194,37 @@ impl ScpProxy {
             .cloned()
             .unwrap_or_default();
         let cache_discriminator = discovery_cache_discriminator(&request.http);
+
+        // scpd-#207: the endpoint is selected by matching the requested service
+        // name AND the API major version in the URI, and taken from the matching
+        // `NFService` (TS 29.510 §6.2.6.2) — not from `nfServices[0]`.
+        let (requested_service, requested_version) = requested_service_and_version(request);
         if let Some(cached) =
             self.discovery_cache
                 .get(&target_nf_type, &service_key, &cache_discriminator)
         {
-            if let Some(selected) = select_nf_instance(&cached) {
+            if let Ok(selected) = select_nf_service_endpoint(
+                &cached,
+                requested_service.as_deref(),
+                requested_version.as_deref(),
+            ) {
                 return Ok(DiscoveredProducer {
                     target: ApiRoot {
                         scheme: selected.scheme,
-                        host: selected.host.clone(),
+                        host: selected.candidate.host.clone(),
                         port: selected.port,
-                        prefix: selected.prefix.clone(),
+                        prefix: selected.prefix,
                     },
-                    nf_instance_id: selected.nf_instance_id.clone(),
+                    nf_instance_id: selected.candidate.nf_instance_id.clone(),
                     nf_set_id: None,
                     nf_group_id: None,
                 });
             }
+            // A cached set that cannot serve THIS request falls through to a
+            // fresh NRF query rather than erroring from stale data: the cache TTL
+            // is the SearchResult's `validityPeriod` (up to an hour), and a
+            // producer offering the requested service/version may have registered
+            // since. The error, if any, is then raised against current data.
         }
 
         let nrf_uri = self.config.nrf_uri.as_deref().ok_or_else(|| {
@@ -1196,17 +1275,12 @@ impl ScpProxy {
         let value: serde_json::Value =
             serde_json::from_slice(body.as_bytes()).unwrap_or(serde_json::Value::Null);
         let candidates = parse_search_result(body.as_bytes());
-        let selected = select_nf_instance(&candidates).ok_or_else(|| {
-            problem_response(
-                502,
-                "Bad Gateway",
-                "NRF discovery returned no usable NF instance",
-                "NF_DISCOVERY_FAILURE",
-            )
-        })?;
 
         // scpd-08: cache the parsed candidates with the SearchResult
-        // `validityPeriod` (seconds) as TTL (default 3600 when absent).
+        // `validityPeriod` (seconds) as TTL (default 3600 when absent). Cached
+        // BEFORE selection (scpd-#207): the cache holds what the NRF answered,
+        // which is still valid for other requests even when it cannot serve this
+        // one's API version.
         if !candidates.is_empty() {
             let validity = value
                 .get("validityPeriod")
@@ -1221,23 +1295,37 @@ impl ScpProxy {
             );
         }
 
+        let selected = select_nf_service_endpoint(
+            &candidates,
+            requested_service.as_deref(),
+            requested_version.as_deref(),
+        )
+        .map_err(|e| {
+            endpoint_selection_error_response(
+                e,
+                requested_service.as_deref(),
+                requested_version.as_deref(),
+            )
+        })?;
+
         // scpd-02/scpd-12: surface the producer's set id / group id when present.
-        let (nf_set_id, nf_group_id) = extract_set_and_group(&value, &selected.nf_instance_id);
+        let (nf_set_id, nf_group_id) =
+            extract_set_and_group(&value, &selected.candidate.nf_instance_id);
 
         // Build the producer ApiRoot from the NF profile fields parsed out of
-        // the SearchResult: scheme and prefix come from nfServices[].scheme /
-        // nfServices[].apiPrefix; host is ipv4→fqdn→ipv6(bracketed).
+        // the SearchResult: scheme, port and prefix come from the MATCHED
+        // `nfServices` entry (scpd-#207); host is ipv4→fqdn→ipv6(bracketed).
         // `client_for`/`oauth_client_for` already honour the scheme field, so
         // an `https` producer is now contacted over TLS automatically.
         let target = ApiRoot {
             scheme: selected.scheme,
-            host: selected.host.clone(),
+            host: selected.candidate.host.clone(),
             port: selected.port,
-            prefix: selected.prefix.clone(),
+            prefix: selected.prefix,
         };
         Ok(DiscoveredProducer {
             target,
-            nf_instance_id: selected.nf_instance_id.clone(),
+            nf_instance_id: selected.candidate.nf_instance_id.clone(),
             nf_set_id,
             nf_group_id,
         })
@@ -2756,12 +2844,13 @@ mod tests {
         });
         let body = serde_json::to_vec(&https_ipv6_result).unwrap();
         let candidates = parse_search_result(&body);
-        let selected = select_nf_instance(&candidates).expect("candidate selected");
+        let selected = select_nf_service_endpoint(&candidates, Some("nudm-sdm"), Some("v1"))
+            .expect("candidate selected");
 
         // Simulate what discover() now does.
         let target = ApiRoot {
             scheme: selected.scheme,
-            host: selected.host.clone(),
+            host: selected.candidate.host.clone(),
             port: selected.port,
             prefix: selected.prefix.clone(),
         };
@@ -2797,11 +2886,12 @@ mod tests {
         });
         let body = serde_json::to_vec(&http_ipv4_result).unwrap();
         let candidates = parse_search_result(&body);
-        let selected = select_nf_instance(&candidates).expect("candidate selected");
+        let selected = select_nf_service_endpoint(&candidates, Some("nudm-uecm"), Some("v1"))
+            .expect("candidate selected");
 
         let target = ApiRoot {
             scheme: selected.scheme,
-            host: selected.host.clone(),
+            host: selected.candidate.host.clone(),
             port: selected.port,
             prefix: selected.prefix.clone(),
         };
@@ -2811,6 +2901,219 @@ mod tests {
         assert_eq!(target.port, 7777);
         assert_eq!(target.prefix, "");
         assert_eq!(target.to_uri(), "http://10.0.0.1:7777");
+    }
+
+    // ------------------------------------------------------------------
+    // scpd-#207: Model D endpoint selection matches serviceName + API version
+    // (TS 29.510 §6.2.6.2)
+    // ------------------------------------------------------------------
+
+    /// A producer that answers 200 with `{"servedBy":"<name>"}` and counts its
+    /// hits, so a test can assert **which** endpoint served a request — and that
+    /// a live producer was *not* contacted.
+    async fn start_named_producer(
+        port: u16,
+        name: &'static str,
+        hits: Arc<AtomicU64>,
+    ) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
+        server
+            .start(move |request: SbiRequest| {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    SbiResponse::ok().with_body(
+                        serde_json::json!({"servedBy": name, "uri": request.header.uri})
+                            .to_string(),
+                        "application/json",
+                    )
+                }
+            })
+            .await
+            .expect("producer start");
+        server
+    }
+
+    /// A mock NRF that answers every `nnrf-disc` query with `search_result`, and
+    /// serves the token endpoint the Model D path needs.
+    async fn start_nrf_serving(
+        port: u16,
+        search_result: serde_json::Value,
+    ) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
+        server
+            .start(move |request: SbiRequest| {
+                let search_result = search_result.clone();
+                async move {
+                    if request.header.uri == "/nnrf-oauth2/v1/access-token" {
+                        return SbiResponse::ok().with_body(
+                            r#"{"access_token":"scp-test-token","token_type":"Bearer","expires_in":3600}"#.to_string(),
+                            "application/json",
+                        );
+                    }
+                    SbiResponse::ok().with_body(search_result.to_string(), "application/json")
+                }
+            })
+            .await
+            .expect("nrf start");
+        server
+    }
+
+    /// scpd-#207 acceptance: a two-service producer on differing ports is
+    /// addressed on the **requested** service's port.
+    ///
+    /// `nudm-sdm` is deliberately `nfServices[0]`, so the pre-fix code — which
+    /// took the endpoint from the first service unconditionally — would send this
+    /// `nudm-uecm` request to the sdm port and the assertion would name the wrong
+    /// producer. Asserting on `servedBy` rather than on a 200 is what makes that
+    /// visible: the sdm producer is live and would have answered 200 too.
+    #[tokio::test]
+    async fn test_model_d_addresses_the_requested_services_endpoint() {
+        let sdm_port = ephemeral_port();
+        let uecm_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let sdm_hits = Arc::new(AtomicU64::new(0));
+        let uecm_hits = Arc::new(AtomicU64::new(0));
+
+        let sdm = start_named_producer(sdm_port, "sdm", sdm_hits.clone()).await;
+        let uecm = start_named_producer(uecm_port, "uecm", uecm_hits.clone()).await;
+        let nrf = start_nrf_serving(
+            nrf_port,
+            serde_json::json!({
+                "validityPeriod": 3600,
+                "nfInstances": [{
+                    "nfInstanceId": "udm-multi-service",
+                    "nfType": "UDM",
+                    "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["127.0.0.1"],
+                    "priority": 1,
+                    "nfServices": [
+                        {
+                            "serviceName": "nudm-sdm",
+                            "versions": [{"apiVersionInUri": "v1"}],
+                            "ipEndPoints": [{"transport": "TCP", "port": sdm_port}]
+                        },
+                        {
+                            "serviceName": "nudm-uecm",
+                            "versions": [{"apiVersionInUri": "v1"}],
+                            "ipEndPoints": [{"transport": "TCP", "port": uecm_port}]
+                        }
+                    ]
+                }]
+            }),
+        )
+        .await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+            .with_header(discovery_header::REQUESTER_NF_TYPE, "AMF")
+            .with_header(discovery_header::SERVICE_NAMES, "nudm-uecm");
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(
+            body["servedBy"], "uecm",
+            "the requested service's endpoint must serve the request, not nfServices[0]'s"
+        );
+        assert_eq!(uecm_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sdm_hits.load(Ordering::SeqCst),
+            0,
+            "the unrequested service's endpoint must not be contacted"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        uecm.stop().await.expect("uecm stop");
+        sdm.stop().await.expect("sdm stop");
+    }
+
+    /// scpd-#207 acceptance: an API version no discovered producer serves is
+    /// `400 INVALID_API` (TS 29.500 Table 5.2.7.2-1) and the request is **not**
+    /// forwarded — asserted against a live producer, so a zero hit count means
+    /// the SCP declined rather than that the forward happened to fail.
+    #[tokio::test]
+    async fn test_model_d_unsupported_api_version_is_400_invalid_api() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let hits = Arc::new(AtomicU64::new(0));
+
+        let producer = start_named_producer(producer_port, "uecm-v1", hits.clone()).await;
+        let nrf = start_nrf_serving(
+            nrf_port,
+            serde_json::json!({
+                "validityPeriod": 3600,
+                "nfInstances": [{
+                    "nfInstanceId": "udm-v1-only",
+                    "nfType": "UDM",
+                    "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["127.0.0.1"],
+                    "priority": 1,
+                    "nfServices": [{
+                        "serviceName": "nudm-uecm",
+                        "versions": [{"apiVersionInUri": "v1"}],
+                        "ipEndPoints": [{"transport": "TCP", "port": producer_port}]
+                    }]
+                }]
+            }),
+        )
+        .await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let client = fast_client(scp_port);
+
+        // v2 is not registered: 400 INVALID_API, nothing forwarded.
+        let v2 = SbiRequest::post("/nudm-uecm/v2/registrations")
+            .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+            .with_header(discovery_header::REQUESTER_NF_TYPE, "AMF")
+            .with_header(discovery_header::SERVICE_NAMES, "nudm-uecm");
+        let response = client.send_request(v2).await.expect("roundtrip");
+        assert_eq!(response.status, 400);
+        let problem: ProblemDetails = response.json_body().unwrap();
+        assert_eq!(problem.cause.as_deref(), Some("INVALID_API"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "an unsupported API version must not be forwarded"
+        );
+
+        // The same producer still serves v1, so the rejection is version-specific
+        // rather than the SCP having broken this profile outright.
+        let v1 = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+            .with_header(discovery_header::REQUESTER_NF_TYPE, "AMF")
+            .with_header(discovery_header::SERVICE_NAMES, "nudm-uecm");
+        let response = client.send_request(v1).await.expect("roundtrip");
+        assert_eq!(response.status, 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
     }
 
     /// When no NRF (and thus no OAuth2 client) is configured, a Model C forward
