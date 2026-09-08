@@ -4776,6 +4776,147 @@ mod tests {
         server.stop().await.expect("server stops");
     }
 
+    /// Closes the #98 verification ceiling for the UE-BINDING half of the event
+    /// surface.
+    ///
+    /// `subscribe_register_deregister_delivers_notifications` above proves the
+    /// PDU-session pair end-to-end against a stub consumer. The UE-binding pair was
+    /// wired and its SUPI/event matching covered, but NOTHING observed a
+    /// `PCF_UE_BINDING_REGISTRATION` or `_DEREGISTRATION` notification arriving —
+    /// the recorded "the helper is tested and the wiring is not" pattern, where the
+    /// better the helper's test the more convincing the illusion.
+    ///
+    /// The load-bearing assertion is not merely that a notification arrives: it is
+    /// that it carries `pcfForUeInfo` and NOT `pcfForPduSessInfos`.
+    /// `BsfEventNotification` models the two binding kinds with different members,
+    /// so using one for the other would tell a consumer the wrong resource changed
+    /// — and a test that only counted notifications would pass either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ue_binding_register_deregister_delivers_notifications() {
+        let (server, client) = start_bsf().await;
+
+        let recorded: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&recorded);
+        let cb_addr = ephemeral_addr();
+        let cb = SbiServer::new(NextgcoreSbiServerConfig::new(cb_addr));
+        cb.start(move |req: SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                if let Some(body) = req.http.content.as_deref() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(v);
+                    }
+                }
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("callback server starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(cb_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let notif_uri = format!("http://127.0.0.1:{}/bsf-notify", cb_addr.port());
+
+        // A SUPI distinct from the PDU-session test's, so the two cannot cross-report
+        // through the process-global context even if they run concurrently.
+        let supi = "imsi-001010000000097";
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/subscriptions",
+                &bsf_sub_doc(
+                    &notif_uri,
+                    supi,
+                    &[
+                        "PCF_UE_BINDING_REGISTRATION",
+                        "PCF_UE_BINDING_DEREGISTRATION",
+                    ],
+                ),
+            )
+            .await
+            .expect("POST subscription");
+        assert_eq!(resp.status, 201);
+
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({
+                    "supi": supi,
+                    "pcfForUeFqdn": "pcf97.example.com",
+                    "pcfId": "pcf-97",
+                }),
+            )
+            .await
+            .expect("POST ue-binding");
+        assert_eq!(resp.status, 201);
+        let binding_id = resp
+            .http
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .and_then(|(_, v)| v.rsplit('/').next().map(str::to_string))
+            .expect("Location");
+
+        let mut got = Vec::new();
+        for _ in 0..150 {
+            got = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            got.len(),
+            1,
+            "a UE-binding registration must notify the subscriber once"
+        );
+        let n = &got[0];
+        // BsfNotification's oneOf: notifCorreId AND eventNotifs together.
+        assert_eq!(n["notifCorreId"], "corr-98");
+        let evs = n["eventNotifs"].as_array().expect("eventNotifs array");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0]["event"], "PCF_UE_BINDING_REGISTRATION");
+        // The UE-binding identity member, and NOT the PDU-session one.
+        assert_eq!(evs[0]["pcfForUeInfo"]["pcfFqdn"], "pcf97.example.com");
+        assert_eq!(evs[0]["pcfForUeInfo"]["pcfId"], "pcf-97");
+        assert!(
+            evs[0].get("pcfForPduSessInfos").is_none(),
+            "a UE-binding event must not carry the PDU-session member: {:?}",
+            evs[0]
+        );
+
+        // Deregister -> the second notification, with the same identity member.
+        let resp = client
+            .delete(&format!("/nbsf-management/v1/pcf-ue-bindings/{binding_id}"))
+            .await
+            .expect("DELETE ue-binding");
+        assert_eq!(resp.status, 204);
+        let mut got = Vec::new();
+        for _ in 0..150 {
+            got = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if got.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(got.len(), 2, "UE-binding deregistration must notify too");
+        assert_eq!(
+            got[1]["eventNotifs"][0]["event"],
+            "PCF_UE_BINDING_DEREGISTRATION"
+        );
+        assert!(
+            got[1]["eventNotifs"][0].get("pcfForUeInfo").is_some(),
+            "the deregistration also names WHICH PCF binding went away: {:?}",
+            got[1]
+        );
+
+        cb.stop().await.expect("callback stops");
+        server.stop().await.expect("server stops");
+    }
+
     /// A subscription is UE-scoped: a binding for a DIFFERENT SUPI must not be
     /// reported to it, or one UE's binding activity leaks to a consumer watching
     /// another.

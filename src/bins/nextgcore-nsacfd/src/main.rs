@@ -2763,6 +2763,218 @@ nsacf:
         server.stop().await.expect("stop");
     }
 
+    /// Closes the #96 verification ceiling: BOTH spawned dispatches are observed
+    /// arriving at a real receiver, not merely constructed.
+    ///
+    /// `test_http_slice_ee_subscription_and_eac_notification` below sees an EAC
+    /// notification that follows a mode TRANSITION, and
+    /// `eac_mode_list_and_first_subscription_detection` covers the mode-list
+    /// construction and the first/repeat decision as pure logic. Neither observes
+    /// the two dispatches that happen at SUBSCRIBE time, both of which go through
+    /// `tokio::spawn` and so are invisible to a test that only checks the 201:
+    ///
+    /// 1. the `immediateFlag` report (TS 29.536 5.3.2.2.2), and
+    /// 2. the immediate EAC notification on a FIRST subscription (5.2.2.2.2).
+    ///
+    /// The two negatives are what make the positives mean something: without the
+    /// flag nothing is reported at subscribe time, and a REPEAT EAC subscription
+    /// from the same `nfId` is not re-notified.
+    #[tokio::test]
+    async fn subscribe_time_dispatches_actually_arrive_at_the_consumer() {
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        let recv_port = free_port();
+        let receiver = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
+            [127, 0, 0, 1],
+            recv_port,
+        ))));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        receiver
+            .start(move |req: SbiRequest| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(req.http.content.unwrap_or_default());
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("receiver start");
+        let cb = format!("http://127.0.0.1:{recv_port}/cb");
+
+        // A quota so the slice has a mode to report at all. Without one,
+        // `eac_mode_list()` is empty and the immediate EAC notification is
+        // deliberately NOT sent (an empty eacModeList would assert "no slices"
+        // rather than "nothing configured yet").
+        create_quota(&client, 96, 10, 100).await;
+
+        // ── 1. immediateFlag: a report must arrive with no admission at all ──
+        //
+        // The trigger is REACHING_THRESHOLD with a threshold of 90%, and occupancy
+        // is 0%, so the trigger gate would SUPPRESS this report. It arrives only
+        // because `immediateFlag` bypasses the gate — which is the whole point of
+        // 5.3.2.2.2 and cannot be observed from the 201 alone.
+        let resp = client
+            .post_json(
+                "/nnsacf-slice-ee/v1/subscriptions",
+                &json!({
+                    "eventNotifyUri": cb,
+                    "nfId": "amf-96-immediate",
+                    "notifyCorrelationId": "corr-96-immediate",
+                    "event": {
+                        "eventType": "NUM_OF_REGD_UES",
+                        "eventFilter": [{"sst": 96}],
+                        "eventTrigger": "REACHING_THRESHOLD",
+                        "notifThreshold": 90,
+                        "immediateFlag": true
+                    }
+                }),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 201);
+
+        let mut immediate_report: Option<serde_json::Value> = None;
+        for _ in 0..8 {
+            let Ok(Some(text)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+            else {
+                break;
+            };
+            let v: serde_json::Value = serde_json::from_str(&text).expect("JSON body");
+            if v["notifyCorrelationId"] == "corr-96-immediate" {
+                immediate_report = Some(v);
+                break;
+            }
+        }
+        let report = immediate_report.expect(
+            "immediateFlag must produce a report AT SUBSCRIBE TIME, with no admission and              despite the trigger gate",
+        );
+        // The SACEventReport shape (TS 29.536 6.2.6.2.4), so this cannot pass on a
+        // bare POST that carries nothing useful.
+        assert_eq!(report["report"]["eventFilter"]["sst"], 96);
+        assert!(
+            report["report"]["sliceStautsInfo"]["reachedNumUes"]["numericValNumUes"].is_number(),
+            "the immediate report carries the CURRENT counts: {report}"
+        );
+
+        // ── 2. the negative: no immediateFlag means nothing at subscribe time ──
+        let resp = client
+            .post_json(
+                "/nnsacf-slice-ee/v1/subscriptions",
+                &json!({
+                    "eventNotifyUri": cb,
+                    "nfId": "amf-96-quiet",
+                    "notifyCorrelationId": "corr-96-quiet",
+                    "event": {
+                        "eventType": "NUM_OF_REGD_UES",
+                        "eventFilter": [{"sst": 96}],
+                        "eventTrigger": "REACHING_THRESHOLD",
+                        "notifThreshold": 90
+                    }
+                }),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 201);
+        // A short window is enough: the dispatch is a spawned task that would run
+        // immediately, and the previous report proves the receiver is live.
+        let quiet = tokio::time::timeout(Duration::from_millis(400), rx.recv()).await;
+        if let Ok(Some(text)) = quiet {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            assert_ne!(
+                v["notifyCorrelationId"], "corr-96-quiet",
+                "a subscription WITHOUT immediateFlag must not report at subscribe time: {v}"
+            );
+        }
+
+        // ── 3. the immediate EAC notification on a FIRST subscription ──
+        //
+        // A NumOfUEsUpdate carrying `eacNotificationUri` is the implicit EAC
+        // subscription. This nfId has not subscribed before, so 5.2.2.2.2 requires
+        // the current modes immediately — again a spawned dispatch.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({
+                    "nfId": "amf-96-eac",
+                    "eacNotificationUri": cb,
+                    "ueACRequestInfo": [{
+                        "supi": "imsi-96-1",
+                        "anType": "3GPP_ACCESS",
+                        "acuOperationList": [{ "updateFlag": "INCREASE", "snssai": {"sst": 96} }]
+                    }]
+                }),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+
+        let mut saw_mode_list = false;
+        for _ in 0..8 {
+            let Ok(Some(text)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+            else {
+                break;
+            };
+            let v: serde_json::Value = serde_json::from_str(&text).expect("JSON body");
+            if v.get("eacModeList").is_some() {
+                // The 6.1.6.2.4 shape: a map keyed by S-NSSAI, not the old
+                // `eacMode` scalar.
+                assert!(
+                    v["eacModeList"].is_object(),
+                    "eacModeList is a map(EACMode): {v}"
+                );
+                assert!(
+                    v["eacModeList"]["96"].is_string(),
+                    "the immediate notification names the subscribed S-NSSAI's mode: {v}"
+                );
+                saw_mode_list = true;
+                break;
+            }
+        }
+        assert!(
+            saw_mode_list,
+            "a FIRST EAC subscription must immediately receive the current EAC modes"
+        );
+
+        // ── 4. the negative: a REPEAT subscription from the same nfId is silent ──
+        //
+        // An AMF re-sends its eacNotificationUri on every NumOfUEsUpdate, so
+        // re-notifying each time would flood it.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({
+                    "nfId": "amf-96-eac",
+                    "eacNotificationUri": cb,
+                    "ueACRequestInfo": [{
+                        "supi": "imsi-96-2",
+                        "anType": "3GPP_ACCESS",
+                        "acuOperationList": [{ "updateFlag": "INCREASE", "snssai": {"sst": 96} }]
+                    }]
+                }),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+        // Drain briefly: an occupancy report may legitimately arrive for the
+        // immediateFlag subscription, but no second eacModeList may.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some(text)) = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await
+            else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            assert!(
+                v.get("eacModeList").is_none(),
+                "a repeat EAC subscription from the same nfId must not be re-notified: {v}"
+            );
+        }
+
+        receiver.stop().await.expect("receiver stops");
+        server.stop().await.expect("server stops");
+    }
+
     #[tokio::test]
     async fn test_http_slice_ee_subscription_and_eac_notification() {
         let (server, port, _ctx_guard) = start_nsacf_server().await;
