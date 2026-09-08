@@ -362,9 +362,25 @@ impl NssfSmContext {
             }
             NssfTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::error!("[{subscription_id}] Subscription validity expired");
-                    // Note: Send new subscription and remove old one
-                    // This is handled by the nnrf integration when NRF is enabled
+                    // #94: actually REMOVE it. This used to log and return, so an
+                    // armed validity timer was a claim the NSSF did not honour —
+                    // the subscription kept matching and kept being notified.
+                    // The run loop's periodic sweep is the load-bearing mechanism;
+                    // this handles the case where a timer was armed for a specific
+                    // subscription, so the two cannot disagree.
+                    let removed = crate::context::nssf_self()
+                        .read()
+                        .ok()
+                        .map(|c| c.subscription_remove(subscription_id))
+                        .unwrap_or(false);
+                    if removed {
+                        log::info!("[{subscription_id}] subscription validity expired; removed");
+                    } else {
+                        log::debug!(
+                            "[{subscription_id}] subscription validity expired but it was \
+                             already gone (deleted, or swept by the run loop)"
+                        );
+                    }
                 }
             }
             NssfTimerId::SubscriptionPatch => {

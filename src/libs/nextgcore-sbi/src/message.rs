@@ -422,6 +422,21 @@ pub struct SbiRequest {
     /// forwarded-certificate header, which is only as trustworthy as the
     /// terminator that set it.
     pub peer_cert_nf_instance_id: Option<String>,
+    /// `sub` of the OAuth2 access token this process **verified** — the NF
+    /// Instance ID of the service consumer (TS 33.501 §13.4.1.2, TS 29.510
+    /// §5.4.2.2.2 `AccessTokenClaims.sub`).
+    ///
+    /// `Some` only when the listener has `require_oauth2` enabled AND the token's
+    /// signature, expiry, audience and scope all verified. `None` for a plaintext
+    /// or token-less request, for a listener that does not require OAuth2, and
+    /// for requests built programmatically.
+    ///
+    /// Like [`Self::peer_cert_nf_instance_id`] this is an identity **this
+    /// process** attested, which is what makes it usable for an authorization
+    /// decision. The server previously verified the token and then DISCARDED the
+    /// claims, so a producer could enforce "a valid token exists" but never "the
+    /// caller is who this resource belongs to" (issue #94).
+    pub oauth2_subject: Option<String>,
 }
 
 impl SbiRequest {

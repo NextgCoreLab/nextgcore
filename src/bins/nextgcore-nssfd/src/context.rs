@@ -186,7 +186,18 @@ pub struct NssfSubscription {
     pub tai_list: Vec<Tai>,
     /// Subscribed event (mandatory), e.g. SNSSAI_STATUS_CHANGE_REPORT
     pub event: String,
+    /// NSSF-assigned expiry, RFC 3339 UTC (TS 29.531 Table 6.2.6.2.9-1).
+    ///
+    /// **Assigned by the NSSF**, not merely echoed from the consumer: the NSSF
+    /// owns the subscription's lifecycle, and a subscription whose lifetime the
+    /// producer does not bound cannot be swept. A consumer-requested expiry is
+    /// honoured only when it is EARLIER than the NSSF's own bound.
     pub expiry: Option<String>,
+    /// The events this NSSF accepted for the subscription
+    /// (`acceptedEvents`, TS 29.531 Table 6.2.6.2.9-1). Persisted via
+    /// `to_persist_json`/`from_persist_json`, which are hand-written for this
+    /// type; an older snapshot restores it empty.
+    pub accepted_events: Vec<String>,
     pub amf_id: Option<String>,
     pub amf_set_id: Option<String>,
 }
@@ -199,7 +210,35 @@ impl NssfSubscription {
         if let Some(ref e) = self.expiry {
             v["expiry"] = serde_json::json!(e);
         }
+        if !self.accepted_events.is_empty() {
+            v["acceptedEvents"] = serde_json::json!(self.accepted_events);
+        }
         v
+    }
+
+    /// Whether this subscription's expiry has passed.
+    ///
+    /// An expiry that cannot be parsed is treated as NOT expired: refusing to
+    /// serve a subscription because the NSSF cannot read its own timestamp would
+    /// turn a formatting bug into silent notification loss. The value the NSSF
+    /// assigns is always parseable; only a hand-edited snapshot could be not.
+    pub fn is_expired_at(&self, now_secs: u64) -> bool {
+        match self.expiry.as_deref() {
+            Some(text) => match nextgcore_sbi::datetime::rfc3339_to_epoch(text) {
+                Some(deadline) => now_secs >= deadline,
+                None => {
+                    log::warn!(
+                        "subscription {} has an unparseable expiry {text:?}; treating it as \
+                         live rather than dropping notifications",
+                        self.subscription_id
+                    );
+                    false
+                }
+            },
+            // No expiry at all: unbounded. The create path always assigns one, so
+            // this is only reachable for a record restored from an older snapshot.
+            None => false,
+        }
     }
 
     /// Serialize the full subscription for the on-disk snapshot (lossless),
@@ -241,6 +280,7 @@ impl NssfSubscription {
             tai_list,
             event,
             expiry: str_at("expiry"),
+            accepted_events: Vec::new(),
             amf_id: str_at("amfId"),
             amf_set_id: str_at("amfSetId"),
         })
@@ -824,10 +864,17 @@ impl NssfContext {
     /// Subscriptions whose TAI list intersects `affected_tais`
     /// (a subscription with an empty TAI list matches everything).
     pub fn subscriptions_matching(&self, affected_tais: &[Tai]) -> Vec<NssfSubscription> {
+        // #94: an EXPIRED subscription never matches. Before this the filter
+        // looked only at `tai_list`, so a subscription kept receiving
+        // notifications for as long as the process lived, however long ago its
+        // expiry had passed — the consumer had been told the subscription was
+        // valid until an instant the NSSF then ignored.
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
         self.subscriptions
             .read()
             .map(|subs| {
                 subs.values()
+                    .filter(|s| !s.is_expired_at(now))
                     .filter(|s| {
                         s.tai_list.is_empty()
                             || s.tai_list
@@ -838,6 +885,40 @@ impl NssfContext {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Remove every subscription whose expiry has passed, returning their ids.
+    ///
+    /// Separate from [`Self::subscriptions_matching`]'s filter on purpose: the
+    /// filter makes an expired subscription stop being SERVED immediately, and
+    /// this sweep makes it stop being STORED. Relying on the sweep alone would
+    /// leave a window in which an expired subscription is still notified;
+    /// relying on the filter alone would accumulate records forever.
+    pub fn sweep_expired_subscriptions(&self, now_secs: u64) -> Vec<String> {
+        let expired: Vec<String> = match self.subscriptions.read() {
+            Ok(subs) => subs
+                .values()
+                .filter(|s| s.is_expired_at(now_secs))
+                .map(|s| s.subscription_id.clone())
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        if expired.is_empty() {
+            return expired;
+        }
+        if let Ok(mut subs) = self.subscriptions.write() {
+            for id in &expired {
+                subs.remove(id);
+            }
+        }
+        log::info!(
+            "swept {} expired NSSAI-availability subscription(s): {expired:?}",
+            expired.len()
+        );
+        // Guards dropped before persisting: persist -> snapshot re-reads these
+        // maps and std RwLock is not reentrant.
+        self.persist();
+        expired
     }
 
     // Target AMF set configuration
@@ -903,8 +984,37 @@ impl NssfContext {
     /// NRF round-trip that would break the matched simulator's AMF. `_tai` is
     /// accepted for spec fidelity and future per-TA authorization (TS 33.521)
     /// but is not consulted under the default-allow policy.
-    pub fn nf_authorized_for_availability(&self, nf_id: &str, _tai: &Tai) -> bool {
-        !nf_id.trim().is_empty()
+    /// Whether `caller` may write the NSSAI-availability document owned by
+    /// `nf_id` (TS 29.531 Table 6.2.3.2.3.1-2, TS 33.501 §13.4.1).
+    ///
+    /// The resource is one AMF's slice picture, so the only consumer entitled to
+    /// write it is that AMF. `caller` is an identity THIS PROCESS attested — a
+    /// verified OAuth2 token `sub` or a verified client-certificate URI SAN —
+    /// never a value taken from the request body or path.
+    ///
+    /// Before #94 this was `!nf_id.trim().is_empty()`: it checked only that the
+    /// path segment was non-empty, so any reachable NF could overwrite any AMF's
+    /// availability document, and the `tai` argument was accepted and ignored.
+    ///
+    /// `caller: None` means no attestable identity was presented. That is a
+    /// DENIAL here; the decision about whether an unauthenticated deployment may
+    /// opt out lives with the caller of this function, where the operator's
+    /// explicit choice is visible.
+    pub fn nf_authorized_for_availability(
+        &self,
+        nf_id: &str,
+        caller: Option<&str>,
+        _tai: &Tai,
+    ) -> bool {
+        if nf_id.trim().is_empty() {
+            return false;
+        }
+        match caller {
+            // TS 29.510 nfInstanceId is a UUID, compared case-insensitively
+            // because the hex may be presented in either case.
+            Some(id) => id.trim().eq_ignore_ascii_case(nf_id.trim()),
+            None => false,
+        }
     }
 
     // -- nssfd-02: per-home-PLMN S-NSSAI restrictions (restrictedSnssaiList) --
@@ -1164,6 +1274,7 @@ mod tests {
             tai_list: vec![tai.clone()],
             event: "SNSSAI_STATUS_CHANGE_REPORT".to_string(),
             expiry: None,
+            accepted_events: Vec::new(),
             amf_id: None,
             amf_set_id: None,
         };
@@ -1223,6 +1334,7 @@ mod tests {
                 tai_list: vec![tai.clone()],
                 event: "SNSSAI_STATUS_CHANGE_REPORT".to_string(),
                 expiry: Some("2030-01-01T00:00:00Z".to_string()),
+                accepted_events: Vec::new(),
                 amf_id: Some("amf-1".to_string()),
                 amf_set_id: None,
             });
@@ -1275,6 +1387,7 @@ mod tests {
                 tai_list: vec![],
                 event: "SNSSAI_STATUS_CHANGE_REPORT".to_string(),
                 expiry: None,
+                accepted_events: Vec::new(),
                 amf_id: None,
                 amf_set_id: None,
             });
@@ -1301,6 +1414,7 @@ mod tests {
             tai_list: vec![],
             event: "E".to_string(),
             expiry: None,
+            accepted_events: Vec::new(),
             amf_id: None,
             amf_set_id: None,
         });
@@ -1372,5 +1486,43 @@ mod tests {
             RoamingIndication::HomeRouted
         );
         assert_eq!(RoamingIndication::NonRoaming.to_openapi(), 1);
+    }
+
+    /// #94 criterion 2 (call-site half): the availability-authorization policy's
+    /// unevaluable path must DENY, and must not have regained a default-allow
+    /// fallback.
+    ///
+    /// A source guard because the property lives on a path no harness can drive:
+    /// poisoning the process-global context lock would poison it for every
+    /// parallel test in the binary. Lives in `context.rs` rather than `main.rs`
+    /// deliberately — a guard that greps its own file matches its own needle,
+    /// including the comment explaining it, which this repo has been bitten by.
+    #[test]
+    fn availability_authorization_has_no_default_allow_fallback() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("fn check_availability_authorization(")
+            .expect("the authorization entry point must exist");
+        // Bound the window at the next top-level `fn` so this reads only that
+        // function's body rather than the whole file.
+        let body = &src[start..];
+        let end = body[1..].find("\nfn ").map(|i| i + 1).unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("policy_unevaluable_response()"),
+            "the unevaluable-policy path must deny via policy_unevaluable_response"
+        );
+        // The exact expression the old fallback used. Its return is what made a
+        // poisoned lock equivalent to "authorization disabled".
+        assert!(
+            !body.contains("unwrap_or_else(|| (!nf_id.trim().is_empty(), None))"),
+            "the default-allow fallback must not come back"
+        );
+        // And nothing in this function may resolve a missing policy to `true`.
+        assert!(
+            !body.contains("unwrap_or(true)"),
+            "an unevaluable policy must never resolve to authorized"
+        );
     }
 }

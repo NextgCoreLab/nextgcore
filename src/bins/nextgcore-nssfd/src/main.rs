@@ -156,8 +156,17 @@ struct SbiServerYaml {
 
 /// SBI OAuth2 enforcement knob (`nssf.sbi.oauth2.require`).
 ///
-/// Defaults to disabled so the existing dev/E2E path keeps working without
-/// tokens; the production/docker `nssf-oauth2.yaml` variant sets it true.
+/// **Defaults to ENABLED** (#94). It used to default to disabled, which meant
+/// the shipped default posture both accepted token-less requests AND — because
+/// availability authorization had no attestable identity to bind to — let any
+/// reachable NF overwrite any AMF's slice-availability document. An absent knob
+/// now means "authenticate", and a deployment that cannot yet issue tokens says
+/// so explicitly with `require: false`; every dev artefact was given that
+/// explicit opt-out in the same commit as this flip, since flipping first would
+/// break them and look like a code bug.
+///
+/// This knob also governs whether availability writes must be bound to an
+/// attested caller — see `strict_availability_authz`.
 #[derive(Debug, Default, Deserialize)]
 struct SbiOauth2Yaml {
     require: Option<bool>,
@@ -218,6 +227,30 @@ struct NssfSection {
     /// serving-to-home pair. With no entries the scenario answers the spec's own
     /// 403 SNSSAI_NOT_SUPPORTED rather than a fabricated mapping.
     nssai_mapping: Option<Vec<NssaiMappingYaml>>,
+    /// Per-home-PLMN S-NSSAI restrictions emitted as `restrictedSnssaiList`
+    /// (TS 29.531 §6.2.6.2.5). Absent => no restrictions (default-allow).
+    snssai_restrictions: Option<Vec<SnssaiRestrictionYaml>>,
+}
+
+/// Per-home-PLMN S-NSSAI restriction: `nssf.snssai_restrictions[]`
+/// (TS 29.531 §6.2.6.2.5 `RestrictedSnssai`).
+///
+/// #94: `set_plmn_snssai_restrictions` previously had **no production caller** —
+/// its only call site was inside `#[cfg(test)]` — so an operator had no way to
+/// configure a restriction at all, and the `restrictedSnssaiList` serialization
+/// bug was latent because nothing could ever emit the field.
+#[derive(Debug, Default, Deserialize)]
+struct SnssaiRestrictionYaml {
+    /// Home PLMN the restriction applies to.
+    home_plmn: PlmnYaml,
+    /// S-NSSAIs a UE from that home PLMN may NOT use here.
+    restricted: Vec<SnssaiYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlmnYaml {
+    mcc: String,
+    mnc: String,
 }
 
 /// One VPLMN-to-HPLMN S-NSSAI mapping: `nssf.nssai_mapping[]`.
@@ -299,7 +332,10 @@ async fn main() -> Result<()> {
 
     // Parse configuration (if file exists) and seed NRF URI
     let mut nrf_uri_cfg: Option<String> = None;
-    let mut require_oauth2 = false;
+    // #94: default ON. An ABSENT nssf.sbi.oauth2 section now means "enforce",
+    // so a config that never mentions OAuth2 gets the secure posture rather than
+    // the permissive one.
+    let mut require_oauth2 = true;
     // How many NSIs the configuration installed. Checked after the config block
     // so the always-403 condition cannot ship silently (#93).
     let mut configured_nsi_count = 0usize;
@@ -342,6 +378,32 @@ async fn main() -> Result<()> {
                             if let Ok(ctx) = nssf_self().read() {
                                 ctx.set_plmn_supported_snssais(Some(snssais));
                             }
+                        }
+                        // #94: per-home-PLMN S-NSSAI restrictions. This is the
+                        // production caller set_plmn_snssai_restrictions never had.
+                        if let Some(list) = nssf.snssai_restrictions {
+                            let mut installed = 0usize;
+                            if let Ok(ctx) = nssf_self().read() {
+                                for r in &list {
+                                    if r.home_plmn.mcc.is_empty() || r.home_plmn.mnc.is_empty() {
+                                        log::warn!(
+                                            "nssf.snssai_restrictions entry has an incomplete \
+                                             home_plmn; skipped (a restriction must name the \
+                                             PLMN it applies to)"
+                                        );
+                                        continue;
+                                    }
+                                    let plmn =
+                                        context::PlmnId::new(&r.home_plmn.mcc, &r.home_plmn.mnc);
+                                    let snssais: Vec<context::SNssai> =
+                                        r.restricted.iter().map(snssai_from_yaml).collect();
+                                    ctx.set_plmn_snssai_restrictions(&plmn, snssais);
+                                    installed += 1;
+                                }
+                            }
+                            log::info!(
+                                "per-home-PLMN S-NSSAI restrictions configured: {installed} PLMN(s)"
+                            );
                         }
                         // #93: VPLMN->HPLMN S-NSSAI mapping for the
                         // pdn-connection scenario (TS 29.531 §5.2.2.2.5).
@@ -388,7 +450,9 @@ async fn main() -> Result<()> {
                                 }
                             }
                             // SBI OAuth2 enforcement knob (nssf.sbi.oauth2.require).
-                            require_oauth2 = sbi.oauth2.and_then(|o| o.require).unwrap_or(false);
+                            // An absent `oauth2` section, and an absent
+                            // `require` inside one, both mean ENFORCE (#94).
+                            require_oauth2 = sbi.oauth2.and_then(|o| o.require).unwrap_or(true);
                         }
                     }
                 }
@@ -455,6 +519,19 @@ async fn main() -> Result<()> {
         .parse()
         .context("Invalid SBI address")?;
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
+    // #94: one knob governs both authentication and the caller-to-resource
+    // binding, because binding is only meaningful against an authenticated
+    // identity. Recorded before the `if` so the log below reports the posture
+    // actually installed.
+    set_strict_availability_authz(require_oauth2);
+    if !require_oauth2 {
+        log::warn!(
+            "SBI OAuth2 enforcement is DISABLED by configuration: incoming requests are not \
+             authenticated, and NSSAI-availability writes therefore cannot be bound to the \
+             AMF that owns the document — any reachable NF can overwrite any AMF's slice \
+             picture (TS 33.501 §13.4.1). This is a documented escape hatch, not a default."
+        );
+    }
     if require_oauth2 {
         // Server side (TS 33.501 §13.4.1): verify incoming Bearer tokens
         // against the NRF's published JWKS and require the token's `aud` to
@@ -1824,26 +1901,112 @@ fn check_availability_authorization(
     nf_id: &str,
     doc: &serde_json::Value,
     affected_tais: &[context::Tai],
+    request: &SbiRequest,
 ) -> Option<SbiResponse> {
     let tai = affected_tais.first().cloned().unwrap_or_default();
-    let (authorized, restriction) = with_nssf_context(|context| {
+
+    // The identity THIS PROCESS attested, in preference order. The verified
+    // client certificate outranks the token because it is bound to the
+    // connection rather than bearer-presentable; both are verified locally, and
+    // neither is read from the request path or body.
+    let caller = request
+        .peer_cert_nf_instance_id
+        .as_deref()
+        .or(request.oauth2_subject.as_deref());
+
+    let result = with_nssf_context(|context| {
         let restriction = if context.has_plmn_snssai_restriction() {
             Some(context.plmn_supported_snssais())
         } else {
             None
         };
         (
-            context.nf_authorized_for_availability(nf_id, &tai),
+            context.nf_authorized_for_availability(nf_id, caller, &tai),
             restriction,
         )
-    })
-    // If the context lock is poisoned, fall back to the default-allow policy
-    // (authorize any non-empty NF Id; impose no S-NSSAI restriction).
-    .unwrap_or_else(|| (!nf_id.trim().is_empty(), None));
+    });
+
+    let (authorized, restriction) = match result {
+        Some(v) => v,
+        // #94: a poisoned context lock now FAILS CLOSED. It used to fall back to
+        // the default-allow policy, so poisoning the lock — which any panicking
+        // sibling request can do — turned the authorization check off entirely.
+        // An availability write is a write to another NF's slice picture; not
+        // being able to evaluate the policy is not a reason to permit it.
+        None => {
+            log::error!(
+                "NSSF context lock poisoned; DENYING availability write for {nf_id} \
+                 (fail-closed, issue #94)"
+            );
+            return Some(policy_unevaluable_response());
+        }
+    };
+
+    // The documented escape hatch: a deployment that has explicitly turned SBI
+    // OAuth2 enforcement off has no attestable identity to bind to, so requiring
+    // one would make availability writes impossible rather than safe. Permitted,
+    // and WARNED about at every write so the posture is visible in the log rather
+    // than only in the config (the #64 pattern).
+    if !authorized && caller.is_none() && !strict_availability_authz() {
+        log::warn!(
+            "availability write for {nf_id} accepted WITHOUT an attested caller identity: \
+             SBI OAuth2 enforcement is disabled, so any reachable NF can write any AMF's \
+             slice-availability document. Set nssf.sbi.oauth2.require = true to bind the \
+             caller to the resource (TS 33.501 §13.4.1)."
+        );
+        return authorize_availability_doc(nf_id, doc, true, restriction.as_deref())
+            .err()
+            .map(AvailabilityAuthError::into_problem);
+    }
+
+    if !authorized {
+        log::warn!(
+            "availability write for {nf_id} REJECTED: attested caller {:?} is not the owner \
+             of that document (TS 29.531 Table 6.2.3.2.3.1-2)",
+            caller
+        );
+    }
 
     authorize_availability_doc(nf_id, doc, authorized, restriction.as_deref())
         .err()
         .map(AvailabilityAuthError::into_problem)
+}
+
+/// The response when the availability-authorization policy cannot be EVALUATED
+/// (e.g. a poisoned context lock).
+///
+/// A denial. Before #94 this path fell back to the default-allow policy, so any
+/// panicking sibling request — which is all it takes to poison a `std` lock —
+/// turned the authorization check off for every subsequent availability write.
+/// Not being able to evaluate a policy is not a reason to permit the write.
+///
+/// Extracted so the outcome is assertable: poisoning the PROCESS-GLOBAL context
+/// lock inside a test would break every parallel test in the binary, which is the
+/// avalanche the recorded poisoned-mutex lesson describes. The call site is pinned
+/// by a source guard instead.
+fn policy_unevaluable_response() -> SbiResponse {
+    problem_details(
+        403,
+        "Forbidden",
+        "NSSF cannot evaluate availability authorization at this time",
+        Some("NOT_AUTHORIZED"),
+    )
+}
+
+/// Whether availability writes must be bound to an attested caller identity.
+///
+/// Tied to `nssf.sbi.oauth2.require`, which is the operator's existing statement
+/// about whether this NSSF authenticates its consumers at all: binding a caller
+/// to a resource is only meaningful when a caller identity is authenticated, so
+/// one knob governs both rather than two that can disagree.
+static STRICT_AVAILABILITY_AUTHZ: AtomicBool = AtomicBool::new(true);
+
+fn strict_availability_authz() -> bool {
+    STRICT_AVAILABILITY_AUTHZ.load(Ordering::SeqCst)
+}
+
+fn set_strict_availability_authz(strict: bool) {
+    STRICT_AVAILABILITY_AUTHZ.store(strict, Ordering::SeqCst);
 }
 
 /// Build the AuthorizedNssaiAvailabilityInfo response for a stored doc
@@ -1884,13 +2047,27 @@ fn authorized_availability_response(doc: &serde_json::Value) -> SbiResponse {
         if let Some(snssai_list) = entry.get("supportedSnssaiList") {
             out["supportedSnssaiList"] = snssai_list.clone();
         }
+        // #94 criterion 7: carry the locality/scoping members through. These were
+        // dropped, so an availability entry scoped by a TAI RANGE (or carrying NSAG
+        // information) came back scoped by nothing — the consumer could not tell
+        // which TAIs the authorization actually covered.
+        for member in ["taiList", "taiRangeList", "nsagInfos"] {
+            if let Some(v) = entry.get(member) {
+                out[member] = v.clone();
+            }
+        }
         if !restrictions.is_empty() {
             out["restrictedSnssaiList"] = serde_json::json!(restrictions
                 .iter()
                 .map(|(plmn, snssais)| {
                     serde_json::json!({
                         "homePlmnId": { "mcc": plmn.mcc, "mnc": plmn.mnc },
-                        "sNssais": snssais.iter().map(context::snssai_to_json).collect::<Vec<_>>()
+                        // #94: `sNssaiList`, not `sNssais`. TS 29.531
+                        // RestrictedSnssai has `required: [homePlmnId, sNssaiList]`,
+                        // so the old key made the object fail schema validation at
+                        // any strict consumer -- latent only because nothing could
+                        // configure a restriction in production until now.
+                        "sNssaiList": snssais.iter().map(context::snssai_to_json).collect::<Vec<_>>()
                     })
                 })
                 .collect::<Vec<_>>());
@@ -1956,7 +2133,7 @@ async fn handle_nssai_availability_update(nf_id: &str, request: &SbiRequest) -> 
     // against the PLMN-supported set BEFORE storing or notifying (TS 29.531
     // §6.2.3.2.3.1, TS 33.521). On failure the 403 returns here, so nothing is
     // stored and no notification is spawned.
-    if let Some(resp) = check_availability_authorization(nf_id, &doc, &affected_tais) {
+    if let Some(resp) = check_availability_authorization(nf_id, &doc, &affected_tais, request) {
         return resp;
     }
 
@@ -2060,7 +2237,7 @@ async fn handle_nssai_availability_patch(nf_id: &str, request: &SbiRequest) -> S
     // the POST-PATCH document before committing (TS 29.531 §6.2.3.2.3.1). A
     // patch that introduces an S-NSSAI unsupported in the PLMN is rejected with
     // 403 and the previously stored document is left unchanged.
-    if let Some(resp) = check_availability_authorization(nf_id, &patched, &affected_tais) {
+    if let Some(resp) = check_availability_authorization(nf_id, &patched, &affected_tais, request) {
         return resp;
     }
 
@@ -2107,8 +2284,31 @@ async fn handle_nssai_availability_options() -> SbiResponse {
 // Availability-change subscriptions + notifications
 // ---------------------------------------------------------------------------
 
-/// Parse and validate NssfEventSubscriptionCreateData
-/// (mandatory: nfNssaiAvailabilityUri, taiList, event)
+/// The only `NssfEventType` this NSSF has a producer for.
+///
+/// `spawn_availability_notifications` fires on an availability change and
+/// nothing else; `SNSSAI_REPLACEMENT_REPORT`, `NSI_UNAVAILABILITY_REPORT` and
+/// `SNSSAI_VALIDITY_TIME_REPORT` have no code path that could emit them. That is
+/// what `acceptedEvents` exists to tell the consumer, so it is reported honestly
+/// rather than echoing back everything requested.
+const REPORTABLE_EVENTS: &[&str] = &["SNSSAI_STATUS_CHANGE_REPORT"];
+
+/// Parse and validate `NssfEventSubscriptionCreateData`.
+///
+/// Mandatory per TS 29.531 Table 6.2.6.2.8-1 and the OpenAPI
+/// (`required: [nfNssaiAvailabilityUri, event]`): **those two only**.
+///
+/// `taiList` is OPTIONAL and was previously rejected as missing, so a conformant
+/// consumer subscribing to all TAIs got a 400. An absent or empty list means "all
+/// TAIs", which is already exactly how `subscriptions_matching` treats an empty
+/// list — the semantics existed, only the validation disagreed.
+///
+/// Deviation from the issue's suggested approach, stated deliberately: #94
+/// proposes requiring `taiList` for the status-change event specifically. The
+/// spec imposes no such conditional, so adding one would 400 a legal request; the
+/// schema is followed instead and the "all TAIs" reading is documented here.
+/// (The issue also names the event `SNSSAI_STATUS_CHANGE`; the enum token is
+/// `SNSSAI_STATUS_CHANGE_REPORT`, and the OpenAPI spelling is what is used.)
 fn subscription_from_json(
     subscription_id: &str,
     v: &serde_json::Value,
@@ -2117,10 +2317,6 @@ fn subscription_from_json(
     let uri = v.get("nfNssaiAvailabilityUri").and_then(|x| x.as_str());
     if uri.is_none() {
         missing.push("nfNssaiAvailabilityUri");
-    }
-    let tai_list_json = v.get("taiList").and_then(|x| x.as_array());
-    if tai_list_json.is_none() {
-        missing.push("taiList");
     }
     let event = v.get("event").and_then(|x| x.as_str());
     if event.is_none() {
@@ -2133,20 +2329,73 @@ fn subscription_from_json(
         ));
     }
 
-    let tai_list_json = tai_list_json.expect("checked above");
-    let mut tai_list = Vec::with_capacity(tai_list_json.len());
-    for (i, t) in tai_list_json.iter().enumerate() {
-        tai_list.push(
-            context::tai_from_json(t).ok_or_else(|| format!("taiList[{i}] is not a valid Tai"))?,
-        );
+    // Optional; absent => no TAI scoping => all TAIs.
+    let mut tai_list = Vec::new();
+    if let Some(arr) = v.get("taiList").and_then(|x| x.as_array()) {
+        for (i, t) in arr.iter().enumerate() {
+            tai_list.push(
+                context::tai_from_json(t)
+                    .ok_or_else(|| format!("taiList[{i}] is not a valid Tai"))?,
+            );
+        }
     }
+
+    // `additionalEvents` alongside `event` (Table 6.2.6.2.8-1). `NssfEventType`
+    // is an anyOf over the enum plus a free-form string, so an unrecognised token
+    // is forward-compatibility and must NOT be rejected — it simply does not
+    // appear in `acceptedEvents`.
+    let event = event.expect("checked above").to_string();
+    let mut requested = vec![event.clone()];
+    if let Some(arr) = v.get("additionalEvents").and_then(|x| x.as_array()) {
+        for e in arr {
+            match e.as_str() {
+                Some(s) if !s.is_empty() => {
+                    if !requested.contains(&s.to_string()) {
+                        requested.push(s.to_string());
+                    }
+                }
+                _ => return Err("additionalEvents members must be non-empty strings".to_string()),
+            }
+        }
+    }
+    let accepted_events: Vec<String> = requested
+        .iter()
+        .filter(|e| REPORTABLE_EVENTS.contains(&e.as_str()))
+        .cloned()
+        .collect();
+    if accepted_events.is_empty() {
+        // Nothing requested can ever fire, so the subscription would leave the
+        // consumer waiting forever. Unlike the Npcf_EventExposure case, TS 29.531
+        // DOES give a conformant way to report partial acceptance
+        // (`acceptedEvents`), which is why only the empty intersection is refused.
+        return Err(format!(
+            "none of the requested event(s) {requested:?} can be reported by this NSSF; \
+             reportable events are {REPORTABLE_EVENTS:?}"
+        ));
+    }
+
+    // TS 29.531 Table 6.2.6.2.9-1: the NSSF assigns the expiry. A
+    // consumer-requested value is honoured only when EARLIER than the NSSF's own
+    // bound, so a consumer cannot extend its subscription past what the producer
+    // is willing to keep. Previously the consumer's value was echoed verbatim and
+    // none was assigned when it was absent, so subscriptions were unbounded.
+    let now = nextgcore_sbi::datetime::now_epoch_secs();
+    let nssf_deadline = now + timer::defaults::SUBSCRIPTION_VALIDITY.as_secs();
+    let deadline = v
+        .get("expiry")
+        .and_then(|x| x.as_str())
+        .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch)
+        .filter(|requested| *requested > now)
+        .map(|requested| requested.min(nssf_deadline))
+        .unwrap_or(nssf_deadline);
 
     Ok(context::NssfSubscription {
         subscription_id: subscription_id.to_string(),
         nf_nssai_availability_uri: uri.expect("checked above").to_string(),
         tai_list,
-        event: event.expect("checked above").to_string(),
-        expiry: v.get("expiry").and_then(|x| x.as_str()).map(String::from),
+        event,
+        expiry: Some(nextgcore_sbi::datetime::epoch_to_rfc3339(deadline)),
+        accepted_events,
         amf_id: v.get("amfId").and_then(|x| x.as_str()).map(String::from),
         amf_set_id: v.get("amfSetId").and_then(|x| x.as_str()).map(String::from),
     })
@@ -2810,6 +3059,17 @@ async fn run_event_loop_async(
 
     let timer_mgr = timer_manager();
 
+    // #94: sweep expired NSSAI-availability subscriptions on the EXISTING run-loop
+    // tick rather than arming one timer per subscription. The loop already exists,
+    // a per-subscription timer would need its own cancellation story on
+    // delete/patch, and a sweep is correct after a restart (where no timer
+    // survived) whereas re-arming from the restored records would have to be
+    // reconstructed. `subscriptions_matching` filters on expiry independently, so
+    // an expired subscription stops being SERVED at once and this only bounds how
+    // long it stays STORED.
+    let mut last_sweep = tokio::time::Instant::now();
+    const SUBSCRIPTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
         // Compute optimal sleep duration based on pending timers
         let poll_interval = nextgcore_core::async_timer::compute_poll_interval(
@@ -2817,6 +3077,16 @@ async fn run_event_loop_async(
             Duration::from_millis(100),
         );
         tokio::time::sleep(poll_interval).await;
+
+        if last_sweep.elapsed() >= SUBSCRIPTION_SWEEP_INTERVAL {
+            last_sweep = tokio::time::Instant::now();
+            let now = nextgcore_sbi::datetime::now_epoch_secs();
+            let removed =
+                with_nssf_context(|c| c.sweep_expired_subscriptions(now)).unwrap_or_default();
+            if !removed.is_empty() {
+                log::info!("expired subscription sweep removed {}", removed.len());
+            }
+        }
 
         // Process timer expirations and dispatch to state machine
         let expired = timer_mgr.process_expired();
@@ -3221,6 +3491,12 @@ mod tests {
         // restriction so this lifecycle PUT/PATCH path sees the default
         // allow-all (matched-sim back-compat).
         let _state_guard = availability_state_guard().await;
+        // #94: this drives a REAL HTTP client against a real SbiServer with no
+        // OAuth2 configured, so there is no attested caller identity for the
+        // server to bind to — which is precisely the deployment the documented
+        // escape hatch describes. Declared explicitly rather than left implicit,
+        // so the test states which posture it is asserting.
+        let _posture = with_authz_posture(false);
         let (server, port) = start_nssf_server().await;
         with_nssf_context(|c| c.set_plmn_supported_snssais(None));
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -3408,7 +3684,24 @@ mod tests {
         assert_eq!(resp.status, 200);
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(body["expiry"], "2030-01-01T00:00:00Z");
+        // #94: the NSSF now OWNS the expiry (TS 29.531 Table 6.2.6.2.9-1). This
+        // assertion used to be `== "2030-01-01T00:00:00Z"`, i.e. it pinned the
+        // echo-the-consumer behaviour that made subscriptions unbounded. A
+        // consumer-requested instant beyond the NSSF's own validity bound must NOT
+        // win, so the returned expiry is the NSSF's, not the requested 2030.
+        let expiry = body["expiry"].as_str().expect("an expiry must be assigned");
+        assert_ne!(
+            expiry, "2030-01-01T00:00:00Z",
+            "a consumer must not be able to extend its subscription past the NSSF bound"
+        );
+        let deadline = nextgcore_sbi::datetime::rfc3339_to_epoch(expiry)
+            .expect("the NSSF-assigned expiry must be parseable RFC 3339 UTC");
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
+        assert!(deadline > now, "the assigned expiry must be in the future");
+        assert!(
+            deadline <= now + timer::defaults::SUBSCRIPTION_VALIDITY.as_secs() + 5,
+            "the assigned expiry must be bounded by SUBSCRIPTION_VALIDITY"
+        );
 
         // 9. DELETE availability -> 204, second DELETE -> 404
         let resp = client
@@ -3472,11 +3765,7 @@ mod tests {
                 "supportedSnssaiList": [{"sst": 2, "sd": "0a0b0c"}]
             }]
         });
-        let req = SbiRequest::put(format!(
-            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
-        ))
-        .with_json_body(&body)
-        .unwrap();
+        let req = authenticated_availability_request("PUT", nf_id, Some(&body));
         let resp = handle_nssai_availability_update(nf_id, &req).await;
 
         assert_eq!(resp.status, 403);
@@ -3539,11 +3828,7 @@ mod tests {
                 "supportedSnssaiList": [{"sst": 1}]
             }]
         });
-        let req = SbiRequest::put(format!(
-            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
-        ))
-        .with_json_body(&body)
-        .unwrap();
+        let req = authenticated_availability_request("PUT", nf_id, Some(&body));
         let resp = handle_nssai_availability_update(nf_id, &req).await;
 
         assert_eq!(resp.status, 200);
@@ -3578,11 +3863,7 @@ mod tests {
                 "supportedSnssaiList": [{"sst": 1}]
             }]
         });
-        let put_req = SbiRequest::put(format!(
-            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
-        ))
-        .with_json_body(&put_body)
-        .unwrap();
+        let put_req = authenticated_availability_request("PUT", nf_id, Some(&put_body));
         assert_eq!(
             handle_nssai_availability_update(nf_id, &put_req)
                 .await
@@ -3596,10 +3877,12 @@ mod tests {
             "path": "/supportedNssaiAvailabilityData/0/supportedSnssaiList/-",
             "value": {"sst": 2}
         }]);
-        let patch_req = SbiRequest::patch(format!(
+        let mut patch_req = SbiRequest::patch(format!(
             "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
         ))
         .with_body(patch.to_string(), "application/json-patch+json");
+        // #94: the attested caller must own the document it patches.
+        patch_req.oauth2_subject = Some(nf_id.to_string());
         let resp = handle_nssai_availability_patch(nf_id, &patch_req).await;
 
         assert_eq!(resp.status, 403);
@@ -3669,7 +3952,15 @@ mod tests {
         );
         assert_eq!(restricted[0]["homePlmnId"]["mcc"], "001");
         assert_eq!(restricted[0]["homePlmnId"]["mnc"], "01");
-        assert_eq!(restricted[0]["sNssais"][0]["sst"], 99);
+        // #94: `sNssaiList` is the key TS 29.531 RestrictedSnssai requires. This
+        // assertion used to read `sNssais`, i.e. it pinned the wire-conformance
+        // bug as the requirement; inverted rather than deleted so review can see
+        // the flip.
+        assert_eq!(restricted[0]["sNssaiList"][0]["sst"], 99);
+        assert!(
+            restricted[0].get("sNssais").is_none(),
+            "the non-conformant `sNssais` key must be gone entirely"
+        );
         // supportedSnssaiList must still equal the input.
         assert_eq!(entries[0]["supportedSnssaiList"][0]["sst"], 1);
 
@@ -4269,6 +4560,51 @@ nssf:
     /// Written out rather than sent raw: a JSON-shaped query value containing
     /// `{` or `"` is refused by the URI layer before the request is ever sent,
     /// which reads exactly like a routing failure.
+    /// Serialises tests that depend on the process-global availability-authz
+    /// posture (`STRICT_AVAILABILITY_AUTHZ`).
+    ///
+    /// The flag is process-wide, so a test that flips it races every parallel
+    /// test that reads it. Taken through a recovering lock so one panicking test
+    /// cannot poison the rest into `PoisonError` instead of running.
+    static AUTHZ_POSTURE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Hold the posture at `strict` for the duration of the returned guard.
+    fn with_authz_posture(strict: bool) -> std::sync::MutexGuard<'static, ()> {
+        let g = AUTHZ_POSTURE_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_strict_availability_authz(strict);
+        g
+    }
+
+    /// Build an availability write request whose ATTESTED caller identity is
+    /// `nf_id` — i.e. what a real AMF writing its own document looks like.
+    ///
+    /// #94 made availability writes require the caller to be the owner of the
+    /// document, so a request with no attested identity is now (correctly) 403.
+    /// These tests are about storage and restriction semantics, not about
+    /// authorization, so they present the identity a conformant consumer would
+    /// rather than turning the check off.
+    fn authenticated_availability_request(
+        method: &str,
+        nf_id: &str,
+        body: Option<&serde_json::Value>,
+    ) -> SbiRequest {
+        let uri = format!("/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}");
+        let mut req = match method {
+            "PUT" => SbiRequest::put(&uri),
+            "PATCH" => SbiRequest::patch(&uri),
+            "DELETE" => SbiRequest::delete(&uri),
+            other => panic!("authenticated_availability_request: unsupported method {other}"),
+        };
+        if let Some(b) = body {
+            req = req.with_json_body(b).expect("encode test body");
+        }
+        // The verified OAuth2 token subject: an identity the server attested.
+        req.oauth2_subject = Some(nf_id.to_string());
+        req
+    }
+
     fn urlencoding_encode(s: &str) -> String {
         s.bytes()
             .map(|b| match b {
@@ -4399,5 +4735,418 @@ nssf:
             path.contains("\"sd\":\"0000ab\""),
             "sd must be 6 hex digits: {path}"
         );
+    }
+
+    // ── #94: authz binding, expiry lifecycle, create validation, wire shape ──
+
+    /// #94 criterion 1: an availability write whose ATTESTED identity is not the
+    /// `{nfId}` that owns the document is refused; a matching one succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn availability_write_requires_the_caller_to_own_the_document() {
+        let _state_guard = availability_state_guard().await;
+        let _posture = with_authz_posture(true);
+        nssf_context_init(512);
+
+        let owner = "amf-owner-94";
+        let intruder = "amf-intruder-94";
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(owner));
+
+        let body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+
+        // A DIFFERENT NF presenting its own attested identity may not write the
+        // owner's document. Before #94 this succeeded: the check was only that the
+        // path segment was non-empty.
+        let mut req = SbiRequest::put(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{owner}"
+        ))
+        .with_json_body(&body)
+        .unwrap();
+        req.oauth2_subject = Some(intruder.to_string());
+        let resp = handle_nssai_availability_update(owner, &req).await;
+        assert_eq!(
+            resp.status, 403,
+            "a non-owner must not be able to write another AMF's slice picture"
+        );
+        assert!(
+            with_nssf_context(|c| c.get_nssai_availability(owner))
+                .flatten()
+                .is_none(),
+            "the refused write must not have been stored"
+        );
+
+        // The owner itself succeeds.
+        let ok = authenticated_availability_request("PUT", owner, Some(&body));
+        let resp = handle_nssai_availability_update(owner, &ok).await;
+        assert_eq!(resp.status, 200, "the owning AMF must be able to write");
+        assert!(with_nssf_context(|c| c.get_nssai_availability(owner))
+            .flatten()
+            .is_some());
+
+        // A verified client CERTIFICATE identity works the same way, and is
+        // preferred over the token: both are attested by this process.
+        let mut cert_req = SbiRequest::put(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{owner}"
+        ))
+        .with_json_body(&body)
+        .unwrap();
+        cert_req.peer_cert_nf_instance_id = Some(owner.to_string());
+        assert_eq!(
+            handle_nssai_availability_update(owner, &cert_req)
+                .await
+                .status,
+            200
+        );
+
+        // A token-less write is refused under the strict posture: there is no
+        // identity to bind to, and "cannot tell who you are" is not permission.
+        let anon = SbiRequest::put(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{owner}"
+        ))
+        .with_json_body(&body)
+        .unwrap();
+        assert_eq!(
+            handle_nssai_availability_update(owner, &anon).await.status,
+            403,
+            "an unattested write must be refused under the strict posture"
+        );
+
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(owner));
+    }
+
+    /// PATCH and DELETE are bound to the owner too, not just PUT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn availability_patch_and_delete_are_bound_to_the_owner() {
+        let _state_guard = availability_state_guard().await;
+        let _posture = with_authz_posture(true);
+        nssf_context_init(512);
+
+        let owner = "amf-owner-94b";
+        let body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let put = authenticated_availability_request("PUT", owner, Some(&body));
+        assert_eq!(
+            handle_nssai_availability_update(owner, &put).await.status,
+            200
+        );
+
+        // PATCH from a non-owner.
+        let patch = json!([{
+            "op": "add",
+            "path": "/supportedNssaiAvailabilityData/0/supportedSnssaiList/-",
+            "value": {"sst": 2}
+        }]);
+        let mut bad = SbiRequest::patch(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{owner}"
+        ))
+        .with_body(patch.to_string(), "application/json-patch+json");
+        bad.oauth2_subject = Some("amf-intruder-94b".to_string());
+        assert_eq!(
+            handle_nssai_availability_patch(owner, &bad).await.status,
+            403,
+            "a non-owner must not be able to PATCH another AMF's document"
+        );
+
+        // The owner's PATCH works.
+        let mut good = SbiRequest::patch(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{owner}"
+        ))
+        .with_body(patch.to_string(), "application/json-patch+json");
+        good.oauth2_subject = Some(owner.to_string());
+        assert_eq!(
+            handle_nssai_availability_patch(owner, &good).await.status,
+            200
+        );
+
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(owner));
+    }
+
+    /// #94 criterion 2: the authorization decision fails CLOSED.
+    ///
+    /// Asserted at the policy function rather than by poisoning the real context
+    /// lock — poisoning a process-global lock would break every parallel test,
+    /// which is the avalanche the recorded poisoned-mutex lesson describes. What
+    /// matters is the property: no attested caller means no authorization.
+    #[test]
+    fn availability_authorization_denies_when_it_cannot_identify_the_caller() {
+        let ctx = context::NssfContext::new();
+        let tai = context::Tai::default();
+        // No caller at all -- the shape a poisoned lock or a token-less request
+        // presents. Before #94 the poisoned-lock path fell back to "allow any
+        // non-empty nfId".
+        assert!(
+            !ctx.nf_authorized_for_availability("amf-1", None, &tai),
+            "no attested identity must not authorize a write"
+        );
+        // A mismatched caller.
+        assert!(!ctx.nf_authorized_for_availability("amf-1", Some("amf-2"), &tai));
+        // The owner.
+        assert!(ctx.nf_authorized_for_availability("amf-1", Some("amf-1"), &tai));
+        // Case-insensitive, because a UUID may be presented in either case.
+        assert!(ctx.nf_authorized_for_availability("AMF-ABC", Some("amf-abc"), &tai));
+        // An empty path segment is never authorized, whoever asks.
+        assert!(!ctx.nf_authorized_for_availability("", Some(""), &tai));
+        assert!(!ctx.nf_authorized_for_availability("  ", Some("  "), &tai));
+    }
+
+    /// #94 criterion 4: the NSSF assigns an expiry, an expired subscription stops
+    /// matching, and the sweep removes it.
+    #[test]
+    fn subscription_expiry_is_assigned_enforced_and_swept() {
+        nssf_context_init(512);
+        let created = subscription_from_json(
+            "sub-94-expiry",
+            &json!({
+                "nfNssaiAvailabilityUri": "http://127.0.0.1:9/cb",
+                "event": "SNSSAI_STATUS_CHANGE_REPORT"
+            }),
+        )
+        .expect("a create with only the two mandatory members must be accepted");
+
+        // An expiry is ASSIGNED even though the consumer requested none.
+        let expiry = created
+            .expiry
+            .as_deref()
+            .expect("the NSSF must assign an expiry (TS 29.531 Table 6.2.6.2.9-1)");
+        let deadline = nextgcore_sbi::datetime::rfc3339_to_epoch(expiry).expect("parseable");
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
+        assert!(deadline > now);
+        assert!(deadline <= now + timer::defaults::SUBSCRIPTION_VALIDITY.as_secs() + 5);
+
+        // A consumer cannot extend past the NSSF bound...
+        let far = subscription_from_json(
+            "sub-94-far",
+            &json!({
+                "nfNssaiAvailabilityUri": "http://127.0.0.1:9/cb",
+                "event": "SNSSAI_STATUS_CHANGE_REPORT",
+                "expiry": "2099-01-01T00:00:00Z"
+            }),
+        )
+        .expect("accepted");
+        let far_deadline =
+            nextgcore_sbi::datetime::rfc3339_to_epoch(far.expiry.as_deref().unwrap()).unwrap();
+        assert!(
+            far_deadline <= now + timer::defaults::SUBSCRIPTION_VALIDITY.as_secs() + 5,
+            "a far-future request must be clamped to the NSSF's own bound"
+        );
+        // ...but a SHORTER consumer-requested expiry is honoured.
+        let soon_epoch = now + 30;
+        let soon_text = nextgcore_sbi::datetime::epoch_to_rfc3339(soon_epoch);
+        let soon = subscription_from_json(
+            "sub-94-soon",
+            &json!({
+                "nfNssaiAvailabilityUri": "http://127.0.0.1:9/cb",
+                "event": "SNSSAI_STATUS_CHANGE_REPORT",
+                "expiry": soon_text
+            }),
+        )
+        .expect("accepted");
+        assert_eq!(soon.expiry.as_deref(), Some(soon_text.as_str()));
+
+        // Expiry enforcement: is_expired_at is the predicate both the matching
+        // filter and the sweep use.
+        assert!(!soon.is_expired_at(soon_epoch - 1));
+        assert!(soon.is_expired_at(soon_epoch));
+        assert!(soon.is_expired_at(soon_epoch + 1));
+
+        // An already-expired subscription never MATCHES...
+        let mut expired = created.clone();
+        expired.subscription_id = "sub-94-dead".to_string();
+        expired.expiry = Some(nextgcore_sbi::datetime::epoch_to_rfc3339(now - 10));
+        with_nssf_context(|c| c.subscription_add(expired.clone()));
+        let matching = with_nssf_context(|c| c.subscriptions_matching(&[])).unwrap_or_default();
+        assert!(
+            !matching.iter().any(|s| s.subscription_id == "sub-94-dead"),
+            "an expired subscription must not be notified"
+        );
+
+        // ...and the sweep REMOVES it, while a live one survives.
+        with_nssf_context(|c| c.subscription_add(created.clone()));
+        let removed = with_nssf_context(|c| c.sweep_expired_subscriptions(now)).unwrap_or_default();
+        assert!(removed.contains(&"sub-94-dead".to_string()));
+        assert!(
+            with_nssf_context(|c| c.subscription_get("sub-94-dead"))
+                .flatten()
+                .is_none(),
+            "the sweep must remove the expired record, not just hide it"
+        );
+        assert!(
+            with_nssf_context(|c| c.subscription_get("sub-94-expiry"))
+                .flatten()
+                .is_some(),
+            "a live subscription must survive the sweep"
+        );
+
+        for id in ["sub-94-expiry", "sub-94-dead"] {
+            let _ = with_nssf_context(|c| c.subscription_remove(id));
+        }
+    }
+
+    /// #94 criterion 5: `taiList` is optional, and `acceptedEvents` is returned.
+    #[test]
+    fn subscription_create_treats_tai_list_as_optional_and_returns_accepted_events() {
+        nssf_context_init(512);
+
+        // Only the two members the schema marks required.
+        let sub = subscription_from_json(
+            "sub-94-notai",
+            &json!({
+                "nfNssaiAvailabilityUri": "http://127.0.0.1:9/cb",
+                "event": "SNSSAI_STATUS_CHANGE_REPORT"
+            }),
+        )
+        .expect("taiList is OPTIONAL per TS 29.531 Table 6.2.6.2.8-1");
+        assert!(sub.tai_list.is_empty(), "absent taiList means all TAIs");
+        assert_eq!(sub.accepted_events, vec!["SNSSAI_STATUS_CHANGE_REPORT"]);
+
+        // acceptedEvents reaches the wire.
+        let created = sub.to_created_json();
+        let accepted = created["acceptedEvents"]
+            .as_array()
+            .expect("acceptedEvents must be returned (Table 6.2.6.2.9-1)");
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0], "SNSSAI_STATUS_CHANGE_REPORT");
+        assert!(created["expiry"].is_string());
+
+        // An empty taiList is also fine, and still means all TAIs.
+        let sub = subscription_from_json(
+            "sub-94-emptytai",
+            &json!({
+                "nfNssaiAvailabilityUri": "http://127.0.0.1:9/cb",
+                "event": "SNSSAI_STATUS_CHANGE_REPORT",
+                "taiList": []
+            }),
+        )
+        .expect("an empty taiList is legal");
+        assert!(sub.tai_list.is_empty());
+
+        // additionalEvents: reportable ones are accepted, unreportable ones are
+        // simply absent from acceptedEvents rather than rejected.
+        let sub = subscription_from_json(
+            "sub-94-addl",
+            &json!({
+                "nfNssaiAvailabilityUri": "http://127.0.0.1:9/cb",
+                "event": "SNSSAI_STATUS_CHANGE_REPORT",
+                "additionalEvents": ["NSI_UNAVAILABILITY_REPORT", "A_FUTURE_EVENT"]
+            }),
+        )
+        .expect("an unreportable additional event must not fail the create");
+        assert_eq!(
+            sub.accepted_events,
+            vec!["SNSSAI_STATUS_CHANGE_REPORT"],
+            "only events with a real producer may be reported as accepted"
+        );
+
+        // A subscription that could NEVER fire is refused rather than silently kept.
+        let err = subscription_from_json(
+            "sub-94-none",
+            &json!({
+                "nfNssaiAvailabilityUri": "http://127.0.0.1:9/cb",
+                "event": "NSI_UNAVAILABILITY_REPORT"
+            }),
+        )
+        .expect_err("a subscription with no reportable event must be refused");
+        assert!(err.contains("can be reported"), "got: {err}");
+
+        // The two genuinely-mandatory members are still enforced.
+        for body in [
+            json!({ "event": "SNSSAI_STATUS_CHANGE_REPORT" }),
+            json!({ "nfNssaiAvailabilityUri": "http://127.0.0.1:9/cb" }),
+        ] {
+            assert!(subscription_from_json("sub-94-bad", &body).is_err());
+        }
+    }
+
+    /// #94 criterion 6: restrictions come from CONFIG, and serialize under
+    /// `sNssaiList`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn configured_restrictions_round_trip_under_the_conformant_key() {
+        let _state_guard = availability_state_guard().await;
+        nssf_context_init(512);
+        with_nssf_context(|c| c.clear_plmn_snssai_restrictions());
+
+        // Loaded from YAML through the production config path -- before #94
+        // set_plmn_snssai_restrictions had no caller outside cfg(test), so an
+        // operator could not configure a restriction at all.
+        let yaml = r#"
+nssf:
+  snssai_restrictions:
+    - home_plmn:
+        mcc: "001"
+        mnc: "01"
+      restricted:
+        - sst: 99
+"#;
+        let doc: NssfYaml = serde_yaml::from_str(yaml).expect("config shape parses");
+        let list = doc
+            .nssf
+            .and_then(|n| n.snssai_restrictions)
+            .expect("the snssai_restrictions block must deserialise");
+        assert_eq!(list.len(), 1);
+        with_nssf_context(|c| {
+            for r in &list {
+                let plmn = context::PlmnId::new(&r.home_plmn.mcc, &r.home_plmn.mnc);
+                c.set_plmn_snssai_restrictions(
+                    &plmn,
+                    r.restricted.iter().map(snssai_from_yaml).collect(),
+                );
+            }
+        });
+
+        let doc = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "001", "mnc": "01"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}],
+                "taiList": [{"plmnId": {"mcc": "001", "mnc": "01"}, "tac": "000002"}],
+                "nsagInfos": [{"nsagId": 7}]
+            }]
+        });
+        let resp = authorized_availability_response(&doc);
+        assert_eq!(resp.status, 200);
+        let raw = resp.http.content.as_deref().unwrap().to_string();
+        let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let entry = &body["authorizedNssaiAvailabilityData"][0];
+
+        let restricted = entry["restrictedSnssaiList"]
+            .as_array()
+            .expect("a configured restriction must be emitted");
+        assert_eq!(restricted[0]["sNssaiList"][0]["sst"], 99);
+        // The non-conformant key must not appear ANYWHERE in the document.
+        assert!(
+            !raw.contains("sNssais\""),
+            "the non-conformant `sNssais` key must not reach the wire: {raw}"
+        );
+
+        // #94 criterion 7: the locality/scoping members survive into the entry.
+        assert_eq!(
+            entry["taiList"][0]["tac"], "000002",
+            "taiList must be carried through, not dropped"
+        );
+        assert_eq!(entry["nsagInfos"][0]["nsagId"], 7);
+
+        with_nssf_context(|c| c.clear_plmn_snssai_restrictions());
+    }
+
+    /// The unevaluable-policy response is a 403 denial with a cause the consumer
+    /// can act on.
+    #[test]
+    fn unevaluable_policy_response_is_a_403_denial() {
+        let resp = policy_unevaluable_response();
+        assert_eq!(resp.status, 403, "an unevaluable policy must DENY");
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pd["cause"], "NOT_AUTHORIZED");
+        assert_eq!(pd["status"], 403);
     }
 }

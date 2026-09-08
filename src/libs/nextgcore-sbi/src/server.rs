@@ -269,11 +269,15 @@ impl OAuthVerifier {
     /// authorizes the invoked service (TS 33.501 §13.4.1.2, TS 29.510
     /// §5.4.2.2.2). `required_scope` is the invoked apiName (service name);
     /// `None` (e.g. a non-service path) skips only the scope check.
+    /// Returns the verified token's `sub` (the consumer's NF Instance ID) so a
+    /// producer can bind an authorization decision to the caller rather than
+    /// merely to "a valid token exists" (issue #94). The claims used to be
+    /// dropped here.
     async fn authorize(
         &self,
         auth_header: Option<&str>,
         required_scope: Option<&str>,
-    ) -> SbiResult<()> {
+    ) -> SbiResult<String> {
         let aud = self.expected_audience.as_deref();
         let claims = match &self.keys {
             OAuthKeySource::Static(jwks) => {
@@ -289,7 +293,7 @@ impl OAuthVerifier {
         if let Some(scope) = required_scope {
             crate::oauth::check_token_scope(&claims.scope, scope)?;
         }
-        Ok(())
+        Ok(claims.sub)
     }
 }
 
@@ -356,7 +360,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             // Convert hyper request to SbiRequest, enforcing the body-size cap
             // BEFORE buffering (T1.4). An oversize body is rejected with 413
             // ProblemDetails without allocating the full body.
-            let sbi_request =
+            let mut sbi_request =
                 match convert_request(req, max_body, tls_exporter_secret, peer_cert_nf_instance_id)
                     .await
                 {
@@ -394,32 +398,37 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                 // TS 33.501 §13.4.1.2: reject a token whose scope does not
                 // authorize the invoked service (the decomposed apiName).
                 let required_scope = sbi_request.header.service_name.as_deref();
-                if let Err(e) = verifier.authorize(auth, required_scope).await {
-                    let (status, title) = match e {
-                        SbiError::AuthorizationFailed(_) => (401, "Unauthorized"),
-                        _ => (503, "Service Unavailable"),
-                    };
-                    let body = serde_json::json!({
-                        "title": title, "status": status, "detail": e.to_string()
-                    })
-                    .to_string();
-                    let mut resp = SbiResponse::with_status(status)
-                        .with_body(body, "application/problem+json");
-                    if status == 401 {
-                        // RFC 6750 §3 (TS 29.500 Table 5.2.2.2-1): a rejected or
-                        // absent bearer token MUST carry a WWW-Authenticate: Bearer
-                        // challenge so the consumer/SCP can classify and retry.
-                        resp = resp.with_header(
+                match verifier.authorize(auth, required_scope).await {
+                    // Record the identity THIS PROCESS verified, so a producer can
+                    // bind authorization to the caller (issue #94).
+                    Ok(sub) => sbi_request.oauth2_subject = Some(sub),
+                    Err(e) => {
+                        let (status, title) = match e {
+                            SbiError::AuthorizationFailed(_) => (401, "Unauthorized"),
+                            _ => (503, "Service Unavailable"),
+                        };
+                        let body = serde_json::json!({
+                            "title": title, "status": status, "detail": e.to_string()
+                        })
+                        .to_string();
+                        let mut resp = SbiResponse::with_status(status)
+                            .with_body(body, "application/problem+json");
+                        if status == 401 {
+                            // RFC 6750 §3 (TS 29.500 Table 5.2.2.2-1): a rejected or
+                            // absent bearer token MUST carry a WWW-Authenticate: Bearer
+                            // challenge so the consumer/SCP can classify and retry.
+                            resp = resp.with_header(
                             "WWW-Authenticate",
                             format!(
                                 "Bearer realm=\"5gc-sbi\", error=\"invalid_token\", error_description=\"{e}\""
                             ),
                         );
+                        }
+                        return Ok(convert_response_with_identity(
+                            resp,
+                            server_identity.as_ref(),
+                        ));
                     }
-                    return Ok(convert_response_with_identity(
-                        resp,
-                        server_identity.as_ref(),
-                    ));
                 }
             }
 
@@ -639,6 +648,9 @@ async fn convert_request(
         correlation_id,
         tls_exporter_secret,
         peer_cert_nf_instance_id,
+        // Set by the caller after the bearer token verifies; `convert_request`
+        // runs before authorization, so it cannot know it here.
+        oauth2_subject: None,
     })
 }
 
@@ -1855,5 +1867,127 @@ mod tests {
 
         // No required scope (e.g. a non-service path) -> scope check skipped.
         assert!(verifier.authorize(Some(&header), None).await.is_ok());
+    }
+
+    /// #94: the SERVER populates `SbiRequest.oauth2_subject` from the verified
+    /// token, so a producer can bind an authorization decision to the caller.
+    ///
+    /// Drives a real server end to end rather than calling `authorize` directly:
+    /// nssfd's authorization tests set the field on a hand-built request, so they
+    /// prove nssfd USES it but nothing proved the server SETS it — the recorded
+    /// "the helper is tested and the wiring is not" gap. This is the test that
+    /// fails if the plumbing is removed.
+    #[tokio::test]
+    async fn server_records_the_verified_token_subject_on_the_request() {
+        let (token, jwks) = token_jwks_with_aud("UDM");
+
+        // The handler reports back what it saw, so the assertion is on the value
+        // that actually reached it.
+        let seen: Arc<std::sync::Mutex<Option<Option<String>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+
+        let port = crate::test_support::free_port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut cfg = SbiServerConfig::new(addr);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(jwks);
+        let server = SbiServer::new(cfg);
+        server
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(req.oauth2_subject.clone());
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("server starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let client = crate::client::SbiClient::new(crate::client::SbiClientConfig::new(
+            "127.0.0.1".to_string(),
+            port,
+        ));
+        // The helper's token carries scope "nudm-sdm", so the invoked service must
+        // be nudm-sdm for the scope check to pass.
+        let req = SbiRequest::get("/nudm-sdm/v1/anything")
+            .with_header("authorization", format!("Bearer {token}"));
+        let resp = client.send_request(req).await.expect("response");
+        assert_eq!(resp.status, 204, "a valid token must be accepted");
+
+        let observed = seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("the handler must have run");
+        assert_eq!(
+            observed.as_deref(),
+            Some("amf-1"),
+            "the handler must see the verified token's `sub` (issue #94)"
+        );
+
+        server.stop().await.expect("stop");
+    }
+
+    /// A request that carries no token at all leaves `oauth2_subject` unset —
+    /// the field must never be populated from anything the caller can assert.
+    #[tokio::test]
+    async fn oauth2_subject_is_absent_without_oauth2_enforcement() {
+        let seen: Arc<std::sync::Mutex<Option<Option<String>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+
+        let port = crate::test_support::free_port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let server = SbiServer::new(SbiServerConfig::new(addr));
+        server
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(req.oauth2_subject.clone());
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("server starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let client = crate::client::SbiClient::new(crate::client::SbiClientConfig::new(
+            "127.0.0.1".to_string(),
+            port,
+        ));
+        // A caller-supplied Authorization header on a listener that does NOT
+        // require OAuth2 must not become an identity.
+        let req = SbiRequest::get("/nudm-sdm/v1/anything")
+            .with_header("authorization", "Bearer not.a.real.token");
+        assert_eq!(
+            client.send_request(req).await.expect("response").status,
+            204
+        );
+
+        let observed = seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("handler ran");
+        assert!(
+            observed.is_none(),
+            "an unverified bearer header must NOT become an attested identity, got {observed:?}"
+        );
+
+        server.stop().await.expect("stop");
     }
 }

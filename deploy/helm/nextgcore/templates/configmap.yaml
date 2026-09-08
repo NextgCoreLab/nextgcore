@@ -267,6 +267,12 @@ data:
             - uri: {{ include "nextgcore.nrfUri" . }}
               s_nssai:
                 sst: 1
+        # #94: SBI OAuth2 enforcement now defaults to ENABLED. This chart wires
+        # up no token issuance, so it opts out EXPLICITLY: requests are not
+        # authenticated and NSSAI-availability writes cannot be bound to the
+        # owning AMF.
+        oauth2:
+          require: false
 
   bsf.yaml: |
     logger:
