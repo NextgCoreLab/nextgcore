@@ -776,9 +776,52 @@ fn token_acquisition_failure_response(err: &SbiError) -> SbiResponse {
     }
 }
 
+/// Split an **absolute** request URI into its apiRoot and the origin-form path
+/// the SCP must forward (scpd-#210).
+///
+/// A notification arrives addressed to the callback URI the consumer handed the
+/// producer, which may be absolute. Forwarding an absolute URI as the HTTP/2
+/// `:path` would be wrong, so the authority becomes the target and the remainder
+/// (path plus any query, sliced from the original string so nothing is dropped)
+/// becomes the forwarded URI.
+///
+/// The split is at the **first** `/` after the authority, so a deployment prefix
+/// stays in the path rather than being parsed into `ApiRoot::prefix` — otherwise
+/// `forward_once`, which prepends `target.prefix`, would emit it twice.
+fn split_absolute_uri(uri: &str) -> Option<(String, String)> {
+    let uri = uri.trim();
+    let (scheme_len, rest) = if let Some(r) = uri.strip_prefix("http://") {
+        ("http://".len(), r)
+    } else if let Some(r) = uri.strip_prefix("https://") {
+        ("https://".len(), r)
+    } else {
+        return None;
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    if authority_end == 0 {
+        return None;
+    }
+    let api_root = uri[..scheme_len + authority_end].to_string();
+    let path = if authority_end == rest.len() {
+        "/".to_string()
+    } else {
+        rest[authority_end..].to_string()
+    };
+    Some((api_root, path))
+}
+
 /// How the proxy decided where to route a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RouteDecision {
+    /// scpd-#210: `3gpp-Sbi-Callback` marks a notification/callback request
+    /// (TS 29.500 §6.10.7). Routed straight to the callback URI with **no**
+    /// discovery and **no** access-token acquisition.
+    Callback {
+        target: ApiRoot,
+        /// Set when the callback URI was absolute and the forwarded URI must be
+        /// rewritten to its origin form.
+        forward_uri: Option<String>,
+    },
     /// Model C: `3gpp-Sbi-Target-apiRoot` was present.
     TargetApiRoot(ApiRoot),
     /// §6.12 stickiness: `3gpp-Sbi-Routing-Binding` matched a cached binding.
@@ -1205,10 +1248,48 @@ impl ScpProxy {
     }
 
     /// Decide how to route an incoming request (TS 29.500 §6.10.2):
-    /// Target-apiRoot wins; otherwise a Routing-Binding that matches a cached
-    /// Binding; otherwise delegated discovery when Discovery headers are
-    /// present; otherwise the request is malformed.
+    /// a `3gpp-Sbi-Callback` notification first; then Target-apiRoot; otherwise a
+    /// Routing-Binding that matches a cached Binding; otherwise delegated
+    /// discovery when Discovery headers are present; otherwise the request is
+    /// malformed.
+    ///
+    /// **Precedence of `3gpp-Sbi-Callback`** (scpd-#210, TS 29.500 §6.10.7). It is
+    /// checked **first**, and it is not in competition with `Target-apiRoot`: the
+    /// callback header decides the *mode* (no discovery, no token) while
+    /// `Target-apiRoot` supplies the *address*, so a callback carrying one is
+    /// routed there. With no `Target-apiRoot`, the address comes from an absolute
+    /// request URI — the normal callback case, since the callback URI is already
+    /// known and needs no discovery.
+    ///
+    /// It outranks `Routing-Binding` and the `Discovery-*` headers because a
+    /// notification's destination is fixed by the consumer that registered the
+    /// callback; discovering a producer for it would address the wrong node
+    /// entirely, and minting a token for a discovered producer is an NRF
+    /// round-trip for a credential the callback target never asked for.
+    ///
+    /// If the header is present but **no** callback URI can be determined (no
+    /// `Target-apiRoot`, relative request URI), the marker is logged and ignored
+    /// and routing falls through to the ordinary precedence. Rejecting instead
+    /// would regress a deployment whose callbacks currently reach their target via
+    /// the Discovery headers — badly, but successfully.
     fn route(&self, request: &SbiRequest) -> RouteDecision {
+        if request.http.get_header(custom_header::CALLBACK).is_some() {
+            match self.callback_target(request) {
+                Some((target, forward_uri)) => {
+                    return RouteDecision::Callback {
+                        target,
+                        forward_uri,
+                    }
+                }
+                None => log::warn!(
+                    "SCP: request carries {} but names no callback URI (no {} and a relative \
+                     request URI); ignoring the marker and routing normally",
+                    custom_header::CALLBACK,
+                    custom_header::TARGET_APIROOT
+                ),
+            }
+        }
+
         if let Some(api_root) = request.http.target_apiroot() {
             return match ApiRoot::parse(api_root) {
                 Ok(target) => RouteDecision::TargetApiRoot(target),
@@ -1231,6 +1312,31 @@ impl ScpProxy {
         } else {
             RouteDecision::Reject
         }
+    }
+
+    /// Resolve where a `3gpp-Sbi-Callback` request should go (scpd-#210): the
+    /// `3gpp-Sbi-Target-apiRoot` when the producer supplied one, otherwise the
+    /// authority of an absolute request URI. Returns the target and, for the
+    /// absolute case, the origin-form URI to forward.
+    ///
+    /// **In practice `Target-apiRoot` is the only conveyance that survives the
+    /// wire.** The shared SBI server records only the path
+    /// (`libs/nextgcore-sbi/src/server.rs:563`, `req.uri().path()`), and over
+    /// HTTP/2 the authority is the SCP's own, so a producer sending a notification
+    /// *through* this SCP must name the callback apiRoot in the header — which is
+    /// the same convention Model C already uses. The absolute-URI arm is retained
+    /// for in-process callers of the public [`ScpProxy::handle`] and would become
+    /// wire-reachable if the ingress ever preserved the authority; it is not
+    /// claimed as wire behaviour, and its test says so.
+    fn callback_target(&self, request: &SbiRequest) -> Option<(ApiRoot, Option<String>)> {
+        if let Some(api_root) = request.http.target_apiroot() {
+            // A malformed Target-apiRoot is NOT silently ignored in favour of the
+            // request URI: the producer named a destination and got it wrong, and
+            // quietly routing somewhere else would hide that.
+            return ApiRoot::parse(api_root).ok().map(|t| (t, None));
+        }
+        let (api_root, path) = split_absolute_uri(&request.header.uri)?;
+        ApiRoot::parse(&api_root).ok().map(|t| (t, Some(path)))
     }
 
     /// Model D delegated discovery (TS 29.500 §6.10.3, TS 29.510 §5.3.2):
@@ -1924,13 +2030,39 @@ impl ScpProxy {
 
     /// Handle one inbound SBI request end-to-end (the server handler entry
     /// point).
-    pub async fn handle(&self, request: SbiRequest) -> SbiResponse {
+    pub async fn handle(&self, mut request: SbiRequest) -> SbiResponse {
         // scpd-04: reject looped / hop-exhausted requests before any forwarding.
         if let Some(rejection) = self.ingress_guard(&request) {
             return rejection;
         }
 
         match self.route(&request) {
+            // scpd-#210: a notification goes straight to its callback URI — no
+            // discovery query, and no delegated token (`delegated: None`), because
+            // the callback target is not a discovered producer and never asked for
+            // one (TS 29.500 §6.10.7).
+            //
+            // `3gpp-Sbi-Callback` itself is deliberately **not** added to
+            // `is_scp_consumed`: it identifies the message as a notification to the
+            // receiver, so stripping it would remove information the SCP merely
+            // read. Nor is this retargeting — the producer was given the callback
+            // URI by the consumer, so `RelayContext::default()` is right.
+            RouteDecision::Callback {
+                target,
+                forward_uri,
+            } => {
+                if let Some(uri) = forward_uri {
+                    request.header.uri = uri;
+                }
+                log::debug!(
+                    "SCP callback: {} {} -> {} (no discovery, no token)",
+                    request.header.method,
+                    request.header.uri,
+                    target.to_uri()
+                );
+                self.forward(&request, &target, RelayContext::default(), None)
+                    .await
+            }
             RouteDecision::TargetApiRoot(target) => {
                 log::debug!(
                     "SCP Model C: {} {} -> {}",
@@ -4329,6 +4461,351 @@ mod tests {
 
         scp.stop().await.expect("scp stop");
         producer.stop().await.expect("producer stop");
+    }
+
+    // ------------------------------------------------------------------
+    // scpd-#210: 3gpp-Sbi-Callback routes without a discovery or OAuth gate
+    // (TS 29.500 §6.10.7)
+    // ------------------------------------------------------------------
+
+    /// An NRF that **counts every request it receives**, split by endpoint, and
+    /// answers discovery with a profile pointing at `producer_port`.
+    ///
+    /// The counters are the point: the callback path must not touch either
+    /// endpoint, and asserting a 200 alone would pass while a token was minted.
+    async fn start_counting_nrf(
+        port: u16,
+        producer_port: u16,
+        disc_hits: Arc<AtomicU64>,
+        token_hits: Arc<AtomicU64>,
+    ) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
+        server
+            .start(move |request: SbiRequest| {
+                let disc_hits = disc_hits.clone();
+                let token_hits = token_hits.clone();
+                async move {
+                    if request.header.uri == "/nnrf-oauth2/v1/access-token" {
+                        token_hits.fetch_add(1, Ordering::SeqCst);
+                        return SbiResponse::ok().with_body(
+                            r#"{"access_token":"scp-test-token","token_type":"Bearer","expires_in":3600}"#.to_string(),
+                            "application/json",
+                        );
+                    }
+                    disc_hits.fetch_add(1, Ordering::SeqCst);
+                    SbiResponse::ok().with_body(
+                        uecm_instances(&[producer_port]).to_string(),
+                        "application/json",
+                    )
+                }
+            })
+            .await
+            .expect("nrf start");
+        server
+    }
+
+    /// scpd-#210, **the discriminating test**: a callback carrying Discovery
+    /// headers and **no** `Target-apiRoot` must go to its callback URI, not take
+    /// the delegated path. This is the case the issue names, and it is the only one
+    /// where the callback rule changes an outcome.
+    ///
+    /// With the rule removed, this request routes to `Discover`: the SCP queries
+    /// the NRF, mints a token, and delivers the notification to a *discovered
+    /// producer* — the wrong node entirely. All three are asserted at zero against
+    /// live counters, so none of them can pass by accident.
+    ///
+    /// In process, necessarily: the destination here comes from the absolute
+    /// request URI, which the SBI server discards (see
+    /// `test_callback_with_an_absolute_uri_is_routed_in_process`).
+    #[tokio::test]
+    async fn test_callback_with_discovery_headers_is_not_discovery_gated() {
+        let callback_port = ephemeral_port();
+        let decoy_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let callback_hits = Arc::new(AtomicU64::new(0));
+        let decoy_hits = Arc::new(AtomicU64::new(0));
+        let disc_hits = Arc::new(AtomicU64::new(0));
+        let token_hits = Arc::new(AtomicU64::new(0));
+
+        let callback_target =
+            start_named_producer(callback_port, "callback-target", callback_hits.clone()).await;
+        let decoy = start_named_producer(decoy_port, "decoy", decoy_hits.clone()).await;
+        let nrf =
+            start_counting_nrf(nrf_port, decoy_port, disc_hits.clone(), token_hits.clone()).await;
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+            connect_timeout: Duration::from_millis(500),
+            request_timeout: Duration::from_millis(500),
+            ..Default::default()
+        });
+
+        let request = SbiRequest::post(format!(
+            "http://127.0.0.1:{callback_port}/namf-comm/v1/subscriptions/1/notify"
+        ))
+        .with_body(r#"{"event":"ping"}"#, "application/json")
+        .with_header(custom_header::CALLBACK, "Namf_Communication_N1N2Notify")
+        .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+        .with_header(discovery_header::REQUESTER_NF_TYPE, "AMF");
+
+        let response = proxy.handle(request).await;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(body["servedBy"], "callback-target");
+        assert_eq!(callback_hits.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            disc_hits.load(Ordering::SeqCst),
+            0,
+            "a callback must not trigger a discovery query"
+        );
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            0,
+            "a callback must not trigger an access-token request"
+        );
+        assert_eq!(
+            decoy_hits.load(Ordering::SeqCst),
+            0,
+            "the notification must not be delivered to a discovered producer"
+        );
+
+        nrf.stop().await.expect("nrf stop");
+        decoy.stop().await.expect("decoy stop");
+        callback_target.stop().await.expect("callback stop");
+    }
+
+    /// scpd-#210 over the wire: a callback addressed by `3gpp-Sbi-Target-apiRoot`
+    /// reaches its target with no discovery and no token.
+    ///
+    /// **Honest scope: this was already true before the change**, because
+    /// `Target-apiRoot` outranks the Discovery headers and the Model C path passes
+    /// `delegated: None`. It is kept as a *regression* guard — the callback rule now
+    /// runs ahead of that precedence, and this pins that it did not disturb the
+    /// outcome — not as evidence the rule does anything here. The test that
+    /// discriminates is `test_callback_with_discovery_headers_is_not_discovery_gated`.
+    #[tokio::test]
+    async fn test_callback_routes_without_discovery_or_token() {
+        let callback_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let callback_hits = Arc::new(AtomicU64::new(0));
+        let disc_hits = Arc::new(AtomicU64::new(0));
+        let token_hits = Arc::new(AtomicU64::new(0));
+        // A producer the SCP would have discovered had it taken the delegated path.
+        let decoy_port = ephemeral_port();
+        let decoy_hits = Arc::new(AtomicU64::new(0));
+
+        let callback_target =
+            start_named_producer(callback_port, "callback-target", callback_hits.clone()).await;
+        let decoy = start_named_producer(decoy_port, "decoy", decoy_hits.clone()).await;
+        let nrf =
+            start_counting_nrf(nrf_port, decoy_port, disc_hits.clone(), token_hits.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // A notification, marked as a callback, addressed by Target-apiRoot, and
+        // carrying Discovery headers the SCP must now ignore.
+        let request = SbiRequest::post("/namf-comm/v1/subscriptions/1/notify")
+            .with_body(r#"{"event":"ping"}"#, "application/json")
+            .with_header(custom_header::CALLBACK, "Namf_Communication_N1N2Notify")
+            .with_header(
+                custom_header::TARGET_APIROOT,
+                format!("http://127.0.0.1:{callback_port}"),
+            )
+            .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+            .with_header(discovery_header::REQUESTER_NF_TYPE, "AMF");
+
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("callback roundtrip");
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(body["servedBy"], "callback-target");
+        assert_eq!(callback_hits.load(Ordering::SeqCst), 1);
+
+        // The load-bearing assertions.
+        assert_eq!(
+            disc_hits.load(Ordering::SeqCst),
+            0,
+            "a callback must not trigger a discovery query"
+        );
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            0,
+            "a callback must not trigger an access-token request"
+        );
+        assert_eq!(
+            decoy_hits.load(Ordering::SeqCst),
+            0,
+            "the notification must not reach a discovered producer"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        decoy.stop().await.expect("decoy stop");
+        callback_target.stop().await.expect("callback stop");
+    }
+
+    /// scpd-#210: a callback whose destination comes from an **absolute request
+    /// URI** rather than `Target-apiRoot`, with no Discovery headers at all.
+    ///
+    /// **This test drives `handle()` in process, deliberately, and that is a
+    /// statement about reachability rather than convenience.** The shared SBI
+    /// server keeps only the path — `libs/nextgcore-sbi/src/server.rs:563` is
+    /// `req.uri().path().to_string()` — and over HTTP/2 the authority a consumer
+    /// dialled is the SCP's own. So an absolute callback URI **cannot** survive
+    /// the wire hop into `route()`, and an end-to-end test asserting this would be
+    /// asserting something the transport makes impossible. The branch is kept
+    /// because `handle` is public and because it is the correct handling if the
+    /// ingress ever preserves the authority; it is not claimed as wire behaviour.
+    ///
+    /// Also pins the URI rewrite: the target receives the origin-form path with
+    /// its query intact, not the absolute URI.
+    #[tokio::test]
+    async fn test_callback_with_an_absolute_uri_is_routed_in_process() {
+        let callback_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let callback_hits = Arc::new(AtomicU64::new(0));
+        let disc_hits = Arc::new(AtomicU64::new(0));
+        let token_hits = Arc::new(AtomicU64::new(0));
+
+        let callback_target =
+            start_named_producer(callback_port, "callback-target", callback_hits.clone()).await;
+        let nrf = start_counting_nrf(
+            nrf_port,
+            callback_port,
+            disc_hits.clone(),
+            token_hits.clone(),
+        )
+        .await;
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+            connect_timeout: Duration::from_millis(500),
+            request_timeout: Duration::from_millis(500),
+            ..Default::default()
+        });
+
+        let request = SbiRequest::post(format!(
+            "http://127.0.0.1:{callback_port}/namf-comm/v1/subscriptions/1/notify"
+        ))
+        .with_body(r#"{"event":"ping"}"#, "application/json")
+        .with_header(custom_header::CALLBACK, "Namf_Communication_N1N2Notify");
+
+        let response = proxy.handle(request).await;
+        assert_eq!(
+            response.status, 200,
+            "a fully-specified callback must not be rejected for want of Discovery headers"
+        );
+        let body: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(body["servedBy"], "callback-target");
+        assert_eq!(
+            body["uri"], "/namf-comm/v1/subscriptions/1/notify",
+            "the callback target receives the origin-form path, not the absolute URI"
+        );
+        assert_eq!(disc_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(token_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(callback_hits.load(Ordering::SeqCst), 1);
+
+        nrf.stop().await.expect("nrf stop");
+        callback_target.stop().await.expect("callback stop");
+    }
+
+    /// scpd-#210 unit: `3gpp-Sbi-Callback` outranks Routing-Binding and the
+    /// Discovery headers, takes its address from `Target-apiRoot` when present, and
+    /// falls through to ordinary routing when it names no destination at all.
+    #[test]
+    fn test_callback_route_precedence() {
+        let proxy = ScpProxy::new(ScpProxyConfig::default());
+
+        // Callback + Target-apiRoot + Discovery headers -> Callback, addressed by
+        // the Target-apiRoot, with no URI rewrite (the request URI is relative).
+        let mut req = SbiRequest::get("/namf-comm/v1/x");
+        req.http.set_header(custom_header::CALLBACK, "Notify");
+        req.http.set_target_apiroot("http://amf:8080");
+        req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
+        assert_eq!(
+            proxy.route(&req),
+            RouteDecision::Callback {
+                target: ApiRoot::parse("http://amf:8080").unwrap(),
+                forward_uri: None,
+            }
+        );
+
+        // Callback + absolute URI, nothing else -> Callback, with the path split out.
+        let mut req = SbiRequest::get("http://amf:8080/namf-comm/v1/x?y=1");
+        req.http.set_header(custom_header::CALLBACK, "Notify");
+        assert_eq!(
+            proxy.route(&req),
+            RouteDecision::Callback {
+                target: ApiRoot::parse("http://amf:8080").unwrap(),
+                forward_uri: Some("/namf-comm/v1/x?y=1".to_string()),
+            }
+        );
+
+        // Callback beats a KNOWN Routing-Binding, which would otherwise win.
+        let bound = ApiRoot::parse("http://udm2:7777").unwrap();
+        proxy.binding_store("bl=nf-instance; nfinst=cb-known", &bound);
+        let mut req = SbiRequest::get("http://amf:8080/namf-comm/v1/x");
+        req.http.set_header(custom_header::CALLBACK, "Notify");
+        req.http
+            .set_routing_binding("bl=nf-instance; nfinst=cb-known");
+        assert!(matches!(
+            proxy.route(&req),
+            RouteDecision::Callback { target, .. } if target != bound
+        ));
+
+        // Callback naming no destination falls THROUGH rather than rejecting, so a
+        // deployment whose callbacks currently reach their target via Discovery
+        // headers is not regressed.
+        let mut req = SbiRequest::get("/namf-comm/v1/x");
+        req.http.set_header(custom_header::CALLBACK, "Notify");
+        req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
+        assert_eq!(proxy.route(&req), RouteDecision::Discover);
+
+        // ...and with nothing to fall through to, it is still a Reject.
+        let mut req = SbiRequest::get("/namf-comm/v1/x");
+        req.http.set_header(custom_header::CALLBACK, "Notify");
+        assert_eq!(proxy.route(&req), RouteDecision::Reject);
+    }
+
+    /// scpd-#210 unit: `split_absolute_uri`.
+    #[test]
+    fn test_split_absolute_uri_unit() {
+        assert_eq!(
+            split_absolute_uri("http://h:1/a/b?q=1"),
+            Some(("http://h:1".to_string(), "/a/b?q=1".to_string()))
+        );
+        assert_eq!(
+            split_absolute_uri("https://h/a"),
+            Some(("https://h".to_string(), "/a".to_string()))
+        );
+        // No path at all still yields a forwardable origin-form root.
+        assert_eq!(
+            split_absolute_uri("http://h:1"),
+            Some(("http://h:1".to_string(), "/".to_string()))
+        );
+        // A deployment prefix stays in the PATH, so `forward_once` prepending
+        // `target.prefix` cannot emit it twice.
+        assert_eq!(
+            split_absolute_uri("http://h:1/deploy/namf-comm/v1/x"),
+            Some((
+                "http://h:1".to_string(),
+                "/deploy/namf-comm/v1/x".to_string()
+            ))
+        );
+        // Relative URIs and empty authorities are not callback destinations.
+        assert_eq!(split_absolute_uri("/namf-comm/v1/x"), None);
+        assert_eq!(split_absolute_uri("http:///a"), None);
+        assert_eq!(split_absolute_uri("ftp://h/a"), None);
     }
 
     /// When no NRF (and thus no OAuth2 client) is configured, a Model C forward
