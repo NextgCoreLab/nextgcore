@@ -100,7 +100,10 @@ be the first thing in a file. Appending it compiled, and then it bit.
   for example if a future in-process embedder initialises the DBI layer from *outside* bsfd, which the guard
   cannot detect because it only reads bsfd's sources. That path is named in the existing env-vars bullet and
   is unchanged by this decision.
-* **The "Honesty note" also mentions `bsf_sbi_send_request` / `bsf_sbi_discover_and_send`**, which the #234
-  change deletes. That sentence is still accurate on this branch; whichever change lands second should drop
-  that clause. Flagged rather than fixed here, because editing it on this branch would conflict with nothing
-  and mislead a reviewer comparing against `main`.
+* **The "Honesty note" clause about `bsf_sbi_send_request` / `bsf_sbi_discover_and_send` is now FIXED, not
+  just flagged.** An earlier draft of this spec left it for whoever merged second. Since #234's branch merges
+  into this one clean (checked with `git merge-tree`, as does every other pair among the eleven open
+  branches), it is merged inward here instead and the clause replaced — a docs page that names two deleted
+  functions is precisely the kind of drift this change exists to prevent, and leaving it would have made this
+  spec's own argument hollow. The replacement names what IS still true: `handle_nf_status_notify` has no
+  non-test caller, which #234 kept deliberately and documented as a latent hook.
