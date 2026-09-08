@@ -217,6 +217,10 @@ pub struct SgwuPdr {
     pub outer_header_removal: Option<u8>,
     pub far_id: Option<u32>,
     pub qer_id: Option<u32>,
+    /// URR IDs this PDR is measured against (TS 29.244 Table 7.5.2.2-1 allows
+    /// several per PDR). Issue #215: without this link there is nothing to
+    /// attribute a matched packet's volume to.
+    pub urr_ids: Vec<u32>,
 }
 
 /// Forwarding Action Rule installed by the SGW-C (TS 29.244 Section 7.5.2.3)
@@ -282,6 +286,207 @@ impl SgwuQer {
     }
 }
 
+/// Measurement Method flags (TS 29.244 §8.2.40).
+pub mod measurement_method {
+    /// DURAT — measure duration.
+    pub const DURATION: u8 = 0x01;
+    /// VOLUM — measure volume.
+    pub const VOLUME: u8 = 0x02;
+    /// EVENT — measure events.
+    pub const EVENT: u8 = 0x04;
+}
+
+/// Reporting Triggers flags, octet 5 (TS 29.244 §8.2.41). Only the triggers the
+/// SGW-U can actually raise are named; the rest of the two-octet field is stored
+/// verbatim so a trigger this build does not implement is still visible in a log
+/// rather than silently discarded.
+pub mod reporting_trigger {
+    /// PERIO — periodic reporting.
+    pub const PERIODIC: u8 = 0x01;
+    /// VOLTH — volume threshold.
+    pub const VOLUME_THRESHOLD: u8 = 0x02;
+    /// TIMTH — time threshold.
+    pub const TIME_THRESHOLD: u8 = 0x04;
+    /// VOLQU — volume quota.
+    pub const VOLUME_QUOTA: u8 = 0x40;
+}
+
+/// A volume triple as it appears in Volume Threshold / Volume Quota /
+/// Volume Measurement (TS 29.244 §8.2.13 / §8.2.14 / §8.2.32). `None` means the
+/// corresponding flag bit was clear, which is different from `Some(0)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Volume {
+    pub total: Option<u64>,
+    pub uplink: Option<u64>,
+    pub downlink: Option<u64>,
+}
+
+impl Volume {
+    /// Whether any of the three is set.
+    pub fn is_set(&self) -> bool {
+        self.total.is_some() || self.uplink.is_some() || self.downlink.is_some()
+    }
+}
+
+/// Which trigger fired, for the Usage Report Trigger IE (TS 29.244 §8.2.42).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageReportTrigger {
+    pub volume_threshold: bool,
+    pub time_threshold: bool,
+    pub volume_quota: bool,
+    pub periodic: bool,
+    /// TEBUR — termination by the UP function, i.e. the final report a session
+    /// deletion produces.
+    pub termination_report: bool,
+}
+
+/// Usage Reporting Rule installed by the SGW-C (TS 29.244 §5.2.2.1, §7.5.2.4).
+///
+/// Issue #215: the SGW-U had **no URR support at all** — no measurement, no
+/// thresholds, no Usage Report IEs — so mandatory usage reporting to the SGW-C
+/// could not function and SGW-CDR charging (TS 32.251) had no volume input.
+///
+/// Counters live here rather than on the PDR because [`SgwuPdr`] is `Clone` and
+/// `pdr_find` hands out copies; a counter on a copy is a counter nobody reads.
+/// Mutation therefore goes through [`SgwuContext::urr_record`], which holds the
+/// store's write lock.
+#[derive(Debug, Clone, Default)]
+pub struct SgwuUrr {
+    pub sess_id: u64,
+    pub urr_id: u32,
+    /// Measurement Method (TS 29.244 §8.2.40) — see [`measurement_method`].
+    pub measurement_method: u8,
+    /// Reporting Triggers, both octets verbatim (TS 29.244 §8.2.41). Octet 5 is
+    /// the low byte; see [`reporting_trigger`].
+    pub reporting_triggers: u16,
+    /// Volume Threshold (§8.2.13): report when accumulated volume reaches it.
+    pub volume_threshold: Volume,
+    /// Volume Quota (§8.2.14): the allowance granted. Reaching it is reportable
+    /// in the same way a threshold is; the SGW-U does not enforce it by dropping,
+    /// because TS 29.244 makes enforcement a FAR/QER matter.
+    pub volume_quota: Volume,
+    /// Time Threshold in seconds (§8.2.15).
+    pub time_threshold: Option<u32>,
+    /// Measurement Period in seconds (§8.2.16), for PERIO reporting.
+    pub measurement_period: Option<u32>,
+
+    // ---- measured state, reset on every report ----
+    pub total_bytes: u64,
+    pub uplink_bytes: u64,
+    pub downlink_bytes: u64,
+    pub total_packets: u64,
+    pub uplink_packets: u64,
+    pub downlink_packets: u64,
+    /// UNIX seconds of the first packet counted in the current period
+    /// (Time of First Packet, §8.2.34). `None` until traffic arrives.
+    pub first_packet_time: Option<u32>,
+    /// UNIX seconds of the most recent packet (Time of Last Packet, §8.2.35).
+    pub last_packet_time: Option<u32>,
+    /// UNIX seconds the current measurement period started (Start Time,
+    /// §8.2.36), set at install and re-set on every report.
+    pub start_time: u32,
+    /// Monotonic UR-SEQN (§8.2.60), the next value to hand out. Kept across
+    /// resets: a sequence number that restarts is a sequence number the CP
+    /// function cannot use to order or de-duplicate reports.
+    pub next_ur_seqn: u32,
+}
+
+impl SgwuUrr {
+    /// Does this URR measure volume?
+    pub fn measures_volume(&self) -> bool {
+        self.measurement_method & measurement_method::VOLUME != 0
+    }
+
+    /// Does this URR measure duration?
+    pub fn measures_duration(&self) -> bool {
+        self.measurement_method & measurement_method::DURATION != 0
+    }
+
+    fn trigger_set(&self, octet5_bit: u8) -> bool {
+        (self.reporting_triggers as u8) & octet5_bit != 0
+    }
+
+    /// Which reportable condition, if any, the current counters satisfy.
+    ///
+    /// A threshold is only checked when the SGW-C actually asked for that
+    /// trigger: TS 29.244 §8.2.41 makes the Reporting Triggers IE the CP
+    /// function's request, so treating a provisioned threshold as reportable
+    /// without its trigger bit would report where the CP asked for silence.
+    pub fn reportable(&self, now: u32) -> Option<UsageReportTrigger> {
+        let reached = |limit: &Volume| {
+            limit.total.is_some_and(|t| t > 0 && self.total_bytes >= t)
+                || limit
+                    .uplink
+                    .is_some_and(|t| t > 0 && self.uplink_bytes >= t)
+                || limit
+                    .downlink
+                    .is_some_and(|t| t > 0 && self.downlink_bytes >= t)
+        };
+        if self.trigger_set(reporting_trigger::VOLUME_THRESHOLD) && reached(&self.volume_threshold)
+        {
+            return Some(UsageReportTrigger {
+                volume_threshold: true,
+                ..Default::default()
+            });
+        }
+        if self.trigger_set(reporting_trigger::VOLUME_QUOTA) && reached(&self.volume_quota) {
+            return Some(UsageReportTrigger {
+                volume_quota: true,
+                ..Default::default()
+            });
+        }
+        if self.trigger_set(reporting_trigger::TIME_THRESHOLD) {
+            if let Some(secs) = self.time_threshold.filter(|s| *s > 0) {
+                if now.saturating_sub(self.start_time) >= secs {
+                    return Some(UsageReportTrigger {
+                        time_threshold: true,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if self.trigger_set(reporting_trigger::PERIODIC) {
+            if let Some(secs) = self.measurement_period.filter(|s| *s > 0) {
+                if now.saturating_sub(self.start_time) >= secs {
+                    return Some(UsageReportTrigger {
+                        periodic: true,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// The measured volume, with each member present only when this URR measures
+    /// volume at all — an absent member and a zero member say different things.
+    pub fn measured_volume(&self) -> Volume {
+        if !self.measures_volume() {
+            return Volume::default();
+        }
+        Volume {
+            total: Some(self.total_bytes),
+            uplink: Some(self.uplink_bytes),
+            downlink: Some(self.downlink_bytes),
+        }
+    }
+
+    /// Duration of the current measurement period in seconds, when measured.
+    pub fn measured_duration(&self, now: u32) -> Option<u32> {
+        self.measures_duration()
+            .then(|| now.saturating_sub(self.start_time))
+    }
+}
+
+/// UNIX seconds, for URR timestamps. Saturates rather than panicking on a clock
+/// before the epoch.
+pub fn now_unix_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
+
 /// Buffering Action Rule (TS 29.244 §5.9, Table 7.5.9.2-1).
 #[derive(Debug, Clone, Default)]
 pub struct SgwuBar {
@@ -336,6 +541,8 @@ pub struct SgwuContext {
     far_list: RwLock<HashMap<(u64, u32), SgwuFar>>,
     /// QERs keyed by (session id, QER ID)
     qer_list: RwLock<HashMap<(u64, u32), SgwuQer>>,
+    /// URRs keyed by (session id, URR ID) — issue #215
+    urr_list: RwLock<HashMap<(u64, u32), SgwuUrr>>,
     /// BARs keyed by (session id, BAR ID)
     bar_list: RwLock<HashMap<(u64, u8), SgwuBar>>,
     /// Local GTP-U TEID -> (session id, PDR ID) for G-PDU matching
@@ -370,6 +577,7 @@ impl SgwuContext {
             pdr_list: RwLock::new(HashMap::new()),
             far_list: RwLock::new(HashMap::new()),
             qer_list: RwLock::new(HashMap::new()),
+            urr_list: RwLock::new(HashMap::new()),
             bar_list: RwLock::new(HashMap::new()),
             teid_hash: RwLock::new(HashMap::new()),
             gtpu_addr: RwLock::new(None),
@@ -486,6 +694,13 @@ impl SgwuContext {
             }
             if let Ok(mut qers) = self.qer_list.write() {
                 qers.retain(|(sess_id, _), _| *sess_id != id);
+            }
+            // #215: URRs go with the session. A caller that wants the final Usage
+            // Reports must `urr_drain_for_sess` BEFORE removing the session — the
+            // deletion handler does, so this is the belt-and-braces cleanup for
+            // every other removal path (peer restart, `sess_remove_all`).
+            if let Ok(mut urrs) = self.urr_list.write() {
+                urrs.retain(|(sess_id, _), _| *sess_id != id);
             }
             if let Ok(mut bars) = self.bar_list.write() {
                 bars.retain(|(sess_id, _), _| *sess_id != id);
@@ -810,6 +1025,176 @@ impl SgwuContext {
     /// Find a QER
     pub fn qer_find(&self, sess_id: u64, qer_id: u32) -> Option<SgwuQer> {
         self.qer_list.read().ok()?.get(&(sess_id, qer_id)).cloned()
+    }
+
+    // ------------------------------------------------------------------
+    // URR store (issue #215)
+    // ------------------------------------------------------------------
+
+    /// Install a URR, or update an existing one's **provisioning** while keeping
+    /// its measured state.
+    ///
+    /// The distinction matters: a Create URR for an id already present, or an
+    /// Update URR, must not silently zero the volume measured so far — that would
+    /// lose billable traffic on every reprovisioning, which is the failure a
+    /// charging function cannot detect. The UR-SEQN is likewise carried over, so a
+    /// re-provisioned URR does not restart its sequence and make the SGW-C unable
+    /// to order or de-duplicate reports.
+    pub fn urr_install(&self, mut urr: SgwuUrr) -> bool {
+        let Ok(mut urrs) = self.urr_list.write() else {
+            return false;
+        };
+        let key = (urr.sess_id, urr.urr_id);
+        if let Some(existing) = urrs.get(&key) {
+            urr.total_bytes = existing.total_bytes;
+            urr.uplink_bytes = existing.uplink_bytes;
+            urr.downlink_bytes = existing.downlink_bytes;
+            urr.total_packets = existing.total_packets;
+            urr.uplink_packets = existing.uplink_packets;
+            urr.downlink_packets = existing.downlink_packets;
+            urr.first_packet_time = existing.first_packet_time;
+            urr.last_packet_time = existing.last_packet_time;
+            urr.start_time = existing.start_time;
+            urr.next_ur_seqn = existing.next_ur_seqn;
+        } else if urr.start_time == 0 {
+            urr.start_time = now_unix_secs();
+        }
+        urrs.insert(key, urr);
+        true
+    }
+
+    /// Remove a URR, returning it so the caller can emit a final Usage Report for
+    /// the traffic it measured. Discarding it here would drop that volume.
+    pub fn urr_remove(&self, sess_id: u64, urr_id: u32) -> Option<SgwuUrr> {
+        self.urr_list.write().ok()?.remove(&(sess_id, urr_id))
+    }
+
+    /// Find a URR (a snapshot; mutation goes through [`Self::urr_record`]).
+    pub fn urr_find(&self, sess_id: u64, urr_id: u32) -> Option<SgwuUrr> {
+        self.urr_list.read().ok()?.get(&(sess_id, urr_id)).cloned()
+    }
+
+    /// Every URR installed for a session, ordered by URR ID so a multi-URR report
+    /// set and its test assertions do not depend on hash order.
+    pub fn urr_find_for_sess(&self, sess_id: u64) -> Vec<SgwuUrr> {
+        let Ok(urrs) = self.urr_list.read() else {
+            return Vec::new();
+        };
+        let mut found: Vec<SgwuUrr> = urrs
+            .values()
+            .filter(|u| u.sess_id == sess_id)
+            .cloned()
+            .collect();
+        found.sort_by_key(|u| u.urr_id);
+        found
+    }
+
+    /// Take every URR of a session out of the store, for the final reports a
+    /// session deletion produces.
+    pub fn urr_drain_for_sess(&self, sess_id: u64) -> Vec<SgwuUrr> {
+        let Ok(mut urrs) = self.urr_list.write() else {
+            return Vec::new();
+        };
+        let keys: Vec<(u64, u32)> = urrs
+            .keys()
+            .filter(|(sid, _)| *sid == sess_id)
+            .copied()
+            .collect();
+        let mut drained: Vec<SgwuUrr> = keys.iter().filter_map(|k| urrs.remove(k)).collect();
+        drained.sort_by_key(|u| u.urr_id);
+        drained
+    }
+
+    /// Count `bytes` (one packet) against a URR and report whether that made it
+    /// reportable.
+    ///
+    /// Volume is counted only when the URR's Measurement Method asks for it
+    /// (TS 29.244 §8.2.40): a duration-only URR that silently accumulated volume
+    /// would report a measurement the CP function never provisioned for.
+    /// Packet counts are kept regardless, because they cost nothing and a Volume
+    /// Measurement IE may carry them alongside a duration.
+    pub fn urr_record(
+        &self,
+        sess_id: u64,
+        urr_id: u32,
+        bytes: u64,
+        uplink: bool,
+    ) -> Option<UsageReportTrigger> {
+        let now = now_unix_secs();
+        let mut urrs = self.urr_list.write().ok()?;
+        let urr = urrs.get_mut(&(sess_id, urr_id))?;
+
+        if urr.measures_volume() {
+            urr.total_bytes = urr.total_bytes.saturating_add(bytes);
+            if uplink {
+                urr.uplink_bytes = urr.uplink_bytes.saturating_add(bytes);
+            } else {
+                urr.downlink_bytes = urr.downlink_bytes.saturating_add(bytes);
+            }
+        }
+        urr.total_packets = urr.total_packets.saturating_add(1);
+        if uplink {
+            urr.uplink_packets = urr.uplink_packets.saturating_add(1);
+        } else {
+            urr.downlink_packets = urr.downlink_packets.saturating_add(1);
+        }
+        if urr.first_packet_time.is_none() {
+            urr.first_packet_time = Some(now);
+        }
+        urr.last_packet_time = Some(now);
+
+        urr.reportable(now)
+    }
+
+    /// Allocate the next monotonic UR-SEQN and reset the measurement period,
+    /// returning the URR as it stood **before** the reset so the caller can build
+    /// the report from it.
+    ///
+    /// One operation rather than a read-then-reset pair, because two packets
+    /// crossing the threshold concurrently would otherwise both build a report
+    /// from the same counters and double-count the volume.
+    pub fn urr_take_report(&self, sess_id: u64, urr_id: u32) -> Option<(SgwuUrr, u32)> {
+        let now = now_unix_secs();
+        let mut urrs = self.urr_list.write().ok()?;
+        let urr = urrs.get_mut(&(sess_id, urr_id))?;
+        let snapshot = urr.clone();
+        let seqn = urr.next_ur_seqn;
+        urr.next_ur_seqn = urr.next_ur_seqn.wrapping_add(1);
+        urr.total_bytes = 0;
+        urr.uplink_bytes = 0;
+        urr.downlink_bytes = 0;
+        urr.total_packets = 0;
+        urr.uplink_packets = 0;
+        urr.downlink_packets = 0;
+        urr.first_packet_time = None;
+        urr.last_packet_time = None;
+        urr.start_time = now;
+        Some((snapshot, seqn))
+    }
+
+    /// Record a URR id on the session's `PfcpSess.urr_ids` (issue #215).
+    ///
+    /// That field existed before this change and was written **only by a unit
+    /// test**, so it described a capability the daemon did not have. Idempotent:
+    /// a Create URR for an id already present must not duplicate the entry.
+    pub fn sess_register_urr(&self, sess_id: u64, urr_id: u32) {
+        if let Ok(mut sessions) = self.sess_list.write() {
+            if let Some(sess) = sessions.get_mut(&sess_id) {
+                let id = urr_id as u64;
+                if !sess.pfcp.urr_ids.contains(&id) {
+                    sess.pfcp.urr_ids.push(id);
+                }
+            }
+        }
+    }
+
+    /// Drop a URR id from the session's `PfcpSess.urr_ids`.
+    pub fn sess_unregister_urr(&self, sess_id: u64, urr_id: u32) {
+        if let Ok(mut sessions) = self.sess_list.write() {
+            if let Some(sess) = sessions.get_mut(&sess_id) {
+                sess.pfcp.urr_ids.retain(|id| *id != urr_id as u64);
+            }
+        }
     }
 
     /// Install or replace a BAR
