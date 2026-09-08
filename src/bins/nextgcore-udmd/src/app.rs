@@ -751,7 +751,16 @@ async fn route_nudm_uecm(
 /// `lcs-*`, `v2x-data`, ...) are deliberately absent: they are #226's to add as
 /// real resources, and until then their URIs name nothing here.
 fn sdm_allowed_methods(parts: &[&str]) -> Option<&'static [&'static str]> {
-    let resource = parts.get(3).copied()?;
+    // #226: the whole-UE resource `/nudm-sdm/v2/{supi}` has no 4th part. It IS a
+    // resource this UDM serves, so a non-GET on it must be 405 with an Allow
+    // header rather than 404 — the distinction #85 introduced.
+    let Some(resource) = parts.get(3).copied() else {
+        return if parts.len() == 3 && !parts[2].is_empty() {
+            Some(&["GET"])
+        } else {
+            None
+        };
+    };
     let tail = parts.get(4).copied().unwrap_or("");
     if parts.len() > 5 {
         return None;
@@ -762,11 +771,26 @@ fn sdm_allowed_methods(parts: &[&str]) -> Option<&'static [&'static str]> {
             "sor-ack" | "upu-ack" => Some(&["PUT"]),
             _ => None,
         },
+        // #226: every TS 29.503 per-SUPI SDM data set this UDM routes. The three
+        // with a `udrd` provisioned-data source return data; the rest relay the
+        // UDR's 404 rather than a 501 this router invented.
         "smf-select-data"
         | "sm-data"
         | "nssai"
-        | "ue-context-in-smf-data"
         | "id-translation-result"
+        | "ue-context-in-amf-data"
+        | "ue-context-in-smf-data"
+        | "ue-context-in-smsf-data"
+        | "sms-data"
+        | "sms-mng-data"
+        | "trace-data"
+        | "lcs-privacy-data"
+        | "lcs-mo-data"
+        | "lcs-bca-data"
+        | "v2x-data"
+        | "prose-data"
+        | "mbs-data"
+        | "uc-data"
             if tail.is_empty() =>
         {
             Some(&["GET"])
@@ -794,6 +818,14 @@ async fn route_nudm_sdm(
     let tail = parts.get(4).copied().unwrap_or("");
 
     match (resource, tail, method) {
+        // #226 criterion 1: GetSupiInfo / Retrieval of Multiple Data Sets
+        // (TS 29.503 §5.2.2.2.9). `/nudm-sdm/v2/{supi}` has only three path parts,
+        // so `resource` is empty here — and the query string was already stripped
+        // by the router, which is why `dataset-names` must be read through the SBI
+        // query accessor rather than from the path.
+        ("", "", "GET") if !supi.is_empty() => {
+            handle_get_subscription_data_sets(supi, request).await
+        }
         ("am-data", "", "GET") => handle_get_am_data(supi, request).await,
         // udmd#1: SoR / UPU acknowledgement (TS 29.503 5.2.2.6, PUT).
         ("am-data", "sor-ack", "PUT") => handle_sor_ack(supi, request).await,
@@ -813,10 +845,37 @@ async fn route_nudm_sdm(
         // operation, not a UECM one — it was routed under nudm-uecm before #85,
         // where a conformant consumer would never have looked for it.
         ("id-translation-result", "", "GET") => handle_id_translation_result(supi, request).await,
-        // udmd-12: UE context in SMF data (an SDM data set, TS 29.503 §5.2.2.2.6).
-        ("ue-context-in-smf-data", "", "GET") => {
-            send_not_implemented("ue-context-in-smf-data is not yet implemented")
+        // #226 criterion 2: UE context in AMF data. The data is already read from
+        // the UDR by the UECM path, so this is a read-through rather than new
+        // storage — and it is the data set the #83 SDM notification producer
+        // reports on every AMF registration and deregistration, so before this a
+        // subscriber was told the resource changed and then could not read it.
+        ("ue-context-in-amf-data", "", "GET") => {
+            handle_get_ue_context_in_amf_data(supi, request).await
         }
+        // #226 criterion 3: the remaining TS 29.503 per-SUPI SDM data sets. Routed
+        // as READ-THROUGHS to the UDR rather than answered with a status this UDM
+        // invents: whether the data exists is the data layer's answer, not the
+        // router's. Today `udrd` serves three provisioned data sets, so the rest
+        // relay its 404 — which is derived rather than asserted, and starts
+        // working the moment udrd grows a source. See the spec for why this is not
+        // a 501.
+        (
+            "ue-context-in-smf-data"
+            | "ue-context-in-smsf-data"
+            | "sms-data"
+            | "sms-mng-data"
+            | "trace-data"
+            | "lcs-privacy-data"
+            | "lcs-mo-data"
+            | "lcs-bca-data"
+            | "v2x-data"
+            | "prose-data"
+            | "mbs-data"
+            | "uc-data",
+            "",
+            "GET",
+        ) => handle_get_sdm_data_set(supi, resource, request).await,
         _ => unmatched(sdm_allowed_methods(parts), method, uri),
     }
 }
@@ -1833,6 +1892,225 @@ pub async fn handle_get_am_data(supi: &str, request: &SbiRequest) -> SbiResponse
         }
         Err(e) => {
             log::warn!("[{supi}] UDR am-data query failed: {e}");
+            nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
+}
+
+/// The TS 29.503 `DataSetName` tokens this UDM recognises, paired with the
+/// `SubscriptionDataSets` member each contributes.
+///
+/// The tokens are the spec's, NOT the path segments. #226's acceptance criterion
+/// writes `dataset-names=am-data,sm-data`, but TS 29.503's `DataSetName` enum is
+/// `AM`, `SMF_SEL`, `SM`, `UEC_AMF`, … — and `udrd` already implements exactly
+/// those tokens for its own combined provisioned-data GET (udrd-03,
+/// `parse_dataset_names`). Following the issue's spelling would have created a
+/// second, non-conformant vocabulary on the two sides of the same query parameter.
+/// An unrecognised token is refused with 400 naming the accepted set, rather than
+/// silently dropped — a consumer that asked for a data set and got a body without
+/// it would otherwise read the absence as "this subscriber has none".
+const SDM_DATA_SET_NAMES: [&str; 4] = ["AM", "SMF_SEL", "SM", "UEC_AMF"];
+
+/// `GET /nudm-sdm/v2/{supi}[?dataset-names=…]` — GetSupiInfo / Retrieval of
+/// Multiple Data Sets (TS 29.503 §5.2.2.2.9), answering `SubscriptionDataSets`.
+///
+/// The provisioned data sets are fetched with ONE combined UDR read rather than a
+/// per-data-set fan-out, because `udrd` already implements the same
+/// `dataset-names` filtering and member naming (udrd-03). Re-implementing the
+/// fan-out here would have made two places decide which member name a data set
+/// contributes, and they would eventually disagree.
+///
+/// `UEC_AMF` is merged in separately: it lives under the UDR's `context-data`, not
+/// `provisioned-data`, so the combined read cannot supply it.
+pub async fn handle_get_subscription_data_sets(supi: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("Get SubscriptionDataSets (multi-data-set): SUPI={supi}");
+
+    let raw = request.http.params.get("dataset-names").cloned();
+    let requested: Option<Vec<String>> = match raw.as_deref() {
+        None => None,
+        Some(raw) => {
+            let names: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_ascii_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if names.is_empty() {
+                return send_bad_request(
+                    "dataset-names was present but named no data set",
+                    Some("MANDATORY_QUERY_PARAM_INCORRECT"),
+                );
+            }
+            if let Some(unknown) = names
+                .iter()
+                .find(|n| !SDM_DATA_SET_NAMES.contains(&n.as_str()))
+            {
+                return send_bad_request(
+                    &format!(
+                        "unsupported dataset-names value {unknown:?}; this UDM serves {}",
+                        SDM_DATA_SET_NAMES.join(", ")
+                    ),
+                    Some("MANDATORY_QUERY_PARAM_INCORRECT"),
+                );
+            }
+            Some(names)
+        }
+    };
+    let wants = |name: &str| -> bool {
+        requested
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|n| n == name))
+    };
+
+    let mut sets = serde_json::Map::new();
+
+    // The provisioned subset, in one read. `udrd` returns the requested members
+    // already keyed by their `SubscriptionDataSets` names.
+    let provisioned: Vec<&str> = ["AM", "SMF_SEL", "SM"]
+        .into_iter()
+        .filter(|n| wants(n))
+        .collect();
+    if !provisioned.is_empty() {
+        let mut params = std::collections::HashMap::new();
+        // Always explicit, even when the consumer sent no filter: this UDM serves a
+        // subset of the data sets udrd might grow, so forwarding "everything" would
+        // silently start returning members this UDM has not agreed to serve.
+        params.insert("dataset-names".to_string(), provisioned.join(","));
+        match crate::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "", &params).await {
+            Ok(resp) if resp.is_success() => {
+                if let Some(body) = resp.http.content.as_deref() {
+                    if let Ok(serde_json::Value::Object(map)) =
+                        serde_json::from_str::<serde_json::Value>(body)
+                    {
+                        for (k, v) in map {
+                            sets.insert(k, v);
+                        }
+                    }
+                }
+            }
+            // A subscriber the UDR does not hold is 404 for the whole request: there
+            // is no partial answer to give, and 200 with an empty body would say
+            // "this subscriber has no data" rather than "no such subscriber".
+            Ok(resp) if resp.status == 404 => {
+                return nextgcore_sbi::server::send_not_found(
+                    &format!("no subscription data for {supi}"),
+                    Some("DATA_NOT_FOUND"),
+                );
+            }
+            Ok(resp) => {
+                log::warn!(
+                    "[{supi}] UDR combined provisioned-data returned {}",
+                    resp.status
+                );
+                return SbiResponse::with_status(resp.status);
+            }
+            Err(e) => {
+                log::warn!("[{supi}] UDR combined provisioned-data query failed: {e}");
+                return nextgcore_sbi::server::send_service_unavailable("UDR unavailable");
+            }
+        }
+    }
+
+    // `uecAmfData` comes from context-data, so it is a separate read. Absence is
+    // NOT an error here: a UE with no AMF registration legitimately has no such
+    // data set, and failing the whole multi-set retrieval for it would deny the
+    // consumer the members that are available.
+    if wants("UEC_AMF") {
+        if let Some(value) = read_ue_context_in_amf_data(supi).await {
+            sets.insert("uecAmfData".to_string(), value);
+        }
+    }
+
+    SbiResponse::with_status(200)
+        .with_json_body(&serde_json::Value::Object(sets))
+        .unwrap_or_else(|_| {
+            nextgcore_sbi::server::send_internal_error("failed to serialise data sets")
+        })
+}
+
+/// The stored `amf-3gpp-access` registration as the `uecAmfData` data set, or
+/// `None` when the UE has no registration (or the UDR is unreachable).
+///
+/// Shared by the individual `ue-context-in-amf-data` GET and the multi-data-set
+/// retrieval so the two cannot answer differently for the same UE.
+async fn read_ue_context_in_amf_data(supi: &str) -> Option<serde_json::Value> {
+    match crate::udm_nudr_dr_send_context_get(supi, "amf-3gpp-access").await {
+        Ok(resp) if resp.is_success() => resp
+            .http
+            .content
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok()),
+        Ok(resp) => {
+            log::debug!("[{supi}] UDR amf-3gpp-access read returned {}", resp.status);
+            None
+        }
+        Err(e) => {
+            log::warn!("[{supi}] UDR amf-3gpp-access read failed: {e}");
+            None
+        }
+    }
+}
+
+/// `GET /nudm-sdm/v2/{supi}/ue-context-in-amf-data` (#226 criterion 2).
+///
+/// 404 `DATA_NOT_FOUND` when the UE has no AMF registration — the data set does
+/// not exist for that UE, which is different from the operation not existing.
+pub async fn handle_get_ue_context_in_amf_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
+    log::info!("Get UE context in AMF data: SUPI={supi}");
+    match read_ue_context_in_amf_data(supi).await {
+        Some(value) => SbiResponse::with_status(200)
+            .with_json_body(&value)
+            .unwrap_or_else(|_| {
+                nextgcore_sbi::server::send_internal_error("failed to serialise uecAmfData")
+            }),
+        None => nextgcore_sbi::server::send_not_found(
+            &format!("no ue-context-in-amf-data for {supi}"),
+            Some("DATA_NOT_FOUND"),
+        ),
+    }
+}
+
+/// The remaining TS 29.503 per-SUPI SDM data sets, as UDR read-throughs (#226
+/// criterion 3).
+///
+/// Deliberately NOT a 501. Whether a data set exists for a subscriber is the data
+/// layer's answer, and routing the read means this UDM reports what the UDR says
+/// rather than a status the router invented. `udrd` currently serves three
+/// provisioned data sets, so the rest relay its 404 as `DATA_NOT_FOUND` — a
+/// derived answer that starts returning data the moment udrd grows a source,
+/// with no change here.
+pub async fn handle_get_sdm_data_set(
+    supi: &str,
+    resource: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    log::info!("Get SDM data set {resource}: SUPI={supi}");
+    let params = sdm_query_params(request);
+    let udr_result = if params.is_empty() {
+        crate::udm_nudr_dr_send_provisioned_data_get(supi, resource, 0, 0).await
+    } else {
+        crate::udm_nudr_dr_send_provisioned_data_get_with_params(supi, resource, &params).await
+    };
+    match udr_result {
+        Ok(resp) if resp.is_success() => {
+            let mut response = SbiResponse::with_status(200);
+            if let Some(body) = resp.http.content {
+                response = response.with_body(body, "application/json");
+            }
+            response
+        }
+        Ok(resp) if resp.status == 404 => nextgcore_sbi::server::send_not_found(
+            &format!("no {resource} for {supi}"),
+            Some("DATA_NOT_FOUND"),
+        ),
+        Ok(resp) => {
+            log::warn!(
+                "[{supi}] UDR {resource} query returned status {}",
+                resp.status
+            );
+            SbiResponse::with_status(resp.status)
+        }
+        Err(e) => {
+            log::warn!("[{supi}] UDR {resource} query failed: {e}");
             nextgcore_sbi::server::send_service_unavailable("UDR unavailable")
         }
     }
@@ -4851,6 +5129,271 @@ mod tests {
     // routing claims: "returns the stored resource rather than 405". A
     // handler-level test cannot fail when a route arm is missing.
     // ========================================================================
+
+    // ========================================================================
+    // #226: the SDM multi-data-set GET and the absent data-set resources
+    //
+    // Routing claims, so they drive the REAL router over HTTP against the mock
+    // UDR. A handler-level test cannot fail when a route arm is missing — which is
+    // exactly the defect: `GET /nudm-sdm/v2/{supi}` reached the default handler.
+    // ========================================================================
+
+    /// Criterion 1: the whole-UE multi-data-set GET is routed and fans out.
+    ///
+    /// Before #226 this had only three path parts, so `route_nudm_sdm` saw an empty
+    /// resource, fell to the catch-all and answered 404 `RESOURCE_URI_NOT_FOUND`.
+    ///
+    /// The `dataset-names` values are the TS 29.503 `DataSetName` tokens (`AM`,
+    /// `SM`, …), NOT the path segments. #226's criterion writes
+    /// `dataset-names=am-data,sm-data`; that spelling is not what a conformant
+    /// consumer sends, and `udrd` already implements the spec tokens for the same
+    /// query parameter on its own combined GET (udrd-03). The deviation is
+    /// deliberate — see the spec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn sdm_multi_data_set_get_is_routed_and_fans_out() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+
+        let (udr_server, store) = start_mock_udr_context_data().await;
+        let (udm_server, client) = start_real_udm().await;
+
+        let supi = "imsi-001010000000226";
+        // The combined provisioned-data document, keyed as udmd asks for it. This
+        // stands in for udrd's own `dataset-names` filtering, which udrd tests.
+        store.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/"),
+            serde_json::json!({
+                "amData": {"subscribedUeAmbr": {"uplink": "1 Gbps", "downlink": "1 Gbps"}},
+                "smfSelData": {"subscribedSnssaiInfos": {}},
+                "smData": [{"singleNssai": {"sst": 1}}],
+            }),
+        );
+
+        // No filter: every data set this UDM serves that has data.
+        let resp = client
+            .get(&format!("/nudm-sdm/v2/{supi}"))
+            .await
+            .expect("multi-data-set GET");
+        assert_eq!(
+            resp.status, 200,
+            "the whole-UE form must be ROUTED, not fall through to the default handler"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).expect("JSON body");
+        assert!(body.get("amData").is_some(), "amData present: {body}");
+        assert!(
+            body.get("smfSelData").is_some(),
+            "smfSelData present: {body}"
+        );
+        assert!(body.get("smData").is_some(), "smData present: {body}");
+
+        // An explicit filter reaches the UDR as the same tokens.
+        let resp = client
+            .get(&format!("/nudm-sdm/v2/{supi}?dataset-names=AM,SM"))
+            .await
+            .expect("filtered multi-data-set GET");
+        assert_eq!(resp.status, 200);
+
+        // An unrecognised token is REFUSED rather than silently dropped: a consumer
+        // that asked for a data set and got a body without it would read the absence
+        // as "this subscriber has none".
+        let resp = client
+            .get(&format!("/nudm-sdm/v2/{supi}?dataset-names=am-data"))
+            .await
+            .expect("bad token GET");
+        assert_eq!(
+            resp.status, 400,
+            "the path-segment spelling is not a DataSetName and must be refused"
+        );
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).expect("ProblemDetails");
+        assert!(
+            problem["detail"].as_str().is_some_and(|d| d.contains("AM")),
+            "the refusal names the accepted values: {problem}"
+        );
+
+        // A non-GET on the whole-UE resource is 405 WITH an Allow header, not 404:
+        // the URI does name a resource this UDM serves (#85's distinction).
+        let resp = client
+            .delete(&format!("/nudm-sdm/v2/{supi}"))
+            .await
+            .expect("DELETE on the whole-UE resource");
+        assert_eq!(resp.status, 405);
+        assert!(
+            resp.http
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("allow") && v.contains("GET")),
+            "405 must carry Allow: GET"
+        );
+
+        udm_server.stop().await.expect("udm stops");
+        udr_server.stop().await.expect("udr stops");
+    }
+
+    /// Criterion 2: `ue-context-in-amf-data` returns the stored AMF registration.
+    ///
+    /// This is the data set the #83 SDM notification producer reports on every AMF
+    /// registration and deregistration, so before #226 a subscriber was told the
+    /// resource changed and then could not read it — the asymmetry the issue calls
+    /// the strongest argument for doing this one first. Both halves are asserted:
+    /// the read after a registration, and the 404 `DATA_NOT_FOUND` before one, so
+    /// the test cannot pass by returning 200 unconditionally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn ue_context_in_amf_data_reads_the_stored_registration() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+        std::env::set_var("UDM_NOTIFY_DISABLE", "1");
+
+        let (udr_server, store) = start_mock_udr_context_data().await;
+        let (udm_server, client) = start_real_udm().await;
+
+        let supi = "imsi-001010000000227";
+        let sdm = format!("/nudm-sdm/v2/{supi}/ue-context-in-amf-data");
+
+        // Before any registration: the data set does not exist for this UE. 404
+        // DATA_NOT_FOUND, which is different from the operation not existing —
+        // and specifically not the 405 this answered before #226.
+        let resp = client.get(&sdm).await.expect("GET before registration");
+        assert_eq!(
+            resp.status, 404,
+            "no registration yet: {:?}",
+            resp.http.content
+        );
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).expect("ProblemDetails");
+        assert_eq!(problem["cause"], "DATA_NOT_FOUND");
+
+        // Register over the real UECM route, which is what writes the UDR resource.
+        let resp = client
+            .put_json(
+                &format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"),
+                &amf_reg_body("amf-226", "NR"),
+            )
+            .await
+            .expect("UECM registration");
+        assert_eq!(resp.status, 201);
+        assert!(
+            store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&format!(
+                    "/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access"
+                )),
+            "the registration reached the UDR, so the read below has something to find"
+        );
+
+        // Now the SDM data set reads it back.
+        let resp = client.get(&sdm).await.expect("GET after registration");
+        assert_eq!(resp.status, 200, "the stored registration must be readable");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).expect("JSON body");
+        assert_eq!(
+            body["amfInstanceId"], "amf-226",
+            "the data set is the stored registration, not an empty object: {body}"
+        );
+
+        // And it appears in the multi-data-set retrieval under `uecAmfData`.
+        let resp = client
+            .get(&format!("/nudm-sdm/v2/{supi}?dataset-names=UEC_AMF"))
+            .await
+            .expect("multi-data-set GET for UEC_AMF");
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).expect("JSON body");
+        assert_eq!(body["uecAmfData"]["amfInstanceId"], "amf-226");
+
+        std::env::remove_var("UDM_NOTIFY_DISABLE");
+        udm_server.stop().await.expect("udm stops");
+        udr_server.stop().await.expect("udr stops");
+    }
+
+    /// Criterion 3: every remaining TS 29.503 per-SUPI SDM data set is ROUTED, and
+    /// answers a data-derived status rather than 405 or 501.
+    ///
+    /// The assertion is deliberately `!= 405 && != 501` plus "is a 404 whose cause
+    /// says why", because that is the criterion: the router no longer claims these
+    /// resources do not exist, and no longer answers with a status it invented. The
+    /// three data sets with a `udrd` source return 200; the rest relay the UDR's
+    /// 404, which starts returning data if udrd grows a source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn every_routed_sdm_data_set_answers_a_derived_status() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        udm_context_init(64, 64);
+
+        let (udr_server, _store) = start_mock_udr_context_data().await;
+        let (udm_server, client) = start_real_udm().await;
+
+        let supi = "imsi-001010000000228";
+        for resource in [
+            "ue-context-in-smf-data",
+            "ue-context-in-smsf-data",
+            "sms-data",
+            "sms-mng-data",
+            "trace-data",
+            "lcs-privacy-data",
+            "lcs-mo-data",
+            "lcs-bca-data",
+            "v2x-data",
+            "prose-data",
+            "mbs-data",
+            "uc-data",
+        ] {
+            let resp = client
+                .get(&format!("/nudm-sdm/v2/{supi}/{resource}"))
+                .await
+                .unwrap_or_else(|e| panic!("GET {resource} failed: {e}"));
+            assert_ne!(
+                resp.status, 405,
+                "{resource} must be ROUTED, not answered method-not-allowed"
+            );
+            assert_ne!(
+                resp.status, 501,
+                "{resource} must not be answered with a status the router invented"
+            );
+            assert_eq!(
+                resp.status, 404,
+                "with no UDR source, {resource} relays the UDR's not-found"
+            );
+            let problem: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap())
+                    .unwrap_or_else(|e| panic!("{resource} ProblemDetails: {e}"));
+            assert_eq!(
+                problem["cause"], "DATA_NOT_FOUND",
+                "{resource} says WHY it has nothing: {problem}"
+            );
+        }
+
+        // The complement: a resource that is genuinely not a Nudm_SDM data set is
+        // still 404 RESOURCE_URI_NOT_FOUND, so routing the twelve above did not
+        // turn the router into an accept-anything.
+        let resp = client
+            .get(&format!("/nudm-sdm/v2/{supi}/not-a-data-set"))
+            .await
+            .expect("GET unknown resource");
+        assert_eq!(resp.status, 404);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).expect("ProblemDetails");
+        assert_eq!(
+            problem["cause"], "RESOURCE_URI_NOT_FOUND",
+            "an unknown path names no resource, which is a different 404: {problem}"
+        );
+
+        udm_server.stop().await.expect("udm stops");
+        udr_server.stop().await.expect("udr stops");
+    }
 
     /// Shared in-memory `context-data` store for the mock UDR below, keyed by
     /// the full Nudr resource path.
