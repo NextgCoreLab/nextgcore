@@ -5793,18 +5793,43 @@ mod tests {
         }
     }
 
-    /// A non-UTC offset is REJECTED rather than read as UTC: misreading an offset
-    /// shifts a subscription's expiry by hours.
+    /// INVERTED: a non-UTC offset is now APPLIED rather than rejected.
+    ///
+    /// This asserted `+02:00` parsed to `None`, on the reasoning that misreading an
+    /// offset shifts a subscription's expiry by hours. The reasoning was right about
+    /// the hazard and wrong about the remedy — the hazard is IGNORING the offset, and
+    /// honouring it avoids that without refusing conformant input. Refusing turned out
+    /// to be actively worse: every consumer of this function reads `None` as "no
+    /// deadline", so a conformant `+02:00` expiry made bsfd's #98 subscription matcher
+    /// and nsacfd's #96 report decision treat a LAPSED subscription as live. See the
+    /// reasoning on `nextgcore_sbi::datetime::rfc3339_to_epoch_signed`.
+    ///
+    /// The flip is recorded rather than the old assertion being deleted, because this
+    /// widening is exactly the kind of change a reader should be able to find. It
+    /// became visible only once nrfd started using the shared parser (the migration
+    /// merged into this branch) — neither change alone breaks anything, and git merges
+    /// them clean.
     #[test]
-    fn rfc3339_rejects_non_utc_and_malformed_input() {
-        assert!(
-            rfc3339_to_epoch("2026-09-07T12:00:00+02:00").is_none(),
-            "offset"
+    fn rfc3339_applies_a_non_utc_offset_and_rejects_malformed_input() {
+        // 12:00 in a +02:00 zone is 10:00 UTC. Subtracting the offset, not ignoring
+        // it, is what makes these equal.
+        assert_eq!(
+            rfc3339_to_epoch("2026-09-07T12:00:00+02:00"),
+            rfc3339_to_epoch("2026-09-07T10:00:00Z"),
+            "a positive offset is subtracted"
         );
-        assert!(
-            rfc3339_to_epoch("2026-09-07T12:00:00-05:00").is_none(),
-            "offset"
+        assert_eq!(
+            rfc3339_to_epoch("2026-09-07T12:00:00-05:00"),
+            rfc3339_to_epoch("2026-09-07T17:00:00Z"),
+            "a negative offset is added"
         );
+        // The sign matters: reading -05:00 as +05:00 would be a ten-hour error.
+        assert_ne!(
+            rfc3339_to_epoch("2026-09-07T12:00:00-05:00"),
+            rfc3339_to_epoch("2026-09-07T12:00:00+05:00")
+        );
+        // Still refused, because a naive local time names no instant at all.
+        assert!(rfc3339_to_epoch("2026-09-07T12:00:00").is_none(), "no zone");
         assert!(rfc3339_to_epoch("not-a-date").is_none());
         assert!(rfc3339_to_epoch("").is_none());
         assert!(rfc3339_to_epoch("2026-09-07").is_none(), "no time part");

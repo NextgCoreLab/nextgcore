@@ -118,18 +118,25 @@ from a decorative test:
 
 ## Merge-order dependency, and it is not optional
 
-These five migration PRs are **not** independent:
+**Corrected after checking rather than assuming.** An earlier draft of this section predicted a *textual*
+conflict with migration 4. There is none: `git merge-tree` reports every pair of the five branches merging
+clean, because migration 4 adds to `datetime.rs`'s formatter half while this rewrites its parser half. Every
+other pair among the eleven open branches is clean too.
 
-* migrations 1–3 (`nrfd`, `udmd`, `pcfd`) do not touch `datetime.rs` and can land in any order;
-* migration 4 (`eesd`) adds `epoch_to_rfc3339_signed` to `datetime.rs` and this one rewrites the parser in
-  the same file, so **the two will conflict textually**. Land 4 first, then rebase this one.
-* migration 1 (`nrfd`) makes `nrfd` a consumer of the shared parser, and `nrfd`'s tests at `main.rs:5801`
-  and `:5805` assert that `+02:00` and `-05:00` are **rejected**. Once both this and migration 1 are in,
-  **those two assertions must be inverted** the same way `bsfd`'s were. On this branch `nrfd` still has its
-  private copy, so its tests pass here and CI cannot see the interaction — whichever of the two lands
-  second is where CI will surface it.
+**The dependency is semantic, and git cannot see it.** Migration 1 makes `nrfd` a *consumer* of the shared
+parser; this change makes that parser apply an offset instead of refusing it. Neither branch alone is wrong,
+they merge clean, and **the combined state fails** `nrfd`'s
+`rfc3339_rejects_non_utc_and_malformed_input` — verified by building `main` + migration 1 + this branch and
+running `cargo test -p nextgcore-nrfd`, which panics at `main.rs:5800` with `offset`. No CI run could have
+seen it, because no branch contained both.
 
-Recommended order: **1, 2, 3 → 4 → 5 (this one, rebased, inverting `nrfd`'s two assertions)**.
+Resolved here rather than left for whoever merges second: **migration 1 is merged into this branch**, so this
+branch's CI validates the combined state, and `nrfd`'s assertion is inverted with the flip recorded at the
+site — the fourth inversion this change makes, and the one that only exists in the combination.
+
+That still leaves an ORDER requirement, just not a conflict one: this must merge **after** migration 1,
+because it contains migration 1's content and the inverted assertion only makes sense once `nrfd` uses the
+shared parser. Recommended order: **1, 2, 3 → 4 → 5 (this one)**.
 
 ## Ceilings
 
