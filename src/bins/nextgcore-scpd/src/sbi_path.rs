@@ -45,10 +45,20 @@ impl Default for SbiServerConfig {
 /// SBI server state
 static SBI_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Custom HTTP headers used by SCP
+/// Custom HTTP headers used by SCP.
+///
+/// **`nextgcore_sbi::constants::{custom_header, discovery_header}` is the one
+/// spelling** for every name here, and the proxy uses those exclusively. The
+/// `3gpp-Sbi-Callback` duplicate was removed from this module (scpd-#210): a
+/// second, lowercased copy of a header name made the capability look implemented
+/// while the routing path had zero readers of it.
+///
+/// The remaining constants are the same duplication and have no readers either;
+/// they are left in place because #210 asks only about `CALLBACK`, and collapsing
+/// the module is a change to this crate's public re-exports (`main.rs`) that no
+/// issue has asked for. Flagged rather than silently widened.
 pub mod headers {
     pub const TARGET_APIROOT: &str = "3gpp-sbi-target-apiroot";
-    pub const CALLBACK: &str = "3gpp-sbi-callback";
     pub const NRF_URI: &str = "3gpp-sbi-nrf-uri";
     pub const DISCOVERY_TARGET_NF_TYPE: &str = "3gpp-sbi-discovery-target-nf-type";
     pub const DISCOVERY_REQUESTER_NF_TYPE: &str = "3gpp-sbi-discovery-requester-nf-type";
