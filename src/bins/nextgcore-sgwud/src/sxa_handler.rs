@@ -242,6 +242,13 @@ pub struct SessionModificationRequest {
 #[derive(Debug, Clone, Default)]
 pub struct UpdatePdrRequest {
     pub pdr_id: u16,
+    /// URR ID(s) to re-point this PDR's measurement at (TS 29.244
+    /// Table 7.5.4.2-1 lists URR ID as an Update PDR IE). #267: absent before, so
+    /// an SGW-C moving a bearer's measurement from URR 3 to URR 4 got `Ok` and the
+    /// SGW-U kept billing URR 3 forever, with no log line. `None` leaves the
+    /// existing association alone; `Some` REPLACES it, because an Update states the
+    /// PDR's current shape.
+    pub urr_ids: Option<Vec<u32>>,
     pub pdi: Option<PdiRequest>,
     pub outer_header_removal: Option<u8>,
     pub far_id: Option<u32>,
@@ -879,6 +886,15 @@ fn process_remove_urr(sess: &SgwuSess, urr_id: u32) -> Result<(), u8> {
         );
     }
     ctx.sess_unregister_urr(sess.id, urr_id);
+    // #267: strip the id from every PDR naming it. Leaving it dangling meant
+    // `urr_record` returned `None` for the missing key and `measure_and_report`'s
+    // `continue` swallowed it -- that PDR was then measured by NOTHING, with no
+    // warning. Worse, a later re-Create of the same id (which this build supports)
+    // silently re-attached the old PDR to a rule the SGW-C may have re-scoped.
+    let detached = ctx.pdr_detach_urr(sess.id, urr_id);
+    if detached > 0 {
+        log::debug!("URR {urr_id} detached from {detached} PDR(s)");
+    }
     Ok(())
 }
 
@@ -903,14 +919,20 @@ pub fn usage_report_from(
     trigger: UsageReportTrigger,
 ) -> crate::sxa_build::UsageReport {
     let now = now_unix_secs();
+    let packets = urr.measured_packets();
     crate::sxa_build::UsageReport {
         urr_id: urr.urr_id,
         ur_seqn,
         trigger,
         volume: urr.measured_volume(),
-        total_packets: Some(urr.total_packets),
-        uplink_packets: Some(urr.uplink_packets),
-        downlink_packets: Some(urr.downlink_packets),
+        // #267: `Some(..)` unconditionally here made a DURAT-only URR emit a Volume
+        // Measurement IE with flags 0x38 -- "measured, all zero" for a measurement
+        // the CP function never provisioned. `measured_packets` returns all-`None`
+        // when the URR does not measure volume. Both tests that claimed otherwise
+        // bypassed THIS function, so reverting the old lines broke nothing.
+        total_packets: packets.0,
+        uplink_packets: packets.1,
+        downlink_packets: packets.2,
         duration_secs: urr.measured_duration(now),
         start_time: Some(urr.start_time),
         end_time: Some(now),
@@ -959,6 +981,18 @@ fn process_update_pdr(sess: &SgwuSess, req: &UpdatePdrRequest) -> Result<(), u8>
     }
     if let Some(far_id) = req.far_id {
         pdr.far_id = Some(far_id);
+    }
+    // #267: re-point the measurement when the Update names URRs. Replaces rather
+    // than merges: an Update PDR states the PDR's current shape, so merging would
+    // leave an association the SGW-C removed still billing.
+    if let Some(ref urr_ids) = req.urr_ids {
+        log::debug!(
+            "PDR {} URR association {:?} -> {:?}",
+            pdr.pdr_id,
+            pdr.urr_ids,
+            urr_ids
+        );
+        pdr.urr_ids = urr_ids.clone();
     }
     if !ctx.pdr_install(pdr) {
         return Err(pfcp_cause::SYSTEM_FAILURE);
@@ -1270,7 +1304,7 @@ mod tests {
         CreateUrrRequest {
             urr_id,
             measurement_method: crate::context::measurement_method::VOLUME,
-            reporting_triggers: crate::context::reporting_trigger::VOLUME_THRESHOLD as u16,
+            reporting_triggers: crate::context::reporting_trigger::VOLUME_THRESHOLD,
             volume_threshold: Volume {
                 total: Some(total_threshold),
                 ..Default::default()
@@ -1355,7 +1389,14 @@ mod tests {
         ctx.urr_record(sess.id, 11, 400, true);
         ctx.urr_take_report(sess.id, 11);
         ctx.urr_record(sess.id, 11, 250, true);
-        assert_eq!(ctx.urr_find(sess.id, 11).unwrap().total_bytes, 250);
+        // #267 FLIP: asserted `total_bytes == 250`. `total_bytes` is now CUMULATIVE
+        // (650) and the per-period figure is the delta, which is what a report
+        // carries. Both are asserted so the model is unambiguous.
+        assert_eq!(ctx.urr_find(sess.id, 11).unwrap().total_bytes, 650);
+        assert_eq!(
+            ctx.urr_find(sess.id, 11).unwrap().measured_volume().total,
+            Some(250)
+        );
         assert_eq!(ctx.urr_find(sess.id, 11).unwrap().next_ur_seqn, 1);
 
         // Update only the threshold.
@@ -1380,9 +1421,16 @@ mod tests {
             Some(9_999),
             "the update applied"
         );
+        // #267 FLIP: asserted 250. `total_bytes` is CUMULATIVE now; the per-period
+        // figure a report carries is the delta, asserted next.
         assert_eq!(
-            urr.total_bytes, 250,
+            urr.total_bytes, 650,
             "an Update URR must NOT reset the measured volume"
+        );
+        assert_eq!(
+            urr.measured_volume().total,
+            Some(250),
+            "nor the unreported delta"
         );
         assert_eq!(
             urr.next_ur_seqn, 1,
@@ -1457,7 +1505,12 @@ mod tests {
         ctx.urr_record(sess.id, 51, 600, true);
         ctx.urr_take_report(sess.id, 51);
         ctx.urr_record(sess.id, 51, 150, false);
-        assert_eq!(ctx.urr_find(sess.id, 51).unwrap().total_bytes, 150);
+        // #267 FLIP: cumulative, with the unreported delta alongside it.
+        assert_eq!(ctx.urr_find(sess.id, 51).unwrap().total_bytes, 750);
+        assert_eq!(
+            ctx.urr_find(sess.id, 51).unwrap().measured_volume().total,
+            Some(150)
+        );
         assert_eq!(ctx.urr_find(sess.id, 51).unwrap().next_ur_seqn, 1);
 
         // A Session Modification re-Creating URR 51 with a new threshold.
@@ -1472,9 +1525,14 @@ mod tests {
         let urr = ctx.urr_find(sess.id, 51).expect("still installed");
         assert_eq!(urr.volume_threshold.total, Some(5_000), "re-provisioned");
         assert_eq!(
-            urr.total_bytes, 150,
+            urr.total_bytes, 750,
             "a re-Create must NOT zero the measured volume: that would lose billable \
              traffic on every reprovisioning, undetectably"
+        );
+        assert_eq!(
+            urr.measured_volume().total,
+            Some(150),
+            "nor the unreported delta"
         );
         assert_eq!(
             urr.next_ur_seqn, 1,
@@ -1485,6 +1543,147 @@ mod tests {
             ctx.sess_find_by_id(sess.id).unwrap().pfcp.urr_ids,
             vec![51u64]
         );
+
+        ctx.sess_remove(sess.id);
+    }
+
+    /// **Issue #267.** An Update PDR can re-point the measurement, and a Remove URR
+    /// leaves no dangling association behind.
+    ///
+    /// Both gaps were silent. `UpdatePdrRequest` had no `urr_ids`, so an SGW-C moving
+    /// a bearer from URR 3 to URR 4 got `Ok` and the SGW-U kept billing URR 3. And
+    /// `process_remove_urr` left the id on the PDR, so `urr_record` returned `None`
+    /// for the missing key, `measure_and_report`'s `continue` swallowed it, and that
+    /// PDR was measured by NOTHING -- until a re-Create of the same id silently
+    /// re-attached it.
+    #[test]
+    fn update_pdr_repoints_the_urr_and_remove_urr_detaches_it() {
+        let ctx = sgwu_self();
+        let sess = ctx_sess(0x8700);
+
+        let est = SessionEstablishmentRequest {
+            create_urrs: vec![volume_urr(3, 1_000), volume_urr(4, 1_000)],
+            create_fars: vec![CreateFarRequest {
+                far_id: 1,
+                apply_action: crate::context::apply_action::FORW,
+                ..Default::default()
+            }],
+            create_pdrs: vec![CreatePdrRequest {
+                pdr_id: 1,
+                far_id: Some(1),
+                urr_ids: vec![3],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_establishment_request(Some(&sess), 1, &est).0,
+            HandlerResult::Ok
+        ));
+        assert_eq!(ctx.pdr_find(sess.id, 1).unwrap().urr_ids, vec![3]);
+
+        // Re-point 3 -> 4. Replaces rather than merges: an Update states the PDR's
+        // current shape, so a merge would leave URR 3 still billing.
+        let modify = SessionModificationRequest {
+            update_pdrs: vec![UpdatePdrRequest {
+                pdr_id: 1,
+                urr_ids: Some(vec![4]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_modification_request(Some(&sess), 1, &modify).0,
+            HandlerResult::Ok
+        ));
+        assert_eq!(
+            ctx.pdr_find(sess.id, 1).unwrap().urr_ids,
+            vec![4],
+            "the measurement must move, not accumulate"
+        );
+
+        // An Update naming no URRs leaves the association alone.
+        let modify = SessionModificationRequest {
+            update_pdrs: vec![UpdatePdrRequest {
+                pdr_id: 1,
+                urr_ids: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_modification_request(Some(&sess), 1, &modify).0,
+            HandlerResult::Ok
+        ));
+        assert_eq!(ctx.pdr_find(sess.id, 1).unwrap().urr_ids, vec![4]);
+
+        // Removing URR 4 detaches it from the PDR, so nothing dangles.
+        let remove = SessionModificationRequest {
+            remove_urrs: vec![4],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_modification_request(Some(&sess), 1, &remove).0,
+            HandlerResult::Ok
+        ));
+        assert!(
+            ctx.pdr_find(sess.id, 1).unwrap().urr_ids.is_empty(),
+            "a removed URR must not be left dangling on the PDR"
+        );
+
+        // And re-Creating id 4 does NOT silently re-attach the old PDR.
+        let recreate = SessionModificationRequest {
+            create_urrs: vec![volume_urr(4, 2_000)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_modification_request(Some(&sess), 1, &recreate).0,
+            HandlerResult::Ok
+        ));
+        assert!(
+            ctx.pdr_find(sess.id, 1).unwrap().urr_ids.is_empty(),
+            "a re-Created id must not resurrect an association the SGW-C removed"
+        );
+
+        ctx.sess_remove(sess.id);
+    }
+
+    /// **Issue #267.** A trigger outside octet 5 is reachable.
+    ///
+    /// `trigger_set` cast the 16-bit Reporting Triggers down to `u8`, so every
+    /// octet-6/7 trigger was structurally unreachable -- and the `VOLUME_QUOTA`
+    /// constant was declared as an octet-5 bit, which made the truncation invisible.
+    /// The two defects hid each other.
+    #[test]
+    fn a_trigger_in_the_high_octet_is_reachable() {
+        use crate::context::reporting_trigger;
+        let ctx = sgwu_self();
+        let sess = ctx_sess(0x8800);
+
+        // VOLQU only -- octet 6 bit 1, i.e. the high byte of the field.
+        let mut urr = volume_urr(61, 0);
+        urr.reporting_triggers = reporting_trigger::VOLUME_QUOTA;
+        urr.volume_quota = Volume {
+            total: Some(100),
+            ..Default::default()
+        };
+        urr.volume_threshold = Volume::default();
+        let est = SessionEstablishmentRequest {
+            create_urrs: vec![urr],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_establishment_request(Some(&sess), 1, &est).0,
+            HandlerResult::Ok
+        ));
+        // VOLQU must live in the HIGH octet or this test proves nothing about the
+        // truncation. A const assertion, because it is a compile-time fact: moving it
+        // back to octet 5 fails the build here rather than silently weakening the test.
+        const _: () = assert!(reporting_trigger::VOLUME_QUOTA > 0xFF);
+        let (snapshot, _) = ctx
+            .urr_record(sess.id, 61, 150, true)
+            .expect("a high-octet trigger must be reachable");
+        assert!(snapshot.fired_trigger.volume_quota);
 
         ctx.sess_remove(sess.id);
     }
@@ -1558,16 +1757,14 @@ mod tests {
             HandlerResult::Ok
         ));
         // Well past the threshold, and still not reportable.
-        assert_eq!(ctx.urr_record(sess.id, 31, 5_000, true), None);
+        assert!(ctx.urr_record(sess.id, 31, 5_000, true).is_none());
         assert_eq!(ctx.urr_find(sess.id, 31).unwrap().total_bytes, 5_000);
 
         // Turning the trigger on makes the same state reportable.
         let modify = SessionModificationRequest {
             update_urrs: vec![UpdateUrrRequest {
                 urr_id: 31,
-                reporting_triggers: Some(
-                    crate::context::reporting_trigger::VOLUME_THRESHOLD as u16,
-                ),
+                reporting_triggers: Some(crate::context::reporting_trigger::VOLUME_THRESHOLD),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1576,10 +1773,10 @@ mod tests {
             handle_session_modification_request(Some(&sess), 1, &modify).0,
             HandlerResult::Ok
         ));
-        let trigger = ctx
+        let (snapshot, _seqn) = ctx
             .urr_record(sess.id, 31, 1, true)
             .expect("now reportable");
-        assert!(trigger.volume_threshold);
+        assert!(snapshot.fired_trigger.volume_threshold);
 
         ctx.sess_remove(sess.id);
     }

@@ -705,18 +705,26 @@ fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResu
             bar.as_ref()
                 .and_then(|b| b.dl_buffering_suggested_packet_count),
         );
-        let count = ctx
-            .far_buffer_packet(pdr.sess_id, far_id, payload.to_vec(), capacity)
-            .unwrap_or(0);
-        log::debug!("BUFF per FAR {far_id} (buffered={count}/{capacity})");
+        let outcome = ctx.far_buffer_packet(pdr.sess_id, far_id, payload.to_vec(), capacity);
+        let count = outcome.map(|o| o.buffered()).unwrap_or(0);
+        let accepted = outcome.is_some_and(|o| o.accepted());
+        log::debug!("BUFF per FAR {far_id} (buffered={count}/{capacity}, accepted={accepted})");
         // #215: a buffered packet HAS been handled by the UP function -- it was
         // accepted and will be delivered when the buffer flushes -- so it counts.
         // Counting it again on flush would double-bill, which is why the flush path
         // does not measure.
-        let _ = measure_and_report(pdr, payload.len() as u64);
+        //
+        // #267: ONLY when it was actually accepted. `far_buffer_packet` discards the
+        // packet once the queue is at capacity, and its old `Option<usize>` return
+        // could not say so -- so a downlink burst past capacity billed its whole
+        // tail, over-billing traffic the SGW-U dropped. A missing FAR (`None`) is
+        // likewise not billed.
+        if accepted {
+            let _ = measure_and_report(pdr, payload.len() as u64);
+        }
         // First buffered packet triggers a Downlink Data Report unless the
         // SGW-C suppressed notification (NOCP)
-        if count == 1 && far.apply_action & apply_action::NOCP == 0 {
+        if count == 1 && accepted && far.apply_action & apply_action::NOCP == 0 {
             if let Some(sess) = ctx.sess_find_by_id(pdr.sess_id) {
                 let report = UserPlaneReport {
                     downlink_data_report: true,
@@ -816,22 +824,23 @@ fn measure_and_report(pdr: &SgwuPdr, bytes: u64) -> Vec<crate::sxa_build::UsageR
 
     let mut reports = Vec::new();
     for urr_id in &pdr.urr_ids {
-        let Some(trigger) = ctx.urr_record(pdr.sess_id, *urr_id, bytes, uplink) else {
+        // #267: recording and taking the report are ONE locked operation, so two
+        // packets crossing the threshold concurrently cannot both produce a report
+        // from the same counters. `urr_record` returns `Some` only when the packet
+        // it just counted made the URR reportable.
+        let Some((snapshot, ur_seqn)) = ctx.urr_record(pdr.sess_id, *urr_id, bytes, uplink) else {
             continue;
         };
-        // Reportable: take the counters and the next UR-SEQN in one operation, so
-        // two packets crossing the threshold concurrently cannot both report the
-        // same volume.
-        if let Some(report) = crate::sxa_handler::take_usage_report(pdr.sess_id, *urr_id, trigger) {
-            log::debug!(
-                "URR {} reportable (trigger {:?}): {} bytes, UR-SEQN {}",
-                report.urr_id,
-                report.trigger,
-                report.volume.total.unwrap_or(0),
-                report.ur_seqn
-            );
-            reports.push(report);
-        }
+        let report =
+            crate::sxa_handler::usage_report_from(&snapshot, ur_seqn, snapshot.fired_trigger);
+        log::debug!(
+            "URR {} reportable (trigger {:?}): {} bytes, UR-SEQN {}",
+            report.urr_id,
+            report.trigger,
+            report.volume.total.unwrap_or(0),
+            report.ur_seqn
+        );
+        reports.push(report);
     }
     if reports.is_empty() {
         return reports;
@@ -1379,7 +1388,7 @@ mod tests {
             SgwuUrr {
                 urr_id: 7,
                 measurement_method: measurement_method::VOLUME | measurement_method::DURATION,
-                reporting_triggers: reporting_trigger::VOLUME_THRESHOLD as u16,
+                reporting_triggers: reporting_trigger::VOLUME_THRESHOLD,
                 volume_threshold: Volume {
                     total: Some(250),
                     ..Default::default()
@@ -1419,10 +1428,24 @@ mod tests {
         assert!(report.duration_secs.is_some(), "DURAT was provisioned");
         assert!(report.time_of_first_packet.is_some());
 
-        // Counters reset for the next period, and the UR-SEQN has advanced.
+        // #267 FLIP: these asserted `total_bytes == 0` and `total_packets == 0`,
+        // pinning the reset-on-report model. Counters are now CUMULATIVE for the
+        // session and `reported_*` advances to cover what a report carried, so the
+        // next report's DELTA is right while the cumulative total survives for the
+        // Volume Quota check. Resetting made a quota unreachable whenever a
+        // threshold also fired.
         let urr = ctx.urr_find(sess_id, 7).expect("URR still installed");
-        assert_eq!(urr.total_bytes, 0, "the period restarts after a report");
-        assert_eq!(urr.total_packets, 0);
+        assert_eq!(urr.total_bytes, 300, "cumulative volume is kept");
+        assert_eq!(
+            urr.reported_total_bytes, 300,
+            "and the report is recorded as covering it"
+        );
+        assert_eq!(
+            urr.measured_volume().total,
+            Some(0),
+            "so the next period's delta starts at zero"
+        );
+        assert_eq!(urr.total_packets, 3);
         assert_eq!(urr.next_ur_seqn, 1);
 
         // A second crossing reports UR-SEQN 1: monotonic, which is what lets the
@@ -1431,6 +1454,12 @@ mod tests {
             let reports = measure_and_report(&pdr, packet.len() as u64);
             if let Some(r) = reports.first() {
                 assert_eq!(r.ur_seqn, 1, "UR-SEQN must advance, not restart");
+                assert_eq!(
+                    r.volume.total,
+                    Some(300),
+                    "the second report carries its own period's delta, not the \
+                     cumulative 600"
+                );
             }
         }
         assert_eq!(ctx.urr_find(sess_id, 7).unwrap().next_ur_seqn, 2);
@@ -1461,7 +1490,7 @@ mod tests {
             SgwuUrr {
                 urr_id: 9,
                 measurement_method: measurement_method::VOLUME,
-                reporting_triggers: reporting_trigger::VOLUME_THRESHOLD as u16,
+                reporting_triggers: reporting_trigger::VOLUME_THRESHOLD,
                 volume_threshold: Volume {
                     total: Some(10_000),
                     ..Default::default()
@@ -1519,6 +1548,128 @@ mod tests {
             100,
             "a DROP FAR must not add to the measured volume"
         );
+
+        ctx.sess_remove(sess_id);
+        server.close();
+    }
+
+    /// **Issue #267.** A downlink packet dropped because the BUFF buffer is FULL is
+    /// not billed.
+    ///
+    /// `far_buffer_packet` discards the packet once the queue is at capacity, and its
+    /// old `Option<usize>` return could not say so -- `apply_far` billed
+    /// unconditionally, so a burst past capacity over-billed its entire tail. That is
+    /// the over-billing direction the URR decision explicitly rules out.
+    #[test]
+    fn a_packet_dropped_because_the_buffer_is_full_is_not_billed() {
+        use crate::context::{measurement_method, reporting_trigger, SgwuUrr, Volume};
+        let _env = QER_ENFORCEMENT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = sgwu_self();
+        let server = test_server(GTPV1_U_UDP_PORT);
+        std::env::set_var("SGWU_MAX_BUFFERED_PACKETS", "2");
+
+        let (sess_id, pdr) = provision_urr(
+            0x7400,
+            0x7401,
+            SgwuUrr {
+                urr_id: 13,
+                measurement_method: measurement_method::VOLUME,
+                reporting_triggers: reporting_trigger::VOLUME_THRESHOLD,
+                volume_threshold: Volume {
+                    total: Some(1_000_000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            None,
+        );
+        // Switch the FAR to BUFF so packets queue instead of forwarding.
+        ctx.far_install(SgwuFar {
+            sess_id,
+            far_id: 1,
+            apply_action: apply_action::BUFF,
+            ..Default::default()
+        });
+
+        let packet = [0u8; 100];
+        // Capacity 2: the first two are accepted and billed, the next three are
+        // dropped and must not be.
+        for _ in 0..5 {
+            apply_far(&server, &pdr, &packet);
+        }
+        std::env::remove_var("SGWU_MAX_BUFFERED_PACKETS");
+
+        let urr = ctx.urr_find(sess_id, 13).expect("URR installed");
+        assert_eq!(
+            urr.total_bytes, 200,
+            "only the two ACCEPTED packets may be billed, not the three the buffer \
+             dropped"
+        );
+        assert_eq!(urr.total_packets, 2);
+
+        ctx.sess_remove(sess_id);
+        server.close();
+    }
+
+    /// **Issue #267.** A Volume Quota fires even when a Volume Threshold is also
+    /// provisioned.
+    ///
+    /// The threshold reset the counters the quota was measured against, so with
+    /// VOLTH=250 and VOLQU=1000 the total never climbed past 250 and quota exhaustion
+    /// was UNREACHABLE -- the subscriber consumed unlimited volume against a quota
+    /// that never reported.
+    #[test]
+    fn a_volume_quota_fires_even_when_a_threshold_keeps_resetting_the_period() {
+        use crate::context::{measurement_method, reporting_trigger, SgwuUrr, Volume};
+        let _env = QER_ENFORCEMENT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = sgwu_self();
+        let server = test_server(GTPV1_U_UDP_PORT);
+        std::env::remove_var("SGWU_QER_ENFORCEMENT");
+
+        let (sess_id, pdr) = provision_urr(
+            0x7500,
+            0x7501,
+            SgwuUrr {
+                urr_id: 15,
+                measurement_method: measurement_method::VOLUME,
+                reporting_triggers: reporting_trigger::VOLUME_THRESHOLD
+                    | reporting_trigger::VOLUME_QUOTA,
+                volume_threshold: Volume {
+                    total: Some(250),
+                    ..Default::default()
+                },
+                volume_quota: Volume {
+                    total: Some(1_000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            None,
+        );
+
+        let packet = [0u8; 100];
+        let mut saw_threshold = false;
+        let mut saw_quota = false;
+        // 10 packets = 1000 bytes cumulative, crossing the 250-byte threshold four
+        // times and the 1000-byte quota once.
+        for _ in 0..10 {
+            for report in measure_and_report(&pdr, packet.len() as u64) {
+                saw_threshold |= report.trigger.volume_threshold;
+                saw_quota |= report.trigger.volume_quota;
+            }
+        }
+        assert!(saw_threshold, "the threshold must fire");
+        assert!(
+            saw_quota,
+            "the quota must fire too: it is cumulative for the session, and a \
+             threshold reset must not make it unreachable"
+        );
+        // The cumulative total survived every threshold report.
+        assert_eq!(ctx.urr_find(sess_id, 15).unwrap().total_bytes, 1_000);
 
         ctx.sess_remove(sess_id);
         server.close();

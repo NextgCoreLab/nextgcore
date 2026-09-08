@@ -471,6 +471,25 @@ fn build_f_teid_ie(data: &mut Vec<u8>, f_teid: &LocalFTeid) {
 /// attribute to a rule, or cannot order, is not usable for charging. Everything
 /// else is emitted only when measured, because an absent Volume Measurement and a
 /// zero one say different things to a CDR.
+/// Seconds between the NTP epoch (1900-01-01) and the UNIX epoch (1970-01-01).
+///
+/// #267: TS 29.244 §8.2.34-§8.2.37 each specify "the first four octets of the 64-bit
+/// timestamp format defined in clause 6 of IETF RFC 5905", i.e. seconds since 1900.
+/// Start Time, End Time, Time of First Packet and Time of Last Packet were written
+/// as UNIX seconds, so every one was ~70 years low and a report generated now decoded
+/// at the SGW-C as 1956 -- wrong CDR period boundaries and wrong End-Start durations.
+/// The same constant exists in `lmfd` (`NTP_UNIX_OFFSET`) and the convention is
+/// documented in `nextgcore-gtp`'s Recovery Time Stamp.
+const NTP_UNIX_OFFSET_SECS: u64 = 2_208_988_800;
+
+/// A UNIX-epoch second count as the RFC 5905 NTP-epoch `u32` the PFCP timestamp IEs
+/// carry. Saturates rather than wrapping past 2036.
+fn ntp_seconds(unix_secs: u32) -> u32 {
+    (unix_secs as u64)
+        .saturating_add(NTP_UNIX_OFFSET_SECS)
+        .min(u32::MAX as u64) as u32
+}
+
 fn build_usage_report_ie(data: &mut Vec<u8>, report: &UsageReport, ie_type: u16) {
     let mut inner = Vec::new();
 
@@ -485,10 +504,10 @@ fn build_usage_report_ie(data: &mut Vec<u8>, report: &UsageReport, ie_type: u16)
         &usage_report_trigger_octets(&report.trigger),
     );
     if let Some(t) = report.start_time {
-        push_u32_ie(&mut inner, pfcp_ie::START_TIME, t);
+        push_u32_ie(&mut inner, pfcp_ie::START_TIME, ntp_seconds(t));
     }
     if let Some(t) = report.end_time {
-        push_u32_ie(&mut inner, pfcp_ie::END_TIME, t);
+        push_u32_ie(&mut inner, pfcp_ie::END_TIME, ntp_seconds(t));
     }
     if let Some(volume) = volume_measurement_octets(report) {
         push_ie(&mut inner, pfcp_ie::VOLUME_MEASUREMENT, &volume);
@@ -497,10 +516,10 @@ fn build_usage_report_ie(data: &mut Vec<u8>, report: &UsageReport, ie_type: u16)
         push_u32_ie(&mut inner, pfcp_ie::DURATION_MEASUREMENT, secs);
     }
     if let Some(t) = report.time_of_first_packet {
-        push_u32_ie(&mut inner, pfcp_ie::TIME_OF_FIRST_PACKET, t);
+        push_u32_ie(&mut inner, pfcp_ie::TIME_OF_FIRST_PACKET, ntp_seconds(t));
     }
     if let Some(t) = report.time_of_last_packet {
-        push_u32_ie(&mut inner, pfcp_ie::TIME_OF_LAST_PACKET, t);
+        push_u32_ie(&mut inner, pfcp_ie::TIME_OF_LAST_PACKET, ntp_seconds(t));
     }
 
     push_ie(data, ie_type, &inner);
@@ -523,7 +542,12 @@ fn usage_report_trigger_octets(trigger: &UsageReportTrigger) -> [u8; 3] {
         flags[0] |= 0x04; // TIMTH
     }
     if trigger.volume_quota {
-        flags[0] |= 0x40; // VOLQU
+        // #267: VOLQU is octet 6 bit 1, NOT octet 5 bit 7. This was `flags[0] |= 0x40`,
+        // which is DROTH (Dropped DL Traffic Threshold) -- so a quota-exhaustion report
+        // told the SGW-C "dropped downlink traffic threshold reached", the CP function
+        // never granted new quota, and the CDR attributed the report to the wrong cause.
+        // `upfd/src/n4_build.rs` had it right; this copy diverged.
+        flags[1] |= 0x01; // VOLQU
     }
     if trigger.termination_report {
         // TEBUR, octet 7 bit 3 (§8.2.42): termination by the UP function, which is
@@ -784,6 +808,30 @@ mod tests {
         None
     }
 
+    /// How many top-level TLVs of `ie_type` the buffer holds.
+    ///
+    /// A sequential walk, like `find_ie`: an offset or byte-pattern search would
+    /// match inside a VALUE, which is what the previous byte-scan did.
+    fn count_ies(data: &[u8], ie_type: u16) -> usize {
+        let mut i = 0usize;
+        let mut count = 0usize;
+        while i + 4 <= data.len() {
+            let t = u16::from_be_bytes([data[i], data[i + 1]]);
+            let len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+            let Some(end) = (i + 4).checked_add(len) else {
+                break;
+            };
+            if end > data.len() {
+                break;
+            }
+            if t == ie_type {
+                count += 1;
+            }
+            i = end;
+        }
+        count
+    }
+
     fn sample_report() -> UsageReport {
         UsageReport {
             urr_id: 7,
@@ -899,20 +947,16 @@ mod tests {
         assert_eq!(trigger[2] & 0x02, 0x02, "TEBUR on the final report");
         assert_eq!(trigger[0], 0, "and no volume/time trigger");
 
-        // Both reports are there: counting the IEs, because a builder that emitted
-        // only the first would still pass every assertion above.
-        let mut count = 0;
-        let mut rest = msg.data.as_slice();
-        while let Some(v) = find_ie(rest, pfcp_ie::USAGE_REPORT_SDR) {
-            count += 1;
-            // advance past this IE
-            let idx = rest
-                .windows(2)
-                .position(|w| w == pfcp_ie::USAGE_REPORT_SDR.to_be_bytes())
-                .unwrap();
-            rest = &rest[idx + 4 + v.len()..];
-        }
-        assert_eq!(count, 2, "one Usage Report IE per URR");
+        // Both reports are there. #267: this used to advance by SCANNING for the raw
+        // byte pair 00 4F anywhere in the buffer, INCLUDING value bytes -- so a URR
+        // ID of 79 or any counter whose encoding contained that pair would have made
+        // the count wrong or panicked on the slice advance. `count_ies` walks the TLV
+        // list properly.
+        assert_eq!(
+            count_ies(&msg.data, pfcp_ie::USAGE_REPORT_SDR),
+            2,
+            "one Usage Report IE per URR"
+        );
 
         // With no reports the response is exactly what it was before #215.
         let plain = build_session_deletion_response(&sess, &[]).expect("built");
@@ -950,6 +994,85 @@ mod tests {
         );
     }
 
+    /// **Issue #267.** The four timestamp IEs carry NTP-epoch seconds, not UNIX.
+    ///
+    /// TS 29.244 §8.2.34-§8.2.37 all specify the RFC 5905 format. Writing UNIX
+    /// seconds made every one ~70 years low, so a report generated now decoded at the
+    /// SGW-C as 1956 -- wrong CDR period boundaries and wrong End-Start durations.
+    #[test]
+    fn usage_report_timestamps_are_ntp_epoch_not_unix() {
+        let sess = SgwuSess {
+            id: 1,
+            sgwc_sxa_f_seid: FSeid::with_ipv4(0x2000, Ipv4Addr::new(10, 0, 0, 1)),
+            ..Default::default()
+        };
+        // A known UNIX instant, so the offset is checkable by arithmetic rather than
+        // by re-deriving it.
+        let unix = 1_700_000_000u32;
+        let report = UsageReport {
+            urr_id: 7,
+            start_time: Some(unix),
+            end_time: Some(unix + 42),
+            time_of_first_packet: Some(unix + 1),
+            time_of_last_packet: Some(unix + 41),
+            ..Default::default()
+        };
+        let msg = build_session_deletion_response(&sess, &[report]).expect("built");
+        let usage = find_ie(&msg.data, pfcp_ie::USAGE_REPORT_SDR).expect("Usage Report IE");
+
+        let read = |ie: u16| -> u32 {
+            let v = find_ie(&usage, ie).unwrap_or_else(|| panic!("IE {ie} missing"));
+            u32::from_be_bytes(v.try_into().expect("4-octet timestamp"))
+        };
+        let offset = 2_208_988_800u32;
+        assert_eq!(read(pfcp_ie::START_TIME), unix + offset);
+        assert_eq!(read(pfcp_ie::END_TIME), unix + 42 + offset);
+        assert_eq!(read(pfcp_ie::TIME_OF_FIRST_PACKET), unix + 1 + offset);
+        assert_eq!(read(pfcp_ie::TIME_OF_LAST_PACKET), unix + 41 + offset);
+        // And specifically NOT the raw UNIX value, which is what shipped.
+        assert_ne!(read(pfcp_ie::START_TIME), unix);
+    }
+
+    /// **Issue #267.** A report that measured no volume omits the Volume Measurement
+    /// IE **when built through `usage_report_from`** — the path the data plane and
+    /// the deletion handler actually use.
+    ///
+    /// The #215 guards for this built a `UsageReport` literal or asserted on
+    /// `measured_volume()`, so neither reached `usage_report_from`, which set the
+    /// three packet counters to `Some(0)` unconditionally -- flags 0x38, a 25-octet
+    /// IE asserting "measured, all zero" for a measurement never provisioned.
+    #[test]
+    fn a_duration_only_urr_emits_no_volume_ie_through_usage_report_from() {
+        use crate::context::{measurement_method, SgwuUrr};
+        let sess = SgwuSess {
+            id: 1,
+            sgwc_sxa_f_seid: FSeid::with_ipv4(0x2000, Ipv4Addr::new(10, 0, 0, 1)),
+            ..Default::default()
+        };
+        let mut urr = SgwuUrr {
+            urr_id: 7,
+            measurement_method: measurement_method::DURATION,
+            ..Default::default()
+        };
+        // Packets counted, volume not measured: exactly the state that produced the
+        // spurious IE.
+        urr.total_packets = 3;
+        urr.uplink_packets = 3;
+
+        let report = crate::sxa_handler::usage_report_from(&urr, 0, Default::default());
+        assert!(!report.volume.is_set(), "no volume was measured");
+        assert_eq!(report.total_packets, None, "so no packet counts either");
+        assert_eq!(report.uplink_packets, None);
+        assert_eq!(report.downlink_packets, None);
+
+        let msg = build_session_deletion_response(&sess, &[report]).expect("built");
+        let usage = find_ie(&msg.data, pfcp_ie::USAGE_REPORT_SDR).expect("Usage Report IE");
+        assert!(
+            find_ie(&usage, pfcp_ie::VOLUME_MEASUREMENT).is_none(),
+            "a DURAT-only URR must emit NO Volume Measurement IE"
+        );
+    }
+
     /// **Issue #215.** Each Usage Report Trigger maps to its own bit, so the SGW-C is
     /// told the right reason.
     ///
@@ -980,11 +1103,14 @@ mod tests {
                 [0x04, 0, 0],
             ),
             (
+                // #267 FLIP: this asserted [0x40, 0, 0], pinning VOLQU onto octet 5's
+                // DROTH bit. VOLQU is octet 6 bit 1 (§8.2.42), which is what
+                // `upfd/src/n4_build.rs` has always emitted.
                 UsageReportTrigger {
                     volume_quota: true,
                     ..Default::default()
                 },
-                [0x40, 0, 0],
+                [0, 0x01, 0],
             ),
             (
                 UsageReportTrigger {
