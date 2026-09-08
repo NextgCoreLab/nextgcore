@@ -1,48 +1,25 @@
 //! UDM Event Definitions
 //!
 //! Port of src/udm/event.h and event.c - Event definitions for UDM
-
-/// FSM signal types (from nextgcore-core)
-pub const NEXTGCORE_FSM_ENTRY_SIG: i32 = 0;
-pub const NEXTGCORE_FSM_EXIT_SIG: i32 = 1;
-pub const NEXTGCORE_FSM_USER_SIG: i32 = 2;
-
-/// Event types for UDM
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UdmEventId {
-    /// FSM entry signal
-    FsmEntry,
-    /// FSM exit signal
-    FsmExit,
-    /// SBI server event
-    SbiServer,
-    /// SBI client event
-    SbiClient,
-    /// SBI timer event
-    SbiTimer,
-}
-
-impl UdmEventId {
-    /// Get the name of the event
-    pub fn name(&self) -> &'static str {
-        match self {
-            UdmEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
-            UdmEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
-            UdmEventId::SbiServer => "NEXTGCORE_EVENT_SBI_SERVER",
-            UdmEventId::SbiClient => "NEXTGCORE_EVENT_SBI_CLIENT",
-            UdmEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
-        }
-    }
-
-    /// Convert from i32 signal
-    pub fn from_signal(signal: i32) -> Self {
-        match signal {
-            NEXTGCORE_FSM_ENTRY_SIG => UdmEventId::FsmEntry,
-            NEXTGCORE_FSM_EXIT_SIG => UdmEventId::FsmExit,
-            _ => UdmEventId::SbiServer,
-        }
-    }
-}
+//!
+//! ## Why this is smaller than its sibling NFs' `event.rs` (#242)
+//!
+//! Every other NF in the workspace carries `SbiServer` / `SbiClient` event kinds
+//! and the `SbiEventData` / `SbiRequest` / `SbiResponse` / `SbiMessage` payloads
+//! that go with them, because their state machines really do serve requests. In
+//! `udmd` they were **never produced**: `grep` for `UdmEvent::sbi_server` and
+//! `UdmEvent::sbi_client` found only their own definitions and their own unit
+//! tests, and the only event `app.rs` ever dispatches is `UdmEvent::sbi_timer`.
+//!
+//! `udmd` serves Nudm through the live async HTTP dispatcher
+//! `app.rs::udm_sbi_route`, which owns its own request parsing and its own
+//! responses. So the divergence from the sibling NFs is the accurate description
+//! of the daemon, and the previous symmetry was the misleading part — it is what
+//! made ~2100 lines of unreachable routing (`udm_sm.rs`'s SBI half, `ue_sm.rs`,
+//! `sess_sm.rs`, `nudr_handler.rs`, `sbi_response.rs`) read as a working path.
+//!
+//! If udmd is ever converted to an event-driven request path, these types come
+//! back **with** their producer, which is the order #242 argues for.
 
 /// Timer IDs for UDM
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,73 +59,43 @@ impl UdmTimerId {
     }
 }
 
-/// SBI message data for events
-#[derive(Debug, Clone, Default)]
-pub struct SbiEventData {
-    /// Request data (if any)
-    pub request: Option<SbiRequest>,
-    /// Response data (if any)
-    pub response: Option<SbiResponse>,
-    /// Message data (if any)
-    pub message: Option<SbiMessage>,
-    /// Stream ID
-    pub stream_id: Option<u64>,
-    /// Generic data pointer (for xact, nf_instance, etc.)
-    pub data: Option<u64>,
-    /// State for multi-step operations
-    pub state: Option<i32>,
+/// Event types for UDM.
+///
+/// These are the only three the daemon produces — see the module doc for why
+/// there is no `SbiServer` / `SbiClient` pair here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdmEventId {
+    /// FSM entry signal
+    FsmEntry,
+    /// FSM exit signal
+    FsmExit,
+    /// SBI timer event
+    SbiTimer,
 }
 
-/// Simplified SBI request representation
-#[derive(Debug, Clone)]
-pub struct SbiRequest {
-    /// HTTP method
-    pub method: String,
-    /// URI
-    pub uri: String,
-    /// Body content
-    pub body: Option<String>,
+impl UdmEventId {
+    /// Get the name of the event
+    pub fn name(&self) -> &'static str {
+        match self {
+            UdmEventId::FsmEntry => "NEXTGCORE_FSM_ENTRY_SIG",
+            UdmEventId::FsmExit => "NEXTGCORE_FSM_EXIT_SIG",
+            UdmEventId::SbiTimer => "NEXTGCORE_EVENT_SBI_TIMER",
+        }
+    }
 }
 
-/// Simplified SBI response representation
-#[derive(Debug, Clone)]
-pub struct SbiResponse {
-    /// HTTP status code
-    pub status: u16,
-    /// Body content
-    pub body: Option<String>,
-}
-
-/// Simplified SBI message representation
-#[derive(Debug, Clone, Default)]
-pub struct SbiMessage {
-    /// Service name
-    pub service_name: String,
-    /// API version
-    pub api_version: String,
-    /// Resource components
-    pub resource_components: Vec<String>,
-    /// HTTP method
-    pub method: String,
-    /// Response status (for client responses)
-    pub res_status: Option<u16>,
-    /// Number of dataset names (for SDM queries)
-    pub num_of_dataset_names: usize,
-}
-
-/// UDM Event structure
+/// UDM Event structure.
+///
+/// #242 also removed the `udm_ue_id` / `sess_id` fields and their `with_udm_ue` /
+/// `with_sess` builders: they existed so the main FSM could tell the per-UE and
+/// per-session child FSMs which context an SBI request belonged to, and with
+/// those children gone nothing writes them and nothing reads them.
 #[derive(Debug, Clone)]
 pub struct UdmEvent {
     /// Event ID
     pub id: UdmEventId,
     /// Timer ID (for timer events)
     pub timer_id: Option<UdmTimerId>,
-    /// SBI event data
-    pub sbi: Option<SbiEventData>,
-    /// UDM UE ID (pool ID)
-    pub udm_ue_id: Option<u64>,
-    /// Session ID (pool ID)
-    pub sess_id: Option<u64>,
     /// NF instance ID (for NF-related events)
     pub nf_instance_id: Option<String>,
     /// Subscription data ID (for subscription events)
@@ -161,9 +108,6 @@ impl UdmEvent {
         Self {
             id,
             timer_id: None,
-            sbi: None,
-            udm_ue_id: None,
-            sess_id: None,
             nf_instance_id: None,
             subscription_id: None,
         }
@@ -179,54 +123,11 @@ impl UdmEvent {
         Self::new(UdmEventId::FsmExit)
     }
 
-    /// Create an SBI server event
-    pub fn sbi_server(stream_id: u64, request: SbiRequest) -> Self {
-        Self {
-            id: UdmEventId::SbiServer,
-            timer_id: None,
-            sbi: Some(SbiEventData {
-                request: Some(request),
-                response: None,
-                message: None,
-                stream_id: Some(stream_id),
-                data: None,
-                state: None,
-            }),
-            udm_ue_id: None,
-            sess_id: None,
-            nf_instance_id: None,
-            subscription_id: None,
-        }
-    }
-
-    /// Create an SBI client event
-    pub fn sbi_client(response: SbiResponse, data: u64) -> Self {
-        Self {
-            id: UdmEventId::SbiClient,
-            timer_id: None,
-            sbi: Some(SbiEventData {
-                request: None,
-                response: Some(response),
-                message: None,
-                stream_id: None,
-                data: Some(data),
-                state: None,
-            }),
-            udm_ue_id: None,
-            sess_id: None,
-            nf_instance_id: None,
-            subscription_id: None,
-        }
-    }
-
     /// Create an SBI timer event
     pub fn sbi_timer(timer_id: UdmTimerId) -> Self {
         Self {
             id: UdmEventId::SbiTimer,
             timer_id: Some(timer_id),
-            sbi: None,
-            udm_ue_id: None,
-            sess_id: None,
             nf_instance_id: None,
             subscription_id: None,
         }
@@ -235,18 +136,6 @@ impl UdmEvent {
     /// Get the event name
     pub fn name(&self) -> &'static str {
         self.id.name()
-    }
-
-    /// Set UDM UE ID
-    pub fn with_udm_ue(mut self, udm_ue_id: u64) -> Self {
-        self.udm_ue_id = Some(udm_ue_id);
-        self
-    }
-
-    /// Set session ID
-    pub fn with_sess(mut self, sess_id: u64) -> Self {
-        self.sess_id = Some(sess_id);
-        self
     }
 
     /// Set NF instance ID
@@ -260,74 +149,6 @@ impl UdmEvent {
         self.subscription_id = Some(subscription_id);
         self
     }
-
-    /// Set SBI message
-    pub fn with_sbi_message(mut self, message: SbiMessage) -> Self {
-        if let Some(ref mut sbi) = self.sbi {
-            sbi.message = Some(message);
-        } else {
-            self.sbi = Some(SbiEventData {
-                request: None,
-                response: None,
-                message: Some(message),
-                stream_id: None,
-                data: None,
-                state: None,
-            });
-        }
-        self
-    }
-
-    /// Set SBI data
-    pub fn with_sbi_data(mut self, data: u64) -> Self {
-        if let Some(ref mut sbi) = self.sbi {
-            sbi.data = Some(data);
-        } else {
-            self.sbi = Some(SbiEventData {
-                request: None,
-                response: None,
-                message: None,
-                stream_id: None,
-                data: Some(data),
-                state: None,
-            });
-        }
-        self
-    }
-
-    /// Set SBI state
-    pub fn with_sbi_state(mut self, state: i32) -> Self {
-        if let Some(ref mut sbi) = self.sbi {
-            sbi.state = Some(state);
-        } else {
-            self.sbi = Some(SbiEventData {
-                request: None,
-                response: None,
-                message: None,
-                stream_id: None,
-                data: None,
-                state: Some(state),
-            });
-        }
-        self
-    }
-
-    /// Set stream ID
-    pub fn with_stream_id(mut self, stream_id: u64) -> Self {
-        if let Some(ref mut sbi) = self.sbi {
-            sbi.stream_id = Some(stream_id);
-        } else {
-            self.sbi = Some(SbiEventData {
-                request: None,
-                response: None,
-                message: None,
-                stream_id: Some(stream_id),
-                data: None,
-                state: None,
-            });
-        }
-        self
-    }
 }
 
 impl Default for UdmEvent {
@@ -336,10 +157,10 @@ impl Default for UdmEvent {
     }
 }
 
-/// Get the name of an event (for logging)
-pub fn udm_event_get_name(event: &UdmEvent) -> &'static str {
-    event.name()
-}
+// #242 also removed `udm_event_get_name(&UdmEvent) -> &'static str`, a one-line
+// alias for `UdmEvent::name`. Its production callers were the "unknown event"
+// error arms of the deleted `ue_sm.rs` / `sess_sm.rs`; the surviving logger
+// (`udm_sm::udm_sm_debug`) calls `name()` directly.
 
 #[cfg(test)]
 mod tests {
@@ -347,8 +168,8 @@ mod tests {
 
     #[test]
     fn test_event_creation() {
-        let event = UdmEvent::new(UdmEventId::SbiServer);
-        assert_eq!(event.id, UdmEventId::SbiServer);
+        let event = UdmEvent::new(UdmEventId::SbiTimer);
+        assert_eq!(event.id, UdmEventId::SbiTimer);
         assert!(event.timer_id.is_none());
     }
 
@@ -370,44 +191,56 @@ mod tests {
 
     #[test]
     fn test_event_name() {
-        let event = UdmEvent::new(UdmEventId::SbiServer);
-        assert_eq!(event.name(), "NEXTGCORE_EVENT_SBI_SERVER");
+        let event = UdmEvent::sbi_timer(UdmTimerId::SbiClientWait);
+        assert_eq!(event.name(), "NEXTGCORE_EVENT_SBI_TIMER");
     }
 
     #[test]
-    fn test_event_with_udm_ue() {
-        let event = UdmEvent::new(UdmEventId::SbiServer).with_udm_ue(123);
-        assert_eq!(event.udm_ue_id, Some(123));
+    fn test_event_with_nf_instance_and_subscription() {
+        let event = UdmEvent::sbi_timer(UdmTimerId::NfInstanceValidity)
+            .with_nf_instance("nf-1".to_string());
+        assert_eq!(event.nf_instance_id.as_deref(), Some("nf-1"));
+        assert_eq!(event.subscription_id, None);
+
+        let event = UdmEvent::sbi_timer(UdmTimerId::SubscriptionValidity)
+            .with_subscription("sub-1".to_string());
+        assert_eq!(event.subscription_id.as_deref(), Some("sub-1"));
+        assert_eq!(event.nf_instance_id, None);
     }
 
+    /// **Issue #242.** Every timer id has a distinct name, and every event id has
+    /// one — the names are what the daemon logs, so a duplicated one would make
+    /// two different expiries indistinguishable in an operator's log.
     #[test]
-    fn test_event_with_sess() {
-        let event = UdmEvent::new(UdmEventId::SbiServer).with_sess(456);
-        assert_eq!(event.sess_id, Some(456));
-    }
+    fn every_event_and_timer_id_has_a_distinct_name() {
+        let event_names: Vec<&str> = [
+            UdmEventId::FsmEntry,
+            UdmEventId::FsmExit,
+            UdmEventId::SbiTimer,
+        ]
+        .iter()
+        .map(|id| id.name())
+        .collect();
+        let mut unique = event_names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), event_names.len(), "{event_names:?}");
 
-    #[test]
-    fn test_sbi_server_event() {
-        let request = SbiRequest {
-            method: "POST".to_string(),
-            uri: "/nudm-ueau/v1/suci-0-001-01/security-information".to_string(),
-            body: None,
-        };
-        let event = UdmEvent::sbi_server(456, request);
-        assert_eq!(event.id, UdmEventId::SbiServer);
-        assert!(event.sbi.is_some());
-        assert_eq!(event.sbi.as_ref().unwrap().stream_id, Some(456));
-    }
-
-    #[test]
-    fn test_sbi_client_event() {
-        let response = SbiResponse {
-            status: 200,
-            body: None,
-        };
-        let event = UdmEvent::sbi_client(response, 789);
-        assert_eq!(event.id, UdmEventId::SbiClient);
-        assert!(event.sbi.is_some());
-        assert_eq!(event.sbi.as_ref().unwrap().data, Some(789));
+        let timer_names: Vec<&str> = [
+            UdmTimerId::NfInstanceRegistrationInterval,
+            UdmTimerId::NfInstanceHeartbeatInterval,
+            UdmTimerId::NfInstanceNoHeartbeat,
+            UdmTimerId::NfInstanceValidity,
+            UdmTimerId::SubscriptionValidity,
+            UdmTimerId::SubscriptionPatch,
+            UdmTimerId::SbiClientWait,
+        ]
+        .iter()
+        .map(|id| id.name())
+        .collect();
+        let mut unique = timer_names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), timer_names.len(), "{timer_names:?}");
     }
 }

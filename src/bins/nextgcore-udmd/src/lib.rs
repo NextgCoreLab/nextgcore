@@ -15,16 +15,18 @@ pub mod event;
 pub mod nes_driver; // issue #22 Network Energy Saving runtime (off by default)
 pub mod notify; // #83 Nudm_SDM Data Change Notification / Nudm_EE Event Occurrence
 pub mod nudm_handler;
-pub mod nudr_handler;
 pub mod sbi_path;
-pub mod sbi_response;
-pub mod sess_sm;
 /// Wave-6 F-04: Steering-of-Roaming injection into Nudm_SDM am-data via the
 /// real Nausf_SoRProtection producer (TS 33.501 §6.14.2.1, TS 29.503/29.509).
 pub mod sor;
 pub mod timer;
+/// UDM lifecycle + timer FSM. Its request-routing half, the per-UE / per-session
+/// child FSMs (`ue_sm`, `sess_sm`), the `nudr_handler` behind them and the
+/// `sbi_response` helpers they used were removed in #242: nothing ever
+/// constructed the `UdmEvent::sbi_server` they switched on, so they were
+/// structurally unreachable while reading as a working Nudm/Nudr request path.
+/// `udmd`'s one request path is `app.rs`'s `udm_sbi_route`.
 pub mod udm_sm;
-pub mod ue_sm;
 pub mod uecm;
 /// Wave-6 F-05: UE-Parameters-Update injection into Nudm_SDM am-data via the
 /// real Nausf_UPUProtection producer (TS 33.501 §6.15.2.1, TS 29.503/29.509).
@@ -38,10 +40,8 @@ pub use context::{
     UdmSdmSubscription, UdmSess, UdmUe,
 };
 pub use event::{UdmEvent, UdmEventId, UdmTimerId};
-pub use sess_sm::{UdmSessSmContext, UdmSessState};
 pub use timer::{timer_manager, timer_type_to_timer_id, udm_timer_get_name, UdmTimerManager};
 pub use udm_sm::{UdmSmContext, UdmState};
-pub use ue_sm::{UdmUeSmContext, UdmUeState};
 
 // Wave-6 H1: expose the real SBI request handler + the sub-handlers peer NF
 // crates drive for strict-peer tests (am-data GET + SoR/UPU ack), plus `run`.

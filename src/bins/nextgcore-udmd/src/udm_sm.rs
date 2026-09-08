@@ -1,14 +1,24 @@
-//! UDM Main State Machine
+//! UDM lifecycle + timer state machine.
 //!
-//! Port of src/udm/udm-sm.c - Main UDM state machine implementation
+//! Originally a port of `src/udm/udm-sm.c`, which in Open5GS is the daemon's
+//! *request* path: an SBI server event arrives, the main FSM routes it by service
+//! name, and per-UE / per-session child FSMs serve it.
+//!
+//! **In this tree that half never existed.** `udmd` serves every Nudm request
+//! through the live async HTTP dispatcher `app.rs::udm_sbi_route`, and nothing
+//! ever constructed the `UdmEvent::sbi_server` / `UdmEvent::sbi_client` that this
+//! module's routing half switched on — so `handle_sbi_server_event`,
+//! `handle_nudm_request`, the per-UE (`ue_sm.rs`) and per-session (`sess_sm.rs`)
+//! child machines and the `nudr_handler.rs` they called were **structurally
+//! unreachable**, while reading as an authoritative Nudm/Nudr request path. Issue
+//! #242 removed all of it; see `specs/fix-udmd-delete-unreachable-state-machine-sbi-half.md`
+//! for the enumeration and the delete-vs-wire reasoning.
+//!
+//! What survives is what `app.rs` really drives: the Initial -> Operational ->
+//! Final lifecycle (`app.rs:333`) and the expired-timer branch fed from
+//! `run_event_loop_async` (`app.rs:3504`).
 
-use crate::context::{udm_self, UdmUe};
 use crate::event::{UdmEvent, UdmEventId, UdmTimerId};
-use crate::sbi_response::{
-    send_error_response, send_gateway_timeout_response, send_not_found_response,
-};
-use crate::sess_sm::{UdmSessSmContext, UdmSessState};
-use crate::ue_sm::{UdmUeSmContext, UdmUeState};
 
 /// UDM state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,10 +35,6 @@ pub enum UdmState {
 pub struct UdmSmContext {
     /// Current state
     state: UdmState,
-    /// UE state machines (keyed by UE ID)
-    ue_sms: std::collections::HashMap<u64, UdmUeSmContext>,
-    /// Session state machines (keyed by session ID)
-    sess_sms: std::collections::HashMap<u64, UdmSessSmContext>,
 }
 
 impl UdmSmContext {
@@ -36,8 +42,6 @@ impl UdmSmContext {
     pub fn new() -> Self {
         Self {
             state: UdmState::Initial,
-            ue_sms: std::collections::HashMap::new(),
-            sess_sms: std::collections::HashMap::new(),
         }
     }
 
@@ -109,507 +113,22 @@ impl UdmSmContext {
                 log::info!("UDM exiting operational state");
             }
 
-            UdmEventId::SbiServer => {
-                self.handle_sbi_server_event(event);
-            }
-
-            UdmEventId::SbiClient => {
-                self.handle_sbi_client_event(event);
-            }
-
             UdmEventId::SbiTimer => {
                 self.handle_sbi_timer_event(event);
             }
         }
     }
 
-    /// Handle SBI server events
-    fn handle_sbi_server_event(&mut self, event: &mut UdmEvent) {
-        let (
-            stream_id,
-            service_name,
-            api_version,
-            method,
-            resource_components,
-            num_of_dataset_names,
-        ) = {
-            let sbi = match &event.sbi {
-                Some(sbi) => sbi,
-                None => {
-                    log::error!("No SBI data in server event");
-                    return;
-                }
-            };
-
-            let stream_id = match sbi.stream_id {
-                Some(id) => id,
-                None => {
-                    log::error!("No stream ID in SBI event");
-                    return;
-                }
-            };
-
-            let message = match &sbi.message {
-                Some(msg) => msg,
-                None => {
-                    log::error!("No message in SBI event");
-                    return;
-                }
-            };
-
-            (
-                stream_id,
-                message.service_name.clone(),
-                message.api_version.clone(),
-                message.method.clone(),
-                message.resource_components.clone(),
-                message.num_of_dataset_names,
-            )
-        };
-
-        // Check API version based on service
-        let expected_version = if service_name == "nudm-sdm" {
-            "v2"
-        } else {
-            "v1"
-        };
-        if api_version != expected_version {
-            log::error!("Not supported version [{api_version}]");
-            send_error_response(
-                stream_id,
-                400,
-                &format!("Unsupported API version: {api_version}"),
-            );
-            return;
-        }
-
-        // Route based on service name
-        match service_name.as_str() {
-            "nnrf-nfm" => {
-                self.handle_nnrf_nfm_request(&method, &resource_components, stream_id);
-            }
-            "nudm-ueau" | "nudm-uecm" | "nudm-sdm" => {
-                self.handle_nudm_request(
-                    event,
-                    &service_name,
-                    &method,
-                    &resource_components,
-                    stream_id,
-                    num_of_dataset_names,
-                );
-            }
-            _ => {
-                log::error!("Invalid API name [{service_name}]");
-                send_error_response(stream_id, 400, &format!("Invalid API name: {service_name}"));
-            }
-        }
-    }
-
-    /// Handle NNRF NFM (NF Management) requests
-    fn handle_nnrf_nfm_request(
-        &mut self,
-        method: &str,
-        resource_components: &[String],
-        _stream_id: u64,
-    ) {
-        let resource = resource_components.first().map(|s| s.as_str());
-
-        match resource {
-            Some("nf-status-notify") => match method {
-                "POST" => {
-                    log::debug!("NF status notify received");
-                    // Note: NF status notify handling requires NRF integration to dispatch to NF FSM
-                }
-                _ => {
-                    log::error!("Invalid HTTP method [{method}]");
-                }
-            },
-            _ => {
-                log::error!("Invalid resource name [{:?}]", resource_components.first());
-            }
-        }
-    }
-
-    /// Handle NUDM requests (UEAU, UECM, SDM)
-    fn handle_nudm_request(
-        &mut self,
-        event: &mut UdmEvent,
-        _service_name: &str,
-        method: &str,
-        resource_components: &[String],
-        stream_id: u64,
-        num_of_dataset_names: usize,
-    ) {
-        // First resource component should be SUPI or SUCI
-        let supi_or_suci = match resource_components.first() {
-            Some(s) => s,
-            None => {
-                log::error!("Not found [{method}]");
-                send_not_found_response(stream_id, "SUPI/SUCI not specified");
-                return;
-            }
-        };
-
-        // Check for auth-events with ctx_id
-        let mut udm_ue: Option<UdmUe> = None;
-
-        if num_of_dataset_names == 0 {
-            if let Some(resource1) = resource_components.get(1) {
-                if resource1 == "auth-events" {
-                    if let Some(ctx_id) = resource_components.get(2) {
-                        let ctx = udm_self();
-                        let context = ctx.read().unwrap();
-                        udm_ue = context.ue_find_by_ctx_id(ctx_id);
-                    }
-                }
-            }
-        }
-
-        // If not found by ctx_id, try SUPI/SUCI
-        if udm_ue.is_none() {
-            let ctx = udm_self();
-            let context = ctx.read().unwrap();
-
-            // Try to find by SUPI first
-            let supi = extract_supi(supi_or_suci);
-            if let Some(ref s) = supi {
-                udm_ue = context.ue_find_by_supi(s);
-            }
-
-            // If not found, try to add for POST/GET methods
-            if udm_ue.is_none() {
-                drop(context);
-                match method {
-                    "POST" | "GET" => {
-                        let ctx = udm_self();
-                        let context = ctx.read().unwrap();
-                        udm_ue = context.ue_add(supi_or_suci);
-                        if udm_ue.is_none() {
-                            log::error!("Invalid Request [{supi_or_suci}]");
-                        }
-                    }
-                    _ => {
-                        log::error!("Invalid HTTP method [{method}]");
-                    }
-                }
-            }
-        }
-
-        let udm_ue = match udm_ue {
-            Some(ue) => ue,
-            None => {
-                log::error!("Not found [{method}]");
-                send_not_found_response(stream_id, "UDM UE not found");
-                return;
-            }
-        };
-
-        // Check if this is a session-related request (SMF registrations)
-        if let Some(resource2) = resource_components.get(2) {
-            if resource2 == "smf-registrations" {
-                if let Some(psi_str) = resource_components.get(3) {
-                    if let Ok(psi) = psi_str.parse::<u8>() {
-                        self.handle_sess_request(event, &udm_ue, psi, stream_id);
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Handle UE-level request
-        self.handle_ue_request(event, &udm_ue, stream_id);
-    }
-
-    /// Handle UE-level request
-    fn handle_ue_request(&mut self, event: &mut UdmEvent, udm_ue: &UdmUe, stream_id: u64) {
-        // Get or create UE state machine
-        let ue_sm = self
-            .ue_sms
-            .entry(udm_ue.id)
-            .or_insert_with(|| UdmUeSmContext::new(udm_ue.id));
-
-        // Set event data
-        event.udm_ue_id = Some(udm_ue.id);
-        if let Some(ref mut sbi) = event.sbi {
-            sbi.stream_id = Some(stream_id);
-        }
-
-        // Dispatch to UE state machine
-        ue_sm.dispatch(event);
-
-        // Check for exception state
-        if ue_sm.state() == UdmUeState::Exception {
-            log::error!("[{}] State machine exception", udm_ue.suci);
-            self.ue_sms.remove(&udm_ue.id);
-            let ctx = udm_self();
-            let context = ctx.read().unwrap();
-            context.ue_remove(udm_ue.id);
-        }
-    }
-
-    /// Handle session-level request
-    fn handle_sess_request(
-        &mut self,
-        event: &mut UdmEvent,
-        udm_ue: &UdmUe,
-        psi: u8,
-        stream_id: u64,
-    ) {
-        // Find or create session
-        let ctx = udm_self();
-        let context = ctx.read().unwrap();
-
-        let sess = match context.sess_find_by_psi(udm_ue.id, psi) {
-            Some(s) => s,
-            None => {
-                drop(context);
-                let ctx = udm_self();
-                let context = ctx.read().unwrap();
-                match context.sess_add(udm_ue.id, psi) {
-                    Some(s) => {
-                        log::debug!(
-                            "[{}:{}] UDM session added",
-                            udm_ue.supi.as_deref().unwrap_or(&udm_ue.suci),
-                            psi
-                        );
-                        s
-                    }
-                    None => {
-                        log::error!("Failed to add session");
-                        return;
-                    }
-                }
-            }
-        };
-
-        // Get or create session state machine
-        let sess_sm = self
-            .sess_sms
-            .entry(sess.id)
-            .or_insert_with(|| UdmSessSmContext::new(sess.id, udm_ue.id));
-
-        // Set event data
-        event.sess_id = Some(sess.id);
-        event.udm_ue_id = Some(udm_ue.id);
-        if let Some(ref mut sbi) = event.sbi {
-            sbi.stream_id = Some(stream_id);
-        }
-
-        // Dispatch to session state machine
-        sess_sm.dispatch(event);
-
-        // Check for exception state
-        if sess_sm.state() == UdmSessState::Exception {
-            log::error!("[{}:{}] State machine exception", udm_ue.suci, psi);
-            self.sess_sms.remove(&sess.id);
-            let ctx = udm_self();
-            let context = ctx.read().unwrap();
-            context.sess_remove(sess.id);
-        }
-    }
-
-    /// Handle SBI client events
-    fn handle_sbi_client_event(&mut self, event: &mut UdmEvent) {
-        let (service_name, api_version, resource_components, _res_status) = {
-            let sbi = match &event.sbi {
-                Some(sbi) => sbi,
-                None => {
-                    log::error!("No SBI data in client event");
-                    return;
-                }
-            };
-
-            let message = match &sbi.message {
-                Some(msg) => msg,
-                None => {
-                    log::error!("No message in SBI client event");
-                    return;
-                }
-            };
-
-            (
-                message.service_name.clone(),
-                message.api_version.clone(),
-                message.resource_components.clone(),
-                message.res_status,
-            )
-        };
-
-        // Check API version
-        let expected_version = if service_name == "nudm-sdm" {
-            "v2"
-        } else {
-            "v1"
-        };
-        if api_version != expected_version {
-            log::error!("Not supported version [{api_version}]");
-            return;
-        }
-
-        // Route based on service name
-        match service_name.as_str() {
-            "nnrf-nfm" => {
-                self.handle_nnrf_nfm_response(&resource_components);
-            }
-            "nnrf-disc" => {
-                self.handle_nnrf_disc_response(event, &resource_components);
-            }
-            "nudr-dr" => {
-                self.handle_nudr_dr_response(event, &resource_components);
-            }
-            _ => {
-                log::error!("Invalid API name [{service_name}]");
-            }
-        }
-    }
-
-    /// Handle NNRF NFM responses
-    fn handle_nnrf_nfm_response(&mut self, resource_components: &[String]) {
-        let resource = resource_components.first().map(|s| s.as_str());
-
-        match resource {
-            Some("nf-instances") => {
-                log::debug!("NF instances response received");
-                // Note: NF instance FSM dispatch requires NRF integration
-            }
-            Some("subscriptions") => {
-                log::debug!("Subscriptions response received");
-                // Note: Subscription handling requires NRF integration
-            }
-            _ => {
-                log::error!("Invalid resource name [{:?}]", resource_components.first());
-            }
-        }
-    }
-
-    /// Handle NNRF DISC responses
-    fn handle_nnrf_disc_response(&mut self, _event: &mut UdmEvent, resource_components: &[String]) {
-        let resource = resource_components.first().map(|s| s.as_str());
-
-        match resource {
-            Some("nf-instances") => {
-                log::debug!("NF discover response received");
-                // Note: NF discover handling requires NRF integration
-            }
-            _ => {
-                log::error!("Invalid resource name [{:?}]", resource_components.first());
-            }
-        }
-    }
-
-    /// Handle NUDR DR responses
-    fn handle_nudr_dr_response(&mut self, event: &mut UdmEvent, resource_components: &[String]) {
-        let resource = resource_components.first().map(|s| s.as_str());
-
-        match resource {
-            Some("subscription-data") => {
-                // Check if this is a session-related response (SMF registrations)
-                if let Some(resource3) = resource_components.get(3) {
-                    if resource3 == "smf-registrations" {
-                        self.handle_nudr_sess_response(event);
-                        return;
-                    }
-                }
-                // Otherwise, it's a UE-level response
-                self.handle_nudr_ue_response(event);
-            }
-            _ => {
-                log::error!("Invalid resource name [{:?}]", resource_components.first());
-            }
-        }
-    }
-
-    /// Handle NUDR UE-level response
-    fn handle_nudr_ue_response(&mut self, event: &mut UdmEvent) {
-        let udm_ue_id = match event.udm_ue_id {
-            Some(id) => id,
-            None => {
-                log::error!("No UDM UE ID in event");
-                return;
-            }
-        };
-
-        let ctx = udm_self();
-        let context = ctx.read().unwrap();
-
-        let udm_ue = match context.ue_find_by_id(udm_ue_id) {
-            Some(ue) => ue,
-            None => {
-                log::error!("UE Context has already been removed");
-                return;
-            }
-        };
-
-        // Get UE state machine
-        let ue_sm = match self.ue_sms.get_mut(&udm_ue_id) {
-            Some(sm) => sm,
-            None => {
-                log::error!("UE state machine not found");
-                return;
-            }
-        };
-
-        // Dispatch to UE state machine
-        ue_sm.dispatch(event);
-
-        // Check for exception state
-        if ue_sm.state() == UdmUeState::Exception {
-            log::warn!("[{}] State machine exception", udm_ue.suci);
-            self.ue_sms.remove(&udm_ue_id);
-            context.ue_remove(udm_ue_id);
-        }
-    }
-
-    /// Handle NUDR session-level response
-    fn handle_nudr_sess_response(&mut self, event: &mut UdmEvent) {
-        let sess_id = match event.sess_id {
-            Some(id) => id,
-            None => {
-                log::error!("No session ID in event");
-                return;
-            }
-        };
-
-        let ctx = udm_self();
-        let context = ctx.read().unwrap();
-
-        let sess = match context.sess_find_by_id(sess_id) {
-            Some(s) => s,
-            None => {
-                log::error!("SESS Context has already been removed");
-                return;
-            }
-        };
-
-        let udm_ue = match context.ue_find_by_id(sess.udm_ue_id) {
-            Some(ue) => ue,
-            None => {
-                log::error!("UE Context has already been removed");
-                return;
-            }
-        };
-
-        // Get session state machine
-        let sess_sm = match self.sess_sms.get_mut(&sess_id) {
-            Some(sm) => sm,
-            None => {
-                log::error!("Session state machine not found");
-                return;
-            }
-        };
-
-        // Dispatch to session state machine
-        sess_sm.dispatch(event);
-
-        // Check for exception state
-        if sess_sm.state() == UdmSessState::Exception {
-            log::error!("[{}:{}] State machine exception", udm_ue.suci, sess.psi);
-            self.sess_sms.remove(&sess_id);
-            context.sess_remove(sess_id);
-        }
-    }
-
-    /// Handle SBI timer events
+    /// Handle SBI timer events.
+    ///
+    /// Every arm is observational. `app.rs::run_event_loop_async` builds the
+    /// event as `UdmEvent::sbi_timer(timer_id)` plus, for the NF-instance timers,
+    /// `with_nf_instance` — so the NF-instance arm logs, and the two subscription
+    /// arms and `SbiClientWait` cannot say anything useful because nothing
+    /// populates `subscription_id` on the timer path. Acting on any of them needs
+    /// the NRF NF-instance FSM that `udmd` does not have; the arms are kept
+    /// because the timers really do expire and a silent expiry is worse than a
+    /// logged one.
     fn handle_sbi_timer_event(&mut self, event: &mut UdmEvent) {
         let timer_id = match event.timer_id {
             Some(id) => id,
@@ -629,53 +148,37 @@ impl UdmSmContext {
                     // Note: NF instance FSM dispatch requires NRF integration
                 }
             }
+            // These two used to log only `if let Some(subscription_id)`, and
+            // nothing on the timer path populates one -- `run_event_loop_async`
+            // attaches `with_nf_instance` and nothing else -- so an expiry that
+            // really does happen produced NO output at all. Logged unconditionally
+            // now, naming the missing id, because a silent expiry is the same
+            // invisible-state problem #242 is about.
             UdmTimerId::SubscriptionValidity => {
-                if let Some(ref subscription_id) = event.subscription_id {
-                    log::error!("[{subscription_id}] Subscription validity expired");
-                    // Note: Subscription renewal requires NRF integration
-                }
+                log::error!(
+                    "Subscription validity expired [{}] (renewal requires NRF integration)",
+                    event.subscription_id.as_deref().unwrap_or("no id attached")
+                );
             }
             UdmTimerId::SubscriptionPatch => {
-                if let Some(ref subscription_id) = event.subscription_id {
-                    log::info!("[{subscription_id}] Need to update Subscription");
-                    // Note: Subscription update requires NRF integration
-                }
+                log::info!(
+                    "Subscription needs update [{}] (patch requires NRF integration)",
+                    event.subscription_id.as_deref().unwrap_or("no id attached")
+                );
             }
             UdmTimerId::SbiClientWait => {
-                log::error!("Cannot receive SBI message");
-                // Send gateway timeout if we have stream context
-                if let Some(ref sbi) = event.sbi {
-                    if let Some(stream_id) = sbi.stream_id {
-                        send_gateway_timeout_response(stream_id, "SBI client timeout");
-                    }
-                }
+                // #242: this used to answer 504 Gateway Timeout on the waiting
+                // stream. It could not: the stream id came from `event.sbi`,
+                // which only the removed `UdmEvent::sbi_server` constructor ever
+                // populated, and the sink (`sbi_path::send_sbi_response`) was a
+                // logging placeholder that sent nothing over the wire. Restoring
+                // a real 504 needs the transaction/stream plumbing `udmd` has
+                // never had, so the expiry is logged rather than answered.
+                log::error!(
+                    "SBI client wait timer expired (no stream to answer: udmd's request \
+                     path is app.rs::udm_sbi_route, which owns its own response)"
+                );
             }
-        }
-    }
-
-    /// Initialize UE state machine
-    pub fn ue_sm_init(&mut self, udm_ue_id: u64) {
-        let ue_sm = UdmUeSmContext::new(udm_ue_id);
-        self.ue_sms.insert(udm_ue_id, ue_sm);
-    }
-
-    /// Finalize UE state machine
-    pub fn ue_sm_fini(&mut self, udm_ue_id: u64) {
-        if let Some(mut ue_sm) = self.ue_sms.remove(&udm_ue_id) {
-            ue_sm.fini();
-        }
-    }
-
-    /// Initialize session state machine
-    pub fn sess_sm_init(&mut self, sess_id: u64, udm_ue_id: u64) {
-        let sess_sm = UdmSessSmContext::new(sess_id, udm_ue_id);
-        self.sess_sms.insert(sess_id, sess_sm);
-    }
-
-    /// Finalize session state machine
-    pub fn sess_sm_fini(&mut self, sess_id: u64) {
-        if let Some(mut sess_sm) = self.sess_sms.remove(&sess_id) {
-            sess_sm.fini();
         }
     }
 }
@@ -683,18 +186,6 @@ impl UdmSmContext {
 impl Default for UdmSmContext {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Extract SUPI from SUCI or SUPI string
-fn extract_supi(suci_or_supi: &str) -> Option<String> {
-    if suci_or_supi.starts_with("imsi-") {
-        Some(suci_or_supi.to_string())
-    } else if suci_or_supi.starts_with("suci-") {
-        // For SUCI, we would need to decode it - for now return None
-        None
-    } else {
-        None
     }
 }
 
@@ -754,5 +245,45 @@ mod tests {
         ctx.init();
         ctx.fini();
         assert_eq!(ctx.state(), UdmState::Final);
+    }
+
+    /// **Issue #242.** The state machine handles exactly the events `app.rs`
+    /// dispatches, and every timer id survives a dispatch without panicking.
+    ///
+    /// The point of this test is the ENUMERATION: `UdmEventId` now has three
+    /// variants and `handle_operational_state` matches all three exhaustively, so
+    /// re-adding an `SbiServer` variant without a producer would fail to compile
+    /// here rather than reintroducing a silently unreachable arm.
+    #[test]
+    fn operational_state_handles_every_event_the_daemon_dispatches() {
+        let mut ctx = UdmSmContext::new();
+        ctx.init();
+        assert!(ctx.is_operational());
+
+        for id in [UdmEventId::FsmEntry, UdmEventId::FsmExit] {
+            let mut event = UdmEvent::new(id);
+            ctx.dispatch(&mut event);
+            assert!(ctx.is_operational(), "{id:?} must not change state");
+        }
+
+        for timer_id in [
+            UdmTimerId::NfInstanceRegistrationInterval,
+            UdmTimerId::NfInstanceHeartbeatInterval,
+            UdmTimerId::NfInstanceNoHeartbeat,
+            UdmTimerId::NfInstanceValidity,
+            UdmTimerId::SubscriptionValidity,
+            UdmTimerId::SubscriptionPatch,
+            UdmTimerId::SbiClientWait,
+        ] {
+            let mut event = UdmEvent::sbi_timer(timer_id);
+            ctx.dispatch(&mut event);
+            assert!(ctx.is_operational(), "{timer_id:?} must not change state");
+        }
+
+        // A timer event with no timer id is rejected, not unwrapped.
+        let mut malformed = UdmEvent::new(UdmEventId::SbiTimer);
+        assert_eq!(malformed.timer_id, None);
+        ctx.dispatch(&mut malformed);
+        assert!(ctx.is_operational());
     }
 }
