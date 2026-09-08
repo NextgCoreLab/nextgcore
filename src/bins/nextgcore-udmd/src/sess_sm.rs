@@ -4,9 +4,7 @@
 
 use crate::context::udm_self;
 use crate::event::{UdmEvent, UdmEventId};
-use crate::nudm_handler;
-use crate::nudr_handler;
-use crate::sbi_response::{send_error_response, send_method_not_allowed_response};
+use crate::sbi_response::send_error_response;
 
 /// UDM Session state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,43 +241,32 @@ impl UdmSessSmContext {
     }
 
     /// Handle NUDM UECM requests for session
+    ///
+    /// udmd-04 / #236: SMF registration and deregistration are handled by the
+    /// live async HTTP dispatcher (`app.rs::udm_sbi_route` ->
+    /// [`crate::uecm::process_smf_registration`] /
+    /// [`crate::uecm::process_smf_deregistration`]). The state-machine branch is
+    /// a legacy Open5GS port that was never wired to the HTTP path — nothing in
+    /// the tree constructs a `UdmEvent::sbi_server`, so this is unreachable. It
+    /// used to call `nudm_handler`'s own second implementation of both
+    /// procedures, and did so with a **default-constructed**
+    /// `SmfRegistrationRequest` (the removed body-parsing was never written), so
+    /// had it ever been reached it would have registered an empty SMF. The
+    /// handler calls have been removed with those handlers; the structure is
+    /// kept for future extension only, matching `ue_sm.rs`.
     fn handle_nudm_uecm_request(
         &mut self,
-        suci: &str,
-        psi: u8,
-        method: &str,
-        resource_components: &[String],
-        stream_id: u64,
+        _suci: &str,
+        _psi: u8,
+        _method: &str,
+        _resource_components: &[String],
+        _stream_id: u64,
     ) {
-        let resource = resource_components.get(1).map(|s| s.as_str());
-
-        match resource {
-            Some("registrations") => match method {
-                "PUT" => {
-                    // Note: In production, parse SmfRegistrationRequest from HTTP body
-                    let request = nudm_handler::SmfRegistrationRequest::default();
-                    let _result = nudm_handler::udm_nudm_uecm_handle_smf_registration(
-                        self.sess_id,
-                        stream_id,
-                        &request,
-                    );
-                }
-                "DELETE" => {
-                    let _result = nudm_handler::udm_nudm_uecm_handle_smf_deregistration(
-                        self.sess_id,
-                        stream_id,
-                    );
-                }
-                _ => {
-                    log::error!("[{suci}:{psi}] Invalid HTTP method [{method}]");
-                    send_method_not_allowed_response(stream_id, method, "nudm-uecm/registrations");
-                }
-            },
-            _ => {
-                log::error!("[{suci}:{psi}] Invalid resource name [{resource:?}]");
-                send_error_response(stream_id, 404, &format!("Resource not found: {resource:?}"));
-            }
-        }
+        log::debug!(
+            "UDM Sess SM [{}:{}]: UECM request on state-machine path — handled by HTTP dispatcher",
+            self.udm_ue_id,
+            self.sess_id
+        );
     }
 
     /// Handle SBI client events in operational state
@@ -333,42 +320,24 @@ impl UdmSessSmContext {
     }
 
     /// Handle NUDR DR responses for session
+    ///
+    /// udmd-04 / #236: see [`Self::handle_nudm_uecm_request`]. The removed body
+    /// hardcoded the HTTP method to `"PUT"` and the status to `204` rather than
+    /// reading either from the response it was dispatched for, so it could only
+    /// ever have reported one outcome.
     fn handle_nudr_dr_response(
         &mut self,
-        suci: &str,
+        _suci: &str,
         _supi: Option<&str>,
-        psi: u8,
-        resource_components: &[String],
-        stream_id: u64,
+        _psi: u8,
+        _resource_components: &[String],
+        _stream_id: u64,
     ) {
-        let resource = resource_components.first().map(|s| s.as_str());
-
-        match resource {
-            Some("subscription-data") => {
-                let resource2 = resource_components.get(2).map(|s| s.as_str());
-                match resource2 {
-                    Some("context-data") => {
-                        let resource3 =
-                            resource_components.get(3).map(|s| s.as_str()).unwrap_or("");
-                        // Note: HTTP method and status extracted from SBI response message headers
-                        let (_result, _registration) =
-                            nudr_handler::udm_nudr_dr_handle_smf_registration(
-                                self.sess_id,
-                                stream_id,
-                                "PUT", // HTTP method
-                                resource3,
-                                204, // HTTP status
-                            );
-                    }
-                    _ => {
-                        log::error!("[{suci}:{psi}] Invalid resource name [{resource2:?}]");
-                    }
-                }
-            }
-            _ => {
-                log::error!("[{suci}:{psi}] Invalid resource name [{resource:?}]");
-            }
-        }
+        log::debug!(
+            "UDM Sess SM [{}:{}]: NUDR-DR response on state-machine path — handled by HTTP dispatcher",
+            self.udm_ue_id,
+            self.sess_id
+        );
     }
 
     /// Handle exception state

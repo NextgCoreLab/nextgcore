@@ -1,21 +1,58 @@
-//! NUDM Handler Functions
+//! Shared helpers left over from the `src/udm/nudm-handler.c` port.
 //!
-//! Port of src/udm/nudm-handler.c - NUDM service handlers
-//! Handles NUDM-UEAU, NUDM-UECM, and NUDM-SDM service requests
-
-use crate::context::{
-    udm_self, Amf3GppAccessRegistration, AuthEvent, AuthType, Guami, PlmnId, RatType,
-    SmfRegistration, UdmSdmSubscription,
-};
+//! This module no longer handles any Nudm service request. It once held a
+//! second, unreachable Nudm UECM/SDM/UEAU implementation beside the live one in
+//! [`crate::uecm`] and [`crate::app`]; see the removal note below for what went
+//! and why. What remains is the [`HandlerResult`] / [`http_status`] pair that
+//! [`crate::nudr_handler`] returns, plus the hex codec that `app.rs`, `sor.rs`
+//! and `upu.rs` use for wire-format key material.
+//!
+//! ## Removed in #236: nine unreachable Nudm handlers
+//!
+//! Every handler below had a live counterpart already serving the same
+//! procedure, so the file was two implementations of one thing with nothing
+//! marking which was which:
+//!
+//! | removed | live implementation that serves it |
+//! |---|---|
+//! | `udm_nudm_uecm_handle_amf_registration` | [`crate::uecm::process_amf_registration`] |
+//! | `udm_nudm_uecm_handle_amf_registration_update` | [`crate::uecm::process_amf_registration_update`] |
+//! | `udm_nudm_uecm_handle_amf_registration_get` | [`crate::uecm::process_amf_registration_get`] |
+//! | `udm_nudm_uecm_handle_smf_registration` | [`crate::uecm::process_smf_registration`] |
+//! | `udm_nudm_uecm_handle_smf_deregistration` | [`crate::uecm::process_smf_deregistration`] |
+//! | `udm_nudm_ueau_handle_result_confirmation_inform` | [`crate::app::handle_auth_event`] |
+//! | `udm_nudm_sdm_handle_subscription_create` | `app.rs::handle_sdm_subscribe` |
+//! | `udm_nudm_sdm_handle_subscription_delete` | the `sdm-subscriptions` DELETE arm of `app.rs::udm_sbi_route` |
+//! | `udm_nudm_sdm_handle_subscription_provisioned` | the `ue-context-in-smf-data` GET arm, which answers 501 |
+//!
+//! Seven had no reference anywhere outside this file. The two SMF ones were
+//! reached only from [`crate::sess_sm`], whose SBI half is itself unreachable —
+//! `UdmEvent::sbi_server` has no constructor in the tree, so the live router
+//! (`app.rs::udm_sbi_route`) is the only thing that ever serves a Nudm request.
+//! The `ue-context-in-smf-data` case is worth naming: the removed handler
+//! returned `HandlerResult::ok()` while doing nothing, whereas the live route
+//! answers 501, so the dead copy was the more dishonest of the two.
+//!
+//! Also removed, having had no non-test caller at all: `parse_amf_id`,
+//! `guami_matches` (the live GUAMI comparison is `uecm.rs`'s, which operates on
+//! the parsed JSON), `buffer_to_u64` and `u64_to_buffer`, together with the
+//! request structs that only fed the deleted handlers
+//! (`Amf3GppAccessRegistrationRequest`, `Amf3GppAccessRegistrationModificationRequest`,
+//! `GuamiRequest`, `PlmnIdRequest`, `SmfRegistrationRequest`,
+//! `SdmSubscriptionRequest`, `AuthEventRequest`) and the two `HandlerResult`
+//! constructors only they used (`created`, `not_found`).
+//!
+//! This continues PR #228, which removed `udm_nudm_ueau_handle_get` from here
+//! for the same reason: it was the only code that persisted `ausf_instance_id`
+//! and it had no caller, so SoR/UPU always picked an arbitrary AUSF (#84 gap 4).
 
 /// HTTP status codes
 pub mod http_status {
     pub const OK: u16 = 200;
-    pub const CREATED: u16 = 201;
     pub const NO_CONTENT: u16 = 204;
     pub const BAD_REQUEST: u16 = 400;
     pub const FORBIDDEN: u16 = 403;
-    pub const NOT_FOUND: u16 = 404;
+    pub const CREATED: u16 = 201;
     pub const INTERNAL_SERVER_ERROR: u16 = 500;
 }
 
@@ -33,15 +70,6 @@ impl HandlerResult {
         Self {
             success: true,
             status: http_status::OK,
-            error_message: None,
-            error_cause: None,
-        }
-    }
-
-    pub fn created() -> Self {
-        Self {
-            success: true,
-            status: http_status::CREATED,
             error_message: None,
             error_cause: None,
         }
@@ -73,721 +101,6 @@ impl HandlerResult {
             error_cause: cause.map(|s| s.to_string()),
         }
     }
-
-    pub fn not_found(message: &str) -> Self {
-        Self {
-            success: false,
-            status: http_status::NOT_FOUND,
-            error_message: Some(message.to_string()),
-            error_cause: None,
-        }
-    }
-}
-
-/// AMF 3GPP Access Registration request
-#[derive(Debug, Clone, Default)]
-pub struct Amf3GppAccessRegistrationRequest {
-    pub amf_instance_id: Option<String>,
-    pub dereg_callback_uri: Option<String>,
-    pub guami: Option<GuamiRequest>,
-    pub rat_type: Option<String>,
-}
-
-/// GUAMI request data
-#[derive(Debug, Clone, Default)]
-pub struct GuamiRequest {
-    pub amf_id: Option<String>,
-    pub plmn_id: Option<PlmnIdRequest>,
-}
-
-/// PLMN ID request data
-#[derive(Debug, Clone, Default)]
-pub struct PlmnIdRequest {
-    pub mcc: Option<String>,
-    pub mnc: Option<String>,
-}
-
-/// AMF 3GPP Access Registration Modification request
-#[derive(Debug, Clone, Default)]
-pub struct Amf3GppAccessRegistrationModificationRequest {
-    pub guami: Option<GuamiRequest>,
-    pub purge_flag: Option<bool>,
-}
-
-/// SMF Registration request
-#[derive(Debug, Clone, Default)]
-pub struct SmfRegistrationRequest {
-    pub smf_instance_id: Option<String>,
-    pub pdu_session_id: Option<u8>,
-    pub single_nssai: Option<String>,
-    pub dnn: Option<String>,
-    pub plmn_id: Option<PlmnIdRequest>,
-}
-
-/// SDM Subscription request
-#[derive(Debug, Clone, Default)]
-pub struct SdmSubscriptionRequest {
-    pub nf_instance_id: Option<String>,
-    pub callback_reference: Option<String>,
-    pub monitored_resource_uris: Vec<String>,
-}
-
-/// Auth Event request
-#[derive(Debug, Clone, Default)]
-pub struct AuthEventRequest {
-    pub nf_instance_id: Option<String>,
-    pub success: Option<bool>,
-    pub time_stamp: Option<String>,
-    pub auth_type: Option<String>,
-    pub serving_network_name: Option<String>,
-    pub auth_removal_ind: Option<bool>,
-}
-
-/// The dead `udm_nudm_ueau_handle_get` used to live here: a C-port handler that
-/// validated `servingNetworkName` / `ausfInstanceId`, stored them on the UE and
-/// ran AUTS resynchronisation, with NO caller anywhere in the tree. It was the
-/// only code that persisted `ausf_instance_id`, so `sor.rs` and `upu.rs` always
-/// read `None` and picked an arbitrary AUSF (#84 gap 4). The live path in
-/// `app.rs::handle_generate_auth_data` now stores it, and the dead copy is gone
-/// rather than kept as a second, unreachable implementation of the same
-/// procedure.
-/// Handle NUDM UEAU result confirmation inform (auth-events)
-/// Port of udm_nudm_ueau_handle_result_confirmation_inform()
-pub fn udm_nudm_ueau_handle_result_confirmation_inform(
-    udm_ue_id: u64,
-    _stream_id: u64,
-    request: &AuthEventRequest,
-) -> HandlerResult {
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-
-    let mut udm_ue = match context.ue_find_by_id(udm_ue_id) {
-        Some(ue) => ue,
-        None => {
-            log::error!("UDM UE not found [{udm_ue_id}]");
-            return HandlerResult::bad_request("UDM UE not found");
-        }
-    };
-    drop(context);
-
-    log::debug!(
-        "[{}] Handle NUDM UEAU result confirmation inform",
-        udm_ue.suci
-    );
-
-    // Validate AuthEvent
-    let nf_instance_id = match &request.nf_instance_id {
-        Some(id) if !id.is_empty() => id.clone(),
-        _ => {
-            log::error!("[{}] No nfInstanceId", udm_ue.suci);
-            return HandlerResult::bad_request("No nfInstanceId");
-        }
-    };
-
-    let success = match request.success {
-        Some(s) => s,
-        None => {
-            log::error!("[{}] No success", udm_ue.suci);
-            return HandlerResult::bad_request("No success");
-        }
-    };
-
-    let time_stamp = match &request.time_stamp {
-        Some(ts) if !ts.is_empty() => ts.clone(),
-        _ => {
-            log::error!("[{}] No timeStamp", udm_ue.suci);
-            return HandlerResult::bad_request("No timeStamp");
-        }
-    };
-
-    let auth_type_str = match &request.auth_type {
-        Some(at) if !at.is_empty() => at.clone(),
-        _ => {
-            log::error!("[{}] No authType", udm_ue.suci);
-            return HandlerResult::bad_request("No authType");
-        }
-    };
-
-    let serving_network_name = match &request.serving_network_name {
-        Some(snn) if !snn.is_empty() => snn.clone(),
-        _ => {
-            log::error!("[{}] No servingNetworkName", udm_ue.suci);
-            return HandlerResult::bad_request("No servingNetworkName");
-        }
-    };
-
-    // Parse auth type
-    let auth_type = match auth_type_str.as_str() {
-        "5G_AKA" => Some(AuthType::FiveGAka),
-        "EAP_AKA_PRIME" => Some(AuthType::EapAkaPrime),
-        "EAP_TLS" => Some(AuthType::EapTls),
-        _ => None,
-    };
-
-    // Create and store auth event
-    let auth_event = AuthEvent {
-        nf_instance_id: Some(nf_instance_id),
-        success,
-        time_stamp: Some(time_stamp),
-        auth_type,
-        serving_network_name: Some(serving_network_name),
-    };
-
-    udm_ue.set_auth_event(auth_event);
-
-    // Update UE in context
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-    context.ue_update(&udm_ue);
-    drop(context);
-
-    // Send request to UDR to update authentication status
-    // This would trigger udm_nudr_dr_build_update_authentication_status
-    HandlerResult::ok()
-}
-
-/// Handle NUDM UECM AMF registration
-/// Port of udm_nudm_uecm_handle_amf_registration()
-pub fn udm_nudm_uecm_handle_amf_registration(
-    udm_ue_id: u64,
-    _stream_id: u64,
-    request: &Amf3GppAccessRegistrationRequest,
-) -> HandlerResult {
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-
-    let mut udm_ue = match context.ue_find_by_id(udm_ue_id) {
-        Some(ue) => ue,
-        None => {
-            log::error!("UDM UE not found [{udm_ue_id}]");
-            return HandlerResult::bad_request("UDM UE not found");
-        }
-    };
-    drop(context);
-
-    let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{supi}] Handle NUDM UECM AMF registration");
-
-    // Validate Amf3GppAccessRegistration
-    let amf_instance_id = match &request.amf_instance_id {
-        Some(id) if !id.is_empty() => id.clone(),
-        _ => {
-            log::error!("[{supi}] No amfInstanceId");
-            return HandlerResult::bad_request("No amfInstanceId");
-        }
-    };
-
-    let dereg_callback_uri = match &request.dereg_callback_uri {
-        Some(uri) if !uri.is_empty() => uri.clone(),
-        _ => {
-            log::error!("[{supi}] No dregCallbackUri");
-            return HandlerResult::bad_request("No dregCallbackUri");
-        }
-    };
-
-    // Validate GUAMI
-    let guami_req = match &request.guami {
-        Some(g) => g,
-        None => {
-            log::error!("[{supi}] No Guami");
-            return HandlerResult::bad_request("No Guami");
-        }
-    };
-
-    let amf_id = match &guami_req.amf_id {
-        Some(id) if !id.is_empty() => id.clone(),
-        _ => {
-            log::error!("[{supi}] No Guami.AmfId");
-            return HandlerResult::bad_request("No Guami.AmfId");
-        }
-    };
-
-    let plmn_id_req = match &guami_req.plmn_id {
-        Some(p) => p,
-        None => {
-            log::error!("[{supi}] No PlmnId");
-            return HandlerResult::bad_request("No PlmnId");
-        }
-    };
-
-    let mcc = match &plmn_id_req.mcc {
-        Some(m) if !m.is_empty() => m.clone(),
-        _ => {
-            log::error!("[{supi}] No PlmnId.Mcc");
-            return HandlerResult::bad_request("No PlmnId.Mcc");
-        }
-    };
-
-    let mnc = match &plmn_id_req.mnc {
-        Some(m) if !m.is_empty() => m.clone(),
-        _ => {
-            log::error!("[{supi}] No PlmnId.Mnc");
-            return HandlerResult::bad_request("No PlmnId.Mnc");
-        }
-    };
-
-    // Validate RAT type
-    if request.rat_type.is_none() {
-        log::error!("[{supi}] No RatType");
-        return HandlerResult::bad_request("No RatType");
-    }
-
-    // Parse RAT type
-    let rat_type = match request.rat_type.as_deref() {
-        Some("NR") => RatType::Nr,
-        Some("EUTRA") => RatType::Eutra,
-        Some("WLAN") => RatType::Wlan,
-        Some("VIRTUAL") => RatType::Virtual,
-        _ => RatType::Nr,
-    };
-
-    // Parse AMF ID (hex string to components)
-    let amf_id_parsed = parse_amf_id(&amf_id);
-
-    // Store registration data
-    udm_ue.dereg_callback_uri = Some(dereg_callback_uri.clone());
-    udm_ue.guami = Guami {
-        plmn_id: PlmnId { mcc, mnc },
-        amf_id: amf_id_parsed,
-    };
-    udm_ue.rat_type = rat_type;
-
-    // Store AMF 3GPP access registration
-    let registration = Amf3GppAccessRegistration {
-        amf_instance_id: Some(amf_instance_id),
-        dereg_callback_uri: Some(dereg_callback_uri),
-        guami: Some(udm_ue.guami.clone()),
-        rat_type: Some(rat_type),
-    };
-    udm_ue.set_amf_3gpp_access_registration(registration);
-
-    // Update UE in context
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-    context.ue_update(&udm_ue);
-    drop(context);
-
-    // Send request to UDR to update AMF context
-    HandlerResult::ok()
-}
-
-/// Handle NUDM UECM AMF registration update
-/// Port of udm_nudm_uecm_handle_amf_registration_update()
-pub fn udm_nudm_uecm_handle_amf_registration_update(
-    udm_ue_id: u64,
-    _stream_id: u64,
-    request: &Amf3GppAccessRegistrationModificationRequest,
-) -> HandlerResult {
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-
-    let udm_ue = match context.ue_find_by_id(udm_ue_id) {
-        Some(ue) => ue,
-        None => {
-            log::error!("UDM UE not found [{udm_ue_id}]");
-            return HandlerResult::bad_request("UDM UE not found");
-        }
-    };
-    drop(context);
-
-    let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{supi}] Handle NUDM UECM AMF registration update");
-
-    // Validate GUAMI
-    let guami_req = match &request.guami {
-        Some(g) => g,
-        None => {
-            log::error!("[{supi}] No Guami");
-            return HandlerResult::bad_request("No Guami");
-        }
-    };
-
-    let amf_id = match &guami_req.amf_id {
-        Some(id) if !id.is_empty() => id.clone(),
-        _ => {
-            log::error!("[{supi}] No Guami.AmfId");
-            return HandlerResult::bad_request("No Guami.AmfId");
-        }
-    };
-
-    let plmn_id_req = match &guami_req.plmn_id {
-        Some(p) => p,
-        None => {
-            log::error!("[{supi}] No PlmnId");
-            return HandlerResult::bad_request("No PlmnId");
-        }
-    };
-
-    let mcc = match &plmn_id_req.mcc {
-        Some(m) if !m.is_empty() => m.clone(),
-        _ => {
-            log::error!("[{supi}] No PlmnId.Mcc");
-            return HandlerResult::bad_request("No PlmnId.Mcc");
-        }
-    };
-
-    let mnc = match &plmn_id_req.mnc {
-        Some(m) if !m.is_empty() => m.clone(),
-        _ => {
-            log::error!("[{supi}] No PlmnId.Mnc");
-            return HandlerResult::bad_request("No PlmnId.Mnc");
-        }
-    };
-
-    // Parse received GUAMI
-    let recv_guami = Guami {
-        plmn_id: PlmnId { mcc, mnc },
-        amf_id: parse_amf_id(&amf_id),
-    };
-
-    // Check if received GUAMI matches stored GUAMI
-    // TS 29.503: 5.3.2.4.2 AMF deregistration for 3GPP access
-    if !guami_matches(&recv_guami, &udm_ue.guami) {
-        log::error!("[{supi}] Guami mismatch");
-        return HandlerResult::forbidden("Guami mismatch", Some("INVALID_GUAMI"));
-    }
-
-    // Handle purge flag if present
-    if let Some(purge_flag) = request.purge_flag {
-        let ctx = udm_self();
-        let context = ctx.read().unwrap();
-        if let Some(mut ue) = context.ue_find_by_id(udm_ue_id) {
-            if let Some(ref mut _reg) = ue.amf_3gpp_access_registration {
-                // Note: purge_flag stored in registration and sent to UDR on PATCH request
-                log::debug!("[{supi}] Setting purge flag to {purge_flag}");
-            }
-            context.ue_update(&ue);
-        }
-        drop(context);
-    }
-
-    // Send PATCH request to UDR
-    HandlerResult::ok()
-}
-
-/// Handle NUDM UECM AMF registration get
-/// Port of udm_nudm_uecm_handle_amf_registration_get()
-pub fn udm_nudm_uecm_handle_amf_registration_get(
-    udm_ue_id: u64,
-    _stream_id: u64,
-    resource_name: &str,
-) -> (HandlerResult, Option<Amf3GppAccessRegistration>) {
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-
-    let udm_ue = match context.ue_find_by_id(udm_ue_id) {
-        Some(ue) => ue,
-        None => {
-            log::error!("UDM UE not found [{udm_ue_id}]");
-            return (HandlerResult::bad_request("UDM UE not found"), None);
-        }
-    };
-    drop(context);
-
-    let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{supi}] Handle NUDM UECM AMF registration get");
-
-    match resource_name {
-        "registrations" => {
-            if let Some(ref registration) = udm_ue.amf_3gpp_access_registration {
-                (HandlerResult::ok(), Some(registration.clone()))
-            } else {
-                log::error!("Invalid UE Identifier [{}]", udm_ue.suci);
-                (HandlerResult::bad_request("Invalid UE Identifier"), None)
-            }
-        }
-        _ => {
-            log::error!("Invalid resource name [{resource_name}]");
-            (HandlerResult::bad_request("Invalid resource name"), None)
-        }
-    }
-}
-
-/// Handle NUDM UECM SMF registration
-/// Port of udm_nudm_uecm_handle_smf_registration()
-pub fn udm_nudm_uecm_handle_smf_registration(
-    sess_id: u64,
-    _stream_id: u64,
-    request: &SmfRegistrationRequest,
-) -> HandlerResult {
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-
-    let mut sess = match context.sess_find_by_id(sess_id) {
-        Some(s) => s,
-        None => {
-            log::error!("UDM session not found [{sess_id}]");
-            return HandlerResult::bad_request("UDM session not found");
-        }
-    };
-
-    let udm_ue = match context.ue_find_by_id(sess.udm_ue_id) {
-        Some(ue) => ue,
-        None => {
-            log::error!("UDM UE not found for session [{sess_id}]");
-            return HandlerResult::bad_request("UDM UE not found");
-        }
-    };
-    drop(context);
-
-    let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}:{}] Handle NUDM UECM SMF registration", supi, sess.psi);
-
-    // Validate SmfRegistration
-    let smf_instance_id = match &request.smf_instance_id {
-        Some(id) if !id.is_empty() => id.clone(),
-        _ => {
-            log::error!("[{}:{}] No smfInstanceId", supi, sess.psi);
-            return HandlerResult::bad_request("No smfInstanceId");
-        }
-    };
-
-    let pdu_session_id = match request.pdu_session_id {
-        Some(id) if id > 0 => id,
-        _ => {
-            log::error!("[{}:{}] No pduSessionId", supi, sess.psi);
-            return HandlerResult::bad_request("No pduSessionId");
-        }
-    };
-
-    let single_nssai = match &request.single_nssai {
-        Some(nssai) if !nssai.is_empty() => nssai.clone(),
-        _ => {
-            log::error!("[{}:{}] No singleNssai", supi, sess.psi);
-            return HandlerResult::bad_request("No singleNssai");
-        }
-    };
-
-    let dnn = match &request.dnn {
-        Some(d) if !d.is_empty() => d.clone(),
-        _ => {
-            log::error!("[{}:{}] No dnn", supi, sess.psi);
-            return HandlerResult::bad_request("No dnn");
-        }
-    };
-
-    // Validate PLMN ID
-    let plmn_id_req = match &request.plmn_id {
-        Some(p) => p,
-        None => {
-            log::error!("[{}:{}] No plmnId", supi, sess.psi);
-            return HandlerResult::bad_request("No plmnId");
-        }
-    };
-
-    let mcc = match &plmn_id_req.mcc {
-        Some(m) if !m.is_empty() => m.clone(),
-        _ => {
-            log::error!("[{}:{}] No plmnId.mcc", supi, sess.psi);
-            return HandlerResult::bad_request("No plmnId.mcc");
-        }
-    };
-
-    let mnc = match &plmn_id_req.mnc {
-        Some(m) if !m.is_empty() => m.clone(),
-        _ => {
-            log::error!("[{}:{}] No plmnId.mnc", supi, sess.psi);
-            return HandlerResult::bad_request("No plmnId.mnc");
-        }
-    };
-
-    // Store SMF registration
-    let smf_registration = SmfRegistration {
-        smf_instance_id: Some(smf_instance_id),
-        pdu_session_id,
-        single_nssai: Some(single_nssai),
-        dnn: Some(dnn),
-        plmn_id: Some(PlmnId { mcc, mnc }),
-    };
-    sess.set_smf_registration(smf_registration);
-
-    // Update session in context
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-    context.sess_update(&sess);
-    drop(context);
-
-    // Send request to UDR to update SMF context
-    HandlerResult::ok()
-}
-
-/// Handle NUDM UECM SMF deregistration
-/// Port of udm_nudm_uecm_handle_smf_deregistration()
-pub fn udm_nudm_uecm_handle_smf_deregistration(sess_id: u64, _stream_id: u64) -> HandlerResult {
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-
-    let sess = match context.sess_find_by_id(sess_id) {
-        Some(s) => s,
-        None => {
-            log::error!("UDM session not found [{sess_id}]");
-            return HandlerResult::bad_request("UDM session not found");
-        }
-    };
-
-    let udm_ue = match context.ue_find_by_id(sess.udm_ue_id) {
-        Some(ue) => ue,
-        None => {
-            log::error!("UDM UE not found for session [{sess_id}]");
-            return HandlerResult::bad_request("UDM UE not found");
-        }
-    };
-    drop(context);
-
-    let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!(
-        "[{}:{}] Handle NUDM UECM SMF deregistration",
-        supi,
-        sess.psi
-    );
-
-    // Send request to UDR to delete SMF context
-    HandlerResult::ok()
-}
-
-/// Handle NUDM SDM subscription provisioned (ue-context-in-smf-data)
-/// Port of udm_nudm_sdm_handle_subscription_provisioned()
-pub fn udm_nudm_sdm_handle_subscription_provisioned(
-    udm_ue_id: u64,
-    _stream_id: u64,
-    resource_name: &str,
-) -> HandlerResult {
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-
-    let udm_ue = match context.ue_find_by_id(udm_ue_id) {
-        Some(ue) => ue,
-        None => {
-            log::error!("UDM UE not found [{udm_ue_id}]");
-            return HandlerResult::bad_request("UDM UE not found");
-        }
-    };
-    drop(context);
-
-    let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{supi}] Handle NUDM SDM subscription provisioned");
-
-    match resource_name {
-        "ue-context-in-smf-data" => {
-            // Return empty UeContextInSmfData
-            // In real implementation, this would return actual SMF context data
-            HandlerResult::ok()
-        }
-        _ => {
-            log::error!("Invalid resource name [{resource_name}]");
-            HandlerResult::bad_request("Invalid resource name")
-        }
-    }
-}
-
-/// Handle NUDM SDM subscription create
-/// Port of udm_nudm_sdm_handle_subscription_create()
-pub fn udm_nudm_sdm_handle_subscription_create(
-    udm_ue_id: u64,
-    _stream_id: u64,
-    request: &SdmSubscriptionRequest,
-) -> (HandlerResult, Option<UdmSdmSubscription>) {
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-
-    let udm_ue = match context.ue_find_by_id(udm_ue_id) {
-        Some(ue) => ue,
-        None => {
-            log::error!("UDM UE not found [{udm_ue_id}]");
-            return (HandlerResult::bad_request("UDM UE not found"), None);
-        }
-    };
-
-    let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{supi}] Handle NUDM SDM subscription create");
-
-    // Validate SDMSubscription
-    if request.nf_instance_id.is_none()
-        || request
-            .nf_instance_id
-            .as_ref()
-            .map(|s| s.is_empty())
-            .unwrap_or(true)
-    {
-        log::error!("[{supi}] No nfInstanceId");
-        return (HandlerResult::bad_request("No nfInstanceId"), None);
-    }
-
-    if request.callback_reference.is_none()
-        || request
-            .callback_reference
-            .as_ref()
-            .map(|s| s.is_empty())
-            .unwrap_or(true)
-    {
-        log::error!("[{supi}] No callbackReference");
-        return (HandlerResult::bad_request("No callbackReference"), None);
-    }
-
-    if request.monitored_resource_uris.is_empty() {
-        log::error!("[{supi}] No monitoredResourceUris");
-        return (HandlerResult::bad_request("No monitoredResourceUris"), None);
-    }
-
-    // Add SDM subscription
-    let subscription = match context.sdm_subscription_add(udm_ue_id) {
-        Some(mut sub) => {
-            sub.data_change_callback_uri = request.callback_reference.clone();
-            context.sdm_subscription_update(&sub);
-            sub
-        }
-        None => {
-            log::error!("[{supi}] sdm_subscription_add() failed");
-            return (
-                HandlerResult::bad_request("sdm_subscription_add() failed"),
-                None,
-            );
-        }
-    };
-    drop(context);
-
-    log::debug!("[{}] SDM subscription created: {}", supi, subscription.id);
-    (HandlerResult::created(), Some(subscription))
-}
-
-/// Handle NUDM SDM subscription delete
-/// Port of udm_nudm_sdm_handle_subscription_delete()
-pub fn udm_nudm_sdm_handle_subscription_delete(
-    udm_ue_id: u64,
-    _stream_id: u64,
-    subscription_id: Option<&str>,
-) -> HandlerResult {
-    let ctx = udm_self();
-    let context = ctx.read().unwrap();
-
-    let udm_ue = match context.ue_find_by_id(udm_ue_id) {
-        Some(ue) => ue,
-        None => {
-            log::error!("UDM UE not found [{udm_ue_id}]");
-            return HandlerResult::bad_request("UDM UE not found");
-        }
-    };
-
-    let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{supi}] Handle NUDM SDM subscription delete");
-
-    let sub_id = match subscription_id {
-        Some(id) if !id.is_empty() => id,
-        _ => {
-            log::error!("[{supi}] No subscriptionID");
-            return HandlerResult::bad_request("No subscriptionID");
-        }
-    };
-
-    // Find and remove subscription
-    if context.sdm_subscription_find_by_id(sub_id).is_some() {
-        context.sdm_subscription_remove(sub_id);
-        log::debug!("[{supi}] SDM subscription deleted: {sub_id}");
-        HandlerResult::no_content()
-    } else {
-        log::error!("Subscription to be deleted does not exist [{sub_id}]");
-        HandlerResult::not_found("Subscription Not found")
-    }
 }
 
 // Helper functions
@@ -805,48 +118,6 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Convert buffer to u64
-fn buffer_to_u64(buf: &[u8]) -> u64 {
-    let mut result: u64 = 0;
-    for &byte in buf {
-        result = (result << 8) | (byte as u64);
-    }
-    result
-}
-
-/// Convert u64 to buffer
-fn u64_to_buffer(value: u64, buf: &mut [u8]) {
-    let len = buf.len();
-    for i in 0..len {
-        buf[len - 1 - i] = ((value >> (i * 8)) & 0xFF) as u8;
-    }
-}
-
-/// Parse AMF ID from hex string
-fn parse_amf_id(amf_id_str: &str) -> crate::context::AmfId {
-    // AMF ID is 24 bits: 8-bit region + 10-bit set + 6-bit pointer
-    let bytes = hex_to_bytes(amf_id_str);
-    if bytes.len() >= 3 {
-        let value = ((bytes[0] as u32) << 16) | ((bytes[1] as u32) << 8) | (bytes[2] as u32);
-        crate::context::AmfId {
-            region: ((value >> 16) & 0xFF) as u8,
-            set: ((value >> 6) & 0x3FF) as u16,
-            pointer: (value & 0x3F) as u8,
-        }
-    } else {
-        crate::context::AmfId::default()
-    }
-}
-
-/// Check if two GUAMIs match
-fn guami_matches(a: &Guami, b: &Guami) -> bool {
-    a.plmn_id.mcc == b.plmn_id.mcc
-        && a.plmn_id.mnc == b.plmn_id.mnc
-        && a.amf_id.region == b.amf_id.region
-        && a.amf_id.set == b.amf_id.set
-        && a.amf_id.pointer == b.amf_id.pointer
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,13 +128,6 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.status, http_status::OK);
         assert!(result.error_message.is_none());
-    }
-
-    #[test]
-    fn test_handler_result_created() {
-        let result = HandlerResult::created();
-        assert!(result.success);
-        assert_eq!(result.status, http_status::CREATED);
     }
 
     #[test]
@@ -911,91 +175,12 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_to_u64() {
-        let buf = [0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
-        assert_eq!(buffer_to_u64(&buf), 1);
-
-        let buf2 = [0x00, 0x00, 0x00, 0x00, 0x01, 0x00];
-        assert_eq!(buffer_to_u64(&buf2), 256);
-    }
-
-    #[test]
-    fn test_u64_to_buffer() {
-        let mut buf = [0u8; 6];
-        u64_to_buffer(1, &mut buf);
-        assert_eq!(buf, [0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
-
-        u64_to_buffer(256, &mut buf);
-        assert_eq!(buf, [0x00, 0x00, 0x00, 0x00, 0x01, 0x00]);
-    }
-
-    #[test]
-    fn test_parse_amf_id() {
-        // AMF ID: region=0x01, set=0x002, pointer=0x01
-        // Binary: 00000001 00000000 10000001 = 0x010081
-        let amf_id = parse_amf_id("010081");
-        assert_eq!(amf_id.region, 0x01);
-        assert_eq!(amf_id.set, 0x002);
-        assert_eq!(amf_id.pointer, 0x01);
-    }
-
-    #[test]
-    fn test_guami_matches() {
-        let guami1 = Guami {
-            plmn_id: PlmnId {
-                mcc: "001".to_string(),
-                mnc: "01".to_string(),
-            },
-            amf_id: crate::context::AmfId {
-                region: 1,
-                set: 2,
-                pointer: 3,
-            },
-        };
-
-        let guami2 = guami1.clone();
-        assert!(guami_matches(&guami1, &guami2));
-
-        let guami3 = Guami {
-            plmn_id: PlmnId {
-                mcc: "001".to_string(),
-                mnc: "02".to_string(), // Different MNC
-            },
-            amf_id: crate::context::AmfId {
-                region: 1,
-                set: 2,
-                pointer: 3,
-            },
-        };
-        assert!(!guami_matches(&guami1, &guami3));
-    }
-
-    #[test]
     fn test_hex_to_bytes_invalid_length() {
-        // Test that invalid RAND length is handled
+        // A short hex string yields the bytes it does contain rather than
+        // padding or erroring: `app.rs` relies on the caller length-checking the
+        // result (a 2-byte RAND is not silently widened to 16).
         let hex = "0123"; // Only 2 bytes instead of 16
         let bytes = hex_to_bytes(hex);
         assert_eq!(bytes.len(), 2);
-    }
-
-    #[test]
-    fn test_buffer_to_u64_conversion() {
-        // Test SQN conversion edge cases
-        let buf = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
-        let val = buffer_to_u64(&buf);
-        assert_eq!(val, 0xFFFFFFFFFFFF);
-
-        let buf2 = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let val2 = buffer_to_u64(&buf2);
-        assert_eq!(val2, 0);
-    }
-
-    #[test]
-    fn test_u64_to_buffer_roundtrip() {
-        let mut buf = [0u8; 6];
-        let original = 0x123456789ABC;
-        u64_to_buffer(original, &mut buf);
-        let converted = buffer_to_u64(&buf);
-        assert_eq!(converted & 0xFFFFFFFFFFFF, original & 0xFFFFFFFFFFFF);
     }
 }
