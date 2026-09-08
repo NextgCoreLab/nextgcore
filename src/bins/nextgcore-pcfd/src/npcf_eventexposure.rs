@@ -26,42 +26,16 @@ use nextgcore_sbi::server::{send_bad_request, send_method_not_allowed_with_allow
 /// `servers` entry plus the resource path.
 const SUBSCRIPTIONS_BASE: &str = "/npcf-eventexposure/v1/subscriptions";
 
-/// Format `secs` since the Unix epoch as an RFC 3339 UTC timestamp
-/// (TS 29.571 `DateTime`).
-///
-/// Hand-rolled rather than pulling in a date/time crate, matching what udmd and
-/// nrfd already do for the same reason.
-pub fn epoch_to_rfc3339(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y,
-        m,
-        d,
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// The RFC 3339 migration: pcfd's own `epoch_to_rfc3339` and `now_secs` used to live
+// here. Both are now `nextgcore_sbi::datetime::{epoch_to_rfc3339, now_epoch_secs}`.
+//
+// `epoch_to_rfc3339` was BYTE-IDENTICAL to the shared module's -- #90 added this
+// copy the day before the shared module existed, and both descend from udmd's -- so
+// nothing about the emitted timestamp changed. `now_secs` was likewise the shared
+// `now_epoch_secs` under a different name, including the same `unwrap_or(0)` for a
+// pre-epoch clock.
+pub use nextgcore_sbi::datetime::epoch_to_rfc3339;
+use nextgcore_sbi::datetime::now_epoch_secs as now_secs;
 
 /// The parsed, validated members of a `PcEventExposureSubsc`.
 struct ParsedSubsc {
