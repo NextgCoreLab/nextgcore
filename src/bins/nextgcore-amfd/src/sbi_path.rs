@@ -441,6 +441,11 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
     let json: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
 
+    // #235: the SearchResult's validityPeriod bounds how long these profiles may
+    // be selected. Read once for the whole result, which is where TS 29.510 puts
+    // it — it is a property of the answer, not of an individual profile.
+    let validity = nextgcore_sbi::context::search_result_validity(&json);
+
     if let Some(nf_instances) = json.get("nfInstances").and_then(|v| v.as_array()) {
         for nf_json in nf_instances {
             let nf_id = nf_json
@@ -502,8 +507,13 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
                 }
             }
 
-            sbi_ctx.add_nf_instance(instance).await;
-            log::info!("Discovered {nf_type_str} instance: {nf_id}");
+            sbi_ctx
+                .add_nf_instance_with_validity(instance, validity)
+                .await;
+            log::info!(
+                "Discovered {nf_type_str} instance: {nf_id} (valid for {}s)",
+                validity.as_secs()
+            );
         }
     }
 

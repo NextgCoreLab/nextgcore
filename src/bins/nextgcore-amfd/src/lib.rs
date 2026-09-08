@@ -788,6 +788,12 @@ impl AmfApp {
     pub async fn shutdown_async(&mut self) {
         log::info!("Shutting down AMF...");
 
+        // #235: NFDeregister (TS 29.510 5.2.2.2.3) first, so the NRF stops
+        // handing this profile to consumers instead of waiting out its
+        // supervision timer. Only the async path can do it — the sync
+        // `shutdown()` above cannot await, and has no caller.
+        nextgcore_sbi::heartbeat::deregister_self().await;
+
         // Close NGAP
         ngap_path::amf_ngap_close().await;
 

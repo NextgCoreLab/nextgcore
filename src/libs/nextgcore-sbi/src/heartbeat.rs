@@ -480,6 +480,125 @@ pub fn heartbeat_paused() -> bool {
     HEARTBEAT_PAUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// ─── NF deregistration on shutdown (#235) ────────────────────────────────────
+//
+// Every NF in this workspace that registers an NFProfile also spawns a
+// heartbeat worker — verified by grep: the 17 crates matching
+// `spawn_heartbeat_worker` are exactly the 17 that PUT
+// `/nnrf-nfm/v1/nf-instances/{id}`. `pind` deliberately does not register
+// (PIND-01), and `scpd` / `seppd` only consume `nnrf-disc`. So recording the ID
+// here catches every registering NF, and `deregister_self()` needs no argument
+// — which matters, because an ID passed by hand at 17 shutdown sites is exactly
+// where a copy-paste error would live.
+
+static REGISTERED_NF_INSTANCE_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record the NF instance ID this process registered under, so
+/// [`deregister_self`] can DELETE the right profile without being told.
+///
+/// Called automatically by [`spawn_heartbeat_worker_with_load`]; public so an NF
+/// that registers without a heartbeat worker can opt in (none does today).
+pub fn set_registered_nf_instance_id(nf_instance_id: impl Into<String>) {
+    let id = nf_instance_id.into();
+    match REGISTERED_NF_INSTANCE_ID.lock() {
+        Ok(mut slot) => *slot = Some(id),
+        // A poisoned lock here must not take the process down on a path whose
+        // only job is bookkeeping; the cost is that deregistration is skipped,
+        // which is the pre-#235 behaviour and is logged.
+        Err(e) => log::warn!("could not record registered NF instance ID: {e}"),
+    }
+}
+
+/// The NF instance ID this process registered under, if it registered.
+pub fn registered_nf_instance_id() -> Option<String> {
+    REGISTERED_NF_INSTANCE_ID
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+/// Forget the recorded NF instance ID.
+///
+/// **Only for use in tests**, so a test that records an ID leaves the
+/// process-global back as it found it.
+///
+/// NOT gated behind `cfg(test)`: `nextgcore-sbi` compiles as a *dependency* of
+/// every NF crate, and `cfg(test)` is false in that build — the recorded trap
+/// that `udmd`'s ungated `test_support` module exists for. A test in `nrfd` needs
+/// this, so gating it would make the symbol invisible exactly where it is used.
+pub fn clear_registered_nf_instance_id() {
+    if let Ok(mut slot) = REGISTERED_NF_INSTANCE_ID.lock() {
+        *slot = None;
+    }
+}
+
+/// `DELETE /nnrf-nfm/v1/nf-instances/{nfInstanceId}` — NFDeregister,
+/// TS 29.510 §5.2.2.2.3.
+///
+/// The single client for this operation. Before #235 there were two hand-rolled
+/// copies (`udmd`'s `udm_nrf_deregister` and the inline DELETE in `udmd`'s NES
+/// driver) and sixteen NFs with none at all.
+pub async fn deregister_nf(nf_instance_id: &str) -> Result<(), String> {
+    let ctx = crate::context::global_context();
+    let nrf_uri = ctx
+        .get_nrf_uri()
+        .await
+        .ok_or_else(|| "no NRF URI configured".to_string())?;
+    let (nrf_host, nrf_port) =
+        parse_nrf_host_port(&nrf_uri).ok_or_else(|| format!("invalid NRF URI '{nrf_uri}'"))?;
+    let client = SbiClient::with_host_port(&nrf_host, nrf_port);
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+
+    match client.send_request(SbiRequest::delete(&path)).await {
+        // TS 29.510 §5.2.2.2.3 specifies 204; 200 is accepted too rather than
+        // reported as a failure, since either means the profile is gone.
+        Ok(resp) if resp.status == 204 || resp.status == 200 => Ok(()),
+        // A profile the NRF does not hold is the state we wanted: treat 404 as
+        // success so a shutdown after the supervision timer already expired does
+        // not log an alarming warning.
+        Ok(resp) if resp.status == 404 => {
+            log::debug!("NRF had already dropped NF instance {nf_instance_id}");
+            Ok(())
+        }
+        Ok(resp) => Err(format!("NRF returned status {}", resp.status)),
+        Err(e) => Err(format!("NFDeregister failed: {e}")),
+    }
+}
+
+/// Deregister this process's own NFProfile from the NRF, for the shutdown path.
+///
+/// Pauses the heartbeat worker **first**: a tick that lands after the DELETE
+/// would PATCH a profile that no longer exists, which reads to an operator as
+/// the NRF losing registrations rather than as an ordering bug here. The NES
+/// deregister action established the same ordering.
+///
+/// Never returns an error the caller has to handle at shutdown — a failure is
+/// logged and swallowed, because refusing to exit because the NRF is unreachable
+/// would be worse than the stale profile this is trying to avoid. Returns
+/// whether a DELETE was actually issued so a test can assert it.
+pub async fn deregister_self() -> bool {
+    let Some(nf_instance_id) = registered_nf_instance_id() else {
+        log::debug!("No registered NF instance ID: skipping NRF deregistration");
+        return false;
+    };
+
+    set_heartbeat_paused(true);
+
+    match deregister_nf(&nf_instance_id).await {
+        Ok(()) => {
+            log::info!("Deregistered NF instance {nf_instance_id} from the NRF");
+            true
+        }
+        Err(e) => {
+            // Deliberately a warning, not an error return: the process is
+            // exiting either way, and the NRF's supervision timer is the
+            // backstop this is merely trying to pre-empt.
+            log::warn!("NRF deregistration for {nf_instance_id} failed: {e}");
+            true
+        }
+    }
+}
+
 /// One-off `nfStatus` PATCH toward the NRF (issue #22 NES transitions),
 /// using the exact wire shape of the heartbeat worker (RFC 6902 array,
 /// `application/json-patch+json`).
@@ -538,6 +657,11 @@ pub fn spawn_heartbeat_worker_with_load<F>(nf_instance_id: String, interval_secs
 where
     F: Fn() -> u8 + Send + 'static,
 {
+    // #235: remember the ID so the shutdown path can deregister without being
+    // handed it again. Done here rather than at each NF's registration site
+    // because every registering NF reaches this function.
+    set_registered_nf_instance_id(nf_instance_id.clone());
+
     tokio::spawn(async move {
         log::info!(
             "Heartbeat worker started for NF instance {nf_instance_id} (interval={interval_secs}s)"
@@ -620,6 +744,58 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #235: the registered-NF-instance-ID plumbing that lets `deregister_self`
+    /// DELETE the right profile without being handed the ID at 17 shutdown sites.
+    ///
+    /// One test, not several, and it restores the static — same reason the NES
+    /// test below gives: the slot is process-global, so mutation and restoration
+    /// belong together. Deliberately does NOT call `deregister_self()`: that
+    /// pauses the heartbeat, which is another process-global the NES test
+    /// asserts on. The end-to-end path is covered in `nrfd`, whose binary
+    /// touches neither global.
+    #[tokio::test]
+    async fn test_registered_nf_instance_id_plumbing() {
+        // Nothing has registered in this test binary.
+        clear_registered_nf_instance_id();
+        assert_eq!(registered_nf_instance_id(), None);
+
+        set_registered_nf_instance_id("5e9b1c0a-2222-4f6a-8888-0123456789ab");
+        assert_eq!(
+            registered_nf_instance_id().as_deref(),
+            Some("5e9b1c0a-2222-4f6a-8888-0123456789ab")
+        );
+
+        // A re-registration (the NES resume path re-registers under a new ID)
+        // must replace, not accumulate — deregistering the previous ID would
+        // delete a profile that is no longer this process's.
+        set_registered_nf_instance_id("5e9b1c0a-3333-4f6a-8888-0123456789ab");
+        assert_eq!(
+            registered_nf_instance_id().as_deref(),
+            Some("5e9b1c0a-3333-4f6a-8888-0123456789ab")
+        );
+
+        // Spawning the heartbeat worker is what records the ID in production —
+        // no NF calls the setter itself. Asserted here because otherwise the
+        // recording is the untested half and every other test seeds the slot by
+        // hand, which would pass with the recording deleted. No NRF URI is
+        // configured, so the worker's first tick logs "no NRF URI" and skips;
+        // the task dies with this test's runtime.
+        clear_registered_nf_instance_id();
+        spawn_heartbeat_worker_with_load(
+            "5e9b1c0a-5555-4f6a-8888-0123456789ab".to_string(),
+            3600,
+            || 0,
+        );
+        assert_eq!(
+            registered_nf_instance_id().as_deref(),
+            Some("5e9b1c0a-5555-4f6a-8888-0123456789ab"),
+            "spawning the heartbeat worker must record the ID the shutdown path deregisters"
+        );
+
+        clear_registered_nf_instance_id();
+        assert_eq!(registered_nf_instance_id(), None);
+    }
 
     /// Issue #22 NES: the default heartbeat body is byte-identical to the
     /// historical hardcoded-REGISTERED patch, the status builder emits the

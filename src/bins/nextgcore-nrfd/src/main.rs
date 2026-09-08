@@ -4143,6 +4143,116 @@ mod tests {
         outcome.expect("lifecycle test timed out");
     }
 
+    /// #235: the SHARED shutdown-path deregistration client really does remove
+    /// the profile from this NRF's real registry.
+    ///
+    /// The lifecycle test above already proves `nrfd`'s DELETE handler over HTTP,
+    /// but it drives the DELETE by hand. What was unproven is that
+    /// `nextgcore_sbi::heartbeat::deregister_self()` — the one line now added to
+    /// every registering NF's shutdown path — reaches that handler: the right
+    /// method, the right URI, and the instance ID it recorded at registration
+    /// rather than one passed in. So this drives the client, not the request.
+    ///
+    /// `nrfd` touches neither the global SBI context nor the heartbeat statics
+    /// anywhere else, so no guard is needed; the test still restores both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_shared_deregister_self_removes_the_profile_from_the_real_nrf() {
+        use serde_json::json;
+
+        let addr = nextgcore_sbi::test_support::ephemeral_addr();
+        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        server
+            .start(nrf_sbi_request_handler)
+            .await
+            .expect("SBI server starts");
+
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let nf_id = "5e9b1c0a-4444-4f6a-8888-0123456789ab";
+
+        let body = async {
+            // Register a real profile through the real handler.
+            let profile = json!({
+                "nfInstanceId": nf_id,
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "heartBeatTimer": 10,
+                "ipv4Addresses": ["10.4.4.4"],
+                "nfServices": [{
+                    "serviceInstanceId": "svc-0",
+                    "serviceName": "nudm-sdm",
+                    "versions": [{"apiVersionInUri": "v2", "apiFullVersion": "2.0.0"}],
+                    "scheme": "http",
+                    "ipEndPoints": [{"ipv4Address": "10.4.4.4", "port": 7777}]
+                }]
+            });
+            let resp = client
+                .put_json(&format!("/nnrf-nfm/v1/nf-instances/{nf_id}"), &profile)
+                .await
+                .expect("PUT register");
+            assert_eq!(resp.status, 201);
+
+            // Stand in for what an NF's startup does: point the global SBI
+            // context at this NRF, and record the ID the heartbeat worker would
+            // have recorded.
+            let sbi_ctx = nextgcore_sbi::context::global_context();
+            sbi_ctx
+                .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+                .await;
+            nextgcore_sbi::heartbeat::set_registered_nf_instance_id(nf_id);
+
+            // The shutdown path, called exactly as the 17 NFs now call it.
+            assert!(
+                nextgcore_sbi::heartbeat::deregister_self().await,
+                "a recorded instance ID must produce a DELETE"
+            );
+
+            // The profile is gone from the REAL registry, not merely from a
+            // recorded request list.
+            assert!(
+                nf_manager().get(nf_id).is_none(),
+                "deregister_self must remove the profile from the NRF registry"
+            );
+            let resp = client
+                .get(&format!("/nnrf-nfm/v1/nf-instances/{nf_id}"))
+                .await
+                .expect("GET after deregister");
+            assert_eq!(resp.status, 404);
+
+            // Heartbeats are paused BEFORE the DELETE, so a tick cannot PATCH a
+            // profile that no longer exists.
+            assert!(
+                nextgcore_sbi::heartbeat::heartbeat_paused(),
+                "deregistration must pause the heartbeat worker"
+            );
+
+            // Deregistering again gets a real 404 from the real handler, and that
+            // must read as success: a profile the NRF does not hold is the state
+            // we wanted, and an NF shutting down after its supervision timer
+            // already expired should not log an alarming warning.
+            assert!(
+                nextgcore_sbi::heartbeat::deregister_nf(nf_id).await.is_ok(),
+                "a 404 from the NRF means the profile is gone, which is success"
+            );
+
+            // With no recorded ID there is nothing to deregister, and the caller
+            // is told so rather than a bare DELETE being sent to /nf-instances/.
+            nextgcore_sbi::heartbeat::clear_registered_nf_instance_id();
+            assert!(
+                !nextgcore_sbi::heartbeat::deregister_self().await,
+                "no recorded instance ID must issue no DELETE"
+            );
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), body).await;
+
+        // Restore the process-globals this test mutated.
+        nextgcore_sbi::heartbeat::set_heartbeat_paused(false);
+        nextgcore_sbi::heartbeat::clear_registered_nf_instance_id();
+        client.close().await;
+        server.stop().await.expect("server stops");
+        outcome.expect("deregister test timed out");
+    }
+
     // -----------------------------------------------------------------
     // SBI OAuth2 knob (T1.1): config parsing + the NRF-as-issuer rule
     // -----------------------------------------------------------------

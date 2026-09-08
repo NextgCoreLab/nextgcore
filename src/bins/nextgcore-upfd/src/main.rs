@@ -436,6 +436,12 @@ async fn main() -> Result<()> {
     // Graceful shutdown
     log::info!("Shutting down...");
 
+    // #235: NFDeregister (TS 29.510 5.2.2.2.3) BEFORE the listener goes
+    // away, so the NRF stops handing this profile to consumers instead of
+    // waiting out its supervision timer. Stopping the server first would
+    // open the bad window: not serving, but still advertised.
+    nextgcore_sbi::heartbeat::deregister_self().await;
+
     // Close GTP-U path
     upf_gtp_close().map_err(|e| anyhow::anyhow!("Failed to close GTP path: {e}"))?;
     log::info!("GTP-U path closed");

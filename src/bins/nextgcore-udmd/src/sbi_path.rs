@@ -283,6 +283,10 @@ pub async fn udm_nrf_discover(
     let search_result: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse NRF discovery response: {e}"))?;
 
+    // #235: the SearchResult's validityPeriod bounds how long these profiles may
+    // be selected; without it a cached peer was chosen for the process lifetime.
+    let validity = nextgcore_sbi::context::search_result_validity(&search_result);
+
     let mut instances = Vec::new();
     if let Some(nf_instances) = search_result.get("nfInstances").and_then(|v| v.as_array()) {
         for nf_json in nf_instances {
@@ -301,8 +305,10 @@ pub async fn udm_nrf_discover(
                 }
             }
 
-            // Cache discovered instance in SBI context
-            sbi_ctx.add_nf_instance(instance.clone()).await;
+            // Cache discovered instance in SBI context, bounded by validityPeriod
+            sbi_ctx
+                .add_nf_instance_with_validity(instance.clone(), validity)
+                .await;
             instances.push(instance);
         }
     }
@@ -315,30 +321,12 @@ pub async fn udm_nrf_discover(
     Ok(instances)
 }
 
-/// Deregister from NRF and close SBI server
-///
-/// Port of udm_sbi_close()
-pub async fn udm_nrf_deregister(nrf_host: &str, nrf_port: u16) -> Result<(), String> {
-    let sbi_ctx = global_context();
-    if let Some(self_instance) = sbi_ctx.get_self_instance().await {
-        let client = sbi_ctx.get_client(nrf_host, nrf_port).await;
-        let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
-        let request = SbiRequest::delete(&path);
-
-        match client.send_request(request).await {
-            Ok(response) if response.is_success() => {
-                log::info!("UDM deregistered from NRF");
-            }
-            Ok(response) => {
-                log::warn!("NRF deregister returned status {}", response.status);
-            }
-            Err(e) => {
-                log::warn!("NRF deregister failed: {e}");
-            }
-        }
-    }
-    Ok(())
-}
+// #235: `udm_nrf_deregister(nrf_host, nrf_port)` used to live here — a per-NF
+// copy of NFDeregister that had NO caller, so udmd never actually deregistered
+// despite owning the only client in the workspace. The one client is now
+// `nextgcore_sbi::heartbeat::deregister_nf`, driven from `app.rs`'s shutdown
+// path via `deregister_self()` and from the NES sleep path in `nes_driver.rs`.
+// Keeping the local copy would have made three implementations of one DELETE.
 
 /// Close SBI server
 ///
@@ -399,10 +387,17 @@ pub async fn udm_sbi_send_request(
         request.header.method
     );
 
-    client
-        .send_request(request)
-        .await
-        .map_err(|e| format!("SBI request to {nf_instance_id} failed: {e}"))
+    match client.send_request(request).await {
+        Ok(response) => Ok(response),
+        Err(e) => {
+            // #235: a TRANSPORT failure is evidence the cached profile is wrong,
+            // so drop it and let the next call re-discover. Deliberately not done
+            // for an error STATUS: a 4xx/5xx means the peer answered, i.e. the
+            // endpoint is live and the profile is fine.
+            sbi_ctx.evict_nf_instance_on_failure(nf_instance_id).await;
+            Err(format!("SBI request to {nf_instance_id} failed: {e}"))
+        }
+    }
 }
 
 /// Discover UDR and send a NUDR-DR request
@@ -421,8 +416,15 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
     // Find UDR instances (from discovery cache or env var fallback)
     let udr_instances = sbi_ctx.find_nf_instances_by_type(NfType::Udr).await;
 
+    // #235: remember WHICH cached profile was selected, so a transport failure
+    // can evict that entry rather than leaving the consumer retrying a dead
+    // endpoint. `None` on the env-var fallback path — there is no cache entry to
+    // blame for a misconfigured environment variable.
+    let selected_instance_id: Option<String>;
+
     let (host_str, port);
     if let Some(udr) = udr_instances.first() {
+        selected_instance_id = Some(udr.id.clone());
         host_str = udr
             .ipv4_addresses
             .first()
@@ -433,6 +435,7 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
             .map(|s| s.port)
             .unwrap_or(80);
     } else {
+        selected_instance_id = None;
         // Fallback: use UDR_SBI_ADDR/UDR_SBI_PORT env vars
         host_str = std::env::var("UDR_SBI_ADDR")
             .map_err(|_| "No UDR instance discovered and UDR_SBI_ADDR not set".to_string())?;
@@ -451,10 +454,17 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
         "Sending NUDR-DR request for UE [{udm_ue_id}] stream [{stream_id}] to UDR at {host_str}:{port}"
     );
 
-    client
-        .send_request(request)
-        .await
-        .map_err(|e| format!("NUDR-DR request to UDR failed: {e}"))
+    match client.send_request(request).await {
+        Ok(response) => Ok(response),
+        Err(e) => {
+            // #235: transport failure only — an error status means the UDR
+            // answered, so its cached profile is still correct.
+            if let Some(id) = selected_instance_id {
+                sbi_ctx.evict_nf_instance_on_failure(&id).await;
+            }
+            Err(format!("NUDR-DR request to UDR failed: {e}"))
+        }
+    }
 }
 
 /// Build and send authentication subscription GET to UDR
@@ -994,6 +1004,188 @@ pub fn send_sbi_response(stream_id: u64, response: SbiResponse) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #235: a TRANSPORT failure to a cached NF must evict that cached profile,
+    /// so the next call re-discovers instead of retrying an endpoint the NRF may
+    /// already have replaced. This is the WIRING, not the library helper — the
+    /// helper has its own tests in `nextgcore-sbi`, and a passing helper test says
+    /// nothing about whether any caller invokes it.
+    ///
+    /// Port 1 on loopback is used rather than an allocated-then-dropped port:
+    /// binding it needs root, so nothing can be listening and the refusal is
+    /// deterministic with no port allocation to contend on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_failure_evicts_the_cached_instance_by_id() {
+        // The discovery cache is process-global and all three #235 tests below
+        // seed `NfType::Udr` entries, so `.first()` in the by-type test could pick
+        // up a sibling's profile. `CONTEXT_GUARD` is udmd's existing process-wide
+        // test lock; poison-tolerant so one failing test does not turn its
+        // siblings into misleading second failures.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The SBI profile defaults to Production, so `get_client` would build a
+        // TLS client and fail loading /etc/nextgcore/tls/client.crt instead of
+        // being refused by the port. That is still a transport failure, so the
+        // eviction assertion would pass -- for the wrong reason, and only when
+        // another test had not already forced Dev. Force it here so the failure
+        // the test documents is the failure the test gets.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let sbi_ctx = global_context();
+        let instance_id = "udmd-235-evict-by-id";
+
+        let mut instance = NfInstance::new(instance_id, NfType::Udr);
+        instance.ipv4_addresses.push("127.0.0.1".to_string());
+        let mut svc = NfService::new("nudr-dr", SbiServiceType::NudrDr);
+        svc.port = 1;
+        instance.add_service(svc);
+        sbi_ctx
+            .add_nf_instance_with_validity(instance, std::time::Duration::from_secs(3600))
+            .await;
+        assert!(
+            sbi_ctx.get_nf_instance(instance_id).await.is_some(),
+            "precondition: the profile is cached and live"
+        );
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            udm_sbi_send_request(instance_id, SbiRequest::get("/nudr-dr/v2/ping")),
+        )
+        .await
+        .expect("the refused connection must not hang");
+        assert!(result.is_err(), "connecting to a closed port must fail");
+
+        assert!(
+            sbi_ctx.get_nf_instance(instance_id).await.is_none(),
+            "a transport failure must evict the cached profile"
+        );
+    }
+
+    /// The same wiring on the by-type selection path (`find_nf_instances_by_type`
+    /// then send), which resolves the UDR without being handed an ID. Kept as its
+    /// own test because the two paths evict from different places: this one has to
+    /// remember which instance it selected.
+    ///
+    /// `.first()` over a process-global map is order-dependent, and the two
+    /// sibling tests here also seed `NfType::Udr` entries — this test DID pick up
+    /// the by-id test's profile and evict that instead, intermittently, before the
+    /// guard below was added. Do not remove the guard on the grounds that the IDs
+    /// are distinct: distinctness was never the problem, the shared view was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_failure_evicts_the_selected_udr() {
+        // The discovery cache is process-global and all three #235 tests below
+        // seed `NfType::Udr` entries, so `.first()` in the by-type test could pick
+        // up a sibling's profile. `CONTEXT_GUARD` is udmd's existing process-wide
+        // test lock; poison-tolerant so one failing test does not turn its
+        // siblings into misleading second failures.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // See the sibling test: Dev profile so the failure is the refused
+        // connection this test is about, not a missing TLS certificate.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let sbi_ctx = global_context();
+        let instance_id = "udmd-235-evict-selected-udr";
+
+        let mut instance = NfInstance::new(instance_id, NfType::Udr);
+        instance.ipv4_addresses.push("127.0.0.1".to_string());
+        let mut svc = NfService::new("nudr-dr", SbiServiceType::NudrDr);
+        svc.port = 1;
+        instance.add_service(svc);
+        sbi_ctx
+            .add_nf_instance_with_validity(instance, std::time::Duration::from_secs(3600))
+            .await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            udm_sbi_discover_and_send_nudr_dr(1, 1, SbiRequest::get("/nudr-dr/v2/ping")),
+        )
+        .await
+        .expect("the refused connection must not hang");
+        assert!(result.is_err(), "connecting to a closed port must fail");
+
+        assert!(
+            sbi_ctx.get_nf_instance(instance_id).await.is_none(),
+            "a transport failure must evict the UDR profile that was selected"
+        );
+    }
+
+    /// #235: the discovery WIRING — a profile learned from the NRF must carry the
+    /// SearchResult's `validityPeriod` into the cache, not be cached forever.
+    ///
+    /// Driven through the real `udm_nrf_discover` against a stub NRF, because the
+    /// interesting failure is a discovery path that calls `add_nf_instance`
+    /// (permanent) instead of `add_nf_instance_with_validity`. A library-level
+    /// test cannot see that: the plain method still works, it is just the wrong
+    /// one to call. `validityPeriod: 0` makes the assertion immediate and
+    /// sleep-free.
+    ///
+    /// The other three discovery writers (`amfd`, `ausfd`, `nssfd`) have the same
+    /// three lines and no equivalent test — see the spec's Ceilings section.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovery_honours_the_search_result_validity_period() {
+        // The discovery cache is process-global and all three #235 tests below
+        // seed `NfType::Udr` entries, so `.first()` in the by-type test could pick
+        // up a sibling's profile. `CONTEXT_GUARD` is udmd's existing process-wide
+        // test lock; poison-tolerant so one failing test does not turn its
+        // siblings into misleading second failures.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Dev profile: the stub NRF below is plain HTTP, and the default
+        // Production profile would make the client attempt TLS against it.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let addr = nextgcore_sbi::test_support::ephemeral_addr();
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+        );
+        server
+            .start(|_req: SbiRequest| async move {
+                let body = serde_json::json!({
+                    // The NRF says "do not cache this". Honouring it is the point.
+                    "validityPeriod": 0,
+                    "nfInstances": [{
+                        "nfInstanceId": "udmd-235-validity-udr",
+                        "nfType": "UDR",
+                        "nfStatus": "REGISTERED",
+                        "ipv4Addresses": ["127.0.0.1"],
+                    }]
+                });
+                SbiResponse::ok().with_json_body(&body).unwrap()
+            })
+            .await
+            .expect("stub NRF starts");
+
+        let sbi_ctx = global_context();
+        // `udm_nrf_discover` refuses to run without a self instance.
+        sbi_ctx
+            .set_self_instance(NfInstance::new("udmd-235-self", NfType::Udm))
+            .await;
+
+        let discovered = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            udm_nrf_discover("127.0.0.1", addr.port(), NfType::Udr),
+        )
+        .await
+        .expect("discovery must not hang")
+        .expect("discovery succeeds");
+        assert_eq!(discovered.len(), 1, "the stub returned one profile");
+
+        // Returned to the caller, but NOT selectable from the cache: a zero
+        // validityPeriod means this answer was good for this call only.
+        assert!(
+            sbi_ctx
+                .get_nf_instance("udmd-235-validity-udr")
+                .await
+                .is_none(),
+            "a zero validityPeriod must not leave a selectable cache entry"
+        );
+
+        server.stop().await.expect("stub NRF stops");
+    }
 
     #[test]
     fn test_sbi_server_config_default() {
