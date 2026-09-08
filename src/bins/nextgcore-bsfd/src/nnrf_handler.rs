@@ -1,100 +1,26 @@
 //! BSF NRF Handler
 //!
-//! Port of src/bsf/nnrf-handler.c - Handler for NRF discovery responses
-
-use crate::sbi_path::bsf_sbi_send_request;
-
-/// NF discovery search result (simplified)
-#[derive(Debug, Clone, Default)]
-pub struct SearchResult {
-    pub nf_instances: Vec<NfInstanceInfo>,
-    pub validity_period: Option<u32>,
-}
-
-/// NF instance information (simplified)
-#[derive(Debug, Clone, Default)]
-pub struct NfInstanceInfo {
-    pub nf_instance_id: String,
-    pub nf_type: String,
-    pub nf_status: String,
-    pub fqdn: Option<String>,
-    pub ipv4_addresses: Vec<String>,
-    pub ipv6_addresses: Vec<String>,
-    pub priority: Option<u16>,
-    pub capacity: Option<u16>,
-    pub load: Option<u8>,
-}
-
-/// SBI transaction context for discovery
-#[derive(Debug)]
-pub struct SbiXactContext {
-    pub id: u64,
-    pub service_type: String,
-    pub target_nf_type: String,
-    pub requester_nf_type: String,
-    pub sess_id: Option<u64>,
-    pub stream_id: Option<u64>,
-}
-
-/// Handle NF discover response
-/// Port of bsf_nnrf_handle_nf_discover
-pub fn bsf_nnrf_handle_nf_discover(
-    xact: &SbiXactContext,
-    search_result: &SearchResult,
-) -> Result<(), String> {
-    log::debug!(
-        "NF discover response: service_type={}, target_nf_type={}, requester_nf_type={}",
-        xact.service_type,
-        xact.target_nf_type,
-        xact.requester_nf_type
-    );
-
-    if search_result.nf_instances.is_empty() {
-        log::error!(
-            "(NF discover) No [{}:{}]",
-            xact.service_type,
-            xact.requester_nf_type
-        );
-        return Err("No NF instances found".to_string());
-    }
-
-    // Process search result
-    // In C: nextgcore_nnrf_disc_handle_nf_discover_search_result(SearchResult)
-    for nf_instance in &search_result.nf_instances {
-        log::debug!(
-            "Found NF instance: id={}, type={}, status={}",
-            nf_instance.nf_instance_id,
-            nf_instance.nf_type,
-            nf_instance.nf_status
-        );
-    }
-
-    // Find NF instance by discovery parameters
-    // In C: nextgcore_sbi_nf_instance_find_by_discovery_param(...)
-    let nf_instance = search_result
-        .nf_instances
-        .first()
-        .ok_or_else(|| "No suitable NF instance found".to_string())?;
-
-    log::debug!(
-        "Selected NF instance: {} ({})",
-        nf_instance.nf_instance_id,
-        nf_instance.nf_type
-    );
-
-    // Send request to discovered NF instance
-    // In C: bsf_sbi_send_request(nf_instance, xact)
-    let request = crate::sbi_path::PathSbiRequest {
-        method: "GET".to_string(),
-        uri: "/nbsf-management/v1/pcf-bindings".to_string(),
-        headers: vec![],
-        body: None,
-    };
-
-    bsf_sbi_send_request(&nf_instance.nf_instance_id, request)?;
-
-    Ok(())
-}
+//! Port of src/bsf/nnrf-handler.c - Handler for NRF status notifications.
+//!
+//! ## Removed in #234: the consumer-side NF-discovery path
+//!
+//! `bsf_nnrf_handle_nf_discover` and the three types that only fed it
+//! (`SearchResult`, `NfInstanceInfo`, `SbiXactContext`) are gone, together with
+//! the two tests that were its only callers — and which passed *because* the stub
+//! they reached fabricated `Ok(1)`. See the removal note in
+//! [`crate::sbi_path`] for the evidence that ruled out wiring it instead: bsfd's
+//! `nnrf-nfm` obligations are already complete, TS 29.521 gives the BSF no
+//! originated service request for binding management, and the handler hardcoded
+//! `GET /nbsf-management/v1/pcf-bindings` — it would have had the BSF query its
+//! own service on another NF.
+//!
+//! What remains is [`handle_nf_status_notify`], which is a different thing: an
+//! inbound status-notify observer, not an outbound discovery client. It has no
+//! non-test caller either — `bsf_sm.rs:176` mentions the C original in a comment
+//! but does not call it — so it is a latent hook rather than live code. It was
+//! left in place because #234 scopes itself to the discovery path, and because
+//! withdrawing an inbound observer is a different decision from deleting an
+//! outbound client that could not work.
 
 /// Handle NF status notify
 pub fn handle_nf_status_notify(nf_instance_id: &str, nf_status: &str) -> Result<(), String> {
@@ -121,48 +47,6 @@ pub fn handle_nf_status_notify(nf_instance_id: &str, nf_status: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_search_result_empty() {
-        let xact = SbiXactContext {
-            id: 1,
-            service_type: "nbsf-management".to_string(),
-            target_nf_type: "PCF".to_string(),
-            requester_nf_type: "BSF".to_string(),
-            sess_id: Some(1),
-            stream_id: Some(1),
-        };
-
-        let search_result = SearchResult::default();
-        let result = bsf_nnrf_handle_nf_discover(&xact, &search_result);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_search_result_with_instances() {
-        let xact = SbiXactContext {
-            id: 1,
-            service_type: "nbsf-management".to_string(),
-            target_nf_type: "PCF".to_string(),
-            requester_nf_type: "BSF".to_string(),
-            sess_id: Some(1),
-            stream_id: Some(1),
-        };
-
-        let search_result = SearchResult {
-            nf_instances: vec![NfInstanceInfo {
-                nf_instance_id: "pcf-001".to_string(),
-                nf_type: "PCF".to_string(),
-                nf_status: "REGISTERED".to_string(),
-                fqdn: Some("pcf.example.com".to_string()),
-                ..Default::default()
-            }],
-            validity_period: Some(3600),
-        };
-
-        let result = bsf_nnrf_handle_nf_discover(&xact, &search_result);
-        assert!(result.is_ok());
-    }
 
     #[test]
     fn test_handle_nf_status_notify() {
