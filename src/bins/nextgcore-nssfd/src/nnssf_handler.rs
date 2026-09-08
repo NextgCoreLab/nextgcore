@@ -273,6 +273,16 @@ pub struct RegistrationSliceInfo {
     pub default_configured_ind: bool,
     /// mappingOfNssai: (servingSnssai, homeSnssai)
     pub mapping_of_nssai: Vec<(SNssai, SNssai)>,
+    /// `allowedNssaiCurrentAccess.accessType` from the request, i.e. the access
+    /// the UE is currently on (TS 29.531 `SliceInfoForRegistration`).
+    ///
+    /// The response's `AllowedNssai.accessType` is a REQUIRED member, and this is
+    /// where the consumer states which access it is asking about — before #93 the
+    /// response hardcoded `3GPP_ACCESS`, so a non-3GPP registration was reported
+    /// back as 3GPP. `None` means the consumer did not say, in which case
+    /// `3GPP_ACCESS` remains the documented default (the member cannot be
+    /// omitted, and 3GPP access is the case a silent consumer means).
+    pub current_access_type: Option<String>,
 }
 
 /// Context snapshots needed to authorize a registration request without
