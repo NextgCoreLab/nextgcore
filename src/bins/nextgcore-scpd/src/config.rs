@@ -13,6 +13,7 @@
 //! - `scp.nf_instance_id` — the SCP's `nfInstanceId` for delegated OAuth2
 //! - `scp.connect_timeout` / `scp.request_timeout` — upstream timeouts (seconds)
 //! - `scp.max_cache_entries` / `scp.cache_ttl` — proxy cache bounds
+//! - `scp.max_producer_attempts` — Model D alternate-producer reselection bound
 //!
 //! Declaring only actionable keys is deliberate: parsing a key nothing reads
 //! is the very defect (#58, #102) being fixed.
@@ -72,6 +73,9 @@ pub struct ScpSection {
     pub max_cache_entries: Option<usize>,
     /// Cache entry lifetime, in whole seconds.
     pub cache_ttl: Option<u64>,
+    /// Maximum producers one Model D request may be forwarded to before the SCP
+    /// gives up (scpd-#209). `1` disables alternate-producer reselection.
+    pub max_producer_attempts: Option<usize>,
 }
 
 /// The top-level document: `scp: { ... }`.
@@ -92,6 +96,7 @@ impl ScpYaml {
             request_timeout: None,
             max_cache_entries: None,
             cache_ttl: None,
+            max_producer_attempts: None,
         };
         self.scp.as_ref().unwrap_or(&EMPTY)
     }
@@ -168,6 +173,7 @@ scp:
   request_timeout: 20
   max_cache_entries: 256
   cache_ttl: 120
+  max_producer_attempts: 5
 "#;
 
     #[test]
@@ -183,6 +189,7 @@ scp:
         assert_eq!(s.request_timeout, Some(20));
         assert_eq!(s.max_cache_entries, Some(256));
         assert_eq!(s.cache_ttl, Some(120));
+        assert_eq!(s.max_producer_attempts, Some(5));
         assert_eq!(
             s.sbi.as_ref().unwrap().tls.as_ref().unwrap().enabled,
             Some(false)
@@ -248,6 +255,7 @@ scp:
         assert!(cfg.section().fqdn.is_none());
         assert!(cfg.section().connect_timeout.is_none());
         assert!(cfg.section().max_cache_entries.is_none());
+        assert!(cfg.section().max_producer_attempts.is_none());
     }
 
     #[test]

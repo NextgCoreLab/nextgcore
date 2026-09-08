@@ -286,6 +286,72 @@ pub fn select_nf_service_endpoint<'a>(
     service_name: Option<&str>,
     api_version: Option<&str>,
 ) -> Result<SelectedEndpoint<'a>, EndpointSelectionError> {
+    rank_nf_service_endpoints(candidates, service_name, api_version)?
+        .into_iter()
+        .next()
+        .ok_or(EndpointSelectionError::NoCandidate)
+}
+
+/// Every producer endpoint matching the requested service and API version, in
+/// **selection order** — the head is exactly what [`select_nf_service_endpoint`]
+/// returns, and each subsequent entry is what it *would* return with all the
+/// preceding ones removed (scpd-#209).
+///
+/// The ranking is built by applying the same health / priority / capacity rule
+/// repeatedly rather than by sorting on a comparable key. That is deliberate:
+/// `select_best` breaks a capacity tie via `max_by_key`, which yields the **last**
+/// maximum, whereas a descending sort yields the first. Re-running the real rule
+/// makes head-equality true by construction instead of by reproducing a tie-break
+/// exactly — which is the sort of detail that drifts and then silently changes
+/// which producer every Model D request goes to.
+///
+/// The candidate lists here are a handful of entries, so the repeated pass is not
+/// a cost worth trading correctness for.
+pub fn rank_nf_service_endpoints<'a>(
+    candidates: &'a [NfInstanceCandidate],
+    service_name: Option<&str>,
+    api_version: Option<&str>,
+) -> Result<Vec<SelectedEndpoint<'a>>, EndpointSelectionError> {
+    let matching = match_candidates(candidates, service_name, api_version)?;
+
+    // The pool rule is applied ONCE, up front, rather than left to emerge from
+    // `select_best`'s own fallback. It has to be: `select_best` falls back to "all
+    // candidates" when none are healthy, so re-running it until the pool empties
+    // would hand back every SUSPENDED instance as a last-resort alternate once the
+    // healthy ones were exhausted. A SUSPENDED NF must not be selected
+    // (TS 29.510 `nfStatus`), so that would trade a reachability problem for a
+    // conformance one. The existing leniency — use everything when the NRF reports
+    // nothing healthy at all — is preserved, because that is a different case.
+    let healthy: Vec<&NfInstanceCandidate> =
+        matching.iter().copied().filter(|c| c.healthy).collect();
+    let mut remaining = if healthy.is_empty() {
+        matching
+    } else {
+        healthy
+    };
+    let mut ranked = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let Some(best) = select_best(remaining.clone()) else {
+            break;
+        };
+        remaining.retain(|c| !std::ptr::eq(*c, best));
+        ranked.push(resolve_endpoint(best, service_name, api_version));
+    }
+    if ranked.is_empty() {
+        return Err(EndpointSelectionError::NoCandidate);
+    }
+    Ok(ranked)
+}
+
+/// The candidates that match the requested service name and API version, in
+/// SearchResult order and before any priority ordering. Splitting this out is
+/// what lets the error variants stay distinct while both the single-pick and the
+/// ranked-list entry points share one definition of "matching".
+fn match_candidates<'a>(
+    candidates: &'a [NfInstanceCandidate],
+    service_name: Option<&str>,
+    api_version: Option<&str>,
+) -> Result<Vec<&'a NfInstanceCandidate>, EndpointSelectionError> {
     if candidates.is_empty() {
         return Err(EndpointSelectionError::NoCandidate);
     }
@@ -321,15 +387,22 @@ pub fn select_nf_service_endpoint<'a>(
         return Err(EndpointSelectionError::UnsupportedApiVersion);
     }
 
-    let candidate = select_best(serves_version).ok_or(EndpointSelectionError::NoCandidate)?;
+    Ok(serves_version)
+}
 
-    // Endpoint from the MATCHING service; the profile-level fields are only the
-    // fallback for a profile with no service list.
+/// Resolve `candidate` to its endpoint, taking scheme / port / `apiPrefix` from
+/// the **matching** service and falling back to the profile-level fields only
+/// when the profile declares no service list.
+fn resolve_endpoint<'a>(
+    candidate: &'a NfInstanceCandidate,
+    service_name: Option<&str>,
+    api_version: Option<&str>,
+) -> SelectedEndpoint<'a> {
     let matched = candidate
         .services
         .iter()
         .find(|s| service_name_matches(s, service_name) && service_version_matches(s, api_version));
-    Ok(match matched {
+    match matched {
         Some(service) => SelectedEndpoint {
             candidate,
             scheme: service.scheme,
@@ -342,7 +415,7 @@ pub fn select_nf_service_endpoint<'a>(
             port: candidate.port,
             prefix: candidate.prefix.clone(),
         },
-    })
+    }
 }
 
 /// Round-robin index for distributing requests across equal-weight instances.
@@ -1403,6 +1476,117 @@ mod tests {
             .expect("the matching instance is selected despite worse priority");
         assert_eq!(selected.candidate.nf_instance_id, "udm-uecm-only");
         assert_eq!(selected.port, 2222);
+    }
+
+    // ------------------------------------------------------------------
+    // scpd-#209: the ranked candidate list reselection walks
+    // ------------------------------------------------------------------
+
+    /// scpd-#209: the ranked list's **head is exactly** what the single-pick entry
+    /// point returns, and each tail entry is the same rule with the preceding ones
+    /// removed. That equality is the whole reason `rank_nf_service_endpoints`
+    /// re-runs `select_best` instead of sorting on a key.
+    ///
+    /// The fixture contains a deliberate **capacity tie** between `udm-a` and
+    /// `udm-b`: `select_best` resolves it with `max_by_key`, which yields the LAST
+    /// maximum, so the head is `udm-b`. A descending sort would have produced
+    /// `udm-a` and silently changed which producer every Model D request goes to.
+    #[test]
+    fn test_ranked_endpoints_head_matches_the_single_pick() {
+        let tied = serde_json::to_vec(&serde_json::json!({
+            "nfInstances": [
+                {
+                    "nfInstanceId": "udm-a",
+                    "nfType": "UDM", "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["10.0.0.20"],
+                    "priority": 10, "capacity": 100, "load": 50,
+                    "nfServices": [{"serviceName": "nudm-uecm",
+                                    "ipEndPoints": [{"port": 1001}]}]
+                },
+                {
+                    "nfInstanceId": "udm-b",
+                    "nfType": "UDM", "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["10.0.0.21"],
+                    "priority": 10, "capacity": 100, "load": 50,
+                    "nfServices": [{"serviceName": "nudm-uecm",
+                                    "ipEndPoints": [{"port": 1002}]}]
+                },
+                {
+                    "nfInstanceId": "udm-c",
+                    "nfType": "UDM", "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["10.0.0.22"],
+                    "priority": 20, "capacity": 100, "load": 0,
+                    "nfServices": [{"serviceName": "nudm-uecm",
+                                    "ipEndPoints": [{"port": 1003}]}]
+                }
+            ]
+        }))
+        .unwrap();
+        let candidates = parse_search_result(&tied);
+
+        let single = select_nf_service_endpoint(&candidates, Some("nudm-uecm"), Some("v1"))
+            .expect("single pick");
+        let ranked =
+            rank_nf_service_endpoints(&candidates, Some("nudm-uecm"), Some("v1")).expect("ranked");
+
+        assert_eq!(
+            ranked.len(),
+            3,
+            "every matching candidate is available as an alternate"
+        );
+        assert_eq!(
+            ranked[0].candidate.nf_instance_id, single.candidate.nf_instance_id,
+            "the ranked head must BE the single pick, or reselection would start \
+             somewhere other than where selection did"
+        );
+        let order: Vec<&str> = ranked
+            .iter()
+            .map(|e| e.candidate.nf_instance_id.as_str())
+            .collect();
+        assert_eq!(order, vec!["udm-b", "udm-a", "udm-c"]);
+        // Each entry still carries its own matched endpoint.
+        assert_eq!(ranked[0].port, 1002);
+        assert_eq!(ranked[1].port, 1001);
+        assert_eq!(ranked[2].port, 1003);
+    }
+
+    /// scpd-#209: an unhealthy instance is **not** offered as an alternate while a
+    /// healthy one exists, mirroring `select_best`'s pool rule. A `SUSPENDED` NF
+    /// must not be selected (TS 29.510), so failing over onto one would trade a
+    /// reachability problem for a conformance one — the ranked list therefore
+    /// stops at the healthy set rather than appending the rest as a last resort.
+    #[test]
+    fn test_ranked_endpoints_exclude_unhealthy_while_a_healthy_one_exists() {
+        let mixed = serde_json::to_vec(&serde_json::json!({
+            "nfInstances": [
+                {
+                    "nfInstanceId": "udm-suspended",
+                    "nfType": "UDM", "nfStatus": "SUSPENDED",
+                    "ipv4Addresses": ["10.0.0.30"],
+                    "priority": 1,
+                    "nfServices": [{"serviceName": "nudm-uecm",
+                                    "ipEndPoints": [{"port": 2001}]}]
+                },
+                {
+                    "nfInstanceId": "udm-registered",
+                    "nfType": "UDM", "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["10.0.0.31"],
+                    "priority": 50,
+                    "nfServices": [{"serviceName": "nudm-uecm",
+                                    "ipEndPoints": [{"port": 2002}]}]
+                }
+            ]
+        }))
+        .unwrap();
+        let candidates = parse_search_result(&mixed);
+        let ranked =
+            rank_nf_service_endpoints(&candidates, Some("nudm-uecm"), Some("v1")).expect("ranked");
+        assert_eq!(
+            ranked.len(),
+            1,
+            "the SUSPENDED instance is not an alternate"
+        );
+        assert_eq!(ranked[0].candidate.nf_instance_id, "udm-registered");
     }
 
     /// scpd-#207: an unhealthy instance is still skipped inside the matching set,

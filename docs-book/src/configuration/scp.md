@@ -2,9 +2,11 @@
 
 The SCP (Service Communication Proxy, `nextgcore-scpd`) is the 5GC indirect-communication proxy: an HTTP/2 forwarding engine implementing TS 29.500 §6.10 (as cited in the daemon's source comments) with both **Model C** (consumer supplies `3gpp-Sbi-Target-apiRoot`) and **Model D** (delegated discovery driven by `3gpp-Sbi-Discovery-*` headers, resolved against the NRF's `nnrf-disc` service per TS 29.500 §6.10.3 / TS 29.510 §5.3.2 per code comments). It exposes no NF-specific API routes of its own — a single catch-all handler (`ScpProxy::handle` in `src/bins/nextgcore-scpd/src/proxy.rs`) proxies every inbound SBI request, adding binding stickiness (TS 29.500 §6.12), Via/Server loop detection (§6.10.10), and delegated OAuth2 token acquisition (TS 33.501 §13, per code comments).
 
-Configuration is **CLI flags and environment variables only**. There is a YAML file path (default `/etc/nextgcore/scp.yaml`, overridable with `-c/--config`), but the daemon does not parse it — see the honesty note below. The NRF URI, the SCP's NF Instance ID, and its FQDN each have an environment-variable fallback (`NRF_URI`, `NF_INSTANCE_ID`, `SCP_FQDN`) used when the corresponding flag is absent; the flag always wins over the env var.
+Configuration comes from **CLI flags, environment variables and the YAML file**, in that precedence order (CLI > env > file > built-in default). The file path defaults to `/etc/nextgcore/scp.yaml` and is overridable with `-c/--config`. The NRF URI, the SCP's NF Instance ID, and its FQDN each have an environment-variable fallback (`NRF_URI`, `NF_INSTANCE_ID`, `SCP_FQDN`) used when the corresponding flag is absent; the flag always wins over the env var, and the file is consulted after both.
 
-> **Honesty note:** SCP behavior is validated by this project's own unit tests (including an in-process mock NRF in `proxy.rs`) and the matched-simulator Docker E2E, not by third-party conformance certification. Three things an operator should know up front: (1) the daemon **reads the YAML config file only to log its byte count** — `main.rs` contains a placeholder (`// In C: scp_context_parse_config()`) and no `#[derive(Deserialize)]` config structs exist anywhere in the crate, so every field in the shipped `scp.yaml` is decorative; (2) the `-k/--kill` flag is a stub that logs "would send SIGTERM" and exits without killing anything; (3) `-l/--log-file` is accepted by clap but never used by `init_logging` — logs always go to the `env_logger` default sink.
+> **Honesty note:** SCP behavior is validated by this project's own unit tests (including an in-process mock NRF in `proxy.rs`) and the matched-simulator Docker E2E, not by third-party conformance certification. Two things an operator should know up front: (1) the `-k/--kill` flag is a stub that logs "would send SIGTERM" and exits without killing anything; (2) `-l/--log-file` is accepted by clap but never used by `init_logging` — logs always go to the `env_logger` default sink.
+>
+> This note previously stated that the daemon read the YAML file only to log its byte count and that every field in it was decorative. **That is no longer true** and is corrected below: `config.rs` carries `#[derive(Deserialize)]` structs and `main.rs` reads the `scp` section for the SBI address/port, the NRF URI, `fqdn`, `nf_instance_id`, both timeouts, the cache bounds, `max_producer_attempts`, and `sbi.tls.enabled`/`cert`/`key`.
 
 ## Example configuration
 
@@ -41,21 +43,36 @@ scp:
       min_version: "1.2"
 ```
 
-Note that the shipped `docker-compose.yml` service (`scp:`, lines 491–503) does not even mount this file into the container — it runs the daemon purely on CLI flags: `command: ["--sbi-addr", "172.23.0.37", "--sbi-port", "7777"]`. The YAML's addresses (`172.22.0.x`) do not match the compose network (`172.23.0.x`), which is further evidence the file is not load-bearing.
+The commented-out optional `scp`-level keys are omitted from the excerpt above; see the live-fields table below.
+
+Note that the shipped `docker-compose.yml` service (`scp:`, lines 491–503) does not mount this file into the container — it runs the daemon purely on CLI flags: `command: ["--sbi-addr", "172.23.0.37", "--sbi-port", "7777"]`. The YAML's addresses (`172.22.0.x`) do not match the compose network (`172.23.0.x`) either. So the file **is** parsed when present, but in *that* deployment it is never mounted and the flags supply everything.
 
 ## YAML parameters
 
-**None.** Unlike the other NF daemons, `nextgcore-scpd` deserializes no YAML fields at all. `main.rs` checks whether the `--config` path exists, reads the file to a string, and logs `"Configuration file loaded (N bytes)"` — nothing more. There are no serde `Deserialize` structs in `src/bins/nextgcore-scpd/`. All runtime knobs are CLI flags (below) with three env-var fallbacks, plumbed into `ScpProxyConfig` (`proxy.rs`) and `SbiServerConfig` (`sbi_path.rs`).
+`nextgcore-scpd` deserializes its `scp` section in `src/bins/nextgcore-scpd/src/config.rs` (serde `Deserialize` structs) and `main.rs` resolves each value as CLI flag > env var > file > built-in default via `config::resolve`. The resolved values are plumbed into `ScpProxyConfig` (`proxy.rs`) and `SbiServerConfig` (`sbi_path.rs`).
 
-### Parsed-but-inert / decorative YAML fields
+### Which YAML fields are live, and which are inert
 
-Every field in the shipped example file is inert. Where the real knob lives:
+**Live** — read by `config.rs` / `main.rs`, and used when no CLI flag or environment variable supplies the value:
 
-- **`logger.file.path` and `logger.level` are inert.** The log level comes from the CLI flag `-e/--log-level` (default `info`); `init_logging` builds `env_logger` with an explicit filter level, so even `RUST_LOG` (set to `info` by the compose file's common environment) is not consulted. There is no working log-file output (`-l/--log-file` is accepted but unused).
-- **`global.max.ue` / `global.max.peer` are inert.** The only pool sizing the daemon applies is `--max-assoc` (default `8192`), passed to `scp_context_init`.
-- **`scp.sbi.server[]` (address/port) is inert.** The SBI bind address and port come from `--sbi-addr`/`--sbi-port`.
-- **`scp.sbi.client.nrf[].uri` is inert.** The NRF URI for Model D delegated discovery comes from `--nrf-uri`, falling back to the `NRF_URI` environment variable; when neither is set, delegated discovery is disabled.
-- **`scp.sbi.tls.*` (enabled/cert/key/ca/min_version) is inert.** TLS is controlled by the `--tls`, `--tls-cert`, and `--tls-key` flags; there is no CA-bundle or minimum-version knob in the code.
+| key | effect |
+|---|---|
+| `scp.sbi.server[0].address` / `.port` | SBI bind address / port (after `--sbi-addr` / `--sbi-port`) |
+| `scp.sbi.client.nrf[0].uri` | NRF URI for Model D (after `--nrf-uri`, then `NRF_URI`) |
+| `scp.sbi.tls.enabled` / `.cert` / `.key` | TLS on the SBI server; `--tls` forces it on regardless |
+| `scp.fqdn` | SCP identity for `Via` / `Server` / loop detection (after `--scp-fqdn`, then `SCP_FQDN`) |
+| `scp.nf_instance_id` | own `nfInstanceId` for delegated tokens (after `--nf-instance-id`, then `NF_INSTANCE_ID`) |
+| `scp.connect_timeout` / `scp.request_timeout` | upstream timeouts, whole seconds |
+| `scp.max_cache_entries` / `scp.cache_ttl` | proxy cache bounds |
+| `scp.max_producer_attempts` | Model D alternate-producer reselection bound |
+
+All of the `scp`-level keys are shipped **commented out**, so the built-in defaults apply unless an operator uncomments them.
+
+**Inert** — present in the shipped file and not read anywhere:
+
+- **`logger.file.path` and `logger.level`.** The log level comes from the CLI flag `-e/--log-level` (default `info`); `init_logging` builds `env_logger` with an explicit filter level, so even `RUST_LOG` (set to `info` by the compose file's common environment) is not consulted. There is no working log-file output (`-l/--log-file` is accepted but unused).
+- **`global.max.ue` / `global.max.peer`.** The only pool sizing the daemon applies is `--max-assoc` (default `8192`), passed to `scp_context_init`.
+- **`scp.sbi.tls.ca` and `scp.sbi.tls.min_version`.** There is no CA-bundle or minimum-version knob in the code; the rest of the `tls` block *is* read.
 
 ## Command-line flags
 
@@ -63,7 +80,7 @@ From the clap `Args` struct in `src/bins/nextgcore-scpd/src/main.rs`:
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `-c, --config` | path | `/etc/nextgcore/scp.yaml` | Configuration file path (read but **not parsed** — see honesty note). |
+| `-c, --config` | path | `/etc/nextgcore/scp.yaml` | Configuration file path. Parsed; see the live-fields table above. |
 | `-l, --log-file` | path | unset | Log file path — **accepted but unused** by `init_logging`. |
 | `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
 | `-m, --no-color` | flag | off | Disable color output. |
@@ -94,8 +111,15 @@ From the clap `Args` struct in `src/bins/nextgcore-scpd/src/main.rs`:
   | NRF answered, non-200 | **502** | `NF_DISCOVERY_FAILURE` |
   | empty `SearchResult`, or no instance offering the requested service | **404** | `NF_DISCOVERY_FAILURE` |
   | requested API major version served by no discovered producer | **400** | `INVALID_API` |
+  | every discovered producer unreachable (candidate set exhausted) | **504** | `TARGET_NF_NOT_REACHABLE` |
 
   `TARGET_NF_NOT_REACHABLE` is reserved for **producer**-side unreachability and is never used for an NRF failure.
+- **Model D alternate-producer reselection** (TS 29.500 §6.10.8.2 per code comment): the whole ranked candidate set is kept, and a forward that **provably never reached** the selected producer is retried against the next-best one. Bounded by `scp.max_producer_attempts` (default **3** — the selected producer plus two alternates; `1` disables reselection), and the bound is logged at `warn` when it leaves discovered candidates untried. Three rules govern when it fires:
+  - **Only pre-send failures.** A connection refused or a TLS handshake failure proves the request bytes were never written, so replaying them cannot duplicate work even for a `POST`. A **timeout** does *not* qualify — the same error covers "never connected" and "sent, producer still working" — and neither does any post-send transport error, so a possibly-delivered request is never replayed.
+  - **An open circuit breaker reselects rather than shedding.** Previously the breaker protected a dead producer but still failed the request; now the request goes to a sibling while the dead producer stays protected. If *every* candidate is shed by its own breaker, the answer is **503** `TARGET_NF_NOT_REACHABLE` (load shedding, retry shortly) rather than 504.
+  - **A producer that answered is never reselected.** Any status the producer returns — including 4xx and 5xx — is relayed verbatim; a sibling has no business overriding it.
+
+  A reselected producer reports **its own** `3gpp-Sbi-Producer-Id`, not the originally selected one's. Model C and binding-stickiness forwarding have no alternates, so a single pinned target keeps its previous mapping (**502** refused / **504** timeout).
 - **Delegated OAuth2**: when an NRF URI is known, the SCP acts as an OAuth2 client of NF type `SCP` and attaches producer-scoped access tokens on the Model D path; a token the NRF refuses yields **403** `ACCESS_TOKEN_DENIED`, and a producer `401` with a Bearer `WWW-Authenticate` challenge triggers one token-retry (TS 29.500 §6.10.11.2.3 per code comment). Model C requests are forwarded with the consumer's own `Authorization` untouched.
 - **No NRF registration**: the SCP never registers or heartbeats itself with the NRF — its only NRF traffic is `GET /nnrf-disc/v1/nf-instances` and token requests. Note the shipped `docker-compose.yml` sets no `NRF_URI` for the `scp` service, so Model D is disabled in that deployment (discovery requests get 503). Error identity: SCP-originated errors carry `Server: SCP-<fqdn>` (§6.10.8.2 per code comment); relayed producer 4xx/5xx keep their body/status verbatim but gain this SCP's `Via` (§6.10.8.3).
 - **Environment variables** (all read in `main.rs`; flags take precedence): `NRF_URI`, `NF_INSTANCE_ID`, `SCP_FQDN` (fallbacks as in the flags table) and `OTEL_EXPORTER_OTLP_ENDPOINT` (OpenTelemetry OTLP trace exporter endpoint, default `http://jaeger:4317`). Upstream timeouts are compile-time constants — 2 s connect, 10 s request (`proxy.rs`, bounded per TS 29.500 §6.11 guidance per code comment) — with no CLI or YAML override.
