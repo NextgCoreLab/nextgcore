@@ -1,6 +1,37 @@
 //! BSF Context Management
 //!
 //! Port of src/bsf/context.c - BSF context with session management and IP address hashing
+//!
+//! # Durability: this is a MEMORY-ONLY NF, by decision
+//!
+//! Every resource held here — PDU-session bindings, UE bindings, MBS bindings and
+//! event subscriptions — lives in process memory and is lost on restart. The
+//! `bsf_bindings` MongoDB helpers below exist, but the daemon never calls
+//! `nextgcore_mongoc_init` / `nextgcore_dbi_init`, so every upsert, delete and load
+//! is a best-effort no-op logging at debug. There is no config key and no
+//! environment variable that would supply a database URI.
+//!
+//! **Restoring bindings would be worse than losing them**, which is why this is a
+//! decision and not a gap. A TS 29.521 binding is a LIVE association between a UE's
+//! PDU session and the PCF currently serving it. While the BSF is down that
+//! association can change — the session can be released, or another PCF can take it
+//! over — so a restored binding asserts a fact that may no longer hold, and a
+//! consumer reading it is told the WRONG PCF. "No binding" makes the consumer
+//! re-discover; a wrong binding makes it send policy traffic to a PCF that does not
+//! serve the session.
+//!
+//! Restoring subscriptions ALONE would be worse still, and is specifically not
+//! done: a subscriber that survived a restart while its bindings did not would
+//! either be notified about nothing, or — if the sweep read absent bindings as
+//! removed — be told bindings "deregistered" that were simply never restored, which
+//! is a fabricated event.
+//!
+//! Consumers must therefore re-register their bindings and re-subscribe after a
+//! restart. `docs-book/src/configuration/bsf.md` states this for interop partners,
+//! and [`tests::bsfd_is_declared_memory_only`] fails if a future change initialises
+//! the DBI layer without updating that page — so the posture cannot quietly stop
+//! being true. The same page records what would have to change to make it durable,
+//! bindings first and subscriptions with them.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -1721,6 +1752,68 @@ mod persistence_visibility_guards {
 
 #[cfg(test)]
 mod tests {
+    /// Guards the memory-only durability posture documented on this module and in
+    /// `docs-book/src/configuration/bsf.md`.
+    ///
+    /// A documented posture that nothing checks is a posture that stops being true
+    /// quietly. This reads bsfd's own sources: if a future change initialises the
+    /// shared DBI layer, the daemon is no longer memory-only and both the module doc
+    /// and the docs-book page are wrong — so the test fails and names them.
+    ///
+    /// Modelled on `nextgcore_core::signal`'s `--kill` guard, including its
+    /// self-check: it asserts the persistence helpers are still PRESENT, so the test
+    /// cannot pass by silently having nothing left to look at.
+    #[test]
+    fn bsfd_is_declared_memory_only() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert!(src_dir.is_dir(), "expected {} to exist", src_dir.display());
+
+        let mut initialisers = Vec::new();
+        let mut saw_persistence_helpers = false;
+        for entry in std::fs::read_dir(&src_dir).expect("read bsfd src/") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // The two calls that would give this daemon a real database.
+            //
+            // Built by concatenation so THIS FILE never contains either marker as a
+            // contiguous string. The first version skipped any line containing a
+            // quote, to avoid matching the guard's own literals -- which would have
+            // silently skipped a real `..._dbi_init("mongodb://...")` call, i.e. the
+            // most likely form of the very thing being guarded against. Removing the
+            // need for that heuristic removes the false negative.
+            for marker in [
+                concat!("nextgcore_", "mongoc_init"),
+                concat!("nextgcore_", "dbi_init"),
+            ] {
+                for line in text.lines() {
+                    if line.contains(marker) && !line.trim_start().starts_with("//") {
+                        initialisers.push(format!("{name}: {}", line.trim()));
+                    }
+                }
+            }
+            if text.contains("fn bsf_db_upsert_binding") {
+                saw_persistence_helpers = true;
+            }
+        }
+
+        assert!(
+            saw_persistence_helpers,
+            "the guard expected to find the bsf_bindings persistence helpers; it found none, so              it is no longer checking anything"
+        );
+        assert!(
+            initialisers.is_empty(),
+            "bsfd now initialises the DBI layer, so it is NOT memory-only: {initialisers:?}.              Update the durability section of docs-book/src/configuration/bsf.md and this              module's doc comment, and decide what a restored binding owes a consumer \
+             (see that section's 'Why restoring bindings would be worse')."
+        );
+    }
+
     use super::*;
 
     #[test]

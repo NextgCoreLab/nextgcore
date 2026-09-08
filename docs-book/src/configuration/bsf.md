@@ -4,7 +4,7 @@ The BSF (Binding Support Function, `nextgcore-bsfd`) stores and serves PCF bindi
 
 Configuration is split between a YAML file (default path `/etc/nextgcore/bsf.yaml`, overridable with `-c/--config`; the docker deployment passes `-c /etc/nextgcore/bsf.yaml`) and command-line flags. Unusually for this codebase, the YAML SBI `server` entry **overrides** the CLI `--sbi-addr`/`--sbi-port` (so the NRF NFProfile advertises a routable endpoint instead of `0.0.0.0`, per the code comment); everything else — TLS flags, session capacity, log level — is CLI-only. The only environment variable the binary reads is `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
-> **Honesty note:** BSF behavior is validated by this project's own unit tests and matched-simulator Docker E2E runs (84/84 as of 2026-07-02), not by third-party conformance certification. Known gaps visible in the source: the `--tls` flag does **not** enable TLS on the actual HTTP/2 listener (it only flips the advertised URI scheme in the legacy NF-instance metadata built in `sbi_path.rs`); the MongoDB persistence layer (`bsf_bindings` collection) is best-effort and the daemon never initializes a MongoDB connection itself — no `nextgcore_mongoc_init`/`nextgcore_dbi_init` call exists in this crate, so in the standalone binary bindings live in memory only; and `sbi_path.rs` still contains legacy placeholder helpers (`bsf_sbi_send_request`/`bsf_sbi_discover_and_send` return a hardcoded transaction ID).
+> **Honesty note:** BSF behavior is validated by this project's own unit tests and matched-simulator Docker E2E runs (84/84 as of 2026-07-02), not by third-party conformance certification. Known gaps visible in the source: the `--tls` flag does **not** enable TLS on the actual HTTP/2 listener (it only flips the advertised URI scheme in the legacy NF-instance metadata built in `sbi_path.rs`); the daemon is **memory-only** by decision — bindings and subscriptions do not survive a restart, see [Durability](#durability-bsfd-is-a-memory-only-nf); and `sbi_path.rs` still contains legacy placeholder helpers (`bsf_sbi_send_request`/`bsf_sbi_discover_and_send` return a hardcoded transaction ID).
 
 ## Example configuration
 
@@ -103,3 +103,55 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
 - **Binding TTL**: every PDU-session binding arms an expiry timer — from the RFC 3339 `expiry` attribute when supplied (invalid values are rejected 400), otherwise the default TTL of **3600 s** (`timer::defaults::BINDING_EXPIRY` in `src/bins/nextgcore-bsfd/src/timer.rs`). The event loop removes expired bindings, and expired-but-unswept bindings are excluded from GET/discovery.
 - **NRF registration and load reporting**: the BSF PUTs an NFProfile (`nfType: BSF`, service `nbsf-management`, `allowedNfTypes: PCF/SMF/SCP`, `heartBeatTimer: 10`) to `/nnrf-nfm/v1/nf-instances/{id}` and, on success, spawns a heartbeat worker every **5 s** that PATCHes a live `/load` gauge computed as bindings vs. `--max-sess` capacity (TS 29.510 §5.2.2.3.2 per code comment). Registration failure is non-fatal ("will operate without NRF"). Quirk: passing `--nrf-uri` on the CLI additionally triggers a second, legacy registration with a separate random NF instance ID from `bsf_sbi_open` (`sbi_path.rs`); the YAML-configured URI only drives the main registration path.
 - **Environment variables**: the only one read is `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://jaeger:4317`) for the OpenTelemetry OTLP exporter. `RUST_LOG` is not honored, and MongoDB persistence has no URI source in this binary at all — the `bsf_bindings` upsert/delete/load calls are best-effort no-ops (failures logged at debug) unless some in-process embedder initializes the shared DBI layer first.
+
+## Durability: bsfd is a memory-only NF
+
+**Decided deliberately, not by omission.** Every resource this BSF holds — PDU-session bindings, UE
+bindings, MBS bindings and event subscriptions — lives in process memory and is **lost when the daemon
+restarts**. There is no state file and no database connection: the `bsf_bindings` MongoDB helpers exist in
+`context.rs` but the daemon never calls `nextgcore_mongoc_init` / `nextgcore_dbi_init`, so every
+upsert/delete/load is a best-effort no-op that logs at debug. A source guard
+(`bsfd_is_declared_memory_only` in `context.rs`) fails the build's test suite if a future change initialises
+the DBI layer without updating this section, so this statement cannot quietly stop being true.
+
+### What a consumer must do
+
+After a BSF restart, a consumer must:
+
+1. **re-register its bindings.** A `GET /pcfBindings?ipv4Addr=…` for a session registered before the restart
+   returns **204** (no match), which is the same answer as "never registered" — deliberately, because it is
+   the truth. The PCF or SMF that owns the binding is the only party that can restore it.
+2. **re-subscribe.** A `POST /nbsf-management/v1/subscriptions` from before the restart is gone, and no
+   notification will be delivered for it. `DELETE` on its `{subId}` answers 404.
+
+Nothing is silently degraded: there is no path that returns a stale binding or accepts a notification
+subscription it will not honour.
+
+### Why restoring bindings would be *worse* than losing them
+
+This is the reason the memory-only posture is a decision rather than a gap to be filled later.
+
+A TS 29.521 binding is a **live** association between a UE's PDU session and the PCF currently serving it.
+While the BSF is down, that association can change: the session can be released, or a different PCF can take
+it over. A restored binding therefore asserts a fact that may no longer hold — and a consumer that reads it
+is told **the wrong PCF**, which is worse than being told nothing, because "nothing" makes it re-discover
+while a wrong answer makes it send policy traffic to a PCF that does not serve the session.
+
+Restoring subscriptions **alone** would be worse still, and is specifically not done: a subscriber that
+survived a restart while its bindings did not would either be notified about nothing at all, or — if the
+sweep treated absent bindings as removed — be told bindings "deregistered" that were simply never restored.
+That is a fabricated event, which is the failure this project treats as most serious.
+
+### What would have to change to make it durable
+
+Recorded so the option stays open and costed, rather than being rediscovered:
+
+1. **bindings first, subscriptions with them** — never subscriptions alone, for the reason above.
+2. a URI source for the DBI layer (there is none in this binary today: no config key, no environment
+   variable) plus a `nextgcore_dbi_init` call on the startup path, and a decision about whether a database
+   that is unreachable at boot is fatal or degrades to memory-only;
+3. a **recovery-time** answer for the staleness above — most plausibly writing `recoveryTime` on each
+   binding and refusing to serve a restored binding whose owning PCF has not reconfirmed it, which is a
+   protocol addition rather than a storage change;
+4. the durable-snapshot hazards this project has already paid for elsewhere: restore **before** the SBI
+   listener accepts, persist removals as well as inserts, and never resurrect a deleted record.
