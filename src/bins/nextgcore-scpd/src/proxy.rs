@@ -431,45 +431,6 @@ fn build_producer_id(nf_instance_id: &str, nf_set_id: Option<&str>) -> Option<St
     Some(value)
 }
 
-/// Extract the producer's NF set id (`nfSetIdList[0]`) and NF group id
-/// (`{udm,udr,ausf,pcf}Info.groupId`) for the selected instance from a parsed
-/// SearchResult, used for `3gpp-Sbi-Producer-Id`/`3gpp-Sbi-Target-Nf-Group-Id`.
-fn extract_set_and_group(
-    value: &serde_json::Value,
-    nf_instance_id: &str,
-) -> (Option<String>, Option<String>) {
-    let inst = value
-        .get("nfInstances")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .find(|i| i.get("nfInstanceId").and_then(|x| x.as_str()) == Some(nf_instance_id))
-        });
-    let set = inst
-        .and_then(|i| i.get("nfSetIdList"))
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let group = inst.and_then(group_id_from_profile);
-    (set, group)
-}
-
-/// Read the NF group id from whichever per-type info object the NF profile
-/// carries (UDM/UDR/AUSF/PCF group membership, TS 29.510 §6.1.6.2.x).
-fn group_id_from_profile(inst: &serde_json::Value) -> Option<String> {
-    for key in ["udmInfo", "udrInfo", "ausfInfo", "pcfInfo"] {
-        if let Some(g) = inst
-            .get(key)
-            .and_then(|x| x.get("groupId"))
-            .and_then(|x| x.as_str())
-        {
-            return Some(g.to_string());
-        }
-    }
-    None
-}
-
 /// A `3gpp-Sbi-Binding` / `3gpp-Sbi-Routing-Binding` value decomposed into its
 /// binding level and entity identifiers (TS 29.500 §5.2.3.2.5/§5.2.3.2.6).
 /// Only the members the SCP keys stickiness on are retained.
@@ -529,6 +490,25 @@ struct DiscoveredProducer {
 struct DiscoveryOutcome {
     primary: DiscoveredProducer,
     alternates: Vec<DiscoveredProducer>,
+}
+
+/// What the SCP decided about the target, carried into the response relay because
+/// the fix-ups it owes the consumer depend on it (TS 29.500 §6.10.3.4 / §6.10.4).
+#[derive(Debug, Default, Clone, Copy)]
+struct RelayContext<'a> {
+    /// The `3gpp-Sbi-Producer-Id` value to surface, when the SCP has one.
+    producer_id: Option<&'a str>,
+    /// The producer's NF group id for `3gpp-Sbi-Target-Nf-Group-Id`.
+    group_id: Option<&'a str>,
+    /// True when the **SCP** chose the producer (Model D, or a sticky binding
+    /// resolved from its own cache) rather than the consumer naming it in
+    /// `3gpp-Sbi-Target-apiRoot`.
+    ///
+    /// This is the §6.10.4 trigger: after retargeting, the consumer does not know
+    /// which apiRoot the created resource lives on, so a relative `Location` it
+    /// receives is unusable. In Model C the consumer picked the target itself and
+    /// needs no help.
+    retargeted: bool,
 }
 
 /// A forward that provably never reached the producer, so another candidate may
@@ -1318,9 +1298,12 @@ impl ScpProxy {
                 // that restarted since the SearchResult was cached is exactly the
                 // case failover exists for.
                 //
-                // nf_set_id / nf_group_id are None on a cache hit because the
-                // cache entry holds parsed candidates and not the raw profile —
-                // the cache-state divergence #208 fixes.
+                // scpd-#208: nf_set_id / nf_group_id come off the CANDIDATE, so
+                // this arm and the fresh-query arm below build an identical
+                // DiscoveredProducer. They used to differ — the fresh path read
+                // them from the raw SearchResult and this one had nothing to read,
+                // so it hardcoded None and the consumer's Producer-Id silently
+                // lost its `nfset=` on every cache hit.
                 let mut producers = ranked.into_iter().map(|selected| DiscoveredProducer {
                     target: ApiRoot {
                         scheme: selected.scheme,
@@ -1329,8 +1312,8 @@ impl ScpProxy {
                         prefix: selected.prefix,
                     },
                     nf_instance_id: selected.candidate.nf_instance_id.clone(),
-                    nf_set_id: None,
-                    nf_group_id: None,
+                    nf_set_id: selected.candidate.nf_set_id.clone(),
+                    nf_group_id: selected.candidate.nf_group_id.clone(),
                 });
                 if let Some(primary) = producers.next() {
                     return Ok(DiscoveryOutcome {
@@ -1437,11 +1420,6 @@ impl ScpProxy {
         })?;
 
         let mut producers = ranked.into_iter().map(|selected| {
-            // scpd-02/scpd-12: surface each producer's set id / group id when
-            // present — per candidate, so a reselected producer reports ITS own
-            // identifiers rather than the originally-selected one's.
-            let (nf_set_id, nf_group_id) =
-                extract_set_and_group(&value, &selected.candidate.nf_instance_id);
             // Build the producer ApiRoot from the NF profile fields parsed out of
             // the SearchResult: scheme, port and prefix come from the MATCHED
             // `nfServices` entry (scpd-#207); host is ipv4→fqdn→ipv6(bracketed).
@@ -1455,8 +1433,11 @@ impl ScpProxy {
                     prefix: selected.prefix,
                 },
                 nf_instance_id: selected.candidate.nf_instance_id.clone(),
-                nf_set_id,
-                nf_group_id,
+                // scpd-02/scpd-12/#208: each producer's own set id / group id,
+                // parsed onto the candidate so a CACHE HIT reports the same
+                // identifiers as the miss that populated it.
+                nf_set_id: selected.candidate.nf_set_id.clone(),
+                nf_group_id: selected.candidate.nf_group_id.clone(),
             }
         });
         let primary = producers.next().ok_or_else(|| {
@@ -1488,14 +1469,10 @@ impl ScpProxy {
         &self,
         request: &SbiRequest,
         target: &ApiRoot,
-        producer_id: Option<&str>,
-        group_id: Option<&str>,
+        relay: RelayContext<'_>,
         delegated: Option<DelegatedAuth>,
     ) -> SbiResponse {
-        match self
-            .forward_once(request, target, producer_id, group_id, delegated)
-            .await
-        {
+        match self.forward_once(request, target, relay, delegated).await {
             ForwardOutcome::Answered(response) | ForwardOutcome::Final(response) => response,
             // A single pinned target has no alternates, so "undeliverable" is the
             // final answer here and keeps its pre-#209 mapping exactly.
@@ -1522,6 +1499,51 @@ impl ScpProxy {
         }
     }
 
+    /// scpd-#208: on a 2xx carrying a **relative** `Location` after the SCP
+    /// retargeted the request, convey the producer's apiRoot in
+    /// `3gpp-Sbi-Target-apiRoot` (TS 29.500 §6.10.4).
+    ///
+    /// **§6.10.4 permits either adding `3gpp-Sbi-Target-apiRoot` or absolutising
+    /// the `Location`. This SCP adds the header**, for three reasons:
+    ///
+    /// 1. It is **additive**. Absolutising rewrites a header the producer set,
+    ///    destroying what it said; adding leaves the producer's `Location` intact
+    ///    so a consumer that does not understand the fix-up is no worse off.
+    /// 2. It keeps the follow-up request flowing **through the SCP**. An absolute
+    ///    `Location` pointing at the producer invites the consumer to address it
+    ///    directly, which silently abandons the binding stickiness, producer
+    ///    selection and delegated token acquisition the SCP exists to provide.
+    /// 3. It round-trips through code that already exists: `route()` reads
+    ///    `3gpp-Sbi-Target-apiRoot` on a request, so a consumer echoing this value
+    ///    back with the relative `Location` path takes the Model C path to the
+    ///    same producer with no new handling. That is testable end to end, which
+    ///    an absolute `Location` is not — nothing in this tree would consume it.
+    ///
+    /// Narrow by design: an **absolute** `Location` is already addressable, so it
+    /// is left alone rather than annotated, and a 2xx with no `Location` gets
+    /// nothing because there is no resource URI to follow up on.
+    fn add_target_apiroot_for_location(&self, relayed: &mut SbiResponse, target: &ApiRoot) {
+        let Some(location) = relayed.http.get_header("Location") else {
+            return;
+        };
+        let location = location.trim();
+        if location.is_empty()
+            || location.starts_with("http://")
+            || location.starts_with("https://")
+        {
+            return;
+        }
+        let api_root = target.to_uri();
+        log::debug!(
+            "SCP relay: relative Location {location} after retargeting; conveying producer \
+             apiRoot {api_root} in {}",
+            custom_header::TARGET_APIROOT
+        );
+        relayed
+            .http
+            .set_header(custom_header::TARGET_APIROOT, api_root);
+    }
+
     /// Forward to exactly **one** producer, reporting whether the request was
     /// delivered (scpd-#209). See [`ForwardOutcome`]; callers with alternates use
     /// [`Self::forward_with_reselection`], callers without use [`Self::forward`].
@@ -1529,8 +1551,7 @@ impl ScpProxy {
         &self,
         request: &SbiRequest,
         target: &ApiRoot,
-        producer_id: Option<&str>,
-        group_id: Option<&str>,
+        relay: RelayContext<'_>,
         delegated: Option<DelegatedAuth>,
     ) -> ForwardOutcome {
         // scpd-#102: consult this producer's circuit breaker before forwarding.
@@ -1744,13 +1765,42 @@ impl ScpProxy {
         // in `nfinst=<uuid>[; nfset=<set>]` ABNF form, plus its NF group id —
         // gated to success responses (TS 29.500 §5.2.3.2.8 / §6.10.3.4).
         if (200..=299).contains(&upstream.status) {
-            if let Some(id) = producer_id.filter(|s| !s.is_empty()) {
-                relayed.http.set_header(custom_header::PRODUCER_ID, id);
+            // scpd-#208: PRESERVE a Producer-Id the producer or a downstream SCP
+            // already supplied instead of overwriting it (§6.10.3.4). `set_header`
+            // replaced it, which discarded the more authoritative value: a
+            // downstream SCP's is derived from the profile of the instance IT
+            // selected, and a producer naming itself is first-hand. Ours is
+            // second-hand by comparison, so it belongs only where there is nothing.
+            let downstream_producer_id = relayed
+                .http
+                .get_header(custom_header::PRODUCER_ID)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            match downstream_producer_id {
+                Some(existing) => log::debug!(
+                    "SCP relay: keeping downstream 3gpp-Sbi-Producer-Id {existing} rather than \
+                     replacing it with our own"
+                ),
+                None => {
+                    if let Some(id) = relay.producer_id.filter(|s| !s.is_empty()) {
+                        relayed.http.set_header(custom_header::PRODUCER_ID, id);
+                    }
+                }
             }
-            if let Some(g) = group_id.filter(|s| !s.is_empty()) {
+            if let Some(g) = relay.group_id.filter(|s| !s.is_empty()) {
                 relayed
                     .http
                     .set_header(custom_header::TARGET_NF_GROUP_ID, g);
+            }
+
+            // scpd-#208: after retargeting, a RELATIVE `Location` is unusable by
+            // the consumer — it names a resource without naming the producer that
+            // holds it, and the consumer never chose that producer. TS 29.500
+            // §6.10.4 allows either absolutising the `Location` or adding
+            // `3gpp-Sbi-Target-apiRoot`; see `add_target_apiroot_for_location`
+            // for which this SCP emits and why.
+            if relay.retargeted {
+                self.add_target_apiroot_for_location(&mut relayed, target);
             }
         }
 
@@ -1808,8 +1858,11 @@ impl ScpProxy {
                 .forward_once(
                     request,
                     &producer.target,
-                    producer_id.as_deref(),
-                    producer.nf_group_id.as_deref(),
+                    RelayContext {
+                        producer_id: producer_id.as_deref(),
+                        group_id: producer.nf_group_id.as_deref(),
+                        retargeted: true,
+                    },
                     delegated.clone(),
                 )
                 .await
@@ -1885,7 +1938,10 @@ impl ScpProxy {
                     request.header.uri,
                     target.to_uri()
                 );
-                self.forward(&request, &target, None, None, None).await
+                // Model C: the consumer named the target, so nothing is
+                // retargeted and no response fix-up is owed.
+                self.forward(&request, &target, RelayContext::default(), None)
+                    .await
             }
             RouteDecision::StickyBinding(target) => {
                 // scpd-12: a sticky / set-level reselection still reports the
@@ -1902,8 +1958,19 @@ impl ScpProxy {
                     request.header.uri,
                     target.to_uri()
                 );
-                self.forward(&request, &target, producer_id.as_deref(), None, None)
-                    .await
+                self.forward(
+                    &request,
+                    &target,
+                    RelayContext {
+                        producer_id: producer_id.as_deref(),
+                        group_id: None,
+                        // The SCP resolved this from its own binding cache, so the
+                        // consumer does not know the apiRoot either.
+                        retargeted: true,
+                    },
+                    None,
+                )
+                .await
             }
             RouteDecision::Discover => match self.discover(&request).await {
                 Ok(outcome) => {
@@ -3958,6 +4025,310 @@ mod tests {
         nrf.stop().await.expect("nrf stop");
         live.stop().await.expect("live stop");
         slow.stop().await.expect("slow stop");
+    }
+
+    // ------------------------------------------------------------------
+    // scpd-#208: response-relay metadata and retargeting fix-ups
+    // (TS 29.500 §6.10.3.4 / §6.10.4)
+    // ------------------------------------------------------------------
+
+    /// A producer answering `201` with `Location: <location>`, optionally naming
+    /// itself in `3gpp-Sbi-Producer-Id`, and echoing the URI it was asked for.
+    async fn start_location_producer(
+        port: u16,
+        location: Option<&'static str>,
+        own_producer_id: Option<&'static str>,
+    ) -> nextgcore_sbi::server::SbiServer {
+        let server = nextgcore_sbi::server::SbiServer::new(
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        );
+        server
+            .start(move |request: SbiRequest| async move {
+                let mut response = SbiResponse::with_status(201).with_body(
+                    serde_json::json!({"uri": request.header.uri}).to_string(),
+                    "application/json",
+                );
+                if let Some(loc) = location {
+                    response.http.set_header("Location", loc);
+                }
+                if let Some(pid) = own_producer_id {
+                    response.http.set_header(custom_header::PRODUCER_ID, pid);
+                }
+                response
+            })
+            .await
+            .expect("producer start");
+        server
+    }
+
+    /// A UDM profile on `port` declaring an NF set and a UDM group.
+    fn udm_with_set_and_group(port: u16) -> serde_json::Value {
+        serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "udm-in-a-set",
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": ["127.0.0.1"],
+                "priority": 1,
+                "nfSetIdList": ["set1.udmset.5gc.mnc012.mcc345"],
+                "udmInfo": {"groupId": "udm-group-7"},
+                "nfServices": [{
+                    "serviceName": "nudm-uecm",
+                    "ipEndPoints": [{"transport": "TCP", "port": port}]
+                }]
+            }]
+        })
+    }
+
+    /// scpd-#208 acceptance, the load-bearing one: the relayed `Producer-Id` is
+    /// **identical** on a discovery-cache miss and on the following hit.
+    ///
+    /// The bug was that `nfSetId`/`nfGroupId` were read from the raw SearchResult,
+    /// which the cache does not store — so `nfset=` was present on the miss and
+    /// gone on the hit, making producer routing metadata depend on SCP cache state
+    /// and look intermittent. Asserting only the miss path is exactly what hid it,
+    /// so this drives both and compares them.
+    #[tokio::test]
+    async fn test_producer_id_is_identical_on_a_cache_miss_and_the_following_hit() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let hits = Arc::new(AtomicU64::new(0));
+
+        let producer = start_named_producer(producer_port, "udm", hits.clone()).await;
+        let nrf = start_nrf_serving(nrf_port, udm_with_set_and_group(producer_port)).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let client = fast_client(scp_port);
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let response = client
+                .send_request(model_d_uecm_request())
+                .await
+                .expect("roundtrip");
+            assert_eq!(response.status, 200);
+            seen.push((
+                response.http.producer_id().cloned(),
+                response
+                    .http
+                    .get_header(custom_header::TARGET_NF_GROUP_ID)
+                    .cloned(),
+            ));
+        }
+        // The second request was served from the discovery cache.
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "both reached the producer");
+
+        let expected = (
+            Some("nfinst=udm-in-a-set; nfset=set1.udmset.5gc.mnc012.mcc345".to_string()),
+            Some("udm-group-7".to_string()),
+        );
+        assert_eq!(seen[0], expected, "cache miss carries set and group");
+        assert_eq!(
+            seen[1], expected,
+            "cache HIT carries the same set and group"
+        );
+        assert_eq!(
+            seen[0], seen[1],
+            "producer routing metadata must not depend on SCP cache state"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-#208 acceptance: a `3gpp-Sbi-Producer-Id` the producer (or a downstream
+    /// SCP) already supplied is **preserved**, not overwritten.
+    ///
+    /// The SCP's own value is second-hand — derived from the profile it read — so
+    /// where a first-hand one exists it wins. The assertion names the producer's
+    /// value explicitly rather than merely checking the header is present, which
+    /// would pass against the overwriting code.
+    #[tokio::test]
+    async fn test_a_downstream_producer_id_is_not_overwritten() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+
+        let producer =
+            start_location_producer(producer_port, None, Some("nfinst=downstream-chosen")).await;
+        let nrf = start_nrf_serving(nrf_port, udm_with_set_and_group(producer_port)).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let response = fast_client(scp_port)
+            .send_request(model_d_uecm_request())
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 201);
+        assert_eq!(
+            response.http.producer_id().map(String::as_str),
+            Some("nfinst=downstream-chosen"),
+            "the downstream value must survive; ours would have been nfinst=udm-in-a-set"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-#208 acceptance: a **relative** `Location` on a 2xx after retargeting
+    /// gains `3gpp-Sbi-Target-apiRoot`, and the follow-up the consumer builds from
+    /// it **reaches the same producer**.
+    ///
+    /// The round-trip is the point. Asserting only that the header appears would
+    /// pass against a value the consumer cannot use; feeding it back through
+    /// `route()`'s Model C path proves it is actionable.
+    #[tokio::test]
+    async fn test_relative_location_after_retargeting_gains_a_usable_target_apiroot() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+
+        let producer =
+            start_location_producer(producer_port, Some("/nudm-uecm/v1/registrations/42"), None)
+                .await;
+        let nrf = start_nrf_serving(nrf_port, udm_with_set_and_group(producer_port)).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let client = fast_client(scp_port);
+        let created = client
+            .send_request(model_d_uecm_request())
+            .await
+            .expect("roundtrip");
+        assert_eq!(created.status, 201);
+        // The producer's Location is left INTACT — the fix-up is additive.
+        assert_eq!(
+            created.http.get_header("Location").map(String::as_str),
+            Some("/nudm-uecm/v1/registrations/42")
+        );
+        let api_root = created
+            .http
+            .get_header(custom_header::TARGET_APIROOT)
+            .cloned()
+            .expect("a retargeted 2xx with a relative Location conveys the producer apiRoot");
+        assert_eq!(api_root, format!("http://127.0.0.1:{producer_port}"));
+
+        // The consumer's follow-up: the relative Location plus the conveyed
+        // apiRoot, which is Model C and must reach the same producer.
+        let follow_up = SbiRequest::get("/nudm-uecm/v1/registrations/42")
+            .with_header(custom_header::TARGET_APIROOT, api_root);
+        let response = client
+            .send_request(follow_up)
+            .await
+            .expect("follow-up roundtrip");
+        assert_eq!(response.status, 201);
+        let body: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(
+            body["uri"], "/nudm-uecm/v1/registrations/42",
+            "the follow-up reached the producer holding the created resource"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-#208: an **absolute** `Location` is already addressable, so it is left
+    /// alone and no `Target-apiRoot` is added — the fix-up is narrow rather than
+    /// applied to every 2xx.
+    #[tokio::test]
+    async fn test_absolute_location_gets_no_target_apiroot() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+
+        let producer = start_location_producer(
+            producer_port,
+            Some("http://udm.example.org:8080/nudm-uecm/v1/registrations/42"),
+            None,
+        )
+        .await;
+        let nrf = start_nrf_serving(nrf_port, udm_with_set_and_group(producer_port)).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let response = fast_client(scp_port)
+            .send_request(model_d_uecm_request())
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 201);
+        assert_eq!(
+            response.http.get_header("Location").map(String::as_str),
+            Some("http://udm.example.org:8080/nudm-uecm/v1/registrations/42")
+        );
+        assert!(
+            response
+                .http
+                .get_header(custom_header::TARGET_APIROOT)
+                .is_none(),
+            "an absolute Location needs no apiRoot annotation"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-#208: Model C gets **no** fix-up even with a relative `Location`. The
+    /// consumer named the target itself, so it can already resolve the URI — and
+    /// echoing its own apiRoot back at it would be noise.
+    #[tokio::test]
+    async fn test_model_c_relative_location_is_not_annotated() {
+        let producer_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+
+        let producer =
+            start_location_producer(producer_port, Some("/nudm-uecm/v1/registrations/42"), None)
+                .await;
+        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
+            custom_header::TARGET_APIROOT,
+            format!("http://127.0.0.1:{producer_port}"),
+        );
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 201);
+        assert!(
+            response
+                .http
+                .get_header(custom_header::TARGET_APIROOT)
+                .is_none(),
+            "Model C is not retargeting: the consumer already knows the apiRoot"
+        );
+
+        scp.stop().await.expect("scp stop");
+        producer.stop().await.expect("producer stop");
     }
 
     /// When no NRF (and thus no OAuth2 client) is configured, a Model C forward

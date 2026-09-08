@@ -162,6 +162,21 @@ pub struct NfInstanceCandidate {
     /// The `scheme`/`port`/`prefix` fields above remain the profile-level
     /// fallback used when the profile declares no services at all.
     pub services: Vec<NfServiceEndpoint>,
+    /// `nfSetIdList[0]` — the producer's NF set, surfaced to the consumer in
+    /// `3gpp-Sbi-Producer-Id` as `nfset=` (TS 29.500 §5.2.3.2.8 / §6.10.3.4).
+    ///
+    /// Held on the **candidate** rather than read from the raw SearchResult at
+    /// selection time (scpd-#208). The candidates are what the discovery cache
+    /// stores; the raw JSON is not. Reading it from the JSON meant the set id was
+    /// present on a cache miss and absent on a hit, so the producer routing
+    /// metadata a consumer received depended on SCP cache state rather than on the
+    /// producer — and looked intermittent.
+    pub nf_set_id: Option<String>,
+    /// The producer's NF group id from whichever per-type info object the profile
+    /// carries (`{udm,udr,ausf,pcf}Info.groupId`, TS 29.510 §6.1.6.2.x), surfaced
+    /// as `3gpp-Sbi-Target-Nf-Group-Id`. Cached with the candidate for the same
+    /// reason as [`Self::nf_set_id`].
+    pub nf_group_id: Option<String>,
 }
 
 /// Why no producer endpoint could be selected for a requested service and API
@@ -731,6 +746,8 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
                 scheme,
                 prefix,
                 services,
+                nf_set_id: nf_set_id_from_profile(inst),
+                nf_group_id: nf_group_id_from_profile(inst),
             });
         }
     }
@@ -783,6 +800,35 @@ fn service_port(service: Option<&serde_json::Value>) -> u16 {
         .and_then(|ep| ep.get("port"))
         .and_then(|v| v.as_u64())
         .unwrap_or(7777) as u16
+}
+
+/// The producer's NF set id (`nfSetIdList[0]`, TS 29.510 §6.1.6.2.x).
+///
+/// Moved here from the proxy's `extract_set_and_group` (scpd-#208), which read it
+/// out of the raw SearchResult at selection time and so could not survive the
+/// discovery cache. Reading it during parsing makes the cache-hit and cache-miss
+/// paths identical **by construction** rather than by agreeing.
+fn nf_set_id_from_profile(inst: &serde_json::Value) -> Option<String> {
+    inst.get("nfSetIdList")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// The producer's NF group id, from whichever per-type info object the profile
+/// carries (UDM/UDR/AUSF/PCF group membership, TS 29.510 §6.1.6.2.x).
+fn nf_group_id_from_profile(inst: &serde_json::Value) -> Option<String> {
+    for key in ["udmInfo", "udrInfo", "ausfInfo", "pcfInfo"] {
+        if let Some(g) = inst
+            .get(key)
+            .and_then(|x| x.get("groupId"))
+            .and_then(|x| x.as_str())
+        {
+            return Some(g.to_string());
+        }
+    }
+    None
 }
 
 /// `nfServices[].versions[].apiVersionInUri` values (TS 29.510 §6.1.6.2.12).
@@ -880,6 +926,8 @@ mod tests {
             scheme: UriScheme::Http,
             prefix: String::new(),
             services: Vec::new(),
+            nf_set_id: None,
+            nf_group_id: None,
         }];
         let selected = select_nf_instance(&candidates);
         assert!(selected.is_some());
@@ -901,6 +949,8 @@ mod tests {
                 scheme: UriScheme::Http,
                 prefix: String::new(),
                 services: Vec::new(),
+                nf_set_id: None,
+                nf_group_id: None,
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-high".to_string(),
@@ -914,6 +964,8 @@ mod tests {
                 scheme: UriScheme::Http,
                 prefix: String::new(),
                 services: Vec::new(),
+                nf_set_id: None,
+                nf_group_id: None,
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -935,6 +987,8 @@ mod tests {
                 scheme: UriScheme::Http,
                 prefix: String::new(),
                 services: Vec::new(),
+                nf_set_id: None,
+                nf_group_id: None,
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-idle".to_string(),
@@ -948,6 +1002,8 @@ mod tests {
                 scheme: UriScheme::Http,
                 prefix: String::new(),
                 services: Vec::new(),
+                nf_set_id: None,
+                nf_group_id: None,
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -969,6 +1025,8 @@ mod tests {
                 scheme: UriScheme::Http,
                 prefix: String::new(),
                 services: Vec::new(),
+                nf_set_id: None,
+                nf_group_id: None,
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-healthy".to_string(),
@@ -982,6 +1040,8 @@ mod tests {
                 scheme: UriScheme::Http,
                 prefix: String::new(),
                 services: Vec::new(),
+                nf_set_id: None,
+                nf_group_id: None,
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -1003,6 +1063,8 @@ mod tests {
                 scheme: UriScheme::Http,
                 prefix: String::new(),
                 services: Vec::new(),
+                nf_set_id: None,
+                nf_group_id: None,
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-b".to_string(),
@@ -1016,6 +1078,8 @@ mod tests {
                 scheme: UriScheme::Http,
                 prefix: String::new(),
                 services: Vec::new(),
+                nf_set_id: None,
+                nf_group_id: None,
             },
         ];
         // Call twice to see round-robin switching
@@ -1049,6 +1113,8 @@ mod tests {
             scheme: UriScheme::Http,
             prefix: String::new(),
             services: Vec::new(),
+            nf_set_id: None,
+            nf_group_id: None,
         }];
 
         cache.put(
@@ -1213,6 +1279,8 @@ mod tests {
             scheme: UriScheme::Http,
             prefix: String::new(),
             services: Vec::new(),
+            nf_set_id: None,
+            nf_group_id: None,
         }]
     }
 
