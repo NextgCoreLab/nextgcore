@@ -59,6 +59,14 @@ mod context;
 
 pub use context::*;
 
+/// The TS 29.122 §5.10 `DeliveryResult` a Device Triggering create reports while
+/// no SMS/T4 delivery leg exists (issue #111).
+///
+/// ONE constant so the stored transaction and the echoed body cannot drift: they
+/// were two separate literals, and a fix applied to one would have left the other
+/// claiming success.
+const DEVICE_TRIGGERING_STUB_RESULT: &str = "UNKNOWN";
+
 /// Northbound TS 29.122 MonitoringType values this minimal NEF accepts.
 /// Each translates to a southbound producer event (see
 /// [`build_southbound_subscribe`]):
@@ -491,6 +499,17 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
+    // #111: retry deferred southbound legs so an accepted subscription either
+    // becomes live or is expired. Without this a subscription created before the
+    // AMF/UDM was configured stayed accepted-and-un-notifiable forever.
+    tokio::spawn(async move {
+        let period = Duration::from_secs(reconcile_interval_secs());
+        loop {
+            tokio::time::sleep(period).await;
+            reconcile_pending_subscriptions().await;
+        }
+    });
+
     // Register with NRF as nfType NEF advertising nnef-eventexposure
     // (registration failure is non-fatal, mirroring nwdafd).
     let sbi_ctx = nextgcore_sbi::context::global_context();
@@ -550,7 +569,14 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     match parts.as_slice() {
         // Monitoring Event northbound API (TS 29.122 §5.3)
         ["3gpp-monitoring-event", "v1", scs_as_id, "subscriptions"] => match method {
-            "POST" => handle_monitoring_subscription_create(scs_as_id, &request).await,
+            "POST" => {
+                handle_monitoring_subscription_create(
+                    scs_as_id,
+                    &request,
+                    NorthboundApi::T8MonitoringEvent,
+                )
+                .await
+            }
             _ => send_method_not_allowed(method, "subscriptions"),
         },
         ["3gpp-monitoring-event", "v1", scs_as_id, "subscriptions", sub_id] => match method {
@@ -562,6 +588,17 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "POST" => handle_device_triggering_create(scs_as_id, &request).await,
             _ => send_method_not_allowed(method, "transactions"),
         },
+        // Nnef_EventExposure (TS 29.591) -- the service the NF profile advertises
+        // (issue #111). Declared BEFORE the notify sink so the more specific
+        // `notify/{id}` arm below is still reached.
+        ["nnef-eventexposure", "v1", "subscriptions"] => match method {
+            "POST" => handle_nnef_event_exposure_create(&request).await,
+            _ => send_method_not_allowed(method, "subscriptions"),
+        },
+        ["nnef-eventexposure", "v1", "subscriptions", sub_id] => match method {
+            "DELETE" => handle_nnef_event_exposure_delete(sub_id, &request).await,
+            _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
+        },
         // Producer (AMF/UDM) notification sink; the NEF subscription ID is
         // embedded in the callback path handed to the producer.
         ["nnef-eventexposure", "v1", "notify", nef_sub_id] => match method {
@@ -572,6 +609,173 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     }
 }
 
+/// Which northbound API a monitoring subscription arrived on (issue #111).
+///
+/// The two are the SAME subscription -- one NEF subscription, one southbound
+/// producer leg, one notification path -- and differ only in the wire shape of the
+/// request and the resource path of the created subscription. Parameterising the
+/// one handler is what keeps them from drifting: a fix to the failure semantics or
+/// the target resolution applies to both by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NorthboundApi {
+    /// TS 29.122 §5.3 T8 Monitoring Event.
+    T8MonitoringEvent,
+    /// TS 29.591 `Nnef_EventExposure`, the service the NF profile advertises.
+    NnefEventExposure,
+}
+
+impl NorthboundApi {
+    /// The created subscription's resource path.
+    fn subscription_location(&self, scs_as_id: &str, sub_id: &str) -> String {
+        match self {
+            Self::T8MonitoringEvent => {
+                format!("/3gpp-monitoring-event/v1/{scs_as_id}/subscriptions/{sub_id}")
+            }
+            Self::NnefEventExposure => {
+                format!("/nnef-eventexposure/v1/subscriptions/{sub_id}")
+            }
+        }
+    }
+}
+
+/// TS 29.591 `Nnef_EventExposure` event IDs this NEF can serve, and the TS 29.122
+/// MonitoringType each maps onto (issue #111).
+///
+/// One subscription machine serves both APIs, so an event the T8 side cannot serve
+/// is not served here either -- and is refused by NAME rather than silently
+/// accepted, which is what #111 is about.
+const NNEF_EVENT_TO_MONITORING_TYPE: &[(&str, &str)] = &[
+    ("LOCATION_REPORT", "LOCATION_REPORTING"),
+    ("UE_REACHABILITY", "UE_REACHABILITY"),
+    ("LOSS_OF_CONNECTIVITY", "LOSS_OF_CONNECTIVITY"),
+];
+
+/// POST /nnef-eventexposure/v1/subscriptions — TS 29.591 `Nnef_EventExposure`
+/// Subscribe (issue #111).
+///
+/// **This route exists because the NF profile advertises `nnef-eventexposure`.**
+/// Before #111 the only thing mounted under that API root was the internal
+/// producer notification SINK, so a consumer that discovered this NEF via the NRF
+/// and issued the advertised operation got `404` from the router fallthrough. The
+/// alternative -- stop advertising the service -- was rejected: the sink path is a
+/// callback the NEF hands to producers, not a service it offers, so dropping the
+/// advertisement would have left the NEF offering nothing over SBI while the
+/// machinery to offer something already existed.
+///
+/// The body is translated into the T8 shape and handed to the one subscription
+/// handler, so the failure semantics, the anyUE guard and the target resolution are
+/// shared rather than reimplemented. An `eventId` outside
+/// [`NNEF_EVENT_TO_MONITORING_TYPE`] is refused with `501` naming it, rather than
+/// accepted for an event that will never fire.
+async fn handle_nnef_event_exposure_create(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = &request.http.content else {
+        return send_bad_request("Missing request body", Some("MISSING_BODY"));
+    };
+    let data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+
+    // TS 29.591 mandatory IEs: notifUri, notifId, and at least one nefEventSubs
+    // entry carrying an eventId.
+    let notif_uri = match data.get("notifUri").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return send_bad_request("notifUri is mandatory", Some("MANDATORY_IE_MISSING")),
+    };
+    let notif_id = match data.get("notifId").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return send_bad_request("notifId is mandatory", Some("MANDATORY_IE_MISSING")),
+    };
+    let subs = match data.get("nefEventSubs").and_then(|v| v.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => {
+            return send_bad_request(
+                "nefEventSubs is mandatory and must be non-empty",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+    // One southbound leg per subscription, so exactly one event is served. Refusing
+    // a multi-event request is honest; accepting it and serving the first would be
+    // the fabricated-success shape this issue exists to remove.
+    if subs.len() > 1 {
+        return send_error(
+            501,
+            "Not Implemented",
+            "this NEF serves one event per subscription; send one nefEventSubs entry",
+            Some("UNSUPPORTED_REQUEST"),
+        );
+    }
+    let event_id = match subs[0].get("eventId").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return send_bad_request(
+                "nefEventSubs[0].eventId is mandatory",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+    let Some((_, monitoring_type)) = NNEF_EVENT_TO_MONITORING_TYPE
+        .iter()
+        .find(|(id, _)| *id == event_id)
+    else {
+        let supported: Vec<&str> = NNEF_EVENT_TO_MONITORING_TYPE
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        return send_error(
+            501,
+            "Not Implemented",
+            &format!("eventId '{event_id}' is not served by this NEF (served: {supported:?})"),
+            Some("UNSUPPORTED_REQUEST"),
+        );
+    };
+
+    // Translate into the T8 shape the one subscription handler validates. The UE
+    // identity keys are carried across verbatim so the anyUE guard and the
+    // path-injection guard apply unchanged.
+    let mut translated = serde_json::json!({
+        "notificationDestination": notif_uri,
+        "monitoringType": monitoring_type,
+    });
+    {
+        let obj = translated.as_object_mut().expect("json! built an object");
+        for key in ["supi", "msisdn", "externalId", "externalGroupId"] {
+            if let Some(value) = subs[0].get(key).or_else(|| data.get(key)) {
+                obj.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    let mut translated_request = request.clone();
+    translated_request.http.content = Some(translated.to_string());
+
+    // `notifId` is the consumer's correlation handle; it names the SUBSCRIPTION on
+    // the consumer side, so it is the natural {scsAsId} equivalent for ownership.
+    let response = handle_monitoring_subscription_create(
+        &notif_id,
+        &translated_request,
+        NorthboundApi::NnefEventExposure,
+    )
+    .await;
+    log::info!("Nnef_EventExposure subscribe: notifId={notif_id}, eventId={event_id}");
+    response
+}
+
+/// DELETE /nnef-eventexposure/v1/subscriptions/{subId} — TS 29.591 Unsubscribe.
+async fn handle_nnef_event_exposure_delete(sub_id: &str, request: &SbiRequest) -> SbiResponse {
+    // Ownership is checked against the subscription's stored `scs_as_id`, which for
+    // this API is the consumer's `notifId` -- so the delete resolves it from the
+    // stored subscription rather than from the path, which carries no consumer id.
+    let scs_as_id = match nef_self().read() {
+        Ok(c) => c.subscription_find(sub_id).map(|s| s.scs_as_id),
+        Err(_) => return send_internal_error("NEF context lock poisoned"),
+    };
+    let Some(scs_as_id) = scs_as_id else {
+        return send_not_found(&format!("Subscription {sub_id} not found"), None);
+    };
+    handle_monitoring_subscription_delete(&scs_as_id, sub_id, request).await
+}
+
 /// POST /3gpp-monitoring-event/v1/{scsAsId}/subscriptions —
 /// TS 29.122 §5.3 Monitoring Event subscription create. Validates the AF
 /// request (mandatory-IE parity with udmd's `handle_ee_subscribe`),
@@ -580,6 +784,7 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 async fn handle_monitoring_subscription_create(
     scs_as_id: &str,
     request: &SbiRequest,
+    api: NorthboundApi,
 ) -> SbiResponse {
     let body = match &request.http.content {
         Some(c) => c,
@@ -746,24 +951,52 @@ async fn handle_monitoring_subscription_create(
     let nf_instance_id = nf_instance_id.unwrap_or_else(|| "nef-unregistered".to_string());
     let nef_notify_uri = format!("{notify_base}/nnef-eventexposure/v1/notify/{}", sub.id);
 
-    let southbound = match build_southbound_subscribe(
+    // #111: a leg that CANNOT be established now rejects the northbound create;
+    // one that has not been ATTEMPTED yet is accepted and retained for the
+    // reconciler. Before this, all four failure modes returned 201 with a `self`
+    // link for a subscription that could never notify.
+    let built = build_southbound_subscribe(
         &monitoring_type,
         &target,
         &nef_notify_uri,
         &sub.id,
         &nf_instance_id,
-    ) {
+    );
+    let (southbound, pending) = match &built {
         Some(req) => {
             let producer_uri = match req.producer {
                 SouthboundProducer::Amf => amf_uri.clone(),
                 SouthboundProducer::Udm => udm_uri.clone(),
             };
-            attempt_southbound_subscribe(producer_uri, req).await
+            match attempt_southbound_subscribe(producer_uri, req).await {
+                SouthboundOutcome::Live(reference) => (Some(reference), None),
+                SouthboundOutcome::Deferred => (
+                    None,
+                    Some(PendingSouthbound {
+                        producer: req.producer,
+                        path: req.path.clone(),
+                        body: req.body.clone(),
+                        since: now_unix_secs(),
+                    }),
+                ),
+                SouthboundOutcome::Failed { retryable, detail } => {
+                    log::warn!(
+                        "rejecting monitoring subscription create for scsAsId={scs_as_id}: {detail}"
+                    );
+                    return SouthboundOutcome::failure_response(retryable, &detail);
+                }
+            }
         }
-        None => None,
+        // No southbound leg is REQUIRED for this monitoring type: there is nothing
+        // deferred and nothing failed, which is why this is not an outcome variant.
+        None => (None, None),
     };
 
-    let sub = NefMonitoringSubscription { southbound, ..sub };
+    let sub = NefMonitoringSubscription {
+        southbound,
+        pending,
+        ..sub
+    };
     let sub_id = sub.id.clone();
     let southbound_cleanup = sub.southbound.clone();
     let ctx = nef_self();
@@ -790,7 +1023,7 @@ async fn handle_monitoring_subscription_create(
         };
     }
 
-    let location = format!("/3gpp-monitoring-event/v1/{scs_as_id}/subscriptions/{sub_id}");
+    let location = api.subscription_location(scs_as_id, &sub_id);
     log::info!(
         "Monitoring event subscription created: id={sub_id}, scsAsId={scs_as_id}, type={monitoring_type}"
     );
@@ -869,10 +1102,18 @@ async fn handle_monitoring_subscription_delete(
 /// POST /3gpp-device-triggering/v1/{scsAsId}/transactions — TS 29.122 §5.10
 /// Device Triggering create. Validates and stores the transaction.
 ///
-/// DEFERRED (issue #19 scope): forwarding the trigger toward SMS delivery is
-/// stubbed — no SMSF NF exists in this repo (`NfType::Smsf` is a routing
-/// label only), so the transaction is validated, stored, and reported with
-/// DeliveryResult `TRIGGERED`.
+/// **No delivery leg exists**, so the reported `deliveryResult` is `UNKNOWN`
+/// (issue #111). Forwarding the trigger toward SMS delivery is stubbed -- no SMSF
+/// NF exists in this repo (`NfType::Smsf` is a routing label only) -- and this used
+/// to report `TRIGGERED`.
+///
+/// `TRIGGERED` is a POSITIVE lifecycle state in TS 29.122 §5.10: it means the
+/// trigger was accepted for delivery. Reporting it with no delivery path told the
+/// AF the message was on its way and gave it no way to distinguish "queued" from
+/// "silently dropped" -- which is precisely the failure mode device triggering
+/// exists to prevent. `UNKNOWN` is the honest value: the transaction was accepted
+/// and stored, and the NEF genuinely does not know the delivery outcome because it
+/// never attempted one. Retire this once an SMSF/T4 leg lands.
 async fn handle_device_triggering_create(scs_as_id: &str, request: &SbiRequest) -> SbiResponse {
     let body = match &request.http.content {
         Some(c) => c,
@@ -903,7 +1144,7 @@ async fn handle_device_triggering_create(scs_as_id: &str, request: &SbiRequest) 
         _ => return send_bad_request("triggerPayload is mandatory", Some("MANDATORY_IE_MISSING")),
     }
 
-    let txn = NefTriggerTransaction::new(scs_as_id, "TRIGGERED", body.clone());
+    let txn = NefTriggerTransaction::new(scs_as_id, DEVICE_TRIGGERING_STUB_RESULT, body.clone());
     let txn_id = txn.id.clone();
     let ctx = nef_self();
     let insert = match ctx.read() {
@@ -923,7 +1164,10 @@ async fn handle_device_triggering_create(scs_as_id: &str, request: &SbiRequest) 
     let mut echoed = data;
     if let Some(obj) = echoed.as_object_mut() {
         obj.insert("self".to_string(), serde_json::json!(location));
-        obj.insert("deliveryResult".to_string(), serde_json::json!("TRIGGERED"));
+        obj.insert(
+            "deliveryResult".to_string(),
+            serde_json::json!(DEVICE_TRIGGERING_STUB_RESULT),
+        );
     }
     SbiResponse::with_status(201)
         .with_header("Location", location)
@@ -965,6 +1209,143 @@ async fn handle_producer_notification(nef_sub_id: &str, request: &SbiRequest) ->
     });
 
     SbiResponse::no_content()
+}
+
+/// How long a deferred southbound leg is retried before it is expired
+/// (issue #111). Overridable so a test does not have to wait.
+fn pending_leg_deadline_secs() -> u64 {
+    std::env::var("NEF_PENDING_LEG_DEADLINE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+}
+
+/// How often the reconciler sweeps deferred legs.
+fn reconcile_interval_secs() -> u64 {
+    std::env::var("NEF_RECONCILE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
+
+/// What one reconciler sweep did (issue #111). Returned rather than only logged so
+/// the sweep is assertable without a timer.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Legs that reached their producer and are now live.
+    pub promoted: usize,
+    /// Legs past the deadline; the subscription was removed.
+    pub expired: usize,
+    /// Legs still deferred, to be retried next sweep.
+    pub still_pending: usize,
+}
+
+/// Retry every deferred southbound leg once, promoting or expiring each
+/// (issue #111).
+///
+/// This is the half that makes accepting a deferred subscription honest. Before
+/// #111 a subscription whose producer was unconfigured was stored with
+/// `southbound: None` and left there **forever**: it could never notify, nothing
+/// retried it, and the AF held a `201` and a `self` link for a subscription that
+/// was dead on arrival.
+///
+/// A leg is **expired** rather than retried indefinitely once it passes
+/// [`pending_leg_deadline_secs`], and expiry REMOVES the subscription: an AF whose
+/// subscription is gone can re-create it, whereas an AF holding one that will never
+/// notify has no signal at all. That is the same reasoning as rejecting a hard
+/// failure at create time, applied to the deferred case.
+///
+/// Returns what it did so a caller -- and a test -- can see it, rather than only
+/// logging.
+pub async fn reconcile_pending_subscriptions() -> ReconcileReport {
+    let ctx = nef_self();
+    let pending = match ctx.read() {
+        Ok(c) => c.subscriptions_pending(),
+        Err(_) => {
+            log::error!("NEF context lock poisoned; skipping reconcile sweep");
+            return ReconcileReport::default();
+        }
+    };
+    if pending.is_empty() {
+        return ReconcileReport::default();
+    }
+
+    let (amf_uri, udm_uri) = match ctx.read() {
+        Ok(c) => (c.amf_uri(), c.udm_uri()),
+        Err(_) => return ReconcileReport::default(),
+    };
+    let deadline = pending_leg_deadline_secs();
+    let now = now_unix_secs();
+    let mut report = ReconcileReport::default();
+
+    for sub in pending {
+        let Some(leg) = sub.pending.clone() else {
+            continue;
+        };
+        let producer_uri = match leg.producer {
+            SouthboundProducer::Amf => amf_uri.clone(),
+            SouthboundProducer::Udm => udm_uri.clone(),
+        };
+        let req = SouthboundSubscribe {
+            producer: leg.producer,
+            path: leg.path.clone(),
+            body: leg.body.clone(),
+        };
+        match attempt_southbound_subscribe(producer_uri, &req).await {
+            SouthboundOutcome::Live(reference) => {
+                if let Ok(c) = ctx.read() {
+                    if c.subscription_promote(&sub.id, reference.clone()) {
+                        log::info!(
+                            "deferred southbound leg promoted to live: sub={} producer={}",
+                            sub.id,
+                            leg.producer.as_str()
+                        );
+                        report.promoted += 1;
+                        continue;
+                    }
+                }
+                // The AF deleted the subscription while this retry was in flight;
+                // tear the producer-side subscription down rather than orphan it.
+                log::info!(
+                    "subscription {} vanished mid-retry; unsubscribing the producer leg",
+                    sub.id
+                );
+                let uri = match reference.producer {
+                    SouthboundProducer::Amf => amf_uri.clone(),
+                    SouthboundProducer::Udm => udm_uri.clone(),
+                };
+                southbound_unsubscribe(uri, reference).await;
+            }
+            outcome => {
+                // Still unreachable, or now failing outright. Either way the clock
+                // that matters is how long the AF has held an un-notifiable
+                // subscription, so both are treated the same by the deadline.
+                if now.saturating_sub(leg.since) >= deadline {
+                    log::warn!(
+                        "expiring subscription {} after {}s with no southbound leg ({outcome:?})",
+                        sub.id,
+                        now.saturating_sub(leg.since)
+                    );
+                    if let Ok(c) = ctx.read() {
+                        c.subscription_remove(&sub.id);
+                    }
+                    report.expired += 1;
+                } else {
+                    log::debug!("southbound leg for {} still deferred ({outcome:?})", sub.id);
+                    report.still_pending += 1;
+                }
+            }
+        }
+    }
+    if report != ReconcileReport::default() {
+        log::info!(
+            "reconcile sweep: {} promoted, {} expired, {} still pending",
+            report.promoted,
+            report.expired,
+            report.still_pending
+        );
+    }
+    report
 }
 
 /// A fully built southbound subscribe request toward a 5GC event producer.
@@ -1152,36 +1533,103 @@ async fn resolve_gpsi_to_supi(udm_uri: Option<String>, gpsi: &str) -> Option<Str
 /// POST the southbound subscribe to the producer and extract the created
 /// subscription reference. Best-effort: any failure is logged and yields
 /// None (northbound-only subscription).
+/// What happened to a southbound subscribe attempt (issue #111).
+///
+/// This replaced an `Option<SouthboundRef>` whose `None` meant FOUR different
+/// things -- no producer configured, an unparseable URI, a producer that rejected
+/// the subscribe, and a transport error -- all of which the caller turned into the
+/// same `201 Created`. The AF was told it held a live subscription that could
+/// never notify, with no error to drive a retry, which is the failure-masking half
+/// of #111.
+#[derive(Debug)]
+enum SouthboundOutcome {
+    /// The producer accepted and gave a usable reference.
+    Live(SouthboundRef),
+    /// No producer URI is configured, so the leg has not been ATTEMPTED yet. The
+    /// northbound create is accepted and the leg is retried by the reconciler --
+    /// distinguished from a failure because a deployment that has not wired its
+    /// AMF/UDM yet is a configuration state, not a request error.
+    Deferred,
+    /// The leg was attempted and cannot be established. `retryable` separates a
+    /// transport problem (the producer may come back) from a protocol one (it
+    /// answered, unusably), which is what picks the northbound status.
+    Failed { retryable: bool, detail: String },
+}
+
+impl SouthboundOutcome {
+    /// The northbound response for a failed leg (TS 29.500 §5.2.7).
+    ///
+    /// A retryable failure is the NEF's dependency being unavailable, so `503`; a
+    /// non-retryable one is the producer answering in a way the NEF cannot use, so
+    /// `500`. Both are statuses §5.2.7 lists; neither is `201`, which is the whole
+    /// point.
+    fn failure_response(retryable: bool, detail: &str) -> SbiResponse {
+        if retryable {
+            send_error(
+                503,
+                "Service Unavailable",
+                &format!("southbound subscription could not be established: {detail}"),
+                Some("SUBSCRIPTION_NOT_ESTABLISHED"),
+            )
+        } else {
+            send_error(
+                500,
+                "Internal Server Error",
+                &format!("southbound subscription could not be established: {detail}"),
+                Some("SUBSCRIPTION_NOT_ESTABLISHED"),
+            )
+        }
+    }
+}
+
 async fn attempt_southbound_subscribe(
     producer_uri: Option<String>,
-    req: SouthboundSubscribe,
-) -> Option<SouthboundRef> {
+    req: &SouthboundSubscribe,
+) -> SouthboundOutcome {
     let producer = req.producer;
     let Some(uri) = producer_uri else {
         log::info!(
-            "no {} URI configured; southbound subscription deferred",
+            "no {} URI configured; southbound subscription deferred for retry",
             producer.as_str()
         );
-        return None;
+        return SouthboundOutcome::Deferred;
     };
     let Some((host, port)) = parse_host_port(&uri) else {
+        // A configured-but-unparseable URI is an operator error, not a transient
+        // one: retrying cannot fix it, and deferring would hide it behind an
+        // accepted subscription.
         log::warn!(
-            "invalid {} URI '{uri}'; southbound subscription skipped",
+            "invalid {} URI '{uri}'; southbound subscription cannot be established",
             producer.as_str()
         );
-        return None;
+        return SouthboundOutcome::Failed {
+            retryable: false,
+            detail: format!("invalid {} URI '{uri}'", producer.as_str()),
+        };
     };
     let client = bounded_client(&host, port);
     match client.post_json(&req.path, &req.body).await {
         Ok(response) if response.status == 200 || response.status == 201 => {
-            let southbound = extract_southbound_ref(producer, &req.path, &response);
-            if southbound.is_none() {
-                log::warn!(
-                    "{} subscribe succeeded but no subscription id could be extracted",
-                    producer.as_str()
-                );
+            match extract_southbound_ref(producer, &req.path, &response) {
+                Some(southbound) => SouthboundOutcome::Live(southbound),
+                None => {
+                    // The producer created something and did not say what. The NEF
+                    // cannot unsubscribe it later, so accepting the northbound
+                    // create would orphan a producer-side subscription AND leave
+                    // the AF unable to delete it.
+                    log::warn!(
+                        "{} subscribe succeeded but no subscription id could be extracted",
+                        producer.as_str()
+                    );
+                    SouthboundOutcome::Failed {
+                        retryable: false,
+                        detail: format!(
+                            "{} accepted the subscribe but returned no subscription id",
+                            producer.as_str()
+                        ),
+                    }
+                }
             }
-            southbound
         }
         Ok(response) => {
             log::warn!(
@@ -1189,11 +1637,17 @@ async fn attempt_southbound_subscribe(
                 producer.as_str(),
                 response.status
             );
-            None
+            SouthboundOutcome::Failed {
+                retryable: false,
+                detail: format!("{} returned status {}", producer.as_str(), response.status),
+            }
         }
         Err(e) => {
             log::warn!("{} subscribe failed: {e}", producer.as_str());
-            None
+            SouthboundOutcome::Failed {
+                retryable: true,
+                detail: format!("{} unreachable: {e}", producer.as_str()),
+            }
         }
     }
 }
@@ -1554,13 +2008,31 @@ mod tests {
     fn reset_context() {
         nef_context_final();
         nef_context_init(1024, 1024);
+        // #111: CLEAR the southbound producer URIs too. `nef_context_final` +
+        // `nef_context_init` did not, so a test that pointed the context at a
+        // producer leaked it into every later test -- which then attempted a real
+        // HTTP call on a current-thread runtime with no IO driver and panicked
+        // inside the SBI client. Six pre-existing tests failed that way the first
+        // time this file set a producer URI. Same process-global-state shape as the
+        // env-var races recorded in LEARNINGS: the hazard appears the moment a
+        // second party touches the shared thing.
+        if let Ok(mut c) = nef_self().write() {
+            c.set_endpoints(None, None, None, None);
+            c.set_udm_sdm_uri(None);
+        }
     }
 
-    /// Drive an async handler to completion on a fresh current-thread
-    /// runtime. The handlers under test do no real I/O (no producer URIs are
-    /// configured), so no timer/IO drivers are needed.
+    /// Drive an async handler to completion on a fresh current-thread runtime.
+    ///
+    /// #111 enabled the IO and time drivers. The comment here used to say none were
+    /// needed "since the handlers under test do no real I/O (no producer URIs are
+    /// configured)" -- true until a test configured one, at which point the SBI
+    /// client's `tokio::time::timeout` PANICKED with "timers are disabled" instead
+    /// of returning a connection error. Enabling them costs nothing and removes the
+    /// whole class, rather than leaving the next author to discover it.
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .expect("build current-thread runtime")
             .block_on(fut)
@@ -1855,7 +2327,11 @@ mod tests {
     #[test]
     fn monitoring_create_no_body_returns_400() {
         let request = SbiRequest::post("/3gpp-monitoring-event/v1/af1/subscriptions");
-        let response = block_on(handle_monitoring_subscription_create("af1", &request));
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &request,
+            NorthboundApi::T8MonitoringEvent,
+        ));
         assert_eq!(response.status, 400);
     }
 
@@ -1864,7 +2340,11 @@ mod tests {
         let request = monitoring_request(serde_json::json!({
             "monitoringType": "LOCATION_REPORTING",
         }));
-        let response = block_on(handle_monitoring_subscription_create("af1", &request));
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &request,
+            NorthboundApi::T8MonitoringEvent,
+        ));
         assert_eq!(
             response.status, 400,
             "missing notificationDestination must be 400"
@@ -1880,7 +2360,11 @@ mod tests {
             "monitoringType": "LOCATION_REPORTING",
             "notificationDestination": "not-a-uri",
         }));
-        let response = block_on(handle_monitoring_subscription_create("af1", &request));
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &request,
+            NorthboundApi::T8MonitoringEvent,
+        ));
         assert_eq!(response.status, 400);
         let body: serde_json::Value =
             serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
@@ -1892,7 +2376,11 @@ mod tests {
         let request = monitoring_request(serde_json::json!({
             "notificationDestination": "http://af.example.com/cb",
         }));
-        let response = block_on(handle_monitoring_subscription_create("af1", &request));
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &request,
+            NorthboundApi::T8MonitoringEvent,
+        ));
         assert_eq!(response.status, 400, "missing monitoringType must be 400");
     }
 
@@ -1902,7 +2390,11 @@ mod tests {
             "monitoringType": "AVAILABILITY_AFTER_DDN_FAILURE",
             "notificationDestination": "http://af.example.com/cb",
         }));
-        let response = block_on(handle_monitoring_subscription_create("af1", &request));
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &request,
+            NorthboundApi::T8MonitoringEvent,
+        ));
         assert_eq!(response.status, 400);
         let body: serde_json::Value =
             serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
@@ -1918,7 +2410,11 @@ mod tests {
             "notificationDestination": "http://af.example.com/cb",
             "supi": "imsi-1/../../nudm-sdm",
         }));
-        let response = block_on(handle_monitoring_subscription_create("af1", &request));
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &request,
+            NorthboundApi::T8MonitoringEvent,
+        ));
         assert_eq!(response.status, 400, "path-injecting identity must be 400");
         let body: serde_json::Value =
             serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
@@ -1935,12 +2431,14 @@ mod tests {
         let first = block_on(handle_monitoring_subscription_create(
             "af1",
             &monitoring_request(valid_monitoring_body()),
+            NorthboundApi::T8MonitoringEvent,
         ));
         assert_eq!(first.status, 201);
 
         let second = block_on(handle_monitoring_subscription_create(
             "af1",
             &monitoring_request(valid_monitoring_body()),
+            NorthboundApi::T8MonitoringEvent,
         ));
         assert_eq!(second.status, 507, "cap exhaustion must be 507");
         let body: serde_json::Value =
@@ -1960,7 +2458,11 @@ mod tests {
         reset_context();
 
         let request = monitoring_request(valid_monitoring_body());
-        let response = block_on(handle_monitoring_subscription_create("af1", &request));
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &request,
+            NorthboundApi::T8MonitoringEvent,
+        ));
         assert_eq!(response.status, 201);
 
         let location = response
@@ -1997,7 +2499,11 @@ mod tests {
         reset_context();
 
         let create = monitoring_request(valid_monitoring_body());
-        let created = block_on(handle_monitoring_subscription_create("af1", &create));
+        let created = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &create,
+            NorthboundApi::T8MonitoringEvent,
+        ));
         assert_eq!(created.status, 201);
         let location = created.http.get_header("location").unwrap().clone();
         let sub_id = location.rsplit('/').next().unwrap().to_string();
@@ -2028,7 +2534,11 @@ mod tests {
         reset_context();
 
         let create = monitoring_request(valid_monitoring_body());
-        let created = block_on(handle_monitoring_subscription_create("af1", &create));
+        let created = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &create,
+            NorthboundApi::T8MonitoringEvent,
+        ));
         let location = created.http.get_header("location").unwrap().clone();
         let sub_id = location.rsplit('/').next().unwrap().to_string();
 
@@ -2078,7 +2588,16 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["self"], location);
-        assert_eq!(body["deliveryResult"], "TRIGGERED");
+        // #111 FLIP: this asserted "TRIGGERED", so the test PINNED the fabricated
+        // success. `TRIGGERED` is a positive TS 29.122 §5.10 lifecycle state -- the
+        // trigger was accepted for delivery -- and no delivery leg exists, so the AF
+        // could not tell "queued" from "silently dropped". `UNKNOWN` is the honest
+        // value while the SMS/T4 path is absent.
+        assert_eq!(body["deliveryResult"], DEVICE_TRIGGERING_STUB_RESULT);
+        assert_ne!(
+            body["deliveryResult"], "TRIGGERED",
+            "no delivery leg exists, so a positive lifecycle state must not be reported"
+        );
 
         let stored = nef_self()
             .read()
@@ -2086,7 +2605,285 @@ mod tests {
             .transaction_find(&txn_id)
             .expect("stored");
         assert_eq!(stored.scs_as_id, "af1");
-        assert_eq!(stored.delivery_result, "TRIGGERED");
+        // The STORED result and the ECHOED result must agree: they were two separate
+        // literals, so a fix to one could have left the other claiming success.
+        assert_eq!(stored.delivery_result, DEVICE_TRIGGERING_STUB_RESULT);
+        assert_eq!(
+            stored.delivery_result,
+            body["deliveryResult"].as_str().unwrap()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #111: service-catalogue truth, honest failures, pending lifecycle
+    // -----------------------------------------------------------------
+
+    /// Point the context's southbound producer URIs somewhere. `None` leaves the
+    /// leg DEFERRED; a URI makes it attempt and (against nothing listening) FAIL.
+    fn set_producers(amf: Option<&str>, udm: Option<&str>) {
+        if let Ok(mut c) = nef_self().write() {
+            c.set_endpoints(
+                amf.map(str::to_string),
+                udm.map(str::to_string),
+                Some("http://127.0.0.1:7817".to_string()),
+                Some("nef-test".to_string()),
+            );
+        }
+    }
+
+    /// **Issue #111, criterion 1.** Every `serviceName` in the NRF profile resolves
+    /// to a real northbound route, not to the router's `send_not_found`.
+    ///
+    /// The profile advertised `nnef-eventexposure` while the only thing mounted
+    /// under that API root was the internal producer notification SINK, so an
+    /// interop partner that discovered this NEF for `Nnef_EventExposure` got a 404
+    /// from the fallthrough. This asserts the catalogue and the router agree.
+    #[test]
+    fn every_advertised_service_name_has_a_northbound_route() {
+        let _guard = lock_globals();
+        reset_context();
+
+        let profile = build_nf_profile("nef-test", "127.0.0.1", 7817);
+        let names: Vec<String> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .filter_map(|s| s["serviceName"].as_str().map(str::to_string))
+            .collect();
+        assert!(!names.is_empty(), "the profile must advertise something");
+
+        for name in &names {
+            // The advertised service's subscription resource must not 404. A
+            // deliberately-invalid body is used so this asserts ROUTING, not
+            // validation: a 400 proves the route exists and rejected the body,
+            // where a 404 would prove nothing is mounted.
+            let request = SbiRequest::post(format!("/{name}/v1/subscriptions"))
+                .with_json_body(&serde_json::json!({}))
+                .expect("serialize");
+            let response = block_on(nef_sbi_request_handler(request));
+            assert_ne!(
+                response.status, 404,
+                "advertised service '{name}' has no northbound route (got 404)"
+            );
+        }
+    }
+
+    /// **Issue #111, criterion 2.** The advertised `Nnef_EventExposure` subscribe
+    /// works, and an event this NEF cannot serve is refused BY NAME rather than
+    /// accepted.
+    #[test]
+    fn nnef_event_exposure_subscribe_is_served_and_unsupported_events_are_refused() {
+        let _guard = lock_globals();
+        reset_context();
+        set_producers(None, None);
+
+        let body = serde_json::json!({
+            "notifUri": "http://af.example.com:8080/notifications",
+            "notifId": "af-corr-1",
+            "nefEventSubs": [{ "eventId": "LOCATION_REPORT", "supi": "imsi-001010000000001" }],
+        });
+        let request = SbiRequest::post("/nnef-eventexposure/v1/subscriptions")
+            .with_json_body(&body)
+            .expect("serialize");
+        let response = block_on(nef_sbi_request_handler(request));
+        assert_eq!(
+            response.status, 201,
+            "the advertised operation must be served"
+        );
+        let location = response
+            .http
+            .get_header("location")
+            .expect("201 must carry Location")
+            .clone();
+        assert!(
+            location.starts_with("/nnef-eventexposure/v1/subscriptions/"),
+            "the created resource must live under the API it was created on, got {location}"
+        );
+
+        // The subscription really exists and is DELETE-able through the same API.
+        let sub_id = location.rsplit('/').next().unwrap().to_string();
+        let delete = SbiRequest::delete(format!("/nnef-eventexposure/v1/subscriptions/{sub_id}"));
+        assert_eq!(block_on(nef_sbi_request_handler(delete)).status, 204);
+
+        // An eventId outside the served set is 501 naming it -- not a 201 for an
+        // event that would never fire.
+        let unsupported = serde_json::json!({
+            "notifUri": "http://af.example.com:8080/notifications",
+            "notifId": "af-corr-2",
+            "nefEventSubs": [{ "eventId": "PDN_CONNECTIVITY_STATUS", "supi": "imsi-001010000000001" }],
+        });
+        let request = SbiRequest::post("/nnef-eventexposure/v1/subscriptions")
+            .with_json_body(&unsupported)
+            .expect("serialize");
+        let response = block_on(nef_sbi_request_handler(request));
+        assert_eq!(response.status, 501);
+        assert!(
+            response
+                .http
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("PDN_CONNECTIVITY_STATUS"),
+            "the refusal must name the event so the consumer knows what to change"
+        );
+
+        // Mandatory IEs are enforced.
+        for missing in ["notifUri", "notifId", "nefEventSubs"] {
+            let mut partial = body.clone();
+            partial.as_object_mut().unwrap().remove(missing);
+            let request = SbiRequest::post("/nnef-eventexposure/v1/subscriptions")
+                .with_json_body(&partial)
+                .expect("serialize");
+            assert_eq!(
+                block_on(nef_sbi_request_handler(request)).status,
+                400,
+                "a body with no {missing} must be rejected"
+            );
+        }
+    }
+
+    /// **Issue #111, criterion 4.** A monitoring create whose southbound producer
+    /// cannot be reached does NOT return 201.
+    ///
+    /// Before this, `attempt_southbound_subscribe` returned `None` for four
+    /// different reasons -- unconfigured, unparseable URI, producer rejected,
+    /// transport error -- and the caller turned all four into `201 Created` with a
+    /// `self` link, so the AF believed it held a live subscription that could never
+    /// notify, with no error to drive a retry.
+    #[test]
+    fn a_southbound_failure_is_not_reported_as_created() {
+        let _guard = lock_globals();
+        reset_context();
+
+        // An unreachable producer is a retryable dependency failure -> 503, and
+        // above all NOT 201. This is the case that used to be indistinguishable
+        // from success.
+        let dead_port = nextgcore_sbi::test_support::free_port();
+        set_producers(Some(&format!("http://127.0.0.1:{dead_port}")), None);
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &monitoring_request(valid_monitoring_body()),
+            NorthboundApi::T8MonitoringEvent,
+        ));
+        assert_ne!(
+            response.status, 201,
+            "a failed leg must never be reported as created"
+        );
+        assert_eq!(
+            response.status, 503,
+            "an unreachable producer is a transient dependency failure"
+        );
+        assert!(response
+            .http
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("SUBSCRIPTION_NOT_ESTABLISHED"));
+        assert_eq!(
+            nef_self().read().unwrap().subscription_count(),
+            0,
+            "a rejected create must not leave a subscription behind"
+        );
+
+        // A syntactically odd URI is NOT the non-retryable case: `parse_host_port`
+        // accepts it (host with a default port) and the connect then fails, so it
+        // lands on the same 503. Asserted rather than assumed -- the first draft of
+        // this test expected 500 and was wrong about which branch it exercised.
+        set_producers(Some("not a uri"), None);
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &monitoring_request(valid_monitoring_body()),
+            NorthboundApi::T8MonitoringEvent,
+        ));
+        assert_eq!(response.status, 503);
+        assert_eq!(nef_self().read().unwrap().subscription_count(), 0);
+    }
+
+    /// **Issue #111.** The retryable/non-retryable split maps to distinct statuses.
+    ///
+    /// Tested on the mapping directly because the non-retryable branch needs a
+    /// producer that ANSWERS unusably (a non-2xx, or a 201 with no extractable
+    /// subscription id), which needs a stub server; asserting the mapping here keeps
+    /// the claim honest without one, and the wire test above covers 503 end to end.
+    #[test]
+    fn southbound_failure_statuses_distinguish_transient_from_unusable() {
+        let transient = SouthboundOutcome::failure_response(true, "AMF unreachable");
+        assert_eq!(transient.status, 503, "a dependency that may return");
+        let unusable = SouthboundOutcome::failure_response(false, "AMF returned status 403");
+        assert_eq!(unusable.status, 500, "a producer that answered unusably");
+        for response in [transient, unusable] {
+            let body = response.http.content.as_deref().unwrap_or("");
+            assert!(
+                body.contains("SUBSCRIPTION_NOT_ESTABLISHED"),
+                "the cause must name what failed, got {body}"
+            );
+            assert_ne!(response.status, 201);
+        }
+    }
+
+    /// **Issue #111, criteria 4 + 5.** With no producer configured the leg is
+    /// DEFERRED: the create is accepted, the subscription is marked pending, and the
+    /// reconciler later promotes or expires it -- never leaves it accepted and
+    /// permanently un-notifiable.
+    #[test]
+    fn a_deferred_leg_is_pending_and_the_reconciler_expires_it() {
+        let _guard = lock_globals();
+        reset_context();
+        set_producers(None, None);
+
+        let response = block_on(handle_monitoring_subscription_create(
+            "af1",
+            &monitoring_request(valid_monitoring_body()),
+            NorthboundApi::T8MonitoringEvent,
+        ));
+        assert_eq!(
+            response.status, 201,
+            "an unconfigured producer is a deployment state, not a request error"
+        );
+        let subs = nef_self().read().unwrap().subscriptions_pending();
+        assert_eq!(subs.len(), 1, "the leg must be retained for retry");
+        let pending = subs[0].pending.as_ref().expect("pending leg");
+        assert!(
+            subs[0].southbound.is_none(),
+            "pending and live are exclusive"
+        );
+        assert!(
+            !pending.path.is_empty(),
+            "the retry request must be retained"
+        );
+
+        // A sweep inside the deadline leaves it pending -- it is retried, not
+        // discarded on the first failure.
+        std::env::set_var("NEF_PENDING_LEG_DEADLINE_SECS", "3600");
+        let report = block_on(reconcile_pending_subscriptions());
+        assert_eq!(
+            report,
+            ReconcileReport {
+                promoted: 0,
+                expired: 0,
+                still_pending: 1
+            }
+        );
+        assert_eq!(nef_self().read().unwrap().subscription_count(), 1);
+
+        // Past the deadline it is EXPIRED and removed: an AF whose subscription is
+        // gone can re-create it, whereas one holding an un-notifiable subscription
+        // has no signal at all.
+        std::env::set_var("NEF_PENDING_LEG_DEADLINE_SECS", "0");
+        let report = block_on(reconcile_pending_subscriptions());
+        std::env::remove_var("NEF_PENDING_LEG_DEADLINE_SECS");
+        assert_eq!(report.expired, 1, "a leg past its deadline must be expired");
+        assert_eq!(
+            nef_self().read().unwrap().subscription_count(),
+            0,
+            "an expired subscription must not be left accepted-and-dead"
+        );
+
+        // And a sweep with nothing pending is a no-op.
+        assert_eq!(
+            block_on(reconcile_pending_subscriptions()),
+            ReconcileReport::default()
+        );
     }
 
     #[test]
@@ -2257,6 +3054,7 @@ mod tests {
                 let response = block_on(handle_monitoring_subscription_create(
                     "af1",
                     &monitoring_request(body),
+                    NorthboundApi::T8MonitoringEvent,
                 ));
                 assert!(
                     response.status == 400 || response.status == 404,
@@ -2282,6 +3080,7 @@ mod tests {
             let response = block_on(handle_monitoring_subscription_create(
                 "af1",
                 &monitoring_request(body),
+                NorthboundApi::T8MonitoringEvent,
             ));
             assert_eq!(
                 response.status, 201,
@@ -2332,6 +3131,7 @@ mod tests {
                 "notificationDestination": "http://af.example.com:8080/cb",
                 "msisdn": "491700000001",
             })),
+            NorthboundApi::T8MonitoringEvent,
         ));
         assert_eq!(
             response.status, 404,

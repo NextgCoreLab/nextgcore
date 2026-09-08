@@ -48,6 +48,42 @@ pub struct SouthboundRef {
     pub delete_path: String,
 }
 
+/// UNIX seconds. Saturates rather than panicking on a clock before the epoch.
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A southbound subscribe that could not be attempted yet, retained so the
+/// reconciler can retry it (issue #111).
+///
+/// A monitoring subscription is accepted with `201` when no AMF/UDM URI is
+/// configured -- a deployment that has not wired its producers yet -- but such a
+/// subscription can never notify, and before #111 it was left in that state
+/// FOREVER with the AF believing it held a live subscription. Retaining the built
+/// request is what lets the reconciler promote it later without re-deriving the
+/// target from the raw AF body.
+///
+/// Exactly one of `NefMonitoringSubscription::southbound` and `::pending` is
+/// `Some` for a stored subscription: `southbound` means live, `pending` means
+/// deferred and being retried.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PendingSouthbound {
+    /// Which producer the retry targets.
+    pub producer: SouthboundProducer,
+    /// Producer resource path for the subscribe.
+    pub path: String,
+    /// Subscribe body, built when the AF create was handled.
+    pub body: serde_json::Value,
+    /// UNIX seconds the leg was first deferred, for the expiry deadline. A
+    /// pending leg is EXPIRED rather than retried forever, because an AF holding
+    /// a subscription that will never notify is worse off than one told it is
+    /// gone.
+    pub since: u64,
+}
+
 /// The external identity the AF used to name its target UE (TS 29.122
 /// `MonitoringEventSubscription`).
 ///
@@ -111,6 +147,10 @@ pub struct NefMonitoringSubscription {
     pub notification_destination: String,
     /// Southbound producer subscription, when one was established.
     pub southbound: Option<SouthboundRef>,
+    /// A deferred southbound leg awaiting retry (issue #111). Mutually exclusive
+    /// with `southbound`; see [`PendingSouthbound`].
+    #[serde(default)]
+    pub pending: Option<PendingSouthbound>,
     /// The external identity the AF used to name its target UE, when it used
     /// one (issue #110).
     ///
@@ -146,6 +186,7 @@ impl NefMonitoringSubscription {
             monitoring_type: monitoring_type.into(),
             notification_destination: notification_destination.into(),
             southbound: None,
+            pending: None,
             af_target: None,
             owner_id: None,
             raw: raw.into(),
@@ -500,6 +541,50 @@ impl NefContext {
             self.persist();
         }
         removed
+    }
+
+    /// Every subscription whose southbound leg is still deferred, oldest first
+    /// (issue #111). The reconciler's work list.
+    ///
+    /// Ordered by `pending.since` so an expiry sweep processes the oldest legs
+    /// first and the order does not depend on hash iteration.
+    pub fn subscriptions_pending(&self) -> Vec<NefMonitoringSubscription> {
+        let Ok(subs) = self.subscriptions.read() else {
+            return Vec::new();
+        };
+        let mut pending: Vec<NefMonitoringSubscription> = subs
+            .values()
+            .filter(|s| s.pending.is_some())
+            .cloned()
+            .collect();
+        pending.sort_by_key(|s| s.pending.as_ref().map(|p| p.since).unwrap_or(0));
+        pending
+    }
+
+    /// Promote a deferred subscription to live (issue #111): record the producer
+    /// reference and clear the pending leg, so the two stay mutually exclusive.
+    ///
+    /// Returns false when the subscription has gone -- the AF deleted it while the
+    /// reconciler was mid-retry -- so the caller can tear the producer-side
+    /// subscription down instead of leaving it orphaned.
+    pub fn subscription_promote(&self, id: &str, southbound: SouthboundRef) -> bool {
+        let promoted = {
+            let Ok(mut subs) = self.subscriptions.write() else {
+                return false;
+            };
+            match subs.get_mut(id) {
+                Some(sub) => {
+                    sub.southbound = Some(southbound);
+                    sub.pending = None;
+                    true
+                }
+                None => false,
+            }
+        };
+        if promoted {
+            self.persist();
+        }
+        promoted
     }
 
     /// Number of stored monitoring subscriptions (NRF `/load` gauge source).
