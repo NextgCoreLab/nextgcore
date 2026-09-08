@@ -165,23 +165,153 @@ pub struct EasDiscoveryReq {
     pub supp_feat: Option<String>,
 }
 
-/// TS 24.558 `EasDiscoveryFilter`.
+/// TS 24.558 `EasDiscoveryFilter` (§6.2.2.2).
 ///
-/// NOTE (bounded scope): `easChars` is modelled as a single
-/// `EASCharacteristics` object (matching the matched-stack shape and the
-/// remediation acceptance `easDiscoveryFilter.easChars.easType`); the spec's
-/// array cardinality is a documented simplification.
+/// #105: `easChars` is an ARRAY with `minItems: 1`
+/// (`TS24558_Eees_EASDiscovery.yaml:527`). It was modelled as a single object and
+/// documented as a "bounded scope simplification", which meant a conformant
+/// discovery body carrying `easChars: [...]` failed serde and was rejected with
+/// `400 MANDATORY_IE_MISSING` at the door -- so the surface was matched-sim only.
+///
+/// A single object is still ACCEPTED on the wire (see [`one_or_many`]) because the
+/// matched simulator sends one and breaking it would trade a conformance defect for
+/// a regression. Serialisation always emits the array, so this EES's own output is
+/// conformant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EasDiscoveryFilter {
+    /// `easChars` — array, `minItems: 1`. Several entries are OR-combined: each is
+    /// an independent set of characteristics a candidate EAS may satisfy.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub eas_chars: Vec<EasCharacteristics>,
+    /// `acChars` — array, `minItems: 1` (yaml:519). Never parsed before #105.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub ac_chars: Vec<AcCharacteristics>,
+    /// `appGroupProfile` (yaml:525). Never parsed before #105.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub eas_chars: Option<EasCharacteristics>,
+    pub app_group_profile: Option<AppGroupProfile>,
+}
+
+/// `AppGroupProfile` (`TS24558_Eecs_ServiceProvisioning.yaml:513-531`) — the
+/// common-EAS application group a discovering EEC is asking about.
+///
+/// `appGrpId` and `easId` are both REQUIRED (yaml:529-531), which is why they are
+/// not `Option`: a body naming this member without them is invalid, and accepting
+/// it would give discovery a filter with nothing to filter on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AppGroupProfile {
+    /// The application group uniquely identifying the UEs using the application.
+    pub app_grp_id: String,
+    /// Application identifier of the EAS serving the group.
+    pub eas_id: String,
+    /// End-to-end response time the group requires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e2e_resp_time: Option<u32>,
+    /// Expected service area (passthrough; `LocationArea5G` is deferred).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_svc_area: Option<serde_json::Value>,
+}
+
+impl AppGroupProfile {
+    /// Whether `eas` can serve this application group.
+    ///
+    /// Narrows on `easId` — the group's own mandatory EAS identifier — and on
+    /// `e2eRespTime` when the EAS advertises a `maxRespTime` to compare it with.
+    ///
+    /// `appGrpId` is NOT cross-checked against the `eees-cea` declared-common-EAS
+    /// store: this is a pure predicate over one `EasProfile`, and making discovery
+    /// depend on a `POST /declare` having happened would hide every EAS in a
+    /// deployment that does not use common EASs at all.
+    pub fn matches(&self, eas: &EasProfile) -> bool {
+        if self.eas_id != eas.eas_id {
+            return false;
+        }
+        match (
+            self.e2e_resp_time,
+            eas.svc_kpi.as_ref().and_then(|k| k.max_resp_time),
+        ) {
+            (Some(want), Some(have)) => have <= want,
+            _ => true,
+        }
+    }
+}
+
+/// Deserialise either a single object or an array of them into a `Vec`.
+///
+/// #105: this is what lets the conformant array shape be accepted WITHOUT rejecting
+/// the single-object body the matched simulator sends. Both are read; only the array
+/// is written.
+fn one_or_many<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany<T> {
+        One(T),
+        Many(Vec<T>),
+    }
+    Ok(match OneOrMany::<T>::deserialize(de)? {
+        OneOrMany::One(v) => vec![v],
+        OneOrMany::Many(v) => v,
+    })
+}
+
+/// TS 24.558 `ACCharacteristics` — the AC-side discovery criteria (yaml:519).
+///
+/// #105: absent entirely before, so a conformant filter naming `acChars` was
+/// rejected. Matching is on `acId` against the EAS profile's permitted AC list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AcCharacteristics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ac_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ac_type: Option<String>,
+}
+
+impl AcCharacteristics {
+    /// Whether `eas` permits this AC.
+    ///
+    /// An EAS profile with no permitted-AC list matches any `acId`: TS 23.558 makes
+    /// `permLevel`/AC restriction optional, so treating absence as "permits nothing"
+    /// would hide every EAS from a conformant filter.
+    pub fn matches(&self, eas: &EasProfile) -> bool {
+        let Some(ac_id) = self.ac_id.as_deref() else {
+            return true;
+        };
+        match &eas.ac_ids {
+            Some(ids) if !ids.is_empty() => ids.iter().any(|id| id == ac_id),
+            _ => true,
+        }
+    }
 }
 
 impl EasDiscoveryFilter {
-    /// True when `eas` satisfies this filter (an absent `easChars` matches all).
+    /// True when `eas` satisfies this filter.
+    ///
+    /// `easChars` and `acChars` are each OR-combined internally (any entry may
+    /// match) and AND-combined with each other, which is what an array of
+    /// alternative characteristic sets means. An empty array matches all, so an
+    /// absent filter member is not a filter that excludes everything.
     pub fn matches(&self, eas: &EasProfile) -> bool {
-        self.eas_chars.as_ref().is_none_or(|c| c.matches(eas))
+        let eas_ok = self.eas_chars.is_empty() || self.eas_chars.iter().any(|c| c.matches(eas));
+        let ac_ok = self.ac_chars.is_empty() || self.ac_chars.iter().any(|c| c.matches(eas));
+        let grp_ok = self
+            .app_group_profile
+            .as_ref()
+            .is_none_or(|p| p.matches(eas));
+        eas_ok && ac_ok && grp_ok
     }
 }
 
@@ -199,8 +329,10 @@ pub struct EasCharacteristics {
         skip_serializing_if = "Option::is_none"
     )]
     pub eas_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ac_ids: Option<Vec<String>>,
+    // #105: `acIds` was here and has NO counterpart in the spec
+    // `EASCharacteristics` (yaml:530-582). AC-side filtering belongs in `acChars`,
+    // which is now modelled -- so this was an invented member doing a real member's
+    // job under the wrong name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub svc_area: Option<ServiceArea>,
 }
@@ -218,14 +350,9 @@ impl EasCharacteristics {
                 return false;
             }
         }
-        if let Some(acs) = &self.ac_ids {
-            if !acs.is_empty() {
-                let eas_acs = eas.ac_ids.as_deref().unwrap_or(&[]);
-                if !acs.iter().any(|a| eas_acs.contains(a)) {
-                    return false;
-                }
-            }
-        }
+        // #105: the non-spec `acIds` criterion was matched here. AC-side filtering
+        // now lives in the filter's `acChars` (`AcCharacteristics::matches`), which
+        // is the member TS 24.558 actually defines.
         if let Some(area) = &self.svc_area {
             match &eas.svc_area {
                 Some(eas_area) => {
@@ -313,8 +440,34 @@ pub struct EasDiscoveryNotification {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EasDiscoverySubscription {
-    /// Callback URI the EES POSTs discovery notifications to (mandatory).
-    pub notification_uri: String,
+    /// `eecId` — **mandatory** (`TS24558_Eees_EASDiscovery.yaml:471-473`).
+    ///
+    /// #105: the required set is `eecId` + `easEventType`. This struct made
+    /// `notificationUri` mandatory instead and carried neither, so a conformant
+    /// subscription body was rejected while a non-conformant one was required.
+    #[serde(default)]
+    pub eec_id: String,
+    /// `easEventType` — **mandatory** (yaml:471-473).
+    #[serde(default)]
+    pub eas_event_type: String,
+    /// `notificationDestination` — **optional** (yaml:445), and differently named
+    /// from the `notificationUri` this used to require. `notificationUri` is still
+    /// accepted as an alias so the matched-simulator body keeps working.
+    #[serde(
+        default,
+        alias = "notificationUri",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub notification_destination: Option<String>,
+    /// `easDynInfoFilter` (optional, passthrough) — dropped before #105.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_dyn_info_filter: Option<serde_json::Value>,
+    /// `easSvcContinuity` (optional) — dropped before #105.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_svc_continuity: Option<bool>,
+    /// `websockNotifConfig` (optional, passthrough) — dropped before #105.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websock_notif_config: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requestor_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -328,7 +481,53 @@ pub struct EasDiscoverySubscription {
     pub subscription_id: Option<String>,
 }
 
+/// TS 24.558 `EasDiscoverySubscriptionPatch` (yaml:210-238). Every member is
+/// optional; an absent one leaves the stored value alone (#105).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EasDiscoverySubscriptionPatch {
+    #[serde(
+        default,
+        alias = "notificationUri",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub notification_destination: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_discovery_filter: Option<EasDiscoveryFilter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_event_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_dyn_info_filter: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eas_svc_continuity: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp_time: Option<String>,
+}
+
 impl EasDiscoverySubscription {
+    /// Apply a partial update in place (#105). Absent members are left alone --
+    /// that is what makes this a PATCH rather than a PUT.
+    pub fn apply_patch(&mut self, patch: &EasDiscoverySubscriptionPatch) {
+        if let Some(v) = &patch.notification_destination {
+            self.notification_destination = Some(v.clone());
+        }
+        if let Some(v) = &patch.eas_discovery_filter {
+            self.eas_discovery_filter = Some(v.clone());
+        }
+        if let Some(v) = &patch.eas_event_type {
+            self.eas_event_type = v.clone();
+        }
+        if let Some(v) = &patch.eas_dyn_info_filter {
+            self.eas_dyn_info_filter = Some(v.clone());
+        }
+        if let Some(v) = patch.eas_svc_continuity {
+            self.eas_svc_continuity = Some(v);
+        }
+        if let Some(v) = &patch.exp_time {
+            self.exp_time = Some(v.clone());
+        }
+    }
+
     /// True when this subscription's filter would select `eas`.
     pub fn filter_matches(&self, eas: &EasProfile) -> bool {
         self.eas_discovery_filter
@@ -365,6 +564,9 @@ pub mod cause {
     pub const MODIFICATION_NOT_ALLOWED: &str = "MODIFICATION_NOT_ALLOWED";
     pub const SUBSCRIPTION_NOT_FOUND: &str = "SUBSCRIPTION_NOT_FOUND";
     pub const INSUFFICIENT_RESOURCES: &str = "INSUFFICIENT_RESOURCES";
+    /// TS 24.558 §5.2.2.2: the cause an EEC registration is refused with when no
+    /// matching EAS is identified for even one of its AC profiles.
+    pub const RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND";
 }
 
 // ---------------------------------------------------------------------------
@@ -622,17 +824,25 @@ mod tests {
         assert!(filter.matches(&profile("eas1", "V2X")));
         assert!(!filter.matches(&profile("eas1", "AR")));
 
-        // acIds intersection.
-        let chars = EasCharacteristics {
-            ac_ids: Some(vec!["ac2".into()]),
+        // #105: AC-side matching moved from the non-spec `EASCharacteristics.acIds`
+        // onto the filter's `acChars`, which is the member TS 24.558 defines
+        // (yaml:519). Same behaviour, spec-shaped.
+        let permitted = EasDiscoveryFilter {
+            ac_chars: vec![AcCharacteristics {
+                ac_id: Some("ac2".into()),
+                ..Default::default()
+            }],
             ..Default::default()
         };
-        assert!(chars.matches(&profile("eas1", "V2X")));
-        let chars_miss = EasCharacteristics {
-            ac_ids: Some(vec!["acX".into()]),
+        assert!(permitted.matches(&profile("eas1", "V2X")));
+        let not_permitted = EasDiscoveryFilter {
+            ac_chars: vec![AcCharacteristics {
+                ac_id: Some("acX".into()),
+                ..Default::default()
+            }],
             ..Default::default()
         };
-        assert!(!chars_miss.matches(&profile("eas1", "V2X")));
+        assert!(!not_permitted.matches(&profile("eas1", "V2X")));
     }
 
     /// eesd-05: the legacy `type` alias still deserializes into `easType`.
@@ -640,7 +850,10 @@ mod tests {
     fn test_discovery_filter_type_alias() {
         let body = r#"{"easChars":{"type":"AR"}}"#;
         let filter: EasDiscoveryFilter = serde_json::from_str(body).unwrap();
-        assert_eq!(filter.eas_chars.unwrap().eas_type.as_deref(), Some("AR"));
+        // #105: `easChars` is a Vec now, and a SINGLE object still deserialises into
+        // it -- which is what keeps the matched-simulator body working.
+        assert_eq!(filter.eas_chars.len(), 1);
+        assert_eq!(filter.eas_chars[0].eas_type.as_deref(), Some("AR"));
     }
 
     /// eesd-05: service-area overlap (shared TAI) gates discovery.

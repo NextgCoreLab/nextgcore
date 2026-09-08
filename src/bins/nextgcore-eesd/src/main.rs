@@ -94,6 +94,7 @@ mod context;
 mod ecs_registration;
 mod eec;
 mod notifier;
+mod relocation;
 mod services;
 mod types;
 
@@ -278,6 +279,10 @@ async fn main() -> Result<()> {
         .ees_id
         .clone()
         .unwrap_or_else(|| format!("ees-{}", uuid::Uuid::new_v4()));
+    // #105: the same identity the ECS registration advertises is what an EEC-context
+    // pull presents as `ees-id`. Publishing it here rather than reading a second
+    // source of truth keeps the S-EES's view of who asked consistent with the ECS's.
+    relocation::set_self_ees_id(ees_id.clone());
 
     // eesd-08: provision OAuth2 verification keys (fail-closed when absent).
     if let Some(path) = args.oauth2_jwks_file.as_deref() {
@@ -416,6 +421,8 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             match method {
                 "GET" => handle_disc_sub_get(subscription_id).await,
                 "PUT" => handle_disc_sub_update(subscription_id, &request).await,
+                // #105: PATCH was unrouted, so a conformant partial update got 405.
+                "PATCH" => handle_disc_sub_patch(subscription_id, &request).await,
                 "DELETE" => handle_disc_sub_delete(subscription_id).await,
                 _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
             }
@@ -920,9 +927,19 @@ async fn handle_disc_sub_create(request: &SbiRequest) -> SbiResponse {
             );
         }
     };
-    if sub.notification_uri.trim().is_empty() {
+    // #105: the mandatory set is `eecId` + `easEventType`
+    // (`TS24558_Eees_EASDiscovery.yaml:471-473`), NOT `notificationUri` -- which is
+    // optional and is spelled `notificationDestination`. Requiring the wrong member
+    // rejected every conformant subscription body.
+    if sub.eec_id.trim().is_empty() {
         return send_bad_request(
-            "Mandatory IE notificationUri is empty",
+            "Mandatory IE eecId is missing or empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    if sub.eas_event_type.trim().is_empty() {
+        return send_bad_request(
+            "Mandatory IE easEventType is missing or empty",
             Some(cause::MANDATORY_IE_MISSING),
         );
     }
@@ -987,9 +1004,19 @@ async fn handle_disc_sub_update(subscription_id: &str, request: &SbiRequest) -> 
             );
         }
     };
-    if sub.notification_uri.trim().is_empty() {
+    // #105: the mandatory set is `eecId` + `easEventType`
+    // (`TS24558_Eees_EASDiscovery.yaml:471-473`), NOT `notificationUri` -- which is
+    // optional and is spelled `notificationDestination`. Requiring the wrong member
+    // rejected every conformant subscription body.
+    if sub.eec_id.trim().is_empty() {
         return send_bad_request(
-            "Mandatory IE notificationUri is empty",
+            "Mandatory IE eecId is missing or empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    if sub.eas_event_type.trim().is_empty() {
+        return send_bad_request(
+            "Mandatory IE easEventType is missing or empty",
             Some(cause::MANDATORY_IE_MISSING),
         );
     }
@@ -1000,6 +1027,57 @@ async fn handle_disc_sub_update(subscription_id: &str, request: &SbiRequest) -> 
         .read()
         .map_err(|_| UpdateError::Internal)
         .and_then(|c| c.disc_sub_update(subscription_id, sub));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(e) => update_error_response(e, &format!("Discovery subscription {subscription_id}")),
+    }
+}
+
+/// `PATCH /eees-easdiscovery/v1/subscriptions/{id}` — partial update via
+/// `EasDiscoverySubscriptionPatch` (`TS24558_Eees_EASDiscovery.yaml:210-238`).
+///
+/// #105: the router handled only GET/PUT/DELETE, so a conformant partial update fell
+/// through to `405`. A consumer wanting to change one member had to PUT a whole
+/// subscription -- which requires re-sending the mandatory IEs it may not have kept.
+async fn handle_disc_sub_patch(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let patch: types::EasDiscoverySubscriptionPatch = match serde_json::from_value(value) {
+        Ok(p) => p,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Invalid EasDiscoverySubscriptionPatch: {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+
+    let ctx = ees_self();
+    // Read-modify-write through the existing update path, so the patch cannot skip
+    // whatever `disc_sub_update` enforces.
+    let existing = match ctx
+        .read()
+        .ok()
+        .and_then(|c| c.disc_sub_find(subscription_id))
+    {
+        Some(sub) => sub,
+        None => {
+            return send_not_found(
+                &format!("Discovery subscription {subscription_id} not found"),
+                Some(cause::SUBSCRIPTION_NOT_FOUND),
+            )
+        }
+    };
+    let mut updated = existing;
+    updated.apply_patch(&patch);
+    let result = ctx
+        .read()
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.disc_sub_update(subscription_id, updated));
     match result {
         Ok(updated) => SbiResponse::with_status(200)
             .with_json_body(&updated)
@@ -1024,8 +1102,131 @@ async fn handle_disc_sub_delete(subscription_id: &str) -> SbiResponse {
 
 // ---- eesd-06: EEC registration handlers ------------------------------------
 
+/// Apply the TS 24.558 §5.2.2.2 step 1 AC-profile matching to `reg` in place.
+///
+/// Returns `Err(response)` when *no* AC profile could be matched — the clause's
+/// *"when a matching EAS is not identified for even one AC profile, the EES shall
+/// reject the request message ... with a status code set to 404 Not Found and
+/// indicate the `RESOURCE_NOT_FOUND` error"*. Otherwise annotates `reg` with the
+/// partial-fulfilment report and, when the EEC asked for EAS selection, with the
+/// selected EASes in `discoveredEas` (step 1 iii B).
+///
+/// Note what this deliberately does **not** do: it never returns `422`. #105's
+/// suggested approach asks for one, but `TS24558_Eees_EECRegistration.yaml`
+/// declares no `422` for `CreateEECReg` at all, and `unfulfillAcProfs` /
+/// `unfulfilledAcProfs` are members of `EECRegistration` — which is the **201**
+/// response body. §5.2.2.2 is explicit: *"the EES shall return the EEC
+/// registration information in the response message ... the EES shall include
+/// `unfulfillAcProfs` or `unfulfilledAcProfs`"*. Partial fulfilment is reported
+/// **in a successful registration**; a `422` would fail a registration the spec
+/// says succeeds.
+fn apply_ac_profile_matching(
+    context: &context::EesContext,
+    reg: &mut EecRegistration,
+) -> Result<(), Box<SbiResponse>> {
+    let profs = reg.ac_profs.clone().unwrap_or_default();
+    let outcome = context.match_ac_profiles(&profs);
+    if outcome.none_matched() {
+        return Err(Box::new(send_not_found(
+            &format!(
+                "No matching EAS identified for any of the {} AC profile(s)",
+                outcome.unfulfilled.len()
+            ),
+            Some(cause::RESOURCE_NOT_FOUND),
+        )));
+    }
+    if !outcome.unfulfilled.is_empty() {
+        log::info!(
+            "EEC registration partially fulfilled: {} of {} AC profile(s) matched",
+            outcome.fulfilled,
+            profs.len()
+        );
+    }
+    reg.set_unfulfilled(outcome.unfulfilled);
+    // Step 1 iii) B): the EES selects from the matching EASes and returns them in
+    // `discoveredEas` — but ONLY when the EEC asked (`easSelReqInd`), because the
+    // spec spells out that `false`/omitted means "the EES shall not select the
+    // EAS", and answering with a selection anyway would override the EEC's choice
+    // to do its own discovery.
+    if reg.eas_sel_req_ind == Some(true) && !outcome.selected.is_empty() {
+        reg.discovered_eas = Some(
+            outcome
+                .selected
+                .into_iter()
+                .map(|eas| types::DiscoveredEas { eas })
+                .collect(),
+        );
+    }
+    Ok(())
+}
+
+/// Drive the TS 29.558 §5.10 EEC-context retrieval for a registration that
+/// presents `(eecCntxId, srcEesId)` (§5.2.2.2 step 2), storing a retrieved
+/// context under its own `cntxId` so a later pull from *this* EES finds it.
+///
+/// Never fails the registration. §5.2.2.2 orders the retrieval *before* resource
+/// creation but does not make it a precondition: the EEC is registering here and
+/// now, and refusing it because an unrelated S-EES is unreachable would deny
+/// service on the strength of another node's availability. Every non-retrieval is
+/// logged with the reason, which is the operator's signal that continuity data did
+/// not come across.
+async fn retrieve_relocated_eec_context(reg: &EecRegistration) {
+    let Some((eec_cntx_id, src_ees_id)) = reg.relocation_source() else {
+        return;
+    };
+    let outcome = relocation::pull_eec_context(relocation::PullRequest {
+        src_ees_id: src_ees_id.to_string(),
+        eec_cntx_id: eec_cntx_id.to_string(),
+        self_ees_id: relocation::self_ees_id(),
+    })
+    .await;
+    match outcome {
+        relocation::PullOutcome::Retrieved(ctx) => {
+            let cntx_id = ctx.cntx_id.clone();
+            // Stored under the id its owner gave it (`EECContext.cntxId` is
+            // mandatory), NOT under a freshly minted one: the S-EES and the EEC
+            // both know the context by that id, and re-keying it here would make
+            // this EES's copy unreachable by the only id anyone can ask for.
+            let stored = ees_self()
+                .read()
+                .ok()
+                .and_then(|c| c.eec_context_push(*ctx));
+            if stored.is_some() {
+                log::info!(
+                    "EEC context relocated from srcEesId={src_ees_id}: cntxId={cntx_id} \
+                     eecId={}",
+                    reg.eec_id
+                );
+            } else {
+                log::error!(
+                    "EEC context pulled from srcEesId={src_ees_id} but could not be stored \
+                     (capacity exhausted): cntxId={cntx_id}"
+                );
+            }
+        }
+        relocation::PullOutcome::NotAddressable => log::warn!(
+            "EEC registration for {} presents eecCntxId={eec_cntx_id} but srcEesId={src_ees_id} \
+             is not addressable; registering WITHOUT the relocated context",
+            reg.eec_id
+        ),
+        relocation::PullOutcome::NotFound => log::warn!(
+            "source EES {src_ees_id} holds no EEC context {eec_cntx_id}; registering WITHOUT \
+             the relocated context"
+        ),
+        relocation::PullOutcome::Failed(detail) => log::warn!(
+            "EEC context pull from {src_ees_id} for {eec_cntx_id} failed ({detail}); \
+             registering WITHOUT the relocated context"
+        ),
+    }
+}
+
 /// `CreateEECReg` (POST /registrations): register an EEC with a server-minted
 /// `registrationId` and an `expTime` lifecycle (minted when absent, eesd-12).
+///
+/// Follows the TS 24.558 §5.2.2.2 step order: AC-profile matching (which can
+/// refuse with `404`), then the §5.10 EEC-context retrieval, then resource
+/// creation. The order matters — a refused registration must not have pulled a
+/// context or created a resource first.
 async fn handle_eec_register(request: &SbiRequest) -> SbiResponse {
     log::info!("EEC Register");
     let value = match parse_json_body(request) {
@@ -1044,6 +1245,15 @@ async fn handle_eec_register(request: &SbiRequest) -> SbiResponse {
     if let Err(detail) = reg.validate() {
         return send_bad_request(&detail, Some(cause::MANDATORY_IE_MISSING));
     }
+    // §5.2.2.2 step 1: match the AC profiles before anything is created.
+    if let Ok(guard) = ees_self().read() {
+        if let Err(resp) = apply_ac_profile_matching(&guard, &mut reg) {
+            return *resp;
+        }
+    }
+    // §5.2.2.2 step 2: retrieve the EEC context from the source EES. Awaited with
+    // no context guard held — `retrieve_relocated_eec_context` takes its own.
+    retrieve_relocated_eec_context(&reg).await;
     // eesd-12: mint an expTime when the consumer supplied none.
     if reg.exp_time.is_none() {
         reg.exp_time = Some(types::epoch_to_rfc3339(
@@ -1111,6 +1321,15 @@ async fn handle_eec_update(registration_id: &str, request: &SbiRequest) -> SbiRe
     };
     if let Err(detail) = reg.validate() {
         return send_bad_request(&detail, Some(cause::MANDATORY_IE_MISSING));
+    }
+    // §5.2.2.3 applies the same matching to an update: *"when a matching EAS is
+    // identified for atleast one AC profile ... shall update the resource"*, and
+    // the same partial-fulfilment report goes in the response. Checked BEFORE the
+    // store is touched, so a refused update leaves the existing resource intact.
+    if let Ok(guard) = ees_self().read() {
+        if let Err(resp) = apply_ac_profile_matching(&guard, &mut reg) {
+            return *resp;
+        }
     }
     if reg.exp_time.is_none() {
         reg.exp_time = Some(types::epoch_to_rfc3339(
@@ -2452,8 +2671,18 @@ mod tests {
     /// Register an EAS through the router and return its server-minted
     /// `registrationId` (from the `Location` header).
     fn register_eas(sk: &SigningKey, eas_id: &str, eas_type: &str) -> String {
+        register_eas_at(sk, eas_id, eas_id, eas_type)
+    }
+
+    /// Register an EAS with its `easId` and its endpoint FQDN given SEPARATELY.
+    ///
+    /// #105: `register_eas` derives the endpoint from the `easId`, so it cannot
+    /// express the shape ACR actually needs -- the SAME application (same `easId`) at
+    /// a DIFFERENT location (TS 23.558 §8.8.3.2). That is why the ACR tests were
+    /// written with two different `easId`s and pinned the inverted predicate.
+    fn register_eas_at(sk: &SigningKey, eas_id: &str, fqdn: &str, eas_type: &str) -> String {
         let body = format!(
-            r#"{{"easProf":{{"easId":"{eas_id}","endPt":{{"fqdn":"{eas_id}"}},"type":"{eas_type}"}}}}"#
+            r#"{{"easProf":{{"easId":"{eas_id}","endPt":{{"fqdn":"{fqdn}"}},"type":"{eas_type}"}}}}"#
         );
         let req = SbiRequest::post("/eees-easregistration/v1/registrations")
             .with_header("Authorization", bearer(sk, "k1", "eees-easregistration"))
@@ -2581,6 +2810,113 @@ mod tests {
         auth::clear_auth_jwks();
     }
 
+    /// #105 criterion 1: a fully spec-shaped discovery filter — `easChars` as an
+    /// **array** with more than one entry, plus `acChars` and `appGroupProfile` —
+    /// is accepted (`200`, not `400`) and every member narrows the result.
+    ///
+    /// Each member is exercised as the *sole* reason a candidate is excluded, so a
+    /// member that is parsed and then ignored fails this test rather than passing
+    /// on another member's work.
+    #[test]
+    fn a_spec_shaped_discovery_filter_is_accepted_and_every_member_narrows() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let discover = |filter: &str| -> SbiResponse {
+            let body = format!(r#"{{"requestorId":"eec-1","easDiscoveryFilter":{filter}}}"#);
+            let req = SbiRequest::post("/eees-easdiscovery/v1/eas-profiles/request-discovery")
+                .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
+                .with_body(body, "application/json");
+            block_on(ees_sbi_request_handler(req))
+        };
+        let found = |resp: &SbiResponse| -> Vec<String> {
+            let dr: EasDiscoveryResp =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let mut ids: Vec<String> = dr
+                .discovered_eas
+                .iter()
+                .map(|d| d.eas.eas_id.clone())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        // Two EASes with DIFFERENT types, and one with an AC allow-list.
+        register_eas(&sk, "eas-c1-v2x.example.com", "V2X");
+        register_eas(&sk, "eas-c1-ar.example.com", "AR");
+        let body = r#"{"easProf":{"easId":"eas-c1-acl.example.com",
+            "endPt":{"fqdn":"eas-c1-acl.example.com"},"type":"V2X",
+            "acIds":["ac-allowed"],"svcKpi":{"maxRespTime":40}}}"#;
+        let req = SbiRequest::post("/eees-easregistration/v1/registrations")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
+            .with_body(body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 201);
+
+        // The array shape, two entries, OR-combined: both types come back. This is
+        // the body that returned 400 before #105.
+        let resp = discover(
+            r#"{"easChars":[{"easId":"eas-c1-v2x.example.com"},
+                            {"easId":"eas-c1-ar.example.com"}]}"#,
+        );
+        assert_eq!(
+            resp.status, 200,
+            "a conformant array-shaped filter must not 400"
+        );
+        assert_eq!(
+            found(&resp),
+            vec!["eas-c1-ar.example.com", "eas-c1-v2x.example.com"],
+            "several easChars entries are alternatives, not a conjunction"
+        );
+
+        // `acChars` alone as the discriminator: the AC-restricted EAS admits
+        // `ac-allowed` and refuses `ac-other`, while the unrestricted ones always
+        // match — so the difference between the two results is acChars' doing.
+        let allowed = discover(r#"{"acChars":[{"acId":"ac-allowed"}]}"#);
+        assert_eq!(allowed.status, 200);
+        assert!(found(&allowed).contains(&"eas-c1-acl.example.com".to_string()));
+        let other = discover(r#"{"acChars":[{"acId":"ac-other"}]}"#);
+        assert!(
+            !found(&other).contains(&"eas-c1-acl.example.com".to_string()),
+            "an EAS whose acIds exclude the requested AC must not be discovered"
+        );
+
+        // `appGroupProfile` alone: narrows to its mandatory `easId` ...
+        let resp = discover(
+            r#"{"appGroupProfile":{"appGrpId":"grp-1","easId":"eas-c1-acl.example.com"}}"#,
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(found(&resp), vec!["eas-c1-acl.example.com"]);
+        // ... and its e2eRespTime is honoured against the EAS's advertised
+        // maxRespTime (40): 100 is satisfiable, 10 is not.
+        let ok = discover(
+            r#"{"appGroupProfile":{"appGrpId":"grp-1","easId":"eas-c1-acl.example.com",
+                "e2eRespTime":100}}"#,
+        );
+        assert_eq!(found(&ok), vec!["eas-c1-acl.example.com"]);
+        let too_slow = discover(
+            r#"{"appGroupProfile":{"appGrpId":"grp-1","easId":"eas-c1-acl.example.com",
+                "e2eRespTime":10}}"#,
+        );
+        assert!(
+            found(&too_slow).is_empty(),
+            "an EAS slower than the group's e2eRespTime must not be discovered"
+        );
+
+        // All three together, and the filter's own round trip emits the array form.
+        let resp = discover(
+            r#"{"easChars":[{"easType":"V2X"}],"acChars":[{"acId":"ac-allowed"}],
+                "appGroupProfile":{"appGrpId":"grp-1","easId":"eas-c1-acl.example.com"}}"#,
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(found(&resp), vec!["eas-c1-acl.example.com"]);
+
+        auth::clear_auth_jwks();
+    }
+
     /// eesd-05: a discovery subscription create returns 201 + a `Location`.
     #[test]
     fn test_disc_subscription_create() {
@@ -2591,7 +2927,17 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        let body = r#"{"notificationUri":"http://eec/cb","easDiscoveryFilter":{"easChars":{"easType":"V2X"}}}"#;
+        // #105 FLIP: this body carried only `notificationDestination`, matching the
+        // old (wrong) mandatory set. The required members are `eecId` +
+        // `easEventType` (`TS24558_Eees_EASDiscovery.yaml:471-473`);
+        // `notificationDestination` is OPTIONAL. `easChars` is sent as the conformant
+        // ARRAY here too.
+        let body = r#"{
+            "eecId":"eec-sub-1",
+            "easEventType":"EAS_AVAILABLE",
+            "notificationDestination":"http://eec/cb",
+            "easDiscoveryFilter":{"easChars":[{"easType":"V2X"}]}
+        }"#;
         let req = SbiRequest::post("/eees-easdiscovery/v1/subscriptions")
             .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
             .with_body(body, "application/json");
@@ -2605,6 +2951,151 @@ mod tests {
         let req = SbiRequest::get(format!("/eees-easdiscovery/v1/subscriptions/{sub_id}"))
             .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"));
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// #105 criterion 3: `PATCH /eees-easdiscovery/v1/subscriptions/{id}` is routed
+    /// and applies an `EasDiscoverySubscriptionPatch` — it used to fall through to
+    /// `405`.
+    ///
+    /// Asserts the PATCH semantics, not just the status: the patched member changes
+    /// and an **unmentioned** member is left alone. A handler that replaced the whole
+    /// subscription would also return `200`, and would silently drop the mandatory
+    /// IEs a consumer did not re-send.
+    #[test]
+    fn a_discovery_subscription_patch_is_routed_and_leaves_unmentioned_members_alone() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let body = r#"{
+            "eecId":"eec-patch-1",
+            "easEventType":"EAS_AVAILABILITY_CHANGE",
+            "notificationDestination":"http://eec/cb-old",
+            "easDiscoveryFilter":{"easChars":[{"easType":"V2X"}]}
+        }"#;
+        let req = SbiRequest::post("/eees-easdiscovery/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 201);
+        let id = resp
+            .http
+            .get_header("location")
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // Patch ONLY notificationDestination.
+        let req = SbiRequest::patch(format!("/eees-easdiscovery/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
+            .with_body(
+                r#"{"notificationDestination":"http://eec/cb-new"}"#,
+                "application/merge-patch+json",
+            );
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(
+            resp.status,
+            200,
+            "PATCH must be routed, not answered 405; got {}",
+            resp.http.content.as_deref().unwrap_or("")
+        );
+        let patched: EasDiscoverySubscription =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            patched.notification_destination.as_deref(),
+            Some("http://eec/cb-new")
+        );
+        assert_eq!(
+            patched.eec_id, "eec-patch-1",
+            "a PATCH must not drop the mandatory IEs it did not mention"
+        );
+        assert_eq!(patched.eas_event_type, "EAS_AVAILABILITY_CHANGE");
+        assert_eq!(
+            patched
+                .eas_discovery_filter
+                .as_ref()
+                .map(|f| f.eas_chars.len()),
+            Some(1),
+            "an unmentioned filter must survive the patch"
+        );
+
+        // A PATCH against an unknown id is 404, not a silent create.
+        let req = SbiRequest::patch("/eees-easdiscovery/v1/subscriptions/no-such-sub")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
+            .with_body(
+                r#"{"notificationDestination":"http://eec/cb"}"#,
+                "application/merge-patch+json",
+            );
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// #105 criterion 2, refusal half: a subscription body missing `eecId` **or**
+    /// `easEventType` is rejected with `MANDATORY_IE_MISSING`, and one carrying both
+    /// but no `notificationDestination` at all is accepted.
+    ///
+    /// Added because reverting the `eecId` check broke no test: the accept-side
+    /// guard in `test_disc_subscription_create` sends a body with every member set,
+    /// so it passes whether or not the requirement is enforced. Both directions have
+    /// to be asserted for the mandatory set to be pinned.
+    #[test]
+    fn a_discovery_subscription_missing_a_mandatory_ie_is_rejected() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let post = |body: &str| -> SbiResponse {
+            let req = SbiRequest::post("/eees-easdiscovery/v1/subscriptions")
+                .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
+                .with_body(body.to_string(), "application/json");
+            block_on(ees_sbi_request_handler(req))
+        };
+
+        for (label, body) in [
+            (
+                "eecId absent",
+                r#"{"easEventType":"EAS_AVAILABILITY_CHANGE","notificationDestination":"http://eec/cb"}"#,
+            ),
+            (
+                "eecId empty",
+                r#"{"eecId":"","easEventType":"EAS_AVAILABILITY_CHANGE"}"#,
+            ),
+            ("easEventType absent", r#"{"eecId":"eec-mand-1"}"#),
+            (
+                "easEventType empty",
+                r#"{"eecId":"eec-mand-1","easEventType":""}"#,
+            ),
+        ] {
+            let resp = post(body);
+            assert_eq!(resp.status, 400, "{label} must be refused");
+            let detail = resp.http.content.as_deref().unwrap_or("");
+            assert!(
+                detail.contains("MANDATORY_IE_MISSING"),
+                "{label}: expected MANDATORY_IE_MISSING, got {detail}"
+            );
+        }
+
+        // Both mandatory members present, `notificationDestination` ABSENT -> 201.
+        // This is the body the pre-#105 handler rejected, because it required
+        // `notificationUri`.
+        let resp = post(r#"{"eecId":"eec-mand-ok","easEventType":"EAS_AVAILABILITY_CHANGE"}"#);
+        assert_eq!(
+            resp.status,
+            201,
+            "notificationDestination is OPTIONAL (yaml:445); got {}",
+            resp.http.content.as_deref().unwrap_or("")
+        );
 
         auth::clear_auth_jwks();
     }
@@ -2676,6 +3167,318 @@ mod tests {
         auth::clear_auth_jwks();
     }
 
+    /// Register an EAS advertising service KPIs, so an AC profile's
+    /// `minimumReqSvcKPIs` has something to be checked against.
+    fn register_eas_with_kpis(sk: &SigningKey, eas_id: &str, max_resp_time: u32) -> String {
+        let body = format!(
+            r#"{{"easProf":{{"easId":"{eas_id}","endPt":{{"fqdn":"{eas_id}"}},
+                "svcKpi":{{"maxRespTime":{max_resp_time},"availability":90}}}}}}"#
+        );
+        let req = SbiRequest::post("/eees-easregistration/v1/registrations")
+            .with_header("Authorization", bearer(sk, "k1", "eees-easregistration"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 201);
+        resp.http
+            .get_header("location")
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn post_eec_registration(sk: &SigningKey, body: &str) -> SbiResponse {
+        let req = SbiRequest::post("/eees-eecregistration/v1/registrations")
+            .with_header("Authorization", bearer(sk, "k1", "eees-eecregistration"))
+            .with_body(body.to_string(), "application/json");
+        block_on(ees_sbi_request_handler(req))
+    }
+
+    /// #105 criterion 5: a registration presenting `(eecCntxId, srcEesId)` drives
+    /// the TS 29.558 §5.10 pull, and the retrieved context is stored where a later
+    /// pull from *this* EES finds it.
+    ///
+    /// The discriminating half is in the same test: a second registration with no
+    /// relocation pair must record NO pull. Without it the guard passes for an
+    /// implementation that pulls on every registration, which would ask the source
+    /// EES about contexts that do not exist.
+    #[test]
+    fn eec_registration_with_a_relocation_pair_pulls_the_source_context() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _hook_guard = relocation::lock_pull_hook();
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let seen = Arc::new(std::sync::RwLock::new(Vec::<relocation::PullRequest>::new()));
+        let recorder = seen.clone();
+        relocation::set_pull_hook(Arc::new(move |req: &relocation::PullRequest| {
+            if let Ok(mut g) = recorder.write() {
+                g.push(req.clone());
+            }
+            relocation::PullOutcome::Retrieved(Box::new(services::EECContext {
+                eec_id: "eec-reloc.example.com".into(),
+                cntx_id: "cntx-105".into(),
+                ..Default::default()
+            }))
+        }));
+
+        let resp = post_eec_registration(
+            &sk,
+            r#"{"eecId":"eec-reloc.example.com","eecCntxId":"cntx-105",
+                "srcEesId":"http://s-ees.example.com:8080"}"#,
+        );
+        assert_eq!(resp.status, 201);
+
+        {
+            let calls = seen.read().unwrap();
+            assert_eq!(
+                calls.len(),
+                1,
+                "the relocation pair must drive exactly one pull"
+            );
+            assert_eq!(calls[0].eec_cntx_id, "cntx-105");
+            assert_eq!(calls[0].src_ees_id, "http://s-ees.example.com:8080");
+            assert_eq!(calls[0].self_ees_id, relocation::DEFAULT_EES_ID);
+        }
+
+        // The pulled context is now servable from this EES under its own cntxId.
+        let req = SbiRequest::get(
+            "/eees-eeccontextreloc/v1/eec-contexts?ees-id=peer&eec-cntx-id=cntx-105",
+        )
+        .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        let pull = block_on(ees_sbi_request_handler(req));
+        assert_eq!(
+            pull.status, 200,
+            "a relocated context that is not stored is a pull nobody can use"
+        );
+        let pulled: services::EECContext =
+            serde_json::from_str(pull.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pulled.eec_id, "eec-reloc.example.com");
+
+        // Discriminating half: no relocation pair -> no pull.
+        let resp = post_eec_registration(&sk, r#"{"eecId":"eec-plain.example.com"}"#);
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            seen.read().unwrap().len(),
+            1,
+            "a registration with no (eecCntxId, srcEesId) must NOT pull"
+        );
+
+        relocation::clear_pull_hook();
+        auth::clear_auth_jwks();
+    }
+
+    /// #105 criterion 6: AC profiles the EES cannot match are reported in the
+    /// created registration, per TS 24.558 §5.2.2.2 — **not** as a `422`, which
+    /// `TS24558_Eees_EECRegistration.yaml` does not declare for `CreateEECReg`.
+    ///
+    /// Also pins the two reasons apart: a named `easId` that is not registered is
+    /// `EAS_NOT_AVAILABLE`, while one that IS registered but misses the profile's
+    /// `minimumReqSvcKPIs` is `REQ_UNFULFILLED`. Collapsing them would tell the EEC
+    /// to go find another EES when the EAS it wants is right here.
+    #[test]
+    fn unmatched_ac_profiles_are_reported_in_the_created_registration() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        register_eas_with_kpis(&sk, "eas-105-fast.example.com", 10);
+        register_eas_with_kpis(&sk, "eas-105-slow.example.com", 500);
+
+        // One profile matched, one naming an unregistered EAS -> 201 with the
+        // SINGULAR member (NOTE 2: exactly one unfulfilled profile).
+        let resp = post_eec_registration(
+            &sk,
+            r#"{"eecId":"eec-105-a.example.com","acProfs":[
+                {"acId":"ac-ok","eass":[{"easId":"eas-105-fast.example.com"}]},
+                {"acId":"ac-ghost","eass":[{"easId":"eas-105-ghost.example.com"}]}
+            ]}"#,
+        );
+        assert_eq!(
+            resp.status, 201,
+            "partial fulfilment is reported in a SUCCESSFUL registration"
+        );
+        let stored: EecRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let reported = stored.unfulfilled();
+        assert_eq!(
+            reported.len(),
+            1,
+            "one unfulfilled profile; got {reported:?}"
+        );
+        assert_eq!(reported[0].ac_id.as_deref(), Some("ac-ghost"));
+        assert_eq!(
+            reported[0].reason.as_deref(),
+            Some(eec::unfulfill_reason::EAS_NOT_AVAILABLE)
+        );
+        assert!(
+            stored.unfulfill_ac_profs.is_none(),
+            "a single entry must use the singular member (NOTE 2)"
+        );
+
+        // The KPI half: the easId IS registered but too slow for the profile.
+        let resp = post_eec_registration(
+            &sk,
+            r#"{"eecId":"eec-105-b.example.com","acProfs":[
+                {"acId":"ac-ok","eass":[{"easId":"eas-105-fast.example.com"}]},
+                {"acId":"ac-slow","eass":[{"easId":"eas-105-slow.example.com",
+                    "minimumReqSvcKPIs":{"respTime":20}}]}
+            ]}"#,
+        );
+        assert_eq!(resp.status, 201);
+        let stored: EecRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let reported = stored.unfulfilled();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].ac_id.as_deref(), Some("ac-slow"));
+        assert_eq!(
+            reported[0].reason.as_deref(),
+            Some(eec::unfulfill_reason::REQ_UNFULFILLED),
+            "a registered EAS that misses the KPIs is NOT 'EAS not available'"
+        );
+
+        // Same EAS, a requirement it DOES meet -> nothing reported at all. Without
+        // this half the guard also passes for an implementation that reports every
+        // profile carrying `minimumReqSvcKPIs`.
+        let resp = post_eec_registration(
+            &sk,
+            r#"{"eecId":"eec-105-c.example.com","acProfs":[
+                {"acId":"ac-slow","eass":[{"easId":"eas-105-slow.example.com",
+                    "minimumReqSvcKPIs":{"respTime":900}}]}
+            ]}"#,
+        );
+        assert_eq!(resp.status, 201);
+        let body = resp.http.content.as_deref().unwrap();
+        assert!(
+            !body.contains("unfulfil"),
+            "a fulfilled profile must report nothing; got {body}"
+        );
+
+        auth::clear_auth_jwks();
+    }
+
+    /// #105 criterion 6, refusal half: TS 24.558 §5.2.2.2 — *"when a matching EAS
+    /// is not identified for even one AC profile, the EES shall reject the request
+    /// message ... 404 Not Found ... `RESOURCE_NOT_FOUND`"*. And the refusal must
+    /// happen **before** the resource exists, or the EEC is told "not found" about
+    /// a registration this EES is now serving.
+    #[test]
+    fn a_registration_with_no_matchable_ac_profile_is_refused_before_anything_is_created() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _hook_guard = relocation::lock_pull_hook();
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // A pull hook that must never fire: step 1 refuses before step 2 runs.
+        let pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = pulls.clone();
+        relocation::set_pull_hook(Arc::new(move |_req: &relocation::PullRequest| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            relocation::PullOutcome::NotFound
+        }));
+
+        let before = ees_self().read().unwrap().eec_list().len();
+        let resp = post_eec_registration(
+            &sk,
+            r#"{"eecId":"eec-105-none.example.com","eecCntxId":"cntx-x",
+                "srcEesId":"http://s-ees.example.com",
+                "acProfs":[{"acId":"ac-ghost","eass":[{"easId":"nowhere.example.com"}]}]}"#,
+        );
+        assert_eq!(resp.status, 404);
+        let body = resp.http.content.as_deref().unwrap_or("");
+        assert!(
+            body.contains("RESOURCE_NOT_FOUND"),
+            "expected cause RESOURCE_NOT_FOUND; got {body}"
+        );
+        assert_eq!(
+            ees_self().read().unwrap().eec_list().len(),
+            before,
+            "a refused registration must not have created a resource"
+        );
+        assert_eq!(
+            pulls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "step 1's refusal must precede step 2's context pull"
+        );
+
+        // A registration carrying NO acProfs is not this case — `acProfs` is
+        // optional and states no requirement to fail.
+        let resp = post_eec_registration(&sk, r#"{"eecId":"eec-105-bare.example.com"}"#);
+        assert_eq!(resp.status, 201);
+
+        // Nor is a profile that names no `eass`: §5.2.2.2's matching rule is
+        // conditioned on `eass` being included, so such a profile states no
+        // requirement either. Treating it as unfulfilled instead would refuse
+        // every `acProfs` body this EES accepted before #105.
+        let resp = post_eec_registration(
+            &sk,
+            r#"{"eecId":"eec-105-noeass.example.com","acProfs":[{"acId":"ac-no-eass"}]}"#,
+        );
+        assert_eq!(
+            resp.status, 201,
+            "an AC profile with no eass names no EAS to be missing"
+        );
+        let stored: EecRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(stored.unfulfilled().is_empty());
+
+        relocation::clear_pull_hook();
+        auth::clear_auth_jwks();
+    }
+
+    /// §5.2.2.2 step 1 iii) B): the EES returns its selection in `discoveredEas`
+    /// **only** when the EEC set `easSelReqInd` — the spec's own wording is that
+    /// `false`/omitted means "the EES shall not select the EAS".
+    #[test]
+    fn eas_selection_is_returned_only_when_the_eec_requested_it() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        register_eas_with_kpis(&sk, "eas-105-sel.example.com", 10);
+
+        let profs = r#""acProfs":[{"acId":"ac1","eass":[{"easId":"eas-105-sel.example.com"}]}]"#;
+
+        let resp = post_eec_registration(
+            &sk,
+            &format!(r#"{{"eecId":"eec-105-sel.example.com","easSelReqInd":true,{profs}}}"#),
+        );
+        assert_eq!(resp.status, 201);
+        let stored: EecRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let selected = stored
+            .discovered_eas
+            .as_ref()
+            .expect("easSelReqInd -> selection");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].eas.eas_id, "eas-105-sel.example.com");
+
+        let resp = post_eec_registration(
+            &sk,
+            &format!(r#"{{"eecId":"eec-105-nosel.example.com",{profs}}}"#),
+        );
+        assert_eq!(resp.status, 201);
+        let stored: EecRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            stored.discovered_eas.is_none(),
+            "omitted easSelReqInd means the EES shall NOT select"
+        );
+
+        auth::clear_auth_jwks();
+    }
+
     /// eesd-08: the EEC registration route is OAuth2-gated (no token → 401).
     #[test]
     fn test_eec_route_requires_auth() {
@@ -2717,6 +3520,69 @@ mod tests {
     /// ACR Determine (TS 24.558 §6.5.5.2.2): register S-EAS + T-EAS, POST a
     /// spec-shaped body → 204 No Content and a DETERMINED state whose T-EAS is
     /// not the S-EAS.
+    /// **Issue #105, criterion 7.** `acr_determine` returns a target with the SAME
+    /// `easId` at a different location, and `NoTEasAvailable` when only a DIFFERENT
+    /// application is registered.
+    ///
+    /// The predicate was `p.eas_id != req.eas_id`, which inverted the intent twice:
+    /// same-application failover between two same-`easId` registrations returned
+    /// `NoTEasAvailable`, and relocation to an UNRELATED application became possible.
+    /// TS 23.558 §8.8.3.2 has the S-EES derive the T-EAS filter from the S-EAS's own
+    /// profile, so the target serves the same application elsewhere.
+    #[test]
+    fn test_acr_determine_selects_the_same_application_elsewhere() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // Only a DIFFERENT application is registered -> no target. This is the case
+        // the old predicate would have "succeeded" on, relocating across applications.
+        register_eas_at(&sk, "other-app", "s-only.example.com", "V2X");
+        let ctx = ees_self();
+        // Built by deserialising the wire shape, so the test does not have to track
+        // every optional member of AcrDetermReq.
+        let req: acr::AcrDetermReq = serde_json::from_str(
+            r#"{
+                "requestorId":"eec-x",
+                "sEasEndpoint":{"fqdn":"s-only.example.com"},
+                "ueId":"imsi-x",
+                "easId":"other-app"
+            }"#,
+        )
+        .expect("AcrDetermReq");
+        assert!(
+            matches!(
+                ctx.read().unwrap().acr_determine(&req),
+                Err(acr::AcrContextError::NoTEasAvailable)
+            ),
+            "one registration of the application is not a relocation target"
+        );
+
+        // Same application at a second location -> that is the target.
+        register_eas_at(&sk, "other-app", "t-only.example.com", "V2X");
+        let state = ctx
+            .read()
+            .unwrap()
+            .acr_determine(&req)
+            .expect("a same-application alternative exists");
+        assert_eq!(
+            state.t_eas_id.as_deref(),
+            Some("other-app"),
+            "the target serves the SAME application"
+        );
+        let t = state.t_eas_endpoint.expect("target endpoint");
+        assert_eq!(
+            t.fqdn.as_deref(),
+            Some("t-only.example.com"),
+            "at the OTHER location, not the source's"
+        );
+
+        auth::clear_auth_jwks();
+    }
+
     #[test]
     fn test_acr_determine_returns_t_eas() {
         let _g = auth::GLOBAL_STATE_TEST_LOCK
@@ -2726,15 +3592,17 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        // Register S-EAS and T-EAS.
-        register_eas(&sk, "s-eas.example.com", "V2X");
-        register_eas(&sk, "t-eas.example.com", "V2X");
+        // #105: the S-EAS and T-EAS serve the SAME application (`easId`) at DIFFERENT
+        // endpoints, which is what TS 23.558 §8.8.3.2 means by a target EAS. This
+        // used to register two DIFFERENT easIds, pinning the inverted predicate.
+        register_eas_at(&sk, "v2x-app", "s-eas.example.com", "V2X");
+        register_eas_at(&sk, "v2x-app", "t-eas.example.com", "V2X");
 
         let body = r#"{
             "requestorId":"eec-acr-1",
             "sEasEndpoint":{"fqdn":"s-eas.example.com"},
             "ueId":"imsi-999700000000001",
-            "easId":"s-eas.example.com"
+            "easId":"v2x-app"
         }"#;
         let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
             .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
@@ -2751,9 +3619,20 @@ mod tests {
             .unwrap();
         assert_eq!(state.status, Some(acr::AcrStatus::Determined));
         let t_eas_id = state.t_eas_id.expect("T-EAS must be determined");
-        assert_ne!(t_eas_id, "s-eas.example.com");
+        // #105 FLIP: this asserted the target's easId DIFFERED from the S-EAS, which
+        // pinned cross-application relocation. The target serves the SAME
+        // application; it is the ENDPOINT that differs.
+        assert_eq!(
+            t_eas_id, "v2x-app",
+            "the target serves the same application"
+        );
         assert!(state.s_eas_endpoint.is_some());
-        assert!(state.t_eas_endpoint.is_some());
+        let t_endpoint = state.t_eas_endpoint.expect("T-EAS endpoint");
+        assert_ne!(
+            format!("{t_endpoint:?}"),
+            format!("{:?}", state.s_eas_endpoint.as_ref().unwrap()),
+            "and it is at a different location"
+        );
 
         auth::clear_auth_jwks();
     }
@@ -3347,7 +4226,7 @@ mod tests {
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
         // Old bespoke body (notificationUri + acrEvents) is rejected fail-closed.
-        let old = r#"{"notificationUri":"http://eec/cb","acrEvents":["ACR_COMPLETED"]}"#;
+        let old = r#"{"notificationDestination":"http://eec/cb","acrEvents":["ACR_COMPLETED"]}"#;
         let req = SbiRequest::post("/eees-acrmgntevent/v1/subscriptions")
             .with_header("Authorization", bearer(&sk, "k1", "eees-acrmgntevent"))
             .with_body(old, "application/json");
@@ -3718,8 +4597,9 @@ mod tests {
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
 
-        register_eas(&sk, "flow-s.example.com", "VIDEO");
-        register_eas(&sk, "flow-t.example.com", "VIDEO");
+        // #105: same application (flow-app) at two locations -- what a T-EAS is.
+        register_eas_at(&sk, "flow-app", "flow-s.example.com", "VIDEO");
+        register_eas_at(&sk, "flow-app", "flow-t.example.com", "VIDEO");
 
         // A single UE undergoes the relocation; all three ops key on its GPSI.
         let ue = "imsi-flow-1";
@@ -3729,7 +4609,7 @@ mod tests {
             "requestorId":"eec-flow",
             "sEasEndpoint":{"fqdn":"flow-s.example.com"},
             "ueId":"imsi-flow-1",
-            "easId":"flow-s.example.com"
+            "easId":"flow-app"
         }"#;
         let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
             .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
@@ -3960,12 +4840,13 @@ mod tests {
         // Isolate the queue from any prior test.
         let _ = notifier::notifier().drain();
 
-        register_eas(&sk, "d5-s.example.com", "VIDEO");
-        register_eas(&sk, "d5-t.example.com", "VIDEO");
+        // #105: same application (d5-app) at two locations -- what a T-EAS is.
+        register_eas_at(&sk, "d5-app", "d5-s.example.com", "VIDEO");
+        register_eas_at(&sk, "d5-app", "d5-t.example.com", "VIDEO");
 
         let sub_body = r#"{
             "eecId":"eec-d5",
-            "easIds":["d5-s.example.com"],
+            "easIds":["d5-app"],
             "eventIds":"TARGET_INFORMATION",
             "notificationDestination":"http://eec-d5/acr-cb",
             "ueId":"imsi-d5-1"
@@ -3976,7 +4857,7 @@ mod tests {
             "requestorId":"eec-d5",
             "sEasEndpoint":{"fqdn":"d5-s.example.com"},
             "ueId":"imsi-d5-1",
-            "easId":"d5-s.example.com"
+            "easId":"d5-app"
         }"#;
         let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
             .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
@@ -3999,7 +4880,7 @@ mod tests {
         // The body deserializes as a spec ACRInfoNotification.
         let notif: ACRInfoNotification = serde_json::from_value(q.body.clone()).unwrap();
         assert_eq!(notif.sub_id, id);
-        assert_eq!(notif.eas_id, "d5-s.example.com");
+        assert_eq!(notif.eas_id, "d5-app");
         assert_eq!(notif.event_id, "TARGET_INFORMATION");
         // The T-EAS is delivered in trgtInfo.trgetEASInfo (populated, not S-EAS).
         let t_eas = notif
@@ -4008,7 +4889,9 @@ mod tests {
             .and_then(|t| t.trget_eas_info.as_ref())
             .expect("trgtInfo.trgetEASInfo populated");
         assert!(!t_eas.eas.eas_id.is_empty());
-        assert_ne!(t_eas.eas.eas_id, "d5-s.example.com");
+        // #105 FLIP: asserted the target's easId DIFFERED. A T-EAS serves the SAME
+        // application at a different location, so the endpoint is what differs.
+        assert_eq!(t_eas.eas.eas_id, "d5-app");
 
         delete_acrevents(&sk, &id);
         auth::clear_auth_jwks();
@@ -4079,14 +4962,15 @@ mod tests {
         let _ = notifier::notifier().drain();
 
         // Unique easIds not referenced by any subscription.
-        register_eas(&sk, "d5neg-s.example.com", "VIDEO");
-        register_eas(&sk, "d5neg-t.example.com", "VIDEO");
+        // #105: same application (d5neg-app) at two locations -- what a T-EAS is.
+        register_eas_at(&sk, "d5neg-app", "d5neg-s.example.com", "VIDEO");
+        register_eas_at(&sk, "d5neg-app", "d5neg-t.example.com", "VIDEO");
 
         let det_body = r#"{
             "requestorId":"eec-d5neg",
             "sEasEndpoint":{"fqdn":"d5neg-s.example.com"},
             "ueId":"imsi-d5neg-1",
-            "easId":"d5neg-s.example.com"
+            "easId":"d5neg-app"
         }"#;
         let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
             .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))

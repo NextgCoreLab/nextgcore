@@ -12,7 +12,9 @@ use crate::acrevents::{
     ACRCompleteEventInfo, ACREventsSubscription, ACRInfoNotification, TargetInfo,
     ACREVENTS_PATCHABLE_FIELDS,
 };
-use crate::eec::EecRegistration;
+use crate::eec::{
+    unfulfill_reason, AcProfile, AcServiceKpis, EecRegistration, UnfulfilledAcProfile,
+};
 use crate::services::{
     ACInfoSubscription, ACRParamsInfo, AcrMgntEventReport, AcrMgntEventsNotification,
     AcrMgntEventsSubscription, CommonEASInfo, EECContext, ACINFO_PATCHABLE_FIELDS,
@@ -30,6 +32,78 @@ use uuid::Uuid;
 /// Resource collection path for `eees-acrmgntevent` subscriptions (D7); used to
 /// build the read-only `self` link stored in each `AcrMgntEventsSubscription`.
 const ACRMGNT_SUB_COLLECTION: &str = "/eees-acrmgntevent/v1/subscriptions";
+
+/// Outcome of [`EesContext::match_ac_profiles`] — how many AC profiles a
+/// registration's `acProfs` had a matching EAS for, and an entry per profile that
+/// did not.
+///
+/// Both halves are needed because TS 24.558 §5.2.2.2 gives them different
+/// consequences: *"when a matching EAS is not identified for even one AC
+/// profile"* the registration is refused with `404`/`RESOURCE_NOT_FOUND`, whereas
+/// profiles unfulfilled *alongside* at least one fulfilled profile are reported
+/// in the created resource. A bare list of failures cannot tell those apart.
+#[derive(Debug, Default, PartialEq)]
+pub struct AcProfileMatch {
+    /// Number of AC profiles a matching EAS was identified for.
+    pub fulfilled: usize,
+    /// One entry per AC profile with no matching EAS, with the reason.
+    pub unfulfilled: Vec<UnfulfilledAcProfile>,
+    /// The matching EAS profiles, de-duplicated by `easId`. This is the "list of
+    /// matching EASs" §5.2.2.2 step 1 iii) B) has the EES select from when the EEC
+    /// sets `easSelReqInd`.
+    pub selected: Vec<EasProfile>,
+}
+
+impl AcProfileMatch {
+    /// True when no AC profile was matched *and* at least one was offered —
+    /// §5.2.2.2's "not identified for even one AC profile", which refuses the
+    /// request.
+    ///
+    /// A registration carrying **no** `acProfs` at all is NOT this case: `acProfs`
+    /// is optional, and refusing a registration that stated no application
+    /// requirement would break the plain EEC registration the rest of this EES
+    /// already serves.
+    pub fn none_matched(&self) -> bool {
+        self.fulfilled == 0 && !self.unfulfilled.is_empty()
+    }
+}
+
+/// Does `eas` suffice every KPI the AC named in `required`?
+///
+/// Only the numeric members with an unambiguous EAS-side counterpart are
+/// compared. Absent on either side means "not constrained": the AC did not ask,
+/// or the EAS did not advertise, and inventing a failure from a missing
+/// advertisement would refuse every EAS that registered without KPIs.
+///
+/// `connBand` is deliberately NOT compared: it is a `BitRate` string
+/// (`"100 Mbps"`) on both sides, and a lexical comparison of those would rank
+/// `"9 Kbps"` above `"100 Mbps"`. Comparing them needs a BitRate parser, which
+/// this tree does not have; a wrong comparison is worse than an absent one
+/// because it refuses EASes that do satisfy the requirement.
+fn eas_suffices_kpis(eas: &EasProfile, required: Option<&AcServiceKpis>) -> bool {
+    let Some(req) = required else {
+        return true;
+    };
+    let advertised = eas.svc_kpi.as_ref();
+    // Response time: the EAS's guaranteed maximum must be within what the AC asks.
+    if let (Some(want), Some(have)) = (req.resp_time, advertised.and_then(|k| k.max_resp_time)) {
+        if have > want {
+            return false;
+        }
+    }
+    // Availability and request rate: the EAS must offer at least what is asked.
+    if let (Some(want), Some(have)) = (req.avail, advertised.and_then(|k| k.availability)) {
+        if have < want {
+            return false;
+        }
+    }
+    if let (Some(want), Some(have)) = (req.req_rate, advertised.and_then(|k| k.max_req_rate)) {
+        if have < want {
+            return false;
+        }
+    }
+    true
+}
 
 /// Outcome of a merge-patch / replace update that can fail for several
 /// spec-distinct reasons mapped to different HTTP status codes by the handler.
@@ -304,6 +378,80 @@ impl EesContext {
         Ok(updated)
     }
 
+    // ---- #105: per-AC-Profile EAS matching (TS 24.558 §5.2.2.2 step 1) -------
+
+    /// Determine, for each AC profile, whether a registered EAS fulfils it
+    /// (TS 24.558 §5.2.2.2 step 1 ii): the matching EAS shall *"A) be identified
+    /// by the `easId` attribute; and B) suffice all information included in the
+    /// `minimumReqSvcKPIs` attribute."*
+    ///
+    /// The rule is conditioned on `eass` being present — *"if `eass` attribute is
+    /// included in the AC Profile"*. A profile that names no EAS therefore states
+    /// no requirement this EES could fail, and counts as fulfilled. Treating it as
+    /// unfulfilled instead would make every `acProfs` body that omits `eass`
+    /// (including every body this EES accepted before #105) register with a
+    /// spurious `EAS_NOT_AVAILABLE`, or be refused outright.
+    ///
+    /// `expectedSvcKPIs` deliberately does **not** participate: NOTE 1 of the same
+    /// clause leaves its bearing on matching to the implementation, and treating
+    /// an *expectation* as a hard requirement would refuse EASes the spec permits.
+    pub fn match_ac_profiles(&self, profs: &[AcProfile]) -> AcProfileMatch {
+        let easen: Vec<EasProfile> = self
+            .registrations
+            .read()
+            .map(|r| r.values().map(|reg| reg.eas_prof.clone()).collect())
+            .unwrap_or_default();
+
+        let mut out = AcProfileMatch::default();
+        for prof in profs {
+            let Some(wanted) = prof.eass.as_deref().filter(|e| !e.is_empty()) else {
+                // No `eass` -> no requirement to fail (see above).
+                out.fulfilled += 1;
+                continue;
+            };
+            // Requirement (A): an EAS registered under one of the named easIds.
+            let by_id: Vec<&EasProfile> = easen
+                .iter()
+                .filter(|eas| wanted.iter().any(|d| d.eas_id == eas.eas_id))
+                .collect();
+            if by_id.is_empty() {
+                out.unfulfilled.push(UnfulfilledAcProfile::new(
+                    &prof.ac_id,
+                    unfulfill_reason::EAS_NOT_AVAILABLE,
+                ));
+                continue;
+            }
+            // Requirement (B): that EAS sufficing its own detail's minimum KPIs.
+            // Any one satisfying detail fulfils the profile — the AC listed
+            // several EASes because any of them will serve it.
+            let matching: Vec<&EasProfile> = wanted
+                .iter()
+                .flat_map(|detail| {
+                    by_id.iter().copied().filter(move |eas| {
+                        eas.eas_id == detail.eas_id
+                            && eas_suffices_kpis(eas, detail.minimum_req_svc_kpis.as_ref())
+                    })
+                })
+                .collect();
+            if !matching.is_empty() {
+                out.fulfilled += 1;
+                for eas in matching {
+                    if !out.selected.iter().any(|s| s.eas_id == eas.eas_id) {
+                        out.selected.push(eas.clone());
+                    }
+                }
+            } else {
+                // The easId IS registered; it is the KPIs that were not met, which
+                // is a different remedy for the EEC than "no such EAS".
+                out.unfulfilled.push(UnfulfilledAcProfile::new(
+                    &prof.ac_id,
+                    unfulfill_reason::REQ_UNFULFILLED,
+                ));
+            }
+        }
+        out
+    }
+
     // ---- eesd-06: EEC registration store -------------------------------------
 
     /// Register an EEC; mints a `registrationId`, preserves the `eecId`.
@@ -480,7 +628,13 @@ impl EesContext {
                     }],
                 };
                 if let Ok(body) = serde_json::to_value(&notif) {
-                    pending.push((sub.notification_uri.clone(), body));
+                    // #105: `notificationDestination` is OPTIONAL, so a subscription may carry
+                    // no callback at all. Skipping it is right -- there is nowhere to
+                    // POST -- and it must not be an empty-string URI, which would be a
+                    // delivery attempt to nowhere.
+                    if let Some(uri) = sub.notification_destination.clone() {
+                        pending.push((uri, body));
+                    }
                 }
             }
         }
@@ -571,10 +725,24 @@ impl EesContext {
             }
         }
 
-        let t_profile = regs
-            .values()
-            .map(|r| &r.eas_prof)
-            .find(|p| Some(p.eas_id.as_str()) != req.eas_id.as_deref());
+        // #105: the target EAS serves the SAME application at a DIFFERENT location
+        // (TS 23.558 §8.8.3.2: the S-EES discovers a T-EAS using a filter derived
+        // from the requesting S-EAS's own profile). This predicate was
+        // `p.eas_id != req.eas_id` -- the first EAS whose easId DIFFERS -- which
+        // inverted the intent twice over: same-application failover between two
+        // same-easId registrations at different endpoints returned
+        // `NoTEasAvailable`, and relocation to an UNRELATED application became
+        // possible. That is the one relocation path that does run, so it selected
+        // the wrong target precisely when continuity was needed.
+        //
+        // Same `easId`, different endpoint. When the request names no `easId` there
+        // is no application to match, so there is no target either -- guessing one
+        // would reintroduce the cross-application relocation this fixes.
+        let t_profile = req.eas_id.as_deref().and_then(|s_eas_id| {
+            regs.values()
+                .map(|r| &r.eas_prof)
+                .find(|p| p.eas_id == s_eas_id && p.end_pt != req.s_eas_endpoint)
+        });
         let (t_eas_id, t_endpoint) = match t_profile {
             Some(p) => (Some(p.eas_id.clone()), Some(p.end_pt.clone())),
             None => return Err(AcrContextError::NoTEasAvailable),
@@ -1396,6 +1564,7 @@ mod tests {
             exp_time: None,
             supp_feat: None,
             registration_id: None,
+            ..Default::default()
         }
     }
 
@@ -1455,12 +1624,13 @@ mod tests {
         ctx.eas_register(make_reg("eas1.example.com", "V2X"));
 
         let sub = EasDiscoverySubscription {
-            notification_uri: "http://eec/callback".into(),
+            notification_destination: Some("http://eec/callback".into()),
             eas_discovery_filter: Some(EasDiscoveryFilter {
-                eas_chars: Some(crate::types::EasCharacteristics {
+                eas_chars: vec![crate::types::EasCharacteristics {
                     eas_type: Some("V2X".into()),
                     ..Default::default()
-                }),
+                }],
+                ..Default::default()
             }),
             ..Default::default()
         };

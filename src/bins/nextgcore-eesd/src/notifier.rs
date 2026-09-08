@@ -734,7 +734,7 @@ mod tests {
         let mut ctx = EesContext::new();
         ctx.init(64);
         ctx.disc_sub_create(EasDiscoverySubscription {
-            notification_uri: format!("http://127.0.0.1:{port}/disc-cb"),
+            notification_destination: Some(format!("http://127.0.0.1:{port}/disc-cb")),
             ..Default::default()
         })
         .expect("subscription created");
