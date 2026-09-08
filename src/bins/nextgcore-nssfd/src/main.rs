@@ -122,9 +122,30 @@ struct NrfClientYaml {
     uri: String,
 }
 
+/// One Network Slice Instance entry: `nssf.sbi.client.nsi[]`.
+///
+/// **This block already exists in every shipped `nssf.yaml`** — it was simply
+/// never deserialised, because `SbiClientYaml` declared only `nrf`. So the NSI
+/// table had no production writer and `nsi_find_by_s_nssai` missed on every
+/// request, which is the `403` #93 reports. The fix is to READ the configuration
+/// the deployments already carry rather than to invent a second, top-level `nsi`
+/// schema: a new key would have left the shipped one inert while looking fixed,
+/// which is the same divergent-configuration trap as two NF-profile builders.
+#[derive(Debug, Default, Deserialize)]
+struct NsiClientYaml {
+    /// NRF serving this slice instance (TS 29.531 `NsiInformation.nrfId`).
+    uri: String,
+    /// The S-NSSAI this slice instance serves.
+    s_nssai: Option<SnssaiYaml>,
+    /// Optional operator-assigned `nsiId`. Absent => a UUID is minted, which is
+    /// what `NssfNsi::new` already does.
+    nsi_id: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct SbiClientYaml {
     nrf: Option<Vec<NrfClientYaml>>,
+    nsi: Option<Vec<NsiClientYaml>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -188,6 +209,22 @@ struct NssfSection {
     /// PUT/PATCH reporting an S-NSSAI outside this set is rejected with 403
     /// SNSSAI_NOT_SUPPORTED.
     supported_snssai_list: Option<Vec<SnssaiYaml>>,
+    /// VPLMN-to-HPLMN S-NSSAI mapping served on the `pdn-connection` scenario
+    /// (TS 29.531 §5.2.2.2.5, `mappingOfNssai`, feature RSIPCE).
+    ///
+    /// Operator-provisioned because nothing in this core derives it: the
+    /// registration path only echoes a mapping the CONSUMER supplied, and the
+    /// home store is keyed by (home PLMN, home S-NSSAI) rather than holding a
+    /// serving-to-home pair. With no entries the scenario answers the spec's own
+    /// 403 SNSSAI_NOT_SUPPORTED rather than a fabricated mapping.
+    nssai_mapping: Option<Vec<NssaiMappingYaml>>,
+}
+
+/// One VPLMN-to-HPLMN S-NSSAI mapping: `nssf.nssai_mapping[]`.
+#[derive(Debug, Default, Deserialize)]
+struct NssaiMappingYaml {
+    serving: SnssaiYaml,
+    home: SnssaiYaml,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -263,6 +300,9 @@ async fn main() -> Result<()> {
     // Parse configuration (if file exists) and seed NRF URI
     let mut nrf_uri_cfg: Option<String> = None;
     let mut require_oauth2 = false;
+    // How many NSIs the configuration installed. Checked after the config block
+    // so the always-403 condition cannot ship silently (#93).
+    let mut configured_nsi_count = 0usize;
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         match std::fs::read_to_string(&args.config) {
@@ -303,6 +343,19 @@ async fn main() -> Result<()> {
                                 ctx.set_plmn_supported_snssais(Some(snssais));
                             }
                         }
+                        // #93: VPLMN->HPLMN S-NSSAI mapping for the
+                        // pdn-connection scenario (TS 29.531 §5.2.2.2.5).
+                        if let Some(list) = nssf.nssai_mapping {
+                            let pairs: Vec<(context::SNssai, context::SNssai)> = list
+                                .iter()
+                                .map(|m| (snssai_from_yaml(&m.serving), snssai_from_yaml(&m.home)))
+                                .collect();
+                            log::info!(
+                                "VPLMN->HPLMN S-NSSAI mapping configured: {} entries",
+                                pairs.len()
+                            );
+                            set_nssai_mapping(pairs);
+                        }
                         if let Some(sbi) = nssf.sbi {
                             // Override the advertised/bind SBI address with the
                             // routable address from config so the NRF NFProfile
@@ -325,6 +378,14 @@ async fn main() -> Result<()> {
                                             .await;
                                     }
                                 }
+                                // #93: populate the NSI table from configuration.
+                                // Until now `nsi_add` had NO production caller, so
+                                // every PDU-session selection missed and answered
+                                // 403 (TS 29.531 §5.2.2.2.3 requires nsiInformation
+                                // for the requested S-NSSAI).
+                                if let Some(nsi_list) = client.nsi {
+                                    configured_nsi_count = load_configured_nsis(&nsi_list);
+                                }
                             }
                             // SBI OAuth2 enforcement knob (nssf.sbi.oauth2.require).
                             require_oauth2 = sbi.oauth2.and_then(|o| o.require).unwrap_or(false);
@@ -338,6 +399,36 @@ async fn main() -> Result<()> {
         }
     } else {
         log::debug!("Configuration file not found: {}", args.config);
+    }
+
+    // #93: an NSSF with an empty NSI table answers 403 to EVERY PDU-session
+    // selection (TS 29.531 §5.2.2.2.3), so it cannot do the job it was deployed
+    // for. That must not be discoverable only by a consumer getting a 403.
+    //
+    // An ERROR log naming the consequence rather than a non-zero exit: startup
+    // failure is the right answer for a malformed config, but an ABSENT optional
+    // section is not malformed, and refusing to boot would break every existing
+    // deployment and the E2E on upgrade — for a daemon that is still perfectly
+    // able to serve the registration and NSSAI-availability scenarios, which do
+    // not consult the NSI table. The shipped configs all carry an `nsi` block, so
+    // this fires only for a deployment that removed it.
+    if configured_nsi_count == 0 {
+        let existing = nssf_self()
+            .read()
+            .map(|c| c.nsi_get_all().len())
+            .unwrap_or(0);
+        if existing == 0 {
+            log::error!(
+                "No Network Slice Instances configured: every \
+                 Nnssf_NSSelection slice-info-request-for-pdu-session will be answered \
+                 403 (TS 29.531 §5.2.2.2.3 requires nsiInformation for the requested \
+                 S-NSSAI). Populate nssf.sbi.client.nsi[] in {} with one entry per \
+                 served S-NSSAI: '- uri: <nrf-uri>' plus 's_nssai: {{ sst: <n>, sd: <hex> }}'.",
+                args.config
+            );
+        }
+    } else {
+        log::info!("{configured_nsi_count} Network Slice Instance(s) configured");
     }
 
     // CLI flag overrides the YAML target AMF set
@@ -758,11 +849,23 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
         .await;
     }
 
+    // #93: the two remaining documented scenarios (TS 29.531 §5.2.2.2.5 and
+    // §5.2.2.2.6). Before this they fell through to the 400 below, which told a
+    // conformant consumer it had omitted a mandatory query parameter it had in
+    // fact supplied.
+    if let Some(raw) = get_param("slice-info-request-for-pdn-connection") {
+        return handle_ns_selection_pdn_connection(&nf_id, &raw);
+    }
+    if let Some(raw) = get_param("slice-info-request-for-other-purpose") {
+        return handle_ns_selection_other_purpose(&nf_id, &raw);
+    }
+
     problem_details(
         400,
         "Bad Request",
-        "One of slice-info-request-for-registration, slice-info-request-for-pdu-session or \
-         slice-info-request-for-ue-cu is required",
+        "One of slice-info-request-for-registration, slice-info-request-for-pdu-session, \
+         slice-info-request-for-ue-cu, slice-info-request-for-pdn-connection or \
+         slice-info-request-for-other-purpose is required",
         Some("MANDATORY_QUERY_PARAM_MISSING"),
     )
 }
@@ -802,6 +905,14 @@ fn parse_registration_slice_info(v: &serde_json::Value) -> nnssf_handler::Regist
             }
         }
     }
+    // #93: the access the consumer is asking about. TS 29.531 puts it on
+    // `allowedNssaiCurrentAccess` (an `AllowedNssai`, whose `accessType` is a
+    // required member); `allowedNssaiOtherAccess` describes the OTHER access and
+    // must not be read as the current one.
+    info.current_access_type = v
+        .pointer("/allowedNssaiCurrentAccess/accessType")
+        .and_then(|a| a.as_str())
+        .map(str::to_string);
     info
 }
 
@@ -839,10 +950,16 @@ fn handle_ns_selection_registration(
             }
             _ => None,
         };
-        let target_amf_set = context.get_target_amf_set().or_else(|| {
-            // Derive a syntactically valid fallback from the UE's serving PLMN
-            tai.map(|t| format!("{}-{}-01-001", t.plmn_id.mcc, t.plmn_id.mnc))
-        });
+        // #93: `targetAmfSet` comes ONLY from configuration.
+        //
+        // This used to synthesise `<mcc>-<mnc>-01-001` from the UE's TAI when
+        // unconfigured. That value is syntactically valid and semantically a
+        // fabrication: region 01 / set 001 is an AMF set nobody deployed, so the
+        // AMF was told to re-select against a set that does not exist — and
+        // because it is well-formed, the failure surfaces as a re-selection that
+        // finds nothing rather than as a bad response. Absent is checkable by the
+        // consumer; a plausible wrong value is acted on with full confidence.
+        let target_amf_set = context.get_target_amf_set();
         nnssf_handler::RegistrationContextSnapshot {
             supported_for_tai,
             per_nf_support: context.per_nf_supported_snssais(),
@@ -880,7 +997,14 @@ fn handle_ns_selection_registration(
             .collect();
         response["allowedNssaiList"] = serde_json::json!([{
             "allowedSnssaiList": allowed_list,
-            "accessType": "3GPP_ACCESS"
+            // #93: the access the consumer asked about, not a hardcoded
+            // 3GPP_ACCESS. A non-3GPP registration was previously answered as
+            // 3GPP, which mis-attributes the access on a response IE the AMF
+            // routes on.
+            "accessType": info
+                .current_access_type
+                .as_deref()
+                .unwrap_or(DEFAULT_ACCESS_TYPE)
         }]);
     }
 
@@ -929,11 +1053,25 @@ fn handle_ns_selection_registration(
     // capability in supportedFeatures (TS 29.531 §6.1.6.3). targetAmfSet
     // is emitted for AMF-set selection only; REROUTE initiation (which
     // requires explicit feature negotiation) is out of scope.
+    //
+    // #93: suppressed when a candidateAmfList is present. TS 29.531 §6.1.6.2.2
+    // makes the two alternative ways to steer re-selection -- a SET to pick from,
+    // or an explicit CANDIDATE LIST -- and sending both leaves the AMF to guess
+    // which governs. The candidate list is the more specific answer, so it wins
+    // when the selection algorithm produced one.
     let effective_amf_set = sel
         .target_amf_set
         .or_else(|| snapshot.target_amf_set.clone());
     if let Some(set) = effective_amf_set {
-        response["targetAmfSet"] = serde_json::json!(set);
+        if sel.candidate_amf_list.is_empty() {
+            response["targetAmfSet"] = serde_json::json!(set);
+        } else {
+            log::debug!(
+                "targetAmfSet {set} suppressed: a candidateAmfList of {} entry/entries is \
+                 the more specific re-selection answer (TS 29.531 §6.1.6.2.2)",
+                sel.candidate_amf_list.len()
+            );
+        }
     }
 
     SbiResponse::with_status(200)
@@ -1002,13 +1140,292 @@ fn handle_ns_selection_ue_cu(
 }
 
 /// Map TS 29.531 RoamingIndication enum string
-fn roaming_indication_from_str(s: &str) -> Option<context::RoamingIndication> {
+/// The normative TS 29.531 §6.1.6.3.3 spelling of the home-routed roaming
+/// indication (`TS29531_Nnssf_NSSelection.yaml:485-492`).
+///
+/// pcfd/nssfd previously used `HOME_ROUTED`, which appears nowhere in the spec:
+/// a conformant consumer sending `HOME_ROUTED_ROAMING` had its value parsed to
+/// `None` and silently dropped, and the outbound H-NSSF query advertised the
+/// non-normative spelling to the home network.
+pub const ROAMING_HOME_ROUTED: &str = "HOME_ROUTED_ROAMING";
+
+/// Parse a `RoamingIndication` (TS 29.531 §6.1.6.3.3).
+///
+/// Returns `Err(())` for a value outside the enumeration so the caller can
+/// answer 400 rather than treating "not understood" as "not sent" — the two are
+/// different facts and only one of them is the consumer's fault.
+///
+/// `HOME_ROUTED` is still ACCEPTED as an inbound back-compat shim, because this
+/// NSSF emitted it on its own H-NSSF queries until this change, so a peer NSSF
+/// deployed against an older build may echo it back. It is never emitted.
+fn roaming_indication_parse(s: &str) -> Result<context::RoamingIndication, ()> {
     match s {
-        "NON_ROAMING" => Some(context::RoamingIndication::NonRoaming),
-        "LOCAL_BREAKOUT" => Some(context::RoamingIndication::LocalBreakout),
-        "HOME_ROUTED" => Some(context::RoamingIndication::HomeRouted),
-        _ => None,
+        "NON_ROAMING" => Ok(context::RoamingIndication::NonRoaming),
+        "LOCAL_BREAKOUT" => Ok(context::RoamingIndication::LocalBreakout),
+        ROAMING_HOME_ROUTED => Ok(context::RoamingIndication::HomeRouted),
+        // Documented non-normative shim; see above.
+        "HOME_ROUTED" => {
+            log::debug!(
+                "accepting non-normative roamingIndication HOME_ROUTED as \
+                 {ROAMING_HOME_ROUTED} (TS 29.531 §6.1.6.3.3)"
+            );
+            Ok(context::RoamingIndication::HomeRouted)
+        }
+        _ => Err(()),
     }
+}
+
+/// Parse a `SnssaiYaml` into an `SNssai`, treating the wildcard `FFFFFF` as
+/// "no SD" exactly as the supported-S-NSSAI loader does.
+fn snssai_from_yaml(y: &SnssaiYaml) -> context::SNssai {
+    let sd =
+        y.sd.as_deref()
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+            .and_then(|v| if v == 0xFF_FFFF { None } else { Some(v) });
+    context::SNssai::new(y.sst, sd)
+}
+
+/// Configured VPLMN-to-HPLMN S-NSSAI mapping (TS 29.531 §5.2.2.2.5).
+///
+/// Process-global and written once at startup, before the SBI server accepts a
+/// request, mirroring how `set_plmn_supported_snssais` is handled. A `Mutex`
+/// rather than `OnceLock` so tests can install a mapping.
+static NSSAI_MAPPING: std::sync::Mutex<Vec<(context::SNssai, context::SNssai)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn set_nssai_mapping(pairs: Vec<(context::SNssai, context::SNssai)>) {
+    if let Ok(mut m) = NSSAI_MAPPING.lock() {
+        *m = pairs;
+    }
+}
+
+/// The home S-NSSAI configured for `serving`, if any.
+fn nssai_mapping_home_for(serving: &context::SNssai) -> Option<context::SNssai> {
+    NSSAI_MAPPING
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(s, _)| s == serving)
+        .map(|(_, h)| h.clone())
+}
+
+/// Parse an `array(Snssai)` query parameter (the shape both the
+/// `pdn-connection` and `other-purpose` scenarios use).
+fn parse_snssai_array(raw: &str) -> Result<Vec<context::SNssai>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
+    let Some(arr) = v.as_array() else {
+        return Err("expected a JSON array of Snssai".to_string());
+    };
+    // Schema: minItems 1.
+    if arr.is_empty() {
+        return Err("array must contain at least one Snssai (minItems: 1)".to_string());
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(sst) = item.get("sst").and_then(|s| s.as_u64()) else {
+            return Err("each Snssai requires sst".to_string());
+        };
+        let sd = item
+            .get("sd")
+            .and_then(|s| s.as_str())
+            .and_then(|h| u32::from_str_radix(h, 16).ok());
+        out.push(context::SNssai::new(sst as u8, sd));
+    }
+    Ok(out)
+}
+
+/// `slice-info-request-for-pdn-connection` (TS 29.531 §5.2.2.2.5, feature
+/// RSIPCE): return the VPLMN-to-HPLMN `mappingOfNssai` for the requested
+/// subscribed S-NSSAI(s).
+///
+/// Per §5.2.2.2.5 step 2b, when no mapping can be found the answer is **403
+/// SNSSAI_NOT_SUPPORTED** — not the 400 MANDATORY_QUERY_PARAM_MISSING this
+/// scenario used to fall through to, which told the consumer it had omitted a
+/// query parameter it had in fact sent.
+fn handle_ns_selection_pdn_connection(nf_id: &str, raw: &str) -> SbiResponse {
+    let requested = match parse_snssai_array(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return problem_details(
+                400,
+                "Bad Request",
+                &format!("Invalid slice-info-request-for-pdn-connection: {e}"),
+                Some("INVALID_QUERY_PARAM"),
+            )
+        }
+    };
+
+    let mapping: Vec<serde_json::Value> = requested
+        .iter()
+        .filter_map(|serving| {
+            nssai_mapping_home_for(serving).map(|home| {
+                serde_json::json!({
+                    "servingSnssai": context::snssai_to_json(serving),
+                    "homeSnssai": context::snssai_to_json(&home),
+                })
+            })
+        })
+        .collect();
+
+    if mapping.is_empty() {
+        log::warn!(
+            "[{nf_id}] pdn-connection: no VPLMN->HPLMN mapping configured for any of the \
+             {} requested S-NSSAI(s); answering 403 SNSSAI_NOT_SUPPORTED \
+             (TS 29.531 §5.2.2.2.5 step 2b). Configure nssf.nssai_mapping[] to serve this.",
+            requested.len()
+        );
+        return problem_details(
+            403,
+            "Forbidden",
+            "No S-NSSAI mapping available for the requested subscribed S-NSSAI(s)",
+            Some("SNSSAI_NOT_SUPPORTED"),
+        );
+    }
+
+    SbiResponse::with_status(200)
+        .with_json_body(&serde_json::json!({
+            "supportedFeatures": NSSF_SUPPORTED_FEATURES,
+            "mappingOfNssai": mapping,
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// `slice-info-request-for-other-purpose` (TS 29.531 §5.2.2.2.6, feature SIOP):
+/// return the NSI ID(s) for the requested S-NSSAI(s) in `snssaiInfoRspData`.
+///
+/// Served from the configured NSI table — the same table the PDU-session
+/// scenario consults — so this scenario became answerable only once #93's NSI
+/// population landed. Per §5.2.2.2.6 step 2b, no resolvable S-NSSAI is 403
+/// SNSSAI_NOT_SUPPORTED.
+fn handle_ns_selection_other_purpose(nf_id: &str, raw: &str) -> SbiResponse {
+    let requested = match parse_snssai_array(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return problem_details(
+                400,
+                "Bad Request",
+                &format!("Invalid slice-info-request-for-other-purpose: {e}"),
+                Some("INVALID_QUERY_PARAM"),
+            )
+        }
+    };
+
+    let mut rsp = serde_json::Map::new();
+    if let Ok(context) = nssf_self().read() {
+        for snssai in &requested {
+            if let Some(nsi) = context.nsi_find_by_s_nssai(snssai) {
+                // The map key is the S-NSSAI; serialised canonically so a
+                // consumer can correlate it with what it asked for.
+                let key = match snssai.sd {
+                    Some(sd) => format!("{}-{:06x}", snssai.sst, sd),
+                    None => format!("{}", snssai.sst),
+                };
+                rsp.insert(key, serde_json::json!({ "nsiIds": [nsi.nsi_id] }));
+            }
+        }
+    }
+
+    if rsp.is_empty() {
+        log::warn!(
+            "[{nf_id}] other-purpose: none of the {} requested S-NSSAI(s) has a configured \
+             NSI; answering 403 SNSSAI_NOT_SUPPORTED (TS 29.531 §5.2.2.2.6 step 2b)",
+            requested.len()
+        );
+        return problem_details(
+            403,
+            "Forbidden",
+            "No slice information available for the requested S-NSSAI(s)",
+            Some("SNSSAI_NOT_SUPPORTED"),
+        );
+    }
+
+    SbiResponse::with_status(200)
+        .with_json_body(&serde_json::json!({
+            "supportedFeatures": NSSF_SUPPORTED_FEATURES,
+            "snssaiInfoRspData": rsp,
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// Feature bits this NSSF advertises on the two scenarios #93 added.
+///
+/// Bit 1 (the pre-existing `"1"`) plus RSIPCE (bit 3, TS 29.531 Table 6.1.8-1
+/// entry 3) and SIOP (bit 4, entry 4), which are the features that gate
+/// `mappingOfNssai` and `snssaiInfoRspData` respectively: 0b1101 = 0xd.
+///
+/// Emitted only on the two new handlers. The registration / PDU-session / UE-CU
+/// responses keep their existing `"1"` — widening what they advertise would be
+/// an unrequested change to already-negotiated behaviour on paths #93 does not
+/// touch.
+const NSSF_SUPPORTED_FEATURES: &str = "d";
+
+/// `AllowedNssai.accessType` when the request does not state one.
+///
+/// The member is REQUIRED by TS 29.531, so it cannot be omitted the way an
+/// optional unheld member would be. `3GPP_ACCESS` is the documented default for
+/// a consumer that did not say, not a claim about the UE: where the request DOES
+/// carry an access type (registration's `allowedNssaiCurrentAccess`), that value
+/// is used instead.
+///
+/// Note `SliceInfoForPDUSession` has NO `accessType` member at all — only
+/// `sNssai`, `homeSnssai` and `roamingIndication` — so on the PDU-session path
+/// there is nothing to derive it from and this default is the only answer
+/// available. Deriving one would mean inventing it.
+const DEFAULT_ACCESS_TYPE: &str = "3GPP_ACCESS";
+
+/// Install the configured NSIs into the context, returning how many landed.
+///
+/// Reads `nssf.sbi.client.nsi[]`, the block every shipped `nssf.yaml` already
+/// carries. An entry with no `s_nssai` is skipped with a warning rather than
+/// defaulted to SST 0: guessing a slice identity would install a slice instance
+/// that answers for a slice nobody configured.
+fn load_configured_nsis(entries: &[NsiClientYaml]) -> usize {
+    let ctx = context::nssf_self();
+    let Ok(context) = ctx.read() else {
+        log::error!("NSSF context unavailable; cannot install configured NSIs");
+        return 0;
+    };
+    let mut installed = 0usize;
+    for entry in entries {
+        let Some(ref snssai) = entry.s_nssai else {
+            log::warn!(
+                "nssf.sbi.client.nsi entry for {} has no s_nssai; skipped (an NSI \
+                 must name the slice it serves)",
+                entry.uri
+            );
+            continue;
+        };
+        // `sd` is 3 octets of hex in the YAML, matching supported_snssai_list.
+        let sd = snssai
+            .sd
+            .as_deref()
+            .and_then(|h| u32::from_str_radix(h, 16).ok());
+        match context.nsi_add(&entry.uri, snssai.sst, sd) {
+            Some(mut nsi) => {
+                // Honour an operator-assigned nsiId; otherwise keep the UUID
+                // NssfNsi::new minted.
+                if let Some(ref id) = entry.nsi_id {
+                    nsi.nsi_id = id.clone();
+                    context.nsi_update(&nsi);
+                }
+                installed += 1;
+                log::info!(
+                    "NSI configured: sst={} sd={:?} nsiId={} nrf={}",
+                    snssai.sst,
+                    sd,
+                    nsi.nsi_id,
+                    entry.uri
+                );
+            }
+            None => log::error!(
+                "failed to install NSI for sst={} sd={:?} (capacity reached?)",
+                snssai.sst,
+                sd
+            ),
+        }
+    }
+    installed
 }
 
 /// PDU-session-scenario NS selection (TS 29.531 §5.2.3.2.4)
@@ -1033,13 +1450,16 @@ async fn handle_ns_selection_pdu_session(
         }
     };
     let roaming = match si_json.get("roamingIndication") {
-        Some(serde_json::Value::String(s)) => match roaming_indication_from_str(s) {
-            Some(r) => r,
-            None => {
+        Some(serde_json::Value::String(s)) => match roaming_indication_parse(s) {
+            Ok(r) => r,
+            Err(()) => {
                 return problem_details(
                     400,
                     "Bad Request",
-                    &format!("Invalid roamingIndication '{s}'"),
+                    &format!(
+                        "Invalid roamingIndication '{s}'; expected one of NON_ROAMING, \
+                         LOCAL_BREAKOUT, {ROAMING_HOME_ROUTED} (TS 29.531 §6.1.6.3.3)"
+                    ),
                     Some("INVALID_IE_VALUE"),
                 )
             }
@@ -1207,7 +1627,10 @@ async fn handle_ns_selection_pdu_session(
             let mut response = serde_json::json!({
                 "allowedNssaiList": [{
                     "allowedSnssaiList": allowed_snssai_list,
-                    "accessType": "3GPP_ACCESS"
+                    // SliceInfoForPDUSession carries no accessType, so this is
+                    // the documented default rather than a derived value; see
+                    // DEFAULT_ACCESS_TYPE.
+                    "accessType": DEFAULT_ACCESS_TYPE
                 }],
                 "supportedFeatures": "1"
             });
@@ -2010,6 +2433,39 @@ async fn handle_subscription_patch(subscription_id: &str, request: &SbiRequest) 
 // H-NSSF / NRF interaction
 // ---------------------------------------------------------------------------
 
+/// Build the H-NSSF `Nnssf_NSSelection` GET path for a home-routed query.
+///
+/// Extracted from [`send_hnssf_query`] so the emitted `roamingIndication` is
+/// assertable without a network: the value on the wire is what TS 29.531
+/// §6.1.6.3.3 constrains, and it was previously the non-normative `HOME_ROUTED`
+/// with no test able to see it (#93).
+fn build_hnssf_query_path(param: &nnssf_handler::NsSelectionParam) -> String {
+    let mut query_parts = vec![format!(
+        "nf-type={}",
+        param.nf_type.as_deref().unwrap_or("AMF")
+    )];
+    if let Some(ref nf_id) = param.nf_id {
+        query_parts.push(format!("nf-id={nf_id}"));
+    }
+    if let Some(ref snssai) = param.slice_info_for_pdu_session.snssai {
+        // TS 29.531 §6.1.6.3.3: the normative token. This emitted the
+        // non-normative `HOME_ROUTED`, which a strict H-NSSF would reject as
+        // outside the RoamingIndication enumeration (#93).
+        let mut si = serde_json::json!({
+            "sNssai": {"sst": snssai.sst},
+            "roamingIndication": ROAMING_HOME_ROUTED
+        });
+        if let Some(sd) = snssai.sd {
+            si["sNssai"]["sd"] = serde_json::json!(format!("{:06x}", sd));
+        }
+        query_parts.push(format!("slice-info-request-for-pdu-session={si}"));
+    }
+    format!(
+        "/nnssf-nsselection/v2/network-slice-information?{}",
+        query_parts.join("&")
+    )
+}
+
 /// Query H-NSSF for home network slice info (B24.2)
 async fn send_hnssf_query(
     home_id: u64,
@@ -2041,29 +2497,7 @@ async fn send_hnssf_query(
 
     let client = sbi_ctx.get_client(host, port).await;
 
-    // Build query parameters
-    let mut query_parts = vec![format!(
-        "nf-type={}",
-        param.nf_type.as_deref().unwrap_or("AMF")
-    )];
-    if let Some(ref nf_id) = param.nf_id {
-        query_parts.push(format!("nf-id={nf_id}"));
-    }
-    if let Some(ref snssai) = param.slice_info_for_pdu_session.snssai {
-        let mut si = serde_json::json!({
-            "sNssai": {"sst": snssai.sst},
-            "roamingIndication": "HOME_ROUTED"
-        });
-        if let Some(sd) = snssai.sd {
-            si["sNssai"]["sd"] = serde_json::json!(format!("{:06x}", sd));
-        }
-        query_parts.push(format!("slice-info-request-for-pdu-session={si}"));
-    }
-
-    let path = format!(
-        "/nnssf-nsselection/v2/network-slice-information?{}",
-        query_parts.join("&")
-    );
+    let path = build_hnssf_query_path(param);
 
     log::debug!("Sending H-NSSF query: GET {path}");
 
@@ -3516,6 +3950,454 @@ mod tests {
         assert!(
             body.get("targetAmfSet").is_none(),
             "targetAmfSet must be absent when not configured and no TAI provided"
+        );
+    }
+
+    // ── #93: NSI population, roaming enum, unrouted scenarios, response IEs ──
+
+    /// The `nsi` block the shipped `nssf.yaml` already carries deserialises and
+    /// installs NSIs through the PRODUCTION loader.
+    ///
+    /// Before #93 `SbiClientYaml` declared only `nrf`, so this block was parsed
+    /// into nothing: `nsi_add` had no production caller at all and the NSI table
+    /// was populated only from `#[cfg(test)]` code. Asserted against the real
+    /// YAML shape rather than a hand-built struct, so a schema drift breaks it.
+    #[test]
+    fn shipped_nsi_config_block_is_deserialised_and_installed() {
+        // The global NSSF context defaults to max_num_of_nf = 0, so `nsi_add`
+        // refuses EVERY insert until `init` runs. Without this the assertions
+        // below pass for the wrong reason -- the revert-verify pass caught
+        // exactly that: a deliberately-broken loader still "installed 0".
+        // Idempotent, so it is safe under the shared process-global context.
+        context::nssf_context_init(64);
+
+        // Exactly the shape docker/rust/configs/5gc/nssf.yaml ships.
+        let yaml = r#"
+nssf:
+  sbi:
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
+      nsi:
+        - uri: http://172.23.0.10:7777
+          s_nssai:
+            sst: 1
+        - uri: http://172.23.0.11:7777
+          s_nssai:
+            sst: 2
+            sd: "010203"
+          nsi_id: operator-assigned-nsi-2
+"#;
+        let doc: NssfYaml = serde_yaml::from_str(yaml).expect("shipped nssf.yaml shape parses");
+        let nsis = doc
+            .nssf
+            .and_then(|n| n.sbi)
+            .and_then(|s| s.client)
+            .and_then(|c| c.nsi)
+            .expect("the nsi block must deserialise (it was silently dropped before #93)");
+        assert_eq!(nsis.len(), 2);
+
+        let installed = load_configured_nsis(&nsis);
+        assert_eq!(installed, 2, "both configured NSIs must be installed");
+
+        // Discoverable by the SAME lookup the PDU-session handler uses.
+        let one = with_nssf_context(|c| c.nsi_find_by_s_nssai(&context::SNssai::new(1, None)))
+            .flatten()
+            .expect("sst=1 NSI must be findable");
+        assert_eq!(one.nrf_id, "http://172.23.0.10:7777");
+        let two =
+            with_nssf_context(|c| c.nsi_find_by_s_nssai(&context::SNssai::new(2, Some(0x010203))))
+                .flatten()
+                .expect("sst=2/sd=010203 NSI must be findable");
+        assert_eq!(two.nrf_id, "http://172.23.0.11:7777");
+        // An operator-assigned nsiId is honoured rather than replaced by a UUID.
+        assert_eq!(two.nsi_id, "operator-assigned-nsi-2");
+        // ...and one without an nsi_id still gets a non-empty opaque identifier.
+        assert!(!one.nsi_id.is_empty());
+    }
+
+    /// An `nsi` entry with no `s_nssai` is skipped, not defaulted to SST 0.
+    #[test]
+    fn nsi_entry_without_snssai_is_skipped_rather_than_defaulted() {
+        // The global NSSF context defaults to max_num_of_nf = 0, so `nsi_add`
+        // refuses EVERY insert until `init` runs. Without this the assertions
+        // below pass for the wrong reason -- the revert-verify pass caught
+        // exactly that: a deliberately-broken loader still "installed 0".
+        // Idempotent, so it is safe under the shared process-global context.
+        context::nssf_context_init(64);
+
+        let yaml = r#"
+nssf:
+  sbi:
+    client:
+      nsi:
+        - uri: http://nrf-no-slice:7777
+"#;
+        let doc: NssfYaml = serde_yaml::from_str(yaml).expect("parses");
+        let nsis = doc
+            .nssf
+            .and_then(|n| n.sbi)
+            .and_then(|s| s.client)
+            .and_then(|c| c.nsi)
+            .expect("nsi block");
+        assert_eq!(
+            load_configured_nsis(&nsis),
+            0,
+            "an NSI with no slice is not installed"
+        );
+        // Critically: it did NOT land under SST 0, which is what defaulting would do.
+        assert!(
+            with_nssf_context(|c| c.nsi_find_by_s_nssai(&context::SNssai::new(0, None)))
+                .flatten()
+                .is_none(),
+            "a slice-less NSI must not be installed under a guessed SST"
+        );
+    }
+
+    /// A PDU-session request for a CONFIGURED S-NSSAI returns 200 with
+    /// nsiInformation, not the 403 #93 reports.
+    ///
+    /// The NSI is installed through `load_configured_nsis` — the production
+    /// config path — rather than through `nsi_add` directly, which is what makes
+    /// this test evidence about the shipped daemon rather than about the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pdu_session_selection_succeeds_for_a_configured_nsi() {
+        // The global NSSF context defaults to max_num_of_nf = 0, so `nsi_add`
+        // refuses EVERY insert until `init` runs. Without this the assertions
+        // below pass for the wrong reason -- the revert-verify pass caught
+        // exactly that: a deliberately-broken loader still "installed 0".
+        // Idempotent, so it is safe under the shared process-global context.
+        context::nssf_context_init(64);
+
+        let yaml = r#"
+nssf:
+  sbi:
+    client:
+      nsi:
+        - uri: http://nrf-slice-7:7777
+          s_nssai:
+            sst: 7
+"#;
+        let doc: NssfYaml = serde_yaml::from_str(yaml).expect("parses");
+        let nsis = doc
+            .nssf
+            .and_then(|n| n.sbi)
+            .and_then(|s| s.client)
+            .and_then(|c| c.nsi)
+            .expect("nsi block");
+        assert_eq!(load_configured_nsis(&nsis), 1);
+
+        let si = json!({
+            "sNssai": {"sst": 7},
+            "roamingIndication": "NON_ROAMING"
+        });
+        let resp = handle_ns_selection_pdu_session("smf-93", "SMF", &si, None, None, None).await;
+        assert_eq!(
+            resp.status, 200,
+            "a configured S-NSSAI must not be answered 403 (TS 29.531 §5.2.2.2.3)"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let nrf = body
+            .pointer("/nsiInformation/nrfId")
+            .and_then(|v| v.as_str())
+            .expect("nsiInformation.nrfId must be present for the requested S-NSSAI");
+        assert_eq!(nrf, "http://nrf-slice-7:7777");
+    }
+
+    /// All three normative `RoamingIndication` values parse, the non-normative
+    /// shim is still accepted inbound, and anything else is refused.
+    #[test]
+    fn roaming_indication_accepts_the_normative_enumeration() {
+        assert_eq!(
+            roaming_indication_parse("NON_ROAMING"),
+            Ok(context::RoamingIndication::NonRoaming)
+        );
+        assert_eq!(
+            roaming_indication_parse("LOCAL_BREAKOUT"),
+            Ok(context::RoamingIndication::LocalBreakout)
+        );
+        // The value a conformant consumer sends. Before #93 this parsed to None
+        // and the request was refused 400 INVALID_IE_VALUE.
+        assert_eq!(
+            roaming_indication_parse("HOME_ROUTED_ROAMING"),
+            Ok(context::RoamingIndication::HomeRouted)
+        );
+        // Documented inbound back-compat shim.
+        assert_eq!(
+            roaming_indication_parse("HOME_ROUTED"),
+            Ok(context::RoamingIndication::HomeRouted)
+        );
+        assert!(roaming_indication_parse("SOMETHING_ELSE").is_err());
+        assert!(roaming_indication_parse("").is_err());
+        // The constant used on the wire is the normative spelling.
+        assert_eq!(ROAMING_HOME_ROUTED, "HOME_ROUTED_ROAMING");
+    }
+
+    /// A conformant `HOME_ROUTED_ROAMING` request is no longer refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn home_routed_roaming_request_is_accepted() {
+        let si = json!({
+            "sNssai": {"sst": 1},
+            "roamingIndication": "HOME_ROUTED_ROAMING"
+        });
+        let resp = handle_ns_selection_pdu_session("smf-93b", "SMF", &si, None, None, None).await;
+        assert_ne!(
+            resp.status, 400,
+            "the normative HOME_ROUTED_ROAMING token must not be a bad request"
+        );
+    }
+
+    /// `slice-info-request-for-pdn-connection` returns the configured
+    /// VPLMN->HPLMN mapping, and 403 SNSSAI_NOT_SUPPORTED when none is
+    /// configured — never the 400 it used to fall through to.
+    #[test]
+    fn pdn_connection_scenario_is_routed_and_maps_configured_snssais() {
+        // No mapping configured: the spec's own answer is 403, per §5.2.2.2.5
+        // step 2b. The old behaviour was 400 MANDATORY_QUERY_PARAM_MISSING, which
+        // accused the consumer of omitting a parameter it had just supplied.
+        set_nssai_mapping(Vec::new());
+        let resp = handle_ns_selection_pdn_connection("smf-pgw-1", r#"[{"sst":1}]"#);
+        assert_eq!(resp.status, 403);
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pd["cause"], "SNSSAI_NOT_SUPPORTED");
+
+        // With a mapping configured, the scenario is served.
+        set_nssai_mapping(vec![(
+            context::SNssai::new(1, Some(0x0000AB)),
+            context::SNssai::new(3, Some(0x00FF01)),
+        )]);
+        let resp = handle_ns_selection_pdn_connection("smf-pgw-1", r#"[{"sst":1,"sd":"0000ab"}]"#);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let m = body["mappingOfNssai"]
+            .as_array()
+            .expect("mappingOfNssai is the RSIPCE response IE (TS 29.531 §5.2.2.2.5)");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0]["servingSnssai"]["sst"], 1);
+        assert_eq!(m[0]["homeSnssai"]["sst"], 3);
+        // The feature bit that gates mappingOfNssai must be advertised.
+        assert_eq!(body["supportedFeatures"], NSSF_SUPPORTED_FEATURES);
+
+        // A malformed array is a 400 on its own merits, not a 403.
+        assert_eq!(
+            handle_ns_selection_pdn_connection("smf-pgw-1", "[]").status,
+            400,
+            "minItems: 1 must be enforced"
+        );
+        assert_eq!(
+            handle_ns_selection_pdn_connection("smf-pgw-1", "not json").status,
+            400
+        );
+        set_nssai_mapping(Vec::new());
+    }
+
+    /// `slice-info-request-for-other-purpose` returns NSI IDs for the requested
+    /// S-NSSAIs from the configured NSI table, and 403 when none resolves.
+    #[test]
+    fn other_purpose_scenario_is_routed_and_returns_nsi_ids() {
+        // The global NSSF context defaults to max_num_of_nf = 0, so `nsi_add`
+        // refuses EVERY insert until `init` runs. Without this the assertions
+        // below pass for the wrong reason -- the revert-verify pass caught
+        // exactly that: a deliberately-broken loader still "installed 0".
+        // Idempotent, so it is safe under the shared process-global context.
+        context::nssf_context_init(64);
+
+        let yaml = r#"
+nssf:
+  sbi:
+    client:
+      nsi:
+        - uri: http://nrf-slice-9:7777
+          s_nssai:
+            sst: 9
+"#;
+        let doc: NssfYaml = serde_yaml::from_str(yaml).expect("parses");
+        let nsis = doc
+            .nssf
+            .and_then(|n| n.sbi)
+            .and_then(|s| s.client)
+            .and_then(|c| c.nsi)
+            .expect("nsi block");
+        load_configured_nsis(&nsis);
+
+        let resp = handle_ns_selection_other_purpose("nwdaf-1", r#"[{"sst":9}]"#);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let rsp = body["snssaiInfoRspData"]
+            .as_object()
+            .expect("snssaiInfoRspData is the SIOP response IE (TS 29.531 §5.2.2.2.6)");
+        let entry = rsp.get("9").expect("keyed by the requested S-NSSAI");
+        let ids = entry["nsiIds"].as_array().expect("nsiIds");
+        assert_eq!(ids.len(), 1);
+        assert!(!ids[0].as_str().unwrap_or("").is_empty());
+        assert_eq!(body["supportedFeatures"], NSSF_SUPPORTED_FEATURES);
+
+        // An S-NSSAI with no configured NSI: 403, per §5.2.2.2.6 step 2b.
+        let resp = handle_ns_selection_other_purpose("nwdaf-1", r#"[{"sst":200}]"#);
+        assert_eq!(resp.status, 403);
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pd["cause"], "SNSSAI_NOT_SUPPORTED");
+    }
+
+    /// Both new scenarios reach the SBI router, not just the handler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_new_scenarios_are_reachable_through_the_router() {
+        for param in [
+            "slice-info-request-for-pdn-connection",
+            "slice-info-request-for-other-purpose",
+        ] {
+            let uri = format!(
+                "/nnssf-nsselection/v2/network-slice-information?nf-type=SMF&nf-id=smf-1&\
+                 {param}={}",
+                urlencoding_encode(r#"[{"sst":1}]"#)
+            );
+            let resp = nssf_sbi_request_handler(SbiRequest::get(&uri)).await;
+            assert_ne!(
+                resp.status, 400,
+                "{param} must be routed, not answered MANDATORY_QUERY_PARAM_MISSING"
+            );
+        }
+    }
+
+    /// A percent-encoder for the JSON-valued query parameters above.
+    ///
+    /// Written out rather than sent raw: a JSON-shaped query value containing
+    /// `{` or `"` is refused by the URI layer before the request is ever sent,
+    /// which reads exactly like a routing failure.
+    fn urlencoding_encode(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    /// `targetAmfSet` is emitted only from configuration, never synthesised from
+    /// the UE's TAI.
+    ///
+    /// The old fallback produced `<mcc>-<mnc>-01-001`: syntactically valid, and
+    /// an AMF set nobody deployed, so the AMF re-selected against a set that does
+    /// not exist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn target_amf_set_is_never_synthesised_from_the_tai() {
+        with_nssf_context(|c| c.clear_target_amf_set());
+        let info = json!({
+            "subscribedNssai": [{"subscribedSnssai": {"sst": 1}}],
+            "requestedNssai": [{"sst": 1}]
+        });
+        // A TAI IS supplied: the old code would have derived 999-70-01-001 here.
+        let tai = context::Tai {
+            plmn_id: context::PlmnId {
+                mcc: "999".to_string(),
+                mnc: "70".to_string(),
+            },
+            tac: 1,
+        };
+        let resp = handle_ns_selection_registration("amf-93", &info, Some(&tai));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("targetAmfSet").is_none(),
+            "targetAmfSet must be absent when unconfigured, even with a TAI: got {:?}",
+            body.get("targetAmfSet")
+        );
+    }
+
+    /// The registration response's `accessType` reflects the access the consumer
+    /// asked about rather than a hardcoded `3GPP_ACCESS`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn access_type_reflects_the_requested_access() {
+        with_nssf_context(|c| c.clear_target_amf_set());
+
+        // Non-3GPP: previously reported back as 3GPP_ACCESS.
+        let info = json!({
+            "subscribedNssai": [{"subscribedSnssai": {"sst": 1}}],
+            "requestedNssai": [{"sst": 1}],
+            "allowedNssaiCurrentAccess": {
+                "allowedSnssaiList": [{"allowedSnssai": {"sst": 1}}],
+                "accessType": "NON_3GPP_ACCESS"
+            }
+        });
+        let resp = handle_ns_selection_registration("amf-93b", &info, None);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["allowedNssaiList"][0]["accessType"], "NON_3GPP_ACCESS",
+            "a NON_3GPP_ACCESS request must not be reported as 3GPP_ACCESS"
+        );
+
+        // An `allowedNssaiOtherAccess` must NOT be read as the current access.
+        let info = json!({
+            "subscribedNssai": [{"subscribedSnssai": {"sst": 1}}],
+            "requestedNssai": [{"sst": 1}],
+            "allowedNssaiOtherAccess": {
+                "allowedSnssaiList": [{"allowedSnssai": {"sst": 1}}],
+                "accessType": "NON_3GPP_ACCESS"
+            }
+        });
+        let resp = handle_ns_selection_registration("amf-93c", &info, None);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["allowedNssaiList"][0]["accessType"], DEFAULT_ACCESS_TYPE,
+            "allowedNssaiOtherAccess describes the OTHER access and must not set the current one"
+        );
+
+        // No access stated at all: the documented default.
+        let info = json!({
+            "subscribedNssai": [{"subscribedSnssai": {"sst": 1}}],
+            "requestedNssai": [{"sst": 1}]
+        });
+        let resp = handle_ns_selection_registration("amf-93d", &info, None);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["allowedNssaiList"][0]["accessType"],
+            DEFAULT_ACCESS_TYPE
+        );
+    }
+
+    /// The outbound H-NSSF query carries the NORMATIVE roaming token.
+    ///
+    /// Pins the value on the wire, which is what TS 29.531 §6.1.6.3.3
+    /// constrains. Before #93 this emitted `HOME_ROUTED`, and no test could see
+    /// it because the string was built inline inside the async send path — the
+    /// reason `build_hnssf_query_path` was extracted.
+    #[test]
+    fn outbound_hnssf_query_emits_the_normative_roaming_token() {
+        let mut param = nnssf_handler::NsSelectionParam {
+            nf_id: Some("amf-hr-1".to_string()),
+            nf_type: Some("AMF".to_string()),
+            ..Default::default()
+        };
+        param.slice_info_for_pdu_session.presence = true;
+        param.slice_info_for_pdu_session.snssai = Some(context::SNssai::new(1, Some(0x0000AB)));
+
+        let path = build_hnssf_query_path(&param);
+        assert!(
+            path.contains("\"roamingIndication\":\"HOME_ROUTED_ROAMING\""),
+            "the H-NSSF query must carry the normative token, got: {path}"
+        );
+        // And must NOT carry the old non-normative spelling as a bare value.
+        assert!(
+            !path.contains("\"roamingIndication\":\"HOME_ROUTED\""),
+            "the non-normative HOME_ROUTED must not reach the wire: {path}"
+        );
+        // Sanity: the rest of the query is still assembled.
+        assert!(path.contains("nf-type=AMF") && path.contains("nf-id=amf-hr-1"));
+        assert!(
+            path.contains("\"sd\":\"0000ab\""),
+            "sd must be 6 hex digits: {path}"
         );
     }
 }
