@@ -34,6 +34,40 @@ impl Default for SbiServerConfig {
 /// SBI server state
 static SBI_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Every service this PCF serves, with the NF types allowed to consume it
+/// (TS 29.510 §6.1.6.2.3 `NFService.allowedNfTypes`).
+///
+/// ONE table, used both to build the [`NfInstance`] and to serialise the
+/// NFProfile PUT to the NRF. Before #90 there were TWO profile builders — this
+/// one, and a divergent JSON literal in `app.rs` — and they disagreed in
+/// complementary ways: the literal omitted `npcf-policyauthorization` entirely
+/// while this builder omitted `allowedNfTypes` and `ipEndPoints`. Both ran, so
+/// pcfd registered TWICE under two different `nfInstanceId`s on every startup
+/// and only one of the two was heartbeaten. A single table is what makes the
+/// registered profile and the builder unable to drift again, which is what the
+/// issue asked for.
+///
+/// `allowedNfTypes` lives here rather than on the shared `NfService` (which has
+/// no such field) because adding it there would touch the profile serialiser of
+/// every other NF in the workspace — a blast radius #90 does not need. The
+/// shape is deliberately local to pcfd.
+const PCF_SERVICES: &[(SbiServiceType, &[&str])] = &[
+    // TS 29.507 — consumed by the AMF.
+    (SbiServiceType::NpcfAmPolicyControl, &["AMF"]),
+    // TS 29.512 — consumed by the SMF.
+    (SbiServiceType::NpcfSmpolicycontrol, &["SMF"]),
+    // TS 29.525 — consumed by the AMF.
+    (SbiServiceType::NpcfUePolicyControl, &["AMF"]),
+    // TS 29.514 — consumed by the AF directly, or by the NEF on an AF's behalf.
+    // The NEF is the reason the omission mattered in practice: without it here
+    // the NRF issues no token scoped to this service, so northbound QoS-on-demand
+    // cannot be onboarded at all.
+    (SbiServiceType::NpcfPolicyauthorization, &["AF", "NEF"]),
+    // TS 29.523 — policy-control event feed; the NEF and AF subscribe on behalf
+    // of northbound consumers, and the NWDAF consumes it for analytics.
+    (SbiServiceType::NpcfEventexposure, &["NEF", "AF", "NWDAF"]),
+];
+
 /// Build the PCF NF instance with service information
 fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
     let nf_id = uuid::Uuid::new_v4().to_string();
@@ -48,47 +82,75 @@ fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
         UriScheme::Http
     };
 
-    // npcf-am-policy-control service (allowed: AMF)
-    let mut am_policy_svc = NfService::new(
-        SbiServiceType::NpcfAmPolicyControl.to_name(),
-        SbiServiceType::NpcfAmPolicyControl,
-    );
-    am_policy_svc.scheme = scheme;
-    am_policy_svc.ip_addresses.push(config.addr.clone());
-    am_policy_svc.port = config.port;
-    nf_instance.add_service(am_policy_svc);
-
-    // npcf-smpolicycontrol service (allowed: SMF)
-    let mut sm_policy_svc = NfService::new(
-        SbiServiceType::NpcfSmpolicycontrol.to_name(),
-        SbiServiceType::NpcfSmpolicycontrol,
-    );
-    sm_policy_svc.scheme = scheme;
-    sm_policy_svc.ip_addresses.push(config.addr.clone());
-    sm_policy_svc.port = config.port;
-    nf_instance.add_service(sm_policy_svc);
-
-    // npcf-policyauthorization service (allowed: AF, PCF)
-    let mut pa_svc = NfService::new(
-        SbiServiceType::NpcfPolicyauthorization.to_name(),
-        SbiServiceType::NpcfPolicyauthorization,
-    );
-    pa_svc.scheme = scheme;
-    pa_svc.ip_addresses.push(config.addr.clone());
-    pa_svc.port = config.port;
-    nf_instance.add_service(pa_svc);
-
-    // npcf-ue-policy-control service (allowed: AMF) — TS 29.525
-    let mut ue_policy_svc = NfService::new(
-        SbiServiceType::NpcfUePolicyControl.to_name(),
-        SbiServiceType::NpcfUePolicyControl,
-    );
-    ue_policy_svc.scheme = scheme;
-    ue_policy_svc.ip_addresses.push(config.addr.clone());
-    ue_policy_svc.port = config.port;
-    nf_instance.add_service(ue_policy_svc);
+    for (service_type, _allowed) in PCF_SERVICES {
+        let mut svc = NfService::new(service_type.to_name(), *service_type);
+        svc.scheme = scheme;
+        svc.ip_addresses.push(config.addr.clone());
+        svc.port = config.port;
+        nf_instance.add_service(svc);
+    }
 
     nf_instance
+}
+
+/// The NF types allowed to consume `service_name`, or an empty slice for a
+/// service this PCF does not serve.
+fn allowed_nf_types_for(service_name: &str) -> &'static [&'static str] {
+    PCF_SERVICES
+        .iter()
+        .find(|(t, _)| t.to_name() == service_name)
+        .map(|(_, allowed)| *allowed)
+        .unwrap_or(&[])
+}
+
+/// Serialise `nf_instance` as the TS 29.510 NFProfile PUT to the NRF.
+///
+/// The single authoritative profile shape. Each service carries `ipEndPoints`
+/// (without which a consumer that discovers the service has no port to dial,
+/// only the NF-level `ipv4Addresses`) and its own `allowedNfTypes`; the NF-level
+/// `allowedNfTypes` is the UNION over the services, since a consumer type barred
+/// at NF level can never reach any service.
+pub fn pcf_nf_profile_json(nf_instance: &NfInstance) -> serde_json::Value {
+    let services: Vec<serde_json::Value> = nf_instance
+        .services
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "serviceInstanceId": format!("{}-{}", nf_instance.id, s.name),
+                "serviceName": s.name,
+                "versions": s.versions.iter().map(|v| {
+                    serde_json::json!({"apiVersionInUri": v, "apiFullVersion": format!("{v}.0.0")})
+                }).collect::<Vec<_>>(),
+                "scheme": s.scheme.as_str(),
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": s.ip_addresses.iter().map(|a| {
+                    serde_json::json!({"ipv4Address": a, "port": s.port})
+                }).collect::<Vec<_>>(),
+                "allowedNfTypes": allowed_nf_types_for(&s.name),
+            })
+        })
+        .collect();
+
+    // Union, order-stable: first appearance in PCF_SERVICES wins, so the emitted
+    // list is deterministic and a test can assert it exactly.
+    let mut allowed: Vec<&str> = Vec::new();
+    for (_, types) in PCF_SERVICES {
+        for t in *types {
+            if !allowed.contains(t) {
+                allowed.push(t);
+            }
+        }
+    }
+
+    serde_json::json!({
+        "nfInstanceId": nf_instance.id,
+        "nfType": "PCF",
+        "nfStatus": "REGISTERED",
+        "heartBeatTimer": nf_instance.heartbeat_interval,
+        "ipv4Addresses": nf_instance.ipv4_addresses,
+        "nfServices": services,
+        "allowedNfTypes": allowed,
+    })
 }
 
 /// Parse host and port from a URI string (e.g., "http://127.0.0.1:7777")
@@ -127,23 +189,7 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
 
     let register_path = format!("/nnrf-nfm/v1/nf-instances/{}", nf_instance.id);
 
-    let body = serde_json::json!({
-        "nfInstanceId": nf_instance.id,
-        "nfType": "PCF",
-        "nfStatus": "REGISTERED",
-        "heartBeatTimer": nf_instance.heartbeat_interval,
-        "ipv4Addresses": nf_instance.ipv4_addresses,
-        "nfServices": nf_instance.services.iter().map(|s| {
-            serde_json::json!({
-                "serviceName": s.name,
-                "versions": s.versions.iter().map(|v| {
-                    serde_json::json!({"apiVersionInUri": v, "apiFullVersion": format!("{}.0.0", v)})
-                }).collect::<Vec<_>>(),
-                "scheme": s.scheme.as_str(),
-                "nfServiceStatus": "REGISTERED",
-            })
-        }).collect::<Vec<_>>(),
-    });
+    let body = pcf_nf_profile_json(nf_instance);
 
     match client.put_json(&register_path, &body).await {
         Ok(response) => {
@@ -193,22 +239,29 @@ pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     let nrf_uri_clone = config.nrf_uri.clone();
     let nf_clone = nf_instance.clone();
 
-    // Attempt async registration (only if tokio runtime is available)
+    // Publish the instance and the NRF URI, but do NOT register here.
+    //
+    // #90: this used to PUT its own NFProfile while `app.rs` PUT a second,
+    // different one under a second `nfInstanceId`, so the NRF held two PCF
+    // records per startup and only app.rs's was heartbeaten. Registration now
+    // happens ONCE, from `pcf_register_with_nrf`, called after the SBI listener
+    // is actually up — registering before the port accepts advertises an
+    // endpoint that would refuse the first consumer to dial it.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
             sbi_ctx.set_self_instance(nf_clone).await;
             if let Some(ref nrf_uri) = nrf_uri_clone {
                 sbi_ctx.set_nrf_uri(nrf_uri).await;
-                if let Err(e) = register_with_nrf(nrf_uri, &nf_instance).await {
-                    log::error!("Failed to register PCF with NRF: {e}");
-                }
             } else {
                 log::info!("No NRF URI configured, PCF running in standalone mode");
             }
         });
     } else {
-        log::debug!("No tokio runtime available, skipping async NRF registration");
+        log::debug!("No tokio runtime available, skipping SBI context publication");
     }
+    // `nf_instance` is retained by the closure above only as a clone; the local
+    // binding is what the id log below reads.
+    let _ = &nf_instance;
 
     log::info!("PCF NF instance built (id={nf_id})");
 
@@ -216,6 +269,73 @@ pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
 
     log::debug!("PCF SBI server opened successfully");
     Ok(())
+}
+
+/// Report a policy-control event to every Npcf_EventExposure subscription that
+/// asked for it (TS 29.523 §4.2.2.3).
+///
+/// `extra` carries the event-specific `PcEventNotification` members the caller
+/// holds; nothing is invented for members it does not. `dnn` is matched against
+/// each subscription's `filterDnns` — pass `None` when the event is not scoped to
+/// a PDU session, in which case only subscriptions with NO DNN filter match,
+/// since "unknown DNN" must not be read as "any DNN".
+///
+/// Returns how many subscriptions were notified. Best-effort per subscriber, in
+/// the same spirit as the other notify paths here: a consumer that is down must
+/// not fail the policy operation that produced the event.
+pub async fn pcf_report_pc_event(
+    event: &str,
+    dnn: Option<&str>,
+    extra: serde_json::Value,
+) -> usize {
+    // Collected (and cloned) before any await: the context guard is a std
+    // RwLock guard and must not be held across an await point.
+    let ctx = crate::context::pcf_self();
+    let subs = match ctx.read() {
+        Ok(context) => context.event_subs_wanting(event, dnn),
+        Err(_) => return 0,
+    };
+    if subs.is_empty() {
+        return 0;
+    }
+
+    let mut delivered = 0usize;
+    for sub in subs {
+        let body =
+            crate::npcf_eventexposure::build_notification(&sub.notif_id, event, extra.clone());
+        // The notifUri is the full callback target, so no suffix is appended.
+        if deliver_notification(&sub.notif_uri, &[], "", &body, "PcEvent").await {
+            delivered += 1;
+        }
+        // Charged on dispatch attempt rather than on success, so a consumer whose
+        // endpoint is down cannot make this PCF retry the same report forever and
+        // exceed maxReportNbr's intent. The counter is what bounds the feed.
+        if let Ok(context) = ctx.read() {
+            context.event_sub_count_report(sub.id);
+        }
+    }
+    log::debug!("PcEvent {event} reported to {delivered} subscription(s)");
+    delivered
+}
+
+/// Register this PCF with the NRF, once, using the single profile builder.
+///
+/// Returns the registered `nfInstanceId` on success, or `Ok(None)` when no NRF
+/// is configured (standalone mode is not an error). The id returned is the SAME
+/// one held as the SBI context's self-instance, so `pcfId` published to the BSF,
+/// the id the heartbeat worker refreshes, and the id `pcf_sbi_close`
+/// deregisters are all one value — before #90 they were two different UUIDs.
+pub async fn pcf_register_with_nrf() -> Result<Option<String>, String> {
+    let ctx = global_context();
+    let Some(nf_instance) = ctx.get_self_instance().await else {
+        return Err("PCF self instance not published; call pcf_sbi_open first".to_string());
+    };
+    let Some(nrf_uri) = ctx.get_nrf_uri().await else {
+        log::debug!("No NRF URI configured, skipping NRF registration");
+        return Ok(None);
+    };
+    register_with_nrf(&nrf_uri, &nf_instance).await?;
+    Ok(Some(nf_instance.id))
 }
 
 /// Close SBI server and deregister from NRF

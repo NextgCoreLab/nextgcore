@@ -29,6 +29,7 @@ pub(crate) mod intent_loop;
 /// suppresses the lint in both configurations.
 #[cfg_attr(not(feature = "intent-loop"), allow(dead_code))]
 mod intent_policy;
+pub mod npcf_eventexposure; // TS 29.523: policy-control event exposure
 pub mod npcf_handler;
 pub mod nudr_handler;
 pub mod pcf_sm;

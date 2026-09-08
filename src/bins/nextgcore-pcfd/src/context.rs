@@ -474,6 +474,15 @@ pub struct PcfSess {
     /// session (TS 29.514 PolicyAuthorization → TS 29.512 SmPolicyDecision).
     /// Pushed to the SMF in the SM policy update notification.
     pub af_pcc_rules: Vec<crate::npcf_handler::AfPccRule>,
+    /// Last `accessType` seen for this PDU session (TS 29.512
+    /// `SmPolicyContextData`/`SmPolicyUpdateContextData`).
+    ///
+    /// Held so an SM policy update can be compared against it to detect a
+    /// genuine access-type CHANGE, which is what TS 29.523 `AC_TY_CH` reports.
+    /// `#[serde(default)]` so a snapshot written before this field existed still
+    /// loads as `None` rather than failing the whole record.
+    #[serde(default)]
+    pub access_type: Option<AccessType>,
 }
 
 impl PcfSess {
@@ -503,6 +512,7 @@ impl PcfSess {
             pcf_ue_sm_id,
             stream_id: None,
             af_pcc_rules: Vec::new(),
+            access_type: None,
         }
     }
 
@@ -1098,6 +1108,115 @@ pub fn ipv6_prefix_contains_for_test(prefix: &[u8; 16], len: u8, addr: &[u8; 16]
     ipv6_prefix_contains(prefix, len, addr)
 }
 
+/// The policy-control events this PCF can actually DETECT and therefore report
+/// (TS 29.523 `PcEvent`).
+///
+/// `PcEvent` is an `anyOf` over an enum plus a free-form string, so an unknown
+/// token is forward-compatibility rather than a bad request and must NOT be
+/// rejected — see [`PcEventSubscription::serviceable_events`]. What this table
+/// encodes is narrower and different: which tokens have a real PRODUCER in this
+/// tree. The other nine tokens in the enum (`SAC_CH`, `SAT_CATEGORY_CH`,
+/// `APPLICATION_START`, `APPLICATION_STOP`, `RATE_LIMIT_INFO_REPO`,
+/// `SIGNALLING_INFO`, `SLICE_REPLACE_OUTCOME`, `PARTLY_UNSUCC_UE_POL_DEL_SP`,
+/// `UNSUCCESS_PCF_SERVICE_AUTHORIZATION`) have no code path that could ever
+/// emit them, so a subscription naming only those could never produce a single
+/// notification. Advertising a feed that cannot fire is the dishonesty this
+/// table exists to prevent (see DECISIONS.md, "advertise only what can
+/// actually be served").
+pub const PC_EVENTS_WITH_PRODUCERS: &[&str] = &[
+    // SM policy update whose accessType differs from the stored session's.
+    "AC_TY_CH",
+    // AM policy update whose GUAMI PLMN differs from the stored association's.
+    "PLMN_CH",
+    // MANAGE UE POLICY COMPLETE correlated to a UE policy association.
+    "SUCCESS_UE_POL_DEL_SP",
+    // MANAGE UE POLICY COMMAND REJECT correlated to a UE policy association.
+    "UNSUCCESS_UE_POL_DEL_SP",
+];
+
+/// An Individual Policy Control Events Subscription (TS 29.523 §4.2,
+/// `PcEventExposureSubsc`).
+///
+/// PERSISTED. Only the fields this PCF can act on are modelled; the whole
+/// received document is kept verbatim in `raw` so a GET echoes back exactly
+/// what the consumer sent, including members no code here interprets. That is
+/// the same reasoning as storing `MbsSessionId` as the received object rather
+/// than canonicalising at ingress: the resource must be echoable.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PcEventSubscription {
+    /// Internal pool id.
+    pub id: u64,
+    /// The `{subscriptionId}` path segment of the individual resource.
+    pub subscription_id: String,
+    /// `notifUri` — where `PcEventExposureNotif` is POSTed. Required by schema.
+    pub notif_uri: String,
+    /// `notifId` — echoed in every notification so the consumer can correlate.
+    /// Required by schema.
+    pub notif_id: String,
+    /// `eventSubs` — the requested `PcEvent` tokens, verbatim (including any
+    /// this build cannot produce, so a GET round-trips them).
+    pub event_subs: Vec<String>,
+    /// `filterDnns` — when non-empty, only events for these DNNs are reported.
+    #[serde(default)]
+    pub filter_dnns: Vec<String>,
+    /// `groupId` — reported alongside, never used to widen scope.
+    #[serde(default)]
+    pub group_id: Option<String>,
+    /// `eventsRepInfo.maxReportNbr`. `None` means unlimited.
+    #[serde(default)]
+    pub max_report_nbr: Option<u32>,
+    /// How many notifications this subscription has already produced, so
+    /// `maxReportNbr` can be enforced across a restart rather than reset by it.
+    #[serde(default)]
+    pub report_count: u32,
+    /// The received document, echoed verbatim on GET.
+    pub raw: serde_json::Value,
+}
+
+impl PcEventSubscription {
+    /// The subset of `event_subs` this build has a producer for.
+    ///
+    /// Deliberately NOT a validation gate on individual tokens: `PcEvent`'s
+    /// free-form `anyOf` alternative makes an unrecognised token legal, and
+    /// TS 29.523 defines no per-item failure report on this resource (unlike
+    /// Nsmf/Nnwdaf `failEventReports`), so there is nowhere conformant to say
+    /// "I kept your subscription but cannot serve token X". A subscription is
+    /// therefore accepted whenever AT LEAST ONE requested event is serviceable,
+    /// and refused only when NONE is — because that subscription would leave
+    /// the consumer waiting on a feed that can never fire.
+    pub fn serviceable_events(events: &[String]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|e| PC_EVENTS_WITH_PRODUCERS.contains(&e.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether this subscription asked for `event` and may still report.
+    pub fn wants(&self, event: &str) -> bool {
+        if !self.event_subs.iter().any(|e| e == event) {
+            return false;
+        }
+        match self.max_report_nbr {
+            Some(max) => self.report_count < max,
+            None => true,
+        }
+    }
+
+    /// Whether `dnn` passes `filterDnns`. An absent filter matches everything;
+    /// an event carrying no DNN passes only when no DNN filter was set, since
+    /// "unknown" must not be treated as "matches".
+    pub fn dnn_matches(&self, dnn: Option<&str>) -> bool {
+        if self.filter_dnns.is_empty() {
+            return true;
+        }
+        match dnn {
+            Some(d) => self.filter_dnns.iter().any(|f| f == d),
+            None => false,
+        }
+    }
+}
+
 /// PCF Context - main context structure for PCF
 /// Port of pcf_context_t from context.h
 pub struct PcfContext {
@@ -1123,6 +1242,11 @@ pub struct PcfContext {
     sm_policy_id_hash: RwLock<HashMap<String, u64>>,
     /// App Session ID -> App ID hash
     app_session_id_hash: RwLock<HashMap<String, u64>>,
+    /// Npcf_EventExposure subscription list (by pool ID). A primary list: the
+    /// `subscription_id` index below is derived from it on restore.
+    event_sub_list: RwLock<HashMap<u64, PcEventSubscription>>,
+    /// Subscription ID -> Event subscription ID hash
+    event_sub_id_hash: RwLock<HashMap<String, u64>>,
     /// Next UE AM ID
     next_ue_am_id: AtomicUsize,
     /// Next UE SM ID
@@ -1131,6 +1255,8 @@ pub struct PcfContext {
     next_sess_id: AtomicUsize,
     /// Next app ID
     next_app_id: AtomicUsize,
+    /// Next Npcf_EventExposure subscription ID
+    next_event_sub_id: AtomicUsize,
     /// Maximum number of UE AMs
     max_num_of_ue: usize,
     /// Maximum number of sessions
@@ -1183,10 +1309,13 @@ impl PcfContext {
             association_id_hash: RwLock::new(HashMap::new()),
             sm_policy_id_hash: RwLock::new(HashMap::new()),
             app_session_id_hash: RwLock::new(HashMap::new()),
+            event_sub_list: RwLock::new(HashMap::new()),
+            event_sub_id_hash: RwLock::new(HashMap::new()),
             next_ue_am_id: AtomicUsize::new(1),
             next_ue_sm_id: AtomicUsize::new(1),
             next_sess_id: AtomicUsize::new(1),
             next_app_id: AtomicUsize::new(1),
+            next_event_sub_id: AtomicUsize::new(1),
             max_num_of_ue: 0,
             max_num_of_sess: 0,
             initialized: AtomicBool::new(false),
@@ -1217,6 +1346,15 @@ impl PcfContext {
         self.state = nextgcore_core::state_store::StateStore::disabled();
         self.ue_am_remove_all();
         self.ue_sm_remove_all();
+        // Event subscriptions hang off no UE, so the two removals above do not
+        // reach them; cleared explicitly or a re-init would inherit the previous
+        // run's subscriptions (and, in tests, the previous test's).
+        if let Ok(mut list) = self.event_sub_list.write() {
+            list.clear();
+        }
+        if let Ok(mut hash) = self.event_sub_id_hash.write() {
+            hash.clear();
+        }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("PCF context finalized");
     }
@@ -1258,6 +1396,127 @@ impl PcfContext {
         }
     }
 
+    // ── Npcf_EventExposure subscriptions (TS 29.523) ─────────────────────────
+
+    /// Create an Individual Policy Control Events Subscription. Returns `None`
+    /// only when a lock is poisoned.
+    pub fn event_sub_add(
+        &self,
+        notif_uri: &str,
+        notif_id: &str,
+        event_subs: Vec<String>,
+        filter_dnns: Vec<String>,
+        group_id: Option<String>,
+        max_report_nbr: Option<u32>,
+        raw: serde_json::Value,
+    ) -> Option<PcEventSubscription> {
+        let sub = {
+            let mut list = self.event_sub_list.write().ok()?;
+            let mut hash = self.event_sub_id_hash.write().ok()?;
+            let id = self.next_event_sub_id.fetch_add(1, Ordering::SeqCst) as u64;
+            let sub = PcEventSubscription {
+                id,
+                // Opaque to the consumer and unguessable, so one AF cannot walk
+                // another's subscription resources by incrementing an integer.
+                subscription_id: Uuid::new_v4().to_string(),
+                notif_uri: notif_uri.to_string(),
+                notif_id: notif_id.to_string(),
+                event_subs,
+                filter_dnns,
+                group_id,
+                max_report_nbr,
+                report_count: 0,
+                raw,
+            };
+            hash.insert(sub.subscription_id.clone(), id);
+            list.insert(id, sub.clone());
+            sub
+        };
+        self.persist();
+        Some(sub)
+    }
+
+    pub fn event_sub_find_by_subscription_id(&self, sub_id: &str) -> Option<PcEventSubscription> {
+        let id = *self.event_sub_id_hash.read().ok()?.get(sub_id)?;
+        self.event_sub_list.read().ok()?.get(&id).cloned()
+    }
+
+    /// Replace a subscription in place (PUT). The `subscription_id` and pool id
+    /// are preserved by the caller, so the derived index needs no update.
+    pub fn event_sub_update(&self, sub: &PcEventSubscription) -> bool {
+        let ok = {
+            match self.event_sub_list.write() {
+                Ok(mut list) => match list.get_mut(&sub.id) {
+                    Some(slot) => {
+                        *slot = sub.clone();
+                        true
+                    }
+                    None => false,
+                },
+                Err(_) => false,
+            }
+        };
+        if ok {
+            self.persist();
+        }
+        ok
+    }
+
+    pub fn event_sub_remove(&self, sub_id: &str) -> Option<PcEventSubscription> {
+        let sub = {
+            let mut list = self.event_sub_list.write().ok()?;
+            let mut hash = self.event_sub_id_hash.write().ok()?;
+            let id = hash.remove(sub_id)?;
+            list.remove(&id)?
+        };
+        self.persist();
+        Some(sub)
+    }
+
+    /// Every subscription that asked for `event`, has not exhausted
+    /// `maxReportNbr`, and whose `filterDnns` admits `dnn`.
+    ///
+    /// Returns clones so the caller can send notifications without holding a
+    /// lock across an await — the notify path is async and the guard is not
+    /// `Send`-safe to hold across it.
+    pub fn event_subs_wanting(&self, event: &str, dnn: Option<&str>) -> Vec<PcEventSubscription> {
+        let Ok(list) = self.event_sub_list.read() else {
+            return Vec::new();
+        };
+        let mut out: Vec<PcEventSubscription> = list
+            .values()
+            .filter(|s| s.wants(event) && s.dnn_matches(dnn))
+            .cloned()
+            .collect();
+        // Stable order so a multi-subscription notification fan-out is
+        // deterministic in tests rather than HashMap-iteration order.
+        out.sort_by_key(|s| s.id);
+        out
+    }
+
+    /// Charge one report against `maxReportNbr`. Separate from the send so the
+    /// counter moves only for a notification actually dispatched.
+    pub fn event_sub_count_report(&self, id: u64) {
+        let counted = match self.event_sub_list.write() {
+            Ok(mut list) => match list.get_mut(&id) {
+                Some(sub) => {
+                    sub.report_count = sub.report_count.saturating_add(1);
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        };
+        if counted {
+            self.persist();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn event_sub_count(&self) -> usize {
+        self.event_sub_list.read().map(|l| l.len()).unwrap_or(0)
+    }
+
     /// Serialize the four primary lists to one snapshot document.
     ///
     /// **Takes one lock at a time, holding at most one at any instant.**
@@ -1291,6 +1550,7 @@ impl PcfContext {
         let ue_sms = sorted(&self.ue_sm_list, |u: &PcfUeSm| u.id);
         let sessions = sorted(&self.sess_list, |s: &PcfSess| s.id);
         let apps = sorted(&self.app_list, |a: &PcfApp| a.id);
+        let event_subs = sorted(&self.event_sub_list, |s: &PcEventSubscription| s.id);
 
         serde_json::json!({
             "version": Self::SNAPSHOT_VERSION,
@@ -1298,12 +1558,19 @@ impl PcfContext {
             "ueSms": ue_sms,
             "sessions": sessions,
             "apps": apps,
+            // Added after SNAPSHOT_VERSION 1 shipped. No version bump: `records`
+            // defaults a missing key to empty, so a v1 snapshot restores with no
+            // event subscriptions rather than failing, and this build's snapshot
+            // is still readable by the version check. Bumping would have made
+            // every existing state file unloadable for a purely additive field.
+            "eventSubs": event_subs,
             // Persisted AND recomputed on restore -- see restore_from.
             "nextIds": {
                 "ueAm": self.next_ue_am_id.load(Ordering::SeqCst),
                 "ueSm": self.next_ue_sm_id.load(Ordering::SeqCst),
                 "sess": self.next_sess_id.load(Ordering::SeqCst),
                 "app": self.next_app_id.load(Ordering::SeqCst),
+                "eventSub": self.next_event_sub_id.load(Ordering::SeqCst),
             },
         })
     }
@@ -1377,12 +1644,14 @@ impl PcfContext {
         let ue_sms: Vec<PcfUeSm> = records(doc, "ueSms");
         let sessions: Vec<PcfSess> = records(doc, "sessions");
         let apps: Vec<PcfApp> = records(doc, "apps");
-        let restored = ue_ams.len() + ue_sms.len() + sessions.len() + apps.len();
+        let event_subs: Vec<PcEventSubscription> = records(doc, "eventSubs");
+        let restored = ue_ams.len() + ue_sms.len() + sessions.len() + apps.len() + event_subs.len();
 
         let mut max_ue_am = 0u64;
         let mut max_ue_sm = 0u64;
         let mut max_sess = 0u64;
         let mut max_app = 0u64;
+        let mut max_event_sub = 0u64;
 
         // ── primary lists + the indexes derived from each ────────────────────
         if let (Ok(mut list), Ok(mut supi_hash), Ok(mut assoc_hash)) = (
@@ -1435,6 +1704,19 @@ impl PcfContext {
                 list.insert(app.id, app);
             }
         }
+        // The subscription_id index is DERIVED here for the same reason as the
+        // other seven: a persisted index that disagreed with the list would make
+        // GET/PUT/DELETE resolve to a different consumer's subscription, which is
+        // worse than resolving to nothing.
+        if let (Ok(mut list), Ok(mut sub_hash)) =
+            (self.event_sub_list.write(), self.event_sub_id_hash.write())
+        {
+            for sub in event_subs {
+                max_event_sub = max_event_sub.max(sub.id);
+                sub_hash.insert(sub.subscription_id.clone(), sub.id);
+                list.insert(sub.id, sub);
+            }
+        }
 
         // ── allocators, lifted above both the persisted counter and the data ──
         let persisted = |key: &str| -> usize {
@@ -1447,6 +1729,7 @@ impl PcfContext {
             (&self.next_ue_sm_id, "ueSm", max_ue_sm),
             (&self.next_sess_id, "sess", max_sess),
             (&self.next_app_id, "app", max_app),
+            (&self.next_event_sub_id, "eventSub", max_event_sub),
         ] {
             let floor = (max_id as usize).saturating_add(1);
             let next = persisted(key).max(floor).max(1);
@@ -1454,11 +1737,13 @@ impl PcfContext {
         }
 
         log::info!(
-            "PCF durable state restored: {restored} record(s); next ids am={} sm={} sess={} app={}",
+            "PCF durable state restored: {restored} record(s); next ids am={} sm={} sess={} \
+             app={} eventSub={}",
             self.next_ue_am_id.load(Ordering::SeqCst),
             self.next_ue_sm_id.load(Ordering::SeqCst),
             self.next_sess_id.load(Ordering::SeqCst),
             self.next_app_id.load(Ordering::SeqCst),
+            self.next_event_sub_id.load(Ordering::SeqCst),
         );
         Ok(restored)
     }
@@ -1694,6 +1979,34 @@ impl PcfContext {
         let mut sess_list = self.sess_list.write().ok()?;
         let mut sm_policy_id_hash = self.sm_policy_id_hash.write().ok()?;
         let mut ue_sm_list = self.ue_sm_list.write().ok()?;
+
+        // A PDU session is identified by (UE SM, PSI): TS 29.512 §4.2.2.2 makes
+        // the SM policy association one-per-PDU-session, so a repeat create for
+        // the same pair is the SAME session, not a second one. Without this a
+        // retransmitted or replayed SmPolicyCreate minted a fresh id and a fresh
+        // sm_policy_id on every call, so `ue_sm.sess_ids` grew without bound and
+        // the older sessions became unreachable by (ue_sm, psi) while still
+        // holding an entry in `sm_policy_id_hash` — a leak that also made
+        // `sess_find_by_psi` answer with whichever duplicate hashing happened to
+        // reach first.
+        //
+        // Scanned inline rather than via `sess_find_by_psi`, which read-locks
+        // `sess_list`: std `RwLock` is not reentrant, so calling it while the
+        // write guard above is held would deadlock (the same hazard the six
+        // documented inversion fixes in this file exist for).
+        if let Some(existing) = sess_list
+            .values()
+            .find(|s| s.pcf_ue_sm_id == pcf_ue_sm_id && s.psi == psi)
+            .cloned()
+        {
+            log::debug!(
+                "[ue_sm_id={pcf_ue_sm_id}, psi={psi}] PCF session already exists (id={}) — \
+                 reusing rather than minting a duplicate",
+                existing.id
+            );
+            // Nothing mutated, so no persist: the snapshot is already correct.
+            return Some(existing);
+        }
 
         if sess_list.len() >= self.max_num_of_sess {
             log::error!(
@@ -2848,5 +3161,121 @@ mod tests {
         let result = engine.evaluate(&analytics, 5, 3).unwrap();
         assert_eq!(result.reason, AdjustmentReason::QosSustainability);
         assert_eq!(result.action, AnomalyAction::ReRoute);
+    }
+
+    // ── #90: session dedupe and event-subscription durability ────────────────
+
+    /// #90 criterion 6: `sess_add` deduplicates on `(ue_sm_id, psi)`.
+    ///
+    /// TS 29.512 §4.2.2.2 makes the SM policy association one-per-PDU-session, so
+    /// a repeat create for the same pair is the SAME session. Before #90 every
+    /// call minted a fresh id and a fresh `sm_policy_id`, so a retransmitted
+    /// SmPolicyCreate grew `ue_sm.sess_ids` without bound and left the older
+    /// session unreachable by `(ue_sm, psi)` while it still held an entry in
+    /// `sm_policy_id_hash`.
+    #[test]
+    fn sess_add_deduplicates_on_ue_sm_and_psi() {
+        let ctx = PcfContext::new();
+        let mut c = ctx;
+        c.init(100, 200);
+        let ctx = c;
+
+        let ue = ctx.ue_sm_add("imsi-001010000000920").expect("ue sm");
+        let first = ctx.sess_add(ue.id, 5).expect("first session");
+        let second = ctx.sess_add(ue.id, 5).expect("same session again");
+
+        assert_eq!(
+            first.id, second.id,
+            "a repeat create for the same (ue_sm, psi) must reuse the session"
+        );
+        assert_eq!(
+            first.sm_policy_id, second.sm_policy_id,
+            "the sm_policy_id must be stable, or the first leaks in sm_policy_id_hash"
+        );
+        assert_eq!(ctx.sess_count(), 1, "exactly one session must exist");
+
+        // The parent UE holds ONE reference, not two.
+        let parent = ctx.ue_sm_find_by_id(ue.id).expect("ue sm back");
+        assert_eq!(
+            parent.sess_ids.len(),
+            1,
+            "ue_sm.sess_ids must not accumulate a duplicate per retransmission"
+        );
+
+        // A DIFFERENT PSI on the same UE is genuinely a different PDU session.
+        let other = ctx.sess_add(ue.id, 6).expect("different psi");
+        assert_ne!(other.id, first.id);
+        assert_eq!(ctx.sess_count(), 2);
+
+        // And the same PSI under a DIFFERENT UE is also distinct: the key is the
+        // pair, not the PSI alone.
+        let ue2 = ctx.ue_sm_add("imsi-001010000000921").expect("second ue sm");
+        let third = ctx.sess_add(ue2.id, 5).expect("same psi, other ue");
+        assert_ne!(third.id, first.id);
+        assert_eq!(ctx.sess_count(), 3);
+    }
+
+    /// Npcf_EventExposure subscriptions survive a restart, are discoverable by
+    /// the SAME `subscriptionId`, and keep their report count — otherwise a
+    /// consumer could reset its own `maxReportNbr` budget by bouncing the PCF.
+    #[test]
+    fn event_subscriptions_survive_a_restart_with_their_report_count() {
+        let path = temp_state_path("event-subs");
+
+        let sub_id = {
+            let ctx = ctx_with_state(&path);
+            let sub = ctx
+                .event_sub_add(
+                    "http://127.0.0.1:9/cb",
+                    "n-restart",
+                    vec!["PLMN_CH".to_string(), "AC_TY_CH".to_string()],
+                    vec!["internet".to_string()],
+                    Some("group-1".to_string()),
+                    Some(3),
+                    serde_json::json!({"notifId": "n-restart", "vendorExtra": 42}),
+                )
+                .expect("subscription added");
+            ctx.event_sub_count_report(sub.id);
+            sub.subscription_id
+        };
+
+        let restored = ctx_with_state(&path);
+        let sub = restored
+            .event_sub_find_by_subscription_id(&sub_id)
+            .expect("the subscription must be found by the SAME id after a restart");
+
+        assert_eq!(sub.notif_id, "n-restart");
+        assert_eq!(sub.notif_uri, "http://127.0.0.1:9/cb");
+        assert_eq!(sub.event_subs, vec!["PLMN_CH", "AC_TY_CH"]);
+        assert_eq!(sub.filter_dnns, vec!["internet"]);
+        assert_eq!(sub.group_id.as_deref(), Some("group-1"));
+        assert_eq!(sub.max_report_nbr, Some(3));
+        assert_eq!(
+            sub.report_count, 1,
+            "reportCount must survive, or maxReportNbr resets on every bounce"
+        );
+        // The verbatim document is what a GET echoes, so it must survive too.
+        assert_eq!(sub.raw["vendorExtra"], 42);
+
+        // The subscription is still selectable by the matching rules.
+        assert_eq!(
+            restored
+                .event_subs_wanting("PLMN_CH", Some("internet"))
+                .len(),
+            1
+        );
+
+        // A deleted subscription is NOT resurrected by a restart.
+        restored
+            .event_sub_remove(&sub_id)
+            .expect("remove the subscription");
+        let after = ctx_with_state(&path);
+        assert!(
+            after.event_sub_find_by_subscription_id(&sub_id).is_none(),
+            "a deleted subscription must not come back after a restart"
+        );
+        assert_eq!(after.event_sub_count(), 0);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

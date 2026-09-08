@@ -427,7 +427,28 @@ pub async fn run() -> Result<()> {
     // PCF address information (TS 29.521 §5.3.2 pcfFqdn|pcfIpEndPoints) and
     // pcfId in Nbsf_Management PcfBinding registrations. The same instance id
     // is used for the NRF NFProfile below so pcfId == nfInstanceId (TS 29.510).
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    // #90: the instance id is the one `pcf_sbi_open` already published to the SBI
+    // context, NOT a fresh UUID. Minting a second one here is what made pcfd
+    // register twice with the NRF under two different ids, with the BSF's `pcfId`
+    // naming one of them and the other never heartbeaten. Taking it from the
+    // context makes `pcfId == nfInstanceId` true, as the comment above always
+    // claimed it was.
+    let nf_instance_id = match nextgcore_sbi::context::global_context()
+        .get_self_instance()
+        .await
+    {
+        Some(instance) => instance.id,
+        None => {
+            // pcf_sbi_open publishes the instance from a spawned task, so on a
+            // very cold start it can lose the race. Falling back to a fresh id
+            // would silently reintroduce the two-id split, so this is loud.
+            log::error!(
+                "PCF self instance not published by pcf_sbi_open; NRF registration and BSF \
+                 pcfId would disagree. Continuing without NRF registration."
+            );
+            String::new()
+        }
+    };
     sbi_path::pcf_self_info_set(sbi_path::PcfSelfInfo {
         sbi_addr: args.sbi_addr.clone(),
         sbi_port: args.sbi_port,
@@ -435,20 +456,28 @@ pub async fn run() -> Result<()> {
         nf_instance_id: nf_instance_id.clone(),
     });
 
-    // Register with NRF and start heartbeat worker
-    match register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
-        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
-            // (policy sessions vs configured capacity; TS 29.510 §5.2.2.3.2).
-            nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
-                let ctx = crate::context::pcf_self();
-                let load = ctx.read().map(|c| c.get_load()).unwrap_or(0);
-                load.clamp(0, 100) as u8
-            });
-        }
-        Ok(_) => {}
-        Err(e) => {
-            log::warn!("NRF registration failed (will operate without NRF): {e}");
+    // Register with NRF and start heartbeat worker. ONE registration, through the
+    // single profile builder in sbi_path, so the advertised service set cannot
+    // drift from the one the router actually serves.
+    if !nf_instance_id.is_empty() {
+        match sbi_path::pcf_register_with_nrf().await {
+            Ok(Some(registered_id)) => {
+                // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+                // (policy sessions vs configured capacity; TS 29.510 §5.2.2.3.2).
+                nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+                    registered_id,
+                    5,
+                    || {
+                        let ctx = crate::context::pcf_self();
+                        let load = ctx.read().map(|c| c.get_load()).unwrap_or(0);
+                        load.clamp(0, 100) as u8
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::warn!("NRF registration failed (will operate without NRF): {e}");
+            }
         }
     }
 
@@ -610,6 +639,11 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // Policy Authorization Service (npcf-policyauthorization)
         ("npcf-policyauthorization", "app-sessions", _) => {
             route_policy_authorization(&parts, method, &request, uri).await
+        }
+
+        // Policy Control Event Exposure Service (npcf-eventexposure, TS 29.523)
+        ("npcf-eventexposure", _, _) => {
+            crate::npcf_eventexposure::route(&parts, method, uri, &request).await
         }
 
         _ => {
@@ -1009,11 +1043,19 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         }
         updated.alt_notif_uris = alternate_notification_uris(&update_data, uri);
     }
+    // Set when the serving PLMN genuinely moves, which is what TS 29.523
+    // `PLMN_CH` reports. Tracked separately from `changed` because that list
+    // records "the consumer sent this member", and a consumer re-sending its
+    // CURRENT GUAMI on an unrelated update must not be reported as a PLMN change.
+    let mut plmn_changed: Option<(String, String)> = None;
     if let Some(guami) = update_data.get("guami") {
         let mcc = guami.pointer("/plmnId/mcc").and_then(|v| v.as_str());
         let mnc = guami.pointer("/plmnId/mnc").and_then(|v| v.as_str());
         let amf_id = guami.get("amfId").and_then(|v| v.as_str());
         if let (Some(mcc), Some(mnc)) = (mcc, mnc) {
+            if updated.guami.plmn_id.mcc != mcc || updated.guami.plmn_id.mnc != mnc {
+                plmn_changed = Some((mcc.to_string(), mnc.to_string()));
+            }
             updated.guami.plmn_id.mcc = mcc.to_string();
             updated.guami.plmn_id.mnc = mnc.to_string();
             // amfId is 6 hex digits = region(2) || set(3) || pointer(1)
@@ -1064,6 +1106,23 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     // reached the consumer that did not ask for it.
     if !changed.is_empty() {
         pcf_sbi_send_am_policy_control_notify(updated.id);
+    }
+
+    // TS 29.523 `PLMN_CH`: report the serving-PLMN change to every
+    // Npcf_EventExposure subscriber that asked for it. Reported with no DNN,
+    // because an AM policy association is not scoped to a PDU session — so only
+    // subscriptions without a filterDnns match, which is the honest reading of
+    // "this event has no DNN" rather than treating it as matching every DNN.
+    if let Some((mcc, mnc)) = plmn_changed {
+        sbi_path::pcf_report_pc_event(
+            "PLMN_CH",
+            None,
+            serde_json::json!({
+                "supi": updated.supi,
+                "plmnId": {"mcc": mcc, "mnc": mnc},
+            }),
+        )
+        .await;
     }
 
     // The 200 response schema is PolicyUpdate, not PolicyAssociation: it carries
@@ -1374,13 +1433,43 @@ pub async fn handle_ue_policy_n1_notify(pol_asso_id: &str, request: &SbiRequest)
         return SbiResponse::with_status(204);
     };
 
-    if ue_policy::apply_ue_policy_ul_container(pol_asso_id, &part.data)
-        == ue_policy::UePolicyResultOutcome::UnknownAssociation
-    {
+    let outcome = ue_policy::apply_ue_policy_ul_container(pol_asso_id, &part.data);
+    if outcome == ue_policy::UePolicyResultOutcome::UnknownAssociation {
         log::warn!(
             "[{pol_asso_id}] UE policy notify: unknown association; dropping N1MessageNotify"
         );
     }
+
+    // TS 29.523 `SUCCESS_UE_POL_DEL_SP` / `UNSUCCESS_UE_POL_DEL_SP`: the UE
+    // policy delivery result, reported to Npcf_EventExposure subscribers.
+    //
+    // Only the two TERMINAL outcomes are reported. A PTI mismatch is a stale or
+    // duplicate command (TS 24.501 D.2.1.6) and leaves the delivery still in
+    // flight; `Ignored` is a message not part of this loop; `Undecodable` and
+    // `UnknownAssociation` are not delivery results at all. Reporting any of
+    // those would tell a consumer the delivery concluded when it has not.
+    let delivery_event = match &outcome {
+        ue_policy::UePolicyResultOutcome::Delivered(_) => Some("SUCCESS_UE_POL_DEL_SP"),
+        ue_policy::UePolicyResultOutcome::Rejected(_) => Some("UNSUCCESS_UE_POL_DEL_SP"),
+        _ => None,
+    };
+    if let Some(event) = delivery_event {
+        // The association's SUPI is what a consumer correlates on; `delivFailure`
+        // is deliberately NOT set for the reject case, because TS 29.522 `Failure`
+        // enumerates northbound delivery failures and the D.6.3 cause here is a
+        // UE-side rejection, not one of those values. The cause text is logged
+        // rather than mapped to a token it does not correspond to.
+        let supi = ue_policy::ue_policy_find(pol_asso_id).map(|a| a.supi.clone());
+        if let ue_policy::UePolicyResultOutcome::Rejected(ref cause) = outcome {
+            log::info!("[{pol_asso_id}] UE policy delivery rejected by UE: {cause}");
+        }
+        let extra = match supi {
+            Some(supi) => serde_json::json!({"supi": supi}),
+            None => serde_json::json!({}),
+        };
+        sbi_path::pcf_report_pc_event(event, None, extra).await;
+    }
+
     // Consumer callbacks acknowledge with 204 No Content (TS 29.518 §5.2.2.4).
     SbiResponse::with_status(204)
 }
@@ -1436,32 +1525,76 @@ fn authorize_uav_session(supi: &str, dnn: &str) -> Option<SbiResponse> {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(120.0);
 
+    // TS 23.256: flight authorisation comes from the USS/UTM via the UAS-NF. This
+    // tree has NO UAS-NF client, so there is nothing to ask — and the previous
+    // code answered that by calling `grant_authorization("CAA-PCF-DEFAULT", 3600)`
+    // unconditionally, i.e. the network self-granted every flight. That is a
+    // fail-open authorisation bypass, not an incomplete feature.
+    //
+    // #90 makes it fail CLOSED: a UAV session is authorised only against an
+    // authorisation the OPERATOR has provisioned, and refused when none exists.
+    // A missing authorisation decision is a missing credential, and this repo's
+    // recorded policy is to fail closed on those (see DECISIONS.md, the
+    // fail-open-vs-fail-closed rule) — the opposite direction from a missing
+    // FILTER, where absence conventionally means "no restriction".
+    //
+    // Deliberate behaviour change, stated in the PR: a deployment that configured
+    // a UAV DNN and relied on the self-grant will now have those sessions
+    // REFUSED until it provisions `PCF_UAV_AUTHORIZATION` and `PCF_UAV_ZONE`.
+    // Not gated behind a switch, because a switch defaulting to the old value
+    // would leave the bypass in place for everyone who does not know to flip it,
+    // and a switch defaulting to the new one is just this with extra steps. Scope
+    // is naturally limited: only a DNN named by `PCF_UAV_DNN` reaches here at all.
+    let Some(authorization) = uav_provisioned_authorization() else {
+        log::warn!(
+            "[UAV Policy] SM policy DENY for SUPI {supi} dnn={dnn}: no USS/UTM flight \
+             authorization available. This PCF has no UAS-NF client (TS 23.256), so an \
+             authorization must be provisioned via PCF_UAV_AUTHORIZATION=<caa-level-uav-id>[,\
+             <validity-seconds>]; refusing rather than self-granting."
+        );
+        return Some(uav_reject(
+            "no USS/UTM flight authorization for this UAV",
+            None,
+        ));
+    };
+
+    // The permitted flight zone must also be provisioned. The previous hardcoded
+    // 37..38N / -123..-122W box silently authorised one region of California and
+    // nothing else, which is a geofence nobody chose.
+    let Some(zone_bounds) = uav_provisioned_zone() else {
+        log::warn!(
+            "[UAV Policy] SM policy DENY for SUPI {supi} dnn={dnn}: no permitted flight zone \
+             provisioned. Set PCF_UAV_ZONE=<min_lat>,<max_lat>,<min_lon>,<max_lon>; refusing \
+             rather than defaulting to a hardcoded region."
+        );
+        return Some(uav_reject("no permitted flight zone provisioned", None));
+    };
+
     let mut uav = UavPolicyAuthorization::new(supi);
     uav.min_altitude_limit = 0.0;
     uav.max_altitude_limit = max_altitude;
-    // A permitted (unrestricted) flight zone covering the configured geofence.
-    let mut zone = UavFlightZone::new("uav-default-zone", UavFlightZoneType::Unrestricted);
-    zone.min_latitude = 37.0;
-    zone.max_latitude = 38.0;
-    zone.min_longitude = -123.0;
-    zone.max_longitude = -122.0;
+    let mut zone = UavFlightZone::new("uav-provisioned-zone", UavFlightZoneType::Unrestricted);
+    zone.min_latitude = zone_bounds.0;
+    zone.max_latitude = zone_bounds.1;
+    zone.min_longitude = zone_bounds.2;
+    zone.max_longitude = zone_bounds.3;
     zone.min_altitude = 0.0;
     zone.max_altitude = max_altitude;
     uav.add_flight_zone(zone);
-    uav.grant_authorization("CAA-PCF-DEFAULT", 3600);
+    uav.grant_authorization(&authorization.0, authorization.1);
 
-    // Flight position to gate against (lat, lon, alt). Default: in-zone.
-    let (lat, lon, alt) = std::env::var("PCF_UAV_POSITION")
-        .ok()
-        .and_then(|v| {
-            let p: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-            if p.len() == 3 {
-                Some((p[0], p[1], p[2]))
-            } else {
-                None
-            }
-        })
-        .unwrap_or((37.5, -122.5, max_altitude.min(100.0)));
+    // Flight position to gate against (lat, lon, alt). NO default: an unknown
+    // position previously defaulted to (37.5, -122.5), which is inside the
+    // hardcoded zone, so "we do not know where this UAV is" authorised the
+    // flight. Unknown position is now a refusal.
+    let Some((lat, lon, alt)) = uav_reported_position() else {
+        log::warn!(
+            "[UAV Policy] SM policy DENY for SUPI {supi} dnn={dnn}: no flight position \
+             available. Set PCF_UAV_POSITION=<lat>,<lon>,<alt>; refusing rather than assuming \
+             an in-zone default."
+        );
+        return Some(uav_reject("no UAV flight position available", None));
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1479,19 +1612,91 @@ fn authorize_uav_session(supi: &str, dnn: &str) -> Option<SbiResponse> {
             "[UAV Policy] SM policy DENY for SUPI {supi} dnn={dnn}: position \
              ({lat:.6}, {lon:.6}) alt={alt:.1}m violates flight policy; rejecting session"
         );
-        Some(
-            SbiResponse::with_status(403)
-                .with_json_body(&serde_json::json!({
-                    "title": "UAV flight policy violation",
-                    "status": 403,
-                    "cause": "UAV_FLIGHT_NOT_AUTHORIZED",
-                    "detail": format!(
-                        "UAV position ({lat}, {lon}) alt={alt}m outside authorized flight policy"
-                    ),
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(403)),
-        )
+        Some(uav_reject(
+            "UAV position outside authorized flight policy",
+            Some(format!(
+                "UAV position ({lat}, {lon}) alt={alt}m outside authorized flight policy"
+            )),
+        ))
     }
+}
+
+/// The 403 a refused UAV session answers with.
+///
+/// One builder for every refusal reason so a newly added reason cannot
+/// accidentally answer with a different status or cause than the others.
+fn uav_reject(reason: &str, detail: Option<String>) -> SbiResponse {
+    SbiResponse::with_status(403)
+        .with_json_body(&serde_json::json!({
+            "title": "UAV flight policy violation",
+            "status": 403,
+            "cause": "UAV_FLIGHT_NOT_AUTHORIZED",
+            "detail": detail.unwrap_or_else(|| reason.to_string()),
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(403))
+}
+
+/// The operator-provisioned USS/UTM flight authorisation, as
+/// `(caa_level_uav_id, validity_seconds)`.
+///
+/// `PCF_UAV_AUTHORIZATION=<caa-level-uav-id>[,<validity-seconds>]`. Returns
+/// `None` when unset or empty, which is what makes the UAV path fail closed. The
+/// validity defaults to one hour only once an authorisation IS provisioned —
+/// defaulting the identifier itself is what the old self-grant did.
+fn uav_provisioned_authorization() -> Option<(String, u64)> {
+    let raw = std::env::var("PCF_UAV_AUTHORIZATION").ok()?;
+    let mut fields = raw.split(',').map(str::trim);
+    let id = fields.next().filter(|s| !s.is_empty())?;
+    let validity = fields
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3600);
+    Some((id.to_string(), validity))
+}
+
+/// The operator-provisioned permitted flight zone as
+/// `(min_lat, max_lat, min_lon, max_lon)`.
+///
+/// `PCF_UAV_ZONE=<min_lat>,<max_lat>,<min_lon>,<max_lon>`. A malformed or
+/// inverted box is rejected rather than clamped: a zone whose min exceeds its max
+/// matches nothing, so silently accepting it would refuse every flight for a
+/// reason the operator could not see in the logs.
+fn uav_provisioned_zone() -> Option<(f64, f64, f64, f64)> {
+    let raw = std::env::var("PCF_UAV_ZONE").ok()?;
+    let v: Vec<f64> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f64>().ok())
+        .collect();
+    if v.len() != 4 {
+        log::warn!("PCF_UAV_ZONE must be <min_lat>,<max_lat>,<min_lon>,<max_lon>; got {raw:?}");
+        return None;
+    }
+    if v[0] > v[1] || v[2] > v[3] {
+        log::warn!(
+            "PCF_UAV_ZONE bounds are inverted (min > max): {raw:?}. Refusing rather than \
+             silently matching no position."
+        );
+        return None;
+    }
+    Some((v[0], v[1], v[2], v[3]))
+}
+
+/// The UAV's reported flight position as `(lat, lon, alt)`.
+///
+/// `PCF_UAV_POSITION=<lat>,<lon>,<alt>`. Returns `None` when unset or malformed;
+/// there is deliberately no default, because the previous in-zone default meant
+/// an unknown position authorised the flight.
+fn uav_reported_position() -> Option<(f64, f64, f64)> {
+    let raw = std::env::var("PCF_UAV_POSITION").ok()?;
+    let p: Vec<f64> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f64>().ok())
+        .collect();
+    if p.len() != 3 {
+        log::warn!("PCF_UAV_POSITION must be <lat>,<lon>,<alt>; got {raw:?}");
+        return None;
+    }
+    Some((p[0], p[1], p[2]))
 }
 
 pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
@@ -1605,6 +1810,20 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                     log::warn!("SM policy create: unparseable ipv6AddressPrefix {prefix}");
                 }
             }
+            // Baseline for TS 29.523 `AC_TY_CH`: without recording the access type
+            // the session was created on, the first update carrying an accessType
+            // has nothing to compare against and would either report a change that
+            // did not happen or miss the one that did. `accessType` is optional in
+            // SmPolicyContextData, so an absent one stays `None` and the first
+            // update merely records it.
+            sess.access_type = policy_data
+                .get("accessType")
+                .and_then(|v| v.as_str())
+                .and_then(|s| match s {
+                    "3GPP_ACCESS" => Some(crate::context::AccessType::ThreeGppAccess),
+                    "NON_3GPP_ACCESS" => Some(crate::context::AccessType::NonThreeGppAccess),
+                    _ => None,
+                });
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
             }
@@ -1617,6 +1836,23 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             // PDU session). The UAV DNN and limits are config-driven.
             if is_uav_dnn(dnn) {
                 if let Some(reject) = authorize_uav_session(supi, dnn) {
+                    // The session was added and updated above; refusing the create
+                    // without removing it leaked one PcfSess (plus its
+                    // sm_policy_id_hash entry and its id in ue_sm.sess_ids) per
+                    // rejected attempt, so a UAV repeatedly denied would grow the
+                    // context until max_num_of_sess was reached and then break
+                    // NON-UAV session creation too. The SMF is being told the PDU
+                    // session is refused, so no state may survive this return.
+                    if let Ok(context) = ctx.read() {
+                        if context.sess_remove(sess.id).is_some() {
+                            log::debug!(
+                                "UAV policy reject: removed session id={} (psi={}) so the \
+                                 refusal leaves no state behind",
+                                sess.id,
+                                pdu_session_id
+                            );
+                        }
+                    }
                     return reject;
                 }
             }
@@ -1912,6 +2148,81 @@ pub async fn handle_sm_policy_update_notify(
                      updating the BSF binding"
                 );
                 sbi_path::pcf_sess_update_bsf_binding(latest.id);
+            }
+
+            // TS 29.523 `AC_TY_CH`: SmPolicyUpdateContextData carries `accessType`,
+            // so an update whose access type differs from the one this session was
+            // last seen on IS the access-type change event. Compared against the
+            // stored value rather than merely reported when the member is present:
+            // an SMF that echoes the unchanged accessType on every update would
+            // otherwise produce a change notification per update.
+            //
+            // `None` stored means this session predates the field (a restored v1
+            // snapshot) — recorded silently rather than reported, because "we did
+            // not know the previous access type" is not evidence of a change.
+            let reported_access = update_data
+                .get("accessType")
+                .and_then(|v| v.as_str())
+                .and_then(|s| match s {
+                    "3GPP_ACCESS" => Some(crate::context::AccessType::ThreeGppAccess),
+                    "NON_3GPP_ACCESS" => Some(crate::context::AccessType::NonThreeGppAccess),
+                    // A token outside the enum is not decodable into the stored
+                    // type; left alone rather than guessed at.
+                    _ => None,
+                });
+            if let Some(new_access) = reported_access {
+                if sess.access_type != Some(new_access) {
+                    let previously_known = sess.access_type.is_some();
+                    let mut latest = match ctx.read() {
+                        Ok(context) => context
+                            .sess_find_by_sm_policy_id(sm_policy_id)
+                            .unwrap_or_else(|| sess.clone()),
+                        Err(_) => sess.clone(),
+                    };
+                    latest.access_type = Some(new_access);
+                    if let Ok(context) = ctx.read() {
+                        context.sess_update(&latest);
+                    }
+                    if previously_known {
+                        let rat_type = update_data
+                            .get("ratType")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let mut extra = serde_json::json!({
+                            "accType": match new_access {
+                                crate::context::AccessType::ThreeGppAccess => "3GPP_ACCESS",
+                                crate::context::AccessType::NonThreeGppAccess => "NON_3GPP_ACCESS",
+                            },
+                        });
+                        // Carried through verbatim only when the SMF sent them —
+                        // `PcEventNotification` members this PCF does not hold stay
+                        // absent rather than being invented.
+                        if let Some(obj) = extra.as_object_mut() {
+                            if let Some(rat) = rat_type {
+                                obj.insert("ratType".to_string(), serde_json::json!(rat));
+                            }
+                            for member in ["addAccessInfo", "relAccessInfo"] {
+                                if let Some(v) = update_data.get(member) {
+                                    obj.insert(member.to_string(), v.clone());
+                                }
+                            }
+                            if let Some(ref dnn) = latest.dnn {
+                                obj.insert(
+                                    "pduSessionInfo".to_string(),
+                                    serde_json::json!({
+                                        "dnn": dnn,
+                                        "snssai": {
+                                            "sst": latest.s_nssai.sst,
+                                            "sd": latest.s_nssai.sd,
+                                        },
+                                    }),
+                                );
+                            }
+                        }
+                        sbi_path::pcf_report_pc_event("AC_TY_CH", latest.dnn.as_deref(), extra)
+                            .await;
+                    }
+                }
             }
 
             // Process PCC rule reports from SMF (rule status changes)
@@ -2767,86 +3078,6 @@ async fn run_event_loop_async(pcf_sm: &mut PcfSmContext, shutdown: Arc<AtomicBoo
     timer_mgr.clear();
     log::debug!("Exiting async main event loop");
     Ok(())
-}
-
-/// Register PCF with NRF.
-///
-/// `nf_instance_id` is generated once in `main` (also published via
-/// `sbi_path::pcf_self_info_set` so PcfBinding registrations carry the same
-/// `pcfId`, WSB-1). Returns the NF instance ID on success so the caller can
-/// start a heartbeat worker.
-async fn register_with_nrf(
-    sbi_addr: &str,
-    sbi_port: u16,
-    nf_instance_id: &str,
-) -> Result<String, String> {
-    let sbi_ctx = nextgcore_sbi::context::global_context();
-
-    let nrf_uri = sbi_ctx.get_nrf_uri().await;
-    let nrf_uri = match nrf_uri {
-        Some(uri) => uri,
-        None => {
-            log::debug!("No NRF URI configured, skipping NRF registration");
-            return Ok(String::new());
-        }
-    };
-
-    log::info!("Registering PCF with NRF at {nrf_uri}");
-
-    let (nrf_host, nrf_port) = parse_nrf_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
-
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "PCF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-npcf-am-policy-control"),
-                "serviceName": "npcf-am-policy-control",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            },
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-npcf-smpolicycontrol"),
-                "serviceName": "npcf-smpolicycontrol",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            },
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-npcf-ue-policy-control"),
-                "serviceName": "npcf-ue-policy-control",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            }
-        ],
-        "allowedNfTypes": ["AMF", "SMF", "SCP"],
-        "heartBeatTimer": 10
-    });
-
-    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
-    let response = client
-        .put_json(&path, &nf_profile)
-        .await
-        .map_err(|e| format!("NRF registration request failed: {e}"))?;
-
-    match response.status {
-        200 | 201 => {
-            log::info!("PCF registered with NRF successfully (id={nf_instance_id})");
-            Ok(nf_instance_id.to_string())
-        }
-        _ => Err(format!(
-            "NRF registration returned status {}",
-            response.status
-        )),
-    }
 }
 
 /// Parse host and port from a URI string (e.g., "http://localhost:7777").
@@ -4814,6 +5045,1187 @@ mod tests {
                 .unwrap()
                 .octets()
         ));
+    }
+
+    // ── #90: Npcf_EventExposure, NRF profile, UAV fail-closed ─────────────────
+
+    /// Start a stub consumer that records every `PcEventExposureNotif` POSTed to
+    /// it, returning `(server, notif_uri, recorded)`.
+    ///
+    /// Hands the server BACK so the caller keeps the listener alive for the
+    /// test's duration, and polls until the port accepts before returning:
+    /// `SbiServer::start` spawns its accept loop, so returning from it does not
+    /// mean the port is listening. Both are the recorded stub-harness rules — a
+    /// helper that drops the server or races the accept loop reports zero
+    /// deliveries while the producer is correct.
+    async fn start_stub_event_consumer() -> (
+        nextgcore_sbi::server::SbiServer,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let port = nextgcore_sbi::test_support::free_port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&recorded);
+        let handler = move |req: SbiRequest| {
+            let sink = std::sync::Arc::clone(&sink);
+            async move {
+                if let Some(body) = req.http.content.as_deref() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(v);
+                    }
+                }
+                SbiResponse::with_status(204)
+            }
+        };
+        server.start(handler).await.expect("stub consumer starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (
+            server,
+            format!("http://127.0.0.1:{port}/pc-events"),
+            recorded,
+        )
+    }
+
+    fn event_subsc_body(notif_uri: &str, notif_id: &str, events: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "notifUri": notif_uri,
+            "notifId": notif_id,
+            "eventSubs": events,
+        })
+    }
+
+    /// #90 criterion 1: the two-resource CRUD exists and answers the spec's
+    /// status codes, with a `Location` header on create.
+    ///
+    /// Before #90 `route_npcf_request` had no `npcf-eventexposure` arm at all, so
+    /// every one of these answered 405 from the catch-all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn event_exposure_subscription_crud_round_trips() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+
+        // CREATE -> 201 + Location
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-eventexposure/v1/subscriptions",
+            Some(event_subsc_body(
+                "http://127.0.0.1:9/pc-events",
+                "notif-crud-1",
+                &["PLMN_CH", "AC_TY_CH"],
+            )),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "POST /subscriptions must create");
+        let location = resp
+            .http
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .map(|(_, v)| v.clone())
+            .expect("201 must carry a Location header (TS 29.523)");
+        assert!(
+            location.starts_with("/npcf-eventexposure/v1/subscriptions/"),
+            "Location must name the individual resource, got {location}"
+        );
+        let sub_id = location
+            .rsplit('/')
+            .next()
+            .expect("subscriptionId")
+            .to_string();
+
+        // GET -> 200, echoing what was sent
+        let resp = pcf_sbi_request_handler(make_request("GET", &location, None)).await;
+        assert_eq!(
+            resp.status, 200,
+            "GET on the individual resource must be 200"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["notifId"], "notif-crud-1");
+        assert_eq!(body["eventSubs"][0], "PLMN_CH");
+
+        // PUT -> 200 with the replacement
+        let resp = pcf_sbi_request_handler(make_request(
+            "PUT",
+            &location,
+            Some(event_subsc_body(
+                "http://127.0.0.1:9/pc-events-moved",
+                "notif-crud-2",
+                &["SUCCESS_UE_POL_DEL_SP"],
+            )),
+        ))
+        .await;
+        assert_eq!(resp.status, 200, "PUT must replace and answer 200");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["notifId"], "notif-crud-2");
+        assert_eq!(body["eventSubs"][0], "SUCCESS_UE_POL_DEL_SP");
+
+        // The resource URI is stable across a PUT.
+        let resp = pcf_sbi_request_handler(make_request("GET", &location, None)).await;
+        assert_eq!(resp.status, 200, "subscriptionId must survive a PUT");
+
+        // DELETE -> 204, then GET -> 404
+        let resp = pcf_sbi_request_handler(make_request("DELETE", &location, None)).await;
+        assert_eq!(resp.status, 204, "DELETE must be 204 No Content");
+        let resp = pcf_sbi_request_handler(make_request("GET", &location, None)).await;
+        assert_eq!(resp.status, 404, "a deleted subscription must be 404");
+
+        // An unknown subscriptionId is 404, not 405 or 500.
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-eventexposure/v1/subscriptions/{sub_id}-nope"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 404);
+    }
+
+    /// The collection rejects a body missing any of the schema's three required
+    /// members, and rejects an empty `eventSubs` (minItems: 1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn event_exposure_create_enforces_mandatory_members() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+
+        for (label, body) in [
+            (
+                "no notifUri",
+                serde_json::json!({"notifId": "n", "eventSubs": ["PLMN_CH"]}),
+            ),
+            (
+                "no notifId",
+                serde_json::json!({"notifUri": "http://127.0.0.1:9/cb", "eventSubs": ["PLMN_CH"]}),
+            ),
+            (
+                "no eventSubs",
+                serde_json::json!({"notifUri": "http://127.0.0.1:9/cb", "notifId": "n"}),
+            ),
+            (
+                "empty eventSubs",
+                serde_json::json!({
+                    "notifUri": "http://127.0.0.1:9/cb", "notifId": "n", "eventSubs": []
+                }),
+            ),
+            (
+                "notifUri is not an absolute http(s) URI",
+                serde_json::json!({
+                    "notifUri": "/relative/cb", "notifId": "n", "eventSubs": ["PLMN_CH"]
+                }),
+            ),
+        ] {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                "/npcf-eventexposure/v1/subscriptions",
+                Some(body),
+            ))
+            .await;
+            assert_eq!(resp.status, 400, "{label} must be refused with 400");
+        }
+    }
+
+    /// A subscription naming ONLY events this PCF cannot produce is refused,
+    /// because it could never fire — but an UNRECOGNISED token alongside a
+    /// serviceable one is accepted, since `PcEvent` is `anyOf [enum, string]` and
+    /// an unknown token is forward-compatibility rather than a bad request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn event_exposure_refuses_only_unserviceable_subscriptions() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+
+        // Every requested event is real per the spec enum but has no producer here.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-eventexposure/v1/subscriptions",
+            Some(event_subsc_body(
+                "http://127.0.0.1:9/cb",
+                "n-1",
+                &["SAC_CH", "APPLICATION_START"],
+            )),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "a subscription that could never fire must be refused, not silently kept"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "EVENT_NOT_SUPPORTED");
+
+        // A future/unknown token is legal per the anyOf, so a mixed list is kept.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-eventexposure/v1/subscriptions",
+            Some(event_subsc_body(
+                "http://127.0.0.1:9/cb",
+                "n-2",
+                &["PLMN_CH", "SOME_REL20_EVENT"],
+            )),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "an unrecognised PcEvent token must NOT be rejected (anyOf free-form string)"
+        );
+        // ...and it round-trips, rather than being silently dropped.
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["eventSubs"][1], "SOME_REL20_EVENT");
+    }
+
+    /// #90 criterion 2: a subscribed consumer is actually POSTed a notification
+    /// when a matching event fires, and the body matches
+    /// `PcEventExposureNotif`.
+    ///
+    /// This drives the real AM policy UPDATE handler and observes the real stub
+    /// consumer, rather than calling the notifier directly — the recorded rule
+    /// that a client-level test leaves the call site untested.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn plmn_change_notifies_a_subscribed_consumer() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let (consumer, notif_uri, recorded) = start_stub_event_consumer().await;
+
+        // Subscribe to PLMN_CH.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-eventexposure/v1/subscriptions",
+            Some(event_subsc_body(&notif_uri, "notif-plmn", &["PLMN_CH"])),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+
+        // Create an AM policy association on PLMN 001-01.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000900",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/900",
+                "suppFeat": "0",
+                "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_asso_id = created
+            .get("polAssoId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                resp.http
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                    .and_then(|(_, v)| v.rsplit('/').next().map(str::to_string))
+            })
+            .expect("association id");
+
+        // Move it to a DIFFERENT PLMN: this is the event.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_asso_id}/update"),
+            Some(serde_json::json!({
+                "guami": { "plmnId": { "mcc": "310", "mnc": "260" }, "amfId": "cafe00" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+
+        // Poll rather than sleep-and-hope; the notify is awaited inside the
+        // handler, so one short settle is enough, but polling keeps it robust.
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            got = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            got.len(),
+            1,
+            "the subscribed consumer must be notified exactly once for one PLMN change"
+        );
+        let notif = &got[0];
+        // PcEventExposureNotif: notifId + eventNotifs, both required.
+        assert_eq!(notif["notifId"], "notif-plmn");
+        let notifs = notif["eventNotifs"]
+            .as_array()
+            .expect("eventNotifs must be an array (PcEventExposureNotif)");
+        assert_eq!(notifs.len(), 1);
+        // PcEventNotification: event + timeStamp are the required members.
+        assert_eq!(notifs[0]["event"], "PLMN_CH");
+        assert!(
+            notifs[0]["timeStamp"].is_string(),
+            "timeStamp is mandatory in PcEventNotification"
+        );
+        assert_eq!(notifs[0]["plmnId"]["mcc"], "310");
+        assert_eq!(notifs[0]["plmnId"]["mnc"], "260");
+
+        // Now re-send the SAME guami. The consumer IS subscribed to PLMN_CH here,
+        // so a spurious fire would be recorded — which is what makes this pin the
+        // change-detection rather than the subscription filter. Asserting this in
+        // the other test (whose subscriber listens to a different event) proved
+        // nothing: the filter absorbed the spurious event before it was recorded.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_asso_id}/update"),
+            Some(serde_json::json!({
+                "guami": { "plmnId": { "mcc": "310", "mnc": "260" }, "amfId": "cafe00" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let got = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            got.len(),
+            1,
+            "re-sending the SAME serving PLMN is not a PLMN change and must not \
+             notify again; got {got:?}"
+        );
+
+        consumer.stop().await.expect("stop stub consumer");
+    }
+
+    /// A consumer that did NOT subscribe to the event receives nothing, and a
+    /// re-sent unchanged GUAMI is not reported as a change.
+    ///
+    /// The second half is the one that matters: the handler's existing `changed`
+    /// list records "the consumer sent this member", which is not the same as a
+    /// PLMN change, so reporting off that list would notify on every update.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn unchanged_plmn_and_unsubscribed_events_notify_nobody() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let (consumer, notif_uri, recorded) = start_stub_event_consumer().await;
+
+        // Subscribed to a DIFFERENT event than the one that will fire.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-eventexposure/v1/subscriptions",
+            Some(event_subsc_body(
+                &notif_uri,
+                "notif-other",
+                &["SUCCESS_UE_POL_DEL_SP"],
+            )),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000901",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/901",
+                "suppFeat": "0",
+                "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_asso_id = created
+            .get("polAssoId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                resp.http
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                    .and_then(|(_, v)| v.rsplit('/').next().map(str::to_string))
+            })
+            .expect("association id");
+
+        // (a) A PLMN change fires, but nobody subscribed to PLMN_CH.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_asso_id}/update"),
+            Some(serde_json::json!({
+                "guami": { "plmnId": { "mcc": "310", "mnc": "260" }, "amfId": "cafe00" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+
+        // (b) The SAME guami re-sent: no change, so no event even for a subscriber.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_asso_id}/update"),
+            Some(serde_json::json!({
+                "guami": { "plmnId": { "mcc": "310", "mnc": "260" }, "amfId": "cafe00" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let got = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            got.is_empty(),
+            "no notification was due (wrong event, then no actual change), got {got:?}"
+        );
+
+        consumer.stop().await.expect("stop stub consumer");
+    }
+
+    /// `filterDnns` scopes the feed, and `maxReportNbr` bounds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn event_subscription_filters_by_dnn_and_honours_max_report_nbr() {
+        let ctx = crate::context::pcf_self();
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+
+        let context = ctx.read().expect("ctx");
+        let sub = context
+            .event_sub_add(
+                "http://127.0.0.1:9/cb",
+                "n-filter",
+                vec!["AC_TY_CH".to_string()],
+                vec!["internet".to_string()],
+                None,
+                Some(1),
+                serde_json::json!({}),
+            )
+            .expect("subscription added");
+
+        // The PCF context is process-global and `pcf_context_init` does not reset
+        // it, so sibling tests' subscriptions are visible here. Asserted on
+        // whether THIS subscription is selected rather than on a total count,
+        // which would be a count of the whole suite's leftovers.
+        let selects = |event: &str, dnn: Option<&str>| {
+            context
+                .event_subs_wanting(event, dnn)
+                .iter()
+                .any(|s| s.id == sub.id)
+        };
+
+        // DNN filter: the named DNN matches, another does not, and an event with
+        // NO DNN does not match a DNN-filtered subscription.
+        assert!(
+            selects("AC_TY_CH", Some("internet")),
+            "the filtered DNN must match"
+        );
+        assert!(
+            !selects("AC_TY_CH", Some("ims")),
+            "a different DNN must not match"
+        );
+        assert!(
+            !selects("AC_TY_CH", None),
+            "an event with no DNN must not match a filterDnns subscription"
+        );
+        // A different event is not wanted at all.
+        assert!(
+            !selects("PLMN_CH", Some("internet")),
+            "an event this subscription did not ask for must not match"
+        );
+
+        // maxReportNbr = 1: after one charged report the subscription stops matching.
+        context.event_sub_count_report(sub.id);
+        assert!(
+            !selects("AC_TY_CH", Some("internet")),
+            "maxReportNbr must bound the feed"
+        );
+    }
+
+    /// #90 criterion 3 (plus the double-registration defect the issue did not
+    /// report): the profile PUT to the NRF advertises every service the router
+    /// serves, each with `ipEndPoints` and `allowedNfTypes`, and the NF-level
+    /// `allowedNfTypes` includes AF and NEF.
+    ///
+    /// Asserted on the SERIALISED body, not on the builder's struct, because the
+    /// defect was precisely that the serialised literal and the builder disagreed.
+    #[test]
+    fn nrf_profile_advertises_every_served_service_with_af_and_nef_allowed() {
+        use nextgcore_sbi::context::{NfInstance, NfService};
+        use nextgcore_sbi::types::{NfType, SbiServiceType, UriScheme};
+
+        let mut inst = NfInstance::new("pcf-under-test", NfType::Pcf);
+        inst.ipv4_addresses.push("10.0.0.7".to_string());
+        inst.heartbeat_interval = 10;
+        for (ty, _) in [
+            (SbiServiceType::NpcfAmPolicyControl, ()),
+            (SbiServiceType::NpcfSmpolicycontrol, ()),
+            (SbiServiceType::NpcfUePolicyControl, ()),
+            (SbiServiceType::NpcfPolicyauthorization, ()),
+            (SbiServiceType::NpcfEventexposure, ()),
+        ] {
+            let mut s = NfService::new(ty.to_name(), ty);
+            s.scheme = UriScheme::Http;
+            s.ip_addresses.push("10.0.0.7".to_string());
+            s.port = 7777;
+            inst.add_service(s);
+        }
+
+        let body = sbi_path::pcf_nf_profile_json(&inst);
+        let services = body["nfServices"].as_array().expect("nfServices array");
+
+        // The service that was missing entirely before #90.
+        let pa = services
+            .iter()
+            .find(|s| s["serviceName"] == "npcf-policyauthorization")
+            .expect("npcf-policyauthorization must be advertised: it IS served");
+        let pa_allowed: Vec<&str> = pa["allowedNfTypes"]
+            .as_array()
+            .expect("per-service allowedNfTypes")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            pa_allowed.contains(&"AF") && pa_allowed.contains(&"NEF"),
+            "AF and NEF must be allowed to consume policy authorization, got {pa_allowed:?}"
+        );
+
+        // The service added by #90.
+        assert!(
+            services
+                .iter()
+                .any(|s| s["serviceName"] == "npcf-eventexposure"),
+            "npcf-eventexposure must be advertised now that it is routed"
+        );
+
+        // Every service carries an endpoint with a PORT; without it a consumer
+        // that discovers the service has nothing to dial.
+        for s in services {
+            let eps = s["ipEndPoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{} must carry ipEndPoints", s["serviceName"]));
+            assert!(
+                !eps.is_empty(),
+                "{} ipEndPoints must not be empty",
+                s["serviceName"]
+            );
+            assert_eq!(eps[0]["port"], 7777);
+        }
+
+        // NF-level allowedNfTypes: the union, so AF/NEF are not barred one level up.
+        let allowed: Vec<&str> = body["allowedNfTypes"]
+            .as_array()
+            .expect("NF-level allowedNfTypes")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for t in ["AMF", "SMF", "AF", "NEF", "NWDAF"] {
+            assert!(
+                allowed.contains(&t),
+                "NF-level allowedNfTypes must include {t}, got {allowed:?}"
+            );
+        }
+
+        // The router serves exactly these services; drift between the advertised
+        // set and the routed set is the defect, so pin the count.
+        assert_eq!(
+            services.len(),
+            5,
+            "advertised service count must match the routed set"
+        );
+    }
+
+    /// #90 criterion 4: with no USS/UTM authorisation provisioned, a UAV session
+    /// is REFUSED rather than self-granted.
+    ///
+    /// Drives the real SM policy create handler, so it covers the wiring and not
+    /// just `authorize_uav_session`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn uav_session_is_refused_when_no_authorization_is_provisioned() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        // The UAV inputs are process-global env; cleared under the same guard
+        // every other context-touching test takes, so a sibling cannot see them.
+        std::env::remove_var("PCF_UAV_AUTHORIZATION");
+        std::env::remove_var("PCF_UAV_ZONE");
+        std::env::remove_var("PCF_UAV_POSITION");
+        std::env::set_var("PCF_UAV_DNN", "uav");
+
+        // The PCF context is process-global and is not reset between tests, so the
+        // leak is asserted as a DELTA over this one create rather than as an
+        // absolute count of the whole suite's sessions.
+        let ctx = crate::context::pcf_self();
+        let before = ctx.read().expect("ctx").sess_count();
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000910",
+                "pduSessionId": 5,
+                "pduSessionType": "IPV4",
+                "dnn": "uav",
+                "notificationUri": "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+                "ipv4Address": "10.45.0.91",
+                "sliceInfo": { "sst": 1 }
+            })),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 403,
+            "with no USS/UTM authorization the UAV session must be refused, not self-granted"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "UAV_FLIGHT_NOT_AUTHORIZED");
+
+        // #90 criterion 5: the refusal leaves NO session behind.
+        let after = ctx.read().expect("ctx").sess_count();
+        assert_eq!(
+            after, before,
+            "a rejected UAV create must not leak a PcfSess (it leaked one per attempt before #90)"
+        );
+        // And specifically: the (ue_sm, psi) pair the refused create used holds no
+        // session, so a later legitimate create for it is not blocked by a ghost.
+        let ue_sm = ctx
+            .read()
+            .expect("ctx")
+            .ue_sm_find_by_supi("imsi-001010000000910");
+        if let Some(ue_sm) = ue_sm {
+            assert!(
+                ctx.read()
+                    .expect("ctx")
+                    .sess_find_by_psi(ue_sm.id, 5)
+                    .is_none(),
+                "the refused (ue_sm, psi) must hold no session"
+            );
+        }
+
+        std::env::remove_var("PCF_UAV_DNN");
+    }
+
+    /// Each of the three fail-closed guards refuses ON ITS OWN.
+    ///
+    /// Written because reverting any ONE of them left the all-three-unset test
+    /// green: the other two still refused, so that test proved "refused" but not
+    /// "refused for THIS reason". Here every case provisions all inputs but one,
+    /// so exactly one guard can be responsible for the 403 and each is
+    /// independently revert-provable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn each_uav_guard_refuses_on_its_own() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        std::env::set_var("PCF_UAV_DNN", "uav");
+
+        const AUTH: &str = "CAA-OPERATOR-1,7200";
+        const ZONE: &str = "37.0,38.0,-123.0,-122.0";
+        const POS: &str = "37.5,-122.5,90.0";
+
+        // (label, auth, zone, position) — exactly one input withheld per case.
+        let cases = [
+            ("authorization withheld", None, Some(ZONE), Some(POS)),
+            ("zone withheld", Some(AUTH), None, Some(POS)),
+            ("position withheld", Some(AUTH), Some(ZONE), None),
+        ];
+
+        for (i, (label, auth, zone, pos)) in cases.iter().enumerate() {
+            for (k, v) in [
+                ("PCF_UAV_AUTHORIZATION", auth),
+                ("PCF_UAV_ZONE", zone),
+                ("PCF_UAV_POSITION", pos),
+            ] {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+
+            let ctx = crate::context::pcf_self();
+            let before = ctx.read().expect("ctx").sess_count();
+            let supi = format!("imsi-00101000000093{i}");
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                "/npcf-smpolicycontrol/v1/sm-policies",
+                Some(serde_json::json!({
+                    "supi": supi,
+                    "pduSessionId": 9,
+                    "pduSessionType": "IPV4",
+                    "dnn": "uav",
+                    "notificationUri": "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+                    "ipv4Address": format!("10.45.1.{}", 10 + i),
+                    "sliceInfo": { "sst": 1 }
+                })),
+            ))
+            .await;
+            assert_eq!(
+                resp.status, 403,
+                "{label}: this guard alone must refuse the UAV session"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(body["cause"], "UAV_FLIGHT_NOT_AUTHORIZED", "{label}");
+            assert_eq!(
+                ctx.read().expect("ctx").sess_count(),
+                before,
+                "{label}: the refusal must not leak a session"
+            );
+        }
+
+        for k in [
+            "PCF_UAV_DNN",
+            "PCF_UAV_AUTHORIZATION",
+            "PCF_UAV_ZONE",
+            "PCF_UAV_POSITION",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// A UAV session IS authorised once the operator provisions an
+    /// authorisation, a zone and a position inside it — so the fail-closed change
+    /// refuses for want of input, not unconditionally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn uav_session_is_allowed_once_authorization_zone_and_position_are_provisioned() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        std::env::set_var("PCF_UAV_DNN", "uav");
+        std::env::set_var("PCF_UAV_AUTHORIZATION", "CAA-OPERATOR-1,7200");
+        std::env::set_var("PCF_UAV_ZONE", "37.0,38.0,-123.0,-122.0");
+        std::env::set_var("PCF_UAV_POSITION", "37.5,-122.5,90.0");
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000911",
+                "pduSessionId": 6,
+                "pduSessionType": "IPV4",
+                "dnn": "uav",
+                "notificationUri": "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+                "ipv4Address": "10.45.0.92",
+                "sliceInfo": { "sst": 1 }
+            })),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "a provisioned, in-zone UAV session must still be authorised"
+        );
+
+        // A position OUTSIDE the provisioned zone is refused.
+        std::env::set_var("PCF_UAV_POSITION", "50.0,10.0,90.0");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000912",
+                "pduSessionId": 7,
+                "pduSessionType": "IPV4",
+                "dnn": "uav",
+                "notificationUri": "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+                "ipv4Address": "10.45.0.93",
+                "sliceInfo": { "sst": 1 }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 403, "an out-of-zone position must be refused");
+
+        // An inverted zone matches nothing and is refused rather than clamped.
+        std::env::set_var("PCF_UAV_POSITION", "37.5,-122.5,90.0");
+        std::env::set_var("PCF_UAV_ZONE", "38.0,37.0,-122.0,-123.0");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000913",
+                "pduSessionId": 8,
+                "pduSessionType": "IPV4",
+                "dnn": "uav",
+                "notificationUri": "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+                "ipv4Address": "10.45.0.94",
+                "sliceInfo": { "sst": 1 }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 403, "an inverted zone must be refused");
+
+        for k in [
+            "PCF_UAV_DNN",
+            "PCF_UAV_AUTHORIZATION",
+            "PCF_UAV_ZONE",
+            "PCF_UAV_POSITION",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// AC_TY_CH: an SM policy update whose `accessType` differs from the one the
+    /// session was created on notifies a subscriber; re-sending the SAME access
+    /// type does not.
+    ///
+    /// Drives the real create and update handlers, so it covers the baseline
+    /// recording at create as well as the comparison at update — the baseline is
+    /// what makes "changed" distinguishable from "reported".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn access_type_change_notifies_a_subscribed_consumer() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let (consumer, notif_uri, recorded) = start_stub_event_consumer().await;
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-eventexposure/v1/subscriptions",
+            Some(event_subsc_body(&notif_uri, "notif-acty", &["AC_TY_CH"])),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+
+        // Create the session on 3GPP access.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000940",
+                "pduSessionId": 11,
+                "pduSessionType": "IPV4",
+                "dnn": "internet",
+                "notificationUri": "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+                "ipv4Address": "10.45.2.10",
+                "sliceInfo": { "sst": 1 },
+                "accessType": "3GPP_ACCESS"
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let sm_policy_id = created
+            .get("smPolicyId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                resp.http
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                    .and_then(|(_, v)| v.rsplit('/').next().map(str::to_string))
+            })
+            .expect("sm policy id");
+
+        // (a) An update on the SAME access type is not a change.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/update"),
+            Some(serde_json::json!({ "accessType": "3GPP_ACCESS" })),
+        ))
+        .await;
+        assert!(resp.status < 400, "unchanged-access update must succeed");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            recorded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "re-sending the same accessType is not an access-type change"
+        );
+
+        // (b) A move to non-3GPP access IS the event.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/update"),
+            Some(serde_json::json!({
+                "accessType": "NON_3GPP_ACCESS",
+                "ratType": "NR"
+            })),
+        ))
+        .await;
+        assert!(resp.status < 400);
+
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            got = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            got.len(),
+            1,
+            "one access-type change must notify exactly once"
+        );
+        assert_eq!(got[0]["notifId"], "notif-acty");
+        let n = &got[0]["eventNotifs"][0];
+        assert_eq!(n["event"], "AC_TY_CH");
+        assert_eq!(n["accType"], "NON_3GPP_ACCESS");
+        assert_eq!(n["ratType"], "NR");
+        // pduSessionInfo identifies which PDU session moved.
+        assert_eq!(n["pduSessionInfo"]["dnn"], "internet");
+        assert!(n["timeStamp"].is_string());
+
+        consumer.stop().await.expect("stop stub consumer");
+    }
+
+    /// The PCF registers with the NRF exactly ONCE, under the SAME instance id it
+    /// published as its self-instance.
+    ///
+    /// This is the defect the issue did not report: `pcf_sbi_open` PUT its own
+    /// profile (with policyauthorization, without allowedNfTypes/ipEndPoints)
+    /// while `app.rs` PUT a second one under a second UUID (with allowedNfTypes,
+    /// without policyauthorization), so the NRF held two PCF records per startup
+    /// and only the second was heartbeaten. Counting PUTs is the only assertion
+    /// that fails when a second registration path comes back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn pcf_registers_with_the_nrf_exactly_once_under_its_self_instance_id() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let port = nextgcore_sbi::test_support::free_port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let nrf = SbiServer::new(SbiServerConfig::new(addr));
+        // Every registration PUT, recorded with the id it targeted.
+        let puts = std::sync::Arc::new(std::sync::Mutex::new(
+            Vec::<(String, serde_json::Value)>::new(),
+        ));
+        let sink = std::sync::Arc::clone(&puts);
+        let handler = move |req: SbiRequest| {
+            let sink = std::sync::Arc::clone(&sink);
+            async move {
+                let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                if req.header.method.as_str() == "PUT"
+                    && path.starts_with("/nnrf-nfm/v1/nf-instances/")
+                {
+                    let id = path.rsplit('/').next().unwrap_or("").to_string();
+                    let body = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    sink.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((id, body));
+                    return SbiResponse::with_status(201);
+                }
+                SbiResponse::with_status(404)
+            }
+        };
+        nrf.start(handler).await.expect("mock NRF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The real startup sequence: open the legacy SBI context, then register.
+        let sbi_config = crate::sbi_path::SbiServerConfig {
+            addr: "127.0.0.1".to_string(),
+            port: 7777,
+            tls_enabled: false,
+            tls_cert: None,
+            tls_key: None,
+            nrf_uri: Some(format!("http://127.0.0.1:{port}")),
+        };
+        crate::sbi_path::pcf_sbi_close();
+        crate::sbi_path::pcf_sbi_open(Some(sbi_config)).expect("pcf_sbi_open");
+
+        // pcf_sbi_open publishes the self-instance from a spawned task.
+        let mut self_id = None;
+        for _ in 0..200 {
+            if let Some(inst) = nextgcore_sbi::context::global_context()
+                .get_self_instance()
+                .await
+            {
+                self_id = Some(inst.id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let self_id = self_id.expect("self instance published");
+
+        // Give any stray registration from pcf_sbi_open time to land, so the
+        // count below would catch it rather than racing past it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            puts.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "pcf_sbi_open must NOT register: registration happens once, after the \
+             SBI listener is up"
+        );
+
+        let registered = crate::sbi_path::pcf_register_with_nrf()
+            .await
+            .expect("registration must not error against a live NRF");
+        assert_eq!(
+            registered.as_deref(),
+            Some(self_id.as_str()),
+            "the registered id must be the published self-instance id, so pcfId == nfInstanceId"
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let recorded = puts.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly ONE NFProfile must reach the NRF per startup; got {:?}",
+            recorded.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        );
+        let (put_id, body) = &recorded[0];
+        assert_eq!(put_id, &self_id);
+        assert_eq!(body["nfInstanceId"], self_id.as_str());
+        // The one profile that lands carries BOTH things the two old profiles each
+        // had only one of.
+        let names: Vec<&str> = body["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .filter_map(|s| s["serviceName"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"npcf-policyauthorization"),
+            "the single profile must advertise policyauthorization, got {names:?}"
+        );
+        assert!(
+            names.contains(&"npcf-eventexposure"),
+            "the single profile must advertise eventexposure, got {names:?}"
+        );
+        let allowed: Vec<&str> = body["allowedNfTypes"]
+            .as_array()
+            .expect("allowedNfTypes")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(allowed.contains(&"AF") && allowed.contains(&"NEF"));
+
+        nrf.stop().await.expect("stop mock NRF");
+        crate::sbi_path::pcf_sbi_close();
+    }
+
+    /// A genuine access-type change on the FIRST update after create is
+    /// reported — which is what the create-time baseline buys.
+    ///
+    /// Written after a revert pass: deleting the baseline recording left the
+    /// other AC_TY_CH test green, because the first update then merely RECORDS
+    /// the access type (`previously_known == false` suppresses the report) and
+    /// the second update reports off that. That is real defence in depth against
+    /// a FALSE report, but it silently loses a TRUE one: without the baseline, a
+    /// session created on 3GPP whose first update moves it to non-3GPP reports
+    /// nothing at all. This is the assertion that distinguishes the two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn first_update_after_create_reports_a_genuine_access_type_change() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let (consumer, notif_uri, recorded) = start_stub_event_consumer().await;
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-eventexposure/v1/subscriptions",
+            Some(event_subsc_body(
+                &notif_uri,
+                "notif-acty-first",
+                &["AC_TY_CH"],
+            )),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000941",
+                "pduSessionId": 12,
+                "pduSessionType": "IPV4",
+                "dnn": "internet",
+                "notificationUri": "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+                "ipv4Address": "10.45.2.11",
+                "sliceInfo": { "sst": 1 },
+                "accessType": "3GPP_ACCESS"
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let sm_policy_id = created
+            .get("smPolicyId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                resp.http
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                    .and_then(|(_, v)| v.rsplit('/').next().map(str::to_string))
+            })
+            .expect("sm policy id");
+
+        // The FIRST update moves the session to non-3GPP access.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/update"),
+            Some(serde_json::json!({ "accessType": "NON_3GPP_ACCESS" })),
+        ))
+        .await;
+        assert!(resp.status < 400);
+
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            got = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            got.len(),
+            1,
+            "a real access-type change on the FIRST update must be reported; \
+             without the create-time baseline it is silently swallowed"
+        );
+        assert_eq!(got[0]["eventNotifs"][0]["event"], "AC_TY_CH");
+        assert_eq!(got[0]["eventNotifs"][0]["accType"], "NON_3GPP_ACCESS");
+
+        consumer.stop().await.expect("stop stub consumer");
     }
 }
 
