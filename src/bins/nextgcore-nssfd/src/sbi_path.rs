@@ -155,29 +155,40 @@ mod tests {
         assert!(!config.tls_enabled);
     }
 
+    /// The open/close lifecycle AND the already-running refusal, in ONE test.
+    ///
+    /// These were two tests, and they raced with each other by construction:
+    /// both began by storing `false` into the process-global
+    /// `SBI_SERVER_RUNNING`, so one test's "Reset state" landed between the
+    /// other's open and its assertion. CI saw exactly that —
+    /// `assertion failed: !nssf_sbi_is_running()` in one and
+    /// `assertion failed: result.is_err()` in the other, in the same run.
+    ///
+    /// Merged rather than serialised with a lock, following the pattern the
+    /// heartbeat statics already use in `nextgcore-sbi`: when the subject IS a
+    /// process-global, mutation and assertion belong in a single test, which
+    /// removes the race instead of scheduling around it.
     #[test]
-    fn test_sbi_open_close() {
-        // Reset state
+    fn test_sbi_open_close_and_already_running() {
         SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
         let result = nssf_sbi_open(None);
         assert!(result.is_ok());
         assert!(nssf_sbi_is_running());
 
+        // A second open while running is refused rather than silently accepted.
+        let again = nssf_sbi_open(None);
+        assert!(
+            again.is_err(),
+            "opening an already-running server must fail"
+        );
+        assert!(
+            nssf_sbi_is_running(),
+            "the refusal must not close the server"
+        );
+
         nssf_sbi_close();
         assert!(!nssf_sbi_is_running());
-    }
-
-    #[test]
-    fn test_sbi_open_already_running() {
-        // Reset state
-        SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
-
-        let _ = nssf_sbi_open(None);
-        let result = nssf_sbi_open(None);
-        assert!(result.is_err());
-
-        nssf_sbi_close();
     }
 
     #[test]
