@@ -915,18 +915,30 @@ pub struct NrfCollectorConfig {
     pub callback_uri: String,
 }
 
-/// Data source configuration for analytics collection
-#[derive(Debug, Clone)]
-pub struct DataSource {
-    /// Source NF type (e.g., "AMF", "SMF", "UPF")
-    pub nf_type: String,
-    /// Source NF instance ID
-    pub nf_instance_id: String,
-    /// Data collection URI
-    pub collection_uri: String,
-    /// Collection enabled flag
-    pub enabled: bool,
-}
+// #233: a `DataSource` registry used to live here -- the struct plus
+// `add_data_source`, `get_data_sources`, `data_source_count` and the
+// `data_sources` map. It was dead: `add_data_source` had NO caller at all, so
+// `data_sources` was always empty and the two readers could only ever report
+// nothing. Removed rather than left as ~40 lines that read as a working
+// data-source inventory and would keep attracting fixes that cannot matter.
+//
+// Two details the issue got slightly wrong, both in the direction of it being
+// MORE dead than reported. #233 says the grep hits are "its definitions and its
+// own tests"; there were no tests — the five definitions were the only references
+// in the crate, which is why deleting them needed no test changes. And
+// `get_data_sources` ended in `.expect("value expected")` where every sibling
+// reader uses `unwrap_or`, so a poisoned lock would have PANICKED the NWDAF on a
+// read of a map that was structurally always empty.
+//
+// The pre-check #233 asked for came out clean: nothing claims an inventory this
+// was meant to feed. `build_nf_profile` never mentioned data sources, and the two
+// docs-book pages that say "data source" (`concepts/ai-stack.md:63`,
+// `configuration/nwdaf.md:73`) describe the G2-1 NRF collector -- "the only data
+// source is the NRF's view of NF load" -- which is `nrf_collector.rs` and is
+// untouched here. Wiring a producer instead would have been a feature, and #233
+// says so: it would need its own issue rather than a silent expansion of this one.
+// It was also correctly EXCLUDED from #192's snapshot, since persisting it would
+// have snapshotted nothing.
 
 /// Why durable state could not be loaded (issue #66/#192).
 #[derive(Debug, thiserror::Error)]
@@ -968,7 +980,6 @@ pub struct NwdafContext {
     /// previous value rather than re-firing on every cycle.
     event_levels: RwLock<HashMap<String, f64>>,
     /// Data sources (nf_instance_id -> source)
-    data_sources: RwLock<HashMap<String, DataSource>>,
     /// The analytics engine (G2-1): sample store + computation, shared by the
     /// Nnwdaf_AnalyticsInfo handler, the notification dispatcher and the NRF
     /// NFStatusNotify ingestion path so samples actually accumulate.
@@ -1028,7 +1039,6 @@ impl NwdafContext {
             analytics_subscriptions: RwLock::new(HashMap::new()),
             ml_prov_subscriptions: RwLock::new(HashMap::new()),
             event_levels: RwLock::new(HashMap::new()),
-            data_sources: RwLock::new(HashMap::new()),
             engine: Mutex::new(AnalyticsEngine::new()),
             nrf_status_subscription: RwLock::new(None),
             nrf_collector_config: RwLock::new(None),
@@ -1152,9 +1162,6 @@ impl NwdafContext {
         }
         if let Ok(mut levels) = self.event_levels.write() {
             levels.clear();
-        }
-        if let Ok(mut sources) = self.data_sources.write() {
-            sources.clear();
         }
         if let Ok(engine) = self.engine.get_mut() {
             *engine = AnalyticsEngine::new();
@@ -1716,23 +1723,6 @@ impl NwdafContext {
         }
     }
 
-    /// Add a data source
-    pub fn add_data_source(&self, source: DataSource) -> bool {
-        if let Ok(mut sources) = self.data_sources.write() {
-            sources.insert(source.nf_instance_id.clone(), source);
-            return true;
-        }
-        false
-    }
-
-    /// Get all enabled data sources
-    pub fn get_data_sources(&self) -> Vec<DataSource> {
-        self.data_sources
-            .read()
-            .map(|sources| sources.values().filter(|s| s.enabled).cloned().collect())
-            .expect("value expected")
-    }
-
     /// Get all active, non-expired subscriptions (for the notification dispatcher)
     pub fn get_all_active_subscriptions(&self) -> Vec<AnalyticsSubscription> {
         self.analytics_subscriptions
@@ -1811,10 +1801,6 @@ impl NwdafContext {
             .read()
             .map(|s| s.len())
             .unwrap_or(0)
-    }
-
-    pub fn data_source_count(&self) -> usize {
-        self.data_sources.read().map(|d| d.len()).unwrap_or(0)
     }
 }
 

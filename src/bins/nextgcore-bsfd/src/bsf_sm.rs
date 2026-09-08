@@ -340,8 +340,12 @@ impl BsfSmContext {
                 log::debug!("NF discover response received");
                 if let Some(sbi_xact_id) = event.sbi_xact_id {
                     log::debug!("SBI xact ID: {sbi_xact_id}");
-                    // Note: bsf_nnrf_handle_nf_discover processes NF discovery results
-                    // This is handled by the nnrf_handler module when NRF integration is enabled
+                    // #234: this used to point at `bsf_nnrf_handle_nf_discover`,
+                    // which is now deleted. The BSF is a PRODUCER of binding
+                    // management (TS 23.501 6.2.19, TS 29.521) with no originated
+                    // service request for that role, so there is nothing for it to
+                    // discover and this branch has nothing to dispatch to. Kept as
+                    // a log so an unexpected discovery response is still visible.
                 }
             }
             _ => {

@@ -225,78 +225,26 @@ pub fn bsf_sbi_is_running() -> bool {
     SBI_SERVER_RUNNING.load(Ordering::SeqCst)
 }
 
-/// SBI request builder function type
-pub type PathSbiRequestBuilder =
-    fn(sess_id: u64, data: &dyn std::any::Any) -> Option<PathSbiRequest>;
-
-/// Simplified SBI request for path operations
-#[derive(Debug, Clone)]
-pub struct PathSbiRequest {
-    pub method: String,
-    pub uri: String,
-    pub headers: Vec<(String, String)>,
-    pub body: Option<String>,
-}
-
-/// SBI transaction for tracking requests
-#[derive(Debug)]
-pub struct SbiXact {
-    pub id: u64,
-    pub sess_id: u64,
-    pub stream_id: u64,
-    pub service_type: String,
-}
-
-/// Send SBI request to NF instance
-/// Port of bsf_sbi_send_request
-pub fn bsf_sbi_send_request(nf_instance_id: &str, request: PathSbiRequest) -> Result<u64, String> {
-    log::debug!(
-        "Sending SBI request to NF instance [{}]: {} {}",
-        nf_instance_id,
-        request.method,
-        request.uri
-    );
-
-    // Note: SBI request sending requires HTTP client integration
-    // In C: nextgcore_sbi_send_request_to_nf_instance(nf_instance, xact)
-    // The actual HTTP client would send the request and handle the response
-
-    // Return transaction ID (placeholder)
-    Ok(1)
-}
-
-/// Discover NF and send request
-/// Port of bsf_sbi_discover_and_send
-pub fn bsf_sbi_discover_and_send(
-    service_type: &str,
-    sess_id: u64,
-    stream_id: u64,
-    _request: PathSbiRequest,
-) -> Result<u64, String> {
-    log::debug!(
-        "Discover and send: service_type={service_type}, sess_id={sess_id}, stream_id={stream_id}"
-    );
-
-    // Note: SBI transaction tracking and NF discovery require NRF integration
-    // In C: nextgcore_sbi_xact_add(...) creates a transaction
-    // In C: nextgcore_sbi_discover_and_send(xact) discovers and sends to target NF
-
-    // Return transaction ID (placeholder)
-    Ok(1)
-}
-
-/// Send SBI response
-/// Port of bsf_sbi_send_response
-pub fn bsf_sbi_send_response(stream_id: u64, status: u16) -> Result<(), String> {
-    log::debug!("Sending SBI response: stream_id={stream_id}, status={status}");
-
-    // Note: Build and send response through HTTP server
-    // In C: nextgcore_sbi_build_response(&sendmsg, status)
-    // In C: nextgcore_sbi_server_send_response(stream, response)
-    // The actual response is sent by the HTTP handler in main.rs
-
-    Ok(())
-}
+// #234: a dead consumer-side NRF-discovery path used to live here. Removed:
+// `PathSbiRequestBuilder`, `PathSbiRequest`, `SbiXact`, `bsf_sbi_send_request`,
+// `bsf_sbi_discover_and_send` and `bsf_sbi_send_response`.
+//
+// The first two of those functions logged at debug, did nothing, and returned a
+// FABRICATED `Ok(1)` transaction ID -- a stub that lies to its caller. The third
+// returned `Ok(())` without sending anything, and had no caller but its own test.
+// `SbiXact` had no reference anywhere in the crate, not even a test, and
+// `PathSbiRequestBuilder` only named the struct beside it.
+//
+// "Wire it per TS 29.521 / TS 29.510" was ruled out on evidence rather than left
+// open, so it is not re-litigated: bsfd's `nnrf-nfm` obligations are ALREADY
+// complete (`register_with_nrf` PUTs the profile, `spawn_heartbeat_worker_with_load`
+// runs in `lib.rs`, and `bsf_sbi_close` tears down); TS 23.501 6.2.19 and TS 29.521
+// define the BSF as a PRODUCER of binding management with no originated service
+// request for that role; and the giveaway was that the discovery handler hardcoded
+// `GET /nbsf-management/v1/pcf-bindings`, i.e. it would have had the BSF query ITS
+// OWN SERVICE on another NF. That is a copy-paste artefact of the C port, not a
+// procedure. Implementing a generic discover-and-send would have invented a
+// capability nothing asked for.
 
 #[cfg(test)]
 mod tests {
@@ -325,22 +273,5 @@ mod tests {
 
         bsf_sbi_close();
         assert!(!bsf_sbi_is_running());
-    }
-
-    #[test]
-    fn test_sbi_request() {
-        let request = PathSbiRequest {
-            method: "POST".to_string(),
-            uri: "/nbsf-management/v1/pcf-bindings".to_string(),
-            headers: vec![],
-            body: None,
-        };
-        assert_eq!(request.method, "POST");
-    }
-
-    #[test]
-    fn test_sbi_send_response() {
-        let result = bsf_sbi_send_response(1, 200);
-        assert!(result.is_ok());
     }
 }
