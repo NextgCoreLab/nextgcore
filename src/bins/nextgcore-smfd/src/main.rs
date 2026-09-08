@@ -975,6 +975,291 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
     }
 }
 
+// ---------------------------------------------------------------------------
+// Nudm_SDM consumer (issue #204): the subscribed default DNN
+// ---------------------------------------------------------------------------
+
+/// Why a subscribed default DNN could not be determined. Each variant maps to a
+/// distinct log line and, at the create handler, a distinct ProblemDetails cause —
+/// "the UDM is unreachable" and "the subscription names several DNNs and flags
+/// none" are different operator problems and must not collapse into one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DefaultDnnError {
+    /// No UDM address could be determined (no NRF, no discovery hit, no env).
+    NoUdmEndpoint,
+    /// The Nudm_SDM_Get failed at the transport or returned a non-2xx.
+    SdmRequestFailed(String),
+    /// The subscription carries no DNN at all for this S-NSSAI.
+    NoSubscribedDnn,
+    /// Several DNNs are subscribed for this S-NSSAI and none carries
+    /// `defaultDnnIndicator: true`, so the subscription does not say which is the
+    /// default. Choosing one here would be a fabrication (issue #204).
+    AmbiguousDefault(Vec<String>),
+}
+
+impl DefaultDnnError {
+    /// The TS 29.502 ProblemDetails cause for a create that cannot resolve a DNN.
+    fn cause(&self) -> &'static str {
+        match self {
+            // The consumer's request is incomplete for THIS network: it named no
+            // DNN and the subscription does not supply one either.
+            Self::NoSubscribedDnn | Self::AmbiguousDefault(_) => "MANDATORY_IE_MISSING",
+            // Not the consumer's fault — the SMF could not reach the data it needs.
+            Self::NoUdmEndpoint | Self::SdmRequestFailed(_) => "SUBSCRIPTION_DATA_NOT_AVAILABLE",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::NoUdmEndpoint => "no dnn in SmContextCreateData and no UDM endpoint is known \
+                 (set UDM_SBI_ADDR or register a UDM with the NRF)"
+                .to_string(),
+            Self::SdmRequestFailed(e) => format!(
+                "no dnn in SmContextCreateData and the subscribed default could not be \
+                 retrieved: {e}"
+            ),
+            Self::NoSubscribedDnn => "no dnn in SmContextCreateData and the subscription carries \
+                 no DNN for the requested S-NSSAI"
+                .to_string(),
+            Self::AmbiguousDefault(dnns) => format!(
+                "no dnn in SmContextCreateData and the subscription names {} DNNs for the \
+                 requested S-NSSAI ({}) with none flagged defaultDnnIndicator, so no default \
+                 can be determined",
+                dnns.len(),
+                dnns.join(", ")
+            ),
+        }
+    }
+}
+
+/// Resolve a UDM `nudm-sdm` endpoint.
+///
+/// NRF discovery first (TS 29.510 §5.3.2), because that is the mechanism a real
+/// deployment uses and the SMF already knows its NRF; `UDM_SBI_ADDR` /
+/// `UDM_SBI_PORT` is the fallback for a deployment with no NRF, matching how every
+/// other cross-NF address is wired in this tree's compose files.
+///
+/// Deliberately does NOT populate the shared NF cache: `amfd` and `udmd` each
+/// carry a full cache-populating discovery routine, and a third copy is a
+/// maintenance cost this issue does not need. What the SMF wants is one address.
+async fn discover_udm_sdm_endpoint() -> Option<(String, u16)> {
+    let sbi_ctx = global_context();
+    let nrf_uri = match sbi_ctx.get_nrf_uri().await {
+        Some(uri) => Some(uri),
+        None => std::env::var("NRF_URI").ok(),
+    };
+
+    if let Some(nrf_uri) = nrf_uri {
+        if let Some((nrf_host, nrf_port)) = parse_host_port(&nrf_uri) {
+            let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+            let path = "/nnrf-disc/v1/nf-instances\
+                        ?target-nf-type=UDM&requester-nf-type=SMF&service-names=nudm-sdm";
+            match client.get(path).await {
+                Ok(resp) if resp.status == 200 => {
+                    if let Some(ep) = resp
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                        .and_then(|json| udm_sdm_endpoint_from_search_result(&json))
+                    {
+                        log::debug!("UDM nudm-sdm discovered via NRF at {}:{}", ep.0, ep.1);
+                        return Some(ep);
+                    }
+                    log::debug!("NRF returned no usable UDM nudm-sdm endpoint");
+                }
+                Ok(resp) => log::debug!("NRF UDM discovery returned status {}", resp.status),
+                Err(e) => log::debug!("NRF UDM discovery failed: {e}"),
+            }
+        }
+    }
+
+    let host = std::env::var("UDM_SBI_ADDR").ok()?;
+    let port = std::env::var("UDM_SBI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    Some((host, port))
+}
+
+/// Pull a `nudm-sdm` address out of a TS 29.510 `SearchResult`.
+///
+/// Split out so the decode is testable without an NRF. Prefers the service's own
+/// `ipEndPoints` over the instance's `ipv4Addresses`, because a UDM may serve
+/// `nudm-sdm` on a different port from its other services.
+fn udm_sdm_endpoint_from_search_result(json: &serde_json::Value) -> Option<(String, u16)> {
+    for instance in json.get("nfInstances")?.as_array()? {
+        let services = instance.get("nfServices").and_then(|v| v.as_array());
+        for svc in services.into_iter().flatten() {
+            if svc.get("serviceName").and_then(|v| v.as_str()) != Some("nudm-sdm") {
+                continue;
+            }
+            let endpoint = svc.get("ipEndPoints").and_then(|v| v.as_array());
+            let (host, port) = match endpoint.and_then(|eps| eps.first()) {
+                Some(ep) => {
+                    let host = ep
+                        .get("ipv4Address")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .or_else(|| {
+                            instance
+                                .get("ipv4Addresses")?
+                                .as_array()?
+                                .first()?
+                                .as_str()
+                                .map(String::from)
+                        })?;
+                    let port = ep.get("port").and_then(|v| v.as_u64()).unwrap_or(7777) as u16;
+                    (host, port)
+                }
+                None => {
+                    let host = instance
+                        .get("ipv4Addresses")?
+                        .as_array()?
+                        .first()?
+                        .as_str()?
+                        .to_string();
+                    (host, 7777)
+                }
+            };
+            return Some((host, port));
+        }
+    }
+    None
+}
+
+/// Select the subscribed default DNN out of a TS 29.503
+/// `SmfSelectionSubscriptionData` body, for the S-NSSAI the create names.
+///
+/// **This reads `smf-sel-data`, not `sm-data`, and that is a deliberate deviation
+/// from #204's suggested approach — see the spec.** The approach says to select
+/// "the `dnnConfigurations` entry flagged as the subscribed default", but
+/// `sm-data`'s `DnnConfiguration` (TS 29.503 Table 5.5.2.4-1) has **no such
+/// flag**; the default-DNN flag is `DnnInfo.defaultDnnIndicator`, which lives in
+/// `SmfSelectionSubscriptionData` (`smf-sel-data`). Selecting from
+/// `dnnConfigurations` would mean picking an arbitrary key out of a JSON *object*,
+/// which is precisely the fabrication #204 exists to remove.
+///
+/// Selection order:
+/// 1. the `dnnInfos` entry with `defaultDnnIndicator: true`;
+/// 2. if exactly ONE DNN is subscribed for the S-NSSAI and none is flagged, that
+///    one — it is unambiguous, there is nothing else the default could be;
+/// 3. otherwise `AmbiguousDefault`, because choosing among several unflagged DNNs
+///    would invent an answer the subscription does not give.
+fn select_default_dnn(
+    smf_sel_data: &serde_json::Value,
+    sst: u8,
+    sd: Option<&str>,
+) -> Result<String, DefaultDnnError> {
+    // `subscribedSnssaiInfos` is keyed by the TS 29.571 S-NSSAI string form:
+    // `{sst:02x}` or `{sst:02x}-{sd}` (udrd's `build_smf_selection_data`).
+    let key = match sd {
+        Some(sd) => format!("{sst:02x}-{sd}"),
+        None => format!("{sst:02x}"),
+    };
+    let infos = smf_sel_data.get("subscribedSnssaiInfos");
+    // Fall back to the key with no SD when the exact key is absent: a subscription
+    // provisioned without an SD still applies to a request that carries one, the
+    // same widening `nsacfd`'s quota lookup does.
+    let entry = infos
+        .and_then(|i| i.get(&key))
+        .or_else(|| infos.and_then(|i| i.get(format!("{sst:02x}"))));
+
+    let dnn_infos = entry
+        .and_then(|e| e.get("dnnInfos"))
+        .and_then(|v| v.as_array())
+        .ok_or(DefaultDnnError::NoSubscribedDnn)?;
+
+    let named: Vec<&serde_json::Value> = dnn_infos
+        .iter()
+        .filter(|i| i.get("dnn").and_then(|v| v.as_str()).is_some())
+        .collect();
+    if named.is_empty() {
+        return Err(DefaultDnnError::NoSubscribedDnn);
+    }
+    if let Some(flagged) = named
+        .iter()
+        .find(|i| i.get("defaultDnnIndicator").and_then(|v| v.as_bool()) == Some(true))
+    {
+        let dnn = flagged["dnn"].as_str().unwrap_or_default().to_string();
+        log::info!("subscribed default DNN '{dnn}' (defaultDnnIndicator) for SST {sst}");
+        return Ok(dnn);
+    }
+    if named.len() == 1 {
+        let dnn = named[0]["dnn"].as_str().unwrap_or_default().to_string();
+        log::info!(
+            "subscribed default DNN '{dnn}' for SST {sst}: the only DNN subscribed for this \
+             S-NSSAI, and none carries defaultDnnIndicator"
+        );
+        return Ok(dnn);
+    }
+    Err(DefaultDnnError::AmbiguousDefault(
+        named
+            .iter()
+            .filter_map(|i| i["dnn"].as_str().map(String::from))
+            .collect(),
+    ))
+}
+
+/// The `Nudm_SDM_Get smf-select-data` request path.
+///
+/// **No `single-nssai` query parameter, deliberately.** TS 29.503 §5.2.2.2.1 lets a
+/// consumer scope the answer to one S-NSSAI, and doing so would be tidier — but the
+/// value is JSON, so on the wire it must be percent-encoded as an RFC 3986 query
+/// component, and this tree's shared SBI server stores query values **verbatim
+/// without decoding them** (`libs/nextgcore-sbi/src/server.rs:583`, which is the gap
+/// issue #65 names). So a percent-encoded `single-nssai` reaches the in-tree UDM as
+/// the literal `%7B%22sst%22...` and cannot be parsed, while sending it unencoded
+/// would be invalid on the wire. Neither is acceptable, and scoping is an
+/// optimisation rather than a correctness requirement: `select_default_dnn` picks the
+/// S-NSSAI's entry out of `subscribedSnssaiInfos` by key regardless. Add the
+/// parameter once #65 makes query decoding work.
+///
+/// Nudm_SDM is at **v2** (TS 29.503 §6.1.1), unlike the other Nudm services.
+fn smf_select_data_path(supi: &str, _sst: u8, _sd: Option<&str>) -> String {
+    format!(
+        "/nudm-sdm/v2/{supi}/{}",
+        nextgcore_sbi::constants::resource::SMF_SELECT_DATA
+    )
+}
+
+/// Nudm_SDM_Get (`smf-sel-data`) → the subscribed default DNN for this S-NSSAI
+/// (TS 29.503 §5.2.2.2, TS 23.501 §5.6.1).
+///
+/// Issue #204: called only when `SmContextCreateData` carries no `dnn`. The
+/// literal `"internet"` the AMF used to substitute meant any deployment whose
+/// subscribers do not all default to a DNN named `internet` attached DNN-less
+/// sessions to the WRONG data network — silently, since the session established
+/// fine against it.
+async fn fetch_subscribed_default_dnn(
+    supi: &str,
+    sst: u8,
+    sd: Option<&str>,
+) -> Result<String, DefaultDnnError> {
+    let (host, port) = discover_udm_sdm_endpoint()
+        .await
+        .ok_or(DefaultDnnError::NoUdmEndpoint)?;
+    let client = global_context().get_client(&host, port).await;
+
+    let path = smf_select_data_path(supi, sst, sd);
+    let response = client.get(&path).await.map_err(|e| {
+        DefaultDnnError::SdmRequestFailed(format!("Nudm_SDM_Get smf-select-data failed: {e}"))
+    })?;
+    if !response.is_success() {
+        return Err(DefaultDnnError::SdmRequestFailed(format!(
+            "Nudm_SDM_Get smf-select-data returned status {}",
+            response.status
+        )));
+    }
+    let body = response.http.content.as_deref().ok_or_else(|| {
+        DefaultDnnError::SdmRequestFailed("empty smf-select-data body".to_string())
+    })?;
+    let json: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        DefaultDnnError::SdmRequestFailed(format!("smf-select-data is not valid JSON: {e}"))
+    })?;
+    select_default_dnn(&json, sst, sd)
+}
+
 /// Parse host and port from a URI string (e.g., "http://localhost:7777")
 fn parse_host_port(uri: &str) -> Option<(String, u16)> {
     let without_scheme = uri
@@ -1951,10 +2236,13 @@ fn validate_sm_context_create_data(body: &serde_json::Value) -> Option<&'static 
     if !psi_ok {
         return Some("MANDATORY_IE_INCORRECT");
     }
-    // dnn (M for this SMF)
-    if body["dnn"].as_str().is_none() {
-        return Some("MANDATORY_IE_MISSING");
-    }
+    // `dnn` is OPTIONAL (TS 29.502 Table 6.1.6.2.2-1), and issue #204 stopped
+    // treating it as mandatory here: when the UE omits the DNN IE the AMF now
+    // omits the member, and the SMF resolves the SUBSCRIBED DEFAULT DNN from SM
+    // subscription data instead (`fetch_subscribed_default_dnn`). Rejecting it at
+    // this validator would make that unreachable. A present-but-empty `dnn` is
+    // still wrong, and is caught in the handler.
+    //
     // sNssai.sst (M)
     if body["sNssai"]["sst"].as_u64().is_none() {
         return Some("MANDATORY_IE_MISSING");
@@ -2001,9 +2289,6 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     else {
         return problem_400("MANDATORY_IE_INCORRECT", "pduSessionId (1..15) is required");
     };
-    let Some(dnn) = req_body["dnn"].as_str().map(str::to_string) else {
-        return problem_400("MANDATORY_IE_MISSING", "dnn is required");
-    };
     let Some(sst) = req_body["sNssai"]["sst"].as_u64().map(|v| v as u8) else {
         return problem_400("MANDATORY_IE_MISSING", "sNssai.sst is required");
     };
@@ -2028,6 +2313,35 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         );
     };
     let supi = supi.to_string();
+
+    // ---- DNN: the UE's, else the SUBSCRIBED DEFAULT (issue #204) ----
+    // `dnn` is optional in SmContextCreateData; when the UE omits the DNN IE the
+    // AMF omits the member, and TS 23.501 §5.6.1 says the network selects the
+    // SUBSCRIBED default DNN. The AMF used to substitute the literal `"internet"`,
+    // so any deployment whose subscribers do not all default to a DNN of that name
+    // attached DNN-less sessions to the WRONG data network -- wrong UPF, wrong
+    // policy and charging, wrong slice -- and silently, because the session
+    // established fine against it.
+    //
+    // Never falls back to a literal: an unresolvable default is a REFUSED session,
+    // which is what the SMF already did for an absent `dnn` before this change,
+    // and the cause names which of the four failure modes it was.
+    let dnn = match req_body["dnn"].as_str().filter(|d| !d.is_empty()) {
+        Some(d) => d.to_string(),
+        None => {
+            log::info!(
+                "[{supi}] SmContextCreateData carries no dnn — resolving the subscribed \
+                 default for SST {sst} (TS 23.501 §5.6.1)"
+            );
+            match fetch_subscribed_default_dnn(&supi, sst, snssai_sd.as_deref()).await {
+                Ok(d) => d,
+                Err(e) => {
+                    log::warn!("[{supi}] no DNN for this session: {}", e.detail());
+                    return problem_400(e.cause(), &e.detail());
+                }
+            }
+        }
+    };
     let an_type = req_body["anType"].as_str().unwrap_or_else(|| {
         log::warn!("SmContextCreateData without anType — assuming 3GPP_ACCESS");
         "3GPP_ACCESS"
@@ -4401,12 +4715,19 @@ mod tests {
             Some("MANDATORY_IE_INCORRECT")
         );
 
+        // #204: `dnn` is OPTIONAL (TS 29.502 Table 6.1.6.2.2-1), so its absence is
+        // NOT a validator failure — the handler resolves the subscribed default
+        // instead (TS 23.501 §5.6.1). Rejecting here would make that unreachable.
         let mut no_dnn = matched_sim.clone();
         no_dnn["dnn"] = serde_json::Value::Null;
         assert_eq!(
             validate_sm_context_create_data(&no_dnn),
-            Some("MANDATORY_IE_MISSING")
+            None,
+            "an absent dnn must reach the handler, which resolves the subscribed default"
         );
+        let mut absent_dnn = matched_sim.clone();
+        absent_dnn.as_object_mut().unwrap().remove("dnn");
+        assert_eq!(validate_sm_context_create_data(&absent_dnn), None);
 
         let mut no_sst = matched_sim.clone();
         no_sst["sNssai"] = serde_json::json!({});
@@ -4418,6 +4739,332 @@ mod tests {
         let mut no_n1 = matched_sim.clone();
         no_n1["n1SmMsg"] = serde_json::Value::Null;
         assert_eq!(validate_sm_context_create_data(&no_n1), Some("N1_SM_ERROR"));
+    }
+
+    // ------------------------------- #204 -------------------------------
+
+    /// **Issue #204.** The subscribed default DNN is selected from
+    /// `SmfSelectionSubscriptionData`'s `dnnInfos`, and nothing is invented when
+    /// the subscription does not say which DNN is the default.
+    ///
+    /// Note where the flag lives: `DnnInfo.defaultDnnIndicator` in `smf-sel-data`.
+    /// The issue's suggested approach said to read `sm-data`'s `dnnConfigurations`,
+    /// which has **no** default flag at all (TS 29.503 Table 5.5.2.4-1) — see the
+    /// `select_default_dnn` doc comment.
+    #[test]
+    fn select_default_dnn_uses_the_indicator_and_refuses_to_guess() {
+        // 1. The flagged entry wins, even when it is not first.
+        let flagged = serde_json::json!({
+            "subscribedSnssaiInfos": {
+                "01": { "dnnInfos": [
+                    { "dnn": "ims" },
+                    { "dnn": "operator-default", "defaultDnnIndicator": true },
+                    { "dnn": "internet" },
+                ]}
+            }
+        });
+        assert_eq!(
+            select_default_dnn(&flagged, 1, None),
+            Ok("operator-default".to_string()),
+            "the flagged DNN wins over position"
+        );
+        // Specifically NOT the literal the AMF used to substitute, which is the
+        // whole point of #204.
+        assert_ne!(select_default_dnn(&flagged, 1, None), Ok("internet".into()));
+
+        // 2. A single subscribed DNN with no flag is unambiguous.
+        let single = serde_json::json!({
+            "subscribedSnssaiInfos": { "01": { "dnnInfos": [{ "dnn": "corp" }] } }
+        });
+        assert_eq!(select_default_dnn(&single, 1, None), Ok("corp".to_string()));
+
+        // 3. Several DNNs and no flag: the subscription does not say, so the SMF
+        //    does not either. Guessing is the fabrication this issue removes.
+        let ambiguous = serde_json::json!({
+            "subscribedSnssaiInfos": {
+                "01": { "dnnInfos": [{ "dnn": "internet" }, { "dnn": "ims" }] }
+            }
+        });
+        match select_default_dnn(&ambiguous, 1, None) {
+            Err(DefaultDnnError::AmbiguousDefault(dnns)) => {
+                assert_eq!(dnns, vec!["internet".to_string(), "ims".to_string()]);
+            }
+            other => panic!("expected AmbiguousDefault, got {other:?}"),
+        }
+
+        // 4. No DNN at all for the S-NSSAI, and an S-NSSAI that is not subscribed.
+        for empty in [
+            serde_json::json!({}),
+            serde_json::json!({ "subscribedSnssaiInfos": {} }),
+            serde_json::json!({ "subscribedSnssaiInfos": { "01": {} } }),
+            serde_json::json!({ "subscribedSnssaiInfos": { "01": { "dnnInfos": [] } } }),
+            // A dnnInfos entry with no `dnn` member names nothing.
+            serde_json::json!({ "subscribedSnssaiInfos": { "01": { "dnnInfos": [{}] } } }),
+        ] {
+            assert_eq!(
+                select_default_dnn(&empty, 1, None),
+                Err(DefaultDnnError::NoSubscribedDnn),
+                "body {empty} must not yield a DNN"
+            );
+        }
+        assert_eq!(
+            select_default_dnn(&single, 9, None),
+            Err(DefaultDnnError::NoSubscribedDnn),
+            "SST 9 is not subscribed"
+        );
+
+        // 5. The key form is the TS 29.571 S-NSSAI string `{sst:02x}[-{sd}]`, and a
+        //    subscription provisioned without an SD still applies to a request that
+        //    carries one.
+        let with_sd = serde_json::json!({
+            "subscribedSnssaiInfos": {
+                "01-000001": { "dnnInfos": [{ "dnn": "slice-a" }] },
+                "01": { "dnnInfos": [{ "dnn": "no-sd" }] }
+            }
+        });
+        assert_eq!(
+            select_default_dnn(&with_sd, 1, Some("000001")),
+            Ok("slice-a".to_string()),
+            "the exact sst-sd key wins"
+        );
+        assert_eq!(
+            select_default_dnn(&with_sd, 1, Some("999999")),
+            Ok("no-sd".to_string()),
+            "an unmatched SD widens to the no-SD entry"
+        );
+    }
+
+    /// **Issue #204.** Every `DefaultDnnError` maps to a cause that distinguishes
+    /// "the consumer named no DNN and the subscription supplies none" from "the SMF
+    /// could not reach the subscription".
+    ///
+    /// Collapsing them would leave an operator unable to tell a provisioning gap
+    /// from an unreachable UDM, which are opposite remedies.
+    #[test]
+    fn default_dnn_error_causes_are_distinct_and_never_silent() {
+        assert_eq!(
+            DefaultDnnError::NoSubscribedDnn.cause(),
+            "MANDATORY_IE_MISSING"
+        );
+        assert_eq!(
+            DefaultDnnError::AmbiguousDefault(vec!["a".into(), "b".into()]).cause(),
+            "MANDATORY_IE_MISSING"
+        );
+        assert_eq!(
+            DefaultDnnError::NoUdmEndpoint.cause(),
+            "SUBSCRIPTION_DATA_NOT_AVAILABLE"
+        );
+        assert_eq!(
+            DefaultDnnError::SdmRequestFailed("boom".into()).cause(),
+            "SUBSCRIPTION_DATA_NOT_AVAILABLE"
+        );
+
+        // Every detail says which failure it was, and none of them says "internet".
+        for e in [
+            DefaultDnnError::NoUdmEndpoint,
+            DefaultDnnError::SdmRequestFailed("status 503".into()),
+            DefaultDnnError::NoSubscribedDnn,
+            DefaultDnnError::AmbiguousDefault(vec!["internet".into(), "ims".into()]),
+        ] {
+            let detail = e.detail();
+            assert!(!detail.is_empty());
+            assert!(
+                detail.contains("dnn") || detail.contains("DNN"),
+                "detail must name the DNN problem: {detail}"
+            );
+        }
+        assert!(
+            DefaultDnnError::AmbiguousDefault(vec!["internet".into(), "ims".into()])
+                .detail()
+                .contains("internet, ims")
+        );
+    }
+
+    /// **Issue #204.** A `nudm-sdm` endpoint is taken from the NRF `SearchResult`,
+    /// preferring the service's own `ipEndPoints` over the instance address.
+    #[test]
+    fn udm_sdm_endpoint_is_read_from_the_search_result() {
+        let result = serde_json::json!({
+            "nfInstances": [
+                // A UDM that does not serve nudm-sdm must be skipped, not used.
+                { "nfType": "UDM", "ipv4Addresses": ["10.0.0.1"],
+                  "nfServices": [{ "serviceName": "nudm-uecm",
+                                   "ipEndPoints": [{ "ipv4Address": "10.0.0.1", "port": 7777 }] }] },
+                { "nfType": "UDM", "ipv4Addresses": ["10.0.0.2"],
+                  "nfServices": [{ "serviceName": "nudm-sdm",
+                                   "ipEndPoints": [{ "ipv4Address": "10.0.0.9", "port": 8080 }] }] },
+            ]
+        });
+        assert_eq!(
+            udm_sdm_endpoint_from_search_result(&result),
+            Some(("10.0.0.9".to_string(), 8080)),
+            "the nudm-sdm service's own endpoint wins over the instance address"
+        );
+
+        // No ipEndPoints: fall back to the instance address and the default port.
+        let no_endpoints = serde_json::json!({
+            "nfInstances": [{ "nfType": "UDM", "ipv4Addresses": ["10.0.0.3"],
+                              "nfServices": [{ "serviceName": "nudm-sdm" }] }]
+        });
+        assert_eq!(
+            udm_sdm_endpoint_from_search_result(&no_endpoints),
+            Some(("10.0.0.3".to_string(), 7777))
+        );
+
+        // Nothing usable yields None rather than a guessed localhost.
+        for empty in [
+            serde_json::json!({}),
+            serde_json::json!({ "nfInstances": [] }),
+            serde_json::json!({ "nfInstances": [{ "nfType": "UDM" }] }),
+            serde_json::json!({ "nfInstances": [{ "nfType": "UDM",
+                "nfServices": [{ "serviceName": "nudm-uecm" }] }] }),
+        ] {
+            assert_eq!(
+                udm_sdm_endpoint_from_search_result(&empty),
+                None,
+                "body {empty} must not yield an endpoint"
+            );
+        }
+    }
+
+    /// Serialises the tests that set the process-global `UDM_SBI_ADDR` /
+    /// `UDM_SBI_PORT` / `NRF_URI` environment. Env is per-process, so two of these
+    /// running concurrently would each see the other's UDM address — the same
+    /// process-global-state race the workspace has hit before with `UDR_SBI_*`.
+    static UDM_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// **Issue #204, end to end.** `fetch_subscribed_default_dnn` really reaches a
+    /// UDM, sends a conformant `Nudm_SDM_Get smf-select-data` with a
+    /// percent-encoded `single-nssai`, and returns the flagged DNN.
+    ///
+    /// The pure-function test above proves the SELECTION; this proves the request
+    /// and the plumbing around it, which is the half a unit test cannot see.
+    #[tokio::test]
+    async fn fetch_subscribed_default_dnn_queries_the_udm_and_returns_the_flagged_dnn() {
+        let _guard = UDM_ENV_TEST_LOCK.lock().await;
+        // The stub UDM is a loopback PLAINTEXT peer, which describes a dev-profile
+        // deployment; the default profile is Production and would require client
+        // TLS material this test has no business inventing.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let port = nextgcore_sbi::test_support::free_port();
+        type Seen = (Vec<String>, Vec<std::collections::HashMap<String, String>>);
+        let seen: Arc<std::sync::Mutex<Seen>> =
+            Arc::new(std::sync::Mutex::new((Vec::new(), Vec::new())));
+        let seen_in_handler = Arc::clone(&seen);
+
+        let server =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            ));
+        server
+            .start(move |req: SbiRequest| {
+                let seen = Arc::clone(&seen_in_handler);
+                async move {
+                    let uri = req.header.uri.clone();
+                    {
+                        let mut s = seen.lock().unwrap();
+                        s.0.push(uri.clone());
+                        s.1.push(req.http.params.clone().into_iter().collect());
+                    }
+                    if uri.contains("/nudm-sdm/") && uri.contains("smf-select-data") {
+                        SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!({
+                                "subscribedSnssaiInfos": {
+                                    "01": { "dnnInfos": [
+                                        { "dnn": "internet" },
+                                        { "dnn": "operator-default", "defaultDnnIndicator": true },
+                                    ]}
+                                }
+                            }))
+                            .unwrap()
+                    } else {
+                        SbiResponse::with_status(404)
+                    }
+                }
+            })
+            .await
+            .expect("stub UDM start");
+
+        // Point the fallback at the stub. NRF discovery is tried first and will
+        // fail (nothing answers nnrf-disc here), which also exercises that the
+        // fallback really is reached rather than the discovery failure being fatal.
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", port.to_string());
+        std::env::remove_var("NRF_URI");
+
+        let dnn = fetch_subscribed_default_dnn("imsi-262011234567890", 1, None).await;
+        assert_eq!(
+            dnn,
+            Ok("operator-default".to_string()),
+            "the flagged subscribed default must be used, not the first entry \
+             and certainly not the old \"internet\" literal"
+        );
+
+        // The resource the UDM saw is the conformant one: v2 (Nudm_SDM is at v2 per
+        // TS 29.503 §6.1.1, unlike the other Nudm services) and `smf-select-data`.
+        // The server decodes the query into params, so the recorded URI carries no
+        // query string -- the ENCODING is pinned by
+        // `smf_select_data_path_percent_encodes_single_nssai` instead, and what is
+        // asserted here is that the value ARRIVED and decoded back to the S-NSSAI.
+        let (uris, params) = {
+            let s = seen.lock().unwrap();
+            (s.0.clone(), s.1.clone())
+        };
+        assert!(
+            uris.iter()
+                .any(|u| u == "/nudm-sdm/v2/imsi-262011234567890/smf-select-data"),
+            "the UDM must have been queried at the v2 smf-select-data resource, saw {uris:?}"
+        );
+        // And NO `single-nssai` is sent: the shared SBI server does not
+        // percent-decode query values (#65), so a JSON-valued parameter cannot
+        // round-trip to the in-tree UDM. Asserted rather than left implicit,
+        // because re-adding it would silently send an unparseable value.
+        assert!(
+            params.iter().all(|p| !p.contains_key("single-nssai")),
+            "no single-nssai until #65 makes query decoding work, saw {params:?}"
+        );
+
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        // Deliberately NOT reset_sbi_profile_override(): the override is
+        // process-wide, and resetting it here flipped `policy.rs`'s
+        // `sm_policy_lifecycle_http_round_trip` back to Production mid-flight and
+        // made it fail. Every other loopback-plaintext test in this crate sets the
+        // Dev override and leaves it set; matching that is what keeps them
+        // compatible.
+        server.stop().await.expect("stop");
+    }
+
+    /// **Issue #204, criterion 4.** A DNN-less create with no reachable UDM is
+    /// REFUSED with a cause that says so — never a silent `"internet"`.
+    #[tokio::test]
+    async fn dnn_less_create_with_no_udm_is_refused_not_defaulted() {
+        let _guard = UDM_ENV_TEST_LOCK.lock().await;
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        std::env::remove_var("NRF_URI");
+        smf_context_init(64, 256, 512);
+
+        let body = serde_json::json!({
+            "pduSessionId": 5,
+            "supi": "imsi-262011234567890",
+            "sNssai": { "sst": 1 },
+            "n1SmMsg": { "contentId": "n1SmMsg" },
+        });
+        let request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
+            .with_body(body.to_string(), "application/json");
+        let resp = handle_sm_context_create(&request).await;
+
+        assert_eq!(resp.status, 400, "an unresolvable DNN refuses the session");
+        let content = resp.http.content.as_deref().unwrap_or("");
+        assert!(
+            content.contains("SUBSCRIPTION_DATA_NOT_AVAILABLE"),
+            "the cause must name the real problem, got {content}"
+        );
+        assert!(
+            !content.contains("internet"),
+            "the refusal must not mention a fabricated default, got {content}"
+        );
     }
 
     // ----------------------------- smfd-07 ------------------------------

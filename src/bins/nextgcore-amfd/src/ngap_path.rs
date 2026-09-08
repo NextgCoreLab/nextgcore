@@ -3579,10 +3579,19 @@ impl NgapServer {
                     .get(&amf_ue_ngap_id)
                     .and_then(|s| s.amf_ue.allowed_nssai.first().map(|n| (n.sst, n.sd)))
                     .unwrap_or((1, None));
-                // DNN from the UE's UL NAS Transport DNN IE (e.g. "xr" for an
-                // XR session); fall back to "internet" for the legacy raw-5GSM
-                // path or when the UE omits the IE.
-                let dnn = dnn_override.unwrap_or("internet");
+                // DNN from the UE's UL NAS Transport DNN IE (e.g. "xr" for an XR
+                // session). Issue #204: when the UE omits the IE -- or on the
+                // legacy raw-5GSM path, which carries no DNN -- the member is
+                // OMITTED from SmContextCreateData rather than filled with the
+                // literal "internet". `dnn` is optional in TS 29.502 §6.1.6.2.2,
+                // and TS 23.501 §5.6.1 makes the SUBSCRIBED default the network's
+                // answer; the SMF owns that decision because it is the NF that
+                // retrieves SM subscription data (TS 23.501 §6.2.2). A literal
+                // here meant every deployment whose subscribers do not all default
+                // to a DNN named "internet" attached DNN-less sessions to the wrong
+                // data network, with the wrong UPF, policy, charging and slice --
+                // and silently, because the session established.
+                let dnn = dnn_override;
 
                 // RedCap indication: propagate the UE's Reduced-Capability
                 // status (parsed at registration in gmm_handler) to the SMF so
