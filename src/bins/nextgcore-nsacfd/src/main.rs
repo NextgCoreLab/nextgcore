@@ -588,7 +588,85 @@ struct UeACRequestInfo {
     /// [`AccessType::from_an_type`] (nsacf-05 accept-and-default).
     #[serde(default)]
     an_type: Option<String>,
+    /// `additionalAnType` (TS 29.536 Table 6.1.6.2.9-1) — the SECOND access a UE
+    /// is registered over, so a UE attached over both 3GPP and non-3GPP access is
+    /// recorded on both and survives a DECREASE on one (§5.2.2.2.2). Never
+    /// deserialised before #95, so a dual-access UE was modelled as single-access
+    /// and deregistered on its first release.
+    #[serde(default)]
+    additional_an_type: Option<String>,
+    /// Roaming information elements (TS 29.536 Table 6.1.6.2.9-1). Parsed and
+    /// logged so a roaming request round-trips and is diagnosable; they do not yet
+    /// drive per-PLMN quota selection — see the spec's Ceilings.
+    #[serde(default)]
+    plmn_id: Option<serde_json::Value>,
+    #[serde(default)]
+    plmn_id_nid: Option<serde_json::Value>,
+    #[serde(default)]
+    ue_reg_ind: Option<bool>,
+    #[serde(default)]
+    serving_plmn_id: Option<serde_json::Value>,
+    #[serde(default)]
+    nsac_mode: Option<String>,
+    #[serde(default)]
+    number_exceed_info: Option<serde_json::Value>,
     acu_operation_list: Vec<AcuOperationItem>,
+}
+
+impl UeACRequestInfo {
+    /// The access set this request names: `anType` (defaulting to 3GPP when
+    /// absent, per nsacf-05) plus `additionalAnType` when present.
+    ///
+    /// Never empty — an absent `anType` defaults rather than yielding nothing, so
+    /// the `ues` <-> `ue_access` invariant cannot be broken by a sparse request.
+    fn access_set(&self) -> AccessSet {
+        let mut set = AccessSet::single(AccessType::from_an_type(self.an_type.as_deref()));
+        if let Some(additional) = self.additional_an_type.as_deref() {
+            // `from_an_type` defaults an unknown string to 3GPP; for the ADDITIONAL
+            // access that default is wrong -- it would silently claim a 3GPP
+            // registration the consumer never asserted. Only the two spelled
+            // TS 29.571 values are honoured here.
+            match additional {
+                "3GPP_ACCESS" => set.insert(AccessType::ThreeGpp),
+                "NON_3GPP_ACCESS" => set.insert(AccessType::NonThreeGpp),
+                other => log::warn!(
+                    "[{}] ignoring unrecognised additionalAnType {other:?} \
+                     (expected 3GPP_ACCESS or NON_3GPP_ACCESS)",
+                    self.supi
+                ),
+            }
+        }
+        set
+    }
+
+    /// The access set a **DECREASE** should release.
+    ///
+    /// When the request names no access at all — neither `anType` nor
+    /// `additionalAnType` — EVERY access is released rather than the 3GPP default.
+    /// This is load-bearing for backward compatibility, and it is the one place
+    /// where the nsacf-05 accept-and-default rule must NOT simply be reused:
+    /// before #95 a DECREASE removed the whole registration entry, so an
+    /// access-unaware consumer that omits `anType` would, under a plain default to
+    /// 3GPP, leave a UE registered over non-3GPP **forever** — the mirror image of
+    /// the premature-removal bug this issue fixes. A consumer that names an access
+    /// is stating which one it is deregistering and gets exactly that.
+    fn release_set(&self) -> AccessSet {
+        if self.an_type.is_none() && self.additional_an_type.is_none() {
+            AccessSet::all()
+        } else {
+            self.access_set()
+        }
+    }
+
+    /// Whether this request carries any roaming IE, for the log line.
+    fn has_roaming_info(&self) -> bool {
+        self.plmn_id.is_some()
+            || self.plmn_id_nid.is_some()
+            || self.ue_reg_ind.is_some()
+            || self.serving_plmn_id.is_some()
+            || self.nsac_mode.is_some()
+            || self.number_exceed_info.is_some()
+    }
 }
 
 /// UeACRequestData (TS 29.536 §6.1.6.2.2). `nfId` is mandatory (nsacf-09): a
@@ -629,8 +707,40 @@ struct PduACRequestData {
     // `pduACRequestInfo`, not serde's default `pduAcRequestInfo`.
     #[serde(rename = "pduACRequestInfo")]
     pdu_ac_request_info: Vec<PduACRequestInfo>,
-    /// NF instance id of the requesting consumer (M, TS 29.536 §6.1.6.2.7).
-    nf_id: String,
+    /// `nfId` — **OPTIONAL** here (#95). TS 29.536 Table 6.1.6.2.7-1 lists
+    /// `pduACRequestInfo` as the only required attribute of `PduACRequestData`;
+    /// `nfId`, `pgwFqdn`, `nsacServiceArea` and `supportedFeatures` are all
+    /// optional. It was a non-`Option` `String` here, so a conformant SMF/PGW-C
+    /// that identifies itself by `pgwFqdn` was turned away with
+    /// `400 MANDATORY_IE_MISSING` and PDU-session number control silently failed
+    /// against off-the-shelf core NFs.
+    ///
+    /// Note the asymmetry with [`UeACRequestData`], which is deliberate and
+    /// correct: `nfId` IS mandatory there (nsacf-09), so that one stays required.
+    #[serde(default)]
+    nf_id: Option<String>,
+    /// `pgwFqdn` — the requester's PGW-C/SMF FQDN, the fallback identity when a
+    /// consumer omits `nfId` (TS 29.536 Table 6.1.6.2.7-1).
+    #[serde(default)]
+    pgw_fqdn: Option<String>,
+    /// `nsacServiceArea` — the NSAC service area the request applies to.
+    #[serde(default)]
+    nsac_service_area: Option<serde_json::Value>,
+    /// `supportedFeatures` — TS 29.571 `SupportedFeatures` bitmap string.
+    #[serde(default)]
+    supported_features: Option<String>,
+}
+
+impl PduACRequestData {
+    /// How to name the requester in a log line: `nfId` if given, else `pgwFqdn`,
+    /// else an explicit marker. Never a fabricated identity — the point of #95 is
+    /// that a consumer may legitimately supply neither.
+    fn requester(&self) -> &str {
+        self.nf_id
+            .as_deref()
+            .or(self.pgw_fqdn.as_deref())
+            .unwrap_or("unidentified consumer")
+    }
 }
 
 /// AcuFailureReason (TS 29.536 §6.1.6.3.5). The aggregate strings plus the
@@ -793,6 +903,17 @@ where
     Deserialize::deserialize(de).map(Some)
 }
 
+/// Render an [`AccessSet`] for a log line, e.g. `3GPP_ACCESS+NON_3GPP_ACCESS`.
+fn access_set_str(set: AccessSet) -> String {
+    if set.is_empty() {
+        return "<none>".to_string();
+    }
+    set.iter()
+        .map(AccessType::as_str)
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 /// Parse a request body of type `T` (UeACRequestData / PduACRequestData),
 /// mapping a missing mandatory field to `MANDATORY_IE_MISSING` and any other
 /// shape/value error to `INVALID_MSG_FORMAT`.
@@ -896,8 +1017,22 @@ async fn handle_ue_ac_update(request: &SbiRequest) -> SbiResponse {
     let mut total_ops = 0usize;
     for info in &req.ue_ac_request_info {
         // anType is mandatory in the spec; an absent value defaults to 3GPP
-        // (nsacf-05 accept-and-default).
-        let access = AccessType::from_an_type(info.an_type.as_deref());
+        // (nsacf-05 accept-and-default). #95: `additionalAnType` joins it, so a
+        // dual-access UE is recorded on both accesses.
+        let accesses = info.access_set();
+        if info.has_roaming_info() {
+            log::debug!(
+                "[{}] UE AC carries roaming info: plmnId={:?} plmnIdNid={:?} ueRegInd={:?} \
+                 servingPlmnId={:?} nsacMode={:?} numberExceedInfo={:?}",
+                info.supi,
+                info.plmn_id,
+                info.plmn_id_nid,
+                info.ue_reg_ind,
+                info.serving_plmn_id,
+                info.nsac_mode,
+                info.number_exceed_info
+            );
+        }
         for op in &info.acu_operation_list {
             total_ops += 1;
             let s_nssai = &op.snssai.0;
@@ -907,12 +1042,12 @@ async fn handle_ue_ac_update(request: &SbiRequest) -> SbiResponse {
                 op.update_flag,
                 s_nssai.sst,
                 s_nssai.sd,
-                access.as_str()
+                access_set_str(accesses)
             );
             match op.update_flag.as_str() {
                 "INCREASE" => {
                     let (result, eac) =
-                        with_nsacf_context(|c| c.admit_ue(s_nssai, &info.supi, access))
+                        with_nsacf_context(|c| c.admit_ue(s_nssai, &info.supi, accesses))
                             .unwrap_or((AdmissionResult::RejectedSliceNotAvailable, None));
                     match result {
                         AdmissionResult::Admitted => {
@@ -930,8 +1065,9 @@ async fn handle_ue_ac_update(request: &SbiRequest) -> SbiResponse {
                     }
                 }
                 "UPDATE" => {
-                    // Move the UE between 3GPP/N3GPP buckets (nsacf-06).
-                    match with_nsacf_context(|c| c.update_ue_access(s_nssai, &info.supi, access))
+                    // Set the UE's access set to exactly what the request names
+                    // (nsacf-06, generalised to a set by #95).
+                    match with_nsacf_context(|c| c.update_ue_access(s_nssai, &info.supi, accesses))
                         .unwrap_or(UpdateOutcome::NotFound)
                     {
                         UpdateOutcome::Updated => spawn_event_reports(s_nssai),
@@ -946,13 +1082,33 @@ async fn handle_ue_ac_update(request: &SbiRequest) -> SbiResponse {
                 // DECREASE (validate_flags guarantees the only remaining flag).
                 // nsacf-10: clean release / idempotent member-absent → success;
                 // S-NSSAI not NSAC-subject → SLICE_NOT_FOUND failure.
-                _ => match with_nsacf_context(|c| c.release_ue(s_nssai, &info.supi))
-                    .unwrap_or(ReleaseOutcome::SliceNotFound)
+                _ => match with_nsacf_context(|c| {
+                    c.release_ue(s_nssai, &info.supi, info.release_set())
+                })
+                .unwrap_or(ReleaseOutcome::SliceNotFound)
                 {
                     ReleaseOutcome::Released(eac) => {
                         if let Some(eac) = eac {
                             spawn_eac_notifications(eac);
                         }
+                        spawn_event_reports(s_nssai);
+                    }
+                    // #95: the UE is still registered over another access, so the
+                    // aggregate count is unchanged and there is no EAC transition
+                    // to report -- but the PER-ACCESS counts moved, so subscribers
+                    // watching those still need the event report.
+                    ReleaseOutcome::AccessReleased => {
+                        log::debug!(
+                            "[{}] released {} but still registered on {} -- entry kept \
+                             (TS 29.536 §5.2.2.2.2)",
+                            info.supi,
+                            access_set_str(accesses),
+                            with_nsacf_context(|c| c
+                                .quota_find_by_snssai(s_nssai)
+                                .map(|q| access_set_str(q.ue_access_set(&info.supi))))
+                            .flatten()
+                            .unwrap_or_else(|| "<unknown>".to_string())
+                        );
                         spawn_event_reports(s_nssai);
                     }
                     ReleaseOutcome::MemberAbsent => { /* idempotent: counts as admitted */ }
@@ -997,7 +1153,14 @@ async fn handle_pdu_ac_update(request: &SbiRequest) -> SbiResponse {
         }
     }
 
-    log::debug!("PDU AC request from nfId={}", req.nf_id);
+    // #95: the requester may identify itself by nfId OR pgwFqdn OR neither, so
+    // the log line names whichever was supplied rather than assuming nfId.
+    log::debug!(
+        "PDU AC request from {} (nsacServiceArea={:?} supportedFeatures={:?})",
+        req.requester(),
+        req.nsac_service_area,
+        req.supported_features
+    );
     let mut failures: Vec<AcFailure> = Vec::new();
     let mut total_ops = 0usize;
     for info in &req.pdu_ac_request_info {
@@ -1047,9 +1210,15 @@ async fn handle_pdu_ac_update(request: &SbiRequest) -> SbiResponse {
                 _ => match with_nsacf_context(|c| c.release_pdu_session(s_nssai, &session_key))
                     .unwrap_or(ReleaseOutcome::SliceNotFound)
                 {
-                    ReleaseOutcome::Released(_) | ReleaseOutcome::MemberAbsent => {
-                        spawn_event_reports(s_nssai)
-                    }
+                    // `AccessReleased` cannot arise here: a PDU session has ONE
+                    // access type (`pdu_access` is still a single `AccessType` per
+                    // session key), so releasing it always removes the session.
+                    // Matched explicitly rather than by `_` so that giving PDU
+                    // sessions a multi-access model later is a compile error here
+                    // instead of a silently-dropped report.
+                    ReleaseOutcome::Released(_)
+                    | ReleaseOutcome::AccessReleased
+                    | ReleaseOutcome::MemberAbsent => spawn_event_reports(s_nssai),
                     ReleaseOutcome::SliceNotFound => failures.push(AcFailure::new(
                         &info.supi,
                         s_nssai,
@@ -1188,6 +1357,15 @@ async fn handle_slice_quota_get(quota_id: &str) -> SbiResponse {
                 "maxPduSessions": quota.max_pdu_sessions,
                 "currentUes": quota.current_ues(),
                 "currentPduSessions": quota.current_pdu_sessions(),
+                // #95: the per-access registered counts moved here from the
+                // roaming-quotas response, which is now the spec's
+                // `QuotaUpdateResponseData` and carries only the ceilings. This is
+                // the admin-only inspection resource, so it is the right home --
+                // and without it there is no wire-observable way to check that a
+                // dual-access UE is counted in both buckets while counting once
+                // against the aggregate.
+                "currentUes3gpp": quota.current_ues_access(AccessType::ThreeGpp),
+                "currentUesN3gpp": quota.current_ues_access(AccessType::NonThreeGpp),
                 "utilization": quota.ue_utilization(),
                 "eacActive": quota.eac_active(),
             }))
@@ -1264,6 +1442,12 @@ async fn handle_utilization_report() -> SbiResponse {
 // vendored OpenAPI does not include TS29536_Nnsacf_*.yaml).
 // ---------------------------------------------------------------------------
 
+/// Ceilings applied to a slice that `ACUpdateData` did not name and that had no
+/// prior quota. Only reachable for a brand-new S-NSSAI: an existing quota keeps
+/// its own value (see `handle_local_configs_update`).
+const DEFAULT_MAX_UES: u64 = 10000;
+const DEFAULT_MAX_PDU_SESSIONS: u64 = 50000;
+
 /// Parse the optional per-access-type ceilings from a config object.
 fn parse_access_limits(v: &serde_json::Value) -> AccessLimits {
     AccessLimits {
@@ -1274,164 +1458,233 @@ fn parse_access_limits(v: &serde_json::Value) -> AccessLimits {
     }
 }
 
-/// Render a slice quota as a LocalConfigurations entry (only the per-access
-/// ceilings that are actually set are emitted).
-fn local_config_json(q: &SliceQuota) -> serde_json::Value {
-    let mut obj = serde_json::json!({
-        "snssai": q.s_nssai.to_json(),
-        "maxUes": q.max_ues,
-        "maxPduSessions": q.max_pdu_sessions,
-    });
-    for (key, val) in [
-        ("maxUes3gpp", q.max_ues_3gpp),
-        ("maxUesN3gpp", q.max_ues_n3gpp),
-        ("maxPdu3gpp", q.max_pdu_3gpp),
-        ("maxPduN3gpp", q.max_pdu_n3gpp),
-    ] {
-        if let Some(v) = val {
-            obj[key] = serde_json::json!(v);
-        }
+/// Per-access ceilings from the request, falling back **per field** to whatever
+/// the existing quota holds.
+///
+/// #95: this matters because `ACUpdateData` is a single object rather than a
+/// full-configuration array, so an update that names only `maxUesNumber` must not
+/// erase per-access ceilings a previous call installed. `parse_access_limits`
+/// alone would return all-`None` and silently disable per-access enforcement.
+fn parse_access_limits_or_keep(
+    v: &serde_json::Value,
+    existing: Option<&SliceQuota>,
+) -> AccessLimits {
+    let requested = parse_access_limits(v);
+    AccessLimits {
+        max_ues_3gpp: requested
+            .max_ues_3gpp
+            .or_else(|| existing.and_then(|q| q.max_ues_3gpp)),
+        max_ues_n3gpp: requested
+            .max_ues_n3gpp
+            .or_else(|| existing.and_then(|q| q.max_ues_n3gpp)),
+        max_pdu_3gpp: requested
+            .max_pdu_3gpp
+            .or_else(|| existing.and_then(|q| q.max_pdu_3gpp)),
+        max_pdu_n3gpp: requested
+            .max_pdu_n3gpp
+            .or_else(|| existing.and_then(|q| q.max_pdu_n3gpp)),
     }
-    obj
+}
+
+/// Parse a TS 29.571 `PlmnId` (`{mcc, mnc}`), rejecting anything that does not
+/// actually name a PLMN. Both members are mandatory in `PlmnId` itself, so a
+/// `{}` or a `null` is not a PLMN and must not satisfy a mandatory `plmnId` IE.
+fn plmn_id_from_json(v: &serde_json::Value) -> Option<PlmnId> {
+    let mcc = v.get("mcc")?.as_str()?;
+    let mnc = v.get("mnc")?.as_str()?;
+    if mcc.is_empty() || mnc.is_empty() {
+        return None;
+    }
+    Some(PlmnId {
+        mcc: mcc.to_string(),
+        mnc: mnc.to_string(),
+    })
+}
+
+/// Decode the JSON body of a custom operation, or the `ProblemDetails` to return.
+#[allow(clippy::result_large_err)] // SbiResponse is the natural error type here
+fn custom_op_body(request: &SbiRequest) -> Result<serde_json::Value, SbiResponse> {
+    let Some(content) = request.http.content.as_deref() else {
+        return Err(problem_details(
+            400,
+            "Bad Request",
+            "Missing mandatory request body",
+            Some("MANDATORY_IE_MISSING"),
+        ));
+    };
+    serde_json::from_str(content).map_err(|e| {
+        problem_details(
+            400,
+            "Bad Request",
+            &format!("Invalid JSON: {e}"),
+            Some("INVALID_MSG_FORMAT"),
+        )
+    })
 }
 
 /// POST /nnsacf-nsac/v1/slices/local-configs/update  (TS 29.536 §6.1.3.4)
 ///
-/// Update the local NSAC configuration (per-slice max UEs / PDU sessions and
-/// optional per-access ceilings). Memberships of existing quotas are preserved.
+/// Request: `ACUpdateData` — `snssai` (M), `maxUesNumber` (O), `maxPdusNumber`
+/// (O). Response: **204 No Content with an empty body** (TS 29.536 §5.2.2.5.2).
+///
+/// #95 replaced a bespoke wire: it required a `localConfigurations` **array**
+/// envelope with `maxUes` / `maxPduSessions`, and answered `200` with a
+/// `{localConfigurations, supportedFeatures}` body. An OSS/BSS or OAM system
+/// driving slice UE/PDU limits speaks `ACUpdateData` and would not have
+/// interworked with either half of that.
+///
+/// Memberships of an existing quota are preserved across the update.
 async fn handle_local_configs_update(request: &SbiRequest) -> SbiResponse {
-    log::info!("LocalConfigurations update");
+    log::info!("LocalConfigurations update (ACUpdateData)");
 
-    let data: serde_json::Value = match &request.http.content {
-        Some(content) => match serde_json::from_str(content) {
-            Ok(v) => v,
-            Err(e) => {
-                return problem_details(
-                    400,
-                    "Bad Request",
-                    &format!("Invalid JSON: {e}"),
-                    Some("INVALID_MSG_FORMAT"),
-                )
-            }
-        },
-        None => {
-            return problem_details(
-                400,
-                "Bad Request",
-                "Missing mandatory request body",
-                Some("MANDATORY_IE_MISSING"),
-            )
-        }
+    let data = match custom_op_body(request) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
-    let configs = match data.get("localConfigurations").and_then(|v| v.as_array()) {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            return problem_details(
-                400,
-                "Bad Request",
-                "Missing mandatory attribute: localConfigurations",
-                Some("MANDATORY_IE_MISSING"),
-            )
-        }
+    // `snssai` is the ONLY mandatory member; a missing or malformed one is
+    // 400 MANDATORY_IE_MISSING.
+    let Some(s_nssai) = data.get("snssai").and_then(SNssai::from_json) else {
+        return problem_details(
+            400,
+            "Bad Request",
+            "Missing/invalid mandatory attribute: snssai",
+            Some("MANDATORY_IE_MISSING"),
+        );
     };
 
-    let mut applied: Vec<serde_json::Value> = Vec::new();
-    for cfg in configs {
-        let s_nssai = match cfg.get("snssai").and_then(SNssai::from_json) {
-            Some(s) => s,
-            None => {
-                return problem_details(
-                    400,
-                    "Bad Request",
-                    "Missing/invalid mandatory attribute snssai in localConfigurations",
-                    Some("MANDATORY_IE_MISSING"),
-                )
-            }
-        };
-        let max_ues = cfg.get("maxUes").and_then(|v| v.as_u64()).unwrap_or(10000);
-        let max_pdu = cfg
-            .get("maxPduSessions")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(50000);
-        let limits = parse_access_limits(cfg);
-        if let Some(quota) =
-            with_nsacf_context(|c| c.quota_update_or_add(s_nssai.clone(), max_ues, max_pdu, limits))
-                .flatten()
-        {
-            applied.push(local_config_json(&quota));
+    // `maxUesNumber` / `maxPdusNumber` are OPTIONAL. When omitted for a slice
+    // that already has a quota, its current ceiling is KEPT rather than reset to
+    // a default -- an ACUpdateData that names only `maxPdusNumber` must not
+    // silently widen the UE ceiling to 10000. Only a brand-new slice falls back
+    // to the defaults.
+    let existing = with_nsacf_context(|c| c.quota_find_by_snssai(&s_nssai)).flatten();
+    let max_ues = data
+        .get("maxUesNumber")
+        .and_then(|v| v.as_u64())
+        .or_else(|| existing.as_ref().map(|q| q.max_ues))
+        .unwrap_or(DEFAULT_MAX_UES);
+    let max_pdu = data
+        .get("maxPdusNumber")
+        .and_then(|v| v.as_u64())
+        .or_else(|| existing.as_ref().map(|q| q.max_pdu_sessions))
+        .unwrap_or(DEFAULT_MAX_PDU_SESSIONS);
+
+    // Per-access ceilings are a NextGCore extension (nsacf-05), not part of
+    // `ACUpdateData`. They are read from the same object as additional optional
+    // members so the capability the bespoke envelope offered is not lost by
+    // becoming conformant; a consumer that sends none is unaffected, and an
+    // existing quota keeps the ceilings it has.
+    let limits = parse_access_limits_or_keep(&data, existing.as_ref());
+
+    match with_nsacf_context(|c| c.quota_update_or_add(s_nssai.clone(), max_ues, max_pdu, limits))
+        .flatten()
+    {
+        Some(quota) => {
+            log::info!(
+                "LocalConfigurations applied: S-NSSAI[SST:{} SD:{:?}] maxUes={} maxPdus={}",
+                quota.s_nssai.sst,
+                quota.s_nssai.sd,
+                quota.max_ues,
+                quota.max_pdu_sessions
+            );
+            // §5.2.2.5.2: 204 with NO body. `SbiResponse::with_status` sets no
+            // content, which is what makes this an empty body rather than "null".
+            SbiResponse::with_status(204)
         }
+        None => problem_details(
+            500,
+            "Internal Server Error",
+            "Failed to apply the local NSAC configuration",
+            Some("INTERNAL_ERROR"),
+        ),
     }
-
-    SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({
-            "localConfigurations": applied,
-            "supportedFeatures": SUPPORTED_FEATURES,
-        }))
-        .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
 /// POST /nnsacf-nsac/v1/slices/roaming-quotas/query  (TS 29.536 §6.1.3.5)
 ///
-/// Query the roaming quotas held by this (central/primary HPLMN) NSACF. An
-/// optional `snssais` filter narrows the result; absent => all configured
-/// slices.
+/// Request: `QuotaUpdateRequestData` — `snssai`, `plmnId` and `quotaType` all
+/// **required**. Response: `200` + `QuotaUpdateResponseData`
+/// `{snssai, maxUesNumber, maxPdusNumber}` (TS 29.536 §5.2.2.6.2 / §5.3.2.4.1).
+///
+/// #95 replaced a bespoke wire: the body was optional, the three mandatory IEs
+/// were ignored, a non-spec `snssais` **array** acted as a filter, and the
+/// response was `{roamingQuotas: [...], supportedFeatures}`. A partner HPLMN
+/// NSACF exchanging roaming quotas speaks the 3GPP shapes and would not have
+/// interworked.
 async fn handle_roaming_quotas_query(request: &SbiRequest) -> SbiResponse {
-    log::info!("RoamingQuotas query");
+    log::info!("RoamingQuotas update (QuotaUpdateRequestData)");
 
-    // Body is optional for the query op; tolerate an empty/absent body.
-    let data: serde_json::Value = match &request.http.content {
-        Some(content) if !content.trim().is_empty() => match serde_json::from_str(content) {
-            Ok(v) => v,
-            Err(e) => {
-                return problem_details(
-                    400,
-                    "Bad Request",
-                    &format!("Invalid JSON: {e}"),
-                    Some("INVALID_MSG_FORMAT"),
-                )
-            }
-        },
-        _ => serde_json::Value::Null,
+    let data = match custom_op_body(request) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
-    let filter: Vec<SNssai> = data
-        .get("snssais")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(SNssai::from_json).collect())
-        .unwrap_or_default();
-
-    let quotas = with_nsacf_context(|c| {
-        if filter.is_empty() {
-            c.quotas_snapshot()
-        } else {
-            filter
-                .iter()
-                .filter_map(|s| c.quota_find_by_snssai(s))
-                .collect()
+    let Some(s_nssai) = data.get("snssai").and_then(SNssai::from_json) else {
+        return problem_details(
+            400,
+            "Bad Request",
+            "Missing/invalid mandatory attribute: snssai",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
+    // `plmnId` must be present and must be a PLMN (mcc+mnc), not any JSON value:
+    // a body carrying `"plmnId": null` or `{}` is naming no PLMN, and accepting it
+    // would make the mandatory IE decorative.
+    let plmn_id = match data.get("plmnId").and_then(plmn_id_from_json) {
+        Some(p) => p,
+        None => {
+            return problem_details(
+                400,
+                "Bad Request",
+                "Missing/invalid mandatory attribute: plmnId",
+                Some("MANDATORY_IE_MISSING"),
+            )
         }
-    })
-    .unwrap_or_default();
+    };
+    // `quotaType` presence is mandated and enforced; its VALUE is not constrained.
+    // TS 29.536's `QuotaType` enumeration is not in the vendored OpenAPI set (see
+    // the module header), and inventing an allowed-value list would risk rejecting
+    // a conformant peer -- which is gap 1 of this very issue committed in a new
+    // place. So: reject absent or empty, accept and log any spelling.
+    let Some(quota_type) = data
+        .get("quotaType")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return problem_details(
+            400,
+            "Bad Request",
+            "Missing/invalid mandatory attribute: quotaType",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
 
-    let roaming_quotas: Vec<serde_json::Value> = quotas
-        .iter()
-        .map(|q| {
-            serde_json::json!({
-                "snssai": q.s_nssai.to_json(),
-                "maxUes": q.max_ues,
-                "currentUes": q.current_ues(),
-                "maxPduSessions": q.max_pdu_sessions,
-                "currentPduSessions": q.current_pdu_sessions(),
-                "currentUes3gpp": q.current_ues_access(AccessType::ThreeGpp),
-                "currentUesN3gpp": q.current_ues_access(AccessType::NonThreeGpp),
-            })
-        })
-        .collect();
+    let Some(quota) = with_nsacf_context(|c| c.quota_find_by_snssai(&s_nssai)).flatten() else {
+        return problem_details(
+            404,
+            "Not Found",
+            "No NSAC quota is configured for the requested S-NSSAI",
+            Some("QUOTA_NOT_FOUND"),
+        );
+    };
+
+    log::info!(
+        "RoamingQuotas: S-NSSAI[SST:{} SD:{:?}] plmn={}-{} quotaType={} -> maxUes={} maxPdus={}",
+        s_nssai.sst,
+        s_nssai.sd,
+        plmn_id.mcc,
+        plmn_id.mnc,
+        quota_type,
+        quota.max_ues,
+        quota.max_pdu_sessions
+    );
 
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::json!({
-            "roamingQuotas": roaming_quotas,
-            "supportedFeatures": SUPPORTED_FEATURES,
+            "snssai": quota.s_nssai.to_json(),
+            "maxUesNumber": quota.max_ues,
+            "maxPdusNumber": quota.max_pdu_sessions,
         }))
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
@@ -2487,7 +2740,11 @@ nsacf:
         server.stop().await.expect("stop");
     }
 
-    async fn create_quota(client: &SbiClient, sst: u8, max_ues: u64, max_pdu: u64) {
+    /// Create a slice quota via the admin extension, returning its `quotaId` so a
+    /// test can `GET /slice-quotas/{id}` to inspect membership counts (#95: the
+    /// per-access counts live there now that `roaming-quotas` carries the spec's
+    /// `QuotaUpdateResponseData`, which has ceilings only).
+    async fn create_quota(client: &SbiClient, sst: u8, max_ues: u64, max_pdu: u64) -> String {
         let resp = client
             .post_json(
                 "/nnsacf-nsac/v1/slice-quotas",
@@ -2496,6 +2753,39 @@ nsacf:
             .await
             .expect("quota create");
         assert_eq!(resp.status, 201);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        v["quotaId"].as_str().expect("quotaId").to_string()
+    }
+
+    /// Read a quota's membership state from the admin extension.
+    async fn get_quota(client: &SbiClient, quota_id: &str) -> serde_json::Value {
+        let resp = client
+            .get(&format!("/nnsacf-nsac/v1/slice-quotas/{quota_id}"))
+            .await
+            .expect("quota get");
+        assert_eq!(resp.status, 200);
+        serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap()
+    }
+
+    /// A spec `ACUpdateData` body (TS 29.536 §5.2.2.5.2), optionally carrying the
+    /// NextGCore per-access ceiling extension.
+    fn ac_update_data(sst: u8, max_ues: u64, max_pdu: u64) -> serde_json::Value {
+        json!({
+            "snssai": {"sst": sst},
+            "maxUesNumber": max_ues,
+            "maxPdusNumber": max_pdu,
+        })
+    }
+
+    /// A spec `QuotaUpdateRequestData` body (TS 29.536 §5.2.2.6.2): all three
+    /// members are required.
+    fn quota_update_request(sst: u8) -> serde_json::Value {
+        json!({
+            "snssai": {"sst": sst},
+            "plmnId": {"mcc": "262", "mnc": "01"},
+            "quotaType": "NUM_OF_UES",
+        })
     }
 
     /// Build a single-UE, single-op UeACRequestData body (TS 29.536 §6.1.6.2.2).
@@ -3426,21 +3716,24 @@ nsacf:
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Provision per-access ceilings via the local-configs custom op: 1 UE
-        // per access, aggregate room for 10.
+        // per access, aggregate room for 10. #95: the request is now a spec
+        // `ACUpdateData` object and the response is 204 with no body, so the
+        // ceilings are read back from the admin resource instead.
         let resp = client
             .post_json(
                 "/nnsacf-nsac/v1/slices/local-configs/update",
-                &json!({"localConfigurations": [{
-                    "snssai": {"sst": 90}, "maxUes": 10, "maxPduSessions": 50,
+                &json!({
+                    "snssai": {"sst": 90}, "maxUesNumber": 10, "maxPdusNumber": 50,
                     "maxUes3gpp": 1, "maxUesN3gpp": 1
-                }]}),
+                }),
             )
             .await
             .expect("response");
-        assert_eq!(resp.status, 200);
-        let v: serde_json::Value =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(v["localConfigurations"][0]["maxUes3gpp"], 1);
+        assert_eq!(resp.status, 204);
+        assert!(
+            resp.http.content.as_deref().unwrap_or("").is_empty(),
+            "§5.2.2.5.2 requires an EMPTY body"
+        );
 
         // First 3GPP UE admits -> the 3GPP bucket is now full (1/1).
         let resp = client
@@ -3492,7 +3785,7 @@ nsacf:
     async fn test_http_ue_update_moves_access_bucket() {
         let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
-        create_quota(&client, 91, 10, 100).await;
+        let quota_id = create_quota(&client, 91, 10, 100).await;
 
         // Admit imsi-91 on 3GPP.
         let resp = client
@@ -3517,20 +3810,13 @@ nsacf:
             .expect("response");
         assert_eq!(resp.status, 204, "UPDATE of a known member -> 204");
 
-        // roaming-quotas/query confirms: aggregate unchanged (1), 3GPP=0, N3GPP=1.
-        let resp = client
-            .post_json(
-                "/nnsacf-nsac/v1/slices/roaming-quotas/query",
-                &json!({"snssais": [{"sst": 91}]}),
-            )
-            .await
-            .expect("response");
-        assert_eq!(resp.status, 200);
-        let v: serde_json::Value =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(v["roamingQuotas"][0]["currentUes"], 1, "no double-count");
-        assert_eq!(v["roamingQuotas"][0]["currentUes3gpp"], 0);
-        assert_eq!(v["roamingQuotas"][0]["currentUesN3gpp"], 1);
+        // The admin quota resource confirms: aggregate unchanged (1), 3GPP=0,
+        // N3GPP=1. #95 moved the per-access counts here from the roaming-quotas
+        // response, which is now the spec's ceilings-only QuotaUpdateResponseData.
+        let v = get_quota(&client, &quota_id).await;
+        assert_eq!(v["currentUes"], 1, "no double-count");
+        assert_eq!(v["currentUes3gpp"], 0, "UPDATE moved the UE out of 3GPP");
+        assert_eq!(v["currentUesN3gpp"], 1);
 
         // Mixed request: a fresh INCREASE + an UPDATE for an unknown member ->
         // partial 200 with acuFailureList SLICE_NOT_FOUND for the unknown.
@@ -3559,83 +3845,263 @@ nsacf:
     }
 
     // -----------------------------------------------------------------
-    // nsacf-08: custom operations local-configs/update + roaming-quotas/query
+    // nsacf-08 / #95: custom operations local-configs/update +
+    // roaming-quotas/query, on the TS 29.536 wire shapes
     // -----------------------------------------------------------------
 
+    /// **Issue #95, gap 2.** LocalConfigurations update takes an `ACUpdateData`
+    /// and answers `204 No Content` with an **empty** body (§5.2.2.5.2).
+    ///
+    /// It used to require a bespoke `localConfigurations` ARRAY envelope with
+    /// `maxUes`/`maxPduSessions` and answer `200` with a
+    /// `{localConfigurations, supportedFeatures}` body. An OSS/BSS or OAM system
+    /// driving slice limits speaks `ACUpdateData` and would not have interworked
+    /// with either half of that.
     #[tokio::test]
-    async fn test_http_custom_ops_local_configs_and_roaming_quotas() {
+    async fn test_http_local_configs_update_is_ac_update_data_and_204() {
         let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
-        // local-configs/update is routed (not 404) and returns a spec-shaped body.
         let resp = client
             .post_json(
                 "/nnsacf-nsac/v1/slices/local-configs/update",
-                &json!({"localConfigurations": [
-                    {"snssai": {"sst": 92}, "maxUes": 7, "maxPduSessions": 9}
-                ]}),
+                &ac_update_data(65, 7, 9),
             )
             .await
             .expect("response");
-        assert_eq!(
-            resp.status, 200,
-            "/slices/local-configs/update must be routed"
+        assert_eq!(resp.status, 204, "§5.2.2.5.2 requires 204 No Content");
+        assert!(
+            resp.http.content.as_deref().unwrap_or("").is_empty(),
+            "§5.2.2.5.2 requires an empty body, got {:?}",
+            resp.http.content
         );
-        let v: serde_json::Value =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(v["localConfigurations"][0]["snssai"]["sst"], 92);
-        assert_eq!(v["localConfigurations"][0]["maxUes"], 7);
 
-        // Missing localConfigurations -> 400 MANDATORY_IE_MISSING.
+        // The update really applied: read it back through the spec query.
         let resp = client
-            .post_json("/nnsacf-nsac/v1/slices/local-configs/update", &json!({}))
+            .post_json(
+                "/nnsacf-nsac/v1/slices/roaming-quotas/query",
+                &quota_update_request(65),
+            )
             .await
             .expect("response");
-        assert_eq!(resp.status, 400);
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["maxUesNumber"], 7);
+        assert_eq!(v["maxPdusNumber"], 9);
+
+        // `snssai` is the only mandatory member -> its absence is 400
+        // MANDATORY_IE_MISSING. The bespoke `localConfigurations` envelope is now
+        // just an unknown member, so a body carrying ONLY it is also rejected:
+        // that is the discriminating case, because a handler that still accepted
+        // the old shape would pass the plain-`{}` check while ignoring the spec.
+        for body in [
+            json!({}),
+            json!({"localConfigurations": [{"snssai": {"sst": 65}}]}),
+        ] {
+            let resp = client
+                .post_json("/nnsacf-nsac/v1/slices/local-configs/update", &body)
+                .await
+                .expect("response");
+            assert_eq!(resp.status, 400, "body {body} must be rejected");
+            assert!(resp
+                .http
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("MANDATORY_IE_MISSING"));
+        }
+
+        // An update naming only maxPdusNumber must NOT reset the UE ceiling.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/local-configs/update",
+                &json!({"snssai": {"sst": 65}, "maxPdusNumber": 11}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/roaming-quotas/query",
+                &quota_update_request(65),
+            )
+            .await
+            .expect("response");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["maxUesNumber"], 7, "the omitted UE ceiling must be KEPT");
+        assert_eq!(v["maxPdusNumber"], 11);
+
+        // And the per-access ceilings survive an update that names none of them.
+        // `ACUpdateData` is a single OBJECT rather than the old full-configuration
+        // array, so a partial update must not erase what a previous call installed.
+        // Asserted through BEHAVIOUR rather than by reading the ceiling back,
+        // because the per-access limits are not on any response body: install
+        // maxUes3gpp=1, then send a ceiling-free update, then check the ceiling
+        // still bites. (This test exists because reverting the carry-over broke
+        // nothing at first — the `maxUesNumber` assertion above did not cover it.)
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/local-configs/update",
+                &json!({"snssai": {"sst": 65}, "maxUesNumber": 10, "maxUes3gpp": 1}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/local-configs/update",
+                &json!({"snssai": {"sst": 65}, "maxPdusNumber": 12}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+
+        let admit = |supi: &'static str| {
+            let client = &client;
+            async move {
+                client
+                    .post_json(
+                        "/nnsacf-nsac/v1/slices/ues",
+                        &json!({"nfId": "amf-1", "ueACRequestInfo": [{
+                            "supi": supi, "anType": "3GPP_ACCESS",
+                            "acuOperationList": [
+                                {"updateFlag": "INCREASE", "snssai": {"sst": 65}}
+                            ]
+                        }]}),
+                    )
+                    .await
+                    .expect("response")
+            }
+        };
+        assert_eq!(
+            admit("imsi-65-a").await.status,
+            204,
+            "1/1 of the 3GPP ceiling"
+        );
+        let resp = admit("imsi-65-b").await;
+        assert_eq!(
+            resp.status, 403,
+            "the maxUes3gpp=1 ceiling must survive a ceiling-free ACUpdateData"
+        );
         assert!(resp
             .http
             .content
             .as_deref()
             .unwrap()
-            .contains("MANDATORY_IE_MISSING"));
+            .contains("ALL_SLICE_FAILED"));
 
-        // roaming-quotas/query is routed (not 404) and returns the quota state.
+        server.stop().await.expect("stop");
+    }
+
+    /// **Issue #95, gap 3.** RoamingQuotas takes a `QuotaUpdateRequestData` with
+    /// `snssai`, `plmnId` and `quotaType` all **required**, and answers with a
+    /// `QuotaUpdateResponseData` `{snssai, maxUesNumber, maxPdusNumber}`
+    /// (§5.2.2.6.2 / §5.3.2.4.1).
+    ///
+    /// It used to treat the body as optional, ignore all three mandatory IEs, read
+    /// a bespoke `snssais` array as a filter, and answer
+    /// `{roamingQuotas: [...], supportedFeatures}`.
+    #[tokio::test]
+    async fn test_http_roaming_quotas_is_quota_update_data() {
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        create_quota(&client, 63, 7, 9).await;
+
         let resp = client
             .post_json(
                 "/nnsacf-nsac/v1/slices/roaming-quotas/query",
-                &json!({"snssais": [{"sst": 92}]}),
+                &quota_update_request(63),
             )
             .await
             .expect("response");
-        assert_eq!(
-            resp.status, 200,
-            "/slices/roaming-quotas/query must be routed"
-        );
+        assert_eq!(resp.status, 200);
         let v: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(v["roamingQuotas"][0]["snssai"]["sst"], 92);
-        assert_eq!(v["roamingQuotas"][0]["maxUes"], 7);
-        assert_eq!(v["roamingQuotas"][0]["currentUes"], 0);
+        assert_eq!(v["snssai"]["sst"], 63);
+        assert_eq!(v["maxUesNumber"], 7);
+        assert_eq!(v["maxPdusNumber"], 9);
+        // The bespoke response shape is gone, not merely joined by the new one:
+        // a peer NSACF that still reads `roamingQuotas` must fail loudly.
+        assert!(v.get("roamingQuotas").is_none());
+        assert!(v.get("supportedFeatures").is_none());
+
+        // Each mandatory IE, dropped one at a time -> 400 MANDATORY_IE_MISSING.
+        // Dropping them one at a time rather than all together is what pins that
+        // ALL THREE are enforced: an implementation checking only `snssai` would
+        // pass an all-empty body check.
+        for missing in ["snssai", "plmnId", "quotaType"] {
+            let mut body = quota_update_request(63);
+            body.as_object_mut().unwrap().remove(missing);
+            let resp = client
+                .post_json("/nnsacf-nsac/v1/slices/roaming-quotas/query", &body)
+                .await
+                .expect("response");
+            assert_eq!(
+                resp.status, 400,
+                "a body with no {missing} must be rejected"
+            );
+            assert!(
+                resp.http
+                    .content
+                    .as_deref()
+                    .unwrap()
+                    .contains("MANDATORY_IE_MISSING"),
+                "missing {missing} must be MANDATORY_IE_MISSING"
+            );
+        }
+
+        // A `plmnId` that is present but names no PLMN is not a plmnId: the
+        // mandatory IE must not be satisfiable by an empty object.
+        for bad_plmn in [
+            json!({}),
+            json!(null),
+            json!({"mcc": "262"}),
+            json!({"mcc": "", "mnc": "01"}),
+        ] {
+            let mut body = quota_update_request(63);
+            body["plmnId"] = bad_plmn.clone();
+            let resp = client
+                .post_json("/nnsacf-nsac/v1/slices/roaming-quotas/query", &body)
+                .await
+                .expect("response");
+            assert_eq!(resp.status, 400, "plmnId {bad_plmn} must be rejected");
+        }
+
+        // An unconfigured S-NSSAI is 404, not an empty 200: "no quota" and "a
+        // quota of zero" are different answers to a partner NSACF.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/roaming-quotas/query",
+                &quota_update_request(64),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 404);
 
         server.stop().await.expect("stop");
     }
 
     // -----------------------------------------------------------------
-    // nsacf-09: mandatory nfId -> 400 MANDATORY_IE_MISSING when absent
+    // nsacf-09 / #95 gap 1: nfId is mandatory on the UE resource and OPTIONAL on
+    // the PDU resource — the asymmetry TS 29.536 actually specifies
     // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn test_http_ac_missing_nf_id() {
         let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
+        create_quota(&client, 66, 10, 100).await;
 
-        // UE AC body WITHOUT nfId -> 400 MANDATORY_IE_MISSING.
+        // UE AC body WITHOUT nfId -> 400 MANDATORY_IE_MISSING. `nfId` IS mandatory
+        // in `UeACRequestData` (nsacf-09), and #95 does not touch that.
         let resp = client
             .post_json(
                 "/nnsacf-nsac/v1/slices/ues",
                 &json!({"ueACRequestInfo": [{
                     "supi": "imsi-1", "anType": "3GPP_ACCESS",
-                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 93}}]
+                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 66}}]
                 }]}),
             )
             .await
@@ -3648,24 +4114,237 @@ nsacf:
             .unwrap()
             .contains("MANDATORY_IE_MISSING"));
 
-        // PDU AC body WITHOUT nfId -> 400 MANDATORY_IE_MISSING (nfId is M there too).
+        // **Issue #95, gap 1.** PDU AC body WITHOUT nfId is ACCEPTED: Table
+        // 6.1.6.2.7-1 lists `pduACRequestInfo` as the ONLY required attribute of
+        // `PduACRequestData`. It used to be a non-Option String, so a conformant
+        // SMF/PGW-C identifying itself by `pgwFqdn` was turned away with 400 and
+        // PDU-session number control silently failed against off-the-shelf NFs.
         let resp = client
             .post_json(
                 "/nnsacf-nsac/v1/slices/pdus",
                 &json!({"pduACRequestInfo": [{
                     "supi": "imsi-1", "anType": "3GPP_ACCESS", "pduSessionId": 1,
-                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 93}}]
+                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 66}}]
                 }]}),
             )
             .await
             .expect("response");
-        assert_eq!(resp.status, 400);
-        assert!(resp
-            .http
-            .content
-            .as_deref()
-            .unwrap()
-            .contains("MANDATORY_IE_MISSING"));
+        assert_eq!(
+            resp.status, 204,
+            "a PduACRequestData with no nfId is conformant and must be admitted"
+        );
+
+        // The other three optional members round-trip rather than being rejected
+        // as unknown, and `pgwFqdn` is the fallback identity.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/pdus",
+                &json!({
+                    "pgwFqdn": "smf1.5gc.mnc001.mcc262.3gppnetwork.org",
+                    "nsacServiceArea": {"taiList": [{"tac": "000001"}]},
+                    "supportedFeatures": "1",
+                    "pduACRequestInfo": [{
+                        "supi": "imsi-2", "anType": "3GPP_ACCESS", "pduSessionId": 1,
+                        "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 66}}]
+                    }]
+                }),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+
+        server.stop().await.expect("stop");
+    }
+
+    // -----------------------------------------------------------------
+    // #95 gap 4: multi-access UE registration (TS 29.536 §5.2.2.2.2)
+    // -----------------------------------------------------------------
+
+    /// **Issue #95, gap 4.** A UE admitted over BOTH accesses survives a DECREASE
+    /// on one and leaves the counted set only on the second.
+    ///
+    /// TS 29.536 §5.2.2.2.2: the NSACF records the access type(s) used by the UE
+    /// and removes the registration entry only when the UE deregisters from **all**
+    /// of them. Before #95 membership was one `AccessType` per SUPI and the first
+    /// DECREASE dropped the entry, so the slice under-counted its registered UEs
+    /// the moment a dual-access UE detached from one access — and could then exceed
+    /// its admission ceiling.
+    #[tokio::test]
+    async fn test_http_dual_access_ue_survives_first_decrease() {
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let quota_id = create_quota(&client, 60, 10, 100).await;
+
+        // INCREASE naming anType + additionalAnType: one aggregate count, both
+        // per-access buckets.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [{
+                    "supi": "imsi-99", "anType": "3GPP_ACCESS",
+                    "additionalAnType": "NON_3GPP_ACCESS",
+                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 60}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+        let v = get_quota(&client, &quota_id).await;
+        assert_eq!(v["currentUes"], 1, "one UE, counted once");
+        assert_eq!(v["currentUes3gpp"], 1);
+        assert_eq!(v["currentUesN3gpp"], 1);
+
+        // DECREASE on 3GPP only: still registered over non-3GPP, so the count
+        // STAYS AT 1. This is the assertion the old model could not satisfy.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [{
+                    "supi": "imsi-99", "anType": "3GPP_ACCESS",
+                    "acuOperationList": [{"updateFlag": "DECREASE", "snssai": {"sst": 60}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+        let v = get_quota(&client, &quota_id).await;
+        assert_eq!(
+            v["currentUes"], 1,
+            "§5.2.2.2.2: the entry is removed only when ALL accesses are released"
+        );
+        assert_eq!(v["currentUes3gpp"], 0, "the 3GPP registration is gone");
+        assert_eq!(v["currentUesN3gpp"], 1, "the non-3GPP one survives");
+
+        // DECREASE on the remaining access: now the entry goes.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [{
+                    "supi": "imsi-99", "anType": "NON_3GPP_ACCESS",
+                    "acuOperationList": [{"updateFlag": "DECREASE", "snssai": {"sst": 60}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+        let v = get_quota(&client, &quota_id).await;
+        assert_eq!(v["currentUes"], 0, "last access released -> deregistered");
+        assert_eq!(v["currentUesN3gpp"], 0);
+
+        server.stop().await.expect("stop");
+    }
+
+    /// A DECREASE that names NO access releases every access, so an access-unaware
+    /// consumer cannot strand a registration.
+    ///
+    /// This is the mirror-image hazard the gap-4 fix creates: with per-access
+    /// releases, a consumer that omits `anType` for a UE registered over non-3GPP
+    /// would — under the plain nsacf-05 default-to-3GPP rule — release nothing and
+    /// leave the UE registered forever.
+    #[tokio::test]
+    async fn test_http_decrease_without_an_type_releases_every_access() {
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let quota_id = create_quota(&client, 61, 10, 100).await;
+
+        // Register over non-3GPP only.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [{
+                    "supi": "imsi-89", "anType": "NON_3GPP_ACCESS",
+                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 61}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+        assert_eq!(get_quota(&client, &quota_id).await["currentUes"], 1);
+
+        // DECREASE with NO anType at all.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [{
+                    "supi": "imsi-89",
+                    "acuOperationList": [{"updateFlag": "DECREASE", "snssai": {"sst": 61}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+        let v = get_quota(&client, &quota_id).await;
+        assert_eq!(
+            v["currentUes"], 0,
+            "an access-unaware DECREASE must not strand the registration"
+        );
+        assert_eq!(v["currentUesN3gpp"], 0);
+
+        server.stop().await.expect("stop");
+    }
+
+    /// **Issue #95, gap 4 (parse half).** `additionalAnType` and every roaming IE
+    /// deserialise rather than being rejected as unknown, and the request applies.
+    #[tokio::test]
+    async fn test_http_ue_ac_roaming_ies_round_trip() {
+        let (server, port, _ctx_guard) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let quota_id = create_quota(&client, 62, 10, 100).await;
+
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [{
+                    "supi": "imsi-88",
+                    "anType": "3GPP_ACCESS",
+                    "additionalAnType": "NON_3GPP_ACCESS",
+                    "plmnId": {"mcc": "262", "mnc": "01"},
+                    "plmnIdNid": {"mcc": "262", "mnc": "01", "nid": "000000000000000000000000000000000"},
+                    "ueRegInd": true,
+                    "servingPlmnId": {"mcc": "310", "mnc": "260"},
+                    "nsacMode": "NSAC_MODE_1",
+                    "numberExceedInfo": {"numberOfUEsExceed": false},
+                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 62}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            resp.status, 204,
+            "a request carrying every Table 6.1.6.2.9-1 IE must be admitted"
+        );
+
+        // Positive proof the body was really applied rather than silently dropped:
+        // both per-access buckets hold the UE, which only `additionalAnType` can
+        // produce from this single operation.
+        let v = get_quota(&client, &quota_id).await;
+        assert_eq!(v["currentUes"], 1);
+        assert_eq!(v["currentUes3gpp"], 1);
+        assert_eq!(v["currentUesN3gpp"], 1);
+
+        // An unrecognised additionalAnType is IGNORED, not defaulted to 3GPP:
+        // claiming a registration the consumer never asserted would be worse than
+        // dropping it.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [{
+                    "supi": "imsi-88-b",
+                    "anType": "NON_3GPP_ACCESS",
+                    "additionalAnType": "WIRELINE_ACCESS",
+                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 62}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+        let v = get_quota(&client, &quota_id).await;
+        assert_eq!(v["currentUes"], 2);
+        assert_eq!(
+            v["currentUes3gpp"], 1,
+            "the unknown additionalAnType must NOT have added a 3GPP registration"
+        );
+        assert_eq!(v["currentUesN3gpp"], 2);
 
         server.stop().await.expect("stop");
     }

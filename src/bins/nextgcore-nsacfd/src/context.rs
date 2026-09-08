@@ -101,6 +101,135 @@ impl AccessType {
     }
 }
 
+/// The set of access types a registered UE is currently using
+/// (TS 29.536 §5.2.2.2.2: *"the NSACF shall record the access type(s) used by the
+/// UE"*, and shall remove the registration entry only when the UE deregisters
+/// from **all** of them).
+///
+/// A two-field struct rather than a `HashSet<AccessType>` because
+/// [`AccessType`] has exactly two variants, so this is the *whole* domain: it is
+/// `Copy`, allocation-free, and `current_ues_access` scans every member on every
+/// admission check. It also makes "remove this one access, keep the entry if
+/// another survives" a single expression instead of a set-emptiness dance at each
+/// call site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccessSet {
+    three_gpp: bool,
+    non_3gpp: bool,
+}
+
+impl AccessSet {
+    /// The empty set — no access. Never stored against a registered UE: a member
+    /// whose last access is released is removed from the counted set entirely.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// A set holding exactly `access`.
+    pub fn single(access: AccessType) -> Self {
+        Self::empty().with(access)
+    }
+
+    /// Every access type. Used for a DECREASE that names no access at all — see
+    /// `UeACRequestInfo::release_set`.
+    pub fn all() -> Self {
+        Self {
+            three_gpp: true,
+            non_3gpp: true,
+        }
+    }
+
+    /// `self` plus `access`.
+    pub fn with(mut self, access: AccessType) -> Self {
+        self.insert(access);
+        self
+    }
+
+    pub fn insert(&mut self, access: AccessType) {
+        match access {
+            AccessType::ThreeGpp => self.three_gpp = true,
+            AccessType::NonThreeGpp => self.non_3gpp = true,
+        }
+    }
+
+    pub fn remove(&mut self, access: AccessType) {
+        match access {
+            AccessType::ThreeGpp => self.three_gpp = false,
+            AccessType::NonThreeGpp => self.non_3gpp = false,
+        }
+    }
+
+    /// Remove every access in `other` from `self`.
+    pub fn remove_all(&mut self, other: AccessSet) {
+        self.three_gpp &= !other.three_gpp;
+        self.non_3gpp &= !other.non_3gpp;
+    }
+
+    pub fn contains(&self, access: AccessType) -> bool {
+        match access {
+            AccessType::ThreeGpp => self.three_gpp,
+            AccessType::NonThreeGpp => self.non_3gpp,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.three_gpp && !self.non_3gpp
+    }
+
+    pub fn len(&self) -> usize {
+        usize::from(self.three_gpp) + usize::from(self.non_3gpp)
+    }
+
+    /// The accesses in `self` that are NOT in `held` — i.e. what an INCREASE
+    /// would actually add.
+    pub fn difference(&self, held: AccessSet) -> AccessSet {
+        Self {
+            three_gpp: self.three_gpp && !held.three_gpp,
+            non_3gpp: self.non_3gpp && !held.non_3gpp,
+        }
+    }
+
+    /// Iterate the accesses present, 3GPP first (stable order, so persisted state
+    /// and log lines do not vary run to run).
+    pub fn iter(&self) -> impl Iterator<Item = AccessType> + '_ {
+        [
+            (self.three_gpp, AccessType::ThreeGpp),
+            (self.non_3gpp, AccessType::NonThreeGpp),
+        ]
+        .into_iter()
+        .filter_map(|(present, at)| present.then_some(at))
+    }
+
+    /// The TS 29.571 `AccessType` strings, for persistence and for the wire.
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.iter()
+                .map(|a| serde_json::Value::String(a.as_str().to_string()))
+                .collect(),
+        )
+    }
+
+    /// Decode a persisted value. Accepts BOTH shapes: the array this now writes,
+    /// and the bare `AccessType` string written before #95, so a state file from
+    /// an older build still loads (see `load_state`).
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        if let Some(s) = v.as_str() {
+            return Some(Self::single(AccessType::from_an_type(Some(s))));
+        }
+        let arr = v.as_array()?;
+        let mut set = Self::empty();
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                set.insert(AccessType::from_an_type(Some(s)));
+            }
+        }
+        // An empty array is not a valid membership; treat it as "unknown" so the
+        // caller applies its own default rather than storing a member with no
+        // access at all.
+        (!set.is_empty()).then_some(set)
+    }
+}
+
 /// Optional per-access-type ceilings for a slice quota (TS 29.536 §6.1.6.2.9
 /// procedural text). All `None` => aggregate-only counting (legacy path
 /// unchanged); a `Some` ceiling enables per-access enforcement for that access.
@@ -119,6 +248,15 @@ pub struct AccessLimits {
 pub enum ReleaseOutcome {
     /// Member was present and removed; carries any EAC mode transition.
     Released(Option<EacTransition>),
+    /// The named access was released but the UE is STILL REGISTERED over another
+    /// access, so it stays in the counted set (TS 29.536 §5.2.2.2.2: the entry is
+    /// removed only when the UE deregisters from all access types). Issue #95.
+    ///
+    /// Distinct from [`Self::Released`] because the aggregate registered-UE count
+    /// does not change, so there can be no EAC transition — and because a caller
+    /// that cannot tell the two apart cannot tell an under-count from a
+    /// correct one.
+    AccessReleased,
     /// S-NSSAI is NSAC-subject but the member/session was not present.
     MemberAbsent,
     /// S-NSSAI is not NSAC-subject (no quota configured for it).
@@ -186,10 +324,13 @@ pub struct SliceQuota {
     pub(crate) ues: HashSet<String>,
     /// Established PDU session keys (`{supi}:{pduSessionId}`)
     pub(crate) pdu_sessions: HashSet<String>,
-    /// Per-member access type for registered UEs (nsacf-05/06). Always kept in
-    /// sync with `ues`; lets per-access counts be derived and UPDATE move a UE
-    /// between 3GPP/N3GPP buckets without changing the aggregate count.
-    pub(crate) ue_access: HashMap<String, AccessType>,
+    /// Per-member access type **set** for registered UEs (nsacf-05/06, #95).
+    /// Always kept in sync with `ues` — every SUPI in `ues` has a non-empty entry
+    /// here and vice versa. Lets per-access counts be derived, lets UPDATE move a
+    /// UE between 3GPP/N3GPP buckets without changing the aggregate count, and
+    /// lets a dual-access UE survive a DECREASE on one access
+    /// (TS 29.536 §5.2.2.2.2).
+    pub(crate) ue_access: HashMap<String, AccessSet>,
     /// Per-session access type for established PDU sessions (nsacf-05/06).
     pub(crate) pdu_access: HashMap<String, AccessType>,
     /// Whether EAC mode is currently active for this slice
@@ -233,8 +374,22 @@ impl SliceQuota {
     }
 
     /// Registered UE count for a single access type (nsacf-05).
+    ///
+    /// #95: a dual-access UE is counted in BOTH per-access buckets, which is why
+    /// `current_ues_access(3GPP) + current_ues_access(N3GPP)` can now exceed
+    /// [`Self::current_ues`]. That is correct — the aggregate counts registered
+    /// UEs, the per-access buckets count registrations per access — and it is why
+    /// the aggregate is kept as its own set rather than derived by summing.
     pub fn current_ues_access(&self, access: AccessType) -> u64 {
-        self.ue_access.values().filter(|a| **a == access).count() as u64
+        self.ue_access
+            .values()
+            .filter(|set| set.contains(access))
+            .count() as u64
+    }
+
+    /// The access set a registered UE currently holds; empty when not a member.
+    pub fn ue_access_set(&self, supi: &str) -> AccessSet {
+        self.ue_access.get(supi).copied().unwrap_or_default()
     }
 
     /// Established PDU-session count for a single access type (nsacf-05).
@@ -743,15 +898,25 @@ impl NsacfContext {
     // UE admission control (TS 29.536 NumOfUEsUpdate, updateFlag INCREASE)
     // ------------------------------------------------------------------
 
-    /// Admit a UE (idempotent per SUPI). Returns the admission result and an
-    /// EAC transition when the registered-UE count crosses the threshold.
-    /// `an_type` selects the per-access bucket and, on a per-access ceiling
-    /// breach, drives the `_3GPP`/`_N3GPP` failure reason (nsacf-05).
+    /// Admit a UE over one or more access types. Returns the admission result and
+    /// an EAC transition when the registered-UE count crosses the threshold.
+    ///
+    /// `accesses` is the request's `anType` plus its `additionalAnType`
+    /// (TS 29.536 Table 6.1.6.2.9-1), so a UE registering over both 3GPP and
+    /// non-3GPP access in one operation lands in both per-access buckets while
+    /// counting ONCE against the aggregate.
+    ///
+    /// #95: idempotency is now **per access**, not per SUPI. An INCREASE naming
+    /// an access the UE already holds is a no-op; one naming a NEW access adds it
+    /// — subject to that access's ceiling — without a second aggregate count.
+    /// Before this, the whole request was swallowed as idempotent the moment the
+    /// SUPI was known, so a UE that later attached over non-3GPP was never
+    /// recorded on it and the eventual DECREASE deregistered it entirely.
     pub fn admit_ue(
         &self,
         s_nssai: &SNssai,
         supi: &str,
-        an_type: AccessType,
+        accesses: AccessSet,
     ) -> (AdmissionResult, Option<EacTransition>) {
         let Some(id) = self.quota_id_for(s_nssai) else {
             log::warn!(
@@ -770,26 +935,46 @@ impl NsacfContext {
             let Some(quota) = quota_list.get_mut(&id) else {
                 return (AdmissionResult::RejectedSliceNotAvailable, None);
             };
-            // Per-access ceiling breached (only when a ceiling is configured for
-            // this access). Aggregate is checked first so it keeps the plain
-            // reason; per-access selects the _3GPP/_N3GPP reason.
-            let over_per_access = quota
-                .max_ues_for(an_type)
-                .is_some_and(|max| quota.current_ues_access(an_type) >= max);
-            if quota.ues.contains(supi) {
-                // Already counted; INCREASE is idempotent per TS 29.536
+            let held = quota.ue_access.get(supi).copied().unwrap_or_default();
+            let to_add = accesses.difference(held);
+            let already_member = quota.ues.contains(supi);
+
+            if to_add.is_empty() && already_member {
+                // Every named access is already recorded: idempotent per TS 29.536.
                 (AdmissionResult::Admitted, None)
-            } else if quota.current_ues() >= quota.max_ues {
+            } else if !already_member && quota.current_ues() >= quota.max_ues {
+                // Aggregate is checked first so it keeps the plain reason; it
+                // applies only to a NEW member, because adding an access to an
+                // existing one does not change the aggregate count.
                 (AdmissionResult::RejectedQuotaExceeded, None)
-            } else if over_per_access {
+            } else if let Some(breached) = to_add.iter().find(|a| {
+                quota
+                    .max_ues_for(*a)
+                    .is_some_and(|max| quota.current_ues_access(*a) >= max)
+            }) {
+                // Per-access ceiling breached for one of the accesses being added
+                // (only when a ceiling is configured for it): selects the
+                // _3GPP/_N3GPP reason. The whole operation is rejected rather
+                // than partially applied, so the consumer's view of which
+                // accesses are registered cannot silently diverge from ours.
                 (
-                    AdmissionResult::RejectedQuotaExceededPerAccess(an_type),
+                    AdmissionResult::RejectedQuotaExceededPerAccess(breached),
                     None,
                 )
             } else {
                 quota.ues.insert(supi.to_string());
-                quota.ue_access.insert(supi.to_string(), an_type);
-                let eac = update_eac(quota, threshold);
+                let mut set = held;
+                for a in to_add.iter() {
+                    set.insert(a);
+                }
+                quota.ue_access.insert(supi.to_string(), set);
+                // Only a NEW member can move the aggregate count, so only then can
+                // the EAC threshold be crossed.
+                let eac = if already_member {
+                    None
+                } else {
+                    update_eac(quota, threshold)
+                };
                 (AdmissionResult::Admitted, eac)
             }
         };
@@ -799,11 +984,17 @@ impl NsacfContext {
         result
     }
 
-    /// Release a UE (updateFlag DECREASE). Distinguishes a clean release from
-    /// an idempotent no-op and from an S-NSSAI that is not NSAC-subject
-    /// (nsacf-10). Carries the EAC transition when the count falls back below
-    /// the threshold.
-    pub fn release_ue(&self, s_nssai: &SNssai, supi: &str) -> ReleaseOutcome {
+    /// Release a UE from the named access types (updateFlag DECREASE).
+    ///
+    /// TS 29.536 §5.2.2.2.2: the registration entry is removed **only when the UE
+    /// deregisters from all access types**. So a UE holding both accesses that
+    /// DECREASEs on one stays in the counted set and yields
+    /// [`ReleaseOutcome::AccessReleased`]; the aggregate count drops (and an EAC
+    /// transition becomes possible) only when the last access goes.
+    ///
+    /// Distinguishes a clean release from an idempotent no-op and from an S-NSSAI
+    /// that is not NSAC-subject (nsacf-10).
+    pub fn release_ue(&self, s_nssai: &SNssai, supi: &str, accesses: AccessSet) -> ReleaseOutcome {
         let Some(id) = self.quota_id_for(s_nssai) else {
             return ReleaseOutcome::SliceNotFound;
         };
@@ -816,29 +1007,50 @@ impl NsacfContext {
             let Some(quota) = quota_list.get_mut(&id) else {
                 return ReleaseOutcome::SliceNotFound;
             };
-            if !quota.ues.remove(supi) {
+            if !quota.ues.contains(supi) {
                 ReleaseOutcome::MemberAbsent
             } else {
-                quota.ue_access.remove(supi);
-                ReleaseOutcome::Released(update_eac(quota, threshold))
+                let mut remaining = quota.ue_access.get(supi).copied().unwrap_or_default();
+                remaining.remove_all(accesses);
+                if remaining.is_empty() {
+                    quota.ues.remove(supi);
+                    quota.ue_access.remove(supi);
+                    ReleaseOutcome::Released(update_eac(quota, threshold))
+                } else {
+                    quota.ue_access.insert(supi.to_string(), remaining);
+                    ReleaseOutcome::AccessReleased
+                }
             }
         };
-        if matches!(outcome, ReleaseOutcome::Released(_)) {
+        if matches!(
+            outcome,
+            ReleaseOutcome::Released(_) | ReleaseOutcome::AccessReleased
+        ) {
             self.save_state();
         }
         outcome
     }
 
-    /// Move a UE between access-type buckets (updateFlag UPDATE, nsacf-06). The
-    /// aggregate count is unchanged (no double-count); only the per-access
-    /// bucket moves. `NotFound` when the S-NSSAI is not NSAC-subject or the UE
-    /// is not a member.
+    /// Set a registered UE's access set to exactly `accesses` (updateFlag UPDATE,
+    /// nsacf-06). The aggregate count is unchanged (no double-count); only the
+    /// per-access buckets move. `NotFound` when the S-NSSAI is not NSAC-subject or
+    /// the UE is not a member.
+    ///
+    /// #95: UPDATE **replaces** rather than adds, which is what generalises
+    /// nsacf-06's "move between buckets" to a set — an AMF reporting
+    /// `anType: NON_3GPP_ACCESS` with no `additionalAnType` is stating the UE's
+    /// current access, and treating that as an addition would leave a stale 3GPP
+    /// registration nothing could ever clear. An empty `accesses` is refused for
+    /// the same reason a release is not an update: it would silently deregister.
     pub fn update_ue_access(
         &self,
         s_nssai: &SNssai,
         supi: &str,
-        new_access: AccessType,
+        accesses: AccessSet,
     ) -> UpdateOutcome {
+        if accesses.is_empty() {
+            return UpdateOutcome::NotFound;
+        }
         let Some(id) = self.quota_id_for(s_nssai) else {
             return UpdateOutcome::NotFound;
         };
@@ -853,7 +1065,7 @@ impl NsacfContext {
             if !quota.ues.contains(supi) {
                 return UpdateOutcome::NotFound;
             }
-            quota.ue_access.insert(supi.to_string(), new_access) != Some(new_access)
+            quota.ue_access.insert(supi.to_string(), accesses) != Some(accesses)
         };
         if changed {
             self.save_state();
@@ -1093,12 +1305,13 @@ impl NsacfContext {
                 .map(|q| {
                     // Per-access membership maps (nsacf-05); absent in legacy
                     // state files, so load_state defaults them to 3GPP access.
+                    // #95: written as an ARRAY of AccessType strings, since a UE
+                    // may hold both. `AccessSet::from_json` still accepts the bare
+                    // string this wrote before, so an older state file loads.
                     let ues_access: serde_json::Map<String, serde_json::Value> = q
                         .ue_access
                         .iter()
-                        .map(|(k, v)| {
-                            (k.clone(), serde_json::Value::String(v.as_str().to_string()))
-                        })
+                        .map(|(k, v)| (k.clone(), v.to_json()))
                         .collect();
                     let pdu_access: serde_json::Map<String, serde_json::Value> = q
                         .pdu_access
@@ -1216,12 +1429,17 @@ impl NsacfContext {
                 // every member defaults to 3GPP access (backward-compatible).
                 let ues_access = q.get("uesAccess").and_then(|v| v.as_object());
                 for supi in quota.ues.iter().cloned().collect::<Vec<_>>() {
-                    let at = ues_access
+                    // #95: an entry may be an array (this build) or a bare string
+                    // (pre-#95 files); `AccessSet::from_json` handles both. A
+                    // member with no decodable entry defaults to 3GPP access, as
+                    // it did before — never to the empty set, which would break
+                    // the `ues` <-> `ue_access` invariant and make the next
+                    // DECREASE deregister a UE it should not.
+                    let set = ues_access
                         .and_then(|m| m.get(&supi))
-                        .and_then(|v| v.as_str())
-                        .map(|s| AccessType::from_an_type(Some(s)))
-                        .unwrap_or(AccessType::ThreeGpp);
-                    quota.ue_access.insert(supi, at);
+                        .and_then(AccessSet::from_json)
+                        .unwrap_or_else(|| AccessSet::single(AccessType::ThreeGpp));
+                    quota.ue_access.insert(supi, set);
                 }
                 let pdu_access = q.get("pduSessionsAccess").and_then(|v| v.as_object());
                 for key in quota.pdu_sessions.iter().cloned().collect::<Vec<_>>() {
@@ -1350,10 +1568,10 @@ mod tests {
         let s_nssai = SNssai::new(1, None);
         ctx.quota_add(s_nssai.clone(), 100, 500);
 
-        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
+        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::single(AccessType::ThreeGpp));
         assert_eq!(result, AdmissionResult::Admitted);
         // Same SUPI again: idempotent, still counted once
-        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
+        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::single(AccessType::ThreeGpp));
         assert_eq!(result, AdmissionResult::Admitted);
         assert_eq!(ctx.quota_find_by_snssai(&s_nssai).unwrap().current_ues(), 1);
     }
@@ -1367,20 +1585,24 @@ mod tests {
         ctx.quota_add(s_nssai.clone(), 2, 10);
 
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp).0,
+            ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::single(AccessType::ThreeGpp))
+                .0,
             AdmissionResult::Admitted
         );
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-2", AccessType::ThreeGpp).0,
+            ctx.admit_ue(&s_nssai, "imsi-2", AccessSet::single(AccessType::ThreeGpp))
+                .0,
             AdmissionResult::Admitted
         );
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-3", AccessType::ThreeGpp).0,
+            ctx.admit_ue(&s_nssai, "imsi-3", AccessSet::single(AccessType::ThreeGpp))
+                .0,
             AdmissionResult::RejectedQuotaExceeded
         );
         // imsi-1 was already admitted: not rejected
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp).0,
+            ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::single(AccessType::ThreeGpp))
+                .0,
             AdmissionResult::Admitted
         );
     }
@@ -1414,7 +1636,7 @@ mod tests {
         ctx.init(64);
 
         let s_nssai = SNssai::new(99, None);
-        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
+        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::single(AccessType::ThreeGpp));
         assert_eq!(result, AdmissionResult::RejectedSliceNotAvailable);
     }
 
@@ -1426,21 +1648,23 @@ mod tests {
         let s_nssai = SNssai::new(3, None);
         ctx.quota_add(s_nssai.clone(), 2, 10);
 
-        ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
-        ctx.admit_ue(&s_nssai, "imsi-2", AccessType::ThreeGpp);
+        ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::single(AccessType::ThreeGpp));
+        ctx.admit_ue(&s_nssai, "imsi-2", AccessSet::single(AccessType::ThreeGpp));
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-3", AccessType::ThreeGpp).0,
+            ctx.admit_ue(&s_nssai, "imsi-3", AccessSet::single(AccessType::ThreeGpp))
+                .0,
             AdmissionResult::RejectedQuotaExceeded
         );
 
         // Releasing imsi-2 frees a slot (the EAC transition, if any, is
         // incidental to this test).
         assert!(matches!(
-            ctx.release_ue(&s_nssai, "imsi-2"),
+            ctx.release_ue(&s_nssai, "imsi-2", AccessSet::all()),
             ReleaseOutcome::Released(_)
         ));
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-3", AccessType::ThreeGpp).0,
+            ctx.admit_ue(&s_nssai, "imsi-3", AccessSet::single(AccessType::ThreeGpp))
+                .0,
             AdmissionResult::Admitted
         );
     }
@@ -1506,11 +1730,15 @@ mod tests {
 
         // 1..=7 admissions: below 80% threshold, no transition
         for i in 1..=7 {
-            let (_, eac) = ctx.admit_ue(&s_nssai, &format!("imsi-{i}"), AccessType::ThreeGpp);
+            let (_, eac) = ctx.admit_ue(
+                &s_nssai,
+                &format!("imsi-{i}"),
+                AccessSet::single(AccessType::ThreeGpp),
+            );
             assert!(eac.is_none(), "no EAC transition expected at {i}/10");
         }
         // 8th admission: 80% reached -> EAC activated
-        let (_, eac) = ctx.admit_ue(&s_nssai, "imsi-8", AccessType::ThreeGpp);
+        let (_, eac) = ctx.admit_ue(&s_nssai, "imsi-8", AccessSet::single(AccessType::ThreeGpp));
         assert_eq!(
             eac,
             Some(EacTransition {
@@ -1519,18 +1747,18 @@ mod tests {
             })
         );
         // 9th: still active, no new transition
-        let (_, eac) = ctx.admit_ue(&s_nssai, "imsi-9", AccessType::ThreeGpp);
+        let (_, eac) = ctx.admit_ue(&s_nssai, "imsi-9", AccessSet::single(AccessType::ThreeGpp));
         assert!(eac.is_none());
         // release back below threshold -> deactivated. A clean release that does
         // NOT cross the threshold is Released(None); the crossing carries the
         // EacTransition.
-        let out = ctx.release_ue(&s_nssai, "imsi-9");
+        let out = ctx.release_ue(&s_nssai, "imsi-9", AccessSet::all());
         assert_eq!(
             out,
             ReleaseOutcome::Released(None),
             "8/10 still at threshold"
         );
-        let out = ctx.release_ue(&s_nssai, "imsi-8");
+        let out = ctx.release_ue(&s_nssai, "imsi-8", AccessSet::all());
         assert_eq!(
             out,
             ReleaseOutcome::Released(Some(EacTransition {
@@ -1538,6 +1766,303 @@ mod tests {
                 activated: false
             }))
         );
+    }
+
+    /// **Issue #95, gap 4.** [`AccessSet`] is the whole access domain, and its
+    /// persisted form round-trips — including the pre-#95 bare-string shape.
+    #[test]
+    fn access_set_semantics_and_json_round_trip() {
+        let three = AccessSet::single(AccessType::ThreeGpp);
+        let non3 = AccessSet::single(AccessType::NonThreeGpp);
+        let both = AccessSet::all();
+
+        assert_eq!(three.len(), 1);
+        assert_eq!(both.len(), 2);
+        assert!(AccessSet::empty().is_empty());
+        assert!(!three.is_empty());
+        assert!(three.contains(AccessType::ThreeGpp) && !three.contains(AccessType::NonThreeGpp));
+        assert!(both.contains(AccessType::ThreeGpp) && both.contains(AccessType::NonThreeGpp));
+
+        // `difference` is what makes INCREASE idempotent PER ACCESS.
+        assert_eq!(both.difference(three), non3);
+        assert_eq!(both.difference(both), AccessSet::empty());
+        assert_eq!(three.difference(non3), three);
+
+        // `remove_all` is what keeps a dual-access UE registered.
+        let mut remaining = both;
+        remaining.remove_all(three);
+        assert_eq!(remaining, non3);
+        remaining.remove_all(non3);
+        assert!(remaining.is_empty());
+
+        // Stable, 3GPP-first iteration order.
+        assert_eq!(
+            both.iter().collect::<Vec<_>>(),
+            vec![AccessType::ThreeGpp, AccessType::NonThreeGpp]
+        );
+
+        // JSON: the array this writes, and the legacy bare string it must still
+        // accept so a pre-#95 state file loads.
+        assert_eq!(
+            both.to_json(),
+            serde_json::json!(["3GPP_ACCESS", "NON_3GPP_ACCESS"])
+        );
+        assert_eq!(AccessSet::from_json(&both.to_json()), Some(both));
+        assert_eq!(AccessSet::from_json(&three.to_json()), Some(three));
+        assert_eq!(
+            AccessSet::from_json(&serde_json::json!("NON_3GPP_ACCESS")),
+            Some(non3),
+            "a pre-#95 bare AccessType string must still decode"
+        );
+        // An empty array and a non-array/non-string are "unknown", so the caller
+        // applies its own default rather than storing a member with no access —
+        // which would break the `ues` <-> `ue_access` invariant.
+        assert_eq!(AccessSet::from_json(&serde_json::json!([])), None);
+        assert_eq!(AccessSet::from_json(&serde_json::json!(7)), None);
+    }
+
+    /// **Issue #95, gap 4.** A dual-access UE survives a DECREASE on one access and
+    /// leaves the counted set only when the last one goes
+    /// (TS 29.536 §5.2.2.2.2), and an INCREASE for a NEW access does not
+    /// double-count the aggregate.
+    #[test]
+    fn dual_access_ue_is_counted_once_and_released_last() {
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+        let s_nssai = SNssai::new(41, None);
+        ctx.quota_add(s_nssai.clone(), 10, 100);
+
+        // Register on 3GPP only.
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::single(AccessType::ThreeGpp))
+                .0,
+            AdmissionResult::Admitted
+        );
+        let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
+        assert_eq!(q.current_ues(), 1);
+        assert_eq!(q.current_ues_access(AccessType::NonThreeGpp), 0);
+
+        // A second INCREASE adding non-3GPP: aggregate STILL 1, both buckets 1.
+        // Before #95 the whole request was swallowed as idempotent because the
+        // SUPI was already known, so the non-3GPP registration was never recorded.
+        assert_eq!(
+            ctx.admit_ue(
+                &s_nssai,
+                "imsi-1",
+                AccessSet::single(AccessType::NonThreeGpp)
+            )
+            .0,
+            AdmissionResult::Admitted
+        );
+        let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
+        assert_eq!(q.current_ues(), 1, "no double-count against the aggregate");
+        assert_eq!(q.current_ues_access(AccessType::ThreeGpp), 1);
+        assert_eq!(q.current_ues_access(AccessType::NonThreeGpp), 1);
+        assert_eq!(q.ue_access_set("imsi-1"), AccessSet::all());
+
+        // Fully-idempotent INCREASE: nothing left to add.
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::all()).0,
+            AdmissionResult::Admitted
+        );
+        assert_eq!(ctx.quota_find_by_snssai(&s_nssai).unwrap().current_ues(), 1);
+
+        // First DECREASE: 3GPP released, entry KEPT.
+        assert_eq!(
+            ctx.release_ue(&s_nssai, "imsi-1", AccessSet::single(AccessType::ThreeGpp)),
+            ReleaseOutcome::AccessReleased
+        );
+        let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
+        assert_eq!(q.current_ues(), 1, "§5.2.2.2.2: still registered");
+        assert_eq!(q.current_ues_access(AccessType::ThreeGpp), 0);
+        assert_eq!(q.current_ues_access(AccessType::NonThreeGpp), 1);
+
+        // Second DECREASE: last access gone -> a real release.
+        assert!(matches!(
+            ctx.release_ue(
+                &s_nssai,
+                "imsi-1",
+                AccessSet::single(AccessType::NonThreeGpp)
+            ),
+            ReleaseOutcome::Released(_)
+        ));
+        let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
+        assert_eq!(q.current_ues(), 0);
+        assert_eq!(q.ue_access_set("imsi-1"), AccessSet::empty());
+
+        // And now it is absent, not "released again".
+        assert_eq!(
+            ctx.release_ue(&s_nssai, "imsi-1", AccessSet::all()),
+            ReleaseOutcome::MemberAbsent
+        );
+    }
+
+    /// **Issue #95, gap 4.** A per-access ceiling still binds when an EXISTING
+    /// member adds an access, and the rejected operation applies nothing.
+    #[test]
+    fn adding_an_access_to_an_existing_member_respects_the_per_access_ceiling() {
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+        let s_nssai = SNssai::new(42, None);
+        ctx.quota_add_with_limits(
+            s_nssai.clone(),
+            10,
+            100,
+            AccessLimits {
+                max_ues_n3gpp: Some(1),
+                ..Default::default()
+            },
+        );
+
+        // imsi-a takes the single non-3GPP slot.
+        assert_eq!(
+            ctx.admit_ue(
+                &s_nssai,
+                "imsi-a",
+                AccessSet::single(AccessType::NonThreeGpp)
+            )
+            .0,
+            AdmissionResult::Admitted
+        );
+        // imsi-b registers on 3GPP (no ceiling there), then tries to ADD non-3GPP.
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-b", AccessSet::single(AccessType::ThreeGpp))
+                .0,
+            AdmissionResult::Admitted
+        );
+        assert_eq!(
+            ctx.admit_ue(
+                &s_nssai,
+                "imsi-b",
+                AccessSet::single(AccessType::NonThreeGpp)
+            )
+            .0,
+            AdmissionResult::RejectedQuotaExceededPerAccess(AccessType::NonThreeGpp),
+            "the non-3GPP ceiling binds even for an already-registered member"
+        );
+        // Nothing was applied: imsi-b still holds 3GPP only, and the aggregate is 2.
+        let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
+        assert_eq!(
+            q.ue_access_set("imsi-b"),
+            AccessSet::single(AccessType::ThreeGpp)
+        );
+        assert_eq!(q.current_ues(), 2);
+        assert_eq!(q.current_ues_access(AccessType::NonThreeGpp), 1);
+    }
+
+    /// **Issue #95, gap 4.** UPDATE **replaces** the access set, and refuses an
+    /// empty one rather than silently deregistering.
+    #[test]
+    fn update_replaces_the_access_set_and_refuses_an_empty_one() {
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+        let s_nssai = SNssai::new(43, None);
+        ctx.quota_add(s_nssai.clone(), 10, 100);
+        ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::all());
+
+        // Replace both-accesses with non-3GPP only: the stale 3GPP registration is
+        // cleared, which an add-only UPDATE could never do.
+        assert_eq!(
+            ctx.update_ue_access(
+                &s_nssai,
+                "imsi-1",
+                AccessSet::single(AccessType::NonThreeGpp)
+            ),
+            UpdateOutcome::Updated
+        );
+        let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
+        assert_eq!(q.current_ues(), 1, "the aggregate never moves on UPDATE");
+        assert_eq!(q.current_ues_access(AccessType::ThreeGpp), 0);
+        assert_eq!(q.current_ues_access(AccessType::NonThreeGpp), 1);
+
+        // An empty set is refused: a release is not an update.
+        assert_eq!(
+            ctx.update_ue_access(&s_nssai, "imsi-1", AccessSet::empty()),
+            UpdateOutcome::NotFound
+        );
+        assert_eq!(
+            ctx.quota_find_by_snssai(&s_nssai).unwrap().current_ues(),
+            1,
+            "a refused UPDATE must not deregister"
+        );
+    }
+
+    /// **Issue #95.** A state file written before #95 — `uesAccess` values are bare
+    /// `AccessType` strings, not arrays — still loads, with each member's single
+    /// access preserved.
+    #[test]
+    fn a_pre_95_state_file_with_string_ues_access_still_loads() {
+        let path =
+            std::env::temp_dir().join(format!("nsacf-legacy-access-{}.json", uuid::Uuid::new_v4()));
+        // Hand-written in the OLD format, so this is a real compatibility check and
+        // not a round-trip through the current writer.
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "quotas": [{
+                    "id": 1, "sst": 44, "sd": null,
+                    "maxUes": 10, "maxPduSessions": 100,
+                    "ues": ["imsi-1", "imsi-2"],
+                    "pduSessions": [],
+                    "uesAccess": { "imsi-1": "3GPP_ACCESS", "imsi-2": "NON_3GPP_ACCESS" },
+                    "pduSessionsAccess": {},
+                    "eacActive": false,
+                }]
+            })
+            .to_string(),
+        )
+        .expect("write legacy state");
+
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+        ctx.set_state_file(Some(path.clone()));
+        assert!(ctx.load_state(), "a pre-#95 state file must load");
+
+        let s_nssai = SNssai::new(44, None);
+        let q = ctx.quota_find_by_snssai(&s_nssai).expect("quota restored");
+        assert_eq!(q.current_ues(), 2);
+        assert_eq!(
+            q.ue_access_set("imsi-1"),
+            AccessSet::single(AccessType::ThreeGpp)
+        );
+        assert_eq!(
+            q.ue_access_set("imsi-2"),
+            AccessSet::single(AccessType::NonThreeGpp)
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Issue #95.** A dual-access membership survives a save/load round-trip, so
+    /// the fix is not undone by a restart.
+    #[test]
+    fn dual_access_membership_survives_a_restart() {
+        let path =
+            std::env::temp_dir().join(format!("nsacf-dual-access-{}.json", uuid::Uuid::new_v4()));
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+        ctx.set_state_file(Some(path.clone()));
+        let s_nssai = SNssai::new(45, None);
+        ctx.quota_add(s_nssai.clone(), 10, 100);
+        ctx.admit_ue(&s_nssai, "imsi-dual", AccessSet::all());
+
+        let mut restarted = NsacfContext::new();
+        restarted.init(64);
+        restarted.set_state_file(Some(path.clone()));
+        assert!(restarted.load_state());
+
+        let q = restarted
+            .quota_find_by_snssai(&s_nssai)
+            .expect("quota restored");
+        assert_eq!(q.current_ues(), 1);
+        assert_eq!(
+            q.ue_access_set("imsi-dual"),
+            AccessSet::all(),
+            "both accesses must survive; restoring only one would re-create the \
+             premature-deregistration bug after every restart"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1551,8 +2076,16 @@ mod tests {
 
         let s_nssai = SNssai::new(6, Some(0x0A0B0C));
         ctx.quota_add(s_nssai.clone(), 5, 10);
-        ctx.admit_ue(&s_nssai, "imsi-100", AccessType::ThreeGpp);
-        ctx.admit_ue(&s_nssai, "imsi-101", AccessType::NonThreeGpp);
+        ctx.admit_ue(
+            &s_nssai,
+            "imsi-100",
+            AccessSet::single(AccessType::ThreeGpp),
+        );
+        ctx.admit_ue(
+            &s_nssai,
+            "imsi-101",
+            AccessSet::single(AccessType::NonThreeGpp),
+        );
         ctx.admit_pdu_session(&s_nssai, "imsi-100:1", AccessType::ThreeGpp);
 
         // Simulate restart: fresh context restores from the state file
@@ -1571,7 +2104,12 @@ mod tests {
         assert_eq!(quota.current_ues_access(AccessType::NonThreeGpp), 1);
         // Membership survives: re-admitting an existing SUPI is idempotent
         assert_eq!(
-            ctx2.admit_ue(&s_nssai, "imsi-100", AccessType::ThreeGpp).0,
+            ctx2.admit_ue(
+                &s_nssai,
+                "imsi-100",
+                AccessSet::single(AccessType::ThreeGpp)
+            )
+            .0,
             AdmissionResult::Admitted
         );
         assert_eq!(
@@ -1710,18 +2248,25 @@ mod tests {
 
         // First 3GPP UE admits; the 3GPP bucket is now full.
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-a", AccessType::ThreeGpp).0,
+            ctx.admit_ue(&s_nssai, "imsi-a", AccessSet::single(AccessType::ThreeGpp))
+                .0,
             AdmissionResult::Admitted
         );
         // Second 3GPP UE: aggregate has room (1/10) but the 3GPP ceiling is hit
         // -> per-access rejection drives the _3GPP reason (nsacf-05).
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-b", AccessType::ThreeGpp).0,
+            ctx.admit_ue(&s_nssai, "imsi-b", AccessSet::single(AccessType::ThreeGpp))
+                .0,
             AdmissionResult::RejectedQuotaExceededPerAccess(AccessType::ThreeGpp)
         );
         // An N3GPP UE for the same slice still admits (separate bucket).
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-c", AccessType::NonThreeGpp).0,
+            ctx.admit_ue(
+                &s_nssai,
+                "imsi-c",
+                AccessSet::single(AccessType::NonThreeGpp)
+            )
+            .0,
             AdmissionResult::Admitted
         );
 
@@ -1740,11 +2285,17 @@ mod tests {
         let s_nssai = SNssai::new(12, None);
         ctx.quota_add(s_nssai.clone(), 1, 50);
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-a", AccessType::ThreeGpp).0,
+            ctx.admit_ue(&s_nssai, "imsi-a", AccessSet::single(AccessType::ThreeGpp))
+                .0,
             AdmissionResult::Admitted
         );
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-b", AccessType::NonThreeGpp).0,
+            ctx.admit_ue(
+                &s_nssai,
+                "imsi-b",
+                AccessSet::single(AccessType::NonThreeGpp)
+            )
+            .0,
             AdmissionResult::RejectedQuotaExceeded,
             "aggregate-only quota yields the plain reason regardless of anType"
         );
@@ -1792,7 +2343,7 @@ mod tests {
         let s_nssai = SNssai::new(14, None);
         ctx.quota_add(s_nssai.clone(), 10, 50);
 
-        ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
+        ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::single(AccessType::ThreeGpp));
         let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
         assert_eq!(q.current_ues_access(AccessType::ThreeGpp), 1);
         assert_eq!(q.current_ues_access(AccessType::NonThreeGpp), 0);
@@ -1800,7 +2351,11 @@ mod tests {
 
         // UPDATE to non-3GPP: bucket moves, aggregate unchanged (no double-count).
         assert_eq!(
-            ctx.update_ue_access(&s_nssai, "imsi-1", AccessType::NonThreeGpp),
+            ctx.update_ue_access(
+                &s_nssai,
+                "imsi-1",
+                AccessSet::single(AccessType::NonThreeGpp)
+            ),
             UpdateOutcome::Updated
         );
         let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
@@ -1810,18 +2365,30 @@ mod tests {
 
         // UPDATE again to the same access is idempotent.
         assert_eq!(
-            ctx.update_ue_access(&s_nssai, "imsi-1", AccessType::NonThreeGpp),
+            ctx.update_ue_access(
+                &s_nssai,
+                "imsi-1",
+                AccessSet::single(AccessType::NonThreeGpp)
+            ),
             UpdateOutcome::Updated
         );
 
         // UPDATE for an unknown SUPI -> NotFound (becomes SLICE_NOT_FOUND).
         assert_eq!(
-            ctx.update_ue_access(&s_nssai, "imsi-unknown", AccessType::ThreeGpp),
+            ctx.update_ue_access(
+                &s_nssai,
+                "imsi-unknown",
+                AccessSet::single(AccessType::ThreeGpp)
+            ),
             UpdateOutcome::NotFound
         );
         // UPDATE on an unconfigured slice -> NotFound.
         assert_eq!(
-            ctx.update_ue_access(&SNssai::new(97, None), "imsi-1", AccessType::ThreeGpp),
+            ctx.update_ue_access(
+                &SNssai::new(97, None),
+                "imsi-1",
+                AccessSet::single(AccessType::ThreeGpp)
+            ),
             UpdateOutcome::NotFound
         );
     }
@@ -1861,21 +2428,21 @@ mod tests {
 
         let s_nssai = SNssai::new(16, None);
         ctx.quota_add(s_nssai.clone(), 10, 50);
-        ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
+        ctx.admit_ue(&s_nssai, "imsi-1", AccessSet::single(AccessType::ThreeGpp));
 
         // Clean release of a present member.
         assert_eq!(
-            ctx.release_ue(&s_nssai, "imsi-1"),
+            ctx.release_ue(&s_nssai, "imsi-1", AccessSet::all()),
             ReleaseOutcome::Released(None)
         );
         // Releasing again: slice known, member absent -> idempotent.
         assert_eq!(
-            ctx.release_ue(&s_nssai, "imsi-1"),
+            ctx.release_ue(&s_nssai, "imsi-1", AccessSet::all()),
             ReleaseOutcome::MemberAbsent
         );
         // Release on a slice that is not NSAC-subject -> SliceNotFound.
         assert_eq!(
-            ctx.release_ue(&SNssai::new(96, None), "imsi-1"),
+            ctx.release_ue(&SNssai::new(96, None), "imsi-1", AccessSet::all()),
             ReleaseOutcome::SliceNotFound
         );
 
