@@ -46,3 +46,12 @@ scp:
   # peer-influenced binding / discovery / client caches (TS 33.522 §4.2.3.3).
   # max_cache_entries: 4096
   # cache_ttl: 3600
+  #
+  # How many discovered producers ONE Model D request may be forwarded to before
+  # the SCP gives up (default 3: the selected producer plus two alternates), per
+  # TS 29.500 §6.10.8.2 alternate-producer reselection. Only reached when a
+  # forward provably never left the SCP (connection refused / TLS failure, or the
+  # producer's circuit breaker is open) -- never for a producer that answered, and
+  # never after a timeout, which could have been delivered already. Set to 1 to
+  # disable reselection entirely.
+  # max_producer_attempts: 3

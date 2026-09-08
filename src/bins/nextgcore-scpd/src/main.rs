@@ -251,6 +251,14 @@ async fn main() -> Result<()> {
         .cache_ttl
         .map(Duration::from_secs)
         .unwrap_or(defaults.cache_ttl);
+    // scpd-#209: how many discovered producers one Model D request may be tried
+    // against. Clamped to >= 1 here as well as in the proxy so a `0` in the config
+    // cannot silently mean "never forward anything".
+    let max_producer_attempts = scp_yaml
+        .section()
+        .max_producer_attempts
+        .unwrap_or(defaults.max_producer_attempts)
+        .max(1);
 
     // TLS: --tls forces on; otherwise honour scp.sbi.tls.enabled. cert/key
     // come from the flag first, then the config.
@@ -267,7 +275,8 @@ async fn main() -> Result<()> {
 
     log::info!(
         "SCP identity: SCP-{own_fqdn}; SBI {sbi_addr}:{sbi_port} (tls={tls_enabled}); \
-         connect_timeout={}s request_timeout={}s; cache max={max_cache_entries} ttl={}s",
+         connect_timeout={}s request_timeout={}s; cache max={max_cache_entries} ttl={}s; \
+         max_producer_attempts={max_producer_attempts}",
         connect_timeout.as_secs(),
         request_timeout.as_secs(),
         cache_ttl.as_secs()
@@ -295,6 +304,7 @@ async fn main() -> Result<()> {
         next_hop_scp: args.next_hop_scp,
         max_cache_entries,
         cache_ttl,
+        max_producer_attempts,
         ..defaults
     }));
     let mut http_config =

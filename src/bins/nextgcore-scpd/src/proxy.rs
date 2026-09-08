@@ -38,7 +38,7 @@ use nextgcore_sbi::SbiError;
 use crate::cache::BoundedCache;
 use crate::circuit_breaker::CircuitBreaker;
 use crate::sbi_path::{
-    parse_search_result, select_nf_service_endpoint, DiscoveryCache, EndpointSelectionError,
+    parse_search_result, rank_nf_service_endpoints, DiscoveryCache, EndpointSelectionError,
 };
 
 /// Default upstream connect timeout (bounded per TS 29.500 §6.11 guidance).
@@ -151,7 +151,17 @@ pub struct ScpProxyConfig {
     /// Set it only for such an NRF: with it on and no consumer CCA, the token
     /// request carries an unattested identity.
     pub trust_requester_identity: bool,
+    /// Maximum producers a single Model D request may be forwarded to before the
+    /// SCP gives up (scpd-#209). `1` disables reselection; the default `3` bounds
+    /// the fan-out so one consumer request cannot walk a large `SearchResult`.
+    /// Clamped to at least 1. Only reached on a *provably undelivered* forward, so
+    /// this is not a retry budget for a producer that answered.
+    pub max_producer_attempts: usize,
 }
+
+/// Default number of producers one Model D request may be forwarded to
+/// (scpd-#209): the selected one plus two alternates.
+const DEFAULT_MAX_PRODUCER_ATTEMPTS: usize = 3;
 
 impl Default for ScpProxyConfig {
     fn default() -> Self {
@@ -167,6 +177,7 @@ impl Default for ScpProxyConfig {
             circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
             circuit_open_timeout: DEFAULT_CIRCUIT_OPEN_TIMEOUT,
             trust_requester_identity: false,
+            max_producer_attempts: DEFAULT_MAX_PRODUCER_ATTEMPTS,
         }
     }
 }
@@ -500,11 +511,72 @@ impl ParsedBinding {
 
 /// A producer selected by Model D delegated discovery, with the identifiers the
 /// SCP surfaces to the consumer.
+#[derive(Debug, Clone)]
 struct DiscoveredProducer {
     target: ApiRoot,
     nf_instance_id: String,
     nf_set_id: Option<String>,
     nf_group_id: Option<String>,
+}
+
+/// The producer delegated discovery selected, plus the ordered alternates the SCP
+/// may fail over to (scpd-#209, TS 29.500 §6.10.8.2).
+///
+/// Before this, the remainder of the `SearchResult` was parsed and then thrown
+/// away, so a single restarting producer failed requests a registered, healthy
+/// sibling could have served: with N replicas behind the NRF, availability was
+/// that of one replica rather than of the set.
+struct DiscoveryOutcome {
+    primary: DiscoveredProducer,
+    alternates: Vec<DiscoveredProducer>,
+}
+
+/// A forward that provably never reached the producer, so another candidate may
+/// still serve it (scpd-#209).
+struct Undeliverable {
+    /// The producer apiRoot that could not be reached, for the error detail.
+    target: String,
+    /// The transport error, or `None` when the SCP's own circuit breaker for this
+    /// producer was Open and nothing was sent at all.
+    error: Option<SbiError>,
+}
+
+/// The result of forwarding to **one** producer (scpd-#209).
+///
+/// `Undeliverable` is separated from `Final` so the Model D path can tell "try
+/// the next candidate" from "this is the answer" — the distinction the old
+/// single-`SbiResponse` return could not express, which is why reselection was
+/// impossible without this split.
+enum ForwardOutcome {
+    /// The producer answered, at any status. Relay it.
+    Answered(SbiResponse),
+    /// The request never reached this producer.
+    Undeliverable(Undeliverable),
+    /// An SCP-originated answer no other candidate could improve on: a delegated
+    /// token the NRF refused (same for every instance of the target NF type), or
+    /// a transport failure that may have delivered the request already.
+    Final(SbiResponse),
+}
+
+/// True when `err` proves the request never left the SCP, so replaying it on
+/// another producer cannot duplicate work (scpd-#209 idempotency decision).
+///
+/// **This is the whole idempotency argument, and it is deliberately narrow.** In
+/// `nextgcore_sbi::client`, `ConnectionError` is produced only by the TCP connect
+/// (`client.rs:452`) and the HTTP/2 handshake (`:514`, `:529`), and `TlsError`
+/// only by server-name validation and the TLS handshake (`:457`, `:465`) — every
+/// one of them before a single request byte is written. So reselecting after one
+/// is safe even for a `POST`.
+///
+/// `Timeout` is excluded although it looks like a transport failure: the same
+/// variant is produced by the connect phase (`:451`, `:464`) **and** by the
+/// send/response phase (`:892`), so it cannot distinguish "never sent" from "sent
+/// and the producer is still working on it". Replaying a non-idempotent request
+/// on a timeout could duplicate a registration or a charging record.
+/// `HyperError` (`:893`) is likewise post-send. Taking the conservative reading
+/// means there is no exposure to document rather than an exposure documented.
+fn is_provably_undelivered(err: &SbiError) -> bool {
+    matches!(err, SbiError::ConnectionError(_) | SbiError::TlsError(_))
 }
 
 /// True for header names a proxy must not forward, in either direction:
@@ -1186,7 +1258,11 @@ impl ScpProxy {
     /// the `3gpp-Sbi-Discovery-*` request headers, parse the SearchResult,
     /// and select a producer. The requester identity comes from
     /// `3gpp-Sbi-Discovery-requester-nf-type` (NOT User-Agent).
-    async fn discover(&self, request: &SbiRequest) -> Result<DiscoveredProducer, SbiResponse> {
+    ///
+    /// Returns the selected producer **and the ordered alternates** (scpd-#209),
+    /// so a forward that never reached the selected one can fail over instead of
+    /// discarding a candidate set the SCP already holds.
+    async fn discover(&self, request: &SbiRequest) -> Result<DiscoveryOutcome, SbiResponse> {
         let target_nf_type = request
             .http
             .get_header(discovery_header::TARGET_NF_TYPE)
@@ -1233,12 +1309,19 @@ impl ScpProxy {
             self.discovery_cache
                 .get(&target_nf_type, &service_key, &cache_discriminator)
         {
-            if let Ok(selected) = select_nf_service_endpoint(
+            if let Ok(ranked) = rank_nf_service_endpoints(
                 &cached,
                 requested_service.as_deref(),
                 requested_version.as_deref(),
             ) {
-                return Ok(DiscoveredProducer {
+                // scpd-#209: the cached set supplies alternates too, so a producer
+                // that restarted since the SearchResult was cached is exactly the
+                // case failover exists for.
+                //
+                // nf_set_id / nf_group_id are None on a cache hit because the
+                // cache entry holds parsed candidates and not the raw profile —
+                // the cache-state divergence #208 fixes.
+                let mut producers = ranked.into_iter().map(|selected| DiscoveredProducer {
                     target: ApiRoot {
                         scheme: selected.scheme,
                         host: selected.candidate.host.clone(),
@@ -1249,6 +1332,12 @@ impl ScpProxy {
                     nf_set_id: None,
                     nf_group_id: None,
                 });
+                if let Some(primary) = producers.next() {
+                    return Ok(DiscoveryOutcome {
+                        primary,
+                        alternates: producers.collect(),
+                    });
+                }
             }
             // A cached set that cannot serve THIS request falls through to a
             // fresh NRF query rather than erroring from stale data: the cache TTL
@@ -1331,7 +1420,10 @@ impl ScpProxy {
             );
         }
 
-        let selected = select_nf_service_endpoint(
+        // scpd-#209: the whole ranked set, not just the head. Every entry is
+        // resolved here so the failover path holds no reference back into the
+        // SearchResult.
+        let ranked = rank_nf_service_endpoints(
             &candidates,
             requested_service.as_deref(),
             requested_version.as_deref(),
@@ -1344,26 +1436,39 @@ impl ScpProxy {
             )
         })?;
 
-        // scpd-02/scpd-12: surface the producer's set id / group id when present.
-        let (nf_set_id, nf_group_id) =
-            extract_set_and_group(&value, &selected.candidate.nf_instance_id);
-
-        // Build the producer ApiRoot from the NF profile fields parsed out of
-        // the SearchResult: scheme, port and prefix come from the MATCHED
-        // `nfServices` entry (scpd-#207); host is ipv4→fqdn→ipv6(bracketed).
-        // `client_for`/`oauth_client_for` already honour the scheme field, so
-        // an `https` producer is now contacted over TLS automatically.
-        let target = ApiRoot {
-            scheme: selected.scheme,
-            host: selected.candidate.host.clone(),
-            port: selected.port,
-            prefix: selected.prefix,
-        };
-        Ok(DiscoveredProducer {
-            target,
-            nf_instance_id: selected.candidate.nf_instance_id.clone(),
-            nf_set_id,
-            nf_group_id,
+        let mut producers = ranked.into_iter().map(|selected| {
+            // scpd-02/scpd-12: surface each producer's set id / group id when
+            // present — per candidate, so a reselected producer reports ITS own
+            // identifiers rather than the originally-selected one's.
+            let (nf_set_id, nf_group_id) =
+                extract_set_and_group(&value, &selected.candidate.nf_instance_id);
+            // Build the producer ApiRoot from the NF profile fields parsed out of
+            // the SearchResult: scheme, port and prefix come from the MATCHED
+            // `nfServices` entry (scpd-#207); host is ipv4→fqdn→ipv6(bracketed).
+            // `client_for`/`oauth_client_for` already honour the scheme field, so
+            // an `https` producer is now contacted over TLS automatically.
+            DiscoveredProducer {
+                target: ApiRoot {
+                    scheme: selected.scheme,
+                    host: selected.candidate.host.clone(),
+                    port: selected.port,
+                    prefix: selected.prefix,
+                },
+                nf_instance_id: selected.candidate.nf_instance_id.clone(),
+                nf_set_id,
+                nf_group_id,
+            }
+        });
+        let primary = producers.next().ok_or_else(|| {
+            endpoint_selection_error_response(
+                EndpointSelectionError::NoCandidate,
+                requested_service.as_deref(),
+                requested_version.as_deref(),
+            )
+        })?;
+        Ok(DiscoveryOutcome {
+            primary,
+            alternates: producers.collect(),
         })
     }
 
@@ -1387,20 +1492,62 @@ impl ScpProxy {
         group_id: Option<&str>,
         delegated: Option<DelegatedAuth>,
     ) -> SbiResponse {
-        // scpd-#102: consult this producer's circuit breaker before forwarding.
-        // An Open circuit short-circuits to 503 without contacting the producer,
-        // so a flapping/down backend cannot amplify latency across consumers.
-        let target_key = format!("{}://{}:{}", target.scheme, target.host, target.port);
-        if !self.circuit_allows(&target_key) {
-            return self.stamp_server(problem_response(
+        match self
+            .forward_once(request, target, producer_id, group_id, delegated)
+            .await
+        {
+            ForwardOutcome::Answered(response) | ForwardOutcome::Final(response) => response,
+            // A single pinned target has no alternates, so "undeliverable" is the
+            // final answer here and keeps its pre-#209 mapping exactly.
+            ForwardOutcome::Undeliverable(u) => self.stamp_server(self.undeliverable_response(&u)),
+        }
+    }
+
+    /// The single-target error response for an undelivered forward: the
+    /// pre-scpd-#209 mapping, unchanged — `503` when our own circuit breaker shed
+    /// the request, otherwise the `502`/`504` `TARGET_NF_NOT_REACHABLE` of
+    /// [`upstream_error_response`].
+    fn undeliverable_response(&self, u: &Undeliverable) -> SbiResponse {
+        match &u.error {
+            Some(err) => upstream_error_response(&u.target, err),
+            None => problem_response(
                 503,
                 "Service Unavailable",
                 &format!(
                     "SCP circuit breaker is open for {} (recent failures)",
-                    target.to_uri()
+                    u.target
                 ),
                 "TARGET_NF_NOT_REACHABLE",
-            ));
+            ),
+        }
+    }
+
+    /// Forward to exactly **one** producer, reporting whether the request was
+    /// delivered (scpd-#209). See [`ForwardOutcome`]; callers with alternates use
+    /// [`Self::forward_with_reselection`], callers without use [`Self::forward`].
+    async fn forward_once(
+        &self,
+        request: &SbiRequest,
+        target: &ApiRoot,
+        producer_id: Option<&str>,
+        group_id: Option<&str>,
+        delegated: Option<DelegatedAuth>,
+    ) -> ForwardOutcome {
+        // scpd-#102: consult this producer's circuit breaker before forwarding.
+        // An Open circuit short-circuits without contacting the producer, so a
+        // flapping/down backend cannot amplify latency across consumers.
+        //
+        // scpd-#209: this is reported as Undeliverable rather than as a finished
+        // 503, so the Model D path can try a DIFFERENT producer. That is the exact
+        // gap #209 names: the breaker stopped us hammering a dead producer but did
+        // not send us to a live one, so the first request after the circuit opened
+        // still failed.
+        let target_key = format!("{}://{}:{}", target.scheme, target.host, target.port);
+        if !self.circuit_allows(&target_key) {
+            return ForwardOutcome::Undeliverable(Undeliverable {
+                target: target.to_uri(),
+                error: None,
+            });
         }
 
         let mut fwd = SbiRequest::default();
@@ -1506,7 +1653,13 @@ impl ScpProxy {
                         }
                     }
                     Err(e) => {
-                        return self.stamp_server(token_acquisition_failure_response(&e));
+                        // scpd-#209: Final, not Undeliverable. The token is minted
+                        // for (consumer, target NF TYPE, scope), so every instance
+                        // of that type would get the same refusal — reselecting
+                        // would just repeat the NRF round-trip.
+                        return ForwardOutcome::Final(
+                            self.stamp_server(token_acquisition_failure_response(&e)),
+                        );
                     }
                 }
             }
@@ -1518,7 +1671,18 @@ impl ScpProxy {
                 // scpd-#102: a transport failure (connect refused / timeout) is
                 // a circuit failure.
                 self.circuit_record(&target_key, false);
-                return self.stamp_server(upstream_error_response(&target.to_uri(), &e));
+                // scpd-#209: only a provably-undelivered failure may be replayed
+                // on another producer; see `is_provably_undelivered`.
+                return if is_provably_undelivered(&e) {
+                    ForwardOutcome::Undeliverable(Undeliverable {
+                        target: target.to_uri(),
+                        error: Some(e),
+                    })
+                } else {
+                    ForwardOutcome::Final(
+                        self.stamp_server(upstream_error_response(&target.to_uri(), &e)),
+                    )
+                };
             }
         };
 
@@ -1596,7 +1760,113 @@ impl ScpProxy {
             self.append_via(&mut relayed.http);
         }
 
-        relayed
+        // scpd-#209: the producer ANSWERED, so this is the answer even at 4xx/5xx.
+        // Reselecting on a producer-generated error would be wrong twice: the
+        // producer is up (so the set is not the problem), and a 409 or a 404 is
+        // frequently the semantically correct answer that a sibling instance would
+        // have no business overriding.
+        ForwardOutcome::Answered(relayed)
+    }
+
+    /// Forward a Model D request, failing over to the next-best discovered
+    /// producer when one provably never received it (scpd-#209,
+    /// TS 29.500 §6.10.8.2).
+    ///
+    /// Bounded by `max_producer_attempts`, and the bound is **logged** when it
+    /// truncates the list: silently trying 3 of 9 candidates and then reporting
+    /// "no producer was reachable" would overstate what the SCP actually did.
+    async fn forward_with_reselection(
+        &self,
+        request: &SbiRequest,
+        outcome: DiscoveryOutcome,
+        delegated: Option<DelegatedAuth>,
+    ) -> SbiResponse {
+        let max_attempts = self.config.max_producer_attempts.max(1);
+        let total_candidates = 1 + outcome.alternates.len();
+        let producers = std::iter::once(outcome.primary).chain(outcome.alternates);
+
+        let mut attempted = 0usize;
+        let mut last_undeliverable: Option<Undeliverable> = None;
+        let mut any_transport_failure = false;
+
+        for producer in producers {
+            if attempted >= max_attempts {
+                break;
+            }
+            attempted += 1;
+            let producer_id =
+                build_producer_id(&producer.nf_instance_id, producer.nf_set_id.as_deref());
+            if attempted > 1 {
+                log::debug!(
+                    "SCP Model D reselection: attempt {attempted}/{max_attempts} -> {} \
+                     (producer {})",
+                    producer.target.to_uri(),
+                    producer.nf_instance_id
+                );
+            }
+            match self
+                .forward_once(
+                    request,
+                    &producer.target,
+                    producer_id.as_deref(),
+                    producer.nf_group_id.as_deref(),
+                    delegated.clone(),
+                )
+                .await
+            {
+                ForwardOutcome::Answered(response) | ForwardOutcome::Final(response) => {
+                    return response
+                }
+                ForwardOutcome::Undeliverable(u) => {
+                    any_transport_failure |= u.error.is_some();
+                    last_undeliverable = Some(u);
+                }
+            }
+        }
+
+        let untried = total_candidates.saturating_sub(attempted);
+        if untried > 0 {
+            log::warn!(
+                "SCP Model D: gave up after {attempted} producer(s); {untried} discovered \
+                 candidate(s) left untried because max_producer_attempts is {max_attempts}"
+            );
+        }
+
+        match last_undeliverable {
+            // At least one producer was actually unreachable on the wire. The SCP
+            // owns selection in Model D, so exhausting the whole candidate set
+            // means its upstream is not answering — 504, per TS 29.500 §6.10.8.2,
+            // rather than the 502 a single refused connection used to give. Model C
+            // keeps 502: there the CONSUMER pinned the target, so the failure is
+            // that one hop and not an exhausted set.
+            Some(u) if any_transport_failure => self.stamp_server(problem_response(
+                504,
+                "Gateway Timeout",
+                &format!(
+                    "SCP could not reach any of {attempted} discovered producer(s); \
+                     last was {} ({})",
+                    u.target,
+                    u.error
+                        .as_ref()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "circuit open".to_string())
+                ),
+                "TARGET_NF_NOT_REACHABLE",
+            )),
+            // Every candidate was shed by its own circuit breaker, so nothing was
+            // ever put on the wire. That is load shedding, not unreachability, and
+            // 503 says "retry shortly" — which is exactly right, since the breakers
+            // will half-open.
+            Some(u) => self.stamp_server(self.undeliverable_response(&u)),
+            // Unreachable in practice: `attempted` is at least 1 and every arm
+            // either returns or sets `last_undeliverable`.
+            None => self.stamp_server(problem_response(
+                502,
+                "Bad Gateway",
+                "SCP selected no producer to forward to",
+                "TARGET_NF_NOT_REACHABLE",
+            )),
+        }
     }
 
     /// Handle one inbound SBI request end-to-end (the server handler entry
@@ -1636,7 +1906,7 @@ impl ScpProxy {
                     .await
             }
             RouteDecision::Discover => match self.discover(&request).await {
-                Ok(producer) => {
+                Ok(outcome) => {
                     // The producer NF type comes from the delegated-discovery
                     // header; used to scope the OAuth2 token the SCP attaches.
                     // #101 criterion 2: the token is minted for the requesting
@@ -1646,23 +1916,18 @@ impl ScpProxy {
                         .get_header(discovery_header::TARGET_NF_TYPE)
                         .and_then(|s| nf_type_from_str(s))
                         .map(|nf| self.delegated_auth(&request, nf));
-                    let producer_id =
-                        build_producer_id(&producer.nf_instance_id, producer.nf_set_id.as_deref());
                     log::debug!(
-                        "SCP Model D: {} {} -> {} (producer {})",
+                        "SCP Model D: {} {} -> {} (producer {}, {} alternate(s))",
                         request.header.method,
                         request.header.uri,
-                        producer.target.to_uri(),
-                        producer.nf_instance_id
+                        outcome.primary.target.to_uri(),
+                        outcome.primary.nf_instance_id,
+                        outcome.alternates.len()
                     );
-                    self.forward(
-                        &request,
-                        &producer.target,
-                        producer_id.as_deref(),
-                        producer.nf_group_id.as_deref(),
-                        delegated_auth,
-                    )
-                    .await
+                    // scpd-#209: fails over to the next-best discovered producer
+                    // when a forward provably never arrived.
+                    self.forward_with_reselection(&request, outcome, delegated_auth)
+                        .await
                 }
                 // scpd-03: SCP-originated discovery errors carry our `Server`.
                 Err(error_response) => self.stamp_server(error_response),
@@ -3045,8 +3310,9 @@ mod tests {
         });
         let body = serde_json::to_vec(&https_ipv6_result).unwrap();
         let candidates = parse_search_result(&body);
-        let selected = select_nf_service_endpoint(&candidates, Some("nudm-sdm"), Some("v1"))
-            .expect("candidate selected");
+        let selected =
+            crate::sbi_path::select_nf_service_endpoint(&candidates, Some("nudm-sdm"), Some("v1"))
+                .expect("candidate selected");
 
         // Simulate what discover() now does.
         let target = ApiRoot {
@@ -3087,8 +3353,9 @@ mod tests {
         });
         let body = serde_json::to_vec(&http_ipv4_result).unwrap();
         let candidates = parse_search_result(&body);
-        let selected = select_nf_service_endpoint(&candidates, Some("nudm-uecm"), Some("v1"))
-            .expect("candidate selected");
+        let selected =
+            crate::sbi_path::select_nf_service_endpoint(&candidates, Some("nudm-uecm"), Some("v1"))
+                .expect("candidate selected");
 
         let target = ApiRoot {
             scheme: selected.scheme,
@@ -3315,6 +3582,382 @@ mod tests {
         scp.stop().await.expect("scp stop");
         nrf.stop().await.expect("nrf stop");
         producer.stop().await.expect("producer stop");
+    }
+
+    // ------------------------------------------------------------------
+    // scpd-#209: alternate-producer reselection on an undelivered forward
+    // (TS 29.500 §6.10.8.2)
+    // ------------------------------------------------------------------
+
+    /// A `SearchResult` naming `ports` as separate UDM instances serving
+    /// `nudm-uecm`, in ascending `priority` — so the FIRST port listed is the one
+    /// selection picks first and reselection walks the rest in order.
+    fn uecm_instances(ports: &[u16]) -> serde_json::Value {
+        let instances: Vec<serde_json::Value> = ports
+            .iter()
+            .enumerate()
+            .map(|(i, port)| {
+                serde_json::json!({
+                    "nfInstanceId": format!("udm-{i}"),
+                    "nfType": "UDM",
+                    "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["127.0.0.1"],
+                    "priority": (i as u64) + 1,
+                    "capacity": 100,
+                    "load": 0,
+                    "nfServices": [{
+                        "serviceName": "nudm-uecm",
+                        "ipEndPoints": [{"transport": "TCP", "port": port}]
+                    }]
+                })
+            })
+            .collect();
+        serde_json::json!({"validityPeriod": 3600, "nfInstances": instances})
+    }
+
+    fn model_d_uecm_request() -> SbiRequest {
+        SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+            .with_header(discovery_header::REQUESTER_NF_TYPE, "AMF")
+            .with_header(discovery_header::SERVICE_NAMES, "nudm-uecm")
+    }
+
+    /// scpd-#209 acceptance: with two candidates where the first refuses
+    /// connections, the **second** serves the request.
+    ///
+    /// Two candidates is the minimum that can distinguish reselection from a
+    /// retry, which is why the issue asks for it: a single-candidate test would
+    /// pass against code that merely dialled the same dead producer twice.
+    #[tokio::test]
+    async fn test_model_d_reselects_the_next_candidate_when_the_first_refuses() {
+        // Port 1 on loopback refuses immediately (privileged, nothing listening).
+        const DEAD_PORT: u16 = 1;
+        let live_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let live_hits = Arc::new(AtomicU64::new(0));
+
+        let live = start_named_producer(live_port, "second", live_hits.clone()).await;
+        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[DEAD_PORT, live_port])).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                connect_timeout: Duration::from_millis(500),
+                request_timeout: Duration::from_millis(500),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let response = fast_client(scp_port)
+            .send_request(model_d_uecm_request())
+            .await
+            .expect("roundtrip");
+        assert_eq!(
+            response.status, 200,
+            "a registered healthy sibling must serve a request the first candidate could not"
+        );
+        let body: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(body["servedBy"], "second");
+        assert_eq!(live_hits.load(Ordering::SeqCst), 1);
+        // scpd-02/#209: the reselected producer reports ITS OWN instance id, not
+        // the one originally selected.
+        assert_eq!(
+            response.http.producer_id().map(String::as_str),
+            Some("nfinst=udm-1"),
+            "Producer-Id must name the producer that actually served the request"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        live.stop().await.expect("live stop");
+    }
+
+    /// scpd-#209 acceptance: exhausting the candidate list on connection-refused
+    /// is `504`, and is distinguishable from the `502 NF_DISCOVERY_FAILURE` a
+    /// genuine discovery error gives.
+    ///
+    /// Both are driven here so the distinction is asserted rather than assumed —
+    /// and note the pair `(504, TARGET_NF_NOT_REACHABLE)` does not collide with
+    /// #211's `(504, NRF_NOT_REACHABLE)`: the cause still names which node failed.
+    #[tokio::test]
+    async fn test_model_d_exhausted_candidates_is_504_distinct_from_discovery_failure() {
+        let nrf_port = ephemeral_port();
+        // Two candidates, both refusing.
+        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[1, 2])).await;
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+            connect_timeout: Duration::from_millis(500),
+            request_timeout: Duration::from_millis(500),
+            ..Default::default()
+        });
+        let exhausted = proxy.handle(model_d_uecm_request()).await;
+        let problem: ProblemDetails = exhausted.json_body().unwrap();
+        let exhausted = (exhausted.status, problem.cause.unwrap_or_default());
+        assert_eq!(exhausted, (504, "TARGET_NF_NOT_REACHABLE".to_string()));
+
+        // A genuine discovery error: the NRF answers non-200.
+        let broken_port = ephemeral_port();
+        let broken =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], broken_port)),
+            ));
+        broken
+            .start(|_r: SbiRequest| async move { SbiResponse::with_status(500) })
+            .await
+            .expect("broken nrf start");
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            nrf_uri: Some(format!("http://127.0.0.1:{broken_port}")),
+            connect_timeout: Duration::from_millis(500),
+            request_timeout: Duration::from_millis(500),
+            ..Default::default()
+        });
+        let discovery_error = proxy.handle(model_d_uecm_request()).await;
+        let problem: ProblemDetails = discovery_error.json_body().unwrap();
+        let discovery_error = (discovery_error.status, problem.cause.unwrap_or_default());
+        assert_eq!(discovery_error, (502, "NF_DISCOVERY_FAILURE".to_string()));
+
+        assert_ne!(
+            exhausted, discovery_error,
+            "an exhausted producer set and a discovery error must not read alike"
+        );
+
+        nrf.stop().await.expect("nrf stop");
+        broken.stop().await.expect("broken nrf stop");
+    }
+
+    /// scpd-#209 acceptance: a producer-generated 5xx is **relayed**, not
+    /// reselected. The producer answered, so the set is not the problem — and a
+    /// sibling has no business overriding a 409 or a 404 the first one returned.
+    ///
+    /// The second candidate is live and counted, so the assertion distinguishes
+    /// "did not reselect" from "reselected and the second also failed".
+    #[tokio::test]
+    async fn test_model_d_does_not_reselect_on_a_producer_error() {
+        let erroring_port = ephemeral_port();
+        let live_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let erroring_hits = Arc::new(AtomicU64::new(0));
+        let live_hits = Arc::new(AtomicU64::new(0));
+
+        let erroring = start_counting_500_producer(erroring_port, erroring_hits.clone()).await;
+        let live = start_named_producer(live_port, "second", live_hits.clone()).await;
+        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[erroring_port, live_port])).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                connect_timeout: Duration::from_millis(500),
+                request_timeout: Duration::from_millis(500),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let response = fast_client(scp_port)
+            .send_request(model_d_uecm_request())
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 500, "the producer's answer is relayed");
+        assert_eq!(erroring_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            live_hits.load(Ordering::SeqCst),
+            0,
+            "a producer that ANSWERED must not trigger failover to a sibling"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        live.stop().await.expect("live stop");
+        erroring.stop().await.expect("erroring stop");
+    }
+
+    /// scpd-#209: `max_producer_attempts` really bounds the walk.
+    ///
+    /// Three candidates, the first two refusing and the third live, with the bound
+    /// set to 2: the request must FAIL even though a healthy producer was in the
+    /// set and one more attempt would have reached it. Asserting the failure is
+    /// how the bound is observed — counting connects to a dead port is not
+    /// possible.
+    #[tokio::test]
+    async fn test_max_producer_attempts_bounds_the_reselection_walk() {
+        let live_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let live_hits = Arc::new(AtomicU64::new(0));
+
+        let live = start_named_producer(live_port, "third", live_hits.clone()).await;
+        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[1, 2, live_port])).await;
+
+        let bounded = ScpProxy::new(ScpProxyConfig {
+            nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+            connect_timeout: Duration::from_millis(500),
+            request_timeout: Duration::from_millis(500),
+            max_producer_attempts: 2,
+            ..Default::default()
+        });
+        let response = bounded.handle(model_d_uecm_request()).await;
+        assert_eq!(response.status, 504, "the bound stopped the walk short");
+        assert_eq!(
+            live_hits.load(Ordering::SeqCst),
+            0,
+            "the third candidate was never tried"
+        );
+
+        // Raising the bound reaches it, so the failure above is the bound and not
+        // a broken third candidate.
+        let unbounded = ScpProxy::new(ScpProxyConfig {
+            nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+            connect_timeout: Duration::from_millis(500),
+            request_timeout: Duration::from_millis(500),
+            max_producer_attempts: 3,
+            ..Default::default()
+        });
+        let response = unbounded.handle(model_d_uecm_request()).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(live_hits.load(Ordering::SeqCst), 1);
+
+        nrf.stop().await.expect("nrf stop");
+        live.stop().await.expect("live stop");
+    }
+
+    /// scpd-#209 + scpd-#102: **an open circuit reselects instead of shedding.**
+    ///
+    /// This is the interaction the issue names in as many words: the breaker
+    /// stopped the SCP hammering a dead producer but never sent it to a live one,
+    /// so "the first request after the circuit opens still fails". Here the first
+    /// candidate answers 500 twice to trip its own breaker; the third request must
+    /// be served by the sibling rather than shed with a 503.
+    #[tokio::test]
+    async fn test_an_open_circuit_reselects_rather_than_shedding() {
+        let flapping_port = ephemeral_port();
+        let live_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let flapping_hits = Arc::new(AtomicU64::new(0));
+        let live_hits = Arc::new(AtomicU64::new(0));
+
+        let flapping = start_counting_500_producer(flapping_port, flapping_hits.clone()).await;
+        let live = start_named_producer(live_port, "sibling", live_hits.clone()).await;
+        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[flapping_port, live_port])).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                connect_timeout: Duration::from_millis(500),
+                request_timeout: Duration::from_millis(500),
+                circuit_failure_threshold: 2,
+                circuit_open_timeout: Duration::from_secs(30),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let client = fast_client(scp_port);
+
+        // Two 5xx answers trip the first candidate's breaker. Both are relayed —
+        // a producer that answers is not reselected.
+        for _ in 0..2 {
+            let response = client
+                .send_request(model_d_uecm_request())
+                .await
+                .expect("roundtrip");
+            assert_eq!(response.status, 500);
+        }
+        assert_eq!(flapping_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(live_hits.load(Ordering::SeqCst), 0);
+
+        // The breaker for the first candidate is now Open. Pre-#209 this request
+        // was shed with 503; it must now be served by the sibling.
+        let response = client
+            .send_request(model_d_uecm_request())
+            .await
+            .expect("roundtrip");
+        assert_eq!(
+            response.status, 200,
+            "an open circuit must send the request to a sibling, not shed it"
+        );
+        let body: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(body["servedBy"], "sibling");
+        assert_eq!(live_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            flapping_hits.load(Ordering::SeqCst),
+            2,
+            "the open circuit still protects the failing producer from more traffic"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        live.stop().await.expect("live stop");
+        flapping.stop().await.expect("flapping stop");
+    }
+
+    /// scpd-#209 unit: the idempotency rule. `ConnectionError` and `TlsError` are
+    /// produced only before any request byte is written, so replaying them is
+    /// safe; `Timeout` and `HyperError` can both occur *after* the request was
+    /// sent, so replaying a `POST` on one could duplicate work.
+    #[test]
+    fn test_only_pre_send_failures_are_replayable() {
+        assert!(is_provably_undelivered(&SbiError::ConnectionError(
+            "Connection refused (os error 111)".to_string()
+        )));
+        assert!(is_provably_undelivered(&SbiError::TlsError(
+            "TLS handshake failed".to_string()
+        )));
+        // The load-bearing negatives: a timeout may mean the producer received the
+        // request and is still working on it.
+        assert!(!is_provably_undelivered(&SbiError::Timeout));
+        assert!(!is_provably_undelivered(&SbiError::HyperError(
+            "stream closed".to_string()
+        )));
+        assert!(!is_provably_undelivered(&SbiError::InvalidResponse(
+            "garbage".to_string()
+        )));
+    }
+
+    /// scpd-#209: a timeout on the FIRST candidate is not replayed on the second,
+    /// because the request may already have been delivered. The live sibling stays
+    /// untouched and the consumer gets the 504 the slow producer earned.
+    #[tokio::test]
+    async fn test_a_timeout_does_not_reselect() {
+        let slow_port = ephemeral_port();
+        let live_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let live_hits = Arc::new(AtomicU64::new(0));
+
+        let slow =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], slow_port)),
+            ));
+        slow.start(|_r: SbiRequest| async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            SbiResponse::ok()
+        })
+        .await
+        .expect("slow producer start");
+        let live = start_named_producer(live_port, "second", live_hits.clone()).await;
+        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[slow_port, live_port])).await;
+
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+            connect_timeout: Duration::from_millis(500),
+            request_timeout: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let response = proxy.handle(model_d_uecm_request()).await;
+        assert_eq!(response.status, 504);
+        let problem: ProblemDetails = response.json_body().unwrap();
+        assert_eq!(problem.cause.as_deref(), Some("TARGET_NF_NOT_REACHABLE"));
+        assert_eq!(
+            live_hits.load(Ordering::SeqCst),
+            0,
+            "a possibly-delivered request must not be replayed on a sibling"
+        );
+
+        nrf.stop().await.expect("nrf stop");
+        live.stop().await.expect("live stop");
+        slow.stop().await.expect("slow stop");
     }
 
     /// When no NRF (and thus no OAuth2 client) is configured, a Model C forward
