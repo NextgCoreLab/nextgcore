@@ -493,7 +493,7 @@ pub struct ImplicitRegDetails {
 ///
 /// Required: `eecId` AND `cntxId` (yaml:265-267). Cross-spec leaves
 /// (`LocationArea5G`, `ACProfile`) are passthrough JSON values.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EECContext {
     /// Unique identifier of the EEC (yaml:233-235; REQUIRED).
