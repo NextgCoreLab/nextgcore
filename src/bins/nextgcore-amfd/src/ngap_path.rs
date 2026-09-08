@@ -2896,6 +2896,14 @@ impl NgapServer {
             state.amf_ue.ue_ambr.uplink = ul;
         }
 
+        // GPSI (UDM am-data `gpsis`, TS 29.503 §5.2.2.2.1) — the UE's external
+        // identity, conveyed onward on N11 (issue #205). Assigned unconditionally
+        // from the response so that a subscription which STOPS carrying a GPSI
+        // clears the stale one on re-registration rather than keeping it; the
+        // parser has already dropped any entry that is not a well-formed
+        // TS 29.571 `Gpsi`, so this is never a placeholder.
+        state.amf_ue.gpsi = am_data.gpsi.clone();
+
         // New 5G-GUTI: GUAMI of this AMF + CSPRNG 5G-TMSI (TS 23.003 2.10.1)
         state.amf_ue.generate_new_guti();
         state.amf_ue.next_guti.plmn_id = guami_plmn;
@@ -3592,52 +3600,10 @@ impl NgapServer {
                 let identity = {
                     let ctx = crate::context::amf_self();
                     let guard = ctx.read().ok();
-                    let state = self.ue_auth_state.get(&amf_ue_ngap_id);
-                    // The serving PLMN: prefer the TAI the UE is actually in,
-                    // then the AMF's own served GUAMI. Never a literal.
-                    let serving_plmn = state
-                        .map(|s| &s.amf_ue.nr_tai.plmn_id)
-                        .map(|p| (p.mcc(), p.mnc()))
-                        .or_else(|| {
-                            guard
-                                .as_ref()
-                                .and_then(|c| c.served_guami.first())
-                                .map(|g| (g.plmn_id.mcc(), g.plmn_id.mnc()))
-                        });
-                    let guami = guard
-                        .as_ref()
-                        .and_then(|c| c.served_guami.first())
-                        .map(|g| {
-                            serde_json::json!({
-                                "plmnId": { "mcc": g.plmn_id.mcc(), "mnc": g.plmn_id.mnc() },
-                                "amfId": format!(
-                                    "{:02x}{:03x}{:02x}",
-                                    g.amf_id.region, g.amf_id.set, g.amf_id.pointer
-                                ),
-                            })
-                        });
-                    // TS 29.571 UserLocation: the serving NR TAI.
-                    let ue_location = state.map(|s| &s.amf_ue.nr_tai).map(|tai| {
-                        serde_json::json!({
-                            "nrLocation": {
-                                "tai": {
-                                    "plmnId": {
-                                        "mcc": tai.plmn_id.mcc(),
-                                        "mnc": tai.plmn_id.mnc(),
-                                    },
-                                    "tac": format!("{:06x}", tai.tac),
-                                }
-                            }
-                        })
-                    });
-                    crate::sbi_path::SmContextIdentity {
-                        supi: state.and_then(|s| s.amf_ue.supi.clone()),
-                        pei: state.and_then(|s| s.amf_ue.pei.clone()),
-                        guami,
-                        serving_plmn,
-                        serving_nf_id: None,
-                        ue_location,
-                    }
+                    build_sm_context_identity(
+                        self.ue_auth_state.get(&amf_ue_ngap_id),
+                        guard.as_ref().and_then(|c| c.served_guami.first()),
+                    )
                 };
 
                 match crate::sbi_path::call_smf_create_sm_context(
@@ -6019,6 +5985,65 @@ fn validate_initial_registration_cleartext(
     None
 }
 
+/// Assemble the UE and serving-network identity the AMF conveys on N11
+/// (TS 29.502 §6.1.6.2.2 `SmContextCreateData`) from the UE's NAS context and the
+/// AMF's own served GUAMI.
+///
+/// Every member is `Option`: an identity the AMF does not hold is OMITTED by
+/// `build_create_sm_context_request` rather than placeheld, because a wrong
+/// identity is worse than an absent one (issue #73).
+///
+/// Extracted from the inline block at the CreateSMContext call site so that this
+/// mapping is reachable from a test. It is the half of the identity path that was
+/// unguarded: a test that hands `build_create_sm_context_request` an identity it
+/// built itself proves the SERIALISER emits what it is given, and would keep
+/// passing if this function returned `None` for every member.
+fn build_sm_context_identity(
+    state: Option<&UeNasContext>,
+    served_guami: Option<&crate::context::Guami>,
+) -> crate::sbi_path::SmContextIdentity {
+    // The serving PLMN: prefer the TAI the UE is actually in, then the AMF's own
+    // served GUAMI. Never a literal.
+    let serving_plmn = state
+        .map(|s| &s.amf_ue.nr_tai.plmn_id)
+        .map(|p| (p.mcc(), p.mnc()))
+        .or_else(|| served_guami.map(|g| (g.plmn_id.mcc(), g.plmn_id.mnc())));
+    let guami = served_guami.map(|g| {
+        serde_json::json!({
+            "plmnId": { "mcc": g.plmn_id.mcc(), "mnc": g.plmn_id.mnc() },
+            "amfId": format!(
+                "{:02x}{:03x}{:02x}",
+                g.amf_id.region, g.amf_id.set, g.amf_id.pointer
+            ),
+        })
+    });
+    // TS 29.571 UserLocation: the serving NR TAI.
+    let ue_location = state.map(|s| &s.amf_ue.nr_tai).map(|tai| {
+        serde_json::json!({
+            "nrLocation": {
+                "tai": {
+                    "plmnId": {
+                        "mcc": tai.plmn_id.mcc(),
+                        "mnc": tai.plmn_id.mnc(),
+                    },
+                    "tac": format!("{:06x}", tai.tac),
+                }
+            }
+        })
+    });
+    crate::sbi_path::SmContextIdentity {
+        supi: state.and_then(|s| s.amf_ue.supi.clone()),
+        pei: state.and_then(|s| s.amf_ue.pei.clone()),
+        guami,
+        serving_plmn,
+        serving_nf_id: None,
+        ue_location,
+        // Issue #205: the UE's EXTERNAL identity, stored on the UE context from
+        // the `gpsis` array of the `am-data` the AMF retrieves at registration.
+        gpsi: state.and_then(|s| s.amf_ue.gpsi.clone()),
+    }
+}
+
 /// amfd-06: choose the authorized Allowed-NSSAI for a Registration Accept
 /// (TS 23.502 §4.2.2.2.3, TS 24.501 §9.11.3.37).
 ///
@@ -6979,6 +7004,46 @@ mod tests {
         assert!(handle.is_ok());
         let handle = handle.unwrap();
         assert_eq!(handle.num_gnbs().await, 0);
+    }
+
+    /// **Issue #205.** The N11 identity is assembled FROM the UE context, so a
+    /// GPSI the AMF stored at registration reaches `SmContextCreateData`.
+    ///
+    /// `sbi_path`'s serialiser tests build an identity by hand, which cannot tell
+    /// a working `gpsi: state.amf_ue.gpsi.clone()` from a hardcoded `None`. This
+    /// asserts the mapping itself, for the GPSI and for the members beside it.
+    #[test]
+    fn sm_context_identity_is_built_from_the_ue_context() {
+        let mut state = UeNasContext::new(1, 2, 3, false);
+        state.amf_ue.supi = Some("imsi-262011234567890".to_string());
+        state.amf_ue.pei = Some("imeisv-1234567890123456".to_string());
+        state.amf_ue.gpsi = Some("msisdn-491234567890".to_string());
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("262", "01");
+        state.amf_ue.nr_tai.tac = 1;
+
+        let identity = build_sm_context_identity(Some(&state), None);
+        assert_eq!(identity.supi.as_deref(), Some("imsi-262011234567890"));
+        assert_eq!(identity.pei.as_deref(), Some("imeisv-1234567890123456"));
+        assert_eq!(identity.gpsi.as_deref(), Some("msisdn-491234567890"));
+        assert_eq!(
+            identity.serving_plmn,
+            Some(("262".to_string(), "01".to_string()))
+        );
+        assert_eq!(
+            identity.ue_location.as_ref().unwrap()["nrLocation"]["tai"]["tac"].as_str(),
+            Some("000001")
+        );
+
+        // A UE the AMF holds no GPSI for yields none — not a SUPI-derived one.
+        state.amf_ue.gpsi = None;
+        let without = build_sm_context_identity(Some(&state), None);
+        assert_eq!(without.gpsi, None);
+        assert_eq!(without.supi.as_deref(), Some("imsi-262011234567890"));
+
+        // No UE context at all: every UE-sourced member is absent.
+        let none = build_sm_context_identity(None, None);
+        assert!(none.supi.is_none() && none.pei.is_none() && none.gpsi.is_none());
+        assert!(none.serving_plmn.is_none() && none.ue_location.is_none());
     }
 
     #[test]

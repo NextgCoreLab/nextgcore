@@ -828,6 +828,11 @@ pub struct SmContextIdentity {
     pub serving_nf_id: Option<String>,
     /// `ueLocation` — TS 29.571 `UserLocation`, built from the serving TAI.
     pub ue_location: Option<serde_json::Value>,
+    /// `gpsi` — the UE's external identity, from the `gpsis` array of the
+    /// `am-data` the AMF already retrieves (TS 29.503 §5.2.2.2.1). `None` when
+    /// the subscription carries none, in which case the member is omitted
+    /// (issue #205).
+    pub gpsi: Option<String>,
 }
 
 fn build_create_sm_context_request(
@@ -880,9 +885,15 @@ fn build_create_sm_context_request(
     if let Some(loc) = &identity.ue_location {
         obj.insert("ueLocation".to_string(), loc.clone());
     }
-    // `gpsi` is deliberately absent: amfd's UE context has no GPSI field at all
-    // (it never retrieves one from UDM), so there is nothing to convey. Emitting
-    // a derived or blank GPSI would be a fabrication. Tracked as a follow-up.
+    // `gpsi` — the UE's EXTERNAL identity, so that the SMF (and through it the
+    // CHF and any AF-facing exposure) has something to correlate on other than
+    // the SUPI, which is internal and is not what a billing system keys on
+    // (issue #205, TS 23.501 §5.9.8). It follows the same omit-never-placehold
+    // rule as the members above: it is emitted only when the `am-data`
+    // subscription actually supplied a well-formed one.
+    if let Some(gpsi) = &identity.gpsi {
+        obj.insert("gpsi".to_string(), serde_json::json!(gpsi));
+    }
     SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
         .with_part(SbiPart::with_content(
@@ -1573,6 +1584,48 @@ pub struct AmDataResponse {
     pub ue_ambr_downlink: Option<String>,
     /// Subscribed S-NSSAIs (SST, optional SD)
     pub nssai: Vec<(u8, Option<u32>)>,
+    /// GPSI — first well-formed entry of the `gpsis` array
+    /// (TS 29.503 §5.2.2.2.1), or `None` when the subscription carries none.
+    pub gpsi: Option<String>,
+}
+
+/// Accept a TS 29.571 `Gpsi` only in one of its two NAMED forms —
+/// `msisdn-<5..15 digits>` or `extid-<local>@<domain>` — and reject everything
+/// else.
+///
+/// TS 29.571's own `Gpsi` pattern is
+/// `^(msisdn-[0-9]{5,15}|extid-[^@]+@[^@]+|.+)$`. That trailing `.+` alternative
+/// makes the pattern match ANY non-empty string, so validating against it
+/// literally would validate nothing: a UDR bug that put a bare SUPI or an empty
+/// placeholder in `gpsis` would sail through and the AMF would convey it to the
+/// SMF as an external identity. Since a GPSI's whole purpose is to be the
+/// identifier a CHF or AF correlates on (TS 23.501 §5.9.8), a value of unknown
+/// form is worth no more than no value at all — and `None` is the honest one,
+/// because every consumer omits the member for it.
+///
+/// The deliberate cost: a subscription carrying a FUTURE GPSI type that 3GPP
+/// adds under the `.+` escape is dropped rather than forwarded. That is logged
+/// at `warn` by the caller so it is diagnosable instead of silent, and the fix
+/// is to add the new form here.
+fn validated_gpsi(raw: &str) -> Option<String> {
+    if let Some(digits) = raw.strip_prefix("msisdn-") {
+        let len = digits.len();
+        if (5..=15).contains(&len) && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(raw.to_string());
+        }
+        return None;
+    }
+    if let Some(ext_id) = raw.strip_prefix("extid-") {
+        // `[^@]+@[^@]+`: exactly one `@`, non-empty on both sides.
+        let mut parts = ext_id.split('@');
+        let local = parts.next().unwrap_or_default();
+        let domain = parts.next().unwrap_or_default();
+        if parts.next().is_none() && !local.is_empty() && !domain.is_empty() {
+            return Some(raw.to_string());
+        }
+        return None;
+    }
+    None
 }
 
 /// Nudm_SDM_Get (am-data): GET /nudm-sdm/v2/{supi}/am-data (TS 29.503 5.2.2.2.1)
@@ -1602,32 +1655,70 @@ pub async fn call_udm_sdm_get_am_data(
         )));
     }
 
+    let out = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+        .map(|json| parse_am_data(&json, supi))
+        .unwrap_or_default();
+
+    log::info!(
+        "[{supi}] Nudm_SDM_Get am-data OK ({} S-NSSAI, gpsi {})",
+        out.nssai.len(),
+        if out.gpsi.is_some() {
+            "present"
+        } else {
+            "absent"
+        }
+    );
+    Ok(out)
+}
+
+/// Decode an `AccessAndMobilitySubscriptionData` body into the subset of it the
+/// AMF keeps (TS 29.503 §5.2.2.2.1).
+///
+/// Split out of `call_udm_sdm_get_am_data` so the decode is reachable from a test
+/// without standing up a UDM: `gpsis` selection in particular has more than one
+/// interesting input (several entries, a malformed entry, an empty array) and
+/// none of them are expressible through the async caller.
+fn parse_am_data(json: &serde_json::Value, supi: &str) -> AmDataResponse {
     let mut out = AmDataResponse::default();
-    if let Some(content) = &response.http.content {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
-            out.ue_ambr_uplink = json["subscribedUeAmbr"]["uplink"]
-                .as_str()
-                .map(String::from);
-            out.ue_ambr_downlink = json["subscribedUeAmbr"]["downlink"]
-                .as_str()
-                .map(String::from);
-            if let Some(list) = json["nssai"]["defaultSingleNssais"].as_array() {
-                for s in list {
-                    if let Some(sst) = s["sst"].as_u64() {
-                        let sd = s["sd"]
-                            .as_str()
-                            .and_then(|h| u32::from_str_radix(h, 16).ok());
-                        out.nssai.push((sst as u8, sd));
-                    }
-                }
+    out.ue_ambr_uplink = json["subscribedUeAmbr"]["uplink"]
+        .as_str()
+        .map(String::from);
+    out.ue_ambr_downlink = json["subscribedUeAmbr"]["downlink"]
+        .as_str()
+        .map(String::from);
+    if let Some(list) = json["nssai"]["defaultSingleNssais"].as_array() {
+        for s in list {
+            if let Some(sst) = s["sst"].as_u64() {
+                let sd = s["sd"]
+                    .as_str()
+                    .and_then(|h| u32::from_str_radix(h, 16).ok());
+                out.nssai.push((sst as u8, sd));
             }
         }
     }
-    log::info!(
-        "[{supi}] Nudm_SDM_Get am-data OK ({} S-NSSAI)",
-        out.nssai.len()
-    );
-    Ok(out)
+    // `gpsis` is an ARRAY (TS 29.503 §5.2.2.2.1) and a subscriber may hold
+    // several external identities; the N11 `gpsi` member is singular, so the
+    // first well-formed entry is taken. Entries that are not one of the two
+    // named `Gpsi` forms are skipped rather than stored -- see `validated_gpsi`.
+    if let Some(list) = json["gpsis"].as_array() {
+        out.gpsi = list
+            .iter()
+            .filter_map(|g| g.as_str())
+            .find_map(validated_gpsi);
+        if out.gpsi.is_none() && !list.is_empty() {
+            log::warn!(
+                "[{supi}] am-data carried {} gpsis entr{}, none in a recognised \
+                 TS 29.571 Gpsi form (msisdn-/extid-); no GPSI stored",
+                list.len(),
+                if list.len() == 1 { "y" } else { "ies" }
+            );
+        }
+    }
+    out
 }
 
 /// Nudm_SDM_Subscribe: POST /nudm-sdm/v2/{supi}/sdm-subscriptions (TS 29.503 5.2.2.3.2)
@@ -2221,6 +2312,7 @@ mod tests {
                     "tai": { "plmnId": { "mcc": "262", "mnc": "01" }, "tac": "000001" }
                 }
             })),
+            gpsi: Some("msisdn-491234567890".to_string()),
         }
     }
 
@@ -2265,6 +2357,128 @@ mod tests {
         );
     }
 
+    /// **Issue #205.** The N11 body carries the `gpsi` — the UE's EXTERNAL
+    /// identity — when the `am-data` subscription supplied one.
+    ///
+    /// Before this the member was unconditionally absent (the AMF had no GPSI
+    /// field at all), so the SMF, and through it the CHF, had nothing but the
+    /// SUPI to key on and no CDR could be joined to an operator's subscriber
+    /// records by MSISDN.
+    #[test]
+    fn n11_create_carries_the_gpsi_when_the_subscription_supplies_one() {
+        let body = n11_body(&test_identity());
+
+        assert_eq!(body["gpsi"].as_str(), Some("msisdn-491234567890"));
+        // The emitted value must be a TS 29.571 `Gpsi`, not an arbitrary string
+        // that happened to be in the subscription.
+        assert_eq!(
+            validated_gpsi(body["gpsi"].as_str().unwrap()).as_deref(),
+            body["gpsi"].as_str(),
+            "the emitted gpsi must itself pass Gpsi validation"
+        );
+        // The SUPI is the INTERNAL identity and must not be reused as the GPSI:
+        // deriving one from the other is the fabrication issue #205 forbids.
+        assert_ne!(body["gpsi"].as_str(), body["supi"].as_str());
+    }
+
+    /// The GPSI the AMF conveys comes from `am-data`'s `gpsis` array, and only a
+    /// well-formed entry is taken.
+    ///
+    /// Each case here is a real decode input the async caller cannot express:
+    /// several entries (take the first usable), a leading malformed entry (skip
+    /// to the usable one), and an all-malformed array (store nothing at all
+    /// rather than the least-bad candidate).
+    #[test]
+    fn am_data_takes_the_first_well_formed_gpsi() {
+        let supi = "imsi-262011234567890";
+
+        let one = parse_am_data(
+            &serde_json::json!({ "gpsis": ["msisdn-491234567890"] }),
+            supi,
+        );
+        assert_eq!(one.gpsi.as_deref(), Some("msisdn-491234567890"));
+
+        // Several: the N11 member is singular, so the FIRST is conveyed.
+        let many = parse_am_data(
+            &serde_json::json!({ "gpsis": ["msisdn-491111111111", "extid-alice@example.com"] }),
+            supi,
+        );
+        assert_eq!(many.gpsi.as_deref(), Some("msisdn-491111111111"));
+
+        // A malformed leading entry is SKIPPED, not conveyed and not fatal.
+        let skip = parse_am_data(
+            &serde_json::json!({ "gpsis": ["msisdn-abc", "extid-bob@example.com"] }),
+            supi,
+        );
+        assert_eq!(skip.gpsi.as_deref(), Some("extid-bob@example.com"));
+
+        // Nothing usable => nothing stored. Not a blank, not the SUPI.
+        for hopeless in [
+            serde_json::json!({ "gpsis": [] }),
+            serde_json::json!({ "gpsis": [""] }),
+            serde_json::json!({ "gpsis": ["imsi-262011234567890"] }),
+            serde_json::json!({ "gpsis": [42] }),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                parse_am_data(&hopeless, supi).gpsi,
+                None,
+                "no GPSI may be stored for {hopeless}"
+            );
+        }
+
+        // The rest of the decode is unaffected by the gpsis handling.
+        let full = parse_am_data(
+            &serde_json::json!({
+                "gpsis": ["msisdn-491234567890"],
+                "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+                "nssai": { "defaultSingleNssais": [{ "sst": 1, "sd": "000001" }] },
+            }),
+            supi,
+        );
+        assert_eq!(full.ue_ambr_uplink.as_deref(), Some("1 Gbps"));
+        assert_eq!(full.nssai, vec![(1u8, Some(1u32))]);
+    }
+
+    /// `Gpsi` is accepted only in one of its two NAMED TS 29.571 forms.
+    ///
+    /// TS 29.571's published pattern ends in a `.+` alternative that matches any
+    /// non-empty string, so this is deliberately stricter than the letter of the
+    /// pattern — see `validated_gpsi` for why, and for what it costs.
+    #[test]
+    fn validated_gpsi_accepts_only_the_named_forms() {
+        for ok in [
+            "msisdn-12345",            // 5 digits: the low bound
+            "msisdn-491234567890",     // a realistic MSISDN
+            "msisdn-123456789012345",  // 15 digits: the high bound
+            "extid-alice@example.com", // an external identifier
+            "extid-a@b",               // minimal both sides
+        ] {
+            assert_eq!(
+                validated_gpsi(ok).as_deref(),
+                Some(ok),
+                "{ok} is a valid Gpsi"
+            );
+        }
+        for bad in [
+            "",                        // empty
+            "msisdn-",                 // no digits
+            "msisdn-1234",             // 4 digits: below the bound
+            "msisdn-1234567890123456", // 16 digits: above the bound
+            "msisdn-49123456789a",     // not all digits
+            "msisdn-+491234567890",    // leading + is not a digit
+            "extid-",                  // no local part, no domain
+            "extid-alice",             // no @
+            "extid-@example.com",      // empty local part
+            "extid-alice@",            // empty domain
+            "extid-a@b@c",             // two @
+            "imsi-262011234567890",    // a SUPI is NOT a GPSI
+            "491234567890",            // bare digits, no scheme prefix
+        ] {
+            assert_eq!(validated_gpsi(bad), None, "{bad} must be rejected");
+        }
+    }
+
     /// **Criterion 2.** `servingNetwork` reflects the real serving PLMN, not the
     /// hardcoded `001/01` every SM context used to claim.
     #[test]
@@ -2295,6 +2509,7 @@ mod tests {
             "servingNfId",
             "ueLocation",
             "servingNetwork",
+            "gpsi",
         ] {
             assert!(
                 body.get(absent).is_none(),
