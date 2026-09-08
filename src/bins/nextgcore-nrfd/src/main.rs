@@ -15,6 +15,9 @@ use nextgcore_nrfd::{
     ChangeItem, DiscoveryQuery, NfProfile, NotificationEventType, NrfSmContext, PatchError,
     SbiServerConfig,
 };
+// The canonical TS 29.571 `DateTime` conversion. nrfd's own copies of these two
+// were the ones this module was derived from; see the note where they used to live.
+use nextgcore_sbi::datetime::{epoch_to_rfc3339, rfc3339_to_epoch};
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::oauth::{AccessTokenResponse, OAuth2Client};
 use nextgcore_sbi::server::{
@@ -1995,27 +1998,6 @@ fn subscription_response_json(
     obj
 }
 
-/// nrfd-08: format epoch seconds (UTC) as an RFC 3339 `YYYY-MM-DDTHH:MM:SSZ`
-/// timestamp without pulling in a date/time crate. Uses Howard Hinnant's
-/// `civil_from_days` algorithm for the calendar conversion.
-fn epoch_to_rfc3339(secs: u64) -> String {
-    let days = (secs / 86400) as i64;
-    let rem = secs % 86400;
-    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    // civil_from_days: days since 1970-01-01 -> (year, month, day).
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let year = if m <= 2 { y + 1 } else { y };
-    format!("{year:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
-}
-
 /// Re-arm supervision timers for records restored from the state file.
 ///
 /// Restored NFs get a no-heartbeat timer so a stale registration is eventually
@@ -2060,54 +2042,16 @@ fn rearm_restored_timers() {
     }
 }
 
-/// Parse an RFC 3339 UTC date-time into seconds since the epoch, the inverse of
-/// [`epoch_to_rfc3339`].
-///
-/// Deliberately strict: only the `YYYY-MM-DDThh:mm:ss` form this NRF emits, with
-/// an optional fractional part and a `Z`/`+00:00` offset. A non-UTC offset is
-/// REJECTED rather than silently read as UTC, because misreading an offset
-/// shifts a subscription's expiry by hours.
-fn rfc3339_to_epoch(text: &str) -> Option<u64> {
-    let t = text.trim();
-    let (date, rest) = t.split_once('T').or_else(|| t.split_once(' '))?;
-    let mut parts = date.split('-');
-    let year: i64 = parts.next()?.parse().ok()?;
-    let month: i64 = parts.next()?.parse().ok()?;
-    let day: i64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-
-    // Strip the zone, accepting only UTC.
-    let time = rest
-        .strip_suffix('Z')
-        .or_else(|| rest.strip_suffix('z'))
-        .or_else(|| rest.strip_suffix("+00:00"))
-        .or_else(|| rest.strip_suffix("+0000"))?;
-    // Drop any fractional seconds.
-    let time = time.split('.').next()?;
-
-    let mut tparts = time.split(':');
-    let hour: u64 = tparts.next()?.parse().ok()?;
-    let minute: u64 = tparts.next()?.parse().ok()?;
-    let second: u64 = tparts.next().unwrap_or("0").parse().ok()?;
-    if tparts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-
-    // days_from_civil, the inverse of the civil_from_days above.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    if days < 0 {
-        return None;
-    }
-    Some(days as u64 * 86400 + hour * 3600 + minute * 60 + second)
-}
+// #235-adjacent (the RFC 3339 migration): nrfd's private `epoch_to_rfc3339` and
+// `rfc3339_to_epoch` used to live here. They are now
+// `nextgcore_sbi::datetime::{epoch_to_rfc3339, rfc3339_to_epoch}`, imported at the
+// top of this file. The shared module was DERIVED from these two, so the migration
+// is behaviour-preserving: both bodies were character-for-character the same
+// algorithm, differing only in whether the civil-days intermediates were typed
+// `i64` or `u64` -- and since `secs: u64` makes every intermediate non-negative,
+// the two are semantically identical. Wire timestamps belong in one place: a
+// leap-year or offset fix applied here would otherwise stay unapplied in the other
+// five copies.
 
 /// Handle Subscription Delete request
 async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
