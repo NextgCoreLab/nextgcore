@@ -202,6 +202,35 @@ pub fn buffer_capacity(suggested: Option<u16>) -> usize {
         .unwrap_or(MAX_BUFFERED_PACKETS)
 }
 
+/// What buffering a packet under a BUFF FAR did (#267).
+///
+/// The distinction is load-bearing for charging: only an ACCEPTED packet has been
+/// handled by the UP function and may be measured. A packet dropped because the
+/// buffer was already at capacity consumed no forwarding resource and must not be
+/// billed -- the previous `Option<usize>` return could not express the difference,
+/// so every full-drop was counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferOutcome {
+    /// The packet was buffered; `buffered` is the new queue depth.
+    Accepted { buffered: usize },
+    /// The queue was already at capacity; the packet was discarded.
+    Full { buffered: usize },
+}
+
+impl BufferOutcome {
+    /// Queue depth after the attempt, for logging.
+    pub fn buffered(&self) -> usize {
+        match self {
+            Self::Accepted { buffered } | Self::Full { buffered } => *buffered,
+        }
+    }
+
+    /// Whether the packet was actually taken, i.e. whether it may be measured.
+    pub fn accepted(&self) -> bool {
+        matches!(self, Self::Accepted { .. })
+    }
+}
+
 /// Packet Detection Rule installed by the SGW-C (TS 29.244 Section 7.5.2.2)
 #[derive(Debug, Clone, Default)]
 pub struct SgwuPdr {
@@ -296,19 +325,23 @@ pub mod measurement_method {
     pub const EVENT: u8 = 0x04;
 }
 
-/// Reporting Triggers flags, octet 5 (TS 29.244 §8.2.41). Only the triggers the
-/// SGW-U can actually raise are named; the rest of the two-octet field is stored
-/// verbatim so a trigger this build does not implement is still visible in a log
-/// rather than silently discarded.
+/// Reporting Triggers flags (TS 29.244 §8.2.41), as `u16` masks over the
+/// two-octet field with **octet 5 in the low byte**.
+///
+/// #267 widened these from `u8`. They were declared as octet-5 bits and matched
+/// with `(reporting_triggers as u8)`, which truncated the field: VOLQU is octet 6
+/// bit 1, so declaring it `0x40` put it on octet 5's DROTH bit AND made every
+/// octet-6/7 trigger structurally unreachable. The two defects hid each other --
+/// the wrong constant made the truncation invisible.
 pub mod reporting_trigger {
-    /// PERIO — periodic reporting.
-    pub const PERIODIC: u8 = 0x01;
-    /// VOLTH — volume threshold.
-    pub const VOLUME_THRESHOLD: u8 = 0x02;
-    /// TIMTH — time threshold.
-    pub const TIME_THRESHOLD: u8 = 0x04;
-    /// VOLQU — volume quota.
-    pub const VOLUME_QUOTA: u8 = 0x40;
+    /// PERIO — periodic reporting (octet 5 bit 1).
+    pub const PERIODIC: u16 = 0x0001;
+    /// VOLTH — volume threshold (octet 5 bit 2).
+    pub const VOLUME_THRESHOLD: u16 = 0x0002;
+    /// TIMTH — time threshold (octet 5 bit 3).
+    pub const TIME_THRESHOLD: u16 = 0x0004;
+    /// VOLQU — volume quota (**octet 6 bit 1**, i.e. the high byte).
+    pub const VOLUME_QUOTA: u16 = 0x0100;
 }
 
 /// A volume triple as it appears in Volume Threshold / Volume Quota /
@@ -370,13 +403,29 @@ pub struct SgwuUrr {
     /// Measurement Period in seconds (§8.2.16), for PERIO reporting.
     pub measurement_period: Option<u32>,
 
-    // ---- measured state, reset on every report ----
+    // ---- measured state ----
+    //
+    // #267: `*_bytes` are CUMULATIVE for the session and `reported_*` records what
+    // previous reports already covered, so a report carries the DELTA while the
+    // cumulative total survives for the quota check. Before this, every counter was
+    // reset on each report and `reportable` compared the same reset counter against
+    // both the threshold and the quota -- so with VOLTH=250 and VOLQU=1000 the total
+    // never climbed past 250 and quota exhaustion was UNREACHABLE. A threshold is
+    // per-measurement-period; a quota is cumulative. upfd's `UrrAccounting` already
+    // had this shape.
     pub total_bytes: u64,
     pub uplink_bytes: u64,
     pub downlink_bytes: u64,
     pub total_packets: u64,
     pub uplink_packets: u64,
     pub downlink_packets: u64,
+    /// Cumulative counts already covered by an emitted report.
+    pub reported_total_bytes: u64,
+    pub reported_uplink_bytes: u64,
+    pub reported_downlink_bytes: u64,
+    pub reported_total_packets: u64,
+    pub reported_uplink_packets: u64,
+    pub reported_downlink_packets: u64,
     /// UNIX seconds of the first packet counted in the current period
     /// (Time of First Packet, §8.2.34). `None` until traffic arrives.
     pub first_packet_time: Option<u32>,
@@ -385,6 +434,9 @@ pub struct SgwuUrr {
     /// UNIX seconds the current measurement period started (Start Time,
     /// §8.2.36), set at install and re-set on every report.
     pub start_time: u32,
+    /// Which trigger fired for the report this snapshot backs (#267). Only
+    /// meaningful on a snapshot returned by `take_report`; `Default` on a stored URR.
+    pub fired_trigger: UsageReportTrigger,
     /// Monotonic UR-SEQN (§8.2.60), the next value to hand out. Kept across
     /// resets: a sequence number that restarts is a sequence number the CP
     /// function cannot use to order or de-duplicate reports.
@@ -402,8 +454,13 @@ impl SgwuUrr {
         self.measurement_method & measurement_method::DURATION != 0
     }
 
-    fn trigger_set(&self, octet5_bit: u8) -> bool {
-        (self.reporting_triggers as u8) & octet5_bit != 0
+    /// Whether the SGW-C requested a trigger. `mask` is a [`reporting_trigger`]
+    /// constant over the whole two-octet field.
+    ///
+    /// #267: this took a `u8` and cast the field down to it, so every trigger
+    /// outside octet 5 was unreachable no matter what was provisioned.
+    fn trigger_set(&self, mask: u16) -> bool {
+        self.reporting_triggers & mask != 0
     }
 
     /// Which reportable condition, if any, the current counters satisfy.
@@ -413,7 +470,22 @@ impl SgwuUrr {
     /// function's request, so treating a provisioned threshold as reportable
     /// without its trigger bit would report where the CP asked for silence.
     pub fn reportable(&self, now: u32) -> Option<UsageReportTrigger> {
-        let reached = |limit: &Volume| {
+        // #267: a THRESHOLD is per measurement period, so it is compared against
+        // the delta since the last report; a QUOTA is the session's allowance, so
+        // it is compared against the cumulative total. Comparing both against one
+        // reset counter made the quota unreachable whenever a threshold also fired.
+        let delta = |cum: u64, reported: u64| cum.saturating_sub(reported);
+        let reached_delta =
+            |limit: &Volume| {
+                limit.total.is_some_and(|t| {
+                    t > 0 && delta(self.total_bytes, self.reported_total_bytes) >= t
+                }) || limit.uplink.is_some_and(|t| {
+                    t > 0 && delta(self.uplink_bytes, self.reported_uplink_bytes) >= t
+                }) || limit.downlink.is_some_and(|t| {
+                    t > 0 && delta(self.downlink_bytes, self.reported_downlink_bytes) >= t
+                })
+            };
+        let reached_cumulative = |limit: &Volume| {
             limit.total.is_some_and(|t| t > 0 && self.total_bytes >= t)
                 || limit
                     .uplink
@@ -422,40 +494,39 @@ impl SgwuUrr {
                     .downlink
                     .is_some_and(|t| t > 0 && self.downlink_bytes >= t)
         };
-        if self.trigger_set(reporting_trigger::VOLUME_THRESHOLD) && reached(&self.volume_threshold)
+
+        // #267: EVERY satisfied reason is reported, not just the first. The Usage
+        // Report Trigger IE is a bitmask precisely so several can be carried at
+        // once (§8.2.42), and `urr_take_report` resets the period -- so returning
+        // only the first CONSUMED the others' conditions without ever reporting
+        // them. A packet that crosses a volume threshold at the same moment a time
+        // threshold expires used to report VOLTH and silently swallow TIMTH.
+        let mut trigger = UsageReportTrigger::default();
+        if self.trigger_set(reporting_trigger::VOLUME_THRESHOLD)
+            && reached_delta(&self.volume_threshold)
         {
-            return Some(UsageReportTrigger {
-                volume_threshold: true,
-                ..Default::default()
-            });
+            trigger.volume_threshold = true;
         }
-        if self.trigger_set(reporting_trigger::VOLUME_QUOTA) && reached(&self.volume_quota) {
-            return Some(UsageReportTrigger {
-                volume_quota: true,
-                ..Default::default()
-            });
+        if self.trigger_set(reporting_trigger::VOLUME_QUOTA)
+            && reached_cumulative(&self.volume_quota)
+        {
+            trigger.volume_quota = true;
         }
         if self.trigger_set(reporting_trigger::TIME_THRESHOLD) {
             if let Some(secs) = self.time_threshold.filter(|s| *s > 0) {
                 if now.saturating_sub(self.start_time) >= secs {
-                    return Some(UsageReportTrigger {
-                        time_threshold: true,
-                        ..Default::default()
-                    });
+                    trigger.time_threshold = true;
                 }
             }
         }
         if self.trigger_set(reporting_trigger::PERIODIC) {
             if let Some(secs) = self.measurement_period.filter(|s| *s > 0) {
                 if now.saturating_sub(self.start_time) >= secs {
-                    return Some(UsageReportTrigger {
-                        periodic: true,
-                        ..Default::default()
-                    });
+                    trigger.periodic = true;
                 }
             }
         }
-        None
+        (trigger != UsageReportTrigger::default()).then_some(trigger)
     }
 
     /// The measured volume, with each member present only when this URR measures
@@ -464,11 +535,68 @@ impl SgwuUrr {
         if !self.measures_volume() {
             return Volume::default();
         }
+        // #267: the DELTA since the last report. A report carries the usage for its
+        // measurement period; the cumulative total stays for the quota check.
         Volume {
-            total: Some(self.total_bytes),
-            uplink: Some(self.uplink_bytes),
-            downlink: Some(self.downlink_bytes),
+            total: Some(self.total_bytes.saturating_sub(self.reported_total_bytes)),
+            uplink: Some(self.uplink_bytes.saturating_sub(self.reported_uplink_bytes)),
+            downlink: Some(
+                self.downlink_bytes
+                    .saturating_sub(self.reported_downlink_bytes),
+            ),
         }
+    }
+
+    /// Packet counts for a report, present ONLY when this URR measures volume
+    /// (#267).
+    ///
+    /// `usage_report_from` used to set these to `Some(..)` unconditionally, so a
+    /// DURAT-only URR produced a Volume Measurement IE whose flags octet was
+    /// `0x38` -- asserting "measured, all zero" for a measurement the CP function
+    /// never provisioned. §8.2.32 also only permits the number-of-packets fields
+    /// when Measurement Information MNOP is set, which sgwud does not parse.
+    pub fn measured_packets(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        if !self.measures_volume() {
+            return (None, None, None);
+        }
+        (
+            Some(
+                self.total_packets
+                    .saturating_sub(self.reported_total_packets),
+            ),
+            Some(
+                self.uplink_packets
+                    .saturating_sub(self.reported_uplink_packets),
+            ),
+            Some(
+                self.downlink_packets
+                    .saturating_sub(self.reported_downlink_packets),
+            ),
+        )
+    }
+
+    /// Snapshot this URR for a report, allocate its UR-SEQN, and start a new
+    /// measurement period (#267).
+    ///
+    /// The cumulative `*_bytes` / `*_packets` are NOT zeroed -- `reported_*` advances
+    /// to cover them instead, so the next report's delta is correct while the
+    /// cumulative total remains available for the Volume Quota check. The UR-SEQN is
+    /// monotonic across periods.
+    fn take_report(&mut self, trigger: UsageReportTrigger, now: u32) -> (SgwuUrr, u32) {
+        let mut snapshot = self.clone();
+        snapshot.fired_trigger = trigger;
+        let seqn = self.next_ur_seqn;
+        self.next_ur_seqn = self.next_ur_seqn.wrapping_add(1);
+        self.reported_total_bytes = self.total_bytes;
+        self.reported_uplink_bytes = self.uplink_bytes;
+        self.reported_downlink_bytes = self.downlink_bytes;
+        self.reported_total_packets = self.total_packets;
+        self.reported_uplink_packets = self.uplink_packets;
+        self.reported_downlink_packets = self.downlink_packets;
+        self.first_packet_time = None;
+        self.last_packet_time = None;
+        self.start_time = now;
+        (snapshot, seqn)
     }
 
     /// Duration of the current measurement period in seconds, when measured.
@@ -983,15 +1111,24 @@ impl SgwuContext {
         far_id: u32,
         packet: Vec<u8>,
         capacity: usize,
-    ) -> Option<usize> {
+    ) -> Option<BufferOutcome> {
         let mut fars = self.far_list.write().ok()?;
         let far = fars.get_mut(&(sess_id, far_id))?;
         if far.buffered.len() >= capacity {
             log::warn!("FAR {far_id}: buffer full at {capacity} packets, dropping packet");
-            return Some(far.buffered.len());
+            // #267: `Some(len)` here was indistinguishable from an ACCEPTED packet, so
+            // `apply_far` billed the whole tail of a downlink burst past capacity --
+            // over-billing traffic the SGW-U dropped on the floor, which is the error
+            // the URR decision explicitly rules out. `None` for the buffered count is
+            // wrong too (it means "no FAR"), hence the explicit outcome.
+            return Some(BufferOutcome::Full {
+                buffered: far.buffered.len(),
+            });
         }
         far.buffered.push(packet);
-        Some(far.buffered.len())
+        Some(BufferOutcome::Accepted {
+            buffered: far.buffered.len(),
+        })
     }
 
     /// Take all buffered packets from a FAR (when transitioning BUFF -> FORW)
@@ -1052,6 +1189,17 @@ impl SgwuContext {
             urr.total_packets = existing.total_packets;
             urr.uplink_packets = existing.uplink_packets;
             urr.downlink_packets = existing.downlink_packets;
+            // #267: the REPORTED watermark must carry over with the cumulative
+            // counters. Preserving the totals while resetting these would make the
+            // next report's delta the whole session again -- re-billing every byte
+            // an earlier report already covered. Caught by the re-Create and Update
+            // tests, which asserted the delta rather than only the total.
+            urr.reported_total_bytes = existing.reported_total_bytes;
+            urr.reported_uplink_bytes = existing.reported_uplink_bytes;
+            urr.reported_downlink_bytes = existing.reported_downlink_bytes;
+            urr.reported_total_packets = existing.reported_total_packets;
+            urr.reported_uplink_packets = existing.reported_uplink_packets;
+            urr.reported_downlink_packets = existing.reported_downlink_packets;
             urr.first_packet_time = existing.first_packet_time;
             urr.last_packet_time = existing.last_packet_time;
             urr.start_time = existing.start_time;
@@ -1119,7 +1267,7 @@ impl SgwuContext {
         urr_id: u32,
         bytes: u64,
         uplink: bool,
-    ) -> Option<UsageReportTrigger> {
+    ) -> Option<(SgwuUrr, u32)> {
         let now = now_unix_secs();
         let mut urrs = self.urr_list.write().ok()?;
         let urr = urrs.get_mut(&(sess_id, urr_id))?;
@@ -1143,33 +1291,50 @@ impl SgwuContext {
         }
         urr.last_packet_time = Some(now);
 
-        urr.reportable(now)
+        // #267: the reportability CHECK and the report TAKE now happen under this
+        // one guard. They were two calls -- `urr_record` returned a trigger and
+        // dropped the lock, then `urr_take_report` re-acquired it and reset
+        // unconditionally without re-checking -- so two threads whose packets both
+        // crossed the threshold each got a trigger, and the second took a
+        // ZERO-VOLUME report with the next UR-SEQN. The SGW-C saw a spurious report
+        // and a gap in the meaningful sequence. `urr_take_report`'s doc comment
+        // claimed this was already one operation; the reset was atomic, the
+        // check-then-take was not.
+        let trigger = urr.reportable(now)?;
+        Some(urr.take_report(trigger, now))
     }
 
-    /// Allocate the next monotonic UR-SEQN and reset the measurement period,
-    /// returning the URR as it stood **before** the reset so the caller can build
-    /// the report from it.
+    /// Take a report for a URR out of band (the deletion path), when there is no
+    /// packet and so no race.
     ///
-    /// One operation rather than a read-then-reset pair, because two packets
-    /// crossing the threshold concurrently would otherwise both build a report
-    /// from the same counters and double-count the volume.
+    /// The DATA path does not use this: `urr_record` checks and takes under one
+    /// guard (#267).
     pub fn urr_take_report(&self, sess_id: u64, urr_id: u32) -> Option<(SgwuUrr, u32)> {
         let now = now_unix_secs();
         let mut urrs = self.urr_list.write().ok()?;
         let urr = urrs.get_mut(&(sess_id, urr_id))?;
-        let snapshot = urr.clone();
-        let seqn = urr.next_ur_seqn;
-        urr.next_ur_seqn = urr.next_ur_seqn.wrapping_add(1);
-        urr.total_bytes = 0;
-        urr.uplink_bytes = 0;
-        urr.downlink_bytes = 0;
-        urr.total_packets = 0;
-        urr.uplink_packets = 0;
-        urr.downlink_packets = 0;
-        urr.first_packet_time = None;
-        urr.last_packet_time = None;
-        urr.start_time = now;
-        Some((snapshot, seqn))
+        let trigger = urr.reportable(now).unwrap_or_default();
+        Some(urr.take_report(trigger, now))
+    }
+
+    /// Remove a URR id from every PDR of a session that names it, returning how
+    /// many PDRs changed (#267).
+    ///
+    /// Called when the URR is removed, so no PDR is left pointing at a rule that no
+    /// longer exists -- a dangling id measures nothing silently, and is re-attached
+    /// silently if the id is later re-Created for a different purpose.
+    pub fn pdr_detach_urr(&self, sess_id: u64, urr_id: u32) -> usize {
+        let Ok(mut pdrs) = self.pdr_list.write() else {
+            return 0;
+        };
+        let mut changed = 0;
+        for ((sid, _), pdr) in pdrs.iter_mut() {
+            if *sid == sess_id && pdr.urr_ids.contains(&urr_id) {
+                pdr.urr_ids.retain(|id| *id != urr_id);
+                changed += 1;
+            }
+        }
+        changed
     }
 
     /// Record a URR id on the session's `PfcpSess.urr_ids` (issue #215).
@@ -1322,6 +1487,59 @@ pub fn sgwu_context_final() {
 
 #[cfg(test)]
 mod tests {
+
+    /// **Issue #267.** One report carries EVERY satisfied trigger, not just the first.
+    ///
+    /// The Usage Report Trigger IE is a bitmask precisely so several reasons can be
+    /// carried at once (§8.2.42), and `take_report` resets the measurement period --
+    /// so returning only the first CONSUMED the others' conditions without ever
+    /// reporting them. A packet that crosses a volume threshold at the same moment a
+    /// time threshold expires used to report VOLTH and silently swallow TIMTH.
+    #[test]
+    fn reportable_carries_every_satisfied_trigger() {
+        let mut urr = SgwuUrr {
+            urr_id: 1,
+            measurement_method: measurement_method::VOLUME | measurement_method::DURATION,
+            reporting_triggers: reporting_trigger::VOLUME_THRESHOLD
+                | reporting_trigger::VOLUME_QUOTA
+                | reporting_trigger::TIME_THRESHOLD
+                | reporting_trigger::PERIODIC,
+            volume_threshold: Volume {
+                total: Some(250),
+                ..Default::default()
+            },
+            volume_quota: Volume {
+                total: Some(1_000),
+                ..Default::default()
+            },
+            time_threshold: Some(60),
+            measurement_period: Some(30),
+            start_time: 1_000,
+            ..Default::default()
+        };
+        // Cumulative 1000 with nothing reported yet: the delta is also 1000, so the
+        // threshold, the quota, the time threshold and the period are ALL satisfied at
+        // once.
+        urr.total_bytes = 1_000;
+        let trigger = urr.reportable(1_100).expect("reportable");
+        assert!(trigger.volume_threshold, "VOLTH");
+        assert!(trigger.volume_quota, "VOLQU");
+        assert!(trigger.time_threshold, "TIMTH");
+        assert!(trigger.periodic, "PERIO");
+
+        // And with nothing satisfied it is None rather than an empty trigger.
+        let idle = SgwuUrr {
+            urr_id: 2,
+            measurement_method: measurement_method::VOLUME,
+            reporting_triggers: reporting_trigger::VOLUME_THRESHOLD,
+            volume_threshold: Volume {
+                total: Some(250),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(idle.reportable(0), None);
+    }
     use super::*;
 
     #[test]
