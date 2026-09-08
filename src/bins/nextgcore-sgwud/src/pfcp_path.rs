@@ -206,12 +206,18 @@ pub fn send_session_modification_response(
 /// Send Session Deletion Response to SGW-C
 /// Port of sgwu_pfcp_send_session_deletion_response
 pub fn send_session_deletion_response(xact: &PfcpXact, sess: &SgwuSess) -> Result<(), String> {
-    let msg = sxa_build::build_session_deletion_response(sess)
+    // #215: the response carries a final Usage Report per URR. Draining them here,
+    // at the point the response is built, is what guarantees they are collected
+    // BEFORE the caller removes the session -- `sess_remove` discards URRs, so
+    // collecting afterwards would always report nothing.
+    let usage_reports = crate::sxa_handler::take_final_usage_reports(sess.id);
+    let msg = sxa_build::build_session_deletion_response(sess, &usage_reports)
         .ok_or_else(|| "Failed to build Session Deletion Response".to_string())?;
 
     log::info!(
-        "Sending PFCP Session Deletion Response: cp_seid=0x{:x}",
-        sess.sgwc_sxa_f_seid.seid
+        "Sending PFCP Session Deletion Response: cp_seid=0x{:x}, {} usage report(s)",
+        sess.sgwc_sxa_f_seid.seid,
+        usage_reports.len()
     );
 
     send_pfcp_response(&msg, xact)

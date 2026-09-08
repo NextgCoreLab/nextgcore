@@ -2,7 +2,10 @@
 //!
 //! Port of src/sgwu/sxa-handler.c - Handlers for PFCP messages from SGW-C
 
-use crate::context::{sgwu_self, FSeid, SgwuBar, SgwuFar, SgwuPdr, SgwuQer, SgwuSess};
+use crate::context::{
+    now_unix_secs, sgwu_self, FSeid, SgwuBar, SgwuFar, SgwuPdr, SgwuQer, SgwuSess, SgwuUrr,
+    UsageReportTrigger, Volume,
+};
 use crate::sxa_build::{pfcp_cause, CreatedPdr, UserPlaneReport};
 
 // ============================================================================
@@ -46,6 +49,9 @@ pub struct SessionEstablishmentRequest {
     pub create_fars: Vec<CreateFarRequest>,
     /// Create QER list
     pub create_qers: Vec<CreateQerRequest>,
+    /// Create URR list (TS 29.244 Table 7.5.2.1-1 lists Create URR as applicable
+    /// on Sxa). Issue #215.
+    pub create_urrs: Vec<CreateUrrRequest>,
     /// Create BAR
     pub create_bar: Option<CreateBarRequest>,
     /// PFCPSEReq-Flags
@@ -68,6 +74,9 @@ pub struct CreatePdrRequest {
     pub outer_header_removal: Option<u8>,
     pub far_id: Option<u32>,
     pub qer_id: Option<u32>,
+    /// URR ID(s) this PDR is measured against (TS 29.244 Table 7.5.2.2-1 allows
+    /// several). Issue #215.
+    pub urr_ids: Vec<u32>,
 }
 
 /// PDI (Packet Detection Information)
@@ -141,6 +150,45 @@ pub struct Gbr {
     pub dl: u64,
 }
 
+/// Create URR Request (TS 29.244 Table 7.5.2.4-1). Issue #215.
+///
+/// The SGW-U had no URR type at all, so `PfcpSess.urr_ids` was populated only in
+/// a unit test and the USAR report-type bit was set only in a unit test — the
+/// SGW-C could provision usage reporting and get nothing back, and SGW-CDR
+/// charging (TS 32.251) had no volume input.
+#[derive(Debug, Clone, Default)]
+pub struct CreateUrrRequest {
+    pub urr_id: u32,
+    /// Measurement Method (§8.2.40): DURAT / VOLUM / EVENT bits.
+    pub measurement_method: u8,
+    /// Reporting Triggers (§8.2.41), both octets; octet 5 is the low byte.
+    pub reporting_triggers: u16,
+    /// Volume Threshold (§8.2.13).
+    pub volume_threshold: Volume,
+    /// Volume Quota (§8.2.14).
+    pub volume_quota: Volume,
+    /// Time Threshold in seconds (§8.2.15).
+    pub time_threshold: Option<u32>,
+    /// Measurement Period in seconds (§8.2.16).
+    pub measurement_period: Option<u32>,
+}
+
+/// Update URR Request (TS 29.244 Table 7.5.4.4-1). Issue #215.
+///
+/// Every provisioning member is optional: an Update URR that names only a new
+/// Volume Threshold must leave the Measurement Method and the other thresholds
+/// alone, and must not disturb the volume measured so far.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateUrrRequest {
+    pub urr_id: u32,
+    pub measurement_method: Option<u8>,
+    pub reporting_triggers: Option<u16>,
+    pub volume_threshold: Option<Volume>,
+    pub volume_quota: Option<Volume>,
+    pub time_threshold: Option<u32>,
+    pub measurement_period: Option<u32>,
+}
+
 /// Create BAR Request
 #[derive(Debug, Clone, Default)]
 pub struct CreateBarRequest {
@@ -178,6 +226,12 @@ pub struct SessionModificationRequest {
     pub update_qers: Vec<UpdateQerRequest>,
     /// Remove QER list
     pub remove_qers: Vec<u32>,
+    /// Create URR list (issue #215)
+    pub create_urrs: Vec<CreateUrrRequest>,
+    /// Update URR list (issue #215)
+    pub update_urrs: Vec<UpdateUrrRequest>,
+    /// Remove URR list (issue #215)
+    pub remove_urrs: Vec<u32>,
     /// Create BAR
     pub create_bar: Option<CreateBarRequest>,
     /// Remove BAR
@@ -270,6 +324,17 @@ pub fn handle_session_establishment_request(
     let mut created_pdrs = Vec::new();
     let restoration_indication = req.sereq_flags.restoration_indication;
 
+    // Process Create URRs FIRST (issue #215): a Create PDR may name a URR ID, and
+    // TS 29.244 §7.5.2 does not fix the IE order in the message, so installing
+    // URRs before PDRs is what makes a single-message provisioning work regardless
+    // of how the SGW-C ordered them.
+    for create_urr in &req.create_urrs {
+        if let Err(cause) = process_create_urr(sess, create_urr) {
+            log::error!("Failed to create URR: cause={cause}");
+            return (HandlerResult::Error(cause), vec![]);
+        }
+    }
+
     // Process Create PDRs
     for create_pdr in &req.create_pdrs {
         match process_create_pdr(sess, create_pdr, restoration_indication) {
@@ -315,10 +380,11 @@ pub fn handle_session_establishment_request(
         sess.sgwc_sxa_f_seid.seid
     );
     log::info!(
-        "    Created {} PDRs, {} FARs, {} QERs",
+        "    Created {} PDRs, {} FARs, {} QERs, {} URRs",
         req.create_pdrs.len(),
         req.create_fars.len(),
-        req.create_qers.len()
+        req.create_qers.len(),
+        req.create_urrs.len()
     );
 
     (HandlerResult::Ok, created_pdrs)
@@ -345,6 +411,21 @@ pub fn handle_session_modification_request(
     };
 
     let mut created_pdrs = Vec::new();
+
+    // #215: URR provisioning first, for the same reason as at establishment — a
+    // Create PDR in the same message may name a URR ID.
+    for create_urr in &req.create_urrs {
+        if let Err(cause) = process_create_urr(sess, create_urr) {
+            log::error!("Failed to create URR: cause={cause}");
+            return (HandlerResult::Error(cause), vec![]);
+        }
+    }
+    for update_urr in &req.update_urrs {
+        if let Err(cause) = process_update_urr(sess, update_urr) {
+            log::error!("Failed to update URR: cause={cause}");
+            return (HandlerResult::Error(cause), vec![]);
+        }
+    }
 
     // Process Create PDRs
     for create_pdr in &req.create_pdrs {
@@ -442,6 +523,15 @@ pub fn handle_session_modification_request(
         }
     }
 
+    // Process Remove URRs LAST of the URR operations (issue #215), so a PDR that
+    // referenced one has already been updated or removed above.
+    for urr_id in &req.remove_urrs {
+        if let Err(cause) = process_remove_urr(sess, *urr_id) {
+            log::error!("Failed to remove URR: cause={cause}");
+            return (HandlerResult::Error(cause), vec![]);
+        }
+    }
+
     // Process Create BAR
     if let Some(ref create_bar) = req.create_bar {
         if let Err(cause) = process_create_bar(sess, create_bar) {
@@ -488,6 +578,33 @@ pub fn handle_session_deletion_request(sess: Option<&SgwuSess>, _xact_id: u64) -
 
     // Session will be removed after sending response
     HandlerResult::Ok
+}
+
+/// The final Usage Reports for a session being deleted (issue #215,
+/// TS 29.244 §7.5.5.2).
+///
+/// Takes every URR out of the store and renders it, tagged TEBUR (termination by
+/// the UP function) — the SGW-U's last chance to hand residual volume to the
+/// SGW-C. A URR that measured nothing still reports: a zero report and no report
+/// are different statements to a charging function, and only the first says "this
+/// rule was installed and saw no traffic".
+///
+/// Separate from `handle_session_deletion_request` because the handler answers a
+/// request while this DRAINS state, and the caller needs the reports to put in the
+/// response before it removes the session.
+pub fn take_final_usage_reports(sess_id: u64) -> Vec<crate::sxa_build::UsageReport> {
+    let trigger = UsageReportTrigger {
+        termination_report: true,
+        ..Default::default()
+    };
+    sgwu_self()
+        .urr_drain_for_sess(sess_id)
+        .into_iter()
+        .map(|urr| {
+            let seqn = urr.next_ur_seqn;
+            usage_report_from(&urr, seqn, trigger)
+        })
+        .collect()
 }
 
 /// Handle Session Report Response from SGW-C
@@ -610,6 +727,7 @@ fn process_create_pdr(
         outer_header_removal: req.outer_header_removal,
         far_id: req.far_id,
         qer_id: req.qer_id,
+        urr_ids: req.urr_ids.clone(),
     }) {
         return Err(pfcp_cause::SYSTEM_FAILURE);
     }
@@ -662,6 +780,143 @@ fn process_create_qer(sess: &SgwuSess, req: &CreateQerRequest) -> Result<(), u8>
         return Err(pfcp_cause::SYSTEM_FAILURE);
     }
     Ok(())
+}
+
+/// Process Create URR: install the measurement rule and register its id on the
+/// session (issue #215).
+///
+/// `PfcpSess.urr_ids` is populated **here**, in production. Before this it was
+/// written only by a unit test, so the field described a capability the daemon did
+/// not have.
+fn process_create_urr(sess: &SgwuSess, req: &CreateUrrRequest) -> Result<(), u8> {
+    log::debug!(
+        "Creating URR: id={} method=0x{:02x} triggers=0x{:04x}",
+        req.urr_id,
+        req.measurement_method,
+        req.reporting_triggers
+    );
+    let ctx = sgwu_self();
+    if !ctx.urr_install(SgwuUrr {
+        sess_id: sess.id,
+        urr_id: req.urr_id,
+        measurement_method: req.measurement_method,
+        reporting_triggers: req.reporting_triggers,
+        volume_threshold: req.volume_threshold,
+        volume_quota: req.volume_quota,
+        time_threshold: req.time_threshold,
+        measurement_period: req.measurement_period,
+        start_time: now_unix_secs(),
+        ..Default::default()
+    }) {
+        return Err(pfcp_cause::SYSTEM_FAILURE);
+    }
+    ctx.sess_register_urr(sess.id, req.urr_id);
+    Ok(())
+}
+
+/// Process Update URR: change provisioning, keep the measurement.
+///
+/// Every member is optional and an absent one leaves the installed value alone
+/// (TS 29.244 Table 7.5.4.4-1). An unknown URR ID is
+/// `RULE_CREATION_MODIFICATION_FAILURE` rather than a silent no-op, matching how
+/// Update PDR/FAR/QER already answer — creating it here would install a URR whose
+/// unspecified members the SGW-C never provisioned.
+fn process_update_urr(sess: &SgwuSess, req: &UpdateUrrRequest) -> Result<(), u8> {
+    log::debug!("Updating URR: id={}", req.urr_id);
+    let ctx = sgwu_self();
+    let Some(mut urr) = ctx.urr_find(sess.id, req.urr_id) else {
+        log::error!("Update URR: id={} not found", req.urr_id);
+        return Err(pfcp_cause::RULE_CREATION_MODIFICATION_FAILURE);
+    };
+    if let Some(method) = req.measurement_method {
+        urr.measurement_method = method;
+    }
+    if let Some(triggers) = req.reporting_triggers {
+        urr.reporting_triggers = triggers;
+    }
+    if let Some(threshold) = req.volume_threshold {
+        urr.volume_threshold = threshold;
+    }
+    if let Some(quota) = req.volume_quota {
+        urr.volume_quota = quota;
+    }
+    if let Some(secs) = req.time_threshold {
+        urr.time_threshold = Some(secs);
+    }
+    if let Some(secs) = req.measurement_period {
+        urr.measurement_period = Some(secs);
+    }
+    // `urr_install` preserves the measured counters and the UR-SEQN for an id
+    // already present, which is what makes this an update rather than a reset.
+    if !ctx.urr_install(urr) {
+        return Err(pfcp_cause::SYSTEM_FAILURE);
+    }
+    Ok(())
+}
+
+/// Process Remove URR (issue #215).
+///
+/// The removed URR's measured volume is **discarded**, deliberately: TS 29.244
+/// §5.2.2.3 has the CP function ask for a final report by setting the
+/// Query URR / Query All URRs IE on the Session Modification Request, and this
+/// build parses neither. Emitting an unrequested report here would invent a
+/// message the SGW-C did not ask for; discarding silently would lose volume. So it
+/// is logged at `warn` with the amount, which is the honest middle — see the spec's
+/// Ceilings.
+fn process_remove_urr(sess: &SgwuSess, urr_id: u32) -> Result<(), u8> {
+    log::debug!("Removing URR: id={urr_id}");
+    let ctx = sgwu_self();
+    let Some(urr) = ctx.urr_remove(sess.id, urr_id) else {
+        log::error!("Remove URR: id={urr_id} not found");
+        return Err(pfcp_cause::RULE_CREATION_MODIFICATION_FAILURE);
+    };
+    if urr.total_bytes > 0 || urr.total_packets > 0 {
+        log::warn!(
+            "Removed URR {urr_id} still held unreported usage: {} bytes / {} packets \
+             (no Query URR support, so no final report is sent — see issue #215)",
+            urr.total_bytes,
+            urr.total_packets
+        );
+    }
+    ctx.sess_unregister_urr(sess.id, urr_id);
+    Ok(())
+}
+
+/// Build the Usage Report for a URR and advance its UR-SEQN, resetting the
+/// measurement period (issue #215).
+///
+/// Returns `None` when the URR has gone — a concurrent Remove URR or session
+/// deletion — rather than reporting on a stale snapshot.
+pub fn take_usage_report(
+    sess_id: u64,
+    urr_id: u32,
+    trigger: UsageReportTrigger,
+) -> Option<crate::sxa_build::UsageReport> {
+    let (urr, ur_seqn) = sgwu_self().urr_take_report(sess_id, urr_id)?;
+    Some(usage_report_from(&urr, ur_seqn, trigger))
+}
+
+/// Render a URR snapshot as a Usage Report (TS 29.244 §7.5.8.3).
+pub fn usage_report_from(
+    urr: &SgwuUrr,
+    ur_seqn: u32,
+    trigger: UsageReportTrigger,
+) -> crate::sxa_build::UsageReport {
+    let now = now_unix_secs();
+    crate::sxa_build::UsageReport {
+        urr_id: urr.urr_id,
+        ur_seqn,
+        trigger,
+        volume: urr.measured_volume(),
+        total_packets: Some(urr.total_packets),
+        uplink_packets: Some(urr.uplink_packets),
+        downlink_packets: Some(urr.downlink_packets),
+        duration_secs: urr.measured_duration(now),
+        start_time: Some(urr.start_time),
+        end_time: Some(now),
+        time_of_first_packet: urr.first_packet_time,
+        time_of_last_packet: urr.last_packet_time,
+    }
 }
 
 /// Process Create BAR
@@ -997,5 +1252,369 @@ mod tests {
         let pdr = sgwu_self().pdr_find_by_teid(fteid.teid).unwrap();
         assert_eq!(pdr.pdr_id, 77);
         assert_eq!(pdr.far_id, Some(7));
+    }
+    // -----------------------------------------------------------------
+    // #215: URR provisioning
+    // -----------------------------------------------------------------
+
+    /// A session in the CONTEXT (not just a local struct), so
+    /// `sess_register_urr` has something to write `PfcpSess.urr_ids` on.
+    fn ctx_sess(seid: u64) -> SgwuSess {
+        let ctx = sgwu_self();
+        ctx.set_gtpu_address(Some(Ipv4Addr::new(10, 0, 0, 99)));
+        ctx.sess_add(&FSeid::with_ipv4(seid, Ipv4Addr::new(10, 0, 0, 1)))
+            .expect("session added")
+    }
+
+    fn volume_urr(urr_id: u32, total_threshold: u64) -> CreateUrrRequest {
+        CreateUrrRequest {
+            urr_id,
+            measurement_method: crate::context::measurement_method::VOLUME,
+            reporting_triggers: crate::context::reporting_trigger::VOLUME_THRESHOLD as u16,
+            volume_threshold: Volume {
+                total: Some(total_threshold),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// **Issue #215.** A Create URR at establishment installs the rule, links it to
+    /// the PDR that names it, and populates `PfcpSess.urr_ids` **in production**.
+    ///
+    /// That field existed before this change and was written only by a unit test, so
+    /// it described a capability the daemon did not have.
+    #[test]
+    fn create_urr_installs_the_rule_and_populates_sess_urr_ids() {
+        let ctx = sgwu_self();
+        let sess = ctx_sess(0x8100);
+
+        let req = SessionEstablishmentRequest {
+            create_urrs: vec![volume_urr(3, 1_000), volume_urr(4, 2_000)],
+            create_fars: vec![CreateFarRequest {
+                far_id: 1,
+                apply_action: crate::context::apply_action::FORW,
+                ..Default::default()
+            }],
+            create_pdrs: vec![CreatePdrRequest {
+                pdr_id: 1,
+                far_id: Some(1),
+                urr_ids: vec![3, 4],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (result, _) = handle_session_establishment_request(Some(&sess), 1, &req);
+        assert!(matches!(result, HandlerResult::Ok), "{result:?}");
+
+        // Both URRs installed, with their provisioning.
+        let urr = ctx.urr_find(sess.id, 3).expect("URR 3 installed");
+        assert!(urr.measures_volume());
+        assert_eq!(urr.volume_threshold.total, Some(1_000));
+        assert_eq!(
+            ctx.urr_find(sess.id, 4).unwrap().volume_threshold.total,
+            Some(2_000)
+        );
+        assert_eq!(ctx.urr_find_for_sess(sess.id).len(), 2);
+
+        // The PDR carries the link, so a matched packet has something to bill.
+        let pdr = ctx.pdr_find(sess.id, 1).expect("PDR installed");
+        assert_eq!(pdr.urr_ids, vec![3, 4]);
+
+        // And `PfcpSess.urr_ids` is populated in production.
+        let stored = ctx.sess_find_by_id(sess.id).expect("session");
+        assert_eq!(
+            stored.pfcp.urr_ids,
+            vec![3u64, 4u64],
+            "PfcpSess.urr_ids must be written by the handler, not only by a test"
+        );
+
+        ctx.sess_remove(sess.id);
+    }
+
+    /// **Issue #215.** An Update URR changes provisioning and **keeps** the
+    /// measurement; a Remove URR takes it out; an unknown id is rejected.
+    ///
+    /// The keep-the-measurement half is the one that matters: zeroing the counters on
+    /// every reprovisioning would lose billable traffic in a way a charging function
+    /// cannot detect.
+    #[test]
+    fn update_urr_keeps_the_measurement_and_remove_urr_takes_it_out() {
+        let ctx = sgwu_self();
+        let sess = ctx_sess(0x8200);
+
+        let est = SessionEstablishmentRequest {
+            create_urrs: vec![volume_urr(11, 1_000)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_establishment_request(Some(&sess), 1, &est).0,
+            HandlerResult::Ok
+        ));
+        // Measure something, and spend a UR-SEQN, so both are observable.
+        ctx.urr_record(sess.id, 11, 400, true);
+        ctx.urr_take_report(sess.id, 11);
+        ctx.urr_record(sess.id, 11, 250, true);
+        assert_eq!(ctx.urr_find(sess.id, 11).unwrap().total_bytes, 250);
+        assert_eq!(ctx.urr_find(sess.id, 11).unwrap().next_ur_seqn, 1);
+
+        // Update only the threshold.
+        let modify = SessionModificationRequest {
+            update_urrs: vec![UpdateUrrRequest {
+                urr_id: 11,
+                volume_threshold: Some(Volume {
+                    total: Some(9_999),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_modification_request(Some(&sess), 1, &modify).0,
+            HandlerResult::Ok
+        ));
+        let urr = ctx.urr_find(sess.id, 11).expect("still installed");
+        assert_eq!(
+            urr.volume_threshold.total,
+            Some(9_999),
+            "the update applied"
+        );
+        assert_eq!(
+            urr.total_bytes, 250,
+            "an Update URR must NOT reset the measured volume"
+        );
+        assert_eq!(
+            urr.next_ur_seqn, 1,
+            "nor restart the UR-SEQN, which the SGW-C uses to order reports"
+        );
+        assert!(
+            urr.measures_volume(),
+            "an unnamed Measurement Method must be left alone"
+        );
+
+        // An Update for an unknown id is a rule failure, not a silent create: a
+        // created-here URR would have every unspecified member unprovisioned.
+        let bad = SessionModificationRequest {
+            update_urrs: vec![UpdateUrrRequest {
+                urr_id: 99,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_modification_request(Some(&sess), 1, &bad).0,
+            HandlerResult::Error(pfcp_cause::RULE_CREATION_MODIFICATION_FAILURE)
+        ));
+
+        // Remove takes it out of the store and off the session.
+        let remove = SessionModificationRequest {
+            remove_urrs: vec![11],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_modification_request(Some(&sess), 1, &remove).0,
+            HandlerResult::Ok
+        ));
+        assert!(ctx.urr_find(sess.id, 11).is_none());
+        assert!(ctx
+            .sess_find_by_id(sess.id)
+            .unwrap()
+            .pfcp
+            .urr_ids
+            .is_empty());
+        // And removing it again is a rule failure rather than a silent success.
+        assert!(matches!(
+            handle_session_modification_request(Some(&sess), 1, &remove).0,
+            HandlerResult::Error(pfcp_cause::RULE_CREATION_MODIFICATION_FAILURE)
+        ));
+
+        ctx.sess_remove(sess.id);
+    }
+
+    /// **Issue #215.** A **re-Create** URR for an id already installed keeps the
+    /// measurement and the UR-SEQN.
+    ///
+    /// This is the case `urr_install`'s carry-over exists for, and it is NOT the same
+    /// as the Update case above: `process_update_urr` reads the existing URR first,
+    /// so it would survive a carry-over-free `urr_install` — reverting the carry-over
+    /// broke no test until this one was added, which is exactly the false-guard shape
+    /// the #210 session recorded. A re-Create starts from a fresh request, so only
+    /// the store can protect the counters.
+    #[test]
+    fn re_creating_an_existing_urr_keeps_the_measurement() {
+        let ctx = sgwu_self();
+        let sess = ctx_sess(0x8600);
+
+        let est = SessionEstablishmentRequest {
+            create_urrs: vec![volume_urr(51, 1_000)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_establishment_request(Some(&sess), 1, &est).0,
+            HandlerResult::Ok
+        ));
+        ctx.urr_record(sess.id, 51, 600, true);
+        ctx.urr_take_report(sess.id, 51);
+        ctx.urr_record(sess.id, 51, 150, false);
+        assert_eq!(ctx.urr_find(sess.id, 51).unwrap().total_bytes, 150);
+        assert_eq!(ctx.urr_find(sess.id, 51).unwrap().next_ur_seqn, 1);
+
+        // A Session Modification re-Creating URR 51 with a new threshold.
+        let modify = SessionModificationRequest {
+            create_urrs: vec![volume_urr(51, 5_000)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_modification_request(Some(&sess), 1, &modify).0,
+            HandlerResult::Ok
+        ));
+        let urr = ctx.urr_find(sess.id, 51).expect("still installed");
+        assert_eq!(urr.volume_threshold.total, Some(5_000), "re-provisioned");
+        assert_eq!(
+            urr.total_bytes, 150,
+            "a re-Create must NOT zero the measured volume: that would lose billable \
+             traffic on every reprovisioning, undetectably"
+        );
+        assert_eq!(
+            urr.next_ur_seqn, 1,
+            "nor restart the UR-SEQN the SGW-C orders reports by"
+        );
+        // And the session's id list is not duplicated.
+        assert_eq!(
+            ctx.sess_find_by_id(sess.id).unwrap().pfcp.urr_ids,
+            vec![51u64]
+        );
+
+        ctx.sess_remove(sess.id);
+    }
+
+    /// **Issue #215.** Session deletion produces one final Usage Report per URR,
+    /// tagged TEBUR, and drains the store.
+    ///
+    /// A URR that measured nothing still reports: a zero report and no report are
+    /// different statements, and only the first says "this rule was installed and saw
+    /// no traffic".
+    #[test]
+    fn session_deletion_produces_a_final_usage_report_per_urr() {
+        let ctx = sgwu_self();
+        let sess = ctx_sess(0x8300);
+
+        let est = SessionEstablishmentRequest {
+            create_urrs: vec![volume_urr(21, 1_000_000), volume_urr(22, 1_000_000)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_establishment_request(Some(&sess), 1, &est).0,
+            HandlerResult::Ok
+        ));
+        ctx.urr_record(sess.id, 21, 700, true);
+        ctx.urr_record(sess.id, 21, 300, false);
+        // URR 22 sees no traffic at all.
+
+        let reports = take_final_usage_reports(sess.id);
+        assert_eq!(reports.len(), 2, "one report per URR, ordered by URR ID");
+        assert_eq!(reports[0].urr_id, 21);
+        assert_eq!(reports[1].urr_id, 22);
+        assert!(
+            reports.iter().all(|r| r.trigger.termination_report),
+            "the final report is TEBUR: termination by the UP function"
+        );
+        assert_eq!(reports[0].volume.total, Some(1_000));
+        assert_eq!(reports[0].volume.uplink, Some(700));
+        assert_eq!(reports[0].volume.downlink, Some(300));
+        assert_eq!(reports[0].total_packets, Some(2));
+        assert_eq!(
+            reports[1].volume.total,
+            Some(0),
+            "an idle URR reports zero rather than not reporting"
+        );
+
+        // The store is drained, so a second call cannot double-report.
+        assert!(ctx.urr_find_for_sess(sess.id).is_empty());
+        assert!(take_final_usage_reports(sess.id).is_empty());
+
+        ctx.sess_remove(sess.id);
+    }
+
+    /// **Issue #215.** A threshold is only reportable when the SGW-C asked for that
+    /// trigger (TS 29.244 §8.2.41).
+    ///
+    /// Reporting on a provisioned threshold whose trigger bit is clear would report
+    /// where the CP function asked for silence.
+    #[test]
+    fn a_threshold_without_its_trigger_bit_does_not_report() {
+        let ctx = sgwu_self();
+        let sess = ctx_sess(0x8400);
+
+        let mut urr = volume_urr(31, 100);
+        urr.reporting_triggers = 0; // threshold provisioned, trigger NOT requested
+        let est = SessionEstablishmentRequest {
+            create_urrs: vec![urr],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_establishment_request(Some(&sess), 1, &est).0,
+            HandlerResult::Ok
+        ));
+        // Well past the threshold, and still not reportable.
+        assert_eq!(ctx.urr_record(sess.id, 31, 5_000, true), None);
+        assert_eq!(ctx.urr_find(sess.id, 31).unwrap().total_bytes, 5_000);
+
+        // Turning the trigger on makes the same state reportable.
+        let modify = SessionModificationRequest {
+            update_urrs: vec![UpdateUrrRequest {
+                urr_id: 31,
+                reporting_triggers: Some(
+                    crate::context::reporting_trigger::VOLUME_THRESHOLD as u16,
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_modification_request(Some(&sess), 1, &modify).0,
+            HandlerResult::Ok
+        ));
+        let trigger = ctx
+            .urr_record(sess.id, 31, 1, true)
+            .expect("now reportable");
+        assert!(trigger.volume_threshold);
+
+        ctx.sess_remove(sess.id);
+    }
+
+    /// **Issue #215.** A duration-only URR does not accumulate volume.
+    ///
+    /// Reporting a Volume Measurement the CP function never asked to measure would
+    /// put a number in a CDR that no provisioning justifies.
+    #[test]
+    fn a_duration_only_urr_measures_no_volume() {
+        let ctx = sgwu_self();
+        let sess = ctx_sess(0x8500);
+
+        let est = SessionEstablishmentRequest {
+            create_urrs: vec![CreateUrrRequest {
+                urr_id: 41,
+                measurement_method: crate::context::measurement_method::DURATION,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            handle_session_establishment_request(Some(&sess), 1, &est).0,
+            HandlerResult::Ok
+        ));
+        ctx.urr_record(sess.id, 41, 5_000, true);
+        let urr = ctx.urr_find(sess.id, 41).expect("installed");
+        assert_eq!(urr.total_bytes, 0, "DURAT-only must not count volume");
+        assert_eq!(urr.total_packets, 1, "packet counts are kept regardless");
+        assert!(
+            !urr.measured_volume().is_set(),
+            "so no Volume Measurement IE"
+        );
+        assert!(urr.measured_duration(now_unix_secs()).is_some());
+
+        ctx.sess_remove(sess.id);
     }
 }

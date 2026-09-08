@@ -709,6 +709,11 @@ fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResu
             .far_buffer_packet(pdr.sess_id, far_id, payload.to_vec(), capacity)
             .unwrap_or(0);
         log::debug!("BUFF per FAR {far_id} (buffered={count}/{capacity})");
+        // #215: a buffered packet HAS been handled by the UP function -- it was
+        // accepted and will be delivered when the buffer flushes -- so it counts.
+        // Counting it again on flush would double-bill, which is why the flush path
+        // does not measure.
+        let _ = measure_and_report(pdr, payload.len() as u64);
         // First buffered packet triggers a Downlink Data Report unless the
         // SGW-C suppressed notification (NOCP)
         if count == 1 && far.apply_action & apply_action::NOCP == 0 {
@@ -758,7 +763,10 @@ fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResu
 
     if far.apply_action & apply_action::FORW != 0 {
         return match server.forward_gpdu(&far, payload) {
-            Ok(()) => GtpuRecvResult::Forwarded,
+            Ok(()) => {
+                let _ = measure_and_report(pdr, payload.len() as u64);
+                GtpuRecvResult::Forwarded
+            }
             Err(e) => {
                 log::error!("FORW per FAR {far_id} failed: {e}");
                 GtpuRecvResult::Dropped(e)
@@ -770,6 +778,80 @@ fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResu
         "FAR {far_id} has no applicable action (0x{:x})",
         far.apply_action
     ))
+}
+
+/// Count a HANDLED packet against every URR the PDR names, and send a Session
+/// Report Request for any URR that became reportable (issue #215).
+///
+/// ## What is counted, and why
+///
+/// Only traffic the UP function actually **handles**: forwarded, or accepted into a
+/// BUFF FAR's buffer. Deliberately NOT counted:
+///
+/// * a packet dropped by a FAR whose Apply Action is DROP;
+/// * a packet dropped by a **closed QER gate** or an exceeded **MBR**.
+///
+/// TS 29.244 §5.2.2.1 has the UP function measure "the network resources usage",
+/// and a packet it discarded consumed none of the resource being billed. The issue
+/// asks for this call to be made deliberately: counting QER-dropped traffic would
+/// **over-bill** a subscriber for traffic the network refused to carry, which is
+/// the worse of the two errors — under-counting a dropped packet costs the operator
+/// nothing it was entitled to. `apply_far` therefore measures *after* the QER
+/// decision, on the two paths that return `Forwarded` or `Buffered`, and a test
+/// pins each case.
+///
+/// A forwarding attempt that FAILS (`forward_gpdu` errors) is not counted either:
+/// nothing reached the peer.
+/// Returns the reports it produced, so a test can assert on their CONTENT.
+/// `apply_far` ignores the return: the reports have already been handed to
+/// `send_session_report_request` by then.
+fn measure_and_report(pdr: &SgwuPdr, bytes: u64) -> Vec<crate::sxa_build::UsageReport> {
+    if pdr.urr_ids.is_empty() {
+        return Vec::new();
+    }
+    let ctx = sgwu_self();
+    // Direction from the PDI, matching how QER enforcement decides it: traffic
+    // sourced from the ACCESS side is uplink.
+    let uplink = pdr.source_interface == crate::sxa_handler::pfcp_interface::ACCESS;
+
+    let mut reports = Vec::new();
+    for urr_id in &pdr.urr_ids {
+        let Some(trigger) = ctx.urr_record(pdr.sess_id, *urr_id, bytes, uplink) else {
+            continue;
+        };
+        // Reportable: take the counters and the next UR-SEQN in one operation, so
+        // two packets crossing the threshold concurrently cannot both report the
+        // same volume.
+        if let Some(report) = crate::sxa_handler::take_usage_report(pdr.sess_id, *urr_id, trigger) {
+            log::debug!(
+                "URR {} reportable (trigger {:?}): {} bytes, UR-SEQN {}",
+                report.urr_id,
+                report.trigger,
+                report.volume.total.unwrap_or(0),
+                report.ur_seqn
+            );
+            reports.push(report);
+        }
+    }
+    if reports.is_empty() {
+        return reports;
+    }
+    let Some(sess) = ctx.sess_find_by_id(pdr.sess_id) else {
+        log::warn!(
+            "Usage report ready for session {} but the session is gone; \
+             {} report(s) dropped",
+            pdr.sess_id,
+            reports.len()
+        );
+        return reports;
+    };
+    // `with_usage_reports` sets the USAR report-type bit alongside the reports, so
+    // the bit is now set FROM THE DATA PATH rather than only in a unit test.
+    let report = UserPlaneReport::with_usage_reports(reports);
+    if let Err(e) = pfcp_path::send_session_report_request(&sess, &report) {
+        log::error!("Session Report (USAR) failed: {e}");
+    }
+    report.usage_reports
 }
 
 /// Send an Error Indication for a G-PDU that matched no PDR
@@ -805,6 +887,17 @@ fn send_error_indication(server: &GtpuServer, teid: u32, peer: SocketAddr) -> Gt
 mod tests {
     use super::*;
     use crate::context::{FSeid, SgwuFar, SgwuPdr};
+
+    /// Serialises the tests that toggle `SGWU_QER_ENFORCEMENT`.
+    ///
+    /// The variable is PROCESS-GLOBAL. Until #215 only one test touched it, so there
+    /// was nothing to race with; adding a second made
+    /// `closed_qer_gate_drops_when_enforcement_is_enabled` fail intermittently with
+    /// "a CLOSED gate must drop, got Forwarded" — one test's `remove_var` landing
+    /// while the other had it set. Reproduced in 1 of 6 runs before the lock, then
+    /// 30 of 30 green after. Same shape as the carried `gtp_path` race over
+    /// `SGWU_GTPU_N3_REQUESTS`.
+    static QER_ENFORCEMENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_server(peer_port: u16) -> GtpuServer {
         GtpuServer::open("127.0.0.1:0", peer_port).unwrap()
@@ -843,6 +936,7 @@ mod tests {
             outer_header_removal: Some(0),
             far_id: Some(far_id),
             qer_id: None,
+            urr_ids: Vec::new(),
         });
         (sess.id, far_id)
     }
@@ -1158,6 +1252,9 @@ mod tests {
     /// decided, not only in the gate decoder.
     #[test]
     fn closed_qer_gate_drops_when_enforcement_is_enabled() {
+        let _env = QER_ENFORCEMENT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let ctx = sgwu_self();
         let server = test_server(GTPV1_U_UDP_PORT);
 
@@ -1206,6 +1303,248 @@ mod tests {
         );
 
         ctx.sess_remove(sess.id);
+        server.close();
+    }
+
+    // -----------------------------------------------------------------
+    // #215: URR measurement on the data path
+    // -----------------------------------------------------------------
+
+    /// Install a session with a forwarding FAR, a PDR pointing at it, and a URR.
+    fn provision_urr(
+        seid: u64,
+        local_teid: u32,
+        urr: crate::context::SgwuUrr,
+        qer: Option<crate::context::SgwuQer>,
+    ) -> (u64, SgwuPdr) {
+        let ctx = sgwu_self();
+        let f_seid = FSeid::with_ipv4(seid, Ipv4Addr::new(10, 0, 0, 1));
+        let sess = ctx.sess_add(&f_seid).unwrap();
+        ctx.far_install(SgwuFar {
+            sess_id: sess.id,
+            far_id: 1,
+            apply_action: apply_action::FORW,
+            outer_header_creation: Some((0x999, Some(Ipv4Addr::new(127, 0, 0, 1)), None)),
+            ..Default::default()
+        });
+        let urr_id = urr.urr_id;
+        ctx.urr_install(crate::context::SgwuUrr {
+            sess_id: sess.id,
+            ..urr
+        });
+        ctx.sess_register_urr(sess.id, urr_id);
+        let qer_id = qer.map(|q| {
+            let id = q.qer_id;
+            ctx.qer_install(crate::context::SgwuQer {
+                sess_id: sess.id,
+                ..q
+            });
+            id
+        });
+        let pdr = SgwuPdr {
+            sess_id: sess.id,
+            pdr_id: 1,
+            source_interface: crate::sxa_handler::pfcp_interface::ACCESS,
+            local_teid,
+            far_id: Some(1),
+            qer_id,
+            urr_ids: vec![urr_id],
+            ..Default::default()
+        };
+        ctx.pdr_install(pdr.clone());
+        (sess.id, pdr)
+    }
+
+    /// **Issue #215.** Forwarded traffic is counted against the PDR's URR, crossing
+    /// a Volume Threshold produces a Usage Report with the accumulated counts, and
+    /// the UR-SEQN advances across reports.
+    ///
+    /// Before this the SGW-U had no URR at all: no measurement, no thresholds and no
+    /// Usage Report IEs, so mandatory usage reporting to the SGW-C could not
+    /// function and SGW-CDR volume (TS 32.251) had no input.
+    #[test]
+    fn forwarded_traffic_crosses_a_volume_threshold_and_reports_with_advancing_ur_seqn() {
+        use crate::context::{measurement_method, reporting_trigger, SgwuUrr, Volume};
+        let _env = QER_ENFORCEMENT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = sgwu_self();
+        let server = test_server(GTPV1_U_UDP_PORT);
+        std::env::remove_var("SGWU_QER_ENFORCEMENT");
+
+        // Threshold 250 bytes total; each packet below is 100 bytes.
+        let (sess_id, pdr) = provision_urr(
+            0x7100,
+            0x7101,
+            SgwuUrr {
+                urr_id: 7,
+                measurement_method: measurement_method::VOLUME | measurement_method::DURATION,
+                reporting_triggers: reporting_trigger::VOLUME_THRESHOLD as u16,
+                volume_threshold: Volume {
+                    total: Some(250),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            None,
+        );
+        let packet = [0u8; 100];
+
+        // Two packets: 200 bytes, still under the threshold, so NO report.
+        assert!(measure_and_report(&pdr, packet.len() as u64).is_empty());
+        assert!(measure_and_report(&pdr, packet.len() as u64).is_empty());
+        let urr = ctx.urr_find(sess_id, 7).expect("URR installed");
+        assert_eq!(urr.total_bytes, 200, "volume accumulates");
+        assert_eq!(urr.uplink_bytes, 200, "ACCESS-sourced traffic is uplink");
+        assert_eq!(urr.downlink_bytes, 0);
+        assert_eq!(urr.total_packets, 2);
+        assert_eq!(urr.next_ur_seqn, 0, "no report yet, so no UR-SEQN spent");
+
+        // The third packet crosses 250 -> one report carrying all 300 bytes.
+        let reports = measure_and_report(&pdr, packet.len() as u64);
+        assert_eq!(reports.len(), 1, "crossing the threshold reports once");
+        let report = &reports[0];
+        assert_eq!(report.urr_id, 7);
+        assert_eq!(report.ur_seqn, 0, "UR-SEQN starts at 0");
+        assert!(report.trigger.volume_threshold, "VOLTH is the trigger");
+        assert!(!report.trigger.volume_quota && !report.trigger.time_threshold);
+        assert_eq!(
+            report.volume.total,
+            Some(300),
+            "the report carries every byte measured in the period, not just the last packet"
+        );
+        assert_eq!(report.volume.uplink, Some(300));
+        assert_eq!(report.volume.downlink, Some(0));
+        assert_eq!(report.total_packets, Some(3));
+        assert!(report.duration_secs.is_some(), "DURAT was provisioned");
+        assert!(report.time_of_first_packet.is_some());
+
+        // Counters reset for the next period, and the UR-SEQN has advanced.
+        let urr = ctx.urr_find(sess_id, 7).expect("URR still installed");
+        assert_eq!(urr.total_bytes, 0, "the period restarts after a report");
+        assert_eq!(urr.total_packets, 0);
+        assert_eq!(urr.next_ur_seqn, 1);
+
+        // A second crossing reports UR-SEQN 1: monotonic, which is what lets the
+        // SGW-C order and de-duplicate.
+        for _ in 0..3 {
+            let reports = measure_and_report(&pdr, packet.len() as u64);
+            if let Some(r) = reports.first() {
+                assert_eq!(r.ur_seqn, 1, "UR-SEQN must advance, not restart");
+            }
+        }
+        assert_eq!(ctx.urr_find(sess_id, 7).unwrap().next_ur_seqn, 2);
+
+        ctx.sess_remove(sess_id);
+        server.close();
+    }
+
+    /// **Issue #215.** Traffic the UP function DISCARDS is not counted — the issue
+    /// asks for this call to be made deliberately, and this test pins it.
+    ///
+    /// TS 29.244 §5.2.2.1 measures "network resources usage", and a packet the SGW-U
+    /// dropped consumed none of the resource being billed. Counting QER-dropped
+    /// traffic would **over-bill** a subscriber for traffic the network refused to
+    /// carry, which is the worse of the two errors.
+    #[test]
+    fn traffic_dropped_by_a_closed_qer_gate_or_a_drop_far_is_not_counted() {
+        use crate::context::{measurement_method, reporting_trigger, SgwuQer, SgwuUrr, Volume};
+        let _env = QER_ENFORCEMENT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = sgwu_self();
+        let server = test_server(GTPV1_U_UDP_PORT);
+
+        let (sess_id, pdr) = provision_urr(
+            0x7200,
+            0x7201,
+            SgwuUrr {
+                urr_id: 9,
+                measurement_method: measurement_method::VOLUME,
+                reporting_triggers: reporting_trigger::VOLUME_THRESHOLD as u16,
+                volume_threshold: Volume {
+                    total: Some(10_000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            // UL gate CLOSED (bits 1-2 = 1); the PDR is ACCESS-sourced = uplink.
+            Some(SgwuQer {
+                qer_id: 5,
+                gate_status: Some(0x01),
+                ..Default::default()
+            }),
+        );
+        let packet = [0u8; 100];
+
+        // Enforcement ON: the closed gate drops, and nothing is counted.
+        std::env::set_var("SGWU_QER_ENFORCEMENT", "1");
+        let result = apply_far(&server, &pdr, &packet);
+        std::env::remove_var("SGWU_QER_ENFORCEMENT");
+        assert!(
+            matches!(&result, GtpuRecvResult::Dropped(r) if r.contains("gate")),
+            "the closed gate must drop, got {result:?}"
+        );
+        let urr = ctx.urr_find(sess_id, 9).expect("URR installed");
+        assert_eq!(
+            urr.total_bytes, 0,
+            "a packet dropped by a closed QER gate must NOT be billed"
+        );
+        assert_eq!(urr.total_packets, 0);
+
+        // With enforcement OFF the same packet forwards, and IS counted — so the
+        // zero above is the gate's doing, not a broken measurement path.
+        let result = apply_far(&server, &pdr, &packet);
+        assert!(matches!(result, GtpuRecvResult::Forwarded), "{result:?}");
+        assert_eq!(
+            ctx.urr_find(sess_id, 9).unwrap().total_bytes,
+            100,
+            "forwarded traffic IS counted"
+        );
+
+        // A DROP FAR is likewise not counted.
+        ctx.far_install(SgwuFar {
+            sess_id,
+            far_id: 1,
+            apply_action: apply_action::DROP,
+            ..Default::default()
+        });
+        let result = apply_far(&server, &pdr, &packet);
+        assert!(
+            matches!(&result, GtpuRecvResult::Dropped(r) if r.contains("DROP")),
+            "{result:?}"
+        );
+        assert_eq!(
+            ctx.urr_find(sess_id, 9).unwrap().total_bytes,
+            100,
+            "a DROP FAR must not add to the measured volume"
+        );
+
+        ctx.sess_remove(sess_id);
+        server.close();
+    }
+
+    /// **Issue #215.** A PDR with no URR measures nothing and costs nothing — the
+    /// overwhelmingly common case, since a session without usage reporting must not
+    /// pay for a store lookup per packet.
+    #[test]
+    fn a_pdr_with_no_urr_produces_no_report() {
+        let server = test_server(GTPV1_U_UDP_PORT);
+        let (sess_id, far_id) = provision(
+            0x7300,
+            0x7301,
+            SgwuFar {
+                far_id: 1,
+                apply_action: apply_action::FORW,
+                outer_header_creation: Some((0x999, Some(Ipv4Addr::new(127, 0, 0, 1)), None)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(far_id, 1);
+        let pdr = sgwu_self().pdr_find(sess_id, 1).expect("PDR installed");
+        assert!(pdr.urr_ids.is_empty());
+        assert!(measure_and_report(&pdr, 100).is_empty());
+        sgwu_self().sess_remove(sess_id);
         server.close();
     }
 
