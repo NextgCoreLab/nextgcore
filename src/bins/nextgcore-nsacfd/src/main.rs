@@ -522,6 +522,11 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions"),
         },
         ["nnsacf-slice-ee", "v1", "subscriptions", sub_id] => match method {
+            // TS 29.536 §5.3.2.2.3: PartialModifySubscription (PATCH) and
+            // CompleteModifySubscription (PUT). Both used to fall through to 405,
+            // so a consumer had to delete and re-create to change anything.
+            "PATCH" => handle_slice_ee_modify_partial(sub_id, &request).await,
+            "PUT" => handle_slice_ee_modify_complete(sub_id, &request).await,
             "DELETE" => handle_slice_ee_unsubscribe(sub_id).await,
             _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
         },
@@ -846,7 +851,35 @@ async fn handle_ue_ac_update(request: &SbiRequest) -> SbiResponse {
     // callback keyed by AMF nfId; an explicit null unsubscribes; absent = no change.
     match &req.eac_notification_uri {
         Some(Some(uri)) => {
+            // TS 29.536 §5.2.2.2.2: on the FIRST subscription the NSACF "shall
+            // immediately send an EAC notification ... including the most recent
+            // EAC Modes for the subscribed S-NSSAIs". Before #96 the callback was
+            // registered and nothing was sent, so a consumer did not learn the
+            // current mode until the next TRANSITION — which for a stable slice
+            // could be never, leaving admission-control policy out of sync from
+            // the moment it subscribed.
+            //
+            // Only on the first: an AMF that re-sends its eacNotificationUri on
+            // every NumOfUEsUpdate must not be re-notified each time.
+            let first =
+                !with_nsacf_context(|c| c.eac_subscription_exists(&req.nf_id)).unwrap_or(false);
             with_nsacf_context(|c| c.eac_subscription_set(&req.nf_id, uri));
+            if first {
+                let modes = with_nsacf_context(|c| c.eac_mode_list()).unwrap_or_default();
+                // An NSACF with no configured slice quotas has no modes to report;
+                // sending an empty eacModeList would assert "no slices" rather than
+                // "nothing configured yet", so nothing is sent.
+                if !modes.is_empty() {
+                    log::info!(
+                        "EAC first subscription from nfId={}: sending immediate EAC \
+                         notification with {} slice mode(s)",
+                        req.nf_id,
+                        modes.len()
+                    );
+                    let body = serde_json::json!({ "eacModeList": modes });
+                    tokio::spawn(deliver_notification(uri.clone(), body));
+                }
+            }
         }
         Some(None) => {
             with_nsacf_context(|c| c.eac_subscription_remove(&req.nf_id));
@@ -1478,19 +1511,21 @@ async fn handle_slice_ee_subscribe(request: &SbiRequest) -> SbiResponse {
         .collect();
 
     let subscription_id = uuid::Uuid::new_v4().to_string();
-    let sub = SacSubscription {
-        subscription_id: subscription_id.clone(),
-        notification_uri: notification_uri.expect("checked above").to_string(),
-        events: vec![event_type.to_string()],
-        snssais,
-        expiry: data
-            .get("expiry")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-    };
+    let sub = build_subscription(&subscription_id, &data, event_type, snssais);
+    let immediate = sub.immediate_flag;
+    let snssais_for_immediate = sub.snssais.clone();
     with_nsacf_context(|c| c.subscription_add(sub));
 
     log::info!("SliceEventExposure subscription created: {subscription_id}");
+
+    // TS 29.536 §5.3.2.2.2: `immediateFlag` asks for one report AT SUBSCRIBE
+    // TIME. Without this a consumer that set the flag learned nothing until the
+    // next admit/release, which for a quiet slice could be never.
+    if immediate {
+        for s in &snssais_for_immediate {
+            emit_reports_for(s, ReportCause::Immediate(&subscription_id));
+        }
+    }
 
     // 201 CreatedSACEventSubscription { subscription, subscriptionId }: echo the
     // received SACEventSubscription verbatim (TS 29.536 §6.2.6.2.3).
@@ -1504,6 +1539,301 @@ async fn handle_slice_ee_subscribe(request: &SbiRequest) -> SbiResponse {
             "subscriptionId": subscription_id,
         }))
         .unwrap_or_else(|_| SbiResponse::with_status(201))
+}
+
+/// Build a `SacSubscription` from a validated `SACEventSubscription` document.
+///
+/// Factored out so `CompleteModifySubscription` (PUT) replaces a subscription
+/// through exactly the same parse as create — two parsers would be two places for
+/// a trigger field to be forgotten, which is how all six came to be dropped.
+///
+/// Note where the members live: `eventTrigger`, `notifThreshold`,
+/// `notificationPeriod` and `immediateFlag` are on the nested `event`
+/// (`SACEvent`), while `notifyCorrelationId`, `maxReports` and `expiry` are on the
+/// TOP-LEVEL `SACEventSubscription`. The issue lists them together; reading them
+/// all from one object would have silently found none.
+fn build_subscription(
+    subscription_id: &str,
+    data: &serde_json::Value,
+    event_type: &str,
+    snssais: Vec<SNssai>,
+) -> SacSubscription {
+    let event = data.get("event");
+    SacSubscription {
+        subscription_id: subscription_id.to_string(),
+        notification_uri: data
+            .get("eventNotifyUri")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        events: vec![event_type.to_string()],
+        snssais,
+        expiry: data
+            .get("expiry")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        event_trigger: event
+            .and_then(|e| e.get("eventTrigger"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        notif_threshold: event.and_then(|e| e.get("notifThreshold")).cloned(),
+        notification_period: event
+            .and_then(|e| e.get("notificationPeriod"))
+            .and_then(|v| v.as_u64()),
+        immediate_flag: event
+            .and_then(|e| e.get("immediateFlag"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        max_reports: data
+            .get("maxReports")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+        report_count: 0,
+        notify_correlation_id: data
+            .get("notifyCorrelationId")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        over_threshold: false,
+        last_report_at: 0,
+    }
+}
+
+/// Validate a `SACEventSubscription` document, returning the parsed event type
+/// and S-NSSAI filter or a ProblemDetails response.
+///
+/// The same validation create performs, shared with PUT.
+fn validate_subscription_doc(
+    data: &serde_json::Value,
+) -> Result<(String, Vec<SNssai>), Box<SbiResponse>> {
+    let mut missing = Vec::new();
+    if data
+        .get("eventNotifyUri")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
+        missing.push("eventNotifyUri");
+    }
+    if data.get("nfId").and_then(|v| v.as_str()).is_none() {
+        missing.push("nfId");
+    }
+    let event = data.get("event");
+    let event_type = event
+        .and_then(|e| e.get("eventType"))
+        .and_then(|v| v.as_str());
+    if event_type.is_none() {
+        missing.push("event.eventType");
+    }
+    let event_filter = event
+        .and_then(|e| e.get("eventFilter"))
+        .and_then(|v| v.as_array());
+    if event_filter.map(|a| a.is_empty()).unwrap_or(true) {
+        missing.push("event.eventFilter");
+    }
+    if !missing.is_empty() {
+        return Err(Box::new(problem_details(
+            400,
+            "Bad Request",
+            &format!("Missing mandatory attribute(s): {}", missing.join(", ")),
+            Some("MANDATORY_IE_MISSING"),
+        )));
+    }
+    let event_type = event_type.expect("checked above");
+    if event_type != "NUM_OF_REGD_UES" && event_type != "NUM_OF_ESTD_PDU_SESSIONS" {
+        return Err(Box::new(problem_details(
+            400,
+            "Bad Request",
+            &format!("Unsupported eventType: {event_type}"),
+            Some("INVALID_MSG_FORMAT"),
+        )));
+    }
+    Ok((
+        event_type.to_string(),
+        event_filter
+            .expect("checked above")
+            .iter()
+            .filter_map(SNssai::from_json)
+            .collect(),
+    ))
+}
+
+/// `PATCH /nnsacf-slice-ee/v1/subscriptions/{id}` — PartialModifySubscription
+/// (TS 29.536 §5.3.2.2.3).
+///
+/// RFC 6902 JSON Patch (`application/json-patch+json`), per the OpenAPI — NOT an
+/// RFC 7396 merge-patch, which is what the issue's "JSON-merge/JSON-patch style"
+/// left open. Applied to a CLONE of the stored document and committed only if the
+/// result still validates, so a bad patch cannot leave a half-modified
+/// subscription.
+async fn handle_slice_ee_modify_partial(
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let Some(existing) = with_nsacf_context(|c| c.subscription_get(subscription_id)).flatten()
+    else {
+        return problem_details(
+            404,
+            "Not Found",
+            &format!("Subscription {subscription_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        );
+    };
+
+    // TS 29.536 / TS 29.500: the media type is part of the contract, and a
+    // consumer sending a merge-patch body under the wrong type must be told so
+    // rather than have it applied as something else.
+    let ctype = request
+        .http
+        .get_header("content-type")
+        .cloned()
+        .unwrap_or_default();
+    if !ctype.contains("json-patch+json") {
+        return problem_details(
+            415,
+            "Unsupported Media Type",
+            "PartialModifySubscription requires application/json-patch+json (RFC 6902)",
+            None,
+        );
+    }
+
+    let Some(body) = &request.http.content else {
+        return problem_details(
+            400,
+            "Bad Request",
+            "Missing mandatory request body",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
+    let patch: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return problem_details(
+                400,
+                "Bad Request",
+                &format!("Invalid JSON patch: {e}"),
+                Some("INVALID_MSG_FORMAT"),
+            )
+        }
+    };
+
+    let mut doc = subscription_to_document(&existing);
+    if let Err(e) = nextgcore_sbi::json_patch::apply_patch(&mut doc, &patch) {
+        return problem_details(
+            400,
+            "Bad Request",
+            &format!("Patch could not be applied: {e}"),
+            Some("INVALID_MSG_FORMAT"),
+        );
+    }
+
+    let (event_type, snssais) = match validate_subscription_doc(&doc) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let mut updated = build_subscription(subscription_id, &doc, &event_type, snssais);
+    // A modification is not a new subscription: the report budget already spent
+    // carries over, so a consumer cannot reset `maxReports` by patching.
+    updated.report_count = existing.report_count;
+    updated.over_threshold = existing.over_threshold;
+    updated.last_report_at = existing.last_report_at;
+    with_nsacf_context(|c| c.subscription_add(updated));
+
+    log::info!("SliceEventExposure subscription {subscription_id} partially modified");
+    SbiResponse::with_status(200)
+        .with_json_body(&serde_json::json!({
+            "subscription": doc,
+            "subscriptionId": subscription_id,
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// `PUT /nnsacf-slice-ee/v1/subscriptions/{id}` — CompleteModifySubscription
+/// (TS 29.536 §5.3.2.2.3): full replacement.
+async fn handle_slice_ee_modify_complete(
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let Some(existing) = with_nsacf_context(|c| c.subscription_get(subscription_id)).flatten()
+    else {
+        return problem_details(
+            404,
+            "Not Found",
+            &format!("Subscription {subscription_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        );
+    };
+
+    let Some(body) = &request.http.content else {
+        return problem_details(
+            400,
+            "Bad Request",
+            "Missing mandatory request body",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
+    let data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return problem_details(
+                400,
+                "Bad Request",
+                &format!("Invalid JSON: {e}"),
+                Some("INVALID_MSG_FORMAT"),
+            )
+        }
+    };
+    let (event_type, snssais) = match validate_subscription_doc(&data) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let mut updated = build_subscription(subscription_id, &data, &event_type, snssais);
+    updated.report_count = existing.report_count;
+    updated.over_threshold = existing.over_threshold;
+    updated.last_report_at = existing.last_report_at;
+    with_nsacf_context(|c| c.subscription_add(updated));
+
+    log::info!("SliceEventExposure subscription {subscription_id} replaced");
+    SbiResponse::with_status(200)
+        .with_json_body(&serde_json::json!({
+            "subscription": data,
+            "subscriptionId": subscription_id,
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// Rebuild the `SACEventSubscription` document a stored subscription represents,
+/// so a PATCH has something RFC 6902 pointers can address.
+fn subscription_to_document(sub: &SacSubscription) -> serde_json::Value {
+    let mut event = serde_json::json!({
+        "eventType": sub.events.first().cloned().unwrap_or_default(),
+        "eventFilter": sub.snssais.iter().map(|s| s.to_json()).collect::<Vec<_>>(),
+        "immediateFlag": sub.immediate_flag,
+    });
+    if let Some(ref t) = sub.event_trigger {
+        event["eventTrigger"] = serde_json::json!(t);
+    }
+    if let Some(ref th) = sub.notif_threshold {
+        event["notifThreshold"] = th.clone();
+    }
+    if let Some(p) = sub.notification_period {
+        event["notificationPeriod"] = serde_json::json!(p);
+    }
+    let mut doc = serde_json::json!({
+        "event": event,
+        "eventNotifyUri": sub.notification_uri,
+        // `nfId` is mandatory on the schema and is not otherwise stored; the
+        // subscription id stands in so a round-tripped document still validates.
+        "nfId": sub.subscription_id,
+    });
+    if let Some(ref e) = sub.expiry {
+        doc["expiry"] = serde_json::json!(e);
+    }
+    if let Some(m) = sub.max_reports {
+        doc["maxReports"] = serde_json::json!(m);
+    }
+    if let Some(ref c) = sub.notify_correlation_id {
+        doc["notifyCorrelationId"] = serde_json::json!(c);
+    }
+    doc
 }
 
 /// DELETE /nnsacf-slice-ee/v1/subscriptions/{subscriptionId}
@@ -1612,7 +1942,29 @@ fn spawn_eac_notifications(eac: EacTransition) {
 
 /// Fire slice event reports (current counts) to subscribers whose events
 /// include UE/PDU count updates.
+/// Why a report is being considered, so the trigger gate can be bypassed for the
+/// one case the spec says is unconditional.
+#[derive(Debug, Clone, Copy)]
+enum ReportCause<'a> {
+    /// An admission/release changed the slice occupancy: the trigger decides.
+    Occupancy,
+    /// `immediateFlag` at subscribe time (TS 29.536 §5.3.2.2.2): the named
+    /// subscription reports once regardless of its trigger, because the consumer
+    /// asked for the current state rather than for a change.
+    Immediate(&'a str),
+}
+
 fn spawn_event_reports(s_nssai: &SNssai) {
+    emit_reports_for(s_nssai, ReportCause::Occupancy);
+}
+
+/// Evaluate every matching subscription's trigger and deliver the reports that
+/// are due.
+///
+/// Before #96 this fanned out a report to every matching subscriber on EVERY
+/// admit/release, with no threshold, period, `maxReports` or expiry gating and no
+/// `notifyCorrelationId` echoed — untenable for a consumer at any real scale.
+fn emit_reports_for(s_nssai: &SNssai, cause: ReportCause<'_>) {
     let snapshot = with_nsacf_context(|c| {
         (
             c.subscriptions_matching(s_nssai),
@@ -1623,25 +1975,80 @@ fn spawn_event_reports(s_nssai: &SNssai) {
         return;
     };
     // SACInfo percentages are the spec's 0..100 integer of current/max.
-    let perc_ues = (quota.current_ues() * 100)
+    let num_ues = quota.current_ues();
+    let num_pdu = quota.current_pdu_sessions();
+    let perc_ues = (num_ues * 100)
         .checked_div(quota.max_ues)
         .unwrap_or(0)
         .min(100);
-    let perc_pdu = (quota.current_pdu_sessions() * 100)
+    let perc_pdu = (num_pdu * 100)
         .checked_div(quota.max_pdu_sessions)
         .unwrap_or(0)
         .min(100);
     let time_stamp = chrono::Utc::now().to_rfc3339();
+    let now = nextgcore_sbi::datetime::now_epoch_secs();
+
     for sub in subs {
         // TS 29.536 §6.2.6.3.3 SACEventType: only the two count events report here.
         let event_type = match sub.events.first() {
             Some(t) if t == "NUM_OF_REGD_UES" || t == "NUM_OF_ESTD_PDU_SESSIONS" => t.clone(),
             _ => continue,
         };
+
+        let over_now = sub.over_threshold_now(
+            num_ues as u32,
+            perc_ues as u32,
+            num_pdu as u32,
+            perc_pdu as u32,
+        );
+
+        let emit = match cause {
+            // An immediate report is for ONE named subscription; every other
+            // matching subscription is untouched by a subscribe.
+            ReportCause::Immediate(id) => {
+                if sub.subscription_id != id {
+                    continue;
+                }
+                true
+            }
+            ReportCause::Occupancy => {
+                match sub.report_decision(
+                    num_ues as u32,
+                    perc_ues as u32,
+                    num_pdu as u32,
+                    perc_pdu as u32,
+                    now,
+                ) {
+                    context::ReportDecision::Emit => true,
+                    context::ReportDecision::Suppress => {
+                        // The edge state still has to be recorded, or a level that
+                        // falls back below the threshold would never re-arm and the
+                        // next crossing would be silent.
+                        with_nsacf_context(|c| {
+                            c.subscription_note_threshold(&sub.subscription_id, over_now)
+                        });
+                        continue;
+                    }
+                    context::ReportDecision::Exhausted => {
+                        log::info!(
+                            "SliceEventExposure subscription {} is spent (maxReports or \
+                             expiry); removing",
+                            sub.subscription_id
+                        );
+                        with_nsacf_context(|c| c.subscription_remove(&sub.subscription_id));
+                        continue;
+                    }
+                }
+            }
+        };
+        if !emit {
+            continue;
+        }
+
         // TS 29.536 §6.2.6.2.4 SACEventReport { report: SACEventReportItem } with
         // mandatory eventType/eventState/timeStamp/eventFilter and the SACEventStatus
         // counts (note the spec's `sliceStautsInfo` typo, emitted verbatim).
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "report": {
                 "eventType": event_type,
                 "eventState": { "active": true },
@@ -1649,16 +2056,27 @@ fn spawn_event_reports(s_nssai: &SNssai) {
                 "eventFilter": quota.s_nssai.to_json(),
                 "sliceStautsInfo": {
                     "reachedNumUes": {
-                        "numericValNumUes": quota.current_ues(),
+                        "numericValNumUes": num_ues,
                         "percValueNumUes": perc_ues,
                     },
                     "reachedNumPduSess": {
-                        "numericValNumPduSess": quota.current_pdu_sessions(),
+                        "numericValNumPduSess": num_pdu,
                         "percValueNumPduSess": perc_pdu,
                     },
                 },
             }
         });
+        // Echoed so the consumer can tie the notification to the subscription
+        // that produced it (TS 29.536 §5.3.2.2.2). Absent when the consumer set
+        // none, rather than invented.
+        if let Some(ref cid) = sub.notify_correlation_id {
+            body["notifyCorrelationId"] = serde_json::json!(cid);
+        }
+
+        // Charged and the edge recorded BEFORE the send: delivery is a spawned
+        // task, so waiting for it would let a burst of admits each pass the
+        // maxReports check before any of them incremented the counter.
+        with_nsacf_context(|c| c.subscription_note_report(&sub.subscription_id, over_now, now));
         tokio::spawn(deliver_notification(sub.notification_uri, body));
     }
 }
@@ -1666,6 +2084,17 @@ fn spawn_event_reports(s_nssai: &SNssai) {
 // ---------------------------------------------------------------------------
 // NRF interaction
 // ---------------------------------------------------------------------------
+
+/// `apiFullVersion` advertised for both Nnsacf services.
+///
+/// TS 29.536 is a single specification covering `Nnsacf_NSAC` and
+/// `Nnsacf_SliceEventExposure`, and both vendored OpenAPI documents carry
+/// `info.version: 1.3.0-alpha.1`. The profile hardcoded `1.1.0`, which told the
+/// NRF (and any consumer reading the profile) that this NSACF implements an older
+/// revision than the contract it is built against. Kept as one named constant so
+/// the two services cannot drift apart, and so the next vendored-spec bump has a
+/// single place to change.
+const NSACF_API_FULL_VERSION: &str = "1.3.0";
 
 /// Register NSACF with NRF
 async fn register_with_nrf(
@@ -1696,24 +2125,35 @@ async fn register_with_nrf(
         "ipv4Addresses": [sbi_addr],
         "nfServices": [{
             "serviceInstanceId": format!("{}-nnsacf-nsac", nf_instance_id),
-            "serviceName": "nnsacf-nsac",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.1.0"}],
+            "serviceName": nextgcore_sbi::types::SbiServiceType::NnsacfNsac.to_name(),
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": NSACF_API_FULL_VERSION}],
             "scheme": "http",
             "nfServiceStatus": "REGISTERED",
             "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
             // nsacf-11: advertise SupportedFeatures with HNSAC/VHNSAC bits clear
             // so consumers never expect home/visited delegation (ueAdmissionList).
-            "supportedFeatures": SUPPORTED_FEATURES
+            "supportedFeatures": SUPPORTED_FEATURES,
+            // TS 29.510 §6.1.6.2.3: per-service scoping. NSAC is consumed by the
+            // AMF/SMF (and an SCP forwarding for them).
+            "allowedNfTypes": ["AMF", "SMF", "SCP"]
         }, {
             "serviceInstanceId": format!("{}-nnsacf-slice-ee", nf_instance_id),
-            "serviceName": "nnsacf-slice-ee",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.1.0"}],
+            // Named from the typed service enum rather than a literal, so the
+            // registered name cannot drift from the one consumers select by.
+            "serviceName": nextgcore_sbi::types::SbiServiceType::NnsacfSliceEe.to_name(),
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": NSACF_API_FULL_VERSION}],
             "scheme": "http",
             "nfServiceStatus": "REGISTERED",
             "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
-            "supportedFeatures": SUPPORTED_FEATURES
+            "supportedFeatures": SUPPORTED_FEATURES,
+            // #96: AF and DCCF added. TS 29.536 §5.3.2.2.2 names both among the
+            // legitimate Slice-EE consumers, and omitting them meant the NRF would
+            // not issue either a token scoped to this service.
+            "allowedNfTypes": ["NEF", "NWDAF", "AF", "DCCF", "SCP"]
         }],
-        "allowedNfTypes": ["AMF", "SMF", "SCP", "NEF", "NWDAF"],
+        // The NF-level list is the UNION over the services: a consumer type barred
+        // here can never reach any of them.
+        "allowedNfTypes": ["AMF", "SMF", "SCP", "NEF", "NWDAF", "AF", "DCCF"],
         "heartBeatTimer": 10
     });
 
@@ -3125,5 +3565,419 @@ nsacf:
         );
 
         server.stop().await.expect("stop");
+    }
+
+    // ── #96: modify, report triggers, immediate EAC, typed service ────────────
+
+    fn subscription_doc(
+        uri: &str,
+        extra_event: serde_json::Value,
+        extra_top: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut event = json!({
+            "eventType": "NUM_OF_REGD_UES",
+            "eventFilter": [{"sst": 96}],
+        });
+        if let Some(o) = extra_event.as_object() {
+            for (k, v) in o {
+                event[k] = v.clone();
+            }
+        }
+        let mut doc = json!({
+            "eventNotifyUri": uri,
+            "nfId": "amf-96",
+            "event": event,
+        });
+        if let Some(o) = extra_top.as_object() {
+            for (k, v) in o {
+                doc[k] = v.clone();
+            }
+        }
+        doc
+    }
+
+    /// #96 criteria 5+6+7: the trigger semantics, `maxReports`, expiry and
+    /// `notifyCorrelationId`, decided by the pure `report_decision`.
+    ///
+    /// Pure so the PERIODIC case is observable without sleeping and the threshold
+    /// EDGE is observable without driving admissions — the two properties a
+    /// notification-count test cannot separate.
+    #[test]
+    fn report_triggers_gate_emission() {
+        use context::ReportDecision;
+        let base = build_subscription(
+            "sub-96",
+            &subscription_doc("http://127.0.0.1:9/cb", json!({}), json!({})),
+            "NUM_OF_REGD_UES",
+            vec![SNssai::new(96, None)],
+        );
+
+        // THRESHOLD with a 50% UE threshold: below it, silence.
+        let mut th = base.clone();
+        th.event_trigger = Some("THRESHOLD".to_string());
+        th.notif_threshold = Some(json!({"percValueNumUes": 50}));
+        assert_eq!(
+            th.report_decision(1, 10, 0, 0, 1_000),
+            ReportDecision::Suppress,
+            "sub-threshold churn must not notify"
+        );
+        // Crossing it reports ONCE...
+        assert_eq!(th.report_decision(5, 50, 0, 0, 1_000), ReportDecision::Emit);
+        // ...and while it stays over, it does not report again (edge, not level).
+        let mut over = th.clone();
+        over.over_threshold = true;
+        assert_eq!(
+            over.report_decision(6, 60, 0, 0, 1_000),
+            ReportDecision::Suppress,
+            "a sustained over-threshold condition must report once, not per admit"
+        );
+        // Falling back below re-arms, so the NEXT crossing reports again.
+        assert!(!over.over_threshold_now(1, 10, 0, 0));
+
+        // An absolute-count threshold works the same way, and ANY met member
+        // crosses (a consumer that set two must not be silenced).
+        let mut abs = th.clone();
+        abs.notif_threshold = Some(json!({"numericValNumUes": 3, "percValueNumPduSess": 90}));
+        assert!(
+            abs.over_threshold_now(3, 1, 0, 0),
+            "the UE count alone crosses"
+        );
+        assert!(!abs.over_threshold_now(2, 1, 0, 0));
+
+        // A THRESHOLD trigger with NO threshold degenerates to report-each-change
+        // rather than never reporting.
+        let mut nothr = th.clone();
+        nothr.notif_threshold = None;
+        assert_eq!(
+            nothr.report_decision(0, 0, 0, 0, 1_000),
+            ReportDecision::Emit
+        );
+
+        // PERIODIC: paced by notificationPeriod, not by the event.
+        let mut per = base.clone();
+        per.event_trigger = Some("PERIODIC".to_string());
+        per.notification_period = Some(30);
+        per.last_report_at = 1_000;
+        assert_eq!(
+            per.report_decision(99, 99, 0, 0, 1_020),
+            ReportDecision::Suppress,
+            "inside the period, even a big change waits"
+        );
+        assert_eq!(per.report_decision(0, 0, 0, 0, 1_030), ReportDecision::Emit);
+        // A PERIODIC subscription with no period cannot be paced, so it reports.
+        let mut per0 = per.clone();
+        per0.notification_period = None;
+        assert_eq!(
+            per0.report_decision(0, 0, 0, 0, 1_001),
+            ReportDecision::Emit
+        );
+
+        // An unrecognised (forward-compatible) trigger token is edge-triggered,
+        // not rejected: SACEventTrigger is an anyOf.
+        let mut future = th.clone();
+        future.event_trigger = Some("SOME_REL20_TRIGGER".to_string());
+        assert_eq!(
+            future.report_decision(5, 50, 0, 0, 1_000),
+            ReportDecision::Emit
+        );
+
+        // maxReports: spent means REMOVE, not merely "not now".
+        let mut capped = base.clone();
+        capped.max_reports = Some(2);
+        capped.report_count = 2;
+        assert_eq!(
+            capped.report_decision(0, 0, 0, 0, 1_000),
+            ReportDecision::Exhausted
+        );
+        capped.report_count = 1;
+        assert_eq!(
+            capped.report_decision(0, 0, 0, 0, 1_000),
+            ReportDecision::Emit
+        );
+
+        // Expiry: also Exhausted, so the subscription is removed rather than kept.
+        let mut expired = base.clone();
+        expired.expiry = Some(nextgcore_sbi::datetime::epoch_to_rfc3339(500));
+        assert_eq!(
+            expired.report_decision(0, 0, 0, 0, 1_000),
+            ReportDecision::Exhausted
+        );
+        expired.expiry = Some(nextgcore_sbi::datetime::epoch_to_rfc3339(2_000));
+        assert_eq!(
+            expired.report_decision(0, 0, 0, 0, 1_000),
+            ReportDecision::Emit
+        );
+    }
+
+    /// Every trigger field is parsed, and from the RIGHT object: `eventTrigger`,
+    /// `notifThreshold`, `notificationPeriod` and `immediateFlag` live on the
+    /// nested `event`, while `notifyCorrelationId`, `maxReports` and `expiry` are
+    /// top-level. Reading them all from one object would find none.
+    #[test]
+    fn every_trigger_field_is_parsed_from_its_own_object() {
+        let doc = subscription_doc(
+            "http://127.0.0.1:9/cb",
+            json!({
+                "eventTrigger": "PERIODIC",
+                "notificationPeriod": 45,
+                "notifThreshold": {"percValueNumUes": 75},
+                "immediateFlag": true
+            }),
+            json!({
+                "notifyCorrelationId": "corr-96",
+                "maxReports": 7,
+                "expiry": "2030-01-01T00:00:00Z"
+            }),
+        );
+        let sub = build_subscription(
+            "sub-96b",
+            &doc,
+            "NUM_OF_REGD_UES",
+            vec![SNssai::new(96, None)],
+        );
+        assert_eq!(sub.event_trigger.as_deref(), Some("PERIODIC"));
+        assert_eq!(sub.notification_period, Some(45));
+        assert_eq!(sub.notif_threshold.as_ref().unwrap()["percValueNumUes"], 75);
+        assert!(sub.immediate_flag);
+        assert_eq!(sub.notify_correlation_id.as_deref(), Some("corr-96"));
+        assert_eq!(sub.max_reports, Some(7));
+        assert_eq!(sub.expiry.as_deref(), Some("2030-01-01T00:00:00Z"));
+        assert_eq!(sub.report_count, 0);
+    }
+
+    /// #96 criteria 1+2: PATCH and PUT modify an existing subscription instead of
+    /// answering 405, and neither resets the report budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscription_modify_patch_and_put_are_implemented() {
+        nsacf_context_init(64);
+        let doc = subscription_doc(
+            "http://127.0.0.1:9/cb",
+            json!({"eventTrigger": "THRESHOLD", "notifThreshold": {"percValueNumUes": 50}}),
+            json!({"maxReports": 9}),
+        );
+        let (event_type, snssais) = validate_subscription_doc(&doc).expect("valid");
+        let mut stored = build_subscription("sub-96c", &doc, &event_type, snssais);
+        // Pretend two reports have already been sent.
+        stored.report_count = 2;
+        with_nsacf_context(|c| c.subscription_add(stored));
+
+        // PATCH (RFC 6902) raises the threshold.
+        let patch = json!([{"op": "replace", "path": "/event/notifThreshold/percValueNumUes", "value": 80}]);
+        let req = SbiRequest::patch("/nnsacf-slice-ee/v1/subscriptions/sub-96c")
+            .with_body(patch.to_string(), "application/json-patch+json");
+        let resp = handle_slice_ee_modify_partial("sub-96c", &req).await;
+        assert_eq!(resp.status, 200, "PATCH must modify, not 405");
+        let after = with_nsacf_context(|c| c.subscription_get("sub-96c"))
+            .flatten()
+            .expect("still there");
+        assert_eq!(
+            after.notif_threshold.as_ref().unwrap()["percValueNumUes"],
+            80
+        );
+        assert_eq!(
+            after.report_count, 2,
+            "a modification must not reset the maxReports budget"
+        );
+
+        // The wrong media type is refused rather than applied as something else.
+        let bad = SbiRequest::patch("/nnsacf-slice-ee/v1/subscriptions/sub-96c")
+            .with_body(patch.to_string(), "application/merge-patch+json");
+        assert_eq!(
+            handle_slice_ee_modify_partial("sub-96c", &bad).await.status,
+            415
+        );
+
+        // A patch that breaks the document is refused and does NOT commit.
+        let destructive = json!([{"op": "remove", "path": "/eventNotifyUri"}]);
+        let req = SbiRequest::patch("/nnsacf-slice-ee/v1/subscriptions/sub-96c")
+            .with_body(destructive.to_string(), "application/json-patch+json");
+        assert_eq!(
+            handle_slice_ee_modify_partial("sub-96c", &req).await.status,
+            400
+        );
+        let unchanged = with_nsacf_context(|c| c.subscription_get("sub-96c"))
+            .flatten()
+            .expect("still there");
+        assert_eq!(
+            unchanged.notification_uri, "http://127.0.0.1:9/cb",
+            "a rejected patch must not have been committed"
+        );
+
+        // PUT replaces the whole subscription.
+        let replacement = subscription_doc(
+            "http://127.0.0.1:9/moved",
+            json!({"eventTrigger": "PERIODIC", "notificationPeriod": 60}),
+            json!({"maxReports": 9}),
+        );
+        let req = SbiRequest::put("/nnsacf-slice-ee/v1/subscriptions/sub-96c")
+            .with_json_body(&replacement)
+            .expect("body");
+        let resp = handle_slice_ee_modify_complete("sub-96c", &req).await;
+        assert_eq!(resp.status, 200, "PUT must replace, not 405");
+        let after = with_nsacf_context(|c| c.subscription_get("sub-96c"))
+            .flatten()
+            .expect("still there");
+        assert_eq!(after.notification_uri, "http://127.0.0.1:9/moved");
+        assert_eq!(after.event_trigger.as_deref(), Some("PERIODIC"));
+        assert_eq!(after.notification_period, Some(60));
+        assert_eq!(
+            after.report_count, 2,
+            "PUT must not reset the budget either"
+        );
+        // The threshold from the old document is gone: PUT is a replacement.
+        assert!(after.notif_threshold.is_none());
+
+        // An unknown subscription is 404 on both verbs, not 405 and not 500.
+        let req = SbiRequest::put("/nnsacf-slice-ee/v1/subscriptions/nope")
+            .with_json_body(&replacement)
+            .expect("body");
+        assert_eq!(
+            handle_slice_ee_modify_complete("nope", &req).await.status,
+            404
+        );
+        let req = SbiRequest::patch("/nnsacf-slice-ee/v1/subscriptions/nope")
+            .with_body(patch.to_string(), "application/json-patch+json");
+        assert_eq!(
+            handle_slice_ee_modify_partial("nope", &req).await.status,
+            404
+        );
+
+        with_nsacf_context(|c| c.subscription_remove("sub-96c"));
+    }
+
+    /// The report counter and edge state are recorded by the store, so
+    /// `maxReports` survives and a sustained condition cannot re-report.
+    #[test]
+    fn report_bookkeeping_charges_and_records_the_edge() {
+        nsacf_context_init(64);
+        let doc = subscription_doc("http://127.0.0.1:9/cb", json!({}), json!({"maxReports": 2}));
+        let sub = build_subscription(
+            "sub-96d",
+            &doc,
+            "NUM_OF_REGD_UES",
+            vec![SNssai::new(96, None)],
+        );
+        with_nsacf_context(|c| c.subscription_add(sub));
+
+        with_nsacf_context(|c| c.subscription_note_report("sub-96d", true, 1_234));
+        let after = with_nsacf_context(|c| c.subscription_get("sub-96d"))
+            .flatten()
+            .expect("there");
+        assert_eq!(after.report_count, 1);
+        assert!(
+            after.over_threshold,
+            "the edge must be recorded with the report"
+        );
+        assert_eq!(after.last_report_at, 1_234);
+
+        // The suppressed path re-arms the edge WITHOUT charging a report.
+        with_nsacf_context(|c| c.subscription_note_threshold("sub-96d", false));
+        let after = with_nsacf_context(|c| c.subscription_get("sub-96d"))
+            .flatten()
+            .expect("there");
+        assert!(!after.over_threshold, "falling below must re-arm the edge");
+        assert_eq!(
+            after.report_count, 1,
+            "re-arming must not consume a report from the budget"
+        );
+
+        with_nsacf_context(|c| c.subscription_remove("sub-96d"));
+    }
+
+    /// #96 criterion 4: the current EAC modes are available for the immediate
+    /// notification, and a first subscription is distinguishable from a repeat.
+    #[test]
+    fn eac_mode_list_and_first_subscription_detection() {
+        nsacf_context_init(64);
+        with_nsacf_context(|c| {
+            c.quota_add(SNssai::new(96, None), 10, 10);
+        });
+
+        // The mode list covers every NSAC-subject slice, not only the one that
+        // most recently transitioned -- §5.2.2.2.2 says "the most recent EAC Modes
+        // for the subscribed S-NSSAIs".
+        let modes = with_nsacf_context(|c| c.eac_mode_list()).expect("ctx");
+        assert!(
+            modes.contains_key(&SNssai::new(96, None).to_key()),
+            "every configured slice must have a mode: {modes:?}"
+        );
+        assert_eq!(modes[&SNssai::new(96, None).to_key()], "DEACTIVE");
+
+        // First-subscription detection: false before, true after.
+        assert!(!with_nsacf_context(|c| c.eac_subscription_exists("amf-96e")).unwrap());
+        with_nsacf_context(|c| c.eac_subscription_set("amf-96e", "http://127.0.0.1:9/eac"));
+        assert!(
+            with_nsacf_context(|c| c.eac_subscription_exists("amf-96e")).unwrap(),
+            "a re-registering AMF must be recognised as already subscribed, so it \
+             is not re-notified on every NumOfUEsUpdate"
+        );
+        with_nsacf_context(|c| c.eac_subscription_remove("amf-96e"));
+    }
+
+    /// #96 criterion 8: the typed service variant round-trips.
+    #[test]
+    fn nnsacf_slice_ee_service_type_round_trips() {
+        use nextgcore_sbi::types::SbiServiceType;
+        assert_eq!(SbiServiceType::NnsacfSliceEe.to_name(), "nnsacf-slice-ee");
+        assert_eq!(
+            SbiServiceType::from_name("nnsacf-slice-ee"),
+            Some(SbiServiceType::NnsacfSliceEe)
+        );
+        // The sibling NSAC service is unaffected.
+        assert_eq!(SbiServiceType::NnsacfNsac.to_name(), "nnsacf-nsac");
+        assert_eq!(
+            SbiServiceType::from_name("nnsacf-nsac"),
+            Some(SbiServiceType::NnsacfNsac)
+        );
+        // They are distinct: before #96 a consumer had only NnsacfNsac and could
+        // not select the exposure service by type at all.
+        assert_ne!(SbiServiceType::NnsacfSliceEe, SbiServiceType::NnsacfNsac);
+    }
+
+    /// #96 criteria 1+2 at the ROUTER: PATCH and PUT reach their handlers instead
+    /// of the 405 the dispatch used to give them.
+    ///
+    /// The handler-level test above proves the handlers work; only this one proves
+    /// they are REACHABLE. Deleting a route arm leaves that test green, which is
+    /// the recorded "the helper is tested and the wiring is not" gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn modify_verbs_are_routed_not_405() {
+        nsacf_context_init(64);
+        let doc = subscription_doc("http://127.0.0.1:9/cb", json!({}), json!({}));
+        let (event_type, snssais) = validate_subscription_doc(&doc).expect("valid");
+        with_nsacf_context(|c| {
+            c.subscription_add(build_subscription("sub-96r", &doc, &event_type, snssais))
+        });
+
+        // PATCH through the router.
+        let patch = json!([{"op": "replace", "path": "/event/eventType", "value": "NUM_OF_ESTD_PDU_SESSIONS"}]);
+        let req = SbiRequest::patch("/nnsacf-slice-ee/v1/subscriptions/sub-96r")
+            .with_body(patch.to_string(), "application/json-patch+json");
+        let resp = nsacf_sbi_request_handler(req).await;
+        assert_ne!(
+            resp.status, 405,
+            "PATCH must be routed to PartialModifySubscription, not rejected as \
+             method-not-allowed"
+        );
+        assert_eq!(resp.status, 200);
+
+        // PUT through the router.
+        let req = SbiRequest::put("/nnsacf-slice-ee/v1/subscriptions/sub-96r")
+            .with_json_body(&doc)
+            .expect("body");
+        let resp = nsacf_sbi_request_handler(req).await;
+        assert_ne!(
+            resp.status, 405,
+            "PUT must be routed to CompleteModifySubscription"
+        );
+        assert_eq!(resp.status, 200);
+
+        // A verb the resource genuinely does not support is still 405.
+        let resp =
+            nsacf_sbi_request_handler(SbiRequest::get("/nnsacf-slice-ee/v1/subscriptions/sub-96r"))
+                .await;
+        assert_eq!(resp.status, 405, "GET is not defined on this resource");
+
+        with_nsacf_context(|c| c.subscription_remove("sub-96r"));
     }
 }

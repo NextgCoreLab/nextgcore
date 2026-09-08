@@ -27,7 +27,6 @@ use std::time::Duration;
 
 mod context;
 mod event;
-mod json_patch;
 mod nnrf_handler;
 mod nnssf_build;
 mod nnssf_handler;
@@ -1947,7 +1946,11 @@ fn check_availability_authorization(
     // one would make availability writes impossible rather than safe. Permitted,
     // and WARNED about at every write so the posture is visible in the log rather
     // than only in the config (the #64 pattern).
-    if !authorized && caller.is_none() && !strict_availability_authz() {
+    // The hatch covers a MISSING CALLER IDENTITY, never a missing resource owner:
+    // an empty `{nfId}` names no document, so there is nothing it could be
+    // authorized to write whatever the posture. Without this guard the hatch
+    // permitted an empty nfId, which the whole-workspace run caught.
+    if !authorized && caller.is_none() && !nf_id.trim().is_empty() && !strict_availability_authz() {
         log::warn!(
             "availability write for {nf_id} accepted WITHOUT an attested caller identity: \
              SBI OAuth2 enforcement is disabled, so any reachable NF can write any AMF's \
@@ -2212,7 +2215,7 @@ async fn handle_nssai_availability_patch(nf_id: &str, request: &SbiRequest) -> S
     // RFC 6902 JSON Patch (TS 29.531 PatchDocument) applied to a clone;
     // only commit on success.
     let mut patched = existing.doc.clone();
-    if let Err(e) = json_patch::apply_patch(&mut patched, &patch) {
+    if let Err(e) = nextgcore_sbi::json_patch::apply_patch(&mut patched, &patch) {
         return problem_details(
             400,
             "Bad Request",
@@ -2644,7 +2647,7 @@ async fn handle_subscription_patch(subscription_id: &str, request: &SbiRequest) 
         doc["amfSetId"] = serde_json::json!(a);
     }
 
-    if let Err(e) = json_patch::apply_patch(&mut doc, &patch) {
+    if let Err(e) = nextgcore_sbi::json_patch::apply_patch(&mut doc, &patch) {
         return problem_details(
             400,
             "Bad Request",
@@ -3399,6 +3402,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_nsselection_registration_scenario() {
+        // Serialise against the tests that set the process-global
+        // PLMN-supported-S-NSSAI restriction: with a sibling's `[sst 1]`
+        // restriction installed concurrently, this registration filters every
+        // requested slice out and the response carries no body, which surfaces as
+        // an unwrap panic here rather than as anything pointing at the sibling.
+        // Taking the guard those tests ALREADY take is the fix; a private lock
+        // would not order them.
+        let _state_guard = availability_state_guard().await;
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None));
         let (server, port) = start_nssf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 

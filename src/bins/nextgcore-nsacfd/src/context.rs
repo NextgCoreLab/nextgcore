@@ -311,11 +311,153 @@ pub struct SacSubscription {
     /// S-NSSAIs of interest (empty = all slices)
     pub snssais: Vec<SNssai>,
     pub expiry: Option<String>,
+    /// `event.eventTrigger` — `THRESHOLD` or `PERIODIC` (TS 29.536
+    /// `SACEventTrigger`). `None` means the consumer did not say; treated as
+    /// THRESHOLD, since reporting on a threshold the consumer also did not give
+    /// degenerates to "report every change", which is the pre-#96 behaviour.
+    pub event_trigger: Option<String>,
+    /// `event.notifThreshold` (a TS 29.571 `SACInfo`) — the level at which a
+    /// THRESHOLD-triggered subscription reports. Stored verbatim so every member
+    /// the consumer set is available to the edge check.
+    pub notif_threshold: Option<serde_json::Value>,
+    /// `event.notificationPeriod` in seconds, for PERIODIC triggers.
+    pub notification_period: Option<u64>,
+    /// `event.immediateFlag` — send one report at subscribe time
+    /// (TS 29.536 §5.3.2.2.2).
+    pub immediate_flag: bool,
+    /// `maxReports` — the total number of reports this subscription may ever
+    /// receive. `None` is unlimited.
+    pub max_reports: Option<u32>,
+    /// How many reports have been sent. Persisted, so `maxReports` cannot be
+    /// reset by restarting the NSACF.
+    pub report_count: u32,
+    /// `notifyCorrelationId` — echoed in every notification so the consumer can
+    /// correlate it with the subscription that produced it.
+    pub notify_correlation_id: Option<String>,
+    /// Whether this subscription was over its threshold at the last evaluation.
+    ///
+    /// This is what makes a THRESHOLD trigger an EDGE rather than a level: a
+    /// report is emitted when the state CHANGES, so sub-threshold churn is silent
+    /// and a sustained over-threshold condition reports once rather than on every
+    /// admit. Not persisted as "true" across a restart would suppress the first
+    /// report after boot; it restores false so the first crossing after a restart
+    /// is reported.
+    pub over_threshold: bool,
+    /// Unix seconds of the last report, for PERIODIC pacing. Not persisted, so a
+    /// restart reports at the next event rather than waiting out the old period.
+    pub last_report_at: u64,
+}
+
+/// Why a subscription is (or is not) reporting right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportDecision {
+    /// Emit a report.
+    Emit,
+    /// Do not emit; the trigger condition is not met.
+    Suppress,
+    /// Do not emit, and the subscription is spent (maxReports reached or expiry
+    /// passed) so the caller should remove it.
+    Exhausted,
 }
 
 impl SacSubscription {
     pub fn matches_snssai(&self, s_nssai: &SNssai) -> bool {
         self.snssais.is_empty() || self.snssais.contains(s_nssai)
+    }
+
+    /// Whether `perc_ues`/`perc_pdu` (and their absolute counts) are at or above
+    /// this subscription's `notifThreshold`.
+    ///
+    /// A threshold with no member set is NOT a threshold — it reads as "over"
+    /// always, which is the honest reading of "the consumer asked for THRESHOLD
+    /// but gave none": it degenerates to reporting each change rather than
+    /// silently never reporting.
+    pub fn over_threshold_now(
+        &self,
+        num_ues: u32,
+        perc_ues: u32,
+        num_pdu: u32,
+        perc_pdu: u32,
+    ) -> bool {
+        let Some(ref th) = self.notif_threshold else {
+            return true;
+        };
+        let mut any = false;
+        let mut met = false;
+        for (key, actual) in [
+            ("numericValNumUes", num_ues),
+            ("percValueNumUes", perc_ues),
+            ("numericValNumPduSess", num_pdu),
+            ("percValueNumPduSess", perc_pdu),
+        ] {
+            if let Some(limit) = th.get(key).and_then(|v| v.as_u64()) {
+                any = true;
+                // ANY member being met crosses the threshold: the members are
+                // alternative ways to express the same "slice is getting full"
+                // condition, so requiring all of them would silence a
+                // subscription that set two.
+                if u64::from(actual) >= limit {
+                    met = true;
+                }
+            }
+        }
+        if !any {
+            return true;
+        }
+        met
+    }
+
+    /// Decide whether to report, given the current occupancy and clock.
+    ///
+    /// Pure so the trigger semantics are testable without a store, a socket or a
+    /// sleep — the periodic case is otherwise only observable by waiting.
+    pub fn report_decision(
+        &self,
+        num_ues: u32,
+        perc_ues: u32,
+        num_pdu: u32,
+        perc_pdu: u32,
+        now_secs: u64,
+    ) -> ReportDecision {
+        // Expiry and maxReports first: a spent subscription is spent whatever the
+        // trigger says, and both mean "remove me" rather than "not now".
+        if let Some(ref e) = self.expiry {
+            if let Some(deadline) = nextgcore_sbi::datetime::rfc3339_to_epoch(e) {
+                if now_secs >= deadline {
+                    return ReportDecision::Exhausted;
+                }
+            }
+        }
+        if let Some(max) = self.max_reports {
+            if self.report_count >= max {
+                return ReportDecision::Exhausted;
+            }
+        }
+
+        match self.event_trigger.as_deref() {
+            Some("PERIODIC") => {
+                let period = self.notification_period.unwrap_or(0);
+                // A PERIODIC subscription with no period cannot be paced, so it
+                // reports on each event rather than never.
+                if period == 0 || now_secs.saturating_sub(self.last_report_at) >= period {
+                    ReportDecision::Emit
+                } else {
+                    ReportDecision::Suppress
+                }
+            }
+            // THRESHOLD, an unrecognised (forward-compatible) token, or none:
+            // report on the EDGE. `SACEventTrigger` is an anyOf over the enum
+            // plus a free-form string, so an unknown token must not be rejected;
+            // edge-triggering is the safer default for one.
+            _ => {
+                let now_over = self.over_threshold_now(num_ues, perc_ues, num_pdu, perc_pdu);
+                if now_over && !self.over_threshold {
+                    ReportDecision::Emit
+                } else {
+                    ReportDecision::Suppress
+                }
+            }
+        }
     }
 }
 
@@ -395,6 +537,39 @@ impl NsacfContext {
         if let Ok(mut m) = self.eac_subscriptions.write() {
             m.insert(nf_id.to_string(), uri.to_string());
         }
+    }
+
+    /// Whether `nf_id` already had an EAC callback registered.
+    ///
+    /// TS 29.536 §5.2.2.2.2 requires the immediate EAC notification on the FIRST
+    /// subscription, so the caller has to know whether this is a first one; a
+    /// re-registration by an AMF that is already subscribed must not re-notify.
+    pub fn eac_subscription_exists(&self, nf_id: &str) -> bool {
+        self.eac_subscriptions
+            .read()
+            .map(|m| m.contains_key(nf_id))
+            .unwrap_or(false)
+    }
+
+    /// The current EAC mode of every NSAC-subject slice, as the
+    /// `eacModeList` map TS 29.536 §6.1.6.2.4 defines: S-NSSAI key -> EACMode.
+    ///
+    /// Used for the immediate notification, which must carry "the most recent EAC
+    /// Modes for the subscribed S-NSSAIs" rather than only the slice that most
+    /// recently transitioned.
+    pub fn eac_mode_list(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut out = serde_json::Map::new();
+        if let Ok(quotas) = self.quota_list.read() {
+            for q in quotas.values() {
+                out.insert(
+                    q.s_nssai.to_key(),
+                    serde_json::Value::String(
+                        if q.eac_active() { "ACTIVE" } else { "DEACTIVE" }.to_string(),
+                    ),
+                );
+            }
+        }
+        out
     }
 
     /// Remove the EAC notification callback for an AMF nfId (null unsubscribe).
@@ -832,6 +1007,34 @@ impl NsacfContext {
 
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.read().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Record that a report was emitted: charge it against `maxReports`, and
+    /// update the threshold edge and periodic pacing state.
+    ///
+    /// One method rather than three so a caller cannot charge the report and
+    /// forget the edge — which would make a sustained over-threshold condition
+    /// report on every single admit.
+    pub fn subscription_note_report(&self, id: &str, over_threshold: bool, now_secs: u64) {
+        if let Ok(mut subs) = self.subscriptions.write() {
+            if let Some(sub) = subs.get_mut(id) {
+                sub.report_count = sub.report_count.saturating_add(1);
+                sub.over_threshold = over_threshold;
+                sub.last_report_at = now_secs;
+            }
+        }
+    }
+
+    /// Record the current threshold state WITHOUT charging a report.
+    ///
+    /// Needed on the suppressed path: when occupancy falls back below the
+    /// threshold the edge has to re-arm, or the next genuine crossing is silent.
+    pub fn subscription_note_threshold(&self, id: &str, over_threshold: bool) {
+        if let Ok(mut subs) = self.subscriptions.write() {
+            if let Some(sub) = subs.get_mut(id) {
+                sub.over_threshold = over_threshold;
+            }
+        }
     }
 
     /// Subscriptions interested in `s_nssai`
@@ -1429,6 +1632,15 @@ mod tests {
             events: vec!["NUM_OF_REGISTERED_UES".to_string()],
             snssais: vec![SNssai::new(1, None)],
             expiry: None,
+            event_trigger: None,
+            notif_threshold: None,
+            notification_period: None,
+            immediate_flag: false,
+            max_reports: None,
+            report_count: 0,
+            notify_correlation_id: None,
+            over_threshold: false,
+            last_report_at: 0,
         });
         ctx.subscription_add(SacSubscription {
             subscription_id: "s2".to_string(),
@@ -1436,6 +1648,15 @@ mod tests {
             events: vec![],
             snssais: vec![], // all slices
             expiry: None,
+            event_trigger: None,
+            notif_threshold: None,
+            notification_period: None,
+            immediate_flag: false,
+            max_reports: None,
+            report_count: 0,
+            notify_correlation_id: None,
+            over_threshold: false,
+            last_report_at: 0,
         });
 
         assert_eq!(ctx.subscriptions_matching(&SNssai::new(1, None)).len(), 2);

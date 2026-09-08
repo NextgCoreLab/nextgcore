@@ -1,10 +1,16 @@
 //! Minimal RFC 6902 JSON Patch engine.
 //!
-//! TS 29.531 NSSAIAvailability PATCH operations carry a `PatchDocument`
-//! (array of RFC 6902 `PatchItem`s, content type `application/json-patch+json`),
-//! NOT an RFC 7396 merge-patch. This module applies such documents to a
-//! `serde_json::Value` with full add/remove/replace/test/copy/move support
-//! and RFC 6901 pointer semantics (`~0`/`~1` unescaping, `-` array append).
+//! Several 3GPP PATCH operations carry a `PatchDocument` — an array of RFC 6902
+//! `PatchItem`s under content type `application/json-patch+json` — and NOT an
+//! RFC 7396 merge-patch: TS 29.531 Nnssf_NSSAIAvailability and TS 29.536
+//! Nnsacf_SliceEventExposure `PartialModifySubscription` are two. This module
+//! applies such documents to a `serde_json::Value` with full
+//! add/remove/replace/test/copy/move support and RFC 6901 pointer semantics
+//! (`~0`/`~1` unescaping, `-` array append).
+//!
+//! Moved here from `nextgcore-nssfd` when nsacfd needed the same engine (#96):
+//! a second hand-rolled RFC 6902 implementation is two places for one pointer- or
+//! escaping bug to live.
 
 use serde_json::Value;
 
