@@ -2101,6 +2101,14 @@ pub struct AmfUe {
     pub home_plmn_id: PlmnId,
     /// PEI (Permanent Equipment Identifier)
     pub pei: Option<String>,
+    /// GPSI — the UE's EXTERNAL identity, taken from the `gpsis` array of the
+    /// `am-data` the AMF retrieves from UDM SDM (TS 29.503 §5.2.2.2.1).
+    ///
+    /// Held as an `Option` and never synthesised: the SUPI is the internal
+    /// identity and cannot be converted into a GPSI, so when the subscription
+    /// carries no usable `gpsis` entry this stays `None` and every consumer
+    /// omits the member rather than conveying a derived one (issue #205).
+    pub gpsi: Option<String>,
     /// Masked IMEISV
     pub masked_imeisv: [u8; NEXTGCORE_MAX_IMEISV_LEN],
     /// Masked IMEISV length
@@ -2661,6 +2669,7 @@ impl AmfUe {
             supi: None,
             home_plmn_id: PlmnId::default(),
             pei: None,
+            gpsi: None,
             masked_imeisv: [0u8; NEXTGCORE_MAX_IMEISV_LEN],
             masked_imeisv_len: 0,
             imeisv_bcd: String::new(),
