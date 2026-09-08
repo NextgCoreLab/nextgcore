@@ -46,14 +46,90 @@ pub fn epoch_to_rfc3339(secs: u64) -> String {
     )
 }
 
-/// Parse an RFC 3339 UTC date-time into seconds since the epoch, the inverse of
-/// [`epoch_to_rfc3339`].
+/// Split a trailing RFC 3339 zone designator off a time string, returning the
+/// time without it and the zone's offset from UTC in seconds.
 ///
-/// Deliberately strict: only the `YYYY-MM-DDThh:mm:ss` form, with an optional
-/// fractional part and a `Z`/`+00:00` offset. **A non-UTC offset is REJECTED**
-/// rather than silently read as UTC, because misreading an offset shifts a
-/// deadline by hours — the same reasoning nrfd's copy records.
-pub fn rfc3339_to_epoch(text: &str) -> Option<u64> {
+/// Accepted: `Z` / `z`, and a numeric `±HH:MM` or `±HHMM`. Anything else — most
+/// importantly *no zone at all* — is refused, because a naive local time has no
+/// defined instant and guessing UTC for it is how a deadline moves by hours.
+///
+/// The no-colon `±HHMM` form is not strictly RFC 3339 (its `time-numoffset`
+/// requires the colon), but the shared parser already accepted `+0000` and
+/// `eesd`'s parser accepts `±HHMM` generally. Accepting both spellings uniformly
+/// is easier to explain than accepting `+0000` while refusing `+0200`.
+fn split_zone(rest: &str) -> Option<(&str, i64)> {
+    if let Some(time) = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z')) {
+        return Some((time, 0));
+    }
+    // Find the sign that starts the offset. Scanning from the end keeps the date's
+    // own '-' separators out of it, since only the last 5 or 6 bytes can be a zone.
+    for width in [6usize, 5] {
+        if rest.len() < width + 1 {
+            continue;
+        }
+        let (time, zone) = rest.split_at(rest.len() - width);
+        let bytes = zone.as_bytes();
+        let sign = match bytes[0] {
+            b'+' => 1i64,
+            b'-' => -1i64,
+            _ => continue,
+        };
+        let (hh, mm) = if width == 6 {
+            if bytes[3] != b':' {
+                continue;
+            }
+            (&zone[1..3], &zone[4..6])
+        } else {
+            (&zone[1..3], &zone[3..5])
+        };
+        let hours: i64 = match hh.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let minutes: i64 = match mm.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        return Some((time, sign * (hours * 3600 + minutes * 60)));
+    }
+    None
+}
+
+/// Parse an RFC 3339 date-time into **signed** seconds since the epoch, the
+/// inverse of [`epoch_to_rfc3339_signed`].
+///
+/// Accepts the `YYYY-MM-DDThh:mm:ss` form with an optional fractional part and a
+/// `Z` or numeric `±HH:MM` / `±HHMM` zone.
+///
+/// # A non-UTC offset is APPLIED, not rejected
+///
+/// This module originally **refused** any offset other than UTC, on the reasoning
+/// that "misreading an offset shifts a deadline by hours". The reasoning was
+/// right about the hazard and wrong about the remedy: the hazard is *ignoring* the
+/// offset, and honouring it avoids that hazard without refusing conformant input.
+/// Refusing turned out to be actively worse, because every consumer of this
+/// function treats `None` as "no deadline":
+///
+/// * `bsfd` accepted a `+02:00` binding `expiry` at ingress and stored it verbatim,
+///   then its subscription matcher parsed it with this function, got `None`, skipped
+///   the deadline check and reported the binding as **live past its expiry**.
+/// * `nsacfd` stores a consumer's `expiry` verbatim too, with the same fail-open
+///   result in its report-decision path.
+/// * `nssfd` silently substituted its own default for a conformant consumer's
+///   requested expiry.
+///
+/// So the strict version converted a valid request into a *missing deadline*, which
+/// is a worse failure than the shifted one it was guarding against. TS 29.571's
+/// `DateTime` is RFC 3339, which permits any offset, so honouring it is also what
+/// the spec says.
+///
+/// Still refused, because these are genuinely undecidable rather than merely
+/// inconvenient: a time with **no zone**, a malformed zone, and out-of-range
+/// fields.
+pub fn rfc3339_to_epoch_signed(text: &str) -> Option<i64> {
     let t = text.trim();
     let (date, rest) = t.split_once('T').or_else(|| t.split_once(' '))?;
     let mut parts = date.split('-');
@@ -64,19 +140,14 @@ pub fn rfc3339_to_epoch(text: &str) -> Option<u64> {
         return None;
     }
 
-    // Strip the zone, accepting only UTC.
-    let time = rest
-        .strip_suffix('Z')
-        .or_else(|| rest.strip_suffix('z'))
-        .or_else(|| rest.strip_suffix("+00:00"))
-        .or_else(|| rest.strip_suffix("+0000"))?;
+    let (time, offset_secs) = split_zone(rest)?;
     // Drop any fractional seconds.
     let time = time.split('.').next()?;
 
     let mut tparts = time.split(':');
-    let hour: u64 = tparts.next()?.parse().ok()?;
-    let minute: u64 = tparts.next()?.parse().ok()?;
-    let second: u64 = tparts.next().unwrap_or("0").parse().ok()?;
+    let hour: i64 = tparts.next()?.parse().ok()?;
+    let minute: i64 = tparts.next()?.parse().ok()?;
+    let second: i64 = tparts.next().unwrap_or("0").parse().ok()?;
     if tparts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
         return None;
     }
@@ -89,10 +160,17 @@ pub fn rfc3339_to_epoch(text: &str) -> Option<u64> {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    if days < 0 {
-        return None;
-    }
-    Some(days as u64 * 86_400 + hour * 3600 + minute * 60 + second)
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs)
+}
+
+/// Parse an RFC 3339 date-time into seconds since the epoch, the inverse of
+/// [`epoch_to_rfc3339`].
+///
+/// Returns `None` for an instant **before** the epoch, which no `u64` can hold —
+/// the same answer the pre-offset implementation gave via its `days < 0` guard.
+/// Call [`rfc3339_to_epoch_signed`] where a pre-epoch instant must survive.
+pub fn rfc3339_to_epoch(text: &str) -> Option<u64> {
+    rfc3339_to_epoch_signed(text).and_then(|secs| u64::try_from(secs).ok())
 }
 
 /// Seconds since the Unix epoch, or 0 if the clock is before it.
@@ -132,19 +210,75 @@ mod tests {
         assert_eq!(rfc3339_to_epoch("  2000-01-01T00:00:00Z  "), base);
     }
 
+    /// INVERTED from `rejects_a_non_utc_offset_rather_than_reading_it_as_utc`.
+    ///
+    /// That test asserted `+02:00` parsed to `None`. It pinned behaviour that
+    /// turned out to be the defect rather than the guard: every consumer reads
+    /// `None` as "no deadline", so refusing a conformant offset made `bsfd` and
+    /// `nsacfd` treat an EXPIRED subscription as live, and made `nssfd` discard a
+    /// consumer's requested expiry. The offset is now applied. The flip is
+    /// recorded here rather than the old test being deleted, so the widening is
+    /// visible to anyone reading the history.
     #[test]
-    fn rejects_a_non_utc_offset_rather_than_reading_it_as_utc() {
-        // The whole point of the strictness: silently treating +02:00 as UTC
-        // shifts a deadline by two hours.
-        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00+02:00"), None);
-        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00-05:00"), None);
-        // Malformed input is refused, not guessed at.
+    fn applies_a_non_utc_offset_rather_than_refusing_it() {
+        // 02:00 in a +02:00 zone is 00:00 UTC. Subtracting the offset, not
+        // ignoring it, is what makes these equal.
+        let utc = rfc3339_to_epoch("2000-01-01T00:00:00Z").expect("UTC parses");
+        assert_eq!(rfc3339_to_epoch("2000-01-01T02:00:00+02:00"), Some(utc));
+        assert_eq!(rfc3339_to_epoch("1999-12-31T19:00:00-05:00"), Some(utc));
+        // Both spellings of the zone, and the zero offset that was already accepted.
+        assert_eq!(rfc3339_to_epoch("2000-01-01T02:00:00+0200"), Some(utc));
+        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00+00:00"), Some(utc));
+        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00+0000"), Some(utc));
+        // The sign matters: reading -05:00 as +05:00 would be a ten-hour error.
+        assert_ne!(
+            rfc3339_to_epoch("2000-01-01T00:00:00-05:00"),
+            rfc3339_to_epoch("2000-01-01T00:00:00+05:00")
+        );
+    }
+
+    /// What is still refused, and why each is undecidable rather than merely
+    /// inconvenient.
+    #[test]
+    fn refuses_input_with_no_defined_instant() {
+        // No zone at all: a naive local time names no instant, and guessing UTC
+        // for it is the hazard the old strictness was actually worried about.
+        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00"), None);
+        // Malformed rather than guessed at.
         assert_eq!(rfc3339_to_epoch(""), None);
         assert_eq!(rfc3339_to_epoch("not a date"), None);
         assert_eq!(rfc3339_to_epoch("2000-13-01T00:00:00Z"), None);
         assert_eq!(rfc3339_to_epoch("2000-01-01T24:00:00Z"), None);
         assert_eq!(rfc3339_to_epoch("2000-01-01T00:60:00Z"), None);
-        // No zone at all.
-        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00"), None);
+        // A malformed zone is refused rather than read as UTC.
+        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00+2:00"), None);
+        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00+xx:00"), None);
+        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00+25:00"), None);
+        assert_eq!(rfc3339_to_epoch("2000-01-01T00:00:00+02:60"), None);
+    }
+
+    /// The `u64` entry point cannot hold a pre-epoch instant and says so with
+    /// `None`, which is the answer the pre-offset implementation gave via its
+    /// `days < 0` guard. The signed one keeps the value.
+    ///
+    /// Reachable now that offsets are applied: a positive-offset timestamp just
+    /// after the epoch resolves to before it.
+    #[test]
+    fn pre_epoch_instants_are_none_for_u64_and_kept_when_signed() {
+        assert_eq!(rfc3339_to_epoch("1970-01-01T00:00:00+02:00"), None);
+        assert_eq!(
+            rfc3339_to_epoch_signed("1970-01-01T00:00:00+02:00"),
+            Some(-7200)
+        );
+        assert_eq!(rfc3339_to_epoch_signed("1969-12-31T23:59:59Z"), Some(-1));
+        // The signed parser agrees with the unsigned one wherever both are defined,
+        // so the u64 entry point is a narrowing and not a second implementation.
+        for text in ["1970-01-01T00:00:00Z", "2000-01-01T00:00:00Z"] {
+            assert_eq!(
+                rfc3339_to_epoch_signed(text).map(|s| s as u64),
+                rfc3339_to_epoch(text),
+                "signed and unsigned must agree for {text}"
+            );
+        }
     }
 }

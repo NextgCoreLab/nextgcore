@@ -222,83 +222,27 @@ impl fmt::Display for Ipv6Prefix {
     }
 }
 
-/// Parse an RFC 3339 date-time (e.g. `2026-06-12T10:00:00Z`,
-/// `2026-06-12T10:00:00.5+02:00`) into Unix epoch seconds.
-///
-/// Implements the subset required by the TS 29.571 DateTime type without an
-/// external date crate. Returns `None` on any malformed input.
-pub fn rfc3339_to_epoch(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    if b.len() < 20 {
-        return None;
-    }
-    let year: i64 = s.get(0..4)?.parse().ok()?;
-    let month: i64 = s.get(5..7)?.parse().ok()?;
-    let day: i64 = s.get(8..10)?.parse().ok()?;
-    let hour: i64 = s.get(11..13)?.parse().ok()?;
-    let min: i64 = s.get(14..16)?.parse().ok()?;
-    let sec: i64 = s.get(17..19)?.parse().ok()?;
-    if b[4] != b'-'
-        || b[7] != b'-'
-        || (b[10] != b'T' && b[10] != b't')
-        || b[13] != b':'
-        || b[16] != b':'
-        || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || min > 59
-        || sec > 60
-    {
-        return None;
-    }
-    // Optional fractional seconds (ignored)
-    let mut idx = 19;
-    if b.get(idx) == Some(&b'.') {
-        idx += 1;
-        let frac_start = idx;
-        while idx < b.len() && b[idx].is_ascii_digit() {
-            idx += 1;
-        }
-        if idx == frac_start {
-            return None;
-        }
-    }
-    // Offset: Z or +HH:MM / -HH:MM
-    let offset_secs: i64 = match b.get(idx)? {
-        b'Z' | b'z' => {
-            if idx + 1 != b.len() {
-                return None;
-            }
-            0
-        }
-        sign @ (b'+' | b'-') => {
-            if idx + 6 != b.len() || b[idx + 3] != b':' {
-                return None;
-            }
-            let oh: i64 = s.get(idx + 1..idx + 3)?.parse().ok()?;
-            let om: i64 = s.get(idx + 4..idx + 6)?.parse().ok()?;
-            if oh > 23 || om > 59 {
-                return None;
-            }
-            let total = oh * 3600 + om * 60;
-            if *sign == b'+' {
-                total
-            } else {
-                -total
-            }
-        }
-        _ => return None,
-    };
-    // Days-from-civil (Howard Hinnant's algorithm)
-    let y = year - i64::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719_468;
-    Some(days * 86_400 + hour * 3600 + min * 60 + sec - offset_secs)
-}
+// The RFC 3339 migration, copy 6 of 6: bsfd's own `rfc3339_to_epoch` used to live
+// here. It is now `nextgcore_sbi::datetime::rfc3339_to_epoch_signed`, re-exported
+// below under the old name so every call site reads unchanged.
+//
+// This copy was the one that could NOT simply be deleted, because it disagreed with
+// the shared module rather than duplicating it: bsfd's parser APPLIED a numeric
+// `±HH:MM` offset while the shared one refused any non-UTC offset outright. And bsfd
+// was using BOTH: its own for the BINDING's `expiry` (`BsfSess::set_expiry`, and the
+// ingress validation in `lib.rs`), and the shared one for the SUBSCRIPTION's
+// `expiry` in the #98 matcher below. So the same RFC 3339 field name on two
+// resources was parsed two ways in one daemon, and the disagreement was a live
+// FAIL-OPEN bug on the subscription side: `lib.rs` stores a subscription's `expiry`
+// verbatim with no validation, so a conformant `+02:00` value was accepted, the
+// matcher's shared parser returned `None`, and `None` was read as "no deadline" --
+// the subscription never expired and notifications kept being delivered to a lapsed
+// subscriber.
+//
+// Resolved by teaching the shared parser to apply the offset -- see the reasoning on
+// `rfc3339_to_epoch_signed` -- rather than by narrowing bsfd, which would have made
+// bsfd reject conformant timestamps it accepts today.
+pub use nextgcore_sbi::datetime::rfc3339_to_epoch_signed as rfc3339_to_epoch;
 
 /// Current Unix epoch seconds.
 pub fn now_epoch() -> i64 {
@@ -715,8 +659,28 @@ impl BsfSubscription {
             _ => return false,
         }
         if let Some(ref e) = self.expiry {
-            if let Some(deadline) = nextgcore_sbi::datetime::rfc3339_to_epoch(e) {
-                if now_secs >= deadline {
+            // #98 used the offset-REJECTING shared parser here while the binding
+            // side used bsfd's offset-applying one. `lib.rs` stores a subscription
+            // `expiry` verbatim without validating it, so a conformant `+02:00`
+            // value parsed to `None` here and `None` was read as "no deadline" --
+            // the subscription never expired. One parser now, and it applies the
+            // offset.
+            match rfc3339_to_epoch(e) {
+                Some(deadline) => {
+                    // Compare as i64: the shared parser is signed, so a
+                    // positive-offset instant just after the epoch can be negative,
+                    // and such a deadline is unambiguously already past. `now_secs`
+                    // is seconds since the epoch and cannot overflow i64.
+                    if now_secs as i64 >= deadline {
+                        return false;
+                    }
+                }
+                // Unparseable despite having passed ingress validation: only
+                // reachable for a record restored from an older snapshot. Fail
+                // CLOSED for matching -- an expiry we cannot read must not be
+                // treated as permission to keep notifying.
+                None => {
+                    log::warn!("binding expiry {e:?} is unparseable; not matching it");
                     return false;
                 }
             }
@@ -1925,10 +1889,97 @@ mod tests {
         );
         // Malformed inputs
         assert_eq!(rfc3339_to_epoch("3600"), None);
-        assert_eq!(rfc3339_to_epoch("2026-06-12 00:00:00Z"), None);
         assert_eq!(rfc3339_to_epoch("2026-13-12T00:00:00Z"), None);
+        // Still refused, and the important one: no zone names no instant.
         assert_eq!(rfc3339_to_epoch("2026-06-12T00:00:00"), None);
-        assert_eq!(rfc3339_to_epoch("2026-06-12T00:00:00+0200"), None);
+
+        // TWO ASSERTIONS INVERTED by the migration onto
+        // `nextgcore_sbi::datetime::rfc3339_to_epoch_signed`, both because the shared
+        // parser is the UNION of the three implementations' accepted spellings rather
+        // than the intersection. Recorded as flips rather than quietly changed:
+        //
+        // 1. A space instead of `T`. RFC 3339 5.6 permits it by mutual agreement and
+        //    the shared parser has always accepted it; bsfd's copy did not.
+        assert_eq!(
+            rfc3339_to_epoch("2026-06-12 00:00:00Z"),
+            Some(1781222400),
+            "the shared parser accepts the space separator RFC 3339 5.6 allows"
+        );
+        // 2. A no-colon `+HHMM` zone. bsfd's copy refused it while accepting
+        //    `+HH:MM`; the shared parser already accepted `+0000`, and eesd's parser
+        //    accepts `±HHMM` generally, so accepting both spellings uniformly is
+        //    easier to explain than accepting `+0000` and refusing `+0200`.
+        assert_eq!(
+            rfc3339_to_epoch("2026-06-12T02:00:00+0200"),
+            Some(1781222400),
+            "the shared parser accepts +HHMM as well as +HH:MM"
+        );
+        // A MALFORMED zone is still refused rather than read as UTC — the widening is
+        // about spellings that name a real offset, not about guessing.
+        assert_eq!(rfc3339_to_epoch("2026-06-12T00:00:00+2:00"), None);
+        assert_eq!(rfc3339_to_epoch("2026-06-12T00:00:00+25:00"), None);
+    }
+
+    fn subscription_with_expiry(expiry: Option<&str>) -> BsfSubscription {
+        BsfSubscription {
+            sub_id: "sub-1".to_string(),
+            notif_uri: "http://pcf.example.com/notify".to_string(),
+            notif_corre_id: "corr-1".to_string(),
+            supi: "imsi-001010000000001".to_string(),
+            events: vec!["PCF_UE_BINDING_REGISTRATION".to_string()],
+            expiry: expiry.map(String::from),
+            raw: serde_json::json!({}),
+        }
+    }
+
+    /// REGRESSION, the reason this migration is a fix and not a tidy-up.
+    ///
+    /// `lib.rs` stores a subscription's `expiry` verbatim without validating it, and
+    /// `wants()` used the offset-REJECTING shared parser. So a conformant
+    /// `+02:00` expiry parsed to `None`, `None` was read as "no deadline", and a
+    /// LAPSED subscription kept matching — notifications were delivered to a
+    /// subscriber whose subscription had expired hours earlier.
+    ///
+    /// The three cases together are the point: the UTC spelling always worked, the
+    /// offset spelling did not, and both must now agree on the same instant.
+    #[test]
+    fn an_expired_subscription_does_not_match_whatever_zone_its_expiry_uses() {
+        // 1781222400 == 2026-06-12T00:00:00Z. "now" is one second later, so every
+        // subscription below has expired.
+        let now = 1781222401u64;
+        let event = "PCF_UE_BINDING_REGISTRATION";
+        let supi = Some("imsi-001010000000001");
+
+        for expiry in [
+            "2026-06-12T00:00:00Z",
+            "2026-06-12T02:00:00+02:00",
+            "2026-06-11T22:00:00-02:00",
+            "2026-06-12T02:00:00+0200",
+        ] {
+            assert!(
+                !subscription_with_expiry(Some(expiry)).wants(event, supi, now),
+                "an expired subscription must not match, expiry={expiry}"
+            );
+        }
+
+        // The complement, so the test cannot pass by rejecting everything: the same
+        // instants one second EARLIER are still live.
+        for expiry in ["2026-06-12T00:00:00Z", "2026-06-12T02:00:00+02:00"] {
+            assert!(
+                subscription_with_expiry(Some(expiry)).wants(event, supi, 1781222399),
+                "a subscription that has not expired must match, expiry={expiry}"
+            );
+        }
+
+        // No expiry at all is unbounded, unchanged.
+        assert!(subscription_with_expiry(None).wants(event, supi, now));
+
+        // An expiry that cannot be parsed at all now fails CLOSED: it used to be
+        // read as "no deadline", which is the same fail-open this test exists for.
+        assert!(
+            !subscription_with_expiry(Some("garbage")).wants(event, supi, now),
+            "an unreadable expiry must not be treated as permission to keep notifying"
+        );
     }
 
     #[test]

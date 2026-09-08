@@ -3707,6 +3707,36 @@ nsacf:
             expired.report_decision(0, 0, 0, 0, 1_000),
             ReportDecision::Emit
         );
+
+        // REGRESSION (RFC 3339 migration 5 of 5): a consumer's `expiry` is stored
+        // VERBATIM by the create path, and the shared parser used to REFUSE any
+        // non-UTC offset. An unparsed expiry skipped the check below, so a
+        // conformant `+02:00` expiry meant the subscription never became Exhausted
+        // and kept reporting past its own deadline. The offset is now applied, so
+        // these three spellings of the same instant agree.
+        //
+        // 1970-01-01T00:16:40Z is epoch 1000, so an expiry of epoch 500 in any zone
+        // must be Exhausted at now=1000.
+        for expiry in [
+            "1970-01-01T00:08:20Z",
+            "1970-01-01T02:08:20+02:00",
+            "1970-01-01T02:08:20+0200",
+        ] {
+            let mut s = base.clone();
+            s.expiry = Some(expiry.to_string());
+            assert_eq!(
+                s.report_decision(0, 0, 0, 0, 1_000),
+                ReportDecision::Exhausted,
+                "an expired subscription is spent whatever zone its expiry uses: {expiry}"
+            );
+        }
+        // The complement, so this cannot pass by treating everything as expired.
+        let mut live = base.clone();
+        live.expiry = Some("1970-01-01T02:33:20+02:00".to_string()); // epoch 2000
+        assert_eq!(
+            live.report_decision(0, 0, 0, 0, 1_000),
+            ReportDecision::Emit
+        );
     }
 
     /// Every trigger field is parsed, and from the RIGHT object: `eventTrigger`,
