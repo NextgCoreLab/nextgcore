@@ -562,6 +562,11 @@ fn problem_response(status: u16, title: &str, detail: &str, cause: &str) -> SbiR
 
 /// Map an upstream client error to the proxy error response:
 /// timeout → 504 Gateway Timeout, anything else → 502 Bad Gateway.
+///
+/// **`TARGET_NF_NOT_REACHABLE` is for the producer only** (scpd-#211). A failure
+/// reaching the *NRF* goes through [`nrf_unreachable_response`] instead: naming
+/// the target NF for an NRF outage sends the investigation to a producer that is
+/// healthy (TS 29.500 §6.10.8.2).
 fn upstream_error_response(target: &str, err: &SbiError) -> SbiResponse {
     match err {
         SbiError::Timeout => problem_response(
@@ -577,6 +582,26 @@ fn upstream_error_response(target: &str, err: &SbiError) -> SbiResponse {
             "TARGET_NF_NOT_REACHABLE",
         ),
     }
+}
+
+/// Map a transport failure while querying the NRF for delegated discovery
+/// (scpd-#211, TS 29.500 §6.10.8.2).
+///
+/// `504` + `NRF_NOT_REACHABLE`, and the two halves of that carry different
+/// information. The **cause** names the node that actually failed: routing an NRF
+/// outage through [`upstream_error_response`] reported
+/// `TARGET_NF_NOT_REACHABLE`, which points the operator at a producer that is
+/// up. The **status** is `504` for both a refused connection and a timeout,
+/// because to the consumer they are the same actionable fact — infrastructure is
+/// down and a retry may help — unlike an empty `SearchResult`, where the
+/// consumer's own criteria matched nothing and retrying cannot help.
+fn nrf_unreachable_response(nrf: &str, err: &SbiError) -> SbiResponse {
+    problem_response(
+        504,
+        "Gateway Timeout",
+        &format!("SCP could not reach the NRF at {nrf} for delegated discovery: {err}"),
+        "NRF_NOT_REACHABLE",
+    )
 }
 
 /// The service name and API major version the request is *for*, used to select
@@ -627,15 +652,20 @@ fn endpoint_selection_error_response(
             ),
             "INVALID_API",
         ),
+        // scpd-#211: an empty / unusable SearchResult is a 4xx, not a 502. The
+        // consumer's own discovery criteria matched nothing, so this is its input
+        // that is wrong and retrying cannot help — which is precisely what a 502
+        // (a failure at or beyond the gateway, retry may help) told it instead.
+        // 502 NF_DISCOVERY_FAILURE is now reserved for the NRF *erroring*.
         EndpointSelectionError::ServiceNotOffered => problem_response(
-            502,
-            "Bad Gateway",
+            404,
+            "Not Found",
             &format!("NRF discovery returned no NF instance offering service {service}"),
             "NF_DISCOVERY_FAILURE",
         ),
         EndpointSelectionError::NoCandidate => problem_response(
-            502,
-            "Bad Gateway",
+            404,
+            "Not Found",
             "NRF discovery returned no usable NF instance",
             "NF_DISCOVERY_FAILURE",
         ),
@@ -1256,12 +1286,18 @@ impl ScpProxy {
             }
         }
 
+        // scpd-#211: an NRF that cannot be reached is reported as the NRF, not as
+        // the target NF (TS 29.500 §6.10.8.2).
         let response = self
             .client_for(&nrf)
             .send_request(disc)
             .await
-            .map_err(|e| upstream_error_response(&nrf.to_uri(), &e))?;
+            .map_err(|e| nrf_unreachable_response(&nrf.to_uri(), &e))?;
 
+        // scpd-#211: the NRF answered, and answered badly — an infrastructure
+        // fault at the gateway's upstream, which is what 502 means. This is the
+        // ONE condition that keeps 502 NF_DISCOVERY_FAILURE; the empty-result case
+        // moved to 404 and the unreachable case to 504.
         if response.status != 200 {
             return Err(problem_response(
                 502,
@@ -2258,8 +2294,17 @@ mod tests {
         server.stop().await.expect("producer stop");
     }
 
+    /// scpd-#211: an empty `SearchResult` is `404 NF_DISCOVERY_FAILURE`.
+    ///
+    /// **This assertion was inverted** (was `502`), and the old one pinned the
+    /// defect rather than the requirement: it made "your criteria matched nothing"
+    /// indistinguishable from "the NRF is down" and from "the producer is
+    /// unreachable", which is the whole of #211. A `502` tells the consumer the
+    /// fault is at or beyond the gateway and a retry may help; here it is the
+    /// consumer's own discovery criteria that matched nothing, and no retry will
+    /// change that.
     #[tokio::test]
-    async fn test_nrf_returning_no_candidates_is_502() {
+    async fn test_nrf_returning_no_candidates_is_404_discovery_failure() {
         let nrf_port = ephemeral_port();
         let server =
             nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
@@ -2283,11 +2328,167 @@ mod tests {
         req.http
             .set_header(discovery_header::REQUESTER_NF_TYPE, "AMF");
         let response = proxy.handle(req).await;
-        assert_eq!(response.status, 502);
+        assert_eq!(response.status, 404);
         let problem: ProblemDetails = response.json_body().unwrap();
         assert_eq!(problem.cause.as_deref(), Some("NF_DISCOVERY_FAILURE"));
 
         server.stop().await.expect("nrf stop");
+    }
+
+    // ------------------------------------------------------------------
+    // scpd-#211: the three delegated-discovery failure conditions are
+    // reported distinctly (TS 29.500 §6.10.8.2)
+    // ------------------------------------------------------------------
+
+    /// Drive one Model D request against `proxy` and return its
+    /// `(status, cause)`.
+    async fn discovery_failure_of(proxy: &ScpProxy) -> (u16, String) {
+        let mut req = SbiRequest::get("/nudm-sdm/v1/x");
+        req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
+        req.http
+            .set_header(discovery_header::REQUESTER_NF_TYPE, "AMF");
+        let response = proxy.handle(req).await;
+        let problem: ProblemDetails = response
+            .json_body()
+            .expect("a ProblemDetails body on every SCP-originated discovery error");
+        (
+            response.status,
+            problem.cause.unwrap_or_else(|| "(no cause)".to_string()),
+        )
+    }
+
+    /// A ScpProxy pointed at `nrf_uri`, with short timeouts.
+    fn proxy_with_nrf(nrf_uri: String) -> ScpProxy {
+        ScpProxy::new(ScpProxyConfig {
+            nrf_uri: Some(nrf_uri),
+            connect_timeout: Duration::from_millis(500),
+            request_timeout: Duration::from_millis(500),
+            ..Default::default()
+        })
+    }
+
+    /// scpd-#211 acceptance: an unreachable NRF is `504 NRF_NOT_REACHABLE` — and
+    /// explicitly **not** `TARGET_NF_NOT_REACHABLE`, which named the wrong node
+    /// and sent the investigation to a healthy producer. The negative assertion is
+    /// paired with the positive one on purpose: asserting only "cause is
+    /// NRF_NOT_REACHABLE" would still pass if some other path also started
+    /// claiming the target NF was at fault.
+    #[tokio::test]
+    async fn test_unreachable_nrf_is_504_nrf_not_reachable() {
+        // Port 1 on loopback refuses connections immediately.
+        let proxy = proxy_with_nrf("http://127.0.0.1:1".to_string());
+        let (status, cause) = discovery_failure_of(&proxy).await;
+        assert_eq!(status, 504);
+        assert_eq!(cause, "NRF_NOT_REACHABLE");
+        assert_ne!(
+            cause, "TARGET_NF_NOT_REACHABLE",
+            "the NRF is not the target NF; naming it sends the operator to the wrong node"
+        );
+    }
+
+    /// scpd-#211 acceptance: an NRF that answers non-200 keeps
+    /// `502 NF_DISCOVERY_FAILURE` — the one condition for which 502 is right,
+    /// since the NRF answered and answered badly.
+    #[tokio::test]
+    async fn test_nrf_error_response_is_502_discovery_failure() {
+        let nrf_port = ephemeral_port();
+        let server =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], nrf_port)),
+            ));
+        server
+            .start(|_request: SbiRequest| async move {
+                SbiResponse::with_status(500)
+                    .with_body(r#"{"cause":"NRF_BROKE"}"#, "application/json")
+            })
+            .await
+            .expect("nrf start");
+
+        let proxy = proxy_with_nrf(format!("http://127.0.0.1:{nrf_port}"));
+        let (status, cause) = discovery_failure_of(&proxy).await;
+        assert_eq!(status, 502);
+        assert_eq!(cause, "NF_DISCOVERY_FAILURE");
+
+        server.stop().await.expect("nrf stop");
+    }
+
+    /// scpd-#211 acceptance, the load-bearing one: the three conditions must be
+    /// distinguishable **from each other**, not merely each "not 200".
+    ///
+    /// All three are driven here and their `(status, cause)` pairs asserted
+    /// pairwise distinct, so collapsing any two of them back together fails this
+    /// test even if each individual test above were adjusted to match.
+    #[tokio::test]
+    async fn test_three_discovery_failures_are_pairwise_distinct() {
+        // 1. NRF unreachable.
+        let unreachable =
+            discovery_failure_of(&proxy_with_nrf("http://127.0.0.1:1".to_string())).await;
+
+        // 2. NRF answers non-200.
+        let erroring_port = ephemeral_port();
+        let erroring =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], erroring_port)),
+            ));
+        erroring
+            .start(|_request: SbiRequest| async move { SbiResponse::with_status(503) })
+            .await
+            .expect("erroring nrf start");
+        let nrf_error =
+            discovery_failure_of(&proxy_with_nrf(format!("http://127.0.0.1:{erroring_port}")))
+                .await;
+
+        // 3. NRF answers 200 with an empty SearchResult.
+        let empty_port = ephemeral_port();
+        let empty =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], empty_port)),
+            ));
+        empty
+            .start(|_request: SbiRequest| async move {
+                SbiResponse::ok().with_body(r#"{"nfInstances":[]}"#, "application/json")
+            })
+            .await
+            .expect("empty nrf start");
+        let empty_result =
+            discovery_failure_of(&proxy_with_nrf(format!("http://127.0.0.1:{empty_port}"))).await;
+
+        assert_eq!(unreachable, (504, "NRF_NOT_REACHABLE".to_string()));
+        assert_eq!(nrf_error, (502, "NF_DISCOVERY_FAILURE".to_string()));
+        assert_eq!(empty_result, (404, "NF_DISCOVERY_FAILURE".to_string()));
+
+        assert_ne!(unreachable, nrf_error, "NRF down vs NRF erroring");
+        assert_ne!(
+            unreachable, empty_result,
+            "NRF down vs criteria matched none"
+        );
+        assert_ne!(
+            nrf_error, empty_result,
+            "NRF erroring vs criteria matched none"
+        );
+
+        erroring.stop().await.expect("erroring nrf stop");
+        empty.stop().await.expect("empty nrf stop");
+    }
+
+    /// scpd-#211 acceptance: `TARGET_NF_NOT_REACHABLE` is reserved for the
+    /// **producer**. The Model C path (no NRF involved at all) must still report
+    /// it, so the reservation is a narrowing rather than a removal.
+    #[tokio::test]
+    async fn test_target_nf_not_reachable_is_still_used_for_the_producer() {
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            connect_timeout: Duration::from_millis(500),
+            request_timeout: Duration::from_millis(500),
+            ..Default::default()
+        });
+        let mut req = SbiRequest::get("/nudm-sdm/v1/x");
+        req.http.set_target_apiroot("http://127.0.0.1:1");
+        let response = proxy.handle(req).await;
+        let problem: ProblemDetails = response.json_body().unwrap();
+        assert_eq!(
+            (response.status, problem.cause.as_deref()),
+            (502, Some("TARGET_NF_NOT_REACHABLE"))
+        );
     }
 
     // ------------------------------------------------------------------
