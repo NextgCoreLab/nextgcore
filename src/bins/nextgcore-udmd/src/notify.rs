@@ -126,34 +126,12 @@ pub fn build_monitoring_report(
     })
 }
 
-/// Format `secs` since the Unix epoch as an RFC 3339 UTC timestamp.
-///
-/// Hand-rolled rather than pulling in a date/time crate, matching what nrfd
-/// already does for the same reason (`epoch_to_rfc3339`).
-pub fn epoch_to_rfc3339(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y,
-        m,
-        d,
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
-}
+// The RFC 3339 migration: udmd's own `epoch_to_rfc3339` used to live here. It is
+// now re-exported from `nextgcore_sbi::datetime` below, so a leap-year or offset fix
+// reaches every producer at once instead of one of six copies. The two bodies were
+// BYTE-IDENTICAL -- the shared module was derived from this one -- so nothing about
+// the emitted timestamp changed.
+pub use nextgcore_sbi::datetime::epoch_to_rfc3339;
 
 /// Deliver SDM and EE notifications for a UECM transition.
 ///
