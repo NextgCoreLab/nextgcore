@@ -977,29 +977,15 @@ impl SbiServer {
     }
 }
 
-/// Send SBI response to a client stream
-///
-/// This function sends the prepared SBI response back to the client.
-/// In a full implementation, this would interact with the HTTP server's
-/// response channel to send the data back to the client connection.
-pub fn send_sbi_response(stream_id: u64, response: SbiResponse) {
-    log::debug!(
-        "Sending SBI response (stream_id={}, status={})",
-        stream_id,
-        response.status
-    );
-
-    // In a real implementation, this would:
-    // 1. Look up the stream/connection by stream_id
-    // 2. Serialize the response to HTTP format
-    // 3. Send through the appropriate HTTP server channel
-    //
-    // For now, we track response in memory for testing/integration
-    // The actual HTTP server in main.rs handles response delivery
-
-    // Placeholder for actual response sending
-    // The response would be queued to the HTTP server's response channel
-}
+// #242 removed `send_sbi_response(stream_id, SbiResponse)` from here. It was a
+// LOGGING PLACEHOLDER -- it formatted a debug line and returned, with a comment
+// saying a real implementation would look up the stream and queue the response --
+// and its only callers were `sbi_response.rs`'s error helpers, reached solely
+// from the unreachable state-machine request path. So every error response that
+// path appeared to send (400, 403, 404, 405, 504) went nowhere even in principle,
+// which is a second, independent reason that path could not have served a request.
+// `udmd`'s live responses are built and sent by `app.rs::udm_sbi_route` through
+// `nextgcore_sbi`'s own server, which needs no such shim.
 
 #[cfg(test)]
 mod tests {
