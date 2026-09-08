@@ -669,6 +669,62 @@ impl BsfSess {
 
 /// BSF Context - main context structure for BSF
 /// Port of bsf_context_t from context.h
+/// An Individual Nbsf_Management event subscription (TS 29.521 §4.2.6,
+/// `BsfSubscription`).
+///
+/// Before #98 there was no subscription surface at all: `/subscriptions` was
+/// unrouted (405) and the only thing resembling it was a 501 stub on a
+/// `pcfBindings/{id}/subscriptions` path the spec does not define. So a consumer —
+/// typically a PCF detecting a binding created by a DIFFERENT PCF, or an AF/NWDAF
+/// reacting to teardown — could not learn about binding changes at all.
+#[derive(Debug, Clone)]
+pub struct BsfSubscription {
+    /// The `{subId}` path segment of the individual resource.
+    pub sub_id: String,
+    /// `notifUri` — where `BsfNotification` is POSTed. Required by schema.
+    pub notif_uri: String,
+    /// `notifCorreId` — echoed in every notification. Required by schema, and
+    /// `BsfNotification`'s `oneOf` makes it mandatory whenever `eventNotifs` is
+    /// present, which is the form this BSF emits.
+    pub notif_corre_id: String,
+    /// `supi` — required by schema, so a subscription is always UE-scoped. This is
+    /// what notification matching filters on: a subscription names the subscriber
+    /// it cares about, so fanning every binding change out to every subscriber
+    /// would leak one UE's binding activity to a consumer watching another.
+    pub supi: String,
+    /// `events` — the subscribed `BsfEvent` tokens, verbatim.
+    pub events: Vec<String>,
+    /// `expiry` — RFC 3339. THIS is where TS 29.521 puts `expiry`: on the
+    /// subscription resource, not on `PcfBinding`.
+    pub expiry: Option<String>,
+    /// The received document, echoed on replace so the resource is what the
+    /// consumer sent.
+    pub raw: serde_json::Value,
+}
+
+impl BsfSubscription {
+    /// Whether this subscription wants `event` for `supi` and has not expired.
+    pub fn wants(&self, event: &str, supi: Option<&str>, now_secs: u64) -> bool {
+        if !self.events.iter().any(|e| e == event) {
+            return false;
+        }
+        // A binding with no SUPI cannot be matched against a SUPI-scoped
+        // subscription; "unknown" must not be read as "matches".
+        match supi {
+            Some(s) if s == self.supi => {}
+            _ => return false,
+        }
+        if let Some(ref e) = self.expiry {
+            if let Some(deadline) = nextgcore_sbi::datetime::rfc3339_to_epoch(e) {
+                if now_secs >= deadline {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
 pub struct BsfContext {
     /// IPv4 address -> session ID hash
     ipv4addr_hash: RwLock<HashMap<u32, u64>>,
@@ -688,9 +744,57 @@ pub struct BsfContext {
     ue_binding_list: RwLock<HashMap<String, PcfUeBinding>>,
     /// MBS bindings (pcf-mbs-bindings, keyed by binding_id, bsfd-12)
     mbs_binding_list: RwLock<HashMap<String, PcfMbsBinding>>,
+    /// Nbsf_Management event subscriptions, keyed by subId (#98).
+    subscription_list: RwLock<HashMap<String, BsfSubscription>>,
 }
 
 impl BsfContext {
+    // ── Nbsf_Management event subscriptions (TS 29.521 §4.2.6-4.2.8, #98) ────
+
+    /// Create or replace a subscription. `subscription_add` is used by both POST
+    /// and PUT: a replace keeps the same `subId`, so the resource URI the consumer
+    /// holds stays valid.
+    pub fn subscription_add(&self, sub: BsfSubscription) {
+        if let Ok(mut m) = self.subscription_list.write() {
+            m.insert(sub.sub_id.clone(), sub);
+        }
+    }
+
+    pub fn subscription_get(&self, sub_id: &str) -> Option<BsfSubscription> {
+        self.subscription_list.read().ok()?.get(sub_id).cloned()
+    }
+
+    pub fn subscription_remove(&self, sub_id: &str) -> bool {
+        self.subscription_list
+            .write()
+            .map(|mut m| m.remove(sub_id).is_some())
+            .unwrap_or(false)
+    }
+
+    pub fn subscription_count(&self) -> usize {
+        self.subscription_list.read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Every subscription that wants `event` for `supi` and has not expired.
+    ///
+    /// Returns clones so the caller can POST notifications without holding the
+    /// lock across an await.
+    pub fn subscriptions_wanting(&self, event: &str, supi: Option<&str>) -> Vec<BsfSubscription> {
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
+        let Ok(m) = self.subscription_list.read() else {
+            return Vec::new();
+        };
+        let mut out: Vec<BsfSubscription> = m
+            .values()
+            .filter(|s| s.wants(event, supi, now))
+            .cloned()
+            .collect();
+        // Stable order so a multi-subscriber fan-out is deterministic in tests
+        // rather than HashMap-iteration order.
+        out.sort_by(|a, b| a.sub_id.cmp(&b.sub_id));
+        out
+    }
+
     pub fn new() -> Self {
         Self {
             ipv4addr_hash: RwLock::new(HashMap::new()),
@@ -702,6 +806,7 @@ impl BsfContext {
             initialized: AtomicBool::new(false),
             ue_binding_list: RwLock::new(HashMap::new()),
             mbs_binding_list: RwLock::new(HashMap::new()),
+            subscription_list: RwLock::new(HashMap::new()),
         }
     }
 
