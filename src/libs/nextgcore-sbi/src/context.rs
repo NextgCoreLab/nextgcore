@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::client::SbiClient;
@@ -130,12 +131,60 @@ pub struct NfSubscription {
     pub validity_time: Option<u64>,
 }
 
+/// A discovered NF instance plus the deadline after which it must not be
+/// selected again (#235).
+///
+/// The deadline is a monotonic [`Instant`], not a wall-clock time, so a clock
+/// step cannot make a live entry look expired or vice versa.
+#[derive(Debug, Clone)]
+struct CachedNfInstance {
+    instance: NfInstance,
+    /// `None` means "never expires" — the state every entry was in before #235,
+    /// and still what [`SbiContext::add_nf_instance`] produces.
+    expires_at: Option<Instant>,
+}
+
+impl CachedNfInstance {
+    /// Whether this entry is past its validity deadline.
+    ///
+    /// A zero validity expires immediately and deterministically, which is what
+    /// lets the expiry tests run without sleeping.
+    fn is_expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
+/// Cache validity applied to a discovered NF profile when the NRF's
+/// `SearchResult` omits `validityPeriod` (#235).
+///
+/// 3600s, matching `nrfd`'s own `NRF_DISC_VALIDITY_PERIOD` default. The point of
+/// having a fallback at all is that a *foreign* NRF which omits the member must
+/// not mean "cache this peer forever" — an hour is a bound, not a guess at what
+/// that NRF intended.
+pub const DEFAULT_NF_DISCOVERY_VALIDITY_SECS: u64 = 3600;
+
+/// Read a discovery `SearchResult`'s `validityPeriod` (seconds, TS 29.510
+/// §6.1.6.2.x) as a cache TTL, falling back to
+/// [`DEFAULT_NF_DISCOVERY_VALIDITY_SECS`].
+///
+/// A `validityPeriod` of `0` is honoured as zero rather than coerced to the
+/// default: an NRF saying "do not cache this" is a legitimate instruction, and
+/// silently replacing it with an hour would be the lower-layer-can-never-win
+/// mistake.
+pub fn search_result_validity(search_result: &serde_json::Value) -> Duration {
+    match search_result.get("validityPeriod").and_then(|v| v.as_u64()) {
+        Some(secs) => Duration::from_secs(secs),
+        None => Duration::from_secs(DEFAULT_NF_DISCOVERY_VALIDITY_SECS),
+    }
+}
+
 /// SBI Context - manages NF instances and clients
 pub struct SbiContext {
     /// Self NF instance
     self_instance: RwLock<Option<NfInstance>>,
-    /// Discovered NF instances by ID
-    nf_instances: RwLock<HashMap<String, NfInstance>>,
+    /// Discovered NF instances by ID, each with its validity deadline (#235)
+    nf_instances: RwLock<HashMap<String, CachedNfInstance>>,
     /// Clients by endpoint
     clients: RwLock<HashMap<String, Arc<SbiClient>>>,
     /// Subscriptions
@@ -180,35 +229,102 @@ impl SbiContext {
         nrf_uri.clone()
     }
 
-    /// Add an NF instance
+    /// Add an NF instance that **never expires**.
+    ///
+    /// This is the pre-#235 behaviour, kept for callers that seed the registry
+    /// by hand (tests, and the strict-peer harnesses that stand in for a real
+    /// NRF). A production discovery path should use
+    /// [`Self::add_nf_instance_with_validity`] instead: an entry added here is
+    /// selected for the whole process lifetime, which is exactly the permanent
+    /// staleness #235 was filed about.
     pub async fn add_nf_instance(&self, instance: NfInstance) {
         let mut instances = self.nf_instances.write().await;
-        instances.insert(instance.id.clone(), instance);
+        instances.insert(
+            instance.id.clone(),
+            CachedNfInstance {
+                instance,
+                expires_at: None,
+            },
+        );
+    }
+
+    /// Add a discovered NF instance that stops being selectable after
+    /// `validity` (#235, TS 29.510 §6.1.6.2.x `validityPeriod`).
+    ///
+    /// Once the deadline passes, the reads below behave as if the entry were
+    /// absent, so the caller's "not in cache -> discover" branch runs again and
+    /// picks up whatever the NRF says now. A `validity` of zero expires the
+    /// entry immediately, which is the lever the tests use.
+    pub async fn add_nf_instance_with_validity(&self, instance: NfInstance, validity: Duration) {
+        let mut instances = self.nf_instances.write().await;
+        instances.insert(
+            instance.id.clone(),
+            CachedNfInstance {
+                instance,
+                expires_at: Some(Instant::now() + validity),
+            },
+        );
     }
 
     /// Remove an NF instance
     pub async fn remove_nf_instance(&self, id: &str) -> Option<NfInstance> {
         let mut instances = self.nf_instances.write().await;
-        instances.remove(id)
+        instances.remove(id).map(|cached| cached.instance)
     }
 
-    /// Get an NF instance by ID
+    /// Evict a cached NF instance because sending to it failed (#235).
+    ///
+    /// Returns whether an entry was actually removed, so a caller can log the
+    /// difference between "we dropped the stale peer" and "someone else already
+    /// had". Separate from [`Self::remove_nf_instance`] so the *reason* is
+    /// legible at the call site: a delivery failure is evidence the profile is
+    /// wrong, and the next request should re-discover rather than retry an
+    /// endpoint the NRF may already have replaced.
+    pub async fn evict_nf_instance_on_failure(&self, id: &str) -> bool {
+        let removed = {
+            let mut instances = self.nf_instances.write().await;
+            instances.remove(id).is_some()
+        };
+        if removed {
+            log::info!(
+                "Evicted NF instance {id} from the discovery cache after a delivery failure"
+            );
+        }
+        removed
+    }
+
+    /// Drop every entry past its validity deadline, returning how many went.
+    ///
+    /// The reads below already ignore expired entries, so this is bookkeeping
+    /// rather than correctness — it stops a long-lived consumer accumulating
+    /// dead profiles it will never look at.
+    pub async fn purge_expired_nf_instances(&self) -> usize {
+        let mut instances = self.nf_instances.write().await;
+        let before = instances.len();
+        instances.retain(|_, cached| !cached.is_expired());
+        before - instances.len()
+    }
+
+    /// Get an NF instance by ID, or `None` if it is absent **or expired**.
     pub async fn get_nf_instance(&self, id: &str) -> Option<NfInstance> {
         let instances = self.nf_instances.read().await;
-        instances.get(id).cloned()
+        instances
+            .get(id)
+            .filter(|cached| !cached.is_expired())
+            .map(|cached| cached.instance.clone())
     }
 
-    /// Find NF instances by type
+    /// Find non-expired NF instances by type
     pub async fn find_nf_instances_by_type(&self, nf_type: NfType) -> Vec<NfInstance> {
         let instances = self.nf_instances.read().await;
         instances
             .values()
-            .filter(|i| i.nf_type == nf_type)
-            .cloned()
+            .filter(|cached| !cached.is_expired() && cached.instance.nf_type == nf_type)
+            .map(|cached| cached.instance.clone())
             .collect()
     }
 
-    /// Find NF instances by service type
+    /// Find non-expired NF instances by service type
     pub async fn find_nf_instances_by_service(
         &self,
         service_type: SbiServiceType,
@@ -216,8 +332,15 @@ impl SbiContext {
         let instances = self.nf_instances.read().await;
         instances
             .values()
-            .filter(|i| i.services.iter().any(|s| s.service_type == service_type))
-            .cloned()
+            .filter(|cached| {
+                !cached.is_expired()
+                    && cached
+                        .instance
+                        .services
+                        .iter()
+                        .any(|s| s.service_type == service_type)
+            })
+            .map(|cached| cached.instance.clone())
             .collect()
     }
 
@@ -276,10 +399,16 @@ impl SbiContext {
         clients.clear();
     }
 
-    /// Get the number of NF instances
+    /// Get the number of **selectable** NF instances.
+    ///
+    /// Counts what the reads above would return, so it cannot report a peer that
+    /// `find_nf_instances_by_type` has already stopped handing out.
     pub async fn nf_instance_count(&self) -> usize {
         let instances = self.nf_instances.read().await;
-        instances.len()
+        instances
+            .values()
+            .filter(|cached| !cached.is_expired())
+            .count()
     }
 }
 
@@ -388,5 +517,159 @@ mod tests {
 
         let amfs = ctx.find_nf_instances_by_type(NfType::Amf).await;
         assert_eq!(amfs.len(), 2);
+    }
+
+    // ─── #235: discovery-cache validity ──────────────────────────────────────
+
+    /// An entry past its validity must read as ABSENT on every path, not merely
+    /// be flagged — the caller's "not in cache -> discover" branch is what
+    /// re-discovery hangs off, so anything that still returns the instance keeps
+    /// the consumer pointed at a dead endpoint.
+    ///
+    /// `Duration::ZERO` expires immediately, so this is deterministic without
+    /// sleeping.
+    #[tokio::test]
+    async fn expired_instance_reads_as_a_cache_miss_on_every_path() {
+        let ctx = SbiContext::new();
+
+        let mut instance = NfInstance::new("udr-stale", NfType::Udr);
+        instance.add_service(NfService::new("nudr-dr", SbiServiceType::NudrDr));
+        ctx.add_nf_instance_with_validity(instance, Duration::ZERO)
+            .await;
+
+        assert!(
+            ctx.get_nf_instance("udr-stale").await.is_none(),
+            "get_nf_instance must not return an expired profile"
+        );
+        assert!(
+            ctx.find_nf_instances_by_type(NfType::Udr).await.is_empty(),
+            "find_nf_instances_by_type must not return an expired profile"
+        );
+        assert!(
+            ctx.find_nf_instances_by_service(SbiServiceType::NudrDr)
+                .await
+                .is_empty(),
+            "find_nf_instances_by_service must not return an expired profile"
+        );
+        assert_eq!(
+            ctx.nf_instance_count().await,
+            0,
+            "the count must agree with what the reads hand out"
+        );
+    }
+
+    /// The complement: a validity that has not elapsed leaves the entry usable,
+    /// so the expiry check cannot be passing the test above by rejecting
+    /// everything.
+    #[tokio::test]
+    async fn instance_within_its_validity_stays_selectable() {
+        let ctx = SbiContext::new();
+
+        let mut instance = NfInstance::new("udr-live", NfType::Udr);
+        instance.add_service(NfService::new("nudr-dr", SbiServiceType::NudrDr));
+        ctx.add_nf_instance_with_validity(instance, Duration::from_secs(3600))
+            .await;
+
+        assert!(ctx.get_nf_instance("udr-live").await.is_some());
+        assert_eq!(ctx.find_nf_instances_by_type(NfType::Udr).await.len(), 1);
+        assert_eq!(
+            ctx.find_nf_instances_by_service(SbiServiceType::NudrDr)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(ctx.nf_instance_count().await, 1);
+    }
+
+    /// `add_nf_instance` deliberately opts out of expiry, so the strict-peer
+    /// harnesses that seed the registry by hand keep working. Pinned as a test
+    /// because it is a behaviour difference between two adjacent methods, and the
+    /// kind of thing a later reader would "tidy" into consistency.
+    #[tokio::test]
+    async fn add_without_validity_never_expires() {
+        let ctx = SbiContext::new();
+        ctx.add_nf_instance(NfInstance::new("udr-forever", NfType::Udr))
+            .await;
+
+        assert!(ctx.get_nf_instance("udr-forever").await.is_some());
+        assert_eq!(
+            ctx.purge_expired_nf_instances().await,
+            0,
+            "an entry with no deadline is never purged"
+        );
+        assert!(ctx.get_nf_instance("udr-forever").await.is_some());
+    }
+
+    /// Purging drops expired entries and leaves live ones, and reports the count
+    /// it dropped.
+    #[tokio::test]
+    async fn purge_expired_drops_only_the_expired() {
+        let ctx = SbiContext::new();
+
+        ctx.add_nf_instance_with_validity(NfInstance::new("gone-1", NfType::Udr), Duration::ZERO)
+            .await;
+        ctx.add_nf_instance_with_validity(NfInstance::new("gone-2", NfType::Ausf), Duration::ZERO)
+            .await;
+        ctx.add_nf_instance_with_validity(
+            NfInstance::new("kept", NfType::Udm),
+            Duration::from_secs(3600),
+        )
+        .await;
+
+        assert_eq!(ctx.purge_expired_nf_instances().await, 2);
+        assert!(ctx.get_nf_instance("kept").await.is_some());
+        assert_eq!(ctx.purge_expired_nf_instances().await, 0);
+    }
+
+    /// A delivery failure evicts the entry, and the return value distinguishes
+    /// "we dropped it" from "it was already gone" — which is what lets a caller
+    /// log the difference instead of claiming an eviction it did not perform.
+    #[tokio::test]
+    async fn eviction_on_failure_removes_the_entry_and_reports_whether_it_did() {
+        let ctx = SbiContext::new();
+        ctx.add_nf_instance_with_validity(
+            NfInstance::new("udr-dead", NfType::Udr),
+            Duration::from_secs(3600),
+        )
+        .await;
+
+        assert!(
+            ctx.evict_nf_instance_on_failure("udr-dead").await,
+            "the first eviction removed a live entry"
+        );
+        assert!(ctx.get_nf_instance("udr-dead").await.is_none());
+        assert!(
+            !ctx.evict_nf_instance_on_failure("udr-dead").await,
+            "a second eviction must report that there was nothing to remove"
+        );
+        assert!(
+            !ctx.evict_nf_instance_on_failure("never-cached").await,
+            "evicting an unknown id must not claim a removal"
+        );
+    }
+
+    /// `validityPeriod` drives the TTL; a MISSING member falls back to the
+    /// bounded default; and an explicit `0` is honoured as zero rather than
+    /// coerced to the default, because an NRF saying "do not cache this" is an
+    /// instruction, not an omission.
+    #[test]
+    fn search_result_validity_reads_the_member_and_honours_zero() {
+        assert_eq!(
+            search_result_validity(&serde_json::json!({"validityPeriod": 120})),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            search_result_validity(&serde_json::json!({"validityPeriod": 0})),
+            Duration::ZERO
+        );
+        assert_eq!(
+            search_result_validity(&serde_json::json!({"nfInstances": []})),
+            Duration::from_secs(DEFAULT_NF_DISCOVERY_VALIDITY_SECS)
+        );
+        // A non-numeric value is not a validity; fall back rather than panic.
+        assert_eq!(
+            search_result_validity(&serde_json::json!({"validityPeriod": "3600"})),
+            Duration::from_secs(DEFAULT_NF_DISCOVERY_VALIDITY_SECS)
+        );
     }
 }

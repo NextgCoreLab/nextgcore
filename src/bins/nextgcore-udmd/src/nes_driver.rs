@@ -123,23 +123,12 @@ impl NesActions for NrfNesActions {
                 // A deleted profile must not be PATCHed: pause heartbeats.
                 nextgcore_sbi::heartbeat::set_heartbeat_paused(true);
                 tokio::spawn(async move {
-                    let ctx = nextgcore_sbi::context::global_context();
-                    let Some(nrf_uri) = ctx.get_nrf_uri().await else {
-                        return;
-                    };
-                    let Some((host, port)) = crate::app::parse_nrf_host_port(&nrf_uri) else {
-                        return;
-                    };
-                    let client = ctx.get_client(&host, port).await;
-                    let path = format!("/nnrf-nfm/v1/nf-instances/{id}");
-                    match client
-                        .send_request(nextgcore_sbi::message::SbiRequest::delete(&path))
-                        .await
-                    {
-                        Ok(resp) if resp.is_success() => {
-                            log::info!("NES: deregistered from NRF (sleep)");
-                        }
-                        Ok(resp) => log::warn!("NES deregister returned {}", resp.status),
+                    // #235: this used to hand-roll the DELETE. It now goes
+                    // through the one NFDeregister client, so the NES sleep path
+                    // and the shutdown path cannot drift apart — and it inherits
+                    // the 404-is-success handling the inline copy lacked.
+                    match nextgcore_sbi::heartbeat::deregister_nf(&id).await {
+                        Ok(()) => log::info!("NES: deregistered from NRF (sleep)"),
                         Err(e) => log::warn!("NES deregister failed: {e}"),
                     }
                 });

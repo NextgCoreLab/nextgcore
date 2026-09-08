@@ -381,6 +381,13 @@ async fn main() -> Result<()> {
     }
 
     log::info!("DCCF shutting down");
+
+    // #235: NFDeregister (TS 29.510 5.2.2.2.3) BEFORE the listener goes away, so
+    // the NRF stops handing this profile to consumers instead of waiting out its
+    // supervision timer. Stopping the server first would open the bad window:
+    // not serving, but still advertised.
+    nextgcore_sbi::heartbeat::deregister_self().await;
+
     sbi_server
         .stop()
         .await

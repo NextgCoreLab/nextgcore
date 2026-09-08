@@ -563,6 +563,12 @@ pub async fn run() -> Result<()> {
     // Graceful shutdown
     log::info!("Shutting down...");
 
+    // #235: NFDeregister (TS 29.510 5.2.2.2.3) BEFORE the listener goes
+    // away, so the NRF stops handing this profile to consumers instead of
+    // waiting out its supervision timer. Stopping the server first would
+    // open the bad window: not serving, but still advertised.
+    nextgcore_sbi::heartbeat::deregister_self().await;
+
     // Stop SBI server
     sbi_server
         .stop()

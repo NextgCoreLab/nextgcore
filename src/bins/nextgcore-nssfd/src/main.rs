@@ -596,6 +596,12 @@ async fn main() -> Result<()> {
     // Graceful shutdown
     log::info!("Shutting down...");
 
+    // #235: NFDeregister (TS 29.510 5.2.2.2.3) BEFORE the listener goes
+    // away, so the NRF stops handing this profile to consumers instead of
+    // waiting out its supervision timer. Stopping the server first would
+    // open the bad window: not serving, but still advertised.
+    nextgcore_sbi::heartbeat::deregister_self().await;
+
     // Stop SBI server
     sbi_server
         .stop()
@@ -2951,6 +2957,10 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
     let json: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
 
+    // #235: the SearchResult's validityPeriod bounds how long these profiles may
+    // be selected; without it a cached peer was chosen for the process lifetime.
+    let validity = nextgcore_sbi::context::search_result_validity(&json);
+
     if let Some(nf_instances) = json.get("nfInstances").and_then(|v| v.as_array()) {
         for nf_json in nf_instances {
             let nf_id = nf_json
@@ -3005,8 +3015,13 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                 }
             }
 
-            sbi_ctx.add_nf_instance(instance).await;
-            log::info!("Discovered {nf_type_str} instance: {nf_id}");
+            sbi_ctx
+                .add_nf_instance_with_validity(instance, validity)
+                .await;
+            log::info!(
+                "Discovered {nf_type_str} instance: {nf_id} (valid for {}s)",
+                validity.as_secs()
+            );
         }
     }
 
