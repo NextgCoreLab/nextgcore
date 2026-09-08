@@ -73,6 +73,9 @@ pub enum SbiServiceType {
     NneesEasdiscovery,
     NmbsmfMbssession,
     NnsacfNsac,
+    /// TS 29.536 Nnsacf_SliceEventExposure. Typed so a consumer (NEF/DCCF/AF/
+    /// NWDAF) can select the exposure service by type rather than by literal.
+    NnsacfSliceEe,
     NdccfDatamanagement,
     NpinPinmanagement,
     NeasdfDnscontext,
@@ -149,6 +152,7 @@ impl SbiServiceType {
             Self::NneesEasdiscovery => "nees-easdiscovery",
             Self::NmbsmfMbssession => "nmbsmf-mbssession",
             Self::NnsacfNsac => "nnsacf-nsac",
+            Self::NnsacfSliceEe => "nnsacf-slice-ee",
             Self::NdccfDatamanagement => "ndccf-datamanagement",
             Self::NpinPinmanagement => "npin-pinmanagement",
             Self::NeasdfDnscontext => "neasdf-dnscontext",
@@ -221,6 +225,7 @@ impl SbiServiceType {
             "nees-easdiscovery" => Some(Self::NneesEasdiscovery),
             "nmbsmf-mbssession" => Some(Self::NmbsmfMbssession),
             "nnsacf-nsac" => Some(Self::NnsacfNsac),
+            "nnsacf-slice-ee" => Some(Self::NnsacfSliceEe),
             "ndccf-datamanagement" => Some(Self::NdccfDatamanagement),
             "npin-pinmanagement" => Some(Self::NpinPinmanagement),
             "neasdf-dnscontext" => Some(Self::NeasdfDnscontext),
