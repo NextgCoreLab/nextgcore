@@ -295,22 +295,20 @@ impl GsmFsm {
     }
 
     /// Handle SBI client events in SM policy association state
+    ///
+    /// #204 removed the `nudm-sdm` arm that used to sit beside the PCF one. It was
+    /// unreachable: nothing in the crate ever issued a Nudm_SDM request, so no
+    /// `nudm-sdm` client response could be dispatched, and the arm read as if the
+    /// SMF fetched subscription data during the policy-association wait. The SMF
+    /// now really does call Nudm_SDM_Get — but for the **subscribed default DNN**,
+    /// and it must happen BEFORE the session exists, because the DNN is an input to
+    /// creating it. So the request returns on a direct `await` in
+    /// `handle_sm_context_create`, not as an FSM event, and dispatching it here as
+    /// well would put one decision in two places.
     fn handle_sbi_client_sm_policy(&mut self, event: &SmfEvent) -> GsmFsmResult {
         if let Some(ref sbi) = event.sbi {
             if let Some(ref message) = sbi.message {
-                // Check service name
-                if message.service_name == "nudm-sdm" {
-                    // UDM subscriber data response
-                    if let Some(status) = message.res_status {
-                        if status == 200 {
-                            log::debug!("UDM SDM response OK");
-                            return GsmFsmResult::Handled;
-                        } else {
-                            log::error!("UDM SDM response error: {status}");
-                            return GsmFsmResult::Transition(GsmState::Exception);
-                        }
-                    }
-                } else if message.service_name == "npcf-smpolicycontrol" {
+                if message.service_name == "npcf-smpolicycontrol" {
                     // PCF SM policy response
                     if let Some(status) = message.res_status {
                         if status == 201 {

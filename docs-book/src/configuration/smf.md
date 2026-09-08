@@ -92,6 +92,7 @@ The N4/PFCP endpoints are configured by environment variables, **not** by the `s
 | `SMF_PFCP_ADDR` / `SMF_PFCP_PORT` | `0.0.0.0` / `8805` | N4 PFCP bind address (single socket; sequence-number matching per TS 29.244 §7.2.1, per code comment). `SMF_PFCP_ADDR` also supplies the PFCP Node ID (falls back to `127.0.0.1` if not a dotted IPv4). |
 | `UPF_PFCP_ADDR` / `UPF_PFCP_PORT` | `127.0.0.1` / `8805` | UPF N4 peer address. |
 | `SMF_SBI_ADVERTISE_URI` | derived from SBI server address/port | Externally reachable base URI used in PCF callback (`notificationUri`) URIs. |
+| `UDM_SBI_ADDR` / `UDM_SBI_PORT` | unset / `7777` | UDM address for `Nudm_SDM_Get(smf-select-data)`, used only to resolve the **subscribed default DNN** (#204). Tried **after** NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a `SmContextCreateData` carrying no `dnn` is refused with `SUBSCRIPTION_DATA_NOT_AVAILABLE`. |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | unset | `1`/`true`/`yes` forces OAuth2 enforcement, taking precedence over the YAML knob. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP trace exporter endpoint. |
 
@@ -105,6 +106,23 @@ The example file follows an Open5GS-style layout, but the typed deserializer ign
 - `smf.gtpc`, `smf.gtpu`, `smf.metrics` — not deserialized by the config structs.
 - `smf.session` (UE IP subnets/gateways), `smf.dns`, `smf.mtu` — not deserialized by the config structs.
 - `smf.tls` — not read by the SMF loader; the file comment ties TLS to `TLS_ENABLED`/`SBI_SCHEME` deployment variables.
+
+## Subscribed default DNN (#204)
+
+`dnn` is **optional** in `SmContextCreateData` (TS 29.502 §6.1.6.2.2). When the UE omits the DNN IE the AMF omits the member — it used to substitute the literal `"internet"`, so any deployment whose subscribers do not all default to a DNN of that name attached DNN-less sessions to the **wrong data network**, silently, because the session established fine against it. The SMF now selects the subscribed default itself, which is correct per TS 23.501 §6.2.2: the SMF is the NF that retrieves SM subscription data.
+
+Resolution, in order:
+
+1. `Nudm_SDM_Get` on **`smf-select-data`** (`SmfSelectionSubscriptionData`), because the default-DNN flag is `DnnInfo.defaultDnnIndicator` and lives there. `sm-data`'s `dnnConfigurations` has **no** default flag (TS 29.503 Table 5.5.2.4-1), so it cannot answer this question.
+2. The `dnnInfos` entry flagged `defaultDnnIndicator: true` wins.
+3. If exactly **one** DNN is subscribed for the S-NSSAI and none is flagged, that one is used — unambiguous.
+4. Otherwise the session is **refused** with `400 MANDATORY_IE_MISSING`, listing the candidate DNNs. Choosing among several unflagged DNNs would invent an answer the subscription does not give.
+
+Failure causes are distinct so an operator can tell a provisioning gap from an unreachable UDM: `MANDATORY_IE_MISSING` for "the subscription supplies no usable default", `SUBSCRIPTION_DATA_NOT_AVAILABLE` for "no UDM endpoint" or "the Nudm_SDM_Get failed".
+
+**Limit worth knowing:** nothing in this tree emits `defaultDnnIndicator` — the subscription DB has no such field and `udrd`'s `build_smf_selection_data` writes only the DNN name. So against this tree's own UDM/UDR, rule 3 is what makes it work, and a subscriber with **two or more DNNs on one S-NSSAI cannot establish a DNN-less PDU session** (it is refused, with the candidates named). Tracked as issue #264 (`decision`).
+
+No `single-nssai` query parameter is sent, even though TS 29.503 §5.2.2.2.1 allows scoping: the value is JSON and must be percent-encoded, but the shared SBI server stores query values verbatim without decoding them (issue #65), so a scoped query cannot round-trip to the in-tree UDM. The S-NSSAI's entry is selected locally by key instead.
 
 ## Honesty notes
 

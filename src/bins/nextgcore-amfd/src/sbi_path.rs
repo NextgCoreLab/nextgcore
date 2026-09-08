@@ -839,7 +839,7 @@ fn build_create_sm_context_request(
     pdu_session_id: u8,
     sst: u8,
     sd: Option<u32>,
-    dnn: &str,
+    dnn: Option<&str>,
     n1_sm_msg_from_ue: &[u8],
     redcap_indication: bool,
     identity: &SmContextIdentity,
@@ -850,11 +850,21 @@ fn build_create_sm_context_request(
             "sst": sst,
             "sd": sd.map(|v| format!("{v:06x}"))
         },
-        "dnn": dnn,
         "n1SmMsg": { "contentId": "n1SmMsg" },
         "redcapIndication": redcap_indication,
     });
     let obj = body.as_object_mut().expect("json! built an object");
+
+    // Issue #204: `dnn` is OPTIONAL in SmContextCreateData (TS 29.502
+    // §6.1.6.2.2) and is emitted only when the UE actually supplied a DNN IE.
+    // This used to substitute the literal `"internet"`, so a subscriber whose
+    // subscription names a different default attached to the WRONG data network
+    // -- silently, since the session established fine against it. The SMF now
+    // selects the SUBSCRIBED default from SM subscription data when the member is
+    // absent (TS 23.501 §5.6.1), which is the NF that owns that decision.
+    if let Some(dnn) = dnn {
+        obj.insert("dnn".to_string(), serde_json::json!(dnn));
+    }
 
     // Issue #73: the serving PLMN comes from the GUAMI/TAI, not a literal. When
     // it is genuinely unknown the member is OMITTED rather than filled with a
@@ -913,14 +923,15 @@ pub async fn call_smf_create_sm_context(
     pdu_session_id: u8,
     sst: u8,
     sd: Option<u32>,
-    dnn: &str,
+    dnn: Option<&str>,
     n1_sm_msg_from_ue: &[u8],
     redcap_indication: bool,
     identity: &SmContextIdentity,
 ) -> SbiResult<SmContextCreateResponse> {
     log::info!(
         "Calling SMF SM Context Create: {smf_host}:{smf_port}, PSI={pdu_session_id}, SST={sst}, \
-         DNN={dnn}, redcap={redcap_indication}"
+         DNN={}, redcap={redcap_indication}",
+        dnn.unwrap_or("<omitted: SMF selects the subscribed default>")
     );
 
     let client = crate::attach_oauth2(
@@ -2321,7 +2332,7 @@ mod tests {
             5,
             1,
             None,
-            "internet",
+            Some("internet"),
             &UE_N1_REQUEST,
             false,
             identity,
@@ -2355,6 +2366,57 @@ mod tests {
             body["ueLocation"]["nrLocation"]["tai"]["tac"].as_str(),
             Some("000001")
         );
+    }
+
+    /// **Issue #204.** `dnn` is emitted only when the UE actually supplied a DNN
+    /// IE, and is OMITTED — not defaulted to `"internet"` — when it did not.
+    ///
+    /// The literal was silent and wrong: any deployment whose subscribers do not
+    /// all default to a DNN named `internet` attached DNN-less sessions to the
+    /// wrong data network, with the wrong UPF, policy, charging and slice, while
+    /// the session established successfully. With the member absent, the SMF
+    /// selects the subscribed default from SM subscription data (TS 23.501
+    /// §5.6.1), which is the NF that owns that decision.
+    #[test]
+    fn n11_omits_dnn_when_the_ue_did_not_supply_one() {
+        let with_dnn = build_create_sm_context_request(
+            5,
+            1,
+            None,
+            Some("xr"),
+            &UE_N1_REQUEST,
+            false,
+            &SmContextIdentity::default(),
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(with_dnn.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["dnn"].as_str(), Some("xr"), "the UE's DNN is conveyed");
+
+        let without_dnn = build_create_sm_context_request(
+            5,
+            1,
+            None,
+            None,
+            &UE_N1_REQUEST,
+            false,
+            &SmContextIdentity::default(),
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(without_dnn.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("dnn").is_none(),
+            "dnn must be ABSENT, not null and not a literal, got {body}"
+        );
+        // Specifically not the old literal, and specifically not `null` — a `null`
+        // member is a value the SMF would have to reject rather than an omission
+        // it can resolve.
+        assert_ne!(body["dnn"].as_str(), Some("internet"));
+        assert!(!body["dnn"].is_null() || body.get("dnn").is_none());
+        // The members that are unconditional are still there, so this is an
+        // omission rather than a broken body.
+        assert_eq!(body["pduSessionId"].as_u64(), Some(5));
+        assert_eq!(body["sNssai"]["sst"].as_u64(), Some(1));
+        assert_eq!(body["n1SmMsg"]["contentId"].as_str(), Some("n1SmMsg"));
     }
 
     /// **Issue #205.** The N11 body carries the `gpsi` — the UE's EXTERNAL
@@ -2530,7 +2592,7 @@ mod tests {
             5,
             1,
             None,
-            "internet",
+            Some("internet"),
             &UE_N1_REQUEST,
             false,
             &SmContextIdentity::default(),

@@ -288,6 +288,13 @@ services:
       UPF_PFCP_ADDR: 172.23.0.7
       UPF_PFCP_PORT: "8805"
       SMF_PFCP_ADDR: 172.23.0.4
+      # Issue #204: the SMF resolves the SUBSCRIBED DEFAULT DNN from
+      # Nudm_SDM_Get(smf-select-data) when SmContextCreateData carries no `dnn`.
+      # NRF discovery is tried first; this is the fallback for a deployment with no
+      # NRF, and it is what makes a DNN-less PDU session establish here rather than
+      # be refused with SUBSCRIPTION_DATA_NOT_AVAILABLE.
+      UDM_SBI_ADDR: 172.23.0.12
+      UDM_SBI_PORT: "7777"
       TLS_CERT: /etc/nextgcore/certs/smf.crt
       TLS_KEY: /etc/nextgcore/certs/smf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
