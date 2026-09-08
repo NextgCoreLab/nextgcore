@@ -392,13 +392,25 @@ async fn pcfd_updates_binding_ip_at_real_bsfd_over_http() {
             "real bsfd must accept the Nbsf_Management_Update"
         );
 
-        // ...and the stored binding now carries the new address, read back
-        // through bsfd's own GET.
-        let resp = nextgcore_bsfd::bsf_sbi_request_handler(SbiRequest::get(format!(
-            "/nbsf-management/v1/pcfBindings/{binding_id}"
-        )))
-        .await;
-        assert_eq!(resp.status, 200, "GET the patched binding");
+        // ...and the stored binding now carries the new address, read back through
+        // bsfd's DISCOVERY query.
+        //
+        // #98 removed `GET /pcfBindings/{bindingId}`: TS 29.521 defines only
+        // DELETE and PATCH on the individual resource. Discovery by UE address is
+        // the spec-defined read, and it is also the stronger assertion here — it
+        // proves the new address is INDEXED and therefore findable by an AF, not
+        // merely stored on the record.
+        // The handler is called DIRECTLY here, so `http.params` is not populated
+        // from the query string — that happens in the server's request conversion.
+        // The parameter is therefore set explicitly, or discovery sees no UE
+        // address and answers 400.
+        let mut discover = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        discover.http.set_param("ipv4Addr", "10.45.0.99");
+        let resp = nextgcore_bsfd::bsf_sbi_request_handler(discover).await;
+        assert_eq!(
+            resp.status, 200,
+            "discover the patched binding by its new address"
+        );
         let stored: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap_or("null")).unwrap();
         assert_eq!(
@@ -553,10 +565,12 @@ async fn sm_policy_update_wires_the_bsf_binding_update() {
         // own Nbsf_Management_Update.
         let mut stored_ip = String::new();
         for _ in 0..200 {
-            let resp = nextgcore_bsfd::bsf_sbi_request_handler(SbiRequest::get(format!(
-                "/nbsf-management/v1/pcfBindings/{binding_id}"
-            )))
-            .await;
+            // #98: discovery by UE address rather than the removed individual GET
+            // (TS 29.521 defines only DELETE/PATCH there). Polling on the NEW
+            // address means a hit is itself the evidence the update landed.
+            let mut discover = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+            discover.http.set_param("ipv4Addr", "10.45.0.98");
+            let resp = nextgcore_bsfd::bsf_sbi_request_handler(discover).await;
             if resp.status == 200 {
                 let doc: serde_json::Value =
                     serde_json::from_str(resp.http.content.as_deref().unwrap_or("null")).unwrap();

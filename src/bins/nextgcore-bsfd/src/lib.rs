@@ -381,23 +381,47 @@ pub async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let resource = parts[2];
 
     match (service, resource, method) {
-        // bsfd-13 stub: subscription sub-resource (any method) -> 501.
-        // Must be checked BEFORE the generic pcfBindings/POST arm.
-        ("nbsf-management", "pcfBindings", _)
-            if parts.len() >= 5 && parts[4] == "subscriptions" =>
-        {
-            nextgcore_sbi::server::send_error(
-                501,
-                "Not Implemented",
-                "Nbsf_Management Subscribe/Unsubscribe is not implemented (bsfd-13 stub)",
-                None,
+        // #98: Nbsf_Management event subscriptions (TS 29.521 §4.2.6-4.2.8).
+        // These replace the bsfd-13 501 stub, which sat on
+        // `pcfBindings/{id}/subscriptions` — a path the spec does not define — while
+        // the spec's own top-level `/subscriptions` was unrouted and fell through
+        // to 405.
+        ("nbsf-management", "subscriptions", "POST") if parts.len() == 3 => {
+            handle_bsf_subscription_create(&request).await
+        }
+        ("nbsf-management", "subscriptions", "PUT") if parts.len() >= 4 => {
+            handle_bsf_subscription_replace(parts[3], &request).await
+        }
+        ("nbsf-management", "subscriptions", "DELETE") if parts.len() >= 4 => {
+            handle_bsf_subscription_delete(parts[3]).await
+        }
+        // A defined resource reached with the wrong method answers 405 WITH an
+        // Allow header (the shared helper #229 added), rather than the bare 405
+        // the fallthrough gives.
+        ("nbsf-management", "subscriptions", _) if parts.len() == 3 => {
+            nextgcore_sbi::server::send_method_not_allowed_with_allow(method, uri, &["POST"])
+        }
+        ("nbsf-management", "subscriptions", _) => {
+            nextgcore_sbi::server::send_method_not_allowed_with_allow(
+                method,
+                uri,
+                &["PUT", "DELETE"],
             )
         }
         // BSF Management Service (nbsf-management) — PDU-session bindings
         ("nbsf-management", "pcfBindings", "POST") => handle_pcf_binding_create(&request).await,
+        // #98: TS 29.521 defines only DELETE and PATCH on
+        // /pcfBindings/{bindingId} — there is no GET. Serving one told a
+        // strict OpenAPI-validating peer this BSF has a resource operation the
+        // API does not define. 405 WITH the Allow header naming what the
+        // resource does support, rather than a bare 404, so the consumer learns
+        // the resource exists and which verbs it takes.
         ("nbsf-management", "pcfBindings", "GET") if parts.len() >= 4 => {
-            let binding_id = parts[3];
-            handle_pcf_binding_get(binding_id).await
+            nextgcore_sbi::server::send_method_not_allowed_with_allow(
+                method,
+                uri,
+                &["DELETE", "PATCH"],
+            )
         }
         ("nbsf-management", "pcfBindings", "GET") => handle_pcf_binding_discovery(&request).await,
         ("nbsf-management", "pcfBindings", "DELETE") if parts.len() >= 4 => {
@@ -520,9 +544,11 @@ fn binding_json(sess: &BsfSess) -> serde_json::Value {
     if let Some(ref v) = sess.pcf_fqdn {
         b.insert("pcfFqdn".to_string(), serde_json::Value::String(v.clone()));
     }
-    if let Some(ref v) = sess.expiry {
-        b.insert("expiry".to_string(), serde_json::Value::String(v.clone()));
-    }
+    // #98: NO `expiry` on PcfBinding. TS 29.521's PcfBinding schema does not
+    // define one — `expiry` belongs to the SUBSCRIPTION resource — so emitting it
+    // here made every binding response fail strict schema validation. The value is
+    // still held on the session and still arms the TTL timer; it is simply not a
+    // wire member of this resource.
     if !sess.pcf_ip.is_empty() {
         let endpoints: Vec<serde_json::Value> = sess
             .pcf_ip
@@ -945,6 +971,18 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                 ttl_secs
             );
 
+            // #98 / TS 29.521 §4.2.6.3: tell every matching subscriber the binding
+            // was registered. `pcfForPduSessInfos` carries the identity of the
+            // binding rather than only its id, so a subscriber can tell WHICH PCF
+            // now serves the session — which is the whole point of a PCF watching
+            // for a binding created by a different PCF.
+            spawn_bsf_notifications(
+                "PCF_PDU_SESSION_BINDING_REGISTRATION",
+                sess.supi.as_deref(),
+                &sess.binding_id,
+                pdu_session_event_info(&sess),
+            );
+
             SbiResponse::with_status(201)
                 .with_header(
                     "Location",
@@ -954,6 +992,330 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
         None => send_bad_request("Failed to create PCF binding", Some("SYSTEM_FAILURE")),
+    }
+}
+
+/// The `PcfForPduSessionInfo`-shaped members describing the binding an event is
+/// about (TS 29.521 `BsfEventNotification.pcfForPduSessInfos`).
+///
+/// Only members actually held are emitted — a `pcfFqdn` or endpoint list the BSF
+/// does not have stays absent rather than being placeheld, so a subscriber can
+/// tell "the PCF has no FQDN" from "the BSF did not know".
+fn pdu_session_event_info(sess: &context::BsfSess) -> serde_json::Value {
+    let mut info = serde_json::Map::new();
+    if let Some(ref dnn) = sess.dnn {
+        info.insert("dnn".to_string(), serde_json::json!(dnn));
+    }
+    // The binding always carries an S-NSSAI (it is one of PcfBinding's two
+    // required members), so it is always emitted.
+    let mut snssai = serde_json::json!({ "sst": sess.s_nssai.sst });
+    if let Some(sd) = sess.s_nssai.sd {
+        snssai["sd"] = serde_json::json!(format!("{sd:06x}"));
+    }
+    info.insert("snssai".to_string(), snssai);
+    if let Some(ref fqdn) = sess.pcf_fqdn {
+        info.insert("pcfFqdn".to_string(), serde_json::json!(fqdn));
+    }
+    if let Some(ref id) = sess.pcf_id {
+        info.insert("pcfId".to_string(), serde_json::json!(id));
+    }
+    serde_json::json!({ "pcfForPduSessInfos": [serde_json::Value::Object(info)] })
+}
+
+/// The `PcfForUeInfo`-shaped members describing a UE binding
+/// (TS 29.521 `BsfEventNotification.pcfForUeInfo`).
+fn ue_binding_event_info(binding: &context::PcfUeBinding) -> serde_json::Value {
+    let mut info = serde_json::Map::new();
+    if let Some(ref fqdn) = binding.pcf_fqdn {
+        info.insert("pcfFqdn".to_string(), serde_json::json!(fqdn));
+    }
+    if let Some(ref id) = binding.pcf_id {
+        info.insert("pcfId".to_string(), serde_json::json!(id));
+    }
+    serde_json::json!({ "pcfForUeInfo": serde_json::Value::Object(info) })
+}
+
+/// The `BsfEvent` tokens this BSF can actually emit.
+///
+/// PDU-session and UE binding register/deregister are the four transitions this
+/// BSF observes. `SNSSAI_DNN_BINDING_REGISTRATION`/`_DEREGISTRATION` have no
+/// producer here — nothing in this BSF tracks an S-NSSAI/DNN binding as a resource
+/// distinct from the PDU-session binding — so a subscription naming only those is
+/// refused rather than accepted and never fired.
+const BSF_REPORTABLE_EVENTS: &[&str] = &[
+    "PCF_PDU_SESSION_BINDING_REGISTRATION",
+    "PCF_PDU_SESSION_BINDING_DEREGISTRATION",
+    "PCF_UE_BINDING_REGISTRATION",
+    "PCF_UE_BINDING_DEREGISTRATION",
+];
+
+/// Parse and validate a `BsfSubscription` (TS 29.521 §4.2.6.2).
+///
+/// `required` is `[events, notifUri, notifCorreId, supi]` — four members, not the
+/// two a reader might assume. `supi` being required is what makes a subscription
+/// UE-scoped, and therefore what notification matching filters on.
+fn parse_bsf_subscription(
+    sub_id: &str,
+    body: &str,
+) -> Result<context::BsfSubscription, Box<SbiResponse>> {
+    let doc: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        Box::new(nextgcore_sbi::server::send_bad_request(
+            &format!("Invalid JSON: {e}"),
+            Some("INVALID_MSG_FORMAT"),
+        ))
+    })?;
+
+    let mut missing = Vec::new();
+    let notif_uri = doc
+        .get("notifUri")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    if notif_uri.is_none() {
+        missing.push("notifUri");
+    }
+    let notif_corre_id = doc
+        .get("notifCorreId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    if notif_corre_id.is_none() {
+        missing.push("notifCorreId");
+    }
+    let supi = doc
+        .get("supi")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    if supi.is_none() {
+        missing.push("supi");
+    }
+    let events_json = doc.get("events").and_then(|v| v.as_array());
+    if events_json.map(|a| a.is_empty()).unwrap_or(true) {
+        missing.push("events");
+    }
+    if !missing.is_empty() {
+        return Err(Box::new(nextgcore_sbi::server::send_bad_request(
+            &format!("Missing mandatory attribute(s): {}", missing.join(", ")),
+            Some("MANDATORY_IE_MISSING"),
+        )));
+    }
+
+    // A notifUri that is not an absolute http(s) URI can never be POSTed to, so
+    // accepting it would create a subscription guaranteed to fail silently at
+    // every notification.
+    let notif_uri = notif_uri.expect("checked above");
+    if !(notif_uri.starts_with("http://") || notif_uri.starts_with("https://")) {
+        return Err(Box::new(nextgcore_sbi::server::send_bad_request(
+            &format!("notifUri must be an absolute http(s) URI, got {notif_uri}"),
+            Some("MANDATORY_IE_INCORRECT"),
+        )));
+    }
+
+    let mut events = Vec::new();
+    for e in events_json.expect("checked above") {
+        match e.as_str() {
+            Some(s) if !s.is_empty() => events.push(s.to_string()),
+            _ => {
+                return Err(Box::new(nextgcore_sbi::server::send_bad_request(
+                    "events members must be non-empty BsfEvent strings",
+                    Some("MANDATORY_IE_INCORRECT"),
+                )))
+            }
+        }
+    }
+    // An UNRECOGNISED token is not rejected: `BsfEvent` is an anyOf over the enum
+    // plus a free-form string, so an unknown value is forward-compatibility with a
+    // later release. Only a subscription with NOTHING this BSF can emit is
+    // refused, because it could never fire.
+    if !events
+        .iter()
+        .any(|e| BSF_REPORTABLE_EVENTS.contains(&e.as_str()))
+    {
+        return Err(Box::new(nextgcore_sbi::server::send_bad_request(
+            &format!(
+                "none of the requested events {events:?} can be reported by this BSF; \
+                 reportable events are {BSF_REPORTABLE_EVENTS:?}"
+            ),
+            Some("EVENT_NOT_SUPPORTED"),
+        )));
+    }
+
+    Ok(context::BsfSubscription {
+        sub_id: sub_id.to_string(),
+        notif_uri: notif_uri.to_string(),
+        notif_corre_id: notif_corre_id.expect("checked above").to_string(),
+        supi: supi.expect("checked above").to_string(),
+        events,
+        expiry: doc.get("expiry").and_then(|v| v.as_str()).map(String::from),
+        raw: doc,
+    })
+}
+
+/// `POST /nbsf-management/v1/subscriptions` (TS 29.521 §4.2.6.2) — 201 + Location.
+async fn handle_bsf_subscription_create(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = &request.http.content else {
+        return nextgcore_sbi::server::send_bad_request(
+            "Missing mandatory request body",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
+    let sub_id = uuid::Uuid::new_v4().to_string();
+    let sub = match parse_bsf_subscription(&sub_id, body) {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    let raw = sub.raw.clone();
+    let ctx = context::bsf_self();
+    if let Ok(c) = ctx.read() {
+        c.subscription_add(sub);
+    }
+    log::info!("Nbsf_Management subscription created: {sub_id}");
+    SbiResponse::with_status(201)
+        .with_json_body(&raw)
+        .unwrap_or_else(|_| SbiResponse::with_status(201))
+        .with_header(
+            "Location",
+            format!("/nbsf-management/v1/subscriptions/{sub_id}"),
+        )
+}
+
+/// `PUT /nbsf-management/v1/subscriptions/{subId}` (TS 29.521 §4.2.7.2) —
+/// full replacement, 200 with the updated resource, 404 when unknown.
+async fn handle_bsf_subscription_replace(sub_id: &str, request: &SbiRequest) -> SbiResponse {
+    let ctx = context::bsf_self();
+    let exists = ctx
+        .read()
+        .ok()
+        .map(|c| c.subscription_get(sub_id).is_some())
+        .unwrap_or(false);
+    if !exists {
+        return nextgcore_sbi::server::send_not_found(
+            &format!("Subscription {sub_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        );
+    }
+    let Some(body) = &request.http.content else {
+        return nextgcore_sbi::server::send_bad_request(
+            "Missing mandatory request body",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
+    // The same parse as create, so a replacement cannot skip a validation the
+    // create enforced. The subId is preserved, so the resource URI the consumer
+    // holds stays valid.
+    let sub = match parse_bsf_subscription(sub_id, body) {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    let raw = sub.raw.clone();
+    if let Ok(c) = ctx.read() {
+        c.subscription_add(sub);
+    }
+    log::info!("Nbsf_Management subscription {sub_id} replaced");
+    SbiResponse::with_status(200)
+        .with_json_body(&raw)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// `DELETE /nbsf-management/v1/subscriptions/{subId}` (TS 29.521 §4.2.8.2) — 204,
+/// 404 when unknown.
+async fn handle_bsf_subscription_delete(sub_id: &str) -> SbiResponse {
+    let ctx = context::bsf_self();
+    let removed = ctx
+        .read()
+        .ok()
+        .map(|c| c.subscription_remove(sub_id))
+        .unwrap_or(false);
+    if removed {
+        log::info!("Nbsf_Management subscription {sub_id} deleted");
+        SbiResponse::with_status(204)
+    } else {
+        nextgcore_sbi::server::send_not_found(
+            &format!("Subscription {sub_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        )
+    }
+}
+
+/// Split an absolute notification URI into `(host, port, path)`.
+fn split_notify_uri(uri: &str) -> Option<(String, u16, String)> {
+    let (scheme_default, rest) = if let Some(r) = uri.strip_prefix("https://") {
+        (443u16, r)
+    } else if let Some(r) = uri.strip_prefix("http://") {
+        (80u16, r)
+    } else {
+        return None;
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (authority.to_string(), scheme_default),
+    };
+    Some((host, port, path.to_string()))
+}
+
+/// POST a `BsfNotification` to every subscription that wants `event` for `supi`
+/// (TS 29.521 §4.2.6.3).
+///
+/// Fire-and-forget per subscriber: a subscriber that is down must not add latency
+/// to, or fail, the binding CRUD that produced the event. Nothing was emitted at
+/// all before #98, so even a subscriber that existed received nothing.
+fn spawn_bsf_notifications(
+    event: &str,
+    supi: Option<&str>,
+    binding_id: &str,
+    info: serde_json::Value,
+) {
+    let ctx = context::bsf_self();
+    let subs = match ctx.read() {
+        Ok(c) => c.subscriptions_wanting(event, supi),
+        Err(_) => return,
+    };
+    if subs.is_empty() {
+        return;
+    }
+    log::info!(
+        "Nbsf_Management {event} for binding {binding_id}: notifying {} subscriber(s)",
+        subs.len()
+    );
+    for sub in subs {
+        // BsfNotification's oneOf: either `bindingIds` alone, or `notifCorreId`
+        // AND `eventNotifs` together. The second form is emitted, so BOTH members
+        // are always present — sending eventNotifs without notifCorreId would
+        // satisfy neither branch of the oneOf.
+        let mut event_notif = serde_json::json!({ "event": event });
+        if let Some(obj) = event_notif.as_object_mut() {
+            if let Some(extra) = info.as_object() {
+                for (k, v) in extra {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let body = serde_json::json!({
+            "notifCorreId": sub.notif_corre_id,
+            "eventNotifs": [event_notif],
+        });
+        let uri = sub.notif_uri.clone();
+        let sub_id = sub.sub_id.clone();
+        tokio::spawn(async move {
+            let Some((host, port, path)) = split_notify_uri(&uri) else {
+                log::warn!("subscription {sub_id}: unusable notifUri {uri}");
+                return;
+            };
+            let client = nextgcore_sbi::client::SbiClient::new(
+                nextgcore_sbi::client::SbiClientConfig::new(host, port)
+                    .with_connect_timeout(Duration::from_secs(2))
+                    .with_request_timeout(Duration::from_secs(3)),
+            );
+            match client.post_json(&path, &body).await {
+                Ok(resp) => log::debug!(
+                    "BsfNotification delivered to {uri} for {sub_id} (status {})",
+                    resp.status
+                ),
+                Err(e) => log::warn!("BsfNotification to {uri} for {sub_id} failed: {e}"),
+            }
+        });
     }
 }
 
@@ -1077,14 +1439,23 @@ async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
 
     match sess_id {
         Some(id) => {
-            let removed = ctx
-                .read()
-                .map(|context| context.sess_remove(id).is_some())
-                .unwrap_or(false);
-            if removed {
+            // The session is read BEFORE removal: the notification identifies the
+            // binding that went away, and after sess_remove there is nothing left
+            // to describe it with.
+            let removed_sess = ctx.read().ok().and_then(|context| context.sess_remove(id));
+            if let Some(ref sess) = removed_sess {
                 // Guard dropped above; unpersist off-thread.
                 context::unpersist_binding_async(binding_id.to_string()).await;
                 log::info!("PCF Binding {binding_id} deleted");
+                // #98 / TS 29.521 §4.2.6.3: the deregistration half. Emitted after
+                // the removal has actually happened, so a subscriber is never told
+                // a binding is gone while it is still discoverable.
+                spawn_bsf_notifications(
+                    "PCF_PDU_SESSION_BINDING_DEREGISTRATION",
+                    sess.supi.as_deref(),
+                    binding_id,
+                    pdu_session_event_info(sess),
+                );
                 return SbiResponse::with_status(204);
             }
             send_not_found(
@@ -1543,6 +1914,17 @@ async fn handle_pcf_ue_binding_create(request: &SbiRequest) -> SbiResponse {
         gpsi
     );
 
+    // #98: the UE-binding half of the event surface. `pcfForUeInfo` rather than
+    // `pcfForPduSessInfos`, because BsfEventNotification models the two binding
+    // kinds with different members and using one for the other would misreport
+    // which resource changed.
+    spawn_bsf_notifications(
+        "PCF_UE_BINDING_REGISTRATION",
+        supi,
+        &binding_id,
+        ue_binding_event_info(&binding),
+    );
+
     SbiResponse::with_status(201)
         .with_header(
             "Location",
@@ -1603,8 +1985,14 @@ async fn handle_pcf_ue_binding_delete(binding_id: &str) -> SbiResponse {
         .ok()
         .and_then(|g| g.ue_binding_remove(binding_id))
     {
-        Some(_) => {
+        Some(removed) => {
             log::info!("PCF UE Binding {binding_id} deleted");
+            spawn_bsf_notifications(
+                "PCF_UE_BINDING_DEREGISTRATION",
+                removed.supi.as_deref(),
+                binding_id,
+                ue_binding_event_info(&removed),
+            );
             SbiResponse::with_status(204)
         }
         None => send_not_found(
@@ -2779,14 +3167,20 @@ mod tests {
         let patched: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(patched["pcfIpEndPoints"][0]["ipv4Address"], "10.0.0.20");
+        // #98: TS 29.521 defines only DELETE and PATCH on /pcfBindings/{bindingId}
+        // — no GET. This assertion used to expect 200 from that undefined
+        // operation; it now pins that the operation is refused with an Allow
+        // header naming what the resource does support. The PATCH response above
+        // already carries the updated representation, so nothing is lost.
         let resp = client
             .get(&format!("/nbsf-management/v1/pcfBindings/{binding_id}"))
             .await
             .expect("GET after PATCH");
-        assert_eq!(resp.status, 200);
-        let got: serde_json::Value =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(got["pcfIpEndPoints"][0]["port"], 8888);
+        assert_eq!(
+            resp.status, 405,
+            "GET on an individual PCF binding is not a TS 29.521 operation"
+        );
+        assert_eq!(patched["pcfIpEndPoints"][0]["port"], 8888);
 
         // A binding with an already-past RFC 3339 expiry is excluded from
         // discovery and GET (expired -> not served).
@@ -2818,11 +3212,20 @@ mod tests {
                 .await
                 .expect("DELETE");
             assert_eq!(resp.status, 204);
+            // #98: the deletion is confirmed by the second DELETE returning 404
+            // below rather than by a GET, since GET is not a TS 29.521 operation on
+            // this resource. It now answers 405 whether or not the binding exists,
+            // so it can no longer serve as an existence probe.
             let resp = client
                 .get(&format!("/nbsf-management/v1/pcfBindings/{id}"))
                 .await
                 .expect("GET deleted");
-            assert_eq!(resp.status, 404);
+            assert_eq!(resp.status, 405);
+            let resp = client
+                .delete(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+                .await
+                .expect("DELETE again confirms removal");
+            assert_eq!(resp.status, 404, "the binding must really be gone");
         }
         // Deleting again -> 404.
         let resp = client
@@ -3246,16 +3649,17 @@ mod tests {
         assert_eq!(body["bindLevel"], "NF_INSTANCE");
         assert_eq!(body["recoveryTime"], "2026-06-01T00:00:00Z");
 
-        // GET by id echoes them too.
+        // #98: the individual GET is not a TS 29.521 operation, so it is refused.
+        // This block used to assert 200 and echo the identity fields; the create
+        // response above already asserts them.
         let resp = client
             .get(&format!("/nbsf-management/v1/pcfBindings/{id}"))
             .await
             .expect("GET identity");
-        assert_eq!(resp.status, 200);
-        let got: serde_json::Value =
-            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(got["pcfId"], "pcf-uuid-abcd");
-        assert_eq!(got["bindLevel"], "NF_INSTANCE");
+        assert_eq!(
+            resp.status, 405,
+            "GET on an individual PCF binding is not a TS 29.521 operation"
+        );
 
         // PATCH clears pcfId (null remove).
         let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{id}"));
@@ -4042,22 +4446,427 @@ mod tests {
     async fn test_http_subscription_stub_not_implemented() {
         let (server, client) = start_bsf().await;
 
-        // POST to the subscriptions sub-resource → 501.
+        // #98: the bsfd-13 stub sat on `pcfBindings/{id}/subscriptions`, a path
+        // TS 29.521 does not define. This test used to assert that 501; it now
+        // asserts the non-spec path is NOT a subscription resource, and that the
+        // spec's own top-level `/subscriptions` is served instead. Inverted rather
+        // than deleted so review can see the flip.
         let resp = client
             .post_json(
                 "/nbsf-management/v1/pcfBindings/1/subscriptions",
-                &json!({
-                    "notifUri": "http://smf.example.com/notify",
-                    "monResUri": "http://bsf/pcfBindings/1"
-                }),
+                &json!({"notifUri": "http://smf.example.com/notify"}),
+            )
+            .await
+            .expect("POST to the non-spec sub-resource");
+        assert_ne!(
+            resp.status, 501,
+            "the bsfd-13 stub on a path the spec does not define must be gone"
+        );
+        assert_ne!(
+            resp.status, 201,
+            "a path TS 29.521 does not define must not create a subscription"
+        );
+
+        server.stop().await.expect("server stops");
+    }
+
+    // ── #98: Nbsf_Management Subscribe / Unsubscribe / Notify ─────────────────
+
+    fn bsf_sub_doc(notif_uri: &str, supi: &str, events: &[&str]) -> serde_json::Value {
+        json!({
+            "notifUri": notif_uri,
+            "notifCorreId": "corr-98",
+            "supi": supi,
+            "events": events,
+        })
+    }
+
+    /// #98 criteria 1–3 + 5: the subscription resource is routed and its CRUD
+    /// answers the spec's status codes, replacing the 405 fallthrough.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bsf_subscription_crud_lifecycle() {
+        let (server, client) = start_bsf().await;
+
+        // POST -> 201 + Location
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/subscriptions",
+                &bsf_sub_doc(
+                    "http://127.0.0.1:9/bsf-notify",
+                    "imsi-001010000000098",
+                    &["PCF_PDU_SESSION_BINDING_REGISTRATION"],
+                ),
             )
             .await
             .expect("POST subscription");
         assert_eq!(
-            resp.status, 501,
-            "bsfd-13: Subscribe is a stub (not implemented)"
+            resp.status, 201,
+            "the spec /subscriptions resource must be routed, not 405"
+        );
+        let location = resp
+            .http
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .map(|(_, v)| v.clone())
+            .expect("201 must carry a Location header (TS 29.521 §4.2.6.2)");
+        assert!(
+            location.starts_with("/nbsf-management/v1/subscriptions/"),
+            "Location must name the individual resource, got {location}"
+        );
+        let sub_id = location.rsplit('/').next().expect("subId").to_string();
+
+        // PUT replaces -> 2xx
+        let resp = client
+            .put_json(
+                &format!("/nbsf-management/v1/subscriptions/{sub_id}"),
+                &bsf_sub_doc(
+                    "http://127.0.0.1:9/bsf-notify-moved",
+                    "imsi-001010000000098",
+                    &["PCF_UE_BINDING_REGISTRATION"],
+                ),
+            )
+            .await
+            .expect("PUT subscription");
+        assert_eq!(resp.status, 200, "PUT must replace, not 405");
+
+        // The replacement took effect and kept the same subId.
+        let stored = bsf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.subscription_get(&sub_id))
+            .expect("still stored under the same subId");
+        assert_eq!(stored.notif_uri, "http://127.0.0.1:9/bsf-notify-moved");
+        assert_eq!(stored.events, vec!["PCF_UE_BINDING_REGISTRATION"]);
+
+        // PUT on an unknown subId -> 404
+        let resp = client
+            .put_json(
+                "/nbsf-management/v1/subscriptions/no-such-sub",
+                &bsf_sub_doc(
+                    "http://127.0.0.1:9/x",
+                    "imsi-1",
+                    &["PCF_UE_BINDING_REGISTRATION"],
+                ),
+            )
+            .await
+            .expect("PUT unknown");
+        assert_eq!(resp.status, 404);
+
+        // DELETE -> 204, then 404
+        let resp = client
+            .delete(&format!("/nbsf-management/v1/subscriptions/{sub_id}"))
+            .await
+            .expect("DELETE subscription");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .delete(&format!("/nbsf-management/v1/subscriptions/{sub_id}"))
+            .await
+            .expect("DELETE again");
+        assert_eq!(resp.status, 404);
+
+        server.stop().await.expect("server stops");
+    }
+
+    /// Mandatory members are enforced, and the spec's four are all required —
+    /// `supi` included, which is what makes a subscription UE-scoped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bsf_subscription_create_enforces_the_four_mandatory_members() {
+        let (server, client) = start_bsf().await;
+        let full = bsf_sub_doc(
+            "http://127.0.0.1:9/cb",
+            "imsi-1",
+            &["PCF_PDU_SESSION_BINDING_REGISTRATION"],
+        );
+
+        for member in ["notifUri", "notifCorreId", "supi", "events"] {
+            let mut doc = full.clone();
+            doc.as_object_mut().expect("obj").remove(member);
+            let resp = client
+                .post_json("/nbsf-management/v1/subscriptions", &doc)
+                .await
+                .expect("POST");
+            assert_eq!(
+                resp.status, 400,
+                "{member} is mandatory per TS 29.521 BsfSubscription"
+            );
+            assert!(
+                resp.http.content.as_deref().unwrap_or("").contains(member),
+                "the 400 must name the missing member {member}"
+            );
+        }
+
+        // A relative notifUri could never be POSTed to, so it is refused at
+        // ingress rather than failing silently at every notification.
+        let mut doc = full.clone();
+        doc["notifUri"] = json!("/relative/cb");
+        assert_eq!(
+            client
+                .post_json("/nbsf-management/v1/subscriptions", &doc)
+                .await
+                .expect("POST")
+                .status,
+            400
+        );
+
+        // A subscription naming only events this BSF cannot emit is refused,
+        // because it could never fire...
+        let mut doc = full.clone();
+        doc["events"] = json!(["SNSSAI_DNN_BINDING_REGISTRATION"]);
+        assert_eq!(
+            client
+                .post_json("/nbsf-management/v1/subscriptions", &doc)
+                .await
+                .expect("POST")
+                .status,
+            400
+        );
+        // ...but an UNRECOGNISED token alongside a reportable one is accepted:
+        // BsfEvent is an anyOf over the enum plus a free-form string.
+        let mut doc = full.clone();
+        doc["events"] = json!(["PCF_PDU_SESSION_BINDING_REGISTRATION", "A_FUTURE_EVENT"]);
+        assert_eq!(
+            client
+                .post_json("/nbsf-management/v1/subscriptions", &doc)
+                .await
+                .expect("POST")
+                .status,
+            201
         );
 
         server.stop().await.expect("server stops");
+    }
+
+    /// #98 criterion 4: subscribe → register → **notify** round-trip, and
+    /// deregister too, observed at a real stub callback.
+    ///
+    /// Drives the real binding handlers through the real router and reads what
+    /// arrives at the consumer, rather than asserting the notifier was called.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_register_deregister_delivers_notifications() {
+        let (server, client) = start_bsf().await;
+
+        // A stub consumer that records every BsfNotification. Handed back so the
+        // caller keeps the listener alive, and polled until the port accepts.
+        let recorded: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&recorded);
+        let cb_addr = ephemeral_addr();
+        let cb = SbiServer::new(NextgcoreSbiServerConfig::new(cb_addr));
+        cb.start(move |req: SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                if let Some(body) = req.http.content.as_deref() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(v);
+                    }
+                }
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("callback server starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(cb_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let notif_uri = format!("http://127.0.0.1:{}/bsf-notify", cb_addr.port());
+
+        let supi = "imsi-001010000000099";
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/subscriptions",
+                &bsf_sub_doc(
+                    &notif_uri,
+                    supi,
+                    &[
+                        "PCF_PDU_SESSION_BINDING_REGISTRATION",
+                        "PCF_PDU_SESSION_BINDING_DEREGISTRATION",
+                    ],
+                ),
+            )
+            .await
+            .expect("POST subscription");
+        assert_eq!(resp.status, 201);
+
+        // Register a binding for that SUPI.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "supi": supi,
+                    "ipv4Addr": "10.98.0.1",
+                    "dnn": "internet",
+                    "snssai": {"sst": 98},
+                    "pcfFqdn": "pcf98.example.com",
+                    "pcfIpEndPoints": [{"ipv4Address": "10.0.0.98", "port": 7777}],
+                    // An expiry IS supplied so the assertion below is anchored:
+                    // without one, `sess.expiry` is None and "no expiry in the
+                    // response" would hold even with the bespoke insertion
+                    // restored. The revert pass caught exactly that.
+                    "expiry": "2030-01-01T00:00:00Z"
+                }),
+            )
+            .await
+            .expect("POST binding");
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        // #98: the bespoke non-spec `expiry` is gone from PcfBinding responses —
+        // TS 29.521 puts `expiry` on the SUBSCRIPTION resource, not on PcfBinding.
+        // The value is still honoured for the TTL timer, just not emitted here.
+        assert!(
+            created.get("expiry").is_none(),
+            "PcfBinding has no `expiry` in TS 29.521; got {created}"
+        );
+        let binding_id = resp
+            .http
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .and_then(|(_, v)| v.rsplit('/').next().map(str::to_string))
+            .expect("Location");
+
+        let mut got = Vec::new();
+        for _ in 0..150 {
+            got = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(got.len(), 1, "registration must notify the subscriber once");
+        let n = &got[0];
+        // BsfNotification's oneOf: notifCorreId AND eventNotifs together.
+        assert_eq!(n["notifCorreId"], "corr-98");
+        let evs = n["eventNotifs"].as_array().expect("eventNotifs array");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0]["event"], "PCF_PDU_SESSION_BINDING_REGISTRATION");
+        // The binding identity, so a consumer can tell WHICH PCF now serves it.
+        assert_eq!(evs[0]["pcfForPduSessInfos"][0]["dnn"], "internet");
+        assert_eq!(evs[0]["pcfForPduSessInfos"][0]["snssai"]["sst"], 98);
+        assert_eq!(
+            evs[0]["pcfForPduSessInfos"][0]["pcfFqdn"],
+            "pcf98.example.com"
+        );
+
+        // Deregister -> the second notification.
+        let resp = client
+            .delete(&format!("/nbsf-management/v1/pcfBindings/{binding_id}"))
+            .await
+            .expect("DELETE binding");
+        assert_eq!(resp.status, 204);
+        let mut got = Vec::new();
+        for _ in 0..150 {
+            got = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if got.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(got.len(), 2, "deregistration must notify too");
+        assert_eq!(
+            got[1]["eventNotifs"][0]["event"],
+            "PCF_PDU_SESSION_BINDING_DEREGISTRATION"
+        );
+
+        cb.stop().await.expect("callback stops");
+        server.stop().await.expect("server stops");
+    }
+
+    /// A subscription is UE-scoped: a binding for a DIFFERENT SUPI must not be
+    /// reported to it, or one UE's binding activity leaks to a consumer watching
+    /// another.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notifications_are_scoped_to_the_subscribed_supi_and_event() {
+        bsf_context_init(1024);
+        let ctx = bsf_self();
+        if let Ok(c) = ctx.read() {
+            c.subscription_add(context::BsfSubscription {
+                sub_id: "sub-98s".to_string(),
+                notif_uri: "http://127.0.0.1:9/cb".to_string(),
+                notif_corre_id: "corr".to_string(),
+                supi: "imsi-watched".to_string(),
+                events: vec!["PCF_PDU_SESSION_BINDING_REGISTRATION".to_string()],
+                expiry: None,
+                raw: json!({}),
+            });
+        }
+        let wanting = |event: &str, supi: Option<&str>| {
+            ctx.read()
+                .map(|c| c.subscriptions_wanting(event, supi).len())
+                .unwrap_or(0)
+        };
+
+        assert_eq!(
+            wanting("PCF_PDU_SESSION_BINDING_REGISTRATION", Some("imsi-watched")),
+            1
+        );
+        assert_eq!(
+            wanting("PCF_PDU_SESSION_BINDING_REGISTRATION", Some("imsi-other")),
+            0,
+            "another UE's binding must not reach this subscriber"
+        );
+        assert_eq!(
+            wanting(
+                "PCF_PDU_SESSION_BINDING_DEREGISTRATION",
+                Some("imsi-watched")
+            ),
+            0,
+            "an event this subscription did not ask for must not match"
+        );
+        assert_eq!(
+            wanting("PCF_PDU_SESSION_BINDING_REGISTRATION", None),
+            0,
+            "a binding with no SUPI must not match a SUPI-scoped subscription"
+        );
+
+        // An expired subscription stops matching.
+        if let Ok(c) = ctx.read() {
+            let mut s = c.subscription_get("sub-98s").expect("there");
+            s.expiry = Some(nextgcore_sbi::datetime::epoch_to_rfc3339(
+                nextgcore_sbi::datetime::now_epoch_secs().saturating_sub(10),
+            ));
+            c.subscription_add(s);
+        }
+        assert_eq!(
+            wanting("PCF_PDU_SESSION_BINDING_REGISTRATION", Some("imsi-watched")),
+            0,
+            "an expired subscription must not be notified"
+        );
+
+        if let Ok(c) = ctx.read() {
+            c.subscription_remove("sub-98s");
+        }
+        drop(ctx);
+    }
+
+    /// The notification URI splitter handles the forms a consumer may send.
+    #[test]
+    fn notify_uri_split_handles_default_ports_and_paths() {
+        assert_eq!(
+            split_notify_uri("http://host:8080/cb/x"),
+            Some(("host".to_string(), 8080, "/cb/x".to_string()))
+        );
+        // No explicit port: the scheme's default, so a consumer that omits :80
+        // is still reachable rather than silently dropped.
+        assert_eq!(
+            split_notify_uri("http://host/cb"),
+            Some(("host".to_string(), 80, "/cb".to_string()))
+        );
+        assert_eq!(
+            split_notify_uri("https://host/cb"),
+            Some(("host".to_string(), 443, "/cb".to_string()))
+        );
+        // No path at all: root.
+        assert_eq!(
+            split_notify_uri("http://host:9"),
+            Some(("host".to_string(), 9, "/".to_string()))
+        );
+        // Not an absolute http(s) URI.
+        assert_eq!(split_notify_uri("/relative"), None);
+        assert_eq!(split_notify_uri("ftp://host/x"), None);
     }
 }
