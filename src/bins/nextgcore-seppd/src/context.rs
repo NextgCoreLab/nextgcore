@@ -596,6 +596,25 @@ pub fn sepp_self() -> Arc<RwLock<SeppContext>> {
 }
 
 /// Initialize the global SEPP context
+/// Serializes every test that touches this crate's process-global state: the SEPP
+/// context (`sender`, the peer/node list), the N32-c TLS exporter-secret store, and
+/// the `allow_insecure_no_tls` flag.
+///
+/// ONE lock for all of it, across modules, on purpose. #100 first added a
+/// per-module lock in `n32c_handler` and another in `n32_server`, and they still
+/// raced — both write `context.sender`, so two locks are two disjoint agreements
+/// about the same variable. A single lock is the only arrangement that cannot be
+/// half-taken.
+#[cfg(test)]
+pub static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`GLOBAL_TEST_LOCK`], ignoring poisoning so one panicking test does not
+/// cascade into spurious failures elsewhere.
+#[cfg(test)]
+pub fn lock_global_test_state() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn sepp_context_init(max_node: usize, max_assoc: usize) {
     let ctx = sepp_self();
     if let Ok(mut context) = ctx.write() {

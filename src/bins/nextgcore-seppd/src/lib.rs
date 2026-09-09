@@ -13,11 +13,11 @@ pub mod jose;
 pub mod n32_server;
 pub mod n32c_build;
 pub mod n32c_handler;
-pub mod pqc_security;
 pub mod prins;
 pub mod sbi_path;
 pub mod sbi_response;
 pub mod sepp_sm;
+pub mod telescopic;
 pub mod timer;
 
 // Re-export specific items to avoid ambiguous glob re-exports

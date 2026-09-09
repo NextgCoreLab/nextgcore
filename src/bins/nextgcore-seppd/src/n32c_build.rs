@@ -170,9 +170,23 @@ pub fn build_security_capability_sbi_request(
 pub struct SecurityCapabilityRequestJson {
     pub sender: String,
     pub supported_sec_capability_list: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "3gppSbiTargetApiRootSupported")]
-    pub target_apiroot_supported: Option<i32>,
+    /// `3GppSbiTargetApiRootSupported` — capital G, JSON **boolean**, `default:
+    /// false` (`TS29573_N32_Handshake.yaml:340-342`). The spec's own comment notes
+    /// the name breaks TS 29.501's naming convention and is kept for backward
+    /// compatibility, so the casing is not ours to normalise.
+    ///
+    /// This was `rename = "3gppSbiTargetApiRootSupported"` typed `Option<i32>`. Both
+    /// halves were wrong, and the type was the worse one: deserialising a JSON
+    /// `true` into an `i32` is a serde **type error**, which aborts the whole
+    /// `SecNegotiateReqData` parse and rejects the handshake — precisely when the
+    /// peer DOES support target-apiRoot forwarding. `#[serde(default)]` does not
+    /// rescue it, because a default applies to an absent field, not a mismatched one.
+    ///
+    /// Always serialised, never skipped: an explicit `false` equals the schema
+    /// default, and emitting the member unconditionally means a peer never has to
+    /// infer our capability from an absence.
+    #[serde(default, rename = "3GppSbiTargetApiRootSupported")]
+    pub target_apiroot_supported: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plmn_id_list: Vec<PlmnIdJson>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,11 +210,7 @@ impl From<&SecNegotiateReqData> for SecurityCapabilityRequestJson {
                 .iter()
                 .map(|c| c.to_string().to_string())
                 .collect(),
-            target_apiroot_supported: if data.target_apiroot_supported {
-                Some(1)
-            } else {
-                None
-            },
+            target_apiroot_supported: data.target_apiroot_supported,
             plmn_id_list: data
                 .plmn_id_list
                 .iter()
@@ -231,9 +241,10 @@ impl From<&SecNegotiateReqData> for SecurityCapabilityRequestJson {
 pub struct SecurityCapabilityResponseJson {
     pub sender: String,
     pub selected_sec_capability: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "3gppSbiTargetApiRootSupported")]
-    pub target_apiroot_supported: Option<i32>,
+    /// `3GppSbiTargetApiRootSupported` (`yaml:389-391`) — see the request struct's
+    /// field for why the name and type both had to change.
+    #[serde(default, rename = "3GppSbiTargetApiRootSupported")]
+    pub target_apiroot_supported: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plmn_id_list: Vec<PlmnIdJson>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -245,11 +256,7 @@ impl From<&SecNegotiateRspData> for SecurityCapabilityResponseJson {
         Self {
             sender: data.sender.clone(),
             selected_sec_capability: data.selected_sec_capability.to_string().to_string(),
-            target_apiroot_supported: if data.target_apiroot_supported {
-                Some(1)
-            } else {
-                None
-            },
+            target_apiroot_supported: data.target_apiroot_supported,
             plmn_id_list: data
                 .plmn_id_list
                 .iter()
@@ -348,6 +355,110 @@ pub fn parse_n32f_message(json_bytes: &[u8]) -> Result<N32fMessage, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #100 anchor, emit side: the capability goes on the wire as
+    /// `3GppSbiTargetApiRootSupported` (capital G) with a JSON **boolean**, never
+    /// `0`/`1` and never under the lowercase name.
+    ///
+    /// Asserted against the serialized text rather than the struct, because the
+    /// struct field name is ours and the wire name is the spec's — only the text
+    /// pins the rename.
+    #[test]
+    fn the_target_apiroot_capability_is_a_boolean_under_the_capital_g_name() {
+        for supported in [true, false] {
+            let data = SecNegotiateReqData {
+                sender: "sepp.local.example.com".to_string(),
+                supported_sec_capability_list: vec![SecurityCapability::Tls],
+                target_apiroot_supported: supported,
+                plmn_id_list: vec![],
+                target_plmn_id: None,
+                supported_features: None,
+            };
+            let json = serde_json::to_string(&SecurityCapabilityRequestJson::from(&data)).unwrap();
+            assert!(
+                json.contains(&format!("\"3GppSbiTargetApiRootSupported\":{supported}")),
+                "expected the capital-G name with a boolean {supported}; got {json}"
+            );
+            assert!(
+                !json.contains("3gppSbiTargetApiRootSupported"),
+                "the lowercase name is not the spec member; got {json}"
+            );
+            for wrong in [":1", ":0", ":\"true\"", ":\"false\""] {
+                assert!(
+                    !json.contains(&format!("\"3GppSbiTargetApiRootSupported\"{wrong}")),
+                    "the value must be a JSON boolean, not {wrong}; got {json}"
+                );
+            }
+        }
+    }
+
+    /// Same, on the response leg (`yaml:389-391`).
+    #[test]
+    fn the_response_capability_is_also_a_boolean_under_the_capital_g_name() {
+        let data = SecNegotiateRspData {
+            sender: "sepp.local.example.com".to_string(),
+            selected_sec_capability: SecurityCapability::Prins,
+            target_apiroot_supported: true,
+            plmn_id_list: vec![],
+            supported_features: None,
+        };
+        let json = serde_json::to_string(&SecurityCapabilityResponseJson::from(&data)).unwrap();
+        assert!(
+            json.contains("\"3GppSbiTargetApiRootSupported\":true"),
+            "got {json}"
+        );
+        assert!(
+            !json.contains("3gppSbiTargetApiRootSupported"),
+            "got {json}"
+        );
+    }
+
+    /// #100 anchor, accept side: a conformant peer's boolean `true` deserialises and
+    /// reads as capability-supported. This is the regression — it previously failed
+    /// with a serde **type error** against `Option<i32>`, aborting the whole
+    /// `SecNegotiateReqData` parse and rejecting the handshake in exactly the case
+    /// where the peer DOES support target-apiRoot forwarding.
+    #[test]
+    fn a_conformant_boolean_capability_deserialises_and_reads_as_supported() {
+        let body = r#"{"sender":"sepp.peer.example.com",
+            "supportedSecCapabilityList":["TLS"],
+            "3GppSbiTargetApiRootSupported":true}"#;
+        let json: SecurityCapabilityRequestJson =
+            serde_json::from_str(body).expect("a boolean true must deserialise, not type-error");
+        assert!(json.target_apiroot_supported);
+
+        let body = r#"{"sender":"sepp.peer.example.com",
+            "supportedSecCapabilityList":["TLS"],
+            "3GppSbiTargetApiRootSupported":false}"#;
+        let json: SecurityCapabilityRequestJson = serde_json::from_str(body).unwrap();
+        assert!(!json.target_apiroot_supported);
+
+        // And on the response leg.
+        let body = r#"{"sender":"sepp.peer.example.com","selectedSecCapability":"PRINS",
+            "3GppSbiTargetApiRootSupported":true}"#;
+        let json: SecurityCapabilityResponseJson = serde_json::from_str(body).unwrap();
+        assert!(json.target_apiroot_supported);
+    }
+
+    /// An absent capability flag is `false` (the schema's `default: false`), without
+    /// an error — and the **lowercase** spelling this SEPP used to emit is NOT
+    /// silently honoured, or a peer running the old code would appear conformant.
+    #[test]
+    fn an_absent_capability_defaults_to_false_and_the_old_lowercase_name_is_ignored() {
+        let body = r#"{"sender":"sepp.peer.example.com","supportedSecCapabilityList":["TLS"]}"#;
+        let json: SecurityCapabilityRequestJson =
+            serde_json::from_str(body).expect("absent flag must not error");
+        assert!(!json.target_apiroot_supported);
+
+        let legacy = r#"{"sender":"sepp.peer.example.com","supportedSecCapabilityList":["TLS"],
+            "3gppSbiTargetApiRootSupported":1}"#;
+        let json: SecurityCapabilityRequestJson =
+            serde_json::from_str(legacy).expect("an unknown member is ignored, not an error");
+        assert!(
+            !json.target_apiroot_supported,
+            "the lowercase integer form is not the spec member and must not be read"
+        );
+    }
 
     #[test]
     fn test_build_security_capability_request() {

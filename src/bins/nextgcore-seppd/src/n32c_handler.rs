@@ -206,8 +206,19 @@ pub fn handle_security_capability_response(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecParamExchReqData {
-    /// Sender FQDN
-    pub sender: String,
+    /// `sender` FQDN — **optional** (`TS29573_N32_Handshake.yaml:422-455` lists
+    /// `required: [n32fContextId]` only).
+    ///
+    /// It was a bare `String`, which made it mandatory twice over: serde failed the
+    /// whole parse when the member was absent, and the handler additionally refused
+    /// an empty one with `MANDATORY_IE_INCORRECT` → 400. A spec-valid
+    /// `exchange-params` request that simply omits it was over-rejected.
+    ///
+    /// When absent, the peer's FQDN is taken from the N32-c association the request
+    /// arrived on (`node.receiver`) — which is who the sender must be anyway, so the
+    /// fallback is not a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
     /// N32-f context ID allocated by the requester
     pub n32f_context_id: String,
     /// Supported JWE cipher suites, preference-ordered
@@ -238,8 +249,13 @@ pub struct SecParamExchReqData {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecParamExchRspData {
-    /// Sender FQDN
-    pub sender: String,
+    /// `sender` FQDN — **optional**, same as the request (`SecParamExchRspData`
+    /// lists `required: [n32fContextId]` only). Fixed alongside the request because
+    /// it is the identical defect on the mirror path: leaving it mandatory would
+    /// still fail parameter exchange against a conformant peer, just on the response
+    /// leg instead of the request leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
     /// N32-f context ID allocated by the responder
     pub n32f_context_id: String,
     /// Selected JWE cipher suite
@@ -701,15 +717,19 @@ pub fn handle_exchange_params_request(
     node: &mut SeppNode,
     req: &SecParamExchReqData,
 ) -> Result<SecParamExchRspData, String> {
-    if req.sender.is_empty() {
-        return Err("No SecParamExchReqData.sender".to_string());
-    }
-    if req.sender != node.receiver {
-        return Err(format!(
-            "FQDN mismatch: expected [{}], got [{}]",
-            node.receiver, req.sender
-        ));
-    }
+    // `sender` is optional: absent means "the peer this association is with".
+    // Present-and-different is still a mismatch, because a body naming a third party
+    // on an established association is either misrouted or an impersonation attempt.
+    let sender = match req.sender.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) if s != node.receiver => {
+            return Err(format!(
+                "FQDN mismatch: expected [{}], got [{s}]",
+                node.receiver
+            ));
+        }
+        Some(s) => s.to_string(),
+        None => node.receiver.clone(),
+    };
     if node.negotiated_security_scheme != SecurityCapability::Prins {
         return Err("exchange-params requires negotiated PRINS".to_string());
     }
@@ -725,7 +745,7 @@ pub fn handle_exchange_params_request(
 
     // Register the requester's ES256 modifications-signing public key so we
     // can verify its modificationsBlock entries (TS 33.501 §13.2.4.6).
-    register_peer_ipx_sec_info(&req.sender, req.ipx_provider_sec_info_list.as_deref())?;
+    register_peer_ipx_sec_info(&sender, req.ipx_provider_sec_info_list.as_deref())?;
 
     // TS 33.501 §13.2.4.4.1: derive the full N32-f key hierarchy from the
     // 64-octet N32 master (RFC 5705 exporter). The requester is the N32-c
@@ -733,7 +753,7 @@ pub fn handle_exchange_params_request(
     // messages we originate. The canonical context ID `{initiator}-{responder}`
     // makes both peers derive identical material.
     let master = resolve_exporter_secret(
-        &req.sender,
+        &sender,
         &req.n32f_context_id,
         &local_context_id,
         allow_insecure_no_tls(),
@@ -771,7 +791,7 @@ pub fn handle_exchange_params_request(
 
     let local_ipx = local_ipx_provider_sec_info(&local_fqdn);
     Ok(SecParamExchRspData {
-        sender: local_fqdn,
+        sender: Some(local_fqdn),
         n32f_context_id: local_context_id,
         selected_jwe_cipher_suite: jwe,
         selected_jws_cipher_suite: jws,
@@ -788,15 +808,17 @@ pub fn handle_exchange_params_response(
     sent_req: &SecParamExchReqData,
     rsp: &SecParamExchRspData,
 ) -> Result<(), String> {
-    if rsp.sender.is_empty() {
-        return Err("No SecParamExchRspData.sender".to_string());
-    }
-    if rsp.sender != node.receiver {
-        return Err(format!(
-            "FQDN mismatch: expected [{}], got [{}]",
-            node.receiver, rsp.sender
-        ));
-    }
+    // Optional `sender`, same rule as the request leg.
+    let sender = match rsp.sender.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) if s != node.receiver => {
+            return Err(format!(
+                "FQDN mismatch: expected [{}], got [{s}]",
+                node.receiver
+            ));
+        }
+        Some(s) => s.to_string(),
+        None => node.receiver.clone(),
+    };
     if !SUPPORTED_JWE_SUITES.contains(&rsp.selected_jwe_cipher_suite.as_str()) {
         return Err(format!(
             "Peer selected unsupported JWE suite [{}]",
@@ -812,7 +834,7 @@ pub fn handle_exchange_params_response(
 
     // Register the responder's ES256 modifications-signing public key so we
     // can verify its modificationsBlock entries (TS 33.501 §13.2.4.6).
-    register_peer_ipx_sec_info(&rsp.sender, rsp.ipx_provider_sec_info_list.as_deref())?;
+    register_peer_ipx_sec_info(&sender, rsp.ipx_provider_sec_info_list.as_deref())?;
 
     // TS 33.501 §13.2.4.4.1: derive the full N32-f key hierarchy from the
     // 64-octet N32 master (RFC 5705 exporter). We (the request sender) are the
@@ -820,7 +842,7 @@ pub fn handle_exchange_params_response(
     // we originate. The canonical context ID `{initiator}-{responder}` makes
     // both peers derive identical material.
     let master = resolve_exporter_secret(
-        &rsp.sender,
+        &sender,
         &sent_req.n32f_context_id,
         &rsp.n32f_context_id,
         allow_insecure_no_tls(),
@@ -1262,7 +1284,7 @@ mod tests {
         let mut node_b = SeppNode::new(30, "sepp-hs256.example.com");
         node_b.negotiated_security_scheme = SecurityCapability::Prins;
         let req = SecParamExchReqData {
-            sender: "sepp-hs256.example.com".to_string(),
+            sender: Some("sepp-hs256.example.com".to_string()),
             n32f_context_id: "ctx".to_string(),
             jwe_cipher_suite_list: vec!["A256GCM".to_string()],
             jws_cipher_suite_list: vec!["HS256".to_string()], // no ES256
@@ -1280,6 +1302,7 @@ mod tests {
     /// output).
     #[test]
     fn test_jwe_suite_negotiates_a128gcm() {
+        let _g = crate::context::lock_global_test_state();
         set_allow_insecure_no_tls(true);
         {
             let ctx = sepp_self();
@@ -1289,7 +1312,7 @@ mod tests {
         let mut node_b = SeppNode::new(31, "sepp-a128.example.com");
         node_b.negotiated_security_scheme = SecurityCapability::Prins;
         let req = SecParamExchReqData {
-            sender: "sepp-a128.example.com".to_string(),
+            sender: Some("sepp-a128.example.com".to_string()),
             n32f_context_id: "a128ctx".to_string(),
             jwe_cipher_suite_list: vec!["A128GCM".to_string()],
             jws_cipher_suite_list: vec!["ES256".to_string()],
@@ -1311,6 +1334,7 @@ mod tests {
     /// N32-f session key (TS 33.501 §13.2.4.4).
     #[test]
     fn test_exchange_params_tls_exporter_key_agreement() {
+        let _g = crate::context::lock_global_test_state();
         {
             let ctx = sepp_self();
             let mut context = ctx.write().unwrap();
@@ -1325,7 +1349,7 @@ mod tests {
         // A builds the request, carrying its ES256 signing pubkey.
         let a_ctx_id = crate::prins::generate_n32f_context_id();
         let req = SecParamExchReqData {
-            sender: "sepp-a.example.com".to_string(),
+            sender: Some("sepp-a.example.com".to_string()),
             n32f_context_id: a_ctx_id.clone(),
             jwe_cipher_suite_list: vec!["A256GCM".to_string()],
             jws_cipher_suite_list: vec!["ES256".to_string()],
@@ -1371,8 +1395,81 @@ mod tests {
         );
     }
 
+    /// #100: an `exchange-params` request that OMITS `sender` is accepted end to end
+    /// by the handler — `sender` is optional (`required: [n32fContextId]` only), and
+    /// this used to be refused with `MANDATORY_IE_INCORRECT` → 400 twice over: once
+    /// by serde on the bare `String`, once by an explicit empty-string check.
+    ///
+    /// Also pins what the absence falls back TO. With the no-TLS fallback DISABLED,
+    /// key derivation succeeds only if an N32-c exporter secret is found under the
+    /// peer FQDN — so depositing one solely under the association's FQDN and watching
+    /// the omitted-sender request succeed proves the fallback resolved to that FQDN
+    /// and not to something else. A fallback that used some other FQDN would produce
+    /// a handshake that "succeeds" and then cannot decrypt anything.
+    #[test]
+    fn exchange_params_accepts_an_omitted_sender_and_uses_the_association_fqdn() {
+        let _g = crate::context::lock_global_test_state();
+        {
+            let ctx = sepp_self();
+            let mut context = ctx.write().unwrap();
+            context.set_sender("sepp.local.example.com");
+        }
+        let base = SecParamExchReqData {
+            sender: None,
+            n32f_context_id: "00cd00cd00cd00cd".to_string(),
+            jwe_cipher_suite_list: vec!["A256GCM".to_string()],
+            jws_cipher_suite_list: vec!["ES256".to_string()],
+            protection_policy_info: None,
+            sec_profiles: None,
+            ipx_provider_sec_info_list: None,
+            sender_api_root: None,
+        };
+
+        // Strict: no exporter secret means no key hierarchy, so a secret found is
+        // proof of which FQDN was looked up.
+        set_allow_insecure_no_tls(false);
+        set_n32c_tls_exporter_secret("sepp-nosender.example.com", vec![0x5a; 64]);
+        let mut node_absent = SeppNode::new(21, "sepp-nosender.example.com");
+        node_absent.negotiated_security_scheme = SecurityCapability::Prins;
+        let rsp = handle_exchange_params_request(&mut node_absent, &base)
+            .expect("an omitted sender must be accepted and resolve to the association FQDN");
+        assert_eq!(rsp.selected_jws_cipher_suite, "ES256");
+
+        // Discriminating half: with the secret deposited under a DIFFERENT FQDN, the
+        // same request must fail — otherwise the assertion above would pass for an
+        // implementation that resolves the peer to anything at all.
+        set_n32c_tls_exporter_secret("sepp-somewhere-else.example.com", vec![0x5a; 64]);
+        let mut node_wrong = SeppNode::new(24, "sepp-nosender.example.com");
+        node_wrong.negotiated_security_scheme = SecurityCapability::Prins;
+        let err = handle_exchange_params_request(&mut node_wrong, &base).unwrap_err();
+        assert!(err.contains("UNAVAILABLE_PRINS_CONTEXT"), "got {err}");
+
+        // An explicit sender equal to the association FQDN behaves identically.
+        set_allow_insecure_no_tls(true);
+        let mut node_explicit = SeppNode::new(22, "sepp-nosender.example.com");
+        node_explicit.negotiated_security_scheme = SecurityCapability::Prins;
+        let explicit = SecParamExchReqData {
+            sender: Some("sepp-nosender.example.com".to_string()),
+            ..base.clone()
+        };
+        handle_exchange_params_request(&mut node_explicit, &explicit)
+            .expect("an explicit sender is still accepted");
+
+        // A sender naming a THIRD party on this association is still a mismatch: it
+        // is either misrouted or an impersonation attempt.
+        let mut node_other = SeppNode::new(23, "sepp-nosender.example.com");
+        node_other.negotiated_security_scheme = SecurityCapability::Prins;
+        let impostor = SecParamExchReqData {
+            sender: Some("sepp-elsewhere.example.com".to_string()),
+            ..base.clone()
+        };
+        let err = handle_exchange_params_request(&mut node_other, &impostor).unwrap_err();
+        assert!(err.contains("FQDN mismatch"), "got {err}");
+    }
+
     #[test]
     fn test_exchange_params_accepts_missing_ipx_sec_info() {
+        let _g = crate::context::lock_global_test_state();
         // ipxProviderSecInfoList is OPTIONAL (only n32fContextId is mandatory in
         // SecParamExchReqData, TS 29.573 §6.1.5.2.4); its absence must NOT reject
         // the handshake.
@@ -1385,7 +1482,7 @@ mod tests {
         let mut node_b = SeppNode::new(13, "sepp-noipx.example.com");
         node_b.negotiated_security_scheme = SecurityCapability::Prins;
         let req = SecParamExchReqData {
-            sender: "sepp-noipx.example.com".to_string(),
+            sender: Some("sepp-noipx.example.com".to_string()),
             n32f_context_id: "00ab00ab00ab00ab".to_string(),
             jwe_cipher_suite_list: vec!["A256GCM".to_string()],
             jws_cipher_suite_list: vec!["ES256".to_string()],
@@ -1479,7 +1576,7 @@ mod tests {
         let mut node_b = SeppNode::new(12, "sepp-a.example.com");
         node_b.negotiated_security_scheme = SecurityCapability::Prins;
         let req = SecParamExchReqData {
-            sender: "sepp-a.example.com".to_string(),
+            sender: Some("sepp-a.example.com".to_string()),
             n32f_context_id: "ctx".to_string(),
             jwe_cipher_suite_list: vec!["A128CBC-HS256".to_string()],
             jws_cipher_suite_list: vec!["ES256".to_string()],
@@ -1535,6 +1632,7 @@ mod tests {
     /// never touches the shared TLS-exporter store of the other handshake tests.
     #[test]
     fn test_exchange_params_responder_drives_profiles_from_negotiated_policy() {
+        let _g = crate::context::lock_global_test_state();
         // No TLS exporter is deposited for this peer; enable the lab fallback.
         set_allow_insecure_no_tls(true);
         {
@@ -1547,7 +1645,7 @@ mod tests {
         peer_policy.data_type_enc_policy = Some(vec![IeType::Ueid]);
 
         let req = SecParamExchReqData {
-            sender: "sepp-neg-peer.example.com".to_string(),
+            sender: Some("sepp-neg-peer.example.com".to_string()),
             n32f_context_id: "00aa11bb22cc33dd".to_string(),
             jwe_cipher_suite_list: vec!["A256GCM".to_string()],
             jws_cipher_suite_list: vec!["ES256".to_string()],
@@ -1594,7 +1692,7 @@ mod tests {
     #[test]
     fn test_sec_param_exch_req_serialization_is_spec_shaped() {
         let req = SecParamExchReqData {
-            sender: "sepp-a.example.com".to_string(),
+            sender: Some("sepp-a.example.com".to_string()),
             n32f_context_id: "0011223344556677".to_string(),
             jwe_cipher_suite_list: vec!["A256GCM".to_string()],
             jws_cipher_suite_list: vec!["ES256".to_string()],
