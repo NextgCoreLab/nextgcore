@@ -10,6 +10,7 @@
 //! from the YAML config.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -183,6 +184,15 @@ pub struct EasdfDnsContext {
     /// the SMF's callback member in the create body; without it a rule asking for
     /// a report has nowhere to send one.
     pub notify_uri: Option<String>,
+    /// The UE's own IP address(es) for this PDU session (#276).
+    ///
+    /// Needed only by the UDP/53 plane, and needed absolutely there: a DNS query
+    /// arriving on a socket carries no context id, so the **source address** is
+    /// the only thing that can associate it with a session. Without this a UDP
+    /// query can be answered from the static EAS map and from nothing else, which
+    /// makes the per-session handling rules #114 added unreachable over the one
+    /// transport a resolver actually speaks.
+    pub ue_addresses: Vec<IpAddr>,
 }
 
 impl EasdfDnsContext {
@@ -194,6 +204,7 @@ impl EasdfDnsContext {
             raw: raw.into(),
             handling_rules: Vec::new(),
             notify_uri: None,
+            ue_addresses: Vec::new(),
         }
     }
 
@@ -232,8 +243,68 @@ impl EasdfDnsContext {
         .find_map(|k| body.get(*k).and_then(|v| v.as_str()))
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+        self.ue_addresses = parse_ue_addresses(body);
         self
     }
+}
+
+/// Pull the UE's IP address(es) out of a DnsContext body (#276).
+///
+/// Same multi-spelling stance as the rules, and for the same reason: TS 29.556 is
+/// not vendored here, so `ueIpv4Address` / `ueIpv6Address` / `ueIpAddress` are all
+/// accepted, singly or as arrays. An unparseable address is **skipped with a
+/// warn** rather than failing the create: a context with no usable UE address is
+/// still a working context for the SBI shim, and refusing it would turn a
+/// cosmetic SMF bug into a session-establishment failure.
+///
+/// An IPv6 *prefix* (`ueIpv6Prefix`, e.g. `2001:db8::/64`) is deliberately NOT
+/// accepted. Matching a source address against a prefix is a different operation
+/// from an exact-address lookup, and implementing it as "take the network address
+/// and hope the UE uses ::1" would answer for one address out of 2^64. Stated
+/// here rather than silently dropped; the UDP plane's ceilings say the same.
+fn parse_ue_addresses(body: &serde_json::Value) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    let mut push = |raw: &str| {
+        if raw.is_empty() {
+            return;
+        }
+        match raw.parse::<IpAddr>() {
+            Ok(ip) => {
+                if !out.contains(&ip) {
+                    out.push(ip);
+                }
+            }
+            Err(_) => log::warn!(
+                "DNS context carries an unparseable UE address '{raw}'; \
+                 UDP queries from that UE will not be scoped to this context"
+            ),
+        }
+    };
+    for key in [
+        "ueIpv4Address",
+        "ueIpv6Address",
+        "ueIpAddress",
+        "ueIpAddresses",
+    ] {
+        match body.get(key) {
+            Some(serde_json::Value::String(s)) => push(s),
+            Some(serde_json::Value::Array(items)) => {
+                for item in items {
+                    if let Some(s) = item.as_str() {
+                        push(s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(prefix) = body.get("ueIpv6Prefix").and_then(|v| v.as_str()) {
+        log::warn!(
+            "DNS context carries ueIpv6Prefix '{prefix}'; prefix matching is not \
+             implemented, so UDP queries from that session fall back to the static EAS map"
+        );
+    }
+    out
 }
 
 /// EASDF context errors.
@@ -274,6 +345,14 @@ pub struct EasdfContext {
     /// the fallback a query falls through to when no session context rule and no
     /// static EAS-map entry matched.
     baseline_patterns: RwLock<HashMap<String, DnsHandlingRule>>,
+    /// UE IP → DNS-context id (#276), the index the UDP plane resolves through.
+    ///
+    /// Derived from `dns_contexts` and maintained by every mutation of it, never
+    /// loaded from anywhere: this store is memory-only, so there is no snapshot
+    /// for a persisted index to disagree with. It exists because a UDP query
+    /// carries no context id and a linear scan of the context map per query would
+    /// put the cost of every DNS answer on the number of live sessions.
+    ue_ip_index: RwLock<HashMap<IpAddr, String>>,
     /// Context initialized flag
     initialized: AtomicBool,
 }
@@ -286,6 +365,7 @@ impl EasdfContext {
             miss_behavior: DnsMissBehavior::default(),
             max_dns_contexts: 0,
             baseline_patterns: RwLock::new(HashMap::new()),
+            ue_ip_index: RwLock::new(HashMap::new()),
             initialized: AtomicBool::new(false),
         }
     }
@@ -308,6 +388,9 @@ impl EasdfContext {
         }
         if let Ok(mut patterns) = self.baseline_patterns.write() {
             patterns.clear();
+        }
+        if let Ok(mut index) = self.ue_ip_index.write() {
+            index.clear();
         }
         self.eas_map.clear();
         self.miss_behavior = DnsMissBehavior::default();
@@ -403,9 +486,95 @@ impl EasdfContext {
             return Err(EasdfContextError::MaxDnsContextsReached);
         }
         let id = ctx.id.clone();
+        let addresses = ctx.ue_addresses.clone();
         contexts.insert(id.clone(), ctx);
+        self.ue_ip_index_add(&id, &addresses);
         log::debug!("EASDF DNS context inserted (id={id})");
         Ok(())
+    }
+
+    /// Point every one of `addresses` at `id` (#276).
+    ///
+    /// A collision means two contexts claim one UE address. The NEWER one wins
+    /// and the older mapping is dropped with a warn naming both ids: an SMF
+    /// assigns a UE address to exactly one live session at a time, so a collision
+    /// means the earlier context is stale (its delete was lost), and steering the
+    /// live session with a dead session's rules is the worse of the two errors.
+    /// The stale context itself is left in the map — only its claim on the address
+    /// is released — because removing a resource the SMF did not delete would make
+    /// its eventual DELETE 404.
+    fn ue_ip_index_add(&self, id: &str, addresses: &[IpAddr]) {
+        if addresses.is_empty() {
+            return;
+        }
+        let Ok(mut index) = self.ue_ip_index.write() else {
+            return;
+        };
+        for addr in addresses {
+            if let Some(previous) = index.insert(*addr, id.to_string()) {
+                if previous != id {
+                    log::warn!(
+                        "UE address {addr} was claimed by DNS context {previous} and is now \
+                         claimed by {id}; the newer context wins. The older one is stale -- \
+                         its DELETE was lost."
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drop `id`'s claim on `addresses`, leaving claims another context has taken
+    /// over intact.
+    fn ue_ip_index_remove(&self, id: &str, addresses: &[IpAddr]) {
+        if addresses.is_empty() {
+            return;
+        }
+        let Ok(mut index) = self.ue_ip_index.write() else {
+            return;
+        };
+        for addr in addresses {
+            // Conditional: after a collision the address belongs to the newer
+            // context, and this one's removal must not un-map it.
+            if index.get(addr).map(String::as_str) == Some(id) {
+                index.remove(addr);
+            }
+        }
+    }
+
+    /// The DNS context a query from `source` belongs to, if any (#276).
+    pub fn dns_context_id_for_source(&self, source: IpAddr) -> Option<String> {
+        self.ue_ip_index.read().ok()?.get(&source).cloned()
+    }
+
+    /// Number of indexed UE addresses. Exposed so a test can assert the index
+    /// does not leak entries across a replace or a remove.
+    pub fn ue_ip_index_len(&self) -> usize {
+        self.ue_ip_index.read().map(|i| i.len()).unwrap_or(0)
+    }
+
+    /// Resolve `fqdn` for a query that arrived from `source` (#276): the UDP
+    /// plane's entry point.
+    ///
+    /// Returns the outcome, whether a matching rule asked for a report, and the
+    /// context id the answer was scoped to — the caller needs the id to send the
+    /// report, and returning it here means the source lookup happens once.
+    ///
+    /// A source with no context falls through to [`Self::resolve_fqdn`] (static
+    /// map, then baseline patterns, then the miss behaviour), which is the same
+    /// answer an unscoped SBI query gets. It does NOT consult some other
+    /// session's rules — the same leak `resolve_in_context` refuses.
+    pub fn resolve_for_source(
+        &self,
+        source: IpAddr,
+        fqdn: &str,
+    ) -> (ResolveOutcome, bool, Option<String>) {
+        match self.dns_context_id_for_source(source) {
+            Some(id) => {
+                let (outcome, report) = self.resolve_in_context(&id, fqdn);
+                (outcome, report, Some(id))
+            }
+            None => (self.resolve_fqdn(fqdn), false, None),
+        }
     }
 
     /// Find a DNS context by ID.
@@ -424,14 +593,32 @@ impl EasdfContext {
             return false;
         }
         ctx.id = id.to_string();
-        contexts.insert(id.to_string(), ctx);
+        let addresses = ctx.ue_addresses.clone();
+        let superseded = contexts.insert(id.to_string(), ctx);
+        // #276: an update that CHANGES the UE address must release the old claim,
+        // or a reassigned address keeps resolving through the session that no
+        // longer holds it. Old claims are dropped first, then the new ones added,
+        // so an address present in both survives.
+        if let Some(old) = superseded {
+            let dropped: Vec<IpAddr> = old
+                .ue_addresses
+                .into_iter()
+                .filter(|a| !addresses.contains(a))
+                .collect();
+            self.ue_ip_index_remove(id, &dropped);
+        }
+        self.ue_ip_index_add(id, &addresses);
         true
     }
 
     /// Remove a DNS context by ID.
     pub fn dns_context_remove(&self, id: &str) -> Option<EasdfDnsContext> {
-        let mut contexts = self.dns_contexts.write().ok()?;
-        contexts.remove(id)
+        let removed = {
+            let mut contexts = self.dns_contexts.write().ok()?;
+            contexts.remove(id)?
+        };
+        self.ue_ip_index_remove(id, &removed.ue_addresses);
+        Some(removed)
     }
 
     /// Number of stored DNS contexts (NRF `/load` gauge source).
@@ -527,6 +714,31 @@ pub fn easdf_context_init(max_dns_contexts: usize) {
     if let Ok(mut context) = ctx.write() {
         context.init(max_dns_contexts);
     };
+}
+
+/// The ONE agreement about the process-global EASDF context, for tests.
+///
+/// It lives here, beside the global it protects, rather than in whichever module
+/// happened to need it first. #276 learned that the hard way: the UDP plane's
+/// tests started with a `tokio::Mutex` of their own while `main.rs`'s tests
+/// already had a `std::Mutex`, and two locks are two disjoint agreements about
+/// one variable. The symptom was not a flaky assertion but a HANG -- a UDP test
+/// called `easdf_context_final()` while a sibling was mid-flight, the sibling's
+/// miss became a hit, and the fake upstream it was waiting on never received a
+/// forward.
+///
+/// A `std::sync::Mutex` even though async tests hold it across awaits (they carry
+/// `#[allow(clippy::await_holding_lock)]` and say why): every holder is a test in
+/// this crate, none blocks on another, and a second `tokio` lock for the async
+/// half would recreate exactly the split this comment exists to prevent.
+#[cfg(test)]
+pub(crate) static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`GLOBAL_TEST_LOCK`], recovering from a poisoned guard so one failing
+/// test does not cascade into every sibling.
+#[cfg(test)]
+pub(crate) fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn easdf_context_final() {
@@ -693,5 +905,173 @@ mod tests {
     #[test]
     fn generated_ids_are_unique() {
         assert_ne!(dns_ctx("a").id, dns_ctx("a").id);
+    }
+
+    // ---- #276: the UE-address index the UDP plane resolves through -----------
+
+    fn ctx_for_ue(ue: &[&str], pattern: &str, eas: &str) -> EasdfDnsContext {
+        let mut c = EasdfDnsContext::new("imsi-1", 5, "{}");
+        c.handling_rules = vec![DnsHandlingRule {
+            domain_patterns: vec![pattern.to_string()],
+            eas_addresses: vec![eas.to_string()],
+            report: false,
+            forward_to: None,
+        }];
+        c.ue_addresses = ue
+            .iter()
+            .map(|a| a.parse().expect("test address"))
+            .collect();
+        c
+    }
+
+    /// A UE address is accepted in each spelling the SMF might use, singly or as
+    /// an array, and a malformed one is skipped rather than failing the create.
+    #[test]
+    fn ue_addresses_are_parsed_from_every_accepted_spelling() {
+        let both = parse_ue_addresses(&serde_json::json!({
+            "ueIpv4Address": "10.45.0.2",
+            "ueIpv6Address": "2001:db8::2",
+        }));
+        assert_eq!(
+            both,
+            vec![
+                "10.45.0.2".parse::<IpAddr>().expect("v4"),
+                "2001:db8::2".parse::<IpAddr>().expect("v6")
+            ]
+        );
+
+        assert_eq!(
+            parse_ue_addresses(&serde_json::json!({
+                "ueIpAddresses": ["10.45.0.3", "not-an-address", "10.45.0.3"]
+            })),
+            vec!["10.45.0.3".parse::<IpAddr>().expect("v4")],
+            "a malformed entry is skipped and a duplicate is not stored twice"
+        );
+
+        // An IPv6 PREFIX is deliberately not accepted: matching a source address
+        // against a prefix is a different operation, and taking the network
+        // address would answer for one address out of 2^64.
+        assert!(parse_ue_addresses(&serde_json::json!({
+            "ueIpv6Prefix": "2001:db8::/64"
+        }))
+        .is_empty());
+
+        assert!(parse_ue_addresses(&serde_json::json!({"supi": "imsi-1"})).is_empty());
+    }
+
+    /// The index is what the UDP plane resolves through, so an entry that
+    /// outlives its context would steer a reassigned UE address through a dead
+    /// session's rules. Remove and replace are both checked, because they are the
+    /// two ways an entry can be left behind.
+    #[test]
+    fn the_ue_address_index_does_not_outlive_its_context() {
+        let context = ctx_with_map(8);
+        let first = ctx_for_ue(&["10.45.0.2"], "*.edge.example.com", "10.60.0.201");
+        let id = first.id.clone();
+        context.dns_context_insert(first).expect("insert");
+        assert_eq!(context.ue_ip_index_len(), 1);
+        assert_eq!(
+            context.dns_context_id_for_source("10.45.0.2".parse().expect("v4")),
+            Some(id.clone())
+        );
+
+        // An update that MOVES the UE address must release the old claim.
+        let moved = ctx_for_ue(&["10.45.0.9"], "*.edge.example.com", "10.60.0.201");
+        assert!(context.dns_context_replace(&id, moved));
+        assert_eq!(
+            context.dns_context_id_for_source("10.45.0.2".parse().expect("v4")),
+            None,
+            "the old address must stop resolving to this context"
+        );
+        assert_eq!(
+            context.dns_context_id_for_source("10.45.0.9".parse().expect("v4")),
+            Some(id.clone())
+        );
+        assert_eq!(
+            context.ue_ip_index_len(),
+            1,
+            "the index must not grow on a move"
+        );
+
+        // Removal releases the claim.
+        assert!(context.dns_context_remove(&id).is_some());
+        assert_eq!(context.ue_ip_index_len(), 0);
+        assert_eq!(
+            context.dns_context_id_for_source("10.45.0.9".parse().expect("v4")),
+            None
+        );
+    }
+
+    /// Two contexts claiming one UE address: the newer wins, and removing the
+    /// STALE one must not un-map the live one.
+    ///
+    /// That second half is the subtle one. An unconditional `index.remove(addr)`
+    /// on delete would pass every other test here and silently break the live
+    /// session the moment the SMF got round to deleting the context whose delete
+    /// had been lost.
+    #[test]
+    fn a_colliding_ue_address_goes_to_the_newer_context_and_survives_the_stale_delete() {
+        let context = ctx_with_map(8);
+        let stale = ctx_for_ue(&["10.45.0.2"], "*.edge.example.com", "10.60.0.111");
+        let live = ctx_for_ue(&["10.45.0.2"], "*.edge.example.com", "10.60.0.222");
+        let stale_id = stale.id.clone();
+        let live_id = live.id.clone();
+        context.dns_context_insert(stale).expect("insert");
+        context.dns_context_insert(live).expect("insert");
+
+        let addr: IpAddr = "10.45.0.2".parse().expect("v4");
+        assert_eq!(
+            context.dns_context_id_for_source(addr),
+            Some(live_id.clone()),
+            "the newer context wins the address"
+        );
+
+        // The SMF finally deletes the stale context.
+        assert!(context.dns_context_remove(&stale_id).is_some());
+        assert_eq!(
+            context.dns_context_id_for_source(addr),
+            Some(live_id),
+            "deleting the STALE context must not un-map the live session"
+        );
+    }
+
+    /// End to end through the resolution entry point the UDP plane calls: the
+    /// context's rule wins for its own UE, and an unknown source gets the static
+    /// map rather than anyone's rules.
+    #[test]
+    fn resolve_for_source_scopes_to_the_sources_own_context() {
+        let context = ctx_with_map(8);
+        let a = ctx_for_ue(&["10.45.0.2"], "app.edge.example.com", "10.60.0.201");
+        let b = ctx_for_ue(&["10.45.0.3"], "app.edge.example.com", "10.60.0.202");
+        let a_id = a.id.clone();
+        context.dns_context_insert(a).expect("insert");
+        context.dns_context_insert(b).expect("insert");
+
+        let (outcome, _, id) =
+            context.resolve_for_source("10.45.0.2".parse().expect("v4"), "app.edge.example.com");
+        assert_eq!(
+            outcome,
+            ResolveOutcome::Resolved(vec!["10.60.0.201".into()])
+        );
+        assert_eq!(id.as_deref(), Some(a_id.as_str()));
+
+        let (outcome, _, id) =
+            context.resolve_for_source("10.45.0.3".parse().expect("v4"), "app.edge.example.com");
+        assert_eq!(
+            outcome,
+            ResolveOutcome::Resolved(vec!["10.60.0.202".into()])
+        );
+        assert!(id.is_some());
+
+        // No context for this source: the static map, and no context id -- so no
+        // report is attributed to a session that did not ask.
+        let (outcome, report, id) =
+            context.resolve_for_source("10.45.0.99".parse().expect("v4"), "app.edge.example.com");
+        assert_eq!(
+            outcome,
+            ResolveOutcome::Resolved(vec!["10.60.0.10".into(), "10.60.0.11".into()])
+        );
+        assert!(!report);
+        assert!(id.is_none());
     }
 }

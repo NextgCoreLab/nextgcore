@@ -14,8 +14,14 @@
 //!   `GET /neasdf-dnscontext/v1/dns-queries?fqdn=<name>` answers from a
 //!   static FQDN → EAS-address map loaded from the YAML config; a miss
 //!   either reports the configured upstream DNS server (`FORWARD`) or a
-//!   404 (`FQDN_NOT_FOUND`). Phase 1 has NO UDP/53 DNS listener — DNS
-//!   arrives over the SBI binding only.
+//!   404 (`FQDN_NOT_FOUND`).
+//! - **Edge DNS resolution over UDP/53** (#276, `dns-udp` cargo feature, off
+//!   by default): the transport a UE or stub resolver actually speaks. The
+//!   query is decoded by [`dns_wire`] (RFC 1035 + EDNS(0)), scoped to a PDU
+//!   session by the query's **source address**, answered with `A`/`AAAA`
+//!   records, forwarded verbatim to the configured upstream on a miss, or
+//!   answered `NXDOMAIN` when no upstream is configured. See [`dns_udp`] for
+//!   why this half is a cargo feature while the codec is not.
 //!
 //! Off by default: the NF exits immediately unless enabled via `--enabled`
 //! or `easdf.enabled: true` in the YAML config (and, like every NF binary,
@@ -25,8 +31,9 @@
 //! Edge Enabler Server of TS 23.558, not this 5GC NF.
 //!
 //! Deferred per issue #21 (follow-ups): SMF UL-CL / branching-point
-//! insertion, PCF traffic-influence rules, latency-aware UPF/PSA
-//! selection, and DNS message-handling-rule enforcement.
+//! insertion, PCF traffic-influence rules, and latency-aware UPF/PSA
+//! selection. (DNS message-handling-rule enforcement landed in #114; the
+//! UDP/53 listener in #276.)
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -44,6 +51,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod context;
+#[cfg(feature = "dns-udp")]
+mod dns_udp;
+mod dns_wire;
 
 pub use context::*;
 
@@ -96,6 +106,17 @@ struct Args {
     /// Maximum stored Neasdf_DNSContext resources.
     #[arg(long, default_value = "4096")]
     max_dns_contexts: usize,
+
+    /// Bind address for the DNS/UDP listener (#276, `dns-udp` feature).
+    #[cfg(feature = "dns-udp")]
+    #[arg(long, default_value = "0.0.0.0")]
+    dns_udp_addr: String,
+
+    /// Bind port for the DNS/UDP listener. 53 needs `CAP_NET_BIND_SERVICE`;
+    /// override it to run the plane on an unprivileged port behind a redirect.
+    #[cfg(feature = "dns-udp")]
+    #[arg(long, default_value = "53")]
+    dns_udp_port: u16,
 }
 
 // ─── YAML config (local serde structs, nssfd pattern) ───────────────────────
@@ -133,6 +154,13 @@ struct DnsYaml {
     /// "forward" (report `upstream` on a miss) or "nxdomain" (default).
     miss_action: Option<String>,
     upstream: Option<String>,
+    /// DNS/UDP listener overrides (#276). Present only with the `dns-udp`
+    /// feature; on a default build these keys are simply ignored, since the
+    /// config structs do not deny unknown fields.
+    #[cfg(feature = "dns-udp")]
+    udp_address: Option<String>,
+    #[cfg(feature = "dns-udp")]
+    udp_port: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -332,6 +360,42 @@ async fn main() -> Result<()> {
             },
         );
     }
+
+    // ---- #276: the DNS/UDP plane ----
+    //
+    // Started AFTER the SBI server and the NRF registration, so a DNS query can
+    // never arrive before the resolution engine's configuration is installed --
+    // answering from a half-configured EAS map would send a UE to the wrong EAS.
+    // A bind failure is FATAL, unlike the non-fatal NRF registration: the
+    // operator compiled the feature in and asked for the port, so silently
+    // running without the listener would be an EASDF that looks up and answers
+    // nothing. Port 53 needs CAP_NET_BIND_SERVICE and the failure is almost
+    // always that.
+    #[cfg(feature = "dns-udp")]
+    let _dns_udp = {
+        let dns = section.and_then(|s| s.dns.as_ref());
+        let addr = dns
+            .and_then(|d| d.udp_address.clone())
+            .unwrap_or_else(|| args.dns_udp_addr.clone());
+        let port = dns.and_then(|d| d.udp_port).unwrap_or(args.dns_udp_port);
+        let bind: SocketAddr = format!("{addr}:{port}")
+            .parse()
+            .context("Invalid DNS/UDP bind address")?;
+        let upstream = dns
+            .and_then(|d| d.upstream.as_deref())
+            .and_then(dns_udp::parse_upstream);
+        let (bound, handle) = dns_udp::spawn(dns_udp::DnsUdpConfig { bind, upstream })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to bind the DNS/UDP listener on {bind} \
+                     (port 53 needs CAP_NET_BIND_SERVICE; set easdf.dns.udp_port \
+                     or --dns-udp-port to use an unprivileged port)"
+                )
+            })?;
+        log::info!("EASDF DNS/UDP plane serving on {bound}");
+        handle
+    };
 
     log::info!("NextGCore EASDF ready (instance: {nf_instance_id})");
 
@@ -929,13 +993,13 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Serializes tests that touch the process-global EASDF context (the
-    /// context is process-global; parallel mutation flakes — CI learning).
-    static GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
-        GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    /// Serializes tests that touch the process-global EASDF context.
+    ///
+    /// The lock itself now lives in `context.rs`, beside the global it protects,
+    /// because `dns_udp`'s tests need the SAME one (#276) and a sibling module
+    /// cannot reach a static declared inside this test submodule. Re-exported
+    /// under the local name so the call sites below are unchanged.
+    use crate::context::lock_globals;
 
     /// Reset the process-global context to a fresh, initialized state with
     /// a small EAS map. Callers must hold [`lock_globals`].
@@ -1068,12 +1132,20 @@ easdf:
         assert_eq!(miss_behavior_from(None), DnsMissBehavior::NxDomain);
         // forward without upstream falls back to nxdomain.
         let dns = DnsYaml {
+            #[cfg(feature = "dns-udp")]
+            udp_address: None,
+            #[cfg(feature = "dns-udp")]
+            udp_port: None,
             miss_action: Some("forward".to_string()),
             upstream: None,
         };
         assert_eq!(miss_behavior_from(Some(&dns)), DnsMissBehavior::NxDomain);
         // unknown action is nxdomain.
         let dns = DnsYaml {
+            #[cfg(feature = "dns-udp")]
+            udp_address: None,
+            #[cfg(feature = "dns-udp")]
+            udp_port: None,
             miss_action: Some("drop".to_string()),
             upstream: Some("10.0.0.53:53".to_string()),
         };

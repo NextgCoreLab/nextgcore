@@ -10,6 +10,15 @@ description = "NextGCore EASDF (Edge Application Server Discovery Function, TS 2
 name = "nextgcore-easdfd"
 path = "src/main.rs"
 
+[features]
+# The UDP/53 DNS listener (#276). OFF by default: unlike the rest of the DNS
+# plane it binds a privileged port and changes the process's network posture, so
+# it is opt-in per the issue's own gating advice. The wire codec is NOT behind
+# this -- it is pure logic with no network posture, so it stays compiled and
+# tested in the default build. CI additionally builds and tests this crate WITH
+# the feature, so the gated half cannot rot uncompiled.
+dns-udp = []
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }

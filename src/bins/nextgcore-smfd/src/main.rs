@@ -2958,7 +2958,24 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // EASDF, because the release path would have nothing to delete. Every failure
     // inside is non-fatal: a session without edge DNS steering is still a working
     // session, and refusing it would turn an EASDF outage into a service outage.
-    let easdf_dns_context_id: Option<String> = None;
+    //
+    // #276: this line used to read `let easdf_dns_context_id = None;` under this
+    // same comment. The comment described an await that was not there, so
+    // `create_dns_context` had NO production caller -- and because the id was
+    // always None, the release path's `delete_dns_context` could never fire
+    // either. The whole SMF->EASDF leg was reachable from its own unit tests and
+    // from nothing else.
+    //
+    // The UE's IP address is passed because the EASDF cannot associate a UDP
+    // query with a session without it: a DNS datagram carries no context id, so
+    // the source address is the only correlator (#276).
+    let easdf_dns_context_id: Option<String> = easdf::create_dns_context(
+        &supi,
+        pdu_session_id,
+        &dnn,
+        std::net::Ipv4Addr::from(ue_ip_octets),
+    )
+    .await;
 
     // ---- #78: fill in the registered session, so Retrieve answers with the real
     // session rather than with whatever `sess_add_by_psi` defaulted to ----
@@ -6046,7 +6063,7 @@ mod tests {
         assert!(
             requests
                 .iter()
-                .any(|(m, p)| m == "DELETE" && p == "/neasdf-dnscontext/v1/dns-contexts/ctx-abc"),
+                .any(|(m, p, _)| m == "DELETE" && p == "/neasdf-dnscontext/v1/dns-contexts/ctx-abc"),
             "the release handler must delete the session's DNS context, got {requests:?}"
         );
 

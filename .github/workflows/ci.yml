@@ -46,6 +46,14 @@ jobs:
         # (bind-and-keep ports + one cross-crate serialize lock).
         run: cd src && (cargo test --workspace || (echo '::warning::cargo test flaked, retrying once' && cargo test --workspace))
 
+      - name: cargo test (non-default features)
+        # Feature-gated paths are invisible to the default build, so a gated
+        # module rots uncompiled -- the reason this project normally prefers a
+        # runtime switch to a cargo feature. easdfd's `dns-udp` listener (#276)
+        # has to be a feature (it binds a privileged port), so it gets an
+        # explicit build+test here instead. Add a line per gated feature.
+        run: cd src && cargo test -p nextgcore-easdfd --features dns-udp
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -63,6 +71,11 @@ jobs:
         # Gate on errors only; warnings shown but don't fail CI until the
         # tail is cleaned up incrementally. See Phase 8 follow-ups.
         run: cd src && cargo clippy --workspace
+
+      - name: cargo clippy (non-default features)
+        # Same reasoning as the test job's non-default step: a gated module is
+        # invisible to a default-feature lint. One line per gated feature.
+        run: cd src && cargo clippy -p nextgcore-easdfd --features dns-udp --all-targets
 
   fmt:
     name: Format

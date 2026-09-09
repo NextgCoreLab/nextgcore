@@ -137,7 +137,12 @@ fn should_create(cfg: Option<&EasdfConfig>) -> bool {
 /// The created context carries a DNS message-handling rule per edge FQDN pattern
 /// this DNN is configured for, each asking for a report so this SMF learns the
 /// resolved EAS address and can drive UL-CL / PSA re-selection.
-pub async fn create_dns_context(supi: &str, pdu_session_id: u8, dnn: &str) -> Option<String> {
+pub async fn create_dns_context(
+    supi: &str,
+    pdu_session_id: u8,
+    dnn: &str,
+    ue_ipv4: std::net::Ipv4Addr,
+) -> Option<String> {
     let cfg = config()?;
     if !should_create(Some(&cfg)) {
         // Not an edge-enabled deployment: TS 23.501 §5.6.7 applies to sessions
@@ -153,6 +158,11 @@ pub async fn create_dns_context(supi: &str, pdu_session_id: u8, dnn: &str) -> Op
         "supi": supi,
         "pduSessionId": pdu_session_id,
         "dnn": dnn,
+        // #276: the UE's own address. Without it the EASDF can serve this
+        // session's rules over the SBI shim only -- a DNS query arriving on
+        // UDP/53 carries no context id, so the source address is the sole
+        // correlator between a datagram and a session.
+        "ueIpv4Address": ue_ipv4.to_string(),
         "notificationUri": cfg.report_uri,
         // One rule per configured edge pattern. `reportInd` is what makes the
         // EASDF tell this SMF what it resolved -- without it the context would be
@@ -405,22 +415,37 @@ pub(crate) mod tests {
         let _g = SWITCH_LOCK.lock().await;
         set_for_test(None);
         assert!(!enabled());
-        assert_eq!(create_dns_context("imsi-1", 5, "internet").await, None);
+        assert_eq!(
+            create_dns_context(
+                "imsi-1",
+                5,
+                "internet",
+                std::net::Ipv4Addr::new(10, 45, 0, 2)
+            )
+            .await,
+            None
+        );
     }
 
     /// A loopback NRF answering EASDF discovery, plus a loopback EASDF recording
     /// the requests it receives.
+    /// The recorded requests: `(method, path, body)`.
+    ///
+    /// #276 widened this from `(method, path)`. The create body is the only place
+    /// the UE address appears, and a test that records just the path cannot tell a
+    /// create carrying it from one that does not.
+    pub(crate) type SeenRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
     pub(crate) async fn spawn_nrf_and_easdf() -> (
         nextgcore_sbi::server::SbiServer,
         nextgcore_sbi::server::SbiServer,
-        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        SeenRequests,
     ) {
         use nextgcore_sbi::message::SbiResponse;
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::net::SocketAddr;
 
-        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen: SeenRequests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         // EASDF: 201 + Location + dnsContextId on create, 204 on delete.
         let sink = seen.clone();
@@ -433,9 +458,11 @@ pub(crate) mod tests {
             .start(move |req: SbiRequest| {
                 let sink = sink.clone();
                 async move {
-                    sink.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push((req.header.method.clone(), req.header.uri.clone()));
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push((
+                        req.header.method.clone(),
+                        req.header.uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                    ));
                     if req.header.method == "POST" {
                         return SbiResponse::with_status(201)
                             .with_header("Location", "/neasdf-dnscontext/v1/dns-contexts/ctx-abc")
@@ -499,9 +526,14 @@ pub(crate) mod tests {
         let _g = SWITCH_LOCK.lock().await;
         let (nrf, easdf, seen) = spawn_nrf_and_easdf().await;
 
-        let ctx_id = create_dns_context("imsi-001010000000001", 5, "internet")
-            .await
-            .expect("a context id");
+        let ctx_id = create_dns_context(
+            "imsi-001010000000001",
+            5,
+            "internet",
+            std::net::Ipv4Addr::new(10, 45, 0, 2),
+        )
+        .await
+        .expect("a context id");
         assert_eq!(ctx_id, "ctx-abc", "the EASDF-assigned id must be returned");
 
         delete_dns_context("imsi-001010000000001", &ctx_id).await;
@@ -510,7 +542,7 @@ pub(crate) mod tests {
         assert_eq!(
             requests
                 .iter()
-                .filter(|(m, p)| m == "POST" && p == "/neasdf-dnscontext/v1/dns-contexts")
+                .filter(|(m, p, _)| m == "POST" && p == "/neasdf-dnscontext/v1/dns-contexts")
                 .count(),
             1,
             "exactly one DNS context create, got {requests:?}"
@@ -518,11 +550,32 @@ pub(crate) mod tests {
         assert_eq!(
             requests
                 .iter()
-                .filter(|(m, p)| m == "DELETE" && p == "/neasdf-dnscontext/v1/dns-contexts/ctx-abc")
+                .filter(
+                    |(m, p, _)| m == "DELETE" && p == "/neasdf-dnscontext/v1/dns-contexts/ctx-abc"
+                )
                 .count(),
             1,
             "the matching delete must be issued, got {requests:?}"
         );
+
+        // #276: the create body must carry the UE's own address. Without it the
+        // EASDF can serve this session's handling rules over the SBI shim only --
+        // a DNS datagram carries no context id, so the source address is the sole
+        // correlator between a query and a session. Asserted on the BODY rather
+        // than on the path, which is why the recorder was widened to capture it.
+        let create = requests
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/neasdf-dnscontext/v1/dns-contexts")
+            .expect("the create request");
+        let body: serde_json::Value =
+            serde_json::from_str(&create.2).expect("the create body is JSON");
+        assert_eq!(
+            body["ueIpv4Address"],
+            serde_json::json!("10.45.0.2"),
+            "the UE address must reach the EASDF, got {body}"
+        );
+        assert_eq!(body["supi"], serde_json::json!("imsi-001010000000001"));
+        assert_eq!(body["pduSessionId"], serde_json::json!(5));
 
         set_for_test(None);
         easdf.stop().await.expect("stop");
