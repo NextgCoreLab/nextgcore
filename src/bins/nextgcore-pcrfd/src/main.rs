@@ -68,6 +68,17 @@ struct Args {
     #[arg(long, default_value = "1024")]
     max_sess: usize,
 
+    /// JSON snapshot file for the Gx/Rx session tables (#57).
+    ///
+    /// Falls back to `NEXTGCORE_PCRF_STATE_FILE`; an empty value is treated as
+    /// unset. With neither set the PCRF is memory-only, which is the shipped
+    /// default: a restart then answers `DIAMETER_UNKNOWN_SESSION_ID` (5002) for
+    /// every live session's CCR-U and CCR-T, indefinitely. An unreadable snapshot,
+    /// or one written by a newer build, FAILS STARTUP rather than coming up empty
+    /// and overwriting it.
+    #[arg(long)]
+    state_file: Option<String>,
+
     /// Database URI (MongoDB)
     #[arg(long)]
     db_uri: Option<String>,
@@ -165,6 +176,36 @@ fn main() -> Result<()> {
     // Initialize PCRF context
     pcrf_context_init(args.max_sess);
     log::info!("PCRF context initialized (max_sess={})", args.max_sess);
+
+    // #57: restore durable state AFTER the context knows its capacity cap and
+    // BEFORE the Diameter listener can accept a CCR, so a restored session is
+    // never shadowed by a fresh one. Precedence matches the other NFs: the flag
+    // wins over the env var, and an empty value is treated as unset.
+    let state_file = args
+        .state_file
+        .clone()
+        .or_else(|| std::env::var("NEXTGCORE_PCRF_STATE_FILE").ok())
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    if let Some(path) = state_file {
+        let ctx = nextgcore_pcrfd::context::pcrf_self();
+        let mut guard = ctx
+            .write()
+            .map_err(|_| anyhow::anyhow!("PCRF context lock poisoned"))?;
+        // Fail STARTUP on a snapshot that cannot be read or is from a newer build.
+        // Coming up empty is the failure this snapshot exists to prevent: every
+        // live PDN connection's CCR-U and CCR-T would be answered 5002 forever,
+        // and the store would then refuse each later write to protect the file, so
+        // the run would be silently non-durable too.
+        let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
+        log::info!("PCRF durable state: {path} ({restored} session(s) restored)");
+    } else {
+        log::info!(
+            "PCRF durable state disabled (no --state-file / NEXTGCORE_PCRF_STATE_FILE): Gx and Rx \
+             sessions are memory-only, and after a restart every CCR-U/CCR-T for a pre-restart \
+             session is answered DIAMETER_UNKNOWN_SESSION_ID (5002)"
+        );
+    }
 
     // Parse configuration file.
     //
