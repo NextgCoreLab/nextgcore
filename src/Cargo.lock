@@ -2504,6 +2504,7 @@ dependencies = [
  "nextgcore-sbi",
  "p256",
  "proptest",
+ "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
