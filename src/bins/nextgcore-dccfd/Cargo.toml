@@ -19,6 +19,10 @@ log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+# #112: the Ndccf_DataManagement wire types are derived, not hand-built from
+# serde_json::Value, so the member spellings (notably notificURI) are pinned in
+# one place and checkable against the yaml.
+serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 uuid.workspace = true
