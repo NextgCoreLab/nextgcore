@@ -186,7 +186,7 @@ fn req_data_from_json(j: &SecurityCapabilityRequestJson) -> SecNegotiateReqData 
             .iter()
             .map(|s| SecurityCapability::from_string(s))
             .collect(),
-        target_apiroot_supported: j.target_apiroot_supported == Some(1),
+        target_apiroot_supported: j.target_apiroot_supported,
         plmn_id_list: j.plmn_id_list.iter().map(plmn_from_json).collect(),
         target_plmn_id: j.target_plmn_id.as_ref().map(plmn_from_json),
         supported_features: j.supported_features.clone(),
@@ -197,7 +197,7 @@ fn rsp_data_from_json(j: &SecurityCapabilityResponseJson) -> SecNegotiateRspData
     SecNegotiateRspData {
         sender: j.sender.clone(),
         selected_sec_capability: SecurityCapability::from_string(&j.selected_sec_capability),
-        target_apiroot_supported: j.target_apiroot_supported == Some(1),
+        target_apiroot_supported: j.target_apiroot_supported,
         plmn_id_list: j.plmn_id_list.iter().map(plmn_from_json).collect(),
         supported_features: j.supported_features.clone(),
     }
@@ -297,6 +297,71 @@ fn handle_exchange_capability(body: &str, cid: &str) -> HttpResponse {
 /// glue from the N32-c TLS connection. When present (real TLS transport), we
 /// deposit it into the n32c_handler store keyed by the sender FQDN so
 /// `resolve_exporter_secret` picks it up instead of the no-TLS fallback.
+/// Resolve which peer an `exchange-params` request came from.
+///
+/// `sender` is OPTIONAL in `SecParamExchReqData`, so it cannot be the only source
+/// of the peer's identity. In order:
+///
+/// 1. `sender` when present — the normal case, and the only one that needs no
+///    inference.
+/// 2. The host of `senderApiRoot` when present. That member is this tree's own
+///    extension carrying the requester's N32-c apiRoot, and its host IS the peer's
+///    FQDN.
+/// 3. The single SEPP node whose N32-c is negotiated but not yet established. This
+///    is what the spec relies on implicitly: `exchange-params` arrives on the same
+///    N32-c TLS connection as the capability negotiation, so the peer is known from
+///    the connection — an identity this server does not currently plumb through to
+///    the handler. Restricted to the *single*-candidate case on purpose: with two
+///    peers mid-handshake, picking one would derive keys against the wrong exporter
+///    secret and produce a silently unusable N32-f context.
+///
+/// `None` means the request is genuinely unattributable. That is not the
+/// over-rejection this fix is about — a spec-valid body from a peer that sent
+/// `senderApiRoot`, or in any deployment with one handshake in flight, is accepted.
+fn resolve_exchange_params_peer(req: &SecParamExchReqData) -> Option<String> {
+    if let Some(sender) = req.sender.as_deref().filter(|s| !s.trim().is_empty()) {
+        return Some(sender.to_string());
+    }
+    if let Some(root) = req.sender_api_root.as_deref() {
+        if let Ok((_tls, host, _port)) = parse_api_root(root) {
+            if !host.is_empty() {
+                log::debug!("exchange-params omitted sender; using senderApiRoot host [{host}]");
+                return Some(host);
+            }
+        }
+    }
+    let nodes = sepp_self().read().ok()?.node_list();
+    single_pending_peer(&nodes)
+}
+
+/// The one SEPP node with an N32-c handshake in flight, or `None` when there is not
+/// exactly one.
+///
+/// Split out as a pure function over the node list rather than reading the global
+/// context directly, so it can be tested without mutating the process-wide peer list
+/// every other test in this module shares. Doing it the other way first made a
+/// pre-existing TLS-mode test fail about one run in five, because the setup had to
+/// clear that list.
+fn single_pending_peer(nodes: &[crate::context::SeppNode]) -> Option<String> {
+    let mut pending = nodes
+        .iter()
+        .filter(|n| n.handshake_state != crate::handshake_sm::HandshakeState::Established)
+        .filter(|n| !n.receiver.is_empty());
+    let first = pending.next()?;
+    if pending.next().is_some() {
+        // Two candidates: picking one would derive the N32-f key hierarchy against
+        // the wrong peer's exporter secret and produce a context that establishes and
+        // then cannot decrypt anything.
+        return None;
+    }
+    log::debug!(
+        "exchange-params omitted sender and senderApiRoot; attributing to the single \
+         in-flight N32-c association [{}]",
+        first.receiver
+    );
+    Some(first.receiver.clone())
+}
+
 fn handle_exchange_params(body: &str, tls_secret: Option<&[u8]>, cid: &str) -> HttpResponse {
     let req: SecParamExchReqData = match serde_json::from_str(body) {
         Ok(j) => j,
@@ -311,17 +376,24 @@ fn handle_exchange_params(body: &str, tls_secret: Option<&[u8]>, cid: &str) -> H
         }
     };
 
+    let Some(peer) = resolve_exchange_params_peer(&req) else {
+        log::warn!("cid={cid} reason=UNATTRIBUTABLE_EXCHANGE_PARAMS: no sender, no senderApiRoot");
+        return send_error(
+            400,
+            "Bad Request",
+            "sender omitted and the requesting peer could not be determined from the              association (no senderApiRoot, and not exactly one N32-c handshake in flight)",
+            Some("MANDATORY_IE_INCORRECT"),
+        );
+    };
+
     // T1.5b: deposit the real TLS exporter secret before the handler calls
     // `resolve_exporter_secret`, replacing the deterministic fallback.
     if let Some(secret) = tls_secret {
-        log::debug!(
-            "cid={cid} depositing N32-c TLS exporter secret for peer [{}] (T1.5b)",
-            req.sender
-        );
-        n32c_handler::set_n32c_tls_exporter_secret(&req.sender, secret.to_vec());
+        log::debug!("cid={cid} depositing N32-c TLS exporter secret for peer [{peer}] (T1.5b)");
+        n32c_handler::set_n32c_tls_exporter_secret(&peer, secret.to_vec());
     }
 
-    let mut node = match find_or_add_node(&req.sender) {
+    let mut node = match find_or_add_node(&peer) {
         Some(n) => n,
         None => {
             return send_error(
@@ -345,10 +417,7 @@ fn handle_exchange_params(body: &str, tls_secret: Option<&[u8]>, cid: &str) -> H
                 .unwrap_or_else(|_| HttpResponse::internal_error())
         }
         Err(e) => {
-            log::warn!(
-                "cid={cid} peer=[{}] reason=NEGOTIATION_NOT_ALLOWED: {e}",
-                req.sender
-            );
+            log::warn!("cid={cid} peer=[{peer}] reason=NEGOTIATION_NOT_ALLOWED: {e}");
             send_error(400, "Bad Request", &e, Some("NEGOTIATION_NOT_ALLOWED"))
         }
     }
@@ -1056,7 +1125,7 @@ pub async fn initiate_n32c_handshake(
             // entries (TS 29.573 §6.1.5.2.15, TS 33.501 §13.2.4.6).
             let local_ipx = n32c_handler::local_ipx_provider_sec_info(&local_sender);
             let params_req = SecParamExchReqData {
-                sender: local_sender,
+                sender: Some(local_sender),
                 n32f_context_id: prins::generate_n32f_context_id(),
                 jwe_cipher_suite_list: n32c_handler::SUPPORTED_JWE_SUITES
                     .iter()
@@ -1210,11 +1279,112 @@ pub async fn start_sbi_server(
     Ok(server)
 }
 
+/// Resource path of the `Nsepp_Telescopic_FQDN_Mapping` mapping document
+/// (`TS29573_SeppTelescopicFqdnMapping.yaml:22-24`).
+const TELESCOPIC_MAPPING_PATH: &str = "/nsepp-telescopic/v1/mapping";
+
+/// One query parameter's raw value from a request URI, or `None`.
+fn query_param<'a>(uri: &'a str, key: &str) -> Option<&'a str> {
+    uri.split_once('?')?
+        .1
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+/// `GetTelescopicMapping` (`GET /nsepp-telescopic/v1/mapping`, TS 29.573 §5.4).
+///
+/// The two query parameters select the two procedures, and **exactly one** must be
+/// present. Both are declared optional by the schema, but §5.4.2 and §5.4.3 are
+/// distinct procedures each driven by one of them: a request with neither asks
+/// nothing, and a request with both asks two contradictory questions — answering
+/// one of them silently would return a mapping the consumer did not unambiguously
+/// request.
+fn handle_telescopic_mapping(uri: &str) -> HttpResponse {
+    let foreign_fqdn = query_param(uri, "foreign-fqdn").filter(|v| !v.is_empty());
+    let telescopic_label = query_param(uri, "telescopic-label").filter(|v| !v.is_empty());
+
+    match (foreign_fqdn, telescopic_label) {
+        // §5.4.2: flatten a foreign FQDN into a label under our own domain.
+        (Some(fqdn), None) => {
+            let sepp_domain = sepp_self()
+                .read()
+                .ok()
+                .and_then(|c| c.sender.clone())
+                .filter(|s| !s.trim().is_empty());
+            let Some(sepp_domain) = sepp_domain else {
+                // Without our own FQDN the consumer cannot form
+                // `<label>.<seppDomain>`, so a 200 carrying only the label would be
+                // an answer it cannot use.
+                log::error!(
+                    "telescopic mapping requested but the local SEPP FQDN is unset;                      start with --sender"
+                );
+                return send_error(
+                    500,
+                    "Internal Server Error",
+                    "Local SEPP FQDN not configured (--sender), so no telescopic FQDN can be                      formed",
+                    Some("SYSTEM_FAILURE"),
+                );
+            };
+            let mapping = crate::telescopic::map_foreign_fqdn(fqdn, &sepp_domain);
+            log::info!(
+                "telescopic mapping: [{fqdn}] -> [{}.{sepp_domain}]",
+                mapping.telescopic_label.as_deref().unwrap_or("")
+            );
+            HttpResponse::ok()
+                .with_json_body(&mapping)
+                .unwrap_or_else(|_| HttpResponse::internal_error())
+        }
+        // §5.4.3: reverse a label a sibling SEPP does not recognise.
+        (None, Some(label)) => match crate::telescopic::resolve_label(label) {
+            Some(fqdn) => {
+                let mapping = crate::telescopic::TelescopicMapping {
+                    telescopic_label: Some(label.to_string()),
+                    sepp_domain: sepp_self().read().ok().and_then(|c| c.sender.clone()),
+                    foreign_fqdn: Some(fqdn),
+                };
+                HttpResponse::ok()
+                    .with_json_body(&mapping)
+                    .unwrap_or_else(|_| HttpResponse::internal_error())
+            }
+            None => send_error(
+                404,
+                "Not Found",
+                &format!("No telescopic mapping for label [{label}]"),
+                Some("DATA_NOT_FOUND"),
+            ),
+        },
+        _ => send_error(
+            400,
+            "Bad Request",
+            "Exactly one of foreign-fqdn or telescopic-label is required",
+            Some("MANDATORY_IE_INCORRECT"),
+        ),
+    }
+}
+
 /// Consumer SBI handler: forward outbound VPLMN requests through the peer
 /// SEPP via N32-f, relaying the peer's response.
 async fn sbi_consumer_handler(request: HttpRequest) -> HttpResponse {
     let method = request.header.method.clone();
     let uri = request.header.uri.clone();
+
+    // TS 29.573 §5.4: the telescopic-FQDN mapping service is served to NFs in THIS
+    // PLMN, so it is answered locally and must be matched before the
+    // target-apiRoot check below — a mapping GET carries no target-apiRoot and would
+    // otherwise be refused 400 as "not a roaming request".
+    if uri.split('?').next().unwrap_or(&uri).trim_end_matches('/') == TELESCOPIC_MAPPING_PATH {
+        if !method.eq_ignore_ascii_case("GET") {
+            return send_error(
+                405,
+                "Method Not Allowed",
+                &format!("Method {method} not allowed for {TELESCOPIC_MAPPING_PATH}"),
+                Some("MANDATORY_IE_INCORRECT"),
+            );
+        }
+        return handle_telescopic_mapping(&uri);
+    }
 
     // Liveness/local endpoints are handled by nextgcore-sbi; everything else with a
     // target-apiroot is a forwarding request.
@@ -1295,6 +1465,146 @@ pub async fn send_n32f_error(peer_api_root: &str, info: &N32fErrorInfo) -> Resul
 mod tests {
     use super::*;
     use crate::sbi_path::select_peer_for_target;
+
+    async fn get(uri: &str) -> HttpResponse {
+        sbi_consumer_handler(HttpRequest::get(uri)).await
+    }
+
+    /// #100: `GET /nsepp-telescopic/v1/mapping` is routed and answers both TS 29.573
+    /// §5.4 procedures. The route did not exist — a mapping GET carries no
+    /// `3gpp-Sbi-Target-apiRoot`, so before this it was refused 400 as "not a
+    /// roaming request".
+    // The guard is held across the awaits deliberately: the whole point is that no
+    // other test rewrites `context.sender` or the mapping store mid-procedure.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn the_telescopic_mapping_route_answers_both_procedures() {
+        let _g = crate::context::lock_global_test_state();
+        crate::sepp_context_init(16, 16);
+        crate::telescopic::clear_mappings();
+        if let Ok(mut c) = sepp_self().write() {
+            c.set_sender("sepp.local.example.com");
+        }
+
+        // §5.4.2: foreign FQDN -> label + our domain.
+        let resp = get("/nsepp-telescopic/v1/mapping?foreign-fqdn=nrf.foreign.example.com").await;
+        assert_eq!(
+            resp.status, 200,
+            "the mapping route must be served locally, not treated as a forwarding              request; got {:?}",
+            resp.http.content
+        );
+        let mapping: crate::telescopic::TelescopicMapping =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let label = mapping.telescopic_label.clone().expect("telescopicLabel");
+        assert_eq!(
+            mapping.sepp_domain.as_deref(),
+            Some("sepp.local.example.com"),
+            "the consumer forms <label>.<seppDomain>, so seppDomain must be present"
+        );
+        assert!(
+            !label.contains('.'),
+            "the label must be flattened to one label; got {label}"
+        );
+
+        // §5.4.3: that same label reverses to the foreign FQDN.
+        let resp = get(&format!(
+            "/nsepp-telescopic/v1/mapping?telescopic-label={label}"
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let reversed: crate::telescopic::TelescopicMapping =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            reversed.foreign_fqdn.as_deref(),
+            Some("nrf.foreign.example.com")
+        );
+
+        // An unissued label is the procedure's own "no existing mapping" -> 404.
+        let resp =
+            get("/nsepp-telescopic/v1/mapping?telescopic-label=tl00000000000000000000000000000000")
+                .await;
+        assert_eq!(resp.status, 404);
+
+        // Exactly one parameter: neither and both are refused.
+        assert_eq!(get("/nsepp-telescopic/v1/mapping").await.status, 400);
+        assert_eq!(
+            get(&format!(
+                "/nsepp-telescopic/v1/mapping?foreign-fqdn=nrf.foreign.example.com\
+                 &telescopic-label={label}"
+            ))
+            .await
+            .status,
+            400
+        );
+
+        // Wrong method on the right path is 405, not a forwarding attempt.
+        let resp = sbi_consumer_handler(HttpRequest::post("/nsepp-telescopic/v1/mapping")).await;
+        assert_eq!(resp.status, 405);
+
+        crate::telescopic::clear_mappings();
+    }
+
+    /// #100: `sender` is optional in `SecParamExchReqData`
+    /// (`yaml:422-455` lists `required: [n32fContextId]` only), so a body omitting
+    /// it must deserialise, and the peer must be resolvable without it.
+    #[test]
+    fn exchange_params_without_a_sender_deserialises_and_resolves_the_peer() {
+        // Deserialising is the half that used to fail outright: a bare `String`
+        // field with no `serde(default)` errors on an absent member.
+        let req: SecParamExchReqData =
+            serde_json::from_str(r#"{"n32fContextId":"0123456789ABCDEF"}"#)
+                .expect("an omitted sender must deserialise");
+        assert!(req.sender.is_none());
+
+        // Resolution 2: senderApiRoot's host stands in for the absent sender.
+        let with_root = SecParamExchReqData {
+            sender_api_root: Some("https://sepp.peer.example.com:9090".to_string()),
+            ..req.clone()
+        };
+        assert_eq!(
+            resolve_exchange_params_peer(&with_root).as_deref(),
+            Some("sepp.peer.example.com")
+        );
+
+        // Resolution 1: an explicit sender still wins over senderApiRoot.
+        let with_both = SecParamExchReqData {
+            sender: Some("sepp.explicit.example.com".to_string()),
+            ..with_root.clone()
+        };
+        assert_eq!(
+            resolve_exchange_params_peer(&with_both).as_deref(),
+            Some("sepp.explicit.example.com")
+        );
+
+        // Resolution 3: with one N32-c handshake in flight, attribute to it.
+        let inflight = crate::context::SeppNode::new(1, "sepp.inflight.example.com");
+        assert_eq!(
+            single_pending_peer(std::slice::from_ref(&inflight)).as_deref(),
+            Some("sepp.inflight.example.com"),
+            "exchange-params arrives on an existing N32-c association"
+        );
+
+        // An ESTABLISHED association is not a candidate — it already completed
+        // parameter exchange, so a further request is a new handshake, not this one.
+        let mut established = crate::context::SeppNode::new(2, "sepp.done.example.com");
+        established.handshake_state = crate::handshake_sm::HandshakeState::Established;
+        assert_eq!(
+            single_pending_peer(&[inflight.clone(), established.clone()]).as_deref(),
+            Some("sepp.inflight.example.com")
+        );
+
+        // ...but NOT with two in flight, because guessing would derive keys against
+        // the wrong exporter secret and yield a silently unusable N32-f context.
+        let second = crate::context::SeppNode::new(3, "sepp.second.example.com");
+        assert_eq!(
+            single_pending_peer(&[inflight, second]),
+            None,
+            "two candidates must be unattributable, not a coin flip"
+        );
+
+        // And none at all is unattributable too.
+        assert_eq!(single_pending_peer(&[established]), None);
+    }
 
     #[test]
     fn test_parse_api_root() {
