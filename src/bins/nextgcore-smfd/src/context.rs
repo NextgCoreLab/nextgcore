@@ -1516,6 +1516,21 @@ pub struct PolicyBinding {
     pub sm_context_status_uri: Option<String>,
     /// GSM (5G session management) FSM for this session
     pub fsm: crate::gsm_sm::GsmFsm,
+    /// EASDF DNS-context id for this session, when one was created (#114,
+    /// TS 23.501 §5.6.7). `None` when the EASDF leg is disabled, the DNN is not
+    /// edge-enabled, or no EASDF is registered.
+    ///
+    /// Held here rather than in a side map so it is removed with the binding at
+    /// release: a DNS context whose session is gone is exactly the orphan the
+    /// delete exists to prevent.
+    pub easdf_dns_context_id: Option<String>,
+    /// EAS address(es) the EASDF last reported for this session (#114).
+    ///
+    /// Recorded, not yet acted on: inserting a UL-CL toward the reported EAS is
+    /// traffic-influence work with its own N4 and PSA implications. This is where
+    /// that work will read from, and keeping it empty-by-default means a session
+    /// that never got a report is indistinguishable from the pre-#114 state.
+    pub easdf_reported_eas: Vec<String>,
 }
 
 pub struct SmfContext {

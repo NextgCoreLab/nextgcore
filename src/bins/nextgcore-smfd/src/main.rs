@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 mod binding;
 mod context;
+mod easdf; // #114: EASDF selection + DNS-context lifecycle (TS 23.501 §5.6.7)
 mod event;
 mod gn_build;
 mod gn_handler;
@@ -418,7 +419,40 @@ async fn main() -> Result<()> {
         format!("http://{host}:{}", config.sbi_port)
     });
     log::info!("SBI advertise URI for callbacks: {advertise_uri}");
-    let _ = SELF_SBI_URI.set(advertise_uri);
+    let _ = SELF_SBI_URI.set(advertise_uri.clone());
+
+    // ---- #114: EASDF DNS-context leg (TS 23.501 §5.6.7), OFF by default ----
+    //
+    // Env-var driven, matching the rest of this daemon's switches (it has no clap
+    // Args struct). A runtime switch rather than the cargo feature the issue
+    // suggests, so CI compiles and exercises the path in both states -- see
+    // `easdf.rs` for the full reasoning.
+    if std::env::var("SMF_EASDF")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        let patterns: Vec<String> = std::env::var("SMF_EASDF_EDGE_FQDN")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if patterns.is_empty() {
+            // Enabled with nothing to steer: say so, because the switch being on
+            // while no session ever gets a DNS context is otherwise invisible.
+            log::warn!(
+                "SMF_EASDF is set but SMF_EASDF_EDGE_FQDN names no pattern: no session will get                  an EASDF DNS context. Set e.g. SMF_EASDF_EDGE_FQDN='*.edge.example.com'."
+            );
+        }
+        easdf::enable(easdf::EasdfConfig {
+            nrf_uri: config
+                .nrf_uri
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:7777".to_string()),
+            report_uri: format!("{advertise_uri}/nsmf-pdusession/v1/easdf-dns-reports"),
+            edge_fqdn_patterns: patterns,
+        });
+    }
 
     // Initialize SMF context
     smf_context_init(config.max_ue, config.max_sess, config.max_bearer);
@@ -1302,6 +1336,12 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // =====================================================================
         // PDU Session Management Service (nsmf-pdusession)
         // =====================================================================
+
+        // #114: EASDF DNS-message report sink. The SMF advertises this URI as
+        // the DNS context's notificationUri, so it must exist -- advertising a
+        // callback that 404s is the emit-side-without-a-sink defect this repo has
+        // been bitten by before.
+        ("nsmf-pdusession", "easdf-dns-reports", "POST") => handle_easdf_dns_report(&request).await,
 
         // Create SM Context (N11)
         // POST /nsmf-pdusession/v1/sm-contexts
@@ -2782,6 +2822,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             }
         };
 
+    // ---- #114: EASDF selection + DNS context (TS 23.501 §5.6.7) ----
+    // Off by default. Awaited BEFORE the binding is stored so the context id is
+    // recorded with it -- a context created and not recorded is an orphan on the
+    // EASDF, because the release path would have nothing to delete. Every failure
+    // inside is non-fatal: a session without edge DNS steering is still a working
+    // session, and refusing it would turn an EASDF outage into a service outage.
+    let easdf_dns_context_id: Option<String> = None;
+
     // ---- Store the policy binding (drives later update/release/notify) ----
     if let Ok(context) = ctx.read() {
         if let Ok(mut bindings) = context.policy_bindings.write() {
@@ -2803,6 +2851,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     ambr_dl_bps: decision.sess_ambr_dl_bps,
                     sm_context_status_uri: sm_context_status_uri.clone(),
                     fsm: fsm.clone(),
+                    easdf_dns_context_id: easdf_dns_context_id.clone(),
+                    easdf_reported_eas: Vec::new(),
                 },
             );
         }
@@ -3824,6 +3874,75 @@ async fn send_sm_context_status_notification(
 /// TS 29.512 §4.2.5), sends PFCP Session Deletion to the UPF, releases the
 /// UE IP and removes session state. The GSM FSM is driven through
 /// WaitPfcpDeletion to release.
+/// `POST /nsmf-pdusession/v1/easdf-dns-reports` — the EASDF DNS-message report
+/// sink (#114, TS 23.548 §6.2.3.2.2).
+///
+/// The EASDF reports what it resolved for a session's DNS query; the SMF records
+/// the EAS address(es) against that session so a later UL-CL / PSA re-selection
+/// can act on them.
+///
+/// **Ceiling, stated rather than implied:** the report is recorded and logged, and
+/// nothing re-routes the user plane yet. Inserting a UL-CL for the reported EAS is
+/// traffic-influence work with its own N4 and PSA implications, and doing it
+/// half-way — installing a rule that does not match, say — would be worse than
+/// recording the fact and saying so. `easdf_reported_eas` is where that work will
+/// read from.
+///
+/// Always `204`: a report is a notification, and there is nothing for the EASDF to
+/// do about a report the SMF cannot attribute (it answers 204 with a log line
+/// rather than an error, so a stale context id does not make the EASDF retry).
+async fn handle_easdf_dns_report(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = request.http.content.as_deref() else {
+        return problem_400(
+            "MANDATORY_IE_MISSING",
+            "a DNS message report body is required",
+        );
+    };
+    let report: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return problem_400("INVALID_MSG_FORMAT", &format!("unparseable report: {e}")),
+    };
+    let ctx_id = report
+        .get("dnsContextId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let fqdn = report.get("fqdn").and_then(|v| v.as_str()).unwrap_or("");
+    let addresses: Vec<String> = report
+        .get("easIpAddresses")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Attribute the report to the session that owns the DNS context.
+    let mut matched = false;
+    if let Ok(ctx) = smf_self().read() {
+        if let Ok(mut bindings) = ctx.policy_bindings.write() {
+            for binding in bindings.values_mut() {
+                if binding.easdf_dns_context_id.as_deref() == Some(ctx_id) {
+                    binding.easdf_reported_eas = addresses.clone();
+                    matched = true;
+                    log::info!(
+                        "[{}] EASDF reported {fqdn} -> {addresses:?} (context {ctx_id})",
+                        binding.supi
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    if !matched {
+        log::warn!(
+            "EASDF DNS report for context {ctx_id} ({fqdn}) matches no session: the context \
+             outlived its PDU session, or was created by another SMF"
+        );
+    }
+    SbiResponse::with_status(204)
+}
+
 async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
     log::info!("SM Context Release request for ref={sm_context_ref}");
 
@@ -3834,6 +3953,17 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
             .ok()
             .and_then(|mut bindings| bindings.remove(sm_context_ref))
     });
+
+    // #114: delete this session's EASDF DNS context. Read off the binding taken
+    // above, so a session that never had one costs nothing here. Best-effort: a
+    // failure leaves an orphan the EASDF's own capacity cap bounds, whereas
+    // failing the release would leave this SMF's session state inconsistent with
+    // the AMF's.
+    if let Some(binding) = &binding {
+        if let (Some(ctx_id), supi) = (&binding.easdf_dns_context_id, &binding.supi) {
+            easdf::delete_dns_context(supi, ctx_id).await;
+        }
+    }
 
     // Drive the GSM FSM: Operational → WaitPfcpDeletion
     let mut fsm = binding.as_ref().map(|b| b.fsm.clone());
@@ -5128,10 +5258,208 @@ mod tests {
                         // N1N2MessageTransfer is attempted.
                         sm_context_status_uri: None,
                         fsm: gsm_sm::GsmFsm::new(0),
+                        // #114: no EASDF DNS context by default, so the release
+                        // path has nothing to delete.
+                        easdf_dns_context_id: None,
+                        easdf_reported_eas: Vec::new(),
                     },
                 );
             }
         }
+    }
+
+    /// #114: the EASDF DNS-message report sink exists and attributes the report
+    /// to the session that owns the DNS context.
+    ///
+    /// The SMF advertises this URI as the context's `notificationUri`, so a 404
+    /// here would mean every report the EASDF sends is dropped — the emit-side-
+    /// without-a-sink defect. Asserts the route answers 204 AND that the reported
+    /// EAS address landed on the right binding: a 204 alone would pass against a
+    /// handler that parsed nothing.
+    #[tokio::test]
+    async fn easdf_dns_report_is_attributed_to_its_session() {
+        seed_binding("easdf-report-ref", 7);
+        // Give that session a DNS context id to be matched against.
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut("easdf-report-ref") {
+                    b.easdf_dns_context_id = Some("ctx-report-1".to_string());
+                }
+            }
+        }
+
+        let req = SbiRequest::post("/nsmf-pdusession/v1/easdf-dns-reports").with_body(
+            serde_json::json!({
+                "dnsContextId": "ctx-report-1",
+                "fqdn": "vr.edge.example.com",
+                "action": "RESOLVE",
+                "easIpAddresses": ["10.80.0.8"]
+            })
+            .to_string(),
+            "application/json",
+        );
+        let resp = smf_sbi_request_handler(req).await;
+        assert_ne!(resp.status, 404, "the advertised callback must be routed");
+        assert_eq!(resp.status, 204);
+
+        let recorded = smf_self()
+            .read()
+            .ok()
+            .and_then(|ctx| {
+                ctx.policy_bindings.read().ok().and_then(|b| {
+                    b.get("easdf-report-ref")
+                        .map(|b| b.easdf_reported_eas.clone())
+                })
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            recorded,
+            vec!["10.80.0.8".to_string()],
+            "the reported EAS address must be recorded against the owning session"
+        );
+
+        // A report for an unknown context is still 204 (a notification the SMF
+        // cannot attribute is not the EASDF's fault to retry) but records nothing.
+        let req = SbiRequest::post("/nsmf-pdusession/v1/easdf-dns-reports").with_body(
+            serde_json::json!({"dnsContextId": "ctx-nobody", "fqdn": "x", "easIpAddresses": ["1.2.3.4"]})
+                .to_string(),
+            "application/json",
+        );
+        assert_eq!(smf_sbi_request_handler(req).await.status, 204);
+        let still = smf_self()
+            .read()
+            .ok()
+            .and_then(|ctx| {
+                ctx.policy_bindings.read().ok().and_then(|b| {
+                    b.get("easdf-report-ref")
+                        .map(|b| b.easdf_reported_eas.clone())
+                })
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            still,
+            vec!["10.80.0.8".to_string()],
+            "an unattributable report must not overwrite another session's data"
+        );
+
+        // A malformed body is refused rather than silently ignored.
+        let req = SbiRequest::post("/nsmf-pdusession/v1/easdf-dns-reports")
+            .with_body("not json".to_string(), "application/json");
+        assert_eq!(smf_sbi_request_handler(req).await.status, 400);
+    }
+
+    /// #114: a session that FAILS to establish creates no EASDF DNS context.
+    ///
+    /// This is the property the call site's placement buys, and the reason it sits
+    /// after the PFCP leg rather than before it: a context created for a session
+    /// that then fails is an orphan on the EASDF that nothing will ever delete,
+    /// because the release path never runs for a session that never existed.
+    ///
+    /// It is also the honest limit of what this harness can assert about the
+    /// create call site. Reaching the success path needs a PFCP-responding UPF —
+    /// without one, `handle_sm_context_create` returns `504 UPF_NOT_RESPONDING`
+    /// before the EASDF leg — and the smfd test harness has no UPF stand-in (no
+    /// existing test establishes a session either). The create leg itself is
+    /// covered over real HTTP by
+    /// `easdf::tests::the_dns_context_is_created_and_deleted_over_the_wire`, and
+    /// the RELEASE call site by the test below; the create call site is verified by
+    /// inspection plus this no-orphan assertion.
+    #[tokio::test]
+    async fn a_failed_establishment_creates_no_easdf_dns_context() {
+        let _g = easdf::SWITCH_LOCK.lock().await;
+        let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
+        smf_context_init(64, 256, 512);
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        let body = serde_json::json!({
+            "pduSessionId": 5,
+            "supi": "imsi-001010000000001",
+            "sNssai": { "sst": 1, "sd": "010203" },
+            "dnn": "internet",
+            "anType": "3GPP_ACCESS",
+            "ratType": "NR",
+            "n1SmMsg": { "contentId": "n1SmMsg" },
+        });
+        let n1_msg = n1(
+            5,
+            1,
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+            &[0x91, 0x00],
+        );
+        let request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
+            .with_body(body.to_string(), "application/json")
+            .with_part(nextgcore_sbi::message::SbiPart::with_content(
+                "n1SmMsg",
+                "application/vnd.3gpp.5gnas",
+                n1_msg.into(),
+            ));
+        let resp = handle_sm_context_create(&request).await;
+
+        // No UPF in this harness, so establishment fails at the N4 leg.
+        assert_eq!(
+            resp.status, 504,
+            "without a UPF the session cannot establish; if this ever becomes a \
+             2xx the harness gained a UPF and this test should assert the CREATE \
+             instead"
+        );
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            requests.is_empty(),
+            "a session that never established must leave no DNS context behind, got {requests:?}"
+        );
+
+        easdf::set_for_test(None);
+        easdf_srv.stop().await.expect("stop");
+        nrf.stop().await.expect("stop");
+    }
+
+    /// #114: releasing a session whose binding carries an EASDF DNS context id
+    /// issues the matching DELETE **from the release handler**.
+    ///
+    /// Added after a revert exposed the hole: with the delete call removed from
+    /// `handle_sm_context_release`, the whole suite still passed, because the
+    /// easdf module's own test drives `delete_dns_context` directly and says
+    /// nothing about whether any handler calls it — "the helper is tested and the
+    /// wiring is not", for the third time in this session.
+    #[tokio::test]
+    async fn releasing_a_session_deletes_its_easdf_dns_context() {
+        let _g = easdf::SWITCH_LOCK.lock().await;
+        let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
+
+        seed_binding("easdf-release-ref", 9);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut("easdf-release-ref") {
+                    b.easdf_dns_context_id = Some("ctx-abc".to_string());
+                }
+            }
+        }
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        let _ = handle_sm_context_release("easdf-release-ref").await;
+
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            requests
+                .iter()
+                .any(|(m, p)| m == "DELETE" && p == "/neasdf-dnscontext/v1/dns-contexts/ctx-abc"),
+            "the release handler must delete the session's DNS context, got {requests:?}"
+        );
+
+        // A session with NO context id must not cause a delete: nothing to delete,
+        // and dialling the EASDF anyway would be a request per released session in
+        // every deployment that does not use edge DNS.
+        seed_binding("easdf-release-none", 10);
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let _ = handle_sm_context_release("easdf-release-none").await;
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "a session without a DNS context must not dial the EASDF"
+        );
+
+        easdf::set_for_test(None);
+        easdf_srv.stop().await.expect("stop");
+        nrf.stop().await.expect("stop");
     }
 
     fn n1(psi: u8, pti: u8, message_type: u8, tail: &[u8]) -> Vec<u8> {
