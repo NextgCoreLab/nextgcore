@@ -170,6 +170,63 @@ Failure causes are distinct so an operator can tell a provisioning gap from an u
 
 No `single-nssai` query parameter is sent, even though TS 29.503 §5.2.2.2.1 allows scoping: the value is JSON and must be percent-encoded, but the shared SBI server stores query values verbatim without decoding them (issue #65), so a scoped query cannot round-trip to the in-tree UDM. The S-NSSAI's entry is selected locally by key instead.
 
+## SM context lifecycle (#78)
+
+`POST /sm-contexts` now **registers** the session in the SMF context list and takes
+the `smContextRef` from the session itself. Before #78 it minted a reference from a
+counter and registered nothing, so every `Retrieve` answered
+`404 CONTEXT_NOT_FOUND` for a session that had just been created successfully. The
+reference is read back out of the session rather than computed alongside it because
+`sess_add_by_psi` mints it from the *same* counter — computing both would consume the
+counter twice and leave the handler's reference one behind the session's.
+
+A create that fails after registration **rolls the registration back**. An abandoned
+registration would be an SM context the AMF never learned about and will never
+release.
+
+| Operation | Before #78 | Now |
+|---|---|---|
+| Retrieve, known ref | `404 CONTEXT_NOT_FOUND` (nothing was registered) | `200` with `SmContextRetrievedData` including the required `ueEpsPdnConnection` |
+| Retrieve, unknown ref | `404`, body `{"status","cause"}` at `application/json` | `404` ProblemDetails at `application/problem+json` |
+| Update, unknown ref | `200` | `404` + ProblemDetails (TS 29.502 §5.2.2.3.2) |
+| Release, unknown ref | `204` | `404` + ProblemDetails (TS 29.502 §5.2.2.4) |
+| Release body | not parsed at all — the handler took no body argument | `SmContextReleaseData` (`cause`, `n2SmInfo`, `vsmfReleaseOnly`) |
+| `HANDOVER_REQUIRED` / `_REQ_ACK` / `_COMPLETE` / `_CANCEL` | `400 N2_SM_ERROR` via the catch-all | processed, `hoState` driven per TS 29.502 §5.2.2.3.4 |
+| PFCP Downlink Data Report | logged only | drives `Namf_Communication_N1N2MessageTransfer` toward the serving AMF |
+
+**The handover states deliberately do not touch the user plane until completion.**
+`PREPARING` and `PREPARED` leave the DL tunnel on the source gNB, because until the
+UE has actually moved the source is still serving it and re-pointing the UPF would
+black-hole downlink traffic for the whole handover-execution window.
+`HANDOVER_COMPLETE` switches it, through the same `pfcp_session_modify` call a path
+switch uses, and **says so in the log when the request carried no decodable target
+F-TEID** — a bare 200 would leave an operator unable to tell a switched tunnel from
+an unswitched one. `HANDOVER_CANCEL` has nothing to undo, which is exactly why the
+earlier states do nothing.
+
+**Paging carries the N2 form, not the N1 form.** TS 23.502 §4.2.3.3 has the SMF send
+N2 SM information so the AMF can re-establish the user plane; there is no NAS message
+to deliver to a sleeping UE. So the DLDR path posts an `n2InfoContainer` (with the
+QFI the UPF reported, so the gNB knows which flow to restore) rather than reusing the
+`n1MessageContainer` sender the 5GSM timer path uses. A DLDR for a session whose user
+plane is **not** `DEACTIVATED` does not page: TS 29.244 §7.5.8.2 scopes the report to
+a deactivated connection, and paging a connected UE is a spurious service request.
+
+**Limits worth knowing:**
+
+- `ueEpsPdnConnection` is the minimal PDN-connection descriptor derivable from the
+  5GS session (APN, PDN type, UE address, default-bearer QCI). It is **not** a mapped
+  EPS bearer-context list, because this tree has no EBI assignment and no Mapped EPS
+  bearer context IE at all — that is #117. A fabricated bearer list would be worse
+  than a minimal descriptor: the AMF would forward it to an MME that would then try
+  to use bearers this SMF never established.
+- `vsmfReleaseOnly` is parsed and **logged, not honoured**: this SMF has no
+  V-SMF/H-SMF split on the `sm-contexts` path, so acting on the flag would mean
+  pretending to a split that does not exist.
+- The create handler's *success* path is unreachable in this tree's test harness (it
+  needs a PFCP-responding UPF, and no test establishes an N4 session), so what tests
+  cover is the registration function's invariant plus the rollback contract.
+
 ## Honesty notes
 
 - Behavior above is grounded in `nextgcore/src/bins/nextgcore-smfd/src/main.rs` and the docker example config; 3GPP TS references are quoted from code comments, not a conformance claim.
