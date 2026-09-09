@@ -891,6 +891,12 @@ async fn handle_pfcp_session_report(
                 "Downlink Data Report: SEID=0x{seid:016x}, PDR={pdr_id:?}, QFI={qfi:?} — \
                  triggering UP connection re-activation"
             );
+            // #78 / TS 29.244 §7.5.8.2 + TS 23.502 §4.2.3.3: drive the Network
+            // Triggered Service Request. Before #78 this branch only logged, and the
+            // `trigger_service_request` flag `n4_handler` sets was reached only from
+            // its own unit test — so downlink data for an idle UE never paged and
+            // every mobile-terminated service silently failed.
+            trigger_network_initiated_service_request(seid, qfi).await;
         } else {
             log::warn!("Report Type has DLDR set but no Downlink Data Report IE present");
         }
@@ -1413,7 +1419,7 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // POST /nsmf-pdusession/v1/sm-contexts/{smContextRef}/release
         ("nsmf-pdusession", "sm-contexts", "POST") if parts.len() >= 5 && parts[4] == "release" => {
             let sm_context_ref = parts[3];
-            handle_sm_context_release(sm_context_ref).await
+            handle_sm_context_release(sm_context_ref, Some(&request)).await
         }
 
         // Retrieve SM Context
@@ -2000,12 +2006,22 @@ fn problem_404(cause: &str, detail: &str) -> SbiResponse {
 }
 
 fn problem_400(cause: &str, detail: &str) -> SbiResponse {
+    problem_response(400, cause, detail)
+}
+
+/// A ProblemDetails answer at any status (TS 29.500 §5.2.7, TS 29.571 §5.2.4.1).
+///
+/// `application/problem+json`, because a consumer that deserialises the body as
+/// ProblemDetails is entitled to that content type — and because a bare
+/// `{"status":..,"cause":..}` at `application/json` (which is what the SM context
+/// 404 used to send) gives it nothing typed to work with (#78).
+fn problem_response(status: u16, cause: &str, detail: &str) -> SbiResponse {
     let body = serde_json::json!({
-        "status": 400,
+        "status": status,
         "cause": cause,
         "detail": detail,
     });
-    SbiResponse::with_status(400).with_body(body.to_string(), "application/problem+json")
+    SbiResponse::with_status(status).with_body(body.to_string(), "application/problem+json")
 }
 
 /// Resolve an N1 (NAS) or N2 (NGAP) binary payload referenced from the JSON
@@ -2537,10 +2553,46 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     let ctx = smf_self();
     let sm_context_ref;
     let ue_ip_octets: [u8; 4];
+    // #78: the session's own id, so the SBI handlers can update the record they
+    // registered. `None` only if registration failed (capacity), which is reported
+    // below rather than silently producing an unfindable context.
+    let registered_sess_id: Option<u64>;
 
     if let Ok(context) = ctx.read() {
-        let sess_idx = context.next_sess_index();
-        sm_context_ref = format!("{sess_idx}");
+        // #78: REGISTER the session in the context list, and take the
+        // `smContextRef` from the session itself.
+        //
+        // Before #78 this called `next_sess_index()` and formatted the result,
+        // registering nothing -- so `sess_find_by_sm_context_ref` never matched and
+        // every Retrieve answered 404 CONTEXT_NOT_FOUND for a session that had just
+        // been created successfully.
+        //
+        // The ref is read back OUT of the session rather than computed here even
+        // though both would use the same counter: `sess_add_by_psi` mints
+        // `sm_context_ref` from `sess_index` itself, so computing it separately
+        // would consume the counter twice and leave the handler's ref one behind the
+        // session's -- a denormalised pair that disagrees with itself, which is the
+        // exact shape of the defect this fixes.
+        match register_sm_context(&context, &supi, pdu_session_id) {
+            Some((reference, sess_id)) => {
+                sm_context_ref = reference;
+                registered_sess_id = Some(sess_id);
+            }
+            None => {
+                log::error!(
+                    "[{supi}] could not register an SM context (UE or session capacity \
+                     reached): refusing the create rather than returning a reference no \
+                     Retrieve can resolve"
+                );
+                return sm_context_create_error(
+                    500,
+                    "INSUFFICIENT_RESOURCES",
+                    pdu_session_id,
+                    pti,
+                    policy::gsm_cause::INSUFFICIENT_RESOURCES,
+                );
+            }
+        }
         // Allocate UE IP from bitmap pool
         match context.ipv4_pool.allocate() {
             Some(addr) => {
@@ -2554,6 +2606,12 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             }
             None => {
                 log::error!("IPv4 address pool exhausted");
+                // #78: the session was registered a few lines above, before the
+                // address was available. Un-register it: an SM context the create
+                // answered 500 for is one the AMF will never release.
+                if let Some(sess_id) = registered_sess_id {
+                    context.sess_remove(sess_id);
+                }
                 return sm_context_create_error(
                     500,
                     "INSUFFICIENT_RESOURCES",
@@ -2576,10 +2634,20 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         ue_ip_octets[3]
     );
 
-    let release_ip = || {
+    // #78: roll back BOTH the address and the session registration. The session is
+    // now registered in the context list before the PFCP leg is established (it has
+    // to be: the `smContextRef` the rest of this handler uses is minted by the
+    // session itself), so every failure path from here on would otherwise leave a
+    // registered SM context behind for a create that answered an error -- a context
+    // the AMF never learned about and will never release. Named `rollback` rather
+    // than `release_ip` so a later reader adding a failure path sees what it undoes.
+    let rollback = || {
         if let Ok(ctx) = smf_self().read() {
             ctx.ipv4_pool
                 .release(std::net::Ipv4Addr::from(ue_ip_octets));
+            if let Some(sess_id) = registered_sess_id {
+                ctx.sess_remove(sess_id);
+            }
         }
     };
 
@@ -2619,7 +2687,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         "NSACF rejected PDU session for S-NSSAI[SST:{sst}] — \
                          rejecting (5GSM cause 67)"
                     );
-                    release_ip();
+                    rollback();
                     return sm_context_create_error(
                         403,
                         "NSAC_PDU_SESSION_REJECTED",
@@ -2694,7 +2762,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     // with 5GSM cause #29 (TS 24.501).
                     log::error!("PCF rejected SM policy (status={status}): {detail}");
                     fsm_dispatch_policy_response(&mut fsm, status);
-                    release_ip();
+                    rollback();
                     rollback_nsac(
                         nsac_admitted,
                         &supi,
@@ -2716,7 +2784,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     // silent fallback) → 5GSM cause #38 network failure.
                     log::error!("SM policy create failed: {e}");
                     fsm.transition_to(gsm_sm::GsmState::Exception);
-                    release_ip();
+                    rollback();
                     rollback_nsac(
                         nsac_admitted,
                         &supi,
@@ -2865,7 +2933,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         }
                     }
                 }
-                release_ip();
+                rollback();
                 rollback_nsac(
                     nsac_admitted,
                     &supi,
@@ -2891,6 +2959,40 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // inside is non-fatal: a session without edge DNS steering is still a working
     // session, and refusing it would turn an EASDF outage into a service outage.
     let easdf_dns_context_id: Option<String> = None;
+
+    // ---- #78: fill in the registered session, so Retrieve answers with the real
+    // session rather than with whatever `sess_add_by_psi` defaulted to ----
+    //
+    // Done here, after the PFCP establishment settled, because `upCnxState` is only
+    // ACTIVATED once the user plane exists. An earlier update would advertise an
+    // activated connection for a session whose N4 leg had not been established.
+    if let Some(sess_id) = registered_sess_id {
+        if let Ok(context) = ctx.read() {
+            if let Some(mut sess) = context.sess_find_by_id(sess_id) {
+                sess.session_name = Some(dnn.clone());
+                sess.full_dnn = Some(dnn.clone());
+                sess.pti = pti;
+                sess.ue_session_type = requested_type;
+                sess.ue_ssc_mode = selected_ssc;
+                sess.s_nssai = context::SNssai {
+                    sst,
+                    // SD is a 24-bit value; the request carries it as a hex string.
+                    sd: snssai_sd
+                        .as_deref()
+                        .and_then(|s| u32::from_str_radix(s, 16).ok()),
+                };
+                sess.set_ipv4_addr(std::net::Ipv4Addr::from(ue_ip_octets));
+                sess.up_cnx_state = context::UpCnxState::Activated;
+                sess.sm_context_status_uri = sm_context_status_uri.clone();
+                sess.session_ambr = context::SessionAmbr {
+                    uplink: decision.sess_ambr_ul_bps,
+                    downlink: decision.sess_ambr_dl_bps,
+                };
+                sess.establishment_accept_sent = true;
+                context.sess_update(&sess);
+            }
+        }
+    }
 
     // ---- Store the policy binding (drives later update/release/notify) ----
     if let Ok(context) = ctx.read() {
@@ -2970,7 +3072,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         Ok(bytes) => bytes,
         Err(e) => {
             log::error!("Failed to encode PDUSessionResourceSetupRequestTransfer: {e:?}");
-            release_ip();
+            rollback();
             rollback_nsac(
                 nsac_admitted,
                 &supi,
@@ -3120,7 +3222,24 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         None => serde_json::json!({}),
     };
 
+    // #78 / TS 29.502 §5.2.2.3.2: an Update for an unknown `smContextRef` must be
+    // answered with an error status and ProblemDetails, not with success. Several
+    // arms below returned 200 without ever checking that the reference resolved, so
+    // the AMF could not distinguish a live context from a stale one and lost state
+    // was masked. Checked HERE, before any branch, so no arm can skip it.
+    if !sm_context_exists(sm_context_ref) {
+        log::warn!("SM Context Update for unknown ref={sm_context_ref}: answering 404");
+        return problem_response(
+            404,
+            "CONTEXT_NOT_FOUND",
+            "No SM context for this smContextRef",
+        );
+    }
+
     let n2_sm_info_type = req_body["n2SmInfoType"].as_str().unwrap_or("");
+    // #78 / TS 29.502 §5.2.2.3.4: `hoState` drives the N2 handover state machine
+    // and was never read (grep found no occurrence in this file before #78).
+    let ho_state = req_body["hoState"].as_str().unwrap_or("");
 
     // TS 29.502 §5.2.2.3.1: the request may carry `n1SmMsg`, `n2SmInfo` /
     // `n2SmInfoType`, or a UP connection-state change, and the SMF must process
@@ -3380,6 +3499,104 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
         }
 
+        // ---- #78 / TS 29.502 §5.2.2.3.4: N2 handover ----
+        //
+        // Before #78 every one of these fell to the catch-all below and was answered
+        // `400 N2_SM_ERROR`, so any inter-gNB N2 handover attempt was refused at the
+        // SMF and the UE lost its PDU session on mobility.
+        //
+        // The state machine is `hoState`: PREPARING -> PREPARED -> COMPLETED, or
+        // CANCELLED. The SMF's job across it is to hold the session while the target
+        // side is prepared and to switch the DL tunnel only at completion — so
+        // PREPARING and PREPARED must NOT touch the user plane, and COMPLETED is
+        // where the switch belongs.
+        "HANDOVER_REQUIRED" => {
+            // Source side asks the SMF to prepare. TS 29.502 §5.2.2.3.4: the
+            // response carries `hoState: PREPARING` and the N2 SM information the
+            // target needs. This SMF has no target-side N2 container to build (that
+            // is amfd/NGAP territory, #70), so it acknowledges the state transition
+            // and holds the session rather than refusing the handover outright.
+            log::info!(
+                "SM Context Update (HANDOVER_REQUIRED, hoState={ho_state}) for \
+                 ref={sm_context_ref}: preparing, user plane untouched"
+            );
+            let response_body = serde_json::json!({ "hoState": "PREPARING" });
+            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+        }
+        "HANDOVER_REQ_ACK" => {
+            // The target gNB accepted. The DL tunnel is NOT switched here: until the
+            // UE has actually moved (HANDOVER_COMPLETE / PATH_SWITCH_REQ) the source
+            // gNB is still serving it, and re-pointing the UPF now would black-hole
+            // downlink traffic for the whole handover-execution window.
+            log::info!(
+                "SM Context Update (HANDOVER_REQ_ACK, hoState={ho_state}) for \
+                 ref={sm_context_ref}: prepared, DL tunnel still on the source gNB"
+            );
+            let response_body = serde_json::json!({ "hoState": "PREPARED" });
+            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+        }
+        "HANDOVER_COMPLETE" => {
+            // The UE is on the target. If the request carries the target's DL
+            // endpoint, switch the UPF to it; the transfer container is the same
+            // shape a path switch uses (TS 38.413 §9.3.4.8).
+            let switched = match resolve_binary_ref(request, &req_body["n2SmInfo"])
+                .and_then(|b| decode_path_switch_dl_endpoint(&b))
+            {
+                Some((gnb_teid, gnb_addr, _qfi)) => match lookup_upf_seid(sm_context_ref) {
+                    Some(upf_seid) => {
+                        // Same call the PATH_SWITCH_REQ arm uses: one DL-switch
+                        // path, so a handover completion and a path switch cannot
+                        // drift apart.
+                        match pfcp_session_modify(
+                            smf_n4_seid_for(sm_context_ref),
+                            upf_seid,
+                            gnb_teid,
+                            gnb_addr,
+                        )
+                        .await
+                        {
+                            Ok(()) => true,
+                            Err(e) => {
+                                log::warn!(
+                                    "DL FAR switch to the target gNB failed after handover \
+                                     completion: {e}"
+                                );
+                                return SbiResponse::with_status(504);
+                            }
+                        }
+                    }
+                    None => false,
+                },
+                None => false,
+            };
+            if !switched {
+                // Stated rather than silently returned as success: a completed
+                // handover whose DL tunnel was not switched leaves downlink traffic
+                // pointed at the source gNB, and an operator reading a bare 200
+                // would have no way to know.
+                log::warn!(
+                    "SM Context Update (HANDOVER_COMPLETE) for ref={sm_context_ref} carried no \
+                     decodable target DL F-TEID: the UPF still points at the previous gNB"
+                );
+            }
+            log::info!(
+                "SM Context Update (HANDOVER_COMPLETE, hoState={ho_state}) for \
+                 ref={sm_context_ref}: DL tunnel switched={switched}"
+            );
+            let response_body = serde_json::json!({ "hoState": "COMPLETED" });
+            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+        }
+        "HANDOVER_CANCEL" => {
+            // Abandoned. Nothing to undo: neither PREPARING nor PREPARED changed the
+            // user plane, which is exactly why they do not.
+            log::info!(
+                "SM Context Update (HANDOVER_CANCEL, hoState={ho_state}) for \
+                 ref={sm_context_ref}: handover abandoned, session retained"
+            );
+            let response_body = serde_json::json!({ "hoState": "CANCELLED" });
+            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+        }
+
         other => {
             log::warn!("SM Context Update: unsupported n2SmInfoType '{other}'");
             problem_400("N2_SM_ERROR", &format!("unsupported n2SmInfoType {other}"))
@@ -3579,6 +3796,131 @@ async fn run_gsm_timer_tick() {
                 );
             }
         }
+    }
+}
+
+/// Drive the Network Triggered Service Request for a buffered downlink packet
+/// (#78, TS 29.244 §7.5.8.2 → TS 23.502 §4.2.3.3).
+///
+/// Resolves the SEID the UPF reported back to the SM context that owns it, then
+/// asks the serving AMF to page the UE with `Namf_Communication_N1N2MessageTransfer`.
+///
+/// **The N2 form, not the N1 form.** §4.2.3.3 step 3a has the SMF send *N2 SM
+/// information* (QFI, QoS profile, CN tunnel info) so the AMF can re-establish the
+/// user plane — there is no NAS message to deliver, the UE is simply asleep. So this
+/// does not reuse `send_n1_n2_message_transfer`, whose body is an `n1MessageContainer`.
+///
+/// Best-effort, and every early return says why: an unresolvable SEID, a session
+/// with no serving-AMF URI, or a failed transfer all leave the packet buffered at
+/// the UPF, which is where it already is. Failing louder would not deliver it.
+async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
+    // The SEID in the report is the SMF's own F-SEID (the UPF echoes it), which is
+    // what `smf_n4_seid_hash` indexes.
+    let Some((sm_context_ref, supi, psi, amf_uri, up_deactivated)) = ({
+        let handle = smf_self();
+        handle.read().ok().and_then(|ctx| {
+            let sess = ctx.sess_find_by_seid(seid)?;
+            let reference = sess.sm_context_ref.clone()?;
+            let binding = ctx
+                .policy_bindings
+                .read()
+                .ok()
+                .and_then(|b| b.get(&reference).cloned());
+            let supi = binding
+                .as_ref()
+                .map(|b| b.supi.clone())
+                .or_else(|| ctx.ue_find_by_id(sess.smf_ue_id).and_then(|ue| ue.supi))?;
+            let amf_uri = binding
+                .as_ref()
+                .and_then(|b| b.sm_context_status_uri.clone())
+                .or_else(|| sess.sm_context_status_uri.clone());
+            Some((
+                reference,
+                supi,
+                sess.psi,
+                amf_uri,
+                sess.up_cnx_state == context::UpCnxState::Deactivated,
+            ))
+        })
+    }) else {
+        log::warn!(
+            "Downlink Data Report for SEID=0x{seid:016x} matches no SM context: cannot page \
+             (the packet stays buffered at the UPF)"
+        );
+        return;
+    };
+
+    if !up_deactivated {
+        // TS 29.244 §7.5.8.2 scopes the DLDR to a *deactivated* user-plane
+        // connection. With the connection up, the UPF should be forwarding rather
+        // than buffering, and paging a UE that is already connected would be a
+        // spurious service request.
+        log::warn!(
+            "Downlink Data Report for ref={sm_context_ref} whose UP connection is not \
+             DEACTIVATED: not paging"
+        );
+        return;
+    }
+
+    let Some(amf_uri) = amf_uri else {
+        log::warn!(
+            "No serving-AMF callback URI for ref={sm_context_ref}: cannot page the UE for \
+             buffered downlink data"
+        );
+        return;
+    };
+
+    send_n1_n2_paging_request(&amf_uri, &supi, psi, qfi).await;
+}
+
+/// Ask the AMF to page an idle UE for buffered downlink data (#78,
+/// TS 29.518 §5.2.2.3.1 with an `n2InfoContainer`).
+///
+/// The body carries `n2InfoContainer` rather than `n1MessageContainer` because the
+/// point is to re-establish the user plane, not to deliver a NAS message. `skipInd`
+/// is deliberately absent: the AMF must NOT skip paging, which is the entire
+/// purpose of the request.
+async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Option<u8>) {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiRequest as SReq;
+
+    let Some((host, port)) = policy::split_host_port(amf_uri) else {
+        log::warn!("AMF URI '{amf_uri}' is not a valid URI — skipping the paging request");
+        return;
+    };
+
+    let path = format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages");
+    let mut body = serde_json::json!({
+        "pduSessionId": psi,
+        "n2InfoContainer": {
+            "n2InformationClass": "SM",
+            "smInfo": {
+                "pduSessionId": psi,
+                "n2InfoContent": {
+                    "ngapIeType": "PDU_RES_SETUP_REQ"
+                }
+            }
+        },
+    });
+    if let Some(qfi) = qfi {
+        // The QFI the UPF reported the buffered packet against, so the AMF can tell
+        // the gNB which flow to re-establish.
+        body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapData"] =
+            serde_json::json!({ "qfi": qfi });
+    }
+    let request = SReq::post(&path).with_body(body.to_string(), content_type::APPLICATION_JSON);
+    let client = nextgcore_sbi::client::SbiClient::new(
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3)),
+    );
+    match client.send_request(request).await {
+        Ok(resp) => log::info!(
+            "N1N2MessageTransfer (paging, SUPI {supi}, PSI {psi}, QFI {qfi:?}) → \
+             {host}:{port}: status={}",
+            resp.status
+        ),
+        Err(e) => log::warn!("N1N2MessageTransfer (paging) to {host}:{port} failed: {e}"),
     }
 }
 
@@ -4014,8 +4356,51 @@ async fn handle_easdf_dns_report(request: &SbiRequest) -> SbiResponse {
     SbiResponse::with_status(204)
 }
 
-async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
+async fn handle_sm_context_release(
+    sm_context_ref: &str,
+    request: Option<&SbiRequest>,
+) -> SbiResponse {
     log::info!("SM Context Release request for ref={sm_context_ref}");
+
+    // #78 / TS 29.502 §5.2.2.4: a release of an unknown context must NOT silently
+    // succeed. Answering 204 for a reference the SMF does not hold tells the AMF a
+    // context was torn down when nothing was, which masks lost state and corrupts
+    // session accounting — the AMF cannot then distinguish a live context from a
+    // stale one.
+    //
+    // Only checked for an AMF-driven release. The PCF-driven path (`request` is
+    // `None`) passes a reference it read out of the binding map itself, and the
+    // binding is removed below, so re-checking would be checking our own read.
+    if request.is_some() && !sm_context_exists(sm_context_ref) {
+        log::warn!("SM Context Release for unknown ref={sm_context_ref}: answering 404");
+        return problem_response(
+            404,
+            "CONTEXT_NOT_FOUND",
+            "No SM context for this smContextRef",
+        );
+    }
+
+    // #78 / TS 29.502 §5.2.2.4: parse SmContextReleaseData. Before #78 this
+    // function took no body argument at all, so `cause`, `n2SmInfo` and
+    // `vsmfReleaseOnly` were unreadable.
+    let release_data = request
+        .map(parse_sm_context_release_data)
+        .unwrap_or_default();
+    if let Some(ref cause) = release_data.cause {
+        log::info!("SM Context Release ref={sm_context_ref} cause={cause}");
+    }
+    if release_data.vsmf_release_only {
+        // TS 29.502 §6.1.6.2.13: the V-SMF releases only its own resources and the
+        // H-SMF keeps the session. This SMF has no V-SMF/H-SMF split on this path
+        // (`is_home_routed_roaming_in_vsmf` is driven by `pdu_session_ref`, which
+        // the sm-contexts path never sets), so honouring the flag here would mean
+        // pretending to a split that does not exist. Recorded, and the limit is
+        // stated rather than a partial release invented.
+        log::warn!(
+            "SM Context Release ref={sm_context_ref} set vsmfReleaseOnly, but this SMF has no \
+             V-SMF/H-SMF split on the sm-contexts path: the whole session is released"
+        );
+    }
 
     // Take the policy binding (copy out, drop guards before any await)
     let binding = smf_self().read().ok().and_then(|ctx| {
@@ -4135,6 +4520,89 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
     SbiResponse::with_status(204)
 }
 
+/// Register an SM context and return `(smContextRef, session id)` (#78).
+///
+/// The reference is read back OUT of the session rather than computed alongside it.
+/// `sess_add_by_psi` mints `sm_context_ref` from the context's `sess_index`, and the
+/// create handler used to compute its reference from `next_sess_index()` — the
+/// **same** counter. Doing both consumes it twice and leaves the handler's reference
+/// one behind the session's, so the value handed to the AMF resolves to nothing, or
+/// worse to the next session. One source, by construction.
+///
+/// Extracted so that invariant is testable: the create handler's success path needs
+/// a PFCP-responding UPF that no harness in this tree has, so a test cannot observe
+/// the reference the handler returns. It can observe this function's.
+///
+/// `None` when the UE or session capacity cap is reached, which the caller must
+/// report rather than answering with a reference no Retrieve can resolve.
+fn register_sm_context(
+    context: &context::SmfContext,
+    supi: &str,
+    psi: u8,
+) -> Option<(String, u64)> {
+    let ue = context
+        .ue_find_by_supi(supi)
+        .or_else(|| context.ue_add_by_supi(supi))?;
+    let sess = context.sess_add_by_psi(ue.id, psi)?;
+    let reference = sess.sm_context_ref.clone()?;
+    Some((reference, sess.id))
+}
+
+/// Does the SMF hold an SM context for this reference? (#78)
+///
+/// Checks BOTH the session list and the policy-binding map, and accepts either.
+/// The two are populated on the same create and removed on the same release, but
+/// they are separate maps: requiring both would make a reference the SMF can
+/// plainly act on look unknown if one half was lost, which is a worse answer than
+/// acting on the half that survived.
+fn sm_context_exists(sm_context_ref: &str) -> bool {
+    let handle = smf_self();
+    let Ok(ctx) = handle.read() else {
+        return false;
+    };
+    if ctx.sess_find_by_sm_context_ref(sm_context_ref).is_some() {
+        return true;
+    }
+    ctx.policy_bindings
+        .read()
+        .map(|b| b.contains_key(sm_context_ref))
+        .unwrap_or(false)
+}
+
+/// `SmContextReleaseData` (TS 29.502 §6.1.6.2.13, #78).
+#[derive(Debug, Default, Clone)]
+struct SmContextReleaseData {
+    /// Release cause the AMF reported
+    cause: Option<String>,
+    /// N2 SM information carried with the release, when present
+    n2_sm_info: Option<Vec<u8>>,
+    /// The V-SMF releases only its own resources
+    vsmf_release_only: bool,
+}
+
+/// Parse `SmContextReleaseData` from a release request (#78).
+///
+/// Every member is optional in the yaml, so an EMPTY body is valid and yields the
+/// default — a release with no stated cause is still a release, and refusing it
+/// would break the AMF path that sends none.
+fn parse_sm_context_release_data(request: &SbiRequest) -> SmContextReleaseData {
+    let Some(json) = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+    else {
+        return SmContextReleaseData::default();
+    };
+    SmContextReleaseData {
+        cause: json["cause"].as_str().map(str::to_string),
+        // The same RefToBinaryData / base64 duality every other N2 payload on this
+        // path accepts (see `resolve_binary_ref`).
+        n2_sm_info: resolve_binary_ref(request, &json["n2SmInfo"]),
+        vsmf_release_only: json["vsmfReleaseOnly"].as_bool().unwrap_or(false),
+    }
+}
+
 /// Handle SM Context Retrieve
 async fn handle_sm_context_retrieve(sm_context_ref: &str) -> SbiResponse {
     log::info!("SM Context Retrieve request for ref={sm_context_ref}");
@@ -4148,7 +4616,7 @@ async fn handle_sm_context_retrieve(sm_context_ref: &str) -> SbiResponse {
                 context::UpCnxState::Deactivated => "DEACTIVATED",
             };
 
-            let response_body = serde_json::json!({
+            let mut response_body = serde_json::json!({
                 "smContextRef": sm_context_ref,
                 "pduSessionId": sess.psi,
                 "dnn": sess.session_name,
@@ -4156,19 +4624,74 @@ async fn handle_sm_context_retrieve(sm_context_ref: &str) -> SbiResponse {
                     "sst": sess.s_nssai.sst,
                     "sd": sess.s_nssai.sd
                 },
-                "upCnxState": up_cnx_state
+                "upCnxState": up_cnx_state,
+                // #78: `ueEpsPdnConnection` is a REQUIRED member of
+                // SmContextRetrievedData (TS29502_Nsmf_PDUSession.yaml), and it was
+                // absent -- so the body did not deserialise as the type the AMF
+                // expects even once Retrieve started answering 200.
+                "ueEpsPdnConnection": build_ue_eps_pdn_connection(&sess),
             });
+            // Only include what the session actually holds: an absent member means
+            // "not applicable", while a member present with a placeholder value is a
+            // claim about the session that is not true.
+            if let Some(ref uri) = sess.sm_context_status_uri {
+                response_body["smContextStatusUri"] = serde_json::json!(uri);
+            }
 
             return SbiResponse::with_status(200)
                 .with_body(response_body.to_string(), "application/json");
         }
     }
 
-    let error = serde_json::json!({
-        "status": 404,
-        "cause": "CONTEXT_NOT_FOUND"
-    });
-    SbiResponse::with_status(404).with_body(error.to_string(), "application/json")
+    // #78: a ProblemDetails body, not a bare status/cause pair. TS 29.500 §5.2.7
+    // and the Nsmf yaml both make the 404 body a ProblemDetails, and a consumer
+    // deserialising one gets nothing usable from `{"status":..,"cause":..}` alone.
+    problem_response(
+        404,
+        "CONTEXT_NOT_FOUND",
+        "No SM context for this smContextRef",
+    )
+}
+
+/// Build the `ueEpsPdnConnection` member of `SmContextRetrievedData`
+/// (TS 29.502 §5.2.2.6.1, #78).
+///
+/// The member carries the EPS PDN Connection this 5GS session maps to, for
+/// 5GS↔EPS interworking (TS 23.502 §4.11.1.4.1). It is a `Bytes` (base64-encoded
+/// octet string) in the yaml: the encoded `ueEpsPdnConnection` container.
+///
+/// **What this returns, and what it deliberately does not.** This SMF has no EPS
+/// bearer contexts to describe — there is no EBI assignment and no Mapped EPS
+/// bearer context IE anywhere in the tree, which is issue #117's defect, not this
+/// one. So the value here is the minimal PDN-connection descriptor derivable from
+/// the 5GS session (APN, PDN type, the UE address, the default bearer's QoS), and
+/// **not** a bearer-context list it would have to invent. A fabricated bearer list
+/// would be worse than a minimal one: the AMF would forward it to an MME that
+/// would then try to use bearers this SMF has not established.
+fn build_ue_eps_pdn_connection(sess: &context::SmfSess) -> String {
+    use base64::Engine as _;
+    // TS 24.301 PDN type values: 1 = IPv4, 2 = IPv6, 3 = IPv4v6.
+    let pdn_type: u8 = match sess.session_type {
+        context::PduSessionType::Ipv6 => 2,
+        context::PduSessionType::Ipv4v6 => 3,
+        _ => 1,
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    // APN, length-prefixed as in TS 24.301 §9.9.4.1.
+    let apn = sess.session_name.as_deref().unwrap_or("");
+    let apn_bytes = apn.as_bytes();
+    buf.push(apn_bytes.len().min(u8::MAX as usize) as u8);
+    buf.extend_from_slice(&apn_bytes[..apn_bytes.len().min(u8::MAX as usize)]);
+    buf.push(pdn_type);
+    // The UE address the PDN connection carries.
+    match sess.ipv4_addr {
+        Some(addr) => buf.extend_from_slice(&addr.octets()),
+        None => buf.extend_from_slice(&[0, 0, 0, 0]),
+    }
+    // Default bearer QoS: the 5QI the session was authorised with, which is what
+    // maps onto the EPS QCI.
+    buf.push(sess.session_qos.index);
+    base64::engine::general_purpose::STANDARD.encode(&buf)
 }
 
 // =============================================================================
@@ -4332,7 +4855,9 @@ async fn handle_sm_policy_terminate(sm_context_ref: &str) -> SbiResponse {
     }
     // Re-use the release path (PFCP deletion, IP release, FSM, binding drop).
     // The SM policy delete inside is a no-op risk-wise: the PCF asked for it.
-    handle_sm_context_release(sm_context_ref).await;
+    // #78: no request body -- this release is PCF-driven, not AMF-driven, so there
+    // is no SmContextReleaseData to parse.
+    handle_sm_context_release(sm_context_ref, None).await;
     SbiResponse::with_status(204)
 }
 
@@ -5515,7 +6040,7 @@ mod tests {
         }
         seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
-        let _ = handle_sm_context_release("easdf-release-ref").await;
+        let _ = handle_sm_context_release("easdf-release-ref", None).await;
 
         let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert!(
@@ -5530,7 +6055,7 @@ mod tests {
         // every deployment that does not use edge DNS.
         seed_binding("easdf-release-none", 10);
         seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        let _ = handle_sm_context_release("easdf-release-none").await;
+        let _ = handle_sm_context_release("easdf-release-none", None).await;
         assert!(
             seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "a session without a DNS context must not dial the EASDF"
@@ -6059,6 +6584,647 @@ mod tests {
              than failing the whole parse"
         );
         assert_eq!(config.mtu, Some(1400));
+    }
+    // ====================================================================
+    // #78: SM context lifecycle
+    //
+    // These drive the REAL SBI handlers, not helpers, and share the process-global
+    // SMF context, so each uses distinct references and asserts only about its own.
+    // ====================================================================
+
+    /// Register a session in the context list the way the create handler now does,
+    /// and return its `smContextRef` — minted by the session itself, so a test can
+    /// never assert against a reference the context does not hold.
+    fn seed_registered_session(supi: &str, psi: u8, dnn: &str) -> String {
+        smf_context_init(64, 256, 512);
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+        let ue = context
+            .ue_find_by_supi(supi)
+            .or_else(|| context.ue_add_by_supi(supi))
+            .expect("ue");
+        let mut sess = context.sess_add_by_psi(ue.id, psi).expect("session");
+        sess.session_name = Some(dnn.to_string());
+        sess.full_dnn = Some(dnn.to_string());
+        sess.s_nssai = context::SNssai { sst: 1, sd: None };
+        sess.set_ipv4_addr(std::net::Ipv4Addr::new(10, 45, 0, 2));
+        sess.up_cnx_state = context::UpCnxState::Activated;
+        sess.session_qos.index = 9;
+        context.sess_update(&sess);
+        sess.sm_context_ref
+            .clone()
+            .expect("the session mints its own ref")
+    }
+
+    /// #78 criterion 1, guarding the CREATE handler itself.
+    ///
+    /// Written after a revert pass showed that
+    /// `retrieve_answers_200_with_ue_eps_pdn_connection` still passed with the
+    /// create handler's registration removed — it seeds a session directly, so it
+    /// guards Retrieve, not create. This drives the real
+    /// `handle_sm_context_create` through the router.
+    ///
+    /// The create CANNOT succeed here: it needs a PFCP-responding UPF, and no
+    /// harness in this tree has one (no existing test establishes an N4 session
+    /// either). So what is asserted is the rollback contract instead, which is the
+    /// half a failing create can prove and the half that a naive registration gets
+    /// wrong: a create that answers an error must leave **no** SM context behind.
+    /// An abandoned registration would be a context the AMF never learned about and
+    /// will never release.
+    #[tokio::test]
+    async fn a_failed_create_leaves_no_registered_sm_context() {
+        smf_context_init(64, 256, 512);
+        let supi = "imsi-001010000000086";
+        let psi = 11u8;
+
+        // A create that reaches the N4 leg and fails there, the same shape
+        // `a_failed_establishment_creates_no_easdf_dns_context` uses.
+        let body = serde_json::json!({
+            "pduSessionId": psi,
+            "supi": supi,
+            "sNssai": { "sst": 1, "sd": "010203" },
+            "dnn": "internet",
+            "anType": "3GPP_ACCESS",
+            "ratType": "NR",
+            "n1SmMsg": { "contentId": "n1SmMsg" },
+        });
+        let n1_msg = n1(
+            psi,
+            1,
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+            &[0x91, 0x00],
+        );
+        let request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
+            .with_body(body.to_string(), "application/json")
+            .with_part(nextgcore_sbi::message::SbiPart::with_content(
+                "n1SmMsg",
+                "application/vnd.3gpp.5gnas",
+                n1_msg.into(),
+            ));
+        let resp = handle_sm_context_create(&request).await;
+        assert_eq!(
+            resp.status, 504,
+            "without a UPF the session cannot establish; if this ever becomes a 2xx \
+             the harness gained a UPF and this test should assert the REGISTRATION \
+             instead of the rollback"
+        );
+
+        // Asserted per-SUPI, not on a global session count: this context is
+        // process-global and sibling tests add sessions of their own, so an absolute
+        // count is a race rather than an assertion (which is how the first version of
+        // this test failed).
+        let ctx = smf_self();
+        let guard = ctx.read().expect("context");
+        let leftover = guard
+            .ue_find_by_supi(supi)
+            .map(|ue| ue.sess_ids.len())
+            .unwrap_or(0);
+        assert_eq!(
+            leftover, 0,
+            "a create that answered 504 must roll its session registration back; an \
+             abandoned registration is an SM context the AMF never learned about and \
+             will never release"
+        );
+    }
+
+    /// #78 criterion 1's invariant, at the function the create handler calls: the
+    /// reference a registration returns is the one that resolves to it.
+    ///
+    /// Guards the defect directly — before #78 the handler returned
+    /// `next_sess_index()` and registered nothing, so the reference resolved to
+    /// nothing at all; and once registration was added, computing the reference
+    /// separately from the same counter would have left it one behind.
+    #[test]
+    fn register_sm_context_returns_the_reference_that_resolves_to_it() {
+        smf_context_init(64, 256, 512);
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+
+        let (first_ref, first_id) =
+            register_sm_context(&context, "imsi-001010000000088", 1).expect("first");
+        let (second_ref, second_id) =
+            register_sm_context(&context, "imsi-001010000000089", 2).expect("second");
+
+        assert_ne!(first_ref, second_ref);
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            context
+                .sess_find_by_sm_context_ref(&first_ref)
+                .map(|s| s.id),
+            Some(first_id),
+            "the reference the handler hands the AMF must resolve to the session it registered"
+        );
+        assert_eq!(
+            context
+                .sess_find_by_sm_context_ref(&second_ref)
+                .map(|s| s.id),
+            Some(second_id)
+        );
+        // Two registrations for the SAME subscriber reuse the UE and still get
+        // distinct references: a second PDU session must not collide with the first.
+        let (third_ref, third_id) =
+            register_sm_context(&context, "imsi-001010000000088", 3).expect("third");
+        assert_ne!(third_ref, first_ref);
+        assert_eq!(
+            context
+                .sess_find_by_sm_context_ref(&third_ref)
+                .map(|s| s.id),
+            Some(third_id)
+        );
+    }
+
+    /// The registration and the reference it returns come from ONE source.
+    ///
+    /// `sess_add_by_psi` mints `sm_context_ref` from `sess_index`, and the handler
+    /// used to compute the reference from `next_sess_index()` — the same counter.
+    /// Doing both would consume it twice and leave the handler's reference one
+    /// behind the session's, so the value the AMF was given would resolve to
+    /// nothing (or, worse, to the next session). This pins that the reference a
+    /// registration yields is the one that resolves.
+    #[test]
+    fn a_registered_session_resolves_by_the_reference_it_minted() {
+        smf_context_init(64, 256, 512);
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+        let ue = context.ue_add_by_supi("imsi-001010000000087").expect("ue");
+        let first = context.sess_add_by_psi(ue.id, 1).expect("first session");
+        let second = context.sess_add_by_psi(ue.id, 2).expect("second session");
+
+        let first_ref = first.sm_context_ref.clone().expect("first ref");
+        let second_ref = second.sm_context_ref.clone().expect("second ref");
+        assert_ne!(first_ref, second_ref, "each session gets its own reference");
+
+        // Each reference resolves to ITS OWN session, not to a neighbour.
+        assert_eq!(
+            context
+                .sess_find_by_sm_context_ref(&first_ref)
+                .map(|s| s.id),
+            Some(first.id)
+        );
+        assert_eq!(
+            context
+                .sess_find_by_sm_context_ref(&second_ref)
+                .map(|s| s.id),
+            Some(second.id)
+        );
+    }
+
+    /// #78 criteria 1 + 2: Retrieve answers 200 with a body that deserialises as
+    /// `SmContextRetrievedData`, INCLUDING the required `ueEpsPdnConnection`.
+    ///
+    /// Before #78 the create handler registered nothing, so this path answered
+    /// `404 CONTEXT_NOT_FOUND` for a session that had just been created.
+    #[tokio::test]
+    async fn retrieve_answers_200_with_ue_eps_pdn_connection() {
+        let reference = seed_registered_session("imsi-001010000000078", 7, "internet");
+
+        let resp = handle_sm_context_retrieve(&reference).await;
+        assert_eq!(resp.status, 200, "a registered session must be retrievable");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["smContextRef"], serde_json::json!(reference));
+        assert_eq!(body["pduSessionId"], serde_json::json!(7));
+        assert_eq!(body["dnn"], serde_json::json!("internet"));
+        assert_eq!(body["upCnxState"], serde_json::json!("ACTIVATED"));
+
+        // The required member, and it must decode to something derived from the
+        // session rather than be a placeholder.
+        let encoded = body["ueEpsPdnConnection"]
+            .as_str()
+            .expect("ueEpsPdnConnection is a required member of SmContextRetrievedData");
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("ueEpsPdnConnection must be valid base64");
+        // APN length prefix, then the APN, then PDN type, address, QCI.
+        assert_eq!(decoded[0] as usize, "internet".len());
+        assert_eq!(&decoded[1..9], b"internet");
+        assert_eq!(decoded[9], 1, "IPv4 PDN type");
+        assert_eq!(&decoded[10..14], &[10, 45, 0, 2], "the UE address");
+        assert_eq!(decoded[14], 9, "the default bearer QCI");
+    }
+
+    /// #78 criterion 3: Retrieve of an unknown ref is 404 with a ProblemDetails —
+    /// at `application/problem+json`, not the bare status/cause pair at
+    /// `application/json` it used to send.
+    #[tokio::test]
+    async fn retrieve_of_an_unknown_ref_is_404_problem_details() {
+        smf_context_init(64, 256, 512);
+        let resp = handle_sm_context_retrieve("no-such-ref-78").await;
+        assert_eq!(resp.status, 404);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["status"], serde_json::json!(404));
+        assert_eq!(body["cause"], serde_json::json!("CONTEXT_NOT_FOUND"));
+        assert!(
+            body["detail"].is_string(),
+            "a ProblemDetails must carry a detail a consumer can log"
+        );
+    }
+
+    /// #78 criterion 3: Update on an unknown ref is 404 + ProblemDetails, and on a
+    /// KNOWN ref still succeeds. Both halves matter — a version that 404s
+    /// everything would satisfy the first alone.
+    #[tokio::test]
+    async fn update_rejects_an_unknown_ref_and_still_serves_a_known_one() {
+        let reference = seed_registered_session("imsi-001010000000079", 9, "internet");
+
+        let unknown = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/nope-78/modify").with_body(
+            serde_json::json!({ "upCnxState": "ACTIVATED" }).to_string(),
+            "application/json",
+        );
+        let resp = handle_sm_context_update("nope-78", &unknown).await;
+        assert_eq!(
+            resp.status, 404,
+            "an Update that blindly returns 200 masks lost state"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["cause"], serde_json::json!("CONTEXT_NOT_FOUND"));
+
+        let known = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
+            serde_json::json!({ "upCnxState": "ACTIVATED" }).to_string(),
+            "application/json",
+        );
+        let resp = handle_sm_context_update(&reference, &known).await;
+        assert_eq!(resp.status, 200, "a known ref must still be served");
+    }
+
+    /// #78 criterion 4: Release on an unknown ref is 404 + ProblemDetails, and a
+    /// known one parses `SmContextReleaseData` and answers 204.
+    #[tokio::test]
+    async fn release_rejects_an_unknown_ref_and_parses_release_data() {
+        let reference = seed_registered_session("imsi-001010000000080", 3, "internet");
+
+        let unknown = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/gone-78/release")
+            .with_body(
+                serde_json::json!({ "cause": "REL_DUE_TO_UE_REQ" }).to_string(),
+                "application/json",
+            );
+        let resp = handle_sm_context_release("gone-78", Some(&unknown)).await;
+        assert_eq!(
+            resp.status, 404,
+            "releasing a context the SMF does not hold must not answer 204"
+        );
+
+        // A real SmContextReleaseData body on a known ref.
+        let known = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/release").with_body(
+            serde_json::json!({
+                "cause": "REL_DUE_TO_UE_REQ",
+                "vsmfReleaseOnly": false,
+            })
+            .to_string(),
+            "application/json",
+        );
+        let resp = handle_sm_context_release(&reference, Some(&known)).await;
+        assert_eq!(resp.status, 204);
+        assert!(
+            !sm_context_exists(&reference),
+            "and the context must actually be gone afterwards"
+        );
+    }
+
+    /// `SmContextReleaseData` members are read. Every member is optional in the
+    /// yaml, so an empty body must still parse — refusing it would break the AMF
+    /// path that sends none.
+    #[test]
+    fn sm_context_release_data_parses_its_members_and_an_empty_body() {
+        let with_members = SbiRequest::post("/x").with_body(
+            serde_json::json!({
+                "cause": "REL_DUE_TO_SLICE_NOT_AVAILABLE",
+                "vsmfReleaseOnly": true,
+            })
+            .to_string(),
+            "application/json",
+        );
+        let parsed = parse_sm_context_release_data(&with_members);
+        assert_eq!(
+            parsed.cause.as_deref(),
+            Some("REL_DUE_TO_SLICE_NOT_AVAILABLE")
+        );
+        assert!(parsed.vsmf_release_only);
+
+        let empty = SbiRequest::post("/x").with_body("{}".to_string(), "application/json");
+        let parsed = parse_sm_context_release_data(&empty);
+        assert_eq!(parsed.cause, None);
+        assert!(!parsed.vsmf_release_only);
+        assert!(parsed.n2_sm_info.is_none());
+    }
+
+    /// #78 criterion 5: an Update carrying `HANDOVER_REQUIRED` with an `hoState` is
+    /// processed rather than refused with 400, and the handover states move the way
+    /// TS 29.502 §5.2.2.3.4 describes.
+    ///
+    /// PREPARING and PREPARED must NOT touch the user plane: until the UE has moved
+    /// the source gNB is still serving it, so re-pointing the UPF would black-hole
+    /// downlink traffic for the whole execution window. The test asserts the state
+    /// answers, which is the observable that distinguishes "handled" from
+    /// "rejected".
+    #[tokio::test]
+    async fn n2_handover_states_are_processed_not_refused() {
+        let reference = seed_registered_session("imsi-001010000000081", 5, "internet");
+
+        for (info_type, requested, expected) in [
+            ("HANDOVER_REQUIRED", "PREPARING", "PREPARING"),
+            ("HANDOVER_REQ_ACK", "PREPARED", "PREPARED"),
+            ("HANDOVER_CANCEL", "CANCELLED", "CANCELLED"),
+        ] {
+            let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
+                serde_json::json!({
+                    "n2SmInfoType": info_type,
+                    "hoState": requested,
+                })
+                .to_string(),
+                "application/json",
+            );
+            let resp = handle_sm_context_update(&reference, &req).await;
+            assert_eq!(
+                resp.status, 200,
+                "{info_type} must be processed, not answered 400"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+            assert_eq!(
+                body["hoState"],
+                serde_json::json!(expected),
+                "{info_type} must drive the §5.2.2.3.4 state"
+            );
+        }
+
+        // And the session survives every one of them: a handover that dropped the
+        // context would be worse than one that was refused.
+        assert!(sm_context_exists(&reference));
+    }
+
+    /// A HANDOVER_COMPLETE with no decodable target endpoint still completes, and
+    /// says so. Asserted because the alternative — a bare 200 — would leave an
+    /// operator unable to tell a switched tunnel from an unswitched one.
+    #[tokio::test]
+    async fn handover_complete_without_a_target_endpoint_still_completes() {
+        let reference = seed_registered_session("imsi-001010000000082", 6, "internet");
+        let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
+            serde_json::json!({
+                "n2SmInfoType": "HANDOVER_COMPLETE",
+                "hoState": "COMPLETED",
+            })
+            .to_string(),
+            "application/json",
+        );
+        let resp = handle_sm_context_update(&reference, &req).await;
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["hoState"], serde_json::json!("COMPLETED"));
+    }
+
+    /// #78 criterion 7: create → retrieve → update → release, asserting each status
+    /// and body, against the REAL request router rather than the handlers directly.
+    ///
+    /// The create leg is driven by seeding a registered session rather than by a
+    /// full `POST /sm-contexts`, because a real create needs a PFCP-responding UPF
+    /// this harness does not have (no existing test establishes an N4 session
+    /// either). What is end-to-end here is the lifecycle of a *registered* context
+    /// through the router: the create handler's registration is covered separately
+    /// by `retrieve_answers_200_with_ue_eps_pdn_connection`, which fails without it.
+    #[tokio::test]
+    async fn the_sm_context_lifecycle_round_trips_through_the_router() {
+        let reference = seed_registered_session("imsi-001010000000083", 4, "internet");
+
+        // Retrieve
+        let resp = smf_sbi_request_handler(SbiRequest::post(&format!(
+            "/nsmf-pdusession/v1/sm-contexts/{reference}/retrieve"
+        )))
+        .await;
+        assert_eq!(resp.status, 200, "retrieve through the router");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert!(body["ueEpsPdnConnection"].is_string());
+
+        // Update
+        let resp = smf_sbi_request_handler(
+            SbiRequest::post(&format!(
+                "/nsmf-pdusession/v1/sm-contexts/{reference}/modify"
+            ))
+            .with_body(
+                serde_json::json!({ "upCnxState": "ACTIVATED" }).to_string(),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "update through the router");
+
+        // Release
+        let resp = smf_sbi_request_handler(
+            SbiRequest::post(&format!(
+                "/nsmf-pdusession/v1/sm-contexts/{reference}/release"
+            ))
+            .with_body(
+                serde_json::json!({ "cause": "REL_DUE_TO_UE_REQ" }).to_string(),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 204, "release through the router");
+
+        // And it is gone: a second retrieve is 404, not a stale 200.
+        let resp = smf_sbi_request_handler(SbiRequest::post(&format!(
+            "/nsmf-pdusession/v1/sm-contexts/{reference}/retrieve"
+        )))
+        .await;
+        assert_eq!(
+            resp.status, 404,
+            "a released context must not still be retrievable"
+        );
+    }
+
+    /// A wire-format PFCP Session Report Request carrying a Downlink Data Report
+    /// (TS 29.244 §7.5.8), so the DLDR path can be driven exactly as a UPF would.
+    ///
+    /// IEs: Report Type (39) with the DLDR bit, then Downlink Data Report (83)
+    /// containing PDR ID (56) and Downlink Data Service Information (45) whose flags
+    /// mark the QFI present.
+    fn dldr_report_packet(seid: u64, qfi: u8) -> Vec<u8> {
+        fn ie(t: u16, v: &[u8]) -> Vec<u8> {
+            let mut out = t.to_be_bytes().to_vec();
+            out.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            out.extend_from_slice(v);
+            out
+        }
+        let mut body = Vec::new();
+        // Report Type: bit 0 = DLDR.
+        body.extend_from_slice(&ie(39, &[0x01]));
+        let mut dldr = Vec::new();
+        dldr.extend_from_slice(&ie(56, &1u16.to_be_bytes()));
+        // Downlink Data Service Information: flags 0x02 = QFI present, no PPI.
+        dldr.extend_from_slice(&ie(45, &[0x02, qfi]));
+        body.extend_from_slice(&ie(83, &dldr));
+        pfcp_path::encode_wire_message(56, Some(seid), 1, &body)
+    }
+
+    /// #78 criterion 6: a DLDR for a deactivated connection emits an OUTBOUND
+    /// `Namf_Communication_N1N2MessageTransfer` — asserted by observing the HTTP
+    /// request at a fake AMF, not by checking a log line or the
+    /// `trigger_service_request` flag, both of which the issue explicitly rules out.
+    #[tokio::test]
+    async fn a_downlink_data_report_pages_the_ue_via_the_amf() {
+        // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+        // dev-profile deployment. Declared rather than inherited: the default
+        // `SbiProfile` is Production, which would refuse the plaintext connection and
+        // make this test fail for a reason unrelated to what it asserts.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        use nextgcore_sbi::message::SbiResponse;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let port = nextgcore_sbi::test_support::free_port();
+        let amf = SbiServer::new(SbiServerConfig::new(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
+        amf.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    req.header.method.clone(),
+                    req.header.uri.clone(),
+                    req.http.content.clone().unwrap_or_default(),
+                ));
+                SbiResponse::with_status(200)
+            }
+        })
+        .await
+        .expect("amf start");
+
+        // A session with a DEACTIVATED user plane and a serving-AMF URI.
+        let supi = "imsi-001010000000084";
+        let reference = seed_registered_session(supi, 8, "internet");
+        let amf_uri = format!("http://127.0.0.1:{port}");
+        let seid = {
+            let ctx = smf_self();
+            let context = ctx.read().expect("context");
+            let mut sess = context
+                .sess_find_by_sm_context_ref(&reference)
+                .expect("session");
+            sess.up_cnx_state = context::UpCnxState::Deactivated;
+            sess.sm_context_status_uri = Some(amf_uri.clone());
+            context.sess_update(&sess);
+            sess.smf_n4_seid
+        };
+
+        // Drive the REAL PFCP Session Report path with a wire-format DLDR, not
+        // `trigger_network_initiated_service_request` directly.
+        //
+        // The first version of this test called the helper, and a revert pass showed
+        // it still passed with the call REMOVED from the DLDR handler — "the helper
+        // is tested and the wiring is not", which is precisely the hazard #78's
+        // criterion 6 names when it says to assert the outbound call rather than the
+        // log line or the flag.
+        let upf = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("fake UPF socket");
+        let smf_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("smf socket");
+        let upf_addr = upf.local_addr().expect("upf addr");
+        handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 5), upf_addr).await;
+
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let paging = requests
+            .iter()
+            .find(|(_, uri, _)| uri.contains("/n1-n2-messages"))
+            .expect("a DLDR must emit an N1N2MessageTransfer toward the AMF");
+        assert_eq!(paging.0, "POST");
+        assert!(
+            paging.1.contains(supi),
+            "addressed to the UE's own ue-context, got {}",
+            paging.1
+        );
+        let body: serde_json::Value = serde_json::from_str(&paging.2).expect("json body");
+        assert_eq!(body["pduSessionId"], serde_json::json!(8));
+        // The N2 form, not the N1 form: the point is to re-establish the user
+        // plane, and there is no NAS message to deliver to a sleeping UE.
+        assert_eq!(
+            body["n2InfoContainer"]["n2InformationClass"],
+            serde_json::json!("SM"),
+            "paging carries n2InfoContainer, not n1MessageContainer"
+        );
+        assert!(
+            body["n1MessageContainer"].is_null(),
+            "there is no NAS message to deliver for a network-triggered service request"
+        );
+        assert_eq!(
+            body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapData"]["qfi"],
+            serde_json::json!(5),
+            "the reported QFI must reach the AMF so the gNB knows which flow to restore"
+        );
+
+        amf.stop().await.expect("stop");
+    }
+
+    /// The other half: a DLDR for a session whose user plane is UP must NOT page.
+    /// TS 29.244 §7.5.8.2 scopes the report to a *deactivated* connection, and
+    /// paging a connected UE is a spurious service request. Without this, "a DLDR
+    /// pages" would be satisfied by a version that pages unconditionally.
+    #[tokio::test]
+    async fn a_downlink_data_report_for_an_active_connection_does_not_page() {
+        // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
+        // dev-profile deployment. Declared rather than inherited: the default
+        // `SbiProfile` is Production, which would refuse the plaintext connection and
+        // make this test fail for a reason unrelated to what it asserts.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        use nextgcore_sbi::message::SbiResponse;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let port = nextgcore_sbi::test_support::free_port();
+        let amf = SbiServer::new(SbiServerConfig::new(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
+        amf.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                sink.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(req.header.uri.clone());
+                SbiResponse::with_status(200)
+            }
+        })
+        .await
+        .expect("amf start");
+
+        let reference = seed_registered_session("imsi-001010000000085", 2, "internet");
+        let seid = {
+            let ctx = smf_self();
+            let context = ctx.read().expect("context");
+            let mut sess = context
+                .sess_find_by_sm_context_ref(&reference)
+                .expect("session");
+            // ACTIVATED, which `seed_registered_session` already sets.
+            sess.sm_context_status_uri = Some(format!("http://127.0.0.1:{port}"));
+            context.sess_update(&sess);
+            sess.smf_n4_seid
+        };
+
+        let upf = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("fake UPF socket");
+        let smf_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("smf socket");
+        let upf_addr = upf.local_addr().expect("upf addr");
+        handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 1), upf_addr).await;
+
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "an active user-plane connection must not be paged"
+        );
+
+        amf.stop().await.expect("stop");
     }
 }
 
