@@ -64,6 +64,11 @@ pub const NEXTGCORE_OPERATOR_DETERMINED_BARRING_STRING: &str = "operator_determi
 pub const NEXTGCORE_NETWORK_ACCESS_MODE_STRING: &str = "network_access_mode";
 pub const NEXTGCORE_SUBSCRIBED_RAU_TAU_TIMER_STRING: &str = "subscribed_rau_tau_timer";
 pub const NEXTGCORE_AMBR_STRING: &str = "ambr";
+/// Subscribed 3GPP-Charging-Characteristics field, subscriber and per-APN
+/// (nextgcore #56).
+pub const NEXTGCORE_CHARGING_CHARACTERISTICS_STRING: &str = "charging_characteristics";
+/// Dynamically allocated PDN-GW identity, per APN (nextgcore #56).
+pub const NEXTGCORE_PGW_ID_STRING: &str = "pgw_id";
 pub const NEXTGCORE_DOWNLINK_STRING: &str = "downlink";
 pub const NEXTGCORE_UPLINK_STRING: &str = "uplink";
 pub const NEXTGCORE_VALUE_STRING: &str = "value";
@@ -198,6 +203,12 @@ pub struct NextgcoreSession {
     pub ue_ip: NextgcoreIp,
     pub ipv4_framed_routes: Vec<String>,
     pub ipv6_framed_routes: Vec<String>,
+    /// Per-APN 3GPP-Charging-Characteristics as provisioned, verbatim
+    /// (nextgcore #56). Falls back to the subscriber-level value when absent.
+    pub charging_characteristics: Option<String>,
+    /// Dynamically allocated PDN-GW identity this APN was last notified for
+    /// (nextgcore #56, TS 29.272 §5.2.5.1.1). Written by the NOR handler.
+    pub pgw_id: Option<String>,
 }
 
 /// Flow direction
@@ -265,6 +276,15 @@ pub struct NextgcoreSubscriptionData {
     pub mme_host: Option<String>,
     pub mme_realm: Option<String>,
     pub purge_flag: bool,
+    /// Subscribed 3GPP-Charging-Characteristics as provisioned, verbatim
+    /// (nextgcore #56).
+    ///
+    /// Kept as the provisioned string rather than parsed octets so the DB layer
+    /// stays free of the S6a wire format: `nextgcore-diameter`'s
+    /// `ChargingCharacteristics` owns the encoding, and this layer owns only what
+    /// the operator wrote. `None` means the subscriber has none provisioned, which
+    /// is what the AVP being absent means.
+    pub charging_characteristics: Option<String>,
 }
 
 impl NextgcoreSubscriptionData {

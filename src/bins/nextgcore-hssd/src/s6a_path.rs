@@ -195,6 +195,169 @@ pub fn register_mme_peer(
         .expect("peer registry lock poisoned")
         .insert(origin_host.to_string(), sender);
     log::info!("S6a peer registered: {origin_host}");
+    // #56: deliver anything that was queued while this peer was disconnected,
+    // rather than leaving it to time out against a link that is now up. Called
+    // after the registry insert so `send_to_mme` can find the new sender.
+    requeue_for_peer(origin_host);
+    // #56: and, if this process came up from an unclean shutdown, tell this MME so
+    // it re-runs Update Location (TS 29.272 §5.2.3, TS 23.007).
+    send_restart_reset_if_armed(origin_host);
+}
+
+// ============================================================================
+// #56: HSS restart restoration (TS 29.272 §5.2.3, TS 23.007)
+// ============================================================================
+
+/// How long after startup an arriving MME is still told about the restart.
+///
+/// Bounded rather than for the process lifetime: an MME that reconnects an hour
+/// later has already re-run Update Location as part of reconnecting, so a Reset
+/// then would ask it to redo work it has done. Five minutes covers the reconnect
+/// storm that follows a restart.
+pub const RESTART_RESET_WINDOW_SECS: u64 = 300;
+
+struct RestartResetState {
+    armed: bool,
+    armed_at: std::time::Instant,
+    user_ids: Vec<String>,
+}
+
+fn restart_reset_state() -> &'static RwLock<RestartResetState> {
+    static STATE: OnceLock<RwLock<RestartResetState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        RwLock::new(RestartResetState {
+            armed: false,
+            armed_at: std::time::Instant::now(),
+            user_ids: Vec::new(),
+        })
+    })
+}
+
+/// Arm restart restoration: every MME that registers within
+/// [`RESTART_RESET_WINDOW_SECS`] is sent a Reset-Request (#56).
+///
+/// Armed rather than sent immediately because at startup **no MME is connected
+/// yet** — the HSS is the responder on S6a, so the peers arrive afterwards. Sending
+/// at startup would reliably send to nobody, which is the shape of a procedure that
+/// looks implemented and never fires.
+pub fn arm_restart_reset(user_ids: Vec<String>) {
+    if let Ok(mut state) = restart_reset_state().write() {
+        state.armed = true;
+        state.armed_at = std::time::Instant::now();
+        state.user_ids = user_ids;
+        log::warn!(
+            "HSS restart restoration armed: MMEs registering in the next {}s will be sent a \
+             Reset-Request (TS 29.272 §5.2.3)",
+            RESTART_RESET_WINDOW_SECS
+        );
+    }
+}
+
+/// Test-only: disarm restart restoration.
+///
+/// `arm_restart_reset` installs process-global state that stays armed for
+/// `RESTART_RESET_WINDOW_SECS`, so a test that arms it and does not disarm makes
+/// every LATER test that registers an MME peer receive an unexpected
+/// Reset-Request first. That is exactly how three sibling tests broke while this
+/// was being written.
+#[cfg(test)]
+pub(crate) fn disarm_restart_reset() {
+    if let Ok(mut state) = restart_reset_state().write() {
+        state.armed = false;
+        state.user_ids.clear();
+    }
+}
+
+/// Whether restart restoration is still armed.
+pub fn restart_reset_armed() -> bool {
+    restart_reset_state()
+        .read()
+        .map(|s| {
+            s.armed
+                && s.armed_at.elapsed() < std::time::Duration::from_secs(RESTART_RESET_WINDOW_SECS)
+        })
+        .unwrap_or(false)
+}
+
+/// Send a Reset-Request to a freshly registered MME if restart restoration is armed.
+fn send_restart_reset_if_armed(origin_host: &str) {
+    if !restart_reset_armed() {
+        return;
+    }
+    let user_ids = restart_reset_state()
+        .read()
+        .map(|s| s.user_ids.clone())
+        .unwrap_or_default();
+    let realm = origin_host
+        .split_once('.')
+        .map(|(_, r)| r)
+        .unwrap_or(origin_host);
+    let rsr = build_rsr_request(origin_host, realm, &user_ids);
+    match send_tracked(origin_host, rsr) {
+        Ok(()) => {
+            log::info!("HSS restart Reset-Request sent to newly registered MME {origin_host}")
+        }
+        Err(e) => log::warn!("HSS restart Reset-Request to {origin_host} failed: {e}"),
+    }
+}
+
+/// Decide whether this start follows an unclean shutdown, from the presence of a
+/// running-marker file (#56).
+///
+/// Pure so the three cases are testable without touching a filesystem at a fixed
+/// path: the marker is absent (first start, or a clean previous shutdown), present
+/// (the previous run did not remove it, so it died), or the path is unusable.
+///
+/// A marker that cannot be *created* is reported as `false`: refusing to start, or
+/// declaring every start unclean, would be worse than not detecting a crash — a
+/// spurious Reset makes every MME re-run Update Location for its whole subscriber
+/// base.
+pub fn unclean_shutdown_from_marker(marker_existed: bool) -> bool {
+    marker_existed
+}
+
+/// The running-marker path. `HSS_RUNTIME_DIR` overrides the default so a test, or a
+/// deployment without `/var/run/nextgcore`, can point it somewhere writable.
+pub fn running_marker_path() -> std::path::PathBuf {
+    let dir = std::env::var("HSS_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/var/run/nextgcore".to_string());
+    std::path::Path::new(&dir).join("hssd-running")
+}
+
+/// Claim the running marker, returning whether the previous run left one behind
+/// (i.e. whether this start follows an unclean shutdown).
+pub fn claim_running_marker() -> bool {
+    let path = running_marker_path();
+    let existed = path.exists();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, b"running\n") {
+        log::warn!(
+            "HSS could not write the running marker at {}: {e}. Crash detection is therefore \
+             disabled for this run, and an unclean shutdown will NOT trigger a Reset.",
+            path.display()
+        );
+        return false;
+    }
+    existed
+}
+
+/// Release the running marker on a clean shutdown, so the next start does not read
+/// it as a crash.
+pub fn release_running_marker() {
+    let path = running_marker_path();
+    if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::warn!(
+                "HSS could not remove the running marker at {}: {e}. The next start will treat \
+                 this shutdown as unclean and send a Reset.",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Unregister an MME peer on disconnect.
@@ -215,6 +378,311 @@ fn send_to_mme(dest_host: &str, msg: DiameterMessage) -> Result<(), String> {
     sender
         .send(msg)
         .map_err(|_| format!("S6a peer connection to {dest_host} is closed"))
+}
+
+// ============================================================================
+// #56: outstanding HSS-initiated requests (RFC 6733 §5.5.4)
+// ============================================================================
+
+/// Default Tc-scale retransmission period for an unanswered HSS-initiated
+/// request, in seconds. RFC 6733 §12 gives Tc = 30s as the connection timer; the
+/// same scale is used here because an S6a peer that has not answered a CLR within
+/// that window is either overloaded or gone, and a faster retry adds load to a node
+/// that is already struggling.
+pub const HSS_INITIATED_RETRANSMIT_SECS: u64 = 30;
+
+/// Maximum transmissions of one HSS-initiated request (the first send plus
+/// retries). Bounded because an MME that never answers must not be retried
+/// forever: TS 29.272 gives the HSS no obligation beyond a reasonable attempt, and
+/// an unbounded queue is a memory leak with a Diameter interface attached.
+pub const HSS_INITIATED_MAX_ATTEMPTS: u32 = 3;
+
+/// One HSS-initiated request awaiting its answer.
+#[derive(Debug, Clone)]
+pub struct PendingRequest {
+    /// Session-Id, which is what the answer is correlated on (RFC 6733 §8.8)
+    pub session_id: String,
+    /// Destination-Host the request was addressed to
+    pub dest_host: String,
+    /// Command code, for logging and for stats attribution
+    pub command_code: u32,
+    /// The message itself, kept so it can be retransmitted or requeued verbatim
+    pub message: DiameterMessage,
+    /// Transmissions so far, including the first
+    pub attempts: u32,
+    /// Monotonic instant of the last transmission
+    pub last_sent: std::time::Instant,
+    /// True while the peer is disconnected: the request waits for reconnection
+    /// rather than counting down its retries against a socket that does not exist.
+    pub awaiting_peer: bool,
+}
+
+type PendingTable = HashMap<String, PendingRequest>;
+
+fn pending_requests() -> &'static RwLock<PendingTable> {
+    static PENDING: OnceLock<RwLock<PendingTable>> = OnceLock::new();
+    PENDING.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Extract the Session-Id from a message, which is the correlation key.
+fn message_session_id(msg: &DiameterMessage) -> Option<String> {
+    msg.session_id().map(|s| s.to_string())
+}
+
+/// Send an HSS-initiated request and record it as outstanding (#56).
+///
+/// Replaces the previous fire-and-forget `send_to_mme` for the CLR/IDR/DSR/RSR
+/// paths. Two behaviour changes, both required by the issue:
+///
+/// * The request is **tracked** by Session-Id, so its answer can be correlated and
+///   a missing answer can be retransmitted. Before this, `handle_s6a_answer` only
+///   incremented a counter, so nothing could tell an answered request from a lost
+///   one.
+/// * A request for a **disconnected** peer is **queued**, not dropped. Before, any
+///   momentary link loss silently discarded the procedure — so even the reactive
+///   half of S6a was unreliable under transient loss.
+fn send_tracked(dest_host: &str, msg: DiameterMessage) -> Result<(), String> {
+    let session_id = message_session_id(&msg)
+        .ok_or_else(|| "HSS-initiated request has no Session-Id to correlate on".to_string())?;
+    let command_code = msg.header.command_code;
+
+    let send_result = send_to_mme(dest_host, msg.clone());
+    let awaiting_peer = send_result.is_err();
+
+    {
+        let mut pending = pending_requests()
+            .write()
+            .expect("pending request table lock poisoned");
+        pending.insert(
+            session_id.clone(),
+            PendingRequest {
+                session_id: session_id.clone(),
+                dest_host: dest_host.to_string(),
+                command_code,
+                message: msg,
+                // A queued request has not been transmitted, so it has made no
+                // attempt yet: counting the failed send would spend a retry on a
+                // socket that never existed.
+                attempts: if awaiting_peer { 0 } else { 1 },
+                last_sent: std::time::Instant::now(),
+                awaiting_peer,
+            },
+        );
+    }
+
+    match send_result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::warn!(
+                "S6a request (cmd={command_code}) to {dest_host} queued for reconnection: {e}"
+            );
+            // Queued, not failed: the caller's procedure is still in flight.
+            Ok(())
+        }
+    }
+}
+
+/// Complete an outstanding request whose answer has arrived.
+/// Returns the request if it was outstanding.
+fn complete_pending(session_id: &str) -> Option<PendingRequest> {
+    pending_requests()
+        .write()
+        .expect("pending request table lock poisoned")
+        .remove(session_id)
+}
+
+/// Number of outstanding HSS-initiated requests.
+pub fn pending_request_count() -> usize {
+    pending_requests().read().map(|p| p.len()).unwrap_or(0)
+}
+
+/// What a sweep of the pending table decided to do with one request (#56).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingAction {
+    /// Leave it alone: its retransmission timer has not expired.
+    Wait,
+    /// Retransmit it now.
+    Retransmit,
+    /// Give up: it has used all its attempts.
+    Abandon,
+}
+
+/// Decide what to do with one outstanding request, given how long ago it was sent
+/// and whether its peer is connected (#56).
+///
+/// Pure, so every branch is testable without a socket, a timer or a peer.
+///
+/// A request whose peer is **disconnected** is neither retransmitted nor abandoned
+/// while it waits — that is the requeue case, and spending its retry budget against
+/// a peer that is not there would abandon it before the peer ever comes back. Once
+/// the peer reconnects, `requeue_for_peer` clears the flag and the normal timer
+/// applies.
+pub fn decide_pending_action(
+    attempts: u32,
+    elapsed: std::time::Duration,
+    peer_connected: bool,
+    awaiting_peer: bool,
+    retransmit_period: std::time::Duration,
+    max_attempts: u32,
+) -> PendingAction {
+    if awaiting_peer || !peer_connected {
+        return PendingAction::Wait;
+    }
+    if attempts >= max_attempts {
+        return PendingAction::Abandon;
+    }
+    if elapsed < retransmit_period {
+        return PendingAction::Wait;
+    }
+    PendingAction::Retransmit
+}
+
+/// Is this peer currently connected?
+fn peer_connected(dest_host: &str) -> bool {
+    peer_registry()
+        .read()
+        .map(|r| r.contains_key(dest_host))
+        .unwrap_or(false)
+}
+
+/// Sweep the outstanding-request table once: retransmit what is due, abandon what
+/// has exhausted its attempts (#56, RFC 6733 §5.5.4).
+///
+/// Returns `(retransmitted, abandoned)`.
+pub fn sweep_pending_requests() -> (usize, usize) {
+    let period = std::time::Duration::from_secs(HSS_INITIATED_RETRANSMIT_SECS);
+    let now = std::time::Instant::now();
+
+    // Decide under the read lock, act after it drops: `send_to_mme` takes the peer
+    // registry lock, and holding the pending-table write lock across it is the
+    // AB-BA shape this crate already documents elsewhere.
+    let decisions: Vec<(String, PendingAction)> = {
+        let pending = match pending_requests().read() {
+            Ok(p) => p,
+            Err(_) => return (0, 0),
+        };
+        pending
+            .values()
+            .map(|req| {
+                let action = decide_pending_action(
+                    req.attempts,
+                    now.saturating_duration_since(req.last_sent),
+                    peer_connected(&req.dest_host),
+                    req.awaiting_peer,
+                    period,
+                    HSS_INITIATED_MAX_ATTEMPTS,
+                );
+                (req.session_id.clone(), action)
+            })
+            .collect()
+    };
+
+    let mut retransmitted = 0usize;
+    let mut abandoned = 0usize;
+    for (session_id, action) in decisions {
+        match action {
+            PendingAction::Wait => {}
+            PendingAction::Retransmit => {
+                let to_send = {
+                    let pending = pending_requests()
+                        .read()
+                        .expect("pending request table lock poisoned");
+                    pending
+                        .get(&session_id)
+                        .map(|r| (r.dest_host.clone(), r.message.clone()))
+                };
+                if let Some((dest_host, msg)) = to_send {
+                    match send_to_mme(&dest_host, msg) {
+                        Ok(()) => {
+                            if let Ok(mut pending) = pending_requests().write() {
+                                if let Some(req) = pending.get_mut(&session_id) {
+                                    req.attempts += 1;
+                                    req.last_sent = std::time::Instant::now();
+                                }
+                            }
+                            retransmitted += 1;
+                            log::info!("S6a request {session_id} retransmitted to {dest_host}");
+                        }
+                        Err(e) => {
+                            // The peer went away between the decision and the send.
+                            // Park it rather than burning an attempt.
+                            if let Ok(mut pending) = pending_requests().write() {
+                                if let Some(req) = pending.get_mut(&session_id) {
+                                    req.awaiting_peer = true;
+                                }
+                            }
+                            log::warn!("S6a retransmission to {dest_host} deferred: {e}");
+                        }
+                    }
+                }
+            }
+            PendingAction::Abandon => {
+                if let Some(req) = complete_pending(&session_id) {
+                    abandoned += 1;
+                    log::error!(
+                        "S6a request (cmd={}) to {} abandoned after {} attempts with no answer: \
+                         MME subscriber state may now diverge from the HSS",
+                        req.command_code,
+                        req.dest_host,
+                        req.attempts
+                    );
+                }
+            }
+        }
+    }
+    (retransmitted, abandoned)
+}
+
+/// Flush everything queued for `dest_host` now that it has reconnected (#56).
+///
+/// Called from the peer registration path, so a CLR or IDR that could not be
+/// delivered during a link outage is delivered when the link returns rather than
+/// being lost.
+pub fn requeue_for_peer(dest_host: &str) -> usize {
+    let queued: Vec<(String, DiameterMessage)> = {
+        let pending = match pending_requests().read() {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+        pending
+            .values()
+            .filter(|r| r.awaiting_peer && r.dest_host == dest_host)
+            .map(|r| (r.session_id.clone(), r.message.clone()))
+            .collect()
+    };
+    if queued.is_empty() {
+        return 0;
+    }
+
+    let mut sent = 0usize;
+    for (session_id, msg) in queued {
+        if send_to_mme(dest_host, msg).is_ok() {
+            if let Ok(mut pending) = pending_requests().write() {
+                if let Some(req) = pending.get_mut(&session_id) {
+                    req.awaiting_peer = false;
+                    req.attempts += 1;
+                    req.last_sent = std::time::Instant::now();
+                }
+            }
+            sent += 1;
+        }
+    }
+    if sent > 0 {
+        log::info!("S6a: {sent} queued request(s) delivered to reconnected peer {dest_host}");
+    }
+    sent
+}
+
+/// Test-only: empty the outstanding-request table.
+///
+/// Tests share this process-global table, so each test that inspects it clears it
+/// FIRST rather than assuming it starts empty — a sibling's leftover entry would
+/// otherwise show up as this test's.
+#[cfg(test)]
+pub(crate) fn clear_pending_requests() {
+    if let Ok(mut pending) = pending_requests().write() {
+        pending.clear();
+    }
 }
 
 /// Initialize S6a interface
@@ -399,6 +867,22 @@ pub fn subscription_data_from_db(
         ambr_downlink: db.ambr.downlink,
         context_identifier: 1,
         all_apn_configs_included: true,
+        // #56: sourced from the subscriber record instead of the hardcoded `None`
+        // it used to be, so the AVP is actually sent when one is provisioned. A
+        // value that is not a valid 4-hex-char charging class is REFUSED rather
+        // than sent mangled: a wrong charging class is a billing error, and the
+        // warning names the subscriber so an operator can fix the provisioning.
+        charging_characteristics: db.charging_characteristics.as_deref().and_then(|s| {
+            let parsed = s6a::ChargingCharacteristics::parse_hex(s);
+            if parsed.is_none() {
+                log::warn!(
+                    "[{}] provisioned charging_characteristics '{s}' is not 4 hexadecimal \
+                     characters (TS 29.061 §16.4.7.2); omitting the AVP",
+                    db.imsi.as_deref().unwrap_or("?")
+                );
+            }
+            parsed
+        }),
         ..Default::default()
     };
 
@@ -430,7 +914,17 @@ pub fn subscription_data_from_db(
                 arp_pre_emption_vulnerability: session.qos.arp.pre_emption_vulnerability != 0,
                 ambr_uplink: session.ambr.uplink,
                 ambr_downlink: session.ambr.downlink,
-                charging_characteristics: None,
+                // #56: the APN's own charging class, falling back to the
+                // subscriber-level one. TS 29.272 Table 7.3.1/2 says the AVP holds
+                // "the EPS PDN Connection Charging Characteristics data for an EPS
+                // APN Configuration, OR ... the Subscribed Charging Characteristics
+                // data for the subscriber level", so the per-APN value is the more
+                // specific answer and the subscriber value is the default.
+                charging_characteristics: session
+                    .charging_characteristics
+                    .as_deref()
+                    .and_then(s6a::ChargingCharacteristics::parse_hex)
+                    .or(sub.charging_characteristics),
             };
             sub.apn_configs.push(apn);
             context_id += 1;
@@ -438,6 +932,39 @@ pub fn subscription_data_from_db(
     }
 
     sub
+}
+
+/// Does the previously stored serving MME need a Cancel Location before the new
+/// one replaces it? (TS 29.272 §5.2.1.1.3, #56)
+///
+/// > *"the HSS shall send a Cancel Location Request with a Cancellation-Type of
+/// > MME_UPDATE_PROCEDURE ... to the previous MME (if any) and replace the stored
+/// > MME-Identity"*
+///
+/// `Some(previous)` only when a previous MME is stored **and differs** from the
+/// one now updating. Kept pure and separate from the DB read so the three cases
+/// that matter — no previous MME, the same MME re-registering, a genuinely
+/// different MME — are testable without Mongo.
+///
+/// The host comparison is ASCII-case-insensitive because a Diameter identity is a
+/// FQDN (RFC 6733 §4.3.1), and treating `MME1.example.org` as a different node
+/// from `mme1.example.org` would send a spurious Cancel Location that detaches a
+/// UE mid-attach. The realm is compared the same way, but a realm change alone with
+/// the same host is still a different node.
+pub fn previous_mme_needing_cancel(
+    stored: Option<(&str, &str)>,
+    new_host: &str,
+    new_realm: &str,
+) -> Option<(String, String)> {
+    let (prev_host, prev_realm) = stored?;
+    if prev_host.eq_ignore_ascii_case(new_host) && prev_realm.eq_ignore_ascii_case(new_realm) {
+        return None;
+    }
+    // A stored identity with an empty host names no reachable node.
+    if prev_host.trim().is_empty() {
+        return None;
+    }
+    Some((prev_host.to_string(), prev_realm.to_string()))
 }
 
 /// Handle Update-Location-Request (ULR)
@@ -452,9 +979,48 @@ pub fn handle_ulr(
 
     use nextgcore_dbi::{nextgcore_dbi_subscription_data, nextgcore_dbi_update_mme};
 
+    // 0. #56 / TS 29.272 §5.2.1.1.3: READ the stored MME identity BEFORE
+    //    overwriting it. `nextgcore_dbi_update_mme` is a blind `$set`, so once it
+    //    has run the previous MME is unrecoverable and the Cancel Location it is
+    //    owed can never be sent -- which is how stale UE contexts accumulate on
+    //    previous MMEs after an inter-MME TAU.
+    //
+    //    A lookup failure is NOT fatal: a subscriber attaching for the first time
+    //    has no stored MME, which `lookup_serving_mme` reports as an error. Failing
+    //    the ULR for that would break every initial attach.
+    let previous_mme = lookup_serving_mme(imsi_bcd).ok();
+    let cancel_target = previous_mme_needing_cancel(
+        previous_mme.as_ref().map(|(h, r)| (h.as_str(), r.as_str())),
+        mme_host,
+        mme_realm,
+    );
+
     // 1. Update serving MME in DB
     let supi = format!("imsi-{imsi_bcd}");
     nextgcore_dbi_update_mme(&supi, mme_host, mme_realm, true).map_err(|e| map_dbi_error(&e))?;
+
+    // 1b. Cancel Location to the PREVIOUS MME, after the stored identity has been
+    //     replaced so a CLA racing back cannot be attributed to the old one.
+    //     Non-fatal: the new MME's location update has already succeeded, and
+    //     failing it because the OLD MME is unreachable would deny service to a UE
+    //     that has correctly attached. The failure is logged and, when the peer is
+    //     merely disconnected, the message is queued for its reconnection.
+    if let Some((prev_host, prev_realm)) = cancel_target {
+        log::info!(
+            "[{imsi_bcd}] inter-MME location update: {prev_host} -> {mme_host}; sending Cancel \
+             Location (MME_UPDATE_PROCEDURE, TS 29.272 §5.2.1.1.3)"
+        );
+        if let Err(e) = hss_s6a_send_clr(
+            imsi_bcd,
+            Some(&prev_host),
+            Some(&prev_realm),
+            CancellationType::MmeUpdateProcedure,
+        ) {
+            log::warn!(
+                "[{imsi_bcd}] Cancel Location to previous MME {prev_host} not delivered: {e}"
+            );
+        }
+    }
 
     // 2. Get subscription data from DB
     let db_data = nextgcore_dbi_subscription_data(&supi).map_err(|e| map_dbi_error(&e))?;
@@ -793,6 +1359,19 @@ pub fn dispatch_s6a_request(request: &DiameterMessage) -> Option<DiameterMessage
                 }
             }
         }
+        // #56: NOR was previously answered 3001 + E-bit by the catch-all below,
+        // which tells a conformant MME the whole Notify procedure is unsupported.
+        cmd::NOTIFY => {
+            log::debug!("[{imsi_bcd}] Dispatching NOR");
+            let info = parse_nor(request);
+            match handle_nor(&imsi_bcd, &info) {
+                Ok(()) => Some(build_noa_answer(request)),
+                Err(failure) => {
+                    log::error!("[{imsi_bcd}] NOR failed: {failure:?}");
+                    Some(build_failure_answer(request, &failure))
+                }
+            }
+        }
         _ => {
             log::warn!("[{imsi_bcd}] Unknown S6a command code: {cmd_code}");
             diam_stats().s6a.inc_rx_unknown();
@@ -822,6 +1401,26 @@ pub fn handle_s6a_answer(answer: &DiameterMessage) {
     let result_code = answer.result_code();
     let exp_code = s6a::experimental_result_code(answer);
     let success = result_code == Some(2001);
+
+    // #56: correlate the answer to its outstanding request by Session-Id
+    // (RFC 6733 §8.8) and CLEAR it, so it is not retransmitted. Before this the
+    // function only incremented counters, so nothing could tell an answered
+    // request from a lost one and no retransmission was possible.
+    let correlated = message_session_id(answer).and_then(|sid| complete_pending(&sid));
+    match &correlated {
+        Some(req) => log::debug!(
+            "S6a answer correlated to outstanding request {} (cmd={}, {} attempt(s))",
+            req.session_id,
+            req.command_code,
+            req.attempts
+        ),
+        None => log::warn!(
+            "S6a answer (cmd={}) matches no outstanding request: it was already abandoned, or the \
+             peer echoed a Session-Id this HSS did not send",
+            answer.header.command_code
+        ),
+    }
+
     match answer.header.command_code {
         cmd::CANCEL_LOCATION => {
             diam_stats().s6a.inc_rx_cla();
@@ -835,6 +1434,22 @@ pub fn handle_s6a_answer(answer: &DiameterMessage) {
             if !success {
                 diam_stats().s6a.inc_rx_ida_error();
                 log::warn!("IDA failure: result={result_code:?} experimental={exp_code:?}");
+            }
+        }
+        // #56: the two HSS-initiated procedures added by this change. They have no
+        // dedicated counters, so they are logged rather than silently ignored --
+        // an unsuccessful DSA means the MME still holds data the HSS deleted.
+        cmd::DELETE_SUBSCRIBER_DATA => {
+            if !success {
+                log::warn!("DSA failure: result={result_code:?} experimental={exp_code:?}");
+            }
+        }
+        cmd::RESET => {
+            if !success {
+                log::warn!(
+                    "RSA failure: result={result_code:?} experimental={exp_code:?}; this MME did \
+                     not accept the restart notification, so its subscriber state may stay stale"
+                );
             }
         }
         other => {
@@ -1093,6 +1708,398 @@ pub fn build_idr_request(
     msg
 }
 
+// ============================================================================
+// #56: Notify (NOR -> NOA), TS 29.272 §5.2.5.1.1 / §7.2.17
+// ============================================================================
+
+/// What an MME reported in a Notify-Request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NorInfo {
+    /// Context-Identifier the PDN-GW identity applies to, when given
+    pub context_identifier: Option<u32>,
+    /// Service-Selection (the APN) the PDN-GW identity applies to, when given
+    pub service_selection: Option<String>,
+    /// The dynamically allocated PDN-GW identity (MIP6-Agent-Info)
+    pub pdn_gw: s6a::PdnGwIdentity,
+    /// NOR-Flags, when given
+    pub nor_flags: Option<u32>,
+    /// Alert-Reason, when given
+    pub alert_reason: Option<i32>,
+}
+
+impl NorInfo {
+    /// Is there a PDN-GW identity to store, and does it name which APN it belongs
+    /// to?
+    ///
+    /// §5.2.5.1.1 scopes the notification to *"an assignment/change of a
+    /// dynamically allocated PDN GW **for an APN**"*, so an identity with no APN
+    /// scope cannot be filed against anything. Both scopings are accepted because
+    /// the NOR message format offers both `Context-Identifier` and
+    /// `Service-Selection` and does not require either.
+    pub fn storable_pdn_gw(&self) -> Option<(String, ApnScope)> {
+        if self.pdn_gw.is_empty() {
+            return None;
+        }
+        let identity = self.pdn_gw.to_stored_string()?;
+        let scope = if let Some(ref apn) = self.service_selection {
+            ApnScope::ServiceSelection(apn.clone())
+        } else if let Some(id) = self.context_identifier {
+            ApnScope::ContextIdentifier(id)
+        } else {
+            return None;
+        };
+        Some((identity, scope))
+    }
+}
+
+/// Which APN a reported PDN-GW identity belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApnScope {
+    /// Named by APN (Service-Selection)
+    ServiceSelection(String),
+    /// Named by the subscription's Context-Identifier
+    ContextIdentifier(u32),
+}
+
+/// Parse the PDN-GW identity out of a MIP6-Agent-Info AVP (TS 29.272 §7.3.45).
+fn parse_mip6_agent_info(avp: &Avp) -> s6a::PdnGwIdentity {
+    let mut out = s6a::PdnGwIdentity::default();
+    let Ok(members) = avp.parse_grouped() else {
+        return out;
+    };
+    for m in &members {
+        match m.code {
+            c if c == s6a::avp::MIP_HOME_AGENT_ADDRESS => {
+                if let Some(b) = m.as_octet_string() {
+                    out.address = Some(b.to_vec());
+                }
+            }
+            c if c == s6a::avp::MIP_HOME_AGENT_HOST => {
+                if let Ok(inner) = m.parse_grouped() {
+                    let host = inner
+                        .iter()
+                        .find(|a| a.code == avp_code::DESTINATION_HOST)
+                        .and_then(|a| a.as_utf8_string())
+                        .map(str::to_string);
+                    let realm = inner
+                        .iter()
+                        .find(|a| a.code == avp_code::DESTINATION_REALM)
+                        .and_then(|a| a.as_utf8_string())
+                        .map(str::to_string);
+                    if let Some(host) = host {
+                        out.fqdn = Some((host, realm.unwrap_or_default()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parse a Notify-Request (TS 29.272 §7.2.17).
+pub fn parse_nor(request: &DiameterMessage) -> NorInfo {
+    NorInfo {
+        context_identifier: request
+            .find_vendor_avp(s6a::avp::CONTEXT_IDENTIFIER, NEXTGCORE_3GPP_VENDOR_ID)
+            .and_then(|a| a.as_u32()),
+        // Service-Selection is RFC 5778 and carries NO vendor id.
+        service_selection: request
+            .find_avp(s6a::avp::SERVICE_SELECTION)
+            .and_then(|a| a.as_utf8_string())
+            .map(str::to_string),
+        // MIP6-Agent-Info is RFC 5447 and carries NO vendor id either.
+        pdn_gw: request
+            .find_avp(s6a::avp::MIP6_AGENT_INFO)
+            .map(parse_mip6_agent_info)
+            .unwrap_or_default(),
+        nor_flags: request
+            .find_vendor_avp(s6a::avp::NOR_FLAGS, NEXTGCORE_3GPP_VENDOR_ID)
+            .and_then(|a| a.as_u32()),
+        alert_reason: request
+            .find_vendor_avp(s6a::avp::ALERT_REASON, NEXTGCORE_3GPP_VENDOR_ID)
+            .and_then(|a| a.as_i32().or_else(|| a.as_u32().map(|v| v as i32))),
+    }
+}
+
+/// Handle a Notify-Request: persist any reported dynamic PDN-GW identity
+/// (TS 29.272 §5.2.5.1.1).
+///
+/// A NOR that reports nothing this HSS stores is still answered **successfully**.
+/// §7.2.17 makes every informational IE optional, and most of them (terminal
+/// information, UE SRVCC capability, monitoring-event status, homogeneous IMS voice
+/// support) are things this HSS does not model. Answering 3001 for those — which is
+/// what the pre-#56 default arm did — tells a conformant MME the command is
+/// unsupported, so it stops using the whole procedure, including the PDN-GW
+/// notification that *is* handled.
+pub fn handle_nor(imsi_bcd: &str, info: &NorInfo) -> Result<(), S6aFailure> {
+    log::debug!("[{imsi_bcd}] Handling NOR: {info:?}");
+
+    let Some((identity, scope)) = info.storable_pdn_gw() else {
+        if !info.pdn_gw.is_empty() {
+            log::warn!(
+                "[{imsi_bcd}] NOR reported a PDN-GW identity with no Context-Identifier and no \
+                 Service-Selection: nothing names which APN it belongs to, so it is not stored \
+                 (TS 29.272 §5.2.5.1.1)"
+            );
+        } else {
+            log::info!(
+                "[{imsi_bcd}] NOR carried nothing this HSS stores (flags={:?}, alert={:?}); \
+                 answered NOA",
+                info.nor_flags,
+                info.alert_reason
+            );
+        }
+        return Ok(());
+    };
+
+    persist_pdn_gw_identity(imsi_bcd, &identity, &scope)?;
+    log::info!("[{imsi_bcd}] Stored dynamic PDN-GW '{identity}' for {scope:?}");
+    Ok(())
+}
+
+/// Persist a dynamically allocated PDN-GW identity against its APN
+/// (TS 29.272 §5.2.5.1.1).
+///
+/// Stored on the matching `slice.session` sub-document, which is where this tree's
+/// subscriber schema keeps per-APN data, under `pgw_id`. A positional `$set` on the
+/// array element is used rather than rewriting the whole slice array: rewriting
+/// would race any concurrent provisioning change against this notification.
+fn persist_pdn_gw_identity(
+    imsi_bcd: &str,
+    identity: &str,
+    scope: &ApnScope,
+) -> Result<(), S6aFailure> {
+    use nextgcore_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
+
+    let collection = get_subscriber_collection()
+        .map_err(|e| S6aFailure::UnableToComply(format!("subscriber collection: {e}")))?;
+
+    // Scoped by APN name where the MME gave one. A Context-Identifier is this
+    // subscription's own ordinal, which `subscription_data_from_db` assigns by
+    // enumeration order starting at 1 -- so it is resolved the same way, by
+    // position, rather than by a stored field that does not exist.
+    let (filter, set_key) = match scope {
+        ApnScope::ServiceSelection(apn) => (
+            doc! { "imsi": imsi_bcd, "slice.session.name": apn },
+            "slice.$[s].session.$[t].pgw_id".to_string(),
+        ),
+        ApnScope::ContextIdentifier(_) => (doc! { "imsi": imsi_bcd }, "pgw_id".to_string()),
+    };
+
+    let update = match scope {
+        ApnScope::ServiceSelection(apn) => {
+            let opts = nextgcore_dbi::mongodb::options::UpdateOptions::builder()
+                .array_filters(vec![
+                    doc! { "s.session": { "$elemMatch": { "name": apn } } },
+                    doc! { "t.name": apn },
+                ])
+                .build();
+            collection.update_one(filter, doc! { "$set": { set_key: identity } }, opts)
+        }
+        // No Service-Selection: the identity is recorded at subscriber level with
+        // the context id it was reported for, because there is no reliable way to
+        // map an ordinal onto an array element without also reading the array, and
+        // a read-modify-write here would race provisioning.
+        ApnScope::ContextIdentifier(id) => collection.update_one(
+            filter,
+            doc! { "$set": { "pgw_id": identity, "pgw_id_context": *id as i32 } },
+            None,
+        ),
+    };
+
+    let result =
+        update.map_err(|e| S6aFailure::UnableToComply(format!("PDN-GW identity store: {e}")))?;
+    if result.matched_count == 0 {
+        // The subscriber (or the named APN) is not provisioned. UserUnknown rather
+        // than UnableToComply: the MME asked about something this HSS does not have.
+        return Err(S6aFailure::UserUnknown);
+    }
+    Ok(())
+}
+
+/// Build a Notify-Answer (TS 29.272 §7.2.18).
+pub fn build_noa_answer(request: &DiameterMessage) -> DiameterMessage {
+    let mut answer = new_answer_with_common(request);
+    answer.add_avp(Avp::mandatory(
+        avp_code::RESULT_CODE,
+        AvpData::Unsigned32(2001),
+    ));
+    answer.add_avp(Avp::mandatory(
+        avp_code::AUTH_SESSION_STATE,
+        AvpData::Enumerated(1),
+    ));
+    add_origin_avps(&mut answer);
+    answer
+}
+
+// ============================================================================
+// #56: Delete-Subscriber-Data (DSR -> DSA) and Reset (RSR -> RSA)
+// ============================================================================
+
+/// Build a Delete-Subscriber-Data-Request (TS 29.272 §7.2.11).
+///
+/// `context_identifiers` is only meaningful with the PDN-subscription-contexts
+/// withdrawal bit set; §7.3.25 Note 1 ties the two together, and sending
+/// identifiers without the bit would name contexts the MME has not been told to
+/// delete.
+pub fn build_dsr_request(
+    imsi_bcd: &str,
+    dest_host: &str,
+    dest_realm: &str,
+    dsr_flags: u32,
+    context_identifiers: &[u32],
+) -> DiameterMessage {
+    use nextgcore_diameter::s6a::{avp, cmd};
+
+    let mut msg =
+        DiameterMessage::new_request(cmd::DELETE_SUBSCRIBER_DATA, s6a::S6A_APPLICATION_ID);
+    let (hbh, e2e) = next_request_ids();
+    msg.header.hop_by_hop_id = hbh;
+    msg.header.end_to_end_id = e2e;
+
+    msg.add_avp(Avp::mandatory(
+        avp_code::SESSION_ID,
+        AvpData::Utf8String(next_session_id(imsi_bcd)),
+    ));
+    msg.add_avp(Avp::mandatory(
+        avp_code::AUTH_SESSION_STATE,
+        AvpData::Enumerated(1),
+    ));
+    add_origin_avps(&mut msg);
+    msg.add_avp(Avp::mandatory(
+        avp_code::DESTINATION_HOST,
+        AvpData::DiameterIdentity(dest_host.to_string()),
+    ));
+    msg.add_avp(Avp::mandatory(
+        avp_code::DESTINATION_REALM,
+        AvpData::DiameterIdentity(dest_realm.to_string()),
+    ));
+    msg.add_avp(Avp::mandatory(
+        avp_code::USER_NAME,
+        AvpData::Utf8String(imsi_bcd.to_string()),
+    ));
+    // DSR-Flags is the one mandatory 3GPP IE of this command.
+    msg.add_avp(Avp::vendor_mandatory(
+        avp::DSR_FLAGS,
+        NEXTGCORE_3GPP_VENDOR_ID,
+        AvpData::Unsigned32(dsr_flags),
+    ));
+    if dsr_flags & s6a::dsr_flags::PDN_SUBSCRIPTION_CONTEXTS_WITHDRAWAL != 0 {
+        for id in context_identifiers {
+            msg.add_avp(Avp::vendor_mandatory(
+                avp::CONTEXT_IDENTIFIER,
+                NEXTGCORE_3GPP_VENDOR_ID,
+                AvpData::Unsigned32(*id),
+            ));
+        }
+    }
+    msg
+}
+
+/// Build a Reset-Request (TS 29.272 §7.2.15).
+///
+/// `user_ids` are IMSI prefixes (§7.3.50): the leading MCC+MNC+MSIN digits that
+/// identify the affected subscriber set. Empty means "all subscribers of this HSS",
+/// which is the plain restart case.
+pub fn build_rsr_request(
+    dest_host: &str,
+    dest_realm: &str,
+    user_ids: &[String],
+) -> DiameterMessage {
+    use nextgcore_diameter::s6a::{avp, cmd};
+
+    let mut msg = DiameterMessage::new_request(cmd::RESET, s6a::S6A_APPLICATION_ID);
+    let (hbh, e2e) = next_request_ids();
+    msg.header.hop_by_hop_id = hbh;
+    msg.header.end_to_end_id = e2e;
+
+    // Reset is not per-subscriber, so the Session-Id is suffixed with the target
+    // MME rather than an IMSI.
+    msg.add_avp(Avp::mandatory(
+        avp_code::SESSION_ID,
+        AvpData::Utf8String(next_session_id(dest_host)),
+    ));
+    msg.add_avp(Avp::mandatory(
+        avp_code::AUTH_SESSION_STATE,
+        AvpData::Enumerated(1),
+    ));
+    add_origin_avps(&mut msg);
+    msg.add_avp(Avp::mandatory(
+        avp_code::DESTINATION_HOST,
+        AvpData::DiameterIdentity(dest_host.to_string()),
+    ));
+    msg.add_avp(Avp::mandatory(
+        avp_code::DESTINATION_REALM,
+        AvpData::DiameterIdentity(dest_realm.to_string()),
+    ));
+    // NOTE: no User-Name. Reset applies to a SET of subscribers, named by User-Id
+    // prefixes, and §7.2.15's message format has no User-Name at all.
+    for uid in user_ids {
+        msg.add_avp(Avp::vendor_mandatory(
+            avp::USER_ID,
+            NEXTGCORE_3GPP_VENDOR_ID,
+            AvpData::Utf8String(uid.clone()),
+        ));
+    }
+    msg
+}
+
+/// Send a Delete-Subscriber-Data-Request to the serving MME (#56).
+pub fn hss_s6a_send_dsr(
+    imsi_bcd: &str,
+    dsr_flags: u32,
+    context_identifiers: &[u32],
+) -> Result<(), String> {
+    log::info!("[{imsi_bcd}] Sending Delete-Subscriber-Data-Request (flags={dsr_flags:#x})");
+    let (dest_host, dest_realm) = lookup_serving_mme(imsi_bcd)?;
+    let dsr = build_dsr_request(
+        imsi_bcd,
+        &dest_host,
+        &dest_realm,
+        dsr_flags,
+        context_identifiers,
+    );
+    send_tracked(&dest_host, dsr)?;
+    log::debug!("[{imsi_bcd}] DSR sent to {dest_host}");
+    Ok(())
+}
+
+/// Send a Reset-Request to every currently registered MME (#56, TS 23.007).
+///
+/// Returns how many peers it went to. Called at startup after an unclean shutdown:
+/// the MMEs are told to re-run Update Location for the affected subscribers,
+/// because the HSS cannot know what it lost.
+pub fn hss_s6a_send_rsr_to_all(user_ids: &[String]) -> usize {
+    let peers: Vec<String> = match peer_registry().read() {
+        Ok(r) => r.keys().cloned().collect(),
+        Err(_) => return 0,
+    };
+    if peers.is_empty() {
+        log::warn!(
+            "HSS restart Reset: no MME peer is connected yet, so no Reset-Request was sent. \
+             Restoration depends on the MMEs reconnecting and re-registering."
+        );
+        return 0;
+    }
+    let mut sent = 0usize;
+    for host in peers {
+        // The MME's realm is not recorded in the peer registry, so it is derived
+        // from the host by stripping the leading label -- the S6a convention for a
+        // Diameter identity (host = <name>.<realm>).
+        let realm = host.split_once('.').map(|(_, r)| r).unwrap_or(&host);
+        let rsr = build_rsr_request(&host, realm, user_ids);
+        match send_tracked(&host, rsr) {
+            Ok(()) => {
+                sent += 1;
+                log::info!("HSS restart Reset-Request sent to {host}");
+            }
+            Err(e) => log::warn!("HSS restart Reset-Request to {host} failed: {e}"),
+        }
+    }
+    sent
+}
+
 /// Send Cancel-Location-Request to the serving MME.
 ///
 /// The CLR is transmitted on the MME's existing S6a connection. Fails if the
@@ -1115,7 +2122,9 @@ pub fn hss_s6a_send_clr(
     };
 
     let clr = build_clr_request(imsi_bcd, &dest_host, &dest_realm, cancellation_type, None);
-    send_to_mme(&dest_host, clr)?;
+    // #56: tracked, so a missing CLA is retransmitted and a disconnected peer
+    // queues the request instead of dropping it.
+    send_tracked(&dest_host, clr)?;
 
     diam_stats().s6a.inc_tx_clr();
     log::debug!("[{imsi_bcd}] CLR sent to {dest_host}");
@@ -1150,7 +2159,7 @@ pub fn hss_s6a_send_idr(imsi_bcd: &str, idr_flags: u32, subdata_mask: u32) -> Re
         &subscription_data,
         subdata_mask,
     );
-    send_to_mme(&dest_host, idr)?;
+    send_tracked(&dest_host, idr)?;
 
     diam_stats().s6a.inc_tx_idr();
     log::debug!("[{imsi_bcd}] IDR sent to {dest_host}");
@@ -1161,6 +2170,21 @@ pub fn hss_s6a_send_idr(imsi_bcd: &str, idr_flags: u32, subdata_mask: u32) -> Re
 mod tests {
     use super::*;
     use nextgcore_crypt::milenage::{milenage_f1, milenage_f2345};
+
+    /// One agreement about the process-global MME peer registry, the outstanding
+    /// request table and the restart-reset arming flag (#56).
+    ///
+    /// All three are process-wide, and they interact: a test that arms restart
+    /// restoration makes every later peer registration receive an unexpected
+    /// Reset-Request, and a test that reads a peer's channel sees whatever a
+    /// sibling queued for the same host. Three existing tests broke exactly this
+    /// way while #56 was being written. Every test that registers a peer or inspects
+    /// the pending table takes this lock, so there is one agreement rather than
+    /// several disjoint ones.
+    ///
+    /// `std::sync::Mutex` rather than tokio's, so the same lock serves the sync and
+    /// `#[tokio::test]` tests alike. No guard is held across an `await`.
+    static PEER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_cancellation_type_from_u32() {
@@ -1630,21 +2654,38 @@ mod tests {
         assert!(parsed.apn_configs.is_empty());
     }
 
+    /// #56 INVERTED this test. It previously required `hss_s6a_send_clr` to FAIL
+    /// when no peer is connected, and asserted on the "no connected S6a peer"
+    /// message — i.e. it pinned the fire-and-forget defect as the requirement.
+    /// Issue #56 criterion 5 is that such a request is *"requeued when the MME
+    /// reconnects rather than dropped when no peer is connected"*, so a momentary
+    /// link loss must no longer discard the procedure. The queued-then-delivered
+    /// behaviour is pinned by
+    /// `a_clr_for_a_disconnected_peer_is_queued_and_delivered_on_reconnect`.
     #[test]
-    fn test_send_clr_requires_connected_peer() {
-        // Explicit host/realm avoids the DB lookup; no peer registered -> Err
+    fn test_send_clr_queues_when_no_peer_is_connected() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        clear_pending_requests();
+        // Explicit host/realm avoids the DB lookup; no peer registered -> queued
         let result = hss_s6a_send_clr(
             "123456789012345",
             Some("mme.unconnected.example.com"),
             Some("example.com"),
             CancellationType::SubscriptionWithdrawal,
         );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no connected S6a peer"));
+        assert!(
+            result.is_ok(),
+            "a disconnected peer must queue the request, not lose it"
+        );
+        assert_eq!(pending_request_count(), 1);
+        clear_pending_requests();
     }
 
     #[test]
     fn test_send_clr_transmits_to_registered_peer() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        disarm_restart_reset();
+        clear_pending_requests();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         register_mme_peer("mme.registered.example.com", tx);
 
@@ -1712,6 +2753,9 @@ mod tests {
     /// application set `main.rs` configures.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn s6a_server_negotiates_applications_with_its_peer() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        disarm_restart_reset();
+        clear_pending_requests();
         use nextgcore_diameter::applications::{well_known, ApplicationRegistry};
         use nextgcore_diameter::config::DiameterConfig;
         use nextgcore_diameter::transport::{DiameterClient, DiameterListener};
@@ -1773,6 +2817,9 @@ mod tests {
     /// connected MME peer and answered with a CLA.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_s6a_server_end_to_end_air_and_clr() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        disarm_restart_reset();
+        clear_pending_requests();
         use nextgcore_diameter::config::DiameterConfig;
         use nextgcore_diameter::transport::{DiameterClient, DiameterListener};
 
@@ -1862,5 +2909,534 @@ mod tests {
             AvpData::Unsigned32(2001),
         ));
         client.send_answer(&cla).await.unwrap();
+    }
+
+    // ====================================================================
+    // #56: HSS-initiated procedures
+    // ====================================================================
+
+    // ---- previous-MME Cancel Location on ULR (TS 29.272 §5.2.1.1.3) ----
+
+    /// The case §5.2.1.1.3 exists for: an inter-MME location update.
+    #[test]
+    fn a_different_previous_mme_needs_a_cancel_location() {
+        assert_eq!(
+            previous_mme_needing_cancel(
+                Some(("mme1.epc.example.org", "epc.example.org")),
+                "mme2.epc.example.org",
+                "epc.example.org"
+            ),
+            Some((
+                "mme1.epc.example.org".to_string(),
+                "epc.example.org".to_string()
+            ))
+        );
+    }
+
+    /// The SAME MME re-registering must NOT be cancelled. A spurious Cancel
+    /// Location detaches the UE that has just attached, which is worse than the
+    /// stale context this fix exists to clear.
+    #[test]
+    fn the_same_mme_re_registering_needs_no_cancel_location() {
+        assert_eq!(
+            previous_mme_needing_cancel(
+                Some(("mme1.epc.example.org", "epc.example.org")),
+                "mme1.epc.example.org",
+                "epc.example.org"
+            ),
+            None
+        );
+        // Case-insensitively, because a Diameter identity is a FQDN
+        // (RFC 6733 §4.3.1) and a case difference is the same node.
+        assert_eq!(
+            previous_mme_needing_cancel(
+                Some(("MME1.EPC.Example.ORG", "EPC.Example.ORG")),
+                "mme1.epc.example.org",
+                "epc.example.org"
+            ),
+            None,
+            "a case difference is the same node, not a handover"
+        );
+    }
+
+    /// A first attach has no previous MME.
+    #[test]
+    fn no_previous_mme_needs_no_cancel_location() {
+        assert_eq!(
+            previous_mme_needing_cancel(None, "mme1.epc.example.org", "epc.example.org"),
+            None
+        );
+        assert_eq!(
+            previous_mme_needing_cancel(Some(("", "")), "mme1.epc.example.org", "epc.example.org"),
+            None,
+            "an empty stored host names no reachable node"
+        );
+    }
+
+    /// A realm change with the same host name is still a different node.
+    #[test]
+    fn a_realm_change_needs_a_cancel_location() {
+        assert_eq!(
+            previous_mme_needing_cancel(
+                Some(("mme1.epc.a.org", "epc.a.org")),
+                "mme1.epc.a.org",
+                "epc.b.org"
+            ),
+            Some(("mme1.epc.a.org".to_string(), "epc.a.org".to_string()))
+        );
+    }
+
+    // ---- reliability: retransmission, abandonment, requeue (RFC 6733 §5.5.4) ----
+
+    fn secs(n: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(n)
+    }
+
+    /// An unanswered request past its Tc-scale period is retransmitted.
+    #[test]
+    fn an_unanswered_request_is_retransmitted_after_the_period() {
+        assert_eq!(
+            decide_pending_action(1, secs(31), true, false, secs(30), 3),
+            PendingAction::Retransmit
+        );
+    }
+
+    /// Before the period expires it is left alone: retrying sooner adds load to a
+    /// peer that may simply be slow.
+    #[test]
+    fn a_recent_request_is_not_retransmitted() {
+        assert_eq!(
+            decide_pending_action(1, secs(5), true, false, secs(30), 3),
+            PendingAction::Wait
+        );
+    }
+
+    /// Retries are bounded: an unbounded queue is a memory leak with a Diameter
+    /// interface attached.
+    #[test]
+    fn a_request_out_of_attempts_is_abandoned() {
+        assert_eq!(
+            decide_pending_action(3, secs(31), true, false, secs(30), 3),
+            PendingAction::Abandon
+        );
+    }
+
+    /// A request whose peer is DISCONNECTED must neither be retransmitted (there is
+    /// no socket) nor abandoned (spending its budget against an absent peer would
+    /// drop it before the peer returns). It waits — that is the requeue case, and it
+    /// is the difference between #56's "requeued when the MME reconnects" and the
+    /// old "failed immediately when no peer is connected".
+    #[test]
+    fn a_request_for_a_disconnected_peer_waits_rather_than_being_abandoned() {
+        // Flagged as awaiting the peer, well past the period and out of attempts:
+        // still Wait.
+        assert_eq!(
+            decide_pending_action(3, secs(3600), false, true, secs(30), 3),
+            PendingAction::Wait
+        );
+        // Not flagged, but the peer is gone: also Wait.
+        assert_eq!(
+            decide_pending_action(1, secs(3600), false, false, secs(30), 3),
+            PendingAction::Wait
+        );
+    }
+
+    /// A CLR for a disconnected MME is QUEUED, not dropped, and delivered when the
+    /// peer registers. Before #56 `send_to_mme` returned an error and the procedure
+    /// was silently lost.
+    #[tokio::test]
+    async fn a_clr_for_a_disconnected_peer_is_queued_and_delivered_on_reconnect() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        disarm_restart_reset();
+        clear_pending_requests();
+        let host = "mme-requeue.epc.example.org";
+        // No peer registered: the send fails and the request is parked.
+        let clr = build_clr_request(
+            "001010000000001",
+            host,
+            "epc.example.org",
+            CancellationType::MmeUpdateProcedure,
+            None,
+        );
+        send_tracked(host, clr).expect("a queued request is not an error to the caller");
+        assert_eq!(
+            pending_request_count(),
+            1,
+            "the request must be held, not dropped"
+        );
+
+        // The MME connects.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_mme_peer(host, tx);
+
+        let delivered = rx
+            .try_recv()
+            .expect("the queued CLR must be delivered on reconnect");
+        assert_eq!(
+            delivered.header.command_code,
+            nextgcore_diameter::s6a::cmd::CANCEL_LOCATION
+        );
+        assert_eq!(
+            delivered
+                .find_vendor_avp(s6a::avp::CANCELLATION_TYPE, NEXTGCORE_3GPP_VENDOR_ID)
+                .and_then(|a| a.as_i32()),
+            Some(CancellationType::MmeUpdateProcedure as i32),
+            "and it must still be the MME_UPDATE_PROCEDURE cancellation it was built as"
+        );
+
+        unregister_mme_peer(host);
+        clear_pending_requests();
+    }
+
+    /// An answer clears its outstanding request, so it is not retransmitted. Before
+    /// #56 `handle_s6a_answer` only bumped a counter, so nothing could distinguish
+    /// an answered request from a lost one.
+    #[tokio::test]
+    async fn an_answer_clears_its_outstanding_request() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        disarm_restart_reset();
+        clear_pending_requests();
+        let host = "mme-correlate.epc.example.org";
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_mme_peer(host, tx);
+
+        let clr = build_clr_request(
+            "001010000000002",
+            host,
+            "epc.example.org",
+            CancellationType::SubscriptionWithdrawal,
+            None,
+        );
+        send_tracked(host, clr).expect("send");
+        assert_eq!(pending_request_count(), 1);
+
+        let sent = rx.try_recv().expect("CLR sent");
+        let session_id = sent.session_id().expect("Session-Id").to_string();
+
+        // The MME answers.
+        let mut cla = DiameterMessage::new_answer(&sent);
+        cla.add_avp(Avp::mandatory(
+            avp_code::SESSION_ID,
+            AvpData::Utf8String(session_id),
+        ));
+        cla.add_avp(Avp::mandatory(
+            avp_code::RESULT_CODE,
+            AvpData::Unsigned32(2001),
+        ));
+        handle_s6a_answer(&cla);
+
+        assert_eq!(
+            pending_request_count(),
+            0,
+            "an answered request must not stay outstanding, or it will be retransmitted"
+        );
+
+        unregister_mme_peer(host);
+        clear_pending_requests();
+    }
+
+    // ---- NOR / NOA (TS 29.272 §5.2.5.1.1, §7.2.17) ----
+
+    fn build_test_nor(imsi: &str) -> DiameterMessage {
+        let mut msg = DiameterMessage::new_request(
+            nextgcore_diameter::s6a::cmd::NOTIFY,
+            s6a::S6A_APPLICATION_ID,
+        );
+        msg.header.hop_by_hop_id = 0x4242;
+        msg.header.end_to_end_id = 0x4243;
+        msg.add_avp(Avp::mandatory(
+            avp_code::SESSION_ID,
+            AvpData::Utf8String(format!("mme;1;1;{imsi}")),
+        ));
+        msg.add_avp(Avp::mandatory(
+            avp_code::AUTH_SESSION_STATE,
+            AvpData::Enumerated(1),
+        ));
+        msg.add_avp(Avp::mandatory(
+            avp_code::ORIGIN_HOST,
+            AvpData::DiameterIdentity("mme1.epc.example.org".to_string()),
+        ));
+        msg.add_avp(Avp::mandatory(
+            avp_code::ORIGIN_REALM,
+            AvpData::DiameterIdentity("epc.example.org".to_string()),
+        ));
+        msg.add_avp(Avp::mandatory(
+            avp_code::DESTINATION_REALM,
+            AvpData::DiameterIdentity("epc.example.org".to_string()),
+        ));
+        msg.add_avp(Avp::mandatory(
+            avp_code::USER_NAME,
+            AvpData::Utf8String(imsi.to_string()),
+        ));
+        msg
+    }
+
+    fn roundtrip(msg: &DiameterMessage) -> DiameterMessage {
+        let encoded = msg.encode();
+        let mut bytes = encoded.freeze();
+        DiameterMessage::decode(&mut bytes).expect("decode")
+    }
+
+    /// The PDN-GW identity and its APN scope are read off the wire.
+    #[test]
+    fn parse_nor_reads_the_pdn_gw_identity_and_its_apn() {
+        let mut nor = build_test_nor("001010000000010");
+        // MIP6-Agent-Info carries NO vendor id (RFC 5447).
+        nor.add_avp(Avp::mandatory(
+            s6a::avp::MIP6_AGENT_INFO,
+            AvpData::Grouped(vec![Avp::mandatory(
+                s6a::avp::MIP_HOME_AGENT_HOST,
+                AvpData::Grouped(vec![
+                    Avp::mandatory(
+                        avp_code::DESTINATION_HOST,
+                        AvpData::DiameterIdentity("pgw1.epc.example.org".to_string()),
+                    ),
+                    Avp::mandatory(
+                        avp_code::DESTINATION_REALM,
+                        AvpData::DiameterIdentity("epc.example.org".to_string()),
+                    ),
+                ]),
+            )]),
+        ));
+        // Service-Selection also carries no vendor id (RFC 5778).
+        nor.add_avp(Avp::mandatory(
+            s6a::avp::SERVICE_SELECTION,
+            AvpData::Utf8String("internet".to_string()),
+        ));
+
+        let info = parse_nor(&roundtrip(&nor));
+        assert_eq!(
+            info.pdn_gw.fqdn.as_ref().map(|(h, _)| h.as_str()),
+            Some("pgw1.epc.example.org")
+        );
+        assert_eq!(info.service_selection.as_deref(), Some("internet"));
+        let (identity, scope) = info.storable_pdn_gw().expect("storable");
+        assert_eq!(identity, "pgw1.epc.example.org");
+        assert_eq!(scope, ApnScope::ServiceSelection("internet".to_string()));
+    }
+
+    /// A PDN-GW identity with no APN scope names nothing to file it against, so it
+    /// is refused rather than stored somewhere arbitrary.
+    #[test]
+    fn an_unscoped_pdn_gw_identity_is_not_storable() {
+        let mut nor = build_test_nor("001010000000011");
+        nor.add_avp(Avp::mandatory(
+            s6a::avp::MIP6_AGENT_INFO,
+            AvpData::Grouped(vec![Avp::mandatory(
+                s6a::avp::MIP_HOME_AGENT_ADDRESS,
+                AvpData::OctetString(bytes::Bytes::from_static(&[0, 1, 10, 45, 0, 1])),
+            )]),
+        ));
+        let info = parse_nor(&roundtrip(&nor));
+        assert_eq!(
+            info.pdn_gw.address.as_deref(),
+            Some(&[0, 1, 10, 45, 0, 1][..])
+        );
+        assert!(
+            info.storable_pdn_gw().is_none(),
+            "no Context-Identifier and no Service-Selection means nothing names the APN"
+        );
+    }
+
+    /// A NOR carrying nothing this HSS stores is answered NOA 2001, not 3001.
+    ///
+    /// Before #56 it fell to the dispatch catch-all and got 3001 + the E-bit, which
+    /// tells a conformant MME the whole Notify command is unsupported — so it stops
+    /// using the procedure, including the PDN-GW notification that IS handled.
+    #[test]
+    fn a_nor_with_nothing_to_store_is_answered_noa() {
+        let nor = roundtrip(&build_test_nor("001010000000012"));
+        let info = parse_nor(&nor);
+        assert!(info.pdn_gw.is_empty());
+        assert!(
+            handle_nor("001010000000012", &info).is_ok(),
+            "an informational NOR this HSS does not model is still a success"
+        );
+
+        let noa = roundtrip(&build_noa_answer(&nor));
+        assert_eq!(noa.result_code(), Some(2001));
+        assert_eq!(
+            noa.header.command_code,
+            nextgcore_diameter::s6a::cmd::NOTIFY
+        );
+        assert!(
+            !noa.header.is_request(),
+            "the R bit must be cleared in the answer"
+        );
+        assert!(
+            !noa.header.is_error(),
+            "and the E bit must NOT be set, which 3001 would have required"
+        );
+    }
+
+    // ---- DSR / RSR builders (TS 29.272 §7.2.11, §7.2.15) ----
+
+    /// DSR-Flags is the one mandatory 3GPP IE, and Context-Identifiers only travel
+    /// with the PDN-subscription-contexts bit (§7.3.25 Note 1).
+    #[test]
+    fn dsr_carries_flags_and_scopes_context_identifiers_to_their_bit() {
+        hss_s6a_set_identity("hss.epc.example.org", "epc.example.org");
+        let with_bit = roundtrip(&build_dsr_request(
+            "001010000000020",
+            "mme1.epc.example.org",
+            "epc.example.org",
+            s6a::dsr_flags::PDN_SUBSCRIPTION_CONTEXTS_WITHDRAWAL,
+            &[3, 4],
+        ));
+        assert_eq!(
+            with_bit.header.command_code,
+            nextgcore_diameter::s6a::cmd::DELETE_SUBSCRIBER_DATA
+        );
+        assert!(with_bit.header.is_request());
+        assert_eq!(
+            with_bit
+                .find_vendor_avp(s6a::avp::DSR_FLAGS, NEXTGCORE_3GPP_VENDOR_ID)
+                .and_then(|a| a.as_u32()),
+            Some(s6a::dsr_flags::PDN_SUBSCRIPTION_CONTEXTS_WITHDRAWAL)
+        );
+        let ids: Vec<u32> =
+            nextgcore_diameter::avp::find_all_avps(&with_bit.avps, s6a::avp::CONTEXT_IDENTIFIER)
+                .iter()
+                .filter_map(|a| a.as_u32())
+                .collect();
+        assert_eq!(ids, vec![3, 4]);
+        assert_eq!(with_bit.user_name(), Some("001010000000020"));
+
+        // Without the bit, the identifiers must NOT be sent: they would name
+        // contexts the MME has not been told to delete.
+        let without_bit = roundtrip(&build_dsr_request(
+            "001010000000020",
+            "mme1.epc.example.org",
+            "epc.example.org",
+            s6a::dsr_flags::STN_SR,
+            &[3, 4],
+        ));
+        assert!(
+            nextgcore_diameter::avp::find_all_avps(&without_bit.avps, s6a::avp::CONTEXT_IDENTIFIER)
+                .is_empty(),
+            "Context-Identifier without its withdrawal bit is a message the spec does not define"
+        );
+    }
+
+    /// Reset applies to a SET of subscribers, named by User-Id prefixes. §7.2.15's
+    /// message format has no User-Name at all, so sending one would be a per-
+    /// subscriber Reset the spec does not define.
+    #[test]
+    fn rsr_carries_user_id_prefixes_and_no_user_name() {
+        hss_s6a_set_identity("hss.epc.example.org", "epc.example.org");
+        let rsr = roundtrip(&build_rsr_request(
+            "mme1.epc.example.org",
+            "epc.example.org",
+            &["00101".to_string(), "00102".to_string()],
+        ));
+        assert_eq!(rsr.header.command_code, nextgcore_diameter::s6a::cmd::RESET);
+        assert!(rsr.header.is_request());
+        assert_eq!(
+            rsr.user_name(),
+            None,
+            "Reset is not per-subscriber; §7.2.15 has no User-Name"
+        );
+        let ids: Vec<String> = nextgcore_diameter::avp::find_all_avps(&rsr.avps, s6a::avp::USER_ID)
+            .iter()
+            .filter_map(|a| a.as_utf8_string().map(str::to_string))
+            .collect();
+        assert_eq!(ids, vec!["00101".to_string(), "00102".to_string()]);
+
+        // No User-Ids: the plain restart case, "all my subscribers".
+        let all = roundtrip(&build_rsr_request(
+            "mme1.epc.example.org",
+            "epc.example.org",
+            &[],
+        ));
+        assert!(nextgcore_diameter::avp::find_all_avps(&all.avps, s6a::avp::USER_ID).is_empty());
+        assert_eq!(
+            all.find_avp(avp_code::DESTINATION_HOST)
+                .and_then(|a| a.as_utf8_string()),
+            Some("mme1.epc.example.org")
+        );
+    }
+
+    // ---- restart restoration (TS 29.272 §5.2.3, TS 23.007) ----
+
+    /// The marker decides, and the direction matters: a start with no marker must
+    /// NOT be treated as a crash, because a spurious Reset makes every MME re-run
+    /// Update Location for its whole subscriber base.
+    #[test]
+    fn a_leftover_running_marker_means_the_previous_shutdown_was_unclean() {
+        assert!(unclean_shutdown_from_marker(true));
+        assert!(!unclean_shutdown_from_marker(false));
+    }
+
+    /// A clean cycle leaves nothing behind; a crash does.
+    #[test]
+    fn the_running_marker_round_trips_through_a_clean_shutdown() {
+        let dir = std::env::temp_dir().join(format!(
+            "nextgcore-hss-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // SAFETY: single-threaded test setup; the variable is read by
+        // `running_marker_path` in this same thread.
+        std::env::set_var("HSS_RUNTIME_DIR", &dir);
+
+        // First ever start: no marker.
+        assert!(!claim_running_marker(), "a first start is not a crash");
+        assert!(running_marker_path().exists(), "and it leaves its marker");
+
+        // Clean shutdown.
+        release_running_marker();
+        assert!(!running_marker_path().exists());
+        assert!(
+            !claim_running_marker(),
+            "a start after a clean shutdown is not a crash"
+        );
+
+        // Crash: the marker stays.
+        assert!(
+            claim_running_marker(),
+            "a start while a marker is present IS a crash"
+        );
+
+        release_running_marker();
+        std::env::remove_var("HSS_RUNTIME_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An MME registering while restoration is armed is sent a Reset-Request.
+    ///
+    /// Armed rather than sent at startup because the HSS is the S6a *responder*: at
+    /// startup no MME is connected, so an immediate send reaches nobody — the shape
+    /// of a procedure that looks implemented and never fires.
+    #[tokio::test]
+    async fn an_mme_registering_after_an_unclean_restart_is_sent_a_reset() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        clear_pending_requests();
+        hss_s6a_set_identity("hss.epc.example.org", "epc.example.org");
+        arm_restart_reset(Vec::new());
+        assert!(restart_reset_armed());
+
+        let host = "mme-reset.epc.example.org";
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_mme_peer(host, tx);
+
+        let msg = rx
+            .try_recv()
+            .expect("a registering MME must be sent the Reset");
+        assert_eq!(msg.header.command_code, nextgcore_diameter::s6a::cmd::RESET);
+        assert_eq!(
+            msg.find_avp(avp_code::DESTINATION_HOST)
+                .and_then(|a| a.as_utf8_string()),
+            Some(host)
+        );
+
+        unregister_mme_peer(host);
+        clear_pending_requests();
+        // Disarm before releasing the lock: leaving it armed makes every later
+        // peer registration receive a Reset it did not ask for.
+        disarm_restart_reset();
     }
 }

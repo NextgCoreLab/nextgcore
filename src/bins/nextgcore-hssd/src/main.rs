@@ -270,6 +270,24 @@ fn main() -> Result<()> {
     }
     log::info!("SWx interface initialized");
 
+    // #56 / TS 29.272 §5.2.3: if the previous run left its running marker behind it
+    // died without cleaning up, so the MMEs still believe in subscriber state this
+    // HSS may have lost. Arm restart restoration rather than sending now: the HSS is
+    // the S6a responder, so no MME is connected at this point and an immediate send
+    // would reliably reach nobody.
+    if nextgcore_hssd::claim_running_marker() {
+        log::warn!(
+            "HSS previous shutdown was UNCLEAN (running marker present): arming S6a restart \
+             restoration"
+        );
+        // No User-Id prefixes: the failure is not known to be limited to a subset,
+        // so the Reset applies to all of this HSS's subscribers (TS 29.272
+        // §7.3.50 makes User-Id optional for exactly that case).
+        nextgcore_hssd::arm_restart_reset(Vec::new());
+    } else {
+        log::debug!("HSS previous shutdown was clean; no S6a Reset needed");
+    }
+
     // Dispatch entry event to transition to operational state
     let mut entry_event = nextgcore_hssd::HssEvent::entry();
     hss_sm.dispatch(&mut entry_event);
@@ -293,6 +311,12 @@ fn main() -> Result<()> {
 
     hss_fd_final();
     log::info!("FreeDiameter finalized");
+
+    // #56: this shutdown reached the end, so the next start must NOT treat it as a
+    // crash. Released here rather than in `cleanup` so it is the last thing that
+    // happens on the successful path only -- an early return above leaves the marker
+    // in place, which is exactly the signal it exists to carry.
+    nextgcore_hssd::release_running_marker();
 
     // Cleanup state machine and context
     cleanup(&mut hss_sm);
@@ -341,12 +365,74 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
+/// How often the subscriber-change watcher polls MongoDB (#56).
+///
+/// One query per interval over subscribers that have a serving MME. Deliberately
+/// much slower than the loop tick: an administrative subscription edit is a
+/// human-scale event, and polling it every 100 ms would put a query per 100 ms on
+/// the subscriber collection for a change that arrives once an hour.
+const SUBSCRIBER_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the outstanding HSS-initiated request table is swept (#56).
+const PENDING_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Is subscriber-change watching enabled? (#56)
+///
+/// A runtime switch rather than a cargo feature, matching this project's
+/// convention, so CI compiles and exercises the code in both states.
+///
+/// Defaults **OFF**, unlike most switches here, and the reason is specific: this is
+/// the one part of #56 whose MongoDB read cannot be verified by any test in this
+/// tree, and a misfiring watcher does not merely fail to notify — it sends
+/// unsolicited Cancel Locations that **detach live UEs**. Something that can detach
+/// a subscriber must be switched on deliberately by an operator who can watch it.
+/// Set `HSS_SUBSCRIBER_WATCH=1` (or `true`) to enable.
+fn subscriber_watch_enabled() -> bool {
+    matches!(
+        std::env::var("HSS_SUBSCRIBER_WATCH")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Main event loop
 fn run_event_loop(hss_sm: &mut HssSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
     log::debug!("Entering main event loop");
 
     // Polling interval for DB changes
     let poll_interval = std::time::Duration::from_millis(100);
+
+    // #56: subscriber-change watching. The first poll establishes the baseline
+    // view WITHOUT acting on it -- diffing an empty previous view against a
+    // populated current one must not be read as "every subscriber just appeared",
+    // and (worse) the reverse on the next tick as "every subscriber was deleted".
+    let watching = subscriber_watch_enabled();
+    let mut watch_view = std::collections::HashMap::new();
+    if watching {
+        match nextgcore_hssd::subscriber_watch::read_current_view() {
+            Ok(view) => {
+                log::info!(
+                    "HSS subscriber-change watch enabled: baseline of {} attached subscriber(s)",
+                    view.len()
+                );
+                watch_view = view;
+            }
+            Err(e) => log::warn!(
+                "HSS subscriber-change watch: baseline read failed ({e}); the first successful \
+                 poll will establish it instead"
+            ),
+        }
+    } else {
+        log::info!(
+            "HSS subscriber-change watch disabled (set HSS_SUBSCRIBER_WATCH=1): administrative \
+             subscription edits will NOT reach an attached UE's MME until it re-attaches"
+        );
+    }
+    let mut last_watch = std::time::Instant::now();
+    let mut last_sweep = std::time::Instant::now();
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
         // Poll for events with timeout
@@ -355,9 +441,26 @@ fn run_event_loop(hss_sm: &mut HssSmContext, shutdown: Arc<AtomicBool>) -> Resul
         // Process timer expirations
         // In full implementation, check timer manager for expired timers
 
-        // Poll database for changes (if configured)
-        // The HSS periodically checks for subscriber data changes
-        // In full implementation, this would use MongoDB change streams
+        // #56: retransmit or abandon outstanding HSS-initiated requests
+        // (RFC 6733 §5.5.4). Runs whether or not the watcher is on, because CLR on
+        // an inter-MME ULR is always tracked.
+        if last_sweep.elapsed() >= PENDING_SWEEP_INTERVAL {
+            last_sweep = std::time::Instant::now();
+            let (retransmitted, abandoned) = nextgcore_hssd::sweep_pending_requests();
+            if retransmitted > 0 || abandoned > 0 {
+                log::info!(
+                    "S6a outstanding requests: {retransmitted} retransmitted, {abandoned} abandoned"
+                );
+            }
+        }
+
+        // #56: poll the subscriber collection and drive IDR / CLR from what changed
+        // (TS 29.272 §5.2.2.1.1 / §5.2.1.2.1). Replaces the comment that used to
+        // stand here describing what a full implementation would do.
+        if watching && last_watch.elapsed() >= SUBSCRIBER_WATCH_INTERVAL {
+            last_watch = std::time::Instant::now();
+            watch_view = nextgcore_hssd::subscriber_watch::poll_once(watch_view);
+        }
 
         // Process events from queue
         // In full implementation, pop events from queue and dispatch

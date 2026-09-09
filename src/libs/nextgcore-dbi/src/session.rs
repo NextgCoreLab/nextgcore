@@ -128,6 +128,19 @@ fn parse_session_data(doc: &Document, dnn: &str) -> DbiResult<NextgcoreSessionDa
         session_data.session.ambr = parse_ambr(ambr_doc);
     }
 
+    // #56: per-APN 3GPP-Charging-Characteristics and the dynamically notified
+    // PDN-GW identity. Both verbatim; the S6a layer owns their wire forms.
+    if let Ok(cc) = doc.get_str(NEXTGCORE_CHARGING_CHARACTERISTICS_STRING) {
+        if !cc.trim().is_empty() {
+            session_data.session.charging_characteristics = Some(cc.to_string());
+        }
+    }
+    if let Ok(pgw) = doc.get_str(NEXTGCORE_PGW_ID_STRING) {
+        if !pgw.trim().is_empty() {
+            session_data.session.pgw_id = Some(pgw.to_string());
+        }
+    }
+
     // Parse PCC rules
     if let Ok(pcc_rule_array) = doc.get_array(NEXTGCORE_PCC_RULE_STRING) {
         let mut pcc_rule_index = 0;
