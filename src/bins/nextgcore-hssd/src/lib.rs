@@ -13,6 +13,7 @@ pub mod event;
 pub mod fd_path;
 pub mod s6a_path;
 pub mod sm;
+pub mod subscriber_watch;
 pub mod swx_path;
 pub mod timer;
 
@@ -27,8 +28,9 @@ pub use fd_path::{
     hss_fd_final, hss_fd_init, HssDiamStats, HssDiamStatsCx, HssDiamStatsS6a, HssDiamStatsSwx,
 };
 pub use s6a_path::{
-    hss_s6a_final, hss_s6a_init, hss_s6a_run_server, hss_s6a_send_clr, hss_s6a_send_idr,
-    hss_s6a_set_identity,
+    arm_restart_reset, claim_running_marker, hss_s6a_final, hss_s6a_init, hss_s6a_run_server,
+    hss_s6a_send_clr, hss_s6a_send_dsr, hss_s6a_send_idr, hss_s6a_send_rsr_to_all,
+    hss_s6a_set_identity, release_running_marker, sweep_pending_requests,
 };
 pub use sm::{hss_sm_debug, HssSmContext, HssState};
 pub use swx_path::{hss_swx_final, hss_swx_init};

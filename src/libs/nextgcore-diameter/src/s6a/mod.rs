@@ -18,7 +18,7 @@ use crate::NEXTGCORE_3GPP_VENDOR_ID;
 /// S6a Application ID (3GPP TS 29.272)
 pub const S6A_APPLICATION_ID: u32 = 16777251;
 
-/// S6a Command Codes
+/// S6a Command Codes (TS 29.272 Table 7.1.2/1)
 pub mod cmd {
     /// Update-Location-Request/Answer
     pub const UPDATE_LOCATION: u32 = 316;
@@ -28,8 +28,17 @@ pub mod cmd {
     pub const AUTHENTICATION_INFORMATION: u32 = 318;
     /// Insert-Subscriber-Data-Request/Answer
     pub const INSERT_SUBSCRIBER_DATA: u32 = 319;
+    /// Delete-Subscriber-Data-Request/Answer (TS 29.272 §7.2.11/§7.2.12).
+    /// HSS -> MME.
+    pub const DELETE_SUBSCRIBER_DATA: u32 = 320;
     /// Purge-UE-Request/Answer
     pub const PURGE_UE: u32 = 321;
+    /// Reset-Request/Answer (TS 29.272 §7.2.15/§7.2.16). HSS -> MME after an
+    /// HSS restart, so the MME re-runs Update Location (TS 23.007 restoration).
+    pub const RESET: u32 = 322;
+    /// Notify-Request/Answer (TS 29.272 §7.2.17/§7.2.18). MME -> HSS, e.g. to
+    /// report a dynamically allocated PDN-GW for an APN (§5.2.5.1.1).
+    pub const NOTIFY: u32 = 323;
 }
 
 /// S6a AVP Codes (3GPP specific)
@@ -140,6 +149,175 @@ pub mod avp {
     pub const ITEM_NUMBER: u32 = 1419;
     /// Service-Selection (RFC 5778, no vendor)
     pub const SERVICE_SELECTION: u32 = 493;
+
+    // ---- #56: HSS-initiated procedures (DSR, RSR) and NOR ----
+
+    /// DSR-Flags (TS 29.272 §7.3.25), Unsigned32
+    pub const DSR_FLAGS: u32 = 1421;
+    /// DSA-Flags (TS 29.272 §7.3.26), Unsigned32
+    pub const DSA_FLAGS: u32 = 1422;
+    /// NOR-Flags (TS 29.272 §7.3.53), Unsigned32
+    pub const NOR_FLAGS: u32 = 1443;
+    /// Alert-Reason (TS 29.272 §7.3.83), Enumerated
+    pub const ALERT_REASON: u32 = 1434;
+    /// User-Id (TS 29.272 §7.3.50), UTF8String — leading digits of an IMSI,
+    /// identifying the set of subscribers a Reset applies to.
+    pub const USER_ID: u32 = 1444;
+    /// Reset-ID (TS 29.272 §7.3.201), OctetString
+    pub const RESET_ID: u32 = 1670;
+
+    // ---- PDN-GW identity (TS 29.272 §7.3.42-§7.3.45) ----
+    //
+    // These three are IETF AVPs the 3GPP spec re-uses by reference (RFC 5447 and
+    // RFC 4004), so they carry NO vendor id and their codes are defined in those
+    // RFCs rather than in the TS 29.272 §7.3 table vendored in this tree.
+
+    /// MIP6-Agent-Info (RFC 5447), Grouped — carries the PDN-GW identity
+    pub const MIP6_AGENT_INFO: u32 = 486;
+    /// MIP-Home-Agent-Address (RFC 4004), Address — the PDN-GW IP address
+    pub const MIP_HOME_AGENT_ADDRESS: u32 = 334;
+    /// MIP-Home-Agent-Host (RFC 4004), Grouped (Destination-Host +
+    /// Destination-Realm) — the PDN-GW FQDN, preferred over the address when known
+    pub const MIP_HOME_AGENT_HOST: u32 = 348;
+}
+
+/// DSR-Flags bits (TS 29.272 Table 7.3.25/1).
+pub mod dsr_flags {
+    pub const REGIONAL_SUBSCRIPTION_WITHDRAWAL: u32 = 1;
+    pub const COMPLETE_APN_CONFIG_PROFILE_WITHDRAWAL: u32 = 1 << 1;
+    pub const SUBSCRIBED_CHARGING_CHARACTERISTICS_WITHDRAWAL: u32 = 1 << 2;
+    pub const PDN_SUBSCRIPTION_CONTEXTS_WITHDRAWAL: u32 = 1 << 3;
+    pub const STN_SR: u32 = 1 << 4;
+    pub const COMPLETE_PDP_CONTEXT_LIST_WITHDRAWAL: u32 = 1 << 5;
+    pub const PDP_CONTEXTS_WITHDRAWAL: u32 = 1 << 6;
+    pub const ROAMING_RESTRICTED_DUE_TO_UNSUPPORTED_FEATURE: u32 = 1 << 7;
+    pub const TRACE_DATA_WITHDRAWAL: u32 = 1 << 8;
+    pub const CSG_DELETED: u32 = 1 << 9;
+}
+
+/// The PDN-GW identity an MME reports in a Notify-Request (TS 29.272 §7.3.45).
+///
+/// The spec says *"FQDN shall be used if known"*, so both forms are modelled and
+/// the FQDN is preferred when both arrive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PdnGwIdentity {
+    /// MIP-Home-Agent-Host: (Destination-Host, Destination-Realm) of the PDN-GW
+    pub fqdn: Option<(String, String)>,
+    /// MIP-Home-Agent-Address: PDN-GW IPv4/IPv6 address, as the raw Address AVP
+    /// payload (2-byte address family followed by the address)
+    pub address: Option<Vec<u8>>,
+}
+
+impl PdnGwIdentity {
+    /// Nothing was reported.
+    pub fn is_empty(&self) -> bool {
+        self.fqdn.is_none() && self.address.is_none()
+    }
+
+    /// The identity to persist, preferring the FQDN per §7.3.45.
+    ///
+    /// The address is rendered from the RFC 3588 Address encoding: a 2-byte
+    /// address family (1 = IPv4, 2 = IPv6) followed by the address bytes. An
+    /// unrecognised family is rendered as hex rather than dropped, because losing
+    /// the identity entirely is worse than storing a form an operator must decode.
+    pub fn to_stored_string(&self) -> Option<String> {
+        if let Some((host, _realm)) = &self.fqdn {
+            return Some(host.clone());
+        }
+        let raw = self.address.as_ref()?;
+        if raw.len() >= 6 && raw[0] == 0 && raw[1] == 1 {
+            return Some(std::net::Ipv4Addr::new(raw[2], raw[3], raw[4], raw[5]).to_string());
+        }
+        if raw.len() >= 18 && raw[0] == 0 && raw[1] == 2 {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&raw[2..18]);
+            return Some(std::net::Ipv6Addr::from(octets).to_string());
+        }
+        Some(raw.iter().map(|b| format!("{b:02x}")).collect())
+    }
+}
+
+/// 3GPP-Charging-Characteristics (AVP 13, vendor 10415).
+///
+/// Two octets of charging characteristics, carried on the wire as the **4-character
+/// hexadecimal string** TS 29.061 §16.4.7.2 specifies for this AVP (TS 29.272
+/// Table 7.3.1/2 defines the AVP only by reference to TS 29.061).
+///
+/// This type exists because the value was previously a bare `[u8; 2]` encoded as a
+/// raw 2-byte OctetString, which round-trips against itself and against nothing
+/// else: a dictionary-based peer reads two octets where four hex characters were
+/// specified. Wrapping it makes the wire form a property of the type rather than of
+/// each call site.
+///
+/// **Verification limit:** TS 29.061 is not vendored in this tree, so the 4-hex-char
+/// form rests on TS 29.272's deferral to it plus the citation in issue #56, not on a
+/// quotable local source. The parser therefore accepts **both** encodings, which is
+/// the direction that cannot regress an existing peer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChargingCharacteristics([u8; 2]);
+
+impl ChargingCharacteristics {
+    /// From the two raw octets, as stored in a subscriber record.
+    pub fn from_octets(octets: [u8; 2]) -> Self {
+        Self(octets)
+    }
+
+    /// From the 4-character hexadecimal wire form. `None` for any other length or
+    /// a non-hex character — a malformed value is refused rather than silently
+    /// truncated, because a half-parsed charging class is a billing error.
+    pub fn parse_hex(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.len() != 4 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let hi = u8::from_str_radix(&s[0..2], 16).ok()?;
+        let lo = u8::from_str_radix(&s[2..4], 16).ok()?;
+        Some(Self([hi, lo]))
+    }
+
+    /// The 4-character hexadecimal wire form, upper case.
+    pub fn to_hex(&self) -> String {
+        format!("{:02X}{:02X}", self.0[0], self.0[1])
+    }
+
+    /// The two raw octets.
+    pub fn octets(&self) -> [u8; 2] {
+        self.0
+    }
+
+    /// Read the value out of a decoded AVP, accepting either encoding.
+    ///
+    /// The two forms are unambiguous by length: the hex form is exactly 4 bytes of
+    /// ASCII hex, and the legacy octet form is 2 bytes. Note that a decoded AVP
+    /// arrives as `Raw`, so the octet form can also satisfy `as_utf8_string` (two
+    /// arbitrary bytes are often valid UTF-8) — which is why the hex branch checks
+    /// length and hex-ness rather than merely "is it a string".
+    pub fn from_avp(avp: &Avp) -> Option<Self> {
+        if let Some(s) = avp.as_utf8_string() {
+            if let Some(cc) = Self::parse_hex(s) {
+                return Some(cc);
+            }
+        }
+        let b = avp.as_octet_string()?;
+        if b.len() == 4 {
+            if let Some(cc) = std::str::from_utf8(b).ok().and_then(Self::parse_hex) {
+                return Some(cc);
+            }
+        }
+        if b.len() >= 2 {
+            return Some(Self([b[0], b[1]]));
+        }
+        None
+    }
+
+    /// Build the AVP in the TS 29.061 wire form.
+    pub fn to_avp(self) -> Avp {
+        Avp::vendor_mandatory(
+            avp::CHARGING_CHARACTERISTICS,
+            NEXTGCORE_3GPP_VENDOR_ID,
+            AvpData::Utf8String(self.to_hex()),
+        )
+    }
 }
 
 /// ULR Flags
@@ -738,8 +916,9 @@ pub struct SubscriptionData {
     pub all_apn_configs_included: bool,
     /// APN configurations
     pub apn_configs: Vec<ApnConfiguration>,
-    /// 3GPP-Charging-Characteristics
-    pub charging_characteristics: Option<[u8; 2]>,
+    /// 3GPP-Charging-Characteristics (TS 29.061 §16.4.7.2 wire form; see
+    /// [`ChargingCharacteristics`])
+    pub charging_characteristics: Option<ChargingCharacteristics>,
 }
 
 /// A single APN-Configuration (TS 29.272 7.3.35)
@@ -763,8 +942,9 @@ pub struct ApnConfiguration {
     pub ambr_uplink: u64,
     /// APN-AMBR downlink (bps)
     pub ambr_downlink: u64,
-    /// 3GPP-Charging-Characteristics
-    pub charging_characteristics: Option<[u8; 2]>,
+    /// 3GPP-Charging-Characteristics (TS 29.061 §16.4.7.2 wire form; see
+    /// [`ChargingCharacteristics`])
+    pub charging_characteristics: Option<ChargingCharacteristics>,
 }
 
 /// Build an AMBR grouped AVP (TS 29.272 7.3.41).
@@ -861,11 +1041,7 @@ pub fn build_apn_configuration_avp(apn: &ApnConfiguration) -> Avp {
         build_ambr_avp(apn.ambr_uplink, apn.ambr_downlink),
     ];
     if let Some(cc) = apn.charging_characteristics {
-        group.push(Avp::vendor_mandatory(
-            avp::CHARGING_CHARACTERISTICS,
-            NEXTGCORE_3GPP_VENDOR_ID,
-            AvpData::OctetString(Bytes::copy_from_slice(&cc)),
-        ));
+        group.push(cc.to_avp());
     }
     Avp::vendor_mandatory(
         avp::APN_CONFIGURATION,
@@ -925,11 +1101,7 @@ pub fn build_subscription_data_avp(sub: &SubscriptionData) -> Avp {
     }
     group.push(build_ambr_avp(sub.ambr_uplink, sub.ambr_downlink));
     if let Some(cc) = sub.charging_characteristics {
-        group.push(Avp::vendor_mandatory(
-            avp::CHARGING_CHARACTERISTICS,
-            NEXTGCORE_3GPP_VENDOR_ID,
-            AvpData::OctetString(Bytes::copy_from_slice(&cc)),
-        ));
+        group.push(cc.to_avp());
     }
 
     // APN-Configuration-Profile (TS 29.272 7.3.34)
@@ -999,11 +1171,9 @@ pub fn parse_apn_configuration_avp(avp_in: &Avp) -> ApnConfiguration {
                 }
             }
             avp::CHARGING_CHARACTERISTICS => {
-                if let Some(b) = inner.as_octet_string() {
-                    if b.len() >= 2 {
-                        apn.charging_characteristics = Some([b[0], b[1]]);
-                    }
-                }
+                // Accepts BOTH the TS 29.061 4-hex-char form and the legacy raw
+                // 2-octet form this tree used to emit.
+                apn.charging_characteristics = ChargingCharacteristics::from_avp(inner);
             }
             avp::AMBR => {
                 let (ul, dl) = parse_ambr(inner);
@@ -1074,11 +1244,7 @@ pub fn parse_subscription_data_avp(avp_in: &Avp) -> SubscriptionData {
                 sub.subscribed_rau_tau_timer = inner.as_u32().unwrap_or(0);
             }
             avp::CHARGING_CHARACTERISTICS => {
-                if let Some(b) = inner.as_octet_string() {
-                    if b.len() >= 2 {
-                        sub.charging_characteristics = Some([b[0], b[1]]);
-                    }
-                }
+                sub.charging_characteristics = ChargingCharacteristics::from_avp(inner);
             }
             avp::AMBR => {
                 let (ul, dl) = parse_ambr(inner);
@@ -1154,7 +1320,9 @@ mod tests {
                     arp_pre_emption_vulnerability: true,
                     ambr_uplink: 50_000_000,
                     ambr_downlink: 100_000_000,
-                    charging_characteristics: Some([0x0A, 0x00]),
+                    charging_characteristics: Some(ChargingCharacteristics::from_octets([
+                        0x0A, 0x00,
+                    ])),
                 },
                 ApnConfiguration {
                     context_identifier: 2,
@@ -1169,7 +1337,7 @@ mod tests {
                     charging_characteristics: None,
                 },
             ],
-            charging_characteristics: Some([0x0A, 0x00]),
+            charging_characteristics: Some(ChargingCharacteristics::from_octets([0x0A, 0x00])),
         }
     }
 
@@ -1318,5 +1486,181 @@ mod tests {
 
         assert_eq!(msg.header.command_code, cmd::UPDATE_LOCATION);
         assert_eq!(msg.header.application_id, S6A_APPLICATION_ID);
+    }
+
+    // ---- #56: 3GPP-Charging-Characteristics wire form ----
+
+    /// The wire form is the TS 29.061 §16.4.7.2 four-hex-character UTF8String, not
+    /// the raw two octets this tree used to emit. Two octets round-trip against
+    /// themselves and against nothing else — a dictionary-based peer reads a
+    /// 2-character string where 4 were specified.
+    #[test]
+    fn charging_characteristics_encodes_as_four_hex_characters() {
+        let cc = ChargingCharacteristics::from_octets([0x0A, 0x00]);
+        assert_eq!(cc.to_hex(), "0A00");
+        let avp = cc.to_avp();
+        assert_eq!(avp.code, avp::CHARGING_CHARACTERISTICS);
+        assert_eq!(avp.vendor_id, Some(NEXTGCORE_3GPP_VENDOR_ID));
+        assert_eq!(
+            avp.as_utf8_string(),
+            Some("0A00"),
+            "four hex characters on the wire, not two raw octets"
+        );
+    }
+
+    /// Both encodings parse, which is what makes the encode change safe against a
+    /// peer still sending the legacy form.
+    #[test]
+    fn charging_characteristics_parses_both_encodings() {
+        // TS 29.061 form
+        let hex_avp = Avp::vendor_mandatory(
+            avp::CHARGING_CHARACTERISTICS,
+            NEXTGCORE_3GPP_VENDOR_ID,
+            AvpData::Utf8String("0A00".to_string()),
+        );
+        assert_eq!(
+            ChargingCharacteristics::from_avp(&hex_avp).map(|c| c.octets()),
+            Some([0x0A, 0x00])
+        );
+
+        // Legacy raw 2-octet form
+        let raw_avp = Avp::vendor_mandatory(
+            avp::CHARGING_CHARACTERISTICS,
+            NEXTGCORE_3GPP_VENDOR_ID,
+            AvpData::OctetString(Bytes::from_static(&[0x0A, 0x00])),
+        );
+        assert_eq!(
+            ChargingCharacteristics::from_avp(&raw_avp).map(|c| c.octets()),
+            Some([0x0A, 0x00]),
+            "a peer still sending two octets must keep working"
+        );
+
+        // And the hex form as it arrives OFF THE WIRE, where it decodes to Raw
+        // rather than to Utf8String.
+        let wire_avp = Avp::vendor_mandatory(
+            avp::CHARGING_CHARACTERISTICS,
+            NEXTGCORE_3GPP_VENDOR_ID,
+            AvpData::OctetString(Bytes::from_static(b"0A00")),
+        );
+        assert_eq!(
+            ChargingCharacteristics::from_avp(&wire_avp).map(|c| c.octets()),
+            Some([0x0A, 0x00])
+        );
+    }
+
+    /// A malformed value is refused, not truncated: a half-parsed charging class is
+    /// a billing error.
+    #[test]
+    fn charging_characteristics_refuses_a_malformed_hex_value() {
+        assert!(
+            ChargingCharacteristics::parse_hex("0A0").is_none(),
+            "3 chars"
+        );
+        assert!(
+            ChargingCharacteristics::parse_hex("0A000").is_none(),
+            "5 chars"
+        );
+        assert!(
+            ChargingCharacteristics::parse_hex("0G00").is_none(),
+            "non-hex"
+        );
+        assert!(ChargingCharacteristics::parse_hex("").is_none(), "empty");
+        // Lower case is accepted: hex is hex.
+        assert_eq!(
+            ChargingCharacteristics::parse_hex("0a0f").map(|c| c.octets()),
+            Some([0x0A, 0x0F])
+        );
+    }
+
+    /// A full Subscription-Data round trip through the real encoder and decoder,
+    /// so the accept-both parse is proven against what this tree actually emits.
+    #[test]
+    fn charging_characteristics_survives_a_subscription_data_round_trip() {
+        let sub = SubscriptionData {
+            subscriber_status: 0,
+            network_access_mode: 2,
+            ambr_uplink: 1_000_000,
+            ambr_downlink: 2_000_000,
+            context_identifier: 1,
+            all_apn_configs_included: true,
+            charging_characteristics: Some(ChargingCharacteristics::from_octets([0x08, 0x00])),
+            apn_configs: vec![ApnConfiguration {
+                context_identifier: 1,
+                service_selection: "internet".to_string(),
+                pdn_type: 2,
+                qci: 9,
+                arp_priority_level: 8,
+                ambr_uplink: 1_000_000,
+                ambr_downlink: 2_000_000,
+                charging_characteristics: Some(ChargingCharacteristics::from_octets([0x0B, 0x01])),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let avp = build_subscription_data_avp(&sub);
+        // Through a real encode/decode, so the AVP arrives as Raw exactly as it
+        // would from a socket.
+        let mut msg = DiameterMessage::new_request(cmd::UPDATE_LOCATION, S6A_APPLICATION_ID);
+        msg.add_avp(avp);
+        let encoded = msg.encode();
+        let mut bytes = encoded.freeze();
+        let decoded = DiameterMessage::decode(&mut bytes).expect("decode");
+        let sub_avp = decoded
+            .find_vendor_avp(avp::SUBSCRIPTION_DATA, NEXTGCORE_3GPP_VENDOR_ID)
+            .expect("Subscription-Data");
+        let parsed = parse_subscription_data_avp(sub_avp);
+
+        assert_eq!(
+            parsed.charging_characteristics.map(|c| c.octets()),
+            Some([0x08, 0x00]),
+            "subscriber-level charging class survives the wire"
+        );
+        assert_eq!(
+            parsed
+                .apn_configs
+                .first()
+                .and_then(|a| a.charging_characteristics)
+                .map(|c| c.octets()),
+            Some([0x0B, 0x01]),
+            "and so does the per-APN one"
+        );
+    }
+
+    /// #56: the PDN-GW identity an MME reports, and how it is rendered for storage.
+    #[test]
+    fn pdn_gw_identity_prefers_the_fqdn_and_renders_addresses() {
+        // §7.3.45: "FQDN shall be used if known".
+        let both = PdnGwIdentity {
+            fqdn: Some((
+                "pgw.epc.mnc001.mcc001.3gppnetwork.org".to_string(),
+                "epc.mnc001.mcc001.3gppnetwork.org".to_string(),
+            )),
+            address: Some(vec![0, 1, 10, 45, 0, 1]),
+        };
+        assert_eq!(
+            both.to_stored_string().as_deref(),
+            Some("pgw.epc.mnc001.mcc001.3gppnetwork.org")
+        );
+
+        // IPv4: RFC 3588 Address = 2-byte family (1) + 4 octets.
+        let v4 = PdnGwIdentity {
+            fqdn: None,
+            address: Some(vec![0, 1, 10, 45, 0, 1]),
+        };
+        assert_eq!(v4.to_stored_string().as_deref(), Some("10.45.0.1"));
+
+        // IPv6: family 2 + 16 octets.
+        let mut raw = vec![0, 2];
+        raw.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let v6 = PdnGwIdentity {
+            fqdn: None,
+            address: Some(raw),
+        };
+        assert_eq!(v6.to_stored_string().as_deref(), Some("2001:db8::1"));
+
+        // Nothing reported.
+        assert!(PdnGwIdentity::default().to_stored_string().is_none());
+        assert!(PdnGwIdentity::default().is_empty());
     }
 }

@@ -448,6 +448,15 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
         subscription_data.ambr = parse_ambr(ambr_doc);
     }
 
+    // Parse subscribed 3GPP-Charging-Characteristics (#56). Read verbatim: this
+    // layer does not know the S6a wire format, and validating here would reject a
+    // value the S6a layer might still be able to use.
+    if let Ok(cc) = document.get_str(NEXTGCORE_CHARGING_CHARACTERISTICS_STRING) {
+        if !cc.trim().is_empty() {
+            subscription_data.charging_characteristics = Some(cc.to_string());
+        }
+    }
+
     // Parse slice array
     if let Ok(slice_array) = document.get_array(NEXTGCORE_SLICE_STRING) {
         for slice_val in slice_array {

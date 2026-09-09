@@ -1576,7 +1576,9 @@ mod tests {
             ambr_downlink: 100_000_000,
             context_identifier: 1,
             all_apn_configs_included: true,
-            charging_characteristics: Some([0x0A, 0x00]),
+            charging_characteristics: Some(
+                nextgcore_diameter::s6a::ChargingCharacteristics::from_octets([0x0A, 0x00]),
+            ),
             ..Default::default()
         };
         sub.apn_configs.push(ApnConfiguration {

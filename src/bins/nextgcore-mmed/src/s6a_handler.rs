@@ -161,7 +161,9 @@ pub fn mme_s6a_handle_ula(mme_ue: &mut MmeUe, ula_message: &UlaMessage) -> S6aRe
 
     // Update charging characteristics
     if let Some(cc) = subscription_data.charging_characteristics {
-        mme_ue.charging_characteristics = cc;
+        // #56: the wire form is now a 4-hex-char UTF8String (TS 29.061
+        // §16.4.7.2); the MME context still holds the two raw octets it means.
+        mme_ue.charging_characteristics = cc.octets();
         mme_ue.charging_characteristics_presence = true;
     }
 
