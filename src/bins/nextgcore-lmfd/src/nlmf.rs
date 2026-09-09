@@ -37,6 +37,10 @@ pub mod cause {
     pub const INSUFFICIENT_RESOURCES: &str = "INSUFFICIENT_RESOURCES";
     pub const EVENT_REPORT_UNRECOGNIZED: &str = "EVENT_REPORT_UNRECOGNIZED";
     pub const LOCATION_MEASUREMENT_UNKNOWN: &str = "LOCATION_MEASUREMENT_UNKNOWN";
+    /// #104: the cause for a `404` on a UP-location subscription that does not
+    /// exist (TS 29.572 §6.1.4.9). `up-unsubscribe` previously answered `204` for
+    /// any id, so a consumer could not tell a real delete from a no-op.
+    pub const SUBSCRIPTION_NOT_FOUND: &str = "SUBSCRIPTION_NOT_FOUND";
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +167,81 @@ pub struct LocationQoS {
     pub vertical_requested: Option<bool>,
     #[serde(rename = "responseTime", skip_serializing_if = "Option::is_none")]
     pub response_time: Option<String>,
+    /// `lcsQosClass` — `BEST_EFFORT` or `ASSURED`
+    /// (`TS29572_Nlmf_Location.yaml` `LcsQosClass`), #104.
+    ///
+    /// Absent from this struct entirely before #104, so the member was never
+    /// deserialised: an `ASSURED` request whose accuracy could not be met was
+    /// answered `200` with `NOT_FULFILLED` instead of being refused, and the
+    /// caller had no way to tell that its accuracy contract had been ignored.
+    /// Carried as a `String` because the yaml enumeration is open (`anyOf` with a
+    /// forward-compatibility string).
+    #[serde(rename = "lcsQosClass", skip_serializing_if = "Option::is_none")]
+    pub lcs_qos_class: Option<String>,
+    /// `velocityRequested` (`TS29572_Nlmf_Location.yaml`), #104. Also absent
+    /// before, so velocity could never be asked for.
+    #[serde(rename = "velocityRequested", skip_serializing_if = "Option::is_none")]
+    pub velocity_requested: Option<bool>,
+}
+
+/// `LcsQosClass` values (`TS29572_Nlmf_Location.yaml`).
+pub mod lcs_qos_class {
+    /// Best effort: an unmet accuracy is reported, not refused.
+    pub const BEST_EFFORT: &str = "BEST_EFFORT";
+    /// Assured: an unmet accuracy means the estimate is discarded
+    /// (TS 29.572 §6.1.6.2.7).
+    pub const ASSURED: &str = "ASSURED";
+}
+
+/// Derive a TS 29.571 `VelocityEstimate` (`HorizontalVelocity`) from two
+/// successive fixes (#104).
+///
+/// Returns `None` when it is **not derivable** — no previous fix, a non-positive
+/// time delta, or an implausible speed — which is the honest answer for a single
+/// position fix. The solvers here produce position only (no Doppler), so two
+/// fixes are the sole basis for a velocity in this LMF, and saying so is better
+/// than reporting a fabricated zero.
+///
+/// `hSpeed` is metres per second over the great-circle distance; `bearing` is the
+/// initial azimuth in degrees clockwise from true north, which is what
+/// `HorizontalVelocity` means.
+pub fn derive_velocity(
+    prev_lat: f64,
+    prev_lon: f64,
+    prev_ts: u64,
+    lat: f64,
+    lon: f64,
+    ts: u64,
+) -> Option<serde_json::Value> {
+    let dt = ts.checked_sub(prev_ts)? as f64;
+    if dt <= 0.0 {
+        return None;
+    }
+    // Great-circle distance (haversine) on a spherical earth. The error against
+    // WGS-84 is well under a percent, and a velocity reported to the nearest
+    // 0.1 m/s does not need an ellipsoidal geodesic.
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let (phi1, phi2) = (prev_lat.to_radians(), lat.to_radians());
+    let dphi = phi2 - phi1;
+    let dlambda = (lon - prev_lon).to_radians();
+    let a = (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
+    let distance = 2.0 * EARTH_RADIUS_M * a.sqrt().asin();
+    let speed = distance / dt;
+    // A UE moving faster than ~1000 km/h is a bad fix pair, not a velocity.
+    if !speed.is_finite() || speed > 280.0 {
+        return None;
+    }
+    // Initial bearing, normalised to 0..360.
+    let y = dlambda.sin() * phi2.cos();
+    let x = phi1
+        .sin()
+        .mul_add(-(phi2.cos() * dlambda.cos()), phi1.cos() * phi2.sin());
+    let bearing = (y.atan2(x).to_degrees() + 360.0) % 360.0;
+    Some(serde_json::json!({
+        "hSpeed": (speed * 10.0).round() / 10.0,
+        "bearing": bearing.round() as u32,
+        "velocityType": "HORIZONTAL",
+    }))
 }
 
 /// `PlmnId` (TS 29.571).

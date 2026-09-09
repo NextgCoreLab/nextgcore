@@ -23,6 +23,7 @@ use std::time::Duration;
 // lmfd-05/06: codec decode glue — NRPPa APER → CellMeasurement, LPP UPER →
 // CellMeasurement.  Exposes the two inbound binary-report route helpers used
 // by `handle_nrppa_binary_report` and `handle_lpp_binary_report` below.
+mod broadcast_exposure; // #104: Nlmf_Broadcast + Nlmf_DataExposure
 mod codec_glue;
 mod context;
 // A2: lmfd → AMF Namf_Communication client leg (NRF discovery of the serving
@@ -388,8 +389,11 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "PUT" => handle_ue_location_update(supi, &request).await,
             _ => send_method_not_allowed(method, "ue-locations/{supi}"),
         },
-        // Capabilities
-        ["nlmf-loc", "v1", "capabilities"] => match method {
+        // Capabilities. #104: gated like the other non-TS 29.572 routes above.
+        // It is a bespoke endpoint (there is no `/capabilities` resource in
+        // TS 29.572 §6.1), it discloses this NF's positioning posture, and it was
+        // the ONE bespoke route left ungated.
+        ["nlmf-loc", "v1", "capabilities"] if debug_endpoints_enabled() => match method {
             "GET" => handle_capabilities().await,
             _ => send_method_not_allowed(method, "capabilities"),
         },
@@ -438,7 +442,275 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "POST" => handle_n2_info_notify(&request).await,
             _ => send_method_not_allowed(method, "notify/n2"),
         },
+        // ---- #104: Nlmf_Broadcast (TS 29.572 §5.3) --------------------------
+        ["nlmf-broadcast", "v1", "cipher-key-data"] => match method {
+            "POST" => handle_cipher_key_data(&request).await,
+            _ => send_method_not_allowed(method, "cipher-key-data"),
+        },
+        // ---- #104: Nlmf_DataExposure (TS 29.572 §5.4) -----------------------
+        ["nlmf-dataexposure", "v1", "subscriptions"] => match method {
+            "POST" => handle_exposure_subscribe(&request).await,
+            _ => send_method_not_allowed(method, "subscriptions"),
+        },
+        ["nlmf-dataexposure", "v1", "subscriptions", subscription_id] => match method {
+            "PATCH" => handle_exposure_modify(subscription_id, &request).await,
+            "DELETE" => handle_exposure_unsubscribe(subscription_id).await,
+            _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
+        },
         _ => send_not_found(&format!("Resource not found: {path}"), None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #104: Nlmf_Broadcast + Nlmf_DataExposure handlers
+// ---------------------------------------------------------------------------
+
+/// Resource collection path for LMF data-exposure subscriptions.
+const EXPOSURE_SUBSCRIPTIONS_PATH: &str = "/nlmf-dataexposure/v1/subscriptions";
+
+/// `POST /nlmf-broadcast/v1/cipher-key-data` — `CipheringKeyData`
+/// (TS 29.572 §5.3), #104.
+///
+/// The AMF asks the LMF for broadcast-assistance ciphering key data and supplies
+/// the callback the LMF will notify on. `amfCallBackURI` is the yaml's sole
+/// required member.
+///
+/// The response is `CIPHERING_KEY_DATA_NOT_AVAILABLE` whenever this LMF holds no
+/// ciphering key sets, which is always today: nothing provisions them (there is no
+/// LCS ciphering-key source in this tree, and they cannot be invented — a
+/// fabricated key would make a UE decipher assistance data into noise). That is
+/// exactly what `dataAvailability` exists to say, so the answer is conformant
+/// rather than a stub: the AMF learns not to wait for a notification.
+async fn handle_cipher_key_data(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = request.http.content.as_deref() else {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "Missing CipherRequestData body",
+        );
+    };
+    let data: broadcast_exposure::CipherRequestData = match serde_json::from_str(body) {
+        Ok(d) => d,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("Malformed CipherRequestData: {e}"),
+            )
+        }
+    };
+    if data.amf_call_back_uri.trim().is_empty() {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "amfCallBackURI is mandatory (TS29572_Nlmf_Broadcast.yaml CipherRequestData)",
+        );
+    }
+
+    // No ciphering-key source exists, so report unavailability rather than
+    // promising a notification that will never come.
+    log::info!(
+        "Nlmf_Broadcast CipheringKeyData request from {}: no ciphering key data held",
+        data.amf_call_back_uri
+    );
+    let response = broadcast_exposure::CipherResponseData {
+        data_availability: broadcast_exposure::data_availability::NOT_AVAILABLE.to_string(),
+    };
+    SbiResponse::with_status(200)
+        .with_json_body(&response)
+        .unwrap_or_else(|_| {
+            problem(
+                500,
+                nlmf::cause::UNSPECIFIED,
+                "Failed to encode CipherResponseData",
+            )
+        })
+}
+
+/// `POST /nlmf-dataexposure/v1/subscriptions` — `CreateSubscription`
+/// (TS 29.572 §5.4), #104. `201` + `Location` + the echoed resource.
+async fn handle_exposure_subscribe(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = request.http.content.as_deref() else {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "Missing LmfDataExposureSubscription body",
+        );
+    };
+    let sub: broadcast_exposure::LmfDataExposureSubscription = match serde_json::from_str(body) {
+        Ok(d) => d,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("Malformed LmfDataExposureSubscription: {e}"),
+            )
+        }
+    };
+    if let Some(missing) = sub.validate() {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            &format!("{missing} is mandatory (LmfDataExposureSubscription required)"),
+        );
+    }
+
+    let Some(id) = lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.exposure_subscription_insert(sub.clone()))
+    else {
+        return problem(
+            500,
+            nlmf::cause::UNSPECIFIED,
+            "Failed to store the data-exposure subscription",
+        );
+    };
+    log::info!("Nlmf_DataExposure subscription created: id={id}");
+    SbiResponse::with_status(201)
+        .with_header("Location", format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}"))
+        .with_json_body(&sub)
+        .unwrap_or_else(|_| {
+            problem(
+                500,
+                nlmf::cause::UNSPECIFIED,
+                "Failed to encode LmfDataExposureSubscription",
+            )
+        })
+}
+
+/// `PATCH /nlmf-dataexposure/v1/subscriptions/{id}` — `ModifySubscription`, #104.
+///
+/// The yaml's body is an array of TS 29.571 `PatchItem`s (RFC 6902 JSON Patch) and
+/// the success response is `204`. Only `replace` on a top-level member is applied;
+/// anything else is refused rather than silently ignored, because a consumer whose
+/// patch was dropped believes its subscription changed.
+async fn handle_exposure_modify(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    let Some(existing) = lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.exposure_subscription_find(subscription_id))
+    else {
+        return problem(
+            404,
+            nlmf::cause::SUBSCRIPTION_NOT_FOUND,
+            &format!("No data-exposure subscription {subscription_id}"),
+        );
+    };
+    let Some(body) = request.http.content.as_deref() else {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "Missing PatchItem array body",
+        );
+    };
+    let patches: Vec<serde_json::Value> = match serde_json::from_str(body) {
+        Ok(serde_json::Value::Array(items)) => items,
+        Ok(_) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                "ModifySubscription takes an array of PatchItem (RFC 6902)",
+            )
+        }
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("Malformed PatchItem array: {e}"),
+            )
+        }
+    };
+
+    let mut document = match serde_json::to_value(&existing) {
+        Ok(v) => v,
+        Err(_) => {
+            return problem(
+                500,
+                nlmf::cause::UNSPECIFIED,
+                "Failed to serialize the stored subscription",
+            )
+        }
+    };
+    for patch in &patches {
+        let op = patch.get("op").and_then(|v| v.as_str()).unwrap_or_default();
+        let path = patch
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        // Only a top-level `/member` replace is supported. A nested pointer or an
+        // add/remove/move is refused: applying part of a patch is worse than
+        // refusing all of it, because the consumer cannot tell which part landed.
+        let member = path.strip_prefix('/').filter(|m| !m.contains('/'));
+        match (op, member, patch.get("value")) {
+            ("replace", Some(member), Some(value)) => {
+                if let Some(obj) = document.as_object_mut() {
+                    obj.insert(member.to_string(), value.clone());
+                }
+            }
+            _ => {
+                return problem(
+                    400,
+                    nlmf::cause::INVALID_MSG_FORMAT,
+                    &format!(
+                        "Unsupported patch operation (op={op:?}, path={path:?}): only a \
+                         top-level `replace` with a value is applied"
+                    ),
+                )
+            }
+        }
+    }
+    let updated: broadcast_exposure::LmfDataExposureSubscription =
+        match serde_json::from_value(document) {
+            Ok(u) => u,
+            Err(e) => {
+                return problem(
+                    400,
+                    nlmf::cause::INVALID_MSG_FORMAT,
+                    &format!("The patched subscription is not a valid resource: {e}"),
+                )
+            }
+        };
+    if let Some(missing) = updated.validate() {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            &format!("The patch would remove the mandatory {missing}"),
+        );
+    }
+    if lmf_self()
+        .read()
+        .ok()
+        .map(|c| c.exposure_subscription_replace(subscription_id, updated))
+        != Some(true)
+    {
+        return problem(
+            500,
+            nlmf::cause::UNSPECIFIED,
+            "Failed to store the patched subscription",
+        );
+    }
+    log::info!("Nlmf_DataExposure subscription modified: id={subscription_id}");
+    SbiResponse::no_content()
+}
+
+/// `DELETE /nlmf-dataexposure/v1/subscriptions/{id}` — `DeleteSubscription`, #104.
+/// `204` when it existed, `404` when it did not.
+async fn handle_exposure_unsubscribe(subscription_id: &str) -> SbiResponse {
+    match lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.exposure_subscription_remove(subscription_id))
+    {
+        Some(_) => {
+            log::info!("Nlmf_DataExposure subscription deleted: id={subscription_id}");
+            SbiResponse::no_content()
+        }
+        None => problem(
+            404,
+            nlmf::cause::SUBSCRIPTION_NOT_FOUND,
+            &format!("No data-exposure subscription {subscription_id}"),
+        ),
     }
 }
 
@@ -1265,6 +1537,89 @@ fn encode_location_response(
         _ => nlmf::accuracy_fulfilment::FULFILLED,
     };
 
+    // #104: an ASSURED lcsQosClass whose accuracy is NOT met discards the estimate
+    // and fails (TS 29.572 §6.1.6.2.7). It used to be answered `200` with
+    // `NOT_FULFILLED`, which is the BEST_EFFORT semantics applied to a request that
+    // explicitly asked for the opposite — a consumer that needs an assured fix (an
+    // emergency or regulatory one) got a worse fix labelled as a success.
+    //
+    // The member itself did not exist on `LocationQoS` before, so the class could
+    // not even be read.
+    let assured = input
+        .location_qos
+        .as_ref()
+        .and_then(|q| q.lcs_qos_class.as_deref())
+        .is_some_and(|c| c.eq_ignore_ascii_case(nlmf::lcs_qos_class::ASSURED));
+    if assured && accuracy_fulfilment_indicator == nlmf::accuracy_fulfilment::NOT_FULFILLED {
+        let requested = input
+            .location_qos
+            .as_ref()
+            .and_then(|q| q.h_accuracy)
+            .unwrap_or(0.0);
+        log::warn!(
+            "ASSURED lcsQosClass requested {requested} m horizontal accuracy; achieved \
+             {} m — discarding the estimate (TS 29.572 §6.1.6.2.7)",
+            est.horizontal_accuracy
+        );
+        return problem(
+            500,
+            nlmf::cause::POSITIONING_FAILED,
+            &format!(
+                "ASSURED lcsQosClass: requested horizontal accuracy {requested} m could not be \
+                 met (achieved {} m); the estimate is discarded rather than reported as \
+                 NOT_FULFILLED",
+                est.horizontal_accuracy
+            ),
+        );
+    }
+
+    // #104: velocity, when asked for AND derivable. `velocityRequested` was not a
+    // member of `LocationQoS` before, and `velocity_estimate` was hardcoded `None`.
+    //
+    // Derivable here means a previous stored fix for this UE with an earlier
+    // timestamp: these solvers produce position only, so two fixes are the sole
+    // basis for a velocity. When there is no previous fix the member is omitted
+    // rather than sent as zero — a stationary UE and an unknown velocity are not
+    // the same claim.
+    let velocity_estimate = input
+        .location_qos
+        .as_ref()
+        .and_then(|q| q.velocity_requested)
+        .unwrap_or(false)
+        .then(|| {
+            // The fix BEFORE the one being reported. `last_location` is the
+            // current fix, so deriving against it would give a zero time delta and
+            // no velocity — which is how the first version of this failed.
+            let previous = input.supi.as_deref().and_then(|supi| {
+                lmf_self()
+                    .read()
+                    .ok()
+                    .and_then(|c| c.ue_location_get(supi))
+                    .and_then(|ctx| ctx.previous_location)
+            })?;
+            nlmf::derive_velocity(
+                previous.latitude,
+                previous.longitude,
+                previous.timestamp,
+                est.latitude,
+                est.longitude,
+                est.timestamp,
+            )
+        })
+        .flatten();
+    if velocity_estimate.is_none()
+        && input
+            .location_qos
+            .as_ref()
+            .and_then(|q| q.velocity_requested)
+            .unwrap_or(false)
+    {
+        log::info!(
+            "velocityRequested set but no velocity is derivable (no earlier fix for this UE); \
+             omitting velocityEstimate rather than reporting a fabricated zero"
+        );
+    }
+
     let response = nlmf::LocationDataExt {
         location_data: nlmf::LocationData {
             location_estimate,
@@ -1281,7 +1636,7 @@ fn encode_location_response(
             }]),
             altitude: None,
             barometric_pressure: None,
-            velocity_estimate: None,
+            velocity_estimate,
             civic_address: None,
         },
         add_location_data: None,
@@ -1370,6 +1725,14 @@ async fn handle_location_context_transfer(request: &SbiRequest) -> SbiResponse {
         }
     };
     // Validate eventClass: only known classes are accepted.
+    //
+    // #104 asked for `DUMMY` to be rejected as "a placeholder value that has no
+    // spec meaning". It is NOT rejected, because the premise is wrong:
+    // `TS29572_Nlmf_Location.yaml`'s `EventClass` enumerates exactly
+    // `[SUPPLEMENTARY_SERVICES, DUMMY]` (plus the open-enumeration string branch).
+    // `DUMMY` is a spec-defined member — 3GPP uses it to keep a single-valued
+    // enumeration extensible — so refusing it would make this LMF reject a
+    // conformant peer. The vendored OpenAPI outranks the issue text.
     match data.event_report_message.event_class.as_str() {
         "SUPPLEMENTARY_SERVICES" | "DUMMY" => {}
         _ => {
@@ -1380,18 +1743,92 @@ async fn handle_location_context_transfer(request: &SbiRequest) -> SbiResponse {
             )
         }
     }
+
+    // #104: restore the periodic parameters from the transferred context, and
+    // RE-ARM the scheduler.
+    //
+    // `periodic_event_info` was hardcoded `None` here, so a relocated PERIODIC
+    // deferred LDR was stored as a record whose trigger never restarted: periodic
+    // reporting stopped silently at AMF relocation, which is a routine mobility
+    // event. The record's presence made it look live.
+    let periodic = periodic_reporting_from_event_content(&data.event_report_message.event_content);
+    let is_periodic = data.ldr_type.eq_ignore_ascii_case("PERIODIC");
+
     if let Ok(c) = lmf_self().read() {
         c.register_ldr(LdrContext {
             ldr_reference: data.ldr_reference.clone(),
             ldr_type: data.ldr_type.clone(),
             hgmlc_callback_uri: Some(data.hgmlc_call_back_uri.clone()),
             supi: data.supi.clone(),
-            // A8: context-transfer restores the LDR record; re-driving the
-            // periodic trigger after AMF relocation is out of A8 scope.
-            periodic_event_info: None,
+            periodic_event_info: periodic,
         });
     }
+
+    match (is_periodic, periodic, data.supi.as_deref()) {
+        (true, Some(params), Some(supi)) => {
+            spawn_periodic_ldr(
+                data.ldr_reference.clone(),
+                supi.to_string(),
+                data.hgmlc_call_back_uri.clone(),
+                params,
+            );
+            log::info!(
+                "A8/#104: periodic reporting RE-ARMED for transferred LDR [{}]",
+                data.ldr_reference
+            );
+        }
+        // A PERIODIC LDR we cannot re-arm is the case the old code produced for
+        // every transfer. It is stored either way -- cancel-location must still
+        // find it -- but the operator is told reporting will not resume, and why,
+        // rather than being left with a record that looks live.
+        (true, None, _) => log::warn!(
+            "transferred PERIODIC LDR [{}] carries no periodicEventInfo in \
+             eventReportMessage.eventContent: reporting canNOT resume at this LMF. The source \
+             LMF must include reportingAmount/reportingInterval for the trigger to be re-armed.",
+            data.ldr_reference
+        ),
+        (true, Some(_), None) => log::warn!(
+            "transferred PERIODIC LDR [{}] carries no supi: reporting cannot resume (the \
+             EventNotify needs a UE identity to report about)",
+            data.ldr_reference
+        ),
+        (false, _, _) => {}
+    }
+
     SbiResponse::no_content()
+}
+
+/// Recover `PeriodicEventInfo` from a transferred `eventReportMessage.eventContent`
+/// (#104).
+///
+/// `eventContent` is a passthrough `serde_json::Value` in this tree, so the
+/// parameters are looked for under `periodicEventInfo`, at the top level or nested
+/// one level down (a source LMF may wrap them in the event body). The member names
+/// are the vendored `PeriodicEventInfo` ones: `reportingAmount` and
+/// `reportingInterval` are required there, `reportingIntervalMs` optional.
+///
+/// `None` when they are absent, which the caller reports rather than papering over
+/// with a default cadence — inventing an interval would make this LMF report at a
+/// rate the requester never asked for.
+fn periodic_reporting_from_event_content(content: &serde_json::Value) -> Option<PeriodicReporting> {
+    let info = content.get("periodicEventInfo").or_else(|| {
+        content
+            .as_object()?
+            .values()
+            .find_map(|v| v.get("periodicEventInfo"))
+    })?;
+    let amount = info.get("reportingAmount")?.as_u64()? as u32;
+    let interval = info.get("reportingInterval")?.as_u64()? as u32;
+    Some(PeriodicReporting {
+        // Clamped to >= 1 for the same reason `periodic_reporting_from_input`
+        // clamps: a scheduler must make forward progress.
+        reporting_amount: amount.max(1),
+        reporting_interval_secs: interval,
+        reporting_interval_ms: info
+            .get("reportingIntervalMs")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+    })
 }
 
 /// POST /nlmf-loc/v1/measure-location (TS 29.572 §6.1.4.6).
@@ -1463,7 +1900,20 @@ async fn handle_configure_up(request: &SbiRequest) -> SbiResponse {
             "UpConfig requires supi or gpsi",
         );
     }
-    SbiResponse::no_content()
+    // #104: persist it. This used to validate and discard, so a consumer that
+    // configured UP reporting and then asked what the LMF held got nothing back —
+    // fabricated success with no way to detect the divergence.
+    match lmf_self().read().ok().and_then(|c| c.up_config_store(data)) {
+        Some(key) => {
+            log::info!("UP location configuration stored for {key}");
+            SbiResponse::no_content()
+        }
+        None => problem(
+            500,
+            nlmf::cause::UNSPECIFIED,
+            "Failed to store the UP location configuration",
+        ),
+    }
 }
 
 /// POST /nlmf-loc/v1/up-subscriptions (TS 29.572 §6.1.4.8).
@@ -1491,8 +1941,21 @@ async fn handle_up_subscribe(request: &SbiRequest) -> SbiResponse {
             )
         }
     };
-    let id = uuid::Uuid::new_v4().to_string();
+    // #104: STORE it. The id used to be minted, echoed in `Location`, and
+    // dropped, so the subscription existed only in the consumer's belief.
+    let Some(id) = lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.up_subscription_insert(sub.clone()))
+    else {
+        return problem(
+            500,
+            nlmf::cause::UNSPECIFIED,
+            "Failed to store the UP location subscription",
+        );
+    };
     let location = format!("/nlmf-loc/v1/up-subscriptions/{id}");
+    log::info!("UP location subscription created: id={id}");
     SbiResponse::with_status(201)
         .with_header("Location", location)
         .with_json_body(&sub)
@@ -1507,12 +1970,29 @@ async fn handle_up_subscribe(request: &SbiRequest) -> SbiResponse {
 
 /// DELETE /nlmf-loc/v1/up-subscriptions/{subscriptionId} (TS 29.572 §6.1.4.9).
 ///
-/// Deletes a UP location reporting subscription. Returns 204 No Content.
-/// Full subscription lifecycle (store + lookup) is E2E-gated (needs a persistent
-/// UP subscription store + a live UPF data path). Minimal implementation accepts
-/// any subscriptionId and returns 204.
-async fn handle_up_unsubscribe(_subscription_id: &str) -> SbiResponse {
-    SbiResponse::no_content()
+/// `204` when the subscription existed and was removed, `404` when it did not
+/// (#104).
+///
+/// This used to ignore the id entirely and always answer `204`, so a consumer
+/// reconciling its state by deleting a stale subscription was told the delete
+/// succeeded against an LMF that had never held one. §6.1.4.9 requires the 404,
+/// and the distinction is the only way a consumer can detect the divergence.
+async fn handle_up_unsubscribe(subscription_id: &str) -> SbiResponse {
+    match lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.up_subscription_remove(subscription_id))
+    {
+        Some(_) => {
+            log::info!("UP location subscription deleted: id={subscription_id}");
+            SbiResponse::no_content()
+        }
+        None => problem(
+            404,
+            nlmf::cause::SUBSCRIPTION_NOT_FOUND,
+            &format!("No UP location subscription {subscription_id}"),
+        ),
+    }
 }
 
 /// Handle a (bespoke/debug) measurement request — NOT a TS 29.572 resource.
@@ -2139,25 +2619,41 @@ async fn handle_ue_location_update(supi: &str, request: &SbiRequest) -> SbiRespo
     }
 }
 
+/// Build the `/capabilities` body from a context (#104).
+///
+/// A **pure function of the context**, not of process-global state, so both
+/// branches are testable: the process-global LMF context is shared with every
+/// other test in this binary and any sibling that wires a cell coordinate makes
+/// the "no measurement source" branch unobservable through the handler.
+///
+/// `nrppaSupported` / `nlsInterfaceSupported` used to be hardcoded `true` while
+/// the mainline measure-location path answered `403
+/// LOCATION_MEASUREMENT_UNKNOWN` for want of a measurement source — so an interop
+/// partner selected an NRPPa/NLs method on the strength of this advertisement and
+/// had every request fail. They now track whether this LMF has cell/TRP
+/// coordinates to solve against.
+fn capabilities_body(context: &context::LmfContext) -> serde_json::Value {
+    let methods: Vec<String> = context
+        .supported_methods()
+        .iter()
+        .map(|m| format!("{m:?}"))
+        .collect();
+    let measurement_source = context.measurement_source_available();
+    serde_json::json!({
+        "supportedMethods": methods,
+        "nrppaSupported": measurement_source,
+        "nlsInterfaceSupported": measurement_source,
+    })
+}
+
 /// Handle capabilities query
 async fn handle_capabilities() -> SbiResponse {
-    let ctx = lmf_self();
-    let methods: Vec<String> = if let Ok(context) = ctx.read() {
-        context
-            .supported_methods()
-            .iter()
-            .map(|m| format!("{m:?}"))
-            .collect()
-    } else {
-        vec![]
+    let body = match lmf_self().read() {
+        Ok(context) => capabilities_body(&context),
+        Err(_) => return problem(500, nlmf::cause::UNSPECIFIED, "LMF context lock poisoned"),
     };
-
     SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({
-            "supportedMethods": methods,
-            "nrppaSupported": true,
-            "nlsInterfaceSupported": true,
-        }))
+        .with_json_body(&body)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
@@ -2211,6 +2707,48 @@ fn parse_qos(s: &str) -> PositioningQos {
     }
 }
 
+/// Build the NFProfile registered with the NRF (TS 29.510), #104.
+///
+/// Extracted from `register_with_nrf` so the advertised service list is
+/// assertable: it was inline, and it was wrong — TS 23.501 Table 7.2.25-1 lists
+/// three LMF services and only `nlmf-loc` appeared, so a consumer discovering
+/// this LMF could not find the other two even once they existed.
+fn build_lmf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "LMF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        // #104: TS 23.501 Table 7.2.25-1 lists THREE LMF services. Only
+        // `nlmf-loc` was advertised, so a consumer discovering this LMF could not
+        // find the broadcast or data-exposure surfaces even once they existed.
+        "nfServices": [{
+            "serviceInstanceId": format!("{}-nlmf-loc", nf_instance_id),
+            "serviceName": "nlmf-loc",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+        }, {
+            "serviceInstanceId": format!("{}-nlmf-broadcast", nf_instance_id),
+            "serviceName": "nlmf-broadcast",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+        }, {
+            "serviceInstanceId": format!("{}-nlmf-dataexposure", nf_instance_id),
+            "serviceName": "nlmf-dataexposure",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+        }],
+        "allowedNfTypes": ["AMF", "SCP"],
+        "heartBeatTimer": 10
+    })
+}
+
 /// Register LMF with NRF
 async fn register_with_nrf(
     sbi_addr: &str,
@@ -2233,22 +2771,10 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "LMF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [{
-            "serviceInstanceId": format!("{}-nlmf-loc", nf_instance_id),
-            "serviceName": "nlmf-loc",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-        }],
-        "allowedNfTypes": ["AMF", "SCP"],
-        "heartBeatTimer": 10
-    });
+    // #104: built by `build_lmf_nf_profile` so a test can assert what this NF
+    // advertises. It was inline here, which made the advertised service list
+    // unassertable — and the list was wrong (one service of three).
+    let nf_profile = build_lmf_nf_profile(nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -2381,6 +2907,20 @@ mod tests {
         seed_fix_at(supi, h_accuracy, unix_now());
     }
 
+    /// #104: seed a fix at an explicit position AND timestamp, so a test can build
+    /// the two-fix history a velocity is derived from.
+    fn seed_fix_displaced(supi: &str, latitude: f64, longitude: f64, timestamp: u64) {
+        let loc = LocationEstimate {
+            latitude,
+            longitude,
+            horizontal_accuracy: 20.0,
+            method_used: Some(nlmf::positioning_method::ECID.to_string()),
+            timestamp,
+            ..Default::default()
+        };
+        assert!(lmf_self().read().unwrap().ue_location_update(supi, loc));
+    }
+
     /// Seed a fix with an explicit capture timestamp (Unix seconds; 0 =
     /// unknown capture instant).
     fn seed_fix_at(supi: &str, h_accuracy: f64, timestamp: u64) {
@@ -2423,8 +2963,13 @@ mod tests {
     async fn test_debug_endpoints_flag_gates_bespoke_routes() {
         lmf_context_init(1024);
 
-        // The six bespoke/debug routes, each with the method it normally handles.
-        let normal: [(&str, &str); 7] = [
+        // The bespoke/debug routes, each with the method it normally handles.
+        // `/capabilities` joined them in #104: it is not a TS 29.572 resource, it
+        // discloses this NF's positioning posture, and it was the one bespoke route
+        // left ungated. Added to THIS test rather than a second toggling one,
+        // because two tests toggling the same process-global gate is the
+        // disjoint-agreement hazard the comment above warns about.
+        let normal: [(&str, &str); 8] = [
             ("POST", "/nlmf-loc/v1/measurements"),
             ("GET", "/nlmf-loc/v1/measurements/abc"),
             ("POST", "/nlmf-loc/v1/nrppa-reports"),
@@ -2432,6 +2977,7 @@ mod tests {
             ("POST", "/nlmf-loc/v1/lpp-binary-reports"),
             ("GET", "/nlmf-loc/v1/ue-locations/imsi-001010000000777"),
             ("PUT", "/nlmf-loc/v1/ue-locations/imsi-001010000000777"),
+            ("GET", "/nlmf-loc/v1/capabilities"),
         ];
         let build = |method: &str, uri: &str| -> SbiRequest {
             match method {
@@ -2458,13 +3004,14 @@ mod tests {
         // outer 404 would fire only if the arm did not match. This discriminator
         // is independent of each handler's body/state handling.
         DEBUG_ENDPOINTS.store(true, Ordering::Relaxed);
-        let reachable: [&str; 6] = [
+        let reachable: [&str; 7] = [
             "/nlmf-loc/v1/measurements",
             "/nlmf-loc/v1/measurements/abc",
             "/nlmf-loc/v1/nrppa-reports",
             "/nlmf-loc/v1/nrppa-binary-reports",
             "/nlmf-loc/v1/lpp-binary-reports",
             "/nlmf-loc/v1/ue-locations/imsi-001010000000777",
+            "/nlmf-loc/v1/capabilities",
         ];
         for uri in reachable {
             let resp = lmf_sbi_request_handler(SbiRequest::delete(uri)).await;
@@ -2528,6 +3075,122 @@ mod tests {
         );
         let v = body_json(&resp);
         assert_eq!(v["locationEstimate"]["shape"], "POINT_UNCERTAINTY_CIRCLE");
+    }
+
+    /// #104 acceptance: an `ASSURED` `lcsQosClass` whose accuracy is NOT met is
+    /// REFUSED — the estimate is discarded — while `BEST_EFFORT` (and an unstated
+    /// class) still answers `200 NOT_FULFILLED`.
+    ///
+    /// Both branches in one test against the same seeded fix, because the defect
+    /// was that they were the SAME branch: `lcsQosClass` was not a member of
+    /// `LocationQoS`, so an assured request got best-effort semantics and a worse
+    /// fix labelled as a success. A consumer that needs an assured fix (an
+    /// emergency or regulatory one) could not tell.
+    #[tokio::test]
+    async fn test_assured_qos_class_refuses_an_unmet_accuracy() {
+        // 200 m achieved accuracy against a 10 m request: not fulfillable.
+        seed_fix("imsi-001010000000101", 200.0);
+        let request = |qos: &str| {
+            let body = format!(
+                r#"{{"supi":"imsi-001010000000101","locationQoS":{qos},
+                     "supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"]}}"#
+            );
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json")
+        };
+
+        // BEST_EFFORT: 200 with NOT_FULFILLED (unchanged behaviour).
+        let resp = handle_determine_location(&request(
+            r#"{"hAccuracy":10.0,"lcsQosClass":"BEST_EFFORT"}"#,
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let ext: nlmf::LocationDataExt =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            ext.location_data.accuracy_fulfilment_indicator.as_deref(),
+            Some("REQUESTED_ACCURACY_NOT_FULFILLED")
+        );
+
+        // No class at all behaves as best effort, so a pre-#104 consumer is
+        // unaffected.
+        let resp = handle_determine_location(&request(r#"{"hAccuracy":10.0}"#)).await;
+        assert_eq!(resp.status, 200);
+
+        // ASSURED: refused, and the response carries NO location estimate.
+        let resp =
+            handle_determine_location(&request(r#"{"hAccuracy":10.0,"lcsQosClass":"ASSURED"}"#))
+                .await;
+        assert_eq!(
+            resp.status, 500,
+            "an ASSURED request whose accuracy cannot be met must not be a 200"
+        );
+        let content = resp.http.content.as_deref().unwrap_or("");
+        assert!(
+            content.contains("POSITIONING_FAILED"),
+            "the cause must say the positioning failed, got {content}"
+        );
+        assert!(
+            !content.contains("locationEstimate"),
+            "the estimate must be DISCARDED, not returned alongside the error: {content}"
+        );
+
+        // ASSURED whose accuracy IS met still succeeds — the refusal is about the
+        // accuracy, not about the class.
+        seed_fix("imsi-001010000000102", 5.0);
+        let met = SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(
+            r#"{"supi":"imsi-001010000000102","locationQoS":{"hAccuracy":10.0,
+                "lcsQosClass":"ASSURED"},"supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"]}"#,
+            "application/json",
+        );
+        assert_eq!(handle_determine_location(&met).await.status, 200);
+    }
+
+    /// #104 acceptance: `velocityRequested` populates `velocityEstimate` when a
+    /// previous fix makes it derivable, and omits it when it does not.
+    #[tokio::test]
+    async fn test_velocity_requested_populates_the_estimate_when_derivable() {
+        // TWO fixes for the same UE, 10 s and ~111 m apart. The first is displaced
+        // into `previous_location` by the second, which is the two-fix history the
+        // derivation needs — a single fix has no velocity.
+        seed_fix_displaced("imsi-001010000000103", 37.5000, -122.3, 1_000);
+        seed_fix_displaced("imsi-001010000000103", 37.5010, -122.3, 1_010);
+
+        let request = SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(
+            r#"{"supi":"imsi-001010000000103","locationQoS":{"hAccuracy":100.0,
+                "velocityRequested":true},"supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"]}"#,
+            "application/json",
+        );
+        let resp = handle_determine_location(&request).await;
+        assert_eq!(resp.status, 200);
+        let ext: nlmf::LocationDataExt =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let velocity = ext
+            .location_data
+            .velocity_estimate
+            .expect("velocityRequested with two timestamped fixes must produce a velocityEstimate");
+        let speed = velocity["hSpeed"].as_f64().expect("hSpeed");
+        assert!(
+            (10.0..13.0).contains(&speed),
+            "~111 m in 10 s is ~11 m/s, got {speed}"
+        );
+        assert_eq!(velocity["bearing"], 0, "due north");
+
+        // Not requested => omitted, so an existing consumer's body is unchanged.
+        let no_velocity = SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(
+            r#"{"supi":"imsi-001010000000103","locationQoS":{"hAccuracy":100.0},
+                "supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"]}"#,
+            "application/json",
+        );
+        let ext: nlmf::LocationDataExt = serde_json::from_str(
+            handle_determine_location(&no_velocity)
+                .await
+                .http
+                .content
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(ext.location_data.velocity_estimate.is_none());
     }
 
     // -- lmfd-04: shape negotiation honors supportedGADShapes ----------------
@@ -2987,6 +3650,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_up_subscribe_201_and_unsubscribe_204() {
+        lmf_context_init(1024);
         let body = r#"{
             "upNotifyCallBackUri": "http://af/up",
             "notifCorrelationId": "nc-sub-1",
@@ -2996,14 +3660,529 @@ mod tests {
             SbiRequest::post("/nlmf-loc/v1/up-subscriptions").with_body(body, "application/json");
         let resp = handle_up_subscribe(&req).await;
         assert_eq!(resp.status, 201);
+        let location = resp
+            .http
+            .get_header("Location")
+            .cloned()
+            .expect("Location header missing on 201");
+        let id = location.rsplit('/').next().unwrap().to_string();
+
+        // #104: the subscription is RETRIEVABLE, which is what makes the 201
+        // more than an echo. It used to be minted and dropped.
+        let stored = lmf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.up_subscription_find(&id))
+            .expect("the subscription must be stored under the id in Location");
+        assert_eq!(stored.notif_correlation_id, "nc-sub-1");
+        assert_eq!(stored.supi, "imsi-001010000000080");
+        assert_eq!(stored.up_notify_call_back_uri, "http://af/up");
+
+        // #104: 201 -> 204 -> 404. This assertion is INVERTED from what it was.
+        // It previously read "DELETE any subscriptionId -> 204" and passed an
+        // arbitrary id, pinning the defect AS the requirement: TS 29.572 §6.1.4.9
+        // requires a 404 for a subscription that does not exist, and answering 204
+        // told a consumer reconciling its state that a delete had succeeded against
+        // an LMF that never held the subscription.
+        assert_eq!(handle_up_unsubscribe(&id).await.status, 204);
+        assert_eq!(
+            handle_up_unsubscribe(&id).await.status,
+            404,
+            "a second delete of the same id must be 404, not another 204"
+        );
+        assert_eq!(
+            handle_up_unsubscribe("sub-never-existed").await.status,
+            404,
+            "an id that was never issued must be 404"
+        );
+    }
+
+    /// #104: `configure-up` PERSISTS the configuration; it used to validate and
+    /// discard, so a consumer could not tell a stored configuration from a
+    /// forgotten one.
+    #[tokio::test]
+    async fn test_configure_up_persists_the_configuration() {
+        lmf_context_init(1024);
+        let body = r#"{
+            "upNotifyCallBackUri": "http://af/up-cfg",
+            "notifCorrelationId": "nc-cfg-1",
+            "supi": "imsi-001010000000081",
+            "amfReallocationInd": true
+        }"#;
+        let req = SbiRequest::post("/nlmf-loc/v1/configure-up").with_body(body, "application/json");
+        assert_eq!(handle_configure_up(&req).await.status, 204);
+
+        let stored = lmf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.up_config_find("imsi-001010000000081"))
+            .expect("the configuration must be stored under the UE identity");
+        assert_eq!(stored.notif_correlation_id, "nc-cfg-1");
+        assert_eq!(stored.up_notify_call_back_uri, "http://af/up-cfg");
+        assert_eq!(stored.amf_reallocation_ind, Some(true));
+
+        // Neither supi nor gpsi is still a 400 (unchanged).
+        let bad = SbiRequest::post("/nlmf-loc/v1/configure-up").with_body(
+            r#"{"upNotifyCallBackUri":"http://af/x","notifCorrelationId":"n"}"#,
+            "application/json",
+        );
+        assert_eq!(handle_configure_up(&bad).await.status, 400);
+    }
+
+    /// #104: `measurement_source_available` is false until a measurement source is
+    /// wired, and true after.
+    ///
+    /// Tested against a FRESH `LmfContext`, not the process-global one: the global
+    /// context is shared with every other test in this binary and a sibling that
+    /// wires a cell coordinate makes the "no source" case unobservable. That is
+    /// how the first version of this test failed — passing alone, failing in the
+    /// suite.
+    #[test]
+    fn test_measurement_source_availability_tracks_the_cell_registry() {
+        let ctx = context::LmfContext::new();
         assert!(
-            resp.http.get_header("Location").is_some(),
-            "Location header missing on 201"
+            !ctx.measurement_source_available(),
+            "a context with no cell/TRP coordinates has no real measurement source"
+        );
+        ctx.set_cell_coord(
+            "001-01-0x1000-1",
+            positioning::TrpCoord {
+                lat_deg: 52.5,
+                lon_deg: 13.4,
+                height_m: 0.0,
+            },
+        );
+        assert!(
+            ctx.measurement_source_available(),
+            "a wired coordinate is what makes the measurement path able to solve"
+        );
+    }
+
+    /// #104 acceptance: the `/capabilities` flags are DERIVED from whether a
+    /// measurement source is wired — both branches, on fresh contexts.
+    ///
+    /// Pure, not through the handler: the process-global context is shared with
+    /// every other test in this binary, and a sibling that wires a cell coordinate
+    /// makes the `false` branch unobservable. The first version of this test went
+    /// through the handler and **passed with the flags hardcoded back to `true`**,
+    /// because it had wired a coordinate itself — a guard that proved nothing.
+    #[test]
+    fn test_capabilities_flags_track_the_real_measurement_source() {
+        // No measurement source: both flags false.
+        let bare = context::LmfContext::new();
+        let body = capabilities_body(&bare);
+        assert_eq!(
+            body["nrppaSupported"], false,
+            "with no measurement source the flag must be false, not hardcoded true"
+        );
+        assert_eq!(body["nlsInterfaceSupported"], false);
+        assert!(
+            body["supportedMethods"]
+                .as_array()
+                .is_some_and(|m| !m.is_empty()),
+            "the method list is unrelated to the measurement source and stays populated"
         );
 
-        // DELETE any subscriptionId -> 204.
-        let resp2 = handle_up_unsubscribe("sub-1").await;
-        assert_eq!(resp2.status, 204);
+        // Wire one: both flags flip.
+        bare.set_cell_coord(
+            "001-01-0xcap01-1",
+            positioning::TrpCoord {
+                lat_deg: 52.5,
+                lon_deg: 13.4,
+                height_m: 0.0,
+            },
+        );
+        let body = capabilities_body(&bare);
+        assert_eq!(body["nrppaSupported"], true);
+        assert_eq!(body["nlsInterfaceSupported"], true);
+    }
+
+    /// #104: the handler serves `capabilities_body` for the live context — the
+    /// wiring the pure test above cannot cover.
+    ///
+    /// Asserts equality against the body computed from the same context rather than
+    /// against a literal, so it holds whatever state a sibling test has left behind.
+    #[tokio::test]
+    async fn test_capabilities_handler_serves_the_derived_body() {
+        lmf_context_init(1024);
+        let resp = handle_capabilities().await;
+        assert_eq!(resp.status, 200);
+        let served: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let expected = lmf_self()
+            .read()
+            .map(|c| capabilities_body(&c))
+            .expect("context readable");
+        assert_eq!(
+            served, expected,
+            "the handler must serve the derived body, not a body of its own"
+        );
+    }
+
+    /// #104 acceptance: `Nlmf_Broadcast` is routed and answers per
+    /// `TS29572_Nlmf_Broadcast.yaml`.
+    ///
+    /// `CIPHERING_KEY_DATA_NOT_AVAILABLE` is the conformant answer, not a stub:
+    /// nothing provisions ciphering key sets in this tree, and `dataAvailability`
+    /// exists precisely to tell the AMF not to wait for a notification. Inventing a
+    /// key would make a UE decipher assistance data into noise.
+    #[tokio::test]
+    async fn test_nlmf_broadcast_cipher_key_data() {
+        lmf_context_init(1024);
+
+        let req = SbiRequest::post("/nlmf-broadcast/v1/cipher-key-data").with_body(
+            r#"{"amfCallBackURI":"http://amf/cipher-notify"}"#,
+            "application/json",
+        );
+        let resp = lmf_sbi_request_handler(req).await;
+        assert_ne!(resp.status, 404, "the service must be routed");
+        assert_eq!(resp.status, 200);
+        let body: broadcast_exposure::CipherResponseData =
+            serde_json::from_str(resp.http.content.as_deref().unwrap())
+                .expect("a conformant CipherResponseData");
+        assert_eq!(
+            body.data_availability,
+            broadcast_exposure::data_availability::NOT_AVAILABLE
+        );
+
+        // The sole mandatory IE is enforced, including present-but-empty.
+        for body in [r#"{}"#, r#"{"amfCallBackURI":""}"#] {
+            let bad = SbiRequest::post("/nlmf-broadcast/v1/cipher-key-data")
+                .with_body(body, "application/json");
+            assert_eq!(
+                lmf_sbi_request_handler(bad).await.status,
+                400,
+                "body {body}"
+            );
+        }
+
+        // Wrong method on a routed path is 405, not 404 — which is what proves the
+        // arm matched rather than falling through.
+        let wrong = SbiRequest::get("/nlmf-broadcast/v1/cipher-key-data");
+        assert_eq!(lmf_sbi_request_handler(wrong).await.status, 405);
+    }
+
+    /// #104 acceptance: `Nlmf_DataExposure` CRUD per
+    /// `TS29572_Nlmf_DataExposure.yaml`.
+    #[tokio::test]
+    async fn test_nlmf_dataexposure_subscription_crud() {
+        lmf_context_init(1024);
+
+        let body = r#"{
+            "notificationUri": "http://nwdaf/lmf-exposure",
+            "notifyCorrelationId": "corr-exp-1",
+            "aoi": {"praId": "pra-1"},
+            "dataSources": ["NG_RAN"],
+            "numOfSamples": 10
+        }"#;
+        let req = SbiRequest::post("/nlmf-dataexposure/v1/subscriptions")
+            .with_body(body, "application/json");
+        let resp = lmf_sbi_request_handler(req).await;
+        assert_ne!(resp.status, 404, "the service must be routed");
+        assert_eq!(resp.status, 201);
+        let location = resp
+            .http
+            .get_header("Location")
+            .cloned()
+            .expect("Location is required: true in the yaml");
+        assert!(
+            location.starts_with(EXPOSURE_SUBSCRIPTIONS_PATH),
+            "got {location}"
+        );
+        let id = location.rsplit('/').next().unwrap().to_string();
+        let echoed: broadcast_exposure::LmfDataExposureSubscription =
+            serde_json::from_str(resp.http.content.as_deref().unwrap())
+                .expect("the 201 echoes the resource");
+        assert_eq!(echoed.notify_correlation_id, "corr-exp-1");
+
+        // Retrievable: the 201 is not just an echo.
+        assert!(lmf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.exposure_subscription_find(&id))
+            .is_some());
+
+        // PATCH a top-level member -> 204, and the change is observable.
+        let patch = SbiRequest::patch(format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}")).with_body(
+            r#"[{"op":"replace","path":"/numOfSamples","value":42}]"#,
+            "application/json",
+        );
+        assert_eq!(lmf_sbi_request_handler(patch).await.status, 204);
+        assert_eq!(
+            lmf_self()
+                .read()
+                .ok()
+                .and_then(|c| c.exposure_subscription_find(&id))
+                .and_then(|s| s.num_of_samples),
+            Some(42),
+            "the patch must be applied, not accepted and dropped"
+        );
+
+        // A patch that would remove a mandatory member, and an unsupported
+        // operation, are both refused rather than silently ignored.
+        for patch_body in [
+            r#"[{"op":"replace","path":"/notificationUri","value":""}]"#,
+            r#"[{"op":"remove","path":"/numOfSamples"}]"#,
+        ] {
+            let bad = SbiRequest::patch(format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}"))
+                .with_body(patch_body, "application/json");
+            assert_eq!(
+                lmf_sbi_request_handler(bad).await.status,
+                400,
+                "patch {patch_body}"
+            );
+        }
+
+        // DELETE -> 204, then 404: the same honesty as up-unsubscribe.
+        let del = SbiRequest::delete(format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}"));
+        assert_eq!(lmf_sbi_request_handler(del).await.status, 204);
+        let del_again = SbiRequest::delete(format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}"));
+        assert_eq!(lmf_sbi_request_handler(del_again).await.status, 404);
+        // PATCH on an unknown id is 404, not a create at a consumer-chosen id.
+        let patch_unknown = SbiRequest::patch(format!("{EXPOSURE_SUBSCRIPTIONS_PATH}/{id}"))
+            .with_body(
+                r#"[{"op":"replace","path":"/numOfSamples","value":1}]"#,
+                "application/json",
+            );
+        assert_eq!(lmf_sbi_request_handler(patch_unknown).await.status, 404);
+
+        // Each mandatory member is enforced on create.
+        for (body, why) in [
+            (
+                r#"{"notifyCorrelationId":"c","aoi":{}}"#,
+                "no notificationUri",
+            ),
+            (
+                r#"{"notificationUri":"http://x","aoi":{}}"#,
+                "no notifyCorrelationId",
+            ),
+            (
+                r#"{"notificationUri":"http://x","notifyCorrelationId":"c"}"#,
+                "no aoi",
+            ),
+        ] {
+            let req = SbiRequest::post("/nlmf-dataexposure/v1/subscriptions")
+                .with_body(body, "application/json");
+            assert_eq!(
+                lmf_sbi_request_handler(req).await.status,
+                400,
+                "must be 400: {why}"
+            );
+        }
+    }
+
+    /// #104 acceptance: all three LMF services are advertised to the NRF
+    /// (TS 23.501 Table 7.2.25-1). Only `nlmf-loc` used to be.
+    #[test]
+    fn test_nf_profile_advertises_all_three_lmf_services() {
+        let profile = build_lmf_nf_profile("lmf-1", "127.0.0.1", 7816);
+        let names: Vec<&str> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .filter_map(|s| s["serviceName"].as_str())
+            .collect();
+        for expected in ["nlmf-loc", "nlmf-broadcast", "nlmf-dataexposure"] {
+            assert!(
+                names.contains(&expected),
+                "{expected} must be advertised, got {names:?}"
+            );
+        }
+    }
+
+    /// #104 acceptance: a transferred PERIODIC deferred LDR RESUMES periodic
+    /// reporting. `periodic_event_info` was hardcoded `None`, so the record was
+    /// stored and its trigger never restarted: reporting stopped silently at AMF
+    /// relocation, and the stored record made it look live.
+    #[tokio::test]
+    async fn test_context_transfer_rearms_periodic_reporting() {
+        lmf_context_init(1024);
+
+        let body = serde_json::json!({
+            "amfId": "amf-1",
+            "ldrType": "PERIODIC",
+            "hgmlcCallBackURI": "http://gmlc/event-notify",
+            "ldrReference": "ldr-transfer-1",
+            "supi": "imsi-001010000000090",
+            "eventReportMessage": {
+                "eventClass": "SUPPLEMENTARY_SERVICES",
+                "eventContent": {
+                    "periodicEventInfo": {"reportingAmount": 5, "reportingInterval": 60}
+                }
+            }
+        })
+        .to_string();
+        let req = SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
+            .with_body(body, "application/json");
+        assert_eq!(lmf_sbi_request_handler(req).await.status, 204);
+
+        // The restored parameters are on the stored LDR...
+        let stored = lmf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.ldr_find("ldr-transfer-1"))
+            .expect("the LDR is registered");
+        let periodic = stored
+            .periodic_event_info
+            .expect("the transferred periodicEventInfo must be restored, not dropped");
+        assert_eq!(periodic.reporting_amount, 5);
+        assert_eq!(periodic.reporting_interval_secs, 60);
+
+        // ...and the scheduler is ARMED, which is the half that was missing. The
+        // task registry is what `cancel-location` and `fini` abort, so a live entry
+        // keyed on THIS ldrReference is the observable proof the trigger restarted
+        // (a count could not tell it from another test's LDR still ticking).
+        assert!(
+            lmf_self()
+                .read()
+                .ok()
+                .map(|c| c.ldr_task_is_running("ldr-transfer-1"))
+                .unwrap_or(false),
+            "a transferred PERIODIC LDR must have its trigger re-armed"
+        );
+
+        // Stop the spawned task so it does not tick through other tests.
+        if let Ok(c) = lmf_self().read() {
+            c.cancel_ldr("ldr-transfer-1");
+        }
+    }
+
+    /// #104: a transferred PERIODIC LDR with NO periodicEventInfo is still stored
+    /// (cancel-location must find it) but is not armed, and no cadence is invented.
+    /// The honest half of the same change.
+    #[tokio::test]
+    async fn test_context_transfer_without_periodic_info_does_not_invent_a_cadence() {
+        lmf_context_init(1024);
+
+        let body = serde_json::json!({
+            "amfId": "amf-1",
+            "ldrType": "PERIODIC",
+            "hgmlcCallBackURI": "http://gmlc/event-notify",
+            "ldrReference": "ldr-transfer-2",
+            "supi": "imsi-001010000000091",
+            "eventReportMessage": {"eventClass": "SUPPLEMENTARY_SERVICES", "eventContent": {}}
+        })
+        .to_string();
+        let req = SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
+            .with_body(body, "application/json");
+        assert_eq!(lmf_sbi_request_handler(req).await.status, 204);
+
+        let stored = lmf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.ldr_find("ldr-transfer-2"))
+            .expect("the LDR is still registered so cancel-location can find it");
+        assert!(
+            stored.periodic_event_info.is_none(),
+            "no cadence may be invented when the source LMF sent none"
+        );
+        assert!(
+            !lmf_self()
+                .read()
+                .ok()
+                .map(|c| c.ldr_task_is_running("ldr-transfer-2"))
+                .unwrap_or(false),
+            "nothing to arm without parameters"
+        );
+    }
+
+    /// #104, **declined criterion**: `DUMMY` is a SPEC-DEFINED `EventClass` value
+    /// and is therefore still accepted.
+    ///
+    /// The issue asks for it to be rejected as "a placeholder value that has no
+    /// spec meaning". `TS29572_Nlmf_Location.yaml`'s `EventClass` enumerates
+    /// exactly `[SUPPLEMENTARY_SERVICES, DUMMY]`, so rejecting it would make this
+    /// LMF refuse a conformant peer. This test pins the acceptance so a later
+    /// reader of the issue does not "fix" it.
+    #[tokio::test]
+    async fn test_dummy_event_class_is_accepted_because_the_yaml_defines_it() {
+        lmf_context_init(1024);
+
+        let transfer = |event_class: &str, reference: &str| {
+            let body = serde_json::json!({
+                "amfId": "amf-1",
+                "ldrType": "UE_AVAILABLE",
+                "hgmlcCallBackURI": "http://gmlc/event-notify",
+                "ldrReference": reference,
+                "eventReportMessage": {"eventClass": event_class, "eventContent": {}}
+            })
+            .to_string();
+            SbiRequest::post("/nlmf-loc/v1/location-context-transfer")
+                .with_body(body, "application/json")
+        };
+
+        assert_eq!(
+            lmf_sbi_request_handler(transfer("DUMMY", "ldr-dummy-1"))
+                .await
+                .status,
+            204,
+            "DUMMY is in the vendored EventClass enum; refusing it would reject a \
+             conformant peer"
+        );
+        // An eventClass that is NOT in the enumeration is still refused.
+        assert_eq!(
+            lmf_sbi_request_handler(transfer("NOT_A_CLASS", "ldr-dummy-2"))
+                .await
+                .status,
+            403
+        );
+    }
+
+    /// #104 acceptance: `lcsQosClass` and `velocityRequested` deserialise.
+    #[test]
+    fn test_location_qos_parses_lcs_qos_class_and_velocity_requested() {
+        let qos: nlmf::LocationQoS = serde_json::from_str(
+            r#"{"hAccuracy":10.0,"lcsQosClass":"ASSURED","velocityRequested":true}"#,
+        )
+        .expect("parses");
+        assert_eq!(qos.h_accuracy, Some(10.0));
+        assert_eq!(
+            qos.lcs_qos_class.as_deref(),
+            Some(nlmf::lcs_qos_class::ASSURED)
+        );
+        assert_eq!(qos.velocity_requested, Some(true));
+
+        // Both absent-tolerant, so a request that names neither is unchanged from
+        // before #104.
+        let plain: nlmf::LocationQoS = serde_json::from_str(r#"{"hAccuracy":50.0}"#).unwrap();
+        assert_eq!(plain.lcs_qos_class, None);
+        assert_eq!(plain.velocity_requested, None);
+
+        // The wire spelling round-trips.
+        let json = serde_json::to_string(&qos).unwrap();
+        assert!(json.contains(r#""lcsQosClass":"ASSURED""#), "got {json}");
+        assert!(json.contains(r#""velocityRequested":true"#), "got {json}");
+    }
+
+    /// #104 acceptance: velocity is derived from two successive fixes, and is
+    /// `None` when it is not derivable — never a fabricated zero.
+    #[test]
+    fn test_velocity_derivation() {
+        // ~111 m north in 10 s => ~11 m/s, bearing 0 (due north).
+        let v = nlmf::derive_velocity(52.5000, 13.4000, 1000, 52.5010, 13.4000, 1010)
+            .expect("two fixes with a positive dt are derivable");
+        let speed = v["hSpeed"].as_f64().expect("hSpeed");
+        assert!(
+            (10.0..13.0).contains(&speed),
+            "expected ~11 m/s for 111 m in 10 s, got {speed}"
+        );
+        assert_eq!(v["bearing"], 0, "due north");
+        assert_eq!(v["velocityType"], "HORIZONTAL");
+
+        // Eastward movement bears 090.
+        assert_eq!(
+            nlmf::derive_velocity(0.0, 0.0, 0, 0.0, 0.001, 10).expect("derivable")["bearing"],
+            90
+        );
+
+        // Not derivable: no time passed, time going backwards, or an implausible
+        // speed (a bad fix pair, not a velocity).
+        assert!(nlmf::derive_velocity(52.5, 13.4, 1000, 52.6, 13.4, 1000).is_none());
+        assert!(nlmf::derive_velocity(52.5, 13.4, 1000, 52.6, 13.4, 900).is_none());
+        assert!(
+            nlmf::derive_velocity(0.0, 0.0, 0, 10.0, 0.0, 1).is_none(),
+            "1100 km in 1 s is not a UE velocity"
+        );
     }
 
     // -- lmfd#1: 204 assistance-data branch -----------------------------------
