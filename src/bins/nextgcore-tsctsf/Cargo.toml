@@ -19,6 +19,10 @@ log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+# #113: typed Ntsctsf IEs (TimeSyncExposureConfig, CapsSubscription, AstiConfig,
+# QosTscSession) are deserialised from the request bodies rather than stored as
+# raw JSON strings.
+serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
