@@ -30,6 +30,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::SbiContext;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
@@ -381,6 +382,18 @@ async fn easdf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "GET" => handle_dns_query(&request).await,
             _ => send_method_not_allowed(method, "dns-queries"),
         },
+        // #114: Neasdf_BaselineDNSPattern (TS 23.501 Table 7.2.25-1) -- the
+        // second EASDF service, previously absent entirely.
+        ["neasdf-baselinednspattern", "v1", "baseline-dns-patterns"] => match method {
+            "POST" => handle_baseline_pattern_create(&request).await,
+            "GET" => handle_baseline_pattern_list().await,
+            _ => send_method_not_allowed(method, "baseline-dns-patterns"),
+        },
+        ["neasdf-baselinednspattern", "v1", "baseline-dns-patterns", pattern_id] => match method {
+            "GET" => handle_baseline_pattern_read(pattern_id).await,
+            "DELETE" => handle_baseline_pattern_delete(pattern_id).await,
+            _ => send_method_not_allowed(method, "baseline-dns-patterns/{patternId}"),
+        },
         _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
 }
@@ -440,7 +453,10 @@ async fn handle_dns_context_create(request: &SbiRequest) -> SbiResponse {
     };
 
     let raw = request.http.content.clone().unwrap_or_default();
-    let dns_context = EasdfDnsContext::new(supi.clone(), pdu_session_id, raw);
+    // #114: parse the DNS message-handling rules and the report callback out of
+    // the body. They used to be stored only inside `raw` and never consulted, so
+    // the context had no effect on what this EASDF answered.
+    let dns_context = EasdfDnsContext::new(supi.clone(), pdu_session_id, raw).with_parsed(&data);
     let ctx_id = dns_context.id.clone();
 
     let ctx = easdf_self();
@@ -478,7 +494,10 @@ async fn handle_dns_context_update(ctx_id: &str, request: &SbiRequest) -> SbiRes
     };
 
     let raw = request.http.content.clone().unwrap_or_default();
-    let replacement = EasdfDnsContext::new(supi, pdu_session_id, raw);
+    // #114: an update must REPARSE the rules; keeping the old ones while storing
+    // the new body is the shape of bug that passes a read-back assertion and
+    // changes nothing about what the EASDF answers.
+    let replacement = EasdfDnsContext::new(supi, pdu_session_id, raw).with_parsed(&data);
 
     let ctx = easdf_self();
     let replaced = match ctx.read() {
@@ -559,11 +578,43 @@ async fn handle_dns_query(request: &SbiRequest) -> SbiResponse {
         );
     };
 
+    // #114: an optional `dns-context-id` scopes the query to a session's own DNS
+    // handling rules. Unscoped queries are answered from the static EAS map only
+    // -- consulting some other session's rules would leak one subscriber's edge
+    // steering into another subscriber's answer.
+    let ctx_id = request
+        .http
+        .get_param("dns-context-id")
+        .filter(|v| !v.is_empty())
+        .cloned();
+
     let ctx = easdf_self();
-    let outcome = match ctx.read() {
-        Ok(c) => c.resolve_fqdn(&fqdn),
+    let (outcome, report) = match ctx.read() {
+        Ok(c) => match &ctx_id {
+            Some(id) => c.resolve_in_context(id, &fqdn),
+            None => (c.resolve_fqdn(&fqdn), false),
+        },
         Err(_) => return send_internal_error("EASDF context lock poisoned"),
     };
+
+    // TS 23.548 §6.2.3.2.2 DNS message reporting: a matching rule that asked for
+    // a report gets one, sent to the callback the SMF supplied on create. Awaited
+    // rather than spawned so the report is on the wire before the DNS answer goes
+    // back -- an SMF that must install a UL-CL for the resolved EAS should not
+    // learn of it after the UE already has the address.
+    if report {
+        if let Some(id) = &ctx_id {
+            let uri = ctx.read().ok().and_then(|c| c.dns_context_notify_uri(id));
+            match uri {
+                Some(uri) => send_dns_message_report(&uri, id, &fqdn, &outcome).await,
+                None => log::warn!(
+                    "DNS context {id} has a rule requesting a report but no notification URI: \
+                     the report cannot be delivered"
+                ),
+            }
+        }
+    }
+
     match outcome {
         ResolveOutcome::Resolved(addresses) => SbiResponse::with_status(200)
             .with_json_body(&serde_json::json!({
@@ -586,6 +637,182 @@ async fn handle_dns_query(request: &SbiRequest) -> SbiResponse {
     }
 }
 
+/// Send a DNS-message report to the SMF's callback URI (#114, TS 23.548
+/// §6.2.3.2.2).
+///
+/// This is the leg the EASDF had no equivalent of at all: the SMF could create a
+/// context and was never told what the EASDF resolved, so it could not drive the
+/// UL-CL / PSA re-selection that edge steering exists for.
+///
+/// The body carries the context id, the queried FQDN, the action taken and the
+/// resolved EAS addresses. TS 29.556 is not vendored, so the member names follow
+/// the same convention as the rest of this crate's northbound bodies; the shape
+/// is asserted by `a_reporting_rule_emits_a_dns_message_report`.
+///
+/// A failed report is logged and swallowed: the DNS answer to the UE must not be
+/// held hostage to the SMF's reachability, and the EASDF has no retry queue.
+async fn send_dns_message_report(
+    notify_uri: &str,
+    ctx_id: &str,
+    fqdn: &str,
+    outcome: &ResolveOutcome,
+) {
+    let (action, addresses) = match outcome {
+        ResolveOutcome::Resolved(addrs) => ("RESOLVE", addrs.clone()),
+        ResolveOutcome::Forward(_) => ("FORWARD", Vec::new()),
+        ResolveOutcome::Miss => ("MISS", Vec::new()),
+    };
+    let body = serde_json::json!({
+        "dnsContextId": ctx_id,
+        "fqdn": fqdn,
+        "action": action,
+        "easIpAddresses": addresses,
+    });
+
+    let Some((host, port, path)) = split_uri(notify_uri) else {
+        log::warn!("DNS context {ctx_id}: unparseable notification URI {notify_uri}");
+        return;
+    };
+    let client = SbiClient::with_host_port(&host, port);
+    match client.post_json(&path, &body).await {
+        Ok(resp) => log::info!(
+            "DNS message report for {fqdn} (context {ctx_id}) -> {notify_uri} status={}",
+            resp.status
+        ),
+        Err(e) => log::warn!("DNS message report to {notify_uri} failed: {e}"),
+    }
+}
+
+/// Split `scheme://host:port/path` into `(host, port, path)`.
+fn split_uri(uri: &str) -> Option<(String, u16, String)> {
+    let (default_port, rest) = if let Some(r) = uri.strip_prefix("https://") {
+        (443u16, r)
+    } else if let Some(r) = uri.strip_prefix("http://") {
+        (80u16, r)
+    } else {
+        (80u16, uri)
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(default_port)),
+        None => (authority.to_string(), default_port),
+    };
+    (!host.is_empty()).then_some((host, port, path))
+}
+
+// ---------------------------------------------------------------------------
+// #114: Neasdf_BaselineDNSPattern (TS 23.501 Table 7.2.25-1)
+// ---------------------------------------------------------------------------
+
+/// Resource collection path for baseline DNS patterns.
+const BASELINE_PATTERNS_PATH: &str = "/neasdf-baselinednspattern/v1/baseline-dns-patterns";
+
+/// `POST .../baseline-dns-patterns` — create a baseline DNS pattern (#114).
+///
+/// The second EASDF service in TS 23.501 Table 7.2.25-1 was absent entirely: not
+/// implemented, not routed, and not advertised in the NFProfile, so an SMF
+/// discovering this EASDF saw an NF that claims to be an EASDF and offers half of
+/// what one offers.
+///
+/// A baseline pattern is EASDF-wide (not per-session): it is the fallback
+/// forwarding/answering configuration a DNS query falls through to when no
+/// session context rule and no static EAS-map entry matched. Mandatory member:
+/// a non-empty domain pattern.
+async fn handle_baseline_pattern_create(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = request.http.content.as_deref() else {
+        return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING"));
+    };
+    let data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+    let Some(rule) = context::DnsHandlingRule::from_json(&data) else {
+        return send_bad_request(
+            "A baseline DNS pattern needs a domain pattern (domainNames / dnsQueryMdt / fqdn) \
+             and an action (easIpAddresses, forwardTo, or reportInd)",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
+
+    let ctx = easdf_self();
+    let created = match ctx.read() {
+        Ok(c) => c.baseline_pattern_insert(rule),
+        Err(_) => return send_internal_error("EASDF context lock poisoned"),
+    };
+    match created {
+        Ok(id) => {
+            let location = format!("{BASELINE_PATTERNS_PATH}/{id}");
+            log::info!("Baseline DNS pattern created: id={id}");
+            let mut echoed = data;
+            if let Some(obj) = echoed.as_object_mut() {
+                obj.insert("patternId".to_string(), serde_json::json!(id));
+                obj.insert("self".to_string(), serde_json::json!(location));
+            }
+            SbiResponse::with_status(201)
+                .with_header("Location", location)
+                .with_json_body(&echoed)
+                .unwrap_or_else(|_| SbiResponse::with_status(201))
+        }
+        Err(err @ EasdfContextError::MaxDnsContextsReached) => {
+            send_error(507, "Insufficient Storage", err.detail(), Some(err.cause()))
+        }
+        Err(err) => send_internal_error(err.detail()),
+    }
+}
+
+/// `GET .../baseline-dns-patterns/{id}` — read one baseline DNS pattern (#114).
+async fn handle_baseline_pattern_read(id: &str) -> SbiResponse {
+    let ctx = easdf_self();
+    let found = ctx.read().ok().and_then(|c| c.baseline_pattern_find(id));
+    match found {
+        Some(rule) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "patternId": id,
+                "self": format!("{BASELINE_PATTERNS_PATH}/{id}"),
+                "domainNames": rule.domain_patterns,
+                "easIpAddresses": rule.eas_addresses,
+                "reportInd": rule.report,
+                "forwardTo": rule.forward_to,
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("Baseline DNS pattern {id} not found"),
+            Some("PATTERN_NOT_FOUND"),
+        ),
+    }
+}
+
+/// `GET .../baseline-dns-patterns` — list the baseline DNS patterns (#114).
+async fn handle_baseline_pattern_list() -> SbiResponse {
+    let ctx = easdf_self();
+    let ids = ctx
+        .read()
+        .map(|c| c.baseline_pattern_ids())
+        .unwrap_or_default();
+    SbiResponse::with_status(200)
+        .with_json_body(&serde_json::json!({"patternIds": ids}))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// `DELETE .../baseline-dns-patterns/{id}` — 204 / 404 (#114).
+async fn handle_baseline_pattern_delete(id: &str) -> SbiResponse {
+    let ctx = easdf_self();
+    let removed = ctx.read().ok().and_then(|c| c.baseline_pattern_remove(id));
+    match removed {
+        Some(_) => {
+            log::info!("Baseline DNS pattern removed: id={id}");
+            SbiResponse::with_status(204)
+        }
+        None => send_not_found(
+            &format!("Baseline DNS pattern {id} not found"),
+            Some("PATTERN_NOT_FOUND"),
+        ),
+    }
+}
+
 /// Build the NFProfile registered with the NRF (TS 29.510): nfType EASDF
 /// advertising the neasdf-dnscontext service (TS 29.556).
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
@@ -598,6 +825,17 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
             {
                 "serviceInstanceId": format!("{nf_instance_id}-neasdf-dnscontext"),
                 "serviceName": "neasdf-dnscontext",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            },
+            // #114: TS 23.501 Table 7.2.25-1 lists BOTH EASDF services. Only the
+            // first was advertised, so an SMF discovering this EASDF was told it
+            // offers half of what an EASDF offers.
+            {
+                "serviceInstanceId": format!("{nf_instance_id}-neasdf-baselinednspattern"),
+                "serviceName": "neasdf-baselinednspattern",
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
                 "scheme": "http",
                 "nfServiceStatus": "REGISTERED",
@@ -1065,5 +1303,275 @@ easdf:
 
         let wrong = SbiRequest::get("/neasdf-dnscontext/v1/dns-contexts");
         assert_eq!(block_on(easdf_sbi_request_handler(wrong)).status, 405);
+    }
+
+    // ─── #114: rule evaluation, DNS-message report, baseline patterns ────────
+
+    /// #114 acceptance: a context's handling rule answers a query for an FQDN
+    /// that is **absent from the static EAS map**.
+    ///
+    /// That absence is the point: before this, resolution consulted only the
+    /// static map, so a per-session context had no effect on any answer. An FQDN
+    /// present in the map could not distinguish the two.
+    #[test]
+    fn a_context_rule_answers_an_fqdn_absent_from_the_eas_map() {
+        let _g = lock_globals();
+        reset_context(DnsMissBehavior::NxDomain);
+
+        // Sanity: the FQDN is NOT in the static map, so without the rule this is
+        // a miss. Asserted, so the test cannot pass because the map happened to
+        // contain it.
+        let ctx = easdf_self();
+        assert_eq!(
+            ctx.read().unwrap().resolve_fqdn("shop.edge2.example.com"),
+            ResolveOutcome::Miss,
+            "the FQDN must be absent from the static map for this test to mean anything"
+        );
+
+        let body = serde_json::json!({
+            "supi": "imsi-001010000000001",
+            "pduSessionId": 5,
+            "dnsHandlingRules": [{
+                "domainNames": ["*.edge2.example.com"],
+                "easIpAddresses": ["10.70.0.7"]
+            }]
+        });
+        let resp = block_on(easdf_sbi_request_handler(create_request(body)));
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let ctx_id = created["dnsContextId"].as_str().unwrap().to_string();
+
+        // Scoped to the context, the rule answers.
+        let mut query = SbiRequest::get("/neasdf-dnscontext/v1/dns-queries");
+        query.http.set_param("fqdn", "shop.edge2.example.com");
+        query.http.set_param("dns-context-id", &ctx_id);
+        let resp = block_on(easdf_sbi_request_handler(query));
+        assert_eq!(resp.status, 200);
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(answer["action"], "RESOLVE");
+        assert_eq!(answer["easAddresses"][0], "10.70.0.7");
+
+        // UNSCOPED, the same query is still a miss: one session's rules must not
+        // answer another's (or an anonymous) query.
+        let mut query = SbiRequest::get("/neasdf-dnscontext/v1/dns-queries");
+        query.http.set_param("fqdn", "shop.edge2.example.com");
+        assert_eq!(
+            block_on(easdf_sbi_request_handler(query)).status,
+            404,
+            "an unscoped query must not be answered from some session's rules"
+        );
+    }
+
+    /// #114: a rule can forward, and an update REPARSES the rules — storing the
+    /// new body while keeping the old rules would pass a read-back assertion and
+    /// change nothing about what the EASDF answers.
+    #[test]
+    fn an_update_reparses_the_handling_rules() {
+        let _g = lock_globals();
+        reset_context(DnsMissBehavior::NxDomain);
+
+        let body = serde_json::json!({
+            "supi": "imsi-1", "pduSessionId": 1,
+            "dnsHandlingRules": [{
+                "domainNames": ["a.edge3.example.com"], "easIpAddresses": ["10.1.1.1"]
+            }]
+        });
+        let resp = block_on(easdf_sbi_request_handler(create_request(body)));
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let ctx_id = created["dnsContextId"].as_str().unwrap().to_string();
+
+        // Replace the rule with a FORWARD rule for a different name.
+        let update = SbiRequest::put(format!("/neasdf-dnscontext/v1/dns-contexts/{ctx_id}"))
+            .with_json_body(&serde_json::json!({
+                "supi": "imsi-1", "pduSessionId": 1,
+                "dnsHandlingRules": [{
+                    "domainNames": ["b.edge3.example.com"],
+                    "forwardTo": "10.0.0.53"
+                }]
+            }))
+            .unwrap();
+        assert_eq!(block_on(easdf_sbi_request_handler(update)).status, 200);
+
+        let resolve = |fqdn: &str| {
+            let ctx = easdf_self();
+            let guard = ctx.read().unwrap();
+            guard.resolve_in_context(&ctx_id, fqdn).0
+        };
+        assert_eq!(
+            resolve("b.edge3.example.com"),
+            ResolveOutcome::Forward("10.0.0.53".to_string()),
+            "the new rule must be in effect"
+        );
+        assert_eq!(
+            resolve("a.edge3.example.com"),
+            ResolveOutcome::Miss,
+            "the replaced rule must be gone, not merely shadowed"
+        );
+    }
+
+    /// #114 acceptance: a reporting-enabled rule emits a DNS-message report to
+    /// the SMF's callback URI, carrying the FQDN and the resolved EAS address(es).
+    // The `GLOBAL_TEST_LOCK` is a `std::sync::Mutex` shared with this module's
+    // SYNCHRONOUS tests, which cannot await. Two locks -- a std one for the sync
+    // tests and a tokio one for this -- would be two disjoint agreements about the
+    // same process-global context, which is the bug the single lock exists to
+    // prevent. Holding it across the awaits below is safe here because these tests
+    // are its only holders and none of them blocks on another.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_reporting_rule_emits_a_dns_message_report() {
+        let _g = lock_globals();
+        reset_context(DnsMissBehavior::NxDomain);
+
+        // A loopback "SMF" that records the report it receives.
+        let seen: std::sync::Arc<Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let port = nextgcore_sbi::test_support::free_port();
+        let smf =
+            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            ));
+        smf.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                if let Some(body) = req.http.content.as_deref() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(v);
+                    }
+                }
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("smf sink start");
+
+        let body = serde_json::json!({
+            "supi": "imsi-001010000000001",
+            "pduSessionId": 5,
+            "notificationUri": format!("http://127.0.0.1:{port}/nsmf-pdusession/v1/easdf-dns-reports"),
+            "dnsHandlingRules": [{
+                "domainNames": ["*.edge4.example.com"],
+                "easIpAddresses": ["10.80.0.8"],
+                "reportInd": true
+            }]
+        });
+        let resp = easdf_sbi_request_handler(create_request(body)).await;
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let ctx_id = created["dnsContextId"].as_str().unwrap().to_string();
+
+        let mut query = SbiRequest::get("/neasdf-dnscontext/v1/dns-queries");
+        query.http.set_param("fqdn", "vr.edge4.example.com");
+        query.http.set_param("dns-context-id", &ctx_id);
+        assert_eq!(easdf_sbi_request_handler(query).await.status, 200);
+
+        // The report is awaited inside the handler, so it is already delivered.
+        let reports = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(reports.len(), 1, "exactly one report, got {reports:?}");
+        assert_eq!(reports[0]["fqdn"], "vr.edge4.example.com");
+        assert_eq!(reports[0]["action"], "RESOLVE");
+        assert_eq!(reports[0]["easIpAddresses"][0], "10.80.0.8");
+        assert_eq!(reports[0]["dnsContextId"], ctx_id);
+
+        // A rule WITHOUT reportInd emits nothing.
+        let body = serde_json::json!({
+            "supi": "imsi-2", "pduSessionId": 6,
+            "notificationUri": format!("http://127.0.0.1:{port}/nsmf-pdusession/v1/easdf-dns-reports"),
+            "dnsHandlingRules": [{
+                "domainNames": ["*.quiet.example.com"], "easIpAddresses": ["10.80.0.9"]
+            }]
+        });
+        let resp = easdf_sbi_request_handler(create_request(body)).await;
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let quiet_id = created["dnsContextId"].as_str().unwrap().to_string();
+        let mut query = SbiRequest::get("/neasdf-dnscontext/v1/dns-queries");
+        query.http.set_param("fqdn", "x.quiet.example.com");
+        query.http.set_param("dns-context-id", &quiet_id);
+        assert_eq!(easdf_sbi_request_handler(query).await.status, 200);
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "a rule without reportInd must not report"
+        );
+
+        smf.stop().await.expect("stop");
+    }
+
+    /// #114 acceptance: `Neasdf_BaselineDNSPattern` Create/Read/Delete, and the
+    /// service appears in the NFProfile registration payload.
+    #[test]
+    fn baseline_dns_pattern_crud_and_nf_profile_advertisement() {
+        let _g = lock_globals();
+        reset_context(DnsMissBehavior::NxDomain);
+
+        // Create.
+        let create = SbiRequest::post("/neasdf-baselinednspattern/v1/baseline-dns-patterns")
+            .with_json_body(&serde_json::json!({
+                "domainNames": ["*.baseline.example.com"],
+                "easIpAddresses": ["10.90.0.9"]
+            }))
+            .unwrap();
+        let resp = block_on(easdf_sbi_request_handler(create));
+        assert_eq!(resp.status, 201);
+        let location = resp.http.get_header("location").cloned().expect("Location");
+        assert!(
+            location.starts_with(BASELINE_PATTERNS_PATH),
+            "got {location}"
+        );
+        let id = location.rsplit('/').next().unwrap().to_string();
+
+        // Read.
+        let read = SbiRequest::get(format!("{BASELINE_PATTERNS_PATH}/{id}"));
+        let resp = block_on(easdf_sbi_request_handler(read));
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got["domainNames"][0], "*.baseline.example.com");
+        assert_eq!(got["easIpAddresses"][0], "10.90.0.9");
+
+        // The pattern actually participates in resolution, after the static map.
+        let mut query = SbiRequest::get("/neasdf-dnscontext/v1/dns-queries");
+        query.http.set_param("fqdn", "a.baseline.example.com");
+        let resp = block_on(easdf_sbi_request_handler(query));
+        assert_eq!(resp.status, 200);
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            answer["easAddresses"][0], "10.90.0.9",
+            "a baseline pattern must answer a query the static map missed"
+        );
+
+        // A body with no domain pattern is refused.
+        let bad = SbiRequest::post("/neasdf-baselinednspattern/v1/baseline-dns-patterns")
+            .with_json_body(&serde_json::json!({"easIpAddresses": ["10.0.0.1"]}))
+            .unwrap();
+        assert_eq!(block_on(easdf_sbi_request_handler(bad)).status, 400);
+
+        // Delete, then 404.
+        let del = SbiRequest::delete(format!("{BASELINE_PATTERNS_PATH}/{id}"));
+        assert_eq!(block_on(easdf_sbi_request_handler(del)).status, 204);
+        let read = SbiRequest::get(format!("{BASELINE_PATTERNS_PATH}/{id}"));
+        assert_eq!(block_on(easdf_sbi_request_handler(read)).status, 404);
+
+        // ...and the service is advertised to the NRF. TS 23.501 Table 7.2.25-1
+        // lists both EASDF services; only the first used to appear.
+        let profile = build_nf_profile("easdf-1", "127.0.0.1", 7777);
+        let names: Vec<&str> = profile["nfServices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["serviceName"].as_str())
+            .collect();
+        assert!(names.contains(&"neasdf-dnscontext"), "got {names:?}");
+        assert!(
+            names.contains(&"neasdf-baselinednspattern"),
+            "the second EASDF service must be advertised, got {names:?}"
+        );
     }
 }
