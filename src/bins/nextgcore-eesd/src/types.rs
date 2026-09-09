@@ -567,6 +567,11 @@ pub mod cause {
     /// TS 24.558 §5.2.2.2: the cause an EEC registration is refused with when no
     /// matching EAS is identified for even one of its AC profiles.
     pub const RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND";
+    /// TS 29.500 §5.2.7.2: the operation is defined by the API but this EES does
+    /// not implement it. Used by the #106 capability APIs whose execution needs a
+    /// 5GC exposure leg that does not exist in this build — a retry can never
+    /// succeed, which is why they are 501 and not 503.
+    pub const NOT_IMPLEMENTED: &str = "NOT_IMPLEMENTED";
 }
 
 // ---------------------------------------------------------------------------

@@ -261,6 +261,59 @@ pub struct EELACRResp {
     pub supp_feat: Option<String>,
 }
 
+/// `ACTStatusSubsc` (`TS29558_Eees_EELManagedACR.yaml`, `ACTStatusSubsc`) — a
+/// subscription to ACT status reporting (#106, TS 29.558 §5.11).
+///
+/// The EEL-managed ACR API served only `request-eelacr`; its subscription
+/// resource did not exist and this type had no counterpart in the tree, so
+/// `/subscriptions` and `/subscriptions/{subscriptionId}` fell through to 404.
+///
+/// Required: `easId`, `notificationUri`. The server-minted `subscriptionId` is
+/// **not** a member of the schema — it is the store key, conveyed in the
+/// `Location` header, exactly as `ACInfoSubscription` does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ACTStatusSubsc {
+    /// Identifier of the service consumer (REQUIRED).
+    pub eas_id: String,
+    /// Callback root for ACT status notifications (REQUIRED). The notification
+    /// is POSTed to `{notificationUri}/act-status` — the callback path the yaml
+    /// declares, not the bare URI.
+    pub notification_uri: String,
+    /// Supported features.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supp_feat: Option<String>,
+}
+
+/// The callback sub-path the yaml appends to `notificationUri` for an ACT status
+/// notification (`'{$request.body#/notificationUri}/act-status'`).
+///
+/// Spelled here as a constant because getting it wrong is invisible in-process:
+/// a notification POSTed to the bare `notificationUri` would be accepted by this
+/// tree's own test consumers and rejected by a conformant one.
+pub const ACT_STATUS_CALLBACK_SUFFIX: &str = "/act-status";
+
+/// `ACTStatusNotif` (`TS29558_Eees_EELManagedACR.yaml`) — the ACT status
+/// notification body. Required: `subscriptionId`, `actStatus`.
+///
+/// `actStatus` is an `ACTResult` (`TS29558_Eees_ACRStatusUpdate.yaml`), an
+/// open enumeration of `SUCCESSFUL` / `FAILED` — carried as a `String` so a
+/// forward-compatible value from a future release round-trips rather than
+/// failing the parse.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ACTStatusNotif {
+    /// Subscription identifier (REQUIRED).
+    pub subscription_id: String,
+    /// Result of the ACT (REQUIRED): `SUCCESSFUL` or `FAILED`.
+    pub act_status: String,
+}
+
+/// `ACTResult` value for a successful ACT.
+pub const ACT_RESULT_SUCCESSFUL: &str = "SUCCESSFUL";
+/// `ACTResult` value for a failed ACT.
+pub const ACT_RESULT_FAILED: &str = "FAILED";
+
 // ---------------------------------------------------------------------------
 // eees-acrstatus-update: ACR status update (TS 29.558 §8.9)
 // ---------------------------------------------------------------------------

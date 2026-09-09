@@ -6,7 +6,8 @@
 //! the consumer `easId` separately for discovery.
 
 use crate::acr::{
-    acr_ue_key, AcrContextError, AcrDecReq, AcrDetermReq, AcrInitReq, AcrState, AcrStatus,
+    acr_ue_key, ACTStatusNotif, ACTStatusSubsc, AcrContextError, AcrDecReq, AcrDetermReq,
+    AcrInitReq, AcrState, AcrStatus, ACT_STATUS_CALLBACK_SUFFIX,
 };
 use crate::acrevents::{
     ACRCompleteEventInfo, ACREventsSubscription, ACRInfoNotification, TargetInfo,
@@ -16,9 +17,9 @@ use crate::eec::{
     unfulfill_reason, AcProfile, AcServiceKpis, EecRegistration, UnfulfilledAcProfile,
 };
 use crate::services::{
-    ACInfoSubscription, ACRParamsInfo, AcrMgntEventReport, AcrMgntEventsNotification,
-    AcrMgntEventsSubscription, CommonEASInfo, EECContext, ACINFO_PATCHABLE_FIELDS,
-    ACRMGNT_PATCHABLE_FIELDS,
+    ACInfoNotification, ACInfoSubscription, ACInformation, ACRParamsInfo, AcrMgntEventReport,
+    AcrMgntEventsNotification, AcrMgntEventsSubscription, CommonEASInfo, EECContext,
+    ACINFO_PATCHABLE_FIELDS, ACRMGNT_PATCHABLE_FIELDS,
 };
 use crate::types::{
     apply_merge_patch, is_expired, DiscoveredEas, EasDiscoveryFilter, EasDiscoveryNotification,
@@ -105,6 +106,58 @@ fn eas_suffices_kpis(eas: &EasProfile, required: Option<&AcServiceKpis>) -> bool
     true
 }
 
+/// Does an AC profile satisfy an AppClientInformation subscription's filters
+/// (TS 29.558 §5.5, `ACFilters`)? — #106.
+///
+/// Semantics, chosen deliberately because the schema states them only as a list
+/// of optional members:
+///
+/// * **No filters at all** (absent, or an empty list) matches everything. The
+///   member is optional, so a subscriber that named no filter asked for all AC
+///   information; refusing to notify them would make an unfiltered subscription
+///   the one shape that never fires.
+/// * **Across filter entries: OR.** `acFltrs` is a list, and a list of filters
+///   is a set of alternatives — a subscriber naming two AC types wants both.
+/// * **Within one entry: AND** over the members that are present, each member
+///   being an OR over its own list. An entry naming `acIdsList` *and*
+///   `acTypesList` is one narrower criterion, not two broader ones.
+///
+/// Only `acIdsList` and `acTypesList` are evaluated. `svcArea`, `maxAcKpi`,
+/// `minAcKpi` and the schedule members are passthrough `serde_json::Value`s in
+/// [`ACFilters`] with no comparable counterpart on [`AcProfile`], and an
+/// unparsed JSON blob cannot be compared without inventing a comparison. A
+/// present-but-unevaluated member is treated as **not constraining** rather than
+/// as a non-match: over-notifying a subscriber that asked for a narrower set is
+/// recoverable at the consumer, whereas silently never notifying is the defect
+/// this function exists to fix. The limit is stated in the module docs and in
+/// the spec so it is not mistaken for a full filter implementation.
+///
+/// [`ACFilters`]: crate::services::ACFilters
+fn ac_profile_matches_filters(
+    prof: &AcProfile,
+    filters: Option<&[crate::services::ACFilters]>,
+) -> bool {
+    let Some(filters) = filters.filter(|f| !f.is_empty()) else {
+        return true;
+    };
+    filters.iter().any(|f| {
+        let id_ok = match f.ac_ids_list.as_ref().filter(|l| !l.is_empty()) {
+            Some(ids) => ids.iter().any(|id| id == &prof.ac_id),
+            None => true,
+        };
+        let type_ok = match f.ac_types_list.as_ref().filter(|l| !l.is_empty()) {
+            // An AC profile with no acType cannot satisfy a type filter: the
+            // subscriber constrained on a value this profile does not state.
+            Some(types) => prof
+                .ac_type
+                .as_deref()
+                .is_some_and(|t| types.iter().any(|want| want == t)),
+            None => true,
+        };
+        id_ok && type_ok
+    })
+}
+
 /// Outcome of a merge-patch / replace update that can fail for several
 /// spec-distinct reasons mapped to different HTTP status codes by the handler.
 #[derive(Debug, PartialEq, Eq)]
@@ -151,6 +204,11 @@ pub struct EesContext {
     /// EEC contexts (`eees-eeccontextreloc`, TS 29.558 §8.7.2), keyed by the
     /// spec pull key `cntxId` (the `eec-cntx-id` query parameter).
     eec_contexts: RwLock<HashMap<String, EECContext>>,
+    /// ACT status subscriptions (`eees-eel-acr/v1/subscriptions`, TS 29.558
+    /// §5.11, #106), keyed by the server-minted `subscriptionId`. The spec
+    /// `ACTStatusSubsc` body carries no id member, so the key lives only here and
+    /// in the `Location` header.
+    act_status_subscriptions: RwLock<HashMap<String, ACTStatusSubsc>>,
     /// Maximum registrations (applied per resource family).
     max_eas: usize,
     /// Context initialized flag.
@@ -170,6 +228,7 @@ impl EesContext {
             acr_mgnt_subscriptions: RwLock::new(HashMap::new()),
             acrevents_subscriptions: RwLock::new(HashMap::new()),
             eec_contexts: RwLock::new(HashMap::new()),
+            act_status_subscriptions: RwLock::new(HashMap::new()),
             max_eas: 0,
             initialized: AtomicBool::new(false),
         }
@@ -217,6 +276,9 @@ impl EesContext {
         }
         if let Ok(mut ctxs) = self.eec_contexts.write() {
             ctxs.clear();
+        }
+        if let Ok(mut subs) = self.act_status_subscriptions.write() {
+            subs.clear();
         }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("EES context finalized");
@@ -1327,6 +1389,186 @@ impl EesContext {
     /// `(uri, body)` pairs are collected UNDER the read lock and enqueued only
     /// AFTER it is released — the documented NF-context AB-BA rule (the notifier
     /// must never be invoked while holding the `EesContext` lock).
+    // ---- eees-eel-acr — ACT status subscriptions (TS 29.558 §5.11, #106) ----
+
+    /// Store an `ACTStatusSubsc`; mints and returns the server `subscriptionId`.
+    ///
+    /// `None` on capacity exhaustion (the handler answers 507), matching every
+    /// other subscription family in this context.
+    pub fn act_status_sub_create(&self, sub: ACTStatusSubsc) -> Option<String> {
+        let mut subs = self.act_status_subscriptions.write().ok()?;
+        if subs.len() >= self.max_eas {
+            return None;
+        }
+        let id = Uuid::new_v4().to_string();
+        subs.insert(id.clone(), sub.clone());
+        log::info!(
+            "ACTStatusSubsc created: subscriptionId={id} easId={} notificationUri={}",
+            sub.eas_id,
+            sub.notification_uri
+        );
+        Some(id)
+    }
+
+    pub fn act_status_sub_find(&self, subscription_id: &str) -> Option<ACTStatusSubsc> {
+        self.act_status_subscriptions
+            .read()
+            .ok()?
+            .get(subscription_id)
+            .cloned()
+    }
+
+    /// All active ACT status subscriptions (`GetACTStatusSubscriptions` returns
+    /// the array directly, not a wrapper object).
+    pub fn act_status_sub_list(&self) -> Vec<ACTStatusSubsc> {
+        self.act_status_subscriptions
+            .read()
+            .map(|s| s.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn act_status_sub_count(&self) -> usize {
+        self.act_status_subscriptions
+            .read()
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    /// Emit `ACTStatusNotif` to the ACT status subscribers for `eas_id` (#106).
+    ///
+    /// Called when an ACR reaches a terminal ACT outcome, which is the only
+    /// moment the notification has content: `ACTStatusNotif.actStatus` is an
+    /// `ACTResult` of `SUCCESSFUL` or `FAILED`, so an in-progress ACR has nothing
+    /// to report.
+    ///
+    /// Only subscriptions whose `easId` matches are notified. `easId` is the sole
+    /// selector the schema offers — there is no per-UE or per-ACR filter — so a
+    /// consumer subscribing for one EAS does not receive another's ACT results.
+    ///
+    /// The notification is POSTed to `{notificationUri}/act-status`, the callback
+    /// path the yaml declares. Returns how many were enqueued.
+    pub fn notify_act_status_subscribers(&self, eas_id: &str, act_status: &str) -> usize {
+        let mut pending: Vec<(String, serde_json::Value)> = Vec::new();
+        {
+            let subs = match self.act_status_subscriptions.read() {
+                Ok(s) => s,
+                Err(_) => return 0,
+            };
+            for (id, sub) in subs.iter() {
+                if sub.eas_id != eas_id {
+                    continue;
+                }
+                let notif = ACTStatusNotif {
+                    subscription_id: id.clone(),
+                    act_status: act_status.to_string(),
+                };
+                if let Ok(body) = serde_json::to_value(&notif) {
+                    // Trailing slashes are trimmed so a consumer that registered
+                    // `http://eas/cb/` does not receive a POST to `//act-status`.
+                    let uri = format!(
+                        "{}{ACT_STATUS_CALLBACK_SUFFIX}",
+                        sub.notification_uri.trim_end_matches('/')
+                    );
+                    pending.push((uri, body));
+                }
+            }
+        }
+        let notified = pending.len();
+        for (uri, body) in pending {
+            crate::notifier::enqueue(uri, body, "ACTStatusNotif");
+        }
+        if notified > 0 {
+            log::info!(
+                "ACTStatusNotif({act_status}) enqueued to {notified} subscriber(s) for easId={eas_id}"
+            );
+        }
+        notified
+    }
+
+    /// Emit `ACInfoNotification` to every AppClientInformation subscriber whose
+    /// filters match the AC profiles of a just-registered EEC
+    /// (TS 29.558 §5.5.2.2, #106).
+    ///
+    /// # Why this exists
+    ///
+    /// `acinfo_create` stored a subscription and answered `201 + Location`, and
+    /// nothing ever produced the callback that gives the subscription its
+    /// purpose: `ACInfoNotification` was constructed only in tests. A consumer
+    /// that subscribed was therefore never told anything, with no error surface
+    /// to reveal it — the worst shape of interop failure, because it looks like
+    /// it worked.
+    ///
+    /// Returns how many subscribers were notified, which is what lets a test
+    /// assert *exactly one* emission rather than "at least something happened".
+    ///
+    /// Collect-then-enqueue, like [`notify_acrmgnt_subscribers`]: the
+    /// subscription lock is released before any `notifier::enqueue`, so a slow
+    /// or blocking notifier cannot hold the store shut against the SBI handlers.
+    ///
+    /// [`notify_acrmgnt_subscribers`]: Self::notify_acrmgnt_subscribers
+    pub fn notify_acinfo_subscribers(&self, reg: &crate::eec::EecRegistration) -> usize {
+        let Some(profs) = reg.ac_profs.as_ref().filter(|p| !p.is_empty()) else {
+            // No AC profiles: there is nothing an AC-information filter could
+            // match, so this is not a missed notification.
+            return 0;
+        };
+
+        let mut pending: Vec<(String, serde_json::Value)> = Vec::new();
+        {
+            let subs = match self.app_client_infos.read() {
+                Ok(s) => s,
+                Err(_) => return 0,
+            };
+            let now = crate::types::now_epoch();
+            for (id, sub) in subs.iter() {
+                // An expired subscription must not fire. The sweep is periodic,
+                // so an entry can still be present past its expTime. Uses the
+                // crate's own `is_expired` rather than a second time comparison,
+                // so "expired" means one thing across eesd.
+                if is_expired(sub.exp_time.as_deref(), now) {
+                    continue;
+                }
+                // `notificationDestination` is OPTIONAL in the schema, and a
+                // subscription without one has nowhere to be delivered. Skipped
+                // rather than treated as a match, so the returned count stays
+                // "notifications actually enqueued".
+                let Some(dest) = sub.notification_destination.as_deref() else {
+                    continue;
+                };
+                let matched: Vec<serde_json::Value> = profs
+                    .iter()
+                    .filter(|p| ac_profile_matches_filters(p, sub.ac_fltrs.as_deref()))
+                    .filter_map(|p| serde_json::to_value(p).ok())
+                    .collect();
+                if matched.is_empty() {
+                    continue;
+                }
+                let notif = ACInfoNotification {
+                    sub_id: id.clone(),
+                    ac_infs: vec![ACInformation {
+                        ac_profs: matched,
+                        ue_ids: reg.ue_id.clone().map(|u| vec![u]),
+                        ue_loc_infs: None,
+                    }],
+                };
+                if let Ok(body) = serde_json::to_value(&notif) {
+                    pending.push((dest.to_string(), body));
+                }
+            }
+        }
+        let notified = pending.len();
+        for (uri, body) in pending {
+            crate::notifier::enqueue(uri, body, "ACInfoNotification");
+        }
+        if notified > 0 {
+            log::info!(
+                "ACInfoNotification enqueued to {notified} subscriber(s) for eecId={}",
+                reg.eec_id
+            );
+        }
+        notified
+    }
+
     pub fn notify_acrmgnt_subscribers(&self, event: &str, app_grp_id: Option<&str>) -> usize {
         let mut pending: Vec<(String, serde_json::Value)> = Vec::new();
         {
@@ -1788,5 +2030,255 @@ mod tests {
         assert!(!ctx
             .eas_discover(Some("forever.example.com"), None)
             .is_empty());
+    }
+
+    // ─── #106: AppClientInformation and ACT status notifications ────────────
+
+    /// An `AcProfile` with the given id and optional type.
+    fn ac_prof(ac_id: &str, ac_type: Option<&str>) -> AcProfile {
+        AcProfile {
+            ac_id: ac_id.into(),
+            ac_type: ac_type.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// #106 acceptance: an AppClientInformation subscription whose filter matches
+    /// a subsequent EEC registration causes **exactly one** `ACInfoNotification`
+    /// to be enqueued via `notifier::enqueue`.
+    ///
+    /// This is the emit assertion the issue asks for: before this change
+    /// `ACInfoNotification` was constructed only in a test, and no production path
+    /// produced one — the subscription was accepted and then inert.
+    #[test]
+    fn test_acinfo_notify_fires_once_on_a_matching_registration() {
+        use crate::notifier::Notifier;
+        use crate::services::{ACFilters, ACInfoSubscription};
+
+        let _g = crate::auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = Arc::new(crate::notifier::QueueNotifier::default());
+        crate::notifier::set_notifier(n.clone());
+        let _ = n.drain();
+
+        let mut ctx = EesContext::new();
+        ctx.init(8);
+
+        // Subscriber wants AC "ac-1" only.
+        let sub_id = ctx
+            .acinfo_create(ACInfoSubscription {
+                eas_id: "eas1.example.com".into(),
+                notification_destination: Some("http://eas/ac-info".into()),
+                ac_fltrs: Some(vec![ACFilters {
+                    ac_ids_list: Some(vec!["ac-1".into()]),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            })
+            .expect("subscription created");
+
+        // A registration carrying that AC fires exactly one notification.
+        let mut reg = make_eec("eec-1");
+        reg.ac_profs = Some(vec![ac_prof("ac-1", Some("V2X")), ac_prof("ac-9", None)]);
+        assert_eq!(ctx.notify_acinfo_subscribers(&reg), 1);
+
+        let queued = n.drain();
+        assert_eq!(queued.len(), 1, "exactly one notification");
+        assert_eq!(queued[0].uri, "http://eas/ac-info");
+        assert_eq!(
+            queued[0].kind, "ACInfoNotification",
+            "the production emit must be tagged as an ACInfoNotification"
+        );
+        let notif: ACInfoNotification = serde_json::from_value(queued[0].body.clone()).unwrap();
+        assert_eq!(notif.sub_id, sub_id);
+        assert_eq!(notif.ac_infs.len(), 1);
+        // Only the MATCHING profile is reported -- not the whole registration.
+        assert_eq!(
+            notif.ac_infs[0].ac_profs.len(),
+            1,
+            "ac-9 does not match the filter and must not be reported"
+        );
+        assert_eq!(notif.ac_infs[0].ac_profs[0]["acId"], "ac-1");
+        assert_eq!(
+            notif.ac_infs[0].ue_ids.as_deref(),
+            Some(&["gpsi-1".to_string()][..]),
+            "the UE hosting the AC is reported"
+        );
+
+        // A registration with no matching AC fires nothing.
+        let mut other = make_eec("eec-2");
+        other.ac_profs = Some(vec![ac_prof("ac-9", None)]);
+        assert_eq!(ctx.notify_acinfo_subscribers(&other), 0);
+        assert!(n.drain().is_empty());
+
+        crate::notifier::set_notifier(Arc::new(crate::notifier::QueueNotifier::default()));
+    }
+
+    /// #106: the filter semantics, each asserted separately because they fail
+    /// independently.
+    #[test]
+    fn test_acinfo_filter_semantics() {
+        use crate::services::ACFilters;
+
+        // No filters at all: everything matches (an unfiltered subscription must
+        // not be the one shape that never fires).
+        assert!(ac_profile_matches_filters(&ac_prof("ac-1", None), None));
+        assert!(ac_profile_matches_filters(
+            &ac_prof("ac-1", None),
+            Some(&[])
+        ));
+
+        // Within one entry: AND. Both the id and the type must match.
+        let id_and_type = [ACFilters {
+            ac_ids_list: Some(vec!["ac-1".into()]),
+            ac_types_list: Some(vec!["V2X".into()]),
+            ..Default::default()
+        }];
+        assert!(ac_profile_matches_filters(
+            &ac_prof("ac-1", Some("V2X")),
+            Some(&id_and_type)
+        ));
+        assert!(
+            !ac_profile_matches_filters(&ac_prof("ac-1", Some("AR")), Some(&id_and_type)),
+            "the id matches but the type does not: one entry is a conjunction"
+        );
+        assert!(
+            !ac_profile_matches_filters(&ac_prof("ac-1", None), Some(&id_and_type)),
+            "a profile stating no acType cannot satisfy a type filter"
+        );
+
+        // Across entries: OR.
+        let either = [
+            ACFilters {
+                ac_ids_list: Some(vec!["ac-1".into()]),
+                ..Default::default()
+            },
+            ACFilters {
+                ac_ids_list: Some(vec!["ac-2".into()]),
+                ..Default::default()
+            },
+        ];
+        assert!(ac_profile_matches_filters(
+            &ac_prof("ac-2", None),
+            Some(&either)
+        ));
+        assert!(!ac_profile_matches_filters(
+            &ac_prof("ac-3", None),
+            Some(&either)
+        ));
+    }
+
+    /// #106: a subscription with no `notificationDestination`, or one already
+    /// past its `expTime`, must not produce a notification. Both are silent
+    /// no-delivery cases that a count-only assertion would miss.
+    #[test]
+    fn test_acinfo_notify_skips_undeliverable_and_expired() {
+        use crate::notifier::Notifier;
+        use crate::services::ACInfoSubscription;
+
+        let _g = crate::auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = Arc::new(crate::notifier::QueueNotifier::default());
+        crate::notifier::set_notifier(n.clone());
+        let _ = n.drain();
+
+        let mut ctx = EesContext::new();
+        ctx.init(8);
+        // No notificationDestination: nowhere to deliver.
+        ctx.acinfo_create(ACInfoSubscription {
+            eas_id: "eas1".into(),
+            notification_destination: None,
+            ..Default::default()
+        });
+        // Expired an hour ago.
+        ctx.acinfo_create(ACInfoSubscription {
+            eas_id: "eas2".into(),
+            notification_destination: Some("http://eas/late".into()),
+            exp_time: Some(crate::types::epoch_to_rfc3339(
+                crate::types::now_epoch() - 3600,
+            )),
+            ..Default::default()
+        });
+
+        let mut reg = make_eec("eec-1");
+        reg.ac_profs = Some(vec![ac_prof("ac-1", None)]);
+        assert_eq!(
+            ctx.notify_acinfo_subscribers(&reg),
+            0,
+            "neither subscription is deliverable"
+        );
+        assert!(n.drain().is_empty());
+
+        crate::notifier::set_notifier(Arc::new(crate::notifier::QueueNotifier::default()));
+    }
+
+    /// #106: ACT status subscriptions are per-`easId`, and the notification goes
+    /// to `{notificationUri}/act-status` — the callback path the yaml declares,
+    /// not the bare URI.
+    #[test]
+    fn test_act_status_subscription_and_notify() {
+        use crate::notifier::Notifier;
+
+        let _g = crate::auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = Arc::new(crate::notifier::QueueNotifier::default());
+        crate::notifier::set_notifier(n.clone());
+        let _ = n.drain();
+
+        let mut ctx = EesContext::new();
+        ctx.init(8);
+
+        let id = ctx
+            .act_status_sub_create(ACTStatusSubsc {
+                eas_id: "eas1.example.com".into(),
+                // Trailing slash on purpose: the join must not produce `//`.
+                notification_uri: "http://eas/cb/".into(),
+                supp_feat: None,
+            })
+            .expect("created");
+        // A second subscriber, for a DIFFERENT easId.
+        ctx.act_status_sub_create(ACTStatusSubsc {
+            eas_id: "other.example.com".into(),
+            notification_uri: "http://other/cb".into(),
+            supp_feat: None,
+        });
+        assert_eq!(ctx.act_status_sub_count(), 2);
+        assert_eq!(ctx.act_status_sub_list().len(), 2);
+        assert_eq!(
+            ctx.act_status_sub_find(&id).map(|s| s.eas_id),
+            Some("eas1.example.com".to_string())
+        );
+        assert!(ctx.act_status_sub_find("no-such-id").is_none());
+
+        // Only the matching easId is notified.
+        assert_eq!(
+            ctx.notify_act_status_subscribers(
+                "eas1.example.com",
+                crate::acr::ACT_RESULT_SUCCESSFUL
+            ),
+            1
+        );
+        let queued = n.drain();
+        assert_eq!(queued.len(), 1, "the other easId must not be notified");
+        assert_eq!(
+            queued[0].uri, "http://eas/cb/act-status",
+            "the yaml appends /act-status to notificationUri, with no doubled slash"
+        );
+        assert_eq!(queued[0].kind, "ACTStatusNotif");
+        let notif: ACTStatusNotif = serde_json::from_value(queued[0].body.clone()).unwrap();
+        assert_eq!(notif.subscription_id, id);
+        assert_eq!(notif.act_status, "SUCCESSFUL");
+
+        // An easId nobody subscribed for notifies nothing.
+        assert_eq!(
+            ctx.notify_act_status_subscribers("unknown.example.com", "FAILED"),
+            0
+        );
+        assert!(n.drain().is_empty());
+
+        crate::notifier::set_notifier(Arc::new(crate::notifier::QueueNotifier::default()));
     }
 }
