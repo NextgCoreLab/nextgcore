@@ -5110,10 +5110,12 @@ mod tests {
         )
         .await;
 
-        // NOTE: the nextgcore-sbi client serializes query params verbatim (no
-        // percent-encoding, a pre-existing lib gap outside scpd's ownership), so
-        // factor *values* here are query-safe tokens. scpd-06 is about the
-        // header→param *mapping*, which is value-independent.
+        // NOTE: the factor *values* here are query-safe tokens, which keeps this
+        // test about the header→param *mapping* (scpd-06) and nothing else. The
+        // lib gap this note used to cite is closed: the client percent-encodes
+        // query values (#101) and the server percent-decodes them (#65), so a
+        // reserved-character factor now survives the proxy hop too — see
+        // `server_percent_decodes_query_parameters` in nextgcore-sbi.
         let request = SbiRequest::post("/nudm-uecm/v1/registrations")
             .with_header("3gpp-Sbi-Discovery-target-nf-type", "UDM")
             .with_header("3gpp-Sbi-Discovery-requester-nf-type", "AMF")

@@ -29,6 +29,10 @@
 //! (e.g. `NF-Instance`, `S-NSSAI`, `DNN`) are preserved verbatim in `extra` so
 //! a parsed header re-emits losslessly.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant};
+
 /// Split a header value into its `Name: value` parameters and route the
 /// recognised keys to `on_known`, collecting the rest into `extra`.
 ///
@@ -253,6 +257,259 @@ impl OverloadControl {
     }
 }
 
+/// Longest period of validity honoured for an OCI that declares none (#65).
+///
+/// TS 29.500 §6.4.3.3 makes `Period-of-Validity` optional and says an OCI stays
+/// valid until superseded. Taken literally, a producer that once reported
+/// `Overload-Reduction-Metric: 100` and then went quiet would be avoided by this
+/// consumer **forever** — one header turning into a permanent self-inflicted
+/// outage toward a healthy NF. A ceiling makes the worst case "wrong for 30
+/// seconds" instead of "wrong until restart"; a producer that is really still
+/// overloaded restates the OCI on the next response, which refreshes the entry.
+const DEFAULT_OCI_VALIDITY: Duration = Duration::from_secs(30);
+
+/// What the consumer should do with a request bound for a given producer (#65).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendDecision {
+    /// Send it: no live OCI, or the OCI does not call for reduction.
+    Send,
+    /// Route it to an alternate producer instead — the preferred reaction
+    /// whenever one exists, because it neither loads the overloaded producer nor
+    /// fails the caller (TS 29.500 §6.5).
+    Reselect(Oci),
+    /// Reject locally without sending (§6.4.2.2 abatement). Only ever returned
+    /// when shedding has been explicitly enabled; see [`OverloadRegistry`].
+    Shed(Oci),
+}
+
+/// One recorded OCI and when it stops applying.
+#[derive(Debug, Clone)]
+struct OciEntry {
+    oci: Oci,
+    expires_at: Instant,
+}
+
+/// Consumer-side record of which producers have reported overload (#65).
+///
+/// # Why this exists
+///
+/// [`Oci`] could already be parsed and emitted before this, and
+/// [`OverloadControl`] could already decide whether to shed — but nothing ever
+/// called either from the request path, so a 503 carrying an OCI was handed
+/// straight to the caller and the next request went to the same overloaded
+/// producer. This is the missing piece: the memory between the response that
+/// reported overload and the request that should react to it.
+///
+/// # Default posture: react by rerouting, not by dropping
+///
+/// * Recording and **reselection** are ON by default. Neither can lose a
+///   request: rerouting sends it somewhere healthier, and with no alternate
+///   configured the decision degrades to [`SendDecision::Send`], i.e. exactly
+///   the previous behaviour.
+/// * **Shedding** — failing a request locally without sending it — is OFF by
+///   default and must be enabled explicitly. It is the spec's literal §6.4.2.2
+///   reaction, but it is also the one that turns a producer's header into
+///   dropped requests here: a metric of 100 with no `Period-of-Validity`, sent
+///   in error, would stop this consumer talking to that producer at all. The
+///   validity ceiling above bounds that, and this switch means an operator opts
+///   into it knowingly.
+///
+/// # Scoped OCI is recorded but not matched
+///
+/// §6.4.3.3 allows an OCI to name a scope (`NF-Instance`, `S-NSSAI`, `DNN`).
+/// Only the **unscoped** (whole-producer) OCI is acted upon: matching a
+/// per-S-NSSAI or per-DNN scope needs the request's S-NSSAI/DNN, which is in the
+/// body and not available at this layer. Scoped occurrences are still stored and
+/// countable via [`OverloadRegistry::live_count`], so a scope-aware reaction can
+/// be added without changing the ingest side — and, until it is, this reports
+/// honestly rather than silently applying a per-DNN metric to every request.
+#[derive(Debug, Default)]
+pub struct OverloadRegistry {
+    /// Keyed by producer (`scheme://host:port`), then by scope key — `""` for
+    /// the unscoped OCI, the verbatim scope parameters otherwise.
+    entries: std::sync::Mutex<HashMap<String, HashMap<String, OciEntry>>>,
+    /// Governs shedding only. Recording and reselection do not consult it.
+    shed: OverloadControl,
+}
+
+impl OverloadRegistry {
+    /// A registry that records and reselects but never sheds (the default).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A registry that also applies §6.4.2.2 shedding.
+    pub fn with_shedding() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(HashMap::new()),
+            shed: OverloadControl::enabled(),
+        }
+    }
+
+    /// Whether local shedding is enabled on this registry.
+    pub fn sheds(&self) -> bool {
+        self.shed.enabled
+    }
+
+    /// Record every OCI occurrence carried by a response from `target`.
+    ///
+    /// Takes the occurrences already split by
+    /// [`SbiHttpMessage::get_header_all`](crate::message::SbiHttpMessage::get_header_all),
+    /// so a producer reporting several scopes is recorded as several entries
+    /// rather than only its last. Returns how many were stored.
+    ///
+    /// A metric of `0` is stored like any other: §6.4.3.3 uses it to signal
+    /// recovery, so it must overwrite a previous non-zero entry rather than being
+    /// dropped as uninteresting.
+    pub fn record(&self, target: &str, oci_headers: &[String], now: Instant) -> usize {
+        let mut stored = 0;
+        let Ok(mut entries) = self.entries.lock() else {
+            // A poisoned lock means another thread panicked while recording.
+            // Overload state is advisory: losing it degrades to the pre-#65
+            // behaviour (send anyway), which is strictly better than propagating
+            // the panic into the request path.
+            return 0;
+        };
+        let per_target = entries.entry(target.to_string()).or_default();
+        for raw in oci_headers {
+            let Some(oci) = Oci::parse(raw) else { continue };
+            // A declared Period-of-Validity is honoured as sent — the producer
+            // said how long it means it. Only an ABSENT one falls back to the
+            // ceiling, which is the case that would otherwise never expire.
+            let validity = oci
+                .period_of_validity_secs
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_OCI_VALIDITY);
+            let scope_key = oci
+                .extra
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(";");
+            per_target.insert(
+                scope_key,
+                OciEntry {
+                    oci,
+                    expires_at: now + validity,
+                },
+            );
+            stored += 1;
+        }
+        stored
+    }
+
+    /// Decide what to do with a request bound for `target`.
+    ///
+    /// `alternate_available` says whether the caller has somewhere else to send
+    /// it; when it does, reselection wins over shedding, because rerouting keeps
+    /// the request alive.
+    pub fn decide(&self, target: &str, alternate_available: bool, now: Instant) -> SendDecision {
+        let Some(oci) = self.effective_oci(target, now) else {
+            return SendDecision::Send;
+        };
+        if oci.reduction_metric == 0 {
+            return SendDecision::Send;
+        }
+        if alternate_available {
+            return SendDecision::Reselect(oci);
+        }
+        if self.shed.should_shed_thread(&oci) {
+            return SendDecision::Shed(oci);
+        }
+        SendDecision::Send
+    }
+
+    /// The live **unscoped** OCI for `target`, if any, dropping expired entries.
+    pub fn effective_oci(&self, target: &str, now: Instant) -> Option<Oci> {
+        let mut entries = self.entries.lock().ok()?;
+        let per_target = entries.get_mut(target)?;
+        per_target.retain(|_, e| e.expires_at > now);
+        let result = per_target.get("").map(|e| e.oci.clone());
+        if per_target.is_empty() {
+            entries.remove(target);
+        }
+        result
+    }
+
+    /// Number of live OCI entries recorded for `target`, scoped ones included.
+    /// Exists so a caller (and the tests) can see that scoped occurrences were
+    /// kept rather than silently discarded.
+    pub fn live_count(&self, target: &str, now: Instant) -> usize {
+        let Ok(mut entries) = self.entries.lock() else {
+            return 0;
+        };
+        let Some(per_target) = entries.get_mut(target) else {
+            return 0;
+        };
+        per_target.retain(|_, e| e.expires_at > now);
+        per_target.len()
+    }
+
+    /// Forget everything recorded for `target` — used when a producer answers
+    /// normally again and the consumer wants to stop reacting immediately.
+    pub fn clear(&self, target: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(target);
+        }
+    }
+}
+
+/// Producer-side overload reporter (#65).
+///
+/// An NF that knows it is overloaded stores a reduction metric here; the SBI
+/// server then stamps `3gpp-Sbi-Oci` on every response it sends, which is the
+/// half of TS 29.500 §6.4 that no NF in this tree could perform before — the
+/// emission code existed, but nothing was wired to a server response.
+///
+/// This deliberately does **not** measure load itself. A generic HTTP layer has
+/// no basis for deciding that an AMF is overloaded (queue depth, UE count and
+/// N2 backlog are the NF's business), and inventing a metric from request
+/// latency here would report overload that the NF does not believe in. The NF
+/// sets the number; this carries it.
+#[derive(Debug, Default)]
+pub struct OverloadReporter {
+    /// 0 = not overloaded, and no header is emitted at all.
+    metric: AtomicU8,
+    /// `Period-of-Validity` in seconds; 0 omits the parameter.
+    validity_secs: AtomicU64,
+}
+
+impl OverloadReporter {
+    /// A reporter that is not overloaded and emits nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the reduction metric (0..=100). `0` stops emission.
+    pub fn set_reduction_metric(&self, metric: u8) {
+        self.metric.store(metric.min(100), AtomicOrdering::Relaxed);
+    }
+
+    /// Set the advertised `Period-of-Validity`, in seconds. `0` omits it.
+    pub fn set_validity_secs(&self, secs: u64) {
+        self.validity_secs.store(secs, AtomicOrdering::Relaxed);
+    }
+
+    /// The current metric.
+    pub fn reduction_metric(&self) -> u8 {
+        self.metric.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The OCI to stamp on a response, or `None` when not overloaded.
+    pub fn oci(&self) -> Option<Oci> {
+        let metric = self.reduction_metric();
+        if metric == 0 {
+            return None;
+        }
+        let mut oci = Oci::new(metric);
+        let validity = self.validity_secs.load(AtomicOrdering::Relaxed);
+        if validity > 0 {
+            oci.period_of_validity_secs = Some(validity);
+        }
+        Some(oci)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +591,106 @@ mod tests {
             assert!(!ctl.should_shed(&Oci::new(0), &mut rng));
             assert!(ctl.should_shed(&Oci::new(100), &mut rng));
         }
+    }
+
+    /// #65: a later OCI supersedes an earlier one for the same scope, so a
+    /// producer signalling recovery with `Overload-Reduction-Metric: 0` stops the
+    /// reaction (TS 29.500 §6.4.3.3).
+    ///
+    /// Both states are asserted — Reselect while the reduction is live, Send once
+    /// it is withdrawn. Asserting only the second would pass against a registry
+    /// that never reacted at all.
+    #[test]
+    fn metric_zero_supersedes_a_live_reduction() {
+        let registry = OverloadRegistry::new();
+        let now = Instant::now();
+        let target = "http://127.0.0.1:8080";
+
+        assert_eq!(registry.record(target, &[Oci::new(70).to_header()], now), 1);
+        assert!(
+            matches!(registry.decide(target, true, now), SendDecision::Reselect(o) if o.reduction_metric == 70),
+            "a live reduction with an alternate available must reselect"
+        );
+
+        // Recovery.
+        assert_eq!(registry.record(target, &[Oci::new(0).to_header()], now), 1);
+        assert_eq!(
+            registry.decide(target, true, now),
+            SendDecision::Send,
+            "metric 0 must supersede the earlier reduction"
+        );
+    }
+
+    /// #65: each scope is an independent entry, and only the UNSCOPED one drives
+    /// the decision — a per-DNN metric must not be applied to every request.
+    ///
+    /// Uses a SHEDDING registry deliberately. With the default (non-shedding) one
+    /// every branch ends in `Send`, so the first version of this test passed even
+    /// when `effective_oci` was reverted to "return any live entry, scoped or
+    /// not": the outcome was decided by shedding being off, not by the scope
+    /// logic. With shedding on, scope is the only variable left.
+    #[test]
+    fn scoped_oci_is_recorded_but_only_the_unscoped_one_decides() {
+        let registry = OverloadRegistry::with_shedding();
+        let now = Instant::now();
+        let target = "http://127.0.0.1:8080";
+
+        let scoped = "Overload-Reduction-Metric: 100; DNN: internet";
+        assert_eq!(registry.record(target, &[scoped.to_string()], now), 1);
+        assert_eq!(registry.live_count(target, now), 1, "it IS recorded");
+        assert_eq!(
+            registry.decide(target, false, now),
+            SendDecision::Send,
+            "a per-DNN metric must not gate unrelated requests, even at 100%"
+        );
+
+        // Add the whole-producer OCI: now the decision changes, and both entries
+        // are still held.
+        registry.record(target, &[Oci::new(100).to_header()], now);
+        assert_eq!(registry.live_count(target, now), 2);
+        assert!(
+            matches!(registry.decide(target, false, now), SendDecision::Shed(o) if o.reduction_metric == 100),
+            "an unscoped 100% reduction with no alternate must shed"
+        );
+        // With an alternate, rerouting is preferred over shedding.
+        assert!(matches!(
+            registry.decide(target, true, now),
+            SendDecision::Reselect(_)
+        ));
+    }
+
+    /// #65: an OCI with no `Period-of-Validity` expires under the local ceiling
+    /// instead of applying forever. One erroneous `metric: 100` must not become a
+    /// permanent outage toward a healthy producer.
+    #[test]
+    fn an_oci_without_a_validity_period_expires_under_the_ceiling() {
+        let registry = OverloadRegistry::new();
+        let now = Instant::now();
+        let target = "http://127.0.0.1:8080";
+
+        // No Period-of-Validity in the header at all.
+        registry.record(target, &["Overload-Reduction-Metric: 100".to_string()], now);
+        assert!(registry.effective_oci(target, now).is_some());
+
+        let after = now + DEFAULT_OCI_VALIDITY + Duration::from_secs(1);
+        assert!(
+            registry.effective_oci(target, after).is_none(),
+            "an OCI with no declared validity must not outlive the ceiling"
+        );
+        assert_eq!(registry.decide(target, false, after), SendDecision::Send);
+
+        // A DECLARED validity is honoured as sent, even a long one.
+        registry.record(
+            target,
+            &["Period-of-Validity: 600s; Overload-Reduction-Metric: 100".to_string()],
+            now,
+        );
+        assert!(
+            registry
+                .effective_oci(target, now + Duration::from_secs(500))
+                .is_some(),
+            "a producer's declared validity is not shortened by the ceiling"
+        );
     }
 
     #[test]

@@ -1350,6 +1350,14 @@ async fn handle_tmgi_allocate(request: &SbiRequest) -> SbiResponse {
 /// Handle TMGI Deallocate (TS 29.532 §5.2.2.3, DELETE /nmbsmf-tmgi/v1/tmgi).
 /// [mbsmfd-04] A `tmgi-list` query param selects specific TMGIs; absent means
 /// deallocate all. Always returns 204 No Content.
+///
+/// `tmgi-list` is a JSON array in a query parameter, so every conformant sender
+/// percent-encodes it (TS 29.500 §5.2.10.2): `[`, `{`, `"` and `:` are all
+/// reserved. Feeding `get_param` straight to `serde_json` is therefore only
+/// correct because the shared SBI server decodes query values on the way in
+/// (#65) — before that it answered 400 to exactly the requests that were
+/// spelled correctly. `percent_encoded_tmgi_list_deallocates_and_does_not_400`
+/// drives the encoded form over a real connection to keep that true.
 async fn handle_tmgi_deallocate(request: &SbiRequest) -> SbiResponse {
     let ctx = mbsmf_self();
 
@@ -2589,6 +2597,81 @@ mod tests {
         )
         .await;
         assert_eq!(rsp.status, 204);
+    }
+
+    /// #65 acceptance: a conformant **percent-encoded** `tmgi-list` must be
+    /// parsed, not answered 400.
+    ///
+    /// End to end over a real HTTP/2 connection, because that is the only place
+    /// the defect lived. The handler and its `serde_json::from_str` were always
+    /// fine, and `test_router_tmgi_allocate_deallocate` above — which calls the
+    /// handler directly with an UNencoded param — passes whether or not the
+    /// server decodes anything. Here the value goes onto the wire encoded (the
+    /// client has encoded query values since #101) and can only arrive parseable
+    /// if the server decodes it.
+    ///
+    /// Asserts 204 AND that the untouched TMGI survived: a deallocate-all
+    /// fallback would also answer 204 while silently freeing everything, which is
+    /// a worse outcome than the 400 this replaces.
+    #[tokio::test]
+    async fn percent_encoded_tmgi_list_deallocates_and_does_not_400() {
+        mbsmf_context_init(256);
+        let port = nextgcore_sbi::test_support::free_port();
+        let server = SbiServer::new(NextgcoreSbiServerConfig::new(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
+        server
+            .start(mbsmf_sbi_request_handler)
+            .await
+            .expect("server start");
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", port);
+
+        // Allocate two so a targeted deallocate is distinguishable from all.
+        let alloc = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.send_request(
+                SbiRequest::post("/nmbsmf-tmgi/v1/tmgi")
+                    .with_body(r#"{"tmgiNumber":2}"#, "application/json"),
+            ),
+        )
+        .await
+        .expect("bounded")
+        .expect("allocate");
+        assert_eq!(alloc.status, 200);
+        let allocated: types::TmgiAllocated =
+            serde_json::from_str(alloc.http.content.as_deref().unwrap()).expect("allocated");
+        assert_eq!(allocated.tmgi_list.len(), 2);
+        let survivor = context_tmgi_from(Some(&allocated.tmgi_list[1]));
+
+        // Name ONLY the first, as a JSON array. `set_param` hands the client raw
+        // JSON; what crosses the wire is `tmgi-list=%5B%7B%22mbsServiceId%22...`.
+        let raw = serde_json::to_string(&vec![allocated.tmgi_list[0].clone()]).expect("json");
+        let mut req = SbiRequest::delete("/nmbsmf-tmgi/v1/tmgi");
+        req.http.set_param("tmgi-list", raw);
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.send_request(req))
+                .await
+                .expect("bounded")
+                .expect("deallocate");
+        assert_eq!(
+            resp.status, 204,
+            "a percent-encoded tmgi-list must parse; 400 here means the server is \
+             not decoding query values (TS 29.500 §5.2.10.2)"
+        );
+
+        // Positive assertion: the OTHER TMGI is still held, so the 204 came from
+        // the targeted path and not from the deallocate-all fallback.
+        assert!(
+            mbsmf_self()
+                .read()
+                .map(|c| c.tmgi_expiry_of(&survivor).is_some())
+                .unwrap_or(false),
+            "only the named TMGI should have been freed; the untouched one is gone, \
+             so the tmgi-list was not honoured"
+        );
+
+        server.stop().await.expect("stop");
     }
 
     // mbsmfd-10: only the spec resource set responds — `/members` is not exposed

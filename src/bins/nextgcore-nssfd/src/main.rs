@@ -653,34 +653,14 @@ fn problem_details(status: u16, title: &str, detail: &str, cause: Option<&str>) 
     SbiResponse::with_status(status).with_body(body.to_string(), "application/problem+json")
 }
 
-/// Percent-decode a URI component (RFC 3986; does not treat '+' as space)
-fn percent_decode(s: &str) -> String {
-    fn hex_val(b: u8) -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
-    }
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Parse the query string of a request URI into percent-decoded key/values
+/// Parse the query string of a request URI into percent-decoded key/values.
+///
+/// #65: the local `percent_decode` copy this used is gone; decoding now happens
+/// once, in the shared SBI server, and this function exists only for a caller
+/// that still holds a whole URI with its query attached (a handler invoked
+/// directly, without going through the server glue). It delegates to
+/// [`nextgcore_sbi::uri_encode::decode_query_value`] so there is one decoder in
+/// the tree rather than three that disagree.
 fn parse_query_params(uri: &str) -> HashMap<String, String> {
     let query = match uri.split_once('?') {
         Some((_, q)) => q,
@@ -691,7 +671,10 @@ fn parse_query_params(uri: &str) -> HashMap<String, String> {
         .filter(|kv| !kv.is_empty())
         .map(|kv| {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (percent_decode(k), percent_decode(v))
+            (
+                nextgcore_sbi::uri_encode::decode_query_value(k),
+                nextgcore_sbi::uri_encode::decode_query_value(v),
+            )
         })
         .collect()
 }
@@ -829,16 +812,20 @@ async fn nssf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 // ---------------------------------------------------------------------------
 
 async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
-    // The nextgcore-sbi server glue strips the query string from header.uri and
-    // stores the RAW (still percent-encoded) values in http.params, so
-    // decode on access. parse_query_params covers callers that kept the
-    // full URI (e.g. direct handler invocation).
+    // #65: `http.params` now arrives ALREADY percent-decoded from the shared SBI
+    // server, so this no longer decodes on access. It must not: decoding again
+    // would corrupt any value whose plaintext legitimately contains a `%`
+    // escape (`%2520` -> `%20` -> a space that was never sent).
+    //
+    // parse_query_params still covers a caller that kept the full URI with its
+    // query attached (a handler invoked directly rather than through the server
+    // glue, which is how several tests below drive this).
     let query = parse_query_params(&request.header.uri);
     let get_param = |k: &str| -> Option<String> {
         query
             .get(k)
             .cloned()
-            .or_else(|| request.http.params.get(k).map(|v| percent_decode(v)))
+            .or_else(|| request.http.params.get(k).cloned())
     };
 
     // nf-type and nf-id are mandatory query parameters (TS 29.531 §6.1.3.2.3.1)
@@ -3210,8 +3197,8 @@ mod tests {
 
     #[test]
     fn test_percent_decode_and_query_parse() {
-        assert_eq!(percent_decode("a%20b%7B%22x%22%3A1%7D"), "a b{\"x\":1}");
-        assert_eq!(percent_decode("plain"), "plain");
+        // #65: the decoder itself is now nextgcore_sbi::uri_encode, tested there.
+        // What is still nssfd's own behaviour is this URI-with-query parse.
         let params = parse_query_params("/x/y?nf-type=AMF&nf-id=abc&j=%7B%22sst%22%3A1%7D&empty");
         assert_eq!(params.get("nf-type").map(String::as_str), Some("AMF"));
         assert_eq!(params.get("j").map(String::as_str), Some(r#"{"sst":1}"#));
