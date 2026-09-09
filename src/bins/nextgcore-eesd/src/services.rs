@@ -21,11 +21,22 @@
 //!   information ([`ACRParamsInfo`]) TO the EES via the custom operation
 //!   `POST /send-acrparamsinfo` (→ 204, no response body).
 //!
-//! DEFERRED (eesd-13 subset requiring 5GC NEF/PCF-AF exposure path):
-//! * `eees-session-with-qos` (TS 29.558 §5.6) — needs Nnef_TrafficInfluence
-//!   to a live NEF; no NEF exposure path exists in this repo.
+//! ROUTED-AND-REFUSED, not deferred (#106). These two still need a 5GC
+//! NEF/PCF-AF exposure path that does not exist here, but they are no longer
+//! UNROUTED: both now answer `501 NOT_IMPLEMENTED` with a ProblemDetails naming
+//! the missing leg, instead of falling through to a `404` that told a conformant
+//! consumer the resource did not exist. See `capabilities.rs`.
+//! * `eees-session-with-qos` (TS 29.558 §5.6) — needs the NEF AsSessionWithQoS
+//!   leg. Answering `201` while actuating no QoS anywhere would be worse than
+//!   refusing: the consumer would believe a QoS flow existed.
 //! * `eees-tie` (TS 29.558 §5.15) — Traffic Influence EAS; same NEF/PCF-AF
-//!   dependency; blocked until Nnef/Npcf AF exposure is wired.
+//!   dependency.
+//!
+//! `ACInfoNotification` is now EMITTED (#106): an `eees-appclientinformation`
+//! subscription whose `acFltrs` match a subsequent EEC registration's `acProfs`
+//! produces one, via `EesContext::notify_acinfo_subscribers`. It was previously
+//! constructed only in tests, so a subscriber was accepted and then never told
+//! anything.
 
 use serde::{Deserialize, Serialize};
 
@@ -116,7 +127,11 @@ pub struct GrpConnInfo {
 /// `WebsockNotifConfig` from TS 29.122) are carried as passthrough JSON
 /// values, per the established `acr.rs` convention (preserve wire bytes
 /// without fabricating a local model).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// `Default` is derived (#106) so a test can name only the members it cares about
+// while every optional member stays `None`. `easId` is REQUIRED on the wire, and
+// `Default` gives it an empty string — which is why the create handler checks it
+// explicitly rather than relying on serde, since serde also accepts `""`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ACInfoSubscription {
     /// Identifier of the EAS subscribing for AC information report

@@ -24,6 +24,9 @@ serde_json.workspace = true
 uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+# #106: SHA-256 for the EDGE UE identifier (eees-ueidentifier). Needed so the
+# identifier is stable, per-EAS and opaque; a UUID would satisfy none of those.
+sha2.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -41,8 +41,26 @@
 //!   (`eees-appclientinformation`, TS 29.558 §5.5), ACRManagementEvent
 //!   (`eees-acrmgntevent`, TS 29.558 §5.8), EECContextRelocation
 //!   (`eees-eeccontextreloc`, TS 29.558 §5.10), ACRParameterInformation
-//!   (`eees-acr-param`, TS 29.558 §5.13). SessionWithQoS and TIE DEFERRED
-//!   (NEF/PCF-AF exposure path missing in this repo).
+//!   (`eees-acr-param`, TS 29.558 §5.13).
+//!
+//! Implemented (#106) — the capability-exposure surface (`capabilities.rs`).
+//! Five service APIs had NO dispatch arm at all and answered 404 for every
+//! request; all five are now routed:
+//! - `eees-easinfoprov` (TS 24.558 EAS Information Provisioning) — served
+//!   locally from this EES's own state: ACR-scenario announcement (204),
+//!   ACR-scenario selection (200, intersected with what this EES can actually
+//!   execute), and EAS selection (200 from the registered EAS profiles).
+//! - `eees-ueidentifier` (TS 29.558 §5.7) — `fetch`/`get` return an `edgeUeId`
+//!   for a UE this EES serves; an IP-only request is `501` (needs the CN UE-ID
+//!   leg) and an unknown GPSI is `404`.
+//! - `eees-uelocation`, `eees-session-with-qos`, `eees-tie` — `501
+//!   NOT_IMPLEMENTED` with a ProblemDetails naming the missing 5GC leg. 501 and
+//!   not 503, because a retry can never succeed; and refused rather than
+//!   accepted, because a stored session that actuates nothing, or a subscription
+//!   that can never notify, fails silently.
+//! Also #106: the `eees-eel-acr` ACT status subscription resource
+//! (`/subscriptions`, `/subscriptions/{subscriptionId}`) is served, and
+//! `ACTStatusNotif` is emitted when an ACR reaches a terminal ACT outcome.
 //!
 //! Implemented (Wave 6, D1+D2):
 //! - D1: `eees-appclientinformation` bodies are spec-exact
@@ -90,6 +108,7 @@ use std::time::Duration;
 mod acr;
 mod acrevents;
 mod auth;
+mod capabilities;
 mod context;
 mod ecs_registration;
 mod eec;
@@ -135,6 +154,10 @@ const ACRMGNTEVENT_SUBSCRIPTIONS_PATH: &str = "/eees-acrmgntevent/v1/subscriptio
 /// Resource path prefix for ACR events subscription resources
 /// (`eees-acrevents`, TS 24.558 §6.4, D5).
 const ACREVENTS_SUBSCRIPTIONS_PATH: &str = "/eees-acrevents/v1/subscriptions";
+
+/// Resource collection path for the `eees-eel-acr` ACT status subscriptions
+/// (#106); used to build the `Location` header of a created subscription.
+const EEL_ACR_SUBSCRIPTIONS_PATH: &str = "/eees-eel-acr/v1/subscriptions";
 
 /// NextGCore EES - Edge Enabler Server
 #[derive(Parser, Debug)]
@@ -488,6 +511,31 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 _ => send_method_not_allowed(method, "request-eelacr"),
             }
         }
+        // #106: the EEL-managed ACR API's ACT status subscription resource
+        // (`TS29558_Eees_EELManagedACR.yaml` /subscriptions). Only
+        // `request-eelacr` was served, so these two paths were 404.
+        ["eees-eel-acr", "v1", "subscriptions"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EEL_ACR) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_act_status_sub_create(&request).await,
+                "GET" => handle_act_status_sub_list().await,
+                _ => send_method_not_allowed(method, "subscriptions"),
+            }
+        }
+        ["eees-eel-acr", "v1", "subscriptions", subscription_id] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EEL_ACR) {
+                return resp;
+            }
+            match method {
+                "GET" => handle_act_status_sub_read(subscription_id).await,
+                // The yaml defines only GET on the individual resource: no PUT,
+                // PATCH or DELETE. Answering 405 with an Allow header is the
+                // spec-correct refusal (TS 29.500 §5.2.7.2).
+                _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
+            }
+        }
         // eesd-07: eees-acrstatus-update (TS 29.558 §5.12) — ACR status notification.
         ["eees-acrstatus-update", "v1", "request-acrupdate"] => {
             if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACRSTATUS_UPDATE) {
@@ -617,6 +665,114 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 "PATCH" => handle_acrevents_modify(subscription_id, &request).await,
                 "DELETE" => handle_acrevents_delete(subscription_id).await,
                 _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
+            }
+        }
+        // ---- #106: EES capability-exposure APIs ----------------------------
+        //
+        // Five service APIs had NO dispatch arm, so every request against their
+        // spec paths fell through to the 404 below — indistinguishable, to a
+        // conformant EAS/EEC, from a mistyped URI. See `capabilities.rs` for why
+        // three of them answer 501 rather than a fabricated 2xx.
+
+        // eees-easinfoprov (TS24558_Eees_EASInformationProvisioning.yaml) —
+        // served locally: everything it needs is in this EES's own state.
+        ["eees-easinfoprov", "v1", "declare"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASINFOPROV) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_eas_info_prov(&request).await,
+                _ => send_method_not_allowed(method, "declare"),
+            }
+        }
+        // eees-ueidentifier (TS29558_Eees_UEIdentifier.yaml) — `fetch` and `get`
+        // take the same body and differ only in the operation name, so both land
+        // on one handler.
+        ["eees-ueidentifier", "v1", op @ ("fetch" | "get")] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_UEIDENTIFIER) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_ue_identifier(&request).await,
+                _ => send_method_not_allowed(method, op),
+            }
+        }
+        // eees-uelocation (TS29558_Eees_UELocation.yaml) — 501: no location
+        // source. The subscription paths are routed so a consumer gets a spec
+        // answer instead of a bare 404; creating a subscription that could never
+        // fire would be worse than refusing it.
+        ["eees-uelocation", "v1", "fetch"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_UELOCATION) {
+                return resp;
+            }
+            match method {
+                "POST" => not_implemented(UELOCATION_UNAVAILABLE),
+                _ => send_method_not_allowed(method, "fetch"),
+            }
+        }
+        ["eees-uelocation", "v1", "subscriptions"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_UELOCATION) {
+                return resp;
+            }
+            match method {
+                "POST" => not_implemented(UELOCATION_UNAVAILABLE),
+                _ => send_method_not_allowed(method, "subscriptions"),
+            }
+        }
+        ["eees-uelocation", "v1", "subscriptions", _subscription_id] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_UELOCATION) {
+                return resp;
+            }
+            match method {
+                // No subscription can exist (create is refused above), so 404 is
+                // the truthful answer for any id — with a ProblemDetails saying
+                // why, rather than the router's generic not-found.
+                "GET" | "PUT" | "PATCH" | "DELETE" => send_not_found(
+                    "No UE location subscription exists: creating one is not implemented \
+                     (no UE location source is available to this EES)",
+                    Some(cause::RESOURCE_NOT_FOUND),
+                ),
+                _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
+            }
+        }
+        // eees-session-with-qos (TS29558_Eees_SessionWithQoS.yaml) — 501: needs
+        // the NEF AsSessionWithQoS leg. A 201 here would claim a QoS flow exists.
+        ["eees-session-with-qos", "v1", "sessions"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_SESSION_WITH_QOS) {
+                return resp;
+            }
+            match method {
+                "POST" | "GET" => not_implemented(SESSION_WITH_QOS_UNAVAILABLE),
+                _ => send_method_not_allowed(method, "sessions"),
+            }
+        }
+        ["eees-session-with-qos", "v1", "sessions", _session_id] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_SESSION_WITH_QOS) {
+                return resp;
+            }
+            match method {
+                "GET" | "PUT" | "PATCH" | "DELETE" => not_implemented(SESSION_WITH_QOS_UNAVAILABLE),
+                _ => send_method_not_allowed(method, "sessions/{sessionId}"),
+            }
+        }
+        // eees-tie (TS29558_Eees_TrafficInfluenceEAS.yaml) — 501: needs the
+        // NEF/PCF-AF traffic-influence leg.
+        ["eees-tie", "v1", "instances"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_TIE) {
+                return resp;
+            }
+            match method {
+                "POST" => not_implemented(TIE_UNAVAILABLE),
+                _ => send_method_not_allowed(method, "instances"),
+            }
+        }
+        ["eees-tie", "v1", "instances", _instance_id] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_TIE) {
+                return resp;
+            }
+            match method {
+                "GET" | "PUT" | "PATCH" | "DELETE" => not_implemented(TIE_UNAVAILABLE),
+                _ => send_method_not_allowed(method, "instances/{instanceId}"),
             }
         }
         _ => send_not_found(&format!("Resource not found: {path}"), None),
@@ -1267,6 +1423,19 @@ async fn handle_eec_register(request: &SbiRequest) -> SbiResponse {
     let stored = ctx.read().ok().and_then(|c| c.eec_register(reg));
     match stored {
         Some(stored) => {
+            // #106: TS 29.558 §5.5.2.2 — tell every AppClientInformation
+            // subscriber whose filters match this EEC's AC profiles. Before this,
+            // `handle_acinfo_create` accepted a subscription, answered 201, and
+            // nothing ever produced the callback, so the subscription was inert
+            // with no error surface to show it.
+            //
+            // After the registration is stored, not before: a notification about
+            // a registration that then failed on capacity would be a lie. The
+            // read guard is taken and dropped inside `notify_acinfo_subscribers`,
+            // which enqueues after releasing the subscription lock.
+            if let Ok(guard) = ctx.read() {
+                guard.notify_acinfo_subscribers(&stored);
+            }
             let id = stored.registration_id.clone().unwrap_or_default();
             SbiResponse::with_status(201)
                 .with_header("Location", format!("{EECREG_REGISTRATIONS_PATH}/{id}"))
@@ -1544,6 +1713,246 @@ async fn handle_acr_declare(request: &SbiRequest) -> SbiResponse {
     }
 }
 
+// ---- #106: EES capability-exposure handlers ---------------------------------
+
+/// Detail for the `501` answered by `eees-uelocation`.
+const UELOCATION_UNAVAILABLE: &str = "UE location reporting is not implemented: this EES has no \
+     UE location source. TS 23.558 §8.6.5 obtains it from the 5GC (a NEF \
+     MonitoringEvent LOCATION_REPORTING subscription) or from the EEC, and \
+     neither leg exists in this build. A subscription is refused rather than \
+     accepted, because a subscription that can never notify fails silently.";
+
+/// Detail for the `501` answered by `eees-session-with-qos`.
+const SESSION_WITH_QOS_UNAVAILABLE: &str =
+    "Session with QoS is not implemented: establishing one requires the NEF \
+     AsSessionWithQoS leg (TS 23.558 §8.6.6), which does not exist in this build. \
+     The resource is refused rather than created, because answering 201 would tell \
+     the consumer a QoS flow exists when nothing was actuated anywhere.";
+
+/// Detail for the `501` answered by `eees-tie`.
+const TIE_UNAVAILABLE: &str = "Traffic influence toward the EAS is not implemented: it requires \
+     the NEF/PCF-AF traffic-influence leg (TS 29.558 §5.15), which does not \
+     exist in this build.";
+
+/// A `501 Not Implemented` carrying the reason, per TS 29.500 §5.2.7.2.
+///
+/// Deliberately distinct from the router's 404: the resource IS part of the API
+/// this EES serves, and a consumer must be able to tell "not built here" from
+/// "no such path". `detail` names the missing dependency so an operator reading a
+/// log does not have to guess.
+fn not_implemented(detail: &str) -> SbiResponse {
+    send_error(501, "Not Implemented", detail, Some(cause::NOT_IMPLEMENTED))
+}
+
+/// `declare` (`POST {apiRoot}/eees-easinfoprov/v1/declare`,
+/// `TS24558_Eees_EASInformationProvisioning.yaml`) — #106.
+///
+/// Served entirely from this EES's own state; there is no 5GC dependency, which
+/// is why this one returns real answers rather than a 501.
+///
+/// The `reqType` decides the answer:
+///
+/// * `ACR_SCENARIO_SELECTION_ANNOUNCEMENT` — the EEC states the scenarios it
+///   selected. Nothing is returned: `204` (which the yaml lists alongside 200).
+/// * `ACR_SCENARIO_SELECTION_REQUEST` — the EES selects, and answers `200` with
+///   `selAcrScenarioList`. The selection is the intersection with what this EES
+///   can actually execute; when the intersection is EMPTY the request is refused
+///   `404`, because an empty list dressed as a selection would read as success.
+/// * `EAS_SELECTION` — the EES answers `200` with `instEasInfo` for the first
+///   `selEasIds` entry that is registered here. An unregistered EAS is `404`.
+/// * absent / unknown `reqType` — `204`: the announcement is the schema's
+///   no-op-shaped case, and refusing a forward-compatible value would break the
+///   open enumeration.
+async fn handle_eas_info_prov(request: &SbiRequest) -> SbiResponse {
+    log::info!("EAS Information Provisioning");
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let req: capabilities::EasInfoProvReq = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Invalid EASInfoProvReq: {e}"),
+                Some(cause::INVALID_MSG_FORMAT),
+            );
+        }
+    };
+
+    match req.req_type.as_deref() {
+        Some(capabilities::REQ_TYPE_ACR_REQUEST) => {
+            let selected = capabilities::select_acr_scenarios(req.sel_acr_scenarios.as_deref());
+            if selected.is_empty() {
+                return send_not_found(
+                    "None of the requested ACR scenarios is supported by this EES",
+                    Some(cause::RESOURCE_NOT_FOUND),
+                );
+            }
+            let resp = capabilities::EasInfoProvResp {
+                sel_acr_scenario_list: Some(selected),
+                ..Default::default()
+            };
+            SbiResponse::with_status(200)
+                .with_json_body(&resp)
+                .unwrap_or_else(|_| SbiResponse::with_status(204))
+        }
+        Some(capabilities::REQ_TYPE_EAS_SELECTION) => {
+            match capabilities::instantiated_eas(req.sel_eas_ids.as_deref()) {
+                Some(inst) => {
+                    let resp = capabilities::EasInfoProvResp {
+                        inst_eas_info: Some(inst),
+                        ..Default::default()
+                    };
+                    SbiResponse::with_status(200)
+                        .with_json_body(&resp)
+                        .unwrap_or_else(|_| SbiResponse::with_status(204))
+                }
+                None => send_not_found(
+                    "None of the selected EAS identifiers is registered with this EES",
+                    Some(cause::RESOURCE_NOT_FOUND),
+                ),
+            }
+        }
+        // The announcement, and any forward-compatible value: accepted, no body.
+        _ => {
+            log::info!(
+                "EAS info provisioning announcement accepted: eecId={:?} selAcrScenarios={:?}",
+                req.eec_id,
+                req.sel_acr_scenarios
+            );
+            SbiResponse::with_status(204)
+        }
+    }
+}
+
+/// `FetchUEId` / `GetUEId` (`POST {apiRoot}/eees-ueidentifier/v1/{fetch,get}`,
+/// `TS29558_Eees_UEIdentifier.yaml`) — #106.
+///
+/// Both operations take the same `UserInfo` body and return the same `UeIdInfo`,
+/// so they share a handler.
+///
+/// Answers with an `edgeUeId` — an edge-enabler-layer identifier this EES is
+/// entitled to assign — for a UE it serves. Two refusals, deliberately distinct:
+///
+/// * a request identifying the UE only by `ipAddr` gets `501`: mapping an IP to a
+///   subscriber needs the core network (Nnef_UEId / the T8 UE-ID API), and no
+///   such leg exists here;
+/// * a GPSI no EEC has registered gets `404`, because this EES serves identifiers
+///   only for UEs it knows. Minting one for any input would make the API an
+///   oracle that tells the caller nothing.
+async fn handle_ue_identifier(request: &SbiRequest) -> SbiResponse {
+    log::info!("UE Identifier request");
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let req: capabilities::UserInfo = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Invalid UserInfo: {e}"),
+                Some(cause::INVALID_MSG_FORMAT),
+            );
+        }
+    };
+    if let Err(detail) = req.validate() {
+        return send_bad_request(&detail, Some(cause::MANDATORY_IE_MISSING));
+    }
+    match capabilities::resolve_ue_ids(&req) {
+        Ok(info) => SbiResponse::with_status(200)
+            .with_json_body(&info)
+            .unwrap_or_else(|_| SbiResponse::with_status(500)),
+        Err(capabilities::UeIdError::CoreNetworkRequired) => not_implemented(
+            "Resolving a UE identifier from an IP address is not implemented: it requires the \
+             core-network UE-ID exposure leg (Nnef_UEId, TS 23.558 §8.6.2), which does not exist \
+             in this build. Identify the UE by its GPSI (`ueId`) instead.",
+        ),
+        Err(capabilities::UeIdError::UnknownUe) => send_not_found(
+            "No EEC is registered for that UE identifier, so this EES serves no identifier for it",
+            Some(cause::RESOURCE_NOT_FOUND),
+        ),
+    }
+}
+
+/// `CreateACTStatusSubsc`
+/// (`POST {apiRoot}/eees-eel-acr/v1/subscriptions`,
+/// `TS29558_Eees_EELManagedACR.yaml`) — #106.
+///
+/// Mandatory IEs: `easId`, `notificationUri`. Returns `201` with the created
+/// representation and a `Location` header; the `subscriptionId` is server-minted
+/// and is not a member of the schema.
+async fn handle_act_status_sub_create(request: &SbiRequest) -> SbiResponse {
+    log::info!("ACT Status Subscription create");
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let sub: acr::ACTStatusSubsc = match serde_json::from_value(value) {
+        Ok(s) => s,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (easId/notificationUri): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    // serde accepts an empty string for a required String, so the presence check
+    // has to be explicit — a subscription with a blank notificationUri has
+    // nowhere to deliver and would be an accepted-but-inert resource.
+    if sub.eas_id.trim().is_empty() || sub.notification_uri.trim().is_empty() {
+        return send_bad_request(
+            "easId and notificationUri must both be non-empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    let created = ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.act_status_sub_create(sub.clone()));
+    match created {
+        Some(id) => SbiResponse::with_status(201)
+            .with_header("Location", format!("{EEL_ACR_SUBSCRIPTIONS_PATH}/{id}"))
+            .with_json_body(&sub)
+            .unwrap_or_else(|_| SbiResponse::with_status(201)),
+        None => send_error(
+            507,
+            "Insufficient Storage",
+            "Failed to create ACT status subscription (capacity exhausted)",
+            Some(cause::INSUFFICIENT_RESOURCES),
+        ),
+    }
+}
+
+/// `GetACTStatusSubscriptions` (`GET {apiRoot}/eees-eel-acr/v1/subscriptions`).
+/// The yaml's 200 body is the array itself, not a wrapper object.
+async fn handle_act_status_sub_list() -> SbiResponse {
+    let subs = ees_self()
+        .read()
+        .map(|c| c.act_status_sub_list())
+        .unwrap_or_default();
+    SbiResponse::with_status(200)
+        .with_json_body(&subs)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// `GetACTStatusSubscription`
+/// (`GET {apiRoot}/eees-eel-acr/v1/subscriptions/{subscriptionId}`).
+async fn handle_act_status_sub_read(subscription_id: &str) -> SbiResponse {
+    match ees_self()
+        .read()
+        .ok()
+        .and_then(|c| c.act_status_sub_find(subscription_id))
+    {
+        Some(sub) => SbiResponse::with_status(200)
+            .with_json_body(&sub)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("ACT status subscription not found: {subscription_id}"),
+            Some(cause::SUBSCRIPTION_NOT_FOUND),
+        ),
+    }
+}
+
 /// eesd-07: `Eees_EELManagedACR_Request`
 /// (`POST .../eees-eel-acr/v1/request-eelacr`).
 ///
@@ -1652,6 +2061,18 @@ async fn handle_acr_status_update(request: &SbiRequest) -> SbiResponse {
     let ctx = ees_self();
     if let Ok(c) = ctx.read() {
         c.acr_status_update(&req.eas_id, status.clone());
+        // #106: an ACR that reached a terminal ACT outcome is what an
+        // `ACTStatusSubsc` subscribes to (TS 29.558 §5.11). Only the terminal
+        // states carry a reportable `ACTResult` — an in-progress ACR has neither
+        // SUCCESSFUL nor FAILED to report, so nothing is sent for it.
+        let act_status = match status {
+            AcrStatus::Completed => Some(acr::ACT_RESULT_SUCCESSFUL),
+            AcrStatus::Failed => Some(acr::ACT_RESULT_FAILED),
+            _ => None,
+        };
+        if let Some(act_status) = act_status {
+            c.notify_act_status_subscribers(&req.eas_id, act_status);
+        }
     }
     // D5: a status-update reaching COMPLETED fires ACR_COMPLETE to matching
     // acrevents subscribers. This path carries no eecId/ueId, so easId
@@ -5026,6 +5447,508 @@ mod tests {
         assert_eq!(notif.event_id, "TARGET_INFORMATION");
 
         delete_acrevents(&sk, &id);
+        auth::clear_auth_jwks();
+    }
+
+    // ─── #106: the five previously-unrouted capability APIs ─────────────────
+
+    /// #106 acceptance: **no** capability API answers 404 any more.
+    ///
+    /// One test over all five roots, because the defect was uniform — no dispatch
+    /// arm at all — and the property to pin is uniform too: a request against a
+    /// path the spec defines must get a spec answer. `assert_ne!(404)` is the
+    /// weakest form of that, so each row also names the status it must actually
+    /// return.
+    #[test]
+    fn test_capability_apis_are_routed_and_never_404() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // (path, scope, body, expected status)
+        let cases: &[(&str, &str, &str, u16)] = &[
+            // Served locally: an announcement is accepted with no body.
+            (
+                "/eees-easinfoprov/v1/declare",
+                auth::SCOPE_EASINFOPROV,
+                r#"{"eecId":"eec-1","reqType":"ACR_SCENARIO_SELECTION_ANNOUNCEMENT"}"#,
+                204,
+            ),
+            // 501: needs the CN UE-ID leg (identified by IP only).
+            (
+                "/eees-ueidentifier/v1/get",
+                auth::SCOPE_UEIDENTIFIER,
+                r#"{"ipAddr":{"ipv4Addr":"10.0.0.1"}}"#,
+                501,
+            ),
+            (
+                "/eees-ueidentifier/v1/fetch",
+                auth::SCOPE_UEIDENTIFIER,
+                r#"{"ipAddr":{"ipv4Addr":"10.0.0.1"}}"#,
+                501,
+            ),
+            // 501: no UE location source.
+            (
+                "/eees-uelocation/v1/fetch",
+                auth::SCOPE_UELOCATION,
+                r#"{"easId":"eas1"}"#,
+                501,
+            ),
+            (
+                "/eees-uelocation/v1/subscriptions",
+                auth::SCOPE_UELOCATION,
+                r#"{"easId":"eas1","notificationDestination":"http://eas/cb"}"#,
+                501,
+            ),
+            // 501: no NEF AsSessionWithQoS leg.
+            (
+                "/eees-session-with-qos/v1/sessions",
+                auth::SCOPE_SESSION_WITH_QOS,
+                r#"{"easId":"eas1"}"#,
+                501,
+            ),
+            // 501: no NEF/PCF-AF traffic-influence leg.
+            (
+                "/eees-tie/v1/instances",
+                auth::SCOPE_TIE,
+                r#"{"easId":"eas1"}"#,
+                501,
+            ),
+        ];
+
+        for (path, scope, body, expected) in cases {
+            let req = SbiRequest::post(*path)
+                .with_header("Authorization", bearer(&sk, "k1", scope))
+                .with_body(*body, "application/json");
+            let resp = block_on(ees_sbi_request_handler(req));
+            assert_ne!(
+                resp.status, 404,
+                "{path} must be routed; 404 is the #106 defect"
+            );
+            assert_eq!(
+                resp.status, *expected,
+                "{path} must answer {expected}, got {}",
+                resp.status
+            );
+            // Every 501 must say WHY, so an operator is not left guessing.
+            if *expected == 501 {
+                let problem: nextgcore_sbi::message::ProblemDetails =
+                    serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}"))
+                        .expect("a 501 must carry ProblemDetails");
+                assert_eq!(problem.cause.as_deref(), Some("NOT_IMPLEMENTED"));
+                assert!(
+                    problem
+                        .detail
+                        .as_deref()
+                        .is_some_and(|d| d.contains("not implemented")),
+                    "the 501 detail must name the missing capability: {problem:?}"
+                );
+            }
+        }
+        auth::clear_auth_jwks();
+    }
+
+    /// #106: `eees-easinfoprov` answers the ACR-scenario-selection request from
+    /// this EES's real capability set, and refuses a request naming only
+    /// scenarios it cannot execute rather than returning an empty selection.
+    #[test]
+    fn test_eas_info_prov_selects_acr_scenarios() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let post = |body: &str| {
+            let req = SbiRequest::post("/eees-easinfoprov/v1/declare")
+                .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EASINFOPROV))
+                .with_body(body.to_string(), "application/json");
+            block_on(ees_sbi_request_handler(req))
+        };
+
+        // A supported scenario is selected and echoed back.
+        let resp = post(
+            r#"{"reqType":"ACR_SCENARIO_SELECTION_REQUEST",
+                "selAcrScenarios":["EEL_MANAGED_ACR","SOURCE_EES_EXECUTED"]}"#,
+        );
+        assert_eq!(resp.status, 200);
+        let body: capabilities::EasInfoProvResp =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body.sel_acr_scenario_list.as_deref(),
+            Some(&["EEL_MANAGED_ACR".to_string()][..]),
+            "the unsupported SOURCE_EES_EXECUTED must be dropped, not echoed"
+        );
+
+        // Only-unsupported: 404, not a 200 with an empty list.
+        let resp = post(
+            r#"{"reqType":"ACR_SCENARIO_SELECTION_REQUEST","selAcrScenarios":["SOURCE_EES_EXECUTED"]}"#,
+        );
+        assert_eq!(
+            resp.status, 404,
+            "an empty selection must not be dressed up as success"
+        );
+        auth::clear_auth_jwks();
+    }
+
+    /// #106: `EAS_SELECTION` returns the profile of a registered EAS, and 404 for
+    /// one that never registered here.
+    #[test]
+    fn test_eas_info_prov_eas_selection() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // Register an EAS so there is something to select.
+        let reg = SbiRequest::post("/eees-easregistration/v1/registrations")
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", auth::SCOPE_EASREGISTRATION),
+            )
+            .with_body(
+                r#"{"easProf":{"easId":"eas1.example.com","endPt":{"fqdn":"eas1.example.com"}}}"#,
+                "application/json",
+            );
+        assert_eq!(block_on(ees_sbi_request_handler(reg)).status, 201);
+
+        let post = |body: &str| {
+            let req = SbiRequest::post("/eees-easinfoprov/v1/declare")
+                .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EASINFOPROV))
+                .with_body(body.to_string(), "application/json");
+            block_on(ees_sbi_request_handler(req))
+        };
+
+        let resp = post(r#"{"reqType":"EAS_SELECTION","selEasIds":["eas1.example.com"]}"#);
+        assert_eq!(resp.status, 200);
+        let body: capabilities::EasInfoProvResp =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let eas = body
+            .inst_eas_info
+            .and_then(|i| i.eas)
+            .expect("the registered EAS profile is returned");
+        assert_eq!(eas.eas_id, "eas1.example.com");
+
+        // An EAS that never registered here.
+        let resp = post(r#"{"reqType":"EAS_SELECTION","selEasIds":["ghost.example.com"]}"#);
+        assert_eq!(resp.status, 404);
+        auth::clear_auth_jwks();
+    }
+
+    /// #106: `eees-ueidentifier` returns an `edgeUeId` for a UE this EES serves,
+    /// stable across calls, and 404 for a GPSI no EEC registered.
+    #[test]
+    fn test_ue_identifier_resolves_a_known_ue() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // An EEC registers, carrying the UE's GPSI.
+        let reg = SbiRequest::post("/eees-eecregistration/v1/registrations")
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", auth::SCOPE_EECREGISTRATION),
+            )
+            .with_body(
+                r#"{"eecId":"eec-1","ueId":"msisdn-491701234567"}"#,
+                "application/json",
+            );
+        assert_eq!(block_on(ees_sbi_request_handler(reg)).status, 201);
+
+        let fetch = || {
+            let req = SbiRequest::post("/eees-ueidentifier/v1/fetch")
+                .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_UEIDENTIFIER))
+                .with_body(
+                    r#"{"ueId":"msisdn-491701234567","easIds":["eas1.example.com"]}"#,
+                    "application/json",
+                );
+            block_on(ees_sbi_request_handler(req))
+        };
+
+        let resp = fetch();
+        assert_eq!(resp.status, 200);
+        let info: capabilities::UeIdInfo =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(info.ue_ids.len(), 1);
+        let first = info.ue_ids[0].edge_ue_id.clone().expect("an edgeUeId");
+        assert!(
+            !first.contains("491701234567"),
+            "the GPSI must not leak into the identifier: {first}"
+        );
+        assert_eq!(info.ue_ids[0].eas_id.as_deref(), Some("eas1.example.com"));
+
+        // Stable across calls, so an EAS can use it as a key.
+        let again: capabilities::UeIdInfo =
+            serde_json::from_str(fetch().http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(again.ue_ids[0].edge_ue_id.as_deref(), Some(first.as_str()));
+
+        // A GPSI no EEC registered: 404, not an invented identifier.
+        let req = SbiRequest::post("/eees-ueidentifier/v1/get")
+            .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_UEIDENTIFIER))
+            .with_body(r#"{"ueId":"msisdn-000000000000"}"#, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        // Neither ueId nor ipAddr: 400 (the schema's anyOf).
+        let req = SbiRequest::post("/eees-ueidentifier/v1/get")
+            .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_UEIDENTIFIER))
+            .with_body(r#"{"requestorId":"eas1"}"#, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+        auth::clear_auth_jwks();
+    }
+
+    /// #106 acceptance: the EEL-managed ACR ACT status subscription resource —
+    /// create, list and read, per `TS29558_Eees_EELManagedACR.yaml`.
+    #[test]
+    fn test_act_status_subscription_lifecycle() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // Create: 201 + Location.
+        let req = SbiRequest::post("/eees-eel-acr/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EEL_ACR))
+            .with_body(
+                r#"{"easId":"eas1.example.com","notificationUri":"http://eas/cb"}"#,
+                "application/json",
+            );
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 201);
+        let loc = resp.http.get_header("location").cloned().unwrap();
+        assert!(loc.starts_with(EEL_ACR_SUBSCRIPTIONS_PATH), "got {loc}");
+        let id = loc.rsplit('/').next().unwrap().to_string();
+        let created: acr::ACTStatusSubsc =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(created.eas_id, "eas1.example.com");
+
+        // Read the individual resource.
+        let req = SbiRequest::get(&format!("/eees-eel-acr/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EEL_ACR));
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let read: acr::ACTStatusSubsc =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(read, created);
+
+        // List the collection: a bare array, per the yaml.
+        let req = SbiRequest::get("/eees-eel-acr/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EEL_ACR));
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let list: Vec<acr::ACTStatusSubsc> =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        // Presence, not an exact count: the EES context is process-global and
+        // shared with sibling tests (which the GLOBAL_STATE_TEST_LOCK serialises
+        // but does not isolate), so a count assertion here fails whenever another
+        // test creates a subscription -- a property of the harness, not of this
+        // API. Asserting the created resource is in the list is what this test is
+        // actually about.
+        assert!(
+            list.contains(&created),
+            "the created subscription must appear in the collection, got {list:?}"
+        );
+
+        // Unknown id: 404.
+        let req = SbiRequest::get("/eees-eel-acr/v1/subscriptions/no-such-id")
+            .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EEL_ACR));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        // A missing mandatory IE is refused.
+        let req = SbiRequest::post("/eees-eel-acr/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EEL_ACR))
+            .with_body(r#"{"easId":"eas1.example.com"}"#, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+        // ...including a present-but-empty one, which serde accepts.
+        let req = SbiRequest::post("/eees-eel-acr/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EEL_ACR))
+            .with_body(
+                r#"{"easId":"eas1.example.com","notificationUri":""}"#,
+                "application/json",
+            );
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+
+        // The yaml defines only GET on the individual resource.
+        let req = SbiRequest::delete(&format!("/eees-eel-acr/v1/subscriptions/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EEL_ACR));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 405);
+        auth::clear_auth_jwks();
+    }
+
+    /// #106: an ACR status update reaching a terminal ACT outcome produces an
+    /// `ACTStatusNotif` **through the router**, and an in-progress one produces
+    /// nothing.
+    ///
+    /// Added after a revert exposed the hole: with the terminal-state gate in
+    /// `handle_acr_status_update` replaced by `None`, the whole suite still
+    /// passed. The context-level test covers `notify_act_status_subscribers` and
+    /// says nothing about whether any handler calls it — "the helper is tested and
+    /// the wiring is not".
+    ///
+    /// Uses an `easId` and callback URI unique to this test. The EES context is
+    /// process-global, so a sibling test's subscription for a shared `easId` would
+    /// be notified too and the count would depend on test order — which is how
+    /// this test failed on its first run.
+    #[test]
+    fn test_act_status_notification_fires_from_a_status_update() {
+        use notifier::Notifier;
+
+        const EAS: &str = "eas-act-notify-test.example.com";
+        const CB: &str = "http://eas-act-notify-test/cb";
+
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        let n = std::sync::Arc::new(notifier::QueueNotifier::default());
+        notifier::set_notifier(n.clone());
+        let _ = n.drain();
+
+        // Subscribe for ACT status on this EAS.
+        let req = SbiRequest::post("/eees-eel-acr/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EEL_ACR))
+            .with_body(
+                format!(r#"{{"easId":"{EAS}","notificationUri":"{CB}"}}"#),
+                "application/json",
+            );
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 201);
+        let _ = n.drain();
+
+        let status_update = |body: String| {
+            let req = SbiRequest::post("/eees-acrstatus-update/v1/request-acrupdate")
+                .with_header(
+                    "Authorization",
+                    bearer(&sk, "k1", auth::SCOPE_ACRSTATUS_UPDATE),
+                )
+                .with_body(body, "application/json");
+            block_on(ees_sbi_request_handler(req))
+        };
+        // Only this test's own callback, so a sibling subscription cannot
+        // contribute to the count.
+        let mine = |n: &notifier::QueueNotifier| -> Vec<notifier::QueuedNotification> {
+            n.drain()
+                .into_iter()
+                .filter(|q| q.kind == "ACTStatusNotif" && q.uri.starts_with(CB))
+                .collect()
+        };
+
+        // An update carrying no ACT result is in-progress: nothing to report.
+        assert_eq!(
+            status_update(format!(r#"{{"easId":"{EAS}","e3SubscIds":["sub-1"]}}"#)).status,
+            204
+        );
+        assert!(
+            mine(&n).is_empty(),
+            "an in-progress ACR has no ACTResult to report"
+        );
+
+        // A successful ACT fires exactly one notification.
+        assert_eq!(
+            status_update(format!(
+                r#"{{"easId":"{EAS}","actResultInfo":{{"actResult":"SUCCESSFUL"}}}}"#
+            ))
+            .status,
+            204
+        );
+        let acts = mine(&n);
+        assert_eq!(acts.len(), 1, "exactly one ACTStatusNotif, got {acts:?}");
+        assert_eq!(acts[0].uri, format!("{CB}/act-status"));
+        let notif: acr::ACTStatusNotif = serde_json::from_value(acts[0].body.clone()).unwrap();
+        assert_eq!(notif.act_status, "SUCCESSFUL");
+
+        // A failed ACT reports FAILED, not SUCCESSFUL.
+        assert_eq!(
+            status_update(format!(
+                r#"{{"easId":"{EAS}","actResultInfo":{{"actResult":"FAILED"}}}}"#
+            ))
+            .status,
+            204
+        );
+        let acts = mine(&n);
+        assert_eq!(acts.len(), 1);
+        let notif: acr::ACTStatusNotif = serde_json::from_value(acts[0].body.clone()).unwrap();
+        assert_eq!(
+            notif.act_status, "FAILED",
+            "a failed ACT must not be reported as successful"
+        );
+
+        notifier::set_notifier(std::sync::Arc::new(notifier::QueueNotifier::default()));
+        auth::clear_auth_jwks();
+    }
+
+    /// #106 acceptance, end to end through the router: an AppClientInformation
+    /// subscription created over SBI, then an EEC registration over SBI, produces
+    /// exactly one `ACInfoNotification` from the PRODUCTION path.
+    ///
+    /// Distinct from the context-level test: this one proves the wiring in
+    /// `handle_eec_register` calls the notifier at all. A context test passes
+    /// whether or not the handler is wired — the mistake this repo has recorded
+    /// twice as "the helper is tested and the wiring is not".
+    #[test]
+    fn test_acinfo_notification_fires_through_the_router() {
+        use notifier::Notifier;
+
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        let n = std::sync::Arc::new(notifier::QueueNotifier::default());
+        notifier::set_notifier(n.clone());
+        let _ = n.drain();
+
+        // Subscribe for AC information about "ac-1".
+        let req = SbiRequest::post("/eees-appclientinformation/v1/subscriptions")
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", auth::SCOPE_APPCLIENTINFORMATION),
+            )
+            .with_body(
+                r#"{"easId":"eas1.example.com","notificationDestination":"http://eas/ac-info",
+                    "acFltrs":[{"acIdsList":["ac-1"]}]}"#,
+                "application/json",
+            );
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 201);
+        let _ = n.drain();
+
+        // Register an EEC serving that AC.
+        let req = SbiRequest::post("/eees-eecregistration/v1/registrations")
+            .with_header(
+                "Authorization",
+                bearer(&sk, "k1", auth::SCOPE_EECREGISTRATION),
+            )
+            .with_body(
+                r#"{"eecId":"eec-1","ueId":"msisdn-1","acProfs":[{"acId":"ac-1"}]}"#,
+                "application/json",
+            );
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 201);
+
+        let queued = n.drain();
+        let ac_infos: Vec<_> = queued
+            .iter()
+            .filter(|q| q.kind == "ACInfoNotification")
+            .collect();
+        assert_eq!(
+            ac_infos.len(),
+            1,
+            "the registration must produce exactly one ACInfoNotification, got {queued:?}"
+        );
+        assert_eq!(ac_infos[0].uri, "http://eas/ac-info");
+
+        notifier::set_notifier(std::sync::Arc::new(notifier::QueueNotifier::default()));
         auth::clear_auth_jwks();
     }
 }
