@@ -23,6 +23,7 @@
   - [DCCF](configuration/dccf.md)
   - [EES](configuration/ees.md)
   - [PIN](configuration/pin.md)
+  - [TSCTSF](configuration/tsctsf.md)
   - [SCP](configuration/scp.md)
   - [SEPP](configuration/sepp.md)
   - [MME (4G/EPC)](configuration/mme.md)

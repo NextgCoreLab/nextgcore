@@ -3166,6 +3166,7 @@ dependencies = [
  "nextgcore-metrics",
  "nextgcore-sbi",
  "proptest",
+ "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
