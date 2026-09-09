@@ -250,6 +250,99 @@ impl SbiHttpMessage {
             .map(|(_, v)| v)
     }
 
+    /// **Append** a header occurrence, preserving any value already stored
+    /// (issue #65).
+    ///
+    /// TS 29.500 §6.4.3 defines `3gpp-Sbi-Oci` and `3gpp-Sbi-Lci` as headers
+    /// that may occur **multiple times**, each occurrence an independent scope
+    /// (per NF instance, per S-NSSAI, per DNN). [`set_header`](Self::set_header)
+    /// replaces, so ingesting repeated occurrences with it kept only the last
+    /// one and an NF reporting overload for two scopes was read as reporting for
+    /// one.
+    ///
+    /// Occurrences are combined into a single field value separated by `, `,
+    /// which is exactly the representation RFC 9110 §5.3 sanctions for a
+    /// list-valued field ("a recipient MAY combine multiple field lines … by
+    /// appending each subsequent field line value … separated by a comma").
+    /// [`get_header_all`](Self::get_header_all) splits them back apart. Storing
+    /// it this way — rather than adding a second, multi-valued map beside
+    /// `headers` — keeps ONE source of truth, so the ~88 call sites that read
+    /// the `headers` field directly cannot disagree with the accessor.
+    ///
+    /// Not for `Set-Cookie`, whose grammar forbids comma-combining (RFC 9110
+    /// §5.3). SBI carries no cookies; use [`set_header`](Self::set_header) if
+    /// that ever changes.
+    pub fn append_header(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into().to_ascii_lowercase();
+        let value = value.into();
+        match self
+            .headers
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+        {
+            Some((_, existing)) => {
+                existing.push_str(", ");
+                existing.push_str(&value);
+            }
+            None => {
+                self.headers.insert(key, value);
+            }
+        }
+    }
+
+    /// Get **every** occurrence of a header, case-insensitively (issue #65).
+    ///
+    /// Splits the stored value on top-level commas — the inverse of
+    /// [`append_header`](Self::append_header) — so two `3gpp-Sbi-Oci` field
+    /// lines are returned as two entries. A comma inside a double-quoted string
+    /// does not split, so a quoted parameter value survives.
+    ///
+    /// Returns an empty vector when the header is absent, and a single entry for
+    /// the ordinary (non-repeated) case. Use this only for fields whose grammar
+    /// is a comma-separated list — OCI, LCI, `3gpp-Sbi-Binding`, `Accept`. For a
+    /// singleton field whose value may itself contain a comma (an IMF-fixdate
+    /// `Date`, a free-text `Server`), use [`get_header`](Self::get_header).
+    pub fn get_header_all(&self, key: &str) -> Vec<String> {
+        let Some(raw) = self.get_header(key) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut escaped = false;
+        for ch in raw.chars() {
+            // A quoted-pair (RFC 9110 §5.6.4): whatever follows the backslash is
+            // literal, including a `"` or a `,`. Handled before the match so the
+            // flag is always cleared, whichever character arrives.
+            if escaped {
+                escaped = false;
+                current.push(ch);
+                continue;
+            }
+            match ch {
+                '\\' if in_quotes => {
+                    escaped = true;
+                    current.push(ch);
+                }
+                '"' => {
+                    in_quotes = !in_quotes;
+                    current.push(ch);
+                }
+                ',' if !in_quotes => {
+                    out.push(current.trim().to_string());
+                    current = String::new();
+                }
+                _ => current.push(ch),
+            }
+        }
+        out.push(current.trim().to_string());
+        // A trailing or doubled comma is legal in an HTTP list ("#rule" allows
+        // empty elements); dropping the empties means a caller never has to
+        // check for them.
+        out.retain(|v| !v.is_empty());
+        out
+    }
+
     /// Remove a header by name, case-insensitively.
     /// Returns the removed value (the last one, if duplicates existed).
     pub fn remove_header(&mut self, key: &str) -> Option<String> {
@@ -867,12 +960,25 @@ impl SbiDiscoveryOption {
     }
 }
 
-/// S-NSSAI (Single Network Slice Selection Assistance Information)
+/// S-NSSAI (Single Network Slice Selection Assistance Information).
+///
+/// Wire shape is TS 29.571 §5.4.4.2: `{"sst": 1, "sd": "000001"}` — `sd` is a
+/// **6-hexadecimal-character string**, not the three raw bytes that a derived
+/// `Serialize` on `[u8; 3]` produces (`[0, 0, 1]`). See [`hex3_opt`] for why the
+/// in-memory type stays a byte triple.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SNssai {
     /// Slice/Service Type (SST)
     pub sst: u8,
-    /// Slice Differentiator (SD) - optional, 3 bytes
+    /// Slice Differentiator (SD) — optional, 3 bytes in memory, 6 hex chars on
+    /// the wire. Absent (`None`) is omitted entirely rather than sent as `null`,
+    /// which is what `sd` being an optional property in the schema means.
+    #[serde(
+        default,
+        with = "hex3_opt",
+        skip_serializing_if = "Option::is_none",
+        rename = "sd"
+    )]
     pub sd: Option<[u8; 3]>,
 }
 
@@ -886,21 +992,38 @@ impl SNssai {
     }
 }
 
-/// TAI (Tracking Area Identity)
+/// TAI (Tracking Area Identity).
+///
+/// Wire shape is TS 29.571 §5.4.4.6: `{"plmnId": {...}, "tac": "000001"}`, the
+/// TAC a 4- or 6-hex-character string.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tai {
     /// PLMN ID
+    #[serde(rename = "plmnId")]
     pub plmn_id: PlmnId,
-    /// TAC (Tracking Area Code)
+    /// TAC (Tracking Area Code) — 3 bytes in memory, 6 hex chars on the wire.
+    /// A 4-character TAC is accepted on input (§5.4.4.6 permits both widths) and
+    /// zero-extended; output is always 6.
+    #[serde(with = "hex3")]
     pub tac: [u8; 3],
 }
 
-/// PLMN ID (Public Land Mobile Network Identity)
+/// PLMN ID (Public Land Mobile Network Identity).
+///
+/// Wire shape is TS 29.571 §5.4.4.3: `{"mcc": "001", "mnc": "01"}` — decimal
+/// **digit strings**, MNC 2 or 3 digits. In memory both are one digit per byte
+/// (value `0..=9`, not ASCII), which is what every caller in this tree builds and
+/// compares.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PlmnId {
-    /// Mobile Country Code (MCC) - 3 digits
+    /// Mobile Country Code (MCC) — 3 digits.
+    #[serde(with = "digits3")]
     pub mcc: [u8; 3],
-    /// Mobile Network Code (MNC) - 2 or 3 digits
+    /// Mobile Network Code (MNC) — 2 or 3 digits. The stored length IS the
+    /// digit count, so a 2-digit MNC round-trips as `"01"` and never as `"010"`:
+    /// MNC 01 and MNC 010 are different networks, and padding one into the other
+    /// misroutes.
+    #[serde(with = "digits_var")]
     pub mnc: Vec<u8>,
 }
 
@@ -910,13 +1033,149 @@ impl PlmnId {
     }
 }
 
-/// GUAMI (Globally Unique AMF Identifier)
+/// GUAMI (Globally Unique AMF Identifier).
+///
+/// Wire shape is TS 29.571 §5.4.4.4: `{"plmnId": {...}, "amfId": "000001"}`,
+/// `amfId` a 6-hex-character string (AMF Region ID, Set ID and Pointer packed).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Guami {
     /// PLMN ID
+    #[serde(rename = "plmnId")]
     pub plmn_id: PlmnId,
-    /// AMF ID
+    /// AMF ID — 3 bytes in memory, 6 hex chars on the wire.
+    #[serde(rename = "amfId", with = "hex3")]
     pub amf_id: [u8; 3],
+}
+
+/// TS 29.571 serde for a 3-octet field carried as 6 hex characters (#65).
+///
+/// # Why the in-memory type is not simply a `String`
+///
+/// The byte triple is what the callers use: `crate::context` compares S-NSSAIs
+/// and PLMN IDs by value, and a TAC/AMF ID is packed from and unpacked into
+/// bit-fields elsewhere in the stack. Storing the hex text instead would move a
+/// parse to every comparison site and make `"000001"` and `"000001 "` two
+/// different slices. So the representation stays binary and the *serde boundary*
+/// does the conversion — which is where the spec's requirement actually applies.
+mod hex3 {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 3], s: S) -> Result<S::Ok, S::Error> {
+        // Lowercase: the patterns in TS 29.571 accept either case, and lowercase
+        // is what the vendored OpenAPI examples use.
+        s.serialize_str(&format!("{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2]))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 3], D::Error> {
+        let text = String::deserialize(d)?;
+        parse(&text).ok_or_else(|| {
+            D::Error::custom(format!(
+                "expected a 4- or 6-hexadecimal-character string (TS 29.571 §5.4.4), got {text:?}"
+            ))
+        })
+    }
+
+    /// Accepts 6 hex characters, or 4 (the narrower TAC width) zero-extended on
+    /// the left. Anything else is `None`.
+    pub(super) fn parse(text: &str) -> Option<[u8; 3]> {
+        let padded = match text.len() {
+            4 => format!("00{text}"),
+            6 => text.to_string(),
+            _ => return None,
+        };
+        let mut out = [0u8; 3];
+        for (i, chunk) in padded.as_bytes().chunks(2).enumerate() {
+            let hi = (chunk[0] as char).to_digit(16)?;
+            let lo = (chunk[1] as char).to_digit(16)?;
+            out[i] = ((hi << 4) | lo) as u8;
+        }
+        Some(out)
+    }
+}
+
+/// The same 6-hex-character encoding for an optional field (`Snssai.sd`).
+mod hex3_opt {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Option<[u8; 3]>, s: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(b) => super::hex3::serialize(b, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 3]>, D::Error> {
+        let Some(text) = Option::<String>::deserialize(d)? else {
+            return Ok(None);
+        };
+        super::hex3::parse(&text).map(Some).ok_or_else(|| {
+            D::Error::custom(format!(
+                "expected a 6-hexadecimal-character sd (TS 29.571 §5.4.4.2), got {text:?}"
+            ))
+        })
+    }
+}
+
+/// TS 29.571 serde for a fixed 3-digit decimal field carried as a string (MCC).
+mod digits3 {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(digits: &[u8; 3], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&super::digits_var::to_text(digits))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 3], D::Error> {
+        let text = String::deserialize(d)?;
+        let parsed = super::digits_var::from_text(&text)
+            .filter(|v| v.len() == 3)
+            .ok_or_else(|| {
+                D::Error::custom(format!(
+                    "expected a 3-digit mcc (TS 29.571 §5.4.4.3), got {text:?}"
+                ))
+            })?;
+        Ok([parsed[0], parsed[1], parsed[2]])
+    }
+}
+
+/// TS 29.571 serde for a variable-length decimal digit field (MNC: 2 or 3).
+mod digits_var {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(digits: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&to_text(digits))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        let parsed = from_text(&text).filter(|v| v.len() == 2 || v.len() == 3);
+        parsed.ok_or_else(|| {
+            D::Error::custom(format!(
+                "expected a 2- or 3-digit mnc (TS 29.571 §5.4.4.3), got {text:?}"
+            ))
+        })
+    }
+
+    /// One digit per byte to its decimal text. A stored value above 9 is not a
+    /// digit; it is clamped to `9` rather than silently emitting a second
+    /// character and changing the field's length.
+    pub(super) fn to_text(digits: &[u8]) -> String {
+        digits
+            .iter()
+            .map(|d| char::from_digit((*d).min(9) as u32, 10).unwrap_or('0'))
+            .collect()
+    }
+
+    /// Decimal text to one digit per byte. `None` when any character is not a
+    /// decimal digit.
+    pub(super) fn from_text(text: &str) -> Option<Vec<u8>> {
+        text.chars()
+            .map(|c| c.to_digit(10).map(|d| d as u8))
+            .collect()
+    }
 }
 
 /// SBI Message Parameters - matches param struct in nextgcore_sbi_message_t
@@ -1465,5 +1724,176 @@ mod tests {
 
         // Only the media type differs; the serialized body is identical.
         assert_eq!(hal.http.content, plain.http.content);
+    }
+
+    // ─── #65: header multiplicity ───────────────────────────────────────────
+
+    /// `append_header` keeps every occurrence; `get_header_all` hands them back
+    /// one by one. `set_header` still replaces, so nothing that relied on
+    /// last-wins changes.
+    #[test]
+    fn append_header_preserves_occurrences_and_set_header_still_replaces() {
+        let mut http = SbiHttpMessage::new();
+        http.append_header(custom_header::OCI, "Overload-Reduction-Metric: 10");
+        http.append_header(custom_header::OCI, "Overload-Reduction-Metric: 60");
+        assert_eq!(
+            http.get_header_all(custom_header::OCI),
+            vec![
+                "Overload-Reduction-Metric: 10".to_string(),
+                "Overload-Reduction-Metric: 60".to_string()
+            ]
+        );
+        // The single-valued view is the RFC 9110 §5.3 combined form.
+        assert_eq!(
+            http.get_header(custom_header::OCI).map(String::as_str),
+            Some("Overload-Reduction-Metric: 10, Overload-Reduction-Metric: 60")
+        );
+
+        // set_header replaces the lot — the pre-#65 semantics, unchanged.
+        http.set_header(custom_header::OCI, "Overload-Reduction-Metric: 5");
+        assert_eq!(
+            http.get_header_all(custom_header::OCI),
+            vec!["Overload-Reduction-Metric: 5".to_string()]
+        );
+    }
+
+    /// Case-insensitivity and absence behave as for `get_header`, and an
+    /// occurrence appended under a different spelling joins the same field.
+    #[test]
+    fn get_header_all_is_case_insensitive_and_empty_when_absent() {
+        let mut http = SbiHttpMessage::new();
+        assert!(http.get_header_all(custom_header::OCI).is_empty());
+        http.append_header("3GPP-SBI-OCI", "Overload-Reduction-Metric: 1");
+        http.append_header("3gpp-sbi-oci", "Overload-Reduction-Metric: 2");
+        assert_eq!(http.get_header_all("3gpp-Sbi-Oci").len(), 2);
+    }
+
+    /// A comma inside a quoted string does not split an occurrence, and empty
+    /// elements are dropped rather than surfacing as blank entries.
+    #[test]
+    fn get_header_all_respects_quoted_commas_and_drops_empties() {
+        let mut http = SbiHttpMessage::new();
+        http.set_header("x-list", r#"a="one,two", b, , c,"#);
+        assert_eq!(
+            http.get_header_all("x-list"),
+            vec![
+                r#"a="one,two""#.to_string(),
+                "b".to_string(),
+                "c".to_string()
+            ]
+        );
+        // A quoted-pair escaping a quote must not end the quoted string early.
+        http.set_header("x-esc", r#"a="he said \"hi, there\"", b"#);
+        assert_eq!(
+            http.get_header_all("x-esc"),
+            vec![r#"a="he said \"hi, there\"""#.to_string(), "b".to_string()]
+        );
+    }
+
+    // ─── #65: TS 29.571 CommonData wire shapes ──────────────────────────────
+
+    /// `Snssai.sd` is a 6-hex-character string on the wire (TS 29.571 §5.4.4.2),
+    /// not the byte triple a derived `Serialize` produces.
+    ///
+    /// Asserts the serialized TEXT, then deserialises a hand-written spec-shaped
+    /// body — a round trip of our own struct would pass even with the wrong
+    /// representation on both sides.
+    #[test]
+    fn snssai_serialises_sd_as_six_hex_characters() {
+        let json = serde_json::to_string(&SNssai::with_sd(1, [0x00, 0x00, 0x01])).expect("json");
+        assert_eq!(json, r#"{"sst":1,"sd":"000001"}"#);
+        assert!(
+            !json.contains('['),
+            "sd must not be a byte array on the wire, got {json}"
+        );
+
+        // A body copied out of the spec must parse back to the same bytes.
+        let parsed: SNssai = serde_json::from_str(r#"{"sst":2,"sd":"0a1b2c"}"#).expect("parses");
+        assert_eq!(parsed.sst, 2);
+        assert_eq!(parsed.sd, Some([0x0a, 0x1b, 0x2c]));
+
+        // An absent sd is omitted entirely, not sent as null.
+        assert_eq!(
+            serde_json::to_string(&SNssai::new(1)).expect("json"),
+            r#"{"sst":1}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SNssai>(r#"{"sst":1}"#)
+                .expect("parses")
+                .sd,
+            None
+        );
+
+        // A malformed sd is rejected rather than silently truncated.
+        assert!(serde_json::from_str::<SNssai>(r#"{"sst":1,"sd":"xyz"}"#).is_err());
+        assert!(serde_json::from_str::<SNssai>(r#"{"sst":1,"sd":"00000"}"#).is_err());
+    }
+
+    /// `PlmnId` is a pair of decimal digit STRINGS, and a 2-digit MNC must not be
+    /// padded to 3 — MNC 01 and MNC 010 are different networks.
+    #[test]
+    fn plmn_id_serialises_as_digit_strings_and_preserves_mnc_width() {
+        let two = PlmnId::new([0, 0, 1], vec![0, 1]);
+        assert_eq!(
+            serde_json::to_string(&two).expect("json"),
+            r#"{"mcc":"001","mnc":"01"}"#
+        );
+        let three = PlmnId::new([3, 1, 0], vec![4, 1, 0]);
+        assert_eq!(
+            serde_json::to_string(&three).expect("json"),
+            r#"{"mcc":"310","mnc":"410"}"#
+        );
+
+        // Round trip from spec-shaped text, both widths.
+        assert_eq!(
+            serde_json::from_str::<PlmnId>(r#"{"mcc":"001","mnc":"01"}"#).expect("parses"),
+            two
+        );
+        assert_eq!(
+            serde_json::from_str::<PlmnId>(r#"{"mcc":"310","mnc":"410"}"#).expect("parses"),
+            three
+        );
+
+        // Non-digits and wrong widths are refused.
+        assert!(serde_json::from_str::<PlmnId>(r#"{"mcc":"00","mnc":"01"}"#).is_err());
+        assert!(serde_json::from_str::<PlmnId>(r#"{"mcc":"abc","mnc":"01"}"#).is_err());
+        assert!(serde_json::from_str::<PlmnId>(r#"{"mcc":"001","mnc":"0"}"#).is_err());
+    }
+
+    /// `Tai.tac` and `Guami.amfId` are hex strings under camelCase names, and a
+    /// 4-character TAC (the narrower width §5.4.4.6 permits) is accepted.
+    #[test]
+    fn tai_and_guami_serialise_per_ts_29_571() {
+        let tai = Tai {
+            plmn_id: PlmnId::new([0, 0, 1], vec![0, 1]),
+            tac: [0x00, 0x00, 0x01],
+        };
+        assert_eq!(
+            serde_json::to_string(&tai).expect("json"),
+            r#"{"plmnId":{"mcc":"001","mnc":"01"},"tac":"000001"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Tai>(r#"{"plmnId":{"mcc":"001","mnc":"01"},"tac":"000001"}"#)
+                .expect("parses"),
+            tai
+        );
+        // 4-hex TAC zero-extends.
+        assert_eq!(
+            serde_json::from_str::<Tai>(r#"{"plmnId":{"mcc":"001","mnc":"01"},"tac":"0001"}"#)
+                .expect("parses")
+                .tac,
+            [0x00, 0x00, 0x01]
+        );
+
+        let guami = Guami {
+            plmn_id: PlmnId::new([0, 0, 1], vec![0, 1]),
+            amf_id: [0xca, 0xfe, 0x01],
+        };
+        let json = serde_json::to_string(&guami).expect("json");
+        assert_eq!(
+            json,
+            r#"{"plmnId":{"mcc":"001","mnc":"01"},"amfId":"cafe01"}"#
+        );
+        assert_eq!(serde_json::from_str::<Guami>(&json).expect("parses"), guami);
     }
 }

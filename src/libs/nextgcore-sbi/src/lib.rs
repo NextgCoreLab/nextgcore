@@ -93,7 +93,7 @@ pub use oauth::{
     AccessTokenError, AccessTokenRequest, AccessTokenResponse, JwksCache, OAuth2Client, TokenCache,
     OAUTH2_STANDARD_PATHS_ENV,
 };
-pub use overload::{Lci, Oci, OverloadControl};
+pub use overload::{Lci, Oci, OverloadControl, OverloadRegistry, OverloadReporter, SendDecision};
 #[cfg(feature = "6g-extensions")]
 pub use pubsub::{
     EventBroker, EventFilter, EventReplayBuffer, SbiEvent, SbiEventCategory, Subscription,

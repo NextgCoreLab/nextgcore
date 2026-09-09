@@ -82,6 +82,18 @@ pub enum SbiError {
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// The request was **not sent**: the target producer reported overload and
+    /// the consumer applied TS 29.500 §6.4.2.2 traffic abatement (#65).
+    ///
+    /// A distinct variant rather than reusing [`Self::ServiceUnavailable`]
+    /// because the two mean opposite things to a caller. A 503 from the producer
+    /// says the request reached it and was refused; this says the request never
+    /// left, so retrying the same target immediately is pointless while trying a
+    /// different producer is not — and, unlike a 503, nothing on the producer
+    /// side has any record of it.
+    #[error("Request shed locally: target reported overload ({0})")]
+    OverloadShed(String),
 }
 
 impl SbiError {
@@ -102,6 +114,10 @@ impl SbiError {
             Self::AuthenticationFailed(_) => Some(401),
             Self::AuthorizationFailed(_) => Some(403),
             Self::ServiceUnavailable(_) => Some(503),
+            // #65: what the caller should report onward. The request was not
+            // served, and 503 is the status a consumer of THIS NF should see when
+            // its upstream producer is overloaded (TS 29.500 §5.2.7.2).
+            Self::OverloadShed(_) => Some(503),
             Self::Timeout => Some(408),
             _ => None,
         }

@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -19,9 +19,11 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
+use crate::constants::custom_header;
 use crate::error::{SbiError, SbiResult};
 use crate::message::{SbiRequest, SbiResponse};
 use crate::oauth::OAuth2Client;
+use crate::overload::{OverloadRegistry, SendDecision};
 use crate::tls;
 use crate::types::{NfType, UriScheme};
 
@@ -193,6 +195,15 @@ struct ConnectTarget {
     port: u16,
 }
 
+impl ConnectTarget {
+    /// `scheme://host:port` — the key overload state is recorded against, and
+    /// the same spelling [`SbiClientConfig::base_uri`] produces for the primary,
+    /// so an alternate and a primary naming the same producer share one entry.
+    fn base_uri(&self) -> String {
+        format!("{}://{}:{}", self.scheme, self.host, self.port)
+    }
+}
+
 /// SBI Client configuration
 #[derive(Debug, Clone)]
 pub struct SbiClientConfig {
@@ -310,6 +321,18 @@ pub struct SbiClient {
     /// Bounded retry / NF-reselection policy (sbi-05). Defaults to a single
     /// attempt (`max_attempts == 1`), so retry is dormant unless opted in.
     retry: RetryPolicy,
+    /// #65: which producers have reported overload, and what to do about it.
+    /// Shared behind an `Arc` because a clone of this client must react to an
+    /// OCI the original recorded — per-clone state would forget it.
+    overload: Arc<OverloadRegistry>,
+    /// #65: alternate producers to reselect to when the primary reports overload
+    /// or fails before the request was sent (TS 29.500 §6.5). Empty by default,
+    /// in which case reselection is a no-op and behaviour is unchanged.
+    alternates: Arc<Vec<ConnectTarget>>,
+    /// #65: binding indications learned from `3gpp-Sbi-Binding` on responses,
+    /// keyed by producer, echoed back as `3gpp-Sbi-Routing-Binding` on later
+    /// requests to the same producer (TS 29.500 §6.12.2).
+    bindings: Arc<StdMutex<HashMap<String, String>>>,
 }
 
 impl SbiClient {
@@ -326,6 +349,9 @@ impl SbiClient {
             client_nf_type: None,
             client_nf_id: None,
             retry: RetryPolicy::default(),
+            overload: Arc::new(OverloadRegistry::new()),
+            alternates: Arc::new(Vec::new()),
+            bindings: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -385,6 +411,53 @@ impl SbiClient {
     pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
+    }
+
+    /// Register **alternate producers** for overload reselection and pre-send
+    /// failure reselection (#65, TS 29.500 §6.5).
+    ///
+    /// A consumer that discovered several instances of a producer NF from the NRF
+    /// passes the runners-up here. When the primary reports overload, or fails in
+    /// a way that proves the request was never processed, the request goes to the
+    /// first alternate that is not itself under a live OCI instead of failing.
+    ///
+    /// Default is empty, which makes reselection a no-op: existing callers are
+    /// byte-for-byte unchanged.
+    pub fn with_alternate_targets<I, S>(mut self, targets: I) -> Self
+    where
+        I: IntoIterator<Item = (S, u16)>,
+        S: Into<String>,
+    {
+        let scheme = self.config.scheme;
+        self.alternates = Arc::new(
+            targets
+                .into_iter()
+                .map(|(host, port)| ConnectTarget {
+                    scheme,
+                    host: host.into(),
+                    port,
+                })
+                .collect(),
+        );
+        self
+    }
+
+    /// Enable TS 29.500 §6.4.2.2 local **shedding** (#65).
+    ///
+    /// Recording an OCI and reselecting away from an overloaded producer are
+    /// always on. This additionally allows the client to fail a request locally,
+    /// with [`SbiError::OverloadShed`], when the producer asked for reduction and
+    /// there is no alternate to send it to. Off by default — it is the only part
+    /// of the reaction that can lose a request, so an operator opts in.
+    pub fn with_overload_shedding(mut self) -> Self {
+        self.overload = Arc::new(OverloadRegistry::with_shedding());
+        self
+    }
+
+    /// The overload registry, for an NF that wants to inspect or reset what this
+    /// client has recorded about its producers.
+    pub fn overload_registry(&self) -> &Arc<OverloadRegistry> {
+        &self.overload
     }
 
     /// Get the client configuration
@@ -574,11 +647,166 @@ impl SbiClient {
     ///   skipped entirely (fast path), so a normal request is byte-for-byte and
     ///   call-sequence identical to the pre-sbi-04/05 client.
     pub async fn send_request(&self, request: SbiRequest) -> SbiResult<SbiResponse> {
-        if self.retry.max_attempts <= 1 {
-            // Fast path: a single attempt, no retry loop, no request clone.
-            return self.send_following_redirects(request).await;
+        self.send_with_overload_reaction(request).await
+    }
+
+    /// #65: the TS 29.500 §6.4/§6.5 reaction that used to be missing entirely.
+    ///
+    /// `overload.rs` could parse an OCI and decide whether to shed since sbi-08,
+    /// but no code path called it, so a 503 carrying an OCI was handed to the
+    /// caller and the very next request went straight back to the producer that
+    /// had just said it was overloaded. This is the layer that closes that loop:
+    /// consult before sending, record after responding.
+    ///
+    /// Order of preference, deliberately: **reselect, then shed, then send
+    /// anyway**. Rerouting keeps the request alive, so it wins whenever an
+    /// alternate exists; shedding only happens when there is nowhere else to go
+    /// AND an operator enabled it; otherwise the request is sent and the OCI is
+    /// logged, which is the pre-#65 behaviour and the default.
+    async fn send_with_overload_reaction(&self, request: SbiRequest) -> SbiResult<SbiResponse> {
+        let primary = self.config.base_uri();
+        let now = Instant::now();
+
+        // Pick a target: the primary, or an alternate when the primary is under a
+        // live OCI. `first_healthy_alternate` returns None when every alternate is
+        // also overloaded, which correctly collapses to shed-or-send below.
+        let reselected = match self.overload.decide(&primary, self.has_alternate(now), now) {
+            SendDecision::Send => None,
+            SendDecision::Reselect(oci) => match self.first_healthy_alternate(now) {
+                Some(alt) => {
+                    log::info!(
+                        "Reselecting away from overloaded producer {primary} \
+                         (Overload-Reduction-Metric: {}) to {}://{}:{} (TS 29.500 §6.5)",
+                        oci.reduction_metric,
+                        alt.scheme,
+                        alt.host,
+                        alt.port
+                    );
+                    Some(alt)
+                }
+                None => None,
+            },
+            SendDecision::Shed(oci) => {
+                log::warn!(
+                    "Shedding request to {primary}: producer asked for {}% traffic reduction \
+                     (TS 29.500 §6.4.2.2) and no alternate target is configured",
+                    oci.reduction_metric
+                );
+                return Err(SbiError::OverloadShed(format!(
+                    "{primary} requested {}% reduction",
+                    oci.reduction_metric
+                )));
+            }
+        };
+
+        // With no alternate chosen, a live OCI may still call for shedding — the
+        // `decide` above returned Reselect on the promise of an alternate that
+        // turned out to be overloaded too.
+        if reselected.is_none() {
+            if let SendDecision::Shed(oci) = self.overload.decide(&primary, false, now) {
+                log::warn!(
+                    "Shedding request to {primary}: producer asked for {}% traffic reduction \
+                     and every configured alternate is also overloaded",
+                    oci.reduction_metric
+                );
+                return Err(SbiError::OverloadShed(format!(
+                    "{primary} requested {}% reduction; all alternates overloaded",
+                    oci.reduction_metric
+                )));
+            }
         }
-        self.send_with_retry(request).await
+
+        let target_key = match &reselected {
+            Some(alt) => alt.base_uri(),
+            None => primary.clone(),
+        };
+
+        let result = self.dispatch(request, reselected, &target_key).await;
+
+        // Record what the response reported, whether it was a 503 or a 200: an
+        // OCI can ride on ANY response (§6.4.3.2), and a producer signals recovery
+        // by sending metric 0 — which only lands if success responses are read too.
+        if let Ok(response) = &result {
+            self.record_overload_and_binding(&target_key, response);
+        }
+        result
+    }
+
+    /// Send via the retry/redirect stack, optionally against a reselected target.
+    async fn dispatch(
+        &self,
+        request: SbiRequest,
+        reselected: Option<ConnectTarget>,
+        target_key: &str,
+    ) -> SbiResult<SbiResponse> {
+        let mut request = request;
+        // Echo a previously learned binding indication back to this producer
+        // (TS 29.500 §6.12.2): the producer told us which instance/set holds the
+        // resource, and a consumer is expected to convey it on subsequent
+        // requests so an SCP can route them there.
+        if let Some(binding) = self.learned_binding(target_key) {
+            if request.http.routing_binding().is_none() {
+                request.http.set_routing_binding(binding);
+            }
+        }
+
+        match reselected {
+            // Reselected: one direct attempt against the alternate. The pooled
+            // connection belongs to the primary, so this deliberately bypasses it
+            // rather than reusing a connection to the overloaded producer.
+            Some(target) => {
+                self.prepare_request(&mut request).await?;
+                self.send_once(&request, Some(&target)).await
+            }
+            None if self.retry.max_attempts <= 1 => {
+                // Fast path: a single attempt, no retry loop, no request clone.
+                self.send_following_redirects(request).await
+            }
+            None => self.send_with_retry(request).await,
+        }
+    }
+
+    /// Whether any configured alternate is currently free of a live OCI.
+    fn has_alternate(&self, now: Instant) -> bool {
+        self.first_healthy_alternate(now).is_some()
+    }
+
+    /// The first alternate with no live OCI recorded against it.
+    fn first_healthy_alternate(&self, now: Instant) -> Option<ConnectTarget> {
+        self.alternates
+            .iter()
+            .find(|alt| {
+                self.overload
+                    .effective_oci(&alt.base_uri(), now)
+                    .map(|oci| oci.reduction_metric == 0)
+                    .unwrap_or(true)
+            })
+            .cloned()
+    }
+
+    /// Store every OCI occurrence and any binding indication from a response.
+    fn record_overload_and_binding(&self, target_key: &str, response: &SbiResponse) {
+        // get_header_all, not get_header: §6.4.3 allows one occurrence per
+        // reporting scope, and reading only the first (or last) would silently
+        // discard the rest.
+        let ocis = response.http.get_header_all(custom_header::OCI);
+        if !ocis.is_empty() {
+            let stored = self.overload.record(target_key, &ocis, Instant::now());
+            log::debug!(
+                "Recorded {stored} OCI occurrence(s) from {target_key} (status {})",
+                response.status
+            );
+        }
+        if let Some(binding) = response.http.binding() {
+            if let Ok(mut bindings) = self.bindings.lock() {
+                bindings.insert(target_key.to_string(), binding.clone());
+            }
+        }
+    }
+
+    /// A binding indication previously learned from this producer.
+    fn learned_binding(&self, target_key: &str) -> Option<String> {
+        self.bindings.lock().ok()?.get(target_key).cloned()
     }
 
     /// Stamp the standard outbound headers on `request` exactly once before the
@@ -903,13 +1131,21 @@ impl SbiClient {
     ) -> SbiResult<SbiResponse> {
         let status = response.status().as_u16();
 
-        // Extract headers
-        let mut headers = HashMap::new();
+        // Extract headers.
+        //
+        // #65: repeated field lines are APPENDED, not overwritten. A producer
+        // reporting overload for several scopes sends one `3gpp-Sbi-Oci` per
+        // scope (TS 29.500 §6.4.3); inserting into the map by name kept only the
+        // last, so the abatement below would have acted on one scope and
+        // silently ignored the rest. `SbiHttpMessage::get_header_all` splits them
+        // back apart.
+        let mut http_headers = crate::message::SbiHttpMessage::new();
         for (key, value) in response.headers() {
             if let Ok(v) = value.to_str() {
-                headers.insert(key.to_string(), v.to_string());
+                http_headers.append_header(key.to_string(), v.to_string());
             }
         }
+        let headers = http_headers.headers;
 
         // Read body
         let body_bytes = response
@@ -1796,6 +2032,359 @@ mod tests {
         assert!(
             !matches!(err, SbiError::AuthenticationFailed(_)),
             "a client with no OAuth2 must not fail on authentication: got {err:?}"
+        );
+    }
+
+    /// #65 acceptance: the query the client puts ON THE WIRE is percent-encoded.
+    ///
+    /// Asserted against the raw query string the peer received, not against a
+    /// decoded param — the encode and decode halves are separate defects, and a
+    /// test that encodes then decodes in-process passes even if both are wrong in
+    /// the same way. Reserved characters must be absent from the wire form.
+    ///
+    /// The encoding itself landed in #101; this pins it from the wire side, which
+    /// is what §5.2.10.2 actually constrains, and is the assertion the #65
+    /// criterion asks for.
+    #[tokio::test]
+    async fn the_emitted_query_is_percent_encoded_on_the_wire() {
+        let seen: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_srv = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_srv = seen_srv.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                        let seen_srv = seen_srv.clone();
+                        async move {
+                            *seen_srv.lock().unwrap_or_else(|e| e.into_inner()) =
+                                req.uri().query().map(|q| q.to_string());
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(204)
+                                    .body(http_body_util::Full::new(bytes::Bytes::new()))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+        let mut request = SbiRequest::get("/nnrf-disc/v1/nf-instances");
+        request
+            .http
+            .set_param("snssais", r#"[{"sst":1,"sd":"000001"}]"#);
+        assert_eq!(
+            client.send_request(request).await.expect("response").status,
+            204
+        );
+
+        let query = seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("the peer saw a query");
+        assert_eq!(
+            query, "snssais=%5B%7B%22sst%22%3A1%2C%22sd%22%3A%22000001%22%7D%5D",
+            "the JSON value must arrive percent-encoded (TS 29.500 §5.2.10.2)"
+        );
+        for reserved in ['[', ']', '{', '}', '"'] {
+            assert!(
+                !query.contains(reserved),
+                "{reserved:?} must not appear unencoded in the query, got {query}"
+            );
+        }
+    }
+
+    // ─── #65: overload reaction (TS 29.500 §6.4.2.2 / §6.5) ─────────────────
+
+    /// An OCI header value at the given metric, with a bounded validity so a
+    /// recorded entry cannot outlive the test process.
+    fn oci_header(metric: u8) -> (String, String) {
+        (
+            custom_header::OCI.to_string(),
+            format!(
+                "Timestamp: 2026-01-01T00:00:00Z; Period-of-Validity: 30s; \
+                 Overload-Reduction-Metric: {metric}"
+            ),
+        )
+    }
+
+    /// #65 acceptance, the default posture: after a 503 carrying OCI, the NEXT
+    /// request is **rerouted to an alternate** rather than sent back into the
+    /// overloaded producer (and rather than the caller getting a bare 503).
+    ///
+    /// The counters are the assertion: the primary is hit exactly once, and the
+    /// alternate serves the second request. Asserting only on the second
+    /// response's status would pass even if the request had gone to the primary
+    /// and the primary had recovered.
+    #[tokio::test]
+    async fn a_503_with_oci_reroutes_the_next_request_to_an_alternate() {
+        let primary_hits = Arc::new(AtomicUsize::new(0));
+        let primary = serve_fixed(
+            503,
+            vec![oci_header(60)],
+            "overloaded",
+            primary_hits.clone(),
+        )
+        .await;
+        let alt_hits = Arc::new(AtomicUsize::new(0));
+        let alternate = serve_fixed(200, vec![], "served", alt_hits.clone()).await;
+
+        let client = SbiClient::with_host_port("127.0.0.1", primary.port())
+            .with_alternate_targets([("127.0.0.1", alternate.port())]);
+
+        // First request: nothing is known yet, so it goes to the primary and the
+        // caller sees its 503. This is the response that TEACHES the client.
+        let first = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/x"))
+            .await
+            .expect("a 503 is a response, not an error");
+        assert_eq!(first.status, 503);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(alt_hits.load(Ordering::SeqCst), 0);
+
+        // Second request: the OCI is live, so it must be rerouted.
+        let second = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/x"))
+            .await
+            .expect("rerouted request succeeds");
+        assert_eq!(
+            second.status, 200,
+            "the second request must be served by the alternate, not answered 503"
+        );
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            1,
+            "the overloaded producer must NOT be dialled again"
+        );
+        assert_eq!(
+            alt_hits.load(Ordering::SeqCst),
+            1,
+            "the alternate must have served exactly the second request"
+        );
+    }
+
+    /// #65 acceptance, the opt-in half: with shedding enabled and no alternate,
+    /// the second request is **throttled locally** — it never reaches the wire.
+    ///
+    /// `primary_hits` staying at 1 is what proves abatement happened; a test that
+    /// only asserted on the error would also pass if the request had been sent and
+    /// 503'd again.
+    #[tokio::test]
+    async fn shedding_stops_the_next_request_from_being_sent_at_all() {
+        let primary_hits = Arc::new(AtomicUsize::new(0));
+        let primary = serve_fixed(
+            503,
+            // 100% reduction makes the probabilistic shed deterministic.
+            vec![oci_header(100)],
+            "overloaded",
+            primary_hits.clone(),
+        )
+        .await;
+
+        let client =
+            SbiClient::with_host_port("127.0.0.1", primary.port()).with_overload_shedding();
+
+        assert_eq!(
+            client
+                .send_request(SbiRequest::get("/x"))
+                .await
+                .expect("response")
+                .status,
+            503
+        );
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+
+        let err = client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect_err("the second request must be shed");
+        assert!(
+            matches!(err, SbiError::OverloadShed(_)),
+            "expected a local shed, got {err:?}"
+        );
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            1,
+            "a shed request must never reach the producer"
+        );
+        // It still reports as 503 onward, so a caller relaying the failure is
+        // unaffected by the distinction.
+        assert_eq!(err.status_code(), Some(503));
+    }
+
+    /// #65: the DEFAULT client does not shed. With no alternate configured, a
+    /// live OCI is recorded and logged but the request is still sent — so
+    /// upgrading to this change cannot start dropping any NF's requests.
+    ///
+    /// This is the guard on the default posture, and it is deliberately the
+    /// inverse of the test above: same producer, same OCI, one builder call
+    /// different.
+    #[tokio::test]
+    async fn the_default_client_records_oci_but_does_not_shed() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let producer = serve_fixed(503, vec![oci_header(100)], "overloaded", hits.clone()).await;
+
+        let client = SbiClient::with_host_port("127.0.0.1", producer.port());
+        for _ in 0..3 {
+            let resp = client
+                .send_request(SbiRequest::get("/x"))
+                .await
+                .expect("every request is still sent");
+            assert_eq!(resp.status, 503);
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "the default posture must not withhold requests"
+        );
+        // The OCI was nonetheless recorded — the reaction is available, just not
+        // destructive by default.
+        assert!(
+            client
+                .overload_registry()
+                .effective_oci(&client.config().base_uri(), Instant::now())
+                .is_some(),
+            "the OCI must be recorded even when it is not acted on"
+        );
+    }
+
+    /// #65: an OCI riding on a **success** response is recorded and acted on
+    /// (TS 29.500 §6.4.3.2 — an OCI may accompany any response, not only a 503).
+    ///
+    /// Positive by construction: the alternate serving the second request is the
+    /// only way this passes. The first version of this test asserted that a
+    /// metric-0 OCI caused NO reroute, which passed with the whole reaction
+    /// reverted — an absence is satisfied by a code path that never arrives.
+    /// Recovery (metric 0 superseding a live reduction) is pinned in
+    /// `overload::tests::metric_zero_supersedes_a_live_reduction`, where both
+    /// states can be asserted.
+    #[tokio::test]
+    async fn an_oci_on_a_success_response_is_recorded_and_acted_on() {
+        let primary_hits = Arc::new(AtomicUsize::new(0));
+        // 200, not 503: the producer is serving requests AND asking for reduction.
+        let primary = serve_fixed(200, vec![oci_header(100)], "served", primary_hits.clone()).await;
+        let alt_hits = Arc::new(AtomicUsize::new(0));
+        let alternate = serve_fixed(200, vec![], "alt", alt_hits.clone()).await;
+
+        let client = SbiClient::with_host_port("127.0.0.1", primary.port())
+            .with_alternate_targets([("127.0.0.1", alternate.port())]);
+
+        assert_eq!(
+            client
+                .send_request(SbiRequest::get("/x"))
+                .await
+                .expect("first")
+                .status,
+            200
+        );
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+
+        client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("second");
+        assert_eq!(
+            alt_hits.load(Ordering::SeqCst),
+            1,
+            "an OCI on a 200 must still drive reselection"
+        );
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            1,
+            "the producer that asked for 100% reduction must not be dialled again"
+        );
+    }
+
+    /// #65: a `3gpp-Sbi-Binding` learned from a response is echoed back as
+    /// `3gpp-Sbi-Routing-Binding` on the next request to that producer
+    /// (TS 29.500 §6.12.2).
+    ///
+    /// The get/set helpers for both headers existed and had no caller; this is
+    /// the consumer behaviour the spec actually asks for, and the reason the
+    /// helpers are no longer dead.
+    #[tokio::test]
+    async fn a_learned_binding_is_echoed_on_the_next_request() {
+        // Capture what the producer received on each request.
+        let seen: Arc<StdMutex<Vec<Option<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_srv = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_srv = seen_srv.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                        let seen_srv = seen_srv.clone();
+                        async move {
+                            let observed = req
+                                .headers()
+                                .get(custom_header::ROUTING_BINDING)
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_string());
+                            seen_srv
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(observed);
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .header(
+                                        custom_header::BINDING,
+                                        "bl=nf-set; nfset=set1.smfset.5gc.mnc012.mcc345",
+                                    )
+                                    .body(http_body_util::Full::new(bytes::Bytes::from("ok")))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+        client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("first");
+        client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("second");
+
+        let observed = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(observed.len(), 2);
+        assert!(
+            observed[0].is_none(),
+            "nothing is known before the first response, so the first request \
+             carries no routing binding"
+        );
+        assert_eq!(
+            observed[1].as_deref(),
+            Some("bl=nf-set; nfset=set1.smfset.5gc.mnc012.mcc345"),
+            "the binding learned from the first response must be conveyed back"
         );
     }
 }

@@ -8,6 +8,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -17,11 +18,12 @@ use hyper::service::Service;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_rustls::TlsAcceptor;
 
 use crate::error::{SbiError, SbiResult};
 use crate::message::{SbiHttpMessage, SbiRequest, SbiResponse};
+use crate::overload::OverloadReporter;
 use crate::tls;
 use crate::types::{NfType, UriScheme};
 
@@ -102,6 +104,14 @@ pub struct SbiServerConfig {
     /// This NF's instance ID / FQDN, combined with `server_nf_type` as the
     /// `Server` value `<NFTYPE>-<id>` (sbi-02).
     pub server_nf_id: Option<String>,
+    /// #65: producer-side overload reporter. When set and its metric is
+    /// non-zero, every response carries `3gpp-Sbi-Oci` so consumers can apply
+    /// TS 29.500 §6.4.2.2 abatement. `None` (default) emits no OCI, which is the
+    /// prior behaviour.
+    ///
+    /// The NF owns the metric — see [`OverloadReporter`] for why this layer does
+    /// not try to measure load itself.
+    pub overload_reporter: Option<Arc<OverloadReporter>>,
 }
 
 impl Default for SbiServerConfig {
@@ -124,6 +134,7 @@ impl Default for SbiServerConfig {
             max_header_list_size: Some(DEFAULT_MAX_HEADER_LIST_SIZE),
             server_nf_type: None,
             server_nf_id: None,
+            overload_reporter: None,
         }
     }
 }
@@ -177,6 +188,16 @@ impl SbiServerConfig {
     /// Set the expected OAuth2 `aud` claim from an [`NfType`] (T1.2).
     pub fn with_expected_audience_nf_type(mut self, nf_type: NfType) -> Self {
         self.oauth2_expected_audience = Some(nf_type.to_str().to_string());
+        self
+    }
+
+    /// Attach a producer-side overload reporter (#65).
+    ///
+    /// Responses carry `3gpp-Sbi-Oci` whenever the reporter's metric is non-zero,
+    /// which is the emission half of TS 29.500 §6.4 — present in `overload.rs`
+    /// since sbi-08 but never reachable from a response until now.
+    pub fn with_overload_reporter(mut self, reporter: Arc<OverloadReporter>) -> Self {
+        self.overload_reporter = Some(reporter);
         self
     }
 
@@ -317,6 +338,8 @@ struct SbiService<H: SbiRequestHandler> {
     /// This NF's `(NfType, id)` identity for the `Server` response header
     /// (sbi-02). `None` emits no `Server` header.
     server_identity: Option<(NfType, String)>,
+    /// #65: producer-side OCI source. `None` emits no `3gpp-Sbi-Oci`.
+    overload_reporter: Option<Arc<OverloadReporter>>,
 }
 
 impl<H: SbiRequestHandler> Clone for SbiService<H> {
@@ -328,6 +351,7 @@ impl<H: SbiRequestHandler> Clone for SbiService<H> {
             tls_exporter_secret: self.tls_exporter_secret.clone(),
             peer_cert_nf_instance_id: self.peer_cert_nf_instance_id.clone(),
             server_identity: self.server_identity.clone(),
+            overload_reporter: self.overload_reporter.clone(),
         }
     }
 }
@@ -344,6 +368,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let tls_exporter_secret = self.tls_exporter_secret.clone();
         let peer_cert_nf_instance_id = self.peer_cert_nf_instance_id.clone();
         let server_identity = self.server_identity.clone();
+        let overload_reporter = self.overload_reporter.clone();
         let path = req.uri().path().to_string();
 
         Box::pin(async move {
@@ -380,6 +405,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                         return Ok(convert_response_with_identity(
                             resp,
                             server_identity.as_ref(),
+                            overload_reporter.as_ref(),
                         ));
                     }
                 };
@@ -427,6 +453,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                         return Ok(convert_response_with_identity(
                             resp,
                             server_identity.as_ref(),
+                            overload_reporter.as_ref(),
                         ));
                     }
                 }
@@ -452,7 +479,11 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
 
             // Convert SbiResponse to hyper response, stamping the Server
             // header (sbi-02) when a server identity is configured.
-            let response = convert_response_with_identity(sbi_response, server_identity.as_ref());
+            let response = convert_response_with_identity(
+                sbi_response,
+                server_identity.as_ref(),
+                overload_reporter.as_ref(),
+            );
 
             Ok(response)
         })
@@ -562,11 +593,17 @@ async fn convert_request(
     let method = req.method().to_string();
     let uri = req.uri().path().to_string();
 
-    // Extract headers
+    // Extract headers.
+    //
+    // #65: APPEND rather than set. hyper yields one entry per field LINE, so a
+    // peer sending two `3gpp-Sbi-Oci` occurrences (TS 29.500 §6.4.3 — one per
+    // reporting scope) arrived here as two calls; `set_header` replaces, so the
+    // first scope was discarded and a producer reporting overload for two scopes
+    // was read as reporting for one.
     let mut http = SbiHttpMessage::new();
     for (key, value) in req.headers() {
         if let Ok(v) = value.to_str() {
-            http.set_header(key.to_string(), v.to_string());
+            http.append_header(key.to_string(), v.to_string());
         }
     }
 
@@ -577,12 +614,40 @@ async fn convert_request(
     // outbound by the SBI client.
     let correlation_id = extract_or_generate_correlation_id(&http);
 
-    // Extract query parameters
+    // Extract query parameters, percent-DECODED (#65, TS 29.500 §5.2.10.2).
+    //
+    // Two defects fixed here, both of which made a conformant peer look
+    // malformed:
+    //
+    // 1. Values were stored verbatim. A producer must percent-encode a query
+    //    value containing reserved characters, so a JSON-valued factor (the MBS
+    //    `tmgi-list`, an S-NSSAI list) arrived as `%5B%7B%22...` and every
+    //    consumer that fed it to `serde_json` answered 400. Two NFs carried
+    //    their own decoder to compensate; both are deleted in this change,
+    //    because a local shim on top of a decoding server DOUBLE-decodes, and a
+    //    value whose plaintext legitimately contains `%20` is then corrupted.
+    //
+    // 2. A parameter with no `=` was DROPPED. RFC 3986 permits a bare flag, and
+    //    dropping it is indistinguishable from the peer never sending it. It is
+    //    now stored with an empty value, so `get_param` returns `Some("")` —
+    //    present-but-empty, which is what the peer said.
+    //
+    // The QUERY decoder is used, not the form decoder: in a query component `+`
+    // is a literal plus. Decoding it as a space would corrupt every RFC 3339
+    // timestamp carrying a non-UTC offset and every base64 value.
     if let Some(query) = req.uri().query() {
         for pair in query.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                http.set_param(key.to_string(), value.to_string());
+            if pair.is_empty() {
+                continue;
             }
+            let (key, value) = match pair.split_once('=') {
+                Some((k, v)) => (k, v),
+                None => (pair, ""),
+            };
+            http.set_param(
+                crate::uri_encode::decode_query_value(key),
+                crate::uri_encode::decode_query_value(value),
+            );
         }
     }
 
@@ -764,6 +829,7 @@ fn convert_response(mut sbi_response: SbiResponse) -> Response<Full<Bytes>> {
 fn convert_response_with_identity(
     mut sbi_response: SbiResponse,
     identity: Option<&(NfType, String)>,
+    overload: Option<&Arc<OverloadReporter>>,
 ) -> Response<Full<Bytes>> {
     if let Some((nf_type, nf_id)) = identity {
         if sbi_response.http.get_header("Server").is_none() {
@@ -772,14 +838,56 @@ fn convert_response_with_identity(
                 .set_header("Server", format!("{}-{}", nf_type.as_server_token(), nf_id));
         }
     }
+    // #65: stamp `3gpp-Sbi-Oci` when this NF has declared itself overloaded
+    // (TS 29.500 §6.4.3.2 — an OCI may ride on any response, not only a 503).
+    // A handler that set its own OCI wins: it knows a per-scope reason this
+    // layer does not.
+    if let Some(reporter) = overload {
+        if let Some(oci) = reporter.oci() {
+            if sbi_response
+                .http
+                .get_header(crate::constants::custom_header::OCI)
+                .is_none()
+            {
+                sbi_response
+                    .http
+                    .set_header(crate::constants::custom_header::OCI, oci.to_header());
+            }
+        }
+    }
     convert_response(sbi_response)
 }
 
 /// Server state
 enum ServerState {
     Stopped,
-    Running(oneshot::Sender<()>),
+    Running(RunningState),
 }
+
+/// Everything `stop()` needs to shut a running server down gracefully (#65).
+struct RunningState {
+    /// Breaks the accept loop, so no NEW connection is taken.
+    accept_shutdown: oneshot::Sender<()>,
+    /// Broadcasts "start draining" to every live connection task, each of which
+    /// answers by sending an HTTP/2 GOAWAY and finishing its in-flight streams.
+    graceful: watch::Sender<bool>,
+    /// Drain barrier. Every connection task holds a clone of the paired
+    /// [`mpsc::Sender`]; when the last one drops, `recv()` here resolves to
+    /// `None`. That is the only reliable "all connections have finished" signal —
+    /// counting with an atomic races with a task that has decremented but not yet
+    /// flushed its final frames.
+    drain: mpsc::Receiver<()>,
+}
+
+/// How long [`SbiServer::stop`] waits for in-flight streams to finish after the
+/// GOAWAY before abandoning them (#65).
+///
+/// A bound is required rather than optional: a peer holding a stream open (a slow
+/// notification consumer, a half-dead TCP connection) would otherwise make
+/// `stop()` hang forever, and `stop()` is called from test teardown and from the
+/// daemons' SIGTERM path — both places where hanging is worse than dropping a
+/// straggler. Exceeding it is logged at warn with the count.
+const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// SBI Server - HTTP/2 server for SBI communication
 /// Matches nextgcore_sbi_server_t
@@ -859,7 +967,16 @@ impl SbiServer {
         };
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-        *state = ServerState::Running(shutdown_tx);
+        // #65: graceful-shutdown plumbing. `graceful_tx` tells live connections to
+        // send GOAWAY and drain; `drain_tx` is cloned into each connection task
+        // purely so that `stop()` can await the last clone being dropped.
+        let (graceful_tx, graceful_rx) = watch::channel(false);
+        let (drain_tx, drain_rx) = mpsc::channel::<()>(1);
+        *state = ServerState::Running(RunningState {
+            accept_shutdown: shutdown_tx,
+            graceful: graceful_tx,
+            drain: drain_rx,
+        });
         drop(state);
 
         let handler = Arc::new(handler);
@@ -876,6 +993,8 @@ impl SbiServer {
         let http2_limits = Http2Limits::from_config(&self.config);
         // sbi-02: resolve the NF identity once for Server-header stamping.
         let server_identity = self.config.server_identity();
+        // #65: the producer-side OCI source, shared by every connection.
+        let overload_reporter = self.config.overload_reporter.clone();
 
         // Spawn the server task
         tokio::spawn(async move {
@@ -888,6 +1007,14 @@ impl SbiServer {
                                 let oauth_ref = oauth.clone();
                                 let http2_limits = http2_limits;
                                 let server_identity_ref = server_identity.clone();
+                                let overload_reporter_ref = overload_reporter.clone();
+                                // #65: one shutdown receiver and one drain token
+                                // per connection. The token must be cloned HERE,
+                                // not inside the spawned task: cloning inside
+                                // races with `stop()` observing the channel
+                                // closed before the new task has registered.
+                                let conn_graceful = graceful_rx.clone();
+                                let conn_drain = drain_tx.clone();
 
                                 if let Some(ref acceptor) = tls_acceptor {
                                     let acceptor = acceptor.clone();
@@ -944,18 +1071,19 @@ impl SbiServer {
                                                     tls_exporter_secret,
                                                     peer_cert_nf_instance_id,
                                                     server_identity: server_identity_ref,
+                                                    overload_reporter:
+                                                        overload_reporter_ref,
                                                 };
                                                 let io = TokioIo::new(tls_stream);
-                                                let mut builder = http2::Builder::new(
-                                                    hyper_util::rt::TokioExecutor::new()
-                                                );
-                                                http2_limits.apply(&mut builder);
-                                                if let Err(e) = builder
-                                                    .serve_connection(io, service)
-                                                    .await
-                                                {
-                                                    eprintln!("HTTP/2 TLS connection error: {e}");
-                                                }
+                                                serve_connection_gracefully(
+                                                    io,
+                                                    service,
+                                                    http2_limits,
+                                                    conn_graceful,
+                                                    conn_drain,
+                                                    "HTTP/2 TLS",
+                                                )
+                                                .await;
                                             }
                                             Err(e) => {
                                                 eprintln!("TLS accept error: {e}");
@@ -972,20 +1100,17 @@ impl SbiServer {
                                         tls_exporter_secret: None,
                                         peer_cert_nf_instance_id: None,
                                         server_identity: server_identity_ref,
+                                        overload_reporter: overload_reporter_ref,
                                     };
                                     let io = TokioIo::new(stream);
-                                    tokio::spawn(async move {
-                                        let mut builder = http2::Builder::new(
-                                            hyper_util::rt::TokioExecutor::new()
-                                        );
-                                        http2_limits.apply(&mut builder);
-                                        if let Err(e) = builder
-                                            .serve_connection(io, service)
-                                            .await
-                                        {
-                                            eprintln!("HTTP/2 connection error: {e}");
-                                        }
-                                    });
+                                    tokio::spawn(serve_connection_gracefully(
+                                        io,
+                                        service,
+                                        http2_limits,
+                                        conn_graceful,
+                                        conn_drain,
+                                        "HTTP/2",
+                                    ));
                                 }
                             }
                             Err(e) => {
@@ -1003,14 +1128,57 @@ impl SbiServer {
         Ok(())
     }
 
-    /// Stop the server
+    /// Stop the server **gracefully** (#65).
+    ///
+    /// Three steps, in this order (RFC 9113 §6.8):
+    ///
+    /// 1. break the accept loop, so no new connection is taken;
+    /// 2. tell every live connection to send GOAWAY and finish its in-flight
+    ///    streams;
+    /// 3. wait — bounded by [`GRACEFUL_DRAIN_TIMEOUT`] — for those streams to
+    ///    complete.
+    ///
+    /// Step 2 and step 3 are what this used to skip. Firing the accept-loop
+    /// signal alone left the connection tasks detached: they were killed when the
+    /// runtime dropped, so a peer with a request in flight during a restart got a
+    /// transport error instead of its response, and no GOAWAY ever told it to
+    /// stop opening streams.
+    ///
+    /// The order matters. Signalling graceful shutdown before closing the
+    /// listener would let a connection accepted in between miss the signal
+    /// entirely and hold the drain open until the timeout.
     pub async fn stop(&self) -> SbiResult<()> {
         let mut state = self.state.lock().await;
 
-        if let ServerState::Running(shutdown_tx) =
-            std::mem::replace(&mut *state, ServerState::Stopped)
-        {
-            let _ = shutdown_tx.send(());
+        let ServerState::Running(running) = std::mem::replace(&mut *state, ServerState::Stopped)
+        else {
+            return Ok(());
+        };
+        let RunningState {
+            accept_shutdown,
+            graceful,
+            mut drain,
+        } = running;
+
+        // 1. No new connections.
+        let _ = accept_shutdown.send(());
+        // 2. GOAWAY + finish in-flight streams on the live ones. A send error
+        //    means every connection task has already exited, which is the same
+        //    end state.
+        let _ = graceful.send(true);
+        // 3. Drop our own token so the barrier depends only on the connections,
+        //    then wait for the last one. `recv()` returns None when every cloned
+        //    sender has dropped; a `Some` cannot happen (nothing ever sends).
+        drop(graceful);
+        match tokio::time::timeout(GRACEFUL_DRAIN_TIMEOUT, drain.recv()).await {
+            Ok(_) => {}
+            Err(_) => log::warn!(
+                "SBI server on {} still had connections in flight after {}s of graceful \
+                 shutdown; abandoning them. A peer holding a stream open (a slow notification \
+                 consumer, or a half-dead TCP connection) will see a transport error.",
+                self.config.addr,
+                GRACEFUL_DRAIN_TIMEOUT.as_secs()
+            ),
         }
 
         Ok(())
@@ -1021,6 +1189,66 @@ impl SbiServer {
         let state = self.state.lock().await;
         matches!(*state, ServerState::Running(_))
     }
+}
+
+/// Serve one HTTP/2 connection, honouring a graceful-shutdown signal (#65).
+///
+/// Before this existed the connection future was awaited directly in a detached
+/// task, so `stop()` had no handle on it: the process dropped the listener and
+/// every live connection was torn down mid-stream with no GOAWAY. A peer with a
+/// request in flight saw a transport error rather than a completed response,
+/// which is what makes a rolling restart lossy (RFC 9113 §6.8: an endpoint
+/// shutting down gracefully sends GOAWAY so the peer stops opening new streams
+/// while existing ones finish).
+///
+/// On the signal this calls `graceful_shutdown()` — which queues the GOAWAY —
+/// and then keeps polling the same connection future, because the GOAWAY is only
+/// written, and the in-flight streams only complete, while the connection is
+/// still being driven. Returning here instead (the tempting one-liner) sends
+/// nothing and drops everything.
+///
+/// `drain_token` is never used; holding it until this function returns is the
+/// point. [`RunningState::drain`] resolves once every token has dropped.
+async fn serve_connection_gracefully<I, H>(
+    io: I,
+    service: SbiService<H>,
+    http2_limits: Http2Limits,
+    mut graceful: watch::Receiver<bool>,
+    drain_token: mpsc::Sender<()>,
+    label: &'static str,
+) where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    H: SbiRequestHandler,
+{
+    let mut builder = http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+    http2_limits.apply(&mut builder);
+    let conn = builder.serve_connection(io, service);
+    let mut conn = std::pin::pin!(conn);
+
+    // Two futures race: the connection finishing on its own, and the shutdown
+    // signal arriving. Only the second needs handling; the first is the normal
+    // keep-alive close.
+    let drained = tokio::select! {
+        result = conn.as_mut() => result,
+        signal = graceful.changed() => {
+            match signal {
+                // `stop()` fired: queue the GOAWAY, then drive the connection to
+                // completion so it is actually written and the in-flight streams
+                // get their responses.
+                Ok(()) => {
+                    conn.as_mut().graceful_shutdown();
+                    conn.as_mut().await
+                }
+                // The watch sender is gone (the server was dropped without
+                // stop()). Nothing to wait for; serve the connection out.
+                Err(_) => conn.as_mut().await,
+            }
+        }
+    };
+    if let Err(e) = drained {
+        eprintln!("{label} connection error: {e}");
+    }
+    drop(drain_token);
 }
 
 /// Stream identifier for tracking requests
@@ -1396,7 +1624,7 @@ mod tests {
         // identity is configured (TS 29.500 §6.10.8.2 EXAMPLE 3 shape).
         let identity = (NfType::Smf, "54804518-abcd".to_string());
         let resp = send_error(404, "Not Found", "missing", None);
-        let hyper_resp = convert_response_with_identity(resp, Some(&identity));
+        let hyper_resp = convert_response_with_identity(resp, Some(&identity), None);
         assert_eq!(
             hyper_resp
                 .headers()
@@ -1407,7 +1635,7 @@ mod tests {
 
         // A 2xx success response is stamped too (harmless, aids debugging).
         let ok = SbiResponse::ok().with_body("{}", "application/json");
-        let hyper_ok = convert_response_with_identity(ok, Some(&identity));
+        let hyper_ok = convert_response_with_identity(ok, Some(&identity), None);
         assert_eq!(
             hyper_ok
                 .headers()
@@ -1465,7 +1693,7 @@ mod tests {
     fn test_convert_response_no_server_header_without_identity() {
         // No identity → no Server header (prior behaviour preserved).
         let resp = send_error(500, "Internal Server Error", "boom", None);
-        let hyper_resp = convert_response_with_identity(resp, None);
+        let hyper_resp = convert_response_with_identity(resp, None, None);
         assert!(hyper_resp.headers().get("server").is_none());
     }
 
@@ -1474,7 +1702,7 @@ mod tests {
         // A handler-supplied Server header is not overwritten.
         let identity = (NfType::Scp, "scp1.operator.com".to_string());
         let resp = SbiResponse::ok().with_header("Server", "custom-server/2.0");
-        let hyper_resp = convert_response_with_identity(resp, Some(&identity));
+        let hyper_resp = convert_response_with_identity(resp, Some(&identity), None);
         assert_eq!(
             hyper_resp
                 .headers()
@@ -1987,6 +2215,306 @@ mod tests {
             observed.is_none(),
             "an unverified bearer header must NOT become an attested identity, got {observed:?}"
         );
+
+        server.stop().await.expect("stop");
+    }
+
+    // ─── #65: query percent-decode, header multiplicity, graceful shutdown ───
+
+    /// Capture what the handler saw, so a test can assert on the DECODED params
+    /// rather than on a response the handler could have produced anyway.
+    fn param_capturing_handler() -> (
+        impl SbiRequestHandler,
+        Arc<std::sync::Mutex<Option<SbiRequest>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = seen.clone();
+        let handler = move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(req);
+                SbiResponse::with_status(204)
+            }
+        };
+        (handler, seen)
+    }
+
+    /// #65 acceptance: the server percent-DECODES query parameters.
+    ///
+    /// The query is put on the request URI verbatim so the client cannot be the
+    /// thing that decodes it — the assertion is about `convert_request` and
+    /// nothing else. The value is the JSON shape TS 29.500 §5.2.10.2 forces a
+    /// producer to encode.
+    #[tokio::test]
+    async fn server_percent_decodes_query_parameters() {
+        use crate::client::SbiClient;
+
+        let (handler, seen) = param_capturing_handler();
+        let (server, port) = start_test_server(SbiServerConfig::default(), handler).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // %5B%7B%22sst%22%3A1%2C%22sd%22%3A%22000001%22%7D%5D == [{"sst":1,"sd":"000001"}]
+        let resp = client
+            .send_request(SbiRequest::get(
+                "/nnrf-disc/v1/nf-instances?snssais=%5B%7B%22sst%22%3A1%2C%22sd%22%3A%22000001%22%7D%5D",
+            ))
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+
+        let req = seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("handler ran");
+        let snssais = req.http.get_param("snssais").expect("param present");
+        assert_eq!(
+            snssais, r#"[{"sst":1,"sd":"000001"}]"#,
+            "the server must decode; a verbatim value here is the #65 defect"
+        );
+        // The whole point: it is now parseable JSON, which is what every consumer
+        // does with it.
+        let parsed: serde_json::Value = serde_json::from_str(snssais).expect("valid JSON");
+        assert_eq!(parsed[0]["sd"], "000001");
+
+        server.stop().await.expect("stop");
+    }
+
+    /// #65 acceptance: an `=`-less query parameter survives as present-but-empty.
+    ///
+    /// It used to be dropped, which a handler cannot tell apart from the peer
+    /// never having sent it.
+    #[tokio::test]
+    async fn server_preserves_valueless_query_flags() {
+        use crate::client::SbiClient;
+
+        let (handler, seen) = param_capturing_handler();
+        let (server, port) = start_test_server(SbiServerConfig::default(), handler).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        client
+            .send_request(SbiRequest::get("/x/y?flag&other=1"))
+            .await
+            .expect("response");
+
+        let req = seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("handler ran");
+        assert_eq!(
+            req.http.get_param("flag").map(String::as_str),
+            Some(""),
+            "a valueless flag must be present with an empty value, not absent"
+        );
+        assert_eq!(req.http.get_param("other").map(String::as_str), Some("1"));
+
+        server.stop().await.expect("stop");
+    }
+
+    /// #65 acceptance: two `3gpp-Sbi-Oci` **field lines** are individually
+    /// retrievable — the header map no longer collapses repeated occurrences.
+    ///
+    /// TS 29.500 §6.4.3 gives each occurrence an independent scope, so keeping
+    /// only one is not a formatting detail: a producer reporting overload for two
+    /// scopes was read as reporting for one.
+    ///
+    /// Driven with a RAW hyper client on purpose. `SbiClient` stores headers in a
+    /// map, so it can only ever emit one field line per name — the first version
+    /// of this test used it, and passed with the server-side fix reverted, because
+    /// it was really only exercising `get_header_all`'s comma splitting. Two
+    /// genuine field lines are the only input that can distinguish `append_header`
+    /// from `set_header` on the ingest path.
+    #[tokio::test]
+    async fn server_keeps_every_repeated_oci_occurrence() {
+        let (handler, seen) = param_capturing_handler();
+        let (server, port) = start_test_server(SbiServerConfig::default(), handler).await;
+
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // `Builder::header` APPENDS, so this is two field lines on the wire.
+        let request = Request::builder()
+            .method("GET")
+            .uri("/x")
+            .header(
+                crate::constants::custom_header::OCI,
+                "Timestamp: 2026-01-01T00:00:00Z; Overload-Reduction-Metric: 10; DNN: internet",
+            )
+            .header(
+                crate::constants::custom_header::OCI,
+                "Timestamp: 2026-01-01T00:00:01Z; Overload-Reduction-Metric: 60",
+            )
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = sender.send_request(request).await.expect("response");
+        assert_eq!(response.status().as_u16(), 204);
+
+        let seen_req = seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("handler ran");
+        let all = seen_req
+            .http
+            .get_header_all(crate::constants::custom_header::OCI);
+        assert_eq!(
+            all.len(),
+            2,
+            "both OCI field lines must survive ingest, got {all:?}"
+        );
+        let metrics: Vec<u8> = all
+            .iter()
+            .filter_map(|v| crate::overload::Oci::parse(v))
+            .map(|o| o.reduction_metric)
+            .collect();
+        assert_eq!(
+            metrics,
+            vec![10, 60],
+            "each occurrence must parse independently, in arrival order"
+        );
+        // The scoped occurrence kept its scope parameter, which is what makes a
+        // future per-DNN reaction possible.
+        assert!(
+            all[0].contains("DNN: internet"),
+            "the scope parameter must survive verbatim, got {:?}",
+            all[0]
+        );
+
+        server.stop().await.expect("stop");
+    }
+
+    /// #65 acceptance: `stop()` drains in-flight streams instead of killing them.
+    ///
+    /// The handler sleeps, so shutdown is requested while the request is
+    /// genuinely mid-flight. Before the graceful path existed, the connection task
+    /// was detached and the client saw a transport error here.
+    ///
+    /// Ceiling, stated rather than implied: this asserts the OBSERVABLE
+    /// consequence of the GOAWAY (in-flight completes, connection then closes),
+    /// not the frame itself — hyper exposes no hook to read the peer's GOAWAY, so
+    /// frame-level inspection would need a raw h2 client this crate does not use.
+    #[tokio::test]
+    async fn stop_drains_an_in_flight_request() {
+        use crate::client::SbiClient;
+
+        let (server, port) =
+            start_test_server(SbiServerConfig::default(), |_req: SbiRequest| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                SbiResponse::with_status(200).with_body("drained", "text/plain")
+            })
+            .await;
+        let client = Arc::new(SbiClient::with_host_port("127.0.0.1", port));
+
+        // Fire the request, let it reach the handler, then stop the server.
+        let in_flight = {
+            let client = client.clone();
+            tokio::spawn(async move { client.send_request(SbiRequest::get("/slow")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let stop_started = std::time::Instant::now();
+        server.stop().await.expect("stop");
+        // stop() must have WAITED for the drain rather than returning at once.
+        assert!(
+            stop_started.elapsed() >= Duration::from_millis(150),
+            "stop() returned in {:?}, so it did not wait for the in-flight stream",
+            stop_started.elapsed()
+        );
+
+        let response = in_flight
+            .await
+            .expect("task joined")
+            .expect("an in-flight request must complete across a graceful shutdown");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.http.content.as_deref(), Some("drained"));
+    }
+
+    /// #65: after a graceful stop the listener is gone, so a NEW connection is
+    /// refused. Together with the drain test above this pins both halves of
+    /// RFC 9113 §6.8 — finish what is in flight, accept nothing new.
+    #[tokio::test]
+    async fn stop_refuses_new_connections() {
+        use crate::client::SbiClient;
+
+        let (server, port) =
+            start_test_server(SbiServerConfig::default(), |_req: SbiRequest| async {
+                SbiResponse::with_status(204)
+            })
+            .await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        assert_eq!(
+            client
+                .send_request(SbiRequest::get("/x"))
+                .await
+                .expect("first response")
+                .status,
+            204
+        );
+
+        server.stop().await.expect("stop");
+
+        // A fresh client cannot connect at all.
+        let after = SbiClient::with_host_port("127.0.0.1", port);
+        assert!(
+            after.send_request(SbiRequest::get("/x")).await.is_err(),
+            "the listener must be closed after stop()"
+        );
+    }
+
+    /// #65: with a reporter attached and a non-zero metric, every response
+    /// carries `3gpp-Sbi-Oci` — the producer half of TS 29.500 §6.4 that had no
+    /// caller before.
+    #[tokio::test]
+    async fn responses_carry_oci_when_the_nf_reports_overload() {
+        use crate::client::SbiClient;
+        use crate::overload::OverloadReporter;
+
+        let reporter = Arc::new(OverloadReporter::new());
+        let config = SbiServerConfig::default().with_overload_reporter(reporter.clone());
+        let (server, port) = start_test_server(config, |_req: SbiRequest| async {
+            SbiResponse::with_status(204)
+        })
+        .await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // Not overloaded: no header at all, so an NF that never sets a metric is
+        // byte-identical to before.
+        let quiet = client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("response");
+        assert!(
+            quiet
+                .http
+                .get_header(crate::constants::custom_header::OCI)
+                .is_none(),
+            "a reporter at metric 0 must emit nothing"
+        );
+
+        reporter.set_reduction_metric(40);
+        reporter.set_validity_secs(75);
+        let loaded = client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("response");
+        let oci = loaded
+            .http
+            .get_header(crate::constants::custom_header::OCI)
+            .expect("OCI stamped once the NF reports overload");
+        let parsed = crate::overload::Oci::parse(oci).expect("parseable OCI");
+        assert_eq!(parsed.reduction_metric, 40);
+        assert_eq!(parsed.period_of_validity_secs, Some(75));
 
         server.stop().await.expect("stop");
     }

@@ -373,27 +373,6 @@ fn nrf_self_uri() -> &'static str {
         .unwrap_or("http://127.0.0.1:7777")
 }
 
-/// Decodes percent-encoding (and `+` as space) in a query parameter value.
-/// Discovery parameters like `snssais` and `target-plmn-list` carry JSON in
-/// the query string (TS 29.510 §6.2.3.2.3.1, content: application/json).
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
 /// Where the ES256 signing key is persisted, when the operator configured a path
 /// (issue #64 gap 4). Set once at startup from `--signing-key-file`.
 static NRF_SIGNING_KEY_FILE: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -1748,9 +1727,19 @@ fn query_params(uri: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
+        // #65: the shared QUERY decoder, where `+` is a literal plus. nrfd's
+        // deleted local copy mapped `+` to a space here, which is the form-body
+        // rule -- so a query value carrying a base64 token or an RFC 3339 offset
+        // (`+02:00`) was silently corrupted.
         .map(|pair| match pair.split_once('=') {
-            Some((k, v)) => (percent_decode(k), percent_decode(v)),
-            None => (percent_decode(pair), String::new()),
+            Some((k, v)) => (
+                nextgcore_sbi::uri_encode::decode_query_value(k),
+                nextgcore_sbi::uri_encode::decode_query_value(v),
+            ),
+            None => (
+                nextgcore_sbi::uri_encode::decode_query_value(pair),
+                String::new(),
+            ),
         })
         .collect()
 }
@@ -2197,12 +2186,15 @@ fn extract_patch_validity_time(patch: &serde_json::Value) -> Option<String> {
 /// permits it to be empty, and the reference NRF (Open5GS) answers 200 OK
 /// with an empty list. 404 is NOT mandated for "target NF type unregistered".
 async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
+    // #65: `http.params` arrives already percent-decoded from the shared SBI
+    // server, so this must NOT decode again -- a second pass turns a legitimately
+    // escaped `%2520` into a space that the consumer never sent.
     let param = |name: &str| {
         request
             .http
             .params
             .get(name)
-            .map(|s| percent_decode(s))
+            .cloned()
             .filter(|s| !s.is_empty())
     };
 
@@ -3109,9 +3101,12 @@ fn parse_token_request(body: &str) -> TokenRequestParams {
         };
         for pair in body.split('&') {
             if let Some((key, value)) = pair.split_once('=') {
-                // nrfd-09: percent-decode key AND value (+ => space).
-                let key = percent_decode(key);
-                let value = percent_decode(value);
+                // nrfd-09: percent-decode key AND value (+ => space). #65: this
+                // is the FORM decoder, not the query one -- `application/x-www-
+                // form-urlencoded` defines `+` as a space, and nextgcore-sbi's
+                // `encode_form_value` emits it that way when minting this body.
+                let key = nextgcore_sbi::uri_encode::decode_form_value(key);
+                let value = nextgcore_sbi::uri_encode::decode_form_value(value);
                 match key.as_str() {
                     "grant_type" => p.grant_type = value,
                     "nfInstanceId" => p.nf_instance_id = value,
@@ -3592,17 +3587,25 @@ mod tests {
         assert!(vk.verify(b"header.tampered", &sig).is_err());
     }
 
+    /// #65: nrfd's local `percent_decode` is gone. What it did for a FORM body is
+    /// now `decode_form_value`; what it did for a QUERY value is
+    /// `decode_query_value`, which differs on `+` -- and that difference is the
+    /// defect the split fixed, so both are pinned here from nrfd's side too.
     #[test]
     fn test_percent_decode() {
-        assert_eq!(percent_decode("plain"), "plain");
-        assert_eq!(percent_decode("a+b"), "a b");
+        use nextgcore_sbi::uri_encode::{decode_form_value, decode_query_value};
+        assert_eq!(decode_query_value("plain"), "plain");
         assert_eq!(
-            percent_decode("%5B%7B%22sst%22%3A1%7D%5D"),
+            decode_query_value("%5B%7B%22sst%22%3A1%7D%5D"),
             r#"[{"sst":1}]"#
         );
         // Malformed escapes pass through unchanged.
-        assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(decode_query_value("100%"), "100%");
+        assert_eq!(decode_query_value("%zz"), "%zz");
+        // The form body keeps the `+`-as-space rule the old copy applied
+        // everywhere; a query value keeps the plus.
+        assert_eq!(decode_form_value("a+b"), "a b");
+        assert_eq!(decode_query_value("a+b"), "a+b");
     }
 
     #[test]
@@ -3874,8 +3877,8 @@ mod tests {
             // Issue #101: the RAW JSON. This used to be hand-percent-encoded
             // here, compensating for a client that did not encode -- so the test
             // exercised a path no real consumer takes. The client encodes now, and
-            // nrfd's `percent_decode` reverses it, so this asserts the real
-            // round trip.
+            // the shared SBI server decodes it on the way in (#65), so this
+            // asserts the real round trip.
             req.http
                 .set_param("snssais", r#"[{"sst":1,"sd":"010203"}]"#);
             let resp = client.send_request(req).await.expect("discover");
@@ -5488,8 +5491,8 @@ mod tests {
     ///
     /// Worth its own test because the two halves live in different crates and
     /// neither one alone can prove the round trip. A form body is
-    /// percent-encoded and `percent_decode` maps `+` to space; a JWT is
-    /// base64url plus `.` separators, which `url_encode` leaves untouched — but
+    /// percent-encoded and `decode_form_value` maps `+` to space; a JWT is
+    /// base64url plus `.` separators, which `encode_form_value` leaves untouched — but
     /// that is a property of two functions agreeing, not something either
     /// guarantees on its own. If it ever stops holding, every NF silently fails
     /// authentication.
