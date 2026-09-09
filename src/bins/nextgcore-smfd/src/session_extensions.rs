@@ -221,6 +221,72 @@ impl Ipv4Pool {
         false
     }
 
+    /// Every host address currently marked allocated, including the reserved
+    /// network (`.0.0`) and gateway (`.0.1`) addresses.
+    ///
+    /// Ascending, so the same pool state serialises identically on every write.
+    /// A set-ordered result would rewrite the whole snapshot for no change and
+    /// make a diff useless for spotting a real one.
+    ///
+    /// Used by the durable snapshot (issue #191): the bitmap is the only record
+    /// of which addresses are held, and rebuilding it empty is what lets the pool
+    /// hand a live UE's address to a second UE after a restart.
+    pub fn allocated_addrs(&self) -> Vec<Ipv4Addr> {
+        let bm = match self.bitmap.lock() {
+            Ok(bm) => bm,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for (word_idx, word) in bm.iter().enumerate() {
+            if *word == 0 {
+                continue;
+            }
+            for bit in 0..64u32 {
+                if *word & (1u64 << bit) == 0 {
+                    continue;
+                }
+                let host_idx = (word_idx as u32) * 64 + bit;
+                if host_idx >= self.pool_size {
+                    break;
+                }
+                let mut octets = self.base;
+                octets[2] = ((host_idx >> 8) & 0xFF) as u8;
+                octets[3] = (host_idx & 0xFF) as u8;
+                out.push(Ipv4Addr::from(octets));
+            }
+        }
+        out
+    }
+
+    /// Mark one specific address allocated, as when restoring a snapshot.
+    ///
+    /// `true` when this call is what marked it; `false` when it was already
+    /// marked — the reserved network/gateway addresses, or a duplicate — or when
+    /// it lies outside this pool. Only a newly-marked address moves
+    /// `active_count`, so restoring a snapshot that includes `.0.0`/`.0.1` (which
+    /// [`allocated_addrs`](Self::allocated_addrs) reports, and `new` already
+    /// marked without counting) does not inflate the count.
+    pub fn reserve(&self, addr: Ipv4Addr) -> bool {
+        let octets = addr.octets();
+        if octets[0] != self.base[0] || octets[1] != self.base[1] {
+            return false;
+        }
+        let host_idx = ((octets[2] as u32) << 8) | (octets[3] as u32);
+        if host_idx >= self.pool_size {
+            return false;
+        }
+        if let Ok(mut bm) = self.bitmap.lock() {
+            let word = (host_idx / 64) as usize;
+            let bit = host_idx % 64;
+            if bm[word] & (1u64 << bit) == 0 {
+                bm[word] |= 1u64 << bit;
+                self.allocated_count.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Number of currently allocated addresses (excluding reserved).
     pub fn active_count(&self) -> u32 {
         self.allocated_count.load(Ordering::Relaxed)

@@ -1491,7 +1491,13 @@ impl MbsSession {
 /// Per-PDU-session policy binding: ties the SBI SM context to its PCF SM
 /// policy association, the UE-requested N1 parameters and the QoS the PCF
 /// authorized (applied to N1 NAS and N4 QERs/PDRs). Drives the GSM FSM.
-#[derive(Debug, Clone)]
+///
+/// Serialisable because it is one of the three things the durable snapshot
+/// carries (issue #191): without it a restarted SMF cannot terminate or update
+/// policy for a session that is still live. `serde(default)` throughout so a
+/// snapshot written before a member existed still loads.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default = "PolicyBinding::snapshot_default")]
 pub struct PolicyBinding {
     /// smPolicyId returned by the PCF (None = config-default fallback)
     pub sm_policy_id: Option<String>,
@@ -1531,6 +1537,35 @@ pub struct PolicyBinding {
     /// that work will read from, and keeping it empty-by-default means a session
     /// that never got a report is indistinguishable from the pre-#114 state.
     pub easdf_reported_eas: Vec<String>,
+}
+
+impl PolicyBinding {
+    /// Per-field fallback for deserialising a durable snapshot written before a
+    /// member existed (issue #191).
+    ///
+    /// Not a `Default` impl: an empty `supi` with `psi` 0 names no session, and a
+    /// binding is only ever created from a real SM context request. Only serde
+    /// reaches this, and only for a member the snapshot does not carry.
+    fn snapshot_default() -> Self {
+        Self {
+            sm_policy_id: None,
+            supi: String::new(),
+            psi: 0,
+            pti: 0,
+            pdu_session_type: 0,
+            ssc_mode: 0,
+            ue_ip: [0; 4],
+            dnn: String::new(),
+            qfi: 0,
+            five_qi: 0,
+            ambr_ul_bps: 0,
+            ambr_dl_bps: 0,
+            sm_context_status_uri: None,
+            fsm: crate::gsm_sm::GsmFsm::new(0),
+            easdf_dns_context_id: None,
+            easdf_reported_eas: Vec::new(),
+        }
+    }
 }
 
 pub struct SmfContext {
@@ -1626,6 +1661,48 @@ pub struct SmfContext {
 
     /// SM policy bindings: sm_context_ref -> PCF policy association + GSM FSM
     pub policy_bindings: RwLock<HashMap<String, PolicyBinding>>,
+
+    /// Last Recovery Time Stamp each UPF peer reported, keyed by the peer's
+    /// socket address (issue #191).
+    ///
+    /// Persisted with the session map because it is what makes restoring that map
+    /// safe: on the first Association Setup after a reload, `check_peer_restart`
+    /// compares the freshly reported value against this one and flushes the
+    /// restored sessions if the UPF restarted while the SMF was down (TS 29.244
+    /// §5.22, TS 23.527 §4.2). Without it the restored `peer_recovery_time_stamp`
+    /// is `None`, no restart is detectable, and the SMF believes in N4 sessions
+    /// the UPF has already discarded.
+    pub upf_recovery_time_stamps: RwLock<HashMap<String, u32>>,
+
+    /// Durable snapshot of the PFCP session map, the policy bindings and the
+    /// IPv4 pool's allocations (issue #191). Disabled unless a state file is
+    /// configured, in which case behaviour is byte-identical to before.
+    ///
+    /// `StateStore` rather than the `read_snapshot`/`write_snapshot` free
+    /// functions: it enforces "never overwrite a snapshot you could not read"
+    /// internally, and a new adopter has no reason to take that on manually.
+    state: nextgcore_core::state_store::StateStore,
+}
+
+/// Why smfd durable state could not be loaded (issue #191).
+#[derive(Debug, thiserror::Error)]
+pub enum SmfStateError {
+    /// The snapshot file itself could not be read or parsed.
+    #[error(transparent)]
+    Store(#[from] nextgcore_core::state_store::StateStoreError),
+    /// The snapshot was written by a newer build. Refused rather than partially
+    /// restored: restoring only what this build recognises and then persisting
+    /// would rewrite a newer-format file in the older format, discarding the rest.
+    #[error(
+        "state file {path} was written by a newer smfd (snapshot version {found}; this build \
+         understands {supported}). Refusing to restore or overwrite it. Run the newer build, or \
+         move the file aside to start fresh."
+    )]
+    UnsupportedVersion {
+        path: std::path::PathBuf,
+        found: u64,
+        supported: u64,
+    },
 }
 
 impl SmfContext {
@@ -1672,6 +1749,8 @@ impl SmfContext {
             initialized: AtomicBool::new(false),
             pfcp_sessions: RwLock::new(HashMap::new()),
             policy_bindings: RwLock::new(HashMap::new()),
+            upf_recovery_time_stamps: RwLock::new(HashMap::new()),
+            state: nextgcore_core::state_store::StateStore::disabled(),
         }
     }
 
@@ -1700,9 +1779,269 @@ impl SmfContext {
             return;
         }
 
+        // Issue #191: DISABLE the store before clearing anything. `ue_remove_all`
+        // empties every list and releases every IP, and smfd has background tasks
+        // (the PFCP listener, the association loop, the timer loop) that can still
+        // reach a mutation during shutdown -- so a persist reached afterwards would
+        // write an empty snapshot over a good one and lose every live session and
+        // its address. Disabling first is the only ordering that cannot lose data
+        // regardless of what runs next.
+        self.state = nextgcore_core::state_store::StateStore::disabled();
         self.ue_remove_all();
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("SMF context finalized");
+    }
+
+    // ── durable state (issue #191) ───────────────────────────────────────────
+
+    /// Snapshot document version. Bump ONLY for a change no `#[serde(default)]`
+    /// can absorb; a bump makes every older snapshot unreadable.
+    pub const SNAPSHOT_VERSION: u64 = 1;
+
+    /// Point this context at a snapshot file and restore any prior state,
+    /// returning how many records were installed.
+    ///
+    /// Call once at startup, **after** [`init`](Self::init) and **before** the SBI
+    /// server or the PFCP association loop can run, so a restored session is never
+    /// shadowed by a fresh one and the restored peer Recovery Time Stamps are in
+    /// place for the first Association Setup.
+    ///
+    /// An unreadable snapshot is an **error**: the caller should refuse to start
+    /// rather than come up with an empty IPv4 pool that will re-issue addresses
+    /// live UEs still hold.
+    pub fn set_state_file(&mut self, path: std::path::PathBuf) -> Result<usize, SmfStateError> {
+        use nextgcore_core::state_store::{Loaded, StateStore};
+        self.state = StateStore::new(Some(path.clone()));
+        match self.state.load()? {
+            Loaded::Snapshot(doc) => {
+                let restored = self.restore_from(&doc, &path);
+                if restored.is_err() {
+                    // The store is not poisoned (the load itself succeeded), so a
+                    // caller that logged and carried on could otherwise overwrite a
+                    // snapshot this build cannot fully read. Disable instead.
+                    self.state = StateStore::disabled();
+                }
+                restored
+            }
+            Loaded::Absent => Ok(0),
+        }
+    }
+
+    /// Whether durable state is armed. `false` is the shipped default.
+    pub fn state_is_enabled(&self) -> bool {
+        self.state.is_enabled()
+    }
+
+    /// Serialize the three durable concerns to one snapshot document.
+    ///
+    /// **Takes one lock at a time, holding at most one at any instant.** This
+    /// file carries several documented lock-ordering rules (see `sess_remove`,
+    /// `sess_update`, `sess_find_by_ipv4`); a function holding three guards at
+    /// once would be a new inversion waiting to happen. Cloning each map out and
+    /// dropping its guard before taking the next means this function cannot
+    /// participate in any cycle, whatever order the mutators use.
+    ///
+    /// The cost is that the document is not one atomic instant across all three.
+    /// That is acceptable: every mutation persists immediately after its guards
+    /// drop, so the next write reconciles any skew -- and the alternative risks
+    /// wedging the NF, which no amount of snapshot precision is worth.
+    fn snapshot(&self) -> serde_json::Value {
+        // Each of these acquires and releases before the next begins.
+        let pfcp_sessions: std::collections::BTreeMap<String, u64> = self
+            .pfcp_sessions
+            .read()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
+        let policy_bindings: std::collections::BTreeMap<String, PolicyBinding> = self
+            .policy_bindings
+            .read()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        let upf_rts: std::collections::BTreeMap<String, u32> = self
+            .upf_recovery_time_stamps
+            .read()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
+        // Ascending already (see `Ipv4Pool::allocated_addrs`), and as strings so
+        // the file is readable by an operator diagnosing a double assignment.
+        let ipv4_allocations: Vec<String> = self
+            .ipv4_pool
+            .allocated_addrs()
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect();
+
+        // BTreeMap, not HashMap: a HashMap iterates in a different order on every
+        // process, so the file would churn wholesale on each write and a diff
+        // would never show which record actually changed.
+        serde_json::json!({
+            "version": Self::SNAPSHOT_VERSION,
+            "pfcpSessions": pfcp_sessions,
+            "policyBindings": policy_bindings,
+            "ipv4Allocations": ipv4_allocations,
+            "upfRecoveryTimeStamps": upf_rts,
+        })
+    }
+
+    /// Restore the three durable concerns.
+    ///
+    /// # Why the IPv4 pool is restored by re-marking, not by counting
+    ///
+    /// The pool is a bitmap plus a count. Restoring the count alone would leave
+    /// every bit clear, so the very next `allocate()` returns `10.45.0.2` — an
+    /// address a live UE is still using. Re-marking each snapshotted address is
+    /// the only restore that makes the pool's answer to "is this free?" agree with
+    /// reality. `reserve` reports whether it was this call that marked the bit, so
+    /// the reserved `.0.0`/`.0.1` that `allocated_addrs` also reports do not
+    /// double-count.
+    ///
+    /// # Why a restored PFCP session is not assumed usable
+    ///
+    /// A restored `sm_context_ref -> SEID` mapping is SMF-side bookkeeping about
+    /// state that lives on the UPF, and the UPF may have restarted while the SMF
+    /// was down. That is why `upfRecoveryTimeStamps` is part of the same document:
+    /// seeding it back into each `PfcpClient` (see `main`) makes the existing
+    /// `check_peer_restart` comparison fire on the first Association Setup after a
+    /// reload, which tears the association down and flushes exactly these restored
+    /// sessions. Reconciling *which* sessions survived, and telling peers about the
+    /// ones that did not, is TS 23.527 restoration signalling and belongs to #193.
+    fn restore_from(
+        &self,
+        doc: &serde_json::Value,
+        path: &std::path::Path,
+    ) -> Result<usize, SmfStateError> {
+        let found = doc
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(Self::SNAPSHOT_VERSION);
+        if found > Self::SNAPSHOT_VERSION {
+            return Err(SmfStateError::UnsupportedVersion {
+                path: path.to_path_buf(),
+                found,
+                supported: Self::SNAPSHOT_VERSION,
+            });
+        }
+
+        let pfcp_sessions: HashMap<String, u64> = doc
+            .get("pfcpSessions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        // Per-record, so one binding whose schema moved does not discard the rest:
+        // the file was already validated as JSON by the store, so a bad record
+        // means a schema change, not corruption.
+        let policy_bindings: HashMap<String, PolicyBinding> = doc
+            .get("policyBindings")
+            .and_then(|v| v.as_object().cloned())
+            .map(|obj| {
+                obj.into_iter()
+                    .filter_map(|(k, v)| match serde_json::from_value::<PolicyBinding>(v) {
+                        Ok(b) => Some((k, b)),
+                        Err(e) => {
+                            log::warn!("skipping unreadable SMF policy binding {k}: {e}");
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ipv4_allocations: Vec<Ipv4Addr> = doc
+            .get("ipv4Allocations")
+            .and_then(|v| v.as_array().cloned())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|s| match s.parse::<Ipv4Addr>() {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            log::warn!("skipping unreadable SMF IPv4 allocation {s}: {e}");
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let upf_rts: HashMap<String, u32> = doc
+            .get("upfRecoveryTimeStamps")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let n_sessions = pfcp_sessions.len();
+        let n_bindings = policy_bindings.len();
+        let n_rts = upf_rts.len();
+
+        // One lock at a time, as in `snapshot`.
+        if let Ok(mut map) = self.pfcp_sessions.write() {
+            map.extend(pfcp_sessions);
+        }
+        if let Ok(mut map) = self.policy_bindings.write() {
+            map.extend(policy_bindings);
+        }
+        if let Ok(mut map) = self.upf_recovery_time_stamps.write() {
+            map.extend(upf_rts);
+        }
+        let mut n_addrs = 0usize;
+        for addr in &ipv4_allocations {
+            if self.ipv4_pool.reserve(*addr) {
+                n_addrs += 1;
+            }
+        }
+
+        let restored = n_sessions + n_bindings + n_addrs;
+        log::info!(
+            "SMF durable state restored: {n_sessions} PFCP session(s), {n_bindings} policy \
+             binding(s), {n_addrs} IPv4 allocation(s) re-marked, {n_rts} UPF recovery time \
+             stamp(s). The PFCP sessions are UNRECONCILED: they are flushed on the first \
+             Association Setup if the UPF reports a changed Recovery Time Stamp."
+        );
+        Ok(restored)
+    }
+
+    /// Write the snapshot after a mutation. A no-op with no state file, and
+    /// refused (loudly) when the previous load failed.
+    ///
+    /// **Every caller must have dropped its write guards first.** `persist` ->
+    /// `snapshot` takes read locks on the same maps and `std::sync::RwLock` is not
+    /// reentrant, so calling this while still holding `pfcp_sessions.write()` or
+    /// `policy_bindings.write()` deadlocks the calling thread. Every call site
+    /// closes its `if let Ok(mut …) = ….write()` block first.
+    pub fn persist(&self) {
+        if !self.state.is_enabled() {
+            return;
+        }
+        let doc = self.snapshot();
+        if let Err(e) = self.state.persist(&doc) {
+            // The session exists in memory but not on disk: the request was
+            // answered and will not survive a restart.
+            log::error!("SMF state was NOT persisted: {e}");
+        }
+    }
+
+    /// Record the Recovery Time Stamp a UPF peer reported, and persist it.
+    ///
+    /// Keyed by the peer socket address as `PfcpClient::peer()` renders it, which
+    /// is what `main` uses to seed the value back after a restart.
+    pub fn note_upf_recovery_time_stamp(&self, peer: &str, rts: u32) {
+        let changed = {
+            match self.upf_recovery_time_stamps.write() {
+                Ok(mut map) => map.insert(peer.to_string(), rts) != Some(rts),
+                Err(_) => false,
+            }
+        };
+        // Only on a change: the association loop re-reports the same stamp on
+        // every heartbeat, and rewriting the whole snapshot every 10s per peer
+        // for an unchanged value is pure write amplification.
+        if changed {
+            self.persist();
+        }
+    }
+
+    /// The Recovery Time Stamp last recorded for `peer`, if any.
+    pub fn upf_recovery_time_stamp(&self, peer: &str) -> Option<u32> {
+        self.upf_recovery_time_stamps
+            .read()
+            .ok()?
+            .get(peer)
+            .copied()
     }
 
     /// Check if context is initialized
@@ -1967,38 +2306,53 @@ impl SmfContext {
         // First, remove all bearers for this session (must be done before acquiring session locks)
         self.bearer_remove_all_for_sess(id);
 
-        // Now remove the session itself
-        let mut sess_list = self.sess_list.write().ok()?;
-        let mut smf_n4_seid_hash = self.smf_n4_seid_hash.write().ok()?;
-        let mut ipv4_hash = self.ipv4_hash.write().ok()?;
-        let mut ipv6_hash = self.ipv6_hash.write().ok()?;
-        let mut n1n2message_hash = self.n1n2message_hash.write().ok()?;
-        let mut smf_ue_list = self.smf_ue_list.write().ok()?;
+        // Issue #191: scoped so every guard is dropped before `persist` runs --
+        // `persist` re-reads the IPv4 pool bitmap and neither `RwLock` nor `Mutex`
+        // is reentrant. The `?` operators inside still return early from
+        // `sess_remove`, which is the pre-#191 behaviour and needs no persist
+        // because nothing was removed.
+        let removed = {
+            // Now remove the session itself
+            let mut sess_list = self.sess_list.write().ok()?;
+            let mut smf_n4_seid_hash = self.smf_n4_seid_hash.write().ok()?;
+            let mut ipv4_hash = self.ipv4_hash.write().ok()?;
+            let mut ipv6_hash = self.ipv6_hash.write().ok()?;
+            let mut n1n2message_hash = self.n1n2message_hash.write().ok()?;
+            let mut smf_ue_list = self.smf_ue_list.write().ok()?;
 
-        if let Some(sess) = sess_list.remove(&id) {
-            smf_n4_seid_hash.remove(&sess.smf_n4_seid);
+            match sess_list.remove(&id) {
+                Some(sess) => {
+                    smf_n4_seid_hash.remove(&sess.smf_n4_seid);
 
-            if let Some(addr) = sess.ipv4_addr {
-                ipv4_hash.remove(&u32::from(addr));
-                self.ipv4_pool.release(addr);
-            }
-            if let Some((_, addr)) = sess.ipv6_prefix {
-                let prefix: [u8; 8] = addr.octets()[..8].try_into().unwrap_or([0; 8]);
-                ipv6_hash.remove(&prefix);
-            }
-            if let Some(ref location) = sess.paging_n1n2message_location {
-                n1n2message_hash.remove(location);
-            }
+                    if let Some(addr) = sess.ipv4_addr {
+                        ipv4_hash.remove(&u32::from(addr));
+                        self.ipv4_pool.release(addr);
+                    }
+                    if let Some((_, addr)) = sess.ipv6_prefix {
+                        let prefix: [u8; 8] = addr.octets()[..8].try_into().unwrap_or([0; 8]);
+                        ipv6_hash.remove(&prefix);
+                    }
+                    if let Some(ref location) = sess.paging_n1n2message_location {
+                        n1n2message_hash.remove(location);
+                    }
 
-            // Remove session ID from UE
-            if let Some(ue) = smf_ue_list.get_mut(&sess.smf_ue_id) {
-                ue.sess_ids.retain(|&sid| sid != id);
-            }
+                    // Remove session ID from UE
+                    if let Some(ue) = smf_ue_list.get_mut(&sess.smf_ue_id) {
+                        ue.sess_ids.retain(|&sid| sid != id);
+                    }
 
-            log::info!("[Removed] SMF session (id={}, psi={})", id, sess.psi);
-            return Some(sess);
+                    log::info!("[Removed] SMF session (id={}, psi={})", id, sess.psi);
+                    Some(sess)
+                }
+                None => None,
+            }
+        };
+        // Issue #191: a released address that is not persisted stays held in the
+        // snapshot forever, which leaks the pool across restarts.
+        if removed.is_some() {
+            self.persist();
         }
-        None
+        removed
     }
 
     /// Remove all sessions for a UE
@@ -2878,5 +3232,312 @@ mod tests {
         assert_eq!(ctx.sess_count(), 0);
         assert_eq!(ctx.bearer_count(), 0);
         assert_eq!(ctx.pf_count(), 0);
+    }
+
+    // ── durable state (issue #191) ───────────────────────────────────────────
+    //
+    // Every test here builds its own `SmfContext`, never `smf_self()`: arming a
+    // state file on the process-global context would make one test's snapshot the
+    // next test's restored state.
+
+    /// Unique snapshot path per test so parallel runs cannot collide.
+    fn temp_state_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "nextgcore-smf-state-{}-{tag}-{nanos}.json",
+            std::process::id()
+        ))
+    }
+
+    fn ctx_with_state(path: &std::path::Path) -> SmfContext {
+        let mut ctx = SmfContext::new();
+        ctx.init(100, 200, 400);
+        ctx.set_state_file(path.to_path_buf())
+            .expect("arming a fresh state file must succeed");
+        ctx
+    }
+
+    fn binding(
+        supi: &str,
+        psi: u8,
+        ue_ip: [u8; 4],
+        state: crate::gsm_sm::GsmState,
+    ) -> PolicyBinding {
+        let mut b = PolicyBinding::snapshot_default();
+        b.sm_policy_id = Some(format!("pol-{supi}-{psi}"));
+        b.supi = supi.to_string();
+        b.psi = psi;
+        b.pti = 3;
+        b.pdu_session_type = 1;
+        b.ssc_mode = 1;
+        b.ue_ip = ue_ip;
+        b.dnn = "internet".to_string();
+        b.qfi = 1;
+        b.five_qi = 9;
+        b.ambr_ul_bps = 100_000_000;
+        b.ambr_dl_bps = 200_000_000;
+        b.sm_context_status_uri = Some("http://amf/status".to_string());
+        b.fsm.state = state;
+        b.easdf_dns_context_id = Some("dns-ctx-9".to_string());
+        b
+    }
+
+    /// The whole point of #191: a session created before a restart, and the
+    /// address it holds, are both still there afterwards.
+    #[test]
+    fn snapshot_restores_sessions_bindings_and_ip_allocations() {
+        let path = temp_state_path("roundtrip");
+        let addr = {
+            let ctx = ctx_with_state(&path);
+            let addr = ctx.ipv4_pool.allocate().expect("pool has addresses");
+            // The allocate call site persists; here the pool is driven directly, so
+            // the mutation is followed by the same explicit persist.
+            ctx.persist();
+            {
+                let mut sessions = ctx.pfcp_sessions.write().unwrap();
+                sessions.insert("ref-1".to_string(), 0x0102_0304_0506_0708);
+            }
+            ctx.persist();
+            {
+                let mut bindings = ctx.policy_bindings.write().unwrap();
+                bindings.insert(
+                    "ref-1".to_string(),
+                    binding(
+                        "imsi-001010000000001",
+                        5,
+                        addr.octets(),
+                        crate::gsm_sm::GsmState::Operational,
+                    ),
+                );
+            }
+            ctx.persist();
+            ctx.note_upf_recovery_time_stamp("127.0.0.1:8805", 4242);
+            addr
+        };
+
+        // A cold rebuild from the same file: a different process would do exactly
+        // this, and nothing carries over except the snapshot.
+        let restored_ctx = ctx_with_state(&path);
+
+        assert_eq!(
+            restored_ctx
+                .pfcp_sessions
+                .read()
+                .unwrap()
+                .get("ref-1")
+                .copied(),
+            Some(0x0102_0304_0506_0708),
+            "the UPF SEID must survive, or the SMF cannot delete the N4 session"
+        );
+        let b = restored_ctx
+            .policy_bindings
+            .read()
+            .unwrap()
+            .get("ref-1")
+            .cloned()
+            .expect("policy binding restored");
+        assert_eq!(b.supi, "imsi-001010000000001");
+        assert_eq!(b.psi, 5);
+        assert_eq!(b.ue_ip, addr.octets());
+        assert_eq!(b.ambr_dl_bps, 200_000_000);
+        assert_eq!(
+            b.sm_policy_id.as_deref(),
+            Some("pol-imsi-001010000000001-5")
+        );
+        assert_eq!(b.easdf_dns_context_id.as_deref(), Some("dns-ctx-9"));
+        assert_eq!(
+            b.fsm.state,
+            crate::gsm_sm::GsmState::Operational,
+            "a binding restored into Initial would re-run establishment for a live session"
+        );
+        assert_eq!(
+            restored_ctx.upf_recovery_time_stamp("127.0.0.1:8805"),
+            Some(4242),
+            "without the peer stamp the restored session map can never be checked"
+        );
+        // The allocation itself, not merely the copy of it inside the binding.
+        assert!(
+            restored_ctx.ipv4_pool.allocated_addrs().contains(&addr),
+            "the pool must know {addr} is held"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The consequence that makes this a correctness fix and not just resilience:
+    /// a restored allocation must not be handed to a second UE.
+    #[test]
+    fn a_restored_allocation_is_not_reissued() {
+        let path = temp_state_path("no-reissue");
+        let held = {
+            let ctx = ctx_with_state(&path);
+            let held: Vec<Ipv4Addr> = (0..3)
+                .map(|_| ctx.ipv4_pool.allocate().expect("pool has addresses"))
+                .collect();
+            ctx.persist();
+            held
+        };
+        // .0.0 and .0.1 are reserved, so the first three allocations are .0.2-.0.4.
+        assert_eq!(
+            held,
+            vec![
+                Ipv4Addr::new(10, 45, 0, 2),
+                Ipv4Addr::new(10, 45, 0, 3),
+                Ipv4Addr::new(10, 45, 0, 4)
+            ]
+        );
+
+        let restored_ctx = ctx_with_state(&path);
+        // POSITIVE assertion: the next free address is the one after the restored
+        // run, not merely "different from the three". A pool that restored nothing
+        // would answer .0.2 here, and a pool that restored the bits but lost the
+        // count would answer .0.5 too -- so the count is checked as well.
+        let fresh = restored_ctx
+            .ipv4_pool
+            .allocate()
+            .expect("pool has addresses");
+        assert_eq!(fresh, Ipv4Addr::new(10, 45, 0, 5));
+        assert_eq!(
+            restored_ctx.ipv4_pool.active_count(),
+            4,
+            "three restored plus one fresh; the reserved .0.0/.0.1 are not counted"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Releasing an address must reach the snapshot, or the pool leaks across
+    /// restarts -- the mirror of the double-assignment above.
+    #[test]
+    fn a_released_allocation_is_not_restored() {
+        let path = temp_state_path("release");
+        {
+            let ctx = ctx_with_state(&path);
+            let ue = ctx.ue_add_by_supi("imsi-001010000000009").expect("ue");
+            let mut sess = ctx.sess_add_by_psi(ue.id, 1).expect("sess");
+            let addr = ctx.ipv4_pool.allocate().expect("pool has addresses");
+            sess.ipv4_addr = Some(addr);
+            ctx.sess_update(&sess);
+            ctx.persist();
+            assert!(ctx.ipv4_pool.allocated_addrs().contains(&addr));
+            // sess_remove releases the address and persists.
+            ctx.sess_remove(sess.id).expect("session removed");
+            assert!(!ctx.ipv4_pool.allocated_addrs().contains(&addr));
+        }
+
+        let restored_ctx = ctx_with_state(&path);
+        assert_eq!(
+            restored_ctx.ipv4_pool.active_count(),
+            0,
+            "a released address must not come back as held"
+        );
+        assert_eq!(
+            restored_ctx.ipv4_pool.allocate(),
+            Some(Ipv4Addr::new(10, 45, 0, 2)),
+            "the released address is reusable again"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The shipped default: no state file means no file operations at all.
+    #[test]
+    fn without_a_state_file_nothing_is_persisted() {
+        let dir = std::env::temp_dir().join(format!(
+            "nextgcore-smf-nostate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Positive control FIRST, so the absence assertion below is known to be
+        // capable of failing: an armed context writing into this same directory
+        // must be visible to the scan. Without this the test would also pass if
+        // the scan were looking in the wrong place.
+        {
+            let armed = ctx_with_state(&dir.join("armed.json"));
+            let _ = armed.ipv4_pool.allocate();
+            armed.persist();
+        }
+        assert!(
+            dir.join("armed.json").exists(),
+            "positive control: an armed store must write into the watched directory"
+        );
+        std::fs::remove_file(dir.join("armed.json")).expect("clear the control");
+
+        let mut ctx = SmfContext::new();
+        ctx.init(100, 200, 400);
+        assert!(!ctx.state_is_enabled());
+        let _ = ctx.ipv4_pool.allocate();
+        {
+            let mut sessions = ctx.pfcp_sessions.write().unwrap();
+            sessions.insert("ref-x".to_string(), 7);
+        }
+        ctx.persist();
+        ctx.note_upf_recovery_time_stamp("127.0.0.1:8805", 11);
+        let ue = ctx.ue_add_by_supi("imsi-001010000000002").expect("ue");
+        let sess = ctx.sess_add_by_psi(ue.id, 1).expect("sess");
+        ctx.sess_remove(sess.id);
+        ctx.fini();
+
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read temp dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "a memory-only SMF must touch no files, found {entries:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A snapshot from a newer build must be refused AND left alone, not
+    /// partially restored and then rewritten in the older format.
+    #[test]
+    fn a_newer_snapshot_is_refused_and_not_overwritten() {
+        let path = temp_state_path("newer");
+        let doc = serde_json::json!({
+            "version": SmfContext::SNAPSHOT_VERSION + 1,
+            "pfcpSessions": { "ref-future": 99 },
+            "policyBindings": {},
+            "ipv4Allocations": ["10.45.7.7"],
+            "upfRecoveryTimeStamps": {},
+        });
+        let before = serde_json::to_vec_pretty(&doc).expect("serialise");
+        std::fs::write(&path, &before).expect("write snapshot");
+
+        let mut ctx = SmfContext::new();
+        ctx.init(100, 200, 400);
+        let err = ctx
+            .set_state_file(path.clone())
+            .expect_err("a newer snapshot must be refused");
+        assert!(
+            matches!(err, SmfStateError::UnsupportedVersion { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !ctx.state_is_enabled(),
+            "the store must be disabled so a later mutation cannot rewrite the file"
+        );
+
+        // Prove the refusal protects the file: a mutation after the failed load
+        // must not rewrite it.
+        let _ = ctx.ipv4_pool.allocate();
+        ctx.persist();
+        assert_eq!(
+            std::fs::read(&path).expect("file still there"),
+            before,
+            "the newer-format file must be byte-identical after a refused load"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

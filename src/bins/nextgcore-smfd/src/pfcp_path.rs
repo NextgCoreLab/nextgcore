@@ -445,6 +445,28 @@ impl PfcpClient {
         self.assoc.read().await.clone()
     }
 
+    /// Install a peer Recovery Time Stamp learned from a durable snapshot rather
+    /// than from the wire (issue #191).
+    ///
+    /// This is what makes restoring the PFCP session map safe across an SMF
+    /// restart. `check_peer_restart` can only detect a restart when it has a
+    /// stored stamp to compare against, and a fresh process has `None` — so
+    /// without this seed the first Association Setup after a reload accepts
+    /// whatever stamp the UPF reports and the restored sessions are never
+    /// questioned, even when the UPF restarted meanwhile and holds none of them.
+    ///
+    /// Deliberately does **not** set `associated`: the association still has to be
+    /// established on the wire. Only the restart-detection input is restored.
+    pub async fn seed_peer_recovery_time_stamp(&self, rts: u32) {
+        let mut assoc = self.assoc.write().await;
+        assoc.peer_recovery_time_stamp = Some(rts);
+        log::info!(
+            "PFCP {}: seeded peer Recovery Time Stamp {rts} from durable state; a different \
+             stamp at Association Setup will flush the restored sessions",
+            self.peer
+        );
+    }
+
     /// Test-only: force association/load state. Unit tests cannot run the
     /// full Association Setup handshake for every selection scenario.
     #[cfg(test)]
@@ -655,6 +677,9 @@ impl PfcpClient {
             self.teardown_association("peer restarted").await;
             // Remember the new incarnation so re-association succeeds
             self.assoc.write().await.peer_recovery_time_stamp = Some(rts);
+            // Issue #191: durably too, so a restart detected on a heartbeat is not
+            // re-detected (or worse, missed) after an SMF restart.
+            self.record_peer_recovery_time_stamp(rts);
         }
     }
 
@@ -708,20 +733,35 @@ impl PfcpClient {
         // Restart detection against any previously stored timestamp
         self.check_peer_restart(resp.recovery_time_stamp).await;
 
-        let mut assoc = self.assoc.write().await;
-        assoc.associated = true;
-        assoc.peer_recovery_time_stamp = Some(resp.recovery_time_stamp);
-        assoc.up_function_features = resp.up_function_features;
-        log::info!(
-            "PFCP association established with {} (peer RTS={}, UP features={:?})",
-            self.peer,
-            resp.recovery_time_stamp,
-            assoc
-                .up_function_features
-                .as_ref()
-                .map(|f| (f.ftup, f.empu, f.bucp))
-        );
+        {
+            let mut assoc = self.assoc.write().await;
+            assoc.associated = true;
+            assoc.peer_recovery_time_stamp = Some(resp.recovery_time_stamp);
+            assoc.up_function_features = resp.up_function_features;
+            log::info!(
+                "PFCP association established with {} (peer RTS={}, UP features={:?})",
+                self.peer,
+                resp.recovery_time_stamp,
+                assoc
+                    .up_function_features
+                    .as_ref()
+                    .map(|f| (f.ftup, f.empu, f.bucp))
+            );
+        }
+        // Issue #191: record the stamp durably so the NEXT process can compare
+        // against it. Scoped after the async guard drops, and the std lock is not
+        // held across an await.
+        self.record_peer_recovery_time_stamp(resp.recovery_time_stamp);
         Ok(())
+    }
+
+    /// Store the peer's Recovery Time Stamp in the SMF context so it reaches the
+    /// durable snapshot (issue #191). A no-op when persistence is disabled.
+    fn record_peer_recovery_time_stamp(&self, rts: u32) {
+        let peer = self.peer.to_string();
+        if let Ok(ctx) = smf_self().read() {
+            ctx.note_upf_recovery_time_stamp(&peer, rts);
+        }
     }
 
     /// Run the PFCP Association Release procedure (TS 29.244 6.2.9).
@@ -780,9 +820,22 @@ impl PfcpClient {
 /// Returns the number of sessions removed.
 pub fn clear_pfcp_sessions() -> usize {
     if let Ok(ctx) = smf_self().read() {
-        if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
-            let n = sessions.len();
-            sessions.clear();
+        let n = {
+            match ctx.pfcp_sessions.write() {
+                Ok(mut sessions) => {
+                    let n = sessions.len();
+                    sessions.clear();
+                    Some(n)
+                }
+                Err(_) => None,
+            }
+        };
+        if let Some(n) = n {
+            // Issue #191: the flush must reach the snapshot too. This is the path
+            // that makes restoring the session map safe -- a UPF whose Recovery
+            // Time Stamp changed no longer holds these sessions, so a snapshot
+            // that kept them would re-restore them on every subsequent start.
+            ctx.persist();
             return n;
         }
     }
@@ -841,6 +894,19 @@ mod tests {
         assert!(!is_response_type(pfcp_message_type::HEARTBEAT_REQUEST));
         assert!(!is_response_type(pfcp_message_type::SESSION_REPORT_REQUEST));
     }
+
+    /// One agreement about the process-global `pfcp_sessions` map.
+    ///
+    /// `teardown_association` calls `clear_pfcp_sessions`, which clears the map
+    /// for the WHOLE process, not for the client that tore down. So any two tests
+    /// that can reach a teardown will flush each other's session entries if they
+    /// interleave — which is exactly how the #191 pair below first failed, one
+    /// clearing the other's key mid-assertion.
+    ///
+    /// Every test that can reach a teardown takes this, so there is one lock
+    /// rather than two disjoint agreements about the same variable. A test that
+    /// only reads client-local association state does not need it.
+    static SESSION_MAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn make_client_with_peer() -> (Arc<PfcpClient>, UdpSocket) {
         let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1021,6 +1087,9 @@ mod tests {
     /// Time Stamp must tear the association down (peer restarted).
     #[tokio::test]
     async fn test_heartbeat_detects_peer_restart() {
+        // Serialised: this test can reach a teardown, which flushes the
+        // process-global session map (see SESSION_MAP_LOCK).
+        let _map_guard = SESSION_MAP_LOCK.lock().await;
         let (client, upf) = make_client_with_peer().await;
         {
             let mut a = client.assoc.write().await;
@@ -1080,6 +1149,9 @@ mod tests {
     /// the association.
     #[tokio::test]
     async fn test_inbound_association_release() {
+        // Serialised: this test can reach a teardown, which flushes the
+        // process-global session map (see SESSION_MAP_LOCK).
+        let _map_guard = SESSION_MAP_LOCK.lock().await;
         let (client, upf) = make_client_with_peer().await;
         client.assoc.write().await.associated = true;
         let local_addr = client.socket.local_addr().unwrap();
@@ -1265,6 +1337,9 @@ mod tests {
     /// from 1) is not stuck behind the old high-watermark.
     #[tokio::test]
     async fn test_teardown_clears_load_state() {
+        // Serialised: this test can reach a teardown, which flushes the
+        // process-global session map (see SESSION_MAP_LOCK).
+        let _map_guard = SESSION_MAP_LOCK.lock().await;
         let (client, _upf) = make_client_with_peer().await;
         client
             .set_assoc_state_for_test(true, Some(40), Some(5000))
@@ -1278,6 +1353,99 @@ mod tests {
         assert_eq!(
             assoc.peer_load_seq, None,
             "a fresh low-seq post-restart report must be acceptable again"
+        );
+    }
+
+    // ── #191: a seeded stamp is what makes a restored session map checkable ──
+    //
+    // These two drive the process-global session map, as `test_teardown_clears_
+    // load_state` above already does via `teardown_association`. Safe because no
+    // smfd test asserts on the *contents* of the global `pfcp_sessions` map, and
+    // each of these asserts only about its own uniquely-named key rather than
+    // about the map being empty.
+
+    /// A stamp restored from a snapshot must participate in restart detection.
+    /// Without the seed a fresh process holds `None`, no restart is detectable,
+    /// and the restored sessions are never questioned.
+    #[tokio::test]
+    async fn a_seeded_recovery_time_stamp_makes_a_peer_restart_detectable() {
+        // Serialised: this test can reach a teardown, which flushes the
+        // process-global session map (see SESSION_MAP_LOCK).
+        let _map_guard = SESSION_MAP_LOCK.lock().await;
+        let (client, _upf) = make_client_with_peer().await;
+        client.seed_peer_recovery_time_stamp(100).await;
+        client.set_assoc_state_for_test(true, None, None).await;
+        if let Ok(ctx) = smf_self().read() {
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert("seeded-restart-ref".to_string(), 0xabcd);
+        }
+
+        // The UPF comes back with a different incarnation: every session it held
+        // is gone (TS 29.244 §5.22, TS 23.527 §4.2).
+        client.check_peer_restart(200).await;
+
+        assert!(
+            !client.is_associated().await,
+            "a changed stamp must tear the association down"
+        );
+        let still_there = smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .read()
+            .unwrap()
+            .contains_key("seeded-restart-ref");
+        assert!(
+            !still_there,
+            "the restored session must be flushed, not left believed-in"
+        );
+        assert_eq!(
+            client.association().await.peer_recovery_time_stamp,
+            Some(200),
+            "the new incarnation is remembered so re-association succeeds"
+        );
+    }
+
+    /// The other half of the interlock: an unchanged stamp means the UPF did NOT
+    /// restart, so the restored sessions are genuinely still valid and must be
+    /// left alone. Without this, "flush on restart" could be satisfied by a
+    /// version that flushes unconditionally — which would make the whole snapshot
+    /// pointless.
+    #[tokio::test]
+    async fn an_unchanged_recovery_time_stamp_leaves_restored_sessions_alone() {
+        // Serialised: this test can reach a teardown, which flushes the
+        // process-global session map (see SESSION_MAP_LOCK).
+        let _map_guard = SESSION_MAP_LOCK.lock().await;
+        let (client, _upf) = make_client_with_peer().await;
+        client.seed_peer_recovery_time_stamp(300).await;
+        client.set_assoc_state_for_test(true, None, None).await;
+        if let Ok(ctx) = smf_self().read() {
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert("unchanged-stamp-ref".to_string(), 0x1234);
+        }
+
+        client.check_peer_restart(300).await;
+
+        assert!(
+            client.is_associated().await,
+            "the same stamp is not a restart"
+        );
+        let seid = smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .read()
+            .unwrap()
+            .get("unchanged-stamp-ref")
+            .copied();
+        assert_eq!(
+            seid,
+            Some(0x1234),
+            "a session on a UPF that did not restart must survive"
         );
     }
 }

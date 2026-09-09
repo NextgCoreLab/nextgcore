@@ -94,7 +94,53 @@ The N4/PFCP endpoints are configured by environment variables, **not** by the `s
 | `SMF_SBI_ADVERTISE_URI` | derived from SBI server address/port | Externally reachable base URI used in PCF callback (`notificationUri`) URIs. |
 | `UDM_SBI_ADDR` / `UDM_SBI_PORT` | unset / `7777` | UDM address for `Nudm_SDM_Get(smf-select-data)`, used only to resolve the **subscribed default DNN** (#204). Tried **after** NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a `SmContextCreateData` carrying no `dnn` is refused with `SUBSCRIPTION_DATA_NOT_AVAILABLE`. |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | unset | `1`/`true`/`yes` forces OAuth2 enforcement, taking precedence over the YAML knob. |
+| `NEXTGCORE_SMF_STATE_FILE` | unset | JSON snapshot file for PFCP sessions, policy bindings and IPv4-pool allocations (#191). Read only when `--state-file` is absent — the flag wins; an empty value is treated as unset. With neither set the SMF is memory-only, which is the shipped default. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP trace exporter endpoint. |
+
+## Command-line flags
+
+`smfd` has no `clap` argument parser; it scans `argv` for the two flags it
+understands and ignores everything else.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-c` / `--config` | `/etc/nextgcore/smf.yaml` | Config file path. Falls back to `SMF_CONFIG`. |
+| `--state-file` | unset | JSON snapshot file for durable state (#191). Falls back to `NEXTGCORE_SMF_STATE_FILE`; an empty value is treated as unset. |
+
+## Durable state (#191)
+
+Off by default. With `--state-file` (or `NEXTGCORE_SMF_STATE_FILE`) the SMF
+snapshots three things on every mutation and reloads them at boot:
+
+| Snapshotted | Why it matters on restart |
+|---|---|
+| PFCP sessions (`sm_context_ref` → UPF SEID) | Without it the UPF holds N4 sessions the SMF can no longer delete or modify. |
+| Policy bindings (PCF association, authorized QoS, GSM FSM state, EASDF DNS context) | Without it a restarted SMF cannot terminate or update policy for a live session. |
+| IPv4-pool allocations | **The one with a correctness consequence beyond lost state.** The pool is a bitmap; rebuilt empty, the next allocation returns an address a live UE still holds, and nothing logs the collision. |
+
+Uses the shared `nextgcore-core::state_store::StateStore`: atomic +
+fsynced + `0600` writes, and a snapshot that cannot be read is **never
+overwritten**. An unreadable snapshot, or one written by a newer build,
+**fails startup** rather than coming up with an empty pool.
+
+**The restored PFCP session map is checked, not trusted.** The snapshot also
+carries the last Recovery Time Stamp each UPF reported. That value is seeded
+back into each `PfcpClient` before the association loop starts, so the first
+Association Setup after a reload compares the UPF's reported stamp against it:
+a changed stamp means the UPF restarted while the SMF was down, and the restored
+sessions are flushed (TS 29.244 §5.22, TS 23.527 §4.2) instead of being believed
+in. An unchanged stamp means they are genuinely still valid.
+
+**Limits worth knowing:**
+
+- The flush is process-wide, not per-peer — `clear_pfcp_sessions` empties the
+  whole map, so with several UPFs configured one peer's restart discards the
+  session bookkeeping for all of them. The map has no peer column to do better.
+- Reconciling *which* sessions survived a restart, and signalling peers about
+  the ones that did not, is TS 23.527 restoration work tracked as #193. This
+  interlock is the minimum that makes restoring the map safe, not that work.
+- Not enabled in the shipped Docker compose (unlike `udrd`), so the default E2E
+  path is unchanged.
 
 ## Parsed-but-inert YAML sections
 
