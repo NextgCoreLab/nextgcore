@@ -22,6 +22,7 @@
   - [MB-SMF](configuration/mbsmf.md)
   - [DCCF](configuration/dccf.md)
   - [EES](configuration/ees.md)
+  - [EASDF](configuration/easdf.md)
   - [PIN](configuration/pin.md)
   - [TSCTSF](configuration/tsctsf.md)
   - [SCP](configuration/scp.md)
