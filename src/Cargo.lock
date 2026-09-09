@@ -2933,6 +2933,7 @@ dependencies = [
  "nextgcore-metrics",
  "proptest",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
  "tokio",

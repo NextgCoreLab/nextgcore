@@ -27,6 +27,8 @@ tokio.workspace = true
 bytes.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
+# Issue #57: the durable session snapshot document.
+serde_json.workspace = true
 
 # Internal crates
 nextgcore-core = { path = "../../libs/nextgcore-core" }

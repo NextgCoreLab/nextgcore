@@ -66,12 +66,55 @@ From the clap `Args` struct in `src/bins/nextgcore-pcrfd/src/main.rs`:
 | `--max-sess` | usize | `1024` | Maximum number of sessions. Stored in the context and logged at startup, but **no code path enforces it** — `gx_session_add` never checks it. |
 | `--db-uri` | string | unset | MongoDB URI — parsed but never wired to the DB layer. |
 | `--db-name` | string | `nextgcore` | Database name — parsed but never used. |
+| `--state-file` | path | unset | JSON snapshot file for the Gx/Rx session tables (#57). Falls back to `NEXTGCORE_PCRF_STATE_FILE`; an empty value is treated as unset. With neither set the PCRF is memory-only. |
 
 ## Behavior notes
 
 - **Peer handling (RFC 6733, per code comments):** CER/CEA (responder role), DWR/DWA and DPR/DPA are handled by the shared `nextgcore_diameter::peer::DiameterPeer`. The PCRF sends a device watchdog every 30 s (`timer_tc` default in `DiameterConfig`) and closes the connection after 3 consecutive missed watchdogs (`MAX_MISSED_WATCHDOGS` in `fd_path.rs`). Peers are registered by Origin-Host once the CER/CEA exchange completes.
-- **Gx CCR semantics (TS 29.212 §5.6 per code comments):** `INITIAL_REQUEST` creates the Gx session and indexes it by Session-Id and by Framed-IP-Address / Framed-IPv6-Prefix; `UPDATE_REQUEST` and `TERMINATION_REQUEST` for an unknown Session-Id are answered with Result-Code 5002 `DIAMETER_UNKNOWN_SESSION_ID`. A successful provisioning CCA carries Default-EPS-Bearer-QoS, QoS-Information (APN-AMBR), Event-Triggers (QoS/RAT change, UE IP allocate/release) and a Charging-Rule-Install. Termination clears the IP bindings and fires Rx ASRs toward any bound AF sessions. An *incoming* Gx RAR is rejected with 3001 `DIAMETER_COMMAND_UNSUPPORTED` (the PCRF only originates RAR); unknown applications get 3007 `DIAMETER_APPLICATION_UNSUPPORTED`.
+- **Gx CCR semantics (TS 29.212 §5.6 per code comments):** `INITIAL_REQUEST` creates the Gx session and indexes it by Session-Id and by Framed-IP-Address / Framed-IPv6-Prefix; `UPDATE_REQUEST` and `TERMINATION_REQUEST` for an unknown Session-Id are answered with Result-Code 5002 `DIAMETER_UNKNOWN_SESSION_ID`. An **initial** provisioning CCA carries Default-EPS-Bearer-QoS, QoS-Information (APN-AMBR), Event-Triggers (QoS/RAT change, UE IP allocate/release) and a Charging-Rule-Install. Termination clears the IP bindings and fires Rx ASRs toward any bound AF sessions. An *incoming* Gx RAR is rejected with 3001 `DIAMETER_COMMAND_UNSUPPORTED` (the PCRF only originates RAR); unknown applications get 3007 `DIAMETER_APPLICATION_UNSUPPORTED`.
+- **What an UPDATE answer carries is now a function of what the PCEF reported (#57).** Before #57 every CCR-U got the same static payload the initial request got, regardless of the request — TS 29.212 §4.5.1 makes the PCRF's decision a function of the reported Event-Trigger and its related data, so unconditional replay meant a consumer could not tell "policy changed" from "nothing happened".
+  - `RAT_CHANGE` re-authorizes: the CCA restates Default-EPS-Bearer-QoS and QoS-Information for the new access.
+  - `QOS_CHANGE` re-authorizes **only if** the QoS-Information the PCEF reports diverges from what was authorized. On agreement the CCA carries no QoS at all. On divergence it carries the **authorized** values, correcting the PCEF — never an echo of what was reported.
+  - `UE_IP_ADDRESS_ALLOCATE` / `UE_IP_ADDRESS_RELEASE` install and clear the IP→session mapping. The release takes the address from the *session*, not from the CCR, because a release report need not echo the address it releases.
+  - A CCR-U reporting **no** recognized trigger provisions nothing. Rules are never re-installed on an update; the PCEF holds them from the initial provisioning.
+  - `RAT-Type` is recorded on the session whenever reported. It was previously hardcoded to `0` and never populated.
+- **PCC rule failure reports are acted on (TS 29.212 §4.5.12, #57).** A `Charging-Rule-Report` with `PCC-Rule-Status = INACTIVE` withdraws the named rule from the PCRF's installed set and from every bound Rx session. If that leaves an Rx session with **no** installed rule, the AF is aborted with an ASR — the state where "the AF believes an unenforced service is active" is the harm §4.5.12 exists to prevent. Three deliberate limits: `TEMPORARILY INACTIVE` withdraws nothing (§5.3.19 says the rule is expected back, so aborting would tear down an AF session that is about to work); no `Charging-Rule-Remove` is sent back, per §4.5.12's own NOTE that the PCRF *"does not need request the PCEF to remove the inactive PCC rule"*; and `Charging-Rule-Base-Name` is logged but not resolved, because this PCRF provisions no base names and so has no membership list to expand one against. `PCRF_ASR_ON_RULE_FAILURE=0` keeps the bookkeeping update and suppresses the ASR; it defaults **on**, because off reproduces the defect.
+
+## Durable state (#57)
+
+Off by default. With `--state-file` (or `NEXTGCORE_PCRF_STATE_FILE`) the PCRF
+snapshots the Gx and Rx session tables on every mutation and reloads them at boot,
+so a restart no longer answers `DIAMETER_UNKNOWN_SESSION_ID` (5002) for every live
+PDN connection's CCR-U and CCR-T indefinitely. Uses the shared
+`nextgcore-core::state_store::StateStore` (atomic + fsynced + `0600` writes; a
+snapshot that cannot be read is never overwritten). An unreadable snapshot, or one
+from a newer build, **fails startup**.
+
+Two details specific to pcrfd:
+
+- **The index hashes ARE persisted**, unlike the other NFs in this tree.
+  `gx_session_remove` and `rx_session_remove` drop only the hash entry and leave a
+  **tombstone** in the vector, because a Gx session's `rx_sessions` and an Rx
+  session's `gx_session_idx` are positional indexes that compacting would
+  re-point. So the hash — not the vector — records which sessions are live, and it
+  is not derivable. Rebuilding it from every vector entry would resurrect every
+  session ever terminated. Only the live sid *set* is stored; the indexes
+  themselves are re-derived from position, so a persisted index cannot disagree
+  with the list it points into.
+- **The IP maps are derived on restore** from the session table under the same
+  `has_ipv4`/`has_ipv6` conditions the live path uses, and only for live sessions,
+  so a tombstone's old address does not come back resolving to a session that no
+  longer answers.
+
+Not enabled in the shipped Docker EPC compose, so the default E2E path is unchanged.
+
+**The restart-signalling alternative was not taken.** #57 offered either
+persistence or clean restart signalling via a fixed-at-start `Origin-State-Id`.
+`nextgcore-diameter`'s `origin_state_id()` returns `SystemTime::now()` seconds on
+every call, so it is not a stable per-instance restart indicator (RFC 6733 §8.16)
+and the signalling option has no working foundation today. That is filed as its own
+diameter-layer issue; persistence needs nothing from it.
 - **Policy is always the default profile in practice:** `build_subscriber_session_data` (`gx_path.rs`) tries `nextgcore_dbi_subscription_data`, but since this binary never initializes the Mongo client, the lookup always fails and it falls back to the built-in `default_profile` — QCI 9, ARP derived from the QCI table, APN-AMBR 100,000,000 bps down / 50,000,000 bps up, and one catch-all non-GBR PCC rule named `pcrf-<apn>-default` (precedence 100, bidirectional `permit ... ip from any to assigned` IPFilterRules).
 - **Rx session binding (TS 29.214 per code comments):** an AAR is bound to the Gx (IP-CAN) session via the UE IP address; if no Gx session matches, the AAA carries Experimental-Result 5065 `IP_CAN_SESSION_NOT_AVAILABLE` (vendor 10415). If pushing the derived PCC rules to the PCEF via Gx RAR fails, the AAA carries 5063 `REQUESTED_SERVICE_NOT_AUTHORIZED`. An STR triggers a Gx RAR with Charging-Rule-Remove and unbinds the Rx session.
 - **PCRF-initiated requests:** RAR/ASR are sent over the connection the target peer established (looked up by Origin-Host); the answer wait is capped at 5 s (`ANSWER_TIMEOUT` in `fd_path.rs`) with no application-level retransmission. If the peer is not connected the send fails immediately.
-- **Environment variables:** `OTEL_EXPORTER_OTLP_ENDPOINT` sets the OpenTelemetry OTLP trace endpoint (default `http://jaeger:4317`; export failure is silently ignored). Note that `RUST_LOG` is **not** read — `init_logging` builds `env_logger` without consulting the environment, so the `RUST_LOG: info` set in `docker-compose-epc.yml` has no effect on this daemon; only `-e/--log-level` does. There are no state files; Gx/Rx message counters are held in memory and logged as a summary line at shutdown.
+- **Environment variables:** `OTEL_EXPORTER_OTLP_ENDPOINT` sets the OpenTelemetry OTLP trace endpoint (default `http://jaeger:4317`; export failure is silently ignored). Note that `RUST_LOG` is **not** read — `init_logging` builds `env_logger` without consulting the environment, so the `RUST_LOG: info` set in `docker-compose-epc.yml` has no effect on this daemon; only `-e/--log-level` does. `NEXTGCORE_PCRF_STATE_FILE` supplies the durable-state path when `--state-file` is absent (the flag wins), and `PCRF_ASR_ON_RULE_FAILURE` (`0`/`false`/`no`/`off`) suppresses the §4.5.12 ASR. Gx/Rx message counters are held in memory and logged as a summary line at shutdown.

@@ -136,6 +136,51 @@ pub mod avp {
     pub const ACCESS_NETWORK_CHARGING_IDENTIFIER_VALUE: u32 = 503;
     /// AN-Trusted
     pub const AN_TRUSTED: u32 = 1503;
+    /// RAT-Type (TS 29.212 §5.3.31). Vendor-specific with the V bit set; the M
+    /// bit is **not** mandatory per the §5.3 AVP table.
+    pub const RAT_TYPE: u32 = 1032;
+    /// Charging-Rule-Report (TS 29.212 §5.3.18), grouped, M+V.
+    ///
+    /// How the PCEF tells the PCRF a PCC rule could not be installed or can no
+    /// longer be enforced. Multiple instances carry different status/failure
+    /// values for different groups of rules in one command.
+    pub const CHARGING_RULE_REPORT: u32 = 1018;
+    /// PCC-Rule-Status (TS 29.212 §5.3.19), enumerated, M+V.
+    pub const PCC_RULE_STATUS: u32 = 1019;
+    /// Rule-Failure-Code (TS 29.212 §5.3.38), enumerated, M+V.
+    pub const RULE_FAILURE_CODE: u32 = 1031;
+}
+
+/// PCC-Rule-Status values (TS 29.212 §5.3.19).
+pub mod pcc_rule_status {
+    /// Successfully installed (PCRF-provisioned) or activated (pre-provisioned).
+    pub const ACTIVE: i32 = 0;
+    /// Removed (PCRF-provisioned) or inactive (pre-provisioned). This is the
+    /// value the PCEF sets both when installation of a new rule fails and when a
+    /// previously installed rule can no longer be enforced.
+    pub const INACTIVE: i32 = 1;
+    /// Already installed rules temporarily disabled, e.g. loss of bearer. NOT the
+    /// same as INACTIVE: the rule is expected to come back, so the PCRF must not
+    /// treat it as removed.
+    pub const TEMPORARILY_INACTIVE: i32 = 2;
+}
+
+/// RAT-Type values (TS 29.212 §5.3.31).
+///
+/// 0-999 generic, 1000-1999 3GPP-specific, 2000-2999 3GPP2-specific.
+pub mod rat_type {
+    pub const WLAN: u32 = 0;
+    pub const VIRTUAL: u32 = 1;
+    pub const TRUSTED_N3GA: u32 = 2;
+    pub const WIRELINE: u32 = 3;
+    pub const WIRELINE_CABLE: u32 = 4;
+    pub const WIRELINE_BBF: u32 = 5;
+    pub const UTRAN: u32 = 1000;
+    pub const GERAN: u32 = 1001;
+    pub const GAN: u32 = 1002;
+    pub const HSPA_EVOLUTION: u32 = 1003;
+    pub const EUTRAN: u32 = 1004;
+    pub const EUTRAN_NB_IOT: u32 = 1005;
 }
 
 /// IP-CAN Type values

@@ -12,7 +12,9 @@ use bytes::Bytes;
 
 use nextgcore_diameter::avp::{find_all_avps, find_avp, Avp, AvpData};
 use nextgcore_diameter::common::avp_code;
-use nextgcore_diameter::gx::{avp as gx_avp, cmd as gx_cmd, GX_APPLICATION_ID};
+use nextgcore_diameter::gx::{
+    avp as gx_avp, cmd as gx_cmd, pcc_rule_status as gx_pcc_rule_status, GX_APPLICATION_ID,
+};
 use nextgcore_diameter::message::DiameterMessage;
 use nextgcore_diameter::NEXTGCORE_3GPP_VENDOR_ID;
 
@@ -216,6 +218,68 @@ pub struct MediaSubComponent {
 // CCR parsing (TS 29.212 section 5.6.2)
 // ============================================================================
 
+/// QoS the PCEF reported in a CCR (TS 29.212 §5.3.16 QoS-Information).
+///
+/// This is what the PCEF says is currently in force, NOT what the PCRF
+/// authorized — the two diverging is exactly what a QOS_CHANGE report is for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReportedQos {
+    /// APN-Aggregate-Max-Bitrate-UL (bps), when reported
+    pub ambr_uplink: Option<u64>,
+    /// APN-Aggregate-Max-Bitrate-DL (bps), when reported
+    pub ambr_downlink: Option<u64>,
+    /// QoS-Class-Identifier, when reported
+    pub qos_index: Option<u8>,
+}
+
+impl ReportedQos {
+    /// Nothing was reported at all.
+    pub fn is_empty(&self) -> bool {
+        self.ambr_uplink.is_none() && self.ambr_downlink.is_none() && self.qos_index.is_none()
+    }
+
+    /// Does what the PCEF reports differ from what the PCRF authorized?
+    ///
+    /// A member the PCEF did **not** report is not a divergence: absent means
+    /// "not stated", and treating it as a mismatch would make every partial
+    /// report look like a violation and trigger a pointless re-authorization.
+    pub fn diverges_from(&self, authorized: &GxSessionData) -> bool {
+        self.ambr_uplink
+            .is_some_and(|v| v != authorized.ambr_uplink)
+            || self
+                .ambr_downlink
+                .is_some_and(|v| v != authorized.ambr_downlink)
+            || self.qos_index.is_some_and(|v| v != authorized.qos_index)
+    }
+}
+
+/// One Charging-Rule-Report from a CCR (TS 29.212 §5.3.18).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChargingRuleReport {
+    /// Charging-Rule-Name instances (the individually named failed rules)
+    pub rule_names: Vec<String>,
+    /// Charging-Rule-Base-Name instances (named rule *groups*)
+    pub rule_base_names: Vec<String>,
+    /// PCC-Rule-Status, when present
+    pub pcc_rule_status: Option<i32>,
+    /// Rule-Failure-Code, when present
+    pub rule_failure_code: Option<i32>,
+}
+
+impl ChargingRuleReport {
+    /// Does this report say the named rules are gone (as opposed to temporarily
+    /// disabled, or successfully active)?
+    ///
+    /// `TEMPORARILY_INACTIVE` is deliberately **not** included: §5.3.19 defines it
+    /// as "already installed or activated PCC rules are temporarily disabled" for
+    /// a reason such as loss of bearer, so the rule is expected to return.
+    /// Treating it as removed would tear down an AF session that is about to work
+    /// again.
+    pub fn reports_removal(&self) -> bool {
+        self.pcc_rule_status == Some(gx_pcc_rule_status::INACTIVE)
+    }
+}
+
 /// Parsed CCR content
 #[derive(Debug, Clone, Default)]
 pub struct CcrInfo {
@@ -239,6 +303,22 @@ pub struct CcrInfo {
     pub framed_ipv6: Option<[u8; NEXTGCORE_IPV6_LEN]>,
     /// Network-Request-Support was present in the CCR
     pub network_request_support: bool,
+    /// Every Event-Trigger the PCEF reported (TS 29.212 §5.3.7). Repeated AVP:
+    /// one CCR-U can report several triggers at once, so all instances are kept.
+    pub event_triggers: Vec<u32>,
+    /// RAT-Type the PCEF reported (TS 29.212 §5.3.31)
+    pub rat_type: Option<u32>,
+    /// QoS the PCEF reported as currently in force
+    pub reported_qos: ReportedQos,
+    /// Charging-Rule-Report instances (TS 29.212 §5.3.18)
+    pub rule_reports: Vec<ChargingRuleReport>,
+}
+
+impl CcrInfo {
+    /// Did the PCEF report `trigger`?
+    pub fn has_trigger(&self, trigger: u32) -> bool {
+        self.event_triggers.contains(&trigger)
+    }
 }
 
 /// Errors detected while validating a CCR against the TS 29.212 message table
@@ -367,6 +447,33 @@ pub fn parse_ccr(msg: &DiameterMessage) -> Result<CcrInfo, GxRequestError> {
 
     let network_request_support = msg.find_avp(base_avp::NETWORK_REQUEST_SUPPORT).is_some();
 
+    // ---- The IP-CAN-session-modification inputs (#57) ----
+    //
+    // TS 29.212 §4.5.1: "the PCEF shall supply within the PCC rule request the
+    // specific event which caused the IP-CAN session modification (within the
+    // Event-Trigger AVP) and any related data". None of these were read before, so
+    // the PCRF's answer could not be a function of them.
+
+    // Repeated: every instance, not just the first.
+    let event_triggers: Vec<u32> = find_all_avps(&msg.avps, gx_avp::EVENT_TRIGGER)
+        .iter()
+        .filter_map(|a| a.as_u32())
+        .collect();
+
+    // Enumerated on the wire; carried as u32 here because the TS 29.212 value
+    // space is 0..2999 and the session field it lands in is u32.
+    let rat_type = msg
+        .find_avp(gx_avp::RAT_TYPE)
+        .and_then(|a| a.as_u32().or_else(|| a.as_i32().map(|v| v as u32)));
+
+    let reported_qos = parse_reported_qos(msg);
+
+    let rule_reports: Vec<ChargingRuleReport> =
+        find_all_avps(&msg.avps, gx_avp::CHARGING_RULE_REPORT)
+            .iter()
+            .filter_map(|a| parse_charging_rule_report(a))
+            .collect();
+
     Ok(CcrInfo {
         session_id,
         origin_host,
@@ -378,6 +485,78 @@ pub fn parse_ccr(msg: &DiameterMessage) -> Result<CcrInfo, GxRequestError> {
         framed_ipv4,
         framed_ipv6,
         network_request_support,
+        event_triggers,
+        rat_type,
+        reported_qos,
+        rule_reports,
+    })
+}
+
+/// Extract the QoS the PCEF reports as currently in force from a command-level
+/// QoS-Information AVP (TS 29.212 §5.3.16).
+///
+/// Only the command-level instance is read. A QoS-Information nested inside a
+/// Charging-Rule-Definition describes a *rule's* QoS, not the session's, and
+/// conflating the two would compare a rule MBR against the session AMBR.
+fn parse_reported_qos(msg: &DiameterMessage) -> ReportedQos {
+    let Some(qos) = msg.find_avp(gx_avp::QOS_INFORMATION) else {
+        return ReportedQos::default();
+    };
+    let Ok(members) = qos.parse_grouped() else {
+        return ReportedQos::default();
+    };
+    ReportedQos {
+        ambr_uplink: find_avp(&members, gx_avp::APN_AGGREGATE_MAX_BITRATE_UL)
+            .and_then(|a| a.as_u32())
+            .map(u64::from),
+        ambr_downlink: find_avp(&members, gx_avp::APN_AGGREGATE_MAX_BITRATE_DL)
+            .and_then(|a| a.as_u32())
+            .map(u64::from),
+        qos_index: find_avp(&members, gx_avp::QOS_CLASS_IDENTIFIER)
+            .and_then(|a| a.as_u32().or_else(|| a.as_i32().map(|v| v as u32)))
+            .and_then(|v| u8::try_from(v).ok()),
+    }
+}
+
+/// Read an AVP as a string whether it decoded as a UTF8String, a DiameterIdentity
+/// or an OctetString.
+///
+/// Charging-Rule-Name is an OctetString carrying a name (TS 29.212 §5.3.29), and
+/// `Avp::as_utf8_string` does not cover the `OctetString` variant — it covers
+/// `Raw`, which is what an AVP that crossed a socket decodes to. A rule name read
+/// only via `as_utf8_string` therefore works on the wire and silently returns
+/// `None` for a locally constructed message, which is the shape of an existing
+/// recorded defect in this tree. Handling both variants makes the reader
+/// independent of where the message came from.
+fn avp_as_string(avp: &Avp) -> Option<String> {
+    if let Some(s) = avp.as_utf8_string() {
+        return Some(s.to_string());
+    }
+    avp.as_octet_string()
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .map(str::to_string)
+}
+
+/// Parse one Charging-Rule-Report grouped AVP (TS 29.212 §5.3.18).
+///
+/// `None` when the group cannot be decoded at all. A group that decodes but names
+/// no rule is still returned: the PCRF logs it rather than silently dropping a
+/// report the PCEF considered worth sending.
+fn parse_charging_rule_report(avp: &Avp) -> Option<ChargingRuleReport> {
+    let members = avp.parse_grouped().ok()?;
+    Some(ChargingRuleReport {
+        rule_names: find_all_avps(&members, gx_avp::CHARGING_RULE_NAME)
+            .iter()
+            .filter_map(|a| avp_as_string(a))
+            .collect(),
+        rule_base_names: find_all_avps(&members, gx_avp::CHARGING_RULE_BASE_NAME)
+            .iter()
+            .filter_map(|a| avp_as_string(a))
+            .collect(),
+        pcc_rule_status: find_avp(&members, gx_avp::PCC_RULE_STATUS)
+            .and_then(|a| a.as_i32().or_else(|| a.as_u32().map(|v| v as i32))),
+        rule_failure_code: find_avp(&members, gx_avp::RULE_FAILURE_CODE)
+            .and_then(|a| a.as_i32().or_else(|| a.as_u32().map(|v| v as i32))),
     })
 }
 
@@ -648,18 +827,89 @@ fn add_cca_base_avps(
     }
 }
 
+/// What the PCRF decided to provision in one CCA (#57).
+///
+/// Before #57 the answer was always "everything in `session_data`", on every
+/// CCR-U, regardless of what the PCEF reported — which is the static replay
+/// TS 29.212 §4.5.1 rules out. Now the shape of the answer is derived from the
+/// reported triggers and data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GxProvisionDecision {
+    /// Emit Default-EPS-Bearer-QoS + QoS-Information (APN-AMBR).
+    pub qos: bool,
+    /// Emit Charging-Rule-Install.
+    pub install_rules: bool,
+    /// Emit the armed Event-Trigger set.
+    pub triggers: bool,
+}
+
+impl GxProvisionDecision {
+    /// Initial provisioning: the PCEF holds nothing, so everything is sent.
+    pub fn initial() -> Self {
+        Self {
+            qos: true,
+            install_rules: true,
+            triggers: true,
+        }
+    }
+
+    /// Nothing to provision.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Is any provisioning being sent at all?
+    pub fn is_empty(&self) -> bool {
+        !self.qos && !self.install_rules && !self.triggers
+    }
+
+    /// Decide what a CCR-**Update** answer must carry, as a function of what the
+    /// PCEF reported (TS 29.212 §4.5.1, §5.3.7).
+    ///
+    /// * **RAT_CHANGE** re-authorizes the QoS. A new serving RAT is a new IP-CAN
+    ///   condition, which is the whole reason the trigger is armed; re-stating the
+    ///   authorization is what the PCEF needs to enforce it on the new access.
+    /// * **QOS_CHANGE** re-authorizes **only if what the PCEF reports diverges
+    ///   from what was authorized.** When they agree, the PCEF already holds the
+    ///   right policy and re-sending it is exactly the static replay this issue is
+    ///   about. When they diverge, the CCA carries the authorized values, which
+    ///   corrects the PCEF.
+    /// * **A CCR-U with no recognized trigger provisions nothing.** This is a
+    ///   deliberate change to the previous default path: unconditional
+    ///   re-provisioning made the PCRF's answer independent of the request, so a
+    ///   consumer could not distinguish "policy changed" from "nothing happened".
+    ///
+    /// Rules are never re-installed on an update: the PCEF holds them from the
+    /// initial provisioning, and re-installing an unchanged rule set is the same
+    /// replay. A genuine rule change is pushed with a RAR, which this path does not
+    /// build.
+    pub fn for_update(info: &CcrInfo, authorized: &GxSessionData) -> Self {
+        let rat_change = info.has_trigger(event_trigger::RAT_CHANGE);
+        let qos_change = info.has_trigger(event_trigger::QOS_CHANGE);
+        let qos_diverged = qos_change && info.reported_qos.diverges_from(authorized);
+        Self {
+            qos: rat_change || qos_diverged,
+            install_rules: false,
+            // Re-arm alongside any re-authorization: TS 29.212 §5.3.7 triggers are
+            // provisioning state at the PCEF, and a PCEF that just re-applied a new
+            // authorization is the one case where confirming the armed set is not
+            // redundant.
+            triggers: rat_change || qos_diverged,
+        }
+    }
+}
+
 /// Build a successful CCA for the given CCR.
 ///
-/// For INITIAL_REQUEST the CCA provisions Charging-Rule-Install,
-/// Default-EPS-Bearer-QoS, QoS-Information (APN-AMBR) and Event-Trigger
-/// AVPs. For UPDATE_REQUEST the QoS and triggers are re-affirmed without
-/// re-installing rules. For TERMINATION_REQUEST only the mandatory AVPs
-/// are present.
+/// `decision` says which provisioning AVP groups to include; see
+/// [`GxProvisionDecision`]. `session_data` supplies the **authorized** values —
+/// always derived from the subscription, never from what the PCEF reported.
 pub fn build_cca_success(
     ccr: &DiameterMessage,
     info: &CcrInfo,
     local: &LocalIdentity,
     session_data: Option<&GxSessionData>,
+    decision: GxProvisionDecision,
 ) -> DiameterMessage {
     let mut cca = DiameterMessage::new_answer(ccr);
     add_cca_base_avps(
@@ -681,22 +931,27 @@ pub fn build_cca_success(
 
     if let Some(data) = session_data {
         // Event-Trigger AVPs (conditional: provisioning state)
-        for trigger in &data.event_triggers {
-            cca.add_avp(build_event_trigger_avp(*trigger));
+        if decision.triggers {
+            for trigger in &data.event_triggers {
+                cca.add_avp(build_event_trigger_avp(*trigger));
+            }
         }
-        // Default-EPS-Bearer-QoS (conditional: IP-CAN session provisioning)
-        cca.add_avp(build_default_eps_bearer_qos_avp(data));
-        // QoS-Information with APN-AMBR
-        cca.add_avp(build_session_qos_information_avp(
-            data.ambr_uplink,
-            data.ambr_downlink,
-        ));
-        // Charging-Rule-Install only at initial provisioning
-        if info.cc_request_type == cc_request_type::INITIAL_REQUEST && !data.pcc_rules.is_empty() {
+        if decision.qos {
+            // Default-EPS-Bearer-QoS (conditional: IP-CAN session provisioning)
+            cca.add_avp(build_default_eps_bearer_qos_avp(data));
+            // QoS-Information with APN-AMBR
+            cca.add_avp(build_session_qos_information_avp(
+                data.ambr_uplink,
+                data.ambr_downlink,
+            ));
+        }
+        if decision.install_rules && !data.pcc_rules.is_empty() {
             cca.add_avp(build_charging_rule_install_avp(&data.pcc_rules));
         }
         // Bearer-Control-Mode (conditional: only when the PCEF indicated
-        // Network-Request-Support, TS 29.212 section 4.5.1)
+        // Network-Request-Support, TS 29.212 section 4.5.1). Not part of the
+        // provisioning delta: it answers a capability the PCEF stated in THIS
+        // request, so it is echoed whenever it was stated.
         if info.network_request_support {
             cca.add_avp(Avp::vendor_mandatory(
                 gx_avp::BEARER_CONTROL_MODE,
@@ -826,10 +1081,23 @@ pub fn handle_ccr(
     };
 
     let mut abort_targets = Vec::new();
+    // The authorized policy for this session, re-derived from the subscription on
+    // every request rather than replayed from the initial answer (#57). An
+    // administrative change between the initial CCR and an update is therefore
+    // visible in the update's answer.
+    let authorized = build_subscriber_session_data(
+        info.imsi.as_deref().unwrap_or(""),
+        info.apn.as_deref().unwrap_or(""),
+    );
 
     let result = match info.cc_request_type {
         cc_request_type::INITIAL_REQUEST => {
             context.gx_session_add(&info.session_id);
+            let installed: Vec<String> = authorized
+                .pcc_rules
+                .iter()
+                .map(|r| r.name.clone())
+                .collect();
             context.gx_session_update(&info.session_id, |session| {
                 session.set_peer_host(&info.origin_host);
                 if let Some(ref imsi) = info.imsi {
@@ -844,6 +1112,14 @@ pub fn handle_ccr(
                 if let Some(addr) = info.framed_ipv6 {
                     session.set_ipv6(addr);
                 }
+                // #57: the RAT the PCEF reported, instead of leaving the field at
+                // its hardcoded 0.
+                if let Some(rat) = info.rat_type {
+                    session.set_rat_type(rat);
+                }
+                // #57: remember what is being provisioned, so a later
+                // Charging-Rule-Report has something to act on.
+                session.set_installed_rules(installed.clone());
             });
             if let Some(addr) = info.framed_ipv4 {
                 context.set_ipv4_mapping(&addr, Some(&info.session_id));
@@ -851,13 +1127,18 @@ pub fn handle_ccr(
             if let Some(addr) = info.framed_ipv6 {
                 context.set_ipv6_mapping(&addr, Some(&info.session_id));
             }
-            Ok(true)
+            Ok(GxProvisionDecision::initial())
         }
         cc_request_type::UPDATE_REQUEST => {
             if context.gx_session_find_by_sid(&info.session_id).is_none() {
                 Err(GxRequestError::UnknownSession)
             } else {
-                Ok(true)
+                // #57: react to what the PCEF actually reported. Previously this
+                // branch checked only that the session existed and fell through to
+                // unconditional re-provisioning.
+                apply_update_triggers(&context, &info);
+                abort_targets.extend(apply_rule_reports(&context, &info));
+                Ok(GxProvisionDecision::for_update(&info, &authorized))
             }
         }
         cc_request_type::TERMINATION_REQUEST => {
@@ -887,7 +1168,7 @@ pub fn handle_ccr(
                         context.rx_session_remove(&target.rx_sid);
                     }
                     context.gx_session_remove(&info.session_id);
-                    Ok(false)
+                    Ok(GxProvisionDecision::none())
                 }
             }
         }
@@ -897,18 +1178,15 @@ pub fn handle_ccr(
     drop(context);
 
     match result {
-        Ok(provision) => {
-            let session_data = if provision {
-                Some(build_subscriber_session_data(
-                    info.imsi.as_deref().unwrap_or(""),
-                    info.apn.as_deref().unwrap_or(""),
-                ))
-            } else {
+        Ok(decision) => {
+            let session_data = if decision.is_empty() {
                 None
+            } else {
+                Some(authorized)
             };
             pcrf_diam_stats().gx.inc_tx_cca();
             (
-                build_cca_success(msg, &info, local, session_data.as_ref()),
+                build_cca_success(msg, &info, local, session_data.as_ref(), decision),
                 abort_targets,
             )
         }
@@ -922,6 +1200,221 @@ pub fn handle_ccr(
             (build_cca_error(msg, local, &e), Vec::new())
         }
     }
+}
+
+/// Apply the state changes an update's reported Event-Triggers imply (#57,
+/// TS 29.212 §4.5.1 / §5.3.7).
+///
+/// Only state that the PCRF owns is touched here; what the *answer* carries is
+/// [`GxProvisionDecision::for_update`]'s job. Separating them keeps "what
+/// changed" from "what we tell the PCEF", which is the distinction the previous
+/// unconditional re-provisioning collapsed.
+fn apply_update_triggers(context: &crate::context::PcrfContext, info: &CcrInfo) {
+    // RAT-Type is recorded whenever reported, not only under RAT_CHANGE: a PCEF
+    // that reports the value without arming the trigger still told us where the UE
+    // is, and dropping that would leave the field at its pre-#57 zero.
+    if let Some(rat) = info.rat_type {
+        context.gx_session_update(&info.session_id, |session| {
+            if session.set_rat_type(rat) {
+                log::info!(
+                    "Gx session {}: RAT changed to {rat} (TS 29.212 §5.3.31)",
+                    info.session_id
+                );
+            }
+        });
+    }
+
+    if info.has_trigger(event_trigger::UE_IP_ADDRESS_ALLOCATE) {
+        if let Some(addr) = info.framed_ipv4 {
+            context.set_ipv4_mapping(&addr, Some(&info.session_id));
+            context.gx_session_update(&info.session_id, |session| {
+                session.set_ipv4(std::net::Ipv4Addr::from(addr));
+            });
+            log::info!(
+                "Gx session {}: UE IPv4 {} allocated",
+                info.session_id,
+                std::net::Ipv4Addr::from(addr)
+            );
+        }
+        if let Some(addr) = info.framed_ipv6 {
+            context.set_ipv6_mapping(&addr, Some(&info.session_id));
+            context.gx_session_update(&info.session_id, |session| {
+                session.set_ipv6(addr);
+            });
+        }
+    }
+
+    if info.has_trigger(event_trigger::UE_IP_ADDRESS_RELEASE) {
+        // The address to drop is taken from the SESSION, not from the CCR: a
+        // release report need not echo the address it is releasing, and dropping
+        // only what the CCR happened to carry would leave the mapping behind —
+        // which is the stale-mapping half of this trigger being inert.
+        let session = context.gx_session_find_by_sid(&info.session_id);
+        if let Some(session) = session {
+            if let Some(addr) = session.ipv4_addr {
+                context.set_ipv4_mapping(&addr.octets(), None);
+                log::info!("Gx session {}: UE IPv4 {addr} released", info.session_id);
+            }
+            if let Some(addr) = session.ipv6_addr {
+                context.set_ipv6_mapping(&addr, None);
+            }
+            context.gx_session_update(&info.session_id, |s| {
+                s.ipv4_addr = None;
+                s.has_ipv4 = false;
+                s.ipv6_addr = None;
+                s.has_ipv6 = false;
+            });
+        }
+    }
+}
+
+/// Whether an INACTIVE rule report may abort the bound AF session.
+///
+/// A runtime switch rather than a cargo feature, so CI compiles and exercises the
+/// path in both states. Defaults **ON**: leaving it off reproduces the defect
+/// TS 29.212 §4.5.12 exists to prevent — the AF keeps believing an unenforced
+/// service is active, which is a charging and QoS-integrity problem, not merely a
+/// missing notification. Set `PCRF_ASR_ON_RULE_FAILURE=0` to keep the
+/// bookkeeping update and suppress the ASR.
+fn asr_on_rule_failure_enabled() -> bool {
+    !matches!(
+        std::env::var("PCRF_ASR_ON_RULE_FAILURE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// Act on the Charging-Rule-Reports in a CCR (TS 29.212 §4.5.12).
+///
+/// Returns the Rx sessions that must be aborted.
+///
+/// What this does, and why each choice:
+///
+/// * **INACTIVE only.** `ACTIVE` is a success confirmation and `TEMPORARILY
+///   INACTIVE` means the rule is expected back (§5.3.19), so only `INACTIVE`
+///   removes anything. Acting on a temporary loss of bearer would tear down an AF
+///   session that is about to work again.
+/// * **No Charging-Rule-Remove is sent back.** §4.5.12's own NOTE: *"When the
+///   PCRF receives PCC-Rule-Status set to INACTIVE, the PCRF does not need
+///   request the PCEF to remove the inactive PCC rule."* The rule is already gone
+///   at the PCEF; asking it to remove it again would be a message the spec says is
+///   unnecessary.
+/// * **The AF is told only when its service has nothing left enforcing it.** An Rx
+///   session that still holds another installed rule is degraded, not dead, and
+///   aborting it would be a bigger action than the report justifies. An Rx session
+///   with **no** remaining rule is precisely the state the issue names as the
+///   harm: "the AF believes an unenforced service is active".
+/// * **Base names are logged, not resolved.** `Charging-Rule-Base-Name` names a
+///   PCEF-preconfigured *group*, and this PCRF provisions no base names
+///   (`build_charging_rule_install_avp` emits Charging-Rule-Definition only), so it
+///   has no membership list to expand one against. Guessing which local rules a
+///   base name covers could remove a rule the PCEF never reported.
+fn apply_rule_reports(context: &crate::context::PcrfContext, info: &CcrInfo) -> Vec<RxAbortTarget> {
+    let mut aborts = Vec::new();
+    if info.rule_reports.is_empty() {
+        return aborts;
+    }
+
+    for report in &info.rule_reports {
+        if !report.rule_base_names.is_empty() {
+            log::warn!(
+                "Gx session {}: Charging-Rule-Report names base name(s) {:?} (status={:?}, \
+                 failure={:?}); this PCRF provisions no rule base names, so the group cannot be \
+                 resolved and is only recorded",
+                info.session_id,
+                report.rule_base_names,
+                report.pcc_rule_status,
+                report.rule_failure_code
+            );
+        }
+        if !report.reports_removal() {
+            if report.pcc_rule_status == Some(gx_pcc_rule_status::TEMPORARILY_INACTIVE) {
+                log::info!(
+                    "Gx session {}: rules {:?} TEMPORARILY INACTIVE (failure={:?}); retained, the \
+                     PCEF is expected to re-activate them",
+                    info.session_id,
+                    report.rule_names,
+                    report.rule_failure_code
+                );
+            }
+            continue;
+        }
+
+        for name in &report.rule_names {
+            log::warn!(
+                "Gx session {}: PCC rule '{name}' reported INACTIVE (Rule-Failure-Code={:?}) \
+                 (TS 29.212 §4.5.12)",
+                info.session_id,
+                report.rule_failure_code
+            );
+            context.gx_session_update(&info.session_id, |session| {
+                session.remove_installed_rule(name);
+            });
+            aborts.extend(withdraw_rule_from_rx_sessions(context, info, name));
+        }
+    }
+    aborts
+}
+
+/// Remove `rule_name` from every Rx session bound to this Gx session, and report
+/// which of them are left with nothing enforcing them.
+fn withdraw_rule_from_rx_sessions(
+    context: &crate::context::PcrfContext,
+    info: &CcrInfo,
+    rule_name: &str,
+) -> Vec<RxAbortTarget> {
+    let mut aborts = Vec::new();
+    let Some(gx) = context.gx_session_find_by_sid(&info.session_id) else {
+        return aborts;
+    };
+    for rx_idx in &gx.rx_sessions {
+        let Some(rx) = context.rx_session_find_by_idx(*rx_idx) else {
+            continue;
+        };
+        if !rx.pcc_rules.iter().any(|r| r.name == rule_name) {
+            continue;
+        }
+        let mut left = 0usize;
+        context.rx_session_update(&rx.sid, |session| {
+            session.pcc_rules.retain(|r| r.name != rule_name);
+            left = session.pcc_rules.len();
+        });
+        if left > 0 {
+            log::warn!(
+                "Rx session {}: rule '{rule_name}' withdrawn, {left} rule(s) still installed; the \
+                 AF is not aborted",
+                rx.sid
+            );
+            continue;
+        }
+        if !asr_on_rule_failure_enabled() {
+            log::warn!(
+                "Rx session {}: rule '{rule_name}' was its last installed rule, but \
+                 PCRF_ASR_ON_RULE_FAILURE is off so the AF is NOT told its service is unenforced",
+                rx.sid
+            );
+            continue;
+        }
+        log::warn!(
+            "Rx session {}: rule '{rule_name}' was its last installed rule — aborting the AF \
+             session (TS 29.212 §4.5.12, TS 29.214 §4.4.6)",
+            rx.sid
+        );
+        aborts.push(RxAbortTarget {
+            rx_sid: rx.sid.clone(),
+            peer_host: rx.peer_host.clone(),
+            peer_realm: Some(info.origin_realm.clone()),
+        });
+    }
+    // An aborted Rx session is gone: leaving the binding would make the next
+    // report try to abort it again.
+    for target in &aborts {
+        context.rx_session_remove(&target.rx_sid);
+    }
+    aborts
 }
 
 /// Resolve an Rx session by its index in the context list
@@ -1714,7 +2207,18 @@ mod tests {
             );
             assert!(session.has_ipv4);
         }
-        // UPDATE re-affirms QoS but does not reinstall rules
+        // UPDATE with no reported Event-Trigger provisions NOTHING.
+        //
+        // #57 INVERTED the Default-EPS-Bearer-QoS half of this assertion, which
+        // previously required it to be present. It was pinning this
+        // implementation's unconditional replay as if the spec demanded it: TS
+        // 29.212 §4.5.5.9 says the PCRF "**may** provision the authorized QoS for
+        // the default EPS bearer", and §4.5.1 makes the PCRF's answer a function of
+        // the event the PCEF reported. `build_test_ccr` reports no trigger, so
+        // there is nothing to react to and re-sending the initial payload is the
+        // static replay this issue is about. The reacting cases are covered by
+        // `a_rat_change_reauthorizes_and_a_triggerless_update_does_not` and
+        // `a_qos_change_reauthorizes_only_when_the_report_diverges`.
         let (cca, _) = handle_ccr(&roundtrip(&build_test_ccr(sid, 2, 1)), &local());
         let cca = roundtrip(&cca);
         assert_eq!(cca.result_code(), Some(result_code::DIAMETER_SUCCESS));
@@ -1723,7 +2227,7 @@ mod tests {
             .is_none());
         assert!(cca
             .find_vendor_avp(gx_avp::DEFAULT_EPS_BEARER_QOS, NEXTGCORE_3GPP_VENDOR_ID)
-            .is_some());
+            .is_none());
         // TERMINATION removes the session
         let (cca, aborts) = handle_ccr(&roundtrip(&build_test_ccr(sid, 3, 2)), &local());
         let cca = roundtrip(&cca);
@@ -2030,5 +2534,468 @@ mod tests {
     fn test_pcrf_gx_init_final() {
         assert!(pcrf_gx_init().is_ok());
         pcrf_gx_final();
+    }
+
+    // ====================================================================
+    // #57: the IP-CAN-session-modification loop
+    //
+    // Every test below uses a distinct Session-Id and asserts only about its own
+    // session, so the process-global `pcrf_self()` context these tests share
+    // cannot make one test's state another's.
+    // ====================================================================
+
+    fn add_event_trigger(ccr: &mut DiameterMessage, trigger: u32) {
+        ccr.add_avp(Avp::vendor_mandatory(
+            gx_avp::EVENT_TRIGGER,
+            NEXTGCORE_3GPP_VENDOR_ID,
+            AvpData::Enumerated(trigger as i32),
+        ));
+    }
+
+    /// RAT-Type with the V bit and **without** M, which is what the TS 29.212
+    /// §5.3 AVP table specifies (V must, M may). Built explicitly rather than with
+    /// `vendor_mandatory` so the parser is exercised against the flags a
+    /// conformant PCEF actually sends.
+    fn add_rat_type(ccr: &mut DiameterMessage, rat: u32) {
+        ccr.add_avp(Avp::new(
+            gx_avp::RAT_TYPE,
+            nextgcore_diameter::avp::avp_flags::VENDOR,
+            Some(NEXTGCORE_3GPP_VENDOR_ID),
+            AvpData::Enumerated(rat as i32),
+        ));
+    }
+
+    /// Command-level QoS-Information carrying what the PCEF says is in force.
+    fn add_reported_qos(ccr: &mut DiameterMessage, ambr_ul: u32, ambr_dl: u32, qci: u8) {
+        ccr.add_avp(Avp::vendor_mandatory(
+            gx_avp::QOS_INFORMATION,
+            NEXTGCORE_3GPP_VENDOR_ID,
+            AvpData::Grouped(vec![
+                Avp::vendor_mandatory(
+                    gx_avp::APN_AGGREGATE_MAX_BITRATE_UL,
+                    NEXTGCORE_3GPP_VENDOR_ID,
+                    AvpData::Unsigned32(ambr_ul),
+                ),
+                Avp::vendor_mandatory(
+                    gx_avp::APN_AGGREGATE_MAX_BITRATE_DL,
+                    NEXTGCORE_3GPP_VENDOR_ID,
+                    AvpData::Unsigned32(ambr_dl),
+                ),
+                Avp::vendor_mandatory(
+                    gx_avp::QOS_CLASS_IDENTIFIER,
+                    NEXTGCORE_3GPP_VENDOR_ID,
+                    AvpData::Enumerated(qci as i32),
+                ),
+            ]),
+        ));
+    }
+
+    fn add_rule_report(ccr: &mut DiameterMessage, rule_name: &str, status: i32, failure_code: i32) {
+        ccr.add_avp(Avp::vendor_mandatory(
+            gx_avp::CHARGING_RULE_REPORT,
+            NEXTGCORE_3GPP_VENDOR_ID,
+            AvpData::Grouped(vec![
+                Avp::vendor_mandatory(
+                    gx_avp::CHARGING_RULE_NAME,
+                    NEXTGCORE_3GPP_VENDOR_ID,
+                    AvpData::OctetString(Bytes::copy_from_slice(rule_name.as_bytes())),
+                ),
+                Avp::vendor_mandatory(
+                    gx_avp::PCC_RULE_STATUS,
+                    NEXTGCORE_3GPP_VENDOR_ID,
+                    AvpData::Enumerated(status),
+                ),
+                Avp::vendor_mandatory(
+                    gx_avp::RULE_FAILURE_CODE,
+                    NEXTGCORE_3GPP_VENDOR_ID,
+                    AvpData::Enumerated(failure_code),
+                ),
+            ]),
+        ));
+    }
+
+    /// Every modification input is read off the wire, not just the first
+    /// Event-Trigger instance.
+    #[test]
+    fn parse_ccr_reads_every_modification_input() {
+        let mut ccr = build_test_ccr("gx-parse-mod-1", 2, 1);
+        add_event_trigger(&mut ccr, event_trigger::QOS_CHANGE);
+        add_event_trigger(&mut ccr, event_trigger::RAT_CHANGE);
+        add_rat_type(&mut ccr, nextgcore_diameter::gx::rat_type::EUTRAN);
+        add_reported_qos(&mut ccr, 1_000, 2_000, 7);
+        add_rule_report(
+            &mut ccr,
+            "pcrf-internet-default",
+            gx_pcc_rule_status::INACTIVE,
+            8,
+        );
+
+        let info = parse_ccr(&roundtrip(&ccr)).expect("parse_ccr");
+
+        // Repeated AVP: BOTH instances, not just the first.
+        assert_eq!(
+            info.event_triggers,
+            vec![event_trigger::QOS_CHANGE, event_trigger::RAT_CHANGE]
+        );
+        assert!(info.has_trigger(event_trigger::RAT_CHANGE));
+        assert_eq!(
+            info.rat_type,
+            Some(nextgcore_diameter::gx::rat_type::EUTRAN)
+        );
+        assert_eq!(info.reported_qos.ambr_uplink, Some(1_000));
+        assert_eq!(info.reported_qos.ambr_downlink, Some(2_000));
+        assert_eq!(info.reported_qos.qos_index, Some(7));
+        assert_eq!(info.rule_reports.len(), 1);
+        let report = &info.rule_reports[0];
+        assert_eq!(report.rule_names, vec!["pcrf-internet-default".to_string()]);
+        assert_eq!(report.pcc_rule_status, Some(gx_pcc_rule_status::INACTIVE));
+        assert_eq!(report.rule_failure_code, Some(8));
+        assert!(report.reports_removal());
+    }
+
+    /// The session's RAT is populated from the CCR instead of staying at the
+    /// hardcoded 0 it had before #57.
+    #[test]
+    fn rat_type_is_populated_from_the_ccr() {
+        crate::context::pcrf_context_init(1024);
+        crate::fd_path::pcrf_fd_set_local_identity(local());
+        let sid = "gx-rat-1";
+
+        let mut initial = build_test_ccr(sid, 1, 0);
+        add_rat_type(&mut initial, nextgcore_diameter::gx::rat_type::EUTRAN);
+        let _ = handle_ccr(&roundtrip(&initial), &local());
+        {
+            let ctx = pcrf_self();
+            let session = ctx
+                .read()
+                .unwrap()
+                .gx_session_find_by_sid(sid)
+                .expect("session");
+            assert_eq!(
+                session.rat_type,
+                nextgcore_diameter::gx::rat_type::EUTRAN,
+                "the reported RAT, not the hardcoded 0"
+            );
+            assert!(session.reported_rat);
+        }
+
+        // A handover to GERAN is recorded.
+        let mut update = build_test_ccr(sid, 2, 1);
+        add_event_trigger(&mut update, event_trigger::RAT_CHANGE);
+        add_rat_type(&mut update, nextgcore_diameter::gx::rat_type::GERAN);
+        let _ = handle_ccr(&roundtrip(&update), &local());
+        {
+            let ctx = pcrf_self();
+            let session = ctx
+                .read()
+                .unwrap()
+                .gx_session_find_by_sid(sid)
+                .expect("session");
+            assert_eq!(session.rat_type, nextgcore_diameter::gx::rat_type::GERAN);
+        }
+    }
+
+    /// A reported RAT_CHANGE re-authorizes; an update reporting nothing does not.
+    /// The two CCAs must differ — before #57 they were identical, because neither
+    /// was a function of the request.
+    #[test]
+    fn a_rat_change_reauthorizes_and_a_triggerless_update_does_not() {
+        crate::context::pcrf_context_init(1024);
+        crate::fd_path::pcrf_fd_set_local_identity(local());
+        let sid = "gx-ratchange-1";
+        let _ = handle_ccr(&roundtrip(&build_test_ccr(sid, 1, 0)), &local());
+
+        // (a) no trigger reported -> nothing provisioned
+        let (quiet, _) = handle_ccr(&roundtrip(&build_test_ccr(sid, 2, 1)), &local());
+        let quiet = roundtrip(&quiet);
+        assert_eq!(quiet.result_code(), Some(result_code::DIAMETER_SUCCESS));
+        assert!(
+            quiet
+                .find_vendor_avp(gx_avp::QOS_INFORMATION, NEXTGCORE_3GPP_VENDOR_ID)
+                .is_none(),
+            "an update that reported no event must not re-provision"
+        );
+
+        // (b) RAT_CHANGE reported -> re-authorized
+        let mut update = build_test_ccr(sid, 2, 2);
+        add_event_trigger(&mut update, event_trigger::RAT_CHANGE);
+        add_rat_type(&mut update, nextgcore_diameter::gx::rat_type::GERAN);
+        let (reacted, _) = handle_ccr(&roundtrip(&update), &local());
+        let reacted = roundtrip(&reacted);
+        let qos = reacted
+            .find_vendor_avp(gx_avp::QOS_INFORMATION, NEXTGCORE_3GPP_VENDOR_ID)
+            .expect("RAT_CHANGE must re-authorize the session QoS");
+        // POSITIVE: the AUTHORIZED values, from the subscription profile — not an
+        // echo of whatever the PCEF reported.
+        let members = qos.parse_grouped().expect("grouped");
+        assert_eq!(
+            find_avp(&members, gx_avp::APN_AGGREGATE_MAX_BITRATE_DL).and_then(|a| a.as_u32()),
+            Some(default_profile::AMBR_DL as u32)
+        );
+        assert!(
+            reacted
+                .find_vendor_avp(gx_avp::DEFAULT_EPS_BEARER_QOS, NEXTGCORE_3GPP_VENDOR_ID)
+                .is_some(),
+            "the default bearer QoS is restated for the new access"
+        );
+        assert!(
+            reacted
+                .find_vendor_avp(gx_avp::CHARGING_RULE_INSTALL, NEXTGCORE_3GPP_VENDOR_ID)
+                .is_none(),
+            "rules are not re-installed on an update; the PCEF already holds them"
+        );
+    }
+
+    /// QOS_CHANGE re-authorizes ONLY when what the PCEF reports diverges from what
+    /// was authorized. Agreement means the PCEF already holds the right policy, and
+    /// re-sending it is the static replay #57 is about.
+    #[test]
+    fn a_qos_change_reauthorizes_only_when_the_report_diverges() {
+        crate::context::pcrf_context_init(1024);
+        crate::fd_path::pcrf_fd_set_local_identity(local());
+        let sid = "gx-qoschange-1";
+        let _ = handle_ccr(&roundtrip(&build_test_ccr(sid, 1, 0)), &local());
+
+        // (a) reported == authorized -> no re-provisioning
+        let mut agreeing = build_test_ccr(sid, 2, 1);
+        add_event_trigger(&mut agreeing, event_trigger::QOS_CHANGE);
+        add_reported_qos(
+            &mut agreeing,
+            default_profile::AMBR_UL as u32,
+            default_profile::AMBR_DL as u32,
+            default_profile::QCI,
+        );
+        let (cca, _) = handle_ccr(&roundtrip(&agreeing), &local());
+        let cca = roundtrip(&cca);
+        assert_eq!(cca.result_code(), Some(result_code::DIAMETER_SUCCESS));
+        assert!(
+            cca.find_vendor_avp(gx_avp::QOS_INFORMATION, NEXTGCORE_3GPP_VENDOR_ID)
+                .is_none(),
+            "the PCEF already enforces the authorized QoS; re-sending it is the replay"
+        );
+
+        // (b) reported != authorized -> the CCA corrects the PCEF
+        let mut diverging = build_test_ccr(sid, 2, 2);
+        add_event_trigger(&mut diverging, event_trigger::QOS_CHANGE);
+        add_reported_qos(&mut diverging, 1_000, 2_000, 5);
+        let (cca, _) = handle_ccr(&roundtrip(&diverging), &local());
+        let cca = roundtrip(&cca);
+        let qos = cca
+            .find_vendor_avp(gx_avp::QOS_INFORMATION, NEXTGCORE_3GPP_VENDOR_ID)
+            .expect("a divergent report must be corrected");
+        let members = qos.parse_grouped().expect("grouped");
+        assert_eq!(
+            find_avp(&members, gx_avp::APN_AGGREGATE_MAX_BITRATE_DL).and_then(|a| a.as_u32()),
+            Some(default_profile::AMBR_DL as u32),
+            "the CCA carries the AUTHORIZED value, not the 2000 the PCEF reported"
+        );
+    }
+
+    /// UE_IP_ADDRESS_RELEASE clears the IP -> session mapping. Before #57 the
+    /// trigger was armed and nothing reacted, so the mapping outlived the address.
+    #[test]
+    fn ue_ip_address_release_clears_the_mapping() {
+        crate::context::pcrf_context_init(1024);
+        crate::fd_path::pcrf_fd_set_local_identity(local());
+        let sid = "gx-iprelease-1";
+        let _ = handle_ccr(&roundtrip(&build_test_ccr(sid, 1, 0)), &local());
+        {
+            let ctx = pcrf_self();
+            assert_eq!(
+                ctx.read()
+                    .unwrap()
+                    .find_sid_by_ipv4(&[10, 45, 0, 2])
+                    .as_deref(),
+                Some(sid),
+                "the initial CCR installs the mapping"
+            );
+        }
+
+        let mut update = build_test_ccr(sid, 2, 1);
+        add_event_trigger(&mut update, event_trigger::UE_IP_ADDRESS_RELEASE);
+        let _ = handle_ccr(&roundtrip(&update), &local());
+
+        let ctx = pcrf_self();
+        let context = ctx.read().unwrap();
+        assert_eq!(
+            context.find_sid_by_ipv4(&[10, 45, 0, 2]),
+            None,
+            "a released address must not still resolve to the session"
+        );
+        let session = context.gx_session_find_by_sid(sid).expect("session");
+        assert!(!session.has_ipv4, "and the session must agree");
+    }
+
+    /// TS 29.212 §4.5.12: an INACTIVE rule report is acted on. The rule leaves the
+    /// PCRF's installed set and the bound Rx session, and because it was that Rx
+    /// session's last rule, the AF is aborted rather than left believing an
+    /// unenforced service is active.
+    #[test]
+    fn an_inactive_rule_report_withdraws_the_rule_and_aborts_the_af() {
+        crate::context::pcrf_context_init(1024);
+        crate::fd_path::pcrf_fd_set_local_identity(local());
+        let sid = "gx-rulereport-1";
+        let rx_sid = "rx-rulereport-1";
+        let rule = "pcrf-internet-default";
+
+        let _ = handle_ccr(&roundtrip(&build_test_ccr(sid, 1, 0)), &local());
+        {
+            let ctx = pcrf_self();
+            let context = ctx.read().unwrap();
+            let session = context.gx_session_find_by_sid(sid).expect("session");
+            assert_eq!(
+                session.installed_rules,
+                vec![rule.to_string()],
+                "the initial provisioning is recorded"
+            );
+            let gx_idx = context.gx_session_get_idx(sid).expect("gx idx");
+            context.rx_session_add(rx_sid, gx_idx).expect("rx session");
+            context.rx_session_update(rx_sid, |rx| {
+                rx.peer_host = Some("pcscf.example.com".to_string());
+                rx.pcc_rules.push(crate::context::PccRule {
+                    name: rule.to_string(),
+                    qos_index: 9,
+                    flow_status: flow_status::ENABLED,
+                    precedence: 100,
+                    num_of_flow: 2,
+                });
+            });
+        }
+
+        let mut update = build_test_ccr(sid, 2, 1);
+        add_rule_report(&mut update, rule, gx_pcc_rule_status::INACTIVE, 8);
+        let (cca, aborts) = handle_ccr(&roundtrip(&update), &local());
+        assert_eq!(
+            roundtrip(&cca).result_code(),
+            Some(result_code::DIAMETER_SUCCESS),
+            "the report is acted on, not rejected"
+        );
+
+        assert_eq!(aborts.len(), 1, "the AF must be told");
+        assert_eq!(aborts[0].rx_sid, rx_sid);
+        assert_eq!(aborts[0].peer_host.as_deref(), Some("pcscf.example.com"));
+
+        let ctx = pcrf_self();
+        let context = ctx.read().unwrap();
+        let session = context.gx_session_find_by_sid(sid).expect("session");
+        assert!(
+            session.installed_rules.is_empty(),
+            "the PCRF must stop believing the rule is installed"
+        );
+        assert!(
+            context.rx_session_find_by_sid(rx_sid).is_none(),
+            "an aborted Rx session is gone, so a second report cannot abort it again"
+        );
+    }
+
+    /// The other side of §4.5.12: TEMPORARILY INACTIVE means the rule is expected
+    /// back (§5.3.19), so nothing is withdrawn and no AF is aborted. Without this,
+    /// "acts on rule reports" would be satisfied by a version that tears down on any
+    /// report at all.
+    #[test]
+    fn a_temporarily_inactive_report_withdraws_nothing() {
+        crate::context::pcrf_context_init(1024);
+        crate::fd_path::pcrf_fd_set_local_identity(local());
+        let sid = "gx-rulereport-2";
+        let rx_sid = "rx-rulereport-2";
+        let rule = "pcrf-internet-default";
+
+        let _ = handle_ccr(&roundtrip(&build_test_ccr(sid, 1, 0)), &local());
+        {
+            let ctx = pcrf_self();
+            let context = ctx.read().unwrap();
+            let gx_idx = context.gx_session_get_idx(sid).expect("gx idx");
+            context.rx_session_add(rx_sid, gx_idx).expect("rx session");
+            context.rx_session_update(rx_sid, |rx| {
+                rx.peer_host = Some("pcscf.example.com".to_string());
+                rx.pcc_rules.push(crate::context::PccRule {
+                    name: rule.to_string(),
+                    qos_index: 9,
+                    flow_status: flow_status::ENABLED,
+                    precedence: 100,
+                    num_of_flow: 2,
+                });
+            });
+        }
+
+        let mut update = build_test_ccr(sid, 2, 1);
+        add_rule_report(
+            &mut update,
+            rule,
+            gx_pcc_rule_status::TEMPORARILY_INACTIVE,
+            8,
+        );
+        let (_, aborts) = handle_ccr(&roundtrip(&update), &local());
+
+        assert!(
+            aborts.is_empty(),
+            "a temporary loss of bearer must not abort the AF"
+        );
+        let ctx = pcrf_self();
+        let context = ctx.read().unwrap();
+        assert_eq!(
+            context
+                .gx_session_find_by_sid(sid)
+                .expect("session")
+                .installed_rules,
+            vec![rule.to_string()],
+            "the rule is retained"
+        );
+        assert!(
+            context.rx_session_find_by_sid(rx_sid).is_some(),
+            "and so is the Rx session"
+        );
+    }
+
+    /// An Rx session that still has another rule is degraded, not dead: it keeps
+    /// running and the AF is not aborted.
+    #[test]
+    fn a_rule_report_leaving_another_rule_does_not_abort_the_af() {
+        crate::context::pcrf_context_init(1024);
+        crate::fd_path::pcrf_fd_set_local_identity(local());
+        let sid = "gx-rulereport-3";
+        let rx_sid = "rx-rulereport-3";
+
+        let _ = handle_ccr(&roundtrip(&build_test_ccr(sid, 1, 0)), &local());
+        {
+            let ctx = pcrf_self();
+            let context = ctx.read().unwrap();
+            let gx_idx = context.gx_session_get_idx(sid).expect("gx idx");
+            context.rx_session_add(rx_sid, gx_idx).expect("rx session");
+            context.rx_session_update(rx_sid, |rx| {
+                rx.peer_host = Some("pcscf.example.com".to_string());
+                for name in ["pcrf-internet-default", "rx-voice-1"] {
+                    rx.pcc_rules.push(crate::context::PccRule {
+                        name: name.to_string(),
+                        qos_index: 9,
+                        flow_status: flow_status::ENABLED,
+                        precedence: 100,
+                        num_of_flow: 2,
+                    });
+                }
+            });
+        }
+
+        let mut update = build_test_ccr(sid, 2, 1);
+        add_rule_report(
+            &mut update,
+            "pcrf-internet-default",
+            gx_pcc_rule_status::INACTIVE,
+            8,
+        );
+        let (_, aborts) = handle_ccr(&roundtrip(&update), &local());
+
+        assert!(aborts.is_empty(), "one surviving rule means no abort");
+        let ctx = pcrf_self();
+        let context = ctx.read().unwrap();
+        let rx = context.rx_session_find_by_sid(rx_sid).expect("rx session");
+        assert_eq!(
+            rx.pcc_rules
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rx-voice-1"],
+            "only the reported rule is withdrawn"
+        );
     }
 }
