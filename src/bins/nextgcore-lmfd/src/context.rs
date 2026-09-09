@@ -152,6 +152,13 @@ pub struct UeLocationContext {
     pub serving_cell: String,
     /// Last known location
     pub last_location: Option<LocationEstimate>,
+    /// The location this UE had BEFORE `last_location` (#104).
+    ///
+    /// Kept because velocity needs two fixes: these solvers produce position
+    /// only (no Doppler), so a single fix has no velocity, and `velocityRequested`
+    /// could never be honoured against a store that remembered one. Set by
+    /// [`LmfContext::ue_location_update`] when it displaces an existing fix.
+    pub previous_location: Option<LocationEstimate>,
     /// Active measurement request ID
     pub active_measurement: Option<u64>,
 }
@@ -279,6 +286,23 @@ pub struct LmfContext {
     callback_base: RwLock<Option<String>>,
     /// Our NF instance id (servingLMFIdentification, TS 29.518).
     nf_instance_id: RwLock<Option<String>>,
+    /// UP-location subscriptions (`up-subscriptions`, TS 29.572 §6.1.4.8),
+    /// keyed by the LMF-minted `subscriptionId` (#104).
+    ///
+    /// `up-subscribe` used to mint a UUID, echo the body and store NOTHING, and
+    /// `up-unsubscribe` ignored the id and always answered 204 — so a consumer
+    /// deleting a subscription that never existed was told it succeeded, and a
+    /// subscribed consumer's state was unretrievable. Fabricated success in both
+    /// directions.
+    up_subscriptions: RwLock<HashMap<String, crate::nlmf::UpSubscription>>,
+    /// UP-location configurations (`configure-up`, TS 29.572 §6.1.4.7), keyed by
+    /// the UE identity the configuration is for (`supi`, else `gpsi`) — #104.
+    /// Previously validated and discarded.
+    up_configs: RwLock<HashMap<String, crate::nlmf::UpConfig>>,
+    /// `Nlmf_DataExposure` subscriptions (TS 29.572 §5.4), keyed by the
+    /// LMF-minted `subscriptionId` (#104). The whole service was absent before.
+    exposure_subscriptions:
+        RwLock<HashMap<String, crate::broadcast_exposure::LmfDataExposureSubscription>>,
 }
 
 impl LmfContext {
@@ -297,6 +321,9 @@ impl LmfContext {
             ],
             initialized: AtomicBool::new(false),
             cell_registry: RwLock::new(HashMap::new()),
+            up_subscriptions: RwLock::new(HashMap::new()),
+            up_configs: RwLock::new(HashMap::new()),
+            exposure_subscriptions: RwLock::new(HashMap::new()),
             ldr_sessions: RwLock::new(HashMap::new()),
             ldr_tasks: RwLock::new(HashMap::new()),
             positioning_sessions: RwLock::new(HashMap::new()),
@@ -364,6 +391,107 @@ impl LmfContext {
 
     pub fn supported_methods(&self) -> &[PositioningMethod] {
         &self.supported_methods
+    }
+
+    // ---- #104: UP-location subscriptions and configurations ------------------
+
+    /// Store a UP-location subscription under a freshly minted id; returns the id.
+    pub fn up_subscription_insert(&self, sub: crate::nlmf::UpSubscription) -> Option<String> {
+        let mut subs = self.up_subscriptions.write().ok()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        subs.insert(id.clone(), sub);
+        Some(id)
+    }
+
+    /// The stored subscription for `id`, if any.
+    pub fn up_subscription_find(&self, id: &str) -> Option<crate::nlmf::UpSubscription> {
+        self.up_subscriptions.read().ok()?.get(id).cloned()
+    }
+
+    /// Remove a UP-location subscription. `None` when the id is unknown, which is
+    /// what lets `up-unsubscribe` answer 404 instead of a fabricated 204.
+    pub fn up_subscription_remove(&self, id: &str) -> Option<crate::nlmf::UpSubscription> {
+        self.up_subscriptions.write().ok()?.remove(id)
+    }
+
+    pub fn up_subscription_count(&self) -> usize {
+        self.up_subscriptions.read().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Record a UP-location configuration for a UE, keyed by `supi` else `gpsi`.
+    /// Returns the key used, so the caller can log what it stored against.
+    pub fn up_config_store(&self, config: crate::nlmf::UpConfig) -> Option<String> {
+        let key = config.supi.clone().or_else(|| config.gpsi.clone())?;
+        self.up_configs.write().ok()?.insert(key.clone(), config);
+        Some(key)
+    }
+
+    /// The stored UP configuration for a UE identity.
+    pub fn up_config_find(&self, ue_id: &str) -> Option<crate::nlmf::UpConfig> {
+        self.up_configs.read().ok()?.get(ue_id).cloned()
+    }
+
+    // ---- #104: Nlmf_DataExposure subscriptions -------------------------------
+
+    /// Store a data-exposure subscription under a freshly minted id.
+    pub fn exposure_subscription_insert(
+        &self,
+        sub: crate::broadcast_exposure::LmfDataExposureSubscription,
+    ) -> Option<String> {
+        let mut subs = self.exposure_subscriptions.write().ok()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        subs.insert(id.clone(), sub);
+        Some(id)
+    }
+
+    pub fn exposure_subscription_find(
+        &self,
+        id: &str,
+    ) -> Option<crate::broadcast_exposure::LmfDataExposureSubscription> {
+        self.exposure_subscriptions.read().ok()?.get(id).cloned()
+    }
+
+    /// Replace an existing subscription (the PATCH result). `false` when the id is
+    /// unknown, so a modify cannot create a resource at a consumer-chosen id.
+    pub fn exposure_subscription_replace(
+        &self,
+        id: &str,
+        sub: crate::broadcast_exposure::LmfDataExposureSubscription,
+    ) -> bool {
+        let Ok(mut subs) = self.exposure_subscriptions.write() else {
+            return false;
+        };
+        if !subs.contains_key(id) {
+            return false;
+        }
+        subs.insert(id.to_string(), sub);
+        true
+    }
+
+    pub fn exposure_subscription_remove(
+        &self,
+        id: &str,
+    ) -> Option<crate::broadcast_exposure::LmfDataExposureSubscription> {
+        self.exposure_subscriptions.write().ok()?.remove(id)
+    }
+
+    /// Is a real positioning measurement source wired (#104)?
+    ///
+    /// `/capabilities` used to hardcode `nrppaSupported: true` and
+    /// `nlsInterfaceSupported: true` while the mainline measure-location path
+    /// answered `403 LOCATION_MEASUREMENT_UNKNOWN` for want of one — so an
+    /// interop partner selected a method that then failed at request time.
+    ///
+    /// "Wired" means this LMF has cell/TRP coordinates to solve against: without
+    /// them the solvers fall back to a heuristic placeholder and the measurement
+    /// path cannot produce a real fix. That makes the advertised flag a function
+    /// of configuration rather than a constant, which is the honesty the issue
+    /// asks for.
+    pub fn measurement_source_available(&self) -> bool {
+        self.cell_registry
+            .read()
+            .map(|r| !r.is_empty())
+            .unwrap_or(false)
     }
 
     /// Create a measurement request (NLs: AMF -> LMF)
@@ -492,6 +620,10 @@ impl LmfContext {
     pub fn ue_location_update(&self, supi: &str, location: LocationEstimate) -> bool {
         if let Ok(mut locs) = self.ue_locations.write() {
             if let Some(ctx) = locs.get_mut(supi) {
+                // #104: the displaced fix becomes `previous_location`, giving the
+                // two-fix history a velocity can be derived from. Only ever
+                // displaced by a NEWER fix, so `previous` is older than `last`.
+                ctx.previous_location = ctx.last_location.take();
                 ctx.last_location = Some(location);
                 return true;
             }
@@ -502,6 +634,7 @@ impl LmfContext {
                     amf_ue_ngap_id: 0,
                     serving_cell: String::new(),
                     last_location: Some(location),
+                    previous_location: None,
                     active_measurement: None,
                 },
             );
@@ -602,6 +735,19 @@ impl LmfContext {
     /// A8: number of running EventNotify trigger tasks (test/observability).
     pub fn ldr_task_count(&self) -> usize {
         self.ldr_tasks.read().map(|t| t.len()).unwrap_or(0)
+    }
+
+    /// A8/#104: is a trigger task armed for this `ldrReference`?
+    ///
+    /// The per-key form of [`Self::ldr_task_count`]. Needed because #104's
+    /// context-transfer criterion is about ONE LDR's trigger resuming, and a count
+    /// cannot distinguish "this LDR was re-armed" from "some other test's LDR is
+    /// still ticking".
+    pub fn ldr_task_is_running(&self, ldr_reference: &str) -> bool {
+        self.ldr_tasks
+            .read()
+            .map(|t| t.contains_key(ldr_reference))
+            .unwrap_or(false)
     }
 
     // -----------------------------------------------------------------------
