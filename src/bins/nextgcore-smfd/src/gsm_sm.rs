@@ -9,7 +9,13 @@
 use crate::event::{SmfEvent, SmfEventId, SmfTimerId};
 
 /// GSM FSM states
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serialised by name (not by discriminant) into the smfd durable snapshot
+/// (issue #191), because a policy binding restored into `Initial` when it was
+/// `Operational` would re-run establishment for a live session. Naming the
+/// variants means inserting a state in the middle of this enum cannot silently
+/// reinterpret an existing snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum GsmState {
     /// Initial state
     #[default]
@@ -62,7 +68,11 @@ impl GsmState {
 }
 
 /// Session management data for tracking in-flight requests
-#[derive(Debug, Clone, Default)]
+///
+/// `serde(default)` on every member so a snapshot written before a member
+/// existed still loads (issue #191).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SmData {
     /// S6b AAR in flight
     pub s6b_aar_in_flight: bool,
@@ -85,7 +95,8 @@ pub struct SmData {
 }
 
 /// GSM State Machine
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default = "GsmFsm::snapshot_default")]
 pub struct GsmFsm {
     /// Current state
     pub state: GsmState,
@@ -103,6 +114,17 @@ impl GsmFsm {
             sess_id,
             sm_data: SmData::default(),
         }
+    }
+
+    /// Per-field fallback for deserialising a durable snapshot written before a
+    /// member existed (issue #191).
+    ///
+    /// Deliberately not a `Default` impl: `sess_id` 0 names no session, so
+    /// offering `GsmFsm::default()` would invite constructing an FSM that belongs
+    /// to nothing. Only serde reaches this, and only for a member the snapshot
+    /// does not carry.
+    fn snapshot_default() -> Self {
+        Self::new(0)
     }
 
     /// Initialize the FSM

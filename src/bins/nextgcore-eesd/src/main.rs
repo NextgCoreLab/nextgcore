@@ -58,6 +58,7 @@
 //!   not 503, because a retry can never succeed; and refused rather than
 //!   accepted, because a stored session that actuates nothing, or a subscription
 //!   that can never notify, fails silently.
+//!
 //! Also #106: the `eees-eel-acr` ACT status subscription resource
 //! (`/subscriptions`, `/subscriptions/{subscriptionId}`) is served, and
 //! `ACTStatusNotif` is emitted when an ACR reaches a terminal ACT outcome.

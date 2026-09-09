@@ -1380,15 +1380,6 @@ impl EesContext {
         removed
     }
 
-    /// Build + enqueue an `AcrMgntEventsNotification` (yaml:537-554) for every
-    /// subscription whose `eventSubscs` include the fired `event` (and, when a
-    /// per-event `appGrpId` filter is present, only when it matches). Returns
-    /// the number of matched subscriptions (kept for testability).
-    ///
-    /// Delivery is fire-and-forget via the shared notifier (D6): the callback
-    /// `(uri, body)` pairs are collected UNDER the read lock and enqueued only
-    /// AFTER it is released — the documented NF-context AB-BA rule (the notifier
-    /// must never be invoked while holding the `EesContext` lock).
     // ---- eees-eel-acr — ACT status subscriptions (TS 29.558 §5.11, #106) ----
 
     /// Store an `ACTStatusSubsc`; mints and returns the server `subscriptionId`.
@@ -1569,6 +1560,15 @@ impl EesContext {
         notified
     }
 
+    /// Build + enqueue an `AcrMgntEventsNotification` (yaml:537-554) for every
+    /// subscription whose `eventSubscs` include the fired `event` (and, when a
+    /// per-event `appGrpId` filter is present, only when it matches). Returns
+    /// the number of matched subscriptions (kept for testability).
+    ///
+    /// Delivery is fire-and-forget via the shared notifier (D6): the callback
+    /// `(uri, body)` pairs are collected UNDER the read lock and enqueued only
+    /// AFTER it is released — the documented NF-context AB-BA rule (the notifier
+    /// must never be invoked while holding the `EesContext` lock).
     pub fn notify_acrmgnt_subscribers(&self, event: &str, app_grp_id: Option<&str>) -> usize {
         let mut pending: Vec<(String, serde_json::Value)> = Vec::new();
         {

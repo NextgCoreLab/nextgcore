@@ -463,6 +463,43 @@ async fn main() -> Result<()> {
         config.max_bearer
     );
 
+    // ---- #191: durable state, OFF by default ----
+    //
+    // Restored AFTER the context knows its capacity caps and BEFORE the SBI server
+    // or the PFCP association loop can run, so a restored session is never
+    // shadowed by a fresh one and the restored peer Recovery Time Stamps are in
+    // place for the first Association Setup.
+    //
+    // Precedence matches the other NFs -- the flag wins over the env var, and an
+    // empty value is treated as unset -- but the flag is parsed by the same argv
+    // scan this daemon already uses for `-c`/`--config` rather than by clap:
+    // smfd has no clap `Args` struct, and introducing one would make every
+    // argument it currently ignores a hard startup error.
+    let state_file = std::env::args()
+        .zip(std::env::args().skip(1))
+        .find_map(|(a, b)| (a == "--state-file").then_some(b))
+        .or_else(|| std::env::var("NEXTGCORE_SMF_STATE_FILE").ok())
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    if let Some(path) = state_file {
+        let ctx = smf_self();
+        let mut guard = ctx
+            .write()
+            .map_err(|_| anyhow::anyhow!("SMF context lock poisoned"))?;
+        // Fail STARTUP on a snapshot that cannot be read or is from a newer build.
+        // Coming up with an empty IPv4 pool is the one failure mode here that is
+        // worse than not starting: it re-issues addresses live UEs still hold, and
+        // nothing logs the collision. The store would then also refuse every later
+        // write to protect the file, so the run would be silently non-durable too.
+        let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
+        log::info!("SMF durable state: {path} ({restored} record(s) restored)");
+    } else {
+        log::info!(
+            "SMF durable state disabled (no --state-file / NEXTGCORE_SMF_STATE_FILE): PFCP \
+             sessions, policy bindings and IPv4 allocations are memory-only and lost on restart"
+        );
+    }
+
     // Initialize SMF state machine
     let mut smf_sm = SmfFsm::new();
     smf_sm.init();
@@ -589,6 +626,22 @@ async fn main() -> Result<()> {
     // client (the legacy single-client paths keep working unchanged).
     pfcp_path::set_global_pool(pfcp_clients.clone());
     let pfcp_client = pfcp_clients[0].clone();
+
+    // #191: hand each client the Recovery Time Stamp the durable snapshot recorded
+    // for its peer, BEFORE the association loop is spawned. This is what turns the
+    // restored PFCP session map from a claim into a checked one: the first
+    // Association Setup compares the UPF's reported stamp against this seed and
+    // flushes the restored sessions if the UPF restarted while the SMF was down.
+    // A no-op when no state file is configured (the map has no entries).
+    for client in &pfcp_clients {
+        let stored = smf_self()
+            .read()
+            .ok()
+            .and_then(|ctx| ctx.upf_recovery_time_stamp(&client.peer().to_string()));
+        if let Some(rts) = stored {
+            client.seed_peer_recovery_time_stamp(rts).await;
+        }
+    }
 
     // PFCP receive/dispatch loop: responses complete pending transactions;
     // node-level requests (heartbeat, association release) are answered by
@@ -2492,6 +2545,12 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         match context.ipv4_pool.allocate() {
             Some(addr) => {
                 ue_ip_octets = addr.octets();
+                // Issue #191: persist the allocation HERE, before the session or
+                // the binding exists, because the failure directions are not
+                // symmetric. A snapshot holding an address whose session never
+                // completed leaks one address; a snapshot missing an address a UE
+                // is using hands the same address to a second UE.
+                context.persist();
             }
             None => {
                 log::error!("IPv4 address pool exhausted");
@@ -2785,6 +2844,9 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
                         sessions.insert(sm_context_ref.to_string(), result.upf_seid);
                     }
+                    // Issue #191: after the write guard drops -- `persist` takes a
+                    // read lock on this same map and RwLock is not reentrant.
+                    ctx.persist();
                 }
                 // FSM: WaitPfcpEstablishment → Operational
                 fsm.dispatch(&event::SmfEvent::n4_message(0, 0, Vec::new()));
@@ -2856,6 +2918,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 },
             );
         }
+        // Issue #191: after the write guard drops (see `SmfContext::persist`).
+        context.persist();
     }
 
     // ---- N1: PDU Session Establishment Accept with authorized QoS ----
@@ -3254,6 +3318,8 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                             b.ambr_dl_bps = ambr_dl;
                         }
                     }
+                    // Issue #191: durable too, not just in memory.
+                    ctx.persist();
                 }
             } else {
                 log::warn!("No PFCP session found for modification: ref={sm_context_ref}");
@@ -3933,6 +3999,11 @@ async fn handle_easdf_dns_report(request: &SbiRequest) -> SbiResponse {
                 }
             }
         }
+        if matched {
+            // Issue #191: the reported EAS list is part of the binding, so it is
+            // part of the snapshot.
+            ctx.persist();
+        }
     }
     if !matched {
         log::warn!(
@@ -4028,6 +4099,8 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
             if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
                 sessions.remove(sm_context_ref);
             }
+            // Issue #191: after the write guard drops (see `SmfContext::persist`).
+            ctx.persist();
         }
     } else {
         log::warn!("No PFCP session found for sm_context_ref={sm_context_ref}");
@@ -4037,6 +4110,10 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
     if let Some(ref b) = binding {
         if let Ok(ctx) = smf_self().read() {
             ctx.ipv4_pool.release(std::net::Ipv4Addr::from(b.ue_ip));
+            // Issue #191: a release that is not persisted leaves the address held
+            // in the snapshot forever -- a pool leak across restarts, which is the
+            // mirror of the double-assignment the snapshot exists to prevent.
+            ctx.persist();
         }
     }
 
@@ -4235,6 +4312,8 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
                 b.five_qi = dec.def_five_qi;
             }
         }
+        // Issue #191: durable too, not just in memory.
+        ctx.persist();
     }
 
     SbiResponse::with_status(204)
