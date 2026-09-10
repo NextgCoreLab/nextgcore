@@ -14,7 +14,66 @@ pub mod timer;
 
 use anyhow::Result;
 
-fn main() -> Result<()> {
+/// Where the Prometheus endpoint listens (`SGWU_METRICS_PORT`, default 9090 — the
+/// port every other daemon in this tree uses for it).
+fn metrics_addr() -> std::net::SocketAddr {
+    let port: u16 = std::env::var("SGWU_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9090);
+    std::net::SocketAddr::from(([0, 0, 0, 0], port))
+}
+
+/// Render the SGW-U's runtime state in Prometheus text format (issue #59).
+///
+/// Deliberately small and honest: the session count and the associated-peer count are
+/// the two numbers that distinguish a working SGW-U from a broken one, and both come
+/// from live state rather than from a counter this function increments.
+fn render_metrics() -> String {
+    let sessions = context::sgwu_self().sess_count();
+    let associated = pfcp_path::sxa_node()
+        .map(|n| n.associated_peer_count())
+        .unwrap_or(0);
+    format!(
+        "# HELP sgwu_pfcp_sessions Number of PFCP sessions held on Sxa\n\
+         # TYPE sgwu_pfcp_sessions gauge\n\
+         sgwu_pfcp_sessions {sessions}\n\
+         # HELP sgwu_pfcp_associations Number of associated SGW-C peers\n\
+         # TYPE sgwu_pfcp_associations gauge\n\
+         sgwu_pfcp_associations {associated}\n\
+         # HELP sgwu_up 1 when the SGW-U runtime is serving\n\
+         # TYPE sgwu_up gauge\n\
+         sgwu_up 1\n"
+    )
+}
+
+/// Resolve when the process is asked to stop: SIGTERM (how a container stops one) or
+/// Ctrl-C. Before #59 neither existed, because `main` had already returned.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Cannot listen for SIGTERM ({e}); Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => log::info!("SIGTERM received"),
+            _ = tokio::signal::ctrl_c() => log::info!("SIGINT received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
@@ -44,11 +103,14 @@ fn main() -> Result<()> {
     let result = sgwu_sm.dispatch(&entry_event);
     log::info!("SGWU state machine result: {result:?}");
 
-    // Open PFCP server sockets
-    if let Err(e) = pfcp_path::pfcp_open() {
-        log::error!("Failed to open PFCP sockets: {e}");
-        return Err(anyhow::anyhow!("PFCP open failed"));
-    }
+    // Open the Sxa PFCP socket (issue #59: this used to bind nothing)
+    let pfcp = match pfcp_path::pfcp_open().await {
+        Ok(node) => node,
+        Err(e) => {
+            log::error!("Failed to open PFCP socket: {e}");
+            return Err(anyhow::anyhow!("PFCP open failed: {e}"));
+        }
+    };
 
     // Open GTP-U server sockets
     if let Err(e) = gtp_path::gtp_open() {
@@ -56,17 +118,43 @@ fn main() -> Result<()> {
         return Err(anyhow::anyhow!("GTP-U open failed"));
     }
 
-    log::info!("NextGCore SGWU initialized successfully");
+    // The runtime (issue #59). `main` used to fall straight through from here to the
+    // cleanup block and return Ok(()), so the process exited 0 on startup -- and
+    // because docker-compose-epc.yml probed it with `kill -0 1` and restarted only
+    // `on-failure`, a clean exit was reported as healthy. Everything below is what
+    // makes the daemon a daemon: a receive loop, heartbeat-driven peer-failure
+    // detection, a metrics endpoint, and a shutdown that waits to be asked.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(pfcp.clone().run(shutdown_rx.clone()));
+    let heartbeats = tokio::spawn(pfcp.clone().heartbeat_monitor(shutdown_rx));
+    match nextgcore_metrics::nes_energy::serve_metrics(
+        metrics_addr(),
+        std::sync::Arc::new(render_metrics),
+    )
+    .await
+    {
+        Ok((bound, _handle)) => log::info!("SGWU metrics endpoint on http://{bound}/metrics"),
+        // Non-fatal: an SGW-U that cannot expose metrics still carries traffic, and
+        // refusing to start would turn a busy port into a user-plane outage.
+        Err(e) => log::warn!("SGWU metrics endpoint not available: {e}"),
+    }
 
-    // Note: Main event loop implementation
-    // Event loop runs via nextgcore_pollset_poll processing PFCP and GTP-U messages:
-    // 1. PFCP messages dispatched to pfcp_sm via SXA events
-    // 2. GTP-U packets forwarded between S1-U/S5-U interfaces via gtp_handler
-    // 3. Session operations handled by pfcp_handler for PFCP Session messages
+    log::info!(
+        "NextGCore SGWU initialized successfully (PFCP/Sxa on {})",
+        pfcp.local_addr()
+    );
+
+    shutdown_signal().await;
+    log::info!("NextGCore SGWU shutting down...");
+    let _ = shutdown_tx.send(true);
+    // Await the tasks so a session removed during teardown is not raced by a
+    // datagram still being processed.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), heartbeats).await;
 
     // Cleanup
     gtp_path::gtp_close();
-    pfcp_path::pfcp_close();
+    pfcp_path::pfcp_close().await;
     gtp_path::gtp_final();
     context::sgwu_context_final();
     sgwu_sm.fini();
@@ -173,10 +261,32 @@ mod tests {
         gtp_path::gtp_final();
     }
 
+    /// #59: `pfcp_open` binds a real socket, so the test asks for an ephemeral one
+    /// rather than fighting a live SGW-U for UDP/8805.
+    #[tokio::test]
+    async fn test_pfcp_path_open_close() {
+        std::env::set_var("PFCP_BIND_ADDR", "127.0.0.1:0");
+        let node = pfcp_path::pfcp_open().await.expect("bind");
+        assert_ne!(node.local_addr().port(), 0, "a real socket was bound");
+        pfcp_path::pfcp_close().await;
+        std::env::remove_var("PFCP_BIND_ADDR");
+    }
+
+    /// #59 criterion 6: the metrics endpoint renders live state, in Prometheus text
+    /// format. Asserted on the rendered body rather than on the endpoint binding,
+    /// because a body that reports nothing is the failure worth catching.
     #[test]
-    fn test_pfcp_path_open_close() {
-        assert!(pfcp_path::pfcp_open().is_ok());
-        pfcp_path::pfcp_close();
+    fn the_metrics_render_reports_sessions_and_associations() {
+        context::sgwu_context_init(1024);
+        let body = render_metrics();
+        for expected in [
+            "# TYPE sgwu_pfcp_sessions gauge",
+            "sgwu_pfcp_sessions ",
+            "sgwu_pfcp_associations ",
+            "sgwu_up 1",
+        ] {
+            assert!(body.contains(expected), "missing {expected} in:\n{body}");
+        }
     }
 
     #[test]
