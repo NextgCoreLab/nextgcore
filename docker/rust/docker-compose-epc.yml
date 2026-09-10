@@ -127,7 +127,28 @@ services:
   sgwu:
     image: nextgcore-rust/sgwu:latest
     container_name: nextgcore-sgwu
-    <<: [*common, *nf-healthcheck]
+    <<: *common
+    # Issue #59: a FUNCTIONAL probe, replacing the shared `kill -0 1` anchor.
+    #
+    # `kill -0 1` asks whether PID 1 exists, which was true of an SGW-U that had
+    # opened its sockets and returned from `main` — and with `restart: on-failure`
+    # a clean exit is not a failure, so a deployment carrying no user plane at all
+    # reported healthy. This asks the daemon's own runtime instead: `sgwu_up 1` is
+    # rendered by the live metrics endpoint, so it can only answer while the
+    # receive loop and the runtime are actually serving.
+    #
+    # Deliberately NOT the association state (`sgwu_pfcp_associations`), which the
+    # same body carries: the SGW-C associates after both containers are up, so
+    # gating liveness on it would report the SGW-U unhealthy during every normal
+    # bring-up. Association belongs in a readiness check, which compose has no
+    # separate notion of.
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -fsS http://localhost:9090/metrics | grep -q '^sgwu_up 1$$'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     environment:
       <<: *common-env
     command: ["-c", "/etc/nextgcore/sgwu.yaml"]

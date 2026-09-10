@@ -66,7 +66,7 @@ pub struct PfcpNodeInfo {
 
 /// PFCP state machine for SGWU
 /// Port of sgwu_pfcp_state_* functions from pfcp-sm.c
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PfcpStateMachine {
     /// Current state
     state: PfcpState,

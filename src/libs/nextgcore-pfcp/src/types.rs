@@ -2450,6 +2450,13 @@ pub struct CreateUrr {
     pub reporting_triggers: ReportingTriggers,
     pub measurement_period: Option<u32>,
     pub volume_threshold: Option<VolumeThreshold>,
+    /// Volume Quota (TS 29.244 §8.2.14). Same wire structure as Volume Threshold
+    /// (§8.2.13) — flags octet then the present volumes — so it reuses that type.
+    ///
+    /// Added by #59: without it a Volume Quota an SGW-C provisions decodes to nothing,
+    /// and a UP function that keeps a `volume_quota` field would enforce a quota of
+    /// zero while looking provisioned.
+    pub volume_quota: Option<VolumeThreshold>,
     pub time_threshold: Option<u32>,
 }
 
@@ -2465,6 +2472,7 @@ impl CreateUrr {
             reporting_triggers,
             measurement_period: None,
             volume_threshold: None,
+            volume_quota: None,
             time_threshold: None,
         }
     }
@@ -2497,6 +2505,14 @@ impl CreateUrr {
             buf.put_slice(&vt_buf);
         }
 
+        if let Some(vq) = &self.volume_quota {
+            let mut vq_buf = BytesMut::new();
+            vq.encode(&mut vq_buf);
+            let header = IeHeader::new(IeType::VolumeQuota as u16, vq_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&vq_buf);
+        }
+
         if let Some(tt) = self.time_threshold {
             encode_u32_ie(buf, IeType::TimeThreshold, tt);
         }
@@ -2510,6 +2526,7 @@ impl CreateUrr {
         let mut reporting_triggers = ReportingTriggers::default();
         let mut measurement_period = None;
         let mut volume_threshold = None;
+        let mut volume_quota = None;
         let mut time_threshold = None;
 
         while buf.remaining() >= IeHeader::LEN {
@@ -2539,6 +2556,10 @@ impl CreateUrr {
                     let mut data = ie.data;
                     volume_threshold = Some(VolumeThreshold::decode(&mut data)?);
                 }
+                t if t == IeType::VolumeQuota as u16 => {
+                    let mut data = ie.data;
+                    volume_quota = Some(VolumeThreshold::decode(&mut data)?);
+                }
                 t if t == IeType::TimeThreshold as u16 => {
                     if ie.data.len() >= 4 {
                         let mut data = ie.data;
@@ -2555,6 +2576,7 @@ impl CreateUrr {
             reporting_triggers,
             measurement_period,
             volume_threshold,
+            volume_quota,
             time_threshold,
         })
     }
@@ -3953,6 +3975,54 @@ mod tests {
         let mut bytes = encoded.clone();
         let decoded = FTeid::decode(&mut bytes).unwrap();
         (encoded, decoded)
+    }
+
+    /// A Create URR's Volume Quota survives the wire (issue #59).
+    ///
+    /// TS 29.244 §8.2.14 has the same structure as the Volume Threshold of §8.2.13,
+    /// and before #59 this IE was neither encoded nor decoded here — so a UP function
+    /// with a `volume_quota` field to enforce read zero from every conformant request
+    /// while looking provisioned.
+    ///
+    /// A ROUND TRIP, not a field read: sgwud's own mapping test builds the struct
+    /// directly, so it passes whether or not the codec carries the IE. Removing the
+    /// decode arm left that test green — this is the guard that fails instead.
+    #[test]
+    fn a_create_urr_carries_its_volume_quota_over_the_wire() {
+        let mut urr = CreateUrr::new(
+            9,
+            MeasurementMethod {
+                volum: true,
+                ..Default::default()
+            },
+            ReportingTriggers::default(),
+        );
+        urr.volume_threshold = Some(VolumeThreshold::new_total(1_000));
+        urr.volume_quota = Some(VolumeThreshold {
+            tovol: true,
+            ulvol: true,
+            total_volume: 5_000,
+            uplink_volume: 2_000,
+            ..Default::default()
+        });
+
+        let mut buf = BytesMut::new();
+        urr.encode(&mut buf);
+        let mut bytes = buf.freeze();
+        let decoded = CreateUrr::decode(&mut bytes).expect("a Create URR must decode");
+
+        assert_eq!(decoded.urr_id, 9);
+        let quota = decoded
+            .volume_quota
+            .expect("the Volume Quota must survive encode+decode");
+        assert_eq!(quota.total_volume, 5_000);
+        assert_eq!(quota.uplink_volume, 2_000);
+        assert!(quota.tovol && quota.ulvol && !quota.dlvol);
+        assert_eq!(
+            decoded.volume_threshold.map(|v| v.total_volume),
+            Some(1_000),
+            "the Threshold and the Quota are distinct IEs and must not collapse into one"
+        );
     }
 
     #[test]
