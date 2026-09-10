@@ -267,37 +267,86 @@ pub struct PfcpClient {
     timers: SmfTimerConfigs,
 }
 
-static PFCP_CLIENT: OnceLock<Arc<PfcpClient>> = OnceLock::new();
+/// The process-wide PFCP client.
+///
+/// A `RwLock<Option<..>>` rather than a `OnceLock` (issue #289), and this is the
+/// production change that issue asked to be decided out loud rather than
+/// silently. The decision was forced by evidence, not preference: a `PfcpClient`
+/// owns a `tokio::net::UdpSocket`, and a tokio socket belongs to the runtime that
+/// created it. Under `#[tokio::test]` — one runtime per test — a client installed
+/// permanently by whichever test ran first is a client whose socket is dead for
+/// every test after it ("A Tokio 1.x context was found, but it is being
+/// shutdown"), so the install-once shape cannot express a UPF stand-in at all.
+///
+/// What changes for the running SMF: `set_global_client` now overwrites instead
+/// of being first-wins. `main` calls it exactly once (through
+/// [`set_global_pool`]) at startup, so today's behaviour is identical, and a
+/// re-installable pool is the more predictable of the two if a future
+/// reconfiguration path ever wants one. What is deliberately NOT added is any
+/// caller that swaps the client while sessions are live: the sessions' peer
+/// bindings (`SESSION_PEERS`) would still point at the old peer.
+static PFCP_CLIENT: std::sync::RwLock<Option<Arc<PfcpClient>>> = std::sync::RwLock::new(None);
 
-/// Install the process-wide PFCP client (once, at startup).
+/// Install the process-wide PFCP client (at startup, or per test).
 pub fn set_global_client(client: Arc<PfcpClient>) {
-    let _ = PFCP_CLIENT.set(client);
+    if let Ok(mut slot) = PFCP_CLIENT.write() {
+        *slot = Some(client);
+    }
 }
 
-/// The process-wide PFCP client, if initialised.
+/// The process-wide PFCP client, if initialised. Cloned out of the lock so no
+/// guard is ever held across an `await`.
 pub fn global_client() -> Option<Arc<PfcpClient>> {
-    PFCP_CLIENT.get().cloned()
+    PFCP_CLIENT.read().ok()?.clone()
 }
 
 // ============================================================================
 // UPF pool + load-aware selection (issue #20)
 // ============================================================================
 
-static PFCP_POOL: OnceLock<Vec<Arc<PfcpClient>>> = OnceLock::new();
+/// The process-wide UPF pool. Settable for the same reason as [`PFCP_CLIENT`],
+/// and always set together with it so the two cannot disagree about which peer
+/// is the default.
+static PFCP_POOL: std::sync::RwLock<Vec<Arc<PfcpClient>>> = std::sync::RwLock::new(Vec::new());
 
-/// Install the process-wide UPF pool (once, at startup). The first entry is
-/// also installed as the process-wide default client, so every legacy
+/// Install the process-wide UPF pool (at startup, or per test). The first entry
+/// is also installed as the process-wide default client, so every legacy
 /// single-client path keeps its pre-pool behavior.
 pub fn set_global_pool(clients: Vec<Arc<PfcpClient>>) {
     if let Some(first) = clients.first() {
         set_global_client(first.clone());
     }
-    let _ = PFCP_POOL.set(clients);
+    if let Ok(mut slot) = PFCP_POOL.write() {
+        *slot = clients;
+    }
 }
 
-/// The process-wide UPF pool (all configured peers), if initialised.
-pub fn global_pool() -> Option<&'static [Arc<PfcpClient>]> {
-    PFCP_POOL.get().map(|v| v.as_slice())
+/// Uninstall the client and pool, returning the process to its pre-startup state.
+///
+/// Test-only, and the "release" half of the per-test install the stand-in does:
+/// a test that asked for a UPF must not leave one behind for a sibling that
+/// expects none, and the sibling would find a client whose runtime has since shut
+/// down. Not offered to production — a running SMF has no reason to un-install
+/// its own N4 endpoint, and doing so mid-session would strand `SESSION_PEERS`.
+#[cfg(test)]
+pub(crate) fn clear_global_upf_for_test() {
+    if let Ok(mut slot) = PFCP_CLIENT.write() {
+        *slot = None;
+    }
+    if let Ok(mut pool) = PFCP_POOL.write() {
+        pool.clear();
+    }
+}
+
+/// The process-wide UPF pool (all configured peers); empty until installed.
+///
+/// Returns an owned snapshot rather than a borrow: the pool is now behind a lock,
+/// and a guard must not be held across the `await`s every caller performs.
+pub fn global_pool() -> Vec<Arc<PfcpClient>> {
+    PFCP_POOL
+        .read()
+        .map(|pool| pool.clone())
+        .unwrap_or_default()
 }
 
 /// Session → UPF binding: the SMF's own N4 SEID → PFCP peer address,
@@ -338,9 +387,9 @@ pub fn client_for_session(smf_n4_seid: u64) -> Option<Arc<PfcpClient>> {
         .read()
         .ok()
         .and_then(|map| map.get(&smf_n4_seid).copied());
-    if let (Some(peer), Some(pool)) = (peer, global_pool()) {
-        if let Some(client) = pool.iter().find(|c| c.peer() == peer) {
-            return Some(client.clone());
+    if let Some(peer) = peer {
+        if let Some(client) = global_pool().into_iter().find(|c| c.peer() == peer) {
+            return Some(client);
         }
     }
     global_client()
@@ -363,11 +412,11 @@ pub async fn select_upf() -> Option<Arc<PfcpClient>> {
     if !cfg!(feature = "compute-aware-upf") {
         return global_client();
     }
-    let pool = match global_pool() {
-        Some(pool) if pool.len() > 1 => pool,
-        _ => return global_client(),
-    };
-    match select_upf_from(pool).await {
+    let pool = global_pool();
+    if pool.len() <= 1 {
+        return global_client();
+    }
+    match select_upf_from(&pool).await {
         Some(client) => Some(client),
         None => {
             log::warn!(
@@ -843,11 +892,306 @@ pub fn clear_pfcp_sessions() -> usize {
 }
 
 // ============================================================================
+// Test harness: the process-wide stand-in UPF (issue #289)
+// ============================================================================
+
+/// One agreement about every N4 process-global in this crate.
+///
+/// Three variables are involved and they cannot be guarded separately:
+/// - `PFCP_CLIENT` / `PFCP_POOL` (this module) — `OnceLock`s, so the first
+///   installer wins for the whole test process;
+/// - `SmfContext::pfcp_sessions` (`context.rs`) — `teardown_association` calls
+///   `clear_pfcp_sessions`, which clears the map for the WHOLE process rather
+///   than for the client that tore down;
+/// - the `AssociationState` of the one installed client, which decides whether
+///   `pfcp_session_establish` proceeds or bails.
+///
+/// Any two tests that touch any of these will flush or contradict each other if
+/// they interleave — which is how the #191 pair first failed, one clearing the
+/// other's session key mid-assertion. A SECOND lock over the same variables
+/// would be two disjoint agreements rather than one, and #276 showed that
+/// mistake HANGS the suite rather than merely flaking it, so this is deliberately
+/// declared here beside the globals and shared by `main.rs`'s tests
+/// (`pub(crate)`) instead of being re-declared there.
+///
+/// Lock order, where a test needs more than one process-global: take
+/// `easdf::SWITCH_LOCK` (or any other module's switch lock) FIRST, then this
+/// one. Every call site in the crate follows that order; reversing it anywhere
+/// reintroduces the deadlock this comment exists to prevent.
+#[cfg(test)]
+pub(crate) static N4_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A PFCP-answering UPF stand-in for tests (issue #289).
+///
+/// Before this existed, `handle_sm_context_create` could not get past its N4 leg
+/// in ANY test: `select_upf()` returned no client, so every create answered
+/// `504 UPF_NOT_RESPONDING` and the whole tail after the PFCP block — the session
+/// fill-in, the policy binding, the EASDF leg, the N1 accept — was unreachable.
+/// Three call sites in that tail were therefore "verified by inspection", and one
+/// of them (`easdf::create_dns_context`, #276) had simply been absent for a month
+/// while looking wired.
+///
+/// **The design choice #289 asks to be made explicitly: install-and-release, per
+/// test, which required making `PFCP_CLIENT` settable.** The issue proposed
+/// installing ONE stand-in permanently and leaving the `OnceLock` alone, calling
+/// that the smaller change — and it cannot work here, for a reason the issue did
+/// not anticipate: a `PfcpClient` owns a `tokio::net::UdpSocket`, which belongs to
+/// the runtime that created it. `#[tokio::test]` gives each test its own runtime,
+/// so a client installed by the first test to touch it is dead for every test
+/// after ("A Tokio 1.x context was found, but it is being shutdown" — observed,
+/// not predicted). So each test installs its own stand-in and RELEASES it on drop
+/// (see [`clear_global_upf_for_test`]), leaving the process exactly as a test that
+/// never asked for a UPF expects to find it.
+///
+/// Which association state a test gets is still its own choice
+/// ([`associated_upf`] / [`unassociated_upf`]): a failure-path test wants the REAL
+/// failure mode (TS 29.244 §6.2.6.2, no session signalling without an
+/// association) rather than the absence of a client, which is what those tests
+/// were approximating all along.
+#[cfg(test)]
+pub(crate) mod stand_in {
+    use super::*;
+
+    /// The stand-in UPF and the identities it hands out, so a test can assert on
+    /// the values that must survive the round trip.
+    ///
+    /// Holds the [`N4_TEST_LOCK`] guard for as long as the test holds this, and
+    /// un-installs the client on drop — so binding it to `_` (which drops it
+    /// immediately) would silently give the test no UPF and no serialisation.
+    #[must_use = "the stand-in UPF is uninstalled as soon as it is dropped"]
+    pub(crate) struct StandInUpf {
+        /// The client installed as the process-wide PFCP client + pool.
+        pub(crate) client: Arc<PfcpClient>,
+        /// Message types the stand-in answered, in order.
+        pub(crate) seen: Arc<std::sync::Mutex<Vec<u8>>>,
+        /// The UP F-SEID this stand-in allocates for every session.
+        pub(crate) upf_seid: u64,
+        /// The F-TEID it returns in the Created PDR.
+        pub(crate) upf_teid: u32,
+        /// The N3 address it reports alongside the F-TEID.
+        pub(crate) upf_ip: [u8; 4],
+        /// Serialises every N4 test against every other; released with this value.
+        _n4_guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for StandInUpf {
+        fn drop(&mut self) {
+            // Runs BEFORE `_n4_guard` is released (Rust drops the body first, then
+            // the fields), so no sibling can observe the half-torn-down state.
+            clear_global_upf_for_test();
+        }
+    }
+
+    impl StandInUpf {
+        /// Message types answered since the last [`Self::clear_seen`].
+        pub(crate) fn seen(&self) -> Vec<u8> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+
+        /// Forget the recorded traffic, so a test asserts only about its own.
+        pub(crate) fn clear_seen(&self) {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+
+    /// Flat TLV encoder for the response IEs the SMF's establishment parser reads.
+    fn tlv(ie_type: u16, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + value.len());
+        out.extend_from_slice(&ie_type.to_be_bytes());
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// A Session Establishment Response body: Cause + UP F-SEID + Created PDR
+    /// carrying the allocated F-TEID (TS 29.244 §7.5.3).
+    ///
+    /// Hand-encoded rather than built with the library's message types because
+    /// the SMF's own establishment parser is what is under test here: it reads
+    /// F-SEID with V4 on **bit 2** (§8.2.37) and F-TEID with V4 on **bit 1**
+    /// (§8.2.3), an asymmetry the production parser calls out and a stand-in that
+    /// shared an encoder with it could not catch.
+    fn establishment_response_body(seid: u64, teid: u32, ip: [u8; 4]) -> Vec<u8> {
+        let mut body = tlv(19, &[pfcp_cause::REQUEST_ACCEPTED]);
+
+        let mut f_seid = Vec::with_capacity(13);
+        f_seid.push(0x02); // V4 present (bit 2)
+        f_seid.extend_from_slice(&seid.to_be_bytes());
+        f_seid.extend_from_slice(&ip);
+        body.extend_from_slice(&tlv(57, &f_seid));
+
+        let mut f_teid = Vec::with_capacity(9);
+        f_teid.push(0x01); // V4 present (bit 1)
+        f_teid.extend_from_slice(&teid.to_be_bytes());
+        f_teid.extend_from_slice(&ip);
+        let mut created_pdr = tlv(56, &[0x00, 0x01]); // PDR ID 1
+        created_pdr.extend_from_slice(&tlv(21, &f_teid));
+        body.extend_from_slice(&tlv(8, &created_pdr));
+
+        body
+    }
+
+    /// Bind a client whose peer socket is returned to the caller and never
+    /// answers on its own. Promoted out of this module's `tests` submodule
+    /// (issue #289) so both `pfcp_path`'s own tests and the stand-in build their
+    /// clients the same way.
+    pub(crate) async fn client_with_silent_peer() -> (Arc<PfcpClient>, UdpSocket) {
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(PfcpClient::new(Arc::new(local), peer_addr, [127, 0, 0, 1]));
+
+        // Pump incoming datagrams into the engine
+        let c = client.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((len, from)) = c.socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                c.on_datagram(&buf[..len], from).await;
+            }
+        });
+        (client, peer_sock)
+    }
+
+    /// Install a stand-in UPF as `PFCP_CLIENT` + `PFCP_POOL` for this test, and
+    /// serialise against every other N4 test until the returned value drops.
+    ///
+    /// Not associated yet — [`associated_upf`] adds the handshake.
+    pub(crate) async fn install_stand_in_upf() -> StandInUpf {
+        let n4_guard = N4_TEST_LOCK.lock().await;
+        let (client, upf_sock) = client_with_silent_peer().await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let upf_seid = 0x0000_0000_dead_beef_u64;
+        let upf_teid = 0x0000_1289_u32;
+        let upf_ip = [127, 0, 0, 4];
+
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            let rts = 0x5EED_0289_u32;
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let Ok((len, from)) = upf_sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                let Some(h) = parse_wire_header(&buf[..len]) else {
+                    continue;
+                };
+                recorded
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(h.msg_type);
+
+                let reply = match h.msg_type {
+                    pfcp_message_type::ASSOCIATION_SETUP_REQUEST => {
+                        let mut resp = AssociationSetupResponse::new(
+                            NodeId::new_ipv4(upf_ip),
+                            nextgcore_pfcp::types::PfcpCause::RequestAccepted,
+                            rts,
+                        );
+                        resp.up_function_features = Some(UpFunctionFeatures {
+                            ftup: true,
+                            ..Default::default()
+                        });
+                        Some(Vec::from(build_message(
+                            &PfcpMessage::AssociationSetupResponse(resp),
+                            h.sequence_number,
+                            None,
+                        )))
+                    }
+                    pfcp_message_type::HEARTBEAT_REQUEST => Some(Vec::from(build_message(
+                        &PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(rts)),
+                        h.sequence_number,
+                        None,
+                    ))),
+                    pfcp_message_type::ASSOCIATION_RELEASE_REQUEST => {
+                        Some(Vec::from(build_message(
+                            &PfcpMessage::AssociationReleaseResponse(
+                                nextgcore_pfcp::message::AssociationReleaseResponse::new(
+                                    NodeId::new_ipv4(upf_ip),
+                                    nextgcore_pfcp::types::PfcpCause::RequestAccepted,
+                                ),
+                            ),
+                            h.sequence_number,
+                            None,
+                        )))
+                    }
+                    pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST => Some(encode_wire_message(
+                        pfcp_message_type::SESSION_ESTABLISHMENT_RESPONSE,
+                        Some(h.seid),
+                        h.sequence_number,
+                        &establishment_response_body(upf_seid, upf_teid, upf_ip),
+                    )),
+                    pfcp_message_type::SESSION_MODIFICATION_REQUEST => Some(encode_wire_message(
+                        pfcp_message_type::SESSION_MODIFICATION_RESPONSE,
+                        Some(h.seid),
+                        h.sequence_number,
+                        &tlv(19, &[pfcp_cause::REQUEST_ACCEPTED]),
+                    )),
+                    pfcp_message_type::SESSION_DELETION_REQUEST => Some(encode_wire_message(
+                        pfcp_message_type::SESSION_DELETION_RESPONSE,
+                        Some(h.seid),
+                        h.sequence_number,
+                        &tlv(19, &[pfcp_cause::REQUEST_ACCEPTED]),
+                    )),
+                    _ => None,
+                };
+                if let Some(pkt) = reply {
+                    let _ = upf_sock.send_to(&pkt, from).await;
+                }
+            }
+        });
+
+        // Installs BOTH globals: `set_global_pool` also sets the default client,
+        // so the two can never disagree about which peer is ours.
+        set_global_pool(vec![client.clone()]);
+
+        StandInUpf {
+            client,
+            seen,
+            upf_seid,
+            upf_teid,
+            upf_ip,
+            _n4_guard: n4_guard,
+        }
+    }
+
+    /// A stand-in UPF with its association UP. Use for a test that must reach the
+    /// success path.
+    pub(crate) async fn associated_upf() -> StandInUpf {
+        let upf = install_stand_in_upf().await;
+        upf.client
+            .associate()
+            .await
+            .expect("the stand-in UPF must accept the association");
+        upf.clear_seen();
+        upf
+    }
+
+    /// A stand-in UPF with its association DOWN. Use for a test that must see
+    /// establishment fail at the N4 leg — the real failure mode (TS 29.244
+    /// §6.2.6.2), rather than the absence of a client.
+    ///
+    /// A freshly built client is un-associated already; the state is set
+    /// explicitly so the test's intent is visible at the call site. Deliberately
+    /// NOT `teardown_association`, which would clear the process-global
+    /// `pfcp_sessions` map — a sibling's state rather than this test's.
+    pub(crate) async fn unassociated_upf() -> StandInUpf {
+        let upf = install_stand_in_upf().await;
+        upf.client.set_assoc_state_for_test(false, None, None).await;
+        upf.clear_seen();
+        upf
+    }
+}
+
+// ============================================================================
 // Unit Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
+    use super::stand_in::{client_with_silent_peer as make_client_with_peer, unassociated_upf};
     use super::*;
 
     fn body_with_cause(cause: u8) -> Vec<u8> {
@@ -893,39 +1237,6 @@ mod tests {
         ));
         assert!(!is_response_type(pfcp_message_type::HEARTBEAT_REQUEST));
         assert!(!is_response_type(pfcp_message_type::SESSION_REPORT_REQUEST));
-    }
-
-    /// One agreement about the process-global `pfcp_sessions` map.
-    ///
-    /// `teardown_association` calls `clear_pfcp_sessions`, which clears the map
-    /// for the WHOLE process, not for the client that tore down. So any two tests
-    /// that can reach a teardown will flush each other's session entries if they
-    /// interleave — which is exactly how the #191 pair below first failed, one
-    /// clearing the other's key mid-assertion.
-    ///
-    /// Every test that can reach a teardown takes this, so there is one lock
-    /// rather than two disjoint agreements about the same variable. A test that
-    /// only reads client-local association state does not need it.
-    static SESSION_MAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    async fn make_client_with_peer() -> (Arc<PfcpClient>, UdpSocket) {
-        let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let peer_addr = peer_sock.local_addr().unwrap();
-        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client = Arc::new(PfcpClient::new(Arc::new(local), peer_addr, [127, 0, 0, 1]));
-
-        // Pump incoming datagrams into the engine
-        let c = client.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            loop {
-                let Ok((len, from)) = c.socket.recv_from(&mut buf).await else {
-                    break;
-                };
-                c.on_datagram(&buf[..len], from).await;
-            }
-        });
-        (client, peer_sock)
     }
 
     /// Association Setup round-trip against a fake UPF answering with the
@@ -1088,8 +1399,8 @@ mod tests {
     #[tokio::test]
     async fn test_heartbeat_detects_peer_restart() {
         // Serialised: this test can reach a teardown, which flushes the
-        // process-global session map (see SESSION_MAP_LOCK).
-        let _map_guard = SESSION_MAP_LOCK.lock().await;
+        // process-global session map (see N4_TEST_LOCK).
+        let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, upf) = make_client_with_peer().await;
         {
             let mut a = client.assoc.write().await;
@@ -1150,8 +1461,8 @@ mod tests {
     #[tokio::test]
     async fn test_inbound_association_release() {
         // Serialised: this test can reach a teardown, which flushes the
-        // process-global session map (see SESSION_MAP_LOCK).
-        let _map_guard = SESSION_MAP_LOCK.lock().await;
+        // process-global session map (see N4_TEST_LOCK).
+        let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, upf) = make_client_with_peer().await;
         client.assoc.write().await.associated = true;
         let local_addr = client.socket.local_addr().unwrap();
@@ -1236,12 +1547,21 @@ mod tests {
 
     /// Acceptance (issue #20): with the feature off — or a pool of one —
     /// session establishment selects the sole/global client, i.e. the
-    /// pre-pool single-client path. This is the ONLY test that installs the
-    /// process-global pool (OnceLock allows a single set per test process).
+    /// pre-pool single-client path.
+    ///
+    /// Takes its client from the shared stand-in (issue #289) rather than
+    /// installing one of its own. `PFCP_CLIENT` and `PFCP_POOL` are `OnceLock`s,
+    /// so two installers race on test order and the loser leaves the winner's
+    /// silent peer installed for every other test in the process — which is
+    /// exactly how a create against the stand-in would have started timing out
+    /// instead of establishing. There is one installer in the test build.
     #[tokio::test]
     async fn test_select_upf_defaults_to_global_client_and_bindings_resolve() {
-        let (client, _upf) = make_client_with_peer().await;
-        set_global_pool(vec![client.clone()]);
+        // Association state is irrelevant to a single-peer pool: `select_upf`
+        // returns the default client without consulting it (the load-aware path
+        // needs the feature AND more than one peer).
+        let upf = unassociated_upf().await;
+        let client = upf.client.clone();
 
         let selected = select_upf().await.expect("pool installed");
         assert_eq!(
@@ -1338,8 +1658,8 @@ mod tests {
     #[tokio::test]
     async fn test_teardown_clears_load_state() {
         // Serialised: this test can reach a teardown, which flushes the
-        // process-global session map (see SESSION_MAP_LOCK).
-        let _map_guard = SESSION_MAP_LOCK.lock().await;
+        // process-global session map (see N4_TEST_LOCK).
+        let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, _upf) = make_client_with_peer().await;
         client
             .set_assoc_state_for_test(true, Some(40), Some(5000))
@@ -1370,8 +1690,8 @@ mod tests {
     #[tokio::test]
     async fn a_seeded_recovery_time_stamp_makes_a_peer_restart_detectable() {
         // Serialised: this test can reach a teardown, which flushes the
-        // process-global session map (see SESSION_MAP_LOCK).
-        let _map_guard = SESSION_MAP_LOCK.lock().await;
+        // process-global session map (see N4_TEST_LOCK).
+        let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, _upf) = make_client_with_peer().await;
         client.seed_peer_recovery_time_stamp(100).await;
         client.set_assoc_state_for_test(true, None, None).await;
@@ -1416,8 +1736,8 @@ mod tests {
     #[tokio::test]
     async fn an_unchanged_recovery_time_stamp_leaves_restored_sessions_alone() {
         // Serialised: this test can reach a teardown, which flushes the
-        // process-global session map (see SESSION_MAP_LOCK).
-        let _map_guard = SESSION_MAP_LOCK.lock().await;
+        // process-global session map (see N4_TEST_LOCK).
+        let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, _upf) = make_client_with_peer().await;
         client.seed_peer_recovery_time_stamp(300).await;
         client.set_assoc_state_for_test(true, None, None).await;

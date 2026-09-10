@@ -212,11 +212,17 @@ pub fn parse_assigned_ebi(body: &str) -> Option<u8> {
 /// policy binding), so creating one unconditionally would populate a store nothing
 /// reads and change what `max_num_of_bearer` means for every session in the process.
 ///
-/// A separate function rather than an inline block because the SM-context create
-/// path cannot be driven past its N4 leg by any test in this crate (no UPF
-/// stand-in — issue #289), so an inline block would be unreachable from a test.
-/// This seam is the reachable half; the call site itself is covered by inspection,
-/// and that limitation is stated rather than implied.
+/// A separate function rather than an inline block because when this was written the
+/// SM-context create path could not be driven past its N4 leg by any test in this
+/// crate, so an inline block would have been unreachable from a test.
+///
+/// #289 has since given the crate a UPF stand-in
+/// (`pfcp_path::stand_in::associated_upf`), so the create path DOES reach this call
+/// site under test. What is still not driven is this call site with the
+/// interworking switch ON — every create test runs with the leg off, so the
+/// `if let (Some(ebi), Some(sess_id))` guard above it is only ever taken on the
+/// `None` arm. The seam remains the tested half; the difference is that closing the
+/// gap is now a test away rather than a harness away.
 pub fn record_mapped_eps_bearer(
     sess_id: u64,
     ebi: u8,

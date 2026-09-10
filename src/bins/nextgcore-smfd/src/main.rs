@@ -6302,18 +6302,20 @@ mod tests {
     /// that then fails is an orphan on the EASDF that nothing will ever delete,
     /// because the release path never runs for a session that never existed.
     ///
-    /// It is also the honest limit of what this harness can assert about the
-    /// create call site. Reaching the success path needs a PFCP-responding UPF —
-    /// without one, `handle_sm_context_create` returns `504 UPF_NOT_RESPONDING`
-    /// before the EASDF leg — and the smfd test harness has no UPF stand-in (no
-    /// existing test establishes a session either). The create leg itself is
-    /// covered over real HTTP by
-    /// `easdf::tests::the_dns_context_is_created_and_deleted_over_the_wire`, and
-    /// the RELEASE call site by the test below; the create call site is verified by
-    /// inspection plus this no-orphan assertion.
+    /// #289 converted this test: the harness now HAS a UPF stand-in, so the
+    /// failure has to be arranged deliberately rather than being the only thing
+    /// this harness could produce. The N4 leg fails here because the association
+    /// is down, which is the real failure mode (TS 29.244 §6.2.6.2) and the one
+    /// `pfcp_session_establish` checks first. The success half — the create call
+    /// site actually firing — is
+    /// `an_established_session_creates_its_easdf_dns_context` below; until it
+    /// existed, removing the `easdf::create_dns_context` call left the whole suite
+    /// green (#276).
     #[tokio::test]
     async fn a_failed_establishment_creates_no_easdf_dns_context() {
+        // Lock order (see `pfcp_path::N4_TEST_LOCK`): switch lock first, N4 second.
         let _g = easdf::SWITCH_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::unassociated_upf().await;
         let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
         smf_context_init(64, 256, 512);
         seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6342,17 +6344,79 @@ mod tests {
             ));
         let resp = handle_sm_context_create(&request).await;
 
-        // No UPF in this harness, so establishment fails at the N4 leg.
+        // The stand-in UPF is present but NOT associated, so establishment fails
+        // at the N4 leg exactly as it does against an unreachable UPF.
         assert_eq!(
             resp.status, 504,
-            "without a UPF the session cannot establish; if this ever becomes a \
-             2xx the harness gained a UPF and this test should assert the CREATE \
-             instead"
+            "an un-associated UPF must fail the N4 leg (TS 29.244 §6.2.6.2)"
         );
         let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert!(
             requests.is_empty(),
             "a session that never established must leave no DNS context behind, got {requests:?}"
+        );
+
+        easdf::set_for_test(None);
+        easdf_srv.stop().await.expect("stop");
+        nrf.stop().await.expect("stop");
+    }
+
+    /// #289 acceptance: a create that REACHES the success path creates the
+    /// session's EASDF DNS context, asserted from `handle_sm_context_create`
+    /// rather than by calling `easdf::create_dns_context` directly.
+    ///
+    /// This is the guard #276 could not write. `create_dns_context` had no
+    /// production caller for a month — PR #277 wrote `let easdf_dns_context_id =
+    /// None;` under a comment describing the awaited call — and the module's own
+    /// over-the-wire test said nothing about it, because a helper's test cannot
+    /// see whether a handler calls it. Removing the call from the handler now
+    /// fails HERE.
+    ///
+    /// The recorded `(method, path, body)` list is the assertion, and the UE
+    /// address in the body is part of it: the EASDF cannot correlate a UDP query
+    /// with a session without it (#276), so a create that omitted it would be a
+    /// context that can never match a query.
+    #[tokio::test]
+    async fn an_established_session_creates_its_easdf_dns_context() {
+        // Lock order (see `pfcp_path::N4_TEST_LOCK`): switch lock first, N4 second.
+        let _g = easdf::SWITCH_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
+        smf_context_init(64, 256, 512);
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        let resp = handle_sm_context_create(&create_request(
+            "imsi-001010000000289",
+            6,
+            &n1(
+                6,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "the stand-in UPF answers Session Establishment, so the create must succeed"
+        );
+        assert!(
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST),
+            "the 201 must have been earned on the N4 wire, not short-circuited"
+        );
+
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let create = requests
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p.contains("/neasdf-dnscontext/v1/dns-contexts"))
+            .unwrap_or_else(|| {
+                panic!("the create handler must POST a DNS context, got {requests:?}")
+            });
+        assert!(
+            create.2.contains("imsi-001010000000289"),
+            "the DNS context must name the subscriber it belongs to, got {}",
+            create.2
         );
 
         easdf::set_for_test(None);
@@ -6413,6 +6477,31 @@ mod tests {
         let mut m = vec![0x2E, psi, pti, message_type];
         m.extend_from_slice(tail);
         m
+    }
+
+    /// A well-formed `SmContextCreateData` request with its N1 container as a
+    /// multipart 5gnas part — the shape the AMF sends (#289).
+    ///
+    /// Shared by every create test so they differ only in the SUPI and PSI they
+    /// drive; three copies of this literal had already drifted apart in wording
+    /// while meaning the same thing.
+    fn create_request(supi: &str, psi: u8, n1_msg: &[u8]) -> SbiRequest {
+        let body = serde_json::json!({
+            "pduSessionId": psi,
+            "supi": supi,
+            "sNssai": { "sst": 1, "sd": "010203" },
+            "dnn": "internet",
+            "anType": "3GPP_ACCESS",
+            "ratType": "NR",
+            "n1SmMsg": { "contentId": "n1SmMsg" },
+        });
+        SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
+            .with_body(body.to_string(), "application/json")
+            .with_part(nextgcore_sbi::message::SbiPart::with_content(
+                "n1SmMsg",
+                "application/vnd.3gpp.5gnas",
+                bytes::Bytes::copy_from_slice(n1_msg),
+            ))
     }
 
     // ---- criteria 1 + 3: the 5GSM message is classified and dispatched ----
@@ -6969,49 +7058,34 @@ mod tests {
     /// guards Retrieve, not create. This drives the real
     /// `handle_sm_context_create` through the router.
     ///
-    /// The create CANNOT succeed here: it needs a PFCP-responding UPF, and no
-    /// harness in this tree has one (no existing test establishes an N4 session
-    /// either). So what is asserted is the rollback contract instead, which is the
-    /// half a failing create can prove and the half that a naive registration gets
-    /// wrong: a create that answers an error must leave **no** SM context behind.
-    /// An abandoned registration would be a context the AMF never learned about and
-    /// will never release.
+    /// What is asserted here is the rollback contract, the half that a naive
+    /// registration gets wrong: a create that answers an error must leave **no**
+    /// SM context behind. An abandoned registration would be a context the AMF
+    /// never learned about and will never release.
+    ///
+    /// #289 converted this test: the N4 leg now fails because the stand-in UPF's
+    /// association is deliberately down, not because no UPF exists. The
+    /// REGISTRATION half its old comment asked for is
+    /// `a_successful_create_registers_an_activated_session_and_its_binding` below.
     #[tokio::test]
     async fn a_failed_create_leaves_no_registered_sm_context() {
+        let _upf = pfcp_path::stand_in::unassociated_upf().await;
         smf_context_init(64, 256, 512);
         let supi = "imsi-001010000000086";
         let psi = 11u8;
 
         // A create that reaches the N4 leg and fails there, the same shape
         // `a_failed_establishment_creates_no_easdf_dns_context` uses.
-        let body = serde_json::json!({
-            "pduSessionId": psi,
-            "supi": supi,
-            "sNssai": { "sst": 1, "sd": "010203" },
-            "dnn": "internet",
-            "anType": "3GPP_ACCESS",
-            "ratType": "NR",
-            "n1SmMsg": { "contentId": "n1SmMsg" },
-        });
         let n1_msg = n1(
             psi,
             1,
             gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
             &[0x91, 0x00],
         );
-        let request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
-            .with_body(body.to_string(), "application/json")
-            .with_part(nextgcore_sbi::message::SbiPart::with_content(
-                "n1SmMsg",
-                "application/vnd.3gpp.5gnas",
-                n1_msg.into(),
-            ));
-        let resp = handle_sm_context_create(&request).await;
+        let resp = handle_sm_context_create(&create_request(supi, psi, &n1_msg)).await;
         assert_eq!(
             resp.status, 504,
-            "without a UPF the session cannot establish; if this ever becomes a 2xx \
-             the harness gained a UPF and this test should assert the REGISTRATION \
-             instead of the rollback"
+            "an un-associated UPF must fail the N4 leg (TS 29.244 §6.2.6.2)"
         );
 
         // Asserted per-SUPI, not on a global session count: this context is
@@ -7030,6 +7104,91 @@ mod tests {
              abandoned registration is an SM context the AMF never learned about and \
              will never release"
         );
+    }
+
+    /// #289 acceptance: the whole tail after the PFCP block, which no test could
+    /// reach before the stand-in UPF existed.
+    ///
+    /// Four claims, each of which was "verified by inspection" until now:
+    /// 1. the create answers `201` with a resolvable `smContextRef`;
+    /// 2. the session fill-in ran — `upCnxState` is ACTIVATED and the authorised
+    ///    session AMBR is stored on the session (#78, #191);
+    /// 3. the `PolicyBinding` was inserted — the release, update and notify paths
+    ///    all key off it, so a create that skipped it produces a session none of
+    ///    them can act on;
+    /// 4. the N4 exchange really happened, asserted from the stand-in's own
+    ///    record rather than from the SMF's report of it.
+    ///
+    /// Positive assertions throughout: each reads a value only reachable by
+    /// executing the step it names, so no early return can satisfy them.
+    #[tokio::test]
+    async fn a_successful_create_registers_an_activated_session_and_its_binding() {
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let supi = "imsi-001010000000290";
+        let psi = 7u8;
+
+        let n1_msg = n1(
+            psi,
+            1,
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+            &[0x91, 0x00],
+        );
+        let resp = handle_sm_context_create(&create_request(supi, psi, &n1_msg)).await;
+        assert_eq!(
+            resp.status, 201,
+            "the stand-in UPF answers Session Establishment, so the create must succeed"
+        );
+        assert!(
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST),
+            "the create must have established the session on the N4 wire"
+        );
+
+        let root: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("JSON root"))
+                .expect("SmContextCreatedData is JSON");
+        let sm_context_ref = root["smContextRef"]
+            .as_str()
+            .expect("smContextRef is mandatory")
+            .to_string();
+
+        // (2) The session fill-in ran. Both values are read back off the
+        // registered session, so they can only be there if the create wrote them
+        // after the N4 leg settled.
+        let sess = smf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_context_ref(&sm_context_ref)
+            .expect("the reference the AMF was handed must resolve to a session");
+        assert_eq!(
+            sess.up_cnx_state,
+            context::UpCnxState::Activated,
+            "upCnxState is ACTIVATED once the user plane exists"
+        );
+        assert_eq!(
+            (sess.session_ambr.uplink, sess.session_ambr.downlink),
+            (100_000_000, 100_000_000),
+            "the authorised session AMBR must be stored on the session"
+        );
+
+        // (3) The policy binding exists, keyed by the reference the AMF holds.
+        let binding = lookup_policy_binding(&sm_context_ref)
+            .expect("the create must store the PolicyBinding the release path keys off");
+        assert_eq!(binding.supi, supi);
+        assert_eq!(binding.psi, psi);
+
+        // The stored UPF SEID is the one the stand-in allocated, so the SEID the
+        // release path will address is the peer's and not a local invention.
+        let stored_seid = smf_self()
+            .read()
+            .expect("context")
+            .pfcp_sessions
+            .read()
+            .expect("sessions")
+            .get(&sm_context_ref)
+            .copied();
+        assert_eq!(stored_seid, Some(upf.upf_seid));
     }
 
     /// #78 criterion 1's invariant, at the function the create handler calls: the
@@ -7345,10 +7504,12 @@ mod tests {
     /// #79 criterion 5: a subscribed event occurrence produces a notification at
     /// the subscribed `notifUri`.
     ///
-    /// `PDU_SES_REL` is chosen because the release handler is reachable from a test,
-    /// unlike the establishment path (which needs a UPF — see #289). The
-    /// notification is captured on a real loopback consumer, so what is asserted is
-    /// a delivered HTTP request rather than a function having been called.
+    /// `PDU_SES_REL` is chosen because the release handler needs no N4 establishment
+    /// to reach; since #289 the establishment path is reachable too (against
+    /// `pfcp_path::stand_in`), so the `PDU_SES_EST` notification is now a test away
+    /// rather than blocked. The notification is captured on a real loopback
+    /// consumer, so what is asserted is a delivered HTTP request rather than a
+    /// function having been called.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_released_session_notifies_its_event_subscriber() {
@@ -7481,10 +7642,12 @@ mod tests {
     /// #79 criteria 1 + 2: the subscribed session-AMBR and default 5QI are applied,
     /// with the configured default as the fallback and NOT the other way round.
     ///
-    /// Asserted on `apply_subscribed_baseline` because the config-default arm of the
-    /// create path is downstream of the N4 leg no test can reach (#289). The
-    /// per-member behaviour is the part that matters: a whole-struct replacement
-    /// would make an absent subscribed member silently mean 0.
+    /// Asserted on `apply_subscribed_baseline` rather than through the create path:
+    /// the per-member behaviour is the part that matters, and a whole-struct
+    /// replacement would make an absent subscribed member silently mean 0. (The
+    /// create path itself is no longer unreachable — #289 gave the crate a UPF
+    /// stand-in — but driving it here would assert the merge through two layers
+    /// instead of one.)
     #[test]
     fn subscribed_values_win_over_the_config_default_per_member() {
         let subscribed = udm::SubscribedSmData {
