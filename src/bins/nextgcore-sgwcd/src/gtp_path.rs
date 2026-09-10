@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -357,17 +357,43 @@ impl GtpcServer {
 // Global server instance (process lifecycle)
 // ============================================================================
 
-static S11_SERVER: OnceLock<GtpcServer> = OnceLock::new();
+/// The process-wide S11 server.
+///
+/// #54: settable rather than install-once. An `OnceLock` was enough while nothing outside
+/// `main` needed it, but the S11 answer is now sent from the Sxa response path — so a test
+/// that drives a gated procedure has to be able to install ITS OWN server, and a
+/// first-wins global makes every test after the first answer through a socket that has
+/// closed. Same reasoning as #217's for sgwud's Sxa node.
+///
+/// A running SGW-C opens exactly one, so replace-on-install and set-once are the same
+/// behaviour there.
+static S11_SERVER: std::sync::RwLock<Option<GtpcServer>> = std::sync::RwLock::new(None);
 
-/// Get the global S11 server, if open
-pub fn s11_server() -> Option<&'static GtpcServer> {
-    S11_SERVER.get()
+/// Get the global S11 server, if open. Cloned out of the lock: `GtpcServer` is an `Arc`
+/// handle, and holding a guard across the sends this feeds would be a lock across I/O.
+pub fn s11_server() -> Option<GtpcServer> {
+    S11_SERVER.read().ok()?.clone()
+}
+
+/// Install the process-wide S11 server (at startup, or per test).
+pub(crate) fn set_s11_server(server: GtpcServer) {
+    if let Ok(mut slot) = S11_SERVER.write() {
+        *slot = Some(server);
+    }
+}
+
+/// Uninstall it, so a test does not leave a closed socket behind for a sibling.
+#[cfg(test)]
+pub(crate) fn clear_s11_server_for_test() {
+    if let Ok(mut slot) = S11_SERVER.write() {
+        *slot = None;
+    }
 }
 
 /// Open the S11 GTP-C server socket
 /// Port of sgwc_gtp_open
 pub fn gtp_open() -> Result<(), String> {
-    if S11_SERVER.get().is_some() {
+    if s11_server().is_some() {
         return Ok(());
     }
 
@@ -409,9 +435,7 @@ pub fn gtp_open() -> Result<(), String> {
             .or(advertised),
     );
 
-    S11_SERVER
-        .set(server)
-        .map_err(|_| "S11 server already open".to_string())?;
+    set_s11_server(server);
     Ok(())
 }
 
@@ -497,7 +521,7 @@ pub(crate) fn advance_persistent_restart_counter(path: &std::path::Path) -> u8 {
 /// Close the S11 GTP-C server socket
 /// Port of sgwc_gtp_close
 pub fn gtp_close() {
-    if let Some(server) = S11_SERVER.get() {
+    if let Some(server) = s11_server() {
         server.close();
     }
     log::info!("GTP-C server closed");
@@ -674,6 +698,14 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
                         data,
                         ack.cause,
                     );
+                    // #54: the Ack used to be parsed and then only logged, so the
+                    // throttling IE did nothing and a refusal left the SGW-U buffering
+                    // forever.
+                    crate::sxa_response::downlink_data_notification_ack(
+                        ue.as_ref().map(|u| u.id),
+                        ack.cause,
+                        ack.data_notification_delay,
+                    );
                 }
                 Err(e) => log::error!(
                     "Malformed DDN Acknowledge from {peer}: cause={} offending_ie={}",
@@ -686,6 +718,13 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
             match s11_parse::parse_downlink_data_notification_failure_indication(&msg) {
                 Ok(cause) => {
                     log::warn!("DDN Failure Indication from {peer}: cause={cause}");
+                    // #54: TS 23.401 §5.3.4.2 -- on a Failure Indication the Serving GW
+                    // DELETES the buffered packet(s). This used to stop at the log line,
+                    // so they stayed on the SGW-U for the life of the session.
+                    crate::sxa_response::downlink_data_notification_failed(
+                        ue_from_header(&msg).map(|u| u.id),
+                        cause,
+                    );
                 }
                 Err(_) => log::error!("Malformed DDN Failure Indication from {peer}"),
             }
@@ -769,7 +808,14 @@ pub(crate) fn delete_contexts_for_peer(peer_ip: std::net::IpAddr) -> usize {
         // PFCP first: once ue_remove runs, the session records are gone and no
         // Session Deletion Request can be built from them.
         for sess in ctx.sess_list_for_ue(ue_id) {
-            if let Err(e) = pfcp_path::send_session_deletion_request(&sess, 0, None) {
+            if let Err(e) = pfcp_path::send_session_deletion_request(
+                &sess,
+                0,
+                None,
+                // No MME is waiting for this one: it is our own restart cleanup, and
+                // the local context is dropped below regardless of the SGW-U's answer.
+                pfcp_path::S11Continuation::None,
+            ) {
                 // Best-effort: a dead SGW-U must not block dropping local state,
                 // or the contexts leak exactly as they did before this fix.
                 log::warn!(
@@ -1017,7 +1063,15 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
         bearer.gbr_dl = parsed.bearer.qos.gbr_dl;
         ctx.bearer_update(&bearer);
 
-        // Allocate local user-plane endpoints for both directions
+        // Allocate local user-plane endpoints for both directions, and the PDR/FAR ids
+        // that name them on Sxa.
+        //
+        // #54: the ids had NO allocator anywhere in this daemon -- `SgwcTunnel.pdr_id` and
+        // `far_id` were `None` for every tunnel that ever existed. The old builders wrote
+        // them with `if let Some(...)`, so an Establishment Request simply omitted them,
+        // and nothing noticed because the request was discarded before it reached a socket.
+        // With a real transport that is an SGW-U provisioned with no rules at all, told to
+        // the MME as an accepted bearer.
         for tunnel in [
             ctx.dl_tunnel_in_bearer(bearer.id),
             ctx.ul_tunnel_in_bearer(bearer.id),
@@ -1029,14 +1083,40 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
             if tunnel.local_teid == 0 {
                 tunnel.local_teid = ctx.next_gtpu_teid();
             }
+            if tunnel.pdr_id.is_none() {
+                tunnel.pdr_id = Some(ctx.next_pdr_id());
+            }
+            if tunnel.far_id.is_none() {
+                tunnel.far_id = Some(ctx.next_far_id());
+            }
             tunnel.local_addr = Some(gtpu_addr);
             ctx.tunnel_update(&tunnel);
         }
     }
 
-    // Establish the user-plane session on the SGW-U over Sxa
+    // Establish the user-plane session on the SGW-U over Sxa, and let the ANSWER decide
+    // what the MME is told (#54).
+    //
+    // TS 23.401 §5.3.2.1: the Serving GW returns the Create Session Response after the
+    // user plane has been provisioned, and TS 29.274 §7.2.2 makes `Request accepted` mean
+    // the request was fulfilled. This used to send the response right here with a
+    // hard-coded REQUEST_ACCEPTED -- before the request had even left, since the transport
+    // discarded it -- so the MME was told a bearer existed whose user plane might not.
     let sess = ctx.sess_find_by_id(sess.id).unwrap_or(sess);
-    if let Err(e) = pfcp_path::send_session_establishment_request(&sess, seq as u64, None, 0) {
+    if let Err(e) = pfcp_path::send_session_establishment_request(
+        &sess,
+        seq as u64,
+        None,
+        0,
+        pfcp_path::S11Continuation::CreateSession {
+            peer,
+            seq,
+            teid: ue.mme_s11_teid,
+        },
+    ) {
+        // The request could not even be queued (no transport running): that IS a local
+        // failure, and the MME is answered now rather than waiting for a response that
+        // will never come.
         log::error!("PFCP Session Establishment failed: {e}");
         send_cause_response(
             server,
@@ -1046,30 +1126,6 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
             seq,
             sxa_handler::gtp_cause_from_pfcp(sxa_handler::pfcp_cause::SYSTEM_FAILURE),
         );
-        return;
-    }
-
-    // NOTE: the triggered response is sent once the local provisioning is
-    // complete. When the Sxa transport delivers asynchronous PFCP
-    // responses, this send moves to the Session Establishment Response
-    // handler in sxa_handler.
-    match s11_build::build_create_session_response(&sess, seq, server.restart_counter()) {
-        Ok(response) => {
-            if let Err(e) = server.send_response(peer, &response) {
-                log::error!("Create Session Response to {peer} failed: {e}");
-            }
-        }
-        Err(e) => {
-            log::error!("Failed to build Create Session Response: {e}");
-            send_cause_response(
-                server,
-                peer,
-                Gtp2MessageType::CreateSessionResponse,
-                ue.mme_s11_teid,
-                seq,
-                gtp_cause::SYSTEM_FAILURE,
-            );
-        }
     }
 }
 
@@ -1232,20 +1288,48 @@ fn dispatch_delete_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
                         .is_some()
                 })
             });
-            if let Some(sess) = sess {
-                if let Err(e) = pfcp_path::send_session_deletion_request(&sess, seq as u64, None) {
-                    log::error!("PFCP session deletion failed: {e}");
+            // #54: the S11 answer and the local removal both wait for the SGW-U.
+            // This used to remove the session and answer REQUEST_ACCEPTED whichever way
+            // the deletion went -- so against a real SGW-U a failed deletion leaked the
+            // user plane, with the SGW-C no longer holding anything to address it by.
+            match sess {
+                Some(sess) => {
+                    if let Err(e) = pfcp_path::send_session_deletion_request(
+                        &sess,
+                        seq as u64,
+                        None,
+                        pfcp_path::S11Continuation::DeleteSession {
+                            peer,
+                            seq,
+                            teid: ue.mme_s11_teid,
+                            sess_id: sess.id,
+                        },
+                    ) {
+                        log::error!("PFCP session deletion failed: {e}");
+                        send_cause_response(
+                            server,
+                            peer,
+                            Gtp2MessageType::DeleteSessionResponse,
+                            ue.mme_s11_teid,
+                            seq,
+                            sxa_handler::gtp_cause_from_pfcp(
+                                sxa_handler::pfcp_cause::SYSTEM_FAILURE,
+                            ),
+                        );
+                    }
                 }
-                ctx.sess_remove(sess.id);
+                None => {
+                    // Nothing to tear down on the SGW-U: answer now, as before.
+                    send_cause_response(
+                        server,
+                        peer,
+                        Gtp2MessageType::DeleteSessionResponse,
+                        ue.mme_s11_teid,
+                        seq,
+                        gtp_cause::REQUEST_ACCEPTED,
+                    );
+                }
             }
-            send_cause_response(
-                server,
-                peer,
-                Gtp2MessageType::DeleteSessionResponse,
-                ue.mme_s11_teid,
-                seq,
-                gtp_cause::REQUEST_ACCEPTED,
-            );
         }
         HandlerResult::Error(cause) => {
             send_cause_response(
@@ -1604,41 +1688,661 @@ mod tests {
         server.close();
     }
 
-    #[test]
-    fn test_create_session_request_accepted_over_socket() {
-        let server = test_server(1000, 1);
-        let sock = client();
-        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x01];
+    // ================================================================
+    // #54: the S11 answer waits for the SGW-U
+    // ================================================================
 
-        sock.send_to(&csr(0x1001, &imsi).encode(), server.local_addr())
+    /// A stand-in SGW-U on an ephemeral port, plus this SGW-C's own Sxa node running.
+    ///
+    /// The stand-in answers Session Establishment / Modification / Deletion with `cause`
+    /// after `delay`, which is what makes "no Create Session Response until the SGW-U
+    /// answers" observable rather than asserted.
+    struct StandInSgwu {
+        _guard: crate::pfcp_path::SxaTestGuard,
+        /// Requests the stand-in received, as (msg_type, seid, body).
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(u8, Option<u64>, Vec<u8>)>>>,
+        /// The stand-in's own socket, so a test can push a Session Report Request at the
+        /// SGW-C the way a real SGW-U reports buffered downlink data.
+        sock: std::sync::Arc<tokio::net::UdpSocket>,
+        /// Where the SGW-C's Sxa socket is listening.
+        sgwc_addr: SocketAddr,
+    }
+
+    impl StandInSgwu {
+        /// Bodies the stand-in received for a message type, in order.
+        fn received(&self, msg_type: u8) -> usize {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(t, _, _)| *t == msg_type)
+                .count()
+        }
+
+        /// Send a Session Report Request carrying a Downlink Data Report for `seid`.
+        async fn report_downlink_data(&self, seid: u64, pdr_id: u16, seq: u32) {
+            use nextgcore_pfcp::header::{PfcpHeader as PHeader, PfcpMessageType as PType};
+            use nextgcore_pfcp::message::SessionReportRequest;
+            use nextgcore_pfcp::types::{DownlinkDataReport, ReportType};
+
+            let mut req = SessionReportRequest::new(ReportType {
+                dldr: true,
+                ..Default::default()
+            });
+            req.downlink_data_report = Some(DownlinkDataReport::new(pdr_id));
+            let mut body = bytes::BytesMut::new();
+            req.encode(&mut body);
+            let mut out = bytes::BytesMut::new();
+            let mut h = PHeader::new_with_seid(PType::SessionReportRequest, seid, seq);
+            h.length = (12 + body.len()) as u16;
+            h.encode(&mut out);
+            out.extend_from_slice(&body);
+            self.sock
+                .send_to(&out, self.sgwc_addr)
+                .await
+                .expect("report to the SGW-C");
+        }
+    }
+
+    async fn stand_in_sgwu(cause: u8, delay: Duration) -> StandInSgwu {
+        use nextgcore_pfcp::header::PfcpHeader as PHeader;
+        use nextgcore_pfcp::message::{
+            SessionDeletionResponse, SessionEstablishmentResponse, SessionModificationResponse,
+        };
+        use nextgcore_pfcp::types::{FSeid, NodeId, PfcpCause};
+
+        let guard = crate::pfcp_path::sxa_test_guard().await;
+        let up = std::sync::Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind stand-in SGW-U"),
+        );
+        let up_addr = up.local_addr().unwrap();
+        // The SGW-U the SGW-C sends to is process-global config; the guard serialises
+        // every test that sets it.
+        std::env::set_var("SGWC_SGWU_ADDR", up_addr.to_string());
+        std::env::set_var("SGWC_PFCP_NODE_IP", "127.0.0.1");
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let handle = up.clone();
+        let up = up.clone();
+        tokio::spawn(async move {
+            let up = handle;
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let Ok((len, from)) = up.recv_from(&mut buf).await else {
+                    return;
+                };
+                let mut cursor = Bytes::copy_from_slice(&buf[..len]);
+                let Ok(header) = PHeader::decode(&mut cursor) else {
+                    continue;
+                };
+                let msg_type = header.message_type as u8;
+                recorded.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    msg_type,
+                    header.seid,
+                    cursor.to_vec(),
+                ));
+
+                let pfcp_cause = PfcpCause::from_wire(cause);
+                let mut body = bytes::BytesMut::new();
+                let resp_type = match msg_type {
+                    50 => {
+                        let mut rsp = SessionEstablishmentResponse::new(pfcp_cause);
+                        rsp.node_id = Some(NodeId::new_ipv4([127, 0, 0, 9]));
+                        // Conditional-mandatory on acceptance (TS 29.244 §7.5.3): the
+                        // UP F-SEID the SGW-C stores and addresses the session by.
+                        if pfcp_cause == PfcpCause::RequestAccepted {
+                            rsp.up_f_seid =
+                                Some(FSeid::new_ipv4(0x0000_0000_5555_0001, [127, 0, 0, 9]));
+                        }
+                        rsp.encode(&mut body);
+                        51u8
+                    }
+                    52 => {
+                        SessionModificationResponse::new(pfcp_cause).encode(&mut body);
+                        53u8
+                    }
+                    54 => {
+                        SessionDeletionResponse::new(pfcp_cause).encode(&mut body);
+                        55u8
+                    }
+                    // Association Setup, Heartbeat: not needed by these tests.
+                    _ => continue,
+                };
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let mut out = bytes::BytesMut::new();
+                let mut h = PHeader::new_with_seid(
+                    nextgcore_pfcp::header::PfcpMessageType::try_from(resp_type).unwrap(),
+                    header.seid.unwrap_or(0),
+                    header.sequence_number,
+                );
+                h.length = (12 + body.len()) as u16;
+                h.encode(&mut out);
+                out.extend_from_slice(&body);
+                let _ = up.send_to(&out, from).await;
+            }
+        });
+
+        let node =
+            crate::pfcp_path::SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+                .await
+                .expect("bind the SGW-C's Sxa socket");
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx));
+        // `run` installs the outbound queue in its own body; a request enqueued before it
+        // is polled would be refused with "no Sxa transport".
+        for _ in 0..200 {
+            if crate::pfcp_path::sxa_node().is_some()
+                && crate::pfcp_path::send_session_report_response(
+                    0,
+                    &crate::context::SgwcSess::default(),
+                    crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+                )
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        StandInSgwu {
+            _guard: guard,
+            seen,
+            sock: up,
+            sgwc_addr: node.local_addr(),
+        }
+    }
+
+    /// Receive one S11 message with a bounded wait, from a blocking socket inside an async
+    /// test.
+    async fn recv_s11(sock: &UdpSocket) -> Option<Gtp2Message> {
+        let sock = sock.try_clone().expect("clone");
+        tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; 4096];
+            let (len, _) = sock.recv_from(&mut buf).ok()?;
+            let mut bytes = Bytes::copy_from_slice(&buf[..len]);
+            Gtp2Message::decode(&mut bytes).ok()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// #54 criterion 6, first half: NO Create Session Response is sent until the PFCP
+    /// Session Establishment Response arrives — and then it is the full accepted one.
+    ///
+    /// The stand-in SGW-U holds its answer for 400ms; the MME socket's own read timeout is
+    /// 150ms for the first attempt, so the "not yet" half is observed rather than assumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_create_session_response_until_the_sgwu_answers() {
+        let sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(400),
+        )
+        .await;
+        let server = test_server(1000, 1);
+        // The gated answer is sent through the PROCESS-GLOBAL S11 server (the Sxa response
+        // path has no other handle), so this test's own server has to be the installed one.
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_millis(150)))
             .unwrap();
-        let response = recv_msg(&sock);
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x54];
+
+        sock.send_to(&csr(0x5401, &imsi).encode(), server.local_addr())
+            .unwrap();
+
+        // Nothing yet: the user plane is not provisioned, so TS 29.274 §7.2.2 has nothing
+        // truthful to say.
+        assert!(
+            recv_s11(&sock).await.is_none(),
+            "the Create Session Response must NOT be sent before the SGW-U has answered"
+        );
+
+        // Now it arrives, accepted, with the full body the MME needs.
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let response = recv_s11(&sock).await.expect("the response must arrive");
         assert_eq!(
             response.header.message_type,
             Gtp2MessageType::CreateSessionResponse as u8
         );
-        assert_eq!(response.header.sequence_number, 0x1001);
-        // MME TEID from the Sender F-TEID we put in the request
+        assert_eq!(response.header.sequence_number, 0x5401);
         assert_eq!(response.header.teid, Some(0xAA01));
-
         let cause =
             Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
                 .unwrap();
         assert_eq!(cause.cause, gtp_cause::REQUEST_ACCEPTED);
-
-        // Sender F-TEID + bearer context with allocated S1-U SGW endpoint
-        let sender =
-            Gtp2FTeidIe::decode(&response.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value)
-                .unwrap();
-        assert_ne!(sender.teid, 0);
         let bc = response.bearer_context(0).unwrap().unwrap();
         assert_eq!(bc.ebi().unwrap(), 5);
-        let s1u = bc.fteid(0).unwrap().unwrap();
-        assert_ne!(s1u.teid, 0);
-        assert_eq!(s1u.ipv4_addr, Some([10, 99, 0, 1]));
+        assert_ne!(bc.fteid(0).unwrap().unwrap().teid, 0);
+
+        // The SGW-U really was asked, and the SEID it returned was stored.
+        let ctx0 = sgwc_self();
+        let sess_cp_seid = ctx0
+            .ue_find_by_imsi(&imsi)
+            .and_then(|u| ctx0.sess_find_by_id(u.sess_ids[0]))
+            .map(|s| s.sgwc_sxa_seid)
+            .expect("session");
+        let seen = sgwu.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let establishment = seen
+            .iter()
+            .find(|(t, _, _)| *t == 50)
+            .map(|(_, _, body)| body.clone())
+            .expect("a Session Establishment Request must have reached the SGW-U");
+
+        // #54: and it must be REAL PFCP. The old builders emitted bare values with no IE
+        // headers, so a conformant SGW-U -- which decodes with this same library -- would
+        // have found zero rules and created a session that forwards nothing, while
+        // answering REQUEST_ACCEPTED. Decoding it here is what separates "bytes were sent"
+        // from "the peer can act on them".
+        let mut body = Bytes::copy_from_slice(&establishment);
+        let decoded = nextgcore_pfcp::message::SessionEstablishmentRequest::decode(&mut body)
+            .expect("the SGW-U's own decoder must be able to read our request");
+        assert_eq!(
+            decoded.cp_f_seid.seid, sess_cp_seid,
+            "the CP F-SEID is what the SGW-U addresses its Session Report to"
+        );
+        assert!(
+            !decoded.create_pdrs.is_empty(),
+            "a bearer with no Create PDR provisions no packet detection at all"
+        );
+        assert!(
+            !decoded.create_fars.is_empty(),
+            "and no Create FAR means nothing is forwarded or buffered"
+        );
+        assert!(
+            decoded.create_pdrs.iter().all(|p| p.pdr_id != 0),
+            "every PDR must carry the id that names it (nothing allocated these before #54)"
+        );
+        assert!(
+            decoded
+                .create_pdrs
+                .iter()
+                .any(|p| p.pdi.local_f_teid.is_some()),
+            "the PDI's F-TEID is what an inbound G-PDU is matched on"
+        );
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("ue");
+        let sess = ctx.sess_find_by_id(ue.sess_ids[0]).expect("sess");
+        assert_eq!(
+            sess.sgwu_sxa_seid, 0x0000_0000_5555_0001,
+            "the UP F-SEID from the response is what later requests are addressed by"
+        );
 
         server.close();
     }
+
+    /// #54 criterion 2: a non-accepted PFCP cause yields a MAPPED GTP cause, not a
+    /// hard-coded `REQUEST_ACCEPTED`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_user_plane_yields_a_mapped_gtp_cause() {
+        let _sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::NO_RESOURCES_AVAILABLE,
+            Duration::ZERO,
+        )
+        .await;
+        let server = test_server(1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x55];
+
+        sock.send_to(&csr(0x5402, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let response = recv_s11(&sock).await.expect("a response must arrive");
+        assert_eq!(
+            response.header.message_type,
+            Gtp2MessageType::CreateSessionResponse as u8
+        );
+        let cause =
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap();
+        assert_eq!(
+            cause.cause,
+            crate::sxa_handler::gtp_cause_from_pfcp(
+                crate::sxa_handler::pfcp_cause::NO_RESOURCES_AVAILABLE
+            ),
+            "the MME must be told what the SGW-U said, not REQUEST_ACCEPTED: {:?}",
+            cause
+        );
+        assert_ne!(
+            cause.cause,
+            gtp_cause::REQUEST_ACCEPTED,
+            "an accepted cause for a user plane that does not exist is the whole defect"
+        );
+
+        server.close();
+    }
+
+    /// #54 criterion 3: Delete Session gates the local removal AND the cause on the PFCP
+    /// deletion result. A refusal keeps the session, so a retry can still reach it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_deletion_keeps_the_session_and_says_so() {
+        let _sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::SYSTEM_FAILURE,
+            Duration::ZERO,
+        )
+        .await;
+        let server = test_server(1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x56];
+
+        // Establish first. The stand-in refuses everything, so this create is refused too;
+        // the session context still exists, which is what the delete needs.
+        sock.send_to(&csr(0x5403, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await;
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("ue");
+        let sess_id = ue.sess_ids[0];
+
+        let dsr = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::DeleteSessionRequest as u8,
+            ue.sgw_s11_teid,
+            0x5404,
+        ));
+        let mut dsr = dsr;
+        dsr.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::Ebi as u8,
+            0,
+            &[5],
+        ));
+        sock.send_to(&dsr.encode(), server.local_addr()).unwrap();
+        let response = recv_s11(&sock).await.expect("a response must arrive");
+        assert_eq!(
+            response.header.message_type,
+            Gtp2MessageType::DeleteSessionResponse as u8
+        );
+        let cause =
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap();
+        assert_ne!(
+            cause.cause,
+            gtp_cause::REQUEST_ACCEPTED,
+            "a deletion the SGW-U refused must not be reported as accepted"
+        );
+        assert!(
+            sgwc_self().sess_find_by_id(sess_id).is_some(),
+            "and the local context must be KEPT: removing it while the SGW-U still holds \
+             the session leaks the user plane with nothing left to address it by"
+        );
+
+        server.close();
+    }
+
+    /// #54 criterion 4: `handle_session_report_request` has a PRODUCTION caller, and a
+    /// Downlink Data Report drives a Downlink Data Notification toward the MME.
+    ///
+    /// Before this the classifier returned `SendGtpToMme` to nobody — it had zero callers
+    /// anywhere in the crate — and `send_downlink_data_notification` was reachable only
+    /// from `mod tests`. So downlink data for an idle UE produced no paging request at all,
+    /// and idle-mode delivery could not work however correct the pieces were.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_downlink_data_report_pages_the_ue() {
+        let sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let server = test_server(1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x57];
+
+        // A live session, so the report has something to be about.
+        sock.send_to(&csr(0x5405, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await.expect("create session response");
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("ue");
+        let sess = ctx.sess_find_by_id(ue.sess_ids[0]).expect("sess");
+        let pdr_id = ctx
+            .dl_tunnel_in_bearer(sess.bearer_ids[0])
+            .and_then(|t| t.pdr_id)
+            .or_else(|| {
+                ctx.ul_tunnel_in_bearer(sess.bearer_ids[0])
+                    .and_then(|t| t.pdr_id)
+            })
+            .expect("the establishment must have allocated a PDR id");
+
+        // The SGW-U buffered a downlink packet and says so (TS 29.244 §7.5.8).
+        sgwu.report_downlink_data(sess.sgwc_sxa_seid, pdr_id, 0x99)
+            .await;
+
+        let ddn = recv_s11(&sock)
+            .await
+            .expect("a Downlink Data Notification must reach the MME");
+        assert_eq!(
+            ddn.header.message_type,
+            Gtp2MessageType::DownlinkDataNotification as u8,
+            "a Downlink Data Report must page the UE (TS 23.401 §5.3.4.2)"
+        );
+        assert_eq!(
+            ddn.header.teid,
+            Some(ue.mme_s11_teid),
+            "and be addressed to the MME that holds this UE"
+        );
+
+        // And the SGW-U got its Session Report Response, so it does not retransmit.
+        for _ in 0..100 {
+            if sgwu.received(57) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            sgwu.received(57) > 0 || sgwu.received(56) == 0,
+            "the report must be answered, or the SGW-U retransmits it"
+        );
+
+        server.close();
+    }
+
+    /// #54 criterion 5: a refused Downlink Data Notification discards the buffered packets.
+    ///
+    /// TS 23.401 §5.3.4.2: on a DDN Acknowledge the MME could not serve, the Serving GW
+    /// deletes the buffered packet(s). This used to be a `log::warn!` and nothing else, so
+    /// the packets stayed on the SGW-U for the life of the session — an unbounded buffer no
+    /// message ever drained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_ddn_discards_the_buffered_packets() {
+        let sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let server = test_server(1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x58];
+
+        sock.send_to(&csr(0x5406, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await.expect("create session response");
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("ue");
+        let sess = ctx.sess_find_by_id(ue.sess_ids[0]).expect("sess");
+        let pdr_id = ctx
+            .dl_tunnel_in_bearer(sess.bearer_ids[0])
+            .and_then(|t| t.pdr_id)
+            .or_else(|| {
+                ctx.ul_tunnel_in_bearer(sess.bearer_ids[0])
+                    .and_then(|t| t.pdr_id)
+            })
+            .expect("pdr id");
+
+        sgwu.report_downlink_data(sess.sgwc_sxa_seid, pdr_id, 0x9A)
+            .await;
+        let ddn = recv_s11(&sock).await.expect("the DDN");
+        let modifications_before = sgwu.received(52);
+
+        // The MME cannot serve it (TS 29.274 §8.4: e.g. UE not responding).
+        let mut ack = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::DownlinkDataNotificationAcknowledge as u8,
+            ue.sgw_s11_teid,
+            ddn.header.sequence_number,
+        ));
+        ack.add_ie(Gtp2CauseIe::new(gtp_cause::CONTEXT_NOT_FOUND).to_ie(0));
+        sock.send_to(&ack.encode(), server.local_addr()).unwrap();
+
+        // A Session Modification carrying DROBU must reach the SGW-U.
+        let mut arrived = false;
+        for _ in 0..200 {
+            if sgwu.received(52) > modifications_before {
+                arrived = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            arrived,
+            "a refused DDN must make the SGW-C ask the SGW-U to discard the buffered \
+             packets; it used to only log the cause"
+        );
+
+        server.close();
+    }
+
+    /// #54 criterion 5: a Downlink Data Notification Failure Indication also discards the
+    /// buffered packets (TS 29.274 §7.2.11.3, TS 23.401 §5.3.4.2).
+    ///
+    /// A separate message from the Acknowledge and a separate dispatch arm, so a separate
+    /// guard: the Failure Indication arm used to be a lone `log::warn!` with no action at
+    /// all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ddn_failure_indication_discards_the_buffered_packets() {
+        let sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let server = test_server(1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x5A];
+
+        sock.send_to(&csr(0x5408, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await.expect("create session response");
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("ue");
+        let sess = ctx.sess_find_by_id(ue.sess_ids[0]).expect("sess");
+        let pdr_id = ctx
+            .dl_tunnel_in_bearer(sess.bearer_ids[0])
+            .and_then(|t| t.pdr_id)
+            .or_else(|| {
+                ctx.ul_tunnel_in_bearer(sess.bearer_ids[0])
+                    .and_then(|t| t.pdr_id)
+            })
+            .expect("pdr id");
+
+        sgwu.report_downlink_data(sess.sgwc_sxa_seid, pdr_id, 0x9D)
+            .await;
+        let _ = recv_s11(&sock).await.expect("the DDN");
+        let modifications_before = sgwu.received(52);
+
+        // The MME could not page the UE at all.
+        let mut fail = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::DownlinkDataNotificationFailureIndication as u8,
+            ue.sgw_s11_teid,
+            0x5409,
+        ));
+        fail.add_ie(Gtp2CauseIe::new(gtp_cause::CONTEXT_NOT_FOUND).to_ie(0));
+        sock.send_to(&fail.encode(), server.local_addr()).unwrap();
+
+        let mut arrived = false;
+        for _ in 0..200 {
+            if sgwu.received(52) > modifications_before {
+                arrived = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            arrived,
+            "a DDN Failure Indication must make the SGW-C discard the SGW-U's buffered \
+             packets; TS 23.401 §5.3.4.2 says delete them, and this used to only log"
+        );
+
+        server.close();
+    }
+
+    /// #54 criterion 5, second half: the Data Notification Delay throttles the next DDN.
+    ///
+    /// The IE was PARSED into `ParsedDdnAck.data_notification_delay` and then dropped by
+    /// the handler, so the throttling TS 29.274 §7.2.11.2 defines could not happen and a
+    /// busy idle UE could produce a notification per downlink packet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_data_notification_delay_throttles_the_next_ddn() {
+        let sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let server = test_server(1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x59];
+
+        sock.send_to(&csr(0x5407, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await.expect("create session response");
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("ue");
+        let sess = ctx.sess_find_by_id(ue.sess_ids[0]).expect("sess");
+        let pdr_id = ctx
+            .dl_tunnel_in_bearer(sess.bearer_ids[0])
+            .and_then(|t| t.pdr_id)
+            .or_else(|| {
+                ctx.ul_tunnel_in_bearer(sess.bearer_ids[0])
+                    .and_then(|t| t.pdr_id)
+            })
+            .expect("pdr id");
+
+        sgwu.report_downlink_data(sess.sgwc_sxa_seid, pdr_id, 0x9B)
+            .await;
+        let ddn = recv_s11(&sock).await.expect("the first DDN");
+
+        // Accepted, with a 20 x 50ms = 1s delay before the next one.
+        let mut ack = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::DownlinkDataNotificationAcknowledge as u8,
+            ue.sgw_s11_teid,
+            ddn.header.sequence_number,
+        ));
+        ack.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED).to_ie(0));
+        ack.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::DelayValue as u8,
+            0,
+            &[20],
+        ));
+        sock.send_to(&ack.encode(), server.local_addr()).unwrap();
+        // Let the acknowledge be processed before the next report.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A second report inside the delay window must NOT page again.
+        sock.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        sgwu.report_downlink_data(sess.sgwc_sxa_seid, pdr_id, 0x9C)
+            .await;
+        assert!(
+            recv_s11(&sock).await.is_none(),
+            "the MME asked for a 1s Data Notification Delay: a second notification inside \
+             it is the storm the IE exists to suppress"
+        );
+
+        server.close();
+    }
+
+    // `test_create_session_request_accepted_over_socket` was REPLACED by
+    // `no_create_session_response_until_the_sgwu_answers` (#54). It asserted that a Create
+    // Session Request is answered `REQUEST_ACCEPTED` immediately, which is precisely the
+    // behaviour this issue removes -- TS 23.401 §5.3.2.1 answers after the user plane is
+    // provisioned. The replacement asserts everything it did (sequence number, MME TEID,
+    // cause, Sender F-TEID, the bearer context's allocated S1-U endpoint) AND that nothing
+    // is sent until the SGW-U has answered.
 
     #[test]
     fn test_create_session_request_missing_imsi_rejected() {
@@ -1688,19 +2392,29 @@ mod tests {
         server.close();
     }
 
-    #[test]
-    fn test_duplicate_request_answered_from_cache() {
+    /// #54: converted to drive a stand-in SGW-U, because the Create Session Response it
+    /// compares is now sent only after the user plane is provisioned. The property under
+    /// test is unchanged: a retransmitted request is answered from the transaction cache
+    /// and creates no second session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_duplicate_request_answered_from_cache() {
+        let _sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
         let server = test_server(1000, 1);
+        set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x03];
 
         let msg = csr(0x1004, &imsi);
         sock.send_to(&msg.encode(), server.local_addr()).unwrap();
-        let first = recv_msg(&sock);
+        let first = recv_s11(&sock).await.expect("first response");
 
         // Retransmit the identical request (same sequence number)
         sock.send_to(&msg.encode(), server.local_addr()).unwrap();
-        let second = recv_msg(&sock);
+        let second = recv_s11(&sock).await.expect("cached response");
 
         assert_eq!(first.encode(), second.encode());
         // The retransmission must not have created a second session
@@ -1711,16 +2425,25 @@ mod tests {
         server.close();
     }
 
-    #[test]
-    fn test_full_session_lifecycle_over_socket() {
+    /// #54: converted to drive a stand-in SGW-U. Every S11 response in this lifecycle that
+    /// is gated on Sxa now waits for it, so without a peer that answers the create step
+    /// alone would time out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_full_session_lifecycle_over_socket() {
+        let _sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
         let server = test_server(1000, 1);
+        set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x04];
 
         // Create
         sock.send_to(&csr(0x2001, &imsi).encode(), server.local_addr())
             .unwrap();
-        let csrsp = recv_msg(&sock);
+        let csrsp = recv_s11(&sock).await.expect("create session response");
         let sgw_teid =
             Gtp2FTeidIe::decode(&csrsp.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value)
                 .unwrap()
@@ -1737,7 +2460,7 @@ mod tests {
         bc.set_fteid(0, &Gtp2FTeidIe::new_ipv4(0, 0xE0B1, [127, 0, 0, 1]));
         mbr.add_bearer_context(0, &bc);
         sock.send_to(&mbr.encode(), server.local_addr()).unwrap();
-        let mbrsp = recv_msg(&sock);
+        let mbrsp = recv_s11(&sock).await.expect("modify bearer response");
         assert_eq!(
             mbrsp.header.message_type,
             Gtp2MessageType::ModifyBearerResponse as u8
@@ -1756,7 +2479,9 @@ mod tests {
             0x2003,
         ));
         sock.send_to(&rab.encode(), server.local_addr()).unwrap();
-        let rabrsp = recv_msg(&sock);
+        let rabrsp = recv_s11(&sock)
+            .await
+            .expect("release access bearers response");
         assert_eq!(
             rabrsp.header.message_type,
             Gtp2MessageType::ReleaseAccessBearersResponse as u8
@@ -1770,7 +2495,7 @@ mod tests {
         ));
         dsr.add_ie(nextgcore_gtp::v2::ie::Gtp2EbiIe::new(5).to_ie(0));
         sock.send_to(&dsr.encode(), server.local_addr()).unwrap();
-        let dsrsp = recv_msg(&sock);
+        let dsrsp = recv_s11(&sock).await.expect("delete session response");
         assert_eq!(
             dsrsp.header.message_type,
             Gtp2MessageType::DeleteSessionResponse as u8

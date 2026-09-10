@@ -24,6 +24,7 @@ pub mod s5c_handler;
 pub mod sm;
 pub mod sxa_build;
 pub mod sxa_handler;
+pub mod sxa_response;
 pub mod timer;
 
 use context::sgwc_self;
@@ -63,6 +64,10 @@ pub struct SgwcApp {
     sgwc_fsm: SgwcFsm,
     /// Timer manager
     timer_mgr: timer::TimerManager,
+    /// The Sxa receive loop, so shutdown can wait for it (#54).
+    pfcp_task: Option<tokio::task::JoinHandle<()>>,
+    /// Asks that loop to stop.
+    pfcp_shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl SgwcApp {
@@ -72,11 +77,17 @@ impl SgwcApp {
             running: Arc::new(AtomicBool::new(true)),
             sgwc_fsm: SgwcFsm::new(),
             timer_mgr: timer::TimerManager::new(),
+            pfcp_task: None,
+            pfcp_shutdown: None,
         }
     }
 
     /// Initialize the SGWC application
-    pub fn init(&mut self, _config_path: &str) -> Result<()> {
+    ///
+    /// #54: `async` because opening the Sxa path now binds a real tokio socket and sets up
+    /// the PFCP association toward the SGW-U. It used to call a `pfcp_open` that opened
+    /// nothing, which is why none of this had to be awaited.
+    pub async fn init(&mut self, _config_path: &str) -> Result<()> {
         log::info!("Initializing SGWC...");
 
         // Initialize SGWC context with default pool sizes
@@ -104,35 +115,56 @@ impl SgwcApp {
         log::debug!("GTP path initialized (S11/S5-C interfaces)");
 
         // Open PFCP path (SXA interface to SGW-U)
-        if let Err(e) = pfcp_path::pfcp_open() {
-            log::error!("Failed to open PFCP path: {e}");
-            gtp_path::gtp_close();
-            return Err(anyhow::anyhow!("PFCP path initialization failed: {e}"));
+        let pfcp = match pfcp_path::pfcp_open().await {
+            Ok(node) => node,
+            Err(e) => {
+                log::error!("Failed to open PFCP path: {e}");
+                gtp_path::gtp_close();
+                return Err(anyhow::anyhow!("PFCP path initialization failed: {e}"));
+            }
+        };
+        log::debug!(
+            "PFCP path initialized (SXA interface on {})",
+            pfcp.local_addr()
+        );
+
+        // The receive loop and the outbound drain. Without this task nothing reads the
+        // socket, so no PFCP response could complete a transaction and every gated S11
+        // procedure would time out.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        self.pfcp_shutdown = Some(shutdown_tx);
+        self.pfcp_task = Some(tokio::spawn(pfcp.clone().run(shutdown_rx)));
+
+        // Associate with the SGW-U (TS 29.244 §6.2.6.2). NOT fatal: an SGW-U that comes up
+        // after the SGW-C is the normal bring-up order in the compose stack, and refusing
+        // to start would make the slower peer an outage. The association is retried by the
+        // first session request that needs it.
+        let sgwu = pfcp_path::configured_sgwu_addr();
+        match pfcp.associate(sgwu).await {
+            Ok(()) => log::info!("Associated with SGW-U {sgwu}"),
+            Err(e) => log::warn!(
+                "No PFCP association with SGW-U {sgwu} yet ({e}); session requests will \
+                 fail until it answers"
+            ),
         }
-        log::debug!("PFCP path initialized (SXA interface)");
 
         log::info!("SGWC initialized successfully");
         Ok(())
     }
 
     /// Run the SGWC main loop
-    pub fn run(&mut self) -> Result<()> {
+    ///
+    /// S11/S5-C datagrams are read by `gtp_path`'s own OS threads and Sxa datagrams by the
+    /// spawned receive loop, so this loop's job is the timers. It `await`s rather than
+    /// `thread::sleep`s: blocking a runtime worker for 100ms at a time would stall the Sxa
+    /// task on a single-threaded runtime, which is the difference between a gated S11
+    /// procedure completing and timing out.
+    pub async fn run(&mut self) -> Result<()> {
         log::info!("SGWC running...");
 
         while self.running.load(Ordering::SeqCst) {
-            // Check for expired timers
             self.process_timers();
-
-            // Process events from the event queue
-            // In a real implementation, this would:
-            // 1. Poll for S11 GTPv2-C messages from MME
-            // 2. Poll for S5-C GTPv2-C messages from PGW
-            // 3. Poll for SXA PFCP messages from SGW-U
-            // 4. Process timer events
-            // 5. Handle state machine transitions
-
-            // For now, just sleep briefly to avoid busy-waiting
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
         log::info!("SGWC main loop exited");
@@ -185,8 +217,17 @@ impl SgwcApp {
     }
 
     /// Shutdown the SGWC application
-    pub fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) {
         log::info!("Shutting down SGWC...");
+
+        // Stop the Sxa receive loop and wait for it, so a session removed during teardown
+        // is not raced by a datagram still being processed.
+        if let Some(tx) = self.pfcp_shutdown.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(task) = self.pfcp_task.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        }
 
         // Send exit event to state machine
         let exit_event = SgwcEvent::exit();
@@ -194,7 +235,7 @@ impl SgwcApp {
         log::debug!("SGWC state machine finalized");
 
         // Close PFCP path
-        pfcp_path::pfcp_close();
+        pfcp_path::pfcp_close().await;
         log::debug!("PFCP path closed");
 
         // Close GTP path
@@ -230,7 +271,8 @@ impl Default for SgwcApp {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Parse command line arguments
     let args = Args::parse();
 
@@ -271,13 +313,13 @@ fn main() -> Result<()> {
     })?;
 
     // Initialize
-    app.init(&args.config)?;
+    app.init(&args.config).await?;
 
     // Run main loop
-    app.run()?;
+    app.run().await?;
 
     // Shutdown
-    app.shutdown();
+    app.shutdown().await;
 
     log::info!("NextGCore SGWC terminated");
     Ok(())
@@ -335,8 +377,8 @@ mod tests {
         .unwrap();
         assert_ne!(server.local_addr().port(), 0);
         server.close();
-        assert!(pfcp_path::pfcp_open().is_ok());
-        pfcp_path::pfcp_close();
+        // `pfcp_open` binds a real socket now (#54), so it is exercised in
+        // `pfcp_path`'s own async tests rather than from this synchronous one.
     }
 
     #[test]
