@@ -483,6 +483,23 @@ pub struct PcfSess {
     /// loads as `None` rather than failing the whole record.
     #[serde(default)]
     pub access_type: Option<AccessType>,
+    /// The UDR's `SmPolicyDnnData` for this session's S-NSSAI and DNN, as last read
+    /// over Nudr_DataRepository (TS 29.519 §5.2).
+    ///
+    /// #299: stored so a RE-authorisation can carry what the create carried. The create
+    /// path reads this resource and maps its `online`/`offline` flags into the
+    /// ChargingData decisions, then DISCARDED it — so every later
+    /// `Npcf_SMPolicyControl_UpdateNotify` rebuilt the decision without them and
+    /// silently reverted the subscriber's charging mode to the local default. It is also
+    /// what a policy-data change notification is compared against, so an operator's edit
+    /// that changes nothing this PCF maps does not produce a spurious notify.
+    ///
+    /// Held as the received JSON rather than parsed into fields: only two members are
+    /// mapped today, and a struct would have to be widened for every future one while
+    /// silently dropping the rest. `#[serde(default)]` for the same snapshot reason as
+    /// `access_type`.
+    #[serde(default)]
+    pub policy_dnn_data: Option<serde_json::Value>,
 }
 
 impl PcfSess {
@@ -513,6 +530,7 @@ impl PcfSess {
             stream_id: None,
             af_pcc_rules: Vec::new(),
             access_type: None,
+            policy_dnn_data: None,
         }
     }
 
