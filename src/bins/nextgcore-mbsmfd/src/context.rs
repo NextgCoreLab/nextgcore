@@ -188,6 +188,114 @@ pub struct MbsSession {
     /// Keyed on `nfcInstanceId` rather than counted, so a consumer that restarts and
     /// re-STARTs is not counted twice and a repeated TERMINATE cannot decrement twice.
     pub consumers: HashSet<String>,
+    /// The RAN nodes currently receiving shared delivery on this session's transport
+    /// (#301, TS 23.247 §7.2.1.4/§7.2.2.4), keyed on a canonical form of the
+    /// ContextUpdate's `ranNodeId`.
+    ///
+    /// A SECOND, independent dimension from [`Self::consumers`], not a rename of it.
+    /// #295 keyed that set on `nfcInstanceId`, which on the N2 leg is the **AMF's** —
+    /// so the AMF leg could not consult it (deregistering the AMF's id finds it absent,
+    /// since SMF STARTs populate the set) and must not register into it (an AMF's
+    /// silence would then pin the transport open, which #295 explicitly declined to
+    /// create). Before this set existed, one RAN node's `MBS_DIS_REL_REQ` deleted the
+    /// MB-UPF session for every other RAN node still receiving on it — the same defect
+    /// shape as #295's, in a different dimension, and just as quiet: the remaining
+    /// RAN nodes' contexts, the `MbsSession` state and the TMGI were all unchanged and
+    /// the data simply stopped.
+    ///
+    /// Keyed on a canonical STRING rather than the decoded structure: `GlobalRanNodeId`
+    /// (TS 29.571) is a choice of `gNbId` / `ngeNbId` / `n3IwfId` / `wagfId` / `tngfId`
+    /// / `eNbId`, so two JSON objects that mean the same node can differ in member
+    /// order and in hex case — and a key that does not agree with what was stored
+    /// silently fails to match, which is what [`Self::ssm`] records for the SSM.
+    /// Nothing echoes a `ranNodeId` back to a peer, so unlike the SSM there is no
+    /// reason to keep the received form; if a future issue needs to, this becomes a map
+    /// from key to the received value.
+    pub ran_nodes: HashSet<String>,
+}
+
+/// Canonical key for a `GlobalRanNodeId` (#301).
+///
+/// One string per RAN node, stable across member order and hex case, so the key a
+/// setup stores is the key a release looks up. Returns `None` for a `ranNodeId` that is
+/// not an object — the caller then treats the release as untracked, which is the
+/// pre-#301 behaviour rather than a silent non-match.
+pub fn canonical_ran_node_key(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+
+    // The PLMN scopes the node id: a gNB id is only unique within its PLMN
+    // (TS 38.413 §9.3.1.5), and a session can carry RAN nodes from more than one in a
+    // shared-PLMN deployment.
+    let plmn = obj
+        .get("plmnId")
+        .and_then(|p| p.as_object())
+        .map(|p| {
+            format!(
+                "{}-{}",
+                p.get("mcc").and_then(|v| v.as_str()).unwrap_or(""),
+                p.get("mnc").and_then(|v| v.as_str()).unwrap_or("")
+            )
+        })
+        .unwrap_or_default();
+
+    // gNB id is a structure (bitLength + gNBValue); the rest are plain strings. Checked
+    // in a fixed order so a peer that (wrongly) sends two never keys inconsistently.
+    if let Some(g) = obj.get("gNbId").and_then(|g| g.as_object()) {
+        let bits = g.get("bitLength").and_then(|v| v.as_u64()).unwrap_or(0);
+        let val = g
+            .get("gNBValue")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        return Some(format!("{plmn}/gNbId:{bits}:{val}"));
+    }
+    for member in ["ngeNbId", "n3IwfId", "wagfId", "tngfId", "eNbId", "nid"] {
+        if let Some(v) = obj.get(member).and_then(|v| v.as_str()) {
+            return Some(format!("{plmn}/{member}:{}", v.to_ascii_uppercase()));
+        }
+    }
+
+    // No known id member. Key on a canonical rendering of the whole object rather than
+    // giving up: an unrecognised-but-consistent RAN node still matches ITSELF, which is
+    // all the set needs. `to_string` is not used because it is not guaranteed to order
+    // members independently of how they were parsed.
+    let mut canonical = String::new();
+    canonical_json(value, &mut canonical);
+    Some(format!("{plmn}/raw:{canonical}"))
+}
+
+/// Render a JSON value with object members in sorted order, so equal values render
+/// equal regardless of how they were parsed.
+fn canonical_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(k);
+                out.push(':');
+                if let Some(v) = map.get(*k) {
+                    canonical_json(v, out);
+                }
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
 }
 
 /// What a consumer's ContextUpdate TERMINATE means for the shared transport (#295).
@@ -195,11 +303,30 @@ pub struct MbsSession {
 pub enum ConsumerTerminate {
     /// No MBS session matched the TMGI.
     NotFound,
-    /// Other consumers are still receiving: the transport stays up. Carries who they
-    /// are, because nothing else in the system can name them.
+    /// Something is still receiving: the transport stays up. Carries who, because
+    /// nothing else in the system can name them.
+    ///
+    /// #301 widened this from "other consumers" to "other HOLDERS": entries are
+    /// prefixed `consumer:` or `ran-node:`, since either dimension being non-empty
+    /// keeps the transport up.
     ConsumerRemains { remaining: Vec<String> },
-    /// The set is now empty: this was the last consumer, so the transport is released.
+    /// Nothing holds it any more, so the transport is released.
     LastConsumer,
+}
+
+/// Who still holds a session's shared N4mb transport (#301).
+///
+/// Both dimensions in one list, prefixed so a log line and a test assertion can tell
+/// them apart. Sorted, because both sides come from `HashSet`s.
+fn transport_holders(session: &MbsSession) -> Vec<String> {
+    let mut holders: Vec<String> = session
+        .consumers
+        .iter()
+        .map(|c| format!("consumer:{c}"))
+        .collect();
+    holders.extend(session.ran_nodes.iter().map(|r| format!("ran-node:{r}")));
+    holders.sort();
+    holders
 }
 
 impl MbsSession {
@@ -223,6 +350,7 @@ impl MbsSession {
             group_members: HashSet::new(),
             ssm: None,
             consumers: HashSet::new(),
+            ran_nodes: HashSet::new(),
         }
     }
 
@@ -984,11 +1112,10 @@ impl MbSmfContext {
             if !nfc_instance_id.is_empty() {
                 session.consumers.remove(nfc_instance_id);
             }
-            let mut remaining: Vec<String> = session.consumers.iter().cloned().collect();
-            // Sorted so a log line and a test assertion are both deterministic over a
-            // HashSet.
-            remaining.sort();
-            remaining
+            // #301: the RAN-node set counts too. An SMF's last consumer leaving while a
+            // RAN node is still receiving shared delivery must NOT delete the MB-UPF
+            // session underneath that RAN node.
+            transport_holders(session)
         };
         if !remaining.is_empty() {
             return ConsumerTerminate::ConsumerRemains { remaining };
@@ -1002,14 +1129,86 @@ impl MbSmfContext {
         }
     }
 
+    /// Shared delivery toward one RAN node is being established (#301, TS 23.247
+    /// §7.2.1.4): record it as a holder of the session's shared transport.
+    ///
+    /// Mirrors [`Self::session_consumer_register`], and for the same reason: the set is
+    /// keyed, not counted, so a RAN node whose AMF re-sends `MBS_DIS_SETUP_REQ` is not
+    /// counted twice and a repeated `MBS_DIS_REL_REQ` cannot decrement twice.
+    pub fn session_ran_node_register(&self, tmgi: &Tmgi, ran_node_key: &str) -> Option<usize> {
+        if ran_node_key.is_empty() {
+            return None;
+        }
+        let id = {
+            let tmgi_hash = self.tmgi_hash.read().ok()?;
+            *tmgi_hash.get(tmgi)?
+        };
+        let mut list = self.session_list.write().ok()?;
+        let session = list.get_mut(&id)?;
+        let fresh = session.ran_nodes.insert(ran_node_key.to_string());
+        let count = session.ran_nodes.len();
+        if fresh {
+            log::info!(
+                "[MBS] RAN node {ran_node_key} registered on session {id} (TMGI {:02x?}); \
+                 {count} RAN node(s) now receive its shared delivery",
+                tmgi.mbs_service_id
+            );
+        }
+        Some(count)
+    }
+
+    /// `MBS_DIS_REL_REQ` from one RAN node (#301): deregister it and say whether the
+    /// shared transport may now be released.
+    ///
+    /// Released only when NOTHING holds it — neither another RAN node nor an SMF
+    /// consumer. A RAN node this session does not hold decrements nothing, so a repeated
+    /// release cannot tear down delivery another RAN node is still receiving.
+    ///
+    /// A session with no registered RAN nodes at all yields
+    /// [`ConsumerTerminate::LastConsumer`] when no consumer holds it either, which is
+    /// deliberately the pre-#301 behaviour: sessions established before any tracked
+    /// setup, and every existing single-RAN-node flow, must keep releasing on the first
+    /// `MBS_DIS_REL_REQ`.
+    pub fn session_ran_node_release(&self, tmgi: &Tmgi, ran_node_key: &str) -> ConsumerTerminate {
+        let id = {
+            match self.tmgi_hash.read() {
+                Ok(h) => match h.get(tmgi) {
+                    Some(&id) => id,
+                    None => return ConsumerTerminate::NotFound,
+                },
+                Err(_) => return ConsumerTerminate::NotFound,
+            }
+        };
+        let remaining = {
+            let Ok(mut list) = self.session_list.write() else {
+                return ConsumerTerminate::NotFound;
+            };
+            let Some(session) = list.get_mut(&id) else {
+                return ConsumerTerminate::NotFound;
+            };
+            if !ran_node_key.is_empty() {
+                session.ran_nodes.remove(ran_node_key);
+            }
+            transport_holders(session)
+        };
+        if !remaining.is_empty() {
+            return ConsumerTerminate::ConsumerRemains { remaining };
+        }
+        if self.session_context_terminate(tmgi) {
+            ConsumerTerminate::LastConsumer
+        } else {
+            ConsumerTerminate::NotFound
+        }
+    }
+
     /// ContextUpdate **Terminate** (SMF) / leave: resolve the MBS session by
     /// TMGI and release its N4mb multicast transport (drives the N4mb release
     /// path). Returns whether a session matched.
     ///
-    /// Unconditional — it does not consult the consumer set (#295). Kept for the N2
-    /// (AMF) release leg, whose `nfcInstanceId` is the AMF's and therefore not a member
-    /// of the consumer set the SMF STARTs populate; see the spec's ceiling on the
-    /// per-RAN-node dimension.
+    /// Unconditional — it consults neither the consumer set (#295) nor the RAN-node set
+    /// (#301). Both `session_context_terminate_for` and `session_ran_node_release` call
+    /// it once they have decided nothing holds the transport, so this is the "mark it
+    /// released" half rather than the decision.
     pub fn session_context_terminate(&self, tmgi: &Tmgi) -> bool {
         let id = {
             match self.tmgi_hash.read() {
@@ -1126,6 +1325,82 @@ mod tests {
         let ctx = MbSmfContext::new();
         assert!(!ctx.is_initialized());
         assert_eq!(ctx.session_count(), 0);
+    }
+
+    /// #301: the RAN-node key is canonical, so a setup and a release for the same node
+    /// match even when the AMF renders the JSON differently.
+    ///
+    /// This is the decision the issue asks to make deliberately ("the whole decoded
+    /// structure, or a canonical string"), and the reason it matters is `ssm`'s: a key
+    /// that does not agree with what was stored silently fails to match, and the symptom
+    /// is a release that releases nothing while answering 204.
+    #[test]
+    fn the_ran_node_key_is_stable_across_member_order_and_hex_case() {
+        let a: serde_json::Value = serde_json::from_str(
+            r#"{"plmnId":{"mcc":"208","mnc":"93"},"gNbId":{"bitLength":24,"gNBValue":"00abcd"}}"#,
+        )
+        .unwrap();
+        // Same node: members in the other order, hex in the other case.
+        let b: serde_json::Value = serde_json::from_str(
+            r#"{"gNbId":{"gNBValue":"00ABCD","bitLength":24},"plmnId":{"mnc":"93","mcc":"208"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical_ran_node_key(&a),
+            canonical_ran_node_key(&b),
+            "one RAN node must produce one key, or its release matches nothing"
+        );
+
+        // A different gNB is a different key.
+        let c: serde_json::Value = serde_json::from_str(
+            r#"{"plmnId":{"mcc":"208","mnc":"93"},"gNbId":{"bitLength":24,"gNBValue":"00abce"}}"#,
+        )
+        .unwrap();
+        assert_ne!(canonical_ran_node_key(&a), canonical_ran_node_key(&c));
+
+        // Same gNB value in a different PLMN is a different node (TS 38.413 §9.3.1.5:
+        // a gNB id is only unique within its PLMN).
+        let d: serde_json::Value = serde_json::from_str(
+            r#"{"plmnId":{"mcc":"001","mnc":"01"},"gNbId":{"bitLength":24,"gNBValue":"00abcd"}}"#,
+        )
+        .unwrap();
+        assert_ne!(canonical_ran_node_key(&a), canonical_ran_node_key(&d));
+
+        // A different bitLength is a different node, not the same one truncated.
+        let e: serde_json::Value = serde_json::from_str(
+            r#"{"plmnId":{"mcc":"208","mnc":"93"},"gNbId":{"bitLength":22,"gNBValue":"00abcd"}}"#,
+        )
+        .unwrap();
+        assert_ne!(canonical_ran_node_key(&a), canonical_ran_node_key(&e));
+
+        // The other choice members key on their own name, so an ng-eNB and an N3IWF
+        // with the same textual id are not the same holder.
+        let ngenb: serde_json::Value =
+            serde_json::from_str(r#"{"plmnId":{"mcc":"208","mnc":"93"},"ngeNbId":"macroNgeNB-1"}"#)
+                .unwrap();
+        let n3iwf: serde_json::Value =
+            serde_json::from_str(r#"{"plmnId":{"mcc":"208","mnc":"93"},"n3IwfId":"macroNgeNB-1"}"#)
+                .unwrap();
+        assert_ne!(
+            canonical_ran_node_key(&ngenb),
+            canonical_ran_node_key(&n3iwf)
+        );
+
+        // An unrecognised shape still keys consistently with ITSELF rather than being
+        // dropped: it only has to match its own release.
+        let odd: serde_json::Value =
+            serde_json::from_str(r#"{"plmnId":{"mcc":"208","mnc":"93"},"someFutureId":"x"}"#)
+                .unwrap();
+        let odd_reordered: serde_json::Value =
+            serde_json::from_str(r#"{"someFutureId":"x","plmnId":{"mnc":"93","mcc":"208"}}"#)
+                .unwrap();
+        assert_eq!(
+            canonical_ran_node_key(&odd),
+            canonical_ran_node_key(&odd_reordered)
+        );
+
+        // Not an object: untracked rather than keyed on nonsense.
+        assert_eq!(canonical_ran_node_key(&serde_json::json!("gnb-1")), None);
     }
 
     #[test]
