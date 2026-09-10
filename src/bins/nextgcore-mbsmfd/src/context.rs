@@ -174,6 +174,32 @@ pub struct MbsSession {
     /// thing, and matching on the received form is what makes a lookup agree with
     /// what was stored.
     pub ssm: Option<crate::types::Ssm>,
+    /// The NF consumers (`ContextUpdateReqData.nfcInstanceId`) currently receiving on
+    /// this session's shared N4mb transport (#295, TS 23.247 §7.2.1.3/§7.2.1.4).
+    ///
+    /// Distinct from [`Self::group_members`], which tracks UE SUPIs: a multicast MBS
+    /// session is a SHARED distribution session established once and reused across
+    /// joins, so the transport underneath it must outlive any single consumer's
+    /// departure. Before this set existed, the first consumer to send a ContextUpdate
+    /// TERMINATE released the MB-UPF session for every other consumer still receiving
+    /// on it — and the remaining consumers' sessions looked fine (state, SBI surface
+    /// and TMGI all unchanged) and simply stopped carrying data.
+    ///
+    /// Keyed on `nfcInstanceId` rather than counted, so a consumer that restarts and
+    /// re-STARTs is not counted twice and a repeated TERMINATE cannot decrement twice.
+    pub consumers: HashSet<String>,
+}
+
+/// What a consumer's ContextUpdate TERMINATE means for the shared transport (#295).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsumerTerminate {
+    /// No MBS session matched the TMGI.
+    NotFound,
+    /// Other consumers are still receiving: the transport stays up. Carries who they
+    /// are, because nothing else in the system can name them.
+    ConsumerRemains { remaining: Vec<String> },
+    /// The set is now empty: this was the last consumer, so the transport is released.
+    LastConsumer,
 }
 
 impl MbsSession {
@@ -196,6 +222,7 @@ impl MbsSession {
             n4mb_session: None,
             group_members: HashSet::new(),
             ssm: None,
+            consumers: HashSet::new(),
         }
     }
 
@@ -886,9 +913,103 @@ impl MbSmfContext {
         self.session_activate_n4mb(id, upf_addr)
     }
 
+    /// Register a consumer NF on a session's shared transport (#295).
+    ///
+    /// Returns the consumer count after the insert, or `None` when no session matches
+    /// the TMGI. Idempotent: a consumer that restarts and re-STARTs the same session is
+    /// the same entry, which is what keying the set on `nfcInstanceId` buys.
+    ///
+    /// **Where the count starts, and why this leg.** #295 asks whether a ContextUpdate
+    /// START implicitly registers `nfcInstanceId` as a consumer. It does: nothing else
+    /// in the tree registers one, TS 23.247 §7.2.1.3 models the START as the establish
+    /// side of a shared session, and this makes the count derivable from traffic the
+    /// MB-SMF already sees rather than from a member the schema does not have. The
+    /// alternative — counting only an explicit `leaveInd` join/leave — would leave the
+    /// shared-transport hazard on exactly the `leaveInd == false` path that carries
+    /// most of the traffic.
+    pub fn session_consumer_register(&self, tmgi: &Tmgi, nfc_instance_id: &str) -> Option<usize> {
+        if nfc_instance_id.is_empty() {
+            return None;
+        }
+        let id = {
+            let tmgi_hash = self.tmgi_hash.read().ok()?;
+            *tmgi_hash.get(tmgi)?
+        };
+        let mut list = self.session_list.write().ok()?;
+        let session = list.get_mut(&id)?;
+        let fresh = session.consumers.insert(nfc_instance_id.to_string());
+        let count = session.consumers.len();
+        if fresh {
+            log::info!(
+                "[MBS] consumer {nfc_instance_id} registered on session {id} \
+                 (TMGI {:02x?}); {count} consumer(s) now hold its shared transport",
+                tmgi.mbs_service_id
+            );
+        }
+        Some(count)
+    }
+
+    /// ContextUpdate **Terminate** from one consumer (#295): deregister it and say
+    /// whether the shared transport may now be released.
+    ///
+    /// The transport is released only when the set becomes EMPTY. A consumer this
+    /// session does not hold does not decrement anything, so a repeated TERMINATE
+    /// cannot release a transport another consumer still holds.
+    ///
+    /// A session with no registered consumers at all yields [`ConsumerTerminate::
+    /// LastConsumer`], which is deliberately the pre-#295 behaviour: sessions created
+    /// before any START, and every existing single-consumer flow, must keep releasing
+    /// on the first TERMINATE.
+    pub fn session_context_terminate_for(
+        &self,
+        tmgi: &Tmgi,
+        nfc_instance_id: &str,
+    ) -> ConsumerTerminate {
+        let id = {
+            match self.tmgi_hash.read() {
+                Ok(h) => match h.get(tmgi) {
+                    Some(&id) => id,
+                    None => return ConsumerTerminate::NotFound,
+                },
+                Err(_) => return ConsumerTerminate::NotFound,
+            }
+        };
+        let remaining = {
+            let Ok(mut list) = self.session_list.write() else {
+                return ConsumerTerminate::NotFound;
+            };
+            let Some(session) = list.get_mut(&id) else {
+                return ConsumerTerminate::NotFound;
+            };
+            if !nfc_instance_id.is_empty() {
+                session.consumers.remove(nfc_instance_id);
+            }
+            let mut remaining: Vec<String> = session.consumers.iter().cloned().collect();
+            // Sorted so a log line and a test assertion are both deterministic over a
+            // HashSet.
+            remaining.sort();
+            remaining
+        };
+        if !remaining.is_empty() {
+            return ConsumerTerminate::ConsumerRemains { remaining };
+        }
+        // Last consumer: mark the transport for release exactly as the unconditional
+        // path does, so the two agree about what "terminating" means locally.
+        if self.session_context_terminate(tmgi) {
+            ConsumerTerminate::LastConsumer
+        } else {
+            ConsumerTerminate::NotFound
+        }
+    }
+
     /// ContextUpdate **Terminate** (SMF) / leave: resolve the MBS session by
     /// TMGI and release its N4mb multicast transport (drives the N4mb release
     /// path). Returns whether a session matched.
+    ///
+    /// Unconditional — it does not consult the consumer set (#295). Kept for the N2
+    /// (AMF) release leg, whose `nfcInstanceId` is the AMF's and therefore not a member
+    /// of the consumer set the SMF STARTs populate; see the spec's ceiling on the
+    /// per-RAN-node dimension.
     pub fn session_context_terminate(&self, tmgi: &Tmgi) -> bool {
         let id = {
             match self.tmgi_hash.read() {

@@ -1192,17 +1192,49 @@ async fn handle_mbs_session_context_update(request: &SbiRequest) -> SbiResponse 
 
     let ctx = mbsmf_self();
 
-    // --- Terminate / leave: release the N4mb multicast transport.
+    // --- Terminate / leave: deregister this consumer, and release the N4mb
+    // multicast transport only when it was the LAST one (#295, TS 23.247
+    // §7.2.1.3/§7.2.1.4).
+    //
+    // A multicast MBS session is a SHARED distribution session established once and
+    // reused across joins. This leg used to release the transport for whichever
+    // consumer asked first, so one SMF leaving tore it down for every other SMF still
+    // receiving — and the remaining consumers' sessions looked fine (state, SBI
+    // surface, TMGI all unchanged) and simply stopped receiving, because the MB-UPF
+    // session underneath them had been deleted.
     if terminate {
-        let released = ctx
+        match ctx
             .read()
-            .map(|c| c.session_context_terminate(&tmgi))
-            .unwrap_or(false);
-        if !released {
-            return send_not_found(
-                "MBS session not found for ContextUpdate",
-                Some("CONTEXT_NOT_FOUND"),
-            );
+            .map(|c| c.session_context_terminate_for(&tmgi, &req.nfc_instance_id))
+            .unwrap_or(context::ConsumerTerminate::NotFound)
+        {
+            context::ConsumerTerminate::NotFound => {
+                return send_not_found(
+                    "MBS session not found for ContextUpdate",
+                    Some("CONTEXT_NOT_FOUND"),
+                );
+            }
+            context::ConsumerTerminate::ConsumerRemains { remaining } => {
+                // The never-departing-consumer decision (#295), logged rather than
+                // implemented: NOTHING unpins a transport whose remaining consumer
+                // never sends a TERMINATE. A TTL would have the MB-SMF tear down a
+                // transport that is still carrying data because a consumer was quiet,
+                // which is worse than the pin; tying it to NRF liveness needs an
+                // NF-status subscription this daemon does not have. So the pin is
+                // accepted and made visible, naming who holds it — nothing else in the
+                // system can.
+                log::warn!(
+                    "ContextUpdate Terminate from {} (TMGI {:02x?}): shared transport \
+                     stays UP for {} remaining consumer(s) {:?}. Nothing unpins it if \
+                     they never terminate (#295).",
+                    req.nfc_instance_id,
+                    tmgi.mbs_service_id,
+                    remaining.len(),
+                    remaining
+                );
+                return SbiResponse::with_status(204);
+            }
+            context::ConsumerTerminate::LastConsumer => {}
         }
         // #76: `session_context_terminate` now only marks the N4mb context
         // ReleasePending -- it used to zero it, discarding the remote SEID before
@@ -1230,6 +1262,33 @@ async fn handle_mbs_session_context_update(request: &SbiRequest) -> SbiResponse 
     }
 
     // --- SMF multicast Start: allocate cTeid + llSsm, drive N4mb establishment.
+    //
+    // #295: register this consumer FIRST, so the transport the establishment below
+    // brings up is already accounted for. Registering after would leave a window in
+    // which a second consumer's TERMINATE saw an empty set and released a transport
+    // this START had just asked for.
+    //
+    // Only this leg registers. The AMF leg's `nfcInstanceId` is the AMF's, and an AMF
+    // relaying N2 for shared delivery is not what pins the MB-UPF session — counting it
+    // would let an AMF's silence hold a transport open.
+    if ctx
+        .read()
+        .ok()
+        .and_then(|c| c.session_consumer_register(&tmgi, &req.nfc_instance_id))
+        .is_none()
+        && req.nfc_instance_id.is_empty()
+    {
+        // Not a rejection: `nfcInstanceId` is required by the schema, so an empty one
+        // is a peer sending a member it declares. Such a consumer cannot be counted and
+        // therefore cannot pin the transport — which is the pre-#295 behaviour for it.
+        log::warn!(
+            "ContextUpdate Start (TMGI {:02x?}) carried an empty nfcInstanceId: the \
+             consumer cannot be tracked, so the first Terminate releases the shared \
+             transport as it did before #295",
+            tmgi.mbs_service_id
+        );
+    }
+
     let upf_addr = configured_mb_upf_ip();
     let started = ctx
         .read()
@@ -2435,6 +2494,190 @@ mod tests {
             body,
             serde_json::to_string(&parsed).unwrap(),
             "byte-identical to the ContextUpdateRspData serde shape"
+        );
+    }
+
+    /// An SMF-leg ContextUpdate body for one consumer (#295).
+    fn smf_ctx_update_body(svc_hex: &str, nfc: &str, action: &str) -> String {
+        format!(
+            r#"{{"nfcInstanceId":"{nfc}","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc_hex}","plmnId":{{"mcc":"001","mnc":"01"}}}}}},"requestedAction":"{action}"}}"#
+        )
+    }
+
+    /// The stored session for a service id seeded by `seed_global_session`.
+    fn stored_session(svc_id: [u8; 3]) -> MbsSession {
+        let tmgi = Tmgi {
+            mbs_service_id: svc_id,
+            plmn_id: PlmnId {
+                mcc: "001".to_string(),
+                mnc: "01".to_string(),
+            },
+        };
+        mbsmf_self()
+            .read()
+            .unwrap()
+            .session_find_by_tmgi(&tmgi)
+            .expect("session exists")
+    }
+
+    /// #295 criteria 1-3: two consumers share one transport, the first TERMINATE
+    /// leaves it up, the second releases it, and a repeated TERMINATE cannot release a
+    /// transport another consumer still holds.
+    ///
+    /// `n4mb_session.is_some()` is the assertion that no Session Deletion was sent:
+    /// `release_n4mb_transport` is the only path that sends one, and it clears the
+    /// context whether or not the MB-UPF answered (which is how the existing AMF-release
+    /// test observes a release). So a context that is still present is a release that
+    /// did not happen.
+    #[tokio::test]
+    async fn two_consumers_share_a_transport_and_only_the_last_terminate_releases_it() {
+        let svc_id = [0xC2, 0x95, 0x01];
+        let svc = seed_global_session(svc_id);
+
+        for nfc in ["smf-a", "smf-b"] {
+            let rsp = post_ctx_update(
+                SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                    .with_body(smf_ctx_update_body(&svc, nfc, "START"), "application/json"),
+            )
+            .await;
+            assert_eq!(rsp.status, 200, "{nfc}'s START must succeed");
+        }
+        let session = stored_session(svc_id);
+        assert_eq!(
+            session.consumers.len(),
+            2,
+            "both consumers hold the shared transport, got {:?}",
+            session.consumers
+        );
+        assert!(session.n4mb_session.is_some(), "the transport is up");
+
+        // --- first TERMINATE: 204, and the transport stays up ---
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                smf_ctx_update_body(&svc, "smf-a", "TERMINATE"),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(rsp.status, 204, "a consumer's departure is a 204");
+        let session = stored_session(svc_id);
+        assert!(
+            session.n4mb_session.is_some(),
+            "the MB-UPF session must survive one consumer leaving: the others are still \
+             receiving on it (TS 23.247 §7.2.1.4)"
+        );
+        assert_eq!(
+            session.consumers.iter().cloned().collect::<Vec<_>>(),
+            vec!["smf-b".to_string()],
+            "only the departing consumer is removed"
+        );
+        assert_ne!(
+            session.state,
+            MbsSessionState::Suspended,
+            "a session another consumer still receives on is not suspended"
+        );
+
+        // --- a REPEATED terminate from the same consumer changes nothing ---
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                smf_ctx_update_body(&svc, "smf-a", "TERMINATE"),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        assert!(
+            stored_session(svc_id).n4mb_session.is_some(),
+            "a repeated TERMINATE must not double-decrement and release a transport \
+             smf-b still holds"
+        );
+
+        // --- the LAST consumer's terminate releases it ---
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                smf_ctx_update_body(&svc, "smf-b", "TERMINATE"),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        let session = stored_session(svc_id);
+        assert!(
+            session.n4mb_session.is_none(),
+            "the last consumer's departure releases the shared transport"
+        );
+        assert!(
+            session.consumers.is_empty(),
+            "and leaves no consumer behind"
+        );
+    }
+
+    /// #295 criterion 4: a START from a consumer already in the set does not
+    /// double-count, so a consumer that restarts and re-STARTs cannot pin the transport
+    /// past its own departure.
+    ///
+    /// Also the empty-`nfcInstanceId` fallback: such a consumer cannot be tracked, so
+    /// the first TERMINATE releases the transport exactly as it did before #295 —
+    /// stated here rather than left to be discovered.
+    #[tokio::test]
+    async fn a_repeated_start_from_one_consumer_does_not_double_count() {
+        let svc_id = [0xC2, 0x95, 0x02];
+        let svc = seed_global_session(svc_id);
+
+        for _ in 0..3 {
+            let rsp = post_ctx_update(
+                SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                    smf_ctx_update_body(&svc, "smf-a", "START"),
+                    "application/json",
+                ),
+            )
+            .await;
+            assert_eq!(rsp.status, 200);
+        }
+        assert_eq!(
+            stored_session(svc_id).consumers.len(),
+            1,
+            "three STARTs from one consumer are one consumer"
+        );
+
+        // One TERMINATE from it is therefore the last one.
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                smf_ctx_update_body(&svc, "smf-a", "TERMINATE"),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        assert!(
+            stored_session(svc_id).n4mb_session.is_none(),
+            "a consumer that STARTed three times still holds the transport once"
+        );
+
+        // ---- an untrackable consumer keeps the pre-#295 behaviour ----
+        let anon_id = [0xC2, 0x95, 0x03];
+        let anon = seed_global_session(anon_id);
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(smf_ctx_update_body(&anon, "", "START"), "application/json"),
+        )
+        .await;
+        assert_eq!(rsp.status, 200, "an empty nfcInstanceId is not a rejection");
+        assert!(
+            stored_session(anon_id).consumers.is_empty(),
+            "an empty nfcInstanceId names no consumer and must not be stored as one"
+        );
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                smf_ctx_update_body(&anon, "", "TERMINATE"),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        assert!(
+            stored_session(anon_id).n4mb_session.is_none(),
+            "with no trackable consumer the first TERMINATE releases, as before #295"
         );
     }
 
