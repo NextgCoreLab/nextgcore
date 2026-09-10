@@ -9,8 +9,9 @@ use crate::types::{
     ApplicationIdsPfds, CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer, CreateUrr,
     DownlinkDataReport, FSeid, FqCsid, GracefulReleasePeriod, LoadControlInformation, NodeId,
     NodeReportType, PfcpAssociationReleaseRequest, PfcpCause, PfcpSessionChangeInfo,
-    PfdPartialFailureInformation, RemoveFar, RemovePdr, ReportType, UpFunctionFeatures, UpdateFar,
-    UpdatePdr, UsageReportSrr, UserPlanePathFailureReport,
+    PfdPartialFailureInformation, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType,
+    UpFunctionFeatures, UpdateFar, UpdatePdr, UpdateQer, UpdateUrr, UsageReportSrr,
+    UserPlanePathFailureReport,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -710,6 +711,17 @@ pub struct SessionModificationRequest {
     pub create_bar: Option<CreateBar>,
     pub update_pdrs: Vec<UpdatePdr>,
     pub update_fars: Vec<UpdateFar>,
+    /// Update QER(s) (TS 29.244 Table 7.5.4.1-1, IE type 14). #304: absent before,
+    /// so a Session Modification closing a gate decoded to an empty list and the UP
+    /// function answered `RequestAccepted` for a policing change it never applied.
+    pub update_qers: Vec<UpdateQer>,
+    /// Update URR(s) (IE type 13).
+    pub update_urrs: Vec<UpdateUrr>,
+    /// Remove QER(s) (IE type 18).
+    pub remove_qers: Vec<RemoveQer>,
+    /// Remove URR(s) (IE type 17). A removal the UP function silently drops keeps
+    /// the session measured on a rule the CP function believes is gone.
+    pub remove_urrs: Vec<RemoveUrr>,
     pub pfcp_smreq_flags: Option<u8>,
 }
 
@@ -732,6 +744,10 @@ impl SessionModificationRequest {
             create_bar: None,
             update_pdrs: Vec::new(),
             update_fars: Vec::new(),
+            update_qers: Vec::new(),
+            update_urrs: Vec::new(),
+            remove_qers: Vec::new(),
+            remove_urrs: Vec::new(),
             pfcp_smreq_flags: None,
         }
     }
@@ -759,6 +775,23 @@ impl SessionModificationRequest {
             let header = IeHeader::new(IeType::RemoveFar as u16, rfar_buf.len() as u16);
             header.encode(buf);
             buf.put_slice(&rfar_buf);
+        }
+
+        // Remove URR before Remove QER, as in TS 29.244 Table 7.5.4.1-1.
+        for rurr in &self.remove_urrs {
+            let mut rurr_buf = BytesMut::new();
+            rurr.encode(&mut rurr_buf);
+            let header = IeHeader::new(IeType::RemoveUrr as u16, rurr_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&rurr_buf);
+        }
+
+        for rqer in &self.remove_qers {
+            let mut rqer_buf = BytesMut::new();
+            rqer.encode(&mut rqer_buf);
+            let header = IeHeader::new(IeType::RemoveQer as u16, rqer_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&rqer_buf);
         }
 
         for pdr in &self.create_pdrs {
@@ -817,6 +850,23 @@ impl SessionModificationRequest {
             buf.put_slice(&ufar_buf);
         }
 
+        // Update URR before Update QER, as in TS 29.244 Table 7.5.4.1-1.
+        for uurr in &self.update_urrs {
+            let mut uurr_buf = BytesMut::new();
+            uurr.encode(&mut uurr_buf);
+            let header = IeHeader::new(IeType::UpdateUrr as u16, uurr_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&uurr_buf);
+        }
+
+        for uqer in &self.update_qers {
+            let mut uqer_buf = BytesMut::new();
+            uqer.encode(&mut uqer_buf);
+            let header = IeHeader::new(IeType::UpdateQer as u16, uqer_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&uqer_buf);
+        }
+
         if let Some(flags) = self.pfcp_smreq_flags {
             encode_u8_ie(buf, IeType::PfcpSmreqFlags, flags);
         }
@@ -867,6 +917,22 @@ impl SessionModificationRequest {
                 t if t == IeType::UpdateFar as u16 => {
                     let mut data = ie.data;
                     result.update_fars.push(UpdateFar::decode(&mut data)?);
+                }
+                t if t == IeType::UpdateUrr as u16 => {
+                    let mut data = ie.data;
+                    result.update_urrs.push(UpdateUrr::decode(&mut data)?);
+                }
+                t if t == IeType::UpdateQer as u16 => {
+                    let mut data = ie.data;
+                    result.update_qers.push(UpdateQer::decode(&mut data)?);
+                }
+                t if t == IeType::RemoveUrr as u16 => {
+                    let mut data = ie.data;
+                    result.remove_urrs.push(RemoveUrr::decode(&mut data)?);
+                }
+                t if t == IeType::RemoveQer as u16 => {
+                    let mut data = ie.data;
+                    result.remove_qers.push(RemoveQer::decode(&mut data)?);
                 }
                 t if t == IeType::PfcpSmreqFlags as u16 => {
                     if !ie.data.is_empty() {
@@ -2456,6 +2522,94 @@ mod tests {
         } else {
             panic!("Wrong message type");
         }
+    }
+
+    /// #304: Update QER / Update URR / Remove QER / Remove URR survive
+    /// `encode` -> `decode` on a Session Modification Request (TS 29.244
+    /// Table 7.5.4.1-1).
+    ///
+    /// A ROUND TRIP rather than a field read, deliberately: before this, the four IE
+    /// *types* existed in `ie.rs` while the structs and the message fields did not, so
+    /// a request carrying them decoded cleanly with the lists EMPTY and the UP
+    /// function answered `RequestAccepted` for a modification it never applied. A test
+    /// that builds the struct and reads a field back passes in exactly that state.
+    #[test]
+    fn a_session_modification_carries_update_and_remove_qer_and_urr_over_the_wire() {
+        let mut msg = SessionModificationRequest::new();
+
+        // Close both gates on QER 7 and drop its MBR to a policing rate.
+        let mut uqer = UpdateQer::new(7);
+        uqer.gate_status = Some(GateStatus::both_closed());
+        uqer.maximum_bitrate = Some(Bitrate::new(5_000, 10_000));
+        msg.update_qers.push(uqer);
+
+        // Re-provision URR 3's volume threshold only: everything else must stay absent
+        // so the UP function leaves the measurement method it already has alone.
+        let mut uurr = UpdateUrr::new(3);
+        uurr.volume_threshold = Some(VolumeThreshold::new_total(9_000));
+        uurr.time_threshold = Some(60);
+        msg.update_urrs.push(uurr);
+
+        msg.remove_qers.push(RemoveQer::new(8));
+        msg.remove_urrs.push(RemoveUrr::new(4));
+
+        let buf = build_message(
+            &PfcpMessage::SessionModificationRequest(msg),
+            102,
+            Some(0xABCD),
+        );
+        let mut bytes = buf.freeze();
+        let (header, decoded) = parse_message(&mut bytes).unwrap();
+        assert_eq!(
+            header.message_type,
+            PfcpMessageType::SessionModificationRequest
+        );
+
+        let PfcpMessage::SessionModificationRequest(req) = decoded else {
+            panic!("Wrong message type");
+        };
+
+        assert_eq!(req.update_qers.len(), 1, "Update QER (IE type 14)");
+        assert_eq!(req.update_qers[0].qer_id, 7);
+        let gate = req.update_qers[0]
+            .gate_status
+            .expect("the Gate Status must survive the wire, or the gate stays open");
+        assert!(
+            !gate.ul_gate && !gate.dl_gate,
+            "both gates must decode as CLOSED (TS 29.244 §8.2.7: 1 = closed)"
+        );
+        let mbr = req.update_qers[0]
+            .maximum_bitrate
+            .as_ref()
+            .expect("MBR present");
+        assert_eq!((mbr.uplink, mbr.downlink), (5_000, 10_000));
+        assert!(
+            req.update_qers[0].guaranteed_bitrate.is_none(),
+            "an IE the CP function did not send must decode as absent, not as zero: \
+             `Some(0)` would re-provision a GBR of nothing"
+        );
+
+        assert_eq!(req.update_urrs.len(), 1, "Update URR (IE type 13)");
+        assert_eq!(req.update_urrs[0].urr_id, 3);
+        assert_eq!(
+            req.update_urrs[0]
+                .volume_threshold
+                .as_ref()
+                .map(|v| v.total_volume),
+            Some(9_000)
+        );
+        assert_eq!(req.update_urrs[0].time_threshold, Some(60));
+        assert!(
+            req.update_urrs[0].measurement_method.is_none()
+                && req.update_urrs[0].reporting_triggers.is_none()
+                && req.update_urrs[0].volume_quota.is_none(),
+            "an Update that names only a threshold must not restate the whole rule"
+        );
+
+        assert_eq!(req.remove_qers.len(), 1, "Remove QER (IE type 18)");
+        assert_eq!(req.remove_qers[0].qer_id, 8);
+        assert_eq!(req.remove_urrs.len(), 1, "Remove URR (IE type 17)");
+        assert_eq!(req.remove_urrs[0].urr_id, 4);
     }
 
     #[test]

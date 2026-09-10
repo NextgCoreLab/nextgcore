@@ -54,8 +54,8 @@ pub mod prelude {
         ApplyAction, Bitrate, CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer,
         CreateUrr, DestinationInterface, DownlinkDataReport, FSeid, FTeid, ForwardingParameters,
         GateStatus, MeasurementMethod, NodeId, NodeIdType, OuterHeaderCreation, OuterHeaderRemoval,
-        Pdi, PfcpCause, RemoveFar, RemovePdr, ReportType, ReportingTriggers, SourceInterface,
-        UeIpAddress, UpFunctionFeatures, UpdateFar, UpdatePdr, UsageReportSrr, VolumeMeasurement,
-        VolumeThreshold,
+        Pdi, PfcpCause, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType, ReportingTriggers,
+        SourceInterface, UeIpAddress, UpFunctionFeatures, UpdateFar, UpdatePdr, UpdateQer,
+        UpdateUrr, UsageReportSrr, VolumeMeasurement, VolumeThreshold,
     };
 }
