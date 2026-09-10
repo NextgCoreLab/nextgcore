@@ -91,6 +91,25 @@ pub struct MbsSessionId {
 ///
 /// Only the fields this bounded chunk reads/echoes are modelled; unknown
 /// fields are ignored on decode (no `deny_unknown_fields`).
+/// A TS 29.571 `TunnelAddress`: `portNumber` plus one of `ipv4Addr`/`ipv6Addr`
+/// (#76).
+///
+/// `ingressTunAddr` is an ARRAY of these, `readOnly`, `minItems: 1` — not a
+/// scalar. The create response used to emit `format!("{:#010x}", gtp_teid)`, i.e. a
+/// hex TEID string where a structured address is required, so a conformant consumer
+/// could not parse the one member of the response it actually needs to send traffic
+/// to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelAddress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv4_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv6_addr: Option<String>,
+    /// `required` in TS 29.571, so never skipped.
+    pub port_number: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtMbsSession {
@@ -98,11 +117,48 @@ pub struct ExtMbsSession {
     pub mbs_session_id: Option<MbsSessionId>,
     /// `serviceType` of type `MbsServiceType` (the spec field name — the audit
     /// text's `mbsServiceType` was wrong).
+    ///
+    /// **`required` in TS 29.571's `MbsSession`.** It used to be defaulted to
+    /// `Multicast` when absent (`_ => Multicast`), so a request that omitted a
+    /// mandatory IE was accepted and silently became a multicast session (#76).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_type: Option<MbsServiceType>,
-    /// GTP-U TEID for the multicast ingress, echoed in the create response.
+    /// `tmgiAllocReq`: the consumer asks the MB-SMF to allocate a TMGI. TS 29.571
+    /// makes `MbsSession` `anyOf [mbsSessionId, tmgiAllocReq]`, so this is the other
+    /// legal way to identify a create (#76).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ingress_tun_addr: Option<String>,
+    pub tmgi_alloc_req: Option<bool>,
+    /// `ingressTunAddrReq`: the consumer asks for ingress tunnel information.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_tun_addr_req: Option<bool>,
+    /// `ingressTunAddr`: an ARRAY of structured tunnel addresses, `readOnly` (#76).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_tun_addr: Option<Vec<TunnelAddress>>,
+    /// `ssm`: source-specific multicast identification, `writeOnly` (#76). Stored so
+    /// an SSM-identified session round-trips.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssm: Option<Ssm>,
+    /// `mbsServiceArea`, `writeOnly` (#76). Kept as the raw value: the shape is a
+    /// union of NCGI and TAI lists, and re-modelling it here without a consumer for
+    /// every member would be a model that reads as enforced and is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mbs_service_area: Option<serde_json::Value>,
+    /// `mbsServInfo` — MBS service information carrying the QoS request (#76).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mbs_serv_info: Option<serde_json::Value>,
+    /// `activityStatus`, from `MbsSession` (#76). Driven by PATCH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_status: Option<String>,
+    /// `mbsSecurityContext` from `MbsSessionExtension`
+    /// (TS29532_Nmbsmf_MBSSession.yaml:809-828), #76.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mbs_security_context: Option<serde_json::Value>,
+    /// `contactPcfInd` from `MbsSessionExtension`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_pcf_ind: Option<bool>,
+    /// `areaSessionPolicyId` from `MbsSessionExtension`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub area_session_policy_id: Option<u32>,
 }
 
 /// CreateReqData (TS 29.532 §6.2.6.2.2): MBS session creation request body.
@@ -145,15 +201,61 @@ pub enum PatchOutcome {
     ReducedArea(serde_json::Value),
 }
 
+/// What a [`PatchData`] changed, beyond the service area (#76).
+///
+/// Returned alongside the outcome so the caller persists exactly what the patch
+/// touched. An `Option` per member rather than a bool: "the patch did not mention
+/// activityStatus" and "the patch set it to something" are different, and collapsing
+/// them would have an unrelated patch reset a session's activity status.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatchChanges {
+    /// New `activityStatus`, when the patch set one.
+    pub activity_status: Option<String>,
+    /// New `mbsServInfo` (the QoS request), when the patch set one.
+    pub mbs_serv_info: Option<serde_json::Value>,
+    /// New `mbsSecurityContext`, when the patch set one.
+    pub mbs_security_context: Option<serde_json::Value>,
+}
+
+impl PatchChanges {
+    /// Whether the patch changed anything this MB-SMF models.
+    pub fn is_empty(&self) -> bool {
+        self.activity_status.is_none()
+            && self.mbs_serv_info.is_none()
+            && self.mbs_security_context.is_none()
+    }
+}
+
 /// Apply a [`PatchData`] to the session's modifiable attributes.
 ///
-/// Returns [`PatchOutcome::ReducedArea`] when the patch touches the MBS service
-/// area (path beginning `/mbsServiceArea`), echoing the new area as
-/// `redMbsServArea`; otherwise [`PatchOutcome::NoContent`]. The `tacs` sink
-/// receives any service-area-derived TAC list so the caller can persist it.
-pub fn apply_patch_data(patch: &PatchData, tacs: &mut Vec<u32>) -> PatchOutcome {
+/// # What #76 changed
+///
+/// This used to inspect **only** paths beginning `/mbsServiceArea` and return
+/// `ReducedArea` for *any* operation on one — including an `add`. TS 29.532 §5.3.2.3
+/// gives the `200` + `redMbsServArea` body to a service-area **reduction**: it is
+/// the MB-SMF telling the consumer which part of the requested area it could not
+/// serve. Returning it for an addition tells the consumer its enlarged area was cut
+/// back to exactly what it asked for, which is a different and confusing statement.
+/// So the outcome now depends on the RFC 6902 `op`: `remove` and `replace` can
+/// reduce, `add` cannot.
+///
+/// `activityStatus`, `mbsServInfo` (QoS) and `mbsSecurityContext` are now applied
+/// too; they were silently ignored, so a PATCH activating a session answered `204`
+/// and changed nothing.
+pub fn apply_patch_data(
+    patch: &PatchData,
+    tacs: &mut Vec<u32>,
+    changes: &mut PatchChanges,
+) -> PatchOutcome {
     let mut reduced: Option<serde_json::Value> = None;
     for item in patch {
+        // RFC 6902 ops this MB-SMF acts on. `move`/`copy`/`test` are accepted and
+        // ignored rather than refused: refusing a legal op would reject a conformant
+        // patch, and acting on one whose semantics need a source document we do not
+        // keep would be inventing behaviour.
+        let is_removal = item.op == "remove";
+        let is_set = item.op == "add" || item.op == "replace";
+
         if item.path.starts_with("/mbsServiceArea") {
             if let Some(value) = &item.value {
                 // Persist any TAC list carried in the new service area so a
@@ -164,8 +266,32 @@ pub fn apply_patch_data(patch: &PatchData, tacs: &mut Vec<u32>) -> PatchOutcome 
                         .filter_map(|v| v.as_u64().map(|n| n as u32))
                         .collect();
                 }
-                reduced = Some(value.clone());
+                // Only a reduction gets the 200 + redMbsServArea body.
+                if item.op == "replace" || is_removal {
+                    reduced = Some(value.clone());
+                }
+            } else if is_removal {
+                // `remove` with no value: the whole area went away, which is the
+                // maximal reduction.
+                tacs.clear();
+                reduced = Some(serde_json::Value::Array(Vec::new()));
             }
+            continue;
+        }
+
+        if !is_set {
+            continue;
+        }
+        let Some(value) = &item.value else { continue };
+        match item.path.as_str() {
+            "/activityStatus" => {
+                if let Some(status) = value.as_str() {
+                    changes.activity_status = Some(status.to_string());
+                }
+            }
+            "/mbsServInfo" => changes.mbs_serv_info = Some(value.clone()),
+            "/mbsSecurityContext" => changes.mbs_security_context = Some(value.clone()),
+            other => log::debug!("MBS session PATCH: path '{other}' is not modelled; ignored"),
         }
     }
     match reduced {
@@ -416,12 +542,24 @@ mod tests {
                     ssm: None,
                 }),
                 service_type: Some(MbsServiceType::Multicast),
-                ingress_tun_addr: Some("0x0bca0001".to_string()),
+                // #76: an ARRAY of structured TunnelAddress, not a hex TEID string.
+                ingress_tun_addr: Some(vec![TunnelAddress {
+                    ipv4_addr: Some("10.0.0.1".to_string()),
+                    ipv6_addr: None,
+                    port_number: 2152,
+                }]),
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&rsp).unwrap();
         assert!(json.contains("\"mbsSession\""));
         assert!(json.contains("\"serviceType\":\"MULTICAST\""));
+        // The structured address must serialise as TS 29.571 declares it: an object
+        // with `portNumber` (required) and one of the address members.
+        assert!(
+            json.contains("\"ingressTunAddr\":[{\"ipv4Addr\":\"10.0.0.1\",\"portNumber\":2152}]"),
+            "got {json}"
+        );
         // The 201 body deserializes back as CreateRspData.
         let back: CreateRspData = serde_json::from_str(&json).unwrap();
         assert_eq!(back, rsp);
@@ -429,27 +567,102 @@ mod tests {
 
     // ---- mbsmfd-08: PatchData 204 / reduced-area 200 ----
 
-    #[test]
-    fn test_patch_data_no_content() {
-        let json = r#"[{"op":"replace","path":"/mbsServiceInfo","value":{"5qi":9}}]"#;
+    fn patch_of(json: &str) -> (PatchOutcome, Vec<u32>, PatchChanges) {
         let patch: PatchData = serde_json::from_str(json).unwrap();
         let mut tacs = vec![];
-        assert_eq!(apply_patch_data(&patch, &mut tacs), PatchOutcome::NoContent);
+        let mut changes = PatchChanges::default();
+        let outcome = apply_patch_data(&patch, &mut tacs, &mut changes);
+        (outcome, tacs, changes)
+    }
+
+    #[test]
+    fn test_patch_data_no_content() {
+        let (outcome, tacs, changes) =
+            patch_of(r#"[{"op":"replace","path":"/mbsServiceInfo","value":{"5qi":9}}]"#);
+        assert_eq!(outcome, PatchOutcome::NoContent);
         assert!(tacs.is_empty());
+        // `/mbsServiceInfo` is not the spec's `/mbsServInfo`, so nothing is applied.
+        assert!(changes.is_empty());
     }
 
     #[test]
     fn test_patch_data_reduced_area() {
-        let json = r#"[{"op":"replace","path":"/mbsServiceArea","value":[1,2,3]}]"#;
-        let patch: PatchData = serde_json::from_str(json).unwrap();
-        let mut tacs = vec![];
-        match apply_patch_data(&patch, &mut tacs) {
+        let (outcome, tacs, _) =
+            patch_of(r#"[{"op":"replace","path":"/mbsServiceArea","value":[1,2,3]}]"#);
+        match outcome {
             PatchOutcome::ReducedArea(v) => {
                 assert_eq!(v, serde_json::json!([1, 2, 3]));
             }
             other => panic!("expected ReducedArea, got {other:?}"),
         }
         assert_eq!(tacs, vec![1, 2, 3]);
+    }
+
+    /// #76 criterion 8, the half that was wrong in a way a consumer would act on: an
+    /// `add` to the service area is NOT a reduction.
+    ///
+    /// TS 29.532 §5.3.2.3 gives the `200` + `redMbsServArea` body to a reduction — it
+    /// is the MB-SMF saying which part of the requested area it could not serve.
+    /// Returning it for an addition tells the consumer its enlarged area was cut back
+    /// to exactly what it asked for, which is a different statement and one it may
+    /// act on by re-requesting.
+    #[test]
+    fn an_added_service_area_is_not_reported_as_a_reduction() {
+        let (outcome, tacs, _) =
+            patch_of(r#"[{"op":"add","path":"/mbsServiceArea","value":[7,8]}]"#);
+        assert_eq!(
+            outcome,
+            PatchOutcome::NoContent,
+            "an addition answers 204, not 200 + redMbsServArea"
+        );
+        assert_eq!(tacs, vec![7, 8], "but the new area is still persisted");
+
+        // `replace` and `remove` can reduce, and both do report it.
+        let (outcome, _, _) =
+            patch_of(r#"[{"op":"replace","path":"/mbsServiceArea","value":[7]}]"#);
+        assert!(matches!(outcome, PatchOutcome::ReducedArea(_)));
+        let (outcome, tacs, _) = patch_of(r#"[{"op":"remove","path":"/mbsServiceArea"}]"#);
+        assert_eq!(outcome, PatchOutcome::ReducedArea(serde_json::json!([])));
+        assert!(tacs.is_empty(), "removing the area clears the TAC list");
+    }
+
+    /// #76 criterion 8: `activityStatus`, QoS and security are APPLIED, not ignored.
+    #[test]
+    fn activity_status_qos_and_security_are_applied_rather_than_acknowledged() {
+        let (outcome, _, changes) = patch_of(
+            r#"[{"op":"replace","path":"/activityStatus","value":"ACTIVE"},
+                 {"op":"replace","path":"/mbsServInfo","value":{"mbsQoSReq":{"5qi":7}}},
+                 {"op":"add","path":"/mbsSecurityContext","value":{"keyList":["k1"]}}]"#,
+        );
+        assert_eq!(
+            outcome,
+            PatchOutcome::NoContent,
+            "none of these is a service-area reduction"
+        );
+        assert_eq!(changes.activity_status.as_deref(), Some("ACTIVE"));
+        assert_eq!(
+            changes
+                .mbs_serv_info
+                .as_ref()
+                .and_then(|v| v.pointer("/mbsQoSReq/5qi"))
+                .and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+        assert!(changes.mbs_security_context.is_some());
+        assert!(!changes.is_empty());
+
+        // An unmodelled path changes nothing rather than being refused: refusing a
+        // legal RFC 6902 op would reject a conformant patch.
+        let (_, _, changes) = patch_of(r#"[{"op":"replace","path":"/somethingElse","value":1}]"#);
+        assert!(changes.is_empty());
+
+        // A `test` op is accepted and applies nothing.
+        let (_, _, changes) =
+            patch_of(r#"[{"op":"test","path":"/activityStatus","value":"ACTIVE"}]"#);
+        assert!(
+            changes.is_empty(),
+            "a `test` op must not be treated as a set"
+        );
     }
 
     // ---- mbsmfd-03: ContextUpdate serde ----
