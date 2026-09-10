@@ -34,6 +34,7 @@ mod context;
 mod easdf; // #114: EASDF selection + DNS-context lifecycle (TS 23.501 §5.6.7)
 mod eps_iwk; // #117: 5GS↔EPS interworking, EBI assignment over Namf_Communication
 mod event;
+mod event_exposure; // #79: Nsmf_EventExposure resource model + notification
 mod gn_build;
 mod gn_handler;
 mod gsm_build;
@@ -54,6 +55,7 @@ mod session_extensions; // #199-#201: IPv6 dual-stack, SSC modes, Ethernet PDU
 pub mod slicing; // Rel-17: per-slice QoS profiles
 mod smf_sm;
 mod timer;
+mod udm; // #79: Nudm_UECM_Registration + Nudm_SDM_Get sm-data
 
 use context::{smf_context_final, smf_context_init, smf_self};
 use smf_sm::SmfFsm;
@@ -469,6 +471,19 @@ async fn main() -> Result<()> {
         eps_iwk::enable();
     }
 
+    // ---- #79: UDM interaction (TS 23.502 §4.3.2.2.1 step 4) ----
+    //
+    // Off by default, as #79 asks: the E2E harness has no conformant UDM, and
+    // enforcing subscription data nothing supplies would regress the matched-sim
+    // data-plane path CI does gate on. A runtime switch rather than a cargo
+    // feature, for the reason recorded across this daemon's other switches.
+    if std::env::var("SMF_UDM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        udm::enable();
+    }
+
     // Initialize SMF context
     smf_context_init(config.max_ue, config.max_sess, config.max_bearer);
     log::info!(
@@ -554,6 +569,9 @@ async fn main() -> Result<()> {
     // Register with NRF (if configured)
     match smf_nrf_register(&config.sbi_addr, config.sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
+            // #79: the UDM must record the SAME instance id the NRF knows, or its
+            // serving-SMF record points at an instance nothing else can resolve.
+            udm::set_instance_id(&nf_instance_id);
             // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
             // (PDU sessions vs configured capacity; TS 29.510 §5.2.2.3.2).
             nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
@@ -1140,6 +1158,20 @@ impl DefaultDnnError {
     }
 }
 
+/// The ONE agreement about the `UDM_SBI_ADDR` / `UDM_SBI_PORT` / `NRF_URI`
+/// environment, for tests.
+///
+/// Declared at the crate root rather than inside `mod tests` because `udm.rs`'s
+/// tests set the same variables (#79) and a sibling module cannot reach a static
+/// inside this file's test submodule. It was in `mod tests` first, and the result
+/// was a flaky `the_smf_registers_with_the_udm_and_fetches_sm_data`: another test
+/// re-pointed `UDM_SBI_PORT` at its own loopback UDM between the registration and
+/// the `sm-data` fetch, so the fetch reached a server that answers 201 to
+/// everything and returned no subscription. Env is per-process; two locks over it
+/// are two disjoint agreements.
+#[cfg(test)]
+pub(crate) static UDM_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Resolve a UDM `nudm-sdm` endpoint.
 ///
 /// NRF discovery first (TS 29.510 §5.3.2), because that is the mechanism a real
@@ -1151,6 +1183,25 @@ impl DefaultDnnError {
 /// carry a full cache-populating discovery routine, and a third copy is a
 /// maintenance cost this issue does not need. What the SMF wants is one address.
 async fn discover_udm_sdm_endpoint() -> Option<(String, u16)> {
+    discover_udm_service_endpoint("nudm-sdm").await
+}
+
+/// Resolve a UDM `nudm-uecm` endpoint (#79).
+///
+/// Separate from the `nudm-sdm` lookup rather than reusing it, because a UDM may
+/// advertise the two services on different ports — `udm_service_endpoint_from_search_result`
+/// already prefers a service's own `ipEndPoints` for exactly that reason, and
+/// asking for one service name and using the answer for another would defeat it.
+pub(crate) async fn discover_udm_uecm_endpoint() -> Option<(String, u16)> {
+    discover_udm_service_endpoint("nudm-uecm").await
+}
+
+/// The shared body of the two lookups above.
+///
+/// The env fallback is deliberately shared: `UDM_SBI_ADDR`/`UDM_SBI_PORT` names one
+/// UDM, so a deployment with no NRF gets both services at the same address, which
+/// is what a single-container UDM actually does.
+async fn discover_udm_service_endpoint(service: &str) -> Option<(String, u16)> {
     let sbi_ctx = global_context();
     let nrf_uri = match sbi_ctx.get_nrf_uri().await {
         Some(uri) => Some(uri),
@@ -1160,21 +1211,23 @@ async fn discover_udm_sdm_endpoint() -> Option<(String, u16)> {
     if let Some(nrf_uri) = nrf_uri {
         if let Some((nrf_host, nrf_port)) = parse_host_port(&nrf_uri) {
             let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
-            let path = "/nnrf-disc/v1/nf-instances\
-                        ?target-nf-type=UDM&requester-nf-type=SMF&service-names=nudm-sdm";
-            match client.get(path).await {
+            let path = format!(
+                "/nnrf-disc/v1/nf-instances\
+                 ?target-nf-type=UDM&requester-nf-type=SMF&service-names={service}"
+            );
+            match client.get(&path).await {
                 Ok(resp) if resp.status == 200 => {
                     if let Some(ep) = resp
                         .http
                         .content
                         .as_deref()
                         .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
-                        .and_then(|json| udm_sdm_endpoint_from_search_result(&json))
+                        .and_then(|json| udm_service_endpoint_from_search_result(&json, service))
                     {
-                        log::debug!("UDM nudm-sdm discovered via NRF at {}:{}", ep.0, ep.1);
+                        log::debug!("UDM {service} discovered via NRF at {}:{}", ep.0, ep.1);
                         return Some(ep);
                     }
-                    log::debug!("NRF returned no usable UDM nudm-sdm endpoint");
+                    log::debug!("NRF returned no usable UDM {service} endpoint");
                 }
                 Ok(resp) => log::debug!("NRF UDM discovery returned status {}", resp.status),
                 Err(e) => log::debug!("NRF UDM discovery failed: {e}"),
@@ -1190,16 +1243,20 @@ async fn discover_udm_sdm_endpoint() -> Option<(String, u16)> {
     Some((host, port))
 }
 
-/// Pull a `nudm-sdm` address out of a TS 29.510 `SearchResult`.
+/// Pull a named UDM service's address out of a TS 29.510 `SearchResult`.
 ///
 /// Split out so the decode is testable without an NRF. Prefers the service's own
 /// `ipEndPoints` over the instance's `ipv4Addresses`, because a UDM may serve
-/// `nudm-sdm` on a different port from its other services.
-fn udm_sdm_endpoint_from_search_result(json: &serde_json::Value) -> Option<(String, u16)> {
+/// `nudm-sdm` on a different port from `nudm-uecm` — which is why the service name
+/// is a parameter rather than a constant (#79).
+fn udm_service_endpoint_from_search_result(
+    json: &serde_json::Value,
+    service: &str,
+) -> Option<(String, u16)> {
     for instance in json.get("nfInstances")?.as_array()? {
         let services = instance.get("nfServices").and_then(|v| v.as_array());
         for svc in services.into_iter().flatten() {
-            if svc.get("serviceName").and_then(|v| v.as_str()) != Some("nudm-sdm") {
+            if svc.get("serviceName").and_then(|v| v.as_str()) != Some(service) {
                 continue;
             }
             let endpoint = svc.get("ipEndPoints").and_then(|v| v.as_array());
@@ -1472,12 +1529,29 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // Event Exposure Service (nsmf-event-exposure)
         // =====================================================================
 
-        // Subscribe to events
+        // Nsmf_EventExposure (TS 29.508 §4.2.2), #79: a subscription is a
+        // PERSISTED resource, so the collection takes POST and the individual
+        // resource takes GET / PUT / DELETE. Before #79 only POST and DELETE
+        // existed and neither touched any store.
+        //
         // POST /nsmf-event-exposure/v1/subscriptions
-        ("nsmf-event-exposure", "subscriptions", "POST") => handle_event_subscribe().await,
+        ("nsmf-event-exposure", "subscriptions", "POST") if resource_id.is_none() => {
+            handle_event_subscribe(&request).await
+        }
 
-        // Unsubscribe from events
-        // DELETE /nsmf-event-exposure/v1/subscriptions/{subscriptionId}
+        // GET /nsmf-event-exposure/v1/subscriptions/{subId}
+        ("nsmf-event-exposure", "subscriptions", "GET") => match resource_id {
+            Some(sub_id) => handle_event_subscription_get(sub_id).await,
+            None => send_bad_request("Missing subscription ID", None),
+        },
+
+        // PUT /nsmf-event-exposure/v1/subscriptions/{subId}
+        ("nsmf-event-exposure", "subscriptions", "PUT") => match resource_id {
+            Some(sub_id) => handle_event_subscription_put(sub_id, &request).await,
+            None => send_bad_request("Missing subscription ID", None),
+        },
+
+        // DELETE /nsmf-event-exposure/v1/subscriptions/{subId}
         ("nsmf-event-exposure", "subscriptions", "DELETE") => {
             if let Some(sub_id) = resource_id {
                 handle_event_unsubscribe(sub_id).await
@@ -2729,6 +2803,47 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         Vec::new(),
     ));
 
+    // ---- #79: UDM interaction (TS 23.502 §4.3.2.2.1 step 4) ----
+    //
+    // Both legs happen BEFORE the PCF call and before PFCP establishment, which is
+    // where the spec puts them and what makes them useful: the subscribed values
+    // are an INPUT to the policy decision, so fetching them afterwards could only
+    // override a PCF decision -- a conformance defect rather than a degradation.
+    //
+    // Off by default (`SMF_UDM=1`). Both are non-fatal: a session that could not
+    // reach the UDM is a working session on config-default QoS, and refusing it
+    // would make a UDM outage a total outage.
+    //
+    // The registration is awaited rather than spawned so its failure is logged
+    // against this session rather than arriving after the response.
+    let serving_plmn = req_body["guami"]["plmnId"]
+        .as_object()
+        .and_then(|p| {
+            Some((
+                p.get("mcc")?.as_str()?.to_string(),
+                p.get("mnc")?.as_str()?.to_string(),
+            ))
+        })
+        .or_else(|| {
+            let p = req_body["servingNetwork"].as_object()?;
+            Some((
+                p.get("mcc")?.as_str()?.to_string(),
+                p.get("mnc")?.as_str()?.to_string(),
+            ))
+        });
+    udm::register_as_serving_smf(
+        &supi,
+        pdu_session_id,
+        &dnn,
+        sst,
+        snssai_sd.as_deref(),
+        serving_plmn
+            .as_ref()
+            .map(|(mcc, mnc)| (mcc.as_str(), mnc.as_str())),
+    )
+    .await;
+    let subscribed = udm::fetch_sm_data(&supi, &dnn, sst, snssai_sd.as_deref()).await;
+
     // ---- Npcf_SMPolicyControl_Create (TS 29.512 §4.2.2) ----
     let notification_uri = format!(
         "{}/nsmf-callback/v1/sm-policy-notify/{}",
@@ -2746,7 +2861,15 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             // DNN-aware default: an XR DNN (e.g. "xr") yields a delay-critical
             // GBR XR 5QI (82-85) with a populated PCC rule, exercising the
             // XR-aware QoS-flow binding + PFCP QER setup below even without a PCF.
-            policy::PolicyDecision::config_default_for_dnn(&dnn)
+            // #79: the subscribed values, when the UDM supplied any, are the
+            // baseline here -- the config default is what they fall back TO, not
+            // the other way round. With a PCF present its decision wins outright
+            // (TS 23.503 §6.1.3.2), which is why this applies only on this arm.
+            let mut decision = policy::PolicyDecision::config_default_for_dnn(&dnn);
+            if let Some(ref sub) = subscribed {
+                decision.apply_subscribed_baseline(sub);
+            }
+            decision
         }
         Some(pcf) => {
             let create_ctx = policy::SmPolicyCreateContext {
@@ -3098,6 +3221,11 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         // Issue #191: after the write guard drops (see `SmfContext::persist`).
         context.persist();
     }
+
+    // #79: Nsmf_EventExposure_Notify for PDU_SES_EST (TS 29.508 §4.2.3.2). After
+    // the binding is stored, so the session a consumer is told about exists by the
+    // time the notification lands.
+    event_exposure::notify(event_exposure::event::PDU_SES_EST, &supi, pdu_session_id).await;
 
     // ---- N1: PDU Session Establishment Accept with authorized QoS ----
     // S-NSSAI (smfd-04) is taken from the create request's S-NSSAI; the SD hex
@@ -4497,6 +4625,19 @@ async fn handle_sm_context_release(
         }
     }
 
+    // #79: Nsmf_EventExposure_Notify for PDU_SES_REL (TS 29.508 §4.2.3.2). Emitted
+    // from the binding taken above, so a subscription scoped to this SUPI or this
+    // PDU session id can be matched. A session with no matching subscription costs
+    // one map read.
+    if let Some(binding) = &binding {
+        event_exposure::notify(
+            event_exposure::event::PDU_SES_REL,
+            &binding.supi,
+            binding.psi,
+        )
+        .await;
+    }
+
     // Drive the GSM FSM: Operational → WaitPfcpDeletion
     let mut fsm = binding.as_ref().map(|b| b.fsm.clone());
     if let Some(ref mut f) = fsm {
@@ -4795,50 +4936,66 @@ fn build_ue_eps_pdn_connection(sess: &context::SmfSess, eps_bearer_id: Option<u8
 
 /// Handle PDU Session Create
 async fn handle_pdu_session_create(_request: &SbiRequest) -> SbiResponse {
-    log::info!("PDU Session Create request received");
+    log::info!("H-SMF PDU Session Create request received (home-routed roaming)");
+    hsmf_not_implemented("Create")
+}
 
-    let pdu_session_ref = "1";
-    let response_body = serde_json::json!({
-        "pduSessionRef": pdu_session_ref,
-        "cause": "REL_DUE_TO_HO"
-    });
-
-    let location = format!("/nsmf-pdusession/v1/pdu-sessions/{pdu_session_ref}");
-
-    SbiResponse::with_status(201)
-        .with_header("Location", location)
-        .with_body(response_body.to_string(), "application/json")
+/// The H-SMF `/pdu-sessions` service answers `501`, deliberately.
+///
+/// #79's criterion offers a choice: implement Create/Update/Release with conformant
+/// `PduSessionCreatedData`/`HsmfUpdatedData` bodies, or return `501` rather than a
+/// fabricated `201`. `501` is taken, for two reasons.
+///
+/// **What it replaces was actively misleading.** Create answered `201` with
+/// `{"pduSessionRef": "1", "cause": "REL_DUE_TO_HO"}` — a **release cause on a
+/// create success**, at a hardcoded reference, with no session created. A partner
+/// V-SMF parsing that gets "your session was established, and by the way it was
+/// released for handover", about a session that does not exist. Update and Release
+/// answered empty `200`/`204` bodies where `HsmfUpdatedData` is expected.
+///
+/// **Home-routed roaming is not implemented here.** There is no V-SMF/H-SMF split
+/// in this tree: nothing establishes an H-SMF session, `PduSessionCreatedData`
+/// requires `pduSessionType`, `sscMode` and one of `hSmfInstanceId`/`smfInstanceId`
+/// (a `oneOf`), and every one of those would have to be invented. This project's
+/// recorded rule for exactly this case is that a spec-defined resource whose
+/// dependency is absent answers `501` — never a `404`, never a fabricated `2xx`.
+///
+/// A partner then fails **cleanly and diagnosably** at the point of the create,
+/// instead of proceeding on a session that was never built. All three operations
+/// answer the same way, because a partner that cannot create can never legitimately
+/// update or release either, and leaving those at `2xx` would say otherwise.
+fn hsmf_not_implemented(operation: &str) -> SbiResponse {
+    nextgcore_sbi::server::send_error(
+        501,
+        "Not Implemented",
+        &format!(
+            "H-SMF PDU Session {operation} is not implemented: this SMF does not \
+             support home-routed roaming (TS 29.502 §5.2.2.7). No V-SMF/H-SMF split \
+             exists in this deployment."
+        ),
+        Some("NOT_IMPLEMENTED"),
+    )
 }
 
 /// Handle PDU Session Update
 async fn handle_pdu_session_update(pdu_session_ref: &str) -> SbiResponse {
-    log::info!("PDU Session Update request for ref={pdu_session_ref}");
-
-    let ctx = smf_self();
-    if let Ok(context) = ctx.read() {
-        if context
-            .sess_find_by_pdu_session_ref(pdu_session_ref)
-            .is_some()
-        {
-            return SbiResponse::with_status(200);
-        }
-    }
-
-    SbiResponse::with_status(404)
+    log::info!("H-SMF PDU Session Update request for ref={pdu_session_ref}");
+    // Answered 200 with an EMPTY body where TS 29.502 §5.2.2.8 expects
+    // `HsmfUpdatedData`. See `hsmf_not_implemented`: a partner that cannot create
+    // through this service can never legitimately update through it either, and a
+    // 2xx here would say otherwise.
+    hsmf_not_implemented("Update")
 }
 
 /// Handle PDU Session Release
 async fn handle_pdu_session_release(pdu_session_ref: &str) -> SbiResponse {
-    log::info!("PDU Session Release request for ref={pdu_session_ref}");
-
-    let ctx = smf_self();
-    if let Ok(context) = ctx.read() {
-        if let Some(sess) = context.sess_find_by_pdu_session_ref(pdu_session_ref) {
-            context.sess_remove(sess.id);
-        }
-    }
-
-    SbiResponse::with_status(204)
+    log::info!("H-SMF PDU Session Release request for ref={pdu_session_ref}");
+    // Used to remove a session by `pduSessionRef` and answer 204. That reference
+    // space is the H-SMF's, which this SMF does not populate, so the lookup could
+    // only ever match a session some other path had registered under it -- i.e. it
+    // was a way for a partner to delete state it did not own. 501 both refuses the
+    // unimplemented service and closes that.
+    hsmf_not_implemented("Release")
 }
 
 // =============================================================================
@@ -4846,25 +5003,115 @@ async fn handle_pdu_session_release(pdu_session_ref: &str) -> SbiResponse {
 // =============================================================================
 
 /// Handle Event Subscribe
-async fn handle_event_subscribe() -> SbiResponse {
-    log::info!("Event subscription request received");
-
-    let subscription_id = uuid::Uuid::new_v4().to_string();
-    let response_body = serde_json::json!({
-        "subscriptionId": subscription_id
-    });
-
-    let location = format!("/nsmf-event-exposure/v1/subscriptions/{subscription_id}");
-
+/// `POST /nsmf-event-exposure/v1/subscriptions` — Nsmf_EventExposure_Subscribe
+/// (TS 29.508 §4.2.2.2), #79.
+///
+/// Answers `201` + `Location` + the created `NsmfEventExposure` document. The
+/// previous version ignored the body, returned `{"subscriptionId": ...}` (not a
+/// schema in TS 29.508) and stored nothing, so the id it handed out referenced
+/// nothing and no notification could ever be sent to it.
+async fn handle_event_subscribe(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+    else {
+        return send_bad_request(
+            "Request body is missing or not valid JSON",
+            Some("INVALID_MSG_FORMAT"),
+        );
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let sub = match event_exposure::parse_subscription(&body, id.clone()) {
+        Ok(sub) => sub,
+        Err(e) => return send_bad_request(&e.detail(), Some(e.cause())),
+    };
+    log::info!(
+        "Event subscription {id} created: events={:?} notifUri={} ({} stored)",
+        sub.events,
+        sub.notif_uri,
+        event_exposure::count() + 1
+    );
+    let document = event_exposure::insert(sub);
     SbiResponse::with_status(201)
-        .with_header("Location", location)
-        .with_body(response_body.to_string(), "application/json")
+        .with_header("Location", event_exposure::resource_path(&id))
+        .with_json_body(&document)
+        .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
-/// Handle Event Unsubscribe
+/// `GET /nsmf-event-exposure/v1/subscriptions/{subId}` (TS 29.508 §4.2.2.3), #79.
+async fn handle_event_subscription_get(subscription_id: &str) -> SbiResponse {
+    match event_exposure::find(subscription_id) {
+        Some(sub) => {
+            let mut document = sub.document;
+            if let Some(obj) = document.as_object_mut() {
+                obj.insert("subId".to_string(), serde_json::json!(subscription_id));
+                obj.insert(
+                    "self".to_string(),
+                    serde_json::json!(event_exposure::resource_path(subscription_id)),
+                );
+            }
+            SbiResponse::with_status(200)
+                .with_json_body(&document)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => event_subscription_not_found(subscription_id),
+    }
+}
+
+/// `PUT /nsmf-event-exposure/v1/subscriptions/{subId}` (TS 29.508 §4.2.2.4), #79.
+///
+/// Replaces an existing subscription and answers `200` with the stored document. A
+/// `PUT` to an unknown id is a `404`, not a create: the id space belongs to the
+/// SMF, so honouring a consumer-chosen one would let a consumer mint resources.
+async fn handle_event_subscription_put(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    let Some(body) = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+    else {
+        return send_bad_request(
+            "Request body is missing or not valid JSON",
+            Some("INVALID_MSG_FORMAT"),
+        );
+    };
+    let sub = match event_exposure::parse_subscription(&body, subscription_id.to_string()) {
+        Ok(sub) => sub,
+        Err(e) => return send_bad_request(&e.detail(), Some(e.cause())),
+    };
+    if !event_exposure::replace(subscription_id, sub) {
+        return event_subscription_not_found(subscription_id);
+    }
+    log::info!("Event subscription {subscription_id} replaced");
+    handle_event_subscription_get(subscription_id).await
+}
+
+/// `DELETE /nsmf-event-exposure/v1/subscriptions/{subId}` —
+/// Nsmf_EventExposure_Unsubscribe (TS 29.508 §4.2.2.5), #79.
+///
+/// `404` on an unknown id. The previous version answered `204` for anything, so a
+/// consumer could not tell a successful unsubscribe from a subscription that had
+/// never existed — which matters, because the latter means its notifications were
+/// never going to arrive.
 async fn handle_event_unsubscribe(subscription_id: &str) -> SbiResponse {
-    log::info!("Event unsubscription request for id={subscription_id}");
-    SbiResponse::with_status(204)
+    match event_exposure::remove(subscription_id) {
+        Some(_) => {
+            log::info!("Event subscription {subscription_id} removed");
+            SbiResponse::with_status(204)
+        }
+        None => event_subscription_not_found(subscription_id),
+    }
+}
+
+fn event_subscription_not_found(subscription_id: &str) -> SbiResponse {
+    nextgcore_sbi::server::send_error(
+        404,
+        "Not Found",
+        &format!("Event subscription '{subscription_id}' not found"),
+        Some("SUBSCRIPTION_NOT_FOUND"),
+    )
 }
 
 // =============================================================================
@@ -5726,7 +5973,7 @@ mod tests {
             ]
         });
         assert_eq!(
-            udm_sdm_endpoint_from_search_result(&result),
+            udm_service_endpoint_from_search_result(&result, "nudm-sdm"),
             Some(("10.0.0.9".to_string(), 8080)),
             "the nudm-sdm service's own endpoint wins over the instance address"
         );
@@ -5737,7 +5984,7 @@ mod tests {
                               "nfServices": [{ "serviceName": "nudm-sdm" }] }]
         });
         assert_eq!(
-            udm_sdm_endpoint_from_search_result(&no_endpoints),
+            udm_service_endpoint_from_search_result(&no_endpoints, "nudm-sdm"),
             Some(("10.0.0.3".to_string(), 7777))
         );
 
@@ -5750,18 +5997,17 @@ mod tests {
                 "nfServices": [{ "serviceName": "nudm-uecm" }] }] }),
         ] {
             assert_eq!(
-                udm_sdm_endpoint_from_search_result(&empty),
+                udm_service_endpoint_from_search_result(&empty, "nudm-sdm"),
                 None,
                 "body {empty} must not yield an endpoint"
             );
         }
     }
 
-    /// Serialises the tests that set the process-global `UDM_SBI_ADDR` /
-    /// `UDM_SBI_PORT` / `NRF_URI` environment. Env is per-process, so two of these
-    /// running concurrently would each see the other's UDM address — the same
-    /// process-global-state race the workspace has hit before with `UDR_SBI_*`.
-    static UDM_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// The lock over the `UDM_SBI_*` / `NRF_URI` environment now lives at the crate
+    /// root, because `udm.rs`'s tests take the SAME one (#79). Re-exported under the
+    /// local name so the call sites below are unchanged.
+    use super::UDM_ENV_TEST_LOCK;
 
     /// **Issue #204, end to end.** `fetch_subscribed_default_dnn` really reaches a
     /// UDM, sends a conformant `Nudm_SDM_Get smf-select-data` with a
@@ -6942,6 +7188,355 @@ mod tests {
             *carried.last().expect("last octet"),
             6,
             "the descriptor must name the EBI the AMF assigned"
+        );
+    }
+
+    // ---- #79: Nsmf_EventExposure, UDM interaction, H-SMF -------------------
+
+    fn events_request(method: &str, path: &str, body: Option<serde_json::Value>) -> SbiRequest {
+        let mut req = match method {
+            "POST" => SbiRequest::post(path.to_string()),
+            "GET" => SbiRequest::get(path.to_string()),
+            "PUT" => SbiRequest::put(path.to_string()),
+            "DELETE" => SbiRequest::delete(path.to_string()),
+            other => panic!("unsupported method {other}"),
+        };
+        if let Some(body) = body {
+            req = req.with_body(body.to_string(), "application/json");
+        }
+        req
+    }
+
+    fn subscription_body(notif_uri: &str, supi: Option<&str>) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "notifId": "corr-79",
+            "notifUri": notif_uri,
+            "eventSubs": [{ "event": "PDU_SES_REL" }],
+        });
+        if let Some(supi) = supi {
+            body["supi"] = serde_json::json!(supi);
+        }
+        body
+    }
+
+    /// #79 criterion 4: create → get → delete, and `404` on an unknown id.
+    ///
+    /// Driven through the ROUTER, because half of what was missing was routing: no
+    /// `GET` and no `PUT` arm existed at all, so a test calling the handlers
+    /// directly would pass against a service a consumer cannot reach.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn event_subscriptions_are_a_real_resource_with_get_put_and_a_404() {
+        let _g = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+
+        // Create.
+        let resp = smf_sbi_request_handler(events_request(
+            "POST",
+            "/nsmf-event-exposure/v1/subscriptions",
+            Some(subscription_body("http://127.0.0.1:9/cb", Some("imsi-79"))),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "body: {:?}", resp.http.content);
+        let location = resp
+            .http
+            .get_header("location")
+            .expect("201 must carry a Location")
+            .to_string();
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        // An NsmfEventExposure document, not the bare {"subscriptionId": ...} the
+        // facade returned.
+        assert!(
+            body.get("subscriptionId").is_none(),
+            "subscriptionId is not a member of NsmfEventExposure, got {body}"
+        );
+        let sub_id = body["subId"].as_str().expect("subId").to_string();
+        assert_eq!(body["notifId"], serde_json::json!("corr-79"));
+        assert_eq!(
+            body["eventSubs"][0]["event"],
+            serde_json::json!("PDU_SES_REL")
+        );
+        assert_eq!(
+            location,
+            format!("/nsmf-event-exposure/v1/subscriptions/{sub_id}")
+        );
+
+        // Get.
+        let resp = smf_sbi_request_handler(events_request("GET", &location, None)).await;
+        assert_eq!(resp.status, 200, "the created resource must be retrievable");
+        let fetched: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(fetched["subId"], serde_json::json!(sub_id));
+        assert_eq!(
+            fetched["notifUri"],
+            serde_json::json!("http://127.0.0.1:9/cb")
+        );
+
+        // Put replaces.
+        let resp = smf_sbi_request_handler(events_request(
+            "PUT",
+            &location,
+            Some(subscription_body(
+                "http://127.0.0.1:9/moved",
+                Some("imsi-79"),
+            )),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let replaced: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(
+            replaced["notifUri"],
+            serde_json::json!("http://127.0.0.1:9/moved"),
+            "the PUT must be applied, not merely acknowledged"
+        );
+
+        // A PUT to an unknown id must NOT create one.
+        let resp = smf_sbi_request_handler(events_request(
+            "PUT",
+            "/nsmf-event-exposure/v1/subscriptions/never-existed",
+            Some(subscription_body("http://127.0.0.1:9/cb", None)),
+        ))
+        .await;
+        assert_eq!(resp.status, 404);
+
+        // Delete, then delete again: 204 then 404. The facade answered 204 for
+        // both, so a consumer could not tell an unsubscribe from a subscription
+        // that had never existed.
+        assert_eq!(
+            smf_sbi_request_handler(events_request("DELETE", &location, None))
+                .await
+                .status,
+            204
+        );
+        assert_eq!(
+            smf_sbi_request_handler(events_request("DELETE", &location, None))
+                .await
+                .status,
+            404,
+            "a second DELETE must 404: the resource is gone"
+        );
+        assert_eq!(
+            smf_sbi_request_handler(events_request("GET", &location, None))
+                .await
+                .status,
+            404
+        );
+
+        // A body missing a required member is refused rather than stored.
+        for missing in ["notifId", "notifUri", "eventSubs"] {
+            let mut body = subscription_body("http://127.0.0.1:9/cb", None);
+            body.as_object_mut().expect("obj").remove(missing);
+            let resp = smf_sbi_request_handler(events_request(
+                "POST",
+                "/nsmf-event-exposure/v1/subscriptions",
+                Some(body),
+            ))
+            .await;
+            assert_eq!(
+                resp.status, 400,
+                "a subscription without {missing} must be refused"
+            );
+        }
+        event_exposure::clear_for_test();
+    }
+
+    /// #79 criterion 5: a subscribed event occurrence produces a notification at
+    /// the subscribed `notifUri`.
+    ///
+    /// `PDU_SES_REL` is chosen because the release handler is reachable from a test,
+    /// unlike the establishment path (which needs a UPF — see #289). The
+    /// notification is captured on a real loopback consumer, so what is asserted is
+    /// a delivered HTTP request rather than a function having been called.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_released_session_notifies_its_event_subscriber() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let _g = event_exposure::lock_store();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        event_exposure::clear_for_test();
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let port = nextgcore_sbi::test_support::free_port();
+        let consumer = SbiServer::new(SbiServerConfig::new(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
+        consumer
+            .start(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push((
+                        req.header.uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                    ));
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("consumer start");
+
+        let supi = "imsi-001010000000079";
+        let resp = smf_sbi_request_handler(events_request(
+            "POST",
+            "/nsmf-event-exposure/v1/subscriptions",
+            Some(subscription_body(
+                &format!("http://127.0.0.1:{port}/nsmf-events"),
+                Some(supi),
+            )),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+
+        // A session for that SUPI, then release it.
+        seed_binding("events-release-ref", 4);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut("events-release-ref") {
+                    b.supi = supi.to_string();
+                    b.psi = 4;
+                }
+            }
+        }
+        let _ = handle_sm_context_release("events-release-ref", None).await;
+
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let notif = requests
+            .iter()
+            .find(|(uri, _)| uri.contains("/nsmf-events"))
+            .unwrap_or_else(|| {
+                panic!("a PDU_SES_REL notification must reach the subscriber, got {requests:?}")
+            });
+        let body: serde_json::Value = serde_json::from_str(&notif.1).expect("json");
+        assert_eq!(
+            body["notifId"],
+            serde_json::json!("corr-79"),
+            "the notification must carry the CONSUMER's correlation id"
+        );
+        assert_eq!(
+            body["eventNotifs"][0]["event"],
+            serde_json::json!("PDU_SES_REL")
+        );
+        assert_eq!(body["eventNotifs"][0]["supi"], serde_json::json!(supi));
+        assert_eq!(body["eventNotifs"][0]["pduSeId"], serde_json::json!(4));
+
+        // A subscription scoped to a DIFFERENT SUPI must not be notified: that
+        // would leak one subscriber's session events to another's consumer.
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        seed_binding("events-release-other", 5);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut("events-release-other") {
+                    b.supi = "imsi-999990000000000".to_string();
+                    b.psi = 5;
+                }
+            }
+        }
+        let _ = handle_sm_context_release("events-release-other", None).await;
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "a SUPI-scoped subscription must not be notified about another subscriber"
+        );
+
+        event_exposure::clear_for_test();
+        consumer.stop().await.expect("stop");
+    }
+
+    /// #79 criterion 6: the H-SMF `/pdu-sessions` service never answers a release
+    /// cause on a create success.
+    ///
+    /// It used to answer `201` with `{"pduSessionRef": "1", "cause":
+    /// "REL_DUE_TO_HO"}` — a release cause on a create — at a hardcoded reference,
+    /// with no session created. `501` is the recorded answer in this project for a
+    /// spec-defined resource whose dependency is absent.
+    #[tokio::test]
+    async fn the_hsmf_pdu_sessions_service_answers_501_and_never_a_release_cause() {
+        for (method, path) in [
+            ("POST", "/nsmf-pdusession/v1/pdu-sessions"),
+            ("POST", "/nsmf-pdusession/v1/pdu-sessions/1/modify"),
+            ("POST", "/nsmf-pdusession/v1/pdu-sessions/1/release"),
+        ] {
+            let resp = smf_sbi_request_handler(events_request(
+                method,
+                path,
+                Some(serde_json::json!({ "vsmfId": "vsmf-1" })),
+            ))
+            .await;
+            assert_eq!(resp.status, 501, "{method} {path} must answer 501");
+            let body = resp.http.content.clone().unwrap_or_default();
+            assert!(
+                !body.contains("REL_DUE_TO_HO"),
+                "a create must never carry a release cause, got {body}"
+            );
+            let json: serde_json::Value = serde_json::from_str(&body).expect("ProblemDetails");
+            assert_eq!(json["cause"], serde_json::json!("NOT_IMPLEMENTED"));
+            assert_eq!(json["status"], serde_json::json!(501));
+        }
+    }
+
+    /// #79 criteria 1 + 2: the subscribed session-AMBR and default 5QI are applied,
+    /// with the configured default as the fallback and NOT the other way round.
+    ///
+    /// Asserted on `apply_subscribed_baseline` because the config-default arm of the
+    /// create path is downstream of the N4 leg no test can reach (#289). The
+    /// per-member behaviour is the part that matters: a whole-struct replacement
+    /// would make an absent subscribed member silently mean 0.
+    #[test]
+    fn subscribed_values_win_over_the_config_default_per_member() {
+        let subscribed = udm::SubscribedSmData {
+            sess_ambr_ul_bps: Some(100_000_000),
+            sess_ambr_dl_bps: Some(500_000_000),
+            default_5qi: Some(7),
+            arp_priority_level: Some(3),
+        };
+        let mut decision = policy::PolicyDecision::config_default_for_dnn("internet");
+        let configured_5qi = decision.def_five_qi;
+        decision.apply_subscribed_baseline(&subscribed);
+        assert_eq!(decision.sess_ambr_ul_bps, 100_000_000);
+        assert_eq!(decision.sess_ambr_dl_bps, 500_000_000);
+        assert_eq!(decision.def_five_qi, 7);
+        assert_eq!(decision.arp_priority_level, 3);
+        assert_ne!(
+            decision.def_five_qi, configured_5qi,
+            "the subscription must actually displace the configured value"
+        );
+
+        // A subscription stating only the AMBR leaves the configured 5QI alone.
+        let partial = udm::SubscribedSmData {
+            sess_ambr_ul_bps: Some(1_000_000),
+            ..Default::default()
+        };
+        let mut decision = policy::PolicyDecision::config_default_for_dnn("internet");
+        let configured_dl = decision.sess_ambr_dl_bps;
+        decision.apply_subscribed_baseline(&partial);
+        assert_eq!(decision.sess_ambr_ul_bps, 1_000_000);
+        assert_eq!(
+            decision.sess_ambr_dl_bps, configured_dl,
+            "an absent subscribed member must fall back to config, not to 0"
+        );
+        assert_eq!(decision.def_five_qi, 9);
+
+        // An empty subscription changes nothing at all.
+        let mut decision = policy::PolicyDecision::config_default_for_dnn("internet");
+        let before = (
+            decision.sess_ambr_ul_bps,
+            decision.sess_ambr_dl_bps,
+            decision.def_five_qi,
+            decision.arp_priority_level,
+        );
+        decision.apply_subscribed_baseline(&udm::SubscribedSmData::default());
+        assert_eq!(
+            (
+                decision.sess_ambr_ul_bps,
+                decision.sess_ambr_dl_bps,
+                decision.def_five_qi,
+                decision.arp_priority_level
+            ),
+            before
         );
     }
 

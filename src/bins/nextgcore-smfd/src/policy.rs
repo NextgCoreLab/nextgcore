@@ -92,6 +92,34 @@ pub struct PolicyDecision {
 }
 
 impl PolicyDecision {
+    /// Overlay the subscribed SM data onto a config-default decision (#79).
+    ///
+    /// Each member is applied ONLY when the subscription states it, so a
+    /// subscription that carries a session-AMBR and no 5QI leaves the configured
+    /// 5QI in place rather than zeroing it. That per-member granularity is the
+    /// point: the criterion is "subscribed values win over config where present,
+    /// config is the fallback", and a whole-struct replacement would make an absent
+    /// member silently mean 0.
+    ///
+    /// Applied to the config-default arm only. With a PCF configured its decision
+    /// is authoritative (TS 23.503 §6.1.3.2 has the PCF take the subscribed values
+    /// as input and answer with authorised ones), so overlaying the subscription on
+    /// top of a PCF answer would override the authorisation with its own input.
+    pub fn apply_subscribed_baseline(&mut self, sub: &crate::udm::SubscribedSmData) {
+        if let Some(ul) = sub.sess_ambr_ul_bps {
+            self.sess_ambr_ul_bps = ul;
+        }
+        if let Some(dl) = sub.sess_ambr_dl_bps {
+            self.sess_ambr_dl_bps = dl;
+        }
+        if let Some(five_qi) = sub.default_5qi {
+            self.def_five_qi = five_qi;
+        }
+        if let Some(arp) = sub.arp_priority_level {
+            self.arp_priority_level = arp;
+        }
+    }
+
     /// Documented config-default fallback used ONLY when no PCF is configured
     /// (see module docs). 5QI=9 non-GBR default bearer, 100 Mbps AMBR.
     pub fn config_default() -> Self {
