@@ -481,6 +481,14 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // #299: subscribe to the UDR for policy-data changes, AFTER the SBI server is
+    // listening. The ordering is the point: the subscription advertises this PCF's own
+    // callback URI, and a UDR that notified before the route existed would post into a
+    // 404 -- the same constraint #293 hit on the SMF's SDM subscribe. Best effort: with
+    // no UDR or no NRF the PCF behaves exactly as it did before, which is the gap this
+    // closes rather than a startup failure.
+    let policy_data_subscription = sbi_path::pcf_subscribe_udr_policy_data().await;
+
     log::info!("NextGCore PCF ready");
 
     // Issue #24: intent-driven closed-loop policy controller (feature
@@ -499,6 +507,14 @@ pub async fn run() -> Result<()> {
 
     // Graceful shutdown
     log::info!("Shutting down...");
+
+    // #299: drop the policy-data subscription before the listener goes away, for the
+    // same reason as the NRF deregistration below -- a UDR still holding it would post
+    // notifications at a socket that has closed, and udrd only logs a delivery failure,
+    // so the subscription would linger for the life of that UDR.
+    if let Some(resource) = policy_data_subscription {
+        sbi_path::pcf_unsubscribe_udr_policy_data(&resource).await;
+    }
 
     // #235: NFDeregister (TS 29.510 5.2.2.2.3) BEFORE the listener goes
     // away, so the NRF stops handing this profile to consumers instead of
@@ -645,6 +661,14 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // Policy Authorization Service (npcf-policyauthorization)
         ("npcf-policyauthorization", "app-sessions", _) => {
             route_policy_authorization(&parts, method, &request, uri).await
+        }
+
+        // Nudr_DM_Notification sink for policy-data changes (#299, TS 29.519 §5.2).
+        // Its path is `sbi_path::POLICY_DATA_NOTIFY_PATH`, the same constant the
+        // subscription advertises, so the URI the UDR is told about is one this router
+        // serves.
+        ("npcf-callback", "policy-data-change-notify", "POST") => {
+            handle_policy_data_change_notify(&request).await
         }
 
         // Policy Control Event Exposure Service (npcf-eventexposure, TS 29.523)
@@ -1916,21 +1940,17 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
 
             // Map the TS 29.519 SmPolicyDnnData online/offline flags into the
             // ChargingData decisions when the UDR provided them.
+            //
+            // #299: through the shared helper, and the resource is STORED on the
+            // session. It used to be applied here and discarded, so every later
+            // Npcf_SMPolicyControl_UpdateNotify rebuilt `chgDecs` without it and
+            // silently reverted this subscriber's charging mode.
             let mut decision = decision;
-            if let Some(ref d) = udr_dnn_data {
-                let online = d.get("online").and_then(|v| v.as_bool());
-                let offline = d.get("offline").and_then(|v| v.as_bool());
-                if online.is_some() || offline.is_some() {
-                    if let Some(map) = decision.chg_decs.as_object_mut() {
-                        for (_id, chg) in map.iter_mut() {
-                            if let Some(o) = online {
-                                chg["online"] = serde_json::json!(o);
-                            }
-                            if let Some(o) = offline {
-                                chg["offline"] = serde_json::json!(o);
-                            }
-                        }
-                    }
+            sbi_path::apply_policy_dnn_charging(&mut decision.chg_decs, udr_dnn_data.as_ref());
+            if let Ok(ctx) = pcf_self().read() {
+                if let Some(mut stored) = ctx.sess_find_by_id(sess.id) {
+                    stored.policy_dnn_data = udr_dnn_data.clone();
+                    ctx.sess_update(&stored);
                 }
             }
 
@@ -2076,6 +2096,144 @@ pub async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
             Some("POLICY_NOT_FOUND"),
         ),
     }
+}
+
+/// `Nudr_DM_Notification` sink for policy-data changes (#299, TS 23.502 §4.16.11,
+/// TS 29.519 §5.2): the UDR POSTs a `PolicyDataChangeNotification` here when a
+/// subscriber's provisioned policy data changes, and every affected live SM policy
+/// association is re-authorised toward its SMF.
+///
+/// Before this, an operator editing a subscriber's policy data reached a **live**
+/// session through no path at all: the SMF sees the UDM's subscription notification and
+/// correctly defers to the PCF (TS 23.503 §6.1.3.2, #293), and the PCF never learned.
+/// The edit took effect when the UE re-established.
+///
+/// **Selection is by SUPI; evaluation is per session, scoped to its own S-NSSAI and
+/// DNN.** The notification names only `ueId` and the changed resource, and a UE can hold
+/// PDU sessions on several slices — so re-authorising every session of that SUPI from an
+/// unscoped read would apply one slice's policy data to another slice's session, which
+/// is the defect #293's Decision 2 records for the SMF's own re-read.
+///
+/// A session whose mapped policy data did not change is deliberately NOT notified: an
+/// `SmPolicyUpdateNotify` carrying an unchanged decision is a re-authorisation the SMF
+/// has to process for nothing, and at scale a UDR edit touching one slice would notify
+/// every session of every UE.
+pub async fn handle_policy_data_change_notify(request: &SbiRequest) -> SbiResponse {
+    let Some(content) = request.http.content.as_deref() else {
+        return send_bad_request("Missing request body", Some("MISSING_BODY"));
+    };
+    let body: serde_json::Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+    // `ueId` is the correlator; without it there is nothing to look up. Answered 400
+    // rather than 204 because silently accepting it would make a malformed notification
+    // indistinguishable from one that changed nothing.
+    let Some(ue_id) = body.get("ueId").and_then(|v| v.as_str()) else {
+        return send_bad_request(
+            "PolicyDataChangeNotification.ueId is required",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
+    let report_id = body.get("reportId").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Sessions of this SUPI, resolved before any await: the guard must not be held
+    // across one (the crate's lock rule), and the re-read below is async.
+    let sessions: Vec<crate::context::PcfSess> = {
+        let ctx = pcf_self();
+        let Ok(guard) = ctx.read() else {
+            return SbiResponse::with_status(204);
+        };
+        match guard.ue_sm_find_by_supi(ue_id) {
+            Some(ue_sm) => ue_sm
+                .sess_ids
+                .iter()
+                .filter_map(|id| guard.sess_find_by_id(*id))
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    if sessions.is_empty() {
+        log::debug!(
+            "Policy-data change for {ue_id} ({report_id}): no live SM policy association, \
+             nothing to re-authorise"
+        );
+        return SbiResponse::with_status(204);
+    }
+
+    // ONE discovery for the whole notification, before the loop: a UE with several PDU
+    // sessions would otherwise cost one NRF round trip each. And when no UDR is
+    // discoverable there is nothing to re-read the decision FROM, so nothing is touched —
+    // sending the old decision as a re-authorisation, or storing the failed read, would
+    // both be worse than doing nothing (criterion 5).
+    let udr = match sbi_path::pcf_discover_endpoint("UDR", "nudr-dr").await {
+        Ok(Some(ep)) => ep,
+        Ok(None) => {
+            log::warn!(
+                "Policy-data change for {ue_id} ({report_id}): no UDR discoverable, so the \
+                 new decision cannot be read. {} live association(s) keep the policy they \
+                 were authorised with.",
+                sessions.len()
+            );
+            return SbiResponse::with_status(204);
+        }
+        Err(e) => {
+            log::warn!("Policy-data change for {ue_id}: UDR discovery failed: {e}");
+            return SbiResponse::with_status(204);
+        }
+    };
+
+    let mut reauthorised = 0usize;
+    for sess in sessions {
+        let dnn = sess.dnn.clone().unwrap_or_else(|| "internet".to_string());
+        // Scoped to THIS session's slice and DNN (see the doc comment).
+        let fresh = match sbi_path::pcf_udr_sm_policy_dnn_data_from(
+            &udr,
+            ue_id,
+            sess.s_nssai.sst,
+            sess.s_nssai.sd,
+            &dnn,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // A failed read is NOT "nothing provisioned": treating it as one would
+                // erase what the session holds and re-authorise it with the local
+                // default, i.e. revert the subscriber on a transient error.
+                log::warn!(
+                    "Policy-data change for {ue_id}: re-reading session {} (dnn={dnn}) \
+                     failed: {e}. It keeps the policy it was authorised with.",
+                    sess.id
+                );
+                continue;
+            }
+        };
+        if fresh == sess.policy_dnn_data {
+            log::debug!(
+                "Policy-data change for {ue_id}: session {} (dnn={dnn}, sst={}) unchanged",
+                sess.id,
+                sess.s_nssai.sst
+            );
+            continue;
+        }
+        if let Ok(ctx) = pcf_self().read() {
+            if let Some(mut stored) = ctx.sess_find_by_id(sess.id) {
+                stored.policy_dnn_data = fresh;
+                ctx.sess_update(&stored);
+            }
+        }
+        // The existing leg (TS 29.512 §4.2.3.2). The SMF's `handle_sm_policy_notify`
+        // consumes it, so nothing is needed on that side.
+        if sbi_path::pcf_sbi_send_smpolicycontrol_update_notify(sess.id) {
+            reauthorised += 1;
+        }
+    }
+    log::info!(
+        "Policy-data change for {ue_id} ({report_id}): re-authorised {reauthorised} SM policy \
+         association(s)"
+    );
+    SbiResponse::with_status(204)
 }
 
 pub async fn handle_sm_policy_update_notify(
@@ -4104,6 +4262,648 @@ mod tests {
             .set_nrf_uri(format!("http://127.0.0.1:{port}"))
             .await;
         server
+    }
+
+    // ====================================================================
+    // #299: a policy-data change reaches a live SM policy association
+    // ====================================================================
+
+    /// A mock NRF+UDR whose `sm-data` leg answers per-`snssai` query, plus a captured
+    /// stub SMF for the `SmPolicyUpdateNotify`.
+    ///
+    /// One port for the NRF and the UDR (the SearchResult points back at itself), a
+    /// second for the SMF, so a test can assert both that the PCF re-read the right
+    /// slice and that it notified the right session.
+    struct PolicyDataPeers {
+        udr: nextgcore_sbi::server::SbiServer,
+        smf: nextgcore_sbi::server::SbiServer,
+        smf_port: u16,
+        /// Every SM policy notification the stub SMF received: (path, body).
+        notified: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        /// Every UDR sm-data GET, with its raw query, so a test can prove the re-read
+        /// was scoped rather than blanket.
+        udr_queries: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// `sm_data_for` maps the `snssai` query value to the body to answer with; a slice
+    /// it does not name gets a 404, which is how "unchanged for that slice" is expressed.
+    async fn start_policy_data_peers(
+        sm_data_for: std::collections::HashMap<String, serde_json::Value>,
+    ) -> PolicyDataPeers {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let notified = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let smf_port = nextgcore_sbi::test_support::free_port();
+        let smf_addr = SocketAddr::from(([127, 0, 0, 1], smf_port));
+        let smf = SbiServer::new(SbiServerConfig::new(smf_addr));
+        let seen = notified.clone();
+        smf.start(move |req: SbiRequest| {
+            let seen = seen.clone();
+            async move {
+                let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                let body = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                seen.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((path, body));
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("stub SMF starts");
+
+        let udr_queries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let udr_port = nextgcore_sbi::test_support::free_port();
+        let udr_addr = SocketAddr::from(([127, 0, 0, 1], udr_port));
+        let udr = SbiServer::new(SbiServerConfig::new(udr_addr));
+        let queries = udr_queries.clone();
+        udr.start(move |req: SbiRequest| {
+            let sm_data_for = sm_data_for.clone();
+            let queries = queries.clone();
+            async move {
+                let uri = req.header.uri.clone();
+                let path = uri.split('?').next().unwrap_or("").to_string();
+                if path == "/nnrf-disc/v1/nf-instances" {
+                    return SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "nfInstances": [{
+                                "nfInstanceId": "udr-mock",
+                                "nfType": "UDR",
+                                "ipv4Addresses": ["127.0.0.1"],
+                                "nfServices": [{
+                                    "serviceName": "nudr-dr",
+                                    "scheme": "http",
+                                    "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": udr_port }]
+                                }]
+                            }]
+                        }))
+                        .unwrap_or_else(|_| SbiResponse::with_status(500));
+                }
+                if path.starts_with("/nudr-dr/v2/policy-data/") && path.ends_with("/sm-data") {
+                    // The server decodes query values into `http.params`, so the JSON
+                    // `snssai` arrives already decoded -- reading it off `header.uri`
+                    // finds nothing, which is how the first draft of this mock made a
+                    // correctly scoped re-read look unscoped.
+                    let snssai = req.http.params.get("snssai").cloned().unwrap_or_default();
+                    queries
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(snssai.clone());
+                    let key = sm_data_for
+                        .keys()
+                        .find(|k| snssai.contains(k.as_str()))
+                        .cloned();
+                    return match key.and_then(|k| sm_data_for.get(&k).cloned()) {
+                        Some(body) => SbiResponse::with_status(200)
+                            .with_json_body(&body)
+                            .unwrap_or_else(|_| SbiResponse::with_status(500)),
+                        None => SbiResponse::with_status(404),
+                    };
+                }
+                SbiResponse::with_status(404)
+            }
+        })
+        .await
+        .expect("mock NRF/UDR starts");
+
+        for addr in [udr_addr, smf_addr] {
+            for _ in 0..200 {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        nextgcore_sbi::context::global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{udr_port}"))
+            .await;
+
+        PolicyDataPeers {
+            udr,
+            smf,
+            smf_port,
+            notified,
+            udr_queries,
+        }
+    }
+
+    /// An `smPolicySnssaiData` body carrying one DNN entry with the charging flags this
+    /// PCF maps (TS 29.519 SmPolicyDnnData).
+    fn sm_policy_body(sst: u8, dnn: &str, online: bool, offline: bool) -> serde_json::Value {
+        serde_json::json!({
+            "smPolicySnssaiData": {
+                format!("{sst:02}"): {
+                    "snssai": { "sst": sst },
+                    "smPolicyDnnData": {
+                        dnn: { "dnn": dnn, "online": online, "offline": offline }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Seed a live SM policy association whose notification URI points at the stub SMF.
+    fn seed_sm_policy_session(
+        supi: &str,
+        psi: u8,
+        sst: u8,
+        dnn: &str,
+        smf_port: u16,
+        stored: Option<serde_json::Value>,
+    ) -> String {
+        let ctx = pcf_self();
+        let guard = ctx.read().expect("context");
+        // REUSE the UE-SM when this SUPI already has one: `ue_sm_add` always inserts a
+        // fresh record and overwrites `supi_sm_hash`, so calling it twice for one SUPI
+        // orphans the first and `ue_sm_find_by_supi` then sees only the second session.
+        // Two PDU sessions of ONE UE is exactly what the multi-slice test needs.
+        let ue_sm = match guard.ue_sm_find_by_supi(supi) {
+            Some(existing) => existing,
+            None => guard.ue_sm_add(supi).expect("ue_sm"),
+        };
+        let mut sess = guard.sess_add(ue_sm.id, psi).expect("sess");
+        sess.dnn = Some(dnn.to_string());
+        sess.s_nssai = SNssai { sst, sd: None };
+        sess.notification_uri = Some(format!(
+            "http://127.0.0.1:{smf_port}/nsmf-callback/v1/sm-policy-notify/{psi}"
+        ));
+        sess.policy_dnn_data = stored;
+        guard.sess_update(&sess);
+        sess.sm_policy_id.clone()
+    }
+
+    /// Every notification received by the stub SMF, after giving the detached POST a
+    /// bounded chance to arrive (`spawn_notification` is fire-and-forget).
+    async fn drain_notifications(
+        peers: &PolicyDataPeers,
+        expected: usize,
+    ) -> Vec<(String, serde_json::Value)> {
+        for _ in 0..200 {
+            let got = peers
+                .notified
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if got.len() >= expected {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        peers
+            .notified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// #299 criterion 1: the URI the subscription advertises is one this router serves.
+    ///
+    /// The ordering constraint the issue names ("the handler ships before the subscribe,
+    /// or the subscription notifies into a 404") is not a timing property that a unit
+    /// test can observe — but the failure it protects against is: a subscription naming
+    /// a path nothing serves. So the guard feeds the advertised URI's own path back
+    /// through the real router and refuses a 404/405.
+    #[tokio::test]
+    async fn the_advertised_policy_data_callback_is_a_path_this_pcf_serves() {
+        let body = sbi_path::policy_data_subscription_body("http://10.0.0.1:7777/x");
+        assert_eq!(
+            body["monitoredResourceUris"],
+            serde_json::json!(["/nudr-dr/v2/policy-data/ues"]),
+            "the PCF cannot enumerate its future subscribers, so it monitors the collection"
+        );
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "ueId": "imsi-001010000000299" })),
+        ))
+        .await;
+        assert_ne!(
+            resp.status, 404,
+            "the advertised callback path must be routed, or the UDR notifies into a 404"
+        );
+        assert_ne!(resp.status, 405, "and with the method it is advertised for");
+        assert_eq!(
+            resp.status, 204,
+            "an unknown SUPI is not an error: there is simply nothing to re-authorise"
+        );
+
+        // A notification with no ueId cannot be acted on and says so, rather than being
+        // indistinguishable from one that changed nothing.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "reportId": "x" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+    }
+
+    /// #299 criteria 2 and 3: a policy-data change re-authorises the live association
+    /// over the wire, and the notification CARRIES the changed decision.
+    ///
+    /// The second half is the one that matters: `build_sm_policy_notification` rebuilt
+    /// `chgDecs` from the local default and dropped the UDR's charging flags, so before
+    /// this the notify would have been sent and changed nothing — a wired mechanism with
+    /// no effect, which is the shape this backlog keeps finding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn a_policy_data_change_reauthorises_the_live_association_with_the_new_decision() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000299";
+
+        // The UDR now says online charging is ON for slice 1 / internet.
+        let mut answers = std::collections::HashMap::new();
+        answers.insert(
+            "\"sst\":1".to_string(),
+            sm_policy_body(1, "internet", true, false),
+        );
+        let peers = start_policy_data_peers(answers).await;
+
+        // The session was created when the UDR said OFF, and that is what it holds.
+        let sm_policy_id = seed_sm_policy_session(
+            supi,
+            5,
+            1,
+            "internet",
+            peers.smf_port,
+            Some(serde_json::json!({ "dnn": "internet", "online": false, "offline": false })),
+        );
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({
+                "ueId": supi,
+                "reportId": format!("/nudr-dr/v2/policy-data/ues/{supi}/sm-data"),
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+
+        let got = drain_notifications(&peers, 1).await;
+        assert_eq!(
+            got.len(),
+            1,
+            "the live association must be re-authorised toward its SMF, got {got:?}"
+        );
+        let (path, body) = &got[0];
+        assert_eq!(
+            path, "/nsmf-callback/v1/sm-policy-notify/5/update",
+            "TS 29.512 §4.2.3.2 POSTs to {{notificationUri}}/update"
+        );
+        assert_eq!(
+            body["resourceUri"],
+            serde_json::json!(format!(
+                "/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}"
+            )),
+            "and names the association it re-authorises"
+        );
+        let chg = body["smPolicyDecision"]["chgDecs"]
+            .as_object()
+            .expect("chgDecs present");
+        assert!(
+            !chg.is_empty(),
+            "a decision with no chgDecs carries nothing"
+        );
+        for (_id, dec) in chg {
+            assert_eq!(
+                dec["online"],
+                serde_json::json!(true),
+                "the UDR's changed online flag must reach the SMF, or the notify is a \
+                 re-authorisation that authorises the OLD decision: {body}"
+            );
+        }
+
+        // And the session now holds what the UDR says, so a second notification for the
+        // same (unchanged) data does not re-notify.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "ueId": supi })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let got = drain_notifications(&peers, 2).await;
+        assert_eq!(
+            got.len(),
+            1,
+            "an edit that changes nothing this PCF maps must not re-authorise: at scale \
+             that is every session of every UE per UDR write"
+        );
+
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #299: the create path STORES the UDR's SmPolicyDnnData, so the first policy-data
+    /// notification for an unchanged subscriber is not a spurious re-authorisation — and
+    /// so a later re-authorisation can carry what the create carried.
+    ///
+    /// Driven through the real `handle_sm_policy_create` rather than by seeding, because
+    /// seeding is what hides the hole: the field would look populated in every test while
+    /// no production path ever wrote it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn the_create_stores_the_udrs_policy_data_so_an_unchanged_edit_is_not_a_reauthorisation()
+    {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000296";
+
+        let mut answers = std::collections::HashMap::new();
+        answers.insert(
+            "\"sst\":1".to_string(),
+            sm_policy_body(1, "internet", true, false),
+        );
+        let peers = start_policy_data_peers(answers).await;
+
+        let create = serde_json::json!({
+            "supi": supi,
+            "pduSessionId": 9,
+            "pduSessionType": "IPV4",
+            "dnn": "internet",
+            "notificationUri": format!(
+                "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/9", peers.smf_port),
+            "sliceInfo": { "sst": 1 },
+        });
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "create: {:?}", resp.http.content);
+
+        // The decision the SMF got on create carries the UDR's flags...
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        for (_id, dec) in body["chgDecs"].as_object().expect("chgDecs") {
+            assert_eq!(dec["online"], serde_json::json!(true), "create: {body}");
+        }
+
+        // ...and the session HOLDS the resource that produced them.
+        let held = pcf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.ue_sm_find_by_supi(supi))
+            .and_then(|u| u.sess_ids.first().copied())
+            .and_then(|id| pcf_self().read().ok().and_then(|c| c.sess_find_by_id(id)))
+            .expect("session");
+        assert_eq!(
+            held.policy_dnn_data
+                .as_ref()
+                .and_then(|d| d.get("online"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "the create read this resource and used to DISCARD it, so every later notify \
+             rebuilt the decision without it: {:?}",
+            held.policy_dnn_data
+        );
+
+        // A notification for data that has not changed therefore re-authorises nothing.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "ueId": supi })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let got = drain_notifications(&peers, 1).await;
+        assert!(
+            got.is_empty(),
+            "nothing changed, so nothing is re-authorised: {got:?}"
+        );
+
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #299: a UDR that is discoverable but whose read FAILS leaves the session alone.
+    ///
+    /// Distinct from "no UDR" (the criterion-5 test): here discovery succeeds and the GET
+    /// does not. Treating the failure as "nothing is provisioned" would erase the
+    /// session's stored policy data and re-authorise it with the local default — a
+    /// transient error silently reverting a subscriber's charging mode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn a_failed_udr_read_leaves_the_association_authorised_as_it_was() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000295";
+
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // An NRF that advertises a UDR on a port with nothing listening: discovery
+        // succeeds, every nudr-dr GET fails.
+        let dead_udr_port = nextgcore_sbi::test_support::free_port();
+        let nrf_port = nextgcore_sbi::test_support::free_port();
+        let nrf_addr = SocketAddr::from(([127, 0, 0, 1], nrf_port));
+        let nrf = SbiServer::new(SbiServerConfig::new(nrf_addr));
+        nrf.start(move |_req: SbiRequest| async move {
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({
+                    "nfInstances": [{
+                        "nfInstanceId": "udr-dead",
+                        "nfType": "UDR",
+                        "ipv4Addresses": ["127.0.0.1"],
+                        "nfServices": [{
+                            "serviceName": "nudr-dr",
+                            "scheme": "http",
+                            "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": dead_udr_port }]
+                        }]
+                    }]
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(500))
+        })
+        .await
+        .expect("mock NRF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(nrf_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        nextgcore_sbi::context::global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
+            .await;
+
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        // `start_policy_data_peers` points the NRF URI at its own mock; put it back at
+        // the one advertising the dead UDR.
+        nextgcore_sbi::context::global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
+            .await;
+
+        let stored = serde_json::json!({ "dnn": "internet", "online": true, "offline": false });
+        seed_sm_policy_session(supi, 3, 1, "internet", peers.smf_port, Some(stored.clone()));
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "ueId": supi })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+
+        let got = drain_notifications(&peers, 1).await;
+        assert!(
+            got.is_empty(),
+            "a failed re-read must not produce a re-authorisation: {got:?}"
+        );
+        let held = pcf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.ue_sm_find_by_supi(supi))
+            .and_then(|u| u.sess_ids.first().copied())
+            .and_then(|id| pcf_self().read().ok().and_then(|c| c.sess_find_by_id(id)))
+            .expect("session");
+        assert_eq!(
+            held.policy_dnn_data,
+            Some(stored),
+            "and must not erase what the session holds"
+        );
+
+        nrf.stop().await.ok();
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #299 criterion 4: the affected-association lookup is scoped, so a change for one
+    /// slice does not re-authorise another slice's session.
+    ///
+    /// Both sessions belong to ONE SUPI, which is what makes an unscoped selection look
+    /// correct: the notification names only `ueId`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn a_change_for_one_slice_does_not_reauthorise_another_slices_session() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000298";
+
+        // Only slice 2's data is provisioned/changed; slice 1's read 404s, which is
+        // "nothing provisioned for that slice" and must leave it alone.
+        let mut answers = std::collections::HashMap::new();
+        answers.insert(
+            "\"sst\":2".to_string(),
+            sm_policy_body(2, "internet", true, false),
+        );
+        let peers = start_policy_data_peers(answers).await;
+
+        seed_sm_policy_session(supi, 1, 1, "internet", peers.smf_port, None);
+        seed_sm_policy_session(
+            supi,
+            2,
+            2,
+            "internet",
+            peers.smf_port,
+            Some(serde_json::json!({ "dnn": "internet", "online": false, "offline": false })),
+        );
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "ueId": supi })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+
+        let got = drain_notifications(&peers, 1).await;
+        assert_eq!(
+            got.len(),
+            1,
+            "exactly the session whose slice data changed is re-authorised, got {got:?}"
+        );
+        assert_eq!(
+            got[0].0, "/nsmf-callback/v1/sm-policy-notify/2/update",
+            "and it is slice 2's session (psi=2), not slice 1's"
+        );
+
+        // The re-read itself was scoped: each session's own S-NSSAI appears in its query.
+        let queries = peers
+            .udr_queries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(
+            queries.iter().any(|q| q.contains("\"sst\":1")),
+            "slice 1's session must be evaluated against SLICE 1's data: {queries:?}"
+        );
+        assert!(
+            queries.iter().any(|q| q.contains("\"sst\":2")),
+            "and slice 2's against slice 2's: {queries:?}"
+        );
+
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #299 criterion 5: with no UDR configured or discoverable, the PCF behaves exactly
+    /// as it did before — the notification is accepted and nothing is re-authorised,
+    /// because there is nothing to re-read the decision from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn with_no_udr_a_policy_data_notification_changes_nothing() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000297";
+
+        // A stub SMF only: no NRF URI is set, so discovery yields nothing.
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        nextgcore_sbi::context::global_context()
+            .set_nrf_uri(String::new())
+            .await;
+
+        let stored = serde_json::json!({ "dnn": "internet", "online": true, "offline": false });
+        seed_sm_policy_session(supi, 7, 1, "internet", peers.smf_port, Some(stored.clone()));
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "ueId": supi })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+
+        let got = drain_notifications(&peers, 1).await;
+        assert!(
+            got.is_empty(),
+            "with no UDR there is no new decision to send, and sending the old one as a \
+             re-authorisation would be worse than silence: {got:?}"
+        );
+        let held = pcf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.ue_sm_find_by_supi(supi))
+            .and_then(|u| u.sess_ids.first().copied())
+            .and_then(|id| pcf_self().read().ok().and_then(|c| c.sess_find_by_id(id)))
+            .expect("session");
+        assert_eq!(
+            held.policy_dnn_data,
+            Some(stored),
+            "and an unreachable UDR must NOT erase what the session already holds: a \
+             404-or-unreachable read returns None, and storing that would revert the \
+             subscriber's charging mode on every failed notification"
+        );
+
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
     }
 
     /// AM policy Create and GET both carry the negotiated `suppFeat` and the

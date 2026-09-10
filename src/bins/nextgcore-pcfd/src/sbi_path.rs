@@ -607,11 +607,17 @@ fn build_sm_policy_notification(sess: &crate::context::PcfSess) -> serde_json::V
     let decision = crate::nudr_handler::pcf_get_session_data("", None, &sess.s_nssai, &dnn)
         .map(|sd| {
             let parts = crate::sm_policy_build::build_sm_policy_decision(&sess.sm_policy_id, &sd);
+            let mut chg_decs = parts.chg_decs;
+            // #299: overlay the UDR's SmPolicyDnnData charging flags, exactly as the
+            // create path does. Without this a re-authorisation rebuilt `chgDecs` from
+            // the local default and silently reverted a subscriber whose policy data
+            // says otherwise -- so the notify LOOKED like a decision and undid one.
+            apply_policy_dnn_charging(&mut chg_decs, sess.policy_dnn_data.as_ref());
             serde_json::json!({
                 "sessRules": parts.sess_rules,
                 "pccRules": parts.pcc_rules,
                 "qosDecs": parts.qos_decs,
-                "chgDecs": parts.chg_decs,
+                "chgDecs": chg_decs,
                 "traffContDecs": parts.traff_cont_decs,
             })
         })
@@ -621,6 +627,39 @@ fn build_sm_policy_notification(sess: &crate::context::PcfSess) -> serde_json::V
         "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id),
         "smPolicyDecision": decision,
     })
+}
+
+/// Map a `SmPolicyDnnData`'s `online`/`offline` flags (TS 29.519 §5.6.2.x) onto every
+/// ChargingData decision (TS 29.512 §5.6.2.11).
+///
+/// The two members are the ONLY ones this PCF derives from that resource — the create
+/// path says so at its call site, because `SmPolicyDnnData` carries no session-AMBR, no
+/// 5QI and no ARP. Shared by the create path and the update-notify builder so the two
+/// cannot drift: they drifting is the #299 defect.
+pub(crate) fn apply_policy_dnn_charging(
+    chg_decs: &mut serde_json::Value,
+    dnn_data: Option<&serde_json::Value>,
+) -> bool {
+    let Some(d) = dnn_data else {
+        return false;
+    };
+    let online = d.get("online").and_then(|v| v.as_bool());
+    let offline = d.get("offline").and_then(|v| v.as_bool());
+    if online.is_none() && offline.is_none() {
+        return false;
+    }
+    let Some(map) = chg_decs.as_object_mut() else {
+        return false;
+    };
+    for (_id, chg) in map.iter_mut() {
+        if let Some(o) = online {
+            chg["online"] = serde_json::json!(o);
+        }
+        if let Some(o) = offline {
+            chg["offline"] = serde_json::json!(o);
+        }
+    }
+    true
 }
 
 /// Send SM policy control update notify to the SMF over HTTP
@@ -925,6 +964,133 @@ pub(crate) fn client_for(
     )
 }
 
+/// The path this PCF serves its `Nudr_DM_Notification` (PolicyDataChangeNotification)
+/// sink on, and the path its subscription advertises. One constant, so the two cannot
+/// disagree — a subscription naming a URI nothing serves is the exact failure #293 hit
+/// and is invisible until an operator edits a subscriber.
+pub const POLICY_DATA_NOTIFY_PATH: &str = "/npcf-callback/v1/policy-data-change-notify";
+
+/// This PCF's policy-data notification URI, or `None` when the self identity was never
+/// published (no config) — the caller then skips the subscribe rather than subscribing
+/// with an address no one can reach.
+pub fn policy_data_notify_uri() -> Option<String> {
+    let info = pcf_self_info()?;
+    Some(format!(
+        "http://{}:{}{POLICY_DATA_NOTIFY_PATH}",
+        info.sbi_addr, info.sbi_port
+    ))
+}
+
+/// The `PolicyDataSubscription` body this PCF subscribes with (TS 29.519 §5.2.x,
+/// `POST /nudr-dr/v2/policy-data/subs-to-notify`).
+///
+/// `monitoredResourceUris` names the per-UE policy-data collection rather than one
+/// subscriber: the PCF cannot enumerate the UEs it will serve in advance, and udrd's
+/// `uri_covers` treats a prefix as covering everything under it.
+pub fn policy_data_subscription_body(notification_uri: &str) -> serde_json::Value {
+    serde_json::json!({
+        "notificationUri": notification_uri,
+        "monitoredResourceUris": ["/nudr-dr/v2/policy-data/ues"],
+    })
+}
+
+/// Subscribe to the UDR for policy-data changes (TS 23.502 §4.16.11, TS 29.519 §5.2).
+///
+/// Called from `main` AFTER the SBI server is listening, so the URI in the subscription
+/// is already being served when the UDR can first use it. Best-effort: no UDR, no NRF,
+/// or a refusal leaves the PCF behaving exactly as it did before #299 — an operator's
+/// edit then reaches a live session through no path, which is the gap, not a crash.
+///
+/// Returns the created subscription's resource URI when the UDR reported one, so
+/// shutdown can delete it.
+pub async fn pcf_subscribe_udr_policy_data() -> Option<String> {
+    let notification_uri = policy_data_notify_uri()?;
+    let ep = match pcf_discover_endpoint("UDR", "nudr-dr").await {
+        Ok(Some(ep)) => ep,
+        Ok(None) => {
+            log::info!(
+                "No UDR discoverable: not subscribing to policy-data changes. An operator \
+                 edit will reach a live SM policy association through no path (#299)."
+            );
+            return None;
+        }
+        Err(e) => {
+            log::warn!("UDR discovery for the policy-data subscription failed: {e}");
+            return None;
+        }
+    };
+    let client = client_for(&ep, NfType::Udr);
+    let body = policy_data_subscription_body(&notification_uri);
+    match client
+        .post_json("/nudr-dr/v2/policy-data/subs-to-notify", &body)
+        .await
+    {
+        Ok(resp) if resp.status == 201 => {
+            let location = resp
+                .http
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                .map(|(_, v)| v.clone());
+            log::info!(
+                "Subscribed to UDR policy-data changes; notifications arrive at \
+                 {notification_uri} (subscription {})",
+                location.as_deref().unwrap_or("<no Location>")
+            );
+            location
+        }
+        Ok(resp) => {
+            log::warn!(
+                "UDR refused the policy-data subscription: status {} — subscription changes \
+                 will not reach live SM policy associations",
+                resp.status
+            );
+            None
+        }
+        Err(e) => {
+            log::warn!("UDR policy-data subscription failed: {e}");
+            None
+        }
+    }
+}
+
+/// Delete this PCF's policy-data subscription at shutdown (#299).
+///
+/// `resource` is the `Location` the UDR returned. Best effort and logged: a UDR that
+/// keeps the subscription only logs a delivery failure per notification, so failing
+/// loudly here would be noise, but staying silent would hide a leak that outlives the
+/// process.
+pub async fn pcf_unsubscribe_udr_policy_data(resource: &str) {
+    let Ok(Some(ep)) = pcf_discover_endpoint("UDR", "nudr-dr").await else {
+        log::warn!("No UDR discoverable at shutdown: policy-data subscription {resource} leaks");
+        return;
+    };
+    let client = client_for(&ep, NfType::Udr);
+    let path = uri_path_only(resource);
+    match client.delete(&path).await {
+        Ok(resp) if (200..300).contains(&resp.status) => {
+            log::info!("Policy-data subscription {resource} deleted");
+        }
+        Ok(resp) => log::warn!(
+            "UDR answered {} to DELETE {path}: the policy-data subscription may linger",
+            resp.status
+        ),
+        Err(e) => log::warn!("DELETE {path} failed: {e}; the policy-data subscription may linger"),
+    }
+}
+
+/// The path part of a possibly-absolute resource URI, so a `Location` given either way
+/// can be used as a request target.
+fn uri_path_only(uri: &str) -> String {
+    match uri.find("://") {
+        Some(i) => match uri[i + 3..].find('/') {
+            Some(j) => uri[i + 3 + j..].to_string(),
+            None => "/".to_string(),
+        },
+        None => uri.to_string(),
+    }
+}
+
 /// Discover a UDR and GET the SM PolicyData for `(supi, snssai, dnn)`
 /// (TS 29.519 nudr-dr: `GET /nudr-dr/v2/policy-data/ues/{ueId}/sm-data`).
 /// Returns the decoded body on 200, `Ok(None)` on 404 or when no UDR is
@@ -964,6 +1130,50 @@ pub async fn pcf_udr_get_sm_policy_data(
             log::warn!("nudr-dr returned 404 for SUPI {supi}; using config defaults");
             Ok(None)
         }
+        other => Err(format!("nudr-dr GET returned status {other}")),
+    }
+}
+
+/// GET the `SmPolicyDnnData` for `(supi, snssai, dnn)` from an ALREADY DISCOVERED UDR.
+///
+/// Separate from [`pcf_udr_sm_policy_dnn_data`] on two counts that matter to #299:
+///
+/// - it does not re-discover per call, so re-authorising a UE with several PDU sessions
+///   is one NRF round trip rather than one per session;
+/// - it distinguishes **"the UDR says nothing is provisioned"** (`Ok(None)`, a 404) from
+///   **"the read failed"** (`Err`). Collapsing those is what made the first draft of the
+///   notification handler erase a session's stored policy data whenever the UDR was
+///   briefly unreachable, and send a re-authorisation carrying the local default.
+pub async fn pcf_udr_sm_policy_dnn_data_from(
+    ep: &DiscoveredEndpoint,
+    supi: &str,
+    sst: u8,
+    sd: Option<u32>,
+    dnn: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let client = client_for(ep, NfType::Udr);
+    let snssai = match sd {
+        Some(sd) => format!("{{\"sst\":{sst},\"sd\":\"{sd:06x}\"}}"),
+        None => format!("{{\"sst\":{sst}}}"),
+    };
+    let path = format!(
+        "/nudr-dr/v2/policy-data/ues/{}/sm-data?snssai={}&dnn={}",
+        percent_encode(supi),
+        percent_encode(&snssai),
+        percent_encode(dnn),
+    );
+    let resp = client
+        .get(&path)
+        .await
+        .map_err(|e| format!("nudr-dr GET failed: {e}"))?;
+    match resp.status {
+        200 => {
+            let body = resp.http.content.ok_or("empty nudr-dr body")?;
+            let json: serde_json::Value =
+                serde_json::from_str(&body).map_err(|e| format!("invalid nudr-dr body: {e}"))?;
+            Ok(extract_sm_policy_dnn_data(&json, dnn))
+        }
+        404 => Ok(None),
         other => Err(format!("nudr-dr GET returned status {other}")),
     }
 }
