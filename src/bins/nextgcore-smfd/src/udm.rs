@@ -364,9 +364,262 @@ pub async fn register_as_serving_smf(
     }
 }
 
+/// `Nudm_UECM_Deregistration` — remove the serving-SMF record when the PDU session
+/// is released (issue #293, TS 29.503 §5.3.2.4,
+/// `DELETE .../registrations/smf-registrations/{pduSessionId}`).
+///
+/// #79 added the registration and nothing removed it, so a UDM accumulated
+/// serving-SMF records for released sessions. The damage, in order of how badly it
+/// bites: a procedure resolving the serving SMF through the UDM resolves a
+/// **released** session to this SMF, which answers `404 CONTEXT_NOT_FOUND` at best;
+/// a re-established session with the same `pduSessionId` overwrites the stale record,
+/// so it self-heals for the common case and is permanent for a `pduSessionId` the UE
+/// never reuses; and `udmd`'s store grows without bound for long-lived subscribers.
+///
+/// Failure is non-fatal — the session is being released either way — and names the
+/// record that is now stale, because that is the only trace an operator gets.
+pub async fn deregister_serving_smf(supi: &str, pdu_session_id: u8) -> bool {
+    if !enabled() {
+        return false;
+    }
+    let Some((host, port)) = crate::discover_udm_uecm_endpoint().await else {
+        log::warn!(
+            "[{supi}] no UDM nudm-uecm endpoint: the serving-SMF record for PSI \
+             {pdu_session_id} is left behind and will resolve a released session to \
+             this SMF"
+        );
+        return false;
+    };
+    let path = format!("/nudm-uecm/v1/{supi}/registrations/smf-registrations/{pdu_session_id}");
+    let client = nextgcore_sbi::context::global_context()
+        .get_client(&host, port)
+        .await;
+    match client
+        .send_request(nextgcore_sbi::message::SbiRequest::delete(path))
+        .await
+    {
+        // 204 is the defined answer; 404 means the UDM does not hold it, which is the
+        // state this call wanted and not a failure worth reporting as one.
+        Ok(resp) if resp.is_success() || resp.status == 404 => {
+            log::info!(
+                "[{supi}] serving-SMF registration for PSI {pdu_session_id} removed \
+                 (status {})",
+                resp.status
+            );
+            true
+        }
+        Ok(resp) => {
+            log::warn!(
+                "[{supi}] Nudm_UECM_Deregistration for PSI {pdu_session_id} returned \
+                 status {}: the serving-SMF record is STALE and will resolve a released \
+                 session to this SMF",
+                resp.status
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!(
+                "[{supi}] Nudm_UECM_Deregistration for PSI {pdu_session_id} failed: {e}: \
+                 the serving-SMF record is STALE and will resolve a released session to \
+                 this SMF"
+            );
+            false
+        }
+    }
+}
+
+/// `Nudm_SDM_Subscribe` — ask the UDM to notify this SMF when the subscriber's SM
+/// data changes (issue #293, TS 29.503 §5.2.2.3,
+/// `POST /nudm-sdm/v2/{supi}/sdm-subscriptions`).
+///
+/// Returns the subscription id, taken from the `Location` header the UDM must send
+/// (TS 29.503 §5.2.2.3.1), so the release path can delete the resource it created.
+/// `None` on any failure: a session without a subscription is a working session whose
+/// QoS simply does not follow a mid-session administrative edit, which is exactly the
+/// pre-#293 behaviour.
+///
+/// **The order matters and is the reason #79 left this out.** Subscribing creates a
+/// resource on the UDM whose notifications go to a callback URI, so a subscription
+/// sent by an SMF that serves no notification handler creates a resource that
+/// notifies into a `404` — strictly worse than not subscribing, because the UDM then
+/// retries against us. The handler
+/// (`nsmf-callback/v1/sdm-notify/{smContextRef}`) is therefore part of this same
+/// change, and `callback_uri` is the caller's proof that it has one.
+pub async fn subscribe_sm_data(
+    supi: &str,
+    callback_uri: &str,
+    dnn: &str,
+    sst: u8,
+    sd: Option<&str>,
+) -> Option<String> {
+    if !enabled() {
+        return None;
+    }
+    let (host, port) = crate::discover_udm_sdm_endpoint().await?;
+
+    // `nfInstanceId`, `callbackReference` and `monitoredResourceUris` are the three
+    // `required` members of SdmSubscription (TS 29.503). The monitored URI is the
+    // same `sm-data` resource `fetch_sm_data` reads, scoped to this session's DNN, so
+    // the UDM notifies about the document this session actually depends on.
+    let mut monitored = format!("/nudm-sdm/v2/{supi}/sm-data?dnn={dnn}&sst={sst}");
+    if let Some(sd) = sd {
+        monitored.push_str(&format!("&sd={sd}"));
+    }
+    let body = serde_json::json!({
+        "nfInstanceId": smf_instance_id(),
+        "callbackReference": callback_uri,
+        "monitoredResourceUris": [monitored],
+    });
+
+    let path = format!("/nudm-sdm/v2/{supi}/sdm-subscriptions");
+    let request = nextgcore_sbi::message::SbiRequest::post(path).with_body(
+        body.to_string(),
+        nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+    );
+    let client = nextgcore_sbi::context::global_context()
+        .get_client(&host, port)
+        .await;
+    let response = match client.send_request(request).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::warn!(
+                "[{supi}] Nudm_SDM_Subscribe failed: {e}. Subscription changes will not \
+                 reach this session until it re-establishes."
+            );
+            return None;
+        }
+    };
+    if !response.is_success() {
+        log::warn!(
+            "[{supi}] Nudm_SDM_Subscribe returned status {}. Subscription changes will \
+             not reach this session until it re-establishes.",
+            response.status
+        );
+        return None;
+    }
+    let id =
+        subscription_id_from_location(response.http.get_header("Location").map(String::as_str))
+            .or_else(|| {
+                response
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                    .and_then(|v| {
+                        v.get("subscriptionId")
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string)
+                    })
+            });
+    match id {
+        Some(id) => {
+            log::info!("[{supi}] subscribed to SM data changes (subscription {id})");
+            Some(id)
+        }
+        None => {
+            // A subscription whose id we do not know is a resource we can never
+            // delete: an orphan on the UDM, notifying a callback whose session is
+            // gone. Reported rather than stored as an empty string.
+            log::warn!(
+                "[{supi}] Nudm_SDM_Subscribe succeeded but named no subscription id \
+                 (no Location header): the subscription is an ORPHAN this SMF cannot delete"
+            );
+            None
+        }
+    }
+}
+
+/// Take the last non-empty path segment of a `Location` header as the resource id.
+///
+/// Separated so the shapes a conformant UDM may send are testable: an absolute URI,
+/// a relative path, and a path with a trailing slash all name the same id, and
+/// `udmd` itself answers with a relative one.
+pub fn subscription_id_from_location(location: Option<&str>) -> Option<String> {
+    let raw = location?.split('?').next().unwrap_or_default();
+    raw.trim_end_matches('/')
+        .rsplit('/')
+        .find(|seg| !seg.is_empty())
+        .map(str::to_string)
+}
+
+/// `Nudm_SDM_Unsubscribe` — delete the subscription created at establishment
+/// (issue #293, TS 29.503 §5.2.2.4,
+/// `DELETE /nudm-sdm/v2/{supi}/sdm-subscriptions/{subscriptionId}`).
+///
+/// Non-fatal, and the consequence named on failure is the one that matters: the
+/// subscription outlives the session, so the UDM keeps notifying a callback URI whose
+/// `smContextRef` no longer resolves.
+pub async fn unsubscribe_sm_data(supi: &str, subscription_id: &str) -> bool {
+    if !enabled() {
+        return false;
+    }
+    let Some((host, port)) = crate::discover_udm_sdm_endpoint().await else {
+        log::warn!(
+            "[{supi}] no UDM nudm-sdm endpoint: SDM subscription {subscription_id} is \
+             left behind and will notify a callback whose session is gone"
+        );
+        return false;
+    };
+    let path = format!("/nudm-sdm/v2/{supi}/sdm-subscriptions/{subscription_id}");
+    let client = nextgcore_sbi::context::global_context()
+        .get_client(&host, port)
+        .await;
+    match client
+        .send_request(nextgcore_sbi::message::SbiRequest::delete(path))
+        .await
+    {
+        Ok(resp) if resp.is_success() || resp.status == 404 => {
+            log::info!("[{supi}] SDM subscription {subscription_id} deleted");
+            true
+        }
+        Ok(resp) => {
+            log::warn!(
+                "[{supi}] Nudm_SDM_Unsubscribe({subscription_id}) returned status {}: the \
+                 subscription outlives its session and will notify a dead callback",
+                resp.status
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!(
+                "[{supi}] Nudm_SDM_Unsubscribe({subscription_id}) failed: {e}: the \
+                 subscription outlives its session and will notify a dead callback"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_subscription_id_is_the_last_segment_of_whatever_location_shape_arrives() {
+        assert_eq!(
+            subscription_id_from_location(Some(
+                "http://udm:7777/nudm-sdm/v2/imsi-1/sdm-subscriptions/sub-42"
+            )),
+            Some("sub-42".to_string())
+        );
+        assert_eq!(
+            subscription_id_from_location(Some("/nudm-sdm/v2/imsi-1/sdm-subscriptions/sub-42")),
+            Some("sub-42".to_string())
+        );
+        assert_eq!(
+            subscription_id_from_location(Some("/nudm-sdm/v2/imsi-1/sdm-subscriptions/sub-42/")),
+            Some("sub-42".to_string()),
+            "a trailing slash names the same resource"
+        );
+        assert_eq!(
+            subscription_id_from_location(Some("/sdm-subscriptions/sub-42?expires=1")),
+            Some("sub-42".to_string()),
+            "a query string is not part of the id"
+        );
+        assert_eq!(subscription_id_from_location(None), None);
+        assert_eq!(subscription_id_from_location(Some("")), None);
+        assert_eq!(subscription_id_from_location(Some("/")), None);
+    }
 
     #[test]
     fn bit_rates_parse_in_every_unit_and_refuse_nonsense() {
