@@ -1956,6 +1956,42 @@ fn next_free_ebi(assigned: &[AssignedEbi]) -> Option<u8> {
         .find(|c| !assigned.iter().any(|a| a.ebi == *c))
 }
 
+/// Free every EPS bearer identity a UE holds, because the UE has deregistered
+/// (issue #291). Returns how many were freed.
+///
+/// This is the backstop that makes an SMF-side miss recoverable, and it turned out
+/// to be **necessary rather than merely nice**: #291 asked whether deregistration
+/// already frees `assigned_ebis` because the context is dropped, and it does not.
+/// Nothing in production calls `amf_ue_remove` — `grep` finds only tests and
+/// `amf_ue_remove_all` (context teardown) — so an `AmfUe` outlives every
+/// deregistration it experiences, and with it every EBI recorded on it. Without this
+/// the eleven-wide space (TS 24.301 §9.3.2 reserves 0..=4) is only ever reclaimed by
+/// the SMF's `releasedEbiList`, and any release that fails to reach the AMF leaks an
+/// identity for the lifetime of the process.
+///
+/// Freeing them here is what TS 23.502 §4.2.2.3.2 implies rather than an invention:
+/// deregistration releases every PDU session the UE has, and an EPS bearer identity
+/// exists only to map one of those sessions into EPS. A UE with no sessions holding
+/// EBIs is the state this restores.
+pub(crate) fn release_all_ebis_on_deregistration(supi: &str) -> usize {
+    let Some(mut ue) = find_ue_by_context_id(supi) else {
+        return 0;
+    };
+    if ue.assigned_ebis.is_empty() {
+        return 0;
+    }
+    let freed: Vec<u8> = ue.assigned_ebis.iter().map(|a| a.ebi).collect();
+    ue.assigned_ebis.clear();
+    if let Ok(guard) = amf_self().read() {
+        guard.amf_ue_update(&ue);
+    }
+    log::info!(
+        "[{supi}] deregistration freed EPS bearer identities {freed:?}: the UE holds no \
+         PDU sessions, so it holds no EPS bearers"
+    );
+    freed.len()
+}
+
 /// POST /namf-comm/v1/ue-contexts/{ueContextId}/assign-ebi —
 /// Namf_Communication_EBIAssignment (TS 29.518 §6.1.6.2.5), issue #117.
 ///
@@ -4404,6 +4440,136 @@ mod tests {
                 .len(),
             1,
             "a partial failure is a 200 carrying both lists, not a 403"
+        );
+    }
+
+    /// #291 criterion 2: twelve sequential establish/release cycles for one UE keep
+    /// succeeding — and the same twelve WITHOUT the release do not.
+    ///
+    /// Both halves are the point. The first proves the SMF's `releasedEbiList`
+    /// (#291) makes the space reusable; the second pins what the leak actually did,
+    /// so a future change that stops honouring the release fails here rather than in
+    /// a deployment eleven session-lifetimes later. Eleven cycles is nothing: a UE
+    /// that re-attaches on the way to work reaches it inside a week.
+    #[test]
+    fn twelve_establish_release_cycles_keep_getting_an_ebi_and_twelve_without_release_do_not() {
+        let supi = "imsi-001010000000291";
+        setup_ue(supi, true, true);
+
+        let mut assigned = Vec::new();
+        for cycle in 1..=12u8 {
+            let resp = assign_ebi_request(supi, json!({ "pduSessionId": 5, "arpList": [arp(8)] }));
+            assert_eq!(
+                resp.status, 200,
+                "cycle {cycle}: a session whose predecessor released its EBI must \
+                 get one, not a 403 for a UE with no live bearers"
+            );
+            let body = body_json(&resp);
+            let ebi = body["assignedEbiList"][0]["epsBearerId"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("cycle {cycle}: no EBI assigned: {body}"));
+            assigned.push(ebi);
+
+            // What the SMF now does when the session is released.
+            let released =
+                assign_ebi_request(supi, json!({ "pduSessionId": 5, "releasedEbiList": [ebi] }));
+            assert_eq!(
+                released.status, 200,
+                "cycle {cycle}: the release must succeed"
+            );
+        }
+        assert_eq!(
+            assigned,
+            vec![5u64; 12],
+            "lowest-free reuse means every cycle gets the same identity back; \
+             a climbing allocator would exhaust the space instead"
+        );
+
+        // The other half: eleven sessions that never release exhaust the space, and
+        // the twelfth is refused. This is the state #291 found in the tree.
+        let leaky = "imsi-001010000000292";
+        setup_ue(leaky, true, true);
+        for cycle in 1..=11u8 {
+            let resp = assign_ebi_request(leaky, json!({ "pduSessionId": 5, "arpList": [arp(8)] }));
+            assert_eq!(resp.status, 200, "cycle {cycle} of eleven must fit");
+        }
+        let twelfth = assign_ebi_request(leaky, json!({ "pduSessionId": 5, "arpList": [arp(8)] }));
+        assert_eq!(
+            twelfth.status, 403,
+            "the twelfth unreleased session must be refused: eleven is the whole \
+             assignable space (TS 24.301 §9.3.2 reserves 0..=4)"
+        );
+        // AssignEbiError nests its cause under `error` rather than carrying a
+        // top-level ProblemDetails one (TS 29.518 §6.1.6.2.5).
+        assert_eq!(
+            body_json(&twelfth)["error"]["cause"],
+            json!("INSUFFICIENT_RESOURCES")
+        );
+        assert_eq!(
+            body_json(&twelfth)["failureDetails"]["failedArpList"]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "the SMF must learn WHICH flow got no EBI"
+        );
+    }
+
+    /// #291 criterion 4: deregistration frees the UE's EBIs.
+    ///
+    /// The issue asked whether this already happened because the context is dropped.
+    /// It did not, and the reason is worth pinning: nothing in production removes an
+    /// `AmfUe` (`amf_ue_remove` has only test callers), so the context — and every
+    /// identity recorded on it — outlives every deregistration. Without this
+    /// backstop the only path that frees an EBI is the SMF's release, and an SMF
+    /// whose release never arrives leaks one for the life of the process.
+    #[test]
+    fn deregistration_frees_the_ues_eps_bearer_identities() {
+        let supi = "imsi-001010000000293";
+        setup_ue(supi, true, true);
+
+        // Two sessions of one UE, both holding an identity.
+        for psi in [5u8, 6u8] {
+            let resp =
+                assign_ebi_request(supi, json!({ "pduSessionId": psi, "arpList": [arp(8)] }));
+            assert_eq!(resp.status, 200);
+        }
+        assert_eq!(
+            find_ue_by_context_id(supi)
+                .map(|ue| ue.assigned_ebis.len())
+                .unwrap_or(0),
+            2,
+            "both identities are held before the deregistration"
+        );
+
+        assert_eq!(
+            release_all_ebis_on_deregistration(supi),
+            2,
+            "deregistration frees every identity the UE holds"
+        );
+        assert!(
+            find_ue_by_context_id(supi)
+                .map(|ue| ue.assigned_ebis.is_empty())
+                .unwrap_or(false),
+            "the freed identities must be gone from the STORED context, not just \
+             from a local copy — an unpersisted clear frees nothing"
+        );
+
+        // And the space is genuinely reusable afterwards.
+        let after = assign_ebi_request(supi, json!({ "pduSessionId": 7, "arpList": [arp(8)] }));
+        assert_eq!(after.status, 200);
+        assert_eq!(
+            body_json(&after)["assignedEbiList"][0]["epsBearerId"],
+            json!(5),
+            "the lowest identity is free again"
+        );
+
+        // A UE holding none, and an unknown UE, are both no-ops rather than errors.
+        let empty = "imsi-001010000000294";
+        setup_ue(empty, true, true);
+        assert_eq!(release_all_ebis_on_deregistration(empty), 0);
+        assert_eq!(
+            release_all_ebis_on_deregistration("imsi-999999999999999"),
+            0
         );
     }
 

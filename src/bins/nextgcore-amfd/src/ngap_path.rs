@@ -3192,6 +3192,23 @@ impl NgapServer {
             });
         }
 
+        // #291: free the UE's EPS bearer identities. Done HERE, in the common tail of
+        // both deregistration directions, and BEFORE `ue_auth_state` is dropped —
+        // that is where the SUPI keying the stored `AmfUe` comes from.
+        //
+        // This is a backstop, not the primary mechanism: the SMF returns each
+        // identity in a `releasedEbiList` when its PDU session is released. It is
+        // needed because the stored `AmfUe` SURVIVES deregistration (nothing in
+        // production removes one), so without it an identity whose release never
+        // reached the AMF is leaked for the life of the process.
+        if let Some(supi) = self
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .and_then(|s| s.amf_ue.supi.clone())
+        {
+            crate::namf_server::release_all_ebis_on_deregistration(&supi);
+        }
+
         self.ue_auth_state.remove(&amf_ue_ngap_id);
         // Cause: NAS deregister (TS 38.413 Section 9.3.1.2, CauseNas value 2)
         self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
@@ -8622,6 +8639,71 @@ mod tests {
                 tai_slice_support_list: vec![nextgcore_ngap::types::SNssai { sst, sd: None }],
             }],
         }
+    }
+
+    /// #291: the deregistration tail actually calls the EBI backstop.
+    ///
+    /// The state change itself is asserted by
+    /// `namf_server::tests::deregistration_frees_the_ues_eps_bearer_identities`; this
+    /// asserts the WIRING, because "the helper is tested and the wiring is not" is
+    /// the defect this repo keeps finding — #276 shipped a fully tested
+    /// `create_dns_context` with no production caller for a month. Driven through
+    /// `finish_deregistration`, the common tail of both deregistration directions.
+    ///
+    /// The NG release at the end of that tail fails (no live SCTP association in this
+    /// test, per `test_ngap_server`), which is fine: the freeing happens before it,
+    /// and asserting on the STORED context is what distinguishes the two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deregistration_frees_the_ues_ebis_through_the_ngap_tail() {
+        use crate::context::{amf_context_init, amf_self};
+
+        let mut server = test_ngap_server().await;
+        let supi = "imsi-001010000000295";
+        let amf_ue_ngap_id = 9_291u64;
+
+        // A stored UE holding an identity, in the GLOBAL context the EBI space lives
+        // in (`handle_assign_ebi` reads it there; the server's own context is a
+        // separate object in this harness).
+        amf_context_init(64, 1024, 4096);
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx");
+            let ran_ue = guard.ran_ue_add(900_291, 291).expect("ran_ue");
+            let ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue");
+            guard.amf_ue_set_supi(ue.id, supi);
+            let mut ue = guard.amf_ue_find_by_supi(supi).expect("stored ue");
+            ue.assigned_ebis.push(crate::context::AssignedEbi {
+                ebi: 5,
+                pdu_session_id: 5,
+                arp: crate::context::EbiArp {
+                    priority_level: 8,
+                    preempt_cap: "NOT_PREEMPT".to_string(),
+                    preempt_vuln: "PREEMPTABLE".to_string(),
+                },
+            });
+            guard.amf_ue_update(&ue);
+        }
+
+        // The NAS state the tail reads the SUPI out of.
+        let mut state = UeNasContext::new(amf_ue_ngap_id, 291, 9_291, false);
+        state.amf_ue.supi = Some(supi.to_string());
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+
+        let _ = server
+            .finish_deregistration(9_291, amf_ue_ngap_id, 291)
+            .await;
+
+        let held = amf_self()
+            .read()
+            .expect("ctx")
+            .amf_ue_find_by_supi(supi)
+            .map(|ue| ue.assigned_ebis.len())
+            .unwrap_or(usize::MAX);
+        assert_eq!(
+            held, 0,
+            "the deregistration tail must free the UE's EPS bearer identities; the \
+             stored AmfUe survives deregistration, so nothing else will"
+        );
     }
 
     // ---- criterion 1: RAN Configuration Update stores what it acknowledges ----

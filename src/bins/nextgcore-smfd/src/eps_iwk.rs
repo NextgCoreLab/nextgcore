@@ -106,22 +106,6 @@ pub async fn request_ebi(
     pdu_session_id: u8,
     arp_priority_level: u8,
 ) -> Option<u8> {
-    if !enabled() {
-        return None;
-    }
-    let Some(amf_uri) = amf_uri else {
-        log::warn!(
-            "[{supi}] EPS interworking is on but the AMF supplied no callback URI: \
-             no EBI can be requested for PSI {pdu_session_id}, so this session \
-             cannot be moved to EPS"
-        );
-        return None;
-    };
-    let Some((host, port)) = crate::policy::split_host_port(amf_uri) else {
-        log::warn!("[{supi}] AMF URI '{amf_uri}' is not a valid URI: no EBI requested");
-        return None;
-    };
-
     let body = serde_json::json!({
         "pduSessionId": pdu_session_id,
         // One ARP entry, so one EBI: this SMF authorises a single default QoS flow
@@ -130,27 +114,7 @@ pub async fn request_ebi(
         "arpList": [default_flow_arp(arp_priority_level)],
     });
 
-    let path = format!("/namf-comm/v1/ue-contexts/{supi}/assign-ebi");
-    let request = nextgcore_sbi::message::SbiRequest::post(&path).with_body(
-        body.to_string(),
-        nextgcore_sbi::constants::content_type::APPLICATION_JSON,
-    );
-    let client = nextgcore_sbi::client::SbiClient::new(
-        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
-            .with_connect_timeout(std::time::Duration::from_secs(2))
-            .with_request_timeout(std::time::Duration::from_secs(3)),
-    );
-
-    let response = match client.send_request(request).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            log::warn!(
-                "[{supi}] EBI assignment to {host}:{port} failed: {e}. The session \
-                 proceeds without EPS interworking."
-            );
-            return None;
-        }
-    };
+    let response = post_assign_ebi(amf_uri, supi, pdu_session_id, &body, "assignment").await?;
     if response.status != 200 {
         log::warn!(
             "[{supi}] AMF refused EBI assignment for PSI {pdu_session_id}: status={}. \
@@ -167,6 +131,115 @@ pub async fn request_ebi(
         );
         None
     })
+}
+
+/// Give an assigned EBI back to the AMF when its PDU session is released
+/// (issue #291, TS 29.518 §6.1.6.2.5's `releasedEbiList`).
+///
+/// The identity space is **eleven wide per UE** — TS 24.301 §9.3.2 reserves 0..=4 —
+/// so an SMF that assigns and never releases exhausts it after eleven session
+/// lifetimes rather than after eleven concurrent bearers. `next_free_ebi` on the AMF
+/// side is lowest-free, so the space does not look under pressure until it is gone,
+/// and the twelfth session gets a `403 INSUFFICIENT_RESOURCES` with no live bearers
+/// to account for it. The failure is silent in the direction that matters:
+/// [`request_ebi`] treats every failure as non-fatal, so nothing surfaces except
+/// that interworking has quietly stopped working for that subscriber.
+///
+/// Returns `true` when the AMF confirmed the release. A `false` is **not** a session
+/// failure — see the module's failure posture — but it does mean one identity is
+/// leaked until the UE deregisters, which is why the log names it.
+///
+/// The disabled leg returns early and says nothing: `false` would otherwise conflate
+/// "not attempted" with "attempted and lost", and the leak warning below would name a
+/// consequence that a deployment with interworking off cannot have.
+pub async fn release_ebi(amf_uri: Option<&str>, supi: &str, pdu_session_id: u8, ebi: u8) -> bool {
+    if !enabled() {
+        return false;
+    }
+    let body = serde_json::json!({
+        "pduSessionId": pdu_session_id,
+        // The AMF frees these BEFORE it allocates anything in the same request, and
+        // treats a release of an EBI it does not hold as a success — so this is
+        // safely repeatable and cannot strand a retry (`handle_assign_ebi`).
+        "releasedEbiList": [ebi],
+    });
+
+    let Some(response) = post_assign_ebi(amf_uri, supi, pdu_session_id, &body, "release").await
+    else {
+        // `post_assign_ebi` logs why it could not send; name the consequence here,
+        // where the leaked identity is known.
+        log::warn!(
+            "[{supi}] EPS bearer identity {ebi} (PSI {pdu_session_id}) could not be \
+             returned to the AMF and is LEAKED until this UE deregisters: the UE has \
+             eleven per its whole registration, so repeated releases like this one end \
+             in a 403 for a session with no live bearers"
+        );
+        return false;
+    };
+    if response.status != 200 {
+        log::warn!(
+            "[{supi}] AMF refused to release EPS bearer identity {ebi} (PSI \
+             {pdu_session_id}): status={}. The identity is LEAKED until this UE \
+             deregisters.",
+            response.status
+        );
+        return false;
+    }
+    log::info!("[{supi}] EPS bearer identity {ebi} (PSI {pdu_session_id}) returned to the AMF");
+    true
+}
+
+/// POST an `AssignEbiData` body to the UE's `assign-ebi` resource.
+///
+/// One place where the leg's switch, the AMF authority and the client posture are
+/// decided, because the assignment and the release differ only in the body they
+/// carry: two copies of this would be two chances for the switch check or the
+/// timeouts to drift apart. `None` means nothing was sent, and why is logged here.
+///
+/// `amf_uri` is the AMF's callback root, which is the only address the SMF has for
+/// it — the same source `send_n1_n2_message_transfer` uses. A session whose create
+/// carried no `smContextStatusUri` therefore can neither get an EBI nor give one
+/// back, and says so.
+async fn post_assign_ebi(
+    amf_uri: Option<&str>,
+    supi: &str,
+    pdu_session_id: u8,
+    body: &serde_json::Value,
+    what: &str,
+) -> Option<nextgcore_sbi::message::SbiResponse> {
+    if !enabled() {
+        return None;
+    }
+    let Some(amf_uri) = amf_uri else {
+        log::warn!(
+            "[{supi}] EPS interworking is on but the AMF supplied no callback URI: \
+             no EBI {what} is possible for PSI {pdu_session_id}"
+        );
+        return None;
+    };
+    let Some((host, port)) = crate::policy::split_host_port(amf_uri) else {
+        log::warn!("[{supi}] AMF URI '{amf_uri}' is not a valid URI: no EBI {what} attempted");
+        return None;
+    };
+
+    let path = format!("/namf-comm/v1/ue-contexts/{supi}/assign-ebi");
+    let request = nextgcore_sbi::message::SbiRequest::post(&path).with_body(
+        body.to_string(),
+        nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+    );
+    let client = nextgcore_sbi::client::SbiClient::new(
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3)),
+    );
+
+    match client.send_request(request).await {
+        Ok(resp) => Some(resp),
+        Err(e) => {
+            log::warn!("[{supi}] EBI {what} to {host}:{port} failed: {e}");
+            None
+        }
+    }
 }
 
 /// Pull the first usable EBI out of an `AssignedEbiData` body.
