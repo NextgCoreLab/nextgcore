@@ -161,6 +161,19 @@ pub struct MbsSession {
     pub n4mb_session: Option<N4mbSession>,
     /// Group membership tracking (SUPI set)
     pub group_members: HashSet<String>,
+    /// The SSM the consumer identified this session with, when it used one (#76).
+    ///
+    /// Distinct from `n4mb_session.ll_ssm_src`/`ll_ssm_dst`, which are the
+    /// lower-layer SSM the MB-SMF *allocates* toward NG-RAN. This is the
+    /// `MbsSessionId.ssm` the consumer supplied, and it is what an SSM-identified
+    /// ContextUpdate has to be resolved by.
+    ///
+    /// Held as the wire type (`crate::types::Ssm`) rather than parsed into
+    /// `std::net::IpAddr`: TS 29.571's `IpAddr` is a choice of two OPTIONAL textual
+    /// members, so "the address the consumer sent" and "an address" are not the same
+    /// thing, and matching on the received form is what makes a lookup agree with
+    /// what was stored.
+    pub ssm: Option<crate::types::Ssm>,
 }
 
 impl MbsSession {
@@ -182,6 +195,7 @@ impl MbsSession {
             sm_context_ref: None,
             n4mb_session: None,
             group_members: HashSet::new(),
+            ssm: None,
         }
     }
 
@@ -480,6 +494,20 @@ impl MbSmfContext {
             return None;
         }
 
+        // #76: a duplicate TMGI used to overwrite `tmgi_hash` silently, so the
+        // earlier session stayed in `session_list` reachable by NOTHING — its TMGI
+        // resolved to the new session, and its N4mb session on the MB-UPF could
+        // never be released. Refusing is the honest answer: a TMGI identifies one
+        // MBS session, so a second create for the same one is the consumer's error,
+        // and the existing session is still there to be found or deleted.
+        if tmgi_hash.contains_key(&tmgi) {
+            log::warn!(
+                "MBS session create refused: TMGI {tmgi:?} already identifies session {:?}",
+                tmgi_hash.get(&tmgi)
+            );
+            return None;
+        }
+
         let id = self.next_session_id.fetch_add(1, Ordering::SeqCst) as u64;
         let mut session = MbsSession::new(id, tmgi.clone(), session_type);
         // Allocate a multicast TEID for this session
@@ -495,23 +523,44 @@ impl MbSmfContext {
         Some(session)
     }
 
+    /// Remove a session's LOCAL state.
+    ///
+    /// #76: this used to be the whole of DELETE, and its log line said "releasing
+    /// N4mb SEID" while releasing nothing — no PFCP Session Deletion Request was
+    /// ever sent, so every released MBS session leaked an N4mb session on the
+    /// MB-UPF. The wire release is the caller's job (it needs an `await`), which is
+    /// why the removed session — carrying its `n4mb_session` — is returned. Callers
+    /// must use [`Self::session_mark_release_pending`] first and remove only after
+    /// the Session Deletion Response.
     pub fn session_remove(&self, id: u64) -> Option<MbsSession> {
         let mut session_list = self.session_list.write().ok()?;
         let mut tmgi_hash = self.tmgi_hash.write().ok()?;
 
         if let Some(session) = session_list.remove(&id) {
             tmgi_hash.remove(&session.tmgi);
-            if let Some(ref n4mb) = session.n4mb_session {
-                log::info!(
-                    "MBS session removed (id={id}) - releasing N4mb SEID {}",
-                    n4mb.local_seid
-                );
-            } else {
-                log::info!("MBS session removed (id={id})");
-            }
+            log::info!("MBS session local state removed (id={id})");
             return Some(session);
         }
         None
+    }
+
+    /// Mark a session's N4mb context `ReleasePending` and return the remote SEID to
+    /// address the Session Deletion Request to (#76).
+    ///
+    /// Two steps rather than one because the deletion is an `await` and the context
+    /// is behind a `std` lock: the state transition happens under the lock, the wire
+    /// exchange outside it, and the local removal only after the response. The
+    /// remote SEID is what the request must be addressed to (TS 29.244 §7.5.4) —
+    /// the LOCAL seid would address a session the UP does not know.
+    pub fn session_mark_release_pending(&self, id: u64) -> Option<u64> {
+        let mut session_list = self.session_list.write().ok()?;
+        let session = session_list.get_mut(&id)?;
+        let n4mb = session.n4mb_session.as_mut()?;
+        n4mb.state = N4mbSessionState::ReleasePending;
+        // A session whose establishment never completed has no UP-allocated SEID,
+        // so there is nothing on the UP to delete. `None` says so, distinctly from
+        // "no N4mb context at all".
+        (n4mb.remote_seid != 0).then_some(n4mb.remote_seid)
     }
 
     pub fn session_remove_all(&self) {
@@ -553,10 +602,33 @@ impl MbSmfContext {
         self.session_list.read().map(|l| l.len()).unwrap_or(0)
     }
 
-    /// Activate a session with N4mb PFCP establishment to UPF
+    /// Activate a session with N4mb PFCP establishment to UPF.
+    ///
+    /// **Idempotent (#76).** An N4mb session that is already `Established` is
+    /// returned unchanged rather than replaced. It used to allocate a fresh
+    /// `local_seid` and overwrite `n4mb_session` on every call, so N repeated
+    /// joins/STARTs created N PFCP sessions on the MB-UPF and orphaned every
+    /// previous one — contrary to the shared-distribution-session model of TS 23.247
+    /// §7.2.1.3/§7.2.1.4, where one MB-UPF session is established once and reused
+    /// across joins. Under multicast churn that leaked a UPF session per join.
+    ///
+    /// An `EstablishmentPending` session is NOT short-circuited: its establishment
+    /// may have failed, and re-driving it is how a retry works. Only a session the
+    /// UP has confirmed is reused.
     pub fn session_activate_n4mb(&self, session_id: u64, upf_addr: Ipv4Addr) -> Option<MbsSession> {
         let mut session_list = self.session_list.write().ok()?;
         let session = session_list.get_mut(&session_id)?;
+
+        if let Some(existing) = session.n4mb_session.as_ref() {
+            if existing.state == N4mbSessionState::Established {
+                log::debug!(
+                    "MBS session {session_id} already has an established N4mb session \
+                     (seid={}); reusing it rather than allocating a second",
+                    existing.local_seid
+                );
+                return Some(session.clone());
+            }
+        }
 
         let local_seid = self.alloc_n4mb_seid();
         let n4mb = build_n4mb_session_establishment(session, local_seid, upf_addr);
@@ -569,6 +641,57 @@ impl MbSmfContext {
             "MBS session {session_id} activated with N4mb to UPF {upf_addr} (seid={local_seid})"
         );
         Some(session.clone())
+    }
+
+    /// Find a session by the SSM the consumer identified it with (#76).
+    ///
+    /// A linear scan rather than a second index. Sessions are capped at
+    /// `max_sessions` and ContextUpdate is not a per-packet path, so the cost is
+    /// irrelevant — while a second index over the same sessions would be a second
+    /// set of invariants to keep in step with `session_add`/`session_remove`, which
+    /// is exactly the class of bug the duplicate-TMGI overwrite was.
+    pub fn session_find_by_ssm(&self, ssm: &crate::types::Ssm) -> Option<MbsSession> {
+        let session_list = self.session_list.read().ok()?;
+        session_list
+            .values()
+            .find(|s| s.ssm.as_ref() == Some(ssm))
+            .cloned()
+    }
+
+    /// Find a session by the LOCAL N4mb SEID (#76).
+    ///
+    /// The MB-UPF addresses a Session Report to the CP F-SEID it was given at
+    /// establishment, i.e. to our `local_seid` — not to the SEID it allocated
+    /// itself. Looking up by `remote_seid` would find nothing for every report.
+    pub fn session_find_by_local_seid(&self, seid: u64) -> Option<MbsSession> {
+        let session_list = self.session_list.read().ok()?;
+        session_list
+            .values()
+            .find(|s| {
+                s.n4mb_session
+                    .as_ref()
+                    .is_some_and(|n| n.local_seid == seid)
+            })
+            .cloned()
+    }
+
+    /// Activate a session on downlink data arrival (TS 23.247 §7.2.5.2), #76.
+    ///
+    /// Returns whether the state actually CHANGED. A session already `Active` is
+    /// left alone and reports `false`, so the caller can distinguish "traffic
+    /// reactivated a deactivated session" — the event that matters — from a report
+    /// about a session that was never deactivated. Answering `true` unconditionally
+    /// would make the log say a session was reactivated every time a packet arrived.
+    pub fn session_activate_on_downlink_data(&self, session_id: u64) -> bool {
+        if let Ok(mut list) = self.session_list.write() {
+            if let Some(session) = list.get_mut(&session_id) {
+                if session.state != MbsSessionState::Active {
+                    session.state = MbsSessionState::Active;
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Join a UE to an MBS session group
@@ -778,12 +901,32 @@ impl MbSmfContext {
         };
         if let Ok(mut list) = self.session_list.write() {
             if let Some(session) = list.get_mut(&id) {
+                // #76: this used to set ReleasePending and then IMMEDIATELY zero
+                // `n4mb_session`, so the SEID needed to delete the session on the
+                // MB-UPF was discarded before anything could send the deletion. The
+                // context is now left in place for the caller to release on the
+                // wire and clear afterwards (`session_clear_n4mb`).
                 if let Some(n4mb) = session.n4mb_session.as_mut() {
                     n4mb.state = N4mbSessionState::ReleasePending;
                 }
-                session.n4mb_session = None;
                 session.state = MbsSessionState::Suspended;
                 return true;
+            }
+        }
+        false
+    }
+
+    /// Clear a session's N4mb context after its Session Deletion completed (#76).
+    ///
+    /// Separate from [`Self::session_context_terminate`] so the SEID survives long
+    /// enough to be used. Returns whether a context was cleared, so a caller can
+    /// tell "released and cleared" from "there was nothing to release".
+    pub fn session_clear_n4mb(&self, id: u64) -> bool {
+        if let Ok(mut list) = self.session_list.write() {
+            if let Some(session) = list.get_mut(&id) {
+                let had = session.n4mb_session.is_some();
+                session.n4mb_session = None;
+                return had;
             }
         }
         false
@@ -1127,8 +1270,27 @@ mod tests {
             .is_none());
     }
 
+    /// **Assertion inverted by #76, and why.** This used to assert that
+    /// `session_context_terminate` leaves `n4mb_session` as `None`. That was pinning
+    /// the defect as the requirement: zeroing the context discards the remote SEID a
+    /// PFCP Session Deletion Request has to be addressed to, so nothing could delete
+    /// the session on the MB-UPF even in principle, and every terminate leaked one.
+    ///
+    /// The governing clause is not a "may": TS 29.244 §7.5.4 has the CP function
+    /// **send** a Session Deletion Request to release a PFCP session, and TS 23.247
+    /// §7.1.1.4 has releasing an MBS session tear down the associated MB-UPF
+    /// resources. So the old assertion was asserting a shortcut past a mandatory
+    /// message, and inverting it is legitimate.
+    ///
+    /// Terminate now marks the context `ReleasePending` and LEAVES it; the wire
+    /// release plus the clear is `release_n4mb_transport` in `main.rs`, and the two
+    /// handler-level tests that assert the post-handler state
+    /// (`test_router_context_update_amf_release_golden_204`,
+    /// `mbs_context_update_strict_peer_release_204`) still pass unchanged — which is
+    /// what shows the observable behaviour of the SERVICE is preserved and only this
+    /// function's own contract narrowed.
     #[test]
-    fn test_context_terminate_releases_n4mb() {
+    fn test_context_terminate_marks_release_pending_without_discarding_the_seid() {
         let mut ctx = MbSmfContext::new();
         ctx.init(256);
         let tmgi = make_tmgi(0x43);
@@ -1137,14 +1299,112 @@ mod tests {
             .unwrap();
         ctx.session_context_start(&tmgi, Ipv4Addr::new(10, 0, 0, 7))
             .unwrap();
+        // Pretend the UP answered, so there is a remote SEID to delete.
+        assert!(ctx.apply_n4mb_response(
+            created.id,
+            0xdead_beef,
+            0x1234,
+            Ipv4Addr::new(10, 0, 0, 7)
+        ));
 
         assert!(ctx.session_context_terminate(&tmgi));
         let after = ctx.session_find_by_id(created.id).unwrap();
-        assert!(after.n4mb_session.is_none());
+        let n4mb = after.n4mb_session.as_ref().expect(
+            "the N4mb context must SURVIVE terminate: its remote SEID is what the \
+                     Session Deletion Request is addressed to",
+        );
+        assert_eq!(n4mb.state, N4mbSessionState::ReleasePending);
+        assert_eq!(n4mb.remote_seid, 0xdead_beef);
         assert_eq!(after.state, MbsSessionState::Suspended);
+
+        // The two-step is what the release driver uses: mark, then delete, then clear.
+        assert_eq!(
+            ctx.session_mark_release_pending(created.id),
+            Some(0xdead_beef),
+            "the remote SEID must be recoverable for the deletion request"
+        );
+        assert!(ctx.session_clear_n4mb(created.id));
+        assert!(ctx
+            .session_find_by_id(created.id)
+            .unwrap()
+            .n4mb_session
+            .is_none());
+        assert!(
+            !ctx.session_clear_n4mb(created.id),
+            "clearing twice must report that there was nothing left to clear"
+        );
 
         // Terminating an unknown TMGI is a no-op.
         assert!(!ctx.session_context_terminate(&make_tmgi(0x77)));
+    }
+
+    /// #76 criterion 5: a repeated START must not allocate a second N4mb session.
+    ///
+    /// N repeated joins used to create N PFCP sessions on the MB-UPF and orphan
+    /// every previous one, contrary to the shared-distribution-session model of TS
+    /// 23.247 §7.2.1.3/§7.2.1.4. An `EstablishmentPending` session is deliberately
+    /// NOT short-circuited: its establishment may have failed, and re-driving it is
+    /// how a retry works.
+    #[test]
+    fn a_repeated_start_reuses_an_established_n4mb_session() {
+        let mut ctx = MbSmfContext::new();
+        ctx.init(256);
+        let tmgi = make_tmgi(0x51);
+        let created = ctx
+            .session_add(tmgi.clone(), MbsSessionType::Multicast)
+            .unwrap();
+        let upf = Ipv4Addr::new(10, 0, 0, 7);
+
+        let first = ctx.session_context_start(&tmgi, upf).unwrap();
+        let first_seid = first.n4mb_session.as_ref().unwrap().local_seid;
+        // Not yet established: a second START re-drives it, which is the retry path.
+        let retry = ctx.session_context_start(&tmgi, upf).unwrap();
+        assert_ne!(
+            retry.n4mb_session.as_ref().unwrap().local_seid,
+            first_seid,
+            "an establishment that never completed must be re-drivable"
+        );
+        let retry_seid = retry.n4mb_session.as_ref().unwrap().local_seid;
+
+        // Now the UP confirms it. Every later START must reuse this one.
+        assert!(ctx.apply_n4mb_response(created.id, 0x99, 0x1234, upf));
+        for _ in 0..3 {
+            let again = ctx.session_context_start(&tmgi, upf).unwrap();
+            let n4mb = again.n4mb_session.as_ref().unwrap();
+            assert_eq!(
+                n4mb.local_seid, retry_seid,
+                "a repeated START must not allocate a new SEID for an established session"
+            );
+            assert_eq!(n4mb.remote_seid, 0x99, "nor discard the UP-allocated one");
+            assert_eq!(n4mb.state, N4mbSessionState::Established);
+        }
+    }
+
+    /// #76 criterion 7: a second create for a TMGI already in use is refused rather
+    /// than silently orphaning the first session.
+    ///
+    /// The overwrite used to leave the earlier session in `session_list` reachable
+    /// by NOTHING — its TMGI resolved to the new session, so it could never be found
+    /// or deleted, and its MB-UPF session could never be released.
+    #[test]
+    fn a_duplicate_tmgi_create_is_refused_and_the_first_session_survives() {
+        let mut ctx = MbSmfContext::new();
+        ctx.init(256);
+        let tmgi = make_tmgi(0x61);
+        let first = ctx
+            .session_add(tmgi.clone(), MbsSessionType::Multicast)
+            .expect("the first create succeeds");
+        assert!(
+            ctx.session_add(tmgi.clone(), MbsSessionType::Multicast)
+                .is_none(),
+            "a TMGI identifies one MBS session; a second create for it must be refused"
+        );
+        assert_eq!(
+            ctx.session_find_by_tmgi(&tmgi).map(|s| s.id),
+            Some(first.id),
+            "the TMGI must still resolve to the FIRST session"
+        );
+        assert_eq!(ctx.session_count(), 1, "and no orphan is left behind");
     }
 
     #[test]

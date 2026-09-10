@@ -268,9 +268,17 @@ async fn main() -> Result<()> {
 
     log::info!("NextGCore MB-SMF ready (instance: {nf_instance_id})");
 
-    // Main event loop
+    // Main event loop.
+    //
+    // #76: also drains the N4mb Session Report queue. The recv loop answers each
+    // report on the wire immediately; this applies the consequence (activating a
+    // deactivated multicast session on downlink data arrival, TS 23.247 §7.2.5.2)
+    // where the session state lives, so the socket loop never takes the context
+    // lock. 100ms is the loop's existing tick, and a report already answered is not
+    // time-critical to apply.
     while !shutdown.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(100)).await;
+        apply_n4mb_reports().await;
     }
 
     // Graceful shutdown
@@ -458,21 +466,66 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
-    // Read mbsSession.serviceType (the spec field name).
+    // #76: `serviceType` is REQUIRED in TS 29.571's `MbsSession`. It used to be
+    // defaulted (`_ => Multicast`), so a request omitting a mandatory IE was
+    // accepted and silently became a multicast session — the create then succeeded
+    // and the consumer never learned its request was incomplete.
     let session_type = match req.mbs_session.service_type {
         Some(types::MbsServiceType::Broadcast) => MbsSessionType::Broadcast,
-        _ => MbsSessionType::Multicast,
+        Some(types::MbsServiceType::Multicast) => MbsSessionType::Multicast,
+        None => {
+            return send_bad_request(
+                "mbsSession.serviceType is mandatory (TS 29.571 MbsSession)",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
     };
 
-    // mbsmfd-07: resolve the TMGI from mbsSession.mbsSessionId (else default).
+    let ctx = mbsmf_self();
+
+    // #76: resolve the TMGI. TS 29.571 makes `MbsSession` `anyOf [mbsSessionId,
+    // tmgiAllocReq]`, so a create either NAMES its session or ASKS for a TMGI.
+    //
+    // The no-TMGI path used to return a HARDCODED TMGI (`mbsServiceId
+    // [0x01,0x02,0x03]`, PLMN 001/01) from `context_tmgi_from`, so every such create
+    // collided with every other one — and `session_add` overwrote `tmgi_hash`
+    // silently, orphaning the earlier session. It now allocates from the same
+    // `TmgiPool` the Nmbsmf TMGI service uses, so two such creates get two sessions.
     let spec_tmgi = req
         .mbs_session
         .mbs_session_id
         .as_ref()
         .and_then(|id| id.tmgi.as_ref());
-    let tmgi = context_tmgi_from(spec_tmgi);
+    let tmgi = match spec_tmgi {
+        Some(t) => context_tmgi_from(Some(t)),
+        None => {
+            // No TMGI: allocate one. TS 29.571's `MbsSession` is
+            // `anyOf [mbsSessionId, tmgiAllocReq]`, and that `anyOf` is deliberately
+            // NOT enforced here -- #76's criterion 7 requires a create carrying no
+            // TMGI to SUCCEED by allocating from the pool, so refusing an absent
+            // `tmgiAllocReq` would contradict it. An absent flag is therefore read as
+            // an implicit request, which is the reading that makes both the criterion
+            // and the schema's intent satisfiable. Stated rather than silent: a
+            // conformance suite exercising the `anyOf` will see it accepted.
+            let allocated = ctx.read().ok().and_then(|c| {
+                let (tmgis, _expiry) =
+                    c.tmgi_allocate(&default_plmn(), 1, context::TMGI_DEFAULT_TTL_SECS);
+                tmgis.into_iter().next()
+            });
+            match allocated {
+                Some(t) => t,
+                None => {
+                    return nextgcore_sbi::server::send_error(
+                        507,
+                        "Insufficient Storage",
+                        "No TMGI could be allocated for this MBS session",
+                        Some("TMGI_POOL_EXHAUSTED"),
+                    )
+                }
+            }
+        }
+    };
 
-    let ctx = mbsmf_self();
     let session = if let Ok(context) = ctx.read() {
         context.session_add(tmgi, session_type)
     } else {
@@ -480,22 +533,66 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
     };
 
     match session {
-        Some(session) => {
+        Some(mut session) => {
             let session_id = format!("mbs-sess-{}", session.id);
             log::info!("MBS Session created: {session_id} (type={session_type:?})");
+
+            // #76: remember the SSM the consumer identified this session with, so an
+            // SSM-identified ContextUpdate can resolve it. `MbsSessionId` is
+            // `anyOf(tmgi, ssm)`, and the SSM form used to be unresolvable at all.
+            if let Some(ssm) = req
+                .mbs_session
+                .mbs_session_id
+                .as_ref()
+                .and_then(|id| id.ssm.as_ref())
+                .or(req.mbs_session.ssm.as_ref())
+            {
+                session.ssm = Some(ssm.clone());
+                if let Ok(context) = ctx.read() {
+                    context.session_update(&session);
+                }
+            }
 
             // mbsmfd-06: respond with CreateRspData{ mbsSession }.
             let rsp = types::CreateRspData {
                 mbs_session: types::ExtMbsSession {
                     mbs_session_id: Some(types::MbsSessionId {
                         tmgi: Some(spec_tmgi_from(&session.tmgi)),
-                        ssm: None,
+                        // #76: an SSM-identified create gets its SSM back, so the
+                        // consumer can address the session the way it named it.
+                        ssm: req
+                            .mbs_session
+                            .mbs_session_id
+                            .as_ref()
+                            .and_then(|id| id.ssm.clone()),
                     }),
                     service_type: Some(match session_type {
                         MbsSessionType::Broadcast => types::MbsServiceType::Broadcast,
                         MbsSessionType::Multicast => types::MbsServiceType::Multicast,
                     }),
-                    ingress_tun_addr: Some(format!("{:#010x}", session.gtp_teid)),
+                    // #76: a structured TS 29.571 `TunnelAddress` ARRAY, not the hex
+                    // TEID string this used to emit. `ingressTunAddr` is readOnly and
+                    // `minItems: 1`, and it is the one member a consumer needs in
+                    // order to send traffic anywhere.
+                    ingress_tun_addr: Some(vec![types::TunnelAddress {
+                        // The MB-SMF's own transport address and the GTP-U port
+                        // (TS 29.281): where the content provider sends ingress
+                        // traffic for this session.
+                        ipv4_addr: Some(std::net::Ipv4Addr::from(configured_cp_addr()).to_string()),
+                        ipv6_addr: None,
+                        port_number: 2152,
+                    }]),
+                    // The write-only members are echoed so a consumer can confirm
+                    // what the MB-SMF stored rather than assume it.
+                    ssm: req.mbs_session.ssm.clone(),
+                    mbs_service_area: req.mbs_session.mbs_service_area.clone(),
+                    mbs_serv_info: req.mbs_session.mbs_serv_info.clone(),
+                    mbs_security_context: req.mbs_session.mbs_security_context.clone(),
+                    contact_pcf_ind: req.mbs_session.contact_pcf_ind,
+                    area_session_policy_id: req.mbs_session.area_session_policy_id,
+                    activity_status: None,
+                    tmgi_alloc_req: None,
+                    ingress_tun_addr_req: None,
                 },
             };
 
@@ -622,7 +719,46 @@ async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> Sb
 
     match session {
         Some(mut session) => {
-            let outcome = types::apply_patch_data(&patch, &mut session.service_area_tacs);
+            // #76: `activityStatus`, `mbsServInfo` (QoS) and `mbsSecurityContext`
+            // used to be silently ignored, so a PATCH activating a session answered
+            // 204 and changed nothing. They are collected here and persisted below.
+            let mut changes = types::PatchChanges::default();
+            let outcome =
+                types::apply_patch_data(&patch, &mut session.service_area_tacs, &mut changes);
+
+            // TS 23.247 §7.2.5: `activityStatus` drives whether distribution is
+            // active. Applied to the session state so a subsequent GET and the N4mb
+            // driver both see it, rather than being acknowledged and dropped.
+            if let Some(ref status) = changes.activity_status {
+                session.state = match status.as_str() {
+                    "ACTIVE" => MbsSessionState::Active,
+                    "INACTIVE" => MbsSessionState::Suspended,
+                    other => {
+                        log::warn!(
+                            "MBS session {session_id} PATCH: unrecognised activityStatus \
+                             '{other}'; state left unchanged"
+                        );
+                        session.state
+                    }
+                };
+            }
+            // The QoS request: 5QI and maximum bit rate, when the patch names them.
+            if let Some(ref info) = changes.mbs_serv_info {
+                if let Some(five_qi) = info
+                    .pointer("/mbsQoSReq/5qi")
+                    .or_else(|| info.get("5qi"))
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    session.fiveqi = five_qi as u8;
+                }
+                if let Some(mbr) = info
+                    .pointer("/mbsQoSReq/mbrDl")
+                    .or_else(|| info.get("mbrDl"))
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    session.max_bitrate = mbr;
+                }
+            }
 
             if let Ok(context) = ctx.read() {
                 context.session_update(&session);
@@ -649,6 +785,15 @@ async fn handle_mbs_session_release(session_id: &str) -> SbiResponse {
     log::info!("MBS Session Release: {session_id}");
 
     let pool_id = parse_session_id(session_id);
+
+    // #76: release the N4mb session on the MB-UPF BEFORE dropping local state. The
+    // old code called `session_remove` alone, whose log line said "releasing N4mb
+    // SEID" while releasing nothing, so every released MBS session leaked a session
+    // on the MB-UPF. Awaited, so the local removal below happens after the Session
+    // Deletion Response (or after it demonstrably failed).
+    if let Some(id) = pool_id {
+        release_n4mb_transport(id).await;
+    }
 
     let ctx = mbsmf_self();
     let removed = pool_id.and_then(|id| {
@@ -854,6 +999,132 @@ async fn drive_n4mb_establishment(pool_id: u64, session: MbsSession) {
     }
 }
 
+/// Apply queued N4mb Session Reports to the session state (#76).
+///
+/// TS 23.247 §7.2.5.2: downlink data arriving at the MB-UPF **activates** a
+/// (de)activated multicast session. The report is answered on the wire by the recv
+/// loop (the UP is waiting); this is the consequence, driven where the session state
+/// lives so the socket loop never takes the context lock.
+///
+/// Returns the ids of the sessions whose state actually changed, so a caller — and a
+/// test — can tell a reactivation from a report about an already-active session.
+async fn apply_n4mb_reports() -> Vec<u64> {
+    let Some(node) = n4mb_node().await else {
+        return Vec::new();
+    };
+    let reports = node.take_reports();
+    if reports.is_empty() {
+        return Vec::new();
+    }
+    let ctx = mbsmf_self();
+    let mut activated = Vec::new();
+    for report in reports {
+        if !report.downlink_data {
+            // A report with no Downlink Data Report is answered and otherwise has no
+            // consequence here: usage reporting is not part of this NF's remit, and
+            // acting on a report type we do not model would be inventing behaviour.
+            log::debug!(
+                "[N4mb] Session Report on seid=0x{:016x} carried no Downlink Data Report; \
+                 answered, no activation",
+                report.seid
+            );
+            continue;
+        }
+        let Ok(c) = ctx.read() else { continue };
+        // Addressed to our LOCAL seid: the UP answers to the CP F-SEID it was given.
+        let Some(session) = c.session_find_by_local_seid(report.seid) else {
+            log::warn!(
+                "[N4mb] Downlink Data Report on seid=0x{:016x} matches no session; the \
+                 MB-UPF may hold a session this MB-SMF has released",
+                report.seid
+            );
+            continue;
+        };
+        if c.session_activate_on_downlink_data(session.id) {
+            log::info!(
+                "[N4mb] downlink data reactivated MBS session {} (TS 23.247 §7.2.5.2)",
+                session.id
+            );
+            activated.push(session.id);
+        }
+    }
+    activated
+}
+
+/// Release a session's N4mb transport ON THE WIRE, then clear it locally (#76).
+///
+/// TS 29.244 §7.5.4 / TS 23.247 §7.1.1.4: releasing an MBS session tears down the
+/// associated MB-UPF resources, and that requires a PFCP Session Deletion Request.
+/// `release_session` existed and had **no callers at all** — `grep` found only its
+/// definition — so both the DELETE and the TERMINATE paths mutated local state and
+/// left the UPF session behind. Every released MBS session leaked one.
+///
+/// Order matters and is the criterion: mark `ReleasePending`, send and await the
+/// deletion, and only then clear. Clearing first (which
+/// `session_context_terminate` used to do) discards the remote SEID the request has
+/// to be addressed to, so nothing could be deleted even in principle.
+///
+/// Returns whether the deletion was **acknowledged**. A timeout or a refusal still
+/// clears the local context: the session is going away from this MB-SMF either way,
+/// and keeping a context whose UPF counterpart may or may not exist would leave the
+/// two sides disagreeing with no path back. The leak is named in the log so it is
+/// diagnosable rather than silent.
+async fn release_n4mb_transport(session_id: u64) -> bool {
+    let ctx = mbsmf_self();
+    let remote_seid = match ctx.read() {
+        Ok(c) => c.session_mark_release_pending(session_id),
+        Err(_) => None,
+    };
+    let Some(remote_seid) = remote_seid else {
+        // No N4mb context, or one whose establishment never completed: there is
+        // nothing on the MB-UPF to delete. Clearing is still right.
+        let cleared = ctx
+            .read()
+            .map(|c| c.session_clear_n4mb(session_id))
+            .unwrap_or(false);
+        if cleared {
+            log::debug!(
+                "[N4mb] session {session_id} had no UP-allocated SEID; cleared without a \
+                 Session Deletion (its establishment never completed)"
+            );
+        }
+        return false;
+    };
+
+    let acknowledged = match n4mb_node().await {
+        Some(node) => match node.release_session(remote_seid).await {
+            Ok(()) => {
+                log::info!(
+                    "[N4mb] session {session_id} released on the MB-UPF \
+                     (remote_seid=0x{remote_seid:016x})"
+                );
+                true
+            }
+            Err(e) => {
+                log::warn!(
+                    "[N4mb] Session Deletion for session {session_id} \
+                     (remote_seid=0x{remote_seid:016x}) failed: {e}. The MB-UPF may retain \
+                     the session; local state is cleared regardless."
+                );
+                false
+            }
+        },
+        None => {
+            log::warn!(
+                "[N4mb] no PFCP node: session {session_id} \
+                 (remote_seid=0x{remote_seid:016x}) is released locally only and LEAKS on the \
+                 MB-UPF"
+            );
+            false
+        }
+    };
+
+    if let Ok(c) = ctx.read() {
+        c.session_clear_n4mb(session_id);
+    }
+    acknowledged
+}
+
 /// Handle ContextUpdate (TS 29.532 §5.3.2.5) - start/terminate MBS data
 /// reception. [mbsmfd-03] On an SMF multicast Start the MB-SMF allocates and
 /// returns a `cTeid` + `llSsm` and drives N4mb establishment; on Terminate /
@@ -875,15 +1146,40 @@ async fn handle_mbs_session_context_update(request: &SbiRequest) -> SbiResponse 
         }
     };
 
-    // mbsSessionId is mandatory; resolve the session by TMGI.
+    // #76: resolve the session by TMGI **or by SSM**. `MbsSessionId` is
+    // `anyOf(tmgi, ssm)`, and this used to hard-reject anything without a TMGI with
+    // `400 MANDATORY_IE_MISSING` — so an SSM-identified multicast session could not
+    // be updated at all, by any consumer, ever.
+    //
+    // An SSM resolves to the session's own TMGI, which every session has (allocated
+    // at create when the consumer supplied none). That keeps the whole downstream
+    // handler keyed on one identifier instead of carrying two.
     let tmgi = match req.mbs_session_id.tmgi.as_ref() {
         Some(t) => context_tmgi_from(Some(t)),
-        None => {
-            return send_bad_request(
-                "ContextUpdate requires mbsSessionId.tmgi",
-                Some("MANDATORY_IE_MISSING"),
-            )
-        }
+        None => match req.mbs_session_id.ssm.as_ref() {
+            Some(ssm) => {
+                match mbsmf_self()
+                    .read()
+                    .ok()
+                    .and_then(|c| c.session_find_by_ssm(ssm))
+                {
+                    Some(session) => session.tmgi,
+                    None => {
+                        return send_not_found(
+                            "No MBS session matches the supplied mbsSessionId.ssm",
+                            Some("CONTEXT_NOT_FOUND"),
+                        )
+                    }
+                }
+            }
+            None => {
+                return send_bad_request(
+                    "ContextUpdate requires mbsSessionId.tmgi or mbsSessionId.ssm \
+                     (TS 29.571 MbsSessionId anyOf)",
+                    Some("MANDATORY_IE_MISSING"),
+                )
+            }
+        },
     };
 
     let action = req
@@ -907,6 +1203,17 @@ async fn handle_mbs_session_context_update(request: &SbiRequest) -> SbiResponse 
                 "MBS session not found for ContextUpdate",
                 Some("CONTEXT_NOT_FOUND"),
             );
+        }
+        // #76: `session_context_terminate` now only marks the N4mb context
+        // ReleasePending -- it used to zero it, discarding the remote SEID before
+        // anything could send a Session Deletion. The wire release happens here and
+        // clears the context afterwards.
+        if let Some(id) = ctx
+            .read()
+            .ok()
+            .and_then(|c| c.session_find_by_tmgi(&tmgi).map(|s| s.id))
+        {
+            release_n4mb_transport(id).await;
         }
         log::info!(
             "ContextUpdate Terminate (TMGI {:02x?})",
@@ -1260,6 +1567,15 @@ async fn handle_context_update_amf(
                     "MBS session not found for ContextUpdate",
                     Some("CONTEXT_NOT_FOUND"),
                 );
+            }
+            // #76: same as the SMF terminate leg above -- the wire release, then the
+            // local clear.
+            if let Some(id) = ctx
+                .read()
+                .ok()
+                .and_then(|c| c.session_find_by_tmgi(tmgi).map(|s| s.id))
+            {
+                release_n4mb_transport(id).await;
             }
             log::info!(
                 "ContextUpdate AMF release (TMGI {:02x?})",
@@ -2807,6 +3123,219 @@ mod tests {
     // loopback notifyUri will fail silently, which is expected in unit tests —
     // we verify the router returns 204 and the subscription count is unchanged
     // because the notify is to a different endpoint than the session).
+    // ---- #76: create validation, TMGI allocation, SSM ContextUpdate ---------
+
+    async fn post_create(body: serde_json::Value) -> SbiResponse {
+        mbsmf_sbi_request_handler(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions")
+                .with_body(body.to_string(), "application/json"),
+        )
+        .await
+    }
+
+    fn rsp_json(resp: &SbiResponse) -> serde_json::Value {
+        serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}"))
+            .expect("response body is not JSON")
+    }
+
+    /// #76 criterion 6: a missing mandatory `serviceType` is REFUSED, and the create
+    /// response carries a structured `ingressTunAddr`.
+    ///
+    /// `serviceType` used to be defaulted (`_ => Multicast`), so a request omitting a
+    /// mandatory IE succeeded and silently became a multicast session.
+    /// `ingressTunAddr` used to be `format!("{:#010x}", gtp_teid)` — a hex TEID
+    /// string where TS 29.571 declares an ARRAY of `TunnelAddress`, i.e. the one
+    /// member a consumer needs in order to send traffic anywhere was unparseable.
+    #[tokio::test]
+    async fn create_refuses_a_missing_service_type_and_answers_a_structured_ingress_address() {
+        mbsmf_context_init(256);
+
+        let resp = post_create(serde_json::json!({ "mbsSession": {} })).await;
+        assert_eq!(resp.status, 400, "body: {:?}", resp.http.content);
+        assert_eq!(
+            rsp_json(&resp)["cause"],
+            serde_json::json!("MANDATORY_IE_MISSING")
+        );
+
+        let resp = post_create(serde_json::json!({
+            "mbsSession": { "serviceType": "MULTICAST" }
+        }))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body = rsp_json(&resp);
+        let addrs = body["mbsSession"]["ingressTunAddr"]
+            .as_array()
+            .expect("ingressTunAddr is an ARRAY of TunnelAddress, minItems 1");
+        assert_eq!(addrs.len(), 1);
+        assert!(
+            addrs[0]["ipv4Addr"].as_str().is_some(),
+            "TunnelAddress is anyOf[ipv4Addr, ipv6Addr], got {}",
+            addrs[0]
+        );
+        assert!(
+            addrs[0]["portNumber"].as_u64().is_some(),
+            "portNumber is REQUIRED in TunnelAddress, got {}",
+            addrs[0]
+        );
+        assert!(
+            !addrs[0].is_string(),
+            "the hex-TEID-string form is what this replaces"
+        );
+    }
+
+    /// #76 criterion 6, the round-trip half: a full `ExtMbsSession` keeps its
+    /// `serviceArea`, `ssm`, QoS and security rather than dropping them.
+    #[tokio::test]
+    async fn a_full_ext_mbs_session_round_trips_its_write_only_members() {
+        mbsmf_context_init(256);
+
+        let resp = post_create(serde_json::json!({
+            "mbsSession": {
+                "serviceType": "MULTICAST",
+                "ssm": { "sourceIpAddr": {"ipv4Addr": "10.1.1.1"},
+                         "destIpAddr": {"ipv4Addr": "232.0.0.1"} },
+                "mbsServiceArea": { "ncgiList": [{ "plmnId": {"mcc":"001","mnc":"01"},
+                                                    "nrCellId": "000000001" }] },
+                "mbsServInfo": { "mbsQoSReq": { "5qi": 7 } },
+                "mbsSecurityContext": { "keyList": ["k1"] },
+                "contactPcfInd": true,
+                "areaSessionPolicyId": 42,
+            }
+        }))
+        .await;
+        assert_eq!(resp.status, 201, "body: {:?}", resp.http.content);
+        let s = &rsp_json(&resp)["mbsSession"];
+        assert_eq!(
+            s["ssm"]["destIpAddr"]["ipv4Addr"],
+            serde_json::json!("232.0.0.1")
+        );
+        assert!(
+            s["mbsServiceArea"]["ncgiList"].is_array(),
+            "serviceArea dropped"
+        );
+        assert_eq!(s["mbsServInfo"]["mbsQoSReq"]["5qi"], serde_json::json!(7));
+        assert!(
+            s["mbsSecurityContext"]["keyList"].is_array(),
+            "security dropped"
+        );
+        assert_eq!(s["contactPcfInd"], serde_json::json!(true));
+        assert_eq!(s["areaSessionPolicyId"], serde_json::json!(42));
+    }
+
+    /// #76 criterion 7: two no-TMGI creates yield two DISTINCT sessions.
+    ///
+    /// `context_tmgi_from` returned a hardcoded TMGI for the no-TMGI path, so every
+    /// such create collided — and `session_add` overwrote `tmgi_hash` silently, so
+    /// the earlier session stayed in the list reachable by nothing and its MB-UPF
+    /// session could never be released.
+    #[tokio::test]
+    async fn two_no_tmgi_creates_get_two_sessions_from_the_pool() {
+        mbsmf_context_init(256);
+
+        let first = post_create(serde_json::json!({
+            "mbsSession": { "serviceType": "MULTICAST", "tmgiAllocReq": true }
+        }))
+        .await;
+        let second = post_create(serde_json::json!({
+            "mbsSession": { "serviceType": "MULTICAST", "tmgiAllocReq": true }
+        }))
+        .await;
+        assert_eq!(first.status, 201, "body: {:?}", first.http.content);
+        assert_eq!(
+            second.status, 201,
+            "a second no-TMGI create must succeed, got {:?}",
+            second.http.content
+        );
+
+        let first_tmgi = rsp_json(&first)["mbsSession"]["mbsSessionId"]["tmgi"].clone();
+        let second_tmgi = rsp_json(&second)["mbsSession"]["mbsSessionId"]["tmgi"].clone();
+        assert_ne!(
+            first_tmgi, second_tmgi,
+            "each allocated TMGI must be distinct, got {first_tmgi} twice"
+        );
+        // Both sessions must still be REACHABLE, which is what "the second did not
+        // orphan the first" means in practice. Asserted per-session rather than on a
+        // global count: the session store is process-global and sibling tests create
+        // their own, so an absolute count is a race rather than an assertion.
+        for (label, resp) in [("first", &first), ("second", &second)] {
+            let path = resp.http.get_header("location").expect("Location").clone();
+            let got = mbsmf_sbi_request_handler(SbiRequest::get(path)).await;
+            assert!(
+                got.status == 200 || got.status == 204,
+                "the {label} session must still be retrievable, got {}",
+                got.status
+            );
+        }
+    }
+
+    /// #76 criterion 9: a ContextUpdate identified by SSM is ACCEPTED.
+    ///
+    /// It used to be rejected `400 MANDATORY_IE_MISSING` for having no TMGI, so an
+    /// SSM-identified multicast session could not be updated at all — by any
+    /// consumer, ever — even though `MbsSessionId` is `anyOf(tmgi, ssm)`.
+    #[tokio::test]
+    async fn a_context_update_identified_by_ssm_is_accepted() {
+        mbsmf_context_init(256);
+
+        let ssm = serde_json::json!({
+            "sourceIpAddr": { "ipv4Addr": "10.2.2.2" },
+            "destIpAddr": { "ipv4Addr": "232.0.0.9" }
+        });
+        let created = post_create(serde_json::json!({
+            "mbsSession": {
+                "serviceType": "MULTICAST",
+                "mbsSessionId": { "ssm": ssm },
+            }
+        }))
+        .await;
+        assert_eq!(created.status, 201, "body: {:?}", created.http.content);
+
+        let resp = mbsmf_sbi_request_handler(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                serde_json::json!({
+                    "nfcInstanceId": "smf-ssm",
+                    "mbsSessionId": { "ssm": ssm },
+                    "requestedAction": "TERMINATE",
+                })
+                .to_string(),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 204,
+            "an SSM-identified ContextUpdate must be served, got {} {:?}",
+            resp.status, resp.http.content
+        );
+
+        // An SSM no session carries is a 404 (a real lookup miss), not a 400.
+        let resp = mbsmf_sbi_request_handler(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                serde_json::json!({
+                    "nfcInstanceId": "smf-ssm",
+                    "mbsSessionId": { "ssm": {
+                        "sourceIpAddr": { "ipv4Addr": "10.9.9.9" },
+                        "destIpAddr": { "ipv4Addr": "232.9.9.9" } } },
+                    "requestedAction": "TERMINATE",
+                })
+                .to_string(),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 404);
+
+        // Neither identifier is still a 400: the anyOf is unsatisfied.
+        let resp = mbsmf_sbi_request_handler(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                serde_json::json!({ "nfcInstanceId": "smf-ssm", "mbsSessionId": {} }).to_string(),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 400);
+    }
+
     #[tokio::test]
     async fn test_router_release_fires_notify_path() {
         mbsmf_context_init(256);

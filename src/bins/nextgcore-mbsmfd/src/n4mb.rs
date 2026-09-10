@@ -25,8 +25,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use nextgcore_pfcp::header::PfcpHeader;
 use nextgcore_pfcp::message::{
-    build_message, parse_message, AssociationSetupRequest, PfcpMessage, SessionDeletionRequest,
-    SessionEstablishmentRequest,
+    build_message, parse_message, AssociationSetupRequest, HeartbeatResponse, PfcpMessage,
+    SessionDeletionRequest, SessionEstablishmentRequest, SessionReportResponse,
 };
 use nextgcore_pfcp::types::{
     ApplyAction, CreateFar, CreatePdr, DestinationInterface, FSeid, FTeid, ForwardingParameters,
@@ -152,6 +152,21 @@ impl From<std::io::Error> for N4mbError {
 
 type PendingTable = Mutex<HashMap<u32, oneshot::Sender<(PfcpHeader, PfcpMessage)>>>;
 
+/// A Session Report the MB-UPF sent us, surfaced to the session driver (#76).
+///
+/// Carries the SEID it arrived on rather than a resolved session, because the
+/// recv loop must not take the context lock: it would hold it across the reply
+/// send, and the context's own writers call back into this node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct N4mbSessionReport {
+    /// The SEID the report arrived on — the MB-SMF's own local SEID, since the UP
+    /// addresses a report to the CP F-SEID it was given at establishment.
+    pub seid: u64,
+    /// Whether the report carried a Downlink Data Report, i.e. traffic arrived for
+    /// a deactivated session (TS 23.247 §7.2.5.2).
+    pub downlink_data: bool,
+}
+
 /// A long-lived N4mb PFCP node toward one MB-UPF (TS 29.244). [mbsmfd-02]
 pub struct N4mbPfcpNode {
     socket: Arc<UdpSocket>,
@@ -163,6 +178,16 @@ pub struct N4mbPfcpNode {
     pending: Arc<PendingTable>,
     t1: Duration,
     n1: u32,
+    /// Session Reports received from the MB-UPF, in arrival order (#76).
+    ///
+    /// A queue rather than a callback: the recv loop answers the report on the
+    /// wire immediately (the UP is waiting, and TS 29.244 §7.5.8 makes the
+    /// response mandatory), and the *consequence* — activating a deactivated
+    /// multicast session per TS 23.247 §7.2.5.2 — is driven by whoever owns the
+    /// session state. Invoking that from the recv loop would put a context-lock
+    /// acquisition inside the socket loop, and the context's writers call back
+    /// into this node.
+    reports: Arc<Mutex<Vec<N4mbSessionReport>>>,
 }
 
 impl N4mbPfcpNode {
@@ -195,6 +220,7 @@ impl N4mbPfcpNode {
             pending: Arc::new(Mutex::new(HashMap::new())),
             t1,
             n1,
+            reports: Arc::new(Mutex::new(Vec::new())),
         });
         node.clone().spawn_recv_loop();
         Ok(node)
@@ -212,11 +238,22 @@ impl N4mbPfcpNode {
             let mut buf = vec![0u8; 65_535];
             loop {
                 match self.socket.recv_from(&mut buf).await {
-                    Ok((n, _src)) => {
+                    Ok((n, src)) => {
                         let mut bytes = Bytes::copy_from_slice(&buf[..n]);
                         match parse_message(&mut bytes) {
                             Ok((header, msg)) => {
                                 let seq = header.sequence_number;
+                                // #76: UP-INITIATED requests are answered here,
+                                // BEFORE the pending-table lookup. They have no
+                                // waiter by definition, so the old code logged
+                                // "unsolicited PFCP, ignoring" and dropped them --
+                                // which meant the MB-UPF could not detect this node
+                                // as alive (§6.2.3.2) and could not report downlink
+                                // data arrival (§7.5.8), so a deactivated multicast
+                                // session never reactivated when traffic resumed.
+                                if self.handle_up_initiated(&header, &msg, src).await {
+                                    continue;
+                                }
                                 // Lock, take the waiter, drop the guard before
                                 // any await (none here, but keep it tight).
                                 let waiter = {
@@ -240,6 +277,88 @@ impl N4mbPfcpNode {
                 }
             }
         });
+    }
+
+    /// Answer a UP-initiated request, or return `false` when the message is not
+    /// one (#76).
+    ///
+    /// The response echoes the request's **sequence number**, which is what makes
+    /// it an answer rather than a new transaction: TS 29.244 §7.2.2.4 requires a
+    /// response to carry the sequence number of the request it answers, and the UP
+    /// correlates on exactly that.
+    ///
+    /// Sent to `src` rather than to `self.upf_dest`: a response must go back to
+    /// whoever asked. Those are the same address in a normal deployment, and using
+    /// the configured destination would silently swallow a request from a UP whose
+    /// source port differs from the one we send to.
+    async fn handle_up_initiated(
+        &self,
+        header: &PfcpHeader,
+        msg: &PfcpMessage,
+        src: SocketAddr,
+    ) -> bool {
+        let seq = header.sequence_number;
+        match msg {
+            // §6.2.3.2: "a node shall be prepared to receive a Heartbeat Request at
+            // any time and shall reply with a Heartbeat Response."
+            PfcpMessage::HeartbeatRequest(_) => {
+                let resp = PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(
+                    self.recovery_time_stamp,
+                ));
+                let bytes = build_message(&resp, seq, None).to_vec();
+                if let Err(e) = self.socket.send_to(&bytes, src).await {
+                    log::warn!("[N4mb] failed to answer a Heartbeat Request from {src}: {e}");
+                } else {
+                    log::debug!("[N4mb] answered a Heartbeat Request from {src} (seq={seq})");
+                }
+                true
+            }
+            // §7.5.8: the UP reports events; the CP must respond. A Downlink Data
+            // Report means traffic arrived for a session whose distribution is
+            // deactivated (TS 23.247 §7.2.5.2), which is what reactivates it.
+            PfcpMessage::SessionReportRequest(req) => {
+                let downlink_data = req.downlink_data_report.is_some();
+                let seid = header.seid.unwrap_or(0);
+                let resp = PfcpMessage::SessionReportResponse(SessionReportResponse::new(
+                    PfcpCause::RequestAccepted,
+                ));
+                // The response is addressed to the SEID the request arrived on,
+                // per §7.2.2.4.2.
+                let bytes = build_message(&resp, seq, Some(seid)).to_vec();
+                if let Err(e) = self.socket.send_to(&bytes, src).await {
+                    log::warn!("[N4mb] failed to answer a Session Report from {src}: {e}");
+                }
+                log::info!(
+                    "[N4mb] Session Report from {src} (seid=0x{seid:016x}, \
+                     downlink_data={downlink_data}) answered"
+                );
+                if let Ok(mut reports) = self.reports.lock() {
+                    reports.push(N4mbSessionReport {
+                        seid,
+                        downlink_data,
+                    });
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drain the reports received since the last call (#76).
+    ///
+    /// Draining rather than peeking, so one report drives one activation: leaving
+    /// them in place would have a periodic driver re-activate an already-active
+    /// session on every tick.
+    pub fn take_reports(&self) -> Vec<N4mbSessionReport> {
+        self.reports
+            .lock()
+            .map(|mut r| std::mem::take(&mut *r))
+            .unwrap_or_default()
+    }
+
+    /// How many reports are queued. For tests and diagnostics.
+    pub fn pending_report_count(&self) -> usize {
+        self.reports.lock().map(|r| r.len()).unwrap_or(0)
     }
 
     /// Send a request and await its correlated response, retransmitting on T1
@@ -411,6 +530,16 @@ mod tests {
                             Some(remote_seid),
                         )
                     }
+                    // #76: the fake UP now answers a Session Deletion too, and the
+                    // SEID it arrived on is what the test reads back.
+                    PfcpMessage::SessionDeletionRequest(_) => (
+                        PfcpMessage::SessionDeletionResponse(
+                            nextgcore_pfcp::message::SessionDeletionResponse::new(
+                                PfcpCause::RequestAccepted,
+                            ),
+                        ),
+                        header.seid,
+                    ),
                     _ => continue,
                 };
                 let out = build_message(&reply, seq, seid).to_vec();
@@ -522,5 +651,257 @@ mod tests {
         assert!(ohc.description.gtpu_udp_ipv4);
         assert_eq!(ohc.teid, Some(p.c_teid));
         assert_eq!(ohc.ipv4_addr, Some([239, 1, 0, 1]));
+    }
+    // ---- #76: UP-initiated requests -----------------------------------------
+
+    /// #76 criterion 1: a Heartbeat Request on the N4mb socket is ANSWERED.
+    ///
+    /// It used to be logged as "unsolicited PFCP, ignoring" and dropped, so the
+    /// MB-UPF could not detect this node as alive — TS 29.244 §6.2.3.2 makes the
+    /// response mandatory and peer-failure detection depends on it.
+    ///
+    /// The assertion is on the datagram the fake UP receives back, decoded with the
+    /// production parser: a test that only checked no warning was logged would pass
+    /// against a node that answered with garbage.
+    #[tokio::test]
+    async fn a_heartbeat_request_is_answered_with_a_heartbeat_response() {
+        use nextgcore_pfcp::message::HeartbeatRequest;
+
+        // The "UP" here is a bare socket: it sends the request and reads the reply.
+        let upf = UdpSocket::bind(loopback(0)).await.unwrap();
+        let upf_addr = upf.local_addr().unwrap();
+        let node = N4mbPfcpNode::with_timers(
+            loopback(0),
+            upf_addr,
+            [127, 0, 0, 1],
+            Duration::from_millis(100),
+            0,
+        )
+        .await
+        .unwrap();
+        let node_addr = node.local_addr().unwrap();
+
+        let req = PfcpMessage::HeartbeatRequest(HeartbeatRequest::new(4242));
+        let bytes = build_message(&req, 77, None).to_vec();
+        upf.send_to(&bytes, node_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), upf.recv_from(&mut buf))
+            .await
+            .expect("the node must answer a Heartbeat Request within 5s")
+            .unwrap();
+        assert_eq!(from, node_addr, "the answer must come from the node");
+
+        let mut bytes = Bytes::copy_from_slice(&buf[..n]);
+        let (header, msg) = parse_message(&mut bytes).expect("the answer is a PFCP message");
+        assert_eq!(
+            header.sequence_number, 77,
+            "a response must echo the request's sequence number (§7.2.2.4); the UP \
+             correlates on exactly that"
+        );
+        match msg {
+            PfcpMessage::HeartbeatResponse(r) => assert_ne!(
+                r.recovery_time_stamp, 0,
+                "the response must carry this node's own Recovery Time Stamp"
+            ),
+            other => panic!("expected a HeartbeatResponse, got {other:?}"),
+        }
+    }
+
+    /// #76 criterion 2, the wire half: a Session Report Request is answered and
+    /// surfaced.
+    ///
+    /// A Downlink Data Report means traffic arrived for a session whose distribution
+    /// is deactivated (TS 23.247 §7.2.5.2), and it was being dropped — so a
+    /// deactivated multicast session never reactivated when traffic resumed. The
+    /// activation itself is driven by the report queue's consumer; what is asserted
+    /// here is the response on the wire and the report being queued for it.
+    #[tokio::test]
+    async fn a_session_report_is_answered_and_queued_for_the_session_driver() {
+        use nextgcore_pfcp::message::SessionReportRequest;
+        use nextgcore_pfcp::types::{DownlinkDataReport, ReportType};
+
+        let upf = UdpSocket::bind(loopback(0)).await.unwrap();
+        let upf_addr = upf.local_addr().unwrap();
+        let node = N4mbPfcpNode::with_timers(
+            loopback(0),
+            upf_addr,
+            [127, 0, 0, 1],
+            Duration::from_millis(100),
+            0,
+        )
+        .await
+        .unwrap();
+        let node_addr = node.local_addr().unwrap();
+        assert_eq!(node.pending_report_count(), 0);
+
+        let mut req = SessionReportRequest::new(ReportType {
+            dldr: true,
+            ..Default::default()
+        });
+        req.downlink_data_report = Some(DownlinkDataReport::new(1));
+        let bytes = build_message(
+            &PfcpMessage::SessionReportRequest(req),
+            88,
+            Some(0x0102_0304_0506_0708),
+        )
+        .to_vec();
+        upf.send_to(&bytes, node_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), upf.recv_from(&mut buf))
+            .await
+            .expect("the node must answer a Session Report within 5s")
+            .unwrap();
+        let mut bytes = Bytes::copy_from_slice(&buf[..n]);
+        let (header, msg) = parse_message(&mut bytes).expect("the answer is a PFCP message");
+        assert_eq!(header.sequence_number, 88);
+        assert_eq!(
+            header.seid,
+            Some(0x0102_0304_0506_0708),
+            "the response is addressed to the SEID the request arrived on (§7.2.2.4.2)"
+        );
+        match msg {
+            PfcpMessage::SessionReportResponse(r) => {
+                assert!(r.cause.is_success(), "got cause {}", r.cause.name())
+            }
+            other => panic!("expected a SessionReportResponse, got {other:?}"),
+        }
+
+        let reports = node.take_reports();
+        assert_eq!(
+            reports,
+            vec![N4mbSessionReport {
+                seid: 0x0102_0304_0506_0708,
+                downlink_data: true,
+            }],
+            "the report must be surfaced so the session driver can activate the session"
+        );
+        assert!(
+            node.take_reports().is_empty(),
+            "reports are DRAINED, so one report drives one activation rather than \
+             re-activating on every tick"
+        );
+    }
+
+    /// A UP-initiated request must not consume a pending waiter.
+    ///
+    /// The dispatch runs before the pending-table lookup, and getting that order
+    /// wrong the other way would have a Heartbeat Request arriving mid-transaction
+    /// steal the waiter for an in-flight Session Establishment — which would look
+    /// like a UPF timeout.
+    #[tokio::test]
+    async fn an_inbound_request_does_not_steal_a_pending_waiter() {
+        let upf_addr = spawn_fake_upf(0x55, [10, 0, 0, 9]).await;
+        let node = N4mbPfcpNode::with_timers(
+            loopback(0),
+            upf_addr,
+            [127, 0, 0, 1],
+            Duration::from_millis(300),
+            1,
+        )
+        .await
+        .unwrap();
+        let node_addr = node.local_addr().unwrap();
+
+        // A heartbeat from a THIRD party arrives while the association is in flight.
+        let intruder = UdpSocket::bind(loopback(0)).await.unwrap();
+        let hb = build_message(
+            &PfcpMessage::HeartbeatRequest(nextgcore_pfcp::message::HeartbeatRequest::new(1)),
+            1,
+            None,
+        )
+        .to_vec();
+
+        let assoc = tokio::spawn({
+            let node = node.clone();
+            async move { node.ensure_association().await.is_ok() }
+        });
+        // Sequence 1 is also the first sequence number the node itself uses, which is
+        // the collision this test is about.
+        intruder.send_to(&hb, node_addr).await.unwrap();
+
+        assert!(
+            assoc.await.unwrap(),
+            "the association must still complete: an inbound request must not consume \
+             the waiter for an in-flight transaction"
+        );
+    }
+    /// #76 criteria 3 + 4, the wire half: a Session Deletion Request is really
+    /// transmitted, addressed to the UP-allocated SEID.
+    ///
+    /// `release_session` existed and had NO callers — `grep` found only its
+    /// definition — so both the DELETE and TERMINATE paths mutated local state and
+    /// left the MB-UPF session behind. This asserts the datagram the UP receives,
+    /// decoded with the production parser: the SEID it carries is the thing that
+    /// makes it a deletion of the right session, and addressing it to the LOCAL seid
+    /// (which the old `session_context_terminate` discarded before anything could
+    /// read it) would delete nothing.
+    #[tokio::test]
+    async fn a_session_deletion_request_is_transmitted_to_the_up_allocated_seid() {
+        let seen: std::sync::Arc<
+            Mutex<Vec<(nextgcore_pfcp::header::PfcpMessageType, Option<u64>)>>,
+        > = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let sock = UdpSocket::bind(loopback(0)).await.unwrap();
+        let upf_addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            loop {
+                let Ok((n, src)) = sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                let mut bytes = Bytes::copy_from_slice(&buf[..n]);
+                let Ok((header, msg)) = parse_message(&mut bytes) else {
+                    continue;
+                };
+                if let Ok(mut s) = sink.lock() {
+                    s.push((header.message_type, header.seid));
+                }
+                let reply = match msg {
+                    PfcpMessage::SessionDeletionRequest(_) => PfcpMessage::SessionDeletionResponse(
+                        nextgcore_pfcp::message::SessionDeletionResponse::new(
+                            PfcpCause::RequestAccepted,
+                        ),
+                    ),
+                    _ => continue,
+                };
+                let out = build_message(&reply, header.sequence_number, header.seid).to_vec();
+                let _ = sock.send_to(&out, src).await;
+            }
+        });
+
+        let node = N4mbPfcpNode::with_timers(
+            loopback(0),
+            upf_addr,
+            [127, 0, 0, 1],
+            Duration::from_millis(300),
+            1,
+        )
+        .await
+        .unwrap();
+
+        node.release_session(0x00ab_cdef_0123_4567)
+            .await
+            .expect("the deletion must be acknowledged");
+
+        let requests = seen.lock().unwrap().clone();
+        let (msg_type, seid) = requests
+            .iter()
+            .find(|(t, _)| *t == nextgcore_pfcp::header::PfcpMessageType::SessionDeletionRequest)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!("a Session Deletion Request must reach the UP, got {requests:?}")
+            });
+        assert_eq!(
+            msg_type,
+            nextgcore_pfcp::header::PfcpMessageType::SessionDeletionRequest
+        );
+        assert_eq!(
+            seid,
+            Some(0x00ab_cdef_0123_4567),
+            "the request must be addressed to the UP-ALLOCATED SEID (TS 29.244 §7.5.4); \
+             the local one names a session the UP does not know"
+        );
     }
 }
