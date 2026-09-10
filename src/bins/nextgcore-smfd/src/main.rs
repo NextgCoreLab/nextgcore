@@ -4625,6 +4625,31 @@ async fn handle_sm_context_release(
         }
     }
 
+    // #291: give this session's EPS bearer identity back to the AMF, which owns the
+    // space. Same shape as the EASDF delete above and for the same reason: read off
+    // the binding taken above, so a session that never had an EBI costs nothing, and
+    // best-effort because the session is leaving either way.
+    //
+    // Without this the eleven-wide per-UE space (TS 24.301 §9.3.2 reserves 0..=4)
+    // leaks one identity per session lifetime, and because the AMF allocates
+    // lowest-free it does not look under pressure until the twelfth session gets a
+    // 403 with no live bearers to show for it.
+    //
+    // The AMF's authority is the same `smContextStatusUri` callback root the
+    // assignment used and that this handler notifies below — the only address this
+    // SMF has for it.
+    if let Some(binding) = &binding {
+        if let Some(ebi) = binding.mapped_eps_bearer_id {
+            eps_iwk::release_ebi(
+                binding.sm_context_status_uri.as_deref(),
+                &binding.supi,
+                binding.psi,
+                ebi,
+            )
+            .await;
+        }
+    }
+
     // #79: Nsmf_EventExposure_Notify for PDU_SES_REL (TS 29.508 §4.2.3.2). Emitted
     // from the binding taken above, so a subscription scoped to this SUPI or this
     // PDU session id can be matched. A session with no matching subscription costs
@@ -6471,6 +6496,202 @@ mod tests {
         easdf::set_for_test(None);
         easdf_srv.stop().await.expect("stop");
         nrf.stop().await.expect("stop");
+    }
+
+    /// Seed a binding that carries an assigned EBI and an AMF callback root, i.e.
+    /// the state a session established with EPS interworking on leaves behind (#291).
+    fn seed_binding_with_ebi(sm_context_ref: &str, psi: u8, ebi: u8, amf_uri: &str) {
+        seed_binding(sm_context_ref, psi);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut(sm_context_ref) {
+                    b.mapped_eps_bearer_id = Some(ebi);
+                    b.sm_context_status_uri = Some(amf_uri.to_string());
+                }
+            }
+        }
+    }
+
+    /// A loopback AMF that answers `assign-ebi` with an `AssignedEbiData` echoing
+    /// the released list, and records every request it received (#291).
+    async fn spawn_recording_amf() -> (
+        nextgcore_sbi::server::SbiServer,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    ) {
+        use nextgcore_sbi::message::SbiResponse;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let port = nextgcore_sbi::test_support::free_port();
+        let amf = SbiServer::new(SbiServerConfig::new(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
+        amf.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                let body = req.http.content.clone().unwrap_or_default();
+                sink.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    req.header.method.clone(),
+                    req.header.uri.clone(),
+                    body.clone(),
+                ));
+                if !req.header.uri.ends_with("/assign-ebi") {
+                    // The RELEASED status notification lands here too; 204 is what
+                    // an AMF answers it with.
+                    return SbiResponse::with_status(204);
+                }
+                let released = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|b| b.get("releasedEbiList").cloned())
+                    .unwrap_or_else(|| serde_json::json!([]));
+                SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({
+                        "pduSessionId": 5,
+                        "assignedEbiList": [],
+                        "releasedEbiList": released,
+                    }))
+                    .unwrap_or_else(|_| SbiResponse::with_status(200))
+            }
+        })
+        .await
+        .expect("amf start");
+        (amf, format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    /// #291 criterion 1: releasing a session whose binding carries an EBI returns
+    /// that EBI to the AMF in a `releasedEbiList`, asserted **over the wire from the
+    /// release handler**.
+    ///
+    /// Driven through `handle_sm_context_release` rather than by calling
+    /// `eps_iwk::release_ebi`, because the helper-is-tested-and-the-wiring-is-not
+    /// shape has bitten this exact area twice (#276's dead `create_dns_context`, and
+    /// #117's IE emitted only from builders with no production caller). What is
+    /// asserted is a recorded HTTP request with the identity in it.
+    #[tokio::test]
+    async fn releasing_a_session_returns_its_ebi_to_the_amf() {
+        let _g = eps_iwk::SWITCH_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        eps_iwk::set_for_test(true);
+        let (amf, amf_uri, seen) = spawn_recording_amf().await;
+
+        seed_binding_with_ebi("ebi-release-ref", 5, 7, &amf_uri);
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        let resp = handle_sm_context_release("ebi-release-ref", None).await;
+        assert_eq!(resp.status, 204, "the release itself must succeed");
+
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let release = requests
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p.ends_with("/assign-ebi"))
+            .unwrap_or_else(|| {
+                panic!("the release handler must return the EBI to the AMF, got {requests:?}")
+            });
+        assert_eq!(
+            release.1, "/namf-comm/v1/ue-contexts/imsi-001010000000001/assign-ebi",
+            "addressed to the UE's own ue-context (TS 29.518 §6.1.6.2.5)"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&release.2).expect("the request body is JSON");
+        assert_eq!(
+            body["releasedEbiList"],
+            serde_json::json!([7]),
+            "the identity on the binding is the one handed back, got {body}"
+        );
+        assert_eq!(
+            body["pduSessionId"],
+            serde_json::json!(5),
+            "pduSessionId is AssignEbiData's only required member"
+        );
+        assert!(
+            body.get("arpList").is_none(),
+            "a release must not ask for a new EBI in the same breath, got {body}"
+        );
+
+        // A session with NO EBI must not dial the AMF's assign-ebi at all: an SMF
+        // that did would send one request per released session in every deployment
+        // that does not use interworking.
+        seed_binding("ebi-release-none", 6);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut("ebi-release-none") {
+                    b.sm_context_status_uri = Some(amf_uri.clone());
+                }
+            }
+        }
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let _ = handle_sm_context_release("ebi-release-none", None).await;
+        assert!(
+            !seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(_, p, _)| p.ends_with("/assign-ebi")),
+            "a session that never had an EBI must not dial assign-ebi"
+        );
+
+        eps_iwk::set_for_test(false);
+        amf.stop().await.expect("stop");
+    }
+
+    /// #291 criterion 5: with interworking disabled the release path sends nothing,
+    /// even for a binding that carries an EBI from an earlier enabled run.
+    #[tokio::test]
+    async fn a_disabled_interworking_leg_releases_no_ebi() {
+        let _g = eps_iwk::SWITCH_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        eps_iwk::set_for_test(false);
+        let (amf, amf_uri, seen) = spawn_recording_amf().await;
+
+        seed_binding_with_ebi("ebi-release-off", 5, 8, &amf_uri);
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        assert_eq!(
+            handle_sm_context_release("ebi-release-off", None)
+                .await
+                .status,
+            204
+        );
+        assert!(
+            !seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(_, p, _)| p.ends_with("/assign-ebi")),
+            "a disabled leg must not dial the AMF"
+        );
+
+        amf.stop().await.expect("stop");
+    }
+
+    /// #291 criterion 3: a failed release does not fail the session release.
+    ///
+    /// The session is going away either way, so the SMF cannot make its own
+    /// teardown depend on the AMF answering. Port 1 is closed, so the request
+    /// fails at connect.
+    #[tokio::test]
+    async fn a_failed_ebi_release_does_not_fail_the_session_release() {
+        let _g = eps_iwk::SWITCH_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        eps_iwk::set_for_test(true);
+
+        seed_binding_with_ebi("ebi-release-dead", 5, 9, "http://127.0.0.1:1");
+        let resp = handle_sm_context_release("ebi-release-dead", None).await;
+        assert_eq!(
+            resp.status, 204,
+            "an unreachable AMF must not turn a session release into a failure"
+        );
+        // The binding is gone regardless: the release completed locally.
+        assert!(
+            lookup_policy_binding("ebi-release-dead").is_none(),
+            "the release must complete even when the EBI could not be returned"
+        );
+
+        eps_iwk::set_for_test(false);
     }
 
     fn n1(psi: u8, pti: u8, message_type: u8, tail: &[u8]) -> Vec<u8> {
