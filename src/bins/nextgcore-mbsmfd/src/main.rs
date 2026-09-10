@@ -1449,8 +1449,26 @@ fn context_update_n2_response(ie_type: types::NgapIeType, ngap_bytes: Vec<u8>) -
 /// answer with an `MBS_DIS_SETUP_RSP` (TS 38.413 §9.3.5.8) built from the
 /// session's real N4mb transport (llSsm + cTeid), or an `MBS_DIS_SETUP_FAIL`
 /// (§9.3.5.9) with a real Cause when establishment cannot be started.
-fn amf_shared_delivery_setup(tmgi: &Tmgi) -> SbiResponse {
+///
+/// #301: registers `ran_node_key` as a holder of the session's shared transport
+/// BEFORE the establishment below brings it up, mirroring where #295 registers a
+/// consumer. Registering afterwards would leave a window in which a second RAN node's
+/// `MBS_DIS_REL_REQ` saw an empty set and released a transport this setup had just
+/// asked for.
+fn amf_shared_delivery_setup(tmgi: &Tmgi, ran_node_key: Option<&str>) -> SbiResponse {
     let ctx = mbsmf_self();
+    match ran_node_key {
+        Some(key) => {
+            let _ = ctx
+                .read()
+                .ok()
+                .and_then(|c| c.session_ran_node_register(tmgi, key));
+        }
+        None => log::warn!(
+            "ContextUpdate AMF setup (TMGI {:02x?}) carried no usable ranNodeId: this RAN              node cannot be tracked, so the first MBS_DIS_REL_REQ releases the shared              transport as it did before #301",
+            tmgi.mbs_service_id
+        ),
+    }
     let upf_addr = configured_mb_upf_ip();
     let started = ctx
         .read()
@@ -1565,11 +1583,19 @@ async fn handle_context_update_amf(
         );
     }
 
+    // #301: one canonical key per RAN node, computed once for both legs. `None` means
+    // the request carried no `ranNodeId` at all (the schema makes it optional, and the
+    // release leg can arrive with only the N2 container), which is the untracked case.
+    let ran_node_key = req
+        .ran_node_id
+        .as_ref()
+        .and_then(context::canonical_ran_node_key);
+
     let Some(n2) = req.n2_mbs_sm_info.as_ref() else {
         // Legacy JSON-only AMF request (ranNodeId only, no inbound container):
         // still a shared-delivery setup — the response now carries a REAL
         // container part (no dangling contentId). [G1-2 step 8]
-        return amf_shared_delivery_setup(tmgi);
+        return amf_shared_delivery_setup(tmgi, ran_node_key.as_deref());
     };
 
     let part = match resolve_n2_part(request, &n2.ngap_data.content_id) {
@@ -1596,7 +1622,7 @@ async fn handle_context_update_amf(
                     Some("INVALID_MSG_FORMAT"),
                 );
             }
-            amf_shared_delivery_setup(tmgi)
+            amf_shared_delivery_setup(tmgi, ran_node_key.as_deref())
         }
         // Release of shared delivery toward the RAN node (TS 23.247
         // §7.2.2.4): decode the Release Request Transfer (§9.3.5.10),
@@ -1617,15 +1643,38 @@ async fn handle_context_update_amf(
                     Some("INVALID_MSG_FORMAT"),
                 );
             }
-            let released = ctx
+            // #301: deregister THIS RAN node and release the shared transport only
+            // when nothing holds it any more. This arm used to call the unconditional
+            // `session_context_terminate`, so one RAN node's release deleted the MB-UPF
+            // session for every other RAN node still receiving on it (TS 23.247
+            // §7.2.2.4 releases shared delivery toward ONE node).
+            let key = ran_node_key.clone().unwrap_or_default();
+            match ctx
                 .read()
-                .map(|c| c.session_context_terminate(tmgi))
-                .unwrap_or(false);
-            if !released {
-                return send_not_found(
-                    "MBS session not found for ContextUpdate",
-                    Some("CONTEXT_NOT_FOUND"),
-                );
+                .map(|c| c.session_ran_node_release(tmgi, &key))
+                .unwrap_or(context::ConsumerTerminate::NotFound)
+            {
+                context::ConsumerTerminate::NotFound => {
+                    return send_not_found(
+                        "MBS session not found for ContextUpdate",
+                        Some("CONTEXT_NOT_FOUND"),
+                    );
+                }
+                context::ConsumerTerminate::ConsumerRemains { remaining } => {
+                    // #295's never-departing-holder decision applies unchanged here:
+                    // logged rather than timed out, because tearing down a transport
+                    // that is still carrying data because a RAN node went quiet is
+                    // worse than the pin.
+                    log::warn!(
+                        "ContextUpdate AMF release from RAN node {} (TMGI {:02x?}): shared                          transport stays UP for {} remaining holder(s) {:?}. Nothing unpins                          it if they never release (#301).",
+                        if key.is_empty() { "<untracked>" } else { &key },
+                        tmgi.mbs_service_id,
+                        remaining.len(),
+                        remaining
+                    );
+                    return SbiResponse::with_status(204);
+                }
+                context::ConsumerTerminate::LastConsumer => {}
             }
             // #76: same as the SMF terminate leg above -- the wire release, then the
             // local clear.
@@ -1637,7 +1686,7 @@ async fn handle_context_update_amf(
                 release_n4mb_transport(id).await;
             }
             log::info!(
-                "ContextUpdate AMF release (TMGI {:02x?})",
+                "ContextUpdate AMF release (TMGI {:02x?}): last holder gone, shared                  transport released",
                 tmgi.mbs_service_id
             );
             SbiResponse::with_status(204)
@@ -2609,6 +2658,358 @@ mod tests {
         assert!(
             session.consumers.is_empty(),
             "and leaves no consumer behind"
+        );
+    }
+
+    // ================================================================
+    // #301: shared delivery is released per RAN NODE, not per session
+    // ================================================================
+
+    /// An AMF ContextUpdate body with an explicit `ranNodeId`, so a test can be two
+    /// different RAN nodes. `amf_ctx_update_body` hardcodes one gNB.
+    fn amf_ctx_update_body_gnb(
+        svc_hex: &str,
+        mcc: &str,
+        mnc: &str,
+        ie_type: &str,
+        content_id: &str,
+        gnb_value: &str,
+    ) -> String {
+        format!(
+            r#"{{"nfcInstanceId":"amf-x","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc_hex}","plmnId":{{"mcc":"{mcc}","mnc":"{mnc}"}}}}}},"ranNodeId":{{"plmnId":{{"mcc":"{mcc}","mnc":"{mnc}"}},"gNbId":{{"bitLength":24,"gNBValue":"{gnb_value}"}}}},"n2MbsSmInfo":{{"ngapIeType":"{ie_type}","ngapData":{{"contentId":"{content_id}"}}}}}}"#
+        )
+    }
+
+    /// An SMF ContextUpdate body for an explicit PLMN, so the SMF and AMF legs in one
+    /// test can address the same session.
+    fn smf_ctx_update_body_plmn(
+        svc_hex: &str,
+        nfc: &str,
+        action: &str,
+        mcc: &str,
+        mnc: &str,
+    ) -> String {
+        format!(
+            r#"{{"nfcInstanceId":"{nfc}","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc_hex}","plmnId":{{"mcc":"{mcc}","mnc":"{mnc}"}}}}}},"requestedAction":"{action}"}}"#
+        )
+    }
+
+    /// The minimal §9.3.5.7 Setup Request Transfer for a TMGI in PLMN 208/93:
+    /// presence/preamble octet, then the PLMN in BCD (02 F8 39) and the service id.
+    fn setup_container_208_93(svc_id: [u8; 3]) -> Vec<u8> {
+        vec![0x00, 0x02, 0xF8, 0x39, svc_id[0], svc_id[1], svc_id[2]]
+    }
+
+    /// The §9.3.5.10 Release Request Transfer for the same TMGI — the setup container
+    /// plus the trailing octet the golden constant carries.
+    fn rel_container_208_93(svc_id: [u8; 3]) -> Vec<u8> {
+        let mut v = setup_container_208_93(svc_id);
+        v.push(0x40);
+        v
+    }
+
+    async fn amf_leg(body: String, container: Vec<u8>) -> SbiResponse {
+        post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(body, "application/json")
+                .with_part(SbiPart::with_content(
+                    "n2SmInfo",
+                    APPLICATION_NGAP,
+                    bytes::Bytes::from(container),
+                )),
+        )
+        .await
+    }
+
+    fn stored_session_plmn(svc_id: [u8; 3], mcc: &str, mnc: &str) -> MbsSession {
+        let tmgi = Tmgi {
+            mbs_service_id: svc_id,
+            plmn_id: PlmnId {
+                mcc: mcc.to_string(),
+                mnc: mnc.to_string(),
+            },
+        };
+        mbsmf_self()
+            .read()
+            .unwrap()
+            .session_find_by_tmgi(&tmgi)
+            .expect("session exists")
+    }
+
+    /// #301 criteria 1-3: two RAN nodes receive one TMGI's shared delivery; the first
+    /// `MBS_DIS_REL_REQ` answers 204 with the transport UP, a repeated one from the same
+    /// node changes nothing, and the second releases it.
+    ///
+    /// `n4mb_session.is_some()` is the assertion that no Session Deletion was sent, as
+    /// in #295's test: `release_n4mb_transport` is the only path that sends one and it
+    /// clears the context either way, so a context still present is a release that did
+    /// not happen.
+    #[tokio::test]
+    async fn two_ran_nodes_share_delivery_and_only_the_last_release_tears_it_down() {
+        let svc_id = [0xC3, 0x01, 0x01];
+        let svc = seed_global_session_plmn(svc_id, "208", "93");
+
+        for gnb in ["000001", "000002"] {
+            let rsp = amf_leg(
+                amf_ctx_update_body_gnb(&svc, "208", "93", "MBS_DIS_SETUP_REQ", "n2SmInfo", gnb),
+                setup_container_208_93(svc_id),
+            )
+            .await;
+            assert_eq!(rsp.status, 200, "gNB {gnb}'s shared-delivery setup");
+        }
+        let session = stored_session_plmn(svc_id, "208", "93");
+        assert_eq!(
+            session.ran_nodes.len(),
+            2,
+            "both RAN nodes receive this session's shared delivery, got {:?}",
+            session.ran_nodes
+        );
+        assert!(session.n4mb_session.is_some(), "the transport is up");
+
+        // --- the first RAN node releases: 204, and delivery continues ---
+        let rsp = amf_leg(
+            amf_ctx_update_body_gnb(&svc, "208", "93", "MBS_DIS_REL_REQ", "n2SmInfo", "000001"),
+            rel_container_208_93(svc_id),
+        )
+        .await;
+        assert_eq!(
+            rsp.status, 204,
+            "release → 204 (spec 2b: nothing to return)"
+        );
+        let session = stored_session_plmn(svc_id, "208", "93");
+        assert!(
+            session.n4mb_session.is_some(),
+            "the MB-UPF session must survive one RAN node's release: the others are still \
+             receiving on it (TS 23.247 §7.2.2.4 releases delivery toward ONE node)"
+        );
+        assert_eq!(
+            session.ran_nodes.len(),
+            1,
+            "only the releasing node is removed, got {:?}",
+            session.ran_nodes
+        );
+
+        // --- a REPEATED release from the same node changes nothing ---
+        let rsp = amf_leg(
+            amf_ctx_update_body_gnb(&svc, "208", "93", "MBS_DIS_REL_REQ", "n2SmInfo", "000001"),
+            rel_container_208_93(svc_id),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        assert!(
+            stored_session_plmn(svc_id, "208", "93")
+                .n4mb_session
+                .is_some(),
+            "a repeated release must not double-decrement and tear down delivery gNB \
+             000002 is still receiving"
+        );
+
+        // --- the last RAN node releases it ---
+        let rsp = amf_leg(
+            amf_ctx_update_body_gnb(&svc, "208", "93", "MBS_DIS_REL_REQ", "n2SmInfo", "000002"),
+            rel_container_208_93(svc_id),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        let session = stored_session_plmn(svc_id, "208", "93");
+        assert!(
+            session.n4mb_session.is_none(),
+            "the last RAN node's release tears the shared transport down"
+        );
+        assert!(session.ran_nodes.is_empty(), "and leaves no node behind");
+    }
+
+    /// #301 criterion 4: a setup from a `ranNodeId` already in the set does not
+    /// double-count, so an AMF that re-sends `MBS_DIS_SETUP_REQ` cannot pin the
+    /// transport past its own release.
+    #[tokio::test]
+    async fn a_repeated_setup_from_one_ran_node_does_not_double_count() {
+        let svc_id = [0xC3, 0x01, 0x02];
+        let svc = seed_global_session_plmn(svc_id, "208", "93");
+
+        for _ in 0..3 {
+            let rsp = amf_leg(
+                amf_ctx_update_body_gnb(
+                    &svc,
+                    "208",
+                    "93",
+                    "MBS_DIS_SETUP_REQ",
+                    "n2SmInfo",
+                    "000001",
+                ),
+                setup_container_208_93(svc_id),
+            )
+            .await;
+            assert_eq!(rsp.status, 200);
+        }
+        assert_eq!(
+            stored_session_plmn(svc_id, "208", "93").ran_nodes.len(),
+            1,
+            "three setups from one RAN node are one RAN node"
+        );
+
+        // So one release is therefore the last one.
+        let rsp = amf_leg(
+            amf_ctx_update_body_gnb(&svc, "208", "93", "MBS_DIS_REL_REQ", "n2SmInfo", "000001"),
+            rel_container_208_93(svc_id),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        assert!(
+            stored_session_plmn(svc_id, "208", "93")
+                .n4mb_session
+                .is_none(),
+            "one node, one release, transport gone"
+        );
+    }
+
+    /// #301 criterion 5: the two sets interact, and EITHER being non-empty keeps the
+    /// shared transport up. Guarded in both directions, because the safe reading is a
+    /// decision rather than an obvious truth.
+    ///
+    /// The reason for it: the sets count different things at different layers — SMF
+    /// consumers of the MBS session, and RAN nodes receiving the shared NG-U tunnel —
+    /// and the ONE MB-UPF session underneath serves both. Releasing it while either
+    /// still needs it stops data for that side, which is the defect #295 and #301 each
+    /// fix in their own dimension; consulting only one set would leave the other's
+    /// version of it open.
+    #[tokio::test]
+    async fn either_a_consumer_or_a_ran_node_keeps_the_shared_transport_up() {
+        // --- direction 1: the RAN node releases while an SMF consumer remains ---
+        let svc_id = [0xC3, 0x01, 0x03];
+        let svc = seed_global_session_plmn(svc_id, "208", "93");
+
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                smf_ctx_update_body_plmn(&svc, "smf-a", "START", "208", "93"),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(rsp.status, 200, "the SMF's START");
+        let rsp = amf_leg(
+            amf_ctx_update_body_gnb(&svc, "208", "93", "MBS_DIS_SETUP_REQ", "n2SmInfo", "000001"),
+            setup_container_208_93(svc_id),
+        )
+        .await;
+        assert_eq!(rsp.status, 200, "the RAN node's setup");
+
+        let session = stored_session_plmn(svc_id, "208", "93");
+        assert_eq!(session.consumers.len(), 1);
+        assert_eq!(session.ran_nodes.len(), 1);
+
+        let rsp = amf_leg(
+            amf_ctx_update_body_gnb(&svc, "208", "93", "MBS_DIS_REL_REQ", "n2SmInfo", "000001"),
+            rel_container_208_93(svc_id),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        assert!(
+            stored_session_plmn(svc_id, "208", "93")
+                .n4mb_session
+                .is_some(),
+            "the last RAN node leaving must not delete the MB-UPF session an SMF consumer \
+             is still using"
+        );
+
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                smf_ctx_update_body_plmn(&svc, "smf-a", "TERMINATE", "208", "93"),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        assert!(
+            stored_session_plmn(svc_id, "208", "93")
+                .n4mb_session
+                .is_none(),
+            "and once neither holds it, it goes"
+        );
+
+        // --- direction 2: the SMF consumer terminates while a RAN node remains ---
+        let svc_id = [0xC3, 0x01, 0x04];
+        let svc = seed_global_session_plmn(svc_id, "208", "93");
+
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                smf_ctx_update_body_plmn(&svc, "smf-a", "START", "208", "93"),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(rsp.status, 200);
+        let rsp = amf_leg(
+            amf_ctx_update_body_gnb(&svc, "208", "93", "MBS_DIS_SETUP_REQ", "n2SmInfo", "000001"),
+            setup_container_208_93(svc_id),
+        )
+        .await;
+        assert_eq!(rsp.status, 200);
+
+        let rsp = post_ctx_update(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update").with_body(
+                smf_ctx_update_body_plmn(&svc, "smf-a", "TERMINATE", "208", "93"),
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        assert!(
+            stored_session_plmn(svc_id, "208", "93")
+                .n4mb_session
+                .is_some(),
+            "the last SMF consumer leaving must not stop delivery a RAN node is still \
+             receiving: #295's set alone would have released here"
+        );
+
+        let rsp = amf_leg(
+            amf_ctx_update_body_gnb(&svc, "208", "93", "MBS_DIS_REL_REQ", "n2SmInfo", "000001"),
+            rel_container_208_93(svc_id),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+        assert!(
+            stored_session_plmn(svc_id, "208", "93")
+                .n4mb_session
+                .is_none(),
+            "and the RAN node's release is then the last holder's"
+        );
+    }
+
+    /// An AMF release carrying no usable `ranNodeId` releases on the first request, as
+    /// it did before #301 — the same "cannot be tracked, so behave as before" rule #295
+    /// states for an empty `nfcInstanceId`, and stated here rather than left to be
+    /// discovered.
+    #[tokio::test]
+    async fn an_untracked_ran_node_releases_on_the_first_request() {
+        let svc_id = [0xC3, 0x01, 0x05];
+        let svc = seed_global_session_plmn(svc_id, "208", "93");
+
+        // Setup with no ranNodeId at all: only the N2 container identifies the leg.
+        let no_ran_node = format!(
+            r#"{{"nfcInstanceId":"amf-x","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc}","plmnId":{{"mcc":"208","mnc":"93"}}}}}},"n2MbsSmInfo":{{"ngapIeType":"MBS_DIS_SETUP_REQ","ngapData":{{"contentId":"n2SmInfo"}}}}}}"#
+        );
+        let rsp = amf_leg(no_ran_node, setup_container_208_93(svc_id)).await;
+        assert_eq!(rsp.status, 200);
+        let session = stored_session_plmn(svc_id, "208", "93");
+        assert!(
+            session.ran_nodes.is_empty(),
+            "an untracked RAN node is not in the set: keying it on nothing would make \
+             every such node the SAME holder"
+        );
+        assert!(session.n4mb_session.is_some());
+
+        let rel_no_ran_node = format!(
+            r#"{{"nfcInstanceId":"amf-x","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc}","plmnId":{{"mcc":"208","mnc":"93"}}}}}},"n2MbsSmInfo":{{"ngapIeType":"MBS_DIS_REL_REQ","ngapData":{{"contentId":"n2SmInfo"}}}}}}"#
+        );
+        let rsp = amf_leg(rel_no_ran_node, rel_container_208_93(svc_id)).await;
+        assert_eq!(rsp.status, 204);
+        assert!(
+            stored_session_plmn(svc_id, "208", "93")
+                .n4mb_session
+                .is_none(),
+            "with nothing tracked there is nothing to keep it up, which is the pre-#301 \
+             behaviour"
         );
     }
 
