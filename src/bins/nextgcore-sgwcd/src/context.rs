@@ -116,6 +116,20 @@ pub struct SgwcUe {
     pub rat_type: u8,
     /// MME S11 peer address (learned from the received UDP datagram)
     pub mme_addr: Option<std::net::SocketAddr>,
+    /// The session a Downlink Data Notification is outstanding for (#54).
+    ///
+    /// Set when a DDN goes to the MME, cleared when it is acknowledged or fails. It is
+    /// what ties a DDN Acknowledge — which names the UE, not the session — back to the
+    /// session whose buffered packets have to be discarded (TS 23.401 §5.3.4.2).
+    pub ddn_outstanding_sess_id: Option<u64>,
+    /// When the next Downlink Data Notification toward this MME may be sent.
+    ///
+    /// TS 29.274 §7.2.11.2: the Data Notification Delay in the DDN Acknowledge throttles
+    /// the SGW's next notification, in units of 50ms. It was PARSED into
+    /// `ParsedDdnAck.data_notification_delay` and then dropped by the handler, so the
+    /// throttling the IE exists to provide could not happen and a busy idle UE could
+    /// produce a DDN storm.
+    pub ddn_not_before: Option<std::time::Instant>,
 }
 
 impl SgwcUe {
@@ -133,6 +147,8 @@ impl SgwcUe {
             gnode_id: None,
             rat_type: 0,
             mme_addr: None,
+            ddn_outstanding_sess_id: None,
+            ddn_not_before: None,
         }
     }
 
@@ -156,6 +172,27 @@ impl SgwcUe {
             }
         }
         result
+    }
+
+    /// How much of the Data Notification Delay is left, or `None` when a Downlink Data
+    /// Notification may be sent now (TS 29.274 §7.2.11.2). Issue #54.
+    pub fn ddn_delay_remaining(&self) -> Option<std::time::Duration> {
+        let not_before = self.ddn_not_before?;
+        let now = std::time::Instant::now();
+        (not_before > now).then(|| not_before - now)
+    }
+
+    /// Apply the Data Notification Delay the MME asked for, in its 50ms units.
+    ///
+    /// Zero means "no delay", which is what an absent IE also means -- so both clear the
+    /// throttle rather than pinning it at `now`.
+    pub fn set_ddn_delay(&mut self, delay_50ms_units: Option<u8>) {
+        self.ddn_not_before = match delay_50ms_units {
+            Some(units) if units > 0 => Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(units as u64 * 50),
+            ),
+            _ => None,
+        };
     }
 }
 
@@ -405,6 +442,10 @@ pub struct SgwcContext {
     sxa_seid_generator: AtomicU64,
     /// GTP-U TEID generator (for SGW user-plane endpoints)
     gtpu_teid_generator: AtomicU64,
+    /// PDR / FAR id allocators (#54): nothing assigned these before, so every tunnel
+    /// carried `None` and every Sxa rule was emitted without the id that names it.
+    pdr_id_generator: AtomicUsize,
+    far_id_generator: AtomicU64,
     /// Local S11/S5-C control-plane IPv4 address
     s11_addr: RwLock<Option<Ipv4Addr>>,
     /// Advertised SGW-U GTP-U IPv4 address (user-plane endpoints)
@@ -442,6 +483,8 @@ impl SgwcContext {
             s11_teid_generator: AtomicU64::new(1),
             sxa_seid_generator: AtomicU64::new(1),
             gtpu_teid_generator: AtomicU64::new(1),
+            pdr_id_generator: AtomicUsize::new(1),
+            far_id_generator: AtomicU64::new(1),
             s11_addr: RwLock::new(None),
             gtpu_addr: RwLock::new(None),
             max_num_of_ue: 0,
@@ -502,6 +545,22 @@ impl SgwcContext {
     /// Allocate a GTP-U TEID for an SGW user-plane endpoint
     pub fn next_gtpu_teid(&self) -> u32 {
         self.gtpu_teid_generator.fetch_add(1, Ordering::SeqCst) as u32
+    }
+
+    /// Allocate a PDR id (#54).
+    ///
+    /// TS 29.244 §8.2.36 scopes a PDR ID to its PFCP session and makes it a u16, so a
+    /// process-wide counter is wider than it needs to be — and that is deliberate: a
+    /// per-session counter would restart at 1 for every session, and a stale rule matched
+    /// by id across a re-establishment is the kind of collision that reads as a data-path
+    /// bug. Wraps rather than saturating, because saturating would hand out one id forever.
+    pub fn next_pdr_id(&self) -> u16 {
+        (self.pdr_id_generator.fetch_add(1, Ordering::SeqCst) % (u16::MAX as usize - 1) + 1) as u16
+    }
+
+    /// Allocate a FAR id (TS 29.244 §8.2.74, u32, session-scoped for the same reason).
+    pub fn next_far_id(&self) -> u32 {
+        self.far_id_generator.fetch_add(1, Ordering::SeqCst) as u32
     }
 
     /// Set the local S11/S5-C control-plane address
